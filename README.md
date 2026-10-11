@@ -87,6 +87,9 @@ LIMIT n;
 ```
 
 - Aggregates: `COUNT(*)` / `COUNT(x)`, `SUM`, `AVG`, `MIN`, `MAX`
+- Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, aggregates `OVER`
+  (`PARTITION BY` / `ORDER BY` / `ROWS` frames; default frame is cumulative
+  with ORDER BY, whole partition without; no `RANGE` frames, no nesting)
 - Scalar functions: `abs`, `round` (1–2 args), `upper`, `lower`, `length`, `substr`
 - Types: `BOOLEAN`, `INTEGER` (i32), `BIGINT` (i64), `DOUBLE` (f64), `VARCHAR`,
   `DATE` (days since epoch), `TIMESTAMP` (microseconds, naive, no time zone)
@@ -137,7 +140,8 @@ Generated with `bench/gen_sales.py` (deterministic seed 42):
 ## Known v1 limits
 
 - No UPDATE/DELETE/transactions (persistence is on-disk `.pink` via `.save`/`.open`)
-- Correlated subqueries are rejected (uncorrelated only); no window functions, no outer joins
+- Correlated subqueries are rejected (uncorrelated only); no outer joins
+- Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position
 - General ORDER BY expressions must be aliases, positions, or GROUP BY keys
 - `%` is integer-only; `SUM` overflow wraps

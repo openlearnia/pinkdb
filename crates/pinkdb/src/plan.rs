@@ -1,7 +1,7 @@
 //! Logical plan: a tree of Scan → Filter → Join → Aggregate → Project →
 //! Distinct → Sort → Limit.
 
-use crate::sql::binder::{BoundAgg, BoundExpr};
+use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::types::{DataType, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +32,15 @@ pub enum LogicalPlan {
         name: String,
         query: Box<LogicalPlan>,
         body: Box<LogicalPlan>,
+    },
+    /// Window functions: output is input columns ++ one column per window.
+    /// Partition/order/arg expressions address the input (scan-relative, or
+    /// Aggregate-output after rebasing — same rules as select items).
+    Window {
+        input: Box<LogicalPlan>,
+        windows: Vec<BoundWindow>,
+        /// Input column count (window results start here).
+        input_cols: usize,
     },
     /// Inner equi-join on a single `left_key = right_key` condition.
     /// Output columns are left ++ right. Keys are side-relative (evaluated
@@ -89,6 +98,19 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         // Binder rejects mixed-type comparisons; order deterministically anyway.
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
     }
+}
+
+/// Output names/types appended by a Window node (one per window).
+pub(crate) fn win_output_schema(
+    windows: &[crate::sql::binder::BoundWindow],
+) -> (Vec<String>, Vec<crate::types::DataType>) {
+    let mut names = Vec::with_capacity(windows.len());
+    let mut types = Vec::with_capacity(windows.len());
+    for (i, w) in windows.iter().enumerate() {
+        names.push(format!("__win{i}"));
+        types.push(w.dtype);
+    }
+    (names, types)
 }
 
 fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {

@@ -262,19 +262,7 @@ impl Parser {
         let mut order_by = Vec::new();
         if self.eat_keyword(Keyword::Order) {
             self.expect_keyword(Keyword::By)?;
-            loop {
-                let expr = self.parse_expr()?;
-                let desc = if self.eat_keyword(Keyword::Desc) {
-                    true
-                } else {
-                    self.eat_keyword(Keyword::Asc);
-                    false
-                };
-                order_by.push(OrderItem { expr, desc });
-                if !self.eat(&Token::Comma) {
-                    break;
-                }
-            }
+            order_by = self.parse_order_list()?;
         }
         let limit = if self.eat_keyword(Keyword::Limit) {
             match self.next() {
@@ -408,6 +396,120 @@ impl Parser {
             out.push(self.parse_expr()?);
         }
         Ok(out)
+    }
+
+    /// `expr [ASC|DESC], ...` (the ORDER BY having been consumed).
+    fn parse_order_list(&mut self) -> Result<Vec<OrderItem>> {
+        let mut order_by = Vec::new();
+        loop {
+            let expr = self.parse_expr()?;
+            let desc = if self.eat_keyword(Keyword::Desc) {
+                true
+            } else {
+                self.eat_keyword(Keyword::Asc);
+                false
+            };
+            order_by.push(OrderItem { expr, desc });
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(order_by)
+    }
+
+    /// `OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS ...])`.
+    fn parse_over(&mut self) -> Result<OverClause> {
+        self.expect_keyword(Keyword::Over)?;
+        self.expect(&Token::LParen)?;
+        let mut partition = Vec::new();
+        if self.eat_keyword(Keyword::Partition) {
+            self.expect_keyword(Keyword::By)?;
+            partition = self.parse_expr_list()?;
+        }
+        let mut order = Vec::new();
+        if self.eat_keyword(Keyword::Order) {
+            self.expect_keyword(Keyword::By)?;
+            order = self.parse_order_list()?;
+        }
+        let mut frame = None;
+        if self.eat_keyword(Keyword::Rows) || self.eat_keyword(Keyword::Row) {
+            frame = Some(self.parse_rows_frame()?);
+        } else if self.eat_keyword(Keyword::Range) {
+            return Err(self.error(
+                "RANGE frames are not supported in v1 (use ROWS)".to_string(),
+            ));
+        }
+        self.expect(&Token::RParen)?;
+        Ok(OverClause { partition, order, frame })
+    }
+
+    /// After `ROWS`: `BETWEEN a AND b | UNBOUNDED PRECEDING | CURRENT ROW |
+    /// UNBOUNDED FOLLOWING | <n> PRECEDING | <n> FOLLOWING`.
+    fn parse_rows_frame(&mut self) -> Result<FrameSpec> {
+        if self.eat_keyword(Keyword::Between) {
+            let start = self.parse_frame_bound()?;
+            self.expect_keyword(Keyword::And)?;
+            let end = self.parse_frame_bound()?;
+            return Ok(FrameSpec { start, end });
+        }
+        if self.eat_keyword(Keyword::Current) {
+            self.expect_keyword(Keyword::Row)?;
+            let b = FrameBound::CurrentRow;
+            return Ok(FrameSpec { start: b, end: b });
+        }
+        if self.eat_keyword(Keyword::Unbounded) {
+            if self.eat_keyword(Keyword::Preceding) {
+                return Ok(FrameSpec {
+                    start: FrameBound::UnboundedPreceding,
+                    end: FrameBound::CurrentRow,
+                });
+            }
+            self.expect_keyword(Keyword::Following)?;
+            return Ok(FrameSpec {
+                start: FrameBound::UnboundedFollowing,
+                end: FrameBound::UnboundedFollowing,
+            });
+        }
+        match self.next() {
+            (Token::Integer(n), _) if n >= 0 => {
+                if self.eat_keyword(Keyword::Preceding) {
+                    return Ok(FrameSpec {
+                        start: FrameBound::Preceding(n as usize),
+                        end: FrameBound::CurrentRow,
+                    });
+                }
+                self.expect_keyword(Keyword::Following)?;
+                Ok(FrameSpec {
+                    start: FrameBound::CurrentRow,
+                    end: FrameBound::Following(n as usize),
+                })
+            }
+            (tok, _) => Err(self.error(format!("bad frame bound: {tok:?}"))),
+        }
+    }
+
+    fn parse_frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_keyword(Keyword::Unbounded) {
+            if self.eat_keyword(Keyword::Preceding) {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            self.expect_keyword(Keyword::Following)?;
+            return Ok(FrameBound::UnboundedFollowing);
+        }
+        if self.eat_keyword(Keyword::Current) {
+            self.expect_keyword(Keyword::Row)?;
+            return Ok(FrameBound::CurrentRow);
+        }
+        match self.next() {
+            (Token::Integer(n), _) if n >= 0 => {
+                if self.eat_keyword(Keyword::Preceding) {
+                    return Ok(FrameBound::Preceding(n as usize));
+                }
+                self.expect_keyword(Keyword::Following)?;
+                Ok(FrameBound::Following(n as usize))
+            }
+            (tok, _) => Err(self.error(format!("bad frame bound: {tok:?}"))),
+        }
     }
 
     // ---------- expressions ----------
@@ -665,6 +767,10 @@ impl Parser {
                         args = self.parse_expr_list()?;
                     }
                     self.expect(&Token::RParen)?;
+                    if self.peek_keyword() == Some(Keyword::Over) {
+                        let over = self.parse_over()?;
+                        return Ok(Expr::Window { name, args, over });
+                    }
                     return Ok(Expr::Function { name, args });
                 }
                 // Qualified `table.column`, `table.*`, or bare column.
@@ -783,6 +889,32 @@ mod tests {
             parse_one("CREATE TABLE t (d DATE, ts TIMESTAMP);"),
             Statement::CreateTable { .. }
         ));
+    }
+
+    #[test]
+    fn window_shapes() {
+        let s = parse_one("SELECT rank() OVER (PARTITION BY a ORDER BY b DESC) FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        match &sel.projections[0] {
+            Projection::Expr { expr: Expr::Window { name, over, .. }, .. } => {
+                assert_eq!(name, "rank");
+                assert_eq!(over.partition.len(), 1);
+                assert_eq!(over.order.len(), 1);
+                assert!(over.order[0].desc);
+                assert!(over.frame.is_none());
+            }
+            _ => panic!(),
+        }
+        let s = parse_one("SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Window { .. }, .. }
+        ));
+        assert!(parse_statements(
+            "SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;"
+        )
+        .is_err());
     }
 
     #[test]

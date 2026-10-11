@@ -92,6 +92,24 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             keys: keys.into_iter().map(|k| fold_expr(&mut cx, k)).collect(),
             aggs: fold_aggs(&mut cx, aggs),
         },
+        LogicalPlan::Window { input, windows, input_cols } => LogicalPlan::Window {
+            input: Box::new(fold_plan(db, *input)),
+            windows: windows
+                .into_iter()
+                .map(|mut w| {
+                    w.arg = w.arg.map(|e| fold_expr(&mut cx, e));
+                    w.partition =
+                        w.partition.into_iter().map(|e| fold_expr(&mut cx, e)).collect();
+                    w.order = w
+                        .order
+                        .into_iter()
+                        .map(|(e, d)| (fold_expr(&mut cx, e), d))
+                        .collect();
+                    w
+                })
+                .collect(),
+            input_cols,
+        },
         LogicalPlan::Project { input, exprs, names } => LogicalPlan::Project {
             input: Box::new(fold_plan(db, *input)),
             exprs: exprs.into_iter().map(|e| fold_expr(&mut cx, e)).collect(),
@@ -133,7 +151,7 @@ fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
         BoundExpr::Column { index, .. } => out.push(*index),
         BoundExpr::Literal(_) | BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
         BoundExpr::InSubquery { expr, .. } => columns_in(expr, out),
-        BoundExpr::AggRef { .. } => out.push(usize::MAX),
+        BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => out.push(usize::MAX),
         BoundExpr::Not(e) | BoundExpr::Negate { expr: e, .. } | BoundExpr::IsNull { expr: e, .. } => {
             columns_in(e, out);
         }
@@ -180,7 +198,9 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             BoundExpr::Column { .. } | BoundExpr::AggRef { .. } => Some(exprs[*index].clone()),
             _ => None,
         },
-        BoundExpr::Literal(_) | BoundExpr::AggRef { .. } => Some(pred.clone()),
+        BoundExpr::Literal(_) | BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => {
+            Some(pred.clone())
+        }
         // Subqueries are scope-independent: pass through (IN's outer expr
         // still rewrites below).
         BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => Some(pred.clone()),
@@ -269,6 +289,7 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                     keep.push(c);
                 }
             }
+            let pushed = !left_push.is_empty() || !right_push.is_empty();
             let left = match and_all(left_push) {
                 Some(p) => Box::new(LogicalPlan::Filter { input: left, predicate: p }),
                 None => left,
@@ -279,12 +300,47 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             };
             let join = LogicalPlan::Join { left, right, left_key, right_key, left_cols };
             match and_all(keep) {
-                Some(p) => (LogicalPlan::Filter { input: Box::new(join), predicate: p }, true),
-                // Everything pushed: filter node disappears (still counts as moved).
+                // Nothing moved below: report unmoved so pushdown terminates.
+                Some(p) => (
+                    LogicalPlan::Filter { input: Box::new(join), predicate: p },
+                    pushed,
+                ),
+                // Everything pushed: filter node disappears (still progress).
                 None => (join, true),
             }
         }
         // Never below Limit (changes semantics) or Aggregate (HAVING, v1).
+        // Below Window: only conjuncts over input columns (window results
+        // start at input_cols); window columns stay above.
+        LogicalPlan::Window { input, windows, input_cols } => {
+            let mut conjuncts = Vec::new();
+            split_conjuncts(pred, &mut conjuncts);
+            let mut keep = Vec::new();
+            let mut push = Vec::new();
+            for c in conjuncts {
+                let mut cols = Vec::new();
+                columns_in(&c, &mut cols);
+                if !cols.is_empty() && cols.iter().all(|i| *i < input_cols) {
+                    push.push(c);
+                } else {
+                    keep.push(c);
+                }
+            }
+            let pushed = !push.is_empty();
+            let input = match and_all(push) {
+                Some(p) => Box::new(LogicalPlan::Filter { input, predicate: p }),
+                None => input,
+            };
+            let window = LogicalPlan::Window { input, windows, input_cols };
+            match and_all(keep) {
+                // Nothing moved below: report unmoved so pushdown terminates.
+                Some(p) => (
+                    LogicalPlan::Filter { input: Box::new(window), predicate: p },
+                    pushed,
+                ),
+                None => (window, true),
+            }
+        }
         // Anything else keeps the filter where it is.
         other => (
             LogicalPlan::Filter { input: Box::new(other), predicate: pred },
@@ -352,6 +408,11 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(pushdown(*input)),
             keys,
             aggs,
+        },
+        LogicalPlan::Window { input, windows, input_cols } => LogicalPlan::Window {
+            input: Box::new(pushdown(*input)),
+            windows,
+            input_cols,
         },
         // Filters push within the body and within the query independently —
         // never across the CTE boundary (different scopes).
@@ -454,5 +515,50 @@ mod tests {
             predicate: B::Literal(Value::Boolean(true)),
         };
         assert!(matches!(pushdown(plan), LogicalPlan::Filter { .. }));
+    }
+
+    #[test]
+    fn partial_pushdown_terminates() {
+        // A mixed join predicate (left-only AND cross-side) must terminate:
+        // the cross-side conjunct stays above while the rest pushes down.
+        let left_only = B::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(col(0)),
+            right: Box::new(B::Literal(Value::Integer(5))),
+            dtype: T::Boolean,
+        };
+        let mixed = B::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col(0)),
+            right: Box::new(col(3)),
+            dtype: T::Boolean,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(LogicalPlan::SingleRow),
+                right: Box::new(LogicalPlan::SingleRow),
+                left_key: col(0),
+                right_key: col(0),
+                left_cols: 2,
+            }),
+            predicate: B::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left_only),
+                right: Box::new(mixed),
+                dtype: T::Boolean,
+            },
+        };
+        let out = pushdown(plan);
+        // Left side got its filter; the mixed conjunct stays on top.
+        match out {
+            LogicalPlan::Filter { input, .. } => {
+                assert!(matches!(*input, LogicalPlan::Join { .. }));
+                if let LogicalPlan::Join { left, right, .. } = *input {
+                    assert!(matches!(*left, LogicalPlan::Filter { .. }));
+                    assert!(matches!(*right, LogicalPlan::SingleRow));
+                }
+            }
+            _ => panic!("filter should stay above the join"),
+        }
     }
 }

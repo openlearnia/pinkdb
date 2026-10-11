@@ -88,6 +88,84 @@ pub struct BoundAgg {
     pub dtype: DataType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    RowNumber,
+    Rank,
+    DenseRank,
+    Agg(AggFunc),
+}
+
+impl WindowFunc {
+    fn ranking(name: &str) -> Option<WindowFunc> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "row_number" => WindowFunc::RowNumber,
+            "rank" => WindowFunc::Rank,
+            "dense_rank" => WindowFunc::DenseRank,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowKind {
+    Rank(WindowFunc),
+    Agg(AggFunc),
+}
+
+fn map_frame_bound(b: crate::sql::ast::FrameBound) -> Result<FrameBound> {
+    Ok(match b {
+        crate::sql::ast::FrameBound::UnboundedPreceding => FrameBound::UnboundedPreceding,
+        crate::sql::ast::FrameBound::Preceding(n) => FrameBound::Preceding(n),
+        crate::sql::ast::FrameBound::CurrentRow => FrameBound::CurrentRow,
+        crate::sql::ast::FrameBound::Following(n) => FrameBound::Following(n),
+        crate::sql::ast::FrameBound::UnboundedFollowing => FrameBound::UnboundedFollowing,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundFrame {
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+impl BoundFrame {
+    /// Default frame: whole partition, or cumulative when ordered.
+    fn default_for(ordered: bool) -> Self {
+        if ordered {
+            Self {
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::CurrentRow,
+            }
+        } else {
+            Self {
+                start: FrameBound::UnboundedPreceding,
+                end: FrameBound::UnboundedFollowing,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BoundWindow {
+    pub func: WindowFunc,
+    /// COUNT(*) has no arg.
+    pub arg: Option<BoundExpr>,
+    pub partition: Vec<BoundExpr>,
+    pub order: Vec<(BoundExpr, bool)>,
+    pub frame: BoundFrame,
+    pub dtype: DataType,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundExpr {
     Literal(Value),
@@ -106,6 +184,9 @@ pub enum BoundExpr {
     /// Aggregate output column. Index is relative to the agg list until
     /// [`resolve_agg_refs`] rebases it past the group keys.
     AggRef { index: usize, dtype: DataType },
+    /// Window output column. Index is relative to the window list until
+    /// rebased past the window input columns.
+    WindowRef { index: usize, dtype: DataType },
     /// Uncorrelated scalar subquery (1 col by construction; rows at runtime).
     ScalarSubquery { query: Box<LogicalPlan>, dtype: DataType },
     /// `expr [NOT] IN (query)` — `expr` may reference the outer scope.
@@ -126,6 +207,7 @@ impl BoundExpr {
             BoundExpr::IsNull { .. } => DataType::Boolean,
             BoundExpr::Scalar { dtype, .. } => *dtype,
             BoundExpr::AggRef { dtype, .. } => *dtype,
+            BoundExpr::WindowRef { dtype, .. } => *dtype,
             BoundExpr::ScalarSubquery { dtype, .. } => *dtype,
             BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => DataType::Boolean,
         }
@@ -135,7 +217,7 @@ impl BoundExpr {
     /// Subquery bodies live in their own scope and never count here.
     pub fn is_aggregate_free(&self) -> bool {
         match self {
-            BoundExpr::AggRef { .. } => false,
+            BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => false,
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
             | BoundExpr::ScalarSubquery { .. }
@@ -159,6 +241,7 @@ impl BoundExpr {
             BoundExpr::Column { .. } => true,
             BoundExpr::Literal(_)
             | BoundExpr::AggRef { .. }
+            | BoundExpr::WindowRef { .. }
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
             BoundExpr::InSubquery { expr, .. } => expr.has_column_ref(),
@@ -178,7 +261,10 @@ impl BoundExpr {
             BoundExpr::ScalarSubquery { .. }
             | BoundExpr::InSubquery { .. }
             | BoundExpr::Exists { .. } => true,
-            BoundExpr::Literal(_) | BoundExpr::Column { .. } | BoundExpr::AggRef { .. } => false,
+            BoundExpr::Literal(_)
+            | BoundExpr::Column { .. }
+            | BoundExpr::AggRef { .. }
+            | BoundExpr::WindowRef { .. } => false,
             BoundExpr::Not(e)
             | BoundExpr::Negate { expr: e, .. }
             | BoundExpr::IsNull { expr: e, .. } => e.has_subquery(),
@@ -297,6 +383,12 @@ struct Binder<'a> {
     resolving: Vec<String>,
     /// Whether bare columns consult aliases (false for WHERE).
     allow_alias: bool,
+    /// Whether window functions may appear (false for WHERE/GROUP BY/HAVING).
+    allow_win: bool,
+    /// True while binding a window's own arguments (rejects nesting).
+    in_window: bool,
+    /// Windows collected from the SELECT list (deduped, like aggregates).
+    windows: Vec<BoundWindow>,
     /// Visible CTEs: (name, output schema). CTEs shadow catalog tables.
     ctes: Vec<(String, Vec<(String, DataType)>)>,
 }
@@ -309,6 +401,9 @@ impl<'a> Binder<'a> {
             aliases: HashMap::new(),
             resolving: Vec::new(),
             allow_alias: true,
+            allow_win: true,
+            in_window: false,
+            windows: Vec::new(),
             ctes: Vec::new(),
         }
     }
@@ -322,6 +417,9 @@ impl<'a> Binder<'a> {
             aliases: HashMap::new(),
             resolving: Vec::new(),
             allow_alias: true,
+            allow_win: true,
+            in_window: false,
+            windows: Vec::new(),
             ctes: self.ctes.clone(),
         }
     }
@@ -470,6 +568,7 @@ impl<'a> Binder<'a> {
                 }
             }
             Expr::Function { name, args } => self.bind_function(name, args, aggs, allow_agg),
+            Expr::Window { name, args, over } => self.bind_window(name, args, over, aggs, allow_agg),
             Expr::ScalarSubquery(q) => {
                 let mut child = self.child();
                 let query = bind_select_with(child.db, &mut child, q)?;
@@ -511,6 +610,101 @@ impl<'a> Binder<'a> {
                 Ok(BoundExpr::Exists { query: Box::new(sub), negated: *negated })
             }
         }
+    }
+
+    fn bind_window(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        over: &OverClause,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        if !self.allow_win {
+            return Err(PinkDbError::Execution(
+                "window functions are not allowed in WHERE, GROUP BY, or HAVING (use a subquery)".to_string(),
+            ));
+        }
+        if self.in_window {
+            return Err(PinkDbError::Execution(
+                "nested window functions are not supported in v1".to_string(),
+            ));
+        }
+        // Resolve the function first (arity checks mirror the agg path).
+        let kind: WindowKind = if let Some(r) = WindowFunc::ranking(name) {
+            if !args.is_empty() {
+                return Err(PinkDbError::Type(format!("{name} takes no arguments")));
+            }
+            WindowKind::Rank(r)
+        } else if let Some(f) = AggFunc::from_name(name) {
+            let is_star = args.len() == 1 && args[0] == Expr::Star;
+            if args.iter().any(|a| a == &Expr::Star) && !is_star {
+                return Err(PinkDbError::Parse("`*` is only valid in COUNT(*)".to_string()));
+            }
+            if f != AggFunc::Count && is_star {
+                return Err(PinkDbError::Type(format!("only COUNT supports *, not {name}")));
+            }
+            if !is_star && args.len() != 1 {
+                return Err(PinkDbError::Type(format!("{name} takes exactly 1 argument in v1")));
+            }
+            WindowKind::Agg(f)
+        } else {
+            return Err(PinkDbError::Catalog(format!("unknown function \"{name}\"")));
+        };
+        // Bind arg/partition/order in window scope (aggregates flow to the
+        // shared agg list so `SUM(SUM(x)) OVER ()` works).
+        self.in_window = true;
+        let result = self.bind_window_inner(kind, args, over, aggs, allow_agg);
+        self.in_window = false;
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_window_inner(
+        &mut self,
+        kind: WindowKind,
+        args: &[Expr],
+        over: &OverClause,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        let is_star = args.len() == 1 && args.first() == Some(&Expr::Star);
+        let arg = if is_star || args.is_empty() {
+            None
+        } else {
+            Some(self.bind_expr(&args[0], aggs, allow_agg)?)
+        };
+        let mut partition = Vec::with_capacity(over.partition.len());
+        for p in &over.partition {
+            partition.push(self.bind_expr(p, aggs, allow_agg)?);
+        }
+        let mut order = Vec::with_capacity(over.order.len());
+        for o in &over.order {
+            order.push((self.bind_expr(&o.expr, aggs, allow_agg)?, o.desc));
+        }
+        let frame = match &over.frame {
+            Some(f) => BoundFrame {
+                start: map_frame_bound(f.start)?,
+                end: map_frame_bound(f.end)?,
+            },
+            None => BoundFrame::default_for(!order.is_empty()),
+        };
+        let (func, dtype) = match kind {
+            WindowKind::Rank(r) => (r, DataType::Bigint),
+            WindowKind::Agg(f) => {
+                let dtype = agg_dtype(f, arg.as_ref().map(|a| a.dtype()))?;
+                (WindowFunc::Agg(f), dtype)
+            }
+        };
+        let win = BoundWindow { func, arg, partition, order, frame, dtype };
+        let index = match self.windows.iter().position(|w| w == &win) {
+            Some(i) => i,
+            None => {
+                self.windows.push(win);
+                self.windows.len() - 1
+            }
+        };
+        Ok(BoundExpr::WindowRef { index, dtype })
     }
 
     fn bind_function(
@@ -758,6 +952,19 @@ fn default_name(expr: &Expr) -> String {
         Expr::Exists { negated, .. } => {
             format!("{}exists(subquery)", if *negated { "not " } else { "" })
         }
+        Expr::Window { name, args, .. } => {
+            let inner: Vec<String> = args
+                .iter()
+                .map(|a| {
+                    if a == &Expr::Star {
+                        "*".to_string()
+                    } else {
+                        default_name(a)
+                    }
+                })
+                .collect();
+            format!("{}({}) OVER", name.to_ascii_lowercase(), inner.join(", "))
+        }
     }
 }
 
@@ -775,6 +982,7 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
     }
     match expr {
         BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
         | BoundExpr::Literal(_)
         | BoundExpr::Column { .. }
         | BoundExpr::ScalarSubquery { .. }
@@ -840,10 +1048,48 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
             query: query.clone(),
             negated: *negated,
         },
-        // ScalarSubquery/Exists bodies live in their own scope.
-        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => expr.clone(),
+        // ScalarSubquery/Exists bodies live in their own scope; WindowRef
+        // already addresses window output.
+        BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::Exists { .. }
+        | BoundExpr::WindowRef { .. } => expr.clone(),
         _ => return None,
     })
+}
+
+/// Rebase relative `WindowRef{index}` past the window input columns.
+fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::WindowRef { index, dtype } => BoundExpr::WindowRef {
+            index: input_width + index,
+            dtype,
+        },
+        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+            op,
+            left: Box::new(resolve_window_refs(*left, input_width)),
+            right: Box::new(resolve_window_refs(*right, input_width)),
+            dtype,
+        },
+        BoundExpr::Not(e) => BoundExpr::Not(Box::new(resolve_window_refs(*e, input_width))),
+        BoundExpr::Negate { expr, dtype } => {
+            BoundExpr::Negate { expr: Box::new(resolve_window_refs(*expr, input_width)), dtype }
+        }
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(resolve_window_refs(*expr, input_width)),
+            negated,
+        },
+        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+            func,
+            args: args.into_iter().map(|a| resolve_window_refs(a, input_width)).collect(),
+            dtype,
+        },
+        BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
+            expr: Box::new(resolve_window_refs(*expr, input_width)),
+            query,
+            negated,
+        },
+        other => other,
+    }
 }
 
 /// Rebase relative `AggRef{index}` past the group keys.
@@ -877,6 +1123,7 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
             query,
             negated,
         },
+        BoundExpr::WindowRef { .. } => expr,
         // ScalarSubquery/Exists bodies bind in their own scope.
         other => other,
     }
@@ -900,6 +1147,7 @@ fn bind_join_keys(db: &PinkDb, left: &ScopeTable, right: &ScopeTable, on: &Expr)
         let mut b = Binder::new(db);
         b.tables.push(scope.clone());
         b.allow_alias = false;
+        b.allow_win = false;
         let mut aggs = Vec::new();
         let bound = b.bind_expr(expr, &mut aggs, false)?;
         if !aggs.is_empty() {
@@ -936,6 +1184,11 @@ fn bind_join_keys(db: &PinkDb, left: &ScopeTable, right: &ScopeTable, on: &Expr)
         )),
     }
 }
+/// Total width of the scan scope (0 with no FROM).
+fn scan_width(binder: &Binder<'_>) -> usize {
+    binder.tables.iter().map(|t| t.columns.len()).sum()
+}
+
 /// Bind one statement. The returned plan borrows nothing from `db`.
 pub fn bind(db: &PinkDb, stmt: &Statement) -> Result<LogicalPlan> {
     match stmt {
@@ -991,6 +1244,7 @@ fn bind_insert(
         // Fill unspecified columns with NULL (only when a column list is given).
         for (pos, cell) in row.iter().enumerate() {
             let mut binder = Binder::new(db);
+            binder.allow_win = false;
             let mut aggs = Vec::new();
             let e = binder.bind_expr(cell, &mut aggs, false)?;
             bound[order[pos]] = e;
@@ -1045,6 +1299,12 @@ fn plan_schema(
             let mut inner: Vec<(String, Vec<(String, DataType)>)> = ctes.to_vec();
             inner.push((name.clone(), plan_schema(db, ctes, query)?));
             plan_schema(db, &inner, body)
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            let mut out = plan_schema(db, ctes, input)?;
+            let (names, types) = crate::plan::win_output_schema(windows);
+            out.extend(names.into_iter().zip(types));
+            Ok(out)
         }
         LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => Ok(Vec::new()),
     }
@@ -1174,12 +1434,14 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // resolves WHERE against table columns so aliases never shadow them).
     let mut where_aggs = Vec::new();
     binder.allow_alias = false;
+    binder.allow_win = false;
     let filter = sel
         .where_clause
         .as_ref()
         .map(|e| binder.bind_expr(e, &mut where_aggs, false))
         .transpose()?;
     binder.allow_alias = true;
+    binder.allow_win = true;
     debug_assert!(where_aggs.is_empty());
     if let Some(f) = &filter {
         if f.dtype() != DataType::Boolean {
@@ -1232,8 +1494,9 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         select.push((binder.bind_expr(e, &mut aggs, true)?, name.clone()));
     }
 
-    // GROUP BY keys (pre-agg scope; positional `GROUP BY 1` = Nth select item).
+    // GROUP BY keys (pre-agg scope, no aggregates, no windows).
     let mut keys: Vec<BoundExpr> = Vec::new();
+    binder.allow_win = false;
     for g in &sel.group_by {
         if let Expr::Literal(Value::Integer(n)) = g {
             let idx = (*n as usize).checked_sub(1).ok_or_else(|| {
@@ -1255,6 +1518,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         let mut no_aggs = Vec::new();
         keys.push(binder.bind_expr(g, &mut no_aggs, false)?);
     }
+    binder.allow_win = true;
 
     // HAVING forces aggregation (single-group when no GROUP BY).
     let is_agg = !aggs.is_empty() || !keys.is_empty() || sel.having.is_some();
@@ -1266,7 +1530,12 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     let having = sel
         .having
         .as_ref()
-        .map(|e| binder.bind_expr(e, &mut aggs, true))
+        .map(|e| {
+            binder.allow_win = false;
+            let h = binder.bind_expr(e, &mut aggs, true);
+            binder.allow_win = true;
+            h
+        })
         .transpose()?;
     if let Some(h) = &having {
         if h.dtype() != DataType::Boolean {
@@ -1277,6 +1546,23 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         validate_grouped(h, &keys)?;
     }
 
+    // Windows collected from the SELECT list. Their args/partition/order
+    // live in the same scope as select items: validate + rebase them alike.
+    let mut windows = std::mem::take(&mut binder.windows);
+    if is_agg {
+        for w in &windows {
+            if let Some(a) = &w.arg {
+                validate_grouped(a, &keys)?;
+            }
+            for p in &w.partition {
+                validate_grouped(p, &keys)?;
+            }
+            for (o, _) in &w.order {
+                validate_grouped(o, &keys)?;
+            }
+        }
+    }
+
     // Rebase relative AggRefs past the group keys (dedupe only appends,
     // so bind-time indices stay valid; HAVING reuses SELECT's agg slots).
     let num_keys = keys.len();
@@ -1285,6 +1571,17 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         .map(|(e, n)| (resolve_agg_refs(e, num_keys), n))
         .collect();
     let mut having = having.map(|h| resolve_agg_refs(h, num_keys));
+    for w in windows.iter_mut() {
+        w.arg = w.arg.take().map(|a| resolve_agg_refs(a, num_keys));
+        w.partition = std::mem::take(&mut w.partition)
+            .into_iter()
+            .map(|p| resolve_agg_refs(p, num_keys))
+            .collect();
+        w.order = std::mem::take(&mut w.order)
+            .into_iter()
+            .map(|(o, d)| (resolve_agg_refs(o, num_keys), d))
+            .collect();
+    }
     // Agg args stay scan-relative (Aggregate evaluates them pre-aggregation).
     // Select/having address Aggregate output [keys..., aggs...]: rebase their
     // scan-relative Columns onto key positions. Validated above, so this is
@@ -1295,10 +1592,24 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             .map(|(e, n)| (rebase_to_keys(&e, &keys).expect("validated"), n))
             .collect();
         having = having.map(|h| rebase_to_keys(&h, &keys).expect("validated"));
+        for w in windows.iter_mut() {
+            // Window fields address the Aggregate output too.
+            if let Some(a) = w.arg.take() {
+                w.arg = Some(rebase_to_keys(&a, &keys).expect("validated"));
+            }
+            w.partition = std::mem::take(&mut w.partition)
+                .into_iter()
+                .map(|p| rebase_to_keys(&p, &keys).expect("validated"))
+                .collect();
+            w.order = std::mem::take(&mut w.order)
+                .into_iter()
+                .map(|(o, d)| (rebase_to_keys(&o, &keys).expect("validated"), d))
+                .collect();
+        }
     }
     let keys_for_order = keys.clone();
 
-    // Scan / join → filter → aggregate → having-filter.
+    // Scan / join → filter → aggregate → having-filter → window.
     let mut plan = base;
     if let Some(pred) = filter {
         plan = LogicalPlan::Filter { input: Box::new(plan), predicate: pred };
@@ -1309,12 +1620,31 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             plan = LogicalPlan::Filter { input: Box::new(plan), predicate: h };
         }
     }
+    // Windows see the aggregate output (or the scan). Their results append
+    // after `input_cols` columns; select items rebase onto those positions.
+    // (HAVING sits below, so it never holds WindowRefs.)
+    let input_cols = match &plan {
+        LogicalPlan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
+        LogicalPlan::Filter { input, .. } => match &**input {
+            LogicalPlan::Aggregate { keys, aggs, .. } => keys.len() + aggs.len(),
+            _ => scan_width(binder),
+        },
+        _ => scan_width(binder),
+    };
+    if !windows.is_empty() {
+        plan = LogicalPlan::Window { input: Box::new(plan), windows, input_cols };
+    }
+    // NOTE: select items are rebound below (resolve_window_refs) once the
+    // projection is built — see the projection section.
 
     // Projection, plus hidden ORDER BY columns pruned after the sort.
     let visible = select.len();
     let visible_dtypes: Vec<DataType> = select.iter().map(|(e, _)| e.dtype()).collect();
     let visible_names: Vec<String> = select.iter().map(|(_, n)| n.clone()).collect();
-    let mut proj_exprs: Vec<BoundExpr> = select.into_iter().map(|(e, _)| e).collect();
+    let mut proj_exprs: Vec<BoundExpr> = select
+        .into_iter()
+        .map(|(e, _)| resolve_window_refs(e, input_cols))
+        .collect();
     let mut proj_names = visible_names.clone();
     let mut hidden = 0usize;
     let mut sort_keys: Vec<(BoundExpr, bool)> = Vec::new();
@@ -1349,7 +1679,9 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         // in agg queries it is rebased onto Aggregate-output scope (key
         // positions). Aggregate-free in v1: aggregates ride via alias/position.
         let mut no_aggs = Vec::new();
+        binder.allow_win = false;
         let bound = binder.bind_expr(&item.expr, &mut no_aggs, false)?;
+        binder.allow_win = true;
         if !no_aggs.is_empty() {
             return Err(PinkDbError::Execution(
                 "aggregates in ORDER BY must use a select alias or position in v1".to_string(),

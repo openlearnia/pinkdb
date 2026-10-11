@@ -110,6 +110,7 @@ LIMIT n;
 | 5 | Persistence: own on-disk columnar format (RLE/dictionary/bitpack), `.save`/`.open` | done (build+test+clippy green, 64 tests, 1M-row save/load bench) |
 | 6 | Subqueries + CTEs: derived tables, scalar/IN/EXISTS (uncorrelated), WITH | done (build+test+clippy green, 72 tests) |
 | 7 | DATE/TIMESTAMP types: storage, literals, arithmetic, date functions, CSV + persist | done (build+test+clippy green, 81 tests) |
+| 8 | Window functions: ranking + aggregates OVER, PARTITION/ORDER/ROWS frames | done (build+test+clippy green, 86 tests) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 

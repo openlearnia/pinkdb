@@ -80,6 +80,29 @@ pub struct OrderItem {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct OverClause {
+    pub partition: Vec<Expr>,
+    pub order: Vec<OrderItem>,
+    /// `None` = default frame (whole partition, or cumulative with ORDER BY).
+    pub frame: Option<FrameSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameSpec {
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(usize),
+    CurrentRow,
+    Following(usize),
+    UnboundedFollowing,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Value),
     /// Bare `*` (only valid as a function arg for `COUNT(*)`).
@@ -108,6 +131,12 @@ pub enum Expr {
     Function {
         name: String,
         args: Vec<Expr>,
+    },
+    /// `f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS ...])`.
+    Window {
+        name: String,
+        args: Vec<Expr>,
+        over: OverClause,
     },
     /// `(SELECT ...)` — uncorrelated scalar subquery (exactly 1 row × 1 col;
     /// 0 rows → NULL).

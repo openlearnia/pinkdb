@@ -23,6 +23,7 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &mut Cx) -> Res
         BoundExpr::Literal(v) => const_vector(v.clone(), n),
         BoundExpr::Column { index, .. } => Ok(chunk.column(*index).clone()),
         BoundExpr::AggRef { index, .. } => Ok(chunk.column(*index).clone()),
+        BoundExpr::WindowRef { index, .. } => Ok(chunk.column(*index).clone()),
         BoundExpr::ScalarSubquery { query, .. } => eval_scalar_subquery(query, chunk, cx),
         BoundExpr::InSubquery { expr, query, negated } => {
             eval_in_subquery(expr, query, *negated, chunk, cx)

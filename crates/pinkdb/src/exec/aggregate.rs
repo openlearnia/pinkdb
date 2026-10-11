@@ -65,7 +65,7 @@ pub(crate) fn encode_row(buf: &mut Vec<u8>, row: &[Value]) {
     }
 }
 
-enum Acc {
+pub(crate) enum Acc {
     Count(i64),
     SumInt { sum: i64, non_null: bool },
     SumFloat { sum: f64, non_null: bool },
@@ -74,7 +74,7 @@ enum Acc {
 }
 
 impl Acc {
-    fn new(func: AggFunc) -> Acc {
+    pub(crate) fn new(func: AggFunc) -> Acc {
         match func {
             AggFunc::Count => Acc::Count(0),
             AggFunc::Sum => Acc::SumInt { sum: 0, non_null: false },
@@ -84,7 +84,7 @@ impl Acc {
         }
     }
 
-    fn update(&mut self, arg: Option<&Value>) {
+    pub(crate) fn update(&mut self, arg: Option<&Value>) {
         match self {
             Acc::Count(n) => {
                 // COUNT(*) passes Some(dummy) per row; COUNT(x) passes None for NULL.
@@ -154,7 +154,7 @@ impl Acc {
         }
     }
 
-    fn finalize(self, dtype: DataType) -> Value {
+    pub(crate) fn finalize(self, dtype: DataType) -> Value {
         match self {
             Acc::Count(n) => Value::Bigint(n),
             // SUM of zero/all-NULL inputs is NULL (like AVG/MIN/MAX).

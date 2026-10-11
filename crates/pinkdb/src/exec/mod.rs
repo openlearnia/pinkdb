@@ -8,14 +8,16 @@
 
 pub mod aggregate;
 pub mod expr;
+pub(crate) mod window;
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use aggregate::{aggregate, encode_row};
 use expr::{coerce_to, eval_expr, select_true};
+use window::eval_window;
 
-use crate::plan::{LogicalPlan, agg_output_schema, compare_values};
+use crate::plan::{LogicalPlan, agg_output_schema, compare_values, win_output_schema};
 use crate::sql::binder::{BoundExpr, common_numeric};
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -180,6 +182,16 @@ fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
             let chunks = aggregate(cx, &inner.chunks, keys, aggs)?;
             let (names, types) = agg_output_schema(keys, aggs);
             Ok(Output { chunks, names, types })
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            let inner = eval(cx, input)?;
+            let chunks = eval_window(cx, &inner.chunks, windows)?;
+            let (names, types) = win_output_schema(windows);
+            let mut all_names = inner.names.clone();
+            all_names.extend(names);
+            let mut all_types = inner.types.clone();
+            all_types.extend(types);
+            Ok(Output { chunks, names: all_names, types: all_types })
         }
         LogicalPlan::Cte { name, query, body } => {
             let out = eval(cx, query)?;
@@ -929,5 +941,123 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][0], V::Varchar("eng".to_string()));
         assert_eq!(rows[0][1], V::Bigint(1));
+    }
+
+    // --- phase 8: window functions ---
+
+    fn win_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        crate::csv::import_csv_string(
+            &mut db,
+            "sales",
+            "region,amount\nwest,10\nwest,20\neast,5\neast,5\n",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn row_number_rank_dense_rank() {
+        let mut db = win_db();
+        let rows = select(
+            &mut db,
+            "SELECT region, amount,
+                    ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn,
+                    RANK() OVER (PARTITION BY region ORDER BY amount) AS r,
+                    DENSE_RANK() OVER (PARTITION BY region ORDER BY amount) AS d
+             FROM sales ORDER BY region, amount;",
+        );
+        // east: (5,5) peers → rn 1,2; r 1,1; d 1,1. west: 10,20 → 1,2; 1,2; 1,2.
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    V::Varchar("east".to_string()),
+                    V::Integer(5),
+                    V::Bigint(1),
+                    V::Bigint(1),
+                    V::Bigint(1)
+                ],
+                vec![
+                    V::Varchar("east".to_string()),
+                    V::Integer(5),
+                    V::Bigint(2),
+                    V::Bigint(1),
+                    V::Bigint(1)
+                ],
+                vec![
+                    V::Varchar("west".to_string()),
+                    V::Integer(10),
+                    V::Bigint(1),
+                    V::Bigint(1),
+                    V::Bigint(1)
+                ],
+                vec![
+                    V::Varchar("west".to_string()),
+                    V::Integer(20),
+                    V::Bigint(2),
+                    V::Bigint(2),
+                    V::Bigint(2)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn window_agg_frames() {
+        let mut db = win_db();
+        // Default cumulative frame with ORDER BY.
+        let rows = select(
+            &mut db,
+            "SELECT amount, SUM(amount) OVER (ORDER BY amount) AS run FROM sales ORDER BY amount;",
+        );
+        let runs: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[1] {
+                V::Bigint(x) => x,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(runs, vec![5, 10, 20, 40]);
+        // Whole-partition default without ORDER BY.
+        let rows = select(&mut db, "SELECT COUNT(*) OVER () AS c FROM sales;");
+        assert!(rows.iter().all(|r| r[0] == V::Bigint(4)));
+        // Explicit ROWS BETWEEN 1 PRECEDING AND CURRENT ROW.
+        let rows = select(
+            &mut db,
+            "SELECT amount, SUM(amount) OVER (ORDER BY amount ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS w
+             FROM sales ORDER BY amount;",
+        );
+        let got: Vec<i64> = rows
+            .iter()
+            .map(|r| match r[1] {
+                V::Bigint(x) => x,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(got, vec![5, 10, 15, 30]);
+    }
+
+    #[test]
+    fn window_over_agg_and_rejections() {
+        let mut db = win_db();
+        let rows = select(
+            &mut db,
+            "SELECT region, SUM(amount) AS s, RANK() OVER (ORDER BY SUM(amount) DESC) AS r
+             FROM sales GROUP BY region ORDER BY r;",
+        );
+        assert_eq!(rows[0][0], V::Varchar("west".to_string()));
+        assert_eq!(rows[0][2], V::Bigint(1));
+        // Windows forbidden in WHERE / GROUP BY / HAVING.
+        assert!(db.execute("SELECT * FROM sales WHERE RANK() OVER () > 1;").is_err());
+        assert!(db.execute("SELECT * FROM sales GROUP BY RANK() OVER ();").is_err());
+        assert!(db
+            .execute("SELECT SUM(amount) FROM sales HAVING RANK() OVER () > 1;")
+            .is_err());
+        // Nested windows rejected; unknown window rejected.
+        assert!(db
+            .execute("SELECT RANK() OVER (ORDER BY SUM(amount) OVER ()) FROM sales;")
+            .is_err());
+        assert!(db.execute("SELECT MEDIAN(amount) OVER () FROM sales;").is_err());
     }
 }

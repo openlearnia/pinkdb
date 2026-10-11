@@ -41,6 +41,15 @@ pub enum Keyword {
     Exists,
     Date,
     Timestamp,
+    Over,
+    Partition,
+    Rows,
+    Row,
+    Range,
+    Unbounded,
+    Preceding,
+    Following,
+    Current,
 }
 
 impl Keyword {
@@ -79,6 +88,15 @@ impl Keyword {
             "EXISTS" => Keyword::Exists,
             "DATE" => Keyword::Date,
             "TIMESTAMP" => Keyword::Timestamp,
+            "OVER" => Keyword::Over,
+            "PARTITION" => Keyword::Partition,
+            "ROWS" => Keyword::Rows,
+            "ROW" => Keyword::Row,
+            "RANGE" => Keyword::Range,
+            "UNBOUNDED" => Keyword::Unbounded,
+            "PRECEDING" => Keyword::Preceding,
+            "FOLLOWING" => Keyword::Following,
+            "CURRENT" => Keyword::Current,
             _ => return None,
         })
     }
