@@ -57,7 +57,7 @@ SQL text
 | `pinkdb::types` | `DataType`, `Value`, `PinkDbError` |
 | `pinkdb::vector` | `Vector` (typed data + validity bitmask, bit = valid) + `gather`, `DataChunk` |
 | `pinkdb::storage` | `DataTable` (per-column `Vector` chunks), `PinkDb` catalog |
-| `pinkdb::csv` | CSV import + whole-file type inference |
+| `pinkdb::csv` | CSV import + type inference (rayon-parallel parse) |
 | `pinkdb::sql` | Hand-written lexer, AST, recursive-descent parser, binder |
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
@@ -121,6 +121,12 @@ CSV inference (per column, over all non-empty cells): all i32 → INTEGER, all
 i64 → BIGINT, all f64 → DOUBLE, all true/false (case-insensitive) → BOOLEAN,
 else VARCHAR. Empty cell → NULL.
 
+Types are inferred from the first 20 480 rows (DuckDB's sample size); if a
+later row disagrees with the sampled schema, the import transparently reruns
+with whole-file inference, so the final schema always matches the rule above.
+Files containing no `"` and no `\r` bytes are parsed in parallel across the
+rayon pool; anything else goes through the `csv` crate sequentially.
+
 ## Persistence
 
 `db.save("x.pink")` writes every table in a single-file columnar format;
@@ -159,12 +165,15 @@ Generated with `bench/gen_sales.py` (deterministic seed 42):
 
 | Step | Time (rayon) | Before |
 |---|---|---|
-| `.import` 1M rows (24 MB CSV) | 0.25 s | 0.42 s |
+| `.import` 1M rows (24 MB CSV) | 0.03 s | 0.42 s |
 | `SELECT COUNT(*) FROM sales` | 0.03 s | 0.04 s |
 | GROUP BY region + 5 aggregates | 0.011 s | 0.11 s |
 | `SELECT COUNT(*) ... WHERE total > 500` | 0.006 s | 0.07 s |
 | WHERE + GROUP BY + HAVING + ORDER + LIMIT | 0.011 s | 0.10 s |
 | 1M-row inner hash join + GROUP BY | 0.10 s | 0.27 s |
+
+For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
+(`read_csv_auto` → table), single connection.
 
 ## Known v1 limits
 
@@ -190,4 +199,5 @@ cargo build            # workspace
 cargo test             # 100+ unit + end-to-end tests
 cargo clippy --all-targets   # must stay clean
 python3 bench/duckdiff.py [--big sales.csv]  # differential test vs DuckDB
+cargo run --release -p pinkdb --example import_bench  # CSV import timing
 ```

@@ -213,6 +213,70 @@ impl Vector {
         Ok(())
     }
 
+    /// Append a borrowed string to a VARCHAR vector: one `Arc` allocation
+    /// copied directly from the slice (no intermediate `String`, unlike
+    /// going through `push_valid(Value::Varchar(..))`).
+    pub fn push_str(&mut self, s: &str) -> Result<()> {
+        if self.dtype() != DataType::Varchar {
+            return Err(PinkDbError::Type(format!(
+                "type mismatch: cannot push a str into {:?} vector",
+                self.dtype()
+            )));
+        }
+        self.check_room()?;
+        if let VectorData::VarChar(v) = &mut self.data {
+            v.push(Arc::from(s));
+        }
+        self.len += 1;
+        self.ensure_mask();
+        bit_set(&mut self.validity, self.len - 1);
+        Ok(())
+    }
+
+    /// Bulk-append `len` elements starting at `start` from `other` onto `self`
+    /// (chunked loads). Types must match; `self` must have room; validity bits
+    /// are copied. Infallible: callers validate (see `DataTable::append_chunk`).
+    pub fn extend_from(&mut self, other: &Vector, start: usize, len: usize) {
+        debug_assert_eq!(self.dtype(), other.dtype());
+        debug_assert!(start + len <= other.len);
+        debug_assert!(self.len + len <= CHUNK_SIZE);
+        match (&mut self.data, &other.data) {
+            (VectorData::Boolean(d), VectorData::Boolean(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::Int32(d), VectorData::Int32(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::Int64(d), VectorData::Int64(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::Float64(d), VectorData::Float64(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::VarChar(d), VectorData::VarChar(s)) => {
+                // Strings share their Arc instead of copying bytes.
+                d.extend(s[start..start + len].iter().cloned());
+            }
+            (VectorData::Date32(d), VectorData::Date32(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            _ => unreachable!("extend_from: vector dtype mismatch"),
+        }
+        let base = self.len;
+        self.len += len;
+        self.ensure_mask();
+        for i in 0..len {
+            if other.is_valid(start + i) {
+                bit_set(&mut self.validity, base + i);
+            } else {
+                bit_clear(&mut self.validity, base + i);
+            }
+        }
+    }
+
     /// Append either NULL or a typed value.
     pub fn push_value(&mut self, value: Value) -> Result<()> {
         if value.is_null() {
@@ -438,6 +502,37 @@ mod tests {
         assert!(v.is_null(1));
         assert!(v.is_valid(0));
         assert_eq!(v.null_count(), 2);
+    }
+
+    #[test]
+    fn push_str_shares_one_allocation() {
+        let mut v = Vector::new_empty(DataType::Varchar);
+        v.push_str("a").unwrap();
+        v.push_str("bb").unwrap();
+        assert_eq!(v.get(0), Value::Varchar("a".to_string()));
+        assert_eq!(v.get(1), Value::Varchar("bb".to_string()));
+        assert!(Vector::new_empty(DataType::Integer).push_str("x").is_err());
+    }
+
+    #[test]
+    fn extend_from_copies_ranges_and_validity() {
+        let mut src = Vector::new_empty(DataType::Varchar);
+        src.push_str("a").unwrap();
+        src.push_null().unwrap();
+        src.push_str("c").unwrap();
+        let mut dst = Vector::new_empty(DataType::Varchar);
+        dst.extend_from(&src, 1, 2);
+        assert_eq!(dst.len(), 2);
+        assert!(dst.is_null(0));
+        assert_eq!(dst.get(1), Value::Varchar("c".to_string()));
+        // Scalar range copy keeps nulls too.
+        let mut ints = Vector::new_empty(DataType::Integer);
+        ints.push_valid(Value::Integer(7)).unwrap();
+        ints.push_null().unwrap();
+        let mut copy = Vector::new_empty(DataType::Integer);
+        copy.extend_from(&ints, 0, 2);
+        assert_eq!(copy.get(0), Value::Integer(7));
+        assert!(copy.is_null(1));
     }
 
     #[test]

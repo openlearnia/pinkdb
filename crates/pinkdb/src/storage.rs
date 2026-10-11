@@ -141,7 +141,8 @@ impl DataTable {
             .unwrap_or(true);
         if tail_full {
             for col in &mut self.columns {
-                col.chunks.push(Arc::new(Vector::new_empty(col.dtype)));
+                col.chunks
+                    .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
             }
         }
         for (col, val) in self.columns.iter_mut().zip(values) {
@@ -150,6 +151,96 @@ impl DataTable {
                 .push_value(coerced)?;
         }
         self.num_rows += 1;
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Append a pre-built batch of typed columns (all the same length ≤
+    /// [`CHUNK_SIZE`], matching this table's schema). Bulk path for ingestion
+    /// (CSV import): one call per batch instead of one `append_row` per row.
+    /// Splits across chunk boundaries as needed; one version bump per batch.
+    pub fn append_chunk(&mut self, chunk: Vec<Vector>) -> Result<()> {
+        if chunk.len() != self.columns.len() {
+            return Err(PinkDbError::Execution(format!(
+                "chunk has {} columns but table \"{}\" has {}",
+                chunk.len(),
+                self.name,
+                self.columns.len()
+            )));
+        }
+        let rows = chunk.first().map(Vector::len).unwrap_or(0);
+        if rows > CHUNK_SIZE {
+            return Err(PinkDbError::Execution(format!(
+                "chunk has {rows} rows but CHUNK_SIZE is {CHUNK_SIZE}"
+            )));
+        }
+        for (dst, src) in self.columns.iter().zip(&chunk) {
+            if src.len() != rows {
+                return Err(PinkDbError::Execution(
+                    "chunk columns must all have the same length".to_string(),
+                ));
+            }
+            if src.dtype() != dst.dtype {
+                return Err(PinkDbError::Type(format!(
+                    "cannot append a {:?} chunk into column \"{}\" ({:?})",
+                    src.dtype(),
+                    dst.name,
+                    dst.dtype
+                )));
+            }
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        // Fast path: the batch fits in an empty tail chunk (rows ≤ CHUNK_SIZE
+        // by the check above) — move the built vectors in without copying.
+        let tail_len = self.columns[0]
+            .chunks
+            .last()
+            .map(|c| c.len())
+            .unwrap_or(0);
+        if tail_len == 0 {
+            if self.columns[0].chunks.is_empty() {
+                for col in &mut self.columns {
+                    col.chunks.push(Arc::new(Vector::new_empty(col.dtype)));
+                }
+            }
+            for (col, src) in self.columns.iter_mut().zip(chunk) {
+                *col.chunks.last_mut().expect("tail chunk exists") = Arc::new(src);
+            }
+            self.num_rows += rows;
+            self.version += 1;
+            return Ok(());
+        }
+        // Partial tail: merge, splitting at chunk boundaries as needed.
+        let mut offset = 0;
+        while offset < rows {
+            let tail_full = self.columns[0]
+                .chunks
+                .last()
+                .map(|c| c.len() >= CHUNK_SIZE)
+                .unwrap_or(true);
+            if tail_full {
+                for col in &mut self.columns {
+                    col.chunks
+                        .push(Arc::new(Vector::with_capacity(col.dtype, CHUNK_SIZE)));
+                }
+            }
+            let take = {
+                let tail_len = self.columns[0]
+                    .chunks
+                    .last()
+                    .map(|c| c.len())
+                    .unwrap_or(0);
+                (CHUNK_SIZE - tail_len).min(rows - offset)
+            };
+            for (col, src) in self.columns.iter_mut().zip(&chunk) {
+                Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
+                    .extend_from(src, offset, take);
+            }
+            offset += take;
+            self.num_rows += take;
+        }
         self.version += 1;
         Ok(())
     }
@@ -533,6 +624,66 @@ mod tests {
         assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 5);
         assert!(t.scan_chunk(2).is_none());
         assert_eq!(t.get(CHUNK_SIZE, 0), Some(Value::Integer(CHUNK_SIZE as i32)));
+    }
+
+    #[test]
+    fn append_chunk_moves_and_merges() {
+        let mut t = DataTable::new(
+            "t".to_string(),
+            vec![
+                ("a".to_string(), DataType::Bigint),
+                ("s".to_string(), DataType::Varchar),
+            ],
+        )
+        .unwrap();
+
+        let chunk_rows = |n: i64, start: i64| -> Vec<Vector> {
+            let mut a = Vector::with_capacity(DataType::Bigint, CHUNK_SIZE);
+            let mut s = Vector::with_capacity(DataType::Varchar, CHUNK_SIZE);
+            for i in start..start + n {
+                a.push_valid(Value::Bigint(i)).unwrap();
+                if i % 5 == 0 {
+                    s.push_null().unwrap();
+                } else {
+                    s.push_str(&format!("v{i}")).unwrap();
+                }
+            }
+            vec![a, s]
+        };
+
+        // Whole batch into an empty tail: moved in as one chunk.
+        t.append_chunk(chunk_rows(2, 0)).unwrap();
+        assert_eq!(t.num_rows(), 2);
+        assert_eq!(t.num_chunks(), 1);
+
+        // Batch spanning a full tail: splits at the chunk boundary.
+        t.append_chunk(chunk_rows(CHUNK_SIZE as i64, 2)).unwrap();
+        assert_eq!(t.num_rows(), 2 + CHUNK_SIZE);
+        assert_eq!(t.num_chunks(), 2);
+        assert_eq!(t.scan_chunk(0).unwrap().num_rows(), CHUNK_SIZE);
+        assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 2);
+        assert_eq!(t.get(CHUNK_SIZE - 1, 0), Some(Value::Bigint(CHUNK_SIZE as i64 - 1)));
+        assert_eq!(t.get(CHUNK_SIZE, 0), Some(Value::Bigint(CHUNK_SIZE as i64)));
+        assert_eq!(
+            t.get(CHUNK_SIZE + 1, 1),
+            Some(Value::Varchar(format!("v{}", CHUNK_SIZE + 1)))
+        );
+
+        // Shape/type validation.
+        let mut t2 = DataTable::new(
+            "u".to_string(),
+            vec![("a".to_string(), DataType::Integer)],
+        )
+        .unwrap();
+        assert!(matches!(
+            t2.append_chunk(vec![Vector::new_empty(DataType::Double)]),
+            Err(PinkDbError::Type(_))
+        ));
+        assert!(matches!(
+            t2.append_chunk(vec![]),
+            Err(PinkDbError::Execution(_))
+        ));
+        assert_eq!(t2.num_rows(), 0);
     }
 
     #[test]

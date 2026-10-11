@@ -117,6 +117,7 @@ LIMIT n;
 | 12 | Parallel execution (rayon) + multi-writer Database/Connection | done (build+test+clippy green, 103 tests, 1M-row bench) |
 | 13 | Differential testing vs DuckDB (53 queries match) | done (bench/duckdiff.py) |
 | 14 | Speed round: Arc storage, borrowed codecs, FNV hashing, COUNT(*) path | done (build+test+clippy green, duckdiff 53/53, 1M-row bench) |
+| 15 | Import speed round: sampled inference + rayon-parallel clean-CSV parse + bulk chunk append | done (build+test+clippy green, duckdiff 53/53, 1M-row import 0.42→0.03 s) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 
