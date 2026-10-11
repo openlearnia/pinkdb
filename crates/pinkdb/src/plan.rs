@@ -84,6 +84,8 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Double(x), Value::Double(y)) => num_cmp(*x, *y),
         (Value::Varchar(x), Value::Varchar(y)) => x.cmp(y),
         (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         // Binder rejects mixed-type comparisons; order deterministically anyway.
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
     }

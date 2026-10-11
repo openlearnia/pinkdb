@@ -109,6 +109,7 @@ LIMIT n;
 | 4 | Independent code review of full codebase; fix findings | done (4 critical + 3 major fixed, 58 tests green) |
 | 5 | Persistence: own on-disk columnar format (RLE/dictionary/bitpack), `.save`/`.open` | done (build+test+clippy green, 64 tests, 1M-row save/load bench) |
 | 6 | Subqueries + CTEs: derived tables, scalar/IN/EXISTS (uncorrelated), WITH | done (build+test+clippy green, 72 tests) |
+| 7 | DATE/TIMESTAMP types: storage, literals, arithmetic, date functions, CSV + persist | done (build+test+clippy green, 81 tests) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 

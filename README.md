@@ -88,7 +88,12 @@ LIMIT n;
 
 - Aggregates: `COUNT(*)` / `COUNT(x)`, `SUM`, `AVG`, `MIN`, `MAX`
 - Scalar functions: `abs`, `round` (1–2 args), `upper`, `lower`, `length`, `substr`
-- Types: `BOOLEAN`, `INTEGER` (i32), `BIGINT` (i64), `DOUBLE` (f64), `VARCHAR`
+- Types: `BOOLEAN`, `INTEGER` (i32), `BIGINT` (i64), `DOUBLE` (f64), `VARCHAR`,
+  `DATE` (days since epoch), `TIMESTAMP` (microseconds, naive, no time zone)
+- Literals: `DATE '2024-02-29'`, `TIMESTAMP '2024-03-15 12:30:45.5'`
+- Date ops: `date ± integer` (days), `date - date` → BIGINT days;
+  `year/month/day/hour/minute/second(x)`, `date_trunc(part, x)`
+- CSV auto-detects `YYYY-MM-DD` → DATE and `YYYY-MM-DD HH:MM:SS[.f]` → TIMESTAMP
 - Coercion: INTEGER → BIGINT → DOUBLE; `int / int` → DOUBLE (DuckDB rule)
 - Three-valued logic: NULL fails `WHERE`; `COUNT(x)`/`SUM`/`AVG` skip NULLs;
   NULL group keys group together; NULL join keys never match
@@ -135,7 +140,9 @@ Generated with `bench/gen_sales.py` (deterministic seed 42):
 - Correlated subqueries are rejected (uncorrelated only); no window functions, no outer joins
 - Aggregates in ORDER BY need a select alias or position
 - General ORDER BY expressions must be aliases, positions, or GROUP BY keys
-- `%` is integer-only; `SUM` overflow wraps; no DATE/TIMESTAMP types
+- `%` is integer-only; `SUM` overflow wraps
+- Mixed DATE/TIMESTAMP comparison is rejected; timestamps never mix with
+  integers (no INTERVAL type in v1); no time zones (naive UTC)
 - Very deeply nested expressions (tens of thousands of levels) can overflow
   the parser stack instead of erroring gracefully
 

@@ -624,6 +624,141 @@ mod tests {
         assert_eq!(select(&mut db, "SELECT * FROM p;"), vec![vec![V::Integer(1)]]);
     }
 
+    // --- phase 7: dates + timestamps ---
+
+    fn date_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE ev (id INTEGER, d DATE, ts TIMESTAMP);").unwrap();
+        db.execute(
+            "INSERT INTO ev VALUES
+             (1, DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00'),
+             (2, DATE '2024-02-20', TIMESTAMP '2024-02-20 23:59:59.5'),
+             (3, NULL, NULL);",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn dates_roundtrip_and_display() {
+        let mut db = date_db();
+        let rows = select(&mut db, "SELECT d, ts FROM ev ORDER BY id;");
+        assert_eq!(rows[0][0].to_string(), "2024-01-15");
+        assert_eq!(rows[0][1].to_string(), "2024-01-15 10:00:00");
+        assert_eq!(rows[1][1].to_string(), "2024-02-20 23:59:59.500000");
+        assert_eq!(rows[2], vec![V::Null, V::Null]);
+    }
+
+    #[test]
+    fn date_arithmetic() {
+        let mut db = date_db();
+        let rows = select(&mut db, "SELECT d + 10, 1 + d, d - 5 FROM ev WHERE id = 1;");
+        assert_eq!(rows[0][0].to_string(), "2024-01-25");
+        assert_eq!(rows[0][1].to_string(), "2024-01-16");
+        assert_eq!(rows[0][2].to_string(), "2024-01-10");
+        let rows = select(&mut db, "SELECT DATE '2024-02-20' - DATE '2024-01-15';");
+        assert_eq!(rows, vec![vec![V::Bigint(36)]]);
+        // NULL propagates.
+        let rows = select(&mut db, "SELECT d + 1 FROM ev WHERE id = 3;");
+        assert_eq!(rows, vec![vec![V::Null]]);
+        // Rejected: timestamp ± int, date ± date (non-minus), mixed compare.
+        assert!(db.execute("SELECT ts + 1 FROM ev;").is_err());
+        assert!(db.execute("SELECT d + d FROM ev;").is_err());
+        assert!(db.execute("SELECT * FROM ev WHERE d = ts;").is_err());
+        assert!(db.execute("SELECT * FROM ev WHERE d = '2024-01-15';").is_err());
+    }
+
+    #[test]
+    fn date_functions() {
+        let mut db = date_db();
+        let rows = select(
+            &mut db,
+            "SELECT year(d), month(d), day(d), hour(ts), minute(ts), second(ts) FROM ev WHERE id = 2;",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Integer(2024),
+                V::Integer(2),
+                V::Integer(20),
+                V::Integer(23),
+                V::Integer(59),
+                V::Integer(59)
+            ]]
+        );
+        let rows = select(&mut db, "SELECT date_trunc('month', d), date_trunc('day', ts) FROM ev WHERE id = 1;");
+        assert_eq!(rows[0][0].to_string(), "2024-01-01");
+        assert_eq!(rows[0][1].to_string(), "2024-01-15 00:00:00");
+        let rows = select(&mut db, "SELECT date_trunc('year', TIMESTAMP '2024-05-06 07:08:09');");
+        assert_eq!(rows[0][0].to_string(), "2024-01-01 00:00:00");
+        assert!(db.execute("SELECT hour(d) FROM ev;").is_err());
+        assert!(db.execute("SELECT date_trunc('century', d) FROM ev;").is_err());
+        assert!(db.execute("SELECT SUM(d) FROM ev;").is_err());
+    }
+
+    #[test]
+    fn dates_group_order_join_minmax() {
+        let mut db = date_db();
+        let rows = select(&mut db, "SELECT MIN(d), MAX(d), COUNT(d) FROM ev;");
+        assert_eq!(rows[0][0].to_string(), "2024-01-15");
+        assert_eq!(rows[0][1].to_string(), "2024-02-20");
+        assert_eq!(rows[0][2], V::Bigint(2));
+        // date_trunc grouping (analytics workhorse).
+        let rows = select(
+            &mut db,
+            "SELECT date_trunc('month', d) AS m, COUNT(*) FROM ev GROUP BY m ORDER BY m;",
+        );
+        assert_eq!(rows.len(), 3); // two months + NULL group
+        assert_eq!(rows[2][0], V::Null);
+        // Ordering + join on dates.
+        db.execute("CREATE TABLE h (d DATE, note VARCHAR);").unwrap();
+        db.execute("INSERT INTO h VALUES (DATE '2024-01-15', 'x');").unwrap();
+        let rows = select(&mut db, "SELECT note FROM ev JOIN h ON ev.d = h.d ORDER BY id;");
+        assert_eq!(rows, vec![vec![V::Varchar("x".to_string())]]);
+        let rows = select(&mut db, "SELECT DISTINCT d FROM ev ORDER BY d;");
+        assert_eq!(rows.last().unwrap(), &vec![V::Null]);
+    }
+
+    #[test]
+    fn csv_inflects_dates() {
+        let mut db = PinkDb::new();
+        crate::csv::import_csv_string(
+            &mut db,
+            "c",
+            "d,ts\n2024-01-15,2024-01-15 10:00:00\n,",
+        )
+        .unwrap();
+        let t = db.table("c").unwrap();
+        assert_eq!(
+            t.schema(),
+            vec![
+                ("d".to_string(), DataType::Date),
+                ("ts".to_string(), DataType::Timestamp),
+            ]
+        );
+        assert_eq!(t.get(1, 0), Some(Value::Null));
+        // Almost-dates stay VARCHAR.
+        let mut db2 = PinkDb::new();
+        crate::csv::import_csv_string(&mut db2, "c", "d\n2024-13-01\n2024-01-15\n").unwrap();
+        assert_eq!(db2.table("c").unwrap().schema()[0].1, DataType::Varchar);
+    }
+
+    #[test]
+    fn dates_persist() {
+        let db = date_db();
+        let path = std::env::temp_dir().join("pinkdb_dates.pink");
+        db.save(path.to_str().unwrap()).unwrap();
+        let back = PinkDb::open(path.to_str().unwrap()).unwrap();
+        let (a, b) = (db.table("ev").unwrap(), back.table("ev").unwrap());
+        assert_eq!(a.num_rows(), b.num_rows());
+        for r in 0..a.num_rows() {
+            for c in 0..3 {
+                assert_eq!(a.get(r, c), b.get(r, c), "row {r} col {c}");
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     // --- phase 6: subqueries + CTEs ---
 
     fn sub_db() -> PinkDb {

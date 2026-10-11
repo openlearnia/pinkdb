@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use crate::storage::PinkDb;
-use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::types::{DataType, PinkDbError, Result, Value, parse_date, parse_timestamp};
 
 /// Infer one column's type from its non-empty cells.
 fn infer_column(cells: &[&str]) -> DataType {
@@ -17,6 +17,8 @@ fn infer_column(cells: &[&str]) -> DataType {
     let mut is_i32 = true;
     let mut is_i64 = true;
     let mut is_f64 = true;
+    let mut is_date = true;
+    let mut is_ts = true;
 
     for c in cells {
         let c = c.trim();
@@ -37,6 +39,12 @@ fn infer_column(cells: &[&str]) -> DataType {
         if c.parse::<f64>().is_err() {
             is_f64 = false;
         }
+        if parse_date(c).is_none() {
+            is_date = false;
+        }
+        if parse_timestamp(c).is_none() {
+            is_ts = false;
+        }
     }
 
     if non_empty == 0 {
@@ -49,6 +57,10 @@ fn infer_column(cells: &[&str]) -> DataType {
         DataType::Bigint
     } else if is_f64 {
         DataType::Double
+    } else if is_date {
+        DataType::Date
+    } else if is_ts {
+        DataType::Timestamp
     } else {
         DataType::Varchar
     }
@@ -91,6 +103,12 @@ fn parse_cell(cell: &str, dtype: DataType) -> Result<Value> {
             PinkDbError::Type(format!("cannot parse \"{c}\" as DOUBLE"))
         }),
         DataType::Varchar => Ok(Value::Varchar(c.to_string())),
+        DataType::Date => parse_date(c)
+            .map(Value::Date)
+            .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{c}\" as DATE"))),
+        DataType::Timestamp => parse_timestamp(c)
+            .map(Value::Timestamp)
+            .ok_or_else(|| PinkDbError::Type(format!("cannot parse \"{c}\" as TIMESTAMP"))),
     }
 }
 

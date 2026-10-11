@@ -356,6 +356,10 @@ fn eval_arith(
 ) -> Result<Vector> {
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
+    // Dates skip numeric coercion (it rejects them): day arithmetic below.
+    if l.dtype() == DataType::Date || r.dtype() == DataType::Date {
+        return eval_date_arith(op, &l, &r, dtype);
+    }
     // Integer division by zero errors even though `/` widens to DOUBLE
     // (DuckDB rule); 0.0/0.0 with a float operand stays IEEE Inf/NaN.
     let int_div = op == BinaryOp::Divide && l.dtype() != DataType::Double && r.dtype() != DataType::Double;
@@ -371,6 +375,37 @@ fn eval_arith(
             return Err(PinkDbError::Execution("integer division by zero".to_string()));
         }
         out.push_valid(arith_values(op, l.get(i), r.get(i))?)?;
+    }
+    Ok(out)
+}
+
+fn eval_date_arith(op: BinaryOp, l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
+    let mut out = Vector::new_empty(dtype);
+    for i in 0..l.len() {
+        if l.is_null(i) || r.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        let v = match (op, l.get(i), r.get(i)) {
+            (BinaryOp::Add, Value::Date(d), Value::Integer(n)) => {
+                Value::Date(d.wrapping_add(n))
+            }
+            (BinaryOp::Add, Value::Integer(n), Value::Date(d)) => {
+                Value::Date(d.wrapping_add(n))
+            }
+            (BinaryOp::Subtract, Value::Date(d), Value::Integer(n)) => {
+                Value::Date(d.wrapping_sub(n))
+            }
+            (BinaryOp::Subtract, Value::Date(a), Value::Date(b)) => {
+                Value::Bigint(a as i64 - b as i64)
+            }
+            (op, a, b) => {
+                return Err(PinkDbError::Execution(format!(
+                    "operator {op:?} does not support {a} and {b}"
+                )));
+            }
+        };
+        out.push_valid(v)?;
     }
     Ok(out)
 }
@@ -498,7 +533,81 @@ fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
             Value::Varchar(s) => Ok(Value::Integer(s.chars().count() as i32)),
             v => Err(PinkDbError::Execution(format!("length of {v}"))),
         },
-        ScalarFunc::Substr => {
+        ScalarFunc::Year | ScalarFunc::Month | ScalarFunc::Day => {
+            let days = match &row[0] {
+                Value::Date(d) => *d,
+                Value::Timestamp(us) => crate::types::split_timestamp(*us).0,
+                v => return Err(PinkDbError::Execution(format!("date part of {v}"))),
+            };
+            let (y, m, d) = crate::types::civil_from_days(days);
+            Ok(Value::Integer(match func {
+                ScalarFunc::Year => y,
+                ScalarFunc::Month => m as i32,
+                _ => d as i32,
+            }))
+        }
+        ScalarFunc::Hour | ScalarFunc::Minute | ScalarFunc::Second => {
+            let (_, h, mi, s, _) = match &row[0] {
+                Value::Timestamp(us) => crate::types::split_timestamp(*us),
+                v => return Err(PinkDbError::Execution(format!("time part of {v}"))),
+            };
+            Ok(Value::Integer(match func {
+                ScalarFunc::Hour => h as i32,
+                ScalarFunc::Minute => mi as i32,
+                _ => s as i32,
+            }))
+        }
+        ScalarFunc::DateTrunc => {
+            let part = match &row[0] {
+                Value::Varchar(s) => s.to_ascii_lowercase(),
+                v => return Err(PinkDbError::Execution(format!("date_trunc part {v}"))),
+            };
+            match &row[1] {
+                Value::Date(d) => {
+                    let (y, m, _) = crate::types::civil_from_days(*d);
+                    let trunc = match part.as_str() {
+                        "year" => crate::types::days_from_civil(y, 1, 1),
+                        "month" => crate::types::days_from_civil(y, m, 1),
+                        "day" => *d,
+                        _ => {
+                            return Err(PinkDbError::Execution(format!(
+                                "date_trunc: bad part \"{part}\" for DATE (want year|month|day)"
+                            )));
+                        }
+                    };
+                    Ok(Value::Date(trunc))
+                }
+                Value::Timestamp(us) => {
+                    let (days, h, mi, s, _) = crate::types::split_timestamp(*us);
+                    let day_us = days as i64 * 86_400_000_000;
+                    let trunc = match part.as_str() {
+                        "year" => {
+                            let (y, _, _) = crate::types::civil_from_days(days);
+                            crate::types::days_from_civil(y, 1, 1) as i64 * 86_400_000_000
+                        }
+                        "month" => {
+                            let (y, m, _) = crate::types::civil_from_days(days);
+                            crate::types::days_from_civil(y, m, 1) as i64 * 86_400_000_000
+                        }
+                        "day" => day_us,
+                        "hour" => day_us + h as i64 * 3_600_000_000,
+                        "minute" => day_us + h as i64 * 3_600_000_000 + mi as i64 * 60_000_000,
+                        "second" => {
+                            day_us + h as i64 * 3_600_000_000
+                                + mi as i64 * 60_000_000
+                                + s as i64 * 1_000_000
+                        }
+                        _ => {
+                            return Err(PinkDbError::Execution(format!(
+                                "date_trunc: bad part \"{part}\" (want year|month|day|hour|minute|second)"
+                            )));
+                        }
+                    };
+                    Ok(Value::Timestamp(trunc))
+                }
+                v => Err(PinkDbError::Execution(format!("date_trunc of {v}"))),
+            }
+        }        ScalarFunc::Substr => {
             let s = match &row[0] {
                 Value::Varchar(s) => s.clone(),
                 v => return Err(PinkDbError::Execution(format!("substr of {v}"))),

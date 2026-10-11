@@ -18,6 +18,8 @@ pub enum VectorData {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     VarChar(Vec<String>),
+    Date32(Vec<i32>),
+    TimestampMicros(Vec<i64>),
 }
 
 impl VectorData {
@@ -28,6 +30,8 @@ impl VectorData {
             VectorData::Int64(_) => DataType::Bigint,
             VectorData::Float64(_) => DataType::Double,
             VectorData::VarChar(_) => DataType::Varchar,
+            VectorData::Date32(_) => DataType::Date,
+            VectorData::TimestampMicros(_) => DataType::Timestamp,
         }
     }
 
@@ -38,6 +42,8 @@ impl VectorData {
             VectorData::Int64(v) => v.len(),
             VectorData::Float64(v) => v.len(),
             VectorData::VarChar(v) => v.len(),
+            VectorData::Date32(v) => v.len(),
+            VectorData::TimestampMicros(v) => v.len(),
         }
     }
 
@@ -48,6 +54,8 @@ impl VectorData {
             DataType::Bigint => VectorData::Int64(Vec::with_capacity(cap)),
             DataType::Double => VectorData::Float64(Vec::with_capacity(cap)),
             DataType::Varchar => VectorData::VarChar(Vec::with_capacity(cap)),
+            DataType::Date => VectorData::Date32(Vec::with_capacity(cap)),
+            DataType::Timestamp => VectorData::TimestampMicros(Vec::with_capacity(cap)),
         }
     }
 }
@@ -107,6 +115,8 @@ impl Vector {
             VectorData::Int64(v) => v.push(0),
             VectorData::Float64(v) => v.push(0.0),
             VectorData::VarChar(v) => v.push(String::new()),
+            VectorData::Date32(v) => v.push(0),
+            VectorData::TimestampMicros(v) => v.push(0),
         }
     }
 
@@ -157,6 +167,8 @@ impl Vector {
             VectorData::Int64(v) => Value::Bigint(v[idx]),
             VectorData::Float64(v) => Value::Double(v[idx]),
             VectorData::VarChar(v) => Value::Varchar(v[idx].clone()),
+            VectorData::Date32(v) => Value::Date(v[idx]),
+            VectorData::TimestampMicros(v) => Value::Timestamp(v[idx]),
         }
     }
 
@@ -184,6 +196,8 @@ impl Vector {
             (VectorData::Int64(v), Value::Bigint(i)) => v.push(i),
             (VectorData::Float64(v), Value::Double(x)) => v.push(x),
             (VectorData::VarChar(v), Value::Varchar(s)) => v.push(s),
+            (VectorData::Date32(v), Value::Date(d)) => v.push(d),
+            (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v.push(us),
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
                     "type mismatch: cannot push {other} into {:?} vector",

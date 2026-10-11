@@ -39,6 +39,8 @@ pub enum Keyword {
     With,
     In,
     Exists,
+    Date,
+    Timestamp,
 }
 
 impl Keyword {
@@ -75,6 +77,8 @@ impl Keyword {
             "WITH" => Keyword::With,
             "IN" => Keyword::In,
             "EXISTS" => Keyword::Exists,
+            "DATE" => Keyword::Date,
+            "TIMESTAMP" => Keyword::Timestamp,
             _ => return None,
         })
     }

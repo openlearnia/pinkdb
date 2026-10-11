@@ -50,6 +50,13 @@ pub enum ScalarFunc {
     Lower,
     Length,
     Substr,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    DateTrunc,
 }
 
 impl ScalarFunc {
@@ -61,6 +68,13 @@ impl ScalarFunc {
             "lower" => ScalarFunc::Lower,
             "length" => ScalarFunc::Length,
             "substr" => ScalarFunc::Substr,
+            "year" => ScalarFunc::Year,
+            "month" => ScalarFunc::Month,
+            "day" => ScalarFunc::Day,
+            "hour" => ScalarFunc::Hour,
+            "minute" => ScalarFunc::Minute,
+            "second" => ScalarFunc::Second,
+            "date_trunc" => ScalarFunc::DateTrunc,
             _ => return None,
         })
     }
@@ -197,6 +211,29 @@ pub(crate) fn common_numeric(a: DataType, b: DataType) -> Result<DataType> {
 }
 
 fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> {
+    // Dates: `date ± integer` is day arithmetic; `date - date` counts days
+    // (BIGINT). Timestamps never mix with integers in v1 (that needs
+    // INTERVAL types).
+    match (op, l, r) {
+        (BinaryOp::Add, DataType::Date, DataType::Integer)
+        | (BinaryOp::Add, DataType::Integer, DataType::Date)
+        | (BinaryOp::Subtract, DataType::Date, DataType::Integer) => {
+            return Ok(DataType::Date)
+        }
+        (BinaryOp::Subtract, DataType::Date, DataType::Date) => {
+            return Ok(DataType::Bigint)
+        }
+        _ => {}
+    }
+    if l == DataType::Date
+        || r == DataType::Date
+        || l == DataType::Timestamp
+        || r == DataType::Timestamp
+    {
+        return Err(PinkDbError::Type(format!(
+            "operator {op:?} does not support {l} and {r} in v1"
+        )));
+    }
     match op {
         BinaryOp::Divide => {
             // DuckDB rule: int / int → DOUBLE.
@@ -225,6 +262,8 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
 fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
+        || (l == DataType::Date && r == DataType::Date)
+        || (l == DataType::Timestamp && r == DataType::Timestamp)
     {
         return Ok(());
     }
@@ -552,7 +591,12 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
         },
         AggFunc::Min | AggFunc::Max => {
             let t = arg.expect("min/max has an arg");
-            if !is_numeric(t) && t != DataType::Varchar && t != DataType::Boolean {
+            if !is_numeric(t)
+                && t != DataType::Varchar
+                && t != DataType::Boolean
+                && t != DataType::Date
+                && t != DataType::Timestamp
+            {
                 return Err(PinkDbError::Type("MIN/MAX need an orderable argument".to_string()));
             }
             Ok(t)
@@ -615,6 +659,32 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
                 }
             }
             Ok(DataType::Varchar)
+        }
+        ScalarFunc::Year | ScalarFunc::Month | ScalarFunc::Day => {
+            arity(&[1])?;
+            match args[0].dtype() {
+                DataType::Date | DataType::Timestamp => Ok(DataType::Integer),
+                t => Err(PinkDbError::Type(format!("{func:?} needs DATE or TIMESTAMP, got {t}"))),
+            }
+        }
+        ScalarFunc::Hour | ScalarFunc::Minute | ScalarFunc::Second => {
+            arity(&[1])?;
+            match args[0].dtype() {
+                DataType::Timestamp => Ok(DataType::Integer),
+                t => Err(PinkDbError::Type(format!("{func:?} needs TIMESTAMP, got {t}"))),
+            }
+        }
+        ScalarFunc::DateTrunc => {
+            arity(&[2])?;
+            if args[0].dtype() != DataType::Varchar {
+                return Err(PinkDbError::Type(
+                    "date_trunc needs a VARCHAR part ('year', 'month', 'day', 'hour', 'minute', 'second')".to_string(),
+                ));
+            }
+            match args[1].dtype() {
+                DataType::Date | DataType::Timestamp => Ok(args[1].dtype()),
+                t => Err(PinkDbError::Type(format!("date_trunc needs DATE or TIMESTAMP, got {t}"))),
+            }
         }
     }
 }

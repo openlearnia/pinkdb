@@ -46,6 +46,16 @@ fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
         }
+        // Dates encode as their raw payloads under distinct tags so same-type
+        // equality (GROUP BY / DISTINCT / JOIN) never mixes them with ints.
+        Value::Date(d) => {
+            buf.push(6);
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        Value::Timestamp(us) => {
+            buf.push(7);
+            buf.extend_from_slice(&us.to_le_bytes());
+        }
     }
 }
 

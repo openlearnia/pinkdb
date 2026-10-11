@@ -135,9 +135,16 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
-            let col = self.parse_ident()?;
-            let (Token::Ident(type_name), _) = self.next() else {
-                return Err(self.error("expected column type".to_string()));
+            let (col, type_name) = (self.parse_ident()?, self.next());
+            // Type names are usually identifiers, but some (BOOLEAN, DATE,
+            // TIMESTAMP) lex as keywords — accept those too.
+            let type_name = match &type_name.0 {
+                Token::Ident(s) => s.clone(),
+                Token::Keyword(Keyword::Date) => "DATE".to_string(),
+                Token::Keyword(Keyword::Timestamp) => "TIMESTAMP".to_string(),
+                tok => {
+                    return Err(self.error(format!("expected column type, found {tok:?}")));
+                }
             };
             let dtype = DataType::from_sql(&type_name).ok_or_else(|| {
                 self.error(format!("unknown data type \"{type_name}\""))
@@ -609,6 +616,22 @@ impl Parser {
             (Token::Keyword(Keyword::True), _) => Ok(Expr::Literal(Value::Boolean(true))),
             (Token::Keyword(Keyword::False), _) => Ok(Expr::Literal(Value::Boolean(false))),
             (Token::Keyword(Keyword::Null), _) => Ok(Expr::Literal(Value::Null)),
+            (Token::Keyword(Keyword::Date), _) => match self.next() {
+                (Token::String(s), _) => crate::types::parse_date(&s)
+                    .map(Value::Date)
+                    .map(Expr::Literal)
+                    .ok_or_else(|| self.error(format!("bad DATE literal \"{s}\""))),
+                (tok, _) => Err(self.error(format!("DATE needs a string literal, found {tok:?}"))),
+            },
+            (Token::Keyword(Keyword::Timestamp), _) => match self.next() {
+                (Token::String(s), _) => crate::types::parse_timestamp(&s)
+                    .map(Value::Timestamp)
+                    .map(Expr::Literal)
+                    .ok_or_else(|| self.error(format!("bad TIMESTAMP literal \"{s}\""))),
+                (tok, _) => Err(self.error(format!(
+                    "TIMESTAMP needs a string literal, found {tok:?}"
+                ))),
+            },
             (Token::Star, _) => Ok(Expr::Star),
             (Token::Keyword(Keyword::Exists), _) => {
                 self.expect(&Token::LParen)?;
@@ -750,8 +773,20 @@ mod tests {
     }
 
     #[test]
-    fn with_in_exists_shapes() {
-        let s = parse_one("WITH a AS (SELECT 1 AS x), b(y) AS (SELECT x FROM a) SELECT * FROM b;");
+    fn date_time_literals_and_types() {
+        let s = parse_one("SELECT DATE '2024-02-29', TIMESTAMP '2024-03-15 12:00:00.5';");
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.projections.len(), 2);
+        assert!(parse_statements("SELECT DATE '2023-02-29';").is_err());
+        assert!(parse_statements("SELECT DATE 123;").is_err());
+        assert!(matches!(
+            parse_one("CREATE TABLE t (d DATE, ts TIMESTAMP);"),
+            Statement::CreateTable { .. }
+        ));
+    }
+
+    #[test]
+    fn with_in_exists_shapes() {        let s = parse_one("WITH a AS (SELECT 1 AS x), b(y) AS (SELECT x FROM a) SELECT * FROM b;");
         let Statement::Select(sel) = s else { panic!() };
         assert_eq!(sel.with.len(), 2);
         assert_eq!(sel.with[1].cols, Some(vec!["y".to_string()]));

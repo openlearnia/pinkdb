@@ -102,6 +102,8 @@ impl DataTable {
             (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
             (Value::Double(x), DataType::Double) => Ok(Value::Double(x)),
             (Value::Varchar(s), DataType::Varchar) => Ok(Value::Varchar(s)),
+            (Value::Date(d), DataType::Date) => Ok(Value::Date(d)),
+            (Value::Timestamp(us), DataType::Timestamp) => Ok(Value::Timestamp(us)),
             (v, t) => Err(PinkDbError::Type(format!(
                 "cannot coerce {v} to {t}"
             ))),

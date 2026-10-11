@@ -48,6 +48,8 @@ fn dtype_tag(t: DataType) -> u8 {
         DataType::Bigint => 2,
         DataType::Double => 3,
         DataType::Varchar => 4,
+        DataType::Date => 5,
+        DataType::Timestamp => 6,
     }
 }
 
@@ -58,6 +60,8 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         2 => Ok(DataType::Bigint),
         3 => Ok(DataType::Double),
         4 => Ok(DataType::Varchar),
+        5 => Ok(DataType::Date),
+        6 => Ok(DataType::Timestamp),
         _ => Err(PinkDbError::Execution(format!("corrupt file: bad dtype tag {b}"))),
     }
 }
@@ -173,7 +177,9 @@ fn as_i64(v: &Value) -> i64 {
     match v {
         Value::Integer(i) => *i as i64,
         Value::Bigint(i) => *i,
-        _ => 0, // only called on int-typed vectors
+        Value::Date(d) => *d as i64,
+        Value::Timestamp(us) => *us,
+        _ => 0, // only called on int/date-typed vectors
     }
 }
 
@@ -262,6 +268,20 @@ fn encode_chunk(dtype: DataType, values: &[Value]) -> (u8, Vec<u8>) {
             let nums: Vec<i64> = values.iter().map(as_i64).collect();
             consider(ENC_PLAIN, encode_ints_plain(dtype, &nums));
             consider(ENC_RLE, encode_ints_rle(dtype, &nums));
+            consider(ENC_BITPACK, encode_ints_bitpack(&nums));
+        }
+        // Dates reuse the integer codecs bit-for-bit; the dtype tag on the
+        // chunk keeps them distinct from INTEGER/BIGINT on decode.
+        DataType::Date => {
+            let nums: Vec<i64> = values.iter().map(as_i64).collect();
+            consider(ENC_PLAIN, encode_ints_plain(DataType::Integer, &nums));
+            consider(ENC_RLE, encode_ints_rle(DataType::Integer, &nums));
+            consider(ENC_BITPACK, encode_ints_bitpack(&nums));
+        }
+        DataType::Timestamp => {
+            let nums: Vec<i64> = values.iter().map(as_i64).collect();
+            consider(ENC_PLAIN, encode_ints_plain(DataType::Bigint, &nums));
+            consider(ENC_RLE, encode_ints_rle(DataType::Bigint, &nums));
             consider(ENC_BITPACK, encode_ints_bitpack(&nums));
         }
         DataType::Double => {
@@ -534,6 +554,14 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             }
             (out, decode_validity(&mut vr, n)?)
         }
+        (DataType::Date, ENC_PLAIN) => {
+            let n = reader.u32()? as usize;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(Value::Date(reader.i32()?));
+            }
+            (out, decode_validity(&mut vr, n)?)
+        }
         (DataType::Bigint, ENC_PLAIN) => {
             let n = reader.u32()? as usize;
             let mut out = Vec::with_capacity(n);
@@ -542,13 +570,28 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             }
             (out, decode_validity(&mut vr, n)?)
         }
-        (DataType::Integer, ENC_RLE) | (DataType::Bigint, ENC_RLE) => {
+        (DataType::Timestamp, ENC_PLAIN) => {
+            let n = reader.u32()? as usize;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(Value::Timestamp(reader.i64()?));
+            }
+            (out, decode_validity(&mut vr, n)?)
+        }
+        (DataType::Integer, ENC_RLE)
+        | (DataType::Bigint, ENC_RLE)
+        | (DataType::Date, ENC_RLE)
+        | (DataType::Timestamp, ENC_RLE) => {
             let n = reader.u32()? as usize;
             let runs = reader.u32()? as usize;
             let mut out = Vec::with_capacity(n);
             for _ in 0..runs {
                 let v = if dtype == DataType::Integer {
                     Value::Integer(reader.i32()?)
+                } else if dtype == DataType::Date {
+                    Value::Date(reader.i32()?)
+                } else if dtype == DataType::Timestamp {
+                    Value::Timestamp(reader.i64()?)
                 } else {
                     Value::Bigint(reader.i64()?)
                 };
@@ -563,7 +606,10 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             }
             (out, decode_validity(&mut vr, n)?)
         }
-        (DataType::Integer, ENC_BITPACK) | (DataType::Bigint, ENC_BITPACK) => {
+        (DataType::Integer, ENC_BITPACK)
+        | (DataType::Bigint, ENC_BITPACK)
+        | (DataType::Date, ENC_BITPACK)
+        | (DataType::Timestamp, ENC_BITPACK) => {
             let n = reader.u32()? as usize;
             let min = reader.i64()?;
             let width = reader.u8()? as u32;
@@ -577,6 +623,10 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
                     let v = min.wrapping_add(s as i64);
                     if dtype == DataType::Integer {
                         Value::Integer(v as i32)
+                    } else if dtype == DataType::Date {
+                        Value::Date(v as i32)
+                    } else if dtype == DataType::Timestamp {
+                        Value::Timestamp(v)
                     } else {
                         Value::Bigint(v)
                     }
@@ -724,6 +774,8 @@ impl PinkDb {
                                 DataType::Bigint => Value::Bigint(0),
                                 DataType::Double => Value::Double(0.0),
                                 DataType::Varchar => Value::Varchar(String::new()),
+                                DataType::Date => Value::Date(0),
+                                DataType::Timestamp => Value::Timestamp(0),
                             },
                             v => v,
                         })
@@ -818,6 +870,8 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
                 DataType::Bigint => Value::Bigint(0),
                 DataType::Double => Value::Double(0.0),
                 DataType::Varchar => Value::Varchar(String::new()),
+                DataType::Date => Value::Date(0),
+                DataType::Timestamp => Value::Timestamp(0),
             },
             v => v.clone(),
         })
@@ -844,8 +898,16 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
         })
         .collect();
     let forced = match (dtype, tag) {
-        (DataType::Integer, ENC_PLAIN) | (DataType::Bigint, ENC_PLAIN) => {
-            encode_ints_plain(dtype, &ints)
+        (DataType::Integer, ENC_PLAIN)
+        | (DataType::Bigint, ENC_PLAIN)
+        | (DataType::Date, ENC_PLAIN)
+        | (DataType::Timestamp, ENC_PLAIN) => {
+            let enc_dtype = match dtype {
+                DataType::Date => DataType::Integer,
+                DataType::Timestamp => DataType::Bigint,
+                t => t,
+            };
+            encode_ints_plain(enc_dtype, &ints)
         }
         (DataType::Double, ENC_PLAIN) => encode_u64_plain(
             &plain
@@ -863,10 +925,21 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
                 .collect::<Vec<_>>(),
         ),
         (DataType::Varchar, ENC_PLAIN) => encode_strs_plain(&strs),
-        (DataType::Integer, ENC_RLE) | (DataType::Bigint, ENC_RLE) => {
-            encode_ints_rle(dtype, &ints)
+        (DataType::Integer, ENC_RLE)
+        | (DataType::Bigint, ENC_RLE)
+        | (DataType::Date, ENC_RLE)
+        | (DataType::Timestamp, ENC_RLE) => {
+            let enc_dtype = match dtype {
+                DataType::Date => DataType::Integer,
+                DataType::Timestamp => DataType::Bigint,
+                t => t,
+            };
+            encode_ints_rle(enc_dtype, &ints)
         }
-        (DataType::Integer, ENC_BITPACK) | (DataType::Bigint, ENC_BITPACK) => {
+        (DataType::Integer, ENC_BITPACK)
+        | (DataType::Bigint, ENC_BITPACK)
+        | (DataType::Date, ENC_BITPACK)
+        | (DataType::Timestamp, ENC_BITPACK) => {
             encode_ints_bitpack(&ints)
         }
         (DataType::Double, ENC_RLE) => encode_u64_rle(
