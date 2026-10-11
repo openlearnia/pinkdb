@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use super::expr::eval_expr;
 use super::Cx;
 use crate::plan::compare_values;
+use rayon::prelude::*;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
 use crate::types::{DataType, Result, Value};
 use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
@@ -154,6 +155,54 @@ impl Acc {
         }
     }
 
+    /// Merge another accumulator of the same aggregate into this one
+    /// (for parallel aggregation: per-partition partials combine in order).
+    pub(crate) fn merge(&mut self, other: Acc) {
+        // Owned matching keeps every combination explicit and total.
+        let mine = std::mem::replace(self, Acc::Count(0));
+        *self = match (mine, other) {
+            (Acc::Count(a), Acc::Count(b)) => Acc::Count(a + b),
+            (
+                Acc::SumInt { sum: a, non_null: an },
+                Acc::SumInt { sum: b, non_null: bn },
+            ) => Acc::SumInt { sum: a.wrapping_add(b), non_null: an || bn },
+            (
+                Acc::SumFloat { sum: a, non_null: an },
+                Acc::SumFloat { sum: b, non_null: bn },
+            ) => Acc::SumFloat { sum: a + b, non_null: an || bn },
+            // Mixed int/float partials (one side saw a DOUBLE first): fold
+            // the int side in as float. Either direction lands in SumFloat.
+            (
+                Acc::SumInt { sum: a, non_null: an },
+                Acc::SumFloat { sum: b, non_null: bn },
+            )
+            | (
+                Acc::SumFloat { sum: b, non_null: bn },
+                Acc::SumInt { sum: a, non_null: an },
+            ) => Acc::SumFloat { sum: a as f64 + b, non_null: an || bn },
+            (
+                Acc::Avg { sum: a, count: ac },
+                Acc::Avg { sum: b, count: bc },
+            ) => Acc::Avg { sum: a + b, count: ac + bc },
+            (
+                Acc::MinMax { cur: a, is_min },
+                Acc::MinMax { cur: b, .. },
+            ) => {
+                let better = match (&a, &b) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(c), Some(v)) => {
+                        let ord = compare_values(v, c);
+                        (ord == std::cmp::Ordering::Less) == is_min
+                            && ord != std::cmp::Ordering::Equal
+                    }
+                };
+                Acc::MinMax { cur: if better { b } else { a }, is_min }
+            }
+            // Different aggregates never meet (one Acc per agg slot).
+            (mine, _) => mine,
+        };
+    }
     pub(crate) fn finalize(self, dtype: DataType) -> Value {
         match self {
             Acc::Count(n) => Value::Bigint(n),
@@ -194,69 +243,111 @@ struct Group {
 
 /// Run hash aggregation over `inputs`. Output columns are
 /// `[keys..., aggs...]`, chunked at [`CHUNK_SIZE`].
+///
+/// Chunks aggregate in parallel (rayon) into per-chunk partials, which merge
+/// in chunk order — group order is deterministic (first-seen row wins).
 pub(crate) fn aggregate(
-    cx: &mut Cx,
+    cx: &Cx,
     inputs: &[DataChunk],
     keys: &[BoundExpr],
     aggs: &[BoundAgg],
 ) -> Result<Vec<DataChunk>> {
+    struct Partial {
+        order: Vec<Vec<u8>>,
+        groups: HashMap<Vec<u8>, Group>,
+    }
+
+    // Phase 1: per-chunk partials in parallel.
+    let partials: Vec<Partial> = inputs
+        .par_iter()
+        .map(|chunk| {
+            let key_vecs: Vec<Vector> = keys
+                .iter()
+                .map(|k| eval_expr(k, chunk, cx))
+                .collect::<Result<_>>()?;
+            let arg_vecs: Vec<Option<Vector>> = aggs
+                .iter()
+                .map(|a| match &a.arg {
+                    Some(e) => eval_expr(e, chunk, cx).map(Some),
+                    None => Ok(None),
+                })
+                .collect::<Result<_>>()?;
+            let mut partial = Partial { order: Vec::new(), groups: HashMap::new() };
+            let mut buf = Vec::new();
+            for i in 0..chunk.num_rows() {
+                buf.clear();
+                let mut key_vals = Vec::with_capacity(key_vecs.len());
+                for kv in &key_vecs {
+                    let v = kv.get(i);
+                    encode_value(&mut buf, &v);
+                    key_vals.push(v);
+                }
+                let group = partial.groups.entry(buf.clone()).or_insert_with(|| {
+                    partial.order.push(buf.clone());
+                    Group {
+                        keys: key_vals.clone(),
+                        accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
+                    }
+                });
+                for (acc, av) in group.accs.iter_mut().zip(arg_vecs.iter()) {
+                    match av {
+                        None => acc.update(Some(&Value::Integer(1))), // COUNT(*)
+                        Some(v) => {
+                            if v.is_null(i) {
+                                acc.update(None);
+                            } else {
+                                acc.update(Some(&v.get(i)));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(partial)
+        })
+        .collect::<Result<_>>()?;
+
+    // Phase 2: merge partials in chunk order (deterministic first-seen order).
     let mut table: HashMap<Vec<u8>, usize> = HashMap::new();
     let mut groups: Vec<Group> = Vec::new();
-    let mut buf = Vec::new();
-
-    let new_group = |key_vals: Vec<Value>| Group {
-        keys: key_vals,
-        accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
-    };
-
-    for chunk in inputs {
-        let key_vecs: Vec<Vector> = keys
-            .iter()
-            .map(|k| eval_expr(k, chunk, cx))
-            .collect::<Result<_>>()?;
-        let arg_vecs: Vec<Option<Vector>> = aggs
-            .iter()
-            .map(|a| match &a.arg {
-                Some(e) => eval_expr(e, chunk, cx).map(Some),
-                None => Ok(None),
-            })
-            .collect::<Result<_>>()?;
-        for i in 0..chunk.num_rows() {
-            buf.clear();
-            let mut key_vals = Vec::with_capacity(key_vecs.len());
-            for kv in &key_vecs {
-                let v = kv.get(i);
-                encode_value(&mut buf, &v);
-                key_vals.push(v);
+    // Fast path: no keys means a single global group — merge accumulators
+    // directly instead of probing the table per row.
+    if keys.is_empty() {
+        let mut accs: Vec<Acc> = aggs.iter().map(|a| Acc::new(a.func)).collect();
+        // Reuse the per-chunk partials computed above (each holds one group
+        // exactly when keys are empty — merge them all in order).
+        for partial in partials {
+            let g = partial.groups.into_values().next().expect("global partial");
+            for (a, b) in accs.iter_mut().zip(g.accs) {
+                a.merge(b);
             }
-            let idx = match table.get(&buf) {
-                Some(&g) => g,
-                None => {
-                    let g = groups.len();
-                    groups.push(new_group(key_vals));
-                    table.insert(buf.clone(), g);
-                    g
-                }
-            };
-            let group = &mut groups[idx];
-            for (acc, av) in group.accs.iter_mut().zip(arg_vecs.iter()) {
-                match av {
-                    None => acc.update(Some(&Value::Integer(1))), // COUNT(*)
-                    Some(v) => {
-                        if v.is_null(i) {
-                            acc.update(None);
-                        } else {
-                            acc.update(Some(&v.get(i)));
+        }
+        groups.push(Group { keys: Vec::new(), accs });
+    } else {
+        for mut partial in partials {
+            for enc in partial.order {
+                let g = partial.groups.remove(&enc).expect("partial group");
+                match table.get(&enc) {
+                    Some(&idx) => {
+                        let target = &mut groups[idx];
+                        for (a, b) in target.accs.iter_mut().zip(g.accs) {
+                            a.merge(b);
                         }
+                    }
+                    None => {
+                        let idx = groups.len();
+                        table.insert(enc, idx);
+                        groups.push(g);
                     }
                 }
             }
         }
     }
-
     // No input rows + no keys → single empty group (e.g. COUNT(*) over ∅).
     if groups.is_empty() && keys.is_empty() {
-        groups.push(new_group(Vec::new()));
+        groups.push(Group {
+            keys: Vec::new(),
+            accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
+        });
     }
 
     // Emit output chunks.

@@ -15,6 +15,7 @@ use crate::plan::compare_values;
 use crate::sql::binder::{BoundWindow, FrameBound, WindowFunc};
 use crate::types::{DataType, Result, Value};
 use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
+use rayon::prelude::*;
 
 struct Row {
     part: Vec<Value>,
@@ -27,7 +28,7 @@ struct Row {
 /// windows could in principle see earlier results — nesting is rejected at
 /// bind time, so each window actually reads only input columns).
 pub(crate) fn eval_window(
-    cx: &mut Cx,
+    cx: &Cx,
     chunks: &[DataChunk],
     windows: &[BoundWindow],
 ) -> Result<Vec<DataChunk>> {
@@ -39,38 +40,45 @@ pub(crate) fn eval_window(
 }
 
 fn eval_one_window(
-    cx: &mut Cx,
+    cx: &Cx,
     chunks: &[DataChunk],
     w: &BoundWindow,
 ) -> Result<Vec<DataChunk>> {
-    // 1. Materialize partition/order/arg values in global row order.
+    // 1. Materialize partition/order/arg values in global row order
+    // (per-chunk evaluation parallelizes; assembly preserves order).
+    let per_chunk: Vec<Vec<Row>> = chunks
+        .par_iter()
+        .map(|chunk| {
+            let parts: Vec<Vector> = w
+                .partition
+                .iter()
+                .map(|e| eval_expr(e, chunk, cx))
+                .collect::<Result<_>>()?;
+            let ords: Vec<Vector> = w
+                .order
+                .iter()
+                .map(|(e, _)| eval_expr(e, chunk, cx))
+                .collect::<Result<_>>()?;
+            let arg = match &w.arg {
+                Some(e) => Some(eval_expr(e, chunk, cx)?),
+                None => None,
+            };
+            Ok((0..chunk.num_rows())
+                .map(|i| Row {
+                    part: parts.iter().map(|v| v.get(i)).collect(),
+                    ord: ords.iter().map(|v| v.get(i)).collect(),
+                    arg: match &arg {
+                        None => Some(Value::Integer(1)), // COUNT(*): every row counts
+                        Some(v) if v.is_null(i) => None,
+                        Some(v) => Some(v.get(i)),
+                    },
+                })
+                .collect::<Vec<_>>())
+        })
+        .collect::<Result<_>>()?;
     let mut rows: Vec<Row> = Vec::new();
-    for chunk in chunks {
-        let parts: Vec<Vector> = w
-            .partition
-            .iter()
-            .map(|e| eval_expr(e, chunk, cx))
-            .collect::<Result<_>>()?;
-        let ords: Vec<Vector> = w
-            .order
-            .iter()
-            .map(|(e, _)| eval_expr(e, chunk, cx))
-            .collect::<Result<_>>()?;
-        let arg = match &w.arg {
-            Some(e) => Some(eval_expr(e, chunk, cx)?),
-            None => None,
-        };
-        for i in 0..chunk.num_rows() {
-            rows.push(Row {
-                part: parts.iter().map(|v| v.get(i)).collect(),
-                ord: ords.iter().map(|v| v.get(i)).collect(),
-                arg: match &arg {
-                    None => Some(Value::Integer(1)), // COUNT(*): every row counts
-                    Some(v) if v.is_null(i) => None,
-                    Some(v) => Some(v.get(i)),
-                },
-            });
-        }
+    for part in per_chunk {
+        rows.extend(part);
     }
     let n = rows.len();
 

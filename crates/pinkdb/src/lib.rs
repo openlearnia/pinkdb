@@ -5,6 +5,7 @@
 //! no unsafe, no async.
 
 pub mod csv;
+pub mod db;
 pub mod exec;
 pub mod optimizer;
 pub mod persist;
@@ -14,6 +15,7 @@ pub mod storage;
 pub mod types;
 pub mod vector;
 
+pub use db::{Connection, Database};
 pub use exec::QueryResult;
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};

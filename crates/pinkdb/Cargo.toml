@@ -7,3 +7,4 @@ license = "MIT"
 
 [dependencies]
 csv = "1"
+rayon = "1.12.0"

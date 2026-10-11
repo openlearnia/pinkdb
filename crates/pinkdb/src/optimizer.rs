@@ -27,7 +27,7 @@ fn const_chunk() -> DataChunk {
     DataChunk { columns: Vec::new(), num_rows: 1 }
 }
 
-fn fold_expr(cx: &mut crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
+fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
     let rebuilt = match expr {
         BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
             op,
@@ -70,7 +70,7 @@ fn fold_expr(cx: &mut crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
     rebuilt
 }
 
-fn fold_aggs(cx: &mut crate::exec::Cx, aggs: Vec<crate::sql::binder::BoundAgg>) -> Vec<crate::sql::binder::BoundAgg> {
+fn fold_aggs(cx: &crate::exec::Cx, aggs: Vec<crate::sql::binder::BoundAgg>) -> Vec<crate::sql::binder::BoundAgg> {
     aggs.into_iter()
         .map(|mut a| {
             a.arg = a.arg.map(|e| fold_expr(cx, e));
@@ -80,38 +80,38 @@ fn fold_aggs(cx: &mut crate::exec::Cx, aggs: Vec<crate::sql::binder::BoundAgg>) 
 }
 
 fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
-    let mut cx = crate::exec::Cx::new(db);
+    let cx = crate::exec::Cx::new(db);
     match plan {
         LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
             input: Box::new(fold_plan(db, *input)),
-            predicate: fold_expr(&mut cx, predicate),
+            predicate: fold_expr(&cx, predicate),
         },
         LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
             LogicalPlan::Join {
                 left: Box::new(fold_plan(db, *left)),
                 right: Box::new(fold_plan(db, *right)),
-                left_key: fold_expr(&mut cx, left_key),
-                right_key: fold_expr(&mut cx, right_key),
+                left_key: fold_expr(&cx, left_key),
+                right_key: fold_expr(&cx, right_key),
                 left_cols,
             }
         }
         LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
             input: Box::new(fold_plan(db, *input)),
-            keys: keys.into_iter().map(|k| fold_expr(&mut cx, k)).collect(),
-            aggs: fold_aggs(&mut cx, aggs),
+            keys: keys.into_iter().map(|k| fold_expr(&cx, k)).collect(),
+            aggs: fold_aggs(&cx, aggs),
         },
         LogicalPlan::Window { input, windows, input_cols } => LogicalPlan::Window {
             input: Box::new(fold_plan(db, *input)),
             windows: windows
                 .into_iter()
                 .map(|mut w| {
-                    w.arg = w.arg.map(|e| fold_expr(&mut cx, e));
+                    w.arg = w.arg.map(|e| fold_expr(&cx, e));
                     w.partition =
-                        w.partition.into_iter().map(|e| fold_expr(&mut cx, e)).collect();
+                        w.partition.into_iter().map(|e| fold_expr(&cx, e)).collect();
                     w.order = w
                         .order
                         .into_iter()
-                        .map(|(e, d)| (fold_expr(&mut cx, e), d))
+                        .map(|(e, d)| (fold_expr(&cx, e), d))
                         .collect();
                     w
                 })
@@ -120,7 +120,7 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
         },
         LogicalPlan::Project { input, exprs, names } => LogicalPlan::Project {
             input: Box::new(fold_plan(db, *input)),
-            exprs: exprs.into_iter().map(|e| fold_expr(&mut cx, e)).collect(),
+            exprs: exprs.into_iter().map(|e| fold_expr(&cx, e)).collect(),
             names,
         },
         LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
@@ -133,7 +133,7 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
         }
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(fold_plan(db, *input)),
-            keys: keys.into_iter().map(|(k, d)| (fold_expr(&mut cx, k), d)).collect(),
+            keys: keys.into_iter().map(|(k, d)| (fold_expr(&cx, k), d)).collect(),
         },
         LogicalPlan::Limit { input, limit } => {
             LogicalPlan::Limit { input: Box::new(fold_plan(db, *input)), limit }
@@ -142,7 +142,7 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             table,
             rows: rows
                 .into_iter()
-                .map(|r| r.into_iter().map(|e| fold_expr(&mut cx, e)).collect())
+                .map(|r| r.into_iter().map(|e| fold_expr(&cx, e)).collect())
                 .collect(),
         },
         LogicalPlan::Union { left, right, distinct, types } => LogicalPlan::Union {
@@ -506,14 +506,14 @@ mod tests {
     #[test]
     fn folds_constants() {
         let db = crate::storage::PinkDb::new();
-        let mut cx = crate::exec::Cx::new(&db);
+        let cx = crate::exec::Cx::new(&db);
         let e = B::Binary {
             op: BinaryOp::Add,
             left: Box::new(B::Literal(Value::Integer(1))),
             right: Box::new(B::Literal(Value::Integer(2))),
             dtype: T::Integer,
         };
-        assert_eq!(fold_expr(&mut cx, e), B::Literal(Value::Integer(3)));
+        assert_eq!(fold_expr(&cx, e), B::Literal(Value::Integer(3)));
         // Columns block folding.
         let e = B::Binary {
             op: BinaryOp::Add,
@@ -521,7 +521,7 @@ mod tests {
             right: Box::new(B::Literal(Value::Integer(2))),
             dtype: T::Integer,
         };
-        assert!(matches!(fold_expr(&mut cx, e), B::Binary { .. }));
+        assert!(matches!(fold_expr(&cx, e), B::Binary { .. }));
     }
 
     #[test]

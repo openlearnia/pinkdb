@@ -34,6 +34,10 @@ pub struct DataTable {
     pub name: String,
     pub columns: Vec<Column>,
     pub num_rows: usize,
+    /// Mutation counter for optimistic-concurrency conflict detection.
+    /// Bumped on every append/update/delete batch; process-lifetime only
+    /// (not persisted — save/load starts fresh).
+    pub version: u64,
 }
 
 impl DataTable {
@@ -59,6 +63,7 @@ impl DataTable {
                 .map(|(name, dtype)| Column::new(name, dtype))
                 .collect(),
             num_rows: 0,
+            version: 0,
         })
     }
 
@@ -142,6 +147,7 @@ impl DataTable {
                 .push_value(coerced)?;
         }
         self.num_rows += 1;
+        self.version += 1;
         Ok(())
     }
 
@@ -180,6 +186,9 @@ impl DataTable {
         }
         for (col, row, v) in staged {
             self.columns[col].chunks[chunk].set_value(row, v)?;
+        }
+        if !updates.is_empty() {
+            self.version += 1;
         }
         Ok(())
     }
@@ -222,6 +231,9 @@ impl DataTable {
             }
         }
         self.num_rows -= removed;
+        if removed > 0 {
+            self.version += 1;
+        }
         Ok(removed)
     }
 
@@ -258,7 +270,7 @@ impl DataTable {
 /// A view: a stored query (rebound at each use, so drops/recreates of the
 /// underlying tables surface as errors, never stale plans). Views are
 /// session-local: `.save` does not persist them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ViewDef {
     pub name: String,
     pub query: Select,
@@ -278,6 +290,31 @@ pub struct PinkDb {
 impl PinkDb {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Current version of one table (for conflict detection).
+    pub fn table_version(&self, name: &str) -> Result<u64> {
+        Ok(self.table(name)?.version)
+    }
+
+    pub(crate) fn tables_remove(&mut self, key: &str) -> Option<DataTable> {
+        self.tables.remove(key)
+    }
+
+    pub(crate) fn tables_insert(&mut self, key: String, table: DataTable) {
+        self.tables.insert(key, table);
+    }
+
+    pub(crate) fn views_remove(&mut self, key: &str) -> Option<ViewDef> {
+        self.views.remove(key)
+    }
+
+    pub(crate) fn views_insert(&mut self, key: String, view: ViewDef) {
+        self.views.insert(key, view);
+    }
+
+    pub(crate) fn clone_views(&self) -> HashMap<String, ViewDef> {
+        self.views.clone()
     }
 
     /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.

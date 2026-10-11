@@ -61,12 +61,13 @@ SQL text
 | `pinkdb::sql` | Hand-written lexer, AST, recursive-descent parser, binder |
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
-| `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators |
+| `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
 | `pinkdb::persist` | `.pink` single-file columnar persistence (RLE/dictionary/bitpack) |
+| `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 
-Design rules: Rust edition 2021, zero async, no unsafe. Only dependencies are
-`csv` (library) and `rustyline` (CLI).
+Design rules: Rust edition 2021, zero async, no unsafe. Dependencies are
+`csv` + `rustyline`, plus `rayon` for parallel execution.
 
 ## SQL surface (v1)
 
@@ -133,18 +134,37 @@ RLE; booleans bitpacked or RLE; strings raw, dictionary (u32 codes), or RLE.
 NULLs ride in a separate validity bitmap. 1M-row sales table: 24.5 MB CSV →
 14.0 MB `.pink`, saved in 0.16 s, reopened and queried in 0.25 s.
 
+## Concurrency
+
+```rust
+use pinkdb::{Database, PinkDb};
+
+// One shared store, one connection per thread.
+let db = Database::new();
+let mut c = db.connect();
+c.execute("CREATE TABLE t (a INTEGER);")?;
+```
+
+Queries run under a shared read lock (parallel readers, parallel chunks via
+rayon inside each query). Writes take the write lock per statement.
+`BEGIN..COMMIT` works on a private snapshot: commits to disjoint tables all
+succeed; overlapping writes abort the second committer with a write-conflict
+error (retry the transaction) — never silent lost updates. This is snapshot
+isolation without predicate tracking (write-skew is possible). The plain
+`PinkDb` API remains for single-connection embedding.
+
 ## Benchmark (1M rows, release, Apple Silicon)
 
 Generated with `bench/gen_sales.py` (deterministic seed 42):
 
-| Step | Time |
-|---|---|
-| `.import` 1M rows (24 MB CSV) | 0.44 s |
-| `SELECT COUNT(*) FROM sales` | 0.04 s |
-| GROUP BY region + 5 aggregates | 0.13 s |
-| `SELECT COUNT(*) ... WHERE total > 500` | 0.08 s |
-| WHERE + GROUP BY + HAVING + ORDER + LIMIT | 0.10 s |
-| 1M-row inner hash join + GROUP BY | 0.27 s |
+| Step | Time (rayon) | Before |
+|---|---|---|
+| `.import` 1M rows (24 MB CSV) | 0.56 s | 0.42 s |
+| `SELECT COUNT(*) FROM sales` | 0.05 s | 0.04 s |
+| GROUP BY region + 5 aggregates | 0.06 s | 0.11 s |
+| `SELECT COUNT(*) ... WHERE total > 500` | 0.06 s | 0.07 s |
+| WHERE + GROUP BY + HAVING + ORDER + LIMIT | 0.06 s | 0.10 s |
+| 1M-row inner hash join + GROUP BY | 0.22 s | 0.27 s |
 
 ## Known v1 limits
 

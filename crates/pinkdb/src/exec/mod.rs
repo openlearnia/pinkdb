@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use aggregate::{aggregate, encode_row};
 use expr::{coerce_to, eval_expr, select_true};
+use rayon::prelude::*;
 use window::eval_window;
 
 use crate::plan::{LogicalPlan, agg_output_schema, compare_values, win_output_schema};
@@ -53,7 +54,7 @@ pub(crate) struct Output {
 pub(crate) struct Cx<'a> {
     pub(crate) db: &'a PinkDb,
     pub(crate) ctes: HashMap<String, Output>,
-    pub(crate) memo: HashMap<usize, Memo>,
+    pub(crate) memo: std::sync::Arc<std::sync::Mutex<HashMap<usize, Memo>>>,
 }
 
 #[derive(Clone)]
@@ -65,7 +66,7 @@ pub(crate) enum Memo {
 
 impl<'a> Cx<'a> {
     pub(crate) fn new(db: &'a PinkDb) -> Self {
-        Self { db, ctes: HashMap::new(), memo: HashMap::new() }
+        Self { db, ctes: HashMap::new(), memo: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())) }
     }
 }
 
@@ -82,12 +83,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let single = DataChunk { columns: Vec::new(), num_rows: 1 };
             let mut staged = Vec::with_capacity(rows.len());
             {
-                let mut cx = Cx::new(db);
+                let cx = Cx::new(db);
                 for row in rows {
                     let values: Vec<Value> = row
                         .iter()
                         .map(|e| {
-                            let v = eval_expr(e, &single, &mut cx)?;
+                            let v = eval_expr(e, &single, &cx)?;
                             if v.len() != 1 {
                                 return Err(PinkDbError::Execution(
                                     "INSERT cell did not evaluate to one value".to_string(),
@@ -127,7 +128,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let mut per_chunk: Vec<Vec<(usize, usize, Value)>>;
             let mut count = 0usize;
             {
-                let mut cx = Cx::new(db);
+                let cx = Cx::new(db);
                 let t = cx.db.table(table)?;
                 per_chunk = vec![Vec::new(); t.num_chunks()];
                 for (ci, writes) in per_chunk.iter_mut().enumerate() {
@@ -135,12 +136,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                         PinkDbError::Execution("storage changed during UPDATE".to_string())
                     })?;
                     let targets = match predicate {
-                        Some(p) => select_true(&eval_expr(p, &chunk, &mut cx)?)?,
+                        Some(p) => select_true(&eval_expr(p, &chunk, &cx)?)?,
                         None => (0..chunk.num_rows()).collect(),
                     };
                     count += targets.len();
                     for (col, expr) in sets {
-                        let vals = eval_expr(expr, &chunk, &mut cx)?;
+                        let vals = eval_expr(expr, &chunk, &cx)?;
                         for &r in &targets {
                             writes.push((*col, r, vals.get(r)));
                         }
@@ -159,7 +160,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             // indices — descending order keeps them valid).
             let mut drops: Vec<Vec<usize>>;
             {
-                let mut cx = Cx::new(db);
+                let cx = Cx::new(db);
                 let t = cx.db.table(table)?;
                 drops = Vec::with_capacity(t.num_chunks());
                 for ci in 0..t.num_chunks() {
@@ -168,7 +169,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                     })?;
                     drops.push(match predicate {
                         // Predicate TRUE ⇒ row is deleted (NULL ⇒ kept).
-                        Some(p) => select_true(&eval_expr(p, &chunk, &mut cx)?)?,
+                        Some(p) => select_true(&eval_expr(p, &chunk, &cx)?)?,
                         None => (0..chunk.num_rows()).collect(),
                     });
                 }
@@ -205,20 +206,32 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             Ok(QueryResult::DroppedView { name: name.clone() })
         }
         _ => {
-            let mut cx = Cx::new(db);
-            let out = eval(&mut cx, plan)?;
-            let mut rows = Vec::new();
-            for chunk in &out.chunks {
-                for i in 0..chunk.num_rows() {
-                    rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
-                }
-            }
-            Ok(QueryResult::Selected { names: out.names, types: out.types, rows })
+            let cx = Cx::new(db);
+            run_read_with(&cx, plan)
         }
     }
 }
 
-fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
+/// Execute a read-only plan against a shared store (used under a read lock
+/// by concurrent readers; also backs [`run`]'s query arm).
+pub fn run_read(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
+    debug_assert!(crate::plan::is_read_only(plan), "run_read needs a query plan");
+    let cx = Cx::new(db);
+    run_read_with(&cx, plan)
+}
+
+fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
+    let out = eval(cx, plan)?;
+    let mut rows = Vec::new();
+    for chunk in &out.chunks {
+        for i in 0..chunk.num_rows() {
+            rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+        }
+    }
+    Ok(QueryResult::Selected { names: out.names, types: out.types, rows })
+}
+
+fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     match plan {
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }
@@ -254,18 +267,24 @@ fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
             types: vec![],
         }),
         LogicalPlan::Filter { input, predicate } => {
-            let mut inner = eval(cx, input)?;
-            let mut chunks = Vec::with_capacity(inner.chunks.len());
-            for chunk in inner.chunks.drain(..) {
-                let pred = eval_expr(predicate, &chunk, cx)?;
-                let sel = select_true(&pred)?;
-                if sel.len() == chunk.num_rows() {
-                    chunks.push(chunk);
-                } else if !sel.is_empty() {
-                    chunks.push(chunk.gather(&sel));
-                }
-                // Empty selection → drop the chunk.
-            }
+            let inner = eval(cx, input)?;
+            // Per-chunk predicates evaluate in parallel; order is preserved.
+            let chunks: Vec<Option<DataChunk>> = inner
+                .chunks
+                .par_iter()
+                .map(|chunk| {
+                    let pred = eval_expr(predicate, chunk, cx)?;
+                    let sel = select_true(&pred)?;
+                    Ok(if sel.len() == chunk.num_rows() {
+                        Some(chunk.clone())
+                    } else if sel.is_empty() {
+                        None
+                    } else {
+                        Some(chunk.gather(&sel))
+                    })
+                })
+                .collect::<Result<_>>()?;
+            let chunks = chunks.into_iter().flatten().collect();
             Ok(Output { chunks, names: inner.names, types: inner.types })
         }
         LogicalPlan::Join { left, right, left_key, right_key, .. } => {
@@ -312,32 +331,27 @@ fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
         }
         LogicalPlan::Cte { name, query, body } => {
             let out = eval(cx, query)?;
-            let old = cx.ctes.insert(name.clone(), out);
-            let body_out = eval(cx, body);
-            // Restore any shadowed entry (nested same-name CTEs).
-            match old {
-                Some(o) => {
-                    cx.ctes.insert(name.clone(), o);
-                }
-                None => {
-                    cx.ctes.remove(name);
-                }
-            }
-            body_out
+            let mut ctes = cx.ctes.clone();
+            ctes.insert(name.clone(), out);
+            let child = Cx { db: cx.db, ctes, memo: cx.memo.clone() };
+            eval(&child, body)
         }
         LogicalPlan::Project { input, exprs, names } => {
-            let mut inner = eval(cx, input)?;
+            let inner = eval(cx, input)?;
             let types: Vec<DataType> = exprs.iter().map(|e| e.dtype()).collect();
             // Project over zero input chunks → zero output chunks (0 rows).
             // (Aggregates always emit ≥1 chunk, so COUNT(*) over ∅ still works.)
-            let mut chunks = Vec::with_capacity(inner.chunks.len());
-            for chunk in inner.chunks.drain(..) {
-                let cols = exprs
-                    .iter()
-                    .map(|e| eval_expr(e, &chunk, cx))
-                    .collect::<Result<Vec<_>>>()?;
-                chunks.push(DataChunk::new(cols)?);
-            }
+            let chunks = inner
+                .chunks
+                .par_iter()
+                .map(|chunk| {
+                    let cols = exprs
+                        .iter()
+                        .map(|e| eval_expr(e, chunk, cx))
+                        .collect::<Result<Vec<_>>>()?;
+                    DataChunk::new(cols)
+                })
+                .collect::<Result<_>>()?;
             Ok(Output { chunks, names: names.clone(), types })
         }
         LogicalPlan::Distinct { input } => {
@@ -377,7 +391,7 @@ fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
 /// Inner hash join: build on the right, probe with the left (preserves
 /// left-row order). NULL keys never match on either side.
 fn hash_join(
-    cx: &mut Cx,
+    cx: &Cx,
     left_chunks: &[DataChunk],
     right_chunks: &[DataChunk],
     left_key: &BoundExpr,
@@ -406,41 +420,54 @@ fn hash_join(
         }
     }
 
-    // Probe.
+    // Probe in parallel: each left chunk yields its joined rows in order;
+    // the shared build map is read-only here.
     let mut dtypes: Vec<DataType> = left_types.to_vec();
     dtypes.extend(right_types.iter().copied());
+    let probed: Vec<Vec<Vec<Value>>> = left_chunks
+        .par_iter()
+        .map(|chunk| {
+            let kv = eval_expr(left_key, chunk, cx)?;
+            let kv = match common {
+                Some(t) => coerce_to(&kv, t)?,
+                None => kv,
+            };
+            let mut rows = Vec::new();
+            let mut buf = Vec::new();
+            for i in 0..chunk.num_rows() {
+                if kv.is_null(i) {
+                    continue;
+                }
+                buf.clear();
+                encode_row(&mut buf, &[kv.get(i)]);
+                if let Some(matches) = map.get(&buf) {
+                    for &(rci, ri) in matches {
+                        let mut row =
+                            Vec::with_capacity(chunk.columns.len() + right_chunks[rci].columns.len());
+                        row.extend(chunk.columns.iter().map(|c| c.get(i)));
+                        row.extend(right_chunks[rci].columns.iter().map(|c| c.get(ri)));
+                        rows.push(row);
+                    }
+                }
+            }
+            Ok(rows)
+        })
+        .collect::<Result<_>>()?;
+    // Assemble into CHUNK_SIZE chunks in left-row order.
     let mut finished = Vec::new();
     let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
     let mut cur_rows = 0usize;
-    for chunk in left_chunks.iter() {
-        let kv = eval_expr(left_key, chunk, cx)?;
-        let kv = match common {
-            Some(t) => coerce_to(&kv, t)?,
-            None => kv,
-        };
-        for i in 0..chunk.num_rows() {
-            if kv.is_null(i) {
-                continue;
+    for rows in probed {
+        for row in rows {
+            if cur_rows >= CHUNK_SIZE {
+                finished.push(DataChunk::new(std::mem::take(&mut cur))?);
+                cur = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
+                cur_rows = 0;
             }
-            buf.clear();
-            encode_row(&mut buf, &[kv.get(i)]);
-            if let Some(matches) = map.get(&buf) {
-                for &(rci, ri) in matches {
-                    if cur_rows >= CHUNK_SIZE {
-                        finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-                        cur = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
-                        cur_rows = 0;
-                    }
-                    let rchunk = &right_chunks[rci];
-                    for (dst, col) in cur.iter_mut().zip(chunk.columns.iter()) {
-                        dst.push_value(col.get(i))?;
-                    }
-                    for (dst, col) in cur.iter_mut().skip(chunk.columns.len()).zip(rchunk.columns.iter()) {
-                        dst.push_value(col.get(ri))?;
-                    }
-                    cur_rows += 1;
-                }
+            for (dst, v) in cur.iter_mut().zip(row) {
+                dst.push_value(v)?;
             }
+            cur_rows += 1;
         }
     }
     if cur_rows > 0 {
@@ -449,7 +476,8 @@ fn hash_join(
     Ok(finished)
 }
 
-fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {    let mut seen = HashSet::new();
+fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
+    let mut seen = HashSet::new();
     let mut out: Vec<Vector> = Vec::new();
     let mut out_rows = 0usize;
     let mut finished: Vec<DataChunk> = Vec::new();
@@ -481,31 +509,46 @@ fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {    let mut seen = 
     Ok(finished)
 }
 
-fn sort(cx: &mut Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec<DataChunk>> {
+fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec<DataChunk>> {
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
     // Evaluate key vectors per chunk, then sort row locations.
+    // (Key evaluation parallelizes; the sort itself uses par_sort with a
+    // global-order tiebreak so results stay deterministic.)
     struct Row {
         key: Vec<Value>,
         chunk: usize,
         row: usize,
+        seq: usize,
     }
     let mut rows: Vec<Row> = Vec::new();
-    for (ci, chunk) in chunks.iter().enumerate() {
-        let key_vecs: Vec<Vector> = keys
-            .iter()
-            .map(|(k, _)| eval_expr(k, chunk, cx))
-            .collect::<Result<_>>()?;
-        for i in 0..chunk.num_rows() {
-            rows.push(Row {
-                key: key_vecs.iter().map(|v| v.get(i)).collect(),
-                chunk: ci,
-                row: i,
-            });
+    // Evaluate keys per chunk in parallel, then assemble in chunk order.
+    let keyed: Vec<Vec<Row>> = chunks
+        .par_iter()
+        .enumerate()
+        .map(|(ci, chunk)| {
+            let key_vecs: Vec<Vector> = keys
+                .iter()
+                .map(|(k, _)| eval_expr(k, chunk, cx))
+                .collect::<Result<_>>()?;
+            Ok((0..chunk.num_rows())
+                .map(|i| Row {
+                    key: key_vecs.iter().map(|v| v.get(i)).collect(),
+                    chunk: ci,
+                    row: i,
+                    seq: 0,
+                })
+                .collect::<Vec<_>>())
+        })
+        .collect::<Result<_>>()?;
+    for part in keyed {
+        for mut r in part {
+            r.seq = rows.len();
+            rows.push(r);
         }
     }
-    rows.sort_by(|a, b| {
+    rows.par_sort_by(|a, b| {
         for ((ka, kb), (_, desc)) in a.key.iter().zip(b.key.iter()).zip(keys.iter()) {
             // NULLS LAST regardless of direction: only non-null values flip.
             let ord = match (ka, kb) {
@@ -521,7 +564,8 @@ fn sort(cx: &mut Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result
                 return ord;
             }
         }
-        Ordering::Equal
+        // Stability tiebreak: input order (par_sort is not stable).
+        a.seq.cmp(&b.seq)
     });
     // Rebuild columns in sorted order.
     let dtypes: Vec<DataType> = chunks[0].columns.iter().map(|c| c.dtype()).collect();
@@ -550,6 +594,18 @@ fn sort(cx: &mut Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result
 mod tests {
     use super::*;
     use crate::types::Value as V;
+
+    // Shared-nothing columnar types must cross threads (rayon + RwLock).
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[test]
+    fn core_types_are_send_sync() {
+        assert_send_sync::<PinkDb>();
+        assert_send_sync::<DataTable>();
+        assert_send_sync::<Vector>();
+        assert_send_sync::<DataChunk>();
+        assert_send_sync::<Value>();
+        assert_send_sync::<QueryResult>();
+    }
 
     fn sales_db() -> PinkDb {
         let mut db = PinkDb::new();

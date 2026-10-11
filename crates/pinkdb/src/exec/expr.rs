@@ -17,7 +17,7 @@ use crate::vector::{DataChunk, Vector};
 use std::collections::HashSet;
 
 /// Evaluate `expr` over every row of `chunk`.
-pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &mut Cx) -> Result<Vector> {
+pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<Vector> {
     let n = chunk.num_rows();
     match expr {
         BoundExpr::Literal(v) => const_vector(v.clone(), n),
@@ -99,10 +99,10 @@ fn memo_key(query: &crate::plan::LogicalPlan) -> usize {
 fn eval_scalar_subquery(
     query: &crate::plan::LogicalPlan,
     chunk: &DataChunk,
-    cx: &mut Cx,
+    cx: &Cx,
 ) -> Result<Vector> {
     let key = memo_key(query);
-    if let Some(Memo::Scalar(v)) = cx.memo.get(&key) {
+    if let Some(Memo::Scalar(v)) = cx.memo.lock().expect("memo").get(&key) {
         let v = v.clone();
         return const_vector(v, chunk.num_rows());
     }
@@ -123,7 +123,7 @@ fn eval_scalar_subquery(
             value = col.get(i);
         }
     }
-    cx.memo.insert(key, Memo::Scalar(value.clone()));
+    cx.memo.lock().expect("memo").insert(key, Memo::Scalar(value.clone()));
     const_vector(value, chunk.num_rows())
 }
 
@@ -134,12 +134,12 @@ fn eval_in_subquery(
     query: &crate::plan::LogicalPlan,
     negated: bool,
     chunk: &DataChunk,
-    cx: &mut Cx,
+    cx: &Cx,
 ) -> Result<Vector> {
     let key = memo_key(query);
     let l = eval_expr(lhs, chunk, cx)?;
     // Hit path borrows the set (no clone); the borrow ends at return.
-    if let Some(Memo::Set(set, has_null, common)) = cx.memo.get(&key) {
+    if let Some(Memo::Set(set, has_null, common)) = cx.memo.lock().expect("memo").get(&key) {
         return probe_in(&l, set, *has_null, *common, negated);
     }
     let out = eval(cx, query)?;
@@ -168,7 +168,7 @@ fn eval_in_subquery(
         }
     }
     let result = probe_in(&l, &set, has_null, common, negated)?;
-    cx.memo.insert(key, Memo::Set(set, has_null, common));
+    cx.memo.lock().expect("memo").insert(key, Memo::Set(set, has_null, common));
     Ok(result)
 }
 
@@ -213,16 +213,16 @@ fn eval_exists(
     query: &crate::plan::LogicalPlan,
     negated: bool,
     chunk: &DataChunk,
-    cx: &mut Cx,
+    cx: &Cx,
 ) -> Result<Vector> {
     let key = memo_key(query);
-    if let Some(Memo::Flag(b)) = cx.memo.get(&key) {
+    if let Some(Memo::Flag(b)) = cx.memo.lock().expect("memo").get(&key) {
         let b = *b;
         return const_vector(Value::Boolean(b != negated), chunk.num_rows());
     }
     let out = eval(cx, query)?;
     let any = out.chunks.iter().any(|c| c.num_rows() > 0);
-    cx.memo.insert(key, Memo::Flag(any));
+    cx.memo.lock().expect("memo").insert(key, Memo::Flag(any));
     const_vector(Value::Boolean(any != negated), chunk.num_rows())
 }
 
@@ -261,7 +261,7 @@ fn eval_logic(
     left: &BoundExpr,
     right: &BoundExpr,
     chunk: &DataChunk,
-    cx: &mut Cx,
+    cx: &Cx,
 ) -> Result<Vector> {
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
@@ -299,7 +299,7 @@ fn eval_comparison(
     left: &BoundExpr,
     right: &BoundExpr,
     chunk: &DataChunk,
-    cx: &mut Cx,
+    cx: &Cx,
 ) -> Result<Vector> {
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
@@ -365,7 +365,7 @@ fn eval_arith(
     left: &BoundExpr,
     right: &BoundExpr,
     chunk: &DataChunk,
-    cx: &mut Cx,
+    cx: &Cx,
 ) -> Result<Vector> {
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
@@ -646,7 +646,7 @@ fn eval_like(
     left: &BoundExpr,
     right: &BoundExpr,
     chunk: &DataChunk,
-    cx: &mut Cx,
+    cx: &Cx,
 ) -> Result<Vector> {
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
@@ -827,7 +827,7 @@ mod tests {
             dtype: DataType::Double,
         };
         let db = PinkDb::new();
-        let v = eval_expr(&e, &chunk2(), &mut test_cx(&db)).unwrap();
+        let v = eval_expr(&e, &chunk2(), &test_cx(&db)).unwrap();
         assert_eq!(v.get(0), V::Double(3.5));
         assert_eq!(v.get(1), V::Null);
     }
@@ -848,10 +848,10 @@ mod tests {
         let and = B::Binary { op: BinaryOp::And, left: Box::new(col(0)), right: Box::new(col(1)), dtype: DataType::Boolean };
         let or = B::Binary { op: BinaryOp::Or, left: Box::new(col(0)), right: Box::new(col(1)), dtype: DataType::Boolean };
         let db = PinkDb::new();
-        let mut cx = test_cx(&db);
-        let a = eval_expr(&and, &c, &mut cx).unwrap();
+        let cx = test_cx(&db);
+        let a = eval_expr(&and, &c, &cx).unwrap();
         assert_eq!((a.get(0), a.get(1), a.get(2)), (V::Boolean(false), V::Null, V::Boolean(true)));
-        let o = eval_expr(&or, &c, &mut cx).unwrap();
+        let o = eval_expr(&or, &c, &cx).unwrap();
         assert_eq!((o.get(0), o.get(1), o.get(2)), (V::Null, V::Boolean(true), V::Boolean(true)));
     }
 }

@@ -112,6 +112,26 @@ pub enum LogicalPlan {
     },
 }
 
+/// True for row-producing queries (safe under a shared read lock).
+/// Everything else mutates the store or the transaction state.
+pub fn is_read_only(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::Scan { .. }
+            | LogicalPlan::SingleRow
+            | LogicalPlan::Filter { .. }
+            | LogicalPlan::Join { .. }
+            | LogicalPlan::Aggregate { .. }
+            | LogicalPlan::Project { .. }
+            | LogicalPlan::Distinct { .. }
+            | LogicalPlan::Sort { .. }
+            | LogicalPlan::Limit { .. }
+            | LogicalPlan::Cte { .. }
+            | LogicalPlan::Window { .. }
+            | LogicalPlan::Union { .. }
+    )
+}
+
 /// Compare two non-null values. Cross-type numerics compare in i64 when both
 /// are int-like, else f64. Used by comparisons, MIN/MAX, and Sort.
 pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
