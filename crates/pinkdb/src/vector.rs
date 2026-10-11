@@ -220,6 +220,40 @@ impl Vector {
         }
     }
 
+    /// Overwrite the value at `idx` (for UPDATE). Type-checked like push;
+    /// NULL clears the validity bit, anything else sets it.
+    pub fn set_value(&mut self, idx: usize, value: Value) -> Result<()> {
+        if idx >= self.len {
+            return Err(PinkDbError::Execution(format!(
+                "vector index {idx} out of bounds (len {})",
+                self.len
+            )));
+        }
+        let is_null = value.is_null();
+        match (&mut self.data, value) {
+            (VectorData::Boolean(v), Value::Boolean(b)) => v[idx] = b,
+            (VectorData::Int32(v), Value::Integer(i)) => v[idx] = i,
+            (VectorData::Int64(v), Value::Bigint(i)) => v[idx] = i,
+            (VectorData::Float64(v), Value::Double(x)) => v[idx] = x,
+            (VectorData::VarChar(v), Value::Varchar(s)) => v[idx] = s,
+            (VectorData::Date32(v), Value::Date(d)) => v[idx] = d,
+            (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v[idx] = us,
+            (_, Value::Null) => {} // placeholder stays; bit cleared below
+            (data, other) => {
+                return Err(PinkDbError::Type(format!(
+                    "type mismatch: cannot store {other} in {:?} vector",
+                    data.dtype()
+                )));
+            }
+        }
+        if is_null {
+            bit_clear(&mut self.validity, idx);
+        } else {
+            bit_set(&mut self.validity, idx);
+        }
+        Ok(())
+    }
+
     /// Build a new vector with rows in `selection` order. Used by Filter.
     pub fn gather(&self, selection: &[usize]) -> Vector {
         let mut out = Vector::with_capacity(self.dtype(), selection.len());

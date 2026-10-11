@@ -73,6 +73,8 @@ Design rules: Rust edition 2021, zero async, no unsafe. Only dependencies are
 ```sql
 CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE);
 INSERT INTO t VALUES (1, 'x', 9.5), (2, NULL, 3.0);
+UPDATE t SET price = price * 1.1 WHERE id > 1;   -- SET exprs see pre-update values
+DELETE FROM t WHERE price IS NULL;               -- NULL never matches; both are statement-atomic
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [JOIN u ON t.x = u.y]      -- inner equi-join, single equality
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
@@ -139,7 +141,7 @@ Generated with `bench/gen_sales.py` (deterministic seed 42):
 
 ## Known v1 limits
 
-- No UPDATE/DELETE/transactions (persistence is on-disk `.pink` via `.save`/`.open`)
+- No transactions (each statement is atomic); persistence is on-disk `.pink` via `.save`/`.open`
 - Correlated subqueries are rejected (uncorrelated only); no outer joins
 - Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position

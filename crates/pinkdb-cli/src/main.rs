@@ -188,6 +188,8 @@ fn run_sql(db: &mut PinkDb, sql: &str) {
                 match r {
                     QueryResult::Created => println!("Table created."),
                     QueryResult::Inserted { count } => println!("Inserted {count} row(s)."),
+                    QueryResult::Updated { count } => println!("Updated {count} row(s)."),
+                    QueryResult::Deleted { count } => println!("Deleted {count} row(s)."),
                     QueryResult::Selected { names, types, rows } => {
                         if rows.is_empty() {
                             println!("(no rows)");

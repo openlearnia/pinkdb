@@ -28,6 +28,8 @@ use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
 pub enum QueryResult {
     Created,
     Inserted { count: usize },
+    Updated { count: usize },
+    Deleted { count: usize },
     Selected { names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>> },
 }
 
@@ -112,6 +114,66 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             Ok(QueryResult::Inserted { count })
         }
+        LogicalPlan::Update { table, sets, predicate } => {
+            // Phase 1: evaluate predicates + SET exprs over current chunks
+            // (subqueries see pre-mutation state). Phase 2: write back.
+            // SET exprs evaluate against original values (simultaneous).
+            let mut per_chunk: Vec<Vec<(usize, usize, Value)>>;
+            let mut count = 0usize;
+            {
+                let mut cx = Cx::new(db);
+                let t = cx.db.table(table)?;
+                per_chunk = vec![Vec::new(); t.num_chunks()];
+                for (ci, writes) in per_chunk.iter_mut().enumerate() {
+                    let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                        PinkDbError::Execution("storage changed during UPDATE".to_string())
+                    })?;
+                    let targets = match predicate {
+                        Some(p) => select_true(&eval_expr(p, &chunk, &mut cx)?)?,
+                        None => (0..chunk.num_rows()).collect(),
+                    };
+                    count += targets.len();
+                    for (col, expr) in sets {
+                        let vals = eval_expr(expr, &chunk, &mut cx)?;
+                        for &r in &targets {
+                            writes.push((*col, r, vals.get(r)));
+                        }
+                    }
+                }
+            }
+            let t = db.table_mut(table)?;
+            for (ci, writes) in per_chunk.iter().enumerate() {
+                t.update_rows(ci, writes)?;
+            }
+            Ok(QueryResult::Updated { count })
+        }
+        LogicalPlan::Delete { table, predicate } => {
+            // Phase 1: collect per-chunk drop lists. Phase 2: apply from the
+            // highest chunk down (emptied chunks are removed, shifting lower
+            // indices — descending order keeps them valid).
+            let mut drops: Vec<Vec<usize>>;
+            {
+                let mut cx = Cx::new(db);
+                let t = cx.db.table(table)?;
+                drops = Vec::with_capacity(t.num_chunks());
+                for ci in 0..t.num_chunks() {
+                    let chunk = t.scan_chunk(ci).ok_or_else(|| {
+                        PinkDbError::Execution("storage changed during DELETE".to_string())
+                    })?;
+                    drops.push(match predicate {
+                        // Predicate TRUE ⇒ row is deleted (NULL ⇒ kept).
+                        Some(p) => select_true(&eval_expr(p, &chunk, &mut cx)?)?,
+                        None => (0..chunk.num_rows()).collect(),
+                    });
+                }
+            }
+            let mut count = 0usize;
+            let t = db.table_mut(table)?;
+            for ci in (0..drops.len()).rev() {
+                count += t.delete_from_chunk(ci, &drops[ci])?;
+            }
+            Ok(QueryResult::Deleted { count })
+        }
         _ => {
             let mut cx = Cx::new(db);
             let out = eval(&mut cx, plan)?;
@@ -128,9 +190,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 
 fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
     match plan {
-        LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => Err(
-            PinkDbError::Execution("DDL/DML does not produce rows".to_string()),
-        ),
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::Insert { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. } => Err(PinkDbError::Execution(
+            "DDL/DML does not produce rows".to_string(),
+        )),
         LogicalPlan::Scan { table } => {
             // CTEs shadow catalog tables (both keyed lowercased).
             if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
@@ -1039,8 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn window_over_agg_and_rejections() {
-        let mut db = win_db();
+    fn window_over_agg_and_rejections() {        let mut db = win_db();
         let rows = select(
             &mut db,
             "SELECT region, SUM(amount) AS s, RANK() OVER (ORDER BY SUM(amount) DESC) AS r
@@ -1059,5 +1123,103 @@ mod tests {
             .execute("SELECT RANK() OVER (ORDER BY SUM(amount) OVER ()) FROM sales;")
             .is_err());
         assert!(db.execute("SELECT MEDIAN(amount) OVER () FROM sales;").is_err());
+    }
+
+    // --- phase 9: UPDATE / DELETE ---
+
+    fn ud_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, NULL);").unwrap();
+        db
+    }
+
+    fn updated(db: &mut PinkDb, sql: &str) -> usize {
+        match db.execute(sql).unwrap().pop().unwrap() {
+            QueryResult::Updated { count } => count,
+            QueryResult::Deleted { count } => count,
+            r => panic!("not a mutation result: {r:?}"),
+        }
+    }
+
+    #[test]
+    fn update_basic_and_where() {
+        let mut db = ud_db();
+        assert_eq!(updated(&mut db, "UPDATE t SET a = a + 10 WHERE a > 1;"), 2);
+        assert_eq!(
+            select(&mut db, "SELECT a, b FROM t ORDER BY a;"),
+            vec![
+                vec![V::Integer(1), V::Varchar("x".to_string())],
+                vec![V::Integer(12), V::Varchar("y".to_string())],
+                vec![V::Integer(13), V::Null],
+            ]
+        );
+        // No WHERE updates everything.
+        assert_eq!(updated(&mut db, "UPDATE t SET b = 'z';"), 3);
+        // NULL assignment + expression to NULL.
+        assert_eq!(updated(&mut db, "UPDATE t SET b = NULL WHERE a = 1;"), 1);
+        assert_eq!(select(&mut db, "SELECT b FROM t WHERE a = 1;"), vec![vec![V::Null]]);
+    }
+
+    #[test]
+    fn update_sets_are_simultaneous() {
+        let mut db = ud_db();
+        // a=b, b=a swaps (both read pre-update values).
+        db.execute("CREATE TABLE s (a INTEGER, b INTEGER);").unwrap();
+        db.execute("INSERT INTO s VALUES (1, 2);").unwrap();
+        assert_eq!(updated(&mut db, "UPDATE s SET a = b, b = a;"), 1);
+        assert_eq!(select(&mut db, "SELECT a, b FROM s;"), vec![vec![V::Integer(2), V::Integer(1)]]);
+    }
+
+    #[test]
+    fn update_type_rules() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE n (i INTEGER, g BIGINT, d DOUBLE);").unwrap();
+        db.execute("INSERT INTO n VALUES (1, 1, 1.0);").unwrap();
+        // Widening allowed.
+        assert_eq!(updated(&mut db, "UPDATE n SET g = i, d = g;"), 1);
+        // Narrowing / wrong types rejected, table untouched.
+        assert!(db.execute("UPDATE n SET i = g;").is_err());
+        assert!(db.execute("UPDATE n SET i = 'x';").is_err());
+        assert!(db.execute("UPDATE n SET missing = 1;").is_err());
+        assert!(db.execute("UPDATE n SET i = 1, i = 2;").is_err());
+        assert!(db.execute("UPDATE n SET i = SUM(i);").is_err());
+        assert_eq!(
+            select(&mut db, "SELECT i, g, d FROM n;"),
+            vec![vec![V::Integer(1), V::Bigint(1), V::Double(1.0)]]
+        );
+    }
+
+    #[test]
+    fn delete_basic_and_all() {
+        let mut db = ud_db();
+        assert_eq!(updated(&mut db, "DELETE FROM t WHERE a >= 2;"), 2);
+        assert_eq!(select(&mut db, "SELECT a FROM t;"), vec![vec![V::Integer(1)]]);
+        // Delete everything, then reinsert (empty chunks are dropped cleanly).
+        assert_eq!(updated(&mut db, "DELETE FROM t;"), 1);
+        assert!(select(&mut db, "SELECT * FROM t;").is_empty());
+        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(0)]]);
+        db.execute("INSERT INTO t VALUES (9, 'q');").unwrap();
+        assert_eq!(select(&mut db, "SELECT a FROM t;"), vec![vec![V::Integer(9)]]);
+        // Unknown table / bad predicate.
+        assert!(db.execute("DELETE FROM missing;").is_err());
+        assert!(db.execute("DELETE FROM t WHERE a;").is_err());
+    }
+
+    #[test]
+    fn update_delete_with_subquery() {
+        let mut db = ud_db();
+        assert_eq!(
+            updated(&mut db, "UPDATE t SET b = 'top' WHERE a = (SELECT MAX(a) FROM t);"),
+            1
+        );
+        assert_eq!(
+            select(&mut db, "SELECT b FROM t WHERE a = 3;"),
+            vec![vec![V::Varchar("top".to_string())]]
+        );
+        // Fresh DB: row 3 still has NULL b, so the IN-set is {3}.
+        let mut db = ud_db();
+        assert_eq!(updated(&mut db, "DELETE FROM t WHERE a IN (SELECT a FROM t WHERE b IS NULL);"), 1);
+        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(2)]]);
     }
 }

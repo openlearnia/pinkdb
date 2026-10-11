@@ -50,6 +50,9 @@ pub enum Keyword {
     Preceding,
     Following,
     Current,
+    Update,
+    Delete,
+    Set,
 }
 
 impl Keyword {
@@ -97,6 +100,9 @@ impl Keyword {
             "PRECEDING" => Keyword::Preceding,
             "FOLLOWING" => Keyword::Following,
             "CURRENT" => Keyword::Current,
+            "UPDATE" => Keyword::Update,
+            "DELETE" => Keyword::Delete,
+            "SET" => Keyword::Set,
             _ => return None,
         })
     }

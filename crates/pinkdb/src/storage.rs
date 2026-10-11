@@ -144,7 +144,86 @@ impl DataTable {
         Ok(())
     }
 
-    /// Append a whole `DataChunk` (used by tests / future INSERT paths).
+    /// Whether values of type `from` can coerce to `to` (type-level check for
+    /// UPDATE validation; mirrors [`DataTable::coerce`]).
+    pub fn can_coerce(from: DataType, to: DataType) -> bool {
+        match (from, to) {
+            (a, b) if a == b => true,
+            (DataType::Integer, DataType::Bigint)
+            | (DataType::Integer, DataType::Double)
+            | (DataType::Bigint, DataType::Double) => true,
+            _ => false,
+        }
+    }
+
+    /// Overwrite cells in one stored chunk: `updates` holds
+    /// `(column, row-in-chunk, value)` triples. Values are coerced to the
+    /// column type first, so a failed coercion leaves the chunk untouched
+    /// (validate everything, then write).
+    pub fn update_rows(&mut self, chunk: usize, updates: &[(usize, usize, Value)]) -> Result<()> {
+        if chunk >= self.num_chunks() {
+            return Err(PinkDbError::Execution(format!("chunk {chunk} out of range")));
+        }
+        // Validate + coerce up front for atomicity.
+        let mut staged: Vec<(usize, usize, Value)> = Vec::with_capacity(updates.len());
+        for (col, row, v) in updates {
+            let dtype = self.columns.get(*col).ok_or_else(|| {
+                PinkDbError::Execution(format!("column {col} out of range"))
+            })?.dtype;
+            if *row >= self.columns[*col].chunks[chunk].len() {
+                return Err(PinkDbError::Execution(format!(
+                    "row {row} out of bounds in chunk {chunk}"
+                )));
+            }
+            staged.push((*col, *row, Self::coerce(v.clone(), dtype)?));
+        }
+        for (col, row, v) in staged {
+            self.columns[col].chunks[chunk].set_value(row, v)?;
+        }
+        Ok(())
+    }
+
+    /// Remove rows (chunk-relative positions) from one stored chunk.
+    /// Returns the removed count. Emptied chunks are dropped.
+    pub fn delete_from_chunk(&mut self, chunk: usize, drop: &[usize]) -> Result<usize> {
+        if chunk >= self.num_chunks() {
+            return Err(PinkDbError::Execution(format!("chunk {chunk} out of range")));
+        }
+        if drop.is_empty() {
+            return Ok(0);
+        }
+        let len = self.columns[0].chunks[chunk].len();
+        let mut drop_sorted = drop.to_vec();
+        drop_sorted.sort_unstable();
+        drop_sorted.dedup();
+        if drop_sorted.iter().any(|&r| r >= len) {
+            return Err(PinkDbError::Execution(format!(
+                "row out of bounds in chunk {chunk}"
+            )));
+        }
+        let mut keep: Vec<usize> = Vec::with_capacity(len - drop_sorted.len());
+        let mut d = 0;
+        for r in 0..len {
+            if d < drop_sorted.len() && drop_sorted[d] == r {
+                d += 1;
+            } else {
+                keep.push(r);
+            }
+        }
+        let removed = len - keep.len();
+        for col in &mut self.columns {
+            col.chunks[chunk] = col.chunks[chunk].gather(&keep);
+        }
+        // Drop chunks left empty (all columns share chunk boundaries).
+        if self.columns[0].chunks[chunk].is_empty() {
+            for col in &mut self.columns {
+                col.chunks.remove(chunk);
+            }
+        }
+        self.num_rows -= removed;
+        Ok(removed)
+    }
+
     /// Number of stored chunks (all columns share the same count).
     pub fn num_chunks(&self) -> usize {
         self.columns.first().map(|c| c.chunks.len()).unwrap_or(0)

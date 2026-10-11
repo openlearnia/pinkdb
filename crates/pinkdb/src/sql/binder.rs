@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use super::ast::*;
 use crate::plan::LogicalPlan;
-use crate::storage::PinkDb;
+use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 
 // ---------- bound expressions ----------
@@ -1197,8 +1197,103 @@ pub fn bind(db: &PinkDb, stmt: &Statement) -> Result<LogicalPlan> {
             schema: columns.clone(),
         }),
         Statement::Insert { table, columns, rows } => bind_insert(db, table, columns, rows),
+        Statement::Update { table, sets, where_clause } => {
+            bind_update(db, table, sets, where_clause)
+        }
+        Statement::Delete { table, where_clause } => bind_delete(db, table, where_clause),
         Statement::Select(sel) => bind_select(db, sel),
     }
+}
+
+/// Bind UPDATE: resolve target columns, bind SET expressions in the table
+/// scope (no aggregates, windows, or aliases), check Boolean WHERE.
+fn bind_update(
+    db: &PinkDb,
+    table: &str,
+    sets: &[(String, Expr)],
+    where_clause: &Option<Expr>,
+) -> Result<LogicalPlan> {
+    let t = db.table(table)?;
+    if sets.is_empty() {
+        return Err(PinkDbError::Parse("UPDATE needs at least one SET assignment".to_string()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (col, _) in sets {
+        if !seen.insert(col.to_ascii_lowercase()) {
+            return Err(PinkDbError::Catalog(format!(
+                "duplicate SET column \"{col}\""
+            )));
+        }
+    }
+    let mut binder = Binder::new(db);
+    binder.allow_win = false;
+    binder.tables.push(ScopeTable {
+        name: t.name.to_ascii_lowercase(),
+        columns: t.schema(),
+    });
+    let mut bound_sets = Vec::with_capacity(sets.len());
+    for (col, expr) in sets {
+        let idx = t.column_index(col).map_err(|_| {
+            PinkDbError::Catalog(format!("no column \"{col}\""))
+        })?;
+        let (_, target) = t.schema()[idx].clone();
+        let mut aggs = Vec::new();
+        let bound = binder.bind_expr(expr, &mut aggs, false)?;
+        if !aggs.is_empty() {
+            return Err(PinkDbError::Execution(
+                "aggregates are not allowed in UPDATE SET".to_string(),
+            ));
+        }
+        // Subqueries are fine (uncorrelated; evaluated pre-mutation).
+        if !DataTable::can_coerce(bound.dtype(), target)
+            && !matches!(bound, BoundExpr::Literal(Value::Null))
+        {
+            return Err(PinkDbError::Type(format!(
+                "cannot assign {} to {target} column \"{col}\"",
+                bound.dtype()
+            )));
+        }
+        bound_sets.push((idx, bound));
+    }
+    binder.allow_alias = false;
+    let mut no_aggs = Vec::new();
+    let predicate = where_clause
+        .as_ref()
+        .map(|e| binder.bind_expr(e, &mut no_aggs, false))
+        .transpose()?;
+    if let Some(p) = &predicate {
+        if p.dtype() != DataType::Boolean {
+            return Err(PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string()));
+        }
+    }
+    Ok(LogicalPlan::Update {
+        table: t.name.clone(),
+        sets: bound_sets,
+        predicate,
+    })
+}
+
+/// Bind DELETE: Boolean WHERE over the table scope (no aggregates/windows).
+fn bind_delete(db: &PinkDb, table: &str, where_clause: &Option<Expr>) -> Result<LogicalPlan> {
+    let t = db.table(table)?;
+    let mut binder = Binder::new(db);
+    binder.allow_win = false;
+    binder.allow_alias = false;
+    binder.tables.push(ScopeTable {
+        name: t.name.to_ascii_lowercase(),
+        columns: t.schema(),
+    });
+    let mut no_aggs = Vec::new();
+    let predicate = where_clause
+        .as_ref()
+        .map(|e| binder.bind_expr(e, &mut no_aggs, false))
+        .transpose()?;
+    if let Some(p) = &predicate {
+        if p.dtype() != DataType::Boolean {
+            return Err(PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string()));
+        }
+    }
+    Ok(LogicalPlan::Delete { table: t.name.clone(), predicate })
 }
 
 fn bind_insert(
@@ -1307,6 +1402,7 @@ fn plan_schema(
             Ok(out)
         }
         LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => Ok(Vec::new()),
+        LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => Ok(Vec::new()),
     }
 }
 

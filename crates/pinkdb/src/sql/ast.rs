@@ -18,6 +18,16 @@ pub enum Statement {
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
     },
+    Update {
+        table: String,
+        /// `(column, expression)` pairs in written order.
+        sets: Vec<(String, Expr)>,
+        where_clause: Option<Expr>,
+    },
+    Delete {
+        table: String,
+        where_clause: Option<Expr>,
+    },
     Select(Select),
 }
 

@@ -16,6 +16,17 @@ pub enum LogicalPlan {
         /// columns are NULL). Evaluated against an empty single-row chunk.
         rows: Vec<Vec<BoundExpr>>,
     },
+    Update {
+        table: String,
+        /// `(column index, value expression)` — expressions address table
+        /// columns and evaluate simultaneously per row (pre-update values).
+        sets: Vec<(usize, BoundExpr)>,
+        predicate: Option<BoundExpr>,
+    },
+    Delete {
+        table: String,
+        predicate: Option<BoundExpr>,
+    },
     /// Full scan of a table (column pruning is wave-3 optimizer work).
     Scan {
         table: String,

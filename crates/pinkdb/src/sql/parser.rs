@@ -118,14 +118,54 @@ impl Parser {
         match self.peek_keyword() {
             Some(Keyword::Create) => self.parse_create(),
             Some(Keyword::Insert) => self.parse_insert(),
+            Some(Keyword::Update) => self.parse_update(),
+            Some(Keyword::Delete) => self.parse_delete(),
             Some(Keyword::Select) | Some(Keyword::With) => {
                 Ok(Statement::Select(self.parse_select()?))
             }
             _ => Err(self.error(format!(
-                "expected CREATE, INSERT, or SELECT, found {:?}",
+                "expected CREATE, INSERT, UPDATE, DELETE, or SELECT, found {:?}",
                 self.peek().0
             ))),
         }
+    }
+
+    fn parse_update(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Update)?;
+        let table = self.parse_ident()?;
+        self.expect_keyword(Keyword::Set)?;
+        let mut sets = Vec::new();
+        loop {
+            let col = self.parse_ident()?;
+            self.expect(&Token::Eq)?;
+            let expr = self.parse_expr()?;
+            sets.push((col, expr));
+            if !self.eat(&Token::Comma) {
+                break;
+            }
+        }
+        if sets.is_empty() {
+            return Err(self.error("UPDATE needs at least one SET assignment".to_string()));
+        }
+        let where_clause = if self.eat_keyword(Keyword::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Update { table, sets, where_clause })
+    }
+
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Delete)?;
+        // `DELETE FROM t` (the FROM is required in v1).
+        self.expect_keyword(Keyword::From)?;
+        let table = self.parse_ident()?;
+        let where_clause = if self.eat_keyword(Keyword::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Delete { table, where_clause })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
@@ -892,8 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn window_shapes() {
-        let s = parse_one("SELECT rank() OVER (PARTITION BY a ORDER BY b DESC) FROM t;");
+    fn window_shapes() {        let s = parse_one("SELECT rank() OVER (PARTITION BY a ORDER BY b DESC) FROM t;");
         let Statement::Select(sel) = s else { panic!() };
         match &sel.projections[0] {
             Projection::Expr { expr: Expr::Window { name, over, .. }, .. } => {
@@ -915,6 +954,27 @@ mod tests {
             "SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;"
         )
         .is_err());
+    }
+
+    #[test]
+    fn update_delete_shapes() {
+        match parse_one("UPDATE t SET a = 1, b = a + 2 WHERE a > 0;") {
+            Statement::Update { table, sets, where_clause } => {
+                assert_eq!(table, "t");
+                assert_eq!(sets.len(), 2);
+                assert!(where_clause.is_some());
+            }
+            _ => panic!(),
+        }
+        match parse_one("DELETE FROM t;") {
+            Statement::Delete { table, where_clause } => {
+                assert_eq!(table, "t");
+                assert!(where_clause.is_none());
+            }
+            _ => panic!(),
+        }
+        assert!(parse_statements("UPDATE t SET;").is_err());
+        assert!(parse_statements("DELETE t;").is_err());
     }
 
     #[test]
