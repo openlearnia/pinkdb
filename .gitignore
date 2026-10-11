@@ -1,0 +1,5 @@
+/target/
+*.pink
+*.csv
+.DS_Store
+*.swp

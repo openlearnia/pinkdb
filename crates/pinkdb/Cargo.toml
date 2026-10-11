@@ -1,0 +1,9 @@
+[package]
+name = "pinkdb"
+version = "0.1.0"
+edition = "2021"
+description = "pinkdb: mini DuckDB — embedded analytical SQL in Rust"
+license = "MIT"
+
+[dependencies]
+csv = "1"

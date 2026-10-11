@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/pinkdb", "crates/pinkdb-cli"]
+resolver = "2"
