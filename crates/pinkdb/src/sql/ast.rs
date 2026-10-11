@@ -31,6 +31,17 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    CreateView {
+        name: String,
+        cols: Option<Vec<String>>,
+        query: Box<Select>,
+    },
+    DropTable {
+        name: String,
+    },
+    DropView {
+        name: String,
+    },
     Select(Select),
 }
 
@@ -45,6 +56,14 @@ pub struct Select {
     pub having: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<usize>,
+    /// `UNION [ALL|DISTINCT] branch...` (left-associative).
+    pub unions: Vec<(SetOp, Select)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    UnionAll,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,6 +184,13 @@ pub enum Expr {
         query: Box<Select>,
         negated: bool,
     },
+    /// `COALESCE(a, b, ...)` — first non-NULL argument.
+    Coalesce(Vec<Expr>),
+    /// `CAST(x AS type)`.
+    Cast {
+        expr: Box<Expr>,
+        dtype: crate::types::DataType,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +208,8 @@ pub enum BinaryOp {
     GtEq,
     And,
     Or,
+    Like,
+    NotLike,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

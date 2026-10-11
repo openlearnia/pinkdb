@@ -94,6 +94,12 @@ LIMIT n;
   (`PARTITION BY` / `ORDER BY` / `ROWS` frames; default frame is cumulative
   with ORDER BY, whole partition without; no `RANGE` frames, no nesting)
 - Scalar functions: `abs`, `round` (1–2 args), `upper`, `lower`, `length`, `substr`
+- `CAST(x AS type)` (numeric tower both ways, bool↔numeric, varchar parse/format,
+  date↔timestamp; bad input errors), `COALESCE(a, b, ...)` (common type),
+  `LIKE`/`NOT LIKE` (`%`/`_` patterns)
+- Set ops: `UNION [ALL|DISTINCT]` (numeric types unify; ORDER BY/LIMIT attach
+  to their own branch in v1); `CREATE VIEW v [(cols)] AS ...` (session-local,
+  rebound per use), `DROP TABLE` / `DROP VIEW`
 - Types: `BOOLEAN`, `INTEGER` (i32), `BIGINT` (i64), `DOUBLE` (f64), `VARCHAR`,
   `DATE` (days since epoch), `TIMESTAMP` (microseconds, naive, no time zone)
 - Literals: `DATE '2024-02-29'`, `TIMESTAMP '2024-03-15 12:30:45.5'`

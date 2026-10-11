@@ -57,6 +57,11 @@ pub enum Keyword {
     Commit,
     Rollback,
     Transaction,
+    Union,
+    View,
+    Drop,
+    Cast,
+    Like,
 }
 
 impl Keyword {
@@ -111,6 +116,11 @@ impl Keyword {
             "COMMIT" => Keyword::Commit,
             "ROLLBACK" => Keyword::Rollback,
             "TRANSACTION" => Keyword::Transaction,
+            "UNION" => Keyword::Union,
+            "VIEW" => Keyword::View,
+            "DROP" => Keyword::Drop,
+            "CAST" => Keyword::Cast,
+            "LIKE" => Keyword::Like,
             _ => return None,
         })
     }

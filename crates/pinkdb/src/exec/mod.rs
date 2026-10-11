@@ -33,6 +33,9 @@ pub enum QueryResult {
     Began,
     Committed,
     RolledBack,
+    CreatedView { name: String },
+    DroppedTable { name: String },
+    DroppedView { name: String },
     Selected { names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>> },
 }
 
@@ -180,14 +183,26 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         LogicalPlan::Begin => {
             db.begin()?;
             Ok(QueryResult::Began)
-        }
-        LogicalPlan::Commit => {
+        }        LogicalPlan::Commit => {
             db.commit()?;
             Ok(QueryResult::Committed)
         }
         LogicalPlan::Rollback => {
             db.rollback()?;
             Ok(QueryResult::RolledBack)
+        }
+        LogicalPlan::CreateView { name, cols, query } => {
+            // Validated at bind time; store the AST for per-use rebinding.
+            db.create_view(name, (**query).clone(), cols.clone())?;
+            Ok(QueryResult::CreatedView { name: name.clone() })
+        }
+        LogicalPlan::DropTable { name } => {
+            db.drop_table(name)?;
+            Ok(QueryResult::DroppedTable { name: name.clone() })
+        }
+        LogicalPlan::DropView { name } => {
+            db.drop_view(name)?;
+            Ok(QueryResult::DroppedView { name: name.clone() })
         }
         _ => {
             let mut cx = Cx::new(db);
@@ -211,7 +226,10 @@ fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::Delete { .. }
         | LogicalPlan::Begin
         | LogicalPlan::Commit
-        | LogicalPlan::Rollback => Err(PinkDbError::Execution(
+        | LogicalPlan::Rollback
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::DropView { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { table } => {
@@ -275,6 +293,22 @@ fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
             let mut all_types = inner.types.clone();
             all_types.extend(types);
             Ok(Output { chunks, names: all_names, types: all_types })
+        }
+        LogicalPlan::Union { left, right, distinct: is_distinct, types } => {
+            let l = eval(cx, left)?;
+            let r = eval(cx, right)?;
+            // Coerce each side to the common column types, then concatenate.
+            // Output names come from the left branch.
+            let mut chunks = Vec::with_capacity(l.chunks.len() + r.chunks.len());
+            for chunk in l.chunks.iter().chain(r.chunks.iter()) {
+                let mut cols = Vec::with_capacity(types.len());
+                for (col, t) in chunk.columns.iter().zip(types.iter()) {
+                    cols.push(coerce_to(col, *t)?);
+                }
+                chunks.push(DataChunk::new(cols)?);
+            }
+            let chunks = if *is_distinct { distinct(&chunks)? } else { chunks };
+            Ok(Output { chunks, names: l.names.clone(), types: types.clone() })
         }
         LogicalPlan::Cte { name, query, body } => {
             let out = eval(cx, query)?;
@@ -1278,5 +1312,103 @@ mod tests {
         db.execute("ROLLBACK;").unwrap();
         // Reads and writes work fine outside transactions too.
         assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(3)]]);
+    }
+
+    // --- phase 11: UNION, views, CAST, COALESCE, LIKE, DROP ---
+
+    fn uv_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE a (x INTEGER, s VARCHAR);").unwrap();
+        db.execute("CREATE TABLE b (y BIGINT, t VARCHAR);").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 'one'), (2, 'two'), (NULL, 'nil');").unwrap();
+        db.execute("INSERT INTO b VALUES (2, 'TWO'), (3, 'three');").unwrap();
+        db
+    }
+
+    #[test]
+    fn union_all_and_distinct() {
+        let mut db = uv_db();
+        // NOTE: ORDER BY/LIMIT attach to their own UNION branch in v1, so
+        // union tests sort client-side.
+        let mut rows = select(&mut db, "SELECT x FROM a WHERE x IS NOT NULL UNION ALL SELECT y FROM b;");
+        rows.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Bigint(1)],
+                vec![V::Bigint(2)],
+                vec![V::Bigint(2)],
+                vec![V::Bigint(3)],
+            ]
+        );
+        // INTEGER unifies to BIGINT (left names win).
+        let rows = select(&mut db, "SELECT x AS n FROM a WHERE x = 1 UNION SELECT y AS m FROM b WHERE y = 3;");
+        assert_eq!(rows.len(), 2);
+        // UNION (distinct) dedupes, NULLs dedupe together.
+        let mut rows = select(&mut db, "SELECT x FROM a UNION SELECT y FROM b;");
+        rows.sort_by(|a, b| match (&a[0], &b[0]) {
+            (V::Null, V::Null) => std::cmp::Ordering::Equal,
+            (V::Null, _) => std::cmp::Ordering::Greater,
+            (_, V::Null) => std::cmp::Ordering::Less,
+            (x, y) => x.to_string().cmp(&y.to_string()),
+        });
+        assert_eq!(rows.len(), 4); // 1, 2, 3, NULL
+        assert_eq!(rows.last().unwrap(), &vec![V::Null]);
+        // Arity + type mismatches.
+        assert!(db.execute("SELECT x FROM a UNION SELECT y, t FROM b;").is_err());
+        assert!(db.execute("SELECT s FROM a UNION SELECT y FROM b;").is_err());
+    }
+
+    #[test]
+    fn views_create_use_drop() {
+        let mut db = uv_db();
+        db.execute("CREATE VIEW evens AS SELECT x FROM a WHERE x % 2 = 0;").unwrap();
+        assert_eq!(select(&mut db, "SELECT * FROM evens;"), vec![vec![V::Integer(2)]]);
+        // Views compose with joins, CTEs, and aliases.
+        let rows = select(
+            &mut db,
+            "WITH w AS (SELECT * FROM evens) SELECT x, y FROM w JOIN b ON w.x = b.y;",
+        );
+        assert_eq!(rows, vec![vec![V::Integer(2), V::Bigint(2)]]);
+        // Column aliases.
+        db.execute("CREATE VIEW named(n) AS SELECT x FROM a WHERE x = 1;").unwrap();
+        assert_eq!(select(&mut db, "SELECT n FROM named;"), vec![vec![V::Integer(1)]]);
+        // Name clashes + dupes rejected.
+        assert!(db.execute("CREATE VIEW a AS SELECT 1;").is_err());
+        assert!(db.execute("CREATE TABLE evens (x INTEGER);").is_err());
+        assert!(db.execute("CREATE VIEW evens AS SELECT 2;").is_err());
+        // Use-after-drop of the base table errors (rebound per use).
+        db.execute("DROP TABLE b;").unwrap();
+        assert!(db.execute("CREATE VIEW vb AS SELECT y FROM b;").is_err());
+        db.execute("DROP VIEW evens;").unwrap();
+        assert!(db.execute("SELECT * FROM evens;").is_err());
+        assert!(db.execute("DROP VIEW evens;").is_err());
+        assert!(db.execute("DROP TABLE missing;").is_err());
+    }
+
+    #[test]
+    fn cast_coalesce_like() {
+        let mut db = uv_db();
+        let rows = select(
+            &mut db,
+            "SELECT CAST(x AS BIGINT), CAST(x AS DOUBLE) FROM a WHERE x = 1;",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(1), V::Double(1.0)]]);
+        // 'one' does not parse as INTEGER.
+        assert!(db.execute("SELECT CAST(s AS INTEGER) FROM a WHERE x = 1;").is_err());
+        assert!(db.execute("SELECT CAST(x AS DATE) FROM a;").is_err());
+        let rows = select(&mut db, "SELECT COALESCE(x, 99), COALESCE(s, 'dflt') FROM a ORDER BY 1;");
+        assert_eq!(rows[0], vec![V::Integer(1), V::Varchar("one".to_string())]);
+        assert_eq!(rows[2], vec![V::Integer(99), V::Varchar("nil".to_string())]);
+        let rows = select(&mut db, "SELECT s FROM a WHERE s LIKE 'o%' ORDER BY s;");
+        assert_eq!(
+            rows,
+            vec![vec![V::Varchar("one".to_string())]]
+        );
+        let rows = select(&mut db, "SELECT s FROM a WHERE s NOT LIKE '%o%' ORDER BY s;");
+        assert_eq!(rows, vec![vec![V::Varchar("nil".to_string())]]);
+        // LIKE is NULL-propagating; mixed types rejected.
+        assert_eq!(select(&mut db, "SELECT CAST(NULL AS VARCHAR) LIKE 'a';"), vec![vec![V::Null]]);
+        assert!(db.execute("SELECT x LIKE '1' FROM a;").is_err());
     }
 }

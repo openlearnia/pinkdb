@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 
+use crate::sql::ast::Select;
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
 
@@ -254,7 +255,15 @@ impl DataTable {
     }
 }
 
-/// The catalog + database. Owns all tables.
+/// A view: a stored query (rebound at each use, so drops/recreates of the
+/// underlying tables surface as errors, never stale plans). Views are
+/// session-local: `.save` does not persist them.
+#[derive(Debug, Clone)]
+pub struct ViewDef {
+    pub name: String,
+    pub query: Select,
+    pub cols: Option<Vec<String>>,
+}
 ///
 /// Holds an optional transaction snapshot (`BEGIN` clones the whole store;
 /// `ROLLBACK` restores it, `COMMIT` drops it). Single connection, so
@@ -262,6 +271,7 @@ impl DataTable {
 #[derive(Debug, Default, Clone)]
 pub struct PinkDb {
     tables: HashMap<String, DataTable>,
+    views: HashMap<String, ViewDef>,
     txn_snapshot: Option<Box<PinkDb>>,
 }
 
@@ -326,6 +336,11 @@ impl PinkDb {
                 "table \"{name}\" already exists"
             )));
         }
+        if self.views.contains_key(&key) {
+            return Err(PinkDbError::Catalog(format!(
+                "a view named \"{name}\" already exists"
+            )));
+        }
         self.tables
             .insert(key, DataTable::new(name.to_string(), schema)?);
         Ok(())
@@ -353,6 +368,48 @@ impl PinkDb {
     /// Sorted table names (stable output for `.tables`).
     pub fn list_tables(&self) -> Vec<String> {
         let mut names: Vec<String> = self.tables.values().map(|t| t.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    /// Store a view definition (validated by the binder before calling).
+    pub fn create_view(
+        &mut self,
+        name: &str,
+        query: Select,
+        cols: Option<Vec<String>>,
+    ) -> Result<()> {
+        let key = Self::key(name);
+        if self.tables.contains_key(&key) {
+            return Err(PinkDbError::Catalog(format!(
+                "a table named \"{name}\" already exists"
+            )));
+        }
+        if self.views.contains_key(&key) {
+            return Err(PinkDbError::Catalog(format!(
+                "view \"{name}\" already exists"
+            )));
+        }
+        self.views.insert(key, ViewDef { name: name.to_string(), query, cols });
+        Ok(())
+    }
+
+    pub fn drop_view(&mut self, name: &str) -> Result<()> {
+        self.views
+            .remove(&Self::key(name))
+            .map(|_| ())
+            .ok_or_else(|| PinkDbError::Catalog(format!("view \"{name}\" not found")))
+    }
+
+    pub fn view(&self, name: &str) -> Result<&ViewDef> {
+        self.views.get(&Self::key(name)).ok_or_else(|| {
+            PinkDbError::Catalog(format!("view \"{name}\" not found"))
+        })
+    }
+
+    /// Sorted view display names.
+    pub fn list_views(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.views.values().map(|v| v.name.clone()).collect();
         names.sort();
         names
     }

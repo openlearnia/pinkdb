@@ -25,6 +25,17 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &mut Cx) -> Res
         BoundExpr::AggRef { index, .. } => Ok(chunk.column(*index).clone()),
         BoundExpr::WindowRef { index, .. } => Ok(chunk.column(*index).clone()),
         BoundExpr::ScalarSubquery { query, .. } => eval_scalar_subquery(query, chunk, cx),
+        BoundExpr::Cast { expr, dtype } => {
+            let v = eval_expr(expr, chunk, cx)?;
+            eval_cast(&v, *dtype)
+        }
+        BoundExpr::Coalesce { args, dtype } => {
+            let mut vecs = Vec::with_capacity(args.len());
+            for a in args {
+                vecs.push(eval_expr(a, chunk, cx)?);
+            }
+            eval_coalesce(*dtype, &vecs)
+        }
         BoundExpr::InSubquery { expr, query, negated } => {
             eval_in_subquery(expr, query, *negated, chunk, cx)
         }
@@ -64,6 +75,7 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &mut Cx) -> Res
         }
         BoundExpr::Binary { op, left, right, dtype } => match op {
             BinaryOp::And | BinaryOp::Or => eval_logic(*op, left, right, chunk, cx),
+            BinaryOp::Like | BinaryOp::NotLike => eval_like(*op, left, right, chunk, cx),
             BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
             | BinaryOp::GtEq => eval_comparison(*op, left, right, chunk, cx),
             _ => eval_arith(*op, *dtype, left, right, chunk, cx),
@@ -627,6 +639,81 @@ fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
     }
 }
 
+/// `LIKE` / `NOT LIKE` with three-valued logic (`%` = any run, `_` = one
+/// char; no ESCAPE clause in v1 — backslash is literal).
+fn eval_like(
+    op: BinaryOp,
+    left: &BoundExpr,
+    right: &BoundExpr,
+    chunk: &DataChunk,
+    cx: &mut Cx,
+) -> Result<Vector> {
+    let l = eval_expr(left, chunk, cx)?;
+    let r = eval_expr(right, chunk, cx)?;
+    let mut out = Vector::new_empty(DataType::Boolean);
+    for i in 0..l.len() {
+        if l.is_null(i) || r.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        let (s, p) = match (l.get(i), r.get(i)) {
+            (Value::Varchar(s), Value::Varchar(p)) => (s, p),
+            _ => {
+                return Err(PinkDbError::Execution(
+                    "LIKE needs VARCHAR on both sides".to_string(),
+                ));
+            }
+        };
+        let hit = like_match(&s, &p);
+        out.push_valid(Value::Boolean(if op == BinaryOp::Like { hit } else { !hit }))?;
+    }
+    Ok(out)
+}
+
+/// Classic `%`/`_` wildcard match (iterative backtracking over chars).
+fn like_match(s: &str, pat: &str) -> bool {
+    let s: Vec<char> = s.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    let (mut si, mut pi) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = Some(pi);
+            mark = si;
+            pi += 1;
+        } else if let Some(st) = star {
+            pi = st + 1;
+            mark += 1;
+            si = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Elementwise `CAST` (NULL in → NULL out).
+fn eval_cast(v: &Vector, target: DataType) -> Result<Vector> {
+    if v.dtype() == target {
+        return Ok(v.clone());
+    }
+    let mut out = Vector::new_empty(target);
+    for i in 0..v.len() {
+        if v.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        out.push_valid(cast_value(v.get(i), target)?)?;
+    }
+    Ok(out)
+}
+
 /// Keep only rows where `pred` (Boolean) is TRUE. NULL/missing → dropped.
 pub fn select_true(pred: &Vector) -> Result<Vec<usize>> {
     ensure_dtype(pred, DataType::Boolean, "WHERE")?;
@@ -639,6 +726,75 @@ pub fn select_true(pred: &Vector) -> Result<Vec<usize>> {
     Ok(sel)
 }
 
+fn cast_value(v: Value, target: DataType) -> Result<Value> {
+    match (v, target) {
+        (v, t) if v.data_type() == Some(t) => Ok(v),
+        // Numeric tower (float→int truncates toward zero, wrapping on overflow).
+        (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
+        (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
+        (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
+        (Value::Bigint(i), DataType::Integer) => Ok(Value::Integer(i as i32)),
+        (Value::Double(x), DataType::Integer) => Ok(Value::Integer(x as i32)),
+        (Value::Double(x), DataType::Bigint) => Ok(Value::Bigint(x as i64)),
+        (Value::Double(x), DataType::Double) => Ok(Value::Double(x)),
+        // Boolean ↔ numeric.
+        (Value::Boolean(b), DataType::Integer) => Ok(Value::Integer(b as i32)),
+        (Value::Boolean(b), DataType::Bigint) => Ok(Value::Bigint(b as i64)),
+        (Value::Boolean(b), DataType::Double) => Ok(Value::Double(if b { 1.0 } else { 0.0 })),
+        (Value::Integer(i), DataType::Boolean) => Ok(Value::Boolean(i != 0)),
+        (Value::Bigint(i), DataType::Boolean) => Ok(Value::Boolean(i != 0)),
+        (Value::Double(x), DataType::Boolean) => Ok(Value::Boolean(x != 0.0)),
+        // Everything formats to VARCHAR.
+        (v, DataType::Varchar) => Ok(Value::Varchar(v.to_string())),
+        // VARCHAR parses (strict; bad input errors per row).
+        (Value::Varchar(s), DataType::Boolean) => match s.to_ascii_lowercase().as_str() {
+            "true" => Ok(Value::Boolean(true)),
+            "false" => Ok(Value::Boolean(false)),
+            _ => Err(PinkDbError::Execution(format!("cannot CAST \"{s}\" AS BOOLEAN"))),
+        },
+        (Value::Varchar(s), DataType::Integer) => s.trim().parse::<i32>().map(Value::Integer).map_err(|_| {
+            PinkDbError::Execution(format!("cannot CAST \"{s}\" AS INTEGER"))
+        }),
+        (Value::Varchar(s), DataType::Bigint) => s.trim().parse::<i64>().map(Value::Bigint).map_err(|_| {
+            PinkDbError::Execution(format!("cannot CAST \"{s}\" AS BIGINT"))
+        }),
+        (Value::Varchar(s), DataType::Double) => s.trim().parse::<f64>().map(Value::Double).map_err(|_| {
+            PinkDbError::Execution(format!("cannot CAST \"{s}\" AS DOUBLE"))
+        }),
+        (Value::Varchar(s), DataType::Date) => crate::types::parse_date(s.trim())
+            .map(Value::Date)
+            .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS DATE"))),
+        (Value::Varchar(s), DataType::Timestamp) => crate::types::parse_timestamp(s.trim())
+            .map(Value::Timestamp)
+            .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS TIMESTAMP"))),
+        // Date ↔ timestamp.
+        (Value::Date(d), DataType::Timestamp) => Ok(Value::Timestamp(d as i64 * 86_400_000_000)),
+        (Value::Timestamp(us), DataType::Date) => {
+            Ok(Value::Date(us.div_euclid(86_400_000_000) as i32))
+        }
+        (v, t) => Err(PinkDbError::Execution(format!("cannot CAST {v} AS {t}"))),
+    }
+}
+
+/// `COALESCE`: first non-NULL argument per row (all args share the dtype).
+fn eval_coalesce(dtype: DataType, args: &[Vector]) -> Result<Vector> {
+    let n = args.first().map(|v| v.len()).unwrap_or(0);
+    let mut out = Vector::new_empty(dtype);
+    for i in 0..n {
+        let mut placed = false;
+        for v in args {
+            if !v.is_null(i) {
+                out.push_valid(v.get(i))?;
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            out.push_null()?;
+        }
+    }
+    Ok(out)
+}
 #[cfg(test)]
 mod tests {
     use super::*;

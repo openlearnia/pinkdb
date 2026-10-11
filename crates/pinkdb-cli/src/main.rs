@@ -28,13 +28,17 @@ fn print_help() {
 
 fn cmd_tables(db: &PinkDb) {
     let tables = db.list_tables();
-    if tables.is_empty() {
+    let views = db.list_views();
+    if tables.is_empty() && views.is_empty() {
         println!("(no tables)");
         return;
     }
     for t in tables {
         let n = db.table(&t).map(|x| x.num_rows()).unwrap_or(0);
         println!("{t} ({n} rows)");
+    }
+    for v in views {
+        println!("{v} (view)");
     }
 }
 
@@ -90,7 +94,14 @@ fn run_dot(db: &mut PinkDb, line: &str) -> bool {
             } else {
                 let t0 = Instant::now();
                 match db.save(path) {
-                    Ok(()) => println!("Saved in {:.3}s", t0.elapsed().as_secs_f64()),
+                    Ok(()) => {
+                        if !db.list_views().is_empty() {
+                            println!(
+                                "Note: views are session-local and were not saved."
+                            );
+                        }
+                        println!("Saved in {:.3}s", t0.elapsed().as_secs_f64())
+                    }
                     Err(e) => println!("Error: {e}"),
                 }
             }
@@ -193,6 +204,9 @@ fn run_sql(db: &mut PinkDb, sql: &str) {
                     QueryResult::Began => println!("Transaction started."),
                     QueryResult::Committed => println!("Transaction committed."),
                     QueryResult::RolledBack => println!("Transaction rolled back."),
+                    QueryResult::CreatedView { name } => println!("View {name} created."),
+                    QueryResult::DroppedTable { name } => println!("Table {name} dropped."),
+                    QueryResult::DroppedView { name } => println!("View {name} dropped."),
                     QueryResult::Selected { names, types, rows } => {
                         if rows.is_empty() {
                             println!("(no rows)");

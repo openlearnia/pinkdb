@@ -15,7 +15,7 @@ pub mod types;
 pub mod vector;
 
 pub use exec::QueryResult;
-pub use storage::{DataTable, PinkDb};
+pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};
 pub use vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
 

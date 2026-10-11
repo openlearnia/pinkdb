@@ -187,6 +187,11 @@ pub enum BoundExpr {
     /// Window output column. Index is relative to the window list until
     /// rebased past the window input columns.
     WindowRef { index: usize, dtype: DataType },
+    /// `CAST(x AS type)`.
+    Cast { expr: Box<BoundExpr>, dtype: DataType },
+    /// `COALESCE(a, b, ...)` — all args share `dtype` (narrower sides are
+    /// wrapped in [`BoundExpr::Cast`] at bind time).
+    Coalesce { args: Vec<BoundExpr>, dtype: DataType },
     /// Uncorrelated scalar subquery (1 col by construction; rows at runtime).
     ScalarSubquery { query: Box<LogicalPlan>, dtype: DataType },
     /// `expr [NOT] IN (query)` — `expr` may reference the outer scope.
@@ -208,6 +213,8 @@ impl BoundExpr {
             BoundExpr::Scalar { dtype, .. } => *dtype,
             BoundExpr::AggRef { dtype, .. } => *dtype,
             BoundExpr::WindowRef { dtype, .. } => *dtype,
+            BoundExpr::Cast { dtype, .. } => *dtype,
+            BoundExpr::Coalesce { dtype, .. } => *dtype,
             BoundExpr::ScalarSubquery { dtype, .. } => *dtype,
             BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => DataType::Boolean,
         }
@@ -218,6 +225,8 @@ impl BoundExpr {
     pub fn is_aggregate_free(&self) -> bool {
         match self {
             BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => false,
+            BoundExpr::Cast { expr, .. } => expr.is_aggregate_free(),
+            BoundExpr::Coalesce { args, .. } => args.iter().all(|a| a.is_aggregate_free()),
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
             | BoundExpr::ScalarSubquery { .. }
@@ -245,6 +254,8 @@ impl BoundExpr {
             | BoundExpr::ScalarSubquery { .. }
             | BoundExpr::Exists { .. } => false,
             BoundExpr::InSubquery { expr, .. } => expr.has_column_ref(),
+            BoundExpr::Cast { expr, .. } => expr.has_column_ref(),
+            BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_column_ref()),
             BoundExpr::Not(e)
             | BoundExpr::Negate { expr: e, .. }
             | BoundExpr::IsNull { expr: e, .. } => e.has_column_ref(),
@@ -267,11 +278,13 @@ impl BoundExpr {
             | BoundExpr::WindowRef { .. } => false,
             BoundExpr::Not(e)
             | BoundExpr::Negate { expr: e, .. }
-            | BoundExpr::IsNull { expr: e, .. } => e.has_subquery(),
+            | BoundExpr::IsNull { expr: e, .. }
+            | BoundExpr::Cast { expr: e, .. } => e.has_subquery(),
             BoundExpr::Binary { left, right, .. } => {
                 left.has_subquery() || right.has_subquery()
             }
             BoundExpr::Scalar { args, .. } => args.iter().any(|a| a.has_subquery()),
+            BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_subquery()),
         }
     }
 }
@@ -345,13 +358,58 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
     }
 }
 
-fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
-    if (is_numeric(l) && is_numeric(r))
+/// Common type for COALESCE/UNION arms: numeric tower, else identical.
+fn coalesce_common(a: DataType, b: DataType) -> Result<DataType> {
+    if a == b {
+        return Ok(a);
+    }
+    common_numeric(a, b).map_err(|_| {
+        PinkDbError::Type(format!("incompatible types {a} and {b} (use CAST)"))
+    })
+}
+
+/// Whether `CAST(from AS to)` is allowed in v1.
+fn check_cast(from: DataType, to: DataType) -> Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    // Numeric tower (both directions; float→int truncates).
+    if from.is_numeric() && to.is_numeric() {
+        return Ok(());
+    }
+    // Everything formats to VARCHAR; VARCHAR parses to everything.
+    if from == DataType::Varchar || to == DataType::Varchar {
+        return Ok(());
+    }
+    // Boolean ↔ numeric.
+    if (from == DataType::Boolean && to.is_numeric())
+        || (from.is_numeric() && to == DataType::Boolean)
+    {
+        return Ok(());
+    }
+    // Date ↔ timestamp (midnight / truncate).
+    if (from == DataType::Date && to == DataType::Timestamp)
+        || (from == DataType::Timestamp && to == DataType::Date)
+    {
+        return Ok(());
+    }
+    Err(PinkDbError::Type(format!("cannot CAST {from} AS {to} in v1")))
+}
+
+fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {    if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
         || (l == DataType::Date && r == DataType::Date)
         || (l == DataType::Timestamp && r == DataType::Timestamp)
     {
-        return Ok(());
+        return match op {
+            // LIKE only compares strings.
+            BinaryOp::Like | BinaryOp::NotLike
+                if l != DataType::Varchar || r != DataType::Varchar =>
+            {
+                Err(PinkDbError::Type("LIKE needs VARCHAR on both sides".to_string()))
+            }
+            _ => Ok(()),
+        };
     }
     if l == DataType::Boolean && r == DataType::Boolean {
         return match op {
@@ -505,7 +563,7 @@ impl<'a> Binder<'a> {
                         DataType::Boolean
                     }
                     BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
-                    | BinaryOp::Gt | BinaryOp::GtEq => {
+                    | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::Like | BinaryOp::NotLike => {
                         comparison_ok(*op, l.dtype(), r.dtype())?;
                         DataType::Boolean
                     }
@@ -569,6 +627,34 @@ impl<'a> Binder<'a> {
             }
             Expr::Function { name, args } => self.bind_function(name, args, aggs, allow_agg),
             Expr::Window { name, args, over } => self.bind_window(name, args, over, aggs, allow_agg),
+            Expr::Coalesce(args) => {
+                let mut bound = Vec::with_capacity(args.len());
+                for a in args {
+                    bound.push(self.bind_expr(a, aggs, allow_agg)?);
+                }
+                // Common type across args (numeric tower, else identical);
+                // narrower sides are wrapped in Casts.
+                let mut common = bound[0].dtype();
+                for b in &bound[1..] {
+                    common = coalesce_common(common, b.dtype())?;
+                }
+                let args = bound
+                    .into_iter()
+                    .map(|b| {
+                        if b.dtype() == common {
+                            b
+                        } else {
+                            BoundExpr::Cast { expr: Box::new(b), dtype: common }
+                        }
+                    })
+                    .collect();
+                Ok(BoundExpr::Coalesce { args, dtype: common })
+            }
+            Expr::Cast { expr, dtype } => {
+                let bound = self.bind_expr(expr, aggs, allow_agg)?;
+                check_cast(bound.dtype(), *dtype)?;
+                Ok(BoundExpr::Cast { expr: Box::new(bound), dtype: *dtype })
+            }
             Expr::ScalarSubquery(q) => {
                 let mut child = self.child();
                 let query = bind_select_with(child.db, &mut child, q)?;
@@ -911,6 +997,8 @@ fn default_name(expr: &Expr) -> String {
                 BinaryOp::GtEq => ">=",
                 BinaryOp::And => "AND",
                 BinaryOp::Or => "OR",
+                BinaryOp::Like => "LIKE",
+                BinaryOp::NotLike => "NOT LIKE",
             };
             format!("({} {sym} {})", default_name(left), default_name(right))
         }
@@ -965,6 +1053,11 @@ fn default_name(expr: &Expr) -> String {
                 .collect();
             format!("{}({}) OVER", name.to_ascii_lowercase(), inner.join(", "))
         }
+        Expr::Coalesce(args) => {
+            let inner: Vec<String> = args.iter().map(default_name).collect();
+            format!("coalesce({})", inner.join(", "))
+        }
+        Expr::Cast { expr, dtype } => format!("cast({} as {dtype})", default_name(expr)),
     }
 }
 
@@ -995,6 +1088,13 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
             validate_grouped(right, keys)
         }
         BoundExpr::Scalar { args, .. } => {
+            for a in args {
+                validate_grouped(a, keys)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Cast { expr, .. } => validate_grouped(expr, keys),
+        BoundExpr::Coalesce { args, .. } => {
             for a in args {
                 validate_grouped(a, keys)?;
             }
@@ -1048,6 +1148,17 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
             query: query.clone(),
             negated: *negated,
         },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(rebase_to_keys(expr, keys)?),
+            dtype: *dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args
+                .iter()
+                .map(|a| rebase_to_keys(a, keys))
+                .collect::<Option<Vec<_>>>()?,
+            dtype: *dtype,
+        },
         // ScalarSubquery/Exists bodies live in their own scope; WindowRef
         // already addresses window output.
         BoundExpr::ScalarSubquery { .. }
@@ -1088,6 +1199,14 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             query,
             negated,
         },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(resolve_window_refs(*expr, input_width)),
+            dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args.into_iter().map(|a| resolve_window_refs(a, input_width)).collect(),
+            dtype,
+        },
         other => other,
     }
 }
@@ -1122,6 +1241,14 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
             expr: Box::new(resolve_agg_refs(*expr, num_keys)),
             query,
             negated,
+        },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(resolve_agg_refs(*expr, num_keys)),
+            dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args.into_iter().map(|a| resolve_agg_refs(a, num_keys)).collect(),
+            dtype,
         },
         BoundExpr::WindowRef { .. } => expr,
         // ScalarSubquery/Exists bodies bind in their own scope.
@@ -1204,8 +1331,38 @@ pub fn bind(db: &PinkDb, stmt: &Statement) -> Result<LogicalPlan> {
         Statement::Begin => Ok(LogicalPlan::Begin),
         Statement::Commit => Ok(LogicalPlan::Commit),
         Statement::Rollback => Ok(LogicalPlan::Rollback),
+        Statement::CreateView { name, cols, query } => bind_create_view(db, name, cols, query),
+        Statement::DropTable { name } => Ok(LogicalPlan::DropTable { name: name.clone() }),
+        Statement::DropView { name } => Ok(LogicalPlan::DropView { name: name.clone() }),
         Statement::Select(sel) => bind_select(db, sel),
     }
+}
+
+/// Bind CREATE VIEW: validate the query now (errors surface at creation),
+// store the AST for per-use rebinding.
+fn bind_create_view(
+    db: &PinkDb,
+    name: &str,
+    cols: &Option<Vec<String>>,
+    query: &Select,
+) -> Result<LogicalPlan> {
+    let mut binder = Binder::new(db);
+    let bound = bind_select_with(db, &mut binder, query)?;
+    let schema = plan_schema(db, &binder.ctes, &bound)?;
+    if let Some(cols) = cols {
+        if cols.len() != schema.len() {
+            return Err(PinkDbError::Execution(format!(
+                "view \"{name}\" has {} columns but {} aliases",
+                schema.len(),
+                cols.len()
+            )));
+        }
+    }
+    Ok(LogicalPlan::CreateView {
+        name: name.to_string(),
+        cols: cols.clone(),
+        query: Box::new(query.clone()),
+    })
 }
 
 /// Bind UPDATE: resolve target columns, bind SET expressions in the table
@@ -1354,7 +1511,32 @@ fn bind_insert(
 
 fn bind_select(db: &PinkDb, sel: &Select) -> Result<LogicalPlan> {
     let mut binder = Binder::new(db);
-    bind_select_with(db, &mut binder, sel)
+    let mut plan = bind_select_with(db, &mut binder, sel)?;
+    // UNION branches (left-associative): each sees the outer CTEs.
+    for (op, branch) in &sel.unions {
+        let mut child = binder.child();
+        let right = bind_select_with(db, &mut child, branch)?;
+        let left_schema = plan_schema(db, &binder.ctes, &plan)?;
+        let right_schema = plan_schema(db, &child.ctes, &right)?;
+        if left_schema.len() != right_schema.len() {
+            return Err(PinkDbError::Execution(format!(
+                "UNION branches have {} and {} columns",
+                left_schema.len(),
+                right_schema.len()
+            )));
+        }
+        let mut types = Vec::with_capacity(left_schema.len());
+        for ((_, l), (_, r)) in left_schema.iter().zip(right_schema.iter()) {
+            types.push(coalesce_common(*l, *r)?);
+        }
+        plan = LogicalPlan::Union {
+            left: Box::new(plan),
+            right: Box::new(right),
+            distinct: *op == crate::sql::ast::SetOp::Union,
+            types,
+        };
+    }
+    Ok(plan)
 }
 
 /// Output schema of a bound plan: (column name, type) per output column.
@@ -1379,7 +1561,16 @@ fn plan_schema(
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. } => plan_schema(db, ctes, input),
-        LogicalPlan::Project { exprs, names, .. } => Ok(names
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::Insert { .. }
+        | LogicalPlan::Update { .. }
+        | LogicalPlan::Delete { .. }
+        | LogicalPlan::Begin
+        | LogicalPlan::Commit
+        | LogicalPlan::Rollback
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::DropView { .. } => Ok(Vec::new()),        LogicalPlan::Project { exprs, names, .. } => Ok(names
             .iter()
             .cloned()
             .zip(exprs.iter().map(|e| e.dtype()))
@@ -1393,6 +1584,11 @@ fn plan_schema(
             out.extend(plan_schema(db, ctes, right)?);
             Ok(out)
         }
+        LogicalPlan::Union { left, types, .. } => {
+            // Output names come from the left branch.
+            let left_schema = plan_schema(db, ctes, left)?;
+            Ok(left_schema.into_iter().zip(types.iter().copied()).map(|((n, _), t)| (n, t)).collect())
+        }
         LogicalPlan::Cte { name, query, body } => {
             let mut inner: Vec<(String, Vec<(String, DataType)>)> = ctes.to_vec();
             inner.push((name.clone(), plan_schema(db, ctes, query)?));
@@ -1404,9 +1600,6 @@ fn plan_schema(
             out.extend(names.into_iter().zip(types));
             Ok(out)
         }
-        LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => Ok(Vec::new()),
-        LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => Ok(Vec::new()),
-        LogicalPlan::Begin | LogicalPlan::Commit | LogicalPlan::Rollback => Ok(Vec::new()),
     }
 }
 
@@ -1422,15 +1615,40 @@ fn bind_source(
 ) -> Result<(ScopeTable, LogicalPlan)> {
     match source {
         FromSource::Table(name) => {
-            let columns = match binder
+            // CTEs shadow everything; views shadow catalog tables
+            // (CREATE enforces no table/view name clashes).
+            if let Some((_, schema)) = binder
                 .ctes
                 .iter()
                 .rev()
                 .find(|(n, _)| n.eq_ignore_ascii_case(name))
             {
-                Some((_, schema)) => schema.clone(),
-                None => db.table(name)?.schema(),
-            };
+                let eff = alias.clone().unwrap_or_else(|| name.clone());
+                return Ok((
+                    ScopeTable { name: eff.to_ascii_lowercase(), columns: schema.clone() },
+                    LogicalPlan::Scan { table: name.clone() },
+                ));
+            }
+            if let Ok(view) = binder.db.view(name) {
+                // Views rebind per use (like derived tables): the scope always
+                // matches the freshly bound plan, so catalog drift surfaces
+                // as errors, never stale indices.
+                let view = view.clone();
+                let mut child = binder.child();
+                let sub = bind_select_with(child.db, &mut child, &view.query)?;
+                let mut schema = plan_schema(child.db, &binder.ctes, &sub)?;
+                if let Some(cols) = &view.cols {
+                    for (s, c) in schema.iter_mut().zip(cols.iter()) {
+                        s.0 = c.clone();
+                    }
+                }
+                let eff = alias.clone().unwrap_or_else(|| name.clone());
+                return Ok((
+                    ScopeTable { name: eff.to_ascii_lowercase(), columns: schema },
+                    sub,
+                ));
+            }
+            let columns = db.table(name)?.schema();
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             Ok((
                 ScopeTable { name: eff.to_ascii_lowercase(), columns },

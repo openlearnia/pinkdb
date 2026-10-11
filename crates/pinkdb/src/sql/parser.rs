@@ -136,11 +136,12 @@ impl Parser {
                 self.eat_keyword(Keyword::Transaction);
                 Ok(Statement::Rollback)
             }
+            Some(Keyword::Drop) => self.parse_drop(),
             Some(Keyword::Select) | Some(Keyword::With) => {
                 Ok(Statement::Select(self.parse_select()?))
             }
             _ => Err(self.error(format!(
-                "expected a statement (CREATE, INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK, SELECT), found {:?}",
+                "expected a statement (CREATE, INSERT, UPDATE, DELETE, DROP, BEGIN, COMMIT, ROLLBACK, SELECT), found {:?}",
                 self.peek().0
             ))),
         }
@@ -184,27 +185,42 @@ impl Parser {
         Ok(Statement::Delete { table, where_clause })
     }
 
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Drop)?;
+        if self.eat_keyword(Keyword::Table) {
+            return Ok(Statement::DropTable { name: self.parse_ident()? });
+        }
+        self.expect_keyword(Keyword::View)?;
+        Ok(Statement::DropView { name: self.parse_ident()? })
+    }
+
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
+        // `CREATE VIEW name [(cols)] AS select`.
+        if self.eat_keyword(Keyword::View) {
+            let name = self.parse_ident()?;
+            let cols = if self.peek().0 == Token::LParen {
+                self.next();
+                let mut c = vec![self.parse_ident()?];
+                while self.eat(&Token::Comma) {
+                    c.push(self.parse_ident()?);
+                }
+                self.expect(&Token::RParen)?;
+                Some(c)
+            } else {
+                None
+            };
+            self.expect_keyword(Keyword::As)?;
+            let query = self.parse_select()?;
+            return Ok(Statement::CreateView { name, cols, query: Box::new(query) });
+        }
         self.expect_keyword(Keyword::Table)?;
         let name = self.parse_ident()?;
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
-            let (col, type_name) = (self.parse_ident()?, self.next());
-            // Type names are usually identifiers, but some (BOOLEAN, DATE,
-            // TIMESTAMP) lex as keywords — accept those too.
-            let type_name = match &type_name.0 {
-                Token::Ident(s) => s.clone(),
-                Token::Keyword(Keyword::Date) => "DATE".to_string(),
-                Token::Keyword(Keyword::Timestamp) => "TIMESTAMP".to_string(),
-                tok => {
-                    return Err(self.error(format!("expected column type, found {tok:?}")));
-                }
-            };
-            let dtype = DataType::from_sql(&type_name).ok_or_else(|| {
-                self.error(format!("unknown data type \"{type_name}\""))
-            })?;
+            let col = self.parse_ident()?;
+            let dtype = self.parse_type_name()?;
             columns.push((col, dtype));
             if !self.eat(&Token::Comma) {
                 break;
@@ -265,7 +281,27 @@ impl Parser {
         Ok(Statement::Insert { table, columns, rows })
     }
 
+    /// A full SELECT including trailing UNION branches (left-associative).
     fn parse_select(&mut self) -> Result<Select> {
+        let mut sel = self.parse_select_body()?;
+        while self.eat_keyword(Keyword::Union) {
+            // `UNION ALL` (bare ident, kept unreserved) or `UNION DISTINCT`.
+            let op = if self.eat_keyword(Keyword::Distinct) {
+                SetOp::Union
+            } else if matches!(&self.peek().0, Token::Ident(s) if s.eq_ignore_ascii_case("all")) {
+                self.next();
+                SetOp::UnionAll
+            } else {
+                SetOp::Union
+            };
+            let branch = self.parse_select_body()?;
+            sel.unions.push((op, branch));
+        }
+        Ok(sel)
+    }
+
+    /// One SELECT statement without UNION branches.
+    fn parse_select_body(&mut self) -> Result<Select> {
         let mut with = Vec::new();
         if self.eat_keyword(Keyword::With) {
             loop {
@@ -342,7 +378,24 @@ impl Parser {
             having,
             order_by,
             limit,
+            unions: Vec::new(),
         })
+    }
+
+    /// A type name: usually an identifier, but some (DATE, TIMESTAMP) lex
+    /// as keywords — accept those too.
+    fn parse_type_name(&mut self) -> Result<DataType> {
+        let (tok, _) = self.next();
+        let name = match &tok {
+            Token::Ident(s) => s.clone(),
+            Token::Keyword(Keyword::Date) => "DATE".to_string(),
+            Token::Keyword(Keyword::Timestamp) => "TIMESTAMP".to_string(),
+            tok => {
+                return Err(self.error(format!("expected column type, found {tok:?}")));
+            }
+        };
+        DataType::from_sql(&name)
+            .ok_or_else(|| self.error(format!("unknown data type \"{name}\"")))
     }
 
     fn parse_projection_list(&mut self) -> Result<Vec<Projection>> {
@@ -679,6 +732,26 @@ impl Parser {
             self.expect(&Token::RParen)?;
             return Ok(desugar_in_list(left, items, negated));
         }
+        // `[NOT] LIKE pattern`
+        let like_negated = if self.eat_keyword(Keyword::Like) {
+            Some(false)
+        } else if self.peek_keyword() == Some(Keyword::Not)
+            && matches!(self.tokens.get(self.pos + 1).map(|(t, _)| t), Some(Token::Keyword(Keyword::Like)))
+        {
+            self.next();
+            self.next();
+            Some(true)
+        } else {
+            None
+        };
+        if let Some(negated) = like_negated {
+            let right = self.parse_additive()?;
+            return Ok(Expr::Binary {
+                op: if negated { BinaryOp::NotLike } else { BinaryOp::Like },
+                left: Box::new(left),
+                right: Box::new(right),
+            });
+        }
         // Plain comparison operators.
         let op = match &self.peek().0 {
             Token::Eq => BinaryOp::Eq,
@@ -790,6 +863,14 @@ impl Parser {
                     "TIMESTAMP needs a string literal, found {tok:?}"
                 ))),
             },
+            (Token::Keyword(Keyword::Cast), _) => {
+                self.expect(&Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect_keyword(Keyword::As)?;
+                let dtype = self.parse_type_name()?;
+                self.expect(&Token::RParen)?;
+                Ok(Expr::Cast { expr: Box::new(expr), dtype })
+            }
             (Token::Star, _) => Ok(Expr::Star),
             (Token::Keyword(Keyword::Exists), _) => {
                 self.expect(&Token::LParen)?;
@@ -815,6 +896,20 @@ impl Parser {
                 // Function call?
                 if self.peek().0 == Token::LParen {
                     self.next();
+                    // COALESCE is n-ary sugar parsed here (not a ScalarFunc).
+                    if name.eq_ignore_ascii_case("coalesce") {
+                        let mut args = Vec::new();
+                        if self.peek().0 != Token::RParen {
+                            args = self.parse_expr_list()?;
+                        }
+                        self.expect(&Token::RParen)?;
+                        if args.is_empty() {
+                            return Err(self.error(
+                                "COALESCE needs at least one argument".to_string(),
+                            ));
+                        }
+                        return Ok(Expr::Coalesce(args));
+                    }
                     let mut args = Vec::new();
                     if self.peek().0 == Token::Star {
                         self.next();

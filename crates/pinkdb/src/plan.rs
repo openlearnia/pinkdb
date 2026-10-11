@@ -1,6 +1,7 @@
-//! Logical plan: a tree of Scan → Filter → Join → Aggregate → Project →
-//! Distinct → Sort → Limit.
+//! Logical plan: Scan → Filter → Join → Aggregate → Window → Project →
+//! Distinct → Sort → Limit (plus DDL/DML and set unions).
 
+use crate::sql::ast::Select;
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::types::{DataType, Value};
 
@@ -30,6 +31,25 @@ pub enum LogicalPlan {
     Begin,
     Commit,
     Rollback,
+    CreateView {
+        name: String,
+        cols: Option<Vec<String>>,
+        query: Box<Select>,
+    },
+    DropTable {
+        name: String,
+    },
+    DropView {
+        name: String,
+    },
+    /// Set union: output names come from the left branch; every column is
+    /// coerced to the pairwise common type at execution.
+    Union {
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        distinct: bool,
+        types: Vec<DataType>,
+    },
     /// Full scan of a table (column pruning is wave-3 optimizer work).
     Scan {
         table: String,

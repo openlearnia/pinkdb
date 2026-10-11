@@ -47,6 +47,14 @@ fn fold_expr(cx: &mut crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
             args: args.into_iter().map(|a| fold_expr(cx, a)).collect(),
             dtype,
         },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(fold_expr(cx, *expr)),
+            dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args.into_iter().map(|a| fold_expr(cx, a)).collect(),
+            dtype,
+        },
         leaf => return leaf,
     };
     // Only fully constant trees (no columns, no aggregate refs) fold.
@@ -137,6 +145,12 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
                 .map(|r| r.into_iter().map(|e| fold_expr(&mut cx, e)).collect())
                 .collect(),
         },
+        LogicalPlan::Union { left, right, distinct, types } => LogicalPlan::Union {
+            left: Box::new(fold_plan(db, *left)),
+            right: Box::new(fold_plan(db, *right)),
+            distinct,
+            types,
+        },
         leaf => leaf,
     }
 }
@@ -160,6 +174,12 @@ fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
             columns_in(right, out);
         }
         BoundExpr::Scalar { args, .. } => {
+            for a in args {
+                columns_in(a, out);
+            }
+        }
+        BoundExpr::Cast { expr, .. } => columns_in(expr, out),
+        BoundExpr::Coalesce { args, .. } => {
             for a in args {
                 columns_in(a, out);
             }
@@ -201,6 +221,14 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
         BoundExpr::Literal(_) | BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => {
             Some(pred.clone())
         }
+        BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
+            expr: Box::new(rewrite_through_project(expr, exprs)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::Coalesce { args, dtype } => Some(BoundExpr::Coalesce {
+            args: args.iter().map(|a| rewrite_through_project(a, exprs)).collect::<Option<Vec<_>>>()?,
+            dtype: *dtype,
+        }),
         // Subqueries are scope-independent: pass through (IN's outer expr
         // still rewrites below).
         BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => Some(pred.clone()),
@@ -310,8 +338,24 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             }
         }
         // Never below Limit (changes semantics) or Aggregate (HAVING, v1).
-        // Below Window: only conjuncts over input columns (window results
-        // start at input_cols); window columns stay above.
+        // Below Union: selection distributes over both branches (same
+        // output width by construction; per-branch types were checked
+        // compatible at bind time).
+        LogicalPlan::Union { left, right, distinct, types } => (
+            LogicalPlan::Union {
+                left: Box::new(LogicalPlan::Filter {
+                    input: left,
+                    predicate: pred.clone(),
+                }),
+                right: Box::new(LogicalPlan::Filter {
+                    input: right,
+                    predicate: pred,
+                }),
+                distinct,
+                types,
+            },
+            true,
+        ),
         LogicalPlan::Window { input, windows, input_cols } => {
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
@@ -357,6 +401,14 @@ fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
             expr: Box::new(shift_columns(*expr, by)),
             query,
             negated,
+        },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(shift_columns(*expr, by)),
+            dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
+            dtype,
         },
         BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
             op,
@@ -413,6 +465,12 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(pushdown(*input)),
             windows,
             input_cols,
+        },
+        LogicalPlan::Union { left, right, distinct, types } => LogicalPlan::Union {
+            left: Box::new(pushdown(*left)),
+            right: Box::new(pushdown(*right)),
+            distinct,
+            types,
         },
         // Filters push within the body and within the query independently —
         // never across the CTE boundary (different scopes).
