@@ -187,6 +187,7 @@ Parquet reader, parallel execution, DATE/TIMESTAMP, subqueries/CTEs.
 
 ```sh
 cargo build            # workspace
-cargo test             # 50+ unit + end-to-end tests
+cargo test             # 100+ unit + end-to-end tests
 cargo clippy --all-targets   # must stay clean
+python3 bench/duckdiff.py [--big sales.csv]  # differential test vs DuckDB
 ```

@@ -115,6 +115,7 @@ LIMIT n;
 | 10 | Transactions: BEGIN/COMMIT/ROLLBACK via whole-store snapshots | done (build+test+clippy green, 95 tests) |
 | 11 | SQL completeness: UNION, views, CAST, COALESCE, LIKE, DROP | done (build+test+clippy green, 98 tests) |
 | 12 | Parallel execution (rayon) + multi-writer Database/Connection | done (build+test+clippy green, 103 tests, 1M-row bench) |
+| 13 | Differential testing vs DuckDB (53 queries match) | done (bench/duckdiff.py) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 
