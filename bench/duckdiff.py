@@ -206,6 +206,8 @@ QUERIES = [
     ("self-join", "SELECT a.name FROM emp a JOIN emp b ON a.did = b.did WHERE a.id < b.id ORDER BY 1;", True, False),
     ("union-all", "SELECT id FROM emp WHERE id <= 2 UNION ALL SELECT did FROM dept WHERE did >= 20;", False, False),
     ("union-distinct", "SELECT did FROM emp UNION SELECT did FROM dept;", False, False),
+    ("union-all-order-limit", "SELECT id FROM emp WHERE id <= 3 UNION ALL SELECT did FROM dept WHERE did >= 20 ORDER BY id DESC LIMIT 4;", True, False),
+    ("union-in-derived", "SELECT x FROM (SELECT id AS x FROM emp WHERE id <= 2 UNION ALL SELECT did AS x FROM dept WHERE did >= 20) s ORDER BY x;", True, False),
     ("empty-agg", "SELECT COUNT(*), SUM(salary), AVG(salary), MIN(salary) FROM emp WHERE false;", False, False),
     ("scalar-sub", "SELECT name FROM emp WHERE did = (SELECT did FROM dept WHERE dname = 'ops');", False, False),
     ("scalar-empty", "SELECT name FROM emp WHERE did = (SELECT did FROM dept WHERE false);", False, False),

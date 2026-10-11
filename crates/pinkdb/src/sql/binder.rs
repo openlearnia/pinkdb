@@ -738,7 +738,7 @@ impl<'a> Binder<'a> {
             }
             Expr::ScalarSubquery(q) => {
                 let mut child = self.child();
-                let query = bind_select_with(child.db, &mut child, q)?;
+                let query = bind_select_in(child.db, &mut child, q)?;
                 let schema = plan_schema(child.db, &child.ctes, &query)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
@@ -751,7 +751,7 @@ impl<'a> Binder<'a> {
             Expr::InSubquery { expr, query, negated } => {
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 let mut child = self.child();
-                let sub = bind_select_with(child.db, &mut child, query)?;
+                let sub = bind_select_in(child.db, &mut child, query)?;
                 let schema = plan_schema(child.db, &child.ctes, &sub)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
@@ -773,7 +773,7 @@ impl<'a> Binder<'a> {
             }
             Expr::Exists { query, negated } => {
                 let mut child = self.child();
-                let sub = bind_select_with(child.db, &mut child, query)?;
+                let sub = bind_select_in(child.db, &mut child, query)?;
                 Ok(BoundExpr::Exists { query: Box::new(sub), negated: *negated })
             }
         }
@@ -1478,7 +1478,7 @@ fn bind_create_view(
     query: &Select,
 ) -> Result<LogicalPlan> {
     let mut binder = Binder::new(db);
-    let bound = bind_select_with(db, &mut binder, query)?;
+    let bound = bind_select_in(db, &mut binder, query)?;
     let schema = plan_schema(db, &binder.ctes, &bound)?;
     if let Some(cols) = cols {
         if cols.len() != schema.len() {
@@ -1640,11 +1640,96 @@ fn bind_insert(
     Ok(LogicalPlan::Insert { table: t.name.clone(), rows: bound_rows })
 }
 
+/// Bind a top-level SELECT with a fresh binder.
 fn bind_select(db: &PinkDb, sel: &Select) -> Result<LogicalPlan> {
     let mut binder = Binder::new(db);
-    let mut plan = bind_select_with(db, &mut binder, sel)?;
-    // UNION branches (left-associative): each sees the outer CTEs.
+    bind_select_in(db, &mut binder, sel)
+}
+
+/// ORDER BY/LIMIT written before a UNION (on the head or a middle branch):
+/// the current parser attaches such clauses to the branch they follow, which
+/// would silently change semantics. DuckDB rejects them too.
+fn union_clause_error() -> PinkDbError {
+    PinkDbError::Parse(
+        "ORDER BY/LIMIT before UNION is not supported; place it after the last branch"
+            .to_string(),
+    )
+}
+
+/// Bind a complete SELECT in an existing scope: WITH/CTE definitions, the
+/// body, and — when present — the whole UNION chain. Chain-level ORDER
+/// BY/LIMIT (written after the last branch) apply to the whole set operation.
+///
+/// Every query context (statement, derived table, CTE body, view, subquery)
+/// must enter here: `bind_select_with` binds a single branch and ignores
+/// `unions`.
+fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
+    if sel.unions.is_empty() {
+        return bind_select_with(db, binder, sel);
+    }
+    // The parser attaches trailing clauses to the last branch; a clause on the
+    // head or on a middle branch was therefore written *before* a UNION.
+    if !sel.order_by.is_empty() || sel.limit.is_some() {
+        return Err(union_clause_error());
+    }
+    for (_, branch) in &sel.unions[..sel.unions.len() - 1] {
+        if !branch.order_by.is_empty() || branch.limit.is_some() {
+            return Err(union_clause_error());
+        }
+    }
+    // Hoist the last branch's trailing clauses to the chain level.
+    let mut head = sel.clone();
+    let (_, last) = head.unions.last_mut().expect("unions checked non-empty");
+    let order_by = std::mem::take(&mut last.order_by);
+    let limit = last.limit.take();
+
+    // WITH belongs to the whole chain: bind it once, then wrap the final plan.
+    // Every branch (and the ORDER BY/LIMIT wrapper below) sees the CTEs.
+    let cte_base = binder.ctes.len();
+    let cte_plans = bind_ctes(db, binder, sel)?;
+    head.with.clear();
+
+    let plan = if order_by.is_empty() && limit.is_none() {
+        bind_union_chain(db, binder, &head)?
+    } else {
+        // Apply the chain clauses over the whole set operation by wrapping it
+        // in a derived table: the plain-SELECT path then binds ORDER BY/LIMIT
+        // with exactly the same positional/alias/expression rules.
+        let wrapper = Select {
+            with: Vec::new(),
+            distinct: false,
+            projections: vec![Projection::Star],
+            from: Some(FromClause {
+                source: FromSource::Derived(Box::new(head)),
+                alias: Some("__setop".to_string()),
+                join: None,
+            }),
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by,
+            limit,
+            unions: Vec::new(),
+        };
+        bind_select_in(db, binder, &wrapper)?
+    };
+    Ok(wrap_ctes(binder, cte_base, cte_plans, plan))
+}
+
+/// Bind the head and every UNION branch into the left-associative set
+/// operation. Branch-level ORDER BY/LIMIT are hoisted (or rejected) by
+/// [`bind_select_in`] before this point, so each branch binds bare; pairwise
+/// type unification (numeric tower) is recorded on every `Union` node.
+fn bind_union_chain(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
+    debug_assert!(!sel.unions.is_empty());
+    debug_assert!(sel.order_by.is_empty() && sel.limit.is_none());
+    let mut head = sel.clone();
+    head.unions.clear();
+    let mut plan = bind_select_with(db, binder, &head)?;
+    // UNION branches (left-associative): each sees the outer CTEs (including
+    // the head's WITH CTEs, bound by the caller).
     for (op, branch) in &sel.unions {
+        debug_assert!(branch.order_by.is_empty() && branch.limit.is_none());
         let mut child = binder.child();
         let right = bind_select_with(db, &mut child, branch)?;
         let left_schema = plan_schema(db, &binder.ctes, &plan)?;
@@ -1663,7 +1748,7 @@ fn bind_select(db: &PinkDb, sel: &Select) -> Result<LogicalPlan> {
         plan = LogicalPlan::Union {
             left: Box::new(plan),
             right: Box::new(right),
-            distinct: *op == crate::sql::ast::SetOp::Union,
+            distinct: *op == SetOp::Union,
             types,
         };
     }
@@ -1766,7 +1851,7 @@ fn bind_source(
                 // as errors, never stale indices.
                 let view = view.clone();
                 let mut child = binder.child();
-                let sub = bind_select_with(child.db, &mut child, &view.query)?;
+                let sub = bind_select_in(child.db, &mut child, &view.query)?;
                 let mut schema = plan_schema(child.db, &binder.ctes, &sub)?;
                 if let Some(cols) = &view.cols {
                     for (s, c) in schema.iter_mut().zip(cols.iter()) {
@@ -1791,7 +1876,7 @@ fn bind_source(
                 PinkDbError::Parse("derived table needs an alias".to_string())
             })?;
             let mut child = binder.child();
-            let sub = bind_select_with(db, &mut child, q)?;
+            let sub = bind_select_in(db, &mut child, q)?;
             let schema = plan_schema(db, &binder.ctes, &sub)?;
             Ok((
                 ScopeTable { name: alias.to_ascii_lowercase(), columns: schema },
@@ -1801,10 +1886,30 @@ fn bind_source(
     }
 }
 
+/// Bind one SELECT branch (no UNION handling — callers use [`bind_select_in`]
+/// for full SELECTs): WITH/CTE definitions + body, wrapped in Cte nodes.
 fn bind_select_with(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
-    // WITH: bind each CTE in order (seeing previous + ancestor CTEs), then
-    // wrap the body in Cte nodes. Scopes pop on exit via truncation.
+    // Every full SELECT must route through `bind_select_in`; a direct call
+    // here with UNION branches would silently drop all but the head branch.
+    if !sel.unions.is_empty() {
+        return Err(PinkDbError::Execution(
+            "internal: UNION must be bound via bind_select_in".to_string(),
+        ));
+    }
     let cte_base = binder.ctes.len();
+    let cte_plans = bind_ctes(db, binder, sel)?;
+    let plan = bind_select_body(db, binder, sel)?;
+    Ok(wrap_ctes(binder, cte_base, cte_plans, plan))
+}
+
+/// Bind the WITH clause of `sel`: each CTE in order (seeing previous +
+/// ancestor CTEs), pushed onto `binder.ctes` so the caller's body — including
+/// every UNION branch — can reference them. Pair with [`wrap_ctes`].
+fn bind_ctes(
+    db: &PinkDb,
+    binder: &mut Binder,
+    sel: &Select,
+) -> Result<Vec<(String, LogicalPlan)>> {
     let mut cte_plans: Vec<(String, LogicalPlan)> = Vec::new();
     for cte in &sel.with {
         if binder.ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(&cte.name)) {
@@ -1814,7 +1919,7 @@ fn bind_select_with(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             )));
         }
         let mut child = binder.child();
-        let query = bind_select_with(db, &mut child, &cte.query)?;
+        let query = bind_select_in(db, &mut child, &cte.query)?;
         let mut schema = plan_schema(db, &binder.ctes, &query)?;
         if let Some(cols) = &cte.cols {
             if cols.len() != schema.len() {
@@ -1832,14 +1937,23 @@ fn bind_select_with(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         binder.ctes.push((cte.name.to_ascii_lowercase(), schema));
         cte_plans.push((cte.name.to_ascii_lowercase(), query));
     }
+    Ok(cte_plans)
+}
 
-    let mut plan = bind_select_body(db, binder, sel)?;
-
+/// Wrap `plan` in the Cte nodes from [`bind_ctes`] (reverse order) and pop
+/// the CTE scope back down to `cte_base`.
+fn wrap_ctes(
+    binder: &mut Binder,
+    cte_base: usize,
+    cte_plans: Vec<(String, LogicalPlan)>,
+    plan: LogicalPlan,
+) -> LogicalPlan {
+    let mut plan = plan;
     for (name, query) in cte_plans.into_iter().rev() {
         plan = LogicalPlan::Cte { name, query: Box::new(query), body: Box::new(plan) };
     }
     binder.ctes.truncate(cte_base);
-    Ok(plan)
+    plan
 }
 
 fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
@@ -2270,5 +2384,18 @@ mod tests {
         // Aliased equi-join binds.
         let plan = bind_one(&db, "SELECT * FROM sales s JOIN sales o ON s.id = o.id;").unwrap();
         assert!(matches!(plan, LogicalPlan::Project { .. }));
+    }
+
+    /// A misrouted call with UNION branches must fail loudly instead of
+    /// silently dropping every branch after the head.
+    #[test]
+    fn union_branches_must_bind_via_bind_select_in() {
+        let db = test_db();
+        let stmts = parse_statements("SELECT id FROM sales UNION ALL SELECT id FROM sales;").unwrap();
+        let Statement::Select(sel) = &stmts[0] else { panic!("expected SELECT") };
+        let mut binder = Binder::new(&db);
+        let err = bind_select_with(&db, &mut binder, sel).unwrap_err();
+        assert!(matches!(err, PinkDbError::Execution(_)), "{err:?}");
+        assert!(err.to_string().contains("bind_select_in"), "{err}");
     }
 }

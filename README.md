@@ -100,8 +100,9 @@ LIMIT n;
   `LIKE`/`NOT LIKE` (`%`/`_` patterns)
 - `CASE WHEN c THEN v ... [ELSE e] END` + simple `CASE x WHEN v` form
   (NULL conditions never match; result types unify like COALESCE)
-- Set ops: `UNION [ALL|DISTINCT]` (numeric types unify; ORDER BY/LIMIT attach
-  to their own branch in v1); `CREATE VIEW v [(cols)] AS ...` (session-local,
+- Set ops: `UNION [ALL|DISTINCT]` (numeric types unify; ORDER BY/LIMIT after
+  the set operation apply to the whole result — branch-level clauses need
+  parentheses, unsupported in v1); `CREATE VIEW v [(cols)] AS ...` (session-local,
   rebound per use), `DROP TABLE` / `DROP VIEW`
 - Types: `BOOLEAN`, `INTEGER` (i32), `BIGINT` (i64), `DOUBLE` (f64), `VARCHAR`,
   `DATE` (days since epoch), `TIMESTAMP` (microseconds, naive, no time zone)

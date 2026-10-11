@@ -2154,10 +2154,11 @@ mod tests {
     #[test]
     fn union_all_and_distinct() {
         let mut db = uv_db();
-        // NOTE: ORDER BY/LIMIT attach to their own UNION branch in v1, so
-        // union tests sort client-side.
-        let mut rows = select(&mut db, "SELECT x FROM a WHERE x IS NOT NULL UNION ALL SELECT y FROM b;");
-        rows.sort_by(|a, b| a[0].to_string().cmp(&b[0].to_string()));
+        // Chain-level ORDER BY sorts the whole union (INTEGER unifies to BIGINT).
+        let rows = select(
+            &mut db,
+            "SELECT x FROM a WHERE x IS NOT NULL UNION ALL SELECT y FROM b ORDER BY x;",
+        );
         assert_eq!(
             rows,
             vec![
@@ -2170,19 +2171,320 @@ mod tests {
         // INTEGER unifies to BIGINT (left names win).
         let rows = select(&mut db, "SELECT x AS n FROM a WHERE x = 1 UNION SELECT y AS m FROM b WHERE y = 3;");
         assert_eq!(rows.len(), 2);
-        // UNION (distinct) dedupes, NULLs dedupe together.
-        let mut rows = select(&mut db, "SELECT x FROM a UNION SELECT y FROM b;");
-        rows.sort_by(|a, b| match (&a[0], &b[0]) {
-            (V::Null, V::Null) => std::cmp::Ordering::Equal,
-            (V::Null, _) => std::cmp::Ordering::Greater,
-            (_, V::Null) => std::cmp::Ordering::Less,
-            (x, y) => x.to_string().cmp(&y.to_string()),
-        });
-        assert_eq!(rows.len(), 4); // 1, 2, 3, NULL
-        assert_eq!(rows.last().unwrap(), &vec![V::Null]);
+        // UNION (distinct) dedupes, NULLs dedupe together; NULLS LAST.
+        let rows = select(&mut db, "SELECT x FROM a UNION SELECT y FROM b ORDER BY x;");
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Bigint(1)],
+                vec![V::Bigint(2)],
+                vec![V::Bigint(3)],
+                vec![V::Null],
+            ]
+        );
         // Arity + type mismatches.
         assert!(db.execute("SELECT x FROM a UNION SELECT y, t FROM b;").is_err());
         assert!(db.execute("SELECT s FROM a UNION SELECT y FROM b;").is_err());
+    }
+
+    /// {1, 3, 5} + {2, 4}: odd/even split so concatenation order is visible.
+    fn union_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE a1 (x INTEGER);").unwrap();
+        db.execute("INSERT INTO a1 VALUES (1), (3), (5);").unwrap();
+        db.execute("CREATE TABLE a2 (x INTEGER);").unwrap();
+        db.execute("INSERT INTO a2 VALUES (2), (4);").unwrap();
+        db
+    }
+
+    fn int_rows(ns: &[i32]) -> Vec<Vec<V>> {
+        ns.iter().map(|n| vec![V::Integer(*n)]).collect()
+    }
+
+    /// Column names + types of a SELECT (for schema-leak assertions).
+    fn select_meta(db: &mut PinkDb, sql: &str) -> (Vec<String>, Vec<DataType>) {
+        let mut last = None;
+        for r in db.execute(sql).unwrap() {
+            if let QueryResult::Selected { names, types, .. } = r {
+                last = Some((names, types));
+            }
+        }
+        last.unwrap()
+    }
+
+    #[test]
+    fn union_chain_order_by_and_limit() {
+        let mut db = union_db();
+        // Trailing ORDER BY/LIMIT apply to the whole set operation (DuckDB: 5,4,3).
+        assert_eq!(
+            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 3;"),
+            int_rows(&[5, 4, 3])
+        );
+        // LIMIT without ORDER BY takes the first rows of the concatenation.
+        assert_eq!(
+            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 LIMIT 2;"),
+            int_rows(&[1, 3])
+        );
+        // UNION (distinct) + chain ORDER BY/LIMIT.
+        assert_eq!(
+            select(&mut db, "SELECT x FROM a1 UNION SELECT x FROM a2 ORDER BY x DESC LIMIT 3;"),
+            int_rows(&[5, 4, 3])
+        );
+        // Positional and head-alias forms bind against the set-op output.
+        assert_eq!(
+            select(&mut db, "SELECT x AS n FROM a1 UNION ALL SELECT x FROM a2 ORDER BY 1 DESC LIMIT 2;"),
+            int_rows(&[5, 4])
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x AS n FROM a1 UNION ALL SELECT x FROM a2 ORDER BY n DESC LIMIT 2;"),
+            int_rows(&[5, 4])
+        );
+        // Clauses before a UNION (head or middle branch) are rejected.
+        assert!(db.execute("SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;").is_err());
+        assert!(db
+            .execute("SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a1;")
+            .is_err());
+    }
+
+    #[test]
+    fn union_in_derived_table_and_subqueries() {
+        let mut db = union_db();
+        // Every branch survives inside a derived table (was: only the first).
+        assert_eq!(
+            select(&mut db, "SELECT x FROM (SELECT x FROM a1 UNION ALL SELECT x FROM a2) s ORDER BY x;"),
+            int_rows(&[1, 2, 3, 4, 5])
+        );
+        // Chain-level ORDER BY/LIMIT apply to the derived result.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM (SELECT x FROM a1 UNION ALL SELECT x FROM a2) s ORDER BY x DESC LIMIT 3;",
+            ),
+            int_rows(&[5, 4, 3])
+        );
+        // Scalar / IN / EXISTS subqueries bind the whole chain.
+        assert_eq!(
+            select(&mut db, "SELECT (SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 1);"),
+            vec![vec![V::Integer(5)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM a1 WHERE x IN (SELECT x FROM a1 UNION SELECT x FROM a2) ORDER BY x;"),
+            int_rows(&[1, 3, 5])
+        );
+        // EXISTS must see the second branch (its only row lives there).
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM a1 WHERE EXISTS (SELECT x FROM a2 WHERE x = 99 UNION ALL SELECT x FROM a2 WHERE x = 4) ORDER BY x;",
+            ),
+            int_rows(&[1, 3, 5])
+        );
+    }
+
+    #[test]
+    fn union_in_cte_and_view() {
+        let mut db = union_db();
+        // CTE body with a UNION binds the whole chain.
+        assert_eq!(
+            select(
+                &mut db,
+                "WITH c AS (SELECT x FROM a1 UNION ALL SELECT x FROM a2) SELECT x FROM c ORDER BY x DESC LIMIT 3;",
+            ),
+            int_rows(&[5, 4, 3])
+        );
+        // The head's WITH is visible to every UNION branch (DuckDB semantics).
+        assert_eq!(
+            select(&mut db, "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION ALL SELECT x FROM c;"),
+            vec![vec![V::Integer(1)], vec![V::Integer(1)]]
+        );
+        // View definition validates + stores the full chain; view use binds it.
+        db.execute("CREATE VIEW uv AS SELECT x FROM a1 UNION ALL SELECT x FROM a2;").unwrap();
+        assert_eq!(select(&mut db, "SELECT x FROM uv ORDER BY x DESC LIMIT 3;"), int_rows(&[5, 4, 3]));
+        // Chain clauses in the view definition apply per use.
+        db.execute("CREATE VIEW uv2 AS SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 3;")
+            .unwrap();
+        assert_eq!(select(&mut db, "SELECT x FROM uv2;"), int_rows(&[5, 4, 3]));
+        // Clauses before a UNION are rejected at CREATE VIEW validation too.
+        assert!(db
+            .execute("CREATE VIEW bad AS SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;")
+            .is_err());
+    }
+
+    #[test]
+    fn union_type_unification_through_wrapper() {
+        let mut db = union_db();
+        db.execute("CREATE TABLE a3 (y BIGINT);").unwrap();
+        db.execute("INSERT INTO a3 VALUES (2), (4);").unwrap();
+        // INTEGER UNION ALL BIGINT unifies to BIGINT through a derived table.
+        assert_eq!(
+            select(&mut db, "SELECT * FROM (SELECT x FROM a1 UNION ALL SELECT y FROM a3) s ORDER BY x;"),
+            vec![
+                vec![V::Bigint(1)],
+                vec![V::Bigint(2)],
+                vec![V::Bigint(3)],
+                vec![V::Bigint(4)],
+                vec![V::Bigint(5)],
+            ]
+        );
+    }
+
+    /// ORDER BY expressions that are not projected: chain-level clauses bind
+    /// over the whole set-op output, and the hidden key must not leak into the
+    /// derived schema (names or types).
+    #[test]
+    fn union_chain_order_by_hidden_expressions() {
+        let mut db = union_db();
+        assert_eq!(
+            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY -x LIMIT 2;"),
+            int_rows(&[5, 4])
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x + 1 DESC LIMIT 2;"),
+            int_rows(&[5, 4])
+        );
+        let (names, types) = select_meta(
+            &mut db,
+            "SELECT * FROM (SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY -x) s;",
+        );
+        assert_eq!(names, vec!["x".to_string()]);
+        assert_eq!(types, vec![DataType::Integer]);
+    }
+
+    /// Clauses written before a UNION (head or middle branch) are Parse errors
+    /// with a message that says where the clause belongs.
+    #[test]
+    fn union_pre_clauses_are_parse_errors() {
+        let mut db = union_db();
+        let err = db
+            .execute("SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;")
+            .unwrap_err();
+        assert!(matches!(err, PinkDbError::Parse(_)), "{err:?}");
+        assert!(err.to_string().contains("before UNION"), "{err}");
+
+        let err = db
+            .execute("SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a1;")
+            .unwrap_err();
+        assert!(matches!(err, PinkDbError::Parse(_)), "{err:?}");
+        assert!(err.to_string().contains("before UNION"), "{err}");
+    }
+
+    /// Only the left branch's output names are visible to chain-level ORDER BY.
+    /// DuckDB resolves right-branch aliases here, but standard SQL exposes only
+    /// the left branch, so we keep the error (a silently wrong result before
+    /// wave 18 was worse).
+    #[test]
+    fn union_right_branch_alias_is_not_visible() {
+        let mut db = union_db();
+        let err = db
+            .execute("SELECT x AS n FROM a1 UNION ALL SELECT x AS m FROM a2 ORDER BY m;")
+            .unwrap_err();
+        assert!(matches!(err, PinkDbError::Catalog(_)), "{err:?}");
+        assert!(err.to_string().contains("no column"), "{err}");
+    }
+
+    /// Filter pushdown distributes over a union in a derived table; surviving
+    /// rows keep the unified (widened) type.
+    #[test]
+    fn union_filter_pushdown_through_derived_type_widening() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE ti (x INTEGER);").unwrap();
+        db.execute("INSERT INTO ti VALUES (1), (3);").unwrap();
+        db.execute("CREATE TABLE td (x DOUBLE);").unwrap();
+        db.execute("INSERT INTO td VALUES (2.0), (3.0);").unwrap();
+        let rows = select(
+            &mut db,
+            "SELECT * FROM (SELECT x FROM ti UNION ALL SELECT x FROM td) s WHERE x = 3;",
+        );
+        assert_eq!(rows, vec![vec![V::Double(3.0)], vec![V::Double(3.0)]]);
+        let (names, types) =
+            select_meta(&mut db, "SELECT * FROM (SELECT x FROM ti UNION ALL SELECT x FROM td) s;");
+        assert_eq!(names, vec!["x".to_string()]);
+        assert_eq!(types, vec![DataType::Double]);
+    }
+
+    /// LIMIT-only hoisting over three branches, and a chain mixing UNION with
+    /// UNION ALL (left-associative) plus trailing ORDER BY/LIMIT.
+    #[test]
+    fn union_three_branch_limit_and_mixed_setops() {
+        let mut db = union_db();
+        // LIMIT alone keeps the first rows of the concatenation.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION ALL SELECT x FROM a2 UNION ALL SELECT x FROM a1 LIMIT 2;",
+            ),
+            int_rows(&[1, 3])
+        );
+        // (a1 UNION a2) UNION ALL a1 → {1,2,3,4,5} ∪ {1,3,5}; DESC top 3 has 5 twice.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION SELECT x FROM a2 UNION ALL SELECT x FROM a1 ORDER BY x DESC LIMIT 3;",
+            ),
+            int_rows(&[5, 5, 4])
+        );
+    }
+
+    /// UNION (distinct) dedupes across branches before chain ORDER BY/LIMIT.
+    #[test]
+    fn union_distinct_cross_branch_dedup_with_order() {
+        let mut db = union_db();
+        db.execute("CREATE TABLE a3 (x INTEGER);").unwrap();
+        db.execute("INSERT INTO a3 VALUES (3), (5), (7);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT x FROM a1 UNION SELECT x FROM a3 ORDER BY x DESC LIMIT 2;"),
+            int_rows(&[7, 5])
+        );
+    }
+
+    /// A CTE column list renames the whole set operation's output; verified
+    /// against DuckDB (5, 4).
+    #[test]
+    fn union_cte_column_list() {
+        let mut db = union_db();
+        assert_eq!(
+            select(
+                &mut db,
+                "WITH c(a) AS (SELECT x FROM a1 UNION ALL SELECT x FROM a2) SELECT a FROM c ORDER BY a DESC LIMIT 2;",
+            ),
+            int_rows(&[5, 4])
+        );
+    }
+
+    /// Branch arity mismatches fail the union bind (scalar subquery and CTE).
+    #[test]
+    fn union_arity_errors() {
+        let mut db = union_db();
+        let err = db
+            .execute("SELECT (SELECT x FROM a1 UNION ALL SELECT x, x FROM a2);")
+            .unwrap_err();
+        assert!(matches!(err, PinkDbError::Execution(_)), "{err:?}");
+        let err = db
+            .execute("WITH c AS (SELECT x FROM a1 UNION ALL SELECT x, x FROM a2) SELECT x FROM c;")
+            .unwrap_err();
+        assert!(matches!(err, PinkDbError::Execution(_)), "{err:?}");
+    }
+
+    /// WITH inside WITH (unions at both levels) and a CTE referenced only by
+    /// the middle branch of a three-branch chain.
+    #[test]
+    fn union_nested_with_and_middle_branch_cte() {
+        let mut db = union_db();
+        assert_eq!(
+            select(
+                &mut db,
+                "WITH o AS (WITH i AS (SELECT x FROM a1 UNION ALL SELECT x FROM a2) SELECT x FROM i) SELECT x FROM o ORDER BY x;",
+            ),
+            int_rows(&[1, 2, 3, 4, 5])
+        );
+        // c (a1) is visible to the middle branch even though the head is a2.
+        assert_eq!(
+            select(
+                &mut db,
+                "WITH c AS (SELECT x FROM a1) SELECT x FROM a2 UNION ALL SELECT x FROM c UNION ALL SELECT x FROM a2 ORDER BY x;",
+            ),
+            int_rows(&[1, 2, 2, 3, 4, 4, 5])
+        );
     }
 
     #[test]

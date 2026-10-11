@@ -120,6 +120,7 @@ LIMIT n;
 | 15 | Import speed round: streaming inference, buffer-reused records, zero-alloc bool checks | done (build+test+clippy green, duckdiff 53/53, 1M-row import 0.42→0.03 s) |
 | 16 | CASE expressions (searched + simple, NULL semantics, type unification) | done (build+test+clippy green, 119 tests, duckdiff 54/54) |
 | 17 | Performance tuning: O(n²) window-aggregate fix, typed expression kernels, sort key arena + top-N, join/group hash paths, REPL display cap, thin LTO | done (build+test+clippy green, 148 tests, duckdiff 54/54, 1M-row query bench) |
+| 18 | Binder fix: UNION inside derived tables/CTEs/views/subqueries; ORDER BY/LIMIT apply to the whole set operation | done (build+test+clippy green, 162 lib + 3 CLI tests, duckdiff 56/56) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 
