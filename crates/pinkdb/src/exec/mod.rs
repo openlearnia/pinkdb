@@ -1499,4 +1499,108 @@ mod tests {
         assert_eq!(select(&mut db, "SELECT CAST(NULL AS VARCHAR) LIKE 'a';"), vec![vec![V::Null]]);
         assert!(db.execute("SELECT x LIKE '1' FROM a;").is_err());
     }
+
+    // --- phase 15: CASE ---
+
+    fn case_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (id INTEGER, name VARCHAR);").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'ann'), (2, 'bob'), (3, NULL);").unwrap();
+        db
+    }
+
+    #[test]
+    fn case_searched_and_simple() {
+        let mut db = case_db();
+        let rows = select(
+            &mut db,
+            "SELECT id, CASE WHEN id = 1 THEN 'one' WHEN id = 2 THEN 'two' ELSE 'other' END AS label
+             FROM t ORDER BY id;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Integer(1), V::Varchar("one".to_string())],
+                vec![V::Integer(2), V::Varchar("two".to_string())],
+                vec![V::Integer(3), V::Varchar("other".to_string())],
+            ]
+        );
+        let rows = select(&mut db, "SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t ORDER BY id;");
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Varchar("one".to_string())],
+                vec![V::Varchar("two".to_string())],
+                vec![V::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn case_nulls_and_nesting() {
+        let mut db = case_db();
+        // NULL conditions never match; NULL results pass through.
+        let rows = select(
+            &mut db,
+            "SELECT CASE WHEN name IS NULL THEN 'anon' WHEN id > 100 THEN NULL ELSE name END FROM t ORDER BY id;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Varchar("ann".to_string())],
+                vec![V::Varchar("bob".to_string())],
+                vec![V::Varchar("anon".to_string())],
+            ]
+        );
+        // Nested CASE + mixed numeric widths unify to DOUBLE.
+        let rows = select(
+            &mut db,
+            "SELECT CASE WHEN id = 1 THEN 1 WHEN id = 2 THEN 2.5 ELSE 0 END FROM t ORDER BY id;",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![V::Double(1.0)], vec![V::Double(2.5)], vec![V::Double(0.0)]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT CASE WHEN id > 1 THEN CASE WHEN id > 2 THEN 'big' ELSE 'mid' END ELSE 'small' END FROM t ORDER BY id;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Varchar("small".to_string())],
+                vec![V::Varchar("mid".to_string())],
+                vec![V::Varchar("big".to_string())],
+            ]
+        );
+        // Non-boolean conditions + incompatible results rejected.
+        assert!(db.execute("SELECT CASE WHEN id THEN 1 END FROM t;").is_err());
+        assert!(db.execute("SELECT CASE WHEN true THEN 1 ELSE 'x' END FROM t;").is_err());
+    }
+
+    #[test]
+    fn case_in_clauses() {
+        let mut db = case_db();
+        // CASE in WHERE, GROUP BY, aggregates, and ORDER BY position.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM t WHERE CASE WHEN id = 1 THEN true ELSE false END;"),
+            vec![vec![V::Bigint(1)]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT CASE WHEN id <= 2 THEN 'low' ELSE 'high' END AS grp, COUNT(*) FROM t GROUP BY grp ORDER BY grp;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Varchar("high".to_string()), V::Bigint(1)],
+                vec![V::Varchar("low".to_string()), V::Bigint(2)],
+            ]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT SUM(CASE WHEN id = 3 THEN 10 ELSE 1 END) FROM t;",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(12)]]);
+    }
 }

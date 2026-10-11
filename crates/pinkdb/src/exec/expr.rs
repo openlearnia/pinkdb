@@ -36,6 +36,9 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             }
             eval_coalesce(*dtype, &vecs)
         }
+        BoundExpr::Case { branches, else_, dtype } => {
+            eval_case(branches, else_, *dtype, chunk, cx)
+        }
         BoundExpr::InSubquery { expr, query, negated } => {
             eval_in_subquery(expr, query, *negated, chunk, cx)
         }
@@ -774,6 +777,45 @@ fn cast_value(v: Value, target: DataType) -> Result<Value> {
         }
         (v, t) => Err(PinkDbError::Execution(format!("cannot CAST {v} AS {t}"))),
     }
+}
+
+/// `CASE WHEN c THEN v ... [ELSE e]`: first TRUE condition wins per row
+/// (NULL conditions never match). Missing ELSE is NULL.
+fn eval_case(
+    branches: &[(BoundExpr, BoundExpr)],
+    else_: &Option<Box<BoundExpr>>,
+    dtype: DataType,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Vector> {
+    let mut conds = Vec::with_capacity(branches.len());
+    let mut vals = Vec::with_capacity(branches.len());
+    for (c, v) in branches {
+        conds.push(eval_expr(c, chunk, cx)?);
+        vals.push(eval_expr(v, chunk, cx)?);
+    }
+    let els = match else_ {
+        Some(e) => Some(eval_expr(e, chunk, cx)?),
+        None => None,
+    };
+    let mut out = Vector::new_empty(dtype);
+    for i in 0..chunk.num_rows() {
+        let mut placed = false;
+        for (c, v) in conds.iter().zip(vals.iter()) {
+            if !c.is_null(i) && as_bool(c, i)? {
+                out.push_value(v.get(i))?;
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            match &els {
+                Some(e) => out.push_value(e.get(i))?,
+                None => out.push_null()?,
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `COALESCE`: first non-NULL argument per row (all args share the dtype).

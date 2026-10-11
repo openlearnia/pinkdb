@@ -192,6 +192,13 @@ pub enum BoundExpr {
     /// `COALESCE(a, b, ...)` — all args share `dtype` (narrower sides are
     /// wrapped in [`BoundExpr::Cast`] at bind time).
     Coalesce { args: Vec<BoundExpr>, dtype: DataType },
+    /// `CASE WHEN c THEN v ... [ELSE e]` — results share `dtype`
+    /// (narrower sides wrapped in [`BoundExpr::Cast`]); missing ELSE is NULL.
+    Case {
+        branches: Vec<(BoundExpr, BoundExpr)>,
+        else_: Option<Box<BoundExpr>>,
+        dtype: DataType,
+    },
     /// Uncorrelated scalar subquery (1 col by construction; rows at runtime).
     ScalarSubquery { query: Box<LogicalPlan>, dtype: DataType },
     /// `expr [NOT] IN (query)` — `expr` may reference the outer scope.
@@ -215,6 +222,7 @@ impl BoundExpr {
             BoundExpr::WindowRef { dtype, .. } => *dtype,
             BoundExpr::Cast { dtype, .. } => *dtype,
             BoundExpr::Coalesce { dtype, .. } => *dtype,
+            BoundExpr::Case { dtype, .. } => *dtype,
             BoundExpr::ScalarSubquery { dtype, .. } => *dtype,
             BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => DataType::Boolean,
         }
@@ -227,6 +235,10 @@ impl BoundExpr {
             BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => false,
             BoundExpr::Cast { expr, .. } => expr.is_aggregate_free(),
             BoundExpr::Coalesce { args, .. } => args.iter().all(|a| a.is_aggregate_free()),
+            BoundExpr::Case { branches, else_, .. } => {
+                branches.iter().all(|(c, v)| c.is_aggregate_free() && v.is_aggregate_free())
+                    && else_.as_ref().map(|e| e.is_aggregate_free()).unwrap_or(true)
+            }
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
             | BoundExpr::ScalarSubquery { .. }
@@ -256,6 +268,10 @@ impl BoundExpr {
             BoundExpr::InSubquery { expr, .. } => expr.has_column_ref(),
             BoundExpr::Cast { expr, .. } => expr.has_column_ref(),
             BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_column_ref()),
+            BoundExpr::Case { branches, else_, .. } => {
+                branches.iter().any(|(c, v)| c.has_column_ref() || v.has_column_ref())
+                    || else_.as_ref().map(|e| e.has_column_ref()).unwrap_or(false)
+            }
             BoundExpr::Not(e)
             | BoundExpr::Negate { expr: e, .. }
             | BoundExpr::IsNull { expr: e, .. } => e.has_column_ref(),
@@ -285,6 +301,10 @@ impl BoundExpr {
             }
             BoundExpr::Scalar { args, .. } => args.iter().any(|a| a.has_subquery()),
             BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_subquery()),
+            BoundExpr::Case { branches, else_, .. } => {
+                branches.iter().any(|(c, v)| c.has_subquery() || v.has_subquery())
+                    || else_.as_ref().map(|e| e.has_subquery()).unwrap_or(false)
+            }
         }
     }
 }
@@ -356,6 +376,19 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
         }
         _ => common_numeric(l, r),
     }
+}
+
+
+/// Fold one result arm into the common type, skipping NULL literals (a bare
+/// NULL fits any result type instead of forcing INTEGER).
+fn fold_result_common(current: Option<DataType>, expr: &BoundExpr) -> Result<Option<DataType>> {
+    if matches!(expr, BoundExpr::Literal(Value::Null)) {
+        return Ok(current);
+    }
+    Ok(Some(match current {
+        None => expr.dtype(),
+        Some(t) => coalesce_common(t, expr.dtype())?,
+    }))
 }
 
 /// Common type for COALESCE/UNION arms: numeric tower, else identical.
@@ -633,15 +666,18 @@ impl<'a> Binder<'a> {
                     bound.push(self.bind_expr(a, aggs, allow_agg)?);
                 }
                 // Common type across args (numeric tower, else identical);
-                // narrower sides are wrapped in Casts.
-                let mut common = bound[0].dtype();
-                for b in &bound[1..] {
-                    common = coalesce_common(common, b.dtype())?;
+                // bare NULLs fit any type. Narrower sides are Cast-wrapped.
+                let mut common: Option<DataType> = None;
+                for b in &bound {
+                    common = fold_result_common(common, b)?;
                 }
+                let common = common.unwrap_or(DataType::Integer);
                 let args = bound
                     .into_iter()
                     .map(|b| {
-                        if b.dtype() == common {
+                        if b.dtype() == common
+                            || matches!(b, BoundExpr::Literal(Value::Null))
+                        {
                             b
                         } else {
                             BoundExpr::Cast { expr: Box::new(b), dtype: common }
@@ -654,6 +690,51 @@ impl<'a> Binder<'a> {
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 check_cast(bound.dtype(), *dtype)?;
                 Ok(BoundExpr::Cast { expr: Box::new(bound), dtype: *dtype })
+            }
+            Expr::Case { branches, else_ } => {
+                let mut bound_branches = Vec::with_capacity(branches.len());
+                let mut common: Option<DataType> = None;
+                for (cond, val) in branches {
+                    let c = self.bind_expr(cond, aggs, allow_agg)?;
+                    if c.dtype() != DataType::Boolean {
+                        return Err(PinkDbError::Type(
+                            "CASE WHEN needs a BOOLEAN condition".to_string(),
+                        ));
+                    }
+                    let v = self.bind_expr(val, aggs, allow_agg)?;
+                    common = fold_result_common(common, &v)?;
+                    bound_branches.push((c, v));
+                }
+                let (else_bound, common) = match else_ {
+                    Some(e) => {
+                        let b = self.bind_expr(e, aggs, allow_agg)?;
+                        let t = fold_result_common(common, &b)?.unwrap_or(b.dtype());
+                        (Some(b), t)
+                    }
+                    // Missing ELSE is NULL: fits any result type. All-NULL
+                    // results keep INTEGER (the NULL-literal convention).
+                    None => (None, common.unwrap_or(DataType::Integer)),
+                };
+                // Widen narrower results to the common type.
+                let branches = bound_branches
+                    .into_iter()
+                    .map(|(c, v)| {
+                        let v = if v.dtype() == common {
+                            v
+                        } else {
+                            BoundExpr::Cast { expr: Box::new(v), dtype: common }
+                        };
+                        (c, v)
+                    })
+                    .collect();
+                let else_ = else_bound.map(|e| {
+                    Box::new(if e.dtype() == common {
+                        e
+                    } else {
+                        BoundExpr::Cast { expr: Box::new(e), dtype: common }
+                    })
+                });
+                Ok(BoundExpr::Case { branches, else_, dtype: common })
             }
             Expr::ScalarSubquery(q) => {
                 let mut child = self.child();
@@ -1058,6 +1139,17 @@ fn default_name(expr: &Expr) -> String {
             format!("coalesce({})", inner.join(", "))
         }
         Expr::Cast { expr, dtype } => format!("cast({} as {dtype})", default_name(expr)),
+        Expr::Case { branches, else_, .. } => {
+            let mut s = String::from("CASE");
+            for (c, v) in branches {
+                s.push_str(&format!(" WHEN {} THEN {}", default_name(c), default_name(v)));
+            }
+            if let Some(e) = else_ {
+                s.push_str(&format!(" ELSE {}", default_name(e)));
+            }
+            s.push_str(" END");
+            s
+        }
     }
 }
 
@@ -1097,6 +1189,16 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
         BoundExpr::Coalesce { args, .. } => {
             for a in args {
                 validate_grouped(a, keys)?;
+            }
+            Ok(())
+        }
+        BoundExpr::Case { branches, else_, .. } => {
+            for (c, v) in branches {
+                validate_grouped(c, keys)?;
+                validate_grouped(v, keys)?;
+            }
+            if let Some(e) = else_ {
+                validate_grouped(e, keys)?;
             }
             Ok(())
         }
@@ -1159,6 +1261,17 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
         },
+        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+            branches: branches
+                .iter()
+                .map(|(c, v)| Some((rebase_to_keys(c, keys)?, rebase_to_keys(v, keys)?)))
+                .collect::<Option<Vec<_>>>()?,
+            else_: match else_ {
+                Some(e) => Some(Box::new(rebase_to_keys(e, keys)?)),
+                None => None,
+            },
+            dtype: *dtype,
+        },
         // ScalarSubquery/Exists bodies live in their own scope; WindowRef
         // already addresses window output.
         BoundExpr::ScalarSubquery { .. }
@@ -1207,6 +1320,16 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             args: args.into_iter().map(|a| resolve_window_refs(a, input_width)).collect(),
             dtype,
         },
+        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| {
+                    (resolve_window_refs(c, input_width), resolve_window_refs(v, input_width))
+                })
+                .collect(),
+            else_: else_.map(|e| Box::new(resolve_window_refs(*e, input_width))),
+            dtype,
+        },
         other => other,
     }
 }
@@ -1248,6 +1371,14 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
         },
         BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
             args: args.into_iter().map(|a| resolve_agg_refs(a, num_keys)).collect(),
+            dtype,
+        },
+        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| (resolve_agg_refs(c, num_keys), resolve_agg_refs(v, num_keys)))
+                .collect(),
+            else_: else_.map(|e| Box::new(resolve_agg_refs(*e, num_keys))),
             dtype,
         },
         BoundExpr::WindowRef { .. } => expr,

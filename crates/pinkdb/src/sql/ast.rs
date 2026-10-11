@@ -191,6 +191,12 @@ pub enum Expr {
         expr: Box<Expr>,
         dtype: crate::types::DataType,
     },
+    /// `CASE [op] WHEN c THEN v ... [ELSE e] END` (simple form desugared
+    /// to `op = c` in the parser; missing ELSE is NULL).
+    Case {
+        branches: Vec<(Expr, Expr)>,
+        else_: Option<Box<Expr>>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

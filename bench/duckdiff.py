@@ -237,6 +237,11 @@ QUERIES = [
     ("delete-where", "DELETE FROM emp WHERE id = 5; SELECT COUNT(*) FROM emp;", False, False),
     ("view", "CREATE VIEW big AS SELECT * FROM emp WHERE salary > 100; SELECT name FROM big ORDER BY name;", True, False),
     ("bad-col", "SELECT nope FROM emp;", False, True),
+    ("case-searched", "SELECT id, CASE WHEN id = 1 THEN 'one' WHEN id = 2 THEN 'two' ELSE 'other' END FROM emp ORDER BY id;", True, False),
+    ("case-simple", "SELECT CASE id WHEN 1 THEN 'one' ELSE 'many' END FROM emp ORDER BY id;", True, False),
+    ("case-nulls", "SELECT CASE WHEN did IS NULL THEN 'none' WHEN salary > 100 THEN 'big' ELSE 'small' END FROM emp ORDER BY id;", True, False),
+    ("case-numeric", "SELECT CASE WHEN id = 1 THEN 1 WHEN id = 2 THEN 2.5 ELSE 0 END FROM emp ORDER BY id;", True, False),
+    ("case-agg", "SELECT SUM(CASE WHEN did = 10 THEN salary ELSE 0 END) FROM emp;", False, False),
 ]
 
 

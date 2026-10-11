@@ -98,6 +98,8 @@ LIMIT n;
 - `CAST(x AS type)` (numeric tower both ways, bool↔numeric, varchar parse/format,
   date↔timestamp; bad input errors), `COALESCE(a, b, ...)` (common type),
   `LIKE`/`NOT LIKE` (`%`/`_` patterns)
+- `CASE WHEN c THEN v ... [ELSE e] END` + simple `CASE x WHEN v` form
+  (NULL conditions never match; result types unify like COALESCE)
 - Set ops: `UNION [ALL|DISTINCT]` (numeric types unify; ORDER BY/LIMIT attach
   to their own branch in v1); `CREATE VIEW v [(cols)] AS ...` (session-local,
   rebound per use), `DROP TABLE` / `DROP VIEW`

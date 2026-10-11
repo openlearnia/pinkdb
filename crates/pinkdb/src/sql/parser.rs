@@ -597,8 +597,48 @@ impl Parser {
         }
     }
 
-    fn parse_frame_bound(&mut self) -> Result<FrameBound> {
-        if self.eat_keyword(Keyword::Unbounded) {
+    /// `CASE [op] WHEN c THEN v ... [ELSE e] END`. The simple form desugars
+    /// `WHEN c` to `WHEN op = c` (NULL never matches, per SQL semantics).
+    /// (The CASE keyword itself was consumed by the caller.)
+    fn parse_case(&mut self) -> Result<Expr> {
+        // Optional simple-case operand: present unless WHEN follows directly.
+        let operand = if self.peek_keyword() == Some(Keyword::When) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        let mut branches = Vec::new();
+        loop {
+            self.expect_keyword(Keyword::When)?;
+            let cond = self.parse_expr()?;
+            self.expect_keyword(Keyword::Then)?;
+            let val = self.parse_expr()?;
+            let cond = match &operand {
+                Some(op) => Expr::Binary {
+                    op: BinaryOp::Eq,
+                    left: Box::new(op.clone()),
+                    right: Box::new(cond),
+                },
+                None => cond,
+            };
+            branches.push((cond, val));
+            if self.peek_keyword() != Some(Keyword::When) {
+                break;
+            }
+        }
+        if branches.is_empty() {
+            return Err(self.error("CASE needs at least one WHEN".to_string()));
+        }
+        let else_ = if self.eat_keyword(Keyword::Else) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        self.expect_keyword(Keyword::End)?;
+        Ok(Expr::Case { branches, else_ })
+    }
+
+    fn parse_frame_bound(&mut self) -> Result<FrameBound> {        if self.eat_keyword(Keyword::Unbounded) {
             if self.eat_keyword(Keyword::Preceding) {
                 return Ok(FrameBound::UnboundedPreceding);
             }
@@ -871,6 +911,7 @@ impl Parser {
                 self.expect(&Token::RParen)?;
                 Ok(Expr::Cast { expr: Box::new(expr), dtype })
             }
+            (Token::Keyword(Keyword::Case), _) => self.parse_case(),
             (Token::Star, _) => Ok(Expr::Star),
             (Token::Keyword(Keyword::Exists), _) => {
                 self.expect(&Token::LParen)?;
@@ -1065,6 +1106,28 @@ mod tests {
             "SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;"
         )
         .is_err());
+    }
+
+    #[test]
+    fn case_shapes() {
+        // Searched form.
+        let s = parse_one("SELECT CASE WHEN a > 1 THEN 'big' WHEN a = 1 THEN 'one' ELSE 'other' END FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Case { branches, else_ }, .. }
+            if branches.len() == 2 && else_.is_some()
+        ));
+        // Simple form parses (desugars in the same node shape).
+        let s = parse_one("SELECT CASE a WHEN 1 THEN 'one' END FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Case { branches, else_ }, .. }
+            if branches.len() == 1 && else_.is_none()
+        ));
+        assert!(parse_statements("SELECT CASE WHEN 1 THEN 2;").is_err());
+        assert!(parse_statements("SELECT CASE END FROM t;").is_err());
     }
 
     #[test]

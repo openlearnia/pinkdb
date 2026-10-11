@@ -55,6 +55,14 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
             args: args.into_iter().map(|a| fold_expr(cx, a)).collect(),
             dtype,
         },
+        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| (fold_expr(cx, c), fold_expr(cx, v)))
+                .collect(),
+            else_: else_.map(|e| Box::new(fold_expr(cx, *e))),
+            dtype,
+        },
         leaf => return leaf,
     };
     // Only fully constant trees (no columns, no aggregate refs) fold.
@@ -179,6 +187,15 @@ fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
             }
         }
         BoundExpr::Cast { expr, .. } => columns_in(expr, out),
+        BoundExpr::Case { branches, else_, .. } => {
+            for (c, v) in branches {
+                columns_in(c, out);
+                columns_in(v, out);
+            }
+            if let Some(e) = else_ {
+                columns_in(e, out);
+            }
+        }
         BoundExpr::Coalesce { args, .. } => {
             for a in args {
                 columns_in(a, out);
@@ -223,6 +240,22 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
         }
         BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
             expr: Box::new(rewrite_through_project(expr, exprs)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::Case { branches, else_, dtype } => Some(BoundExpr::Case {
+            branches: branches
+                .iter()
+                .map(|(c, v)| {
+                    Some((
+                        rewrite_through_project(c, exprs)?,
+                        rewrite_through_project(v, exprs)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            else_: match else_ {
+                Some(e) => Some(Box::new(rewrite_through_project(e, exprs)?)),
+                None => None,
+            },
             dtype: *dtype,
         }),
         BoundExpr::Coalesce { args, dtype } => Some(BoundExpr::Coalesce {
@@ -404,6 +437,14 @@ fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
             expr: Box::new(shift_columns(*expr, by)),
+            dtype,
+        },
+        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| (shift_columns(c, by), shift_columns(v, by)))
+                .collect(),
+            else_: else_.map(|e| Box::new(shift_columns(*e, by))),
             dtype,
         },
         BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {

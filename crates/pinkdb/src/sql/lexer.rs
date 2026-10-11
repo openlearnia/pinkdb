@@ -62,6 +62,11 @@ pub enum Keyword {
     Drop,
     Cast,
     Like,
+    Case,
+    When,
+    Then,
+    Else,
+    End,
 }
 
 impl Keyword {
@@ -121,6 +126,11 @@ impl Keyword {
             "DROP" => Keyword::Drop,
             "CAST" => Keyword::Cast,
             "LIKE" => Keyword::Like,
+            "CASE" => Keyword::Case,
+            "WHEN" => Keyword::When,
+            "THEN" => Keyword::Then,
+            "ELSE" => Keyword::Else,
+            "END" => Keyword::End,
             _ => return None,
         })
     }
