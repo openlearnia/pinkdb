@@ -30,6 +30,9 @@ pub enum QueryResult {
     Inserted { count: usize },
     Updated { count: usize },
     Deleted { count: usize },
+    Began,
+    Committed,
+    RolledBack,
     Selected { names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>> },
 }
 
@@ -174,6 +177,18 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             Ok(QueryResult::Deleted { count })
         }
+        LogicalPlan::Begin => {
+            db.begin()?;
+            Ok(QueryResult::Began)
+        }
+        LogicalPlan::Commit => {
+            db.commit()?;
+            Ok(QueryResult::Committed)
+        }
+        LogicalPlan::Rollback => {
+            db.rollback()?;
+            Ok(QueryResult::RolledBack)
+        }
         _ => {
             let mut cx = Cx::new(db);
             let out = eval(&mut cx, plan)?;
@@ -193,7 +208,10 @@ fn eval(cx: &mut Cx, plan: &LogicalPlan) -> Result<Output> {
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }
         | LogicalPlan::Update { .. }
-        | LogicalPlan::Delete { .. } => Err(PinkDbError::Execution(
+        | LogicalPlan::Delete { .. }
+        | LogicalPlan::Begin
+        | LogicalPlan::Commit
+        | LogicalPlan::Rollback => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { table } => {
@@ -1207,8 +1225,7 @@ mod tests {
     }
 
     #[test]
-    fn update_delete_with_subquery() {
-        let mut db = ud_db();
+    fn update_delete_with_subquery() {        let mut db = ud_db();
         assert_eq!(
             updated(&mut db, "UPDATE t SET b = 'top' WHERE a = (SELECT MAX(a) FROM t);"),
             1
@@ -1221,5 +1238,45 @@ mod tests {
         let mut db = ud_db();
         assert_eq!(updated(&mut db, "DELETE FROM t WHERE a IN (SELECT a FROM t WHERE b IS NULL);"), 1);
         assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(2)]]);
+    }
+
+    // --- phase 10: transactions ---
+
+    #[test]
+    fn txn_commit_and_rollback() {
+        let mut db = ud_db();
+        assert!(!db.in_transaction());
+        db.execute("BEGIN;").unwrap();
+        assert!(db.in_transaction());
+        db.execute("UPDATE t SET a = 100 WHERE a = 1;").unwrap();
+        db.execute("DELETE FROM t WHERE a = 2;").unwrap();
+        db.execute("CREATE TABLE tmp (x INTEGER);").unwrap();
+        // Inside: changes visible.
+        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(2)]]);
+        db.execute("ROLLBACK;").unwrap();
+        assert!(!db.in_transaction());
+        // Outside: everything reverted, data and catalog alike.
+        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(3)]]);
+        assert_eq!(select(&mut db, "SELECT a FROM t WHERE a = 1;"), vec![vec![V::Integer(1)]]);
+        assert!(db.table("tmp").is_err());
+
+        db.execute("BEGIN;").unwrap();
+        db.execute("DELETE FROM t;").unwrap();
+        db.execute("COMMIT;").unwrap();
+        assert!(!db.in_transaction());
+        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(0)]]);
+    }
+
+    #[test]
+    fn txn_errors() {
+        let mut db = ud_db();
+        assert!(db.execute("COMMIT;").is_err());
+        assert!(db.execute("ROLLBACK;").is_err());
+        db.execute("BEGIN;").unwrap();
+        assert!(db.execute("BEGIN;").is_err());
+        assert!(db.execute("BEGIN TRANSACTION;").is_err());
+        db.execute("ROLLBACK;").unwrap();
+        // Reads and writes work fine outside transactions too.
+        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(3)]]);
     }
 }

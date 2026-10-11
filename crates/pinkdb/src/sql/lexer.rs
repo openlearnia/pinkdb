@@ -53,6 +53,10 @@ pub enum Keyword {
     Update,
     Delete,
     Set,
+    Begin,
+    Commit,
+    Rollback,
+    Transaction,
 }
 
 impl Keyword {
@@ -103,6 +107,10 @@ impl Keyword {
             "UPDATE" => Keyword::Update,
             "DELETE" => Keyword::Delete,
             "SET" => Keyword::Set,
+            "BEGIN" => Keyword::Begin,
+            "COMMIT" => Keyword::Commit,
+            "ROLLBACK" => Keyword::Rollback,
+            "TRANSACTION" => Keyword::Transaction,
             _ => return None,
         })
     }

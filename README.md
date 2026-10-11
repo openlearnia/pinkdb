@@ -75,6 +75,7 @@ CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE);
 INSERT INTO t VALUES (1, 'x', 9.5), (2, NULL, 3.0);
 UPDATE t SET price = price * 1.1 WHERE id > 1;   -- SET exprs see pre-update values
 DELETE FROM t WHERE price IS NULL;               -- NULL never matches; both are statement-atomic
+BEGIN; UPDATE t SET price = 0; ROLLBACK;         -- flat snapshot transactions (in-memory only)
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [JOIN u ON t.x = u.y]      -- inner equi-join, single equality
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
@@ -141,7 +142,8 @@ Generated with `bench/gen_sales.py` (deterministic seed 42):
 
 ## Known v1 limits
 
-- No transactions (each statement is atomic); persistence is on-disk `.pink` via `.save`/`.open`
+- No nested transactions or savepoints; snapshots live in memory only
+  (crash recovery is future work); `.open` replaces the whole store
 - Correlated subqueries are rejected (uncorrelated only); no outer joins
 - Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position

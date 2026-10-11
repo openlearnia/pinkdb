@@ -255,14 +255,60 @@ impl DataTable {
 }
 
 /// The catalog + database. Owns all tables.
-#[derive(Debug, Default)]
+///
+/// Holds an optional transaction snapshot (`BEGIN` clones the whole store;
+/// `ROLLBACK` restores it, `COMMIT` drops it). Single connection, so
+/// transactions give multi-statement atomicity, not isolation.
+#[derive(Debug, Default, Clone)]
 pub struct PinkDb {
     tables: HashMap<String, DataTable>,
+    txn_snapshot: Option<Box<PinkDb>>,
 }
 
 impl PinkDb {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.
+    pub fn in_transaction(&self) -> bool {
+        self.txn_snapshot.is_some()
+    }
+
+    /// Open a transaction: snapshot the whole store. Fails if one is open
+    /// (flat transactions only — no savepoints in v1).
+    pub fn begin(&mut self) -> Result<()> {
+        if self.txn_snapshot.is_some() {
+            return Err(PinkDbError::Execution(
+                "already in a transaction".to_string(),
+            ));
+        }
+        self.txn_snapshot = Some(Box::new(self.clone()));
+        Ok(())
+    }
+
+    /// Commit: drop the snapshot, keeping all changes.
+    pub fn commit(&mut self) -> Result<()> {
+        match self.txn_snapshot.take() {
+            Some(_) => Ok(()),
+            None => Err(PinkDbError::Execution(
+                "no transaction in progress".to_string(),
+            )),
+        }
+    }
+
+    /// Roll back: restore the snapshot, discarding all changes since BEGIN
+    /// (data and catalog alike).
+    pub fn rollback(&mut self) -> Result<()> {
+        match self.txn_snapshot.take() {
+            Some(snap) => {
+                *self = *snap;
+                Ok(())
+            }
+            None => Err(PinkDbError::Execution(
+                "no transaction in progress".to_string(),
+            )),
+        }
     }
 
     fn key(name: &str) -> String {

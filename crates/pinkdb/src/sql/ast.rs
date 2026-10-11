@@ -28,6 +28,9 @@ pub enum Statement {
         table: String,
         where_clause: Option<Expr>,
     },
+    Begin,
+    Commit,
+    Rollback,
     Select(Select),
 }
 

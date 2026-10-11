@@ -112,6 +112,7 @@ LIMIT n;
 | 7 | DATE/TIMESTAMP types: storage, literals, arithmetic, date functions, CSV + persist | done (build+test+clippy green, 81 tests) |
 | 8 | Window functions: ranking + aggregates OVER, PARTITION/ORDER/ROWS frames | done (build+test+clippy green, 86 tests) |
 | 9 | UPDATE/DELETE: physical DML, simultaneous SET, statement-atomic | done (build+test+clippy green, 92 tests) |
+| 10 | Transactions: BEGIN/COMMIT/ROLLBACK via whole-store snapshots | done (build+test+clippy green, 95 tests) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 

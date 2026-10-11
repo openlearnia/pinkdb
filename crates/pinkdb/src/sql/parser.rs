@@ -120,11 +120,27 @@ impl Parser {
             Some(Keyword::Insert) => self.parse_insert(),
             Some(Keyword::Update) => self.parse_update(),
             Some(Keyword::Delete) => self.parse_delete(),
+            Some(Keyword::Begin) => {
+                self.next();
+                // `BEGIN` or `BEGIN TRANSACTION`.
+                self.eat_keyword(Keyword::Transaction);
+                Ok(Statement::Begin)
+            }
+            Some(Keyword::Commit) => {
+                self.next();
+                self.eat_keyword(Keyword::Transaction);
+                Ok(Statement::Commit)
+            }
+            Some(Keyword::Rollback) => {
+                self.next();
+                self.eat_keyword(Keyword::Transaction);
+                Ok(Statement::Rollback)
+            }
             Some(Keyword::Select) | Some(Keyword::With) => {
                 Ok(Statement::Select(self.parse_select()?))
             }
             _ => Err(self.error(format!(
-                "expected CREATE, INSERT, UPDATE, DELETE, or SELECT, found {:?}",
+                "expected a statement (CREATE, INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK, SELECT), found {:?}",
                 self.peek().0
             ))),
         }
@@ -975,6 +991,14 @@ mod tests {
         }
         assert!(parse_statements("UPDATE t SET;").is_err());
         assert!(parse_statements("DELETE t;").is_err());
+    }
+
+    #[test]
+    fn txn_statements() {
+        assert!(matches!(parse_one("BEGIN;"), Statement::Begin));
+        assert!(matches!(parse_one("BEGIN TRANSACTION;"), Statement::Begin));
+        assert!(matches!(parse_one("COMMIT;"), Statement::Commit));
+        assert!(matches!(parse_one("ROLLBACK TRANSACTION;"), Statement::Rollback));
     }
 
     #[test]

@@ -1201,6 +1201,9 @@ pub fn bind(db: &PinkDb, stmt: &Statement) -> Result<LogicalPlan> {
             bind_update(db, table, sets, where_clause)
         }
         Statement::Delete { table, where_clause } => bind_delete(db, table, where_clause),
+        Statement::Begin => Ok(LogicalPlan::Begin),
+        Statement::Commit => Ok(LogicalPlan::Commit),
+        Statement::Rollback => Ok(LogicalPlan::Rollback),
         Statement::Select(sel) => bind_select(db, sel),
     }
 }
@@ -1403,6 +1406,7 @@ fn plan_schema(
         }
         LogicalPlan::CreateTable { .. } | LogicalPlan::Insert { .. } => Ok(Vec::new()),
         LogicalPlan::Update { .. } | LogicalPlan::Delete { .. } => Ok(Vec::new()),
+        LogicalPlan::Begin | LogicalPlan::Commit | LogicalPlan::Rollback => Ok(Vec::new()),
     }
 }
 

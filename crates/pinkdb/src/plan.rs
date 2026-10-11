@@ -27,6 +27,9 @@ pub enum LogicalPlan {
         table: String,
         predicate: Option<BoundExpr>,
     },
+    Begin,
+    Commit,
+    Rollback,
     /// Full scan of a table (column pruning is wave-3 optimizer work).
     Scan {
         table: String,
