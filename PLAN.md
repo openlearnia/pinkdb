@@ -116,6 +116,7 @@ LIMIT n;
 | 11 | SQL completeness: UNION, views, CAST, COALESCE, LIKE, DROP | done (build+test+clippy green, 98 tests) |
 | 12 | Parallel execution (rayon) + multi-writer Database/Connection | done (build+test+clippy green, 103 tests, 1M-row bench) |
 | 13 | Differential testing vs DuckDB (53 queries match) | done (bench/duckdiff.py) |
+| 14 | Speed round: Arc storage, borrowed codecs, FNV hashing, COUNT(*) path | done (build+test+clippy green, duckdiff 53/53, 1M-row bench) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 

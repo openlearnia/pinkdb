@@ -11,9 +11,10 @@ pub mod expr;
 pub(crate) mod window;
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use crate::types::{FastMap, FastSet};
 
-use aggregate::{aggregate, encode_row};
+use aggregate::aggregate;
 use expr::{coerce_to, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
@@ -60,7 +61,7 @@ pub(crate) struct Cx<'a> {
 #[derive(Clone)]
 pub(crate) enum Memo {
     Scalar(Value),
-    Set(HashSet<Vec<u8>>, bool, Option<DataType>),
+    Set(FastSet<Vec<u8>>, bool, Option<DataType>),
     Flag(bool),
 }
 
@@ -299,6 +300,24 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
             let inner = eval(cx, input)?;
+            // Fast path: pure COUNT(*) with no keys counts chunk lengths —
+            // no data touched at all.
+            if keys.is_empty()
+                && !aggs.is_empty()
+                && aggs.iter().all(|a| a.func == crate::sql::binder::AggFunc::Count && a.arg.is_none())
+            {
+                let total: i64 = inner.chunks.iter().map(|c| c.num_rows() as i64).sum();
+                let mut vec = Vector::new_empty(DataType::Bigint);
+                vec.push_valid(Value::Bigint(total))?;
+                let chunks = vec![DataChunk::new(vec![vec])?];
+                let mut names = Vec::with_capacity(aggs.len());
+                let mut types = Vec::with_capacity(aggs.len());
+                for (i, a) in aggs.iter().enumerate() {
+                    names.push(format!("__agg{i}"));
+                    types.push(a.dtype);
+                }
+                return Ok(Output { chunks, names, types });
+            }
             let chunks = aggregate(cx, &inner.chunks, keys, aggs)?;
             let (names, types) = agg_output_schema(keys, aggs);
             Ok(Output { chunks, names, types })
@@ -402,7 +421,7 @@ fn hash_join(
     // Build: encoding → right row locations. Cross-type numeric keys are
     // canonicalized to their common type first (binder allows `1 = 1.0`).
     let common = common_numeric(left_key.dtype(), right_key.dtype()).ok();
-    let mut map: HashMap<Vec<u8>, Vec<(usize, usize)>> = HashMap::new();
+    let mut map: FastMap<Vec<u8>, Vec<(usize, usize)>> = FastMap::default();
     let mut buf = Vec::new();
     for (ci, chunk) in right_chunks.iter().enumerate() {
         let kv = eval_expr(right_key, chunk, cx)?;
@@ -414,58 +433,67 @@ fn hash_join(
             if kv.is_null(i) {
                 continue;
             }
+            // Borrowed encoding, get-first: hits allocate nothing.
             buf.clear();
-            encode_row(&mut buf, &[kv.get(i)]);
-            map.entry(buf.clone()).or_default().push((ci, i));
+            kv.encode_into(&mut buf, i);
+            match map.get_mut(&buf) {
+                Some(v) => v.push((ci, i)),
+                None => {
+                    map.insert(buf.clone(), vec![(ci, i)]);
+                }
+            }
         }
     }
 
-    // Probe in parallel: each left chunk yields its joined rows in order;
-    // the shared build map is read-only here.
+    // Probe in parallel: each left chunk yields match locations in order;
+    // assembly below pushes straight from source chunks (no Value roundtrip).
     let mut dtypes: Vec<DataType> = left_types.to_vec();
     dtypes.extend(right_types.iter().copied());
-    let probed: Vec<Vec<Vec<Value>>> = left_chunks
+    let n_left = left_types.len();
+    let probed: Vec<Vec<(usize, usize, usize, usize)>> = left_chunks
         .par_iter()
-        .map(|chunk| {
+        .enumerate()
+        .map(|(lci, chunk)| {
             let kv = eval_expr(left_key, chunk, cx)?;
             let kv = match common {
                 Some(t) => coerce_to(&kv, t)?,
                 None => kv,
             };
-            let mut rows = Vec::new();
+            let mut locs = Vec::with_capacity(chunk.num_rows());
             let mut buf = Vec::new();
             for i in 0..chunk.num_rows() {
                 if kv.is_null(i) {
                     continue;
                 }
                 buf.clear();
-                encode_row(&mut buf, &[kv.get(i)]);
+                kv.encode_into(&mut buf, i);
                 if let Some(matches) = map.get(&buf) {
                     for &(rci, ri) in matches {
-                        let mut row =
-                            Vec::with_capacity(chunk.columns.len() + right_chunks[rci].columns.len());
-                        row.extend(chunk.columns.iter().map(|c| c.get(i)));
-                        row.extend(right_chunks[rci].columns.iter().map(|c| c.get(ri)));
-                        rows.push(row);
+                        locs.push((lci, i, rci, ri));
                     }
                 }
             }
-            Ok(rows)
+            Ok(locs)
         })
         .collect::<Result<_>>()?;
     // Assemble into CHUNK_SIZE chunks in left-row order.
     let mut finished = Vec::new();
-    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
+    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
     let mut cur_rows = 0usize;
-    for rows in probed {
-        for row in rows {
+    for locs in probed {
+        for (lci, i, rci, ri) in locs {
             if cur_rows >= CHUNK_SIZE {
                 finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-                cur = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
+                cur = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
                 cur_rows = 0;
             }
-            for (dst, v) in cur.iter_mut().zip(row) {
-                dst.push_value(v)?;
+            let lchunk = &left_chunks[lci];
+            let rchunk = &right_chunks[rci];
+            for (dst, col) in cur.iter_mut().take(n_left).zip(lchunk.columns.iter()) {
+                dst.push_from(col, i)?;
+            }
+            for (dst, col) in cur.iter_mut().skip(n_left).zip(rchunk.columns.iter()) {
+                dst.push_from(col, ri)?;
             }
             cur_rows += 1;
         }
@@ -477,24 +505,28 @@ fn hash_join(
 }
 
 fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
-    let mut seen = HashSet::new();
+    let mut seen = FastSet::default();
     let mut out: Vec<Vector> = Vec::new();
     let mut out_rows = 0usize;
     let mut finished: Vec<DataChunk> = Vec::new();
     let mut buf = Vec::new();
     for chunk in chunks.iter() {
         for i in 0..chunk.num_rows() {
+            // Borrowed encoding, get-first: hits (dupes) allocate nothing.
             buf.clear();
-            encode_row(&mut buf, &chunk.columns.iter().map(|c| c.get(i)).collect::<Vec<_>>());
-            if !seen.insert(buf.clone()) {
+            for col in chunk.columns.iter() {
+                col.encode_into(&mut buf, i);
+            }
+            if seen.contains(&buf) {
                 continue;
             }
+            seen.insert(buf.clone());
             if out.is_empty() {
-                out = chunk.columns.iter().map(|c| Vector::new_empty(c.dtype())).collect();
+                out = chunk.columns.iter().map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE)).collect();
             }
             if out_rows >= CHUNK_SIZE {
                 finished.push(DataChunk::new(std::mem::take(&mut out))?);
-                out = chunk.columns.iter().map(|c| Vector::new_empty(c.dtype())).collect();
+                out = chunk.columns.iter().map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE)).collect();
                 out_rows = 0;
             }
             for (col, src) in out.iter_mut().zip(chunk.columns.iter()) {
@@ -570,12 +602,12 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec
     // Rebuild columns in sorted order.
     let dtypes: Vec<DataType> = chunks[0].columns.iter().map(|c| c.dtype()).collect();
     let mut finished = Vec::new();
-    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
+    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
     let mut cur_rows = 0;
     for r in rows {
         if cur_rows >= CHUNK_SIZE {
             finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-            cur = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
+            cur = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
             cur_rows = 0;
         }
         let src = &chunks[r.chunk];

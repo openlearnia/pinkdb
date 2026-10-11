@@ -5,6 +5,7 @@
 //! thread. No persistence in v1.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::sql::ast::Select;
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -15,7 +16,11 @@ use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
 pub struct Column {
     pub name: String,
     pub dtype: DataType,
-    pub chunks: Vec<Vector>,
+    /// Reference-counted chunks: scans share storage instead of cloning
+    /// megabytes per query. Mutations use copy-on-write (`Arc::make_mut`),
+    /// which never actually clones — the executor never holds chunks
+    /// across a `&mut` borrow.
+    pub chunks: Vec<Arc<Vector>>,
 }
 
 impl Column {
@@ -23,7 +28,7 @@ impl Column {
         Self {
             name,
             dtype,
-            chunks: vec![Vector::new_empty(dtype)],
+            chunks: vec![Arc::new(Vector::new_empty(dtype))],
         }
     }
 }
@@ -136,14 +141,12 @@ impl DataTable {
             .unwrap_or(true);
         if tail_full {
             for col in &mut self.columns {
-                col.chunks.push(Vector::new_empty(col.dtype));
+                col.chunks.push(Arc::new(Vector::new_empty(col.dtype)));
             }
         }
         for (col, val) in self.columns.iter_mut().zip(values) {
             let coerced = Self::coerce(val, col.dtype)?;
-            col.chunks
-                .last_mut()
-                .expect("tail chunk exists")
+            Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
                 .push_value(coerced)?;
         }
         self.num_rows += 1;
@@ -185,7 +188,7 @@ impl DataTable {
             staged.push((*col, *row, Self::coerce(v.clone(), dtype)?));
         }
         for (col, row, v) in staged {
-            self.columns[col].chunks[chunk].set_value(row, v)?;
+            Arc::make_mut(&mut self.columns[col].chunks[chunk]).set_value(row, v)?;
         }
         if !updates.is_empty() {
             self.version += 1;
@@ -222,7 +225,7 @@ impl DataTable {
         }
         let removed = len - keep.len();
         for col in &mut self.columns {
-            col.chunks[chunk] = col.chunks[chunk].gather(&keep);
+            col.chunks[chunk] = Arc::new(col.chunks[chunk].gather(&keep));
         }
         // Drop chunks left empty (all columns share chunk boundaries).
         if self.columns[0].chunks[chunk].is_empty() {
@@ -242,13 +245,14 @@ impl DataTable {
         self.columns.first().map(|c| c.chunks.len()).unwrap_or(0)
     }
 
-    /// Read chunk `idx` as a `DataChunk` (column chunks cloned).
+    /// Read chunk `idx` as a `DataChunk` (columns shared by reference —
+    /// scans never copy data).
     pub fn scan_chunk(&self, idx: usize) -> Option<DataChunk> {
         if idx >= self.num_chunks() {
             return None;
         }
         let cols = self.columns.iter().map(|c| c.chunks[idx].clone()).collect();
-        DataChunk::new(cols).ok()
+        DataChunk::from_arcs(cols)
     }
 
     /// Value at (row, col).

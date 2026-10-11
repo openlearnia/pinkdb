@@ -6,6 +6,41 @@
 
 use std::fmt;
 
+// ---------- fast deterministic hashing ----------
+// FNV-1a for short group/join keys: much cheaper than SipHash RandomState
+// and deterministic across runs (stable chunk-partitioning behavior).
+
+#[derive(Clone, Default)]
+pub struct FnvBuild;
+
+pub struct FnvHash(u64);
+
+impl std::hash::BuildHasher for FnvBuild {
+    type Hasher = FnvHash;
+    fn build_hasher(&self) -> FnvHash {
+        FnvHash(0xcbf29ce484222325)
+    }
+}
+
+impl std::hash::Hasher for FnvHash {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// HashMap with FNV-1a hashing for hot grouping paths.
+pub type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
+
+/// HashSet with FNV-1a hashing (IN-sets, DISTINCT).
+pub type FastSet<T> = std::collections::HashSet<T, FnvBuild>;
+
 /// Column data type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DataType {

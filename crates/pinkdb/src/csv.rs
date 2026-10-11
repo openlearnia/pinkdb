@@ -10,60 +10,87 @@ use std::path::Path;
 use crate::storage::PinkDb;
 use crate::types::{DataType, PinkDbError, Result, Value, parse_date, parse_timestamp};
 
-/// Infer one column's type from its non-empty cells.
-fn infer_column(cells: &[&str]) -> DataType {
-    let mut non_empty = 0;
-    let mut is_bool = true;
-    let mut is_i32 = true;
-    let mut is_i64 = true;
-    let mut is_f64 = true;
-    let mut is_date = true;
-    let mut is_ts = true;
+/// Streaming inference state: folded per cell, no row storage.
+/// Same rule as before (all-non-empty-cells agree), computed in one pass.
+#[derive(Clone)]
+struct InferState {
+    non_empty: usize,
+    is_bool: bool,
+    is_i32: bool,
+    is_i64: bool,
+    is_f64: bool,
+    is_date: bool,
+    is_ts: bool,
+}
 
-    for c in cells {
-        let c = c.trim();
-        if c.is_empty() {
-            continue;
+impl InferState {
+    fn new() -> Self {
+        Self {
+            non_empty: 0,
+            is_bool: true,
+            is_i32: true,
+            is_i64: true,
+            is_f64: true,
+            is_date: true,
+            is_ts: true,
         }
-        non_empty += 1;
-        let lower = c.to_ascii_lowercase();
-        if lower != "true" && lower != "false" {
-            is_bool = false;
+    }
+
+    fn feed(&mut self, cell: &str) {
+        let c = cell.trim();
+        if c.is_empty() {
+            return;
+        }
+        self.non_empty += 1;
+        // Case-insensitive compare without allocating (hot path: every cell).
+        if !(c.eq_ignore_ascii_case("true") || c.eq_ignore_ascii_case("false")) {
+            self.is_bool = false;
         }
         if c.parse::<i32>().is_err() {
-            is_i32 = false;
+            self.is_i32 = false;
         }
         if c.parse::<i64>().is_err() {
-            is_i64 = false;
+            self.is_i64 = false;
         }
         if c.parse::<f64>().is_err() {
-            is_f64 = false;
+            self.is_f64 = false;
         }
         if parse_date(c).is_none() {
-            is_date = false;
+            self.is_date = false;
         }
         if parse_timestamp(c).is_none() {
-            is_ts = false;
+            self.is_ts = false;
         }
     }
 
-    if non_empty == 0 {
-        DataType::Varchar
-    } else if is_bool {
-        DataType::Boolean
-    } else if is_i32 {
-        DataType::Integer
-    } else if is_i64 {
-        DataType::Bigint
-    } else if is_f64 {
-        DataType::Double
-    } else if is_date {
-        DataType::Date
-    } else if is_ts {
-        DataType::Timestamp
-    } else {
-        DataType::Varchar
+    fn dtype(&self) -> DataType {
+        if self.non_empty == 0 {
+            DataType::Varchar
+        } else if self.is_bool {
+            DataType::Boolean
+        } else if self.is_i32 {
+            DataType::Integer
+        } else if self.is_i64 {
+            DataType::Bigint
+        } else if self.is_f64 {
+            DataType::Double
+        } else if self.is_date {
+            DataType::Date
+        } else if self.is_ts {
+            DataType::Timestamp
+        } else {
+            DataType::Varchar
+        }
     }
+}
+
+/// Infer one column's type from its non-empty cells.
+fn infer_column(cells: &[&str]) -> DataType {
+    let mut st = InferState::new();
+    for c in cells {
+        st.feed(c);
+    }
+    st.dtype()
 }
 
 /// Infer a full schema from header + string records.
@@ -86,9 +113,9 @@ fn parse_cell(cell: &str, dtype: DataType) -> Result<Value> {
         return Ok(Value::Null);
     }
     match dtype {
-        DataType::Boolean => match c.to_ascii_lowercase().as_str() {
-            "true" => Ok(Value::Boolean(true)),
-            "false" => Ok(Value::Boolean(false)),
+        DataType::Boolean => match c {
+            c if c.eq_ignore_ascii_case("true") => Ok(Value::Boolean(true)),
+            c if c.eq_ignore_ascii_case("false") => Ok(Value::Boolean(false)),
             _ => Err(PinkDbError::Type(format!(
                 "cannot parse \"{c}\" as BOOLEAN"
             ))),
@@ -121,63 +148,80 @@ fn default_table_name(path: &str) -> String {
         .to_string()
 }
 
-/// Read CSV bytes (with header row) into `(headers, records)`.
-fn read_records(data: &[u8]) -> Result<(Vec<String>, Vec<Vec<String>>)> {
-    let mut reader = csv::ReaderBuilder::new()
+fn open_reader(data: &[u8]) -> csv::Reader<&[u8]> {
+    csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
         .trim(csv::Trim::None)
-        .from_reader(data);
+        .from_reader(data)
+}
+
+fn read_headers(reader: &mut csv::Reader<&[u8]>) -> Result<Vec<String>> {
     let headers: Vec<String> = reader
-        .headers()
+        .byte_headers()
         .map_err(PinkDbError::Csv)?
         .iter()
-        .map(|h| h.to_string())
+        .map(|h| String::from_utf8_lossy(h).into_owned())
         .collect();
     if headers.is_empty() {
         return Err(PinkDbError::Catalog("CSV has no header row".to_string()));
     }
-    // Note: constructing a csv::Error for an empty-header case without IO
-    // backing is awkward; use a Catalog error instead.
-    let mut records = Vec::new();
-    for row in reader.records() {
-        let row = row.map_err(PinkDbError::Csv)?;
-        records.push(row.iter().map(|f| f.to_string()).collect());
-    }
-    Ok((headers, records))
+    Ok(headers)
 }
 
-/// Load header + records into a fresh table (shared by file/string import).
-/// All-or-nothing: a failure drops the freshly created table.
-fn load_into(
-    db: &mut PinkDb,
-    table: &str,
-    headers: Vec<String>,
-    records: Vec<Vec<String>>,
-) -> Result<usize> {
-    let schema_types = infer_schema(&headers, &records);
-    let schema: Vec<(String, DataType)> =
-        headers.into_iter().zip(schema_types.iter().copied()).collect();
+/// Borrowed field as &str (invalid UTF-8 errors instead of panicking).
+fn field_str(rec: &csv::ByteRecord, i: usize) -> Result<&str> {
+    match rec.get(i) {
+        Some(b) => std::str::from_utf8(b)
+            .map_err(|_| PinkDbError::Execution("CSV contains invalid UTF-8".to_string())),
+        None => Ok(""),
+    }
+}
+
+/// Load CSV bytes into a fresh table (shared by file/string import).
+/// Two streaming passes over the input (page-cache resident): inference
+/// folds per-cell state with no row storage, then rows parse straight into
+/// typed columns. All-or-nothing: a failure drops the created table.
+fn load_bytes(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<usize> {
+    // Pass 1: headers + inference (record buffer reused across rows).
+    let mut reader = open_reader(data);
+    let headers = read_headers(&mut reader)?;
+    let mut states = vec![InferState::new(); headers.len()];
+    let mut rec = csv::ByteRecord::new();
+    while reader.read_byte_record(&mut rec).map_err(PinkDbError::Csv)? {
+        for (i, st) in states.iter_mut().enumerate() {
+            st.feed(field_str(&rec, i)?);
+        }
+    }
+    let schema: Vec<(String, DataType)> = headers
+        .into_iter()
+        .zip(states.iter().map(|st| st.dtype()))
+        .collect();
     let parsed_types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
     db.create_table(table, schema)?;
+    // Pass 2: parse + append (record buffer reused).
     let result = (|| {
+        let mut reader = open_reader(data);
+        let _ = read_headers(&mut reader)?;
         let tbl = db.table_mut(table)?;
-        for row in &records {
-            if row.len() > parsed_types.len() {
+        let mut count = 0usize;
+        let mut rec = csv::ByteRecord::new();
+        while reader.read_byte_record(&mut rec).map_err(PinkDbError::Csv)? {
+            if rec.len() > parsed_types.len() {
                 return Err(PinkDbError::Catalog(format!(
                     "CSV row has {} fields but the header has {}",
-                    row.len(),
+                    rec.len(),
                     parsed_types.len()
                 )));
             }
             let mut values = Vec::with_capacity(parsed_types.len());
             for (i, dtype) in parsed_types.iter().enumerate() {
-                let cell = row.get(i).map(String::as_str).unwrap_or("");
-                values.push(parse_cell(cell, *dtype)?);
+                values.push(parse_cell(field_str(&rec, i)?, *dtype)?);
             }
             tbl.append_row(values)?;
+            count += 1;
         }
-        Ok(records.len())
+        Ok(count)
     })();
     if result.is_err() {
         db.drop_table(table).ok();
@@ -196,11 +240,7 @@ pub fn import_csv(db: &mut PinkDb, path: &str, table: Option<&str>) -> Result<us
             &owned
         }
     };
-    let (headers, records) = read_records(&data)?;
-    if headers.is_empty() {
-        return Err(PinkDbError::Catalog("CSV has no header row".to_string()));
-    }
-    load_into(db, table_name, headers, records)
+    load_bytes(db, table_name, &data)
 }
 
 /// Import CSV text (header + rows) — used by tests and the REPL.
@@ -209,11 +249,7 @@ pub fn import_csv_string(
     table: &str,
     csv_text: &str,
 ) -> Result<usize> {
-    let (headers, records) = read_records(csv_text.as_bytes())?;
-    if headers.is_empty() {
-        return Err(PinkDbError::Catalog("CSV has no header row".to_string()));
-    }
-    load_into(db, table, headers, records)
+    load_bytes(db, table, csv_text.as_bytes())
 }
 
 #[cfg(test)]

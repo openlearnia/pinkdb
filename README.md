@@ -159,12 +159,12 @@ Generated with `bench/gen_sales.py` (deterministic seed 42):
 
 | Step | Time (rayon) | Before |
 |---|---|---|
-| `.import` 1M rows (24 MB CSV) | 0.43 s | 0.42 s |
+| `.import` 1M rows (24 MB CSV) | 0.25 s | 0.42 s |
 | `SELECT COUNT(*) FROM sales` | 0.03 s | 0.04 s |
-| GROUP BY region + 5 aggregates | 0.04 s | 0.11 s |
-| `SELECT COUNT(*) ... WHERE total > 500` | 0.03 s | 0.07 s |
-| WHERE + GROUP BY + HAVING + ORDER + LIMIT | 0.04 s | 0.10 s |
-| 1M-row inner hash join + GROUP BY | 0.13 s | 0.27 s |
+| GROUP BY region + 5 aggregates | 0.011 s | 0.11 s |
+| `SELECT COUNT(*) ... WHERE total > 500` | 0.006 s | 0.07 s |
+| WHERE + GROUP BY + HAVING + ORDER + LIMIT | 0.011 s | 0.10 s |
+| 1M-row inner hash join + GROUP BY | 0.10 s | 0.27 s |
 
 ## Known v1 limits
 

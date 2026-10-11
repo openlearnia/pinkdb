@@ -6,6 +6,8 @@
 //! `DataChunk`s; `WHERE` produces a selection vector applied via `gather`
 //! instead of copying rows eagerly.
 
+use std::sync::Arc;
+
 use crate::types::{DataType, PinkDbError, Result, Value};
 
 /// Max rows per vector / chunk. DuckDB uses 2048; so do we.
@@ -17,7 +19,7 @@ pub enum VectorData {
     Int32(Vec<i32>),
     Int64(Vec<i64>),
     Float64(Vec<f64>),
-    VarChar(Vec<String>),
+    VarChar(Vec<Arc<str>>),
     Date32(Vec<i32>),
     TimestampMicros(Vec<i64>),
 }
@@ -114,7 +116,7 @@ impl Vector {
             VectorData::Int32(v) => v.push(0),
             VectorData::Int64(v) => v.push(0),
             VectorData::Float64(v) => v.push(0.0),
-            VectorData::VarChar(v) => v.push(String::new()),
+            VectorData::VarChar(v) => v.push(Arc::from("")),
             VectorData::Date32(v) => v.push(0),
             VectorData::TimestampMicros(v) => v.push(0),
         }
@@ -166,7 +168,7 @@ impl Vector {
             VectorData::Int32(v) => Value::Integer(v[idx]),
             VectorData::Int64(v) => Value::Bigint(v[idx]),
             VectorData::Float64(v) => Value::Double(v[idx]),
-            VectorData::VarChar(v) => Value::Varchar(v[idx].clone()),
+            VectorData::VarChar(v) => Value::Varchar(v[idx].to_string()),
             VectorData::Date32(v) => Value::Date(v[idx]),
             VectorData::TimestampMicros(v) => Value::Timestamp(v[idx]),
         }
@@ -195,7 +197,7 @@ impl Vector {
             (VectorData::Int32(v), Value::Integer(i)) => v.push(i),
             (VectorData::Int64(v), Value::Bigint(i)) => v.push(i),
             (VectorData::Float64(v), Value::Double(x)) => v.push(x),
-            (VectorData::VarChar(v), Value::Varchar(s)) => v.push(s),
+            (VectorData::VarChar(v), Value::Varchar(s)) => v.push(s.into()),
             (VectorData::Date32(v), Value::Date(d)) => v.push(d),
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v.push(us),
             (data, other) => {
@@ -235,7 +237,7 @@ impl Vector {
             (VectorData::Int32(v), Value::Integer(i)) => v[idx] = i,
             (VectorData::Int64(v), Value::Bigint(i)) => v[idx] = i,
             (VectorData::Float64(v), Value::Double(x)) => v[idx] = x,
-            (VectorData::VarChar(v), Value::Varchar(s)) => v[idx] = s,
+            (VectorData::VarChar(v), Value::Varchar(s)) => v[idx] = s.into(),
             (VectorData::Date32(v), Value::Date(d)) => v[idx] = d,
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v[idx] = us,
             (_, Value::Null) => {} // placeholder stays; bit cleared below
@@ -254,18 +256,95 @@ impl Vector {
         Ok(())
     }
 
+    /// Append this row's encoding to `buf` WITHOUT materializing a `Value`
+    /// (hot path for GROUP BY / JOIN / DISTINCT keys). Byte-identical to
+    /// encoding [`Value`]s, including the NULL tag.
+    pub fn encode_into(&self, buf: &mut Vec<u8>, idx: usize) {
+        debug_assert!(idx < self.len);
+        if !self.is_valid(idx) {
+            buf.push(0);
+            return;
+        }
+        match &self.data {
+            VectorData::Boolean(v) => {
+                buf.push(1);
+                buf.push(v[idx] as u8);
+            }
+            VectorData::Int32(v) => {
+                buf.push(2);
+                buf.extend_from_slice(&v[idx].to_le_bytes());
+            }
+            VectorData::Int64(v) => {
+                buf.push(3);
+                buf.extend_from_slice(&v[idx].to_le_bytes());
+            }
+            VectorData::Float64(v) => {
+                buf.push(4);
+                buf.extend_from_slice(&v[idx].to_bits().to_le_bytes());
+            }
+            VectorData::VarChar(v) => {
+                let s: &str = &v[idx];
+                buf.push(5);
+                buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                buf.extend_from_slice(s.as_bytes());
+            }
+            VectorData::Date32(v) => {
+                buf.push(6);
+                buf.extend_from_slice(&v[idx].to_le_bytes());
+            }
+            VectorData::TimestampMicros(v) => {
+                buf.push(7);
+                buf.extend_from_slice(&v[idx].to_le_bytes());
+            }
+        }
+    }
+    /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
+    /// bulk moves: filter/project/sort/join/distinct outputs). Types must
+    /// match; strings share the `Arc` (no allocation).
+    pub fn push_from(&mut self, other: &Vector, idx: usize) -> Result<()> {
+        if self.dtype() != other.dtype() {
+            return Err(PinkDbError::Execution(
+                "push_from needs matching vector types".to_string(),
+            ));
+        }
+        if self.len >= CHUNK_SIZE {
+            return Err(PinkDbError::Execution(format!(
+                "vector overflow: len {} >= CHUNK_SIZE {CHUNK_SIZE}",
+                self.len
+            )));
+        }
+        match (&mut self.data, &other.data) {
+            (VectorData::Boolean(d), VectorData::Boolean(s)) => d.push(s[idx]),
+            (VectorData::Int32(d), VectorData::Int32(s)) => d.push(s[idx]),
+            (VectorData::Int64(d), VectorData::Int64(s)) => d.push(s[idx]),
+            (VectorData::Float64(d), VectorData::Float64(s)) => d.push(s[idx]),
+            (VectorData::VarChar(d), VectorData::VarChar(s)) => d.push(s[idx].clone()),
+            (VectorData::Date32(d), VectorData::Date32(s)) => d.push(s[idx]),
+            (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => {
+                d.push(s[idx])
+            }
+            _ => {
+                return Err(PinkDbError::Execution(
+                    "push_from needs matching vector types".to_string(),
+                ));
+            }
+        }
+        self.len += 1;
+        self.ensure_mask();
+        if other.is_valid(idx) {
+            bit_set(&mut self.validity, self.len - 1);
+        } else {
+            bit_clear(&mut self.validity, self.len - 1);
+        }
+        Ok(())
+    }
     /// Build a new vector with rows in `selection` order. Used by Filter.
     pub fn gather(&self, selection: &[usize]) -> Vector {
         let mut out = Vector::with_capacity(self.dtype(), selection.len());
         for &i in selection {
             debug_assert!(i < self.len);
-            // gather() is infallible for in-bounds indices; capacity was reserved.
-            if self.is_null(i) {
-                out.push_null().expect("gather push_null cannot fail");
-            } else {
-                out.push_valid(self.get(i))
-                    .expect("gather push_valid cannot fail");
-            }
+            // push_from shares string Arcs instead of cloning.
+            out.push_from(self, i).expect("gather push_from cannot fail");
         }
         out
     }
@@ -279,7 +358,9 @@ impl Vector {
 /// A horizontal slice of columns, all of equal length.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DataChunk {
-    pub columns: Vec<Vector>,
+    /// Reference-counted columns: scans and pass-throughs share storage
+    /// instead of cloning megabytes per query.
+    pub columns: Vec<Arc<Vector>>,
     pub num_rows: usize,
 }
 
@@ -294,7 +375,19 @@ impl DataChunk {
                 )));
             }
         }
-        Ok(Self { columns, num_rows })
+        Ok(Self {
+            columns: columns.into_iter().map(Arc::new).collect(),
+            num_rows,
+        })
+    }
+
+    /// Build from pre-shared columns (zero-copy scan path).
+    pub fn from_arcs(columns: Vec<Arc<Vector>>) -> Option<Self> {
+        let num_rows = columns.first().map(|c| c.len()).unwrap_or(0);
+        if columns.iter().any(|c| c.len() != num_rows) {
+            return None;
+        }
+        Some(Self { columns, num_rows })
     }
 
     pub fn empty() -> Self {
@@ -318,7 +411,7 @@ impl DataChunk {
 
     /// Apply a selection vector to every column.
     pub fn gather(&self, selection: &[usize]) -> DataChunk {
-        let columns = self.columns.iter().map(|c| c.gather(selection)).collect();
+        let columns = self.columns.iter().map(|c| Arc::new(c.gather(selection))).collect();
         DataChunk {
             columns,
             num_rows: selection.len(),

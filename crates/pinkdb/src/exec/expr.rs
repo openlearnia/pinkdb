@@ -14,7 +14,7 @@ use crate::sql::binder::{BoundExpr, ScalarFunc, common_numeric};
 use crate::sql::ast::BinaryOp;
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector};
-use std::collections::HashSet;
+use crate::types::FastSet;
 
 /// Evaluate `expr` over every row of `chunk`.
 pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<Vector> {
@@ -145,7 +145,7 @@ fn eval_in_subquery(
     let out = eval(cx, query)?;
     let rhs_t = out.types.first().copied().unwrap_or(DataType::Integer);
     let common = common_numeric(l.dtype(), rhs_t).ok();
-    let mut set = HashSet::new();
+    let mut set = FastSet::default();
     let mut has_null = false;
     let mut buf = Vec::new();
     for c in &out.chunks {
@@ -155,7 +155,7 @@ fn eval_in_subquery(
         };
         let col = match common {
             Some(t) => coerce_to(col, t)?,
-            None => col.clone(),
+            None => (**col).clone(),
         };
         for i in 0..col.len() {
             if col.is_null(i) {
@@ -174,7 +174,7 @@ fn eval_in_subquery(
 
 fn probe_in(
     l: &Vector,
-    set: &HashSet<Vec<u8>>,
+    set: &FastSet<Vec<u8>>,
     has_null: bool,
     common: Option<DataType>,
     negated: bool,

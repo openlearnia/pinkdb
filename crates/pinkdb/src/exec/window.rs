@@ -6,7 +6,7 @@
 //! hash aggregation; an empty frame yields COUNT → 0, others → NULL.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use crate::types::FastMap;
 
 use super::aggregate::{Acc, encode_row};
 use super::expr::eval_expr;
@@ -83,7 +83,7 @@ fn eval_one_window(
     let n = rows.len();
 
     // 2. Group global indices by partition encoding (NULL keys group together).
-    let mut groups: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    let mut groups: FastMap<Vec<u8>, Vec<usize>> = FastMap::default();
     let mut buf = Vec::new();
     for (g, row) in rows.iter().enumerate() {
         buf.clear();
@@ -146,14 +146,14 @@ fn eval_one_window(
         chunks[0].columns.iter().map(|c| c.dtype()).collect();
     dtypes.push(w.dtype);
     let mut finished = Vec::new();
-    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
+    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
     let mut cur_rows = 0usize;
     let mut g = 0usize;
     for chunk in chunks {
         for i in 0..chunk.num_rows() {
             if cur_rows >= CHUNK_SIZE {
                 finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-                cur = dtypes.iter().map(|t| Vector::new_empty(*t)).collect();
+                cur = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
                 cur_rows = 0;
             }
             for (dst, col) in cur.iter_mut().zip(chunk.columns.iter()) {
