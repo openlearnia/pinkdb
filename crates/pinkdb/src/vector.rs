@@ -90,6 +90,13 @@ fn bit_clear(mask: &mut [u64], idx: usize) {
     mask[idx / 64] &= !(1u64 << (idx % 64));
 }
 
+/// Error for a typed push into the wrong column layout (internal fast paths).
+fn typed_push_error(what: &str, into: DataType) -> PinkDbError {
+    PinkDbError::Type(format!(
+        "type mismatch: cannot push {what} into {into:?} vector"
+    ))
+}
+
 impl Vector {
     pub fn new_empty(dtype: DataType) -> Self {
         Self::with_capacity(dtype, 0)
@@ -101,6 +108,43 @@ impl Vector {
             validity: vec![0u64; mask_len(cap.min(CHUNK_SIZE))],
             len: 0,
         }
+    }
+
+    /// Build a constant vector of `n` identical rows without per-row `Value`
+    /// materialization or string cloning. `NULL` ⇒ INTEGER-typed vector with
+    /// every validity bit clear (matches the old `push_value(Value::Null)`
+    /// loop); scalars ⇒ `n` valid rows; VARCHAR ⇒ one shared `Arc<str>`
+    /// cloned `n` times.
+    pub(crate) fn new_const(value: &Value, n: usize) -> Vector {
+        debug_assert!(n <= CHUNK_SIZE, "constant vector exceeds CHUNK_SIZE");
+        let (data, all_valid) = match value {
+            Value::Null => (VectorData::Int32(vec![0; n]), false),
+            Value::Boolean(b) => (VectorData::Boolean(vec![*b; n]), true),
+            Value::Integer(i) => (VectorData::Int32(vec![*i; n]), true),
+            Value::Bigint(i) => (VectorData::Int64(vec![*i; n]), true),
+            Value::Double(x) => (VectorData::Float64(vec![*x; n]), true),
+            Value::Varchar(s) => {
+                let shared: Arc<str> = Arc::from(s.as_str());
+                (VectorData::VarChar(vec![shared; n]), true)
+            }
+            Value::Date(d) => (VectorData::Date32(vec![*d; n]), true),
+            Value::Timestamp(us) => (VectorData::TimestampMicros(vec![*us; n]), true),
+        };
+        let mut validity = vec![if all_valid { u64::MAX } else { 0 }; mask_len(n)];
+        if all_valid && !n.is_multiple_of(64) {
+            // Bits past `len` must read as NULL, like push-built masks do.
+            validity[mask_len(n) - 1] = (1u64 << (n % 64)) - 1;
+        }
+        Vector::from_parts(data, validity, n)
+    }
+
+    /// Build a vector directly from raw parts (crate-internal fast paths):
+    /// `data` must hold exactly `len` elements; `validity` is normalized to
+    /// `mask_len(len)` words (extra words dropped, missing ones read NULL).
+    pub(crate) fn from_parts(data: VectorData, mut validity: Vec<u64>, len: usize) -> Vector {
+        debug_assert_eq!(data.len(), len);
+        validity.resize(mask_len(len), 0);
+        Vector { data, validity, len }
     }
 
     fn ensure_mask(&mut self) {
@@ -146,6 +190,14 @@ impl Vector {
 
     pub fn data(&self) -> &VectorData {
         &self.data
+    }
+
+    /// Raw validity bitmask: bit `i` set ⇒ row `i` valid. May span more
+    /// words than `mask_len(len)` for preallocated vectors; the extra words
+    /// are always zero. Crate-internal fast paths only (`is_valid` is the
+    /// checked per-row read).
+    pub(crate) fn validity(&self) -> &[u64] {
+        &self.validity
     }
 
     pub fn is_valid(&self, idx: usize) -> bool {
@@ -231,6 +283,55 @@ impl Vector {
         self.ensure_mask();
         bit_set(&mut self.validity, self.len - 1);
         Ok(())
+    }
+
+    /// Typed append helpers for crate-internal fast paths: no `Value`
+    /// materialization, same dtype checks as [`Self::push_valid`].
+    pub(crate) fn push_bool(&mut self, b: bool) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Boolean(v) => v.push(b),
+            data => return Err(typed_push_error("a boolean", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
+    pub(crate) fn push_int32(&mut self, i: i32) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Int32(v) => v.push(i),
+            data => return Err(typed_push_error("an integer", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
+    pub(crate) fn push_int64(&mut self, i: i64) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Int64(v) => v.push(i),
+            data => return Err(typed_push_error("a bigint", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
+    pub(crate) fn push_float64(&mut self, x: f64) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Float64(v) => v.push(x),
+            data => return Err(typed_push_error("a double", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
+    /// Shared tail of the typed push helpers: bump `len`, mark the new row valid.
+    fn finish_typed_push(&mut self) {
+        self.len += 1;
+        self.ensure_mask();
+        bit_set(&mut self.validity, self.len - 1);
     }
 
     /// Bulk-append `len` elements starting at `start` from `other` onto `self`
@@ -344,7 +445,18 @@ impl Vector {
             }
             VectorData::Float64(v) => {
                 buf.push(4);
-                buf.extend_from_slice(&v[idx].to_bits().to_le_bytes());
+                // Normalize -0.0 → 0.0 and all NaNs to one encoding (same as
+                // `aggregate::encode_value`) so GROUP BY / DISTINCT / JOIN
+                // agree with `=` and window partitioning.
+                let x = v[idx];
+                let norm = if x.is_nan() {
+                    f64::NAN
+                } else if x == 0.0 {
+                    0.0
+                } else {
+                    x
+                };
+                buf.extend_from_slice(&norm.to_bits().to_le_bytes());
             }
             VectorData::VarChar(v) => {
                 let s: &str = &v[idx];
@@ -605,5 +717,65 @@ mod tests {
         assert!(v.is_null(65));
         assert!(v.is_valid(128));
         assert!(v.is_null(129));
+    }
+
+    #[test]
+    fn new_const_matches_push_loop() {
+        // Dtypes, lengths, payloads, and validity must match a vector built
+        // row-by-row with push_value, across the validity word boundary.
+        let cases = [
+            Value::Null,
+            Value::Integer(7),
+            Value::Varchar("pink".to_string()),
+        ];
+        for value in &cases {
+            for n in [0usize, 1, 63, 64, 65, 130] {
+                let dtype = value.data_type().unwrap_or(DataType::Integer);
+                let mut pushed = Vector::new_empty(dtype);
+                for _ in 0..n {
+                    pushed.push_value(value.clone()).unwrap();
+                }
+                let packed = Vector::new_const(value, n);
+                assert_eq!(packed.dtype(), pushed.dtype(), "value={value:?} n={n}");
+                assert_eq!(packed.len(), pushed.len());
+                assert_eq!(packed, pushed, "value={value:?} n={n}");
+                for i in 0..n {
+                    assert_eq!(packed.get(i), pushed.get(i));
+                    assert_eq!(packed.is_valid(i), pushed.is_valid(i));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_const_varchar_shares_one_allocation() {
+        let value = Value::Varchar("shared".to_string());
+        let v = Vector::new_const(&value, 100);
+        let VectorData::VarChar(strings) = v.data() else {
+            panic!("expected VARCHAR data");
+        };
+        assert_eq!(strings.len(), 100);
+        assert!(strings.iter().all(|s| Arc::ptr_eq(s, &strings[0])));
+    }
+
+    /// GROUP BY / DISTINCT / JOIN keys use `encode_into`: FLOAT cells must
+    /// normalize -0.0 → 0.0 and all NaNs to one encoding (like
+    /// `aggregate::encode_value`), so the hash paths agree with `=`.
+    #[test]
+    fn encode_normalizes_float_zeros_and_nans() {
+        let mut v = Vector::new_empty(DataType::Double);
+        v.push_valid(Value::Double(-0.0)).unwrap();
+        v.push_valid(Value::Double(0.0)).unwrap();
+        // Two NaNs with different sign/payload bits.
+        v.push_valid(Value::Double(f64::from_bits(0x7ff8_0000_0000_0001))).unwrap();
+        v.push_valid(Value::Double(f64::from_bits(0xfff8_0000_0000_0042))).unwrap();
+        let enc = |i: usize| {
+            let mut b = Vec::new();
+            v.encode_into(&mut b, i);
+            b
+        };
+        assert_eq!(enc(0), enc(1), "-0.0 and 0.0 must encode the same");
+        assert_eq!(enc(2), enc(3), "all NaNs must encode the same");
+        assert_ne!(enc(0), enc(2));
     }
 }

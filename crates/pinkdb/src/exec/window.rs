@@ -125,14 +125,39 @@ fn eval_one_window(
                 }
             }
             WindowFunc::Agg(f) => {
-                for (pos, g) in seq.iter().enumerate() {
+                // `UnboundedPreceding` frames only ever grow: `hi(pos)` from
+                // `frame_range` is monotone non-decreasing (every end bound
+                // saturates; a `k PRECEDING` end is empty — `None` — before
+                // it reaches row 0), so one running accumulator extended row
+                // by row gives bit-identical results to recomputing each
+                // frame — but O(n) instead of O(n²) on whole-partition frames.
+                if w.frame.start == FrameBound::UnboundedPreceding {
                     let mut acc = Acc::new(f);
-                    if let Some((lo, hi)) = frame_range(&w.frame, pos, seq.len()) {
-                        for k in lo..=hi {
-                            acc.update(rows[seq[k]].arg.as_ref());
+                    let mut next_to_add = 0usize;
+                    for (pos, g) in seq.iter().enumerate() {
+                        if let Some((_, hi)) = frame_range(&w.frame, pos, seq.len()) {
+                            // Additions happen in the same order as the
+                            // per-row recompute used to (same frame rows,
+                            // same order ⇒ identical float results too).
+                            while next_to_add <= hi {
+                                acc.update(rows[seq[next_to_add]].arg.as_ref());
+                                next_to_add += 1;
+                            }
                         }
+                        out_vals[*g] = acc.finalize_ref(w.dtype);
                     }
-                    out_vals[*g] = acc.finalize(w.dtype);
+                } else {
+                    // Bounded start: frames are bounded by the spec, so a
+                    // per-row recompute is fine (and keeps the code simple).
+                    for (pos, g) in seq.iter().enumerate() {
+                        let mut acc = Acc::new(f);
+                        if let Some((lo, hi)) = frame_range(&w.frame, pos, seq.len()) {
+                            for k in lo..=hi {
+                                acc.update(rows[seq[k]].arg.as_ref());
+                            }
+                        }
+                        out_vals[*g] = acc.finalize(w.dtype);
+                    }
                 }
             }
         }
@@ -157,7 +182,7 @@ fn eval_one_window(
                 cur_rows = 0;
             }
             for (dst, col) in cur.iter_mut().zip(chunk.columns.iter()) {
-                dst.push_value(col.get(i))?;
+                dst.push_from(col, i)?;
             }
             cur.last_mut().expect("new column").push_value(out_vals[g].clone())?;
             cur_rows += 1;
@@ -218,7 +243,9 @@ fn frame_range(
     };
     let hi = match frame.end {
         UnboundedPreceding => return None,
-        Preceding(k) => pos.saturating_sub(k),
+        // A `k PRECEDING` end bound before the partition start is an EMPTY
+        // frame; saturating would wrongly clamp it to row 0 and include it.
+        Preceding(k) => pos.checked_sub(k)?,
         CurrentRow => pos,
         Following(k) => pos.saturating_add(k).min(len - 1),
         UnboundedFollowing => len - 1,

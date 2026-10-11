@@ -163,16 +163,24 @@ isolation without predicate tracking (write-skew is possible). The plain
 
 ## Benchmark (1M rows, release, Apple Silicon)
 
-Generated with `bench/gen_sales.py` (deterministic seed 42):
+Generated with `bench/gen_sales.py` (deterministic seed 42), measured with `cargo run --release -p pinkdb --example query_bench` (best of 5):
 
-| Step | Time (rayon) | Before |
+| Query | Now (ms) | Before wave 17 (ms) |
 |---|---|---|
-| `.import` 1M rows (24 MB CSV) | 0.03 s | 0.42 s |
-| `SELECT COUNT(*) FROM sales` | 0.000 s | 0.04 s |
-| GROUP BY region + 5 aggregates | 0.011 s | 0.11 s |
-| `SELECT COUNT(*) ... WHERE total > 500` | 0.006 s | 0.07 s |
-| WHERE + GROUP BY + HAVING + ORDER + LIMIT | 0.011 s | 0.10 s |
-| 1M-row inner hash join + GROUP BY | 0.10 s | 0.27 s |
+| `.import` 1M rows (24 MB CSV) | 25 | 28 |
+| `SELECT COUNT(*) FROM sales` | 0.01 | 0.02 |
+| `SELECT COUNT(*) ... WHERE total > 500` | 5.1 | 5.8 |
+| `SELECT COUNT(*) ... WHERE region = 'west'` | 4.1 | 27 |
+| `SELECT upper(region), length(region)` (1M rows) | 15 | 35 |
+| GROUP BY region + 5 aggregates | 7.7 | 9 |
+| GROUP BY id (1M groups) | 66 | 141 |
+| ORDER BY total DESC LIMIT 10 | 3.0 | 100 |
+| ORDER BY region (full sort) | 40 | 104 |
+| DISTINCT region, active | 22 | 22 |
+| DISTINCT id (1M values) | 64 | 75 |
+| ROW_NUMBER() OVER (PARTITION BY region ORDER BY id) | 93 | 165 |
+| COUNT(*) OVER (PARTITION BY region) | 79 | minutes (O(n²)) |
+| 1M-row self hash join + COUNT | 64 | 143 |
 
 For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 (`read_csv_auto` → table), single connection.
@@ -202,4 +210,5 @@ cargo test             # 100+ unit + end-to-end tests
 cargo clippy --all-targets   # must stay clean
 python3 bench/duckdiff.py [--big sales.csv]  # differential test vs DuckDB
 cargo run --release -p pinkdb --example import_bench  # CSV import timing
+cargo run --release -p pinkdb --example query_bench  # full query battery (ms)
 ```

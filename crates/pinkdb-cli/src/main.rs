@@ -96,9 +96,7 @@ fn run_dot(db: &mut PinkDb, line: &str) -> bool {
                 match db.save(path) {
                     Ok(()) => {
                         if !db.list_views().is_empty() {
-                            println!(
-                                "Note: views are session-local and were not saved."
-                            );
+                            println!("Note: views are session-local and were not saved.");
                         }
                         println!("Saved in {:.3}s", t0.elapsed().as_secs_f64())
                     }
@@ -140,8 +138,23 @@ fn display_value(v: &Value) -> String {
     }
 }
 
-fn render_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) {
-    let cells: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(display_value).collect()).collect();
+/// Formats a `SELECT` result as the DuckDB-style box table: header names,
+/// type row, up to [`DISPLAY_CAP`] data rows, and the trailing summary line.
+///
+/// Only the shown rows are formatted: column widths are computed from the
+/// header names, the type row, and those rows, so huge results don't pay for
+/// rows that are never displayed. The summary still reports the true total
+/// row count.
+///
+/// The result has no trailing newline; `run_sql` prints it with `println!`
+/// so a single call reproduces the old per-line output byte for byte.
+fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> String {
+    let shown = rows.len().min(DISPLAY_CAP);
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .take(shown)
+        .map(|r| r.iter().map(display_value).collect())
+        .collect();
     let type_row: Vec<String> = types.iter().map(|t| t.name().to_string()).collect();
     let mut widths: Vec<usize> = names.iter().map(|n| n.chars().count().max(1)).collect();
     for (i, t) in type_row.iter().enumerate() {
@@ -153,42 +166,47 @@ fn render_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) {
         }
     }
 
-    let border = |l: &str, m: &str, r: &str| {
-        let mut s = String::from(l);
+    let mut out = String::new();
+    let border = |out: &mut String, l: &str, m: &str, r: &str| {
+        out.push_str(l);
         for (i, w) in widths.iter().enumerate() {
             if i > 0 {
-                s.push_str(m);
+                out.push_str(m);
             }
-            s.push_str(&"─".repeat(w + 2));
+            out.push_str(&"─".repeat(w + 2));
         }
-        s.push_str(r);
-        println!("{s}");
+        out.push_str(r);
+        out.push('\n');
     };
-    let row_out = |items: &[String]| {
-        let mut s = String::from("│");
+    let row_out = |out: &mut String, items: &[String]| {
+        out.push('│');
         for (i, c) in items.iter().enumerate() {
             let w = widths[i];
-            s.push(' ');
-            s.push_str(c);
-            s.push_str(&" ".repeat(w - c.chars().count() + 1));
-            s.push('│');
+            out.push(' ');
+            out.push_str(c);
+            out.push_str(&" ".repeat(w - c.chars().count() + 1));
+            out.push('│');
         }
-        println!("{s}");
+        out.push('\n');
     };
 
-    border("┌", "┬", "┐");
-    row_out(&names.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-    row_out(&type_row);
-    border("├", "┼", "┤");
-    for row in cells.iter().take(DISPLAY_CAP) {
-        row_out(row);
+    border(&mut out, "┌", "┬", "┐");
+    row_out(&mut out, names);
+    row_out(&mut out, &type_row);
+    border(&mut out, "├", "┼", "┤");
+    for row in &cells {
+        row_out(&mut out, row);
     }
-    border("└", "┴", "┘");
-    if cells.len() > DISPLAY_CAP {
-        println!("({} more rows not shown)", cells.len() - DISPLAY_CAP);
+    border(&mut out, "└", "┴", "┘");
+    if rows.len() > DISPLAY_CAP {
+        out.push_str(&format!(
+            "({} more rows not shown)\n",
+            rows.len() - DISPLAY_CAP
+        ));
     }
     let noun = if rows.len() == 1 { "row" } else { "rows" };
-    println!("{} {noun}", rows.len());
+    out.push_str(&format!("{} {noun}", rows.len()));
+    out
 }
 
 fn run_sql(db: &mut PinkDb, sql: &str) {
@@ -211,7 +229,8 @@ fn run_sql(db: &mut PinkDb, sql: &str) {
                         if rows.is_empty() {
                             println!("(no rows)");
                         }
-                        render_select(names, types, rows);
+                        let table = format_select(names, types, rows);
+                        println!("{table}");
                     }
                 }
             }
@@ -231,7 +250,11 @@ fn main() {
 
     let mut pending = String::new();
     loop {
-        let prompt = if pending.is_empty() { PROMPT } else { CONT_PROMPT };
+        let prompt = if pending.is_empty() {
+            PROMPT
+        } else {
+            CONT_PROMPT
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 let trimmed = line.trim();
@@ -266,5 +289,81 @@ fn main() {
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_small_result_exactly() {
+        let names = vec!["id".to_string(), "name".to_string()];
+        let types = vec![DataType::Integer, DataType::Varchar];
+        let rows = vec![
+            vec![Value::Integer(1), Value::Varchar("alice".to_string())],
+            vec![Value::Integer(2), Value::Varchar("bob".to_string())],
+        ];
+        let expected = concat!(
+            "┌─────────┬─────────┐\n",
+            "│ id      │ name    │\n",
+            "│ INTEGER │ VARCHAR │\n",
+            "├─────────┼─────────┤\n",
+            "│ 1       │ alice   │\n",
+            "│ 2       │ bob     │\n",
+            "└─────────┴─────────┘\n",
+            "2 rows",
+        );
+        assert_eq!(format_select(&names, &types, &rows), expected);
+    }
+
+    #[test]
+    fn caps_formatting_but_reports_true_total() {
+        let names = vec!["v".to_string()];
+        let types = vec![DataType::Varchar];
+        let total = DISPLAY_CAP + 5;
+        // A uniquely wide cell lives only beyond the display cap; if it were
+        // formatted, it would widen the column and leak into the output.
+        let rows: Vec<Vec<Value>> = (0..total)
+            .map(|i| {
+                if i == total - 1 {
+                    vec![Value::Varchar("w".repeat(60))]
+                } else {
+                    vec![Value::Varchar(format!("r{i}"))]
+                }
+            })
+            .collect();
+
+        let out = format_select(&names, &types, &rows);
+
+        assert!(
+            out.contains("(5 more rows not shown)"),
+            "missing truncation note:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{total} rows")),
+            "summary must report the true total:\n{out}"
+        );
+        // Widths come from the shown rows only, so the border stays narrow
+        // (VARCHAR is 7 wide) instead of 60 wide.
+        assert_eq!(out.lines().next().unwrap(), "┌─────────┐");
+        assert!(
+            !out.contains(&"w".repeat(60)),
+            "beyond-cap cell leaked into output"
+        );
+    }
+
+    #[test]
+    fn single_row_summary_is_singular() {
+        let names = vec!["n".to_string()];
+        let types = vec![DataType::Bigint];
+        let rows = vec![vec![Value::Bigint(42)]];
+
+        let out = format_select(&names, &types, &rows);
+
+        assert!(
+            out.ends_with("\n1 row"),
+            "expected singular summary, got:\n{out}"
+        );
     }
 }

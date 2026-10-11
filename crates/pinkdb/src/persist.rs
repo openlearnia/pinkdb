@@ -979,7 +979,13 @@ mod tests {
     use crate::vector::CHUNK_SIZE;
 
     fn roundtrip(db: &PinkDb) -> PinkDb {
-        let path = std::env::temp_dir().join(format!("pinkdb_rt_{}.pink", std::process::id()));
+        // Pid + process-wide counter: concurrent tests in one process must
+        // not race on the same temp path.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static RT_SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = RT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join(format!("pinkdb_rt_{}_{seq}.pink", std::process::id()));
         db.save(path.to_str().unwrap()).unwrap();
         let data = std::fs::read(&path).unwrap();
         assert!(data.starts_with(MAGIC));
