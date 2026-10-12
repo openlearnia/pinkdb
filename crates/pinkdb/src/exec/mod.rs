@@ -39,6 +39,10 @@ pub enum QueryResult {
     CreatedView { name: String },
     DroppedTable { name: String },
     DroppedView { name: String },
+    CreatedDatabase { name: String },
+    DroppedDatabase { name: String },
+    /// `USE <db>`: the session layer applies this to its current database.
+    Used { db: String },
     Selected { names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>> },
 }
 
@@ -72,14 +76,34 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// The database a DDL/DML plan targets: its binder-resolved qualifier, else
+/// the store's current database (the embedded session's).
+fn resolve_db(db: &PinkDb, qdb: &Option<String>) -> String {
+    qdb.clone().unwrap_or_else(|| db.current_db().to_string())
+}
+
+/// `USE` validation + result. Bind already checks existence; re-checking here
+/// closes the window for the multi-writer `Connection` path (bind and run are
+/// separate lock acquisitions) and keeps `run` self-contained.
+fn use_result(db: &PinkDb, name: &str) -> Result<QueryResult> {
+    if !db.database_exists(name) {
+        return Err(PinkDbError::Catalog(format!(
+            "database \"{name}\" not found"
+        )));
+    }
+    Ok(QueryResult::Used { db: name.to_ascii_lowercase() })
+}
+
 /// Execute a bound plan.
 pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
     match plan {
-        LogicalPlan::CreateTable { name, schema } => {
-            db.create_table(name, schema.clone())?;
+        LogicalPlan::CreateTable { db: qdb, name, schema } => {
+            let target = resolve_db(db, qdb);
+            db.create_table_in(&target, name, schema.clone())?;
             Ok(QueryResult::Created)
         }
-        LogicalPlan::Insert { table, rows } => {
+        LogicalPlan::Insert { db: qdb, table, rows } => {
+            let target = resolve_db(db, qdb);
             // Evaluate constant cells against an empty single-row chunk, then
             // append (storage coerces INTEGER → BIGINT → DOUBLE).
             let single = DataChunk { columns: Vec::new(), num_rows: 1 };
@@ -104,7 +128,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             let count = staged.len();
             // Validate every row before appending any: multi-row INSERT is atomic.
-            let schema = db.table(table)?.schema();
+            let schema = db.table_in(&target, table)?.schema();
             for values in &staged {
                 if values.len() != schema.len() {
                     return Err(PinkDbError::Execution(format!(
@@ -117,13 +141,14 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                     DataTable::coerce(v.clone(), *t)?;
                 }
             }
-            let t = db.table_mut(table)?;
+            let t = db.table_mut_in(&target, table)?;
             for values in staged {
                 t.append_row(values)?;
             }
             Ok(QueryResult::Inserted { count })
         }
-        LogicalPlan::Update { table, sets, predicate } => {
+        LogicalPlan::Update { db: qdb, table, sets, predicate } => {
+            let target = resolve_db(db, qdb);
             // Phase 1: evaluate predicates + SET exprs over current chunks
             // (subqueries see pre-mutation state). Phase 2: write back.
             // SET exprs evaluate against original values (simultaneous).
@@ -131,7 +156,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let mut count = 0usize;
             {
                 let cx = Cx::new(db);
-                let t = cx.db.table(table)?;
+                let t = cx.db.table_in(&target, table)?;
                 per_chunk = vec![Vec::new(); t.num_chunks()];
                 for (ci, writes) in per_chunk.iter_mut().enumerate() {
                     let chunk = t.scan_chunk(ci).ok_or_else(|| {
@@ -150,20 +175,21 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                     }
                 }
             }
-            let t = db.table_mut(table)?;
+            let t = db.table_mut_in(&target, table)?;
             for (ci, writes) in per_chunk.iter().enumerate() {
                 t.update_rows(ci, writes)?;
             }
             Ok(QueryResult::Updated { count })
         }
-        LogicalPlan::Delete { table, predicate } => {
+        LogicalPlan::Delete { db: qdb, table, predicate } => {
+            let target = resolve_db(db, qdb);
             // Phase 1: collect per-chunk drop lists. Phase 2: apply from the
             // highest chunk down (emptied chunks are removed, shifting lower
             // indices — descending order keeps them valid).
             let mut drops: Vec<Vec<usize>>;
             {
                 let cx = Cx::new(db);
-                let t = cx.db.table(table)?;
+                let t = cx.db.table_in(&target, table)?;
                 drops = Vec::with_capacity(t.num_chunks());
                 for ci in 0..t.num_chunks() {
                     let chunk = t.scan_chunk(ci).ok_or_else(|| {
@@ -177,7 +203,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                 }
             }
             let mut count = 0usize;
-            let t = db.table_mut(table)?;
+            let t = db.table_mut_in(&target, table)?;
             for ci in (0..drops.len()).rev() {
                 count += t.delete_from_chunk(ci, &drops[ci])?;
             }
@@ -194,19 +220,31 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db.rollback()?;
             Ok(QueryResult::RolledBack)
         }
-        LogicalPlan::CreateView { name, cols, query } => {
+        LogicalPlan::CreateView { db: qdb, name, cols, query } => {
+            let target = resolve_db(db, qdb);
             // Validated at bind time; store the AST for per-use rebinding.
-            db.create_view(name, (**query).clone(), cols.clone())?;
+            db.create_view_in(&target, name, (**query).clone(), cols.clone())?;
             Ok(QueryResult::CreatedView { name: name.clone() })
         }
-        LogicalPlan::DropTable { name } => {
-            db.drop_table(name)?;
+        LogicalPlan::DropTable { db: qdb, name } => {
+            let target = resolve_db(db, qdb);
+            db.drop_table_in(&target, name)?;
             Ok(QueryResult::DroppedTable { name: name.clone() })
         }
-        LogicalPlan::DropView { name } => {
-            db.drop_view(name)?;
+        LogicalPlan::DropView { db: qdb, name } => {
+            let target = resolve_db(db, qdb);
+            db.drop_view_in(&target, name)?;
             Ok(QueryResult::DroppedView { name: name.clone() })
         }
+        LogicalPlan::CreateDatabase { name } => {
+            db.create_database(name)?;
+            Ok(QueryResult::CreatedDatabase { name: name.clone() })
+        }
+        LogicalPlan::DropDatabase { name } => {
+            db.drop_database(name)?;
+            Ok(QueryResult::DroppedDatabase { name: name.clone() })
+        }
+        LogicalPlan::Use { name } => use_result(db, name),
         _ => {
             let cx = Cx::new(db);
             run_read_with(&cx, plan)
@@ -223,6 +261,11 @@ pub fn run_read(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 }
 
 fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
+    // `USE` is read-only for locking but is not a row-producing plan: it
+    // returns the target database for the session layer to apply.
+    if let LogicalPlan::Use { name } = plan {
+        return use_result(cx.db, name);
+    }
     let out = eval(cx, plan)?;
     let mut rows = Vec::new();
     for chunk in &out.chunks {
@@ -244,15 +287,22 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::Rollback
         | LogicalPlan::CreateView { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::DropView { .. } => Err(PinkDbError::Execution(
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Use { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
-        LogicalPlan::Scan { table } => {
-            // CTEs shadow catalog tables (both keyed lowercased).
-            if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
-                return Ok(out.clone());
+        LogicalPlan::Scan { db: qdb, table } => {
+            // Unqualified scans name CTEs (binder-resolved); qualified scans
+            // are catalog tables in their database.
+            if qdb.is_none() {
+                if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
+                    return Ok(out.clone());
+                }
             }
-            let t = cx.db.table(table)?;
+            let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
+            let t = cx.db.table_in(lookup, table)?;
             let mut chunks = Vec::with_capacity(t.num_chunks());
             for i in 0..t.num_chunks() {
                 if let Some(c) = t.scan_chunk(i) {
@@ -4805,7 +4855,7 @@ mod tests {
     /// Bind + optimize `sql` exactly like `PinkDb::execute` does.
     fn bound_plan(db: &PinkDb, sql: &str) -> LogicalPlan {
         let stmts = crate::sql::parse_statements(sql).unwrap();
-        crate::optimizer::optimize(db, crate::sql::bind(db, &stmts[0]).unwrap())
+        crate::optimizer::optimize(db, crate::sql::bind(db, &stmts[0], db.current_db()).unwrap())
     }
 
     /// Descend to the topmost `Aggregate` (through Project/Cte wrappers).
@@ -5803,5 +5853,93 @@ mod tests {
         assert_eq!(fused.chunks.len(), 1);
         assert_eq!(fused.chunks[0].columns.len(), 1);
         assert_eq!(fused.names.len(), 1);
+    }
+
+    // ---------- multi-database (embedded session) ----------
+
+    /// `USE` applies to every later statement in the same string; unqualified
+    /// names resolve against the session's database.
+    #[test]
+    fn embedded_use_scopes_following_statements() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE DATABASE db1; \
+             CREATE TABLE main.t (a INTEGER); \
+             CREATE TABLE db1.t (a INTEGER);",
+        )
+        .unwrap();
+        let results = db
+            .execute("USE db1; INSERT INTO t VALUES (1); USE main; INSERT INTO t VALUES (2);")
+            .unwrap();
+        assert_eq!(results[0], QueryResult::Used { db: "db1".to_string() });
+        assert_eq!(results[2], QueryResult::Used { db: "main".to_string() });
+        assert_eq!(select(&mut db, "SELECT a FROM main.t;"), vec![vec![V::Integer(2)]]);
+        assert_eq!(select(&mut db, "SELECT a FROM db1.t;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(db.current_db(), "main");
+        // Case-insensitive database names.
+        db.execute("USE DB1;").unwrap();
+        assert_eq!(db.current_db(), "db1");
+        assert_eq!(select(&mut db, "SELECT a FROM t;"), vec![vec![V::Integer(1)]]);
+    }
+
+    #[test]
+    fn embedded_database_ddl_errors_and_session_fallback() {
+        let mut db = PinkDb::new();
+        // Last database / duplicate / missing.
+        assert!(db.execute("DROP DATABASE main;").is_err());
+        assert!(db.execute("CREATE DATABASE db1; CREATE DATABASE DB1;").is_err());
+        assert!(db.execute("USE nope;").is_err());
+        db.execute("CREATE DATABASE db2;").unwrap();
+        // Dropping the current database switches to main.
+        db.execute("USE db2; DROP DATABASE db2;").unwrap();
+        assert_eq!(db.current_db(), "main");
+        // Dropping main while db1 remains switches to the first remaining db.
+        db.execute("DROP DATABASE main;").unwrap();
+        assert_eq!(db.current_db(), "db1");
+        assert_eq!(db.list_databases(), vec!["db1".to_string()]);
+        // CREATE/DROP DATABASE inside a transaction is refused.
+        db.execute("BEGIN;").unwrap();
+        let err = db.execute("CREATE DATABASE x;").unwrap_err();
+        assert!(err.to_string().contains("not allowed inside a transaction"), "{err}");
+        db.execute("ROLLBACK;").unwrap();
+    }
+
+    /// A view's body resolves in the database the view lives in, even when
+    /// the querying session is elsewhere.
+    #[test]
+    fn embedded_views_are_per_database() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE DATABASE db1; \
+             CREATE TABLE main.src (v INTEGER); \
+             CREATE TABLE db1.src (v INTEGER); \
+             INSERT INTO main.src VALUES (1); \
+             INSERT INTO db1.src VALUES (10), (20); \
+             CREATE VIEW db1.v AS SELECT v FROM src; \
+             CREATE VIEW main.v AS SELECT v FROM src;",
+        )
+        .unwrap();
+        assert_eq!(select(&mut db, "SELECT * FROM v;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT * FROM db1.v ORDER BY v;"),
+            vec![vec![V::Integer(10)], vec![V::Integer(20)]]
+        );
+        // Views are not persisted by save: still session-local.
+        assert_eq!(db.list_views(), vec!["v".to_string()]);
+        assert_eq!(db.list_views_in("db1"), vec!["v".to_string()]);
+    }
+
+    /// DROP DATABASE leaves no views behind.
+    #[test]
+    fn drop_database_removes_its_views() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE DATABASE db1; CREATE TABLE db1.t (a INTEGER); \
+             CREATE VIEW db1.v AS SELECT * FROM t;",
+        )
+        .unwrap();
+        db.execute("DROP DATABASE db1;").unwrap();
+        assert!(db.execute("SELECT * FROM db1.v;").is_err());
+        assert!(db.execute("SELECT * FROM db1.t;").is_err());
     }
 }

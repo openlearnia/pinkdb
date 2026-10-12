@@ -72,6 +72,8 @@ pub enum Keyword {
     Then,
     Else,
     End,
+    Use,
+    Database,
 }
 
 impl Keyword {
@@ -141,6 +143,8 @@ impl Keyword {
             "THEN" => Keyword::Then,
             "ELSE" => Keyword::Else,
             "END" => Keyword::End,
+            "USE" => Keyword::Use,
+            "DATABASE" => Keyword::Database,
             _ => return None,
         })
     }

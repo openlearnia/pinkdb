@@ -56,13 +56,13 @@ SQL text
 |---|---|
 | `pinkdb::types` | `DataType`, `Value`, `PinkDbError` |
 | `pinkdb::vector` | `Vector` (typed data + validity bitmask, bit = valid) + `gather`, `DataChunk` |
-| `pinkdb::storage` | `DataTable` (per-column `Vector` chunks), `PinkDb` catalog |
+| `pinkdb::storage` | `DataTable` (per-column `Vector` chunks), `PinkDb` catalog (databases → tables/views) |
 | `pinkdb::csv` | CSV import + type inference (rayon-parallel parse) |
 | `pinkdb::sql` | PEG grammar + hand-written lexer/recursive-descent parser, AST, binder |
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
 | `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
-| `pinkdb::persist` | `.pink` single-file columnar persistence (RLE/dictionary/bitpack) |
+| `pinkdb::persist` | `.pink` single-file columnar persistence, v2 (databases + RLE/dictionary/bitpack; v1 files load) |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 
@@ -81,13 +81,19 @@ differently.
 
 ```sql
 CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE);
+CREATE TABLE db1.t (...);            -- qualified: any db.table target works
 INSERT INTO t VALUES (1, 'x', 9.5), (2, NULL, 3.0);
 UPDATE t SET price = price * 1.1 WHERE id > 1;   -- SET exprs see pre-update values
 DELETE FROM t WHERE price IS NULL;               -- NULL never matches; both are statement-atomic
 BEGIN; UPDATE t SET price = 0; ROLLBACK;         -- flat snapshot transactions (in-memory only)
+CREATE DATABASE db1;                 -- new, empty database
+DROP DATABASE db1;                   -- last database cannot be dropped; dropping the
+                                     -- current one switches the session to main
+USE db1;                             -- per-session current database (default: main)
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT [OUTER] / RIGHT [OUTER]
                                   -- equi-join (single equality)
+  | FROM db1.t                    -- qualified tables resolve in that database
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
   | WITH w AS (SELECT ...) ...     -- CTEs, incl. WITH w(a, b) AS column aliases
 WHERE expr                        -- incl. IS [NOT] NULL, BETWEEN,
@@ -98,6 +104,25 @@ LIMIT n;
 -- Scalar subqueries `(SELECT ...)` anywhere an expression goes
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
 ```
+
+### Databases
+
+Databases are named, case-insensitive namespaces (`main` by default). A
+session (the embedded `PinkDb`, or each `Connection`) has a current database;
+unqualified table names resolve there. `USE db` switches it and never affects
+other sessions — `Database`/`Connection` carry their own current database, the
+shared store is untouched. `db.table` qualifies any table reference in
+`FROM`/`JOIN`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`,
+`CREATE VIEW` and `DROP VIEW`; cross-database joins (`db1.t JOIN db2.u`) work.
+Three-part column references (`db.table.col`) are not supported (clear parse
+error). CTEs shadow unqualified names only; a qualified name never resolves to
+a CTE. Views are session-local *and* per-database: created in the current
+database and resolved there, with their body resolving unqualified names in
+that same database. View bodies are self-contained: the caller's CTEs never
+leak in, so a CTE named like a table in the body does not shadow that table.
+`DROP DATABASE` refuses the last database and switches a
+session that was using the dropped database to `main` (or the first remaining
+database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
 
 - Aggregates: `COUNT(*)` / `COUNT(x)`, `SUM`, `AVG`, `MIN`, `MAX`
 - Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, aggregates `OVER`
@@ -126,9 +151,17 @@ LIMIT n;
 - Integer division/modulo by zero is an error; `0.0` float division is IEEE
 - `SUM` over integers accumulates in i64 (wraps on overflow)
 
-REPL dot-commands: `.help`, `.quit` / `.exit`, `.tables`, `.schema <t>`,
-`.import <file.csv> [table]` (table defaults to the file stem),
-`.save <file.pink>`, `.open <file.pink>`.
+REPL dot-commands: `.help`, `.quit` / `.exit`, `.databases`, `.tables`,
+`.schema <t|v>` (accepts `db.table`; views show their output columns),
+`.import <file.csv> [table]` (table defaults to the file stem; `db.table`
+targets another database), `.save <file.pink>`, `.open <file.pink>`.
+`.databases` marks the current one and counts tables and views separately
+(`main (current) (2 tables, 1 view)`). `.tables` and `.schema` scope to the
+current database; `USE <db>` switches it. Double-quoted identifiers with
+spaces/quotes work in dot-command arguments (`"My Db".t`). For `.import`, a
+dotted target is `db.table` only when the left side names an existing
+database — otherwise the whole string is the table name, so a file stem like
+`data.2024.csv` imports as `data.2024`.
 
 CSV inference (per column, over all non-empty cells): all i32 → INTEGER, all
 i64 → BIGINT, all f64 → DOUBLE, all true/false (case-insensitive) → BOOLEAN,
@@ -142,18 +175,32 @@ rayon pool; anything else goes through the `csv` crate sequentially.
 
 ## Persistence
 
-`db.save("x.pink")` writes every table in a single-file columnar format;
-`PinkDb::open("x.pink")` loads it back (`.save` / `.open` in the REPL).
-Round-trips are bit-exact (including `-0.0` and NaN payloads); truncated or
-corrupt files return errors, never panics.
+`db.save("x.pink")` writes every database and table in a single-file
+columnar format (v2: `PINKDB02`); `PinkDb::open("x.pink")` loads it back
+(`.save` / `.open` in the REPL). v1 files (`PINKDB01`, a flat table list)
+still load: their tables become the single `main` database. Views are
+session-local and never persisted. Round-trips are bit-exact (including
+`-0.0` and NaN payloads); truncated or corrupt files return errors, never
+panics.
 
 Durable opens add a sidecar write-ahead log: `PinkDb::open_durable("x.pink")`
 (the REPL's `.open`) loads the checkpoint, recovers an interrupted checkpoint,
 replays `x.pink.wal`, then logs each committed transaction unit — an
 autocommit statement individually, `BEGIN..COMMIT` as one record at `COMMIT`
-(a `ROLLBACK` or conflict abort logs nothing). `SyncPolicy::Sync` fsyncs every
-record; `Batch` fsyncs on `flush_wal`/checkpoint. The `.pink` file format
-itself is unchanged.
+(a `ROLLBACK` or conflict abort logs nothing). `USE`, `CREATE DATABASE` and
+`DROP DATABASE` are logged like any other mutating statement: replay starts in
+the checkpoint's session and the logged `USE` records switch the replay
+session. Because the WAL is shared by every `Connection` while `USE` is
+per-session, a record is made self-contained — when the replay session differs
+from the statement's session (after a checkpoint, or with multiple connections
+on different databases) a `USE <db>` statement is prepended to the record, so
+replay always reproduces each statement in the database it ran in. A `USE`
+prefix is never emitted for a database that no longer exists (the `DROP` is
+already earlier in the WAL): the record is appended without it, and a
+transaction whose write target or `USE` target was dropped since `BEGIN`
+fails `COMMIT` with a write conflict instead of logging an unreplayable
+record. `SyncPolicy::Sync` fsyncs every record; `Batch` fsyncs on
+`flush_wal`/checkpoint.
 
 The WAL format is `PINKWAL1` + version `2` + a generation number, and rolled
 generations are named `<wal>.<gen>.roll`. A checkpoint writes `.pink.tmp`
@@ -248,12 +295,17 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 
 - No nested transactions or savepoints; one process per `.pink` path
   (single-writer: no file locking is taken); `.open` replaces the whole store
+- `CREATE DATABASE` / `DROP DATABASE` are refused inside a transaction; the
+  last database cannot be dropped; `DROP DATABASE` does not remove views from
+  other databases (views are per-database and session-local)
+- Three-part column references (`db.table.col`) are unsupported; use an alias
+  (`SELECT x.col FROM db.table AS x`)
+- `USE`, `DATABASE` and `LEFT`/`RIGHT`/`OUTER`/`FULL`/`CROSS` are reserved
+  words; quote identifiers to use them as names (`"use"` works)
 - Durable commits refuse statements that read a session-local view (views are
   never persisted); `.import` checkpoints, so it needs a settled transaction
 - Correlated subqueries are rejected (uncorrelated only); no FULL joins and
   CROSS joins are rejected
-- `LEFT`/`RIGHT`/`OUTER`/`FULL`/`CROSS` are reserved words; quote identifiers
-  to use them as names (`"left"` works)
 - Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position
 - General ORDER BY expressions must be aliases, positions, or GROUP BY keys
@@ -265,9 +317,8 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
   `Parse` error (`expression nesting too deep`) in both parsers instead of
   overflowing the parser stack
 
-Post-v1 roadmap: multi-database (`USE`), network server
-(`pinkdb-server`), at-rest encryption, C/Python/Go language bindings, Parquet
-reader (see PLAN.md).
+Post-v1 roadmap: network server (`pinkdb-server`), at-rest encryption,
+C/Python/Go language bindings, Parquet reader (see PLAN.md).
 
 ## Development
 

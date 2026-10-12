@@ -30,6 +30,9 @@ impl PinkDb {
     /// statement to the WAL: autocommit statements individually, transaction
     /// statements as one record at `COMMIT`. In-memory databases skip that
     /// entirely — behavior is unchanged.
+    ///
+    /// The embedded session's current database (`USE`) applies to every later
+    /// statement in the same string; unqualified names resolve against it.
     pub fn execute(&mut self, sql: &str) -> types::Result<Vec<QueryResult>> {
         let stmts = sql::parse_statements(sql)?;
         // Only durable databases need per-statement source text for the WAL.
@@ -47,8 +50,39 @@ impl PinkDb {
         };
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
-            let plan = optimizer::optimize(self, sql::bind(self, stmt)?);
+            let session_db = self.current_db().to_string();
+            let plan = optimizer::optimize(self, sql::bind(self, stmt, &session_db)?);
+            // Database create/drop are store-level and cannot be undone by a
+            // snapshot commit of the multi-writer path: refuse inside a txn.
+            if self.in_transaction()
+                && matches!(
+                    plan,
+                    plan::LogicalPlan::CreateDatabase { .. }
+                        | plan::LogicalPlan::DropDatabase { .. }
+                )
+            {
+                return Err(types::PinkDbError::Execution(format!(
+                    "{} is not allowed inside a transaction",
+                    if matches!(plan, plan::LogicalPlan::CreateDatabase { .. }) {
+                        "CREATE DATABASE"
+                    } else {
+                        "DROP DATABASE"
+                    }
+                )));
+            }
             let result = exec::run(self, &plan)?;
+            // Session transitions are applied before WAL logging so the log
+            // record carries the post-statement session database.
+            match &result {
+                QueryResult::Used { db } => self.set_current_db(db),
+                QueryResult::DroppedDatabase { name }
+                    if name.eq_ignore_ascii_case(self.current_db()) =>
+                {
+                    let fallback = self.fallback_db();
+                    self.set_current_db(&fallback);
+                }
+                _ => {}
+            }
             if let Some(texts) = &texts {
                 self.wal_log_statement(&plan, &texts[i])?;
             }

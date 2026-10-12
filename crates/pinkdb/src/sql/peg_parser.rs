@@ -253,20 +253,39 @@ peg::parser! {
             / update()
             / delete()
             / txn()
+            / use_stmt()
             / drop()
             / select_statement()
 
         rule select_statement() -> Statement = s:select() { Statement::Select(s) }
 
-        rule create() -> Statement
-            = kw(Keyword::Create) kw(Keyword::View) name:ident() cols:col_name_list()? kw(Keyword::As) query:select() {
-                  Statement::CreateView { name, cols, query: Box::new(query) }
+        rule use_stmt() -> Statement
+            = kw(Keyword::Use) name:ident() { Statement::Use { name } }
+
+        /// `name` or `db.name` — a table reference. Three-part names are
+        /// rejected as soon as the second dot appears, with the same clear
+        /// error as the recursive-descent parser (this alternative reaches
+        /// furthest and wins, whatever follows the dot: `.col`, `.*`, or
+        /// nothing at all).
+        rule table_ref() -> (Option<String>, String)
+            = _db:ident() dot() _t:ident() dot() {?
+                  Err("three-part names (db.table.col) are not supported")
               }
-            / kw(Keyword::Create) kw(Keyword::Table) name:ident() lparen() first:table_column()
+            / db:ident() dot() name:ident() { (Some(db), name) }
+            / name:ident() { (None, name) }
+
+        rule create() -> Statement
+            = kw(Keyword::Create) kw(Keyword::Database) name:ident() {
+                  Statement::CreateDatabase { name }
+              }
+            / kw(Keyword::Create) kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
+                  Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query) }
+              }
+            / kw(Keyword::Create) kw(Keyword::Table) t:table_ref() lparen() first:table_column()
               rest:(comma() c:table_column() { c })* rparen() {
                   let mut columns = vec![first];
                   columns.extend(rest);
-                  Statement::CreateTable { name, columns }
+                  Statement::CreateTable { db: t.0, name: t.1, columns }
               }
 
         rule table_column() -> (String, DataType) = name:ident() ty:type_name() { (name, ty) }
@@ -285,8 +304,8 @@ peg::parser! {
               }
 
         rule insert() -> Statement
-            = kw(Keyword::Insert) kw(Keyword::Into) table:ident() columns:col_name_list()? kw(Keyword::Values) rows:insert_rows() {
-                  Statement::Insert { table, columns, rows }
+            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? kw(Keyword::Values) rows:insert_rows() {
+                  Statement::Insert { db: t.0, table: t.1, columns, rows }
               }
 
         rule insert_rows() -> Vec<Vec<Expr>>
@@ -300,23 +319,24 @@ peg::parser! {
             = lparen() items:expr_list()? rparen() { items.unwrap_or_default() }
 
         rule update() -> Statement
-            = kw(Keyword::Update) table:ident() kw(Keyword::Set) first:set_item() rest:(comma() s:set_item() { s })*
+            = kw(Keyword::Update) t:table_ref() kw(Keyword::Set) first:set_item() rest:(comma() s:set_item() { s })*
               where_:where_clause()? {
                   let mut sets = vec![first];
                   sets.extend(rest);
-                  Statement::Update { table, sets, where_clause: where_ }
+                  Statement::Update { db: t.0, table: t.1, sets, where_clause: where_ }
               }
 
         rule set_item() -> (String, Expr) = col:ident() eq() e:expr() { (col, e) }
 
         rule delete() -> Statement
-            = kw(Keyword::Delete) kw(Keyword::From) table:ident() where_:where_clause()? {
-                  Statement::Delete { table, where_clause: where_ }
+            = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() where_:where_clause()? {
+                  Statement::Delete { db: t.0, table: t.1, where_clause: where_ }
               }
 
         rule drop() -> Statement
-            = kw(Keyword::Drop) kw(Keyword::Table) name:ident() { Statement::DropTable { name } }
-            / kw(Keyword::Drop) kw(Keyword::View) name:ident() { Statement::DropView { name } }
+            = kw(Keyword::Drop) kw(Keyword::Database) name:ident() { Statement::DropDatabase { name } }
+            / kw(Keyword::Drop) kw(Keyword::Table) t:table_ref() { Statement::DropTable { db: t.0, name: t.1 } }
+            / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
 
         rule txn() -> Statement
             = kw(Keyword::Begin) kw(Keyword::Transaction)? { Statement::Begin }
@@ -407,7 +427,7 @@ peg::parser! {
 
         rule from_source() -> FromSource
             = lparen() q:select() rparen() { FromSource::Derived(Box::new(q)) }
-            / t:ident() { FromSource::Table(t) }
+            / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
 
         /// FULL/CROSS/USING/NATURAL are not part of the grammar: like the
         /// recursive-descent parser, they fail to parse.
@@ -601,9 +621,22 @@ peg::parser! {
         rule ident_expr() -> Expr
             = coalesce_call()
             / fn_call()
+            / three_part_column()
             / name:ident() dot() col:ident() { Expr::Column { table: Some(name), name: col } }
             / name:ident() dot() star() { Expr::QualifiedStar(Some(name)) }
             / name:ident() { Expr::Column { table: None, name } }
+
+        /// `db.table.col` / `db.table.*` are not supported: fail with the
+        /// same clear message as the recursive-descent parser. This
+        /// alternative consumes one token further than the valid two-part
+        /// forms, so its error is the one that surfaces.
+        rule three_part_column() -> Expr
+            = _db:ident() dot() _t:ident() dot() _c:ident() {?
+                  Err("three-part column references (db.table.col) are not supported")
+              }
+            / _db:ident() dot() _t:ident() dot() star() {?
+                  Err("three-part references (db.table.*) are not supported")
+              }
 
         rule coalesce_call() -> Expr
             = name:coalesce_name() lparen() args:coalesce_args() rparen() {?
@@ -707,7 +740,7 @@ mod tests {
     ///    CASE/CAST/COALESCE/LIKE/BETWEEN/IN/EXISTS;
     /// 3. deliberately invalid SQL (one list below) pinning rejection parity.
     ///
-    /// 782 valid + 122 invalid entries.
+    /// 807 valid + 146 invalid entries.
     /// Must parse with both parsers to identical ASTs.
     const VALID: &[&str] = &[
         "SELECT COUNT(*) FROM sales;",
@@ -1494,6 +1527,32 @@ mod tests {
         "SELECT COALESCE(*/did, -1);",
         "SELECT coalesce(*, 1);",
         "SELECT CoAlEsCe(*);",
+        // Multi-database: CREATE/DROP DATABASE, USE, qualified table refs.
+        "CREATE DATABASE analytics;",
+        "USE analytics;",
+        "USE main;",
+        "use MAIN;",
+        "CREATE DATABASE \"My Db\";",
+        "DROP DATABASE analytics;",
+        "CREATE TABLE db1.t (a INTEGER, b VARCHAR);",
+        "INSERT INTO db1.t VALUES (1, 'x'), (2, NULL);",
+        "SELECT a FROM db1.t ORDER BY a;",
+        "SELECT t.a FROM db1.t;",
+        "SELECT * FROM db1.t AS x;",
+        "SELECT COUNT(*) FROM db1.t;",
+        "UPDATE db1.t SET a = a + 1 WHERE a > 0;",
+        "DELETE FROM db1.t WHERE a = 1;",
+        "DROP TABLE db1.t;",
+        "CREATE VIEW db1.v AS SELECT * FROM db1.t;",
+        "DROP VIEW db1.v;",
+        "CREATE TABLE main.m (k BIGINT);",
+        "INSERT INTO main.m VALUES (1);",
+        "SELECT * FROM main.m;",
+        "SELECT COUNT(*) FROM db1.t JOIN db2.u ON t.a = u.a;",
+        "SELECT COUNT(*) FROM db1.t LEFT JOIN db2.u ON t.a = u.a;",
+        "SELECT COUNT(*) FROM (SELECT a FROM db1.t) s JOIN db2.u ON s.a = u.a;",
+        "WITH c AS (SELECT 1 AS x) SELECT * FROM c JOIN db1.t ON c.x = t.a;",
+        "SELECT * FROM main.m AS m JOIN analytics.m AS a ON m.k = a.k;",
     ];
 
     /// Must be rejected by both parsers as `PinkDbError::Parse`.
@@ -1620,6 +1679,31 @@ mod tests {
         "SELECT DISTINCT ON (a) b FROM t;",
         "SELECT 1e+;",
         "SELECT 1e-;",
+        // Multi-database syntax errors.
+        "CREATE DATABASE;",
+        "DROP DATABASE;",
+        "USE;",
+        "USE 1;",
+        "USE main extra;",
+        "CREATE DATABASE a b;",
+        "CREATE DATABASE db1.t;",
+        "DROP DATABASE db1.t;",
+        "CREATE TABLE db1.;",
+        "INSERT INTO db1.;",
+        "UPDATE db1.;",
+        "DELETE FROM db1.;",
+        "SELECT * FROM db1.;",
+        "SELECT * FROM db1.t.col;",
+        "SELECT * FROM db1.t.*;",
+        "SELECT a FROM db1.t.;",
+        "CREATE TABLE db1.t.col (a INTEGER);",
+        "CREATE VIEW db1.t.col AS SELECT 1;",
+        "SELECT db1.t.a FROM db1.t;",
+        "SELECT db1.t.* FROM db1.t;",
+        "SELECT a FROM db1.t WHERE db1.t.a = 1;",
+        "DROP TABLE db1.;",
+        "CREATE VIEW db1.;",
+        "SELECT * FROM db1.t JOIN db2.u;",
     ];
 
     /// Parse `sql` with both parsers; valid entries must produce equal ASTs and
@@ -1671,6 +1755,30 @@ mod tests {
             assert!(
                 matches!(peg(sql), Err(PinkDbError::Parse(_))),
                 "PEG accepted invalid {sql:?}"
+            );
+        }
+    }
+
+    /// m2: the four three-part shapes must fail with the same message as the
+    /// recursive-descent parser, not a generic PEG error.
+    #[test]
+    fn three_part_reference_errors_match_legacy() {
+        let cases = [
+            "SELECT * FROM db1.t.*;",
+            "SELECT a FROM db1.t.;",
+            "CREATE TABLE db1.t.col (a INTEGER);",
+            "CREATE VIEW db1.t.col AS SELECT 1;",
+        ];
+        for sql in cases {
+            let legacy_err = legacy(sql).unwrap_err().to_string();
+            let peg_err = peg(sql).unwrap_err().to_string();
+            assert!(
+                legacy_err.contains("three-part names (db.table.col) are not supported"),
+                "{sql}: legacy message changed: {legacy_err}"
+            );
+            assert!(
+                peg_err.contains("three-part names (db.table.col) are not supported"),
+                "{sql}: PEG message not aligned: {peg_err}"
             );
         }
     }

@@ -10,21 +10,26 @@ use crate::types::Value;
 #[allow(clippy::large_enum_variant)]
 pub enum Statement {
     CreateTable {
+        /// Explicit `db.` qualifier, if written (resolved at bind).
+        db: Option<String>,
         name: String,
         columns: Vec<(String, crate::types::DataType)>,
     },
     Insert {
+        db: Option<String>,
         table: String,
         columns: Option<Vec<String>>,
         rows: Vec<Vec<Expr>>,
     },
     Update {
+        db: Option<String>,
         table: String,
         /// `(column, expression)` pairs in written order.
         sets: Vec<(String, Expr)>,
         where_clause: Option<Expr>,
     },
     Delete {
+        db: Option<String>,
         table: String,
         where_clause: Option<Expr>,
     },
@@ -32,14 +37,29 @@ pub enum Statement {
     Commit,
     Rollback,
     CreateView {
+        db: Option<String>,
         name: String,
         cols: Option<Vec<String>>,
         query: Box<Select>,
     },
     DropTable {
+        db: Option<String>,
         name: String,
     },
     DropView {
+        db: Option<String>,
+        name: String,
+    },
+    /// `CREATE DATABASE <name>`.
+    CreateDatabase {
+        name: String,
+    },
+    /// `DROP DATABASE <name>`.
+    DropDatabase {
+        name: String,
+    },
+    /// `USE <name>`: switch the session's current database.
+    Use {
         name: String,
     },
     Select(Select),
@@ -86,7 +106,11 @@ pub struct CteDef {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FromSource {
-    Table(String),
+    /// A possibly-qualified table reference (`db.table`).
+    Table {
+        db: Option<String>,
+        name: String,
+    },
     Derived(Box<Select>),
 }
 

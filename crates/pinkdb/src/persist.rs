@@ -1,20 +1,26 @@
 //! Persistence: a single-file on-disk columnar format (`.pink`).
 //!
-//! Layout (all integers little-endian):
+//! Layout v2 (all integers little-endian):
 //! ```text
-//! magic "PINKDB01" (8 bytes)
-//! table_count u32
-//! per table:
+//! magic "PINKDB02" (8 bytes)
+//! db_count u32
+//! per database:
 //!   name_len u32 + name bytes
-//!   col_count u32
-//!   per column: name_len u32 + name bytes, dtype u8
-//!   num_rows u64
-//!   per column: chunk_count u32
-//!     per chunk:
-//!       encoding u8 (0=Plain, 1=RLE, 2=Dict, 3=Bitpack)
-//!       validity_len u32 + validity bytes (bit set = valid)
-//!       payload (encoding-specific)
+//!   table_count u32
+//!   per table:
+//!     name_len u32 + name bytes
+//!     col_count u32
+//!     per column: name_len u32 + name bytes, dtype u8
+//!     num_rows u64
+//!     per column: chunk_count u32
+//!       per chunk:
+//!         encoding u8 (0=Plain, 1=RLE, 2=Dict, 3=Bitpack)
+//!         validity_len u32 + validity bytes (bit set = valid)
+//!         payload (encoding-specific)
 //! ```
+//!
+//! v1 files (`PINKDB01`) hold a flat table list and load as a single `main`
+//! database; `open` accepts both. Views are session-local and never written.
 //!
 //! Payloads store every row including NULL placeholders; validity is applied
 //! afterwards. Per-chunk encoding is picked by size (smallest wins):
@@ -35,6 +41,8 @@ use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::Vector;
 
 const MAGIC: &[u8; 8] = b"PINKDB01";
+/// Version 2 adds the database dimension: one file holds every database.
+const MAGIC_V2: &[u8; 8] = b"PINKDB02";
 
 const ENC_PLAIN: u8 = 0;
 const ENC_RLE: u8 = 1;
@@ -735,66 +743,74 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
 // ---------- public API ----------
 
 impl PinkDb {
-    /// Serialize every table in the `.pink` columnar format. Tables are
-    /// stored in sorted name order (deterministic bytes).
+    /// Serialize every database (and every table in it) in the `.pink`
+    /// columnar format. Databases and tables are stored in sorted name order
+    /// (deterministic bytes). Views are session-local and never persisted.
     fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut w = Writer::new();
-        w.bytes(MAGIC);
-        let mut names = self.list_tables();
-        names.sort();
-        w.u32(names.len() as u32);
-        for name in &names {
-            let t = self.table(name)?;
-            let schema = t.schema();
-            w.str(&t.name);
-            w.u32(schema.len() as u32);
-            for (col, dtype) in &schema {
-                w.str(col);
-                w.u8(dtype_tag(*dtype));
-            }
-            w.u64(t.num_rows() as u64);
-            for (ci, (_, dtype)) in schema.iter().enumerate() {
-                let col_idx = ci;
-                let n_chunks = t.num_chunks();
-                w.u32(n_chunks as u32);
-                for chunk_idx in 0..n_chunks {
-                    let chunk = t.scan_chunk(chunk_idx).ok_or_else(|| {
-                        PinkDbError::Execution("storage changed during save".to_string())
-                    })?;
-                    let vec = &chunk.columns[col_idx];
-                    debug_assert_eq!(vec.dtype(), *dtype);
-                    // Materialize placeholder values for NULLs (validity separate).
-                    let values: Vec<Value> = (0..vec.len()).map(|i| vec.get(i)).collect();
-                    let plain_for_null: Vec<Value> = values
-                        .into_iter()
-                        .map(|v| match v {
-                            Value::Null => match dtype {
-                                DataType::Boolean => Value::Boolean(false),
-                                DataType::Integer => Value::Integer(0),
-                                DataType::Bigint => Value::Bigint(0),
-                                DataType::Double => Value::Double(0.0),
-                                DataType::Varchar => Value::Varchar(String::new()),
-                                DataType::Date => Value::Date(0),
-                                DataType::Timestamp => Value::Timestamp(0),
-                            },
-                            v => v,
-                        })
-                        .collect();
-                    let (tag, payload) = encode_chunk(*dtype, &plain_for_null);
-                    w.u8(tag);
-                    let mut vw = Writer::new();
-                    encode_validity(&mut vw, vec);
-                    w.u32(vw.buf.len() as u32);
-                    w.bytes(&vw.buf);
-                    w.bytes(&payload);
+        w.bytes(MAGIC_V2);
+        let mut dbs = self.list_databases();
+        dbs.sort();
+        w.u32(dbs.len() as u32);
+        for dbname in &dbs {
+            w.str(dbname);
+            let mut names = self.list_tables_in(dbname);
+            names.sort();
+            w.u32(names.len() as u32);
+            for name in &names {
+                let t = self.table_in(dbname, name)?;
+                let schema = t.schema();
+                w.str(&t.name);
+                w.u32(schema.len() as u32);
+                for (col, dtype) in &schema {
+                    w.str(col);
+                    w.u8(dtype_tag(*dtype));
+                }
+                w.u64(t.num_rows() as u64);
+                for (ci, (_, dtype)) in schema.iter().enumerate() {
+                    let col_idx = ci;
+                    let n_chunks = t.num_chunks();
+                    w.u32(n_chunks as u32);
+                    for chunk_idx in 0..n_chunks {
+                        let chunk = t.scan_chunk(chunk_idx).ok_or_else(|| {
+                            PinkDbError::Execution("storage changed during save".to_string())
+                        })?;
+                        let vec = &chunk.columns[col_idx];
+                        debug_assert_eq!(vec.dtype(), *dtype);
+                        // Materialize placeholder values for NULLs (validity separate).
+                        let values: Vec<Value> = (0..vec.len()).map(|i| vec.get(i)).collect();
+                        let plain_for_null: Vec<Value> = values
+                            .into_iter()
+                            .map(|v| match v {
+                                Value::Null => match dtype {
+                                    DataType::Boolean => Value::Boolean(false),
+                                    DataType::Integer => Value::Integer(0),
+                                    DataType::Bigint => Value::Bigint(0),
+                                    DataType::Double => Value::Double(0.0),
+                                    DataType::Varchar => Value::Varchar(String::new()),
+                                    DataType::Date => Value::Date(0),
+                                    DataType::Timestamp => Value::Timestamp(0),
+                                },
+                                v => v,
+                            })
+                            .collect();
+                        let (tag, payload) = encode_chunk(*dtype, &plain_for_null);
+                        w.u8(tag);
+                        let mut vw = Writer::new();
+                        encode_validity(&mut vw, vec);
+                        w.u32(vw.buf.len() as u32);
+                        w.bytes(&vw.buf);
+                        w.bytes(&payload);
+                    }
                 }
             }
         }
         Ok(w.buf)
     }
 
-    /// Write every table to `path` in the `.pink` columnar format.
-    /// Tables are stored in sorted name order (deterministic bytes).
+    /// Write every database to `path` in the `.pink` columnar format.
+    /// Databases and tables are stored in sorted name order (deterministic
+    /// bytes). Views are session-local and never persisted.
     pub fn save(&self, path: &str) -> Result<()> {
         std::fs::write(path, self.to_bytes()?)?;
         Ok(())
@@ -811,57 +827,44 @@ impl PinkDb {
     }
 
     /// Load a database from a `.pink` file written by [`PinkDb::save`].
-    /// Truncated or malformed files return errors, never panics.
+    /// Accepts the v1 format (a single, implicit `main` database) and the v2
+    /// format (all databases). Truncated or malformed files return errors,
+    /// never panics.
     pub fn open(path: &str) -> Result<PinkDb> {
         let data = std::fs::read(path)?;
         let mut r = Reader::new(&data);
-        if r.take(8)? != MAGIC {
+        let magic = r.take(8)?;
+        let v2 = if magic == MAGIC_V2 {
+            true
+        } else if magic == MAGIC {
+            false
+        } else {
             return Err(PinkDbError::Execution(
                 "not a .pink file (bad magic)".to_string(),
             ));
-        }
-        let mut db = PinkDb::new();
-        let n_tables = r.u32()?;
-        for _ in 0..n_tables {
-            let name = r.str()?;
-            let n_cols = r.u32()? as usize;
-            let mut schema = Vec::with_capacity(n_cols);
-            for _ in 0..n_cols {
-                let col = r.str()?;
-                let dtype = dtype_from_tag(r.u8()?)?;
-                schema.push((col, dtype));
-            }
-            let num_rows = r.u64()? as usize;
-            // Decode per-column chunks, then append row-wise.
-            let mut columns: Vec<Vec<Value>> = vec![Vec::new(); n_cols];
-            for (ci, (_, dtype)) in schema.iter().enumerate() {
-                let n_chunks = r.u32()? as usize;
-                let mut decoded = 0usize;
-                for _ in 0..n_chunks {
-                    let tag = r.u8()?;
-                    let vals = decode_chunk(*dtype, tag, &mut r)?;
-                    decoded += vals.len();
-                    columns[ci].extend(vals);
-                }
-                if decoded != num_rows {
-                    return Err(PinkDbError::Execution(format!(
-                        "corrupt file: column {ci} has {decoded} values, want {num_rows}"
-                    )));
+        };
+        // Start from an empty store: a v2 file may legitimately have no
+        // `main` (it was dropped) and `open` must round-trip exactly.
+        let mut db = PinkDb::with_databases(Vec::<String>::new());
+        if v2 {
+            let n_dbs = r.u32()?;
+            for _ in 0..n_dbs {
+                let dbname = r.str()?;
+                db.create_database(&dbname)?;
+                let n_tables = r.u32()?;
+                for _ in 0..n_tables {
+                    load_table(&mut r, &mut db, &dbname)?;
                 }
             }
-            // Sanity: chunk rows must stay small (guards giant allocations).
-            for col in &columns {
-                if col.len() != num_rows {
-                    return Err(PinkDbError::Execution(
-                        "corrupt file: column length mismatch".to_string(),
-                    ));
-                }
+            if db.list_databases().is_empty() {
+                db.create_database("main")?;
             }
-            db.create_table(&name, schema)?;
-            let t = db.table_mut(&name)?;
-            for i in 0..num_rows {
-                let row: Vec<Value> = columns.iter().map(|c| c[i].clone()).collect();
-                t.append_row(row)?;
+        } else {
+            // v1: every table lived in the single implicit database.
+            db.create_database("main")?;
+            let n_tables = r.u32()?;
+            for _ in 0..n_tables {
+                load_table(&mut r, &mut db, "main")?;
             }
         }
         if !r.end() {
@@ -869,8 +872,57 @@ impl PinkDb {
                 "corrupt file: trailing bytes after last table".to_string(),
             ));
         }
+        // The session starts on `main` when it exists, else the first
+        // database in sorted order.
+        let current = db.fallback_db();
+        db.set_current_db(&current);
         Ok(db)
     }
+}
+
+/// Decode one table from `r` into `db`'s `dbname` database.
+fn load_table(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
+    let name = r.str()?;
+    let n_cols = r.u32()? as usize;
+    let mut schema = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        let col = r.str()?;
+        let dtype = dtype_from_tag(r.u8()?)?;
+        schema.push((col, dtype));
+    }
+    let num_rows = r.u64()? as usize;
+    // Decode per-column chunks, then append row-wise.
+    let mut columns: Vec<Vec<Value>> = vec![Vec::new(); n_cols];
+    for (ci, (_, dtype)) in schema.iter().enumerate() {
+        let n_chunks = r.u32()? as usize;
+        let mut decoded = 0usize;
+        for _ in 0..n_chunks {
+            let tag = r.u8()?;
+            let vals = decode_chunk(*dtype, tag, r)?;
+            decoded += vals.len();
+            columns[ci].extend(vals);
+        }
+        if decoded != num_rows {
+            return Err(PinkDbError::Execution(format!(
+                "corrupt file: column {ci} has {decoded} values, want {num_rows}"
+            )));
+        }
+    }
+    // Sanity: chunk rows must stay small (guards giant allocations).
+    for col in &columns {
+        if col.len() != num_rows {
+            return Err(PinkDbError::Execution(
+                "corrupt file: column length mismatch".to_string(),
+            ));
+        }
+    }
+    db.create_table_in(dbname, &name, schema)?;
+    let t = db.table_mut_in(dbname, &name)?;
+    for i in 0..num_rows {
+        let row: Vec<Value> = columns.iter().map(|c| c[i].clone()).collect();
+        t.append_row(row)?;
+    }
+    Ok(())
 }
 
 /// Re-export for tests: chunk encode/decode round trip.
@@ -1004,7 +1056,7 @@ mod tests {
             .join(format!("pinkdb_rt_{}_{seq}.pink", std::process::id()));
         db.save(path.to_str().unwrap()).unwrap();
         let data = std::fs::read(&path).unwrap();
-        assert!(data.starts_with(MAGIC));
+        assert!(data.starts_with(MAGIC_V2));
         let back = PinkDb::open(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
         back
@@ -1186,5 +1238,74 @@ mod tests {
             _ => panic!(),
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn roundtrip_multiple_databases_and_empty_ones() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE DATABASE analytics;").unwrap();
+        db.execute("CREATE DATABASE empty;").unwrap();
+        db.execute("CREATE TABLE main.t (a INTEGER, b VARCHAR);").unwrap();
+        db.execute("INSERT INTO main.t VALUES (1, 'x'), (2, NULL);").unwrap();
+        db.execute("CREATE TABLE analytics.u (k BIGINT);").unwrap();
+        db.execute("INSERT INTO analytics.u VALUES (7);").unwrap();
+        // Same table name in two databases, different shapes.
+        db.execute("CREATE TABLE analytics.t (z DOUBLE);").unwrap();
+        db.execute("INSERT INTO analytics.t VALUES (1.5);").unwrap();
+
+        let back = roundtrip(&db);
+        assert_eq!(back.list_databases(), vec!["analytics", "empty", "main"]);
+        assert_eq!(back.current_db(), "main");
+        assert_eq!(all_values(&back, "t").len(), 2);
+        assert_eq!(all_values(&back, "t")[1][1], Value::Null);
+        assert_eq!(back.list_tables_in("analytics"), vec!["t", "u"]);
+        assert_eq!(back.table_in("analytics", "u").unwrap().num_rows(), 1);
+        assert_eq!(
+            back.table_in("analytics", "t").unwrap().get(0, 0),
+            Some(Value::Double(1.5))
+        );
+        assert!(back.list_tables_in("empty").is_empty());
+        assert!(back.database_exists("empty"));
+    }
+
+    /// A `.pink` file written by the v1 code path (committed fixture) must
+    /// still load: every table lands in a single `main` database.
+    #[test]
+    fn v1_fixture_loads_as_single_main_database() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/v1_single_db.pink"
+        );
+        let data = std::fs::read(path).unwrap();
+        assert!(data.starts_with(MAGIC), "fixture must be the v1 format");
+        let db = PinkDb::open(path).unwrap();
+        assert_eq!(db.list_databases(), vec!["main".to_string()]);
+        assert_eq!(db.list_tables(), vec!["empty".to_string(), "t".to_string()]);
+        let t = db.table("t").unwrap();
+        assert_eq!(t.num_rows(), 3);
+        assert_eq!(t.get(0, 0), Some(Value::Integer(1)));
+        assert_eq!(t.get(0, 1), Some(Value::Varchar("x".to_string())));
+        assert_eq!(t.get(1, 1), Some(Value::Null));
+        assert_eq!(t.get(2, 0), Some(Value::Integer(3)));
+        assert_eq!(db.table("empty").unwrap().num_rows(), 0);
+        // A v1 file re-saved becomes v2 and round-trips.
+        let back = roundtrip(&db);
+        assert_eq!(back.list_databases(), vec!["main".to_string()]);
+        assert_eq!(all_values(&back, "t"), all_values(&db, "t"));
+    }
+
+    /// A store whose `main` was dropped persists without resurrecting it.
+    #[test]
+    fn roundtrip_without_main_keeps_the_remaining_databases() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE DATABASE db1; CREATE TABLE db1.t (a INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO db1.t VALUES (5);").unwrap();
+        db.execute("DROP DATABASE main;").unwrap();
+        assert_eq!(db.current_db(), "db1");
+        let back = roundtrip(&db);
+        assert_eq!(back.list_databases(), vec!["db1".to_string()]);
+        assert_eq!(back.current_db(), "db1", "session starts on the only database");
+        assert_eq!(all_values(&back, "t"), vec![vec![Value::Integer(5)]]);
     }
 }

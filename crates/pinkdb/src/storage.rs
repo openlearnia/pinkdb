@@ -372,10 +372,26 @@ pub struct ViewDef {
     pub query: Select,
     pub cols: Option<Vec<String>>,
 }
+
+/// One database's catalog: its tables and its session-local views.
+#[derive(Debug, Default, Clone)]
+pub struct DbCatalog {
+    /// Display name as created (the map key is the lowercased name).
+    pub(crate) name: String,
+    pub(crate) tables: HashMap<String, DataTable>,
+    pub(crate) views: HashMap<String, ViewDef>,
+}
+
+/// A store of databases.
 ///
 /// Holds an optional transaction snapshot (`BEGIN` clones the whole store;
 /// `ROLLBACK` restores it, `COMMIT` drops it). Single connection, so
 /// transactions give multi-statement atomicity, not isolation.
+///
+/// Databases are named, case-insensitive namespaces (default `main`).
+/// `current_db` is the *embedded session's* default database: unqualified
+/// names resolve against it. [`crate::Connection`]s carry their own session
+/// database and never mutate this one.
 ///
 /// Durable databases (opened via [`PinkDb::open_durable`]) additionally carry
 /// a write-ahead log: committed statements are appended as records, and
@@ -383,16 +399,27 @@ pub struct ViewDef {
 /// the WAL handle (`Arc`), so transaction snapshots and multi-writer
 /// `txn.work` copies all log to the same file. In-memory databases have
 /// `wal == None` and are byte-for-byte unchanged.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct PinkDb {
-    tables: HashMap<String, DataTable>,
-    views: HashMap<String, ViewDef>,
+    /// Key = lowercased database name.
+    databases: HashMap<String, DbCatalog>,
+    /// Lowercased name of the embedded session's current database.
+    current_db: String,
     txn_snapshot: Option<Box<PinkDb>>,
     /// Durable WAL handle, shared by every clone of this store.
     pub(crate) wal: Option<Arc<Mutex<Wal>>>,
     /// SQL text of mutating statements executed since `BEGIN` of a durable
     /// transaction; flushed as one WAL record by [`PinkDb::commit`].
     wal_txn: Vec<String>,
+    /// Session database before the first statement of the open transaction's
+    /// WAL record (the record replays in that session).
+    wal_txn_db: Option<String>,
+}
+
+impl Default for PinkDb {
+    fn default() -> Self {
+        Self::with_databases(["main"])
+    }
 }
 
 impl PinkDb {
@@ -400,29 +427,151 @@ impl PinkDb {
         Self::default()
     }
 
+    /// A store with exactly the named databases (used by `open` for v2
+    /// files, which may legitimately lack `main` after it was dropped).
+    pub(crate) fn with_databases<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut databases = HashMap::new();
+        for name in names {
+            databases.insert(
+                Self::db_key(name.as_ref()),
+                DbCatalog { name: name.as_ref().to_string(), ..DbCatalog::default() },
+            );
+        }
+        Self {
+            databases,
+            current_db: "main".to_string(),
+            txn_snapshot: None,
+            wal: None,
+            wal_txn: Vec::new(),
+            wal_txn_db: None,
+        }
+    }
+
+    /// The embedded session's current database (lowercased).
+    pub fn current_db(&self) -> &str {
+        &self.current_db
+    }
+
+    /// Set the embedded session's current database without validation
+    /// (used by `open`, which restores the file's databases exactly, and by
+    /// the session layer after `USE`/`DROP DATABASE`).
+    pub(crate) fn set_current_db(&mut self, name: &str) {
+        self.current_db = name.to_string();
+    }
+
+    /// Sorted display names of every database.
+    pub fn list_databases(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.databases.values().map(|c| c.name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    pub fn database_exists(&self, name: &str) -> bool {
+        self.databases.contains_key(&Self::db_key(name))
+    }
+
+    /// Create a new, empty database. Case-insensitive; errors if it exists.
+    pub fn create_database(&mut self, name: &str) -> Result<()> {
+        let key = Self::db_key(name);
+        if self.databases.contains_key(&key) {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" already exists"
+            )));
+        }
+        self.databases.insert(
+            key,
+            DbCatalog { name: name.to_string(), ..DbCatalog::default() },
+        );
+        Ok(())
+    }
+
+    /// Remove a database and everything in it. The last remaining database
+    /// cannot be dropped. The *session* switch after dropping the current
+    /// database is the caller's job (see [`PinkDb::fallback_db`]).
+    pub fn drop_database(&mut self, name: &str) -> Result<()> {
+        let key = Self::db_key(name);
+        if !self.databases.contains_key(&key) {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" not found"
+            )));
+        }
+        if self.databases.len() == 1 {
+            return Err(PinkDbError::Catalog(format!(
+                "cannot drop the last database \"{name}\""
+            )));
+        }
+        self.databases.remove(&key);
+        Ok(())
+    }
+
+    /// Switch the embedded session to `name` (validated).
+    pub fn use_database(&mut self, name: &str) -> Result<()> {
+        if !self.database_exists(name) {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" not found"
+            )));
+        }
+        self.current_db = Self::db_key(name);
+        Ok(())
+    }
+
+    /// The database a session should fall back to after dropping its current
+    /// one: `main` when it exists, else the first database in sorted order.
+    pub fn fallback_db(&self) -> String {
+        if self.databases.contains_key("main") {
+            return "main".to_string();
+        }
+        let mut names: Vec<&String> = self.databases.keys().collect();
+        names.sort();
+        names.first().map(|s| (*s).clone()).unwrap_or_else(|| "main".to_string())
+    }
+
+    fn db_key(name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
+
+    fn catalog(&self, db: &str) -> Result<&DbCatalog> {
+        self.databases.get(&Self::db_key(db)).ok_or_else(|| {
+            PinkDbError::Catalog(format!("database \"{db}\" not found"))
+        })
+    }
+
+    fn catalog_mut(&mut self, db: &str) -> Result<&mut DbCatalog> {
+        self.databases.get_mut(&Self::db_key(db)).ok_or_else(|| {
+            PinkDbError::Catalog(format!("database \"{db}\" not found"))
+        })
+    }
+
     /// Current version of one table (for conflict detection).
     pub fn table_version(&self, name: &str) -> Result<u64> {
-        Ok(self.table(name)?.version)
+        let db = self.current_db.clone();
+        self.table_version_in(&db, name)
     }
 
-    pub(crate) fn tables_remove(&mut self, key: &str) -> Option<DataTable> {
-        self.tables.remove(key)
+    pub fn table_version_in(&self, db: &str, name: &str) -> Result<u64> {
+        Ok(self.table_in(db, name)?.version)
     }
 
-    pub(crate) fn tables_insert(&mut self, key: String, table: DataTable) {
-        self.tables.insert(key, table);
+    pub(crate) fn tables_remove_in(&mut self, db: &str, key: &str) -> Option<DataTable> {
+        self.databases.get_mut(&Self::db_key(db))?.tables.remove(key)
     }
 
-    pub(crate) fn views_remove(&mut self, key: &str) -> Option<ViewDef> {
-        self.views.remove(key)
+    pub(crate) fn tables_insert_in(&mut self, db: &str, key: String, table: DataTable) -> Result<()> {
+        self.catalog_mut(db)?.tables.insert(key, table);
+        Ok(())
     }
 
-    pub(crate) fn views_insert(&mut self, key: String, view: ViewDef) {
-        self.views.insert(key, view);
+    pub(crate) fn views_remove_in(&mut self, db: &str, key: &str) -> Option<ViewDef> {
+        self.databases.get_mut(&Self::db_key(db))?.views.remove(key)
     }
 
-    pub(crate) fn clone_views(&self) -> HashMap<String, ViewDef> {
-        self.views.clone()
+    pub(crate) fn views_insert_in(&mut self, db: &str, key: String, view: ViewDef) -> Result<()> {
+        self.catalog_mut(db)?.views.insert(key, view);
+        Ok(())
     }
 
     /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.
@@ -443,6 +592,10 @@ impl PinkDb {
     /// (autocommit) — or was executed inside an open transaction, in which
     /// case its text is buffered until `COMMIT`. Non-mutating statements
     /// (queries, view DDL) never reach the WAL.
+    ///
+    /// The record is made self-contained: when the WAL's replay session
+    /// differs from the statement's session (after a checkpoint, or when
+    /// multiple connections share the file) a `USE` prefix is emitted.
     pub(crate) fn wal_log_statement(
         &mut self,
         plan: &crate::plan::LogicalPlan,
@@ -452,20 +605,53 @@ impl PinkDb {
             return Ok(());
         }
         if self.in_transaction() {
+            if self.wal_txn_db.is_none() {
+                self.wal_txn_db = Some(self.current_db.clone());
+            }
             self.wal_txn.push(sql.to_string());
             return Ok(());
         }
-        self.wal_append(&[sql.to_string()])
+        // `USE` is self-contained: replaying it lands in the target session
+        // from anywhere, so no prefix is needed (and none would help).
+        if let crate::plan::LogicalPlan::Use { name } = plan {
+            if let Some(wal) = self.durable_handle() {
+                let mut guard = wal.lock().map_err(|_| {
+                    PinkDbError::Execution("internal lock error (poisoned)".to_string())
+                })?;
+                guard.append(&[sql.to_string()])?;
+                guard.set_session_db(&name.to_ascii_lowercase());
+            }
+            return Ok(());
+        }
+        let db = self.current_db.clone();
+        self.wal_append_session(&db, &db, &[sql.to_string()])
     }
 
-    /// Append one committed unit (one autocommit statement, or every mutating
-    /// statement of a committed transaction) to the WAL. No-op in memory.
-    pub(crate) fn wal_append(&mut self, stmts: &[String]) -> Result<()> {
+    /// Append one committed unit executed in session database `db_before`,
+    /// leaving the replay session at `db_after` (no-op in memory). When the
+    /// WAL's replay session differs from `db_before`, a `USE db_before`
+    /// statement is prepended so the record replays in the right database —
+    /// used by the embedded path (after a checkpoint or recovery) and by
+    /// [`crate::Connection`]s, whose session is not the store's.
+    ///
+    /// A `USE` prefix naming a database that no longer exists could never
+    /// replay (the `DROP` that removed it is already earlier in the WAL), so
+    /// the prefix is dropped in that case. Callers hold the store lock across
+    /// execution and append, which guarantees the statements are then
+    /// session-independent: a session-dependent statement against a vanished
+    /// database would have failed before reaching the WAL.
+    pub(crate) fn wal_append_session(
+        &self,
+        db_before: &str,
+        db_after: &str,
+        stmts: &[String],
+    ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
             let mut guard = wal.lock().map_err(|_| {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
-            guard.append(stmts)?;
+            let before = self.database_exists(db_before).then_some(db_before);
+            guard.append_in_session(before, db_after, stmts)?;
         }
         Ok(())
     }
@@ -479,6 +665,7 @@ impl PinkDb {
             ));
         }
         self.wal_txn.clear();
+        self.wal_txn_db = None;
         self.txn_snapshot = Some(Box::new(self.clone()));
         Ok(())
     }
@@ -494,25 +681,33 @@ impl PinkDb {
         }
         if !self.wal_txn.is_empty() {
             let stmts = std::mem::take(&mut self.wal_txn);
-            if let Err(e) = self.wal_append(&stmts) {
+            let before = self.wal_txn_db.take().unwrap_or_else(|| self.current_db.clone());
+            let after = self.current_db.clone();
+            if let Err(e) = self.wal_append_session(&before, &after, &stmts) {
                 // Keep the statements: a retried COMMIT must never publish
                 // changes that made it to memory but not to the WAL.
                 self.wal_txn = stmts;
+                self.wal_txn_db = Some(before);
                 return Err(e);
             }
         }
         self.wal_txn.clear();
+        self.wal_txn_db = None;
         self.txn_snapshot = None;
         Ok(())
     }
 
     /// Roll back: restore the snapshot, discarding all changes since BEGIN
-    /// (data and catalog alike); nothing is logged.
+    /// (data and catalog alike); nothing is logged. The session's current
+    /// database is *not* transactional — it keeps its live value.
     pub fn rollback(&mut self) -> Result<()> {
         match self.txn_snapshot.take() {
             Some(snap) => {
+                let current = self.current_db.clone();
                 *self = *snap;
+                self.current_db = current;
                 self.wal_txn.clear();
+                self.wal_txn_db = None;
                 Ok(())
             }
             None => Err(PinkDbError::Execution(
@@ -530,44 +725,79 @@ impl PinkDb {
         name: &str,
         schema: Vec<(String, DataType)>,
     ) -> Result<()> {
+        let db = self.current_db.clone();
+        self.create_table_in(&db, name, schema)
+    }
+
+    pub fn create_table_in(
+        &mut self,
+        db: &str,
+        name: &str,
+        schema: Vec<(String, DataType)>,
+    ) -> Result<()> {
         let key = Self::key(name);
-        if self.tables.contains_key(&key) {
+        let cat = self.catalog_mut(db)?;
+        if cat.tables.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "table \"{name}\" already exists"
             )));
         }
-        if self.views.contains_key(&key) {
+        if cat.views.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "a view named \"{name}\" already exists"
             )));
         }
-        self.tables
+        cat.tables
             .insert(key, DataTable::new(name.to_string(), schema)?);
         Ok(())
     }
 
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
-        self.tables
+        let db = self.current_db.clone();
+        self.drop_table_in(&db, name)
+    }
+
+    pub fn drop_table_in(&mut self, db: &str, name: &str) -> Result<()> {
+        self.catalog_mut(db)?
+            .tables
             .remove(&Self::key(name))
             .map(|_| ())
             .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
     }
 
     pub fn table(&self, name: &str) -> Result<&DataTable> {
-        self.tables.get(&Self::key(name)).ok_or_else(|| {
+        self.table_in(&self.current_db, name)
+    }
+
+    pub fn table_in(&self, db: &str, name: &str) -> Result<&DataTable> {
+        self.catalog(db)?.tables.get(&Self::key(name)).ok_or_else(|| {
             PinkDbError::Catalog(format!("table \"{name}\" not found"))
         })
     }
 
     pub fn table_mut(&mut self, name: &str) -> Result<&mut DataTable> {
-        self.tables.get_mut(&Self::key(name)).ok_or_else(|| {
+        let db = self.current_db.clone();
+        self.table_mut_in(&db, name)
+    }
+
+    pub fn table_mut_in(&mut self, db: &str, name: &str) -> Result<&mut DataTable> {
+        self.catalog_mut(db)?.tables.get_mut(&Self::key(name)).ok_or_else(|| {
             PinkDbError::Catalog(format!("table \"{name}\" not found"))
         })
     }
 
     /// Sorted table names (stable output for `.tables`).
     pub fn list_tables(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.tables.values().map(|t| t.name.clone()).collect();
+        self.list_tables_in(&self.current_db)
+    }
+
+    /// Sorted table display names in `db`.
+    pub fn list_tables_in(&self, db: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .databases
+            .get(&Self::db_key(db))
+            .map(|c| c.tables.values().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
         names.sort();
         names
     }
@@ -579,37 +809,68 @@ impl PinkDb {
         query: Select,
         cols: Option<Vec<String>>,
     ) -> Result<()> {
+        let db = self.current_db.clone();
+        self.create_view_in(&db, name, query, cols)
+    }
+
+    pub fn create_view_in(
+        &mut self,
+        db: &str,
+        name: &str,
+        query: Select,
+        cols: Option<Vec<String>>,
+    ) -> Result<()> {
         let key = Self::key(name);
-        if self.tables.contains_key(&key) {
+        let cat = self.catalog_mut(db)?;
+        if cat.tables.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "a table named \"{name}\" already exists"
             )));
         }
-        if self.views.contains_key(&key) {
+        if cat.views.contains_key(&key) {
             return Err(PinkDbError::Catalog(format!(
                 "view \"{name}\" already exists"
             )));
         }
-        self.views.insert(key, ViewDef { name: name.to_string(), query, cols });
+        cat.views.insert(key, ViewDef { name: name.to_string(), query, cols });
         Ok(())
     }
 
     pub fn drop_view(&mut self, name: &str) -> Result<()> {
-        self.views
+        let db = self.current_db.clone();
+        self.drop_view_in(&db, name)
+    }
+
+    pub fn drop_view_in(&mut self, db: &str, name: &str) -> Result<()> {
+        self.catalog_mut(db)?
+            .views
             .remove(&Self::key(name))
             .map(|_| ())
             .ok_or_else(|| PinkDbError::Catalog(format!("view \"{name}\" not found")))
     }
 
     pub fn view(&self, name: &str) -> Result<&ViewDef> {
-        self.views.get(&Self::key(name)).ok_or_else(|| {
+        self.view_in(&self.current_db, name)
+    }
+
+    pub fn view_in(&self, db: &str, name: &str) -> Result<&ViewDef> {
+        self.catalog(db)?.views.get(&Self::key(name)).ok_or_else(|| {
             PinkDbError::Catalog(format!("view \"{name}\" not found"))
         })
     }
 
     /// Sorted view display names.
     pub fn list_views(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.views.values().map(|v| v.name.clone()).collect();
+        self.list_views_in(&self.current_db)
+    }
+
+    /// Sorted view display names in `db`.
+    pub fn list_views_in(&self, db: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .databases
+            .get(&Self::db_key(db))
+            .map(|c| c.views.values().map(|v| v.name.clone()).collect())
+            .unwrap_or_default();
         names.sort();
         names
     }
@@ -618,6 +879,7 @@ impl PinkDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::ast::{Expr, Projection};
 
     fn sample() -> DataTable {
         let mut t = DataTable::new(
@@ -765,5 +1027,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PinkDbError::Catalog(_)));
+    }
+
+    #[test]
+    fn databases_catalog_and_session_default() {
+        let mut db = PinkDb::new();
+        assert_eq!(db.current_db(), "main");
+        assert_eq!(db.list_databases(), vec!["main".to_string()]);
+        assert!(db.database_exists("Main"));
+        assert!(!db.database_exists("other"));
+
+        // Case-insensitive create/use; display name kept as written.
+        db.create_database("Analytics").unwrap();
+        assert!(db.create_database("ANALYTICS").is_err(), "duplicate");
+        assert_eq!(db.list_databases(), vec!["Analytics".to_string(), "main".to_string()]);
+        db.use_database("analytics").unwrap();
+        assert_eq!(db.current_db(), "analytics");
+        assert!(db.use_database("missing").is_err());
+
+        // Tables resolve against the session's current database.
+        db.create_table("t", vec![("a".to_string(), DataType::Integer)]).unwrap();
+        assert!(db.table_in("analytics", "t").is_ok());
+        assert!(db.table("t").is_ok());
+        assert!(db.table_in("main", "t").is_err());
+        // Explicit targets work regardless of the session.
+        db.create_table_in("main", "m", vec![("a".to_string(), DataType::Integer)]).unwrap();
+        assert_eq!(db.list_tables_in("main"), vec!["m".to_string()]);
+        assert_eq!(db.list_tables(), vec!["t".to_string()]);
+
+        // Drop rules: never the last database; fallback prefers main.
+        assert!(db.drop_database("main").is_ok());
+        assert_eq!(db.fallback_db(), "analytics");
+        assert!(db.drop_database("analytics").is_err(), "last database");
+        assert!(db.drop_database("nope").is_err());
+        assert_eq!(db.list_databases(), vec!["Analytics".to_string()]);
+    }
+
+    #[test]
+    fn views_are_per_database() {
+        let mut db = PinkDb::new();
+        db.create_database("db1").unwrap();
+        let query = Select {
+            with: Vec::new(),
+            distinct: false,
+            projections: vec![Projection::Expr {
+                expr: Expr::Literal(Value::Integer(1)),
+                alias: None,
+            }],
+            from: None,
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            unions: Vec::new(),
+        };
+        db.create_view("v", query.clone(), None).unwrap();
+        assert!(db.view_in("main", "v").is_ok());
+        assert!(db.view_in("db1", "v").is_err());
+        db.create_view_in("db1", "v", query, None).unwrap();
+        assert_eq!(db.list_views_in("db1"), vec!["v".to_string()]);
+        assert_eq!(db.list_views(), vec!["v".to_string()]);
+        db.drop_view_in("db1", "v").unwrap();
+        assert!(db.view_in("db1", "v").is_err());
     }
 }

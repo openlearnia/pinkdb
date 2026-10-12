@@ -228,6 +228,22 @@ impl Parser {
         }
     }
 
+    /// `name` or `db.name` (a table reference). Three-part names are not
+    /// valid table references and get a clear error.
+    fn parse_table_ref(&mut self) -> Result<(Option<String>, String)> {
+        let first = self.parse_ident()?;
+        if self.eat(&Token::Dot) {
+            let second = self.parse_ident()?;
+            if self.peek().0 == Token::Dot {
+                return Err(self.error(
+                    "three-part names (db.table.col) are not supported".to_string(),
+                ));
+            }
+            return Ok((Some(first), second));
+        }
+        Ok((None, first))
+    }
+
     // ---------- statements ----------
 
     fn parse_statement(&mut self) -> Result<Statement> {
@@ -236,6 +252,10 @@ impl Parser {
             Some(Keyword::Insert) => self.parse_insert(),
             Some(Keyword::Update) => self.parse_update(),
             Some(Keyword::Delete) => self.parse_delete(),
+            Some(Keyword::Use) => {
+                self.next();
+                Ok(Statement::Use { name: self.parse_ident()? })
+            }
             Some(Keyword::Begin) => {
                 self.next();
                 // `BEGIN` or `BEGIN TRANSACTION`.
@@ -257,7 +277,7 @@ impl Parser {
                 Ok(Statement::Select(self.parse_select()?))
             }
             _ => Err(self.error(format!(
-                "expected a statement (CREATE, INSERT, UPDATE, DELETE, DROP, BEGIN, COMMIT, ROLLBACK, SELECT), found {:?}",
+                "expected a statement (CREATE, INSERT, UPDATE, DELETE, DROP, USE, BEGIN, COMMIT, ROLLBACK, SELECT), found {:?}",
                 self.peek().0
             ))),
         }
@@ -265,7 +285,7 @@ impl Parser {
 
     fn parse_update(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Update)?;
-        let table = self.parse_ident()?;
+        let (db, table) = self.parse_table_ref()?;
         self.expect_keyword(Keyword::Set)?;
         let mut sets = Vec::new();
         loop {
@@ -285,36 +305,45 @@ impl Parser {
         } else {
             None
         };
-        Ok(Statement::Update { table, sets, where_clause })
+        Ok(Statement::Update { db, table, sets, where_clause })
     }
 
     fn parse_delete(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Delete)?;
         // `DELETE FROM t` (the FROM is required in v1).
         self.expect_keyword(Keyword::From)?;
-        let table = self.parse_ident()?;
+        let (db, table) = self.parse_table_ref()?;
         let where_clause = if self.eat_keyword(Keyword::Where) {
             Some(self.parse_expr()?)
         } else {
             None
         };
-        Ok(Statement::Delete { table, where_clause })
+        Ok(Statement::Delete { db, table, where_clause })
     }
 
     fn parse_drop(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Drop)?;
+        if self.eat_keyword(Keyword::Database) {
+            return Ok(Statement::DropDatabase { name: self.parse_ident()? });
+        }
         if self.eat_keyword(Keyword::Table) {
-            return Ok(Statement::DropTable { name: self.parse_ident()? });
+            let (db, name) = self.parse_table_ref()?;
+            return Ok(Statement::DropTable { db, name });
         }
         self.expect_keyword(Keyword::View)?;
-        Ok(Statement::DropView { name: self.parse_ident()? })
+        let (db, name) = self.parse_table_ref()?;
+        Ok(Statement::DropView { db, name })
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Create)?;
+        // `CREATE DATABASE name`.
+        if self.eat_keyword(Keyword::Database) {
+            return Ok(Statement::CreateDatabase { name: self.parse_ident()? });
+        }
         // `CREATE VIEW name [(cols)] AS select`.
         if self.eat_keyword(Keyword::View) {
-            let name = self.parse_ident()?;
+            let (db, name) = self.parse_table_ref()?;
             let cols = if self.peek().0 == Token::LParen {
                 self.next();
                 let mut c = vec![self.parse_ident()?];
@@ -328,10 +357,10 @@ impl Parser {
             };
             self.expect_keyword(Keyword::As)?;
             let query = self.parse_select()?;
-            return Ok(Statement::CreateView { name, cols, query: Box::new(query) });
+            return Ok(Statement::CreateView { db, name, cols, query: Box::new(query) });
         }
         self.expect_keyword(Keyword::Table)?;
-        let name = self.parse_ident()?;
+        let (db, name) = self.parse_table_ref()?;
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
@@ -349,13 +378,13 @@ impl Parser {
         if columns.is_empty() {
             return Err(self.error("table needs at least one column".to_string()));
         }
-        Ok(Statement::CreateTable { name, columns })
+        Ok(Statement::CreateTable { db, name, columns })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword(Keyword::Insert)?;
         self.expect_keyword(Keyword::Into)?;
-        let table = self.parse_ident()?;
+        let (db, table) = self.parse_table_ref()?;
         let columns = if self.peek().0 == Token::LParen {
             // Ambiguous with VALUES row parens only in theory: a column list
             // holds bare idents, and we require VALUES right after.
@@ -394,7 +423,7 @@ impl Parser {
         if rows.is_empty() {
             return Err(self.error("INSERT needs at least one row".to_string()));
         }
-        Ok(Statement::Insert { table, columns, rows })
+        Ok(Statement::Insert { db, table, columns, rows })
     }
 
     /// A full SELECT including trailing UNION branches (left-associative).
@@ -571,7 +600,7 @@ impl Parser {
         }
     }
 
-    /// A FROM/JOIN source: `table` or `(SELECT ...)`.
+    /// A FROM/JOIN source: `table` / `db.table` or `(SELECT ...)`.
     /// Derived tables require an alias (checked by the caller).
     fn parse_source(&mut self) -> Result<FromSource> {
         if self.peek().0 == Token::LParen
@@ -585,7 +614,8 @@ impl Parser {
             self.expect(&Token::RParen)?;
             Ok(FromSource::Derived(Box::new(q)))
         } else {
-            Ok(FromSource::Table(self.parse_ident()?))
+            let (db, name) = self.parse_table_ref()?;
+            Ok(FromSource::Table { db, name })
         }
     }
 
@@ -1118,10 +1148,18 @@ impl Parser {
                 if self.peek().0 == Token::Dot {
                     self.next();
                     match self.next() {
-                        (Token::Ident(col), _) => Ok(Expr::Column {
-                            table: Some(name),
-                            name: col,
-                        }),
+                        (Token::Ident(col), _) => {
+                            if self.peek().0 == Token::Dot {
+                                return Err(self.error(
+                                    "three-part column references (db.table.col) are not supported"
+                                        .to_string(),
+                                ));
+                            }
+                            Ok(Expr::Column {
+                                table: Some(name),
+                                name: col,
+                            })
+                        }
                         (Token::Star, _) => Ok(Expr::QualifiedStar(Some(name))),
                         (tok, _) => Err(self.error(format!(
                             "expected column name or `*` after `.`, found {tok:?}"
@@ -1309,15 +1347,24 @@ mod tests {
     #[test]
     fn update_delete_shapes() {
         match parse_one("UPDATE t SET a = 1, b = a + 2 WHERE a > 0;") {
-            Statement::Update { table, sets, where_clause } => {
+            Statement::Update { db, table, sets, where_clause } => {
+                assert_eq!(db, None);
                 assert_eq!(table, "t");
                 assert_eq!(sets.len(), 2);
                 assert!(where_clause.is_some());
             }
             _ => panic!(),
         }
+        match parse_one("UPDATE db1.t SET a = 1;") {
+            Statement::Update { db, table, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(table, "t");
+            }
+            _ => panic!(),
+        }
         match parse_one("DELETE FROM t;") {
-            Statement::Delete { table, where_clause } => {
+            Statement::Delete { db, table, where_clause } => {
+                assert_eq!(db, None);
                 assert_eq!(table, "t");
                 assert!(where_clause.is_none());
             }
@@ -1325,6 +1372,72 @@ mod tests {
         }
         assert!(parse_statements("UPDATE t SET;").is_err());
         assert!(parse_statements("DELETE t;").is_err());
+    }
+
+    #[test]
+    fn multi_database_statements() {
+        assert!(matches!(
+            parse_one("CREATE DATABASE analytics;"),
+            Statement::CreateDatabase { name } if name == "analytics"
+        ));
+        assert!(matches!(
+            parse_one("DROP DATABASE analytics;"),
+            Statement::DropDatabase { name } if name == "analytics"
+        ));
+        assert!(matches!(
+            parse_one("USE analytics;"),
+            Statement::Use { name } if name == "analytics"
+        ));
+        // Qualified DDL/DML.
+        match parse_one("CREATE TABLE db1.t (a INTEGER);") {
+            Statement::CreateTable { db, name, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "t");
+            }
+            _ => panic!(),
+        }
+        match parse_one("INSERT INTO db1.t VALUES (1);") {
+            Statement::Insert { db, table, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(table, "t");
+            }
+            _ => panic!(),
+        }
+        match parse_one("CREATE VIEW db1.v AS SELECT 1;") {
+            Statement::CreateView { db, name, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "v");
+            }
+            _ => panic!(),
+        }
+        match parse_one("DROP TABLE db1.t;") {
+            Statement::DropTable { db, name } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "t");
+            }
+            _ => panic!(),
+        }
+        match parse_one("DROP VIEW db1.v;") {
+            Statement::DropView { db, name } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "v");
+            }
+            _ => panic!(),
+        }
+        // Qualified FROM source.
+        let Statement::Select(sel) = parse_one("SELECT a FROM db1.t;") else { panic!() };
+        match sel.from.unwrap().source {
+            FromSource::Table { db, name } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "t");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Three-part references are rejected with a clear message.
+        let err = parse_statements("SELECT db1.t.a FROM db1.t;").unwrap_err();
+        assert!(err.to_string().contains("three-part"), "{err}");
+        let err = parse_statements("SELECT db1.t.* FROM db1.t;").unwrap_err();
+        assert!(err.to_string().contains("three-part"), "{err}");
     }
 
     #[test]

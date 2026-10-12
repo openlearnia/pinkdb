@@ -1,5 +1,6 @@
 /target/
 *.pink
+!crates/pinkdb/tests/fixtures/*.pink
 *.csv
 .DS_Store
 __pycache__/

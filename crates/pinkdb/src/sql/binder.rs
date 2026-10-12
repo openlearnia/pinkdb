@@ -469,6 +469,8 @@ struct ScopeTable {
 
 struct Binder<'a> {
     db: &'a PinkDb,
+    /// Session database for unqualified names (lowercased when used).
+    default_db: String,
     tables: Vec<ScopeTable>,
     /// Select alias (lowercased) → AST, for cross-clause references.
     aliases: HashMap<String, Expr>,
@@ -491,9 +493,10 @@ struct Binder<'a> {
 }
 
 impl<'a> Binder<'a> {
-    fn new(db: &'a PinkDb) -> Self {
+    fn new(db: &'a PinkDb, default_db: &str) -> Self {
         Self {
             db,
+            default_db: default_db.to_string(),
             tables: Vec::new(),
             aliases: HashMap::new(),
             resolving: Vec::new(),
@@ -511,6 +514,7 @@ impl<'a> Binder<'a> {
     fn child(&self) -> Self {
         Self {
             db: self.db,
+            default_db: self.default_db.clone(),
             tables: Vec::new(),
             aliases: HashMap::new(),
             resolving: Vec::new(),
@@ -520,6 +524,23 @@ impl<'a> Binder<'a> {
             windows: Vec::new(),
             ctes: self.ctes.clone(),
             views_used: Rc::clone(&self.views_used),
+        }
+    }
+
+    /// Resolve a statement's table reference to a concrete database: an
+    /// explicit qualifier must name an existing database; otherwise the
+    /// session's default database is used.
+    fn resolve_db(&self, db: &Option<String>) -> Result<String> {
+        match db {
+            Some(q) => {
+                if !self.db.database_exists(q) {
+                    return Err(PinkDbError::Catalog(format!(
+                        "database \"{q}\" not found"
+                    )));
+                }
+                Ok(q.to_ascii_lowercase())
+            }
+            None => Ok(self.default_db.to_ascii_lowercase()),
         }
     }
 
@@ -752,7 +773,8 @@ impl<'a> Binder<'a> {
             Expr::ScalarSubquery(q) => {
                 let mut child = self.child();
                 let query = bind_select_in(child.db, &mut child, q)?;
-                let schema = plan_schema(child.db, &child.ctes, &query)?;
+                let schema =
+                    plan_schema(child.db, &child.default_db, &child.ctes, &query)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
                         "scalar subquery must return exactly one column".to_string(),
@@ -765,7 +787,7 @@ impl<'a> Binder<'a> {
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 let mut child = self.child();
                 let sub = bind_select_in(child.db, &mut child, query)?;
-                let schema = plan_schema(child.db, &child.ctes, &sub)?;
+                let schema = plan_schema(child.db, &child.default_db, &child.ctes, &sub)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
                         "IN subquery must return exactly one column".to_string(),
@@ -1405,7 +1427,13 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
 /// Bind a JOIN `ON` condition. v1 accepts a single `left_expr = right_expr`
 /// equality (either orientation); each side binds in its own table's scope,
 /// so keys are side-relative. Aggregates are forbidden in ON.
-fn bind_join_keys(db: &PinkDb, left: &ScopeTable, right: &ScopeTable, on: &Expr) -> Result<(BoundExpr, BoundExpr)> {
+fn bind_join_keys(
+    db: &PinkDb,
+    default_db: &str,
+    left: &ScopeTable,
+    right: &ScopeTable,
+    on: &Expr,
+) -> Result<(BoundExpr, BoundExpr)> {
     let (l, r) = match on {
         Expr::Binary { op: BinaryOp::Eq, left, right } => (left.as_ref(), right.as_ref()),
         _ => {
@@ -1414,8 +1442,13 @@ fn bind_join_keys(db: &PinkDb, left: &ScopeTable, right: &ScopeTable, on: &Expr)
             ));
         }
     };
-    fn bind_side(db: &PinkDb, scope: &ScopeTable, expr: &Expr) -> Result<BoundExpr> {
-        let mut b = Binder::new(db);
+    fn bind_side(
+        db: &PinkDb,
+        default_db: &str,
+        scope: &ScopeTable,
+        expr: &Expr,
+    ) -> Result<BoundExpr> {
+        let mut b = Binder::new(db, default_db);
         b.tables.push(scope.clone());
         b.allow_alias = false;
         b.allow_win = false;
@@ -1429,7 +1462,10 @@ fn bind_join_keys(db: &PinkDb, left: &ScopeTable, right: &ScopeTable, on: &Expr)
         Ok(bound)
     }
     // Try `l=left, r=right`, then the swapped orientation.
-    if let (Ok(lk), Ok(rk)) = (bind_side(db, left, l), bind_side(db, right, r)) {
+    if let (Ok(lk), Ok(rk)) = (
+        bind_side(db, default_db, left, l),
+        bind_side(db, default_db, right, r),
+    ) {
         comparison_ok(BinaryOp::Eq, lk.dtype(), rk.dtype()).map_err(|_| {
             PinkDbError::Type(format!(
                 "JOIN keys have incompatible types: {} and {}",
@@ -1439,7 +1475,10 @@ fn bind_join_keys(db: &PinkDb, left: &ScopeTable, right: &ScopeTable, on: &Expr)
         })?;
         return Ok((lk, rk));
     }
-    match (bind_side(db, right, l), bind_side(db, left, r)) {
+    match (
+        bind_side(db, default_db, right, l),
+        bind_side(db, default_db, left, r),
+    ) {
         (Ok(lk), Ok(rk)) => {
             comparison_ok(BinaryOp::Eq, rk.dtype(), lk.dtype()).map_err(|_| {
                 PinkDbError::Type(format!(
@@ -1460,39 +1499,74 @@ fn scan_width(binder: &Binder<'_>) -> usize {
     binder.tables.iter().map(|t| t.columns.len()).sum()
 }
 
-/// Bind one statement. The returned plan borrows nothing from `db`.
-pub fn bind(db: &PinkDb, stmt: &Statement) -> Result<LogicalPlan> {
+/// Bind one statement against `db`, with `default_db` as the session's
+/// current database for unqualified names. The returned plan borrows nothing
+/// from `db`.
+pub fn bind(db: &PinkDb, stmt: &Statement, default_db: &str) -> Result<LogicalPlan> {
     match stmt {
-        Statement::CreateTable { name, columns } => Ok(LogicalPlan::CreateTable {
+        Statement::CreateTable { db: qdb, name, columns } => Ok(LogicalPlan::CreateTable {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
             schema: columns.clone(),
         }),
-        Statement::Insert { table, columns, rows } => bind_insert(db, table, columns, rows),
-        Statement::Update { table, sets, where_clause } => {
-            bind_update(db, table, sets, where_clause)
+        Statement::Insert { db: qdb, table, columns, rows } => {
+            bind_insert(db, default_db, qdb, table, columns, rows)
         }
-        Statement::Delete { table, where_clause } => bind_delete(db, table, where_clause),
+        Statement::Update { db: qdb, table, sets, where_clause } => {
+            bind_update(db, default_db, qdb, table, sets, where_clause)
+        }
+        Statement::Delete { db: qdb, table, where_clause } => {
+            bind_delete(db, default_db, qdb, table, where_clause)
+        }
         Statement::Begin => Ok(LogicalPlan::Begin),
         Statement::Commit => Ok(LogicalPlan::Commit),
         Statement::Rollback => Ok(LogicalPlan::Rollback),
-        Statement::CreateView { name, cols, query } => bind_create_view(db, name, cols, query),
-        Statement::DropTable { name } => Ok(LogicalPlan::DropTable { name: name.clone() }),
-        Statement::DropView { name } => Ok(LogicalPlan::DropView { name: name.clone() }),
-        Statement::Select(sel) => bind_select(db, sel),
+        Statement::CreateView { db: qdb, name, cols, query } => {
+            bind_create_view(db, default_db, qdb, name, cols, query)
+        }
+        Statement::DropTable { db: qdb, name } => Ok(LogicalPlan::DropTable {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+        }),
+        Statement::DropView { db: qdb, name } => Ok(LogicalPlan::DropView {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+        }),
+        Statement::CreateDatabase { name } => {
+            Ok(LogicalPlan::CreateDatabase { name: name.clone() })
+        }
+        Statement::DropDatabase { name } => {
+            Ok(LogicalPlan::DropDatabase { name: name.clone() })
+        }
+        Statement::Use { name } => {
+            // Validate at bind: USE must fail clearly before touching the
+            // session (and before any later statement in the same string).
+            if !db.database_exists(name) {
+                return Err(PinkDbError::Catalog(format!(
+                    "database \"{name}\" not found"
+                )));
+            }
+            Ok(LogicalPlan::Use { name: name.clone() })
+        }
+        Statement::Select(sel) => bind_select(db, default_db, sel),
     }
 }
 
 /// Bind CREATE VIEW: validate the query now (errors surface at creation),
-// store the AST for per-use rebinding.
+/// store the AST for per-use rebinding. The view lives in the qualified
+/// database (or the session's), and its body resolves unqualified names there.
 fn bind_create_view(
     db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
     name: &str,
     cols: &Option<Vec<String>>,
     query: &Select,
 ) -> Result<LogicalPlan> {
-    let mut binder = Binder::new(db);
+    let view_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let mut binder = Binder::new(db, &view_db);
     let bound = bind_select_in(db, &mut binder, query)?;
-    let schema = plan_schema(db, &binder.ctes, &bound)?;
+    let schema = plan_schema(db, &view_db, &binder.ctes, &bound)?;
     if let Some(cols) = cols {
         if cols.len() != schema.len() {
             return Err(PinkDbError::Execution(format!(
@@ -1503,6 +1577,7 @@ fn bind_create_view(
         }
     }
     Ok(LogicalPlan::CreateView {
+        db: Some(view_db),
         name: name.to_string(),
         cols: cols.clone(),
         query: Box::new(query.clone()),
@@ -1513,11 +1588,14 @@ fn bind_create_view(
 /// scope (no aggregates, windows, or aliases), check Boolean WHERE.
 fn bind_update(
     db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
     table: &str,
     sets: &[(String, Expr)],
     where_clause: &Option<Expr>,
 ) -> Result<LogicalPlan> {
-    let t = db.table(table)?;
+    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let t = db.table_in(&table_db, table)?;
     if sets.is_empty() {
         return Err(PinkDbError::Parse("UPDATE needs at least one SET assignment".to_string()));
     }
@@ -1529,7 +1607,7 @@ fn bind_update(
             )));
         }
     }
-    let mut binder = Binder::new(db);
+    let mut binder = Binder::new(db, &table_db);
     binder.allow_win = false;
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
@@ -1572,6 +1650,7 @@ fn bind_update(
     }
     reject_view_dependency(db, &binder.views_used())?;
     Ok(LogicalPlan::Update {
+        db: Some(table_db),
         table: t.name.clone(),
         sets: bound_sets,
         predicate,
@@ -1579,9 +1658,16 @@ fn bind_update(
 }
 
 /// Bind DELETE: Boolean WHERE over the table scope (no aggregates/windows).
-fn bind_delete(db: &PinkDb, table: &str, where_clause: &Option<Expr>) -> Result<LogicalPlan> {
-    let t = db.table(table)?;
-    let mut binder = Binder::new(db);
+fn bind_delete(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
+    table: &str,
+    where_clause: &Option<Expr>,
+) -> Result<LogicalPlan> {
+    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let t = db.table_in(&table_db, table)?;
+    let mut binder = Binder::new(db, &table_db);
     binder.allow_win = false;
     binder.allow_alias = false;
     binder.tables.push(ScopeTable {
@@ -1599,16 +1685,19 @@ fn bind_delete(db: &PinkDb, table: &str, where_clause: &Option<Expr>) -> Result<
         }
     }
     reject_view_dependency(db, &binder.views_used())?;
-    Ok(LogicalPlan::Delete { table: t.name.clone(), predicate })
+    Ok(LogicalPlan::Delete { db: Some(table_db), table: t.name.clone(), predicate })
 }
 
 fn bind_insert(
     db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
 ) -> Result<LogicalPlan> {
-    let t = db.table(table)?;
+    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let t = db.table_in(&table_db, table)?;
     let schema = t.schema();
     let order: Vec<usize> = match columns {
         Some(cols) => cols
@@ -1645,7 +1734,7 @@ fn bind_insert(
         let mut bound = vec![BoundExpr::Literal(Value::Null); schema.len()];
         // Fill unspecified columns with NULL (only when a column list is given).
         for (pos, cell) in row.iter().enumerate() {
-            let mut binder = Binder::new(db);
+            let mut binder = Binder::new(db, &table_db);
             binder.allow_win = false;
             let mut aggs = Vec::new();
             let e = binder.bind_expr(cell, &mut aggs, false)?;
@@ -1659,7 +1748,11 @@ fn bind_insert(
         bound_rows.push(bound);
     }
     reject_view_dependency(db, &views_used)?;
-    Ok(LogicalPlan::Insert { table: t.name.clone(), rows: bound_rows })
+    Ok(LogicalPlan::Insert {
+        db: Some(table_db),
+        table: t.name.clone(),
+        rows: bound_rows,
+    })
 }
 
 /// Durable databases replay committed SQL text, and views are never
@@ -1678,8 +1771,8 @@ fn reject_view_dependency(db: &PinkDb, views: &[String]) -> Result<()> {
 }
 
 /// Bind a top-level SELECT with a fresh binder.
-fn bind_select(db: &PinkDb, sel: &Select) -> Result<LogicalPlan> {
-    let mut binder = Binder::new(db);
+fn bind_select(db: &PinkDb, default_db: &str, sel: &Select) -> Result<LogicalPlan> {
+    let mut binder = Binder::new(db, default_db);
     bind_select_in(db, &mut binder, sel)
 }
 
@@ -1769,8 +1862,8 @@ fn bind_union_chain(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         debug_assert!(branch.order_by.is_empty() && branch.limit.is_none());
         let mut child = binder.child();
         let right = bind_select_with(db, &mut child, branch)?;
-        let left_schema = plan_schema(db, &binder.ctes, &plan)?;
-        let right_schema = plan_schema(db, &child.ctes, &right)?;
+        let left_schema = plan_schema(db, &binder.default_db, &binder.ctes, &plan)?;
+        let right_schema = plan_schema(db, &child.default_db, &child.ctes, &right)?;
         if left_schema.len() != right_schema.len() {
             return Err(PinkDbError::Execution(format!(
                 "UNION branches have {} and {} columns",
@@ -1794,26 +1887,31 @@ fn bind_union_chain(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
 
 /// Output schema of a bound plan: (column name, type) per output column.
 /// Used for CTE/derived-table scoping and subquery arity checks. `ctes`
-/// carries the CTEs visible at this point (CTEs shadow catalog tables).
+/// carries the CTEs visible at this point (CTEs shadow catalog tables);
+/// `default_db` resolves a `Scan` that names a CTE only indirectly.
 fn plan_schema(
     db: &PinkDb,
+    default_db: &str,
     ctes: &[(String, Vec<(String, DataType)>)],
     plan: &LogicalPlan,
 ) -> Result<Vec<(String, DataType)>> {
     match plan {
-        LogicalPlan::Scan { table } => {
-            if let Some((_, schema)) =
-                ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(table))
-            {
-                return Ok(schema.clone());
+        LogicalPlan::Scan { db: qdb, table } => {
+            if qdb.is_none() {
+                if let Some((_, schema)) =
+                    ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(table))
+                {
+                    return Ok(schema.clone());
+                }
             }
-            Ok(db.table(table)?.schema())
+            let lookup = qdb.as_deref().unwrap_or(default_db);
+            Ok(db.table_in(lookup, table)?.schema())
         }
         LogicalPlan::SingleRow => Ok(Vec::new()),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Limit { input, .. } => plan_schema(db, ctes, input),
+        | LogicalPlan::Limit { input, .. } => plan_schema(db, default_db, ctes, input),
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::Insert { .. }
         | LogicalPlan::Update { .. }
@@ -1823,7 +1921,11 @@ fn plan_schema(
         | LogicalPlan::Rollback
         | LogicalPlan::CreateView { .. }
         | LogicalPlan::DropTable { .. }
-        | LogicalPlan::DropView { .. } => Ok(Vec::new()),        LogicalPlan::Project { exprs, names, .. } => Ok(names
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Use { .. } => Ok(Vec::new()),
+        LogicalPlan::Project { exprs, names, .. } => Ok(names
             .iter()
             .cloned()
             .zip(exprs.iter().map(|e| e.dtype()))
@@ -1833,22 +1935,22 @@ fn plan_schema(
             Ok(names.into_iter().zip(types).collect())
         }
         LogicalPlan::Join { left, right, .. } => {
-            let mut out = plan_schema(db, ctes, left)?;
-            out.extend(plan_schema(db, ctes, right)?);
+            let mut out = plan_schema(db, default_db, ctes, left)?;
+            out.extend(plan_schema(db, default_db, ctes, right)?);
             Ok(out)
         }
         LogicalPlan::Union { left, types, .. } => {
             // Output names come from the left branch.
-            let left_schema = plan_schema(db, ctes, left)?;
+            let left_schema = plan_schema(db, default_db, ctes, left)?;
             Ok(left_schema.into_iter().zip(types.iter().copied()).map(|((n, _), t)| (n, t)).collect())
         }
         LogicalPlan::Cte { name, query, body } => {
             let mut inner: Vec<(String, Vec<(String, DataType)>)> = ctes.to_vec();
-            inner.push((name.clone(), plan_schema(db, ctes, query)?));
-            plan_schema(db, &inner, body)
+            inner.push((name.clone(), plan_schema(db, default_db, ctes, query)?));
+            plan_schema(db, default_db, &inner, body)
         }
         LogicalPlan::Window { input, windows, .. } => {
-            let mut out = plan_schema(db, ctes, input)?;
+            let mut out = plan_schema(db, default_db, ctes, input)?;
             let (names, types) = crate::plan::win_output_schema(windows);
             out.extend(names.into_iter().zip(types));
             Ok(out)
@@ -1857,9 +1959,11 @@ fn plan_schema(
 }
 
 /// Bind one FROM/JOIN source: returns its scope entry + executable plan.
-/// Tables resolve CTEs first (shadowing), then the catalog; derived tables
-/// bind their inner query in a child scope (same CTEs, no outer tables —
-/// subqueries are uncorrelated in v1).
+/// Unqualified tables resolve CTEs first (shadowing), then views, then the
+/// catalog — all in the session's default database. Qualified `db.table`
+/// never resolves a CTE and looks only in `db`. Derived tables bind their
+/// inner query in a child scope (same CTEs, no outer tables — subqueries are
+/// uncorrelated in v1).
 fn bind_source(
     db: &PinkDb,
     binder: &mut Binder,
@@ -1867,25 +1971,28 @@ fn bind_source(
     alias: &Option<String>,
 ) -> Result<(ScopeTable, LogicalPlan)> {
     match source {
-        FromSource::Table(name) => {
-            // CTEs shadow everything; views shadow catalog tables
-            // (CREATE enforces no table/view name clashes).
-            if let Some((_, schema)) = binder
-                .ctes
-                .iter()
-                .rev()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-            {
-                let eff = alias.clone().unwrap_or_else(|| name.clone());
-                return Ok((
-                    ScopeTable { name: eff.to_ascii_lowercase(), columns: schema.clone() },
-                    LogicalPlan::Scan { table: name.clone() },
-                ));
+        FromSource::Table { db: qdb, name } => {
+            // CTEs shadow everything — but only unqualified names.
+            if qdb.is_none() {
+                if let Some((_, schema)) = binder
+                    .ctes
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                {
+                    let eff = alias.clone().unwrap_or_else(|| name.clone());
+                    return Ok((
+                        ScopeTable { name: eff.to_ascii_lowercase(), columns: schema.clone() },
+                        LogicalPlan::Scan { db: None, table: name.clone() },
+                    ));
+                }
             }
-            if let Ok(view) = binder.db.view(name) {
+            let lookup_db = binder.resolve_db(qdb)?;
+            if let Ok(view) = db.view_in(&lookup_db, name) {
                 // Views rebind per use (like derived tables): the scope always
                 // matches the freshly bound plan, so catalog drift surfaces
-                // as errors, never stale indices.
+                // as errors, never stale indices. The body resolves
+                // unqualified names in the view's own database.
                 {
                     let mut used = binder.views_used.borrow_mut();
                     if !used.iter().any(|v| v.eq_ignore_ascii_case(name)) {
@@ -1894,8 +2001,14 @@ fn bind_source(
                 }
                 let view = view.clone();
                 let mut child = binder.child();
+                child.default_db = lookup_db.clone();
+                // A view body is self-contained: the caller's CTEs must not
+                // leak in (a caller CTE named like a table in the body would
+                // silently shadow it; DuckDB resolves the table). The body's
+                // own CTEs are bound below and scoped to it.
+                child.ctes.clear();
                 let sub = bind_select_in(child.db, &mut child, &view.query)?;
-                let mut schema = plan_schema(child.db, &binder.ctes, &sub)?;
+                let mut schema = plan_schema(child.db, &child.default_db, &child.ctes, &sub)?;
                 if let Some(cols) = &view.cols {
                     for (s, c) in schema.iter_mut().zip(cols.iter()) {
                         s.0 = c.clone();
@@ -1907,11 +2020,11 @@ fn bind_source(
                     sub,
                 ));
             }
-            let columns = db.table(name)?.schema();
+            let columns = db.table_in(&lookup_db, name)?.schema();
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             Ok((
                 ScopeTable { name: eff.to_ascii_lowercase(), columns },
-                LogicalPlan::Scan { table: name.clone() },
+                LogicalPlan::Scan { db: Some(lookup_db), table: name.clone() },
             ))
         }
         FromSource::Derived(q) => {
@@ -1920,7 +2033,7 @@ fn bind_source(
             })?;
             let mut child = binder.child();
             let sub = bind_select_in(db, &mut child, q)?;
-            let schema = plan_schema(db, &binder.ctes, &sub)?;
+            let schema = plan_schema(db, &child.default_db, &binder.ctes, &sub)?;
             Ok((
                 ScopeTable { name: alias.to_ascii_lowercase(), columns: schema },
                 sub,
@@ -1963,7 +2076,7 @@ fn bind_ctes(
         }
         let mut child = binder.child();
         let query = bind_select_in(db, &mut child, &cte.query)?;
-        let mut schema = plan_schema(db, &binder.ctes, &query)?;
+        let mut schema = plan_schema(db, &child.default_db, &binder.ctes, &query)?;
         if let Some(cols) = &cte.cols {
             if cols.len() != schema.len() {
                 return Err(PinkDbError::Execution(format!(
@@ -2016,7 +2129,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 )));
             }
             let (left_key, right_key) =
-                bind_join_keys(db, &binder.tables[0], &right, &join.on)?;
+                bind_join_keys(db, &binder.default_db, &binder.tables[0], &right, &join.on)?;
             binder.tables.push(right);
             base = LogicalPlan::Join {
                 kind: join.kind,
@@ -2371,7 +2484,22 @@ mod tests {
 
     fn bind_one(db: &PinkDb, sql: &str) -> Result<LogicalPlan> {
         let stmts = parse_statements(sql).unwrap();
-        bind(db, &stmts[0])
+        bind(db, &stmts[0], "main")
+    }
+
+    fn bind_in(db: &PinkDb, sql: &str, default_db: &str) -> Result<LogicalPlan> {
+        let stmts = parse_statements(sql).unwrap();
+        bind(db, &stmts[0], default_db)
+    }
+
+    /// The database of the first `Scan` under the top projection.
+    fn scan_db(plan: &LogicalPlan) -> Option<String> {
+        match plan {
+            LogicalPlan::Project { input, .. } => scan_db(input),
+            LogicalPlan::Cte { body, .. } => scan_db(body),
+            LogicalPlan::Scan { db, .. } => db.clone(),
+            other => panic!("no scan in plan: {other:?}"),
+        }
     }
 
     #[test]
@@ -2437,9 +2565,167 @@ mod tests {
         let db = test_db();
         let stmts = parse_statements("SELECT id FROM sales UNION ALL SELECT id FROM sales;").unwrap();
         let Statement::Select(sel) = &stmts[0] else { panic!("expected SELECT") };
-        let mut binder = Binder::new(&db);
+        let mut binder = Binder::new(&db, "main");
         let err = bind_select_with(&db, &mut binder, sel).unwrap_err();
         assert!(matches!(err, PinkDbError::Execution(_)), "{err:?}");
         assert!(err.to_string().contains("bind_select_in"), "{err}");
+    }
+
+    /// Two databases with a same-named table of different shapes.
+    fn multi_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.create_database("db1").unwrap();
+        db.create_table("t", vec![("a".to_string(), DataType::Integer)]).unwrap();
+        db.create_table_in(
+            "db1",
+            "t",
+            vec![
+                ("a".to_string(), DataType::Integer),
+                ("b".to_string(), DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn unqualified_names_resolve_against_the_session_database() {
+        let db = multi_db();
+        // `main.t` has one column; `db1.t` has two.
+        let main_plan = bind_in(&db, "SELECT * FROM t;", "main").unwrap();
+        assert_eq!(scan_db(&main_plan).as_deref(), Some("main"));
+        assert_eq!(
+            plan_schema(&db, "main", &[], &main_plan).unwrap().len(),
+            1
+        );
+        let db1_plan = bind_in(&db, "SELECT * FROM t;", "db1").unwrap();
+        assert_eq!(scan_db(&db1_plan).as_deref(), Some("db1"));
+        assert_eq!(plan_schema(&db, "db1", &[], &db1_plan).unwrap().len(), 2);
+        // A column that only exists in db1.t fails when bound on main.
+        assert!(bind_in(&db, "SELECT b FROM t;", "main").is_err());
+        assert!(bind_in(&db, "SELECT b FROM t;", "db1").is_ok());
+    }
+
+    #[test]
+    fn qualified_names_resolve_independently_of_the_session() {
+        let db = multi_db();
+        for session in ["main", "db1"] {
+            let plan = bind_in(&db, "SELECT a FROM db1.t;", session).unwrap();
+            assert_eq!(scan_db(&plan).as_deref(), Some("db1"));
+        }
+        let plan = bind_in(&db, "SELECT a FROM main.t;", "db1").unwrap();
+        assert_eq!(scan_db(&plan).as_deref(), Some("main"));
+        // Unknown database / table errors are clear.
+        let err = bind_in(&db, "SELECT * FROM nope.t;", "main").unwrap_err();
+        assert!(err.to_string().contains("database \"nope\" not found"), "{err}");
+        let err = bind_in(&db, "SELECT * FROM db1.missing;", "main").unwrap_err();
+        assert!(err.to_string().contains("table \"missing\" not found"), "{err}");
+    }
+
+    #[test]
+    fn ctes_shadow_unqualified_names_only() {
+        let db = multi_db();
+        // The CTE shadows db1.t (the session's table).
+        let plan = bind_in(&db, "WITH t AS (SELECT 1 AS x) SELECT x FROM t;", "db1").unwrap();
+        match &plan {
+            LogicalPlan::Cte { query, body, .. } => {
+                assert!(matches!(**query, LogicalPlan::Project { .. }));
+                assert_eq!(scan_db(body), None, "body scans the CTE");
+            }
+            other => panic!("{other:?}"),
+        }
+        // A qualified name never resolves to a CTE.
+        let plan = bind_in(
+            &db,
+            "WITH t AS (SELECT 1 AS x) SELECT a FROM db1.t;",
+            "main",
+        )
+        .unwrap();
+        assert_eq!(scan_db(&plan).as_deref(), Some("db1"));
+    }
+
+    #[test]
+    fn use_and_database_ddl_bind() {
+        let db = multi_db();
+        assert!(matches!(
+            bind_one(&db, "USE db1;").unwrap(),
+            LogicalPlan::Use { name } if name == "db1"
+        ));
+        assert!(matches!(
+            bind_one(&db, "USE MAIN;").unwrap(),
+            LogicalPlan::Use { .. }
+        ));
+        let err = bind_one(&db, "USE nope;").unwrap_err();
+        assert!(err.to_string().contains("database \"nope\" not found"), "{err}");
+        assert!(matches!(
+            bind_one(&db, "CREATE DATABASE db2;").unwrap(),
+            LogicalPlan::CreateDatabase { name } if name == "db2"
+        ));
+        assert!(matches!(
+            bind_one(&db, "DROP DATABASE db1;").unwrap(),
+            LogicalPlan::DropDatabase { name } if name == "db1"
+        ));
+    }
+
+    #[test]
+    fn qualified_ddl_and_dml_bind_to_the_right_database() {
+        let db = multi_db();
+        assert!(matches!(
+            bind_one(&db, "CREATE TABLE db1.u (x BIGINT);").unwrap(),
+            LogicalPlan::CreateTable { db: Some(d), name, .. } if d == "db1" && name == "u"
+        ));
+        assert!(matches!(
+            bind_one(&db, "INSERT INTO db1.t VALUES (1, 'x');").unwrap(),
+            LogicalPlan::Insert { db: Some(d), .. } if d == "db1"
+        ));
+        assert!(matches!(
+            bind_one(&db, "UPDATE db1.t SET a = 2;").unwrap(),
+            LogicalPlan::Update { db: Some(d), .. } if d == "db1"
+        ));
+        assert!(matches!(
+            bind_one(&db, "DELETE FROM db1.t;").unwrap(),
+            LogicalPlan::Delete { db: Some(d), .. } if d == "db1"
+        ));
+        assert!(matches!(
+            bind_one(&db, "DROP TABLE db1.t;").unwrap(),
+            LogicalPlan::DropTable { db: Some(d), .. } if d == "db1"
+        ));
+        // Unqualified DDL/DML resolves to the session database.
+        assert!(matches!(
+            bind_in(&db, "INSERT INTO t VALUES (1, 'x');", "db1").unwrap(),
+            LogicalPlan::Insert { db: Some(d), .. } if d == "db1"
+        ));
+        // A DML statement against a missing database is a clean error.
+        let err = bind_one(&db, "INSERT INTO nope.t VALUES (1);").unwrap_err();
+        assert!(err.to_string().contains("database \"nope\""), "{err}");
+    }
+
+    #[test]
+    fn views_are_per_database_and_resolve_their_body_there() {
+        let mut db = multi_db();
+        // A view in db1 over db1.t; db1.t and main.t differ in shape.
+        db.create_table_in(
+            "db1",
+            "src",
+            vec![("v".to_string(), DataType::Bigint)],
+        )
+        .unwrap();
+        db.create_view_in(
+            "db1",
+            "v",
+            {
+                let stmts = parse_statements("SELECT v FROM src;").unwrap();
+                let Statement::Select(sel) = &stmts[0] else { panic!() };
+                sel.clone()
+            },
+            None,
+        )
+        .unwrap();
+        // Found in db1: body resolves `src` in db1.
+        assert!(bind_in(&db, "SELECT * FROM v;", "db1").is_ok());
+        assert!(bind_in(&db, "SELECT * FROM db1.v;", "main").is_ok());
+        // `v` is not visible from main, and `src` does not exist there.
+        let err = bind_in(&db, "SELECT * FROM v;", "main").unwrap_err();
+        assert!(err.to_string().contains("table \"v\" not found"), "{err}");
     }
 }

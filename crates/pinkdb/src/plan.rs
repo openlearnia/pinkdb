@@ -8,16 +8,20 @@ use crate::types::{DataType, Value};
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogicalPlan {
     CreateTable {
+        /// Target database (binder-resolved; `None` = session default).
+        db: Option<String>,
         name: String,
         schema: Vec<(String, DataType)>,
     },
     Insert {
+        db: Option<String>,
         table: String,
         /// One bound expr per table column per row (constants; missing
         /// columns are NULL). Evaluated against an empty single-row chunk.
         rows: Vec<Vec<BoundExpr>>,
     },
     Update {
+        db: Option<String>,
         table: String,
         /// `(column index, value expression)` — expressions address table
         /// columns and evaluate simultaneously per row (pre-update values).
@@ -25,6 +29,7 @@ pub enum LogicalPlan {
         predicate: Option<BoundExpr>,
     },
     Delete {
+        db: Option<String>,
         table: String,
         predicate: Option<BoundExpr>,
     },
@@ -32,14 +37,29 @@ pub enum LogicalPlan {
     Commit,
     Rollback,
     CreateView {
+        db: Option<String>,
         name: String,
         cols: Option<Vec<String>>,
         query: Box<Select>,
     },
     DropTable {
+        db: Option<String>,
         name: String,
     },
     DropView {
+        db: Option<String>,
+        name: String,
+    },
+    /// `CREATE DATABASE <name>` (store-level; never inside a transaction).
+    CreateDatabase {
+        name: String,
+    },
+    /// `DROP DATABASE <name>` (store-level; never inside a transaction).
+    DropDatabase {
+        name: String,
+    },
+    /// `USE <name>`: the session layer applies the returned database.
+    Use {
         name: String,
     },
     /// Set union: output names come from the left branch; every column is
@@ -50,8 +70,10 @@ pub enum LogicalPlan {
         distinct: bool,
         types: Vec<DataType>,
     },
-    /// Full scan of a table (column pruning is wave-3 optimizer work).
+    /// Full scan of a table. `db: None` names a CTE (binder-resolved);
+    /// `Some(db)` is a catalog table in that database.
     Scan {
+        db: Option<String>,
         table: String,
     },
     /// One empty row — `SELECT` without `FROM`.
@@ -116,7 +138,9 @@ pub enum LogicalPlan {
 }
 
 /// True for row-producing queries (safe under a shared read lock).
-/// Everything else mutates the store or the transaction state.
+/// Everything else mutates the store or the transaction state. `USE` is
+/// read-only for locking: it only changes session state (the WAL record is
+/// appended through the WAL's own lock).
 pub fn is_read_only(plan: &LogicalPlan) -> bool {
     matches!(
         plan,
@@ -132,13 +156,16 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Cte { .. }
             | LogicalPlan::Window { .. }
             | LogicalPlan::Union { .. }
+            | LogicalPlan::Use { .. }
     )
 }
 
-/// True for plans that mutate table data or the table catalog — exactly the
-/// statements a durable commit has to log (view DDL is exempt: views are
+/// True for plans whose committed SQL text has to be logged — exactly the
+/// statements a durable commit must replay: table data/catalog mutations,
+/// database create/drop, and `USE` (replay starts at `main` and the logged
+/// `USE` records switch the replay session). View DDL is exempt: views are
 /// session-local and never persisted, so replaying them would not match
-/// `save`/`open` semantics). Control plans (`BEGIN`/`COMMIT`/`ROLLBACK`) are
+/// `save`/`open` semantics. Control plans (`BEGIN`/`COMMIT`/`ROLLBACK`) are
 /// also false: transaction boundaries are encoded in record shape.
 pub fn writes_tables(plan: &LogicalPlan) -> bool {
     matches!(
@@ -148,6 +175,9 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
             | LogicalPlan::DropTable { .. }
+            | LogicalPlan::CreateDatabase { .. }
+            | LogicalPlan::DropDatabase { .. }
+            | LogicalPlan::Use { .. }
     )
 }
 

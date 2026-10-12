@@ -18,12 +18,43 @@ fn print_help() {
     println!("Dot-commands:");
     println!("  .help                  show this help");
     println!("  .quit | .exit          leave the shell");
-    println!("  .tables                list tables");
-    println!("  .schema <table>        show table schema");
-    println!("  .import <file.csv> [table]  import CSV (table defaults to file stem)");
+    println!("  .databases             list databases (the current one is marked)");
+    println!("  .tables                list tables and views of the current database");
+    println!("  .schema <table|view>   show a schema (accepts db.table; quoting honored)");
+    println!("  .import <file.csv> [table]  import CSV (table defaults to file stem;");
+    println!("                         db.table targets another database)");
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
-    println!("SQL: end statements with `;`.");
+    println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
+    println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases.");
+}
+
+fn cmd_databases(db: &PinkDb) {
+    let current = db.current_db();
+    for name in db.list_databases() {
+        let nt = db.list_tables_in(&name).len();
+        let nv = db.list_views_in(&name).len();
+        let marker = if name.eq_ignore_ascii_case(current) {
+            " (current)"
+        } else {
+            ""
+        };
+        let tables = format!("{nt} table{}", plural(nt));
+        let label = if nv == 0 {
+            format!("({tables})")
+        } else {
+            format!("({tables}, {nv} view{})", plural(nv))
+        };
+        println!("{name}{marker} {label}");
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 fn cmd_tables(db: &PinkDb) {
@@ -42,13 +73,31 @@ fn cmd_tables(db: &PinkDb) {
     }
 }
 
-fn cmd_schema(db: &PinkDb, arg: &str) {
+fn cmd_schema(db: &mut PinkDb, arg: &str) {
     let name = arg.trim();
     if name.is_empty() {
-        println!("Usage: .schema <table>");
+        println!("Usage: .schema <table|view>");
         return;
     }
-    match db.table(name) {
+    let (qdb, table) = match pinkdb::csv::parse_table_target(name) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            println!("Error: {e}");
+            return;
+        }
+    };
+    // `db.table` is a qualifier only when `db` names an existing database;
+    // otherwise the whole string is the table name (same rule as `.import`).
+    let (lookup_db, lookup_name) = match qdb {
+        Some(q) if db.database_exists(&q) => (Some(q), table),
+        Some(q) => (None, format!("{q}.{table}")),
+        None => (None, table),
+    };
+    let table_result = match &lookup_db {
+        Some(q) => db.table_in(q, &lookup_name),
+        None => db.table(&lookup_name),
+    };
+    match table_result {
         Ok(t) => {
             println!("CREATE TABLE {} (", t.name);
             let schema = t.schema();
@@ -58,18 +107,96 @@ fn cmd_schema(db: &PinkDb, arg: &str) {
             }
             println!("); -- {} rows, {} chunks", t.num_rows(), t.num_chunks());
         }
-        Err(e) => println!("Error: {e}"),
+        Err(table_err) => {
+            // Not a table: `.schema db.v` on a view shows the view's output
+            // columns (bound through `LIMIT 0`, so a broken body is a clear
+            // error, never stale columns).
+            let view_result = match &lookup_db {
+                Some(q) => db.view_in(q, &lookup_name),
+                None => db.view(&lookup_name),
+            };
+            match view_result {
+                Ok(v) => {
+                    let view_name = v.name.clone();
+                    let qualified = match &lookup_db {
+                        Some(q) => format!("{}.{}", quote_ident(q), quote_ident(&view_name)),
+                        None => quote_ident(&view_name),
+                    };
+                    match db.execute(&format!("SELECT * FROM {qualified} LIMIT 0;")) {
+                        Ok(results) => match results.first() {
+                            Some(QueryResult::Selected { names, types, .. }) => {
+                                println!("CREATE VIEW {view_name} (");
+                                for (i, (n, t)) in names.iter().zip(types).enumerate() {
+                                    let comma = if i + 1 == names.len() { "" } else { "," };
+                                    println!("  {n} {t}{comma}");
+                                }
+                                println!("); -- view (session-local)");
+                            }
+                            _ => {
+                                println!("Error: view \"{view_name}\" did not produce a schema")
+                            }
+                        },
+                        Err(e) => println!("Error: {e}"),
+                    }
+                }
+                Err(_) => println!("Error: {table_err}; no such view either"),
+            }
+        }
     }
 }
 
+/// Split one whitespace-delimited token off the front of `input`, keeping
+/// double-quoted spans together (the quotes stay in the token so the
+/// identifier parser can honor them).
+fn take_token(input: &str) -> Option<(String, &str)> {
+    let s = input.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    let mut in_quotes = false;
+    let mut end = s.len();
+    for (i, c) in s.char_indices() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+        } else if c.is_whitespace() && !in_quotes {
+            end = i;
+            break;
+        }
+    }
+    Some((s[..end].to_string(), &s[end..]))
+}
+
+/// Strip surrounding quotes from a token and unescape `""` (file paths).
+fn unquote(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
+        t[1..t.len() - 1].replace("\"\"", "\"")
+    } else {
+        t.to_string()
+    }
+}
+
+/// Quote an identifier for SQL (embedded quotes doubled).
+fn quote_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
 fn cmd_import(db: &mut PinkDb, arg: &str) {
-    let parts: Vec<&str> = arg.split_whitespace().collect();
-    if parts.is_empty() {
+    let Some((file, rest)) = take_token(arg) else {
         println!("Usage: .import <file.csv> [table]");
         return;
-    }
+    };
+    let file = unquote(&file);
+    let table = match take_token(rest) {
+        Some((t, tail)) if tail.trim().is_empty() => Some(t),
+        Some(_) => {
+            println!("Usage: .import <file.csv> [table]");
+            return;
+        }
+        None => None,
+    };
     let t0 = Instant::now();
-    match pinkdb::csv::import_csv(db, parts[0], parts.get(1).copied()) {
+    match pinkdb::csv::import_csv(db, &file, table.as_deref()) {
         Ok(n) => println!("Imported {n} rows in {:.3}s", t0.elapsed().as_secs_f64()),
         Err(e) => println!("Error: {e}"),
     }
@@ -84,6 +211,7 @@ fn run_dot(db: &mut PinkDb, line: &str) -> bool {
     match cmd {
         ".help" => print_help(),
         ".quit" | ".exit" => return false,
+        ".databases" => cmd_databases(db),
         ".tables" => cmd_tables(db),
         ".schema" => cmd_schema(db, rest),
         ".import" => cmd_import(db, rest),
@@ -108,7 +236,11 @@ fn run_dot(db: &mut PinkDb, line: &str) -> bool {
                 };
                 match result {
                     Ok(()) => {
-                        if !db.list_views().is_empty() {
+                        let any_views = db
+                            .list_databases()
+                            .iter()
+                            .any(|d| !db.list_views_in(d).is_empty());
+                        if any_views {
                             println!("Note: views are session-local and were not saved.");
                         }
                         println!("Saved in {:.3}s", t0.elapsed().as_secs_f64())
@@ -253,6 +385,13 @@ fn run_sql(db: &mut PinkDb, sql: &str) {
                     QueryResult::CreatedView { name } => println!("View {name} created."),
                     QueryResult::DroppedTable { name } => println!("Table {name} dropped."),
                     QueryResult::DroppedView { name } => println!("View {name} dropped."),
+                    QueryResult::CreatedDatabase { name } => {
+                        println!("Database {name} created.")
+                    }
+                    QueryResult::DroppedDatabase { name } => {
+                        println!("Database {name} dropped.")
+                    }
+                    QueryResult::Used { db } => println!("Using database {db}."),
                     QueryResult::Selected { names, types, rows } => {
                         if rows.is_empty() {
                             println!("(no rows)");

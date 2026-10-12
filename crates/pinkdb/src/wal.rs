@@ -165,6 +165,11 @@ pub struct Wal {
     /// Set after a write/sync failure: appends are refused so a retry can
     /// never append a duplicate record after a partially durable write.
     poisoned: Option<String>,
+    /// The replay session's database after the records appended so far
+    /// (`None` = unknown, so the next append prefixes unconditionally).
+    /// Multi-connection appends emit a `USE` prefix whenever their session
+    /// differs, so every record replays in the database it was executed in.
+    session_db: Option<String>,
 }
 
 /// One rolled-away WAL generation found on disk.
@@ -245,6 +250,7 @@ impl Wal {
             gen,
             last_lsn,
             poisoned: None,
+            session_db: None,
         };
         if !path.exists() {
             return Ok((
@@ -321,6 +327,62 @@ impl Wal {
             )));
         }
         self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Record the replay-session database after the records appended so far.
+    /// Called after recovery (the replay leaves the session wherever the last
+    /// record did) and by the embedded path (whose session is the store's).
+    pub(crate) fn set_session_db(&mut self, db: &str) {
+        self.session_db = Some(db.to_string());
+    }
+
+    /// Append one committed unit executed in session database `db_before`
+    /// (when it still exists), leaving the replay session at `db_after`. When
+    /// the WAL's replay session differs from `db_before`, a `USE db_before`
+    /// statement is prepended so the record replays against the same database
+    /// (multi-connection stores: `USE` is per-connection but the WAL is
+    /// shared).
+    ///
+    /// `db_before` is `None` when that database no longer exists at append
+    /// time: a `USE` prefix naming it could never replay (the `DROP` that
+    /// removed it is already earlier in the WAL), so the record is appended
+    /// bare. Callers pass `None` only when the statements are
+    /// session-independent — the store lock held across execution and append
+    /// guarantees it for the autocommit write path (a session-dependent
+    /// statement against a vanished database would have failed at execution).
+    /// The tracked replay session then becomes unknown, so the next append
+    /// prefixes unconditionally.
+    pub(crate) fn append_in_session(
+        &mut self,
+        db_before: Option<&str>,
+        db_after: &str,
+        stmts: &[String],
+    ) -> Result<()> {
+        match db_before {
+            Some(before) => {
+                if self
+                    .session_db
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(before))
+                {
+                    self.append(stmts)?;
+                } else {
+                    // Quote the name: databases may hold spaces/keywords when
+                    // created with a quoted identifier (`CREATE DATABASE
+                    // "My Db"`).
+                    let mut rec = Vec::with_capacity(stmts.len() + 1);
+                    rec.push(format!("USE \"{}\"", before.replace('"', "\"\"")));
+                    rec.extend_from_slice(stmts);
+                    self.append(&rec)?;
+                }
+                self.session_db = Some(db_after.to_string());
+            }
+            None => {
+                self.append(stmts)?;
+                self.session_db = None;
+            }
+        }
         Ok(())
     }
 
@@ -836,6 +898,10 @@ impl PinkDb {
         info.replayed_records += records.len() as u64;
         info.replayed_statements += records.iter().map(|r| r.stmts.len() as u64).sum::<u64>();
         info.truncated_bytes = truncated;
+        let mut handle = handle;
+        // Replay leaves the session wherever the last record did (a logged
+        // `USE` or the start at `main`): later appends must know that.
+        handle.set_session_db(db.current_db());
         db.wal = Some(std::sync::Arc::new(std::sync::Mutex::new(handle)));
         Ok((db, info))
     }
@@ -860,7 +926,13 @@ impl PinkDb {
         let mut guard = wal.lock().map_err(|_| {
             PinkDbError::Execution("internal lock error (poisoned)".to_string())
         })?;
-        guard.checkpoint(|tmp| self.save_sync(tmp))
+        guard.checkpoint(|tmp| self.save_sync(tmp))?;
+        // A fresh WAL generation replays from the checkpoint's session
+        // default (the checkpoint does not store a session): reset the
+        // tracked replay session so later appends `USE`-prefix correctly.
+        let fallback = self.fallback_db();
+        guard.set_session_db(&fallback);
+        Ok(())
     }
 
     /// The `.pink` path this database is durable to, if any.
@@ -961,13 +1033,50 @@ mod tests {
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
-    /// Unique per-test checkpoint path in the temp dir.
-    fn tmp_ckpt(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "pinkdb_wal_{tag}_{}_{}.pink",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ))
+    /// Per-test scratch directory: every file the test creates under it is
+    /// removed when the guard drops — including on a panic — so WAL tests
+    /// never leak `pinkdb_wal_*` files into the system temp dir. Derefs to
+    /// the checkpoint path, so existing call sites read unchanged.
+    struct TempCkpt {
+        dir: PathBuf,
+        ckpt: PathBuf,
+    }
+
+    impl TempCkpt {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "pinkdb_wal_{tag}_{}_{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("create test scratch dir");
+            let ckpt = dir.join("db.pink");
+            Self { dir, ckpt }
+        }
+    }
+
+    impl std::ops::Deref for TempCkpt {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.ckpt
+        }
+    }
+
+    impl AsRef<Path> for TempCkpt {
+        fn as_ref(&self) -> &Path {
+            &self.ckpt
+        }
+    }
+
+    impl Drop for TempCkpt {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Unique per-test checkpoint path inside its own scratch directory.
+    fn tmp_ckpt(tag: &str) -> TempCkpt {
+        TempCkpt::new(tag)
     }
 
     fn cleanup(ckpt: &Path) {
@@ -1813,6 +1922,176 @@ mod tests {
         cleanup(&p);
     }
 
+    /// C1/A: a connection whose session database was dropped by another
+    /// connection must not log a `USE` prefix for it. The fully qualified
+    /// write is self-contained, so the record replays (before the fix the
+    /// record began `USE "db1"` and every reopen hard-errored).
+    #[test]
+    fn dropped_session_database_does_not_brick_replay() {
+        let p = tmp_ckpt("dropsession");
+        let (db, _) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let db = crate::Database::from_store(db);
+        let mut a = db.connect();
+        a.execute("CREATE DATABASE db1;").unwrap();
+        a.execute("CREATE TABLE main.t (x INTEGER);").unwrap();
+        a.execute("USE db1;").unwrap();
+        let mut b = db.connect();
+        b.execute("DROP DATABASE db1;").unwrap();
+        // a's session is still db1 (it was dropped by b): the append must
+        // drop the dead prefix, not poison the store.
+        a.execute("INSERT INTO main.t VALUES (1);").unwrap();
+        let recs = records_of(&wal_path(&p));
+        let last = recs.last().expect("the insert was logged");
+        assert!(
+            !last
+                .stmts
+                .iter()
+                .any(|s| s.to_ascii_uppercase().contains("USE")),
+            "no dead USE prefix may be logged: {last:?}"
+        );
+        drop(a);
+        drop(b);
+        drop(db);
+
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT x FROM main.t ORDER BY x;"), vec![1]);
+        // The recovered session tracking is still usable: another append
+        // replays too.
+        back.execute("INSERT INTO main.t VALUES (2);").unwrap();
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(
+            ints(&mut again, "SELECT x FROM main.t ORDER BY x;"),
+            vec![1, 2]
+        );
+        cleanup(&p);
+    }
+
+    /// The same append decision, single-threaded: a session database that is
+    /// already gone when a fully qualified write appends (the autocommit
+    /// race's end state) must produce a replayable record.
+    #[test]
+    fn append_with_a_vanished_session_database_is_prefixless() {
+        let p = tmp_ckpt("deadprefix");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE main.t (a INTEGER);").unwrap();
+        db.execute("CREATE DATABASE db1;").unwrap();
+        db.execute("DROP DATABASE db1;").unwrap();
+        db.set_current_db("db1");
+        db.execute("INSERT INTO main.t VALUES (1);").unwrap();
+        let recs = records_of(&wal_path(&p));
+        assert!(
+            recs.iter()
+                .all(|r| !r.stmts.iter().any(|s| s.to_ascii_uppercase().contains("USE"))),
+            "record for a vanished session must not carry a USE prefix: {recs:?}"
+        );
+        drop(db);
+
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM main.t ORDER BY a;"), vec![1]);
+        cleanup(&p);
+    }
+
+    /// C1/B: a transaction that created a table in a database dropped before
+    /// COMMIT must fail the commit as a conflict — never log `CREATE TABLE
+    /// db1.t` (which can never replay) or silently drop the table.
+    #[test]
+    fn dropped_database_before_commit_conflicts() {
+        let p = tmp_ckpt("droptxn");
+        let (db, _) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let db = crate::Database::from_store(db);
+        let mut a = db.connect();
+        a.execute("CREATE DATABASE db1;").unwrap();
+        let mut b = db.connect();
+        a.execute("BEGIN;").unwrap();
+        a.execute("CREATE TABLE db1.t (x INTEGER);").unwrap();
+        b.execute("DROP DATABASE db1;").unwrap();
+        let err = a.execute("COMMIT;").unwrap_err();
+        assert!(err.to_string().contains("conflict"), "{err}");
+        assert!(
+            err.to_string().contains("db1"),
+            "the conflict must name the vanished database: {err}"
+        );
+        drop(a);
+        drop(b);
+        drop(db);
+
+        // The aborted commit logged nothing: the store reopens cleanly.
+        let mut back = durable(&p);
+        assert!(back.execute("SELECT * FROM db1.t;").is_err());
+        back.execute("CREATE TABLE main.t (a INTEGER);").unwrap();
+        back.execute("INSERT INTO main.t VALUES (1);").unwrap();
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(ints(&mut again, "SELECT * FROM main.t;"), vec![1]);
+        cleanup(&p);
+    }
+
+    /// C1/C: `BEGIN; USE db1;` then another connection drops db1: COMMIT must
+    /// conflict (the record's `USE db1` could never replay).
+    #[test]
+    fn dropped_use_target_before_commit_conflicts() {
+        let p = tmp_ckpt("dropuse");
+        let (db, _) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let db = crate::Database::from_store(db);
+        let mut a = db.connect();
+        a.execute("CREATE DATABASE db1;").unwrap();
+        let mut b = db.connect();
+        a.execute("BEGIN;").unwrap();
+        a.execute("USE db1;").unwrap();
+        b.execute("DROP DATABASE db1;").unwrap();
+        let err = a.execute("COMMIT;").unwrap_err();
+        assert!(err.to_string().contains("conflict"), "{err}");
+        drop(a);
+        drop(b);
+        drop(db);
+
+        let mut back = durable(&p);
+        back.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        back.execute("INSERT INTO t VALUES (1);").unwrap();
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(ints(&mut again, "SELECT a FROM t;"), vec![1]);
+        cleanup(&p);
+    }
+
+    /// A durable store without `main`: drop it, checkpoint, append, reopen —
+    /// the session falls back to the remaining database and both the
+    /// checkpoint and the post-checkpoint record replay there.
+    #[test]
+    fn durable_flow_without_main_reopens_and_appends() {
+        let p = tmp_ckpt("nomain");
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE DATABASE db1;").unwrap();
+            db.execute("CREATE TABLE db1.t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO db1.t VALUES (1);").unwrap();
+            db.execute("DROP DATABASE main;").unwrap();
+            db.checkpoint().unwrap();
+            // The checkpoint has no `main`; the session fell back to db1 and
+            // this append must replay in db1.
+            db.execute("INSERT INTO db1.t VALUES (2);").unwrap();
+        }
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(back.list_databases(), vec!["db1".to_string()]);
+        assert_eq!(back.current_db(), "db1");
+        assert_eq!(info.replayed_records, 1, "only the post-checkpoint insert");
+        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 2]);
+        // Appends after the reopen keep replaying in the no-main store.
+        back.execute("INSERT INTO db1.t VALUES (3);").unwrap();
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(
+            ints(&mut again, "SELECT a FROM db1.t ORDER BY a;"),
+            vec![1, 2, 3]
+        );
+        cleanup(&p);
+    }
+
     #[test]
     fn two_connections_commit_in_order_and_both_survive_reopen() {
         let p = tmp_ckpt("multi");
@@ -1980,8 +2259,139 @@ mod tests {
     }
 
     #[test]
-    fn save_snapshot_refuses_a_target_with_a_live_wal() {
-        let a = tmp_ckpt("snapa");
+    fn use_and_create_database_replay_reproduces_state_exactly() {
+        let p = tmp_ckpt("usedb");
+        {
+            let mut db = durable(&p);
+            db.execute(
+                "CREATE DATABASE db1; \
+                 CREATE TABLE main.t (a INTEGER); \
+                 CREATE TABLE db1.t (a INTEGER);",
+            )
+            .unwrap();
+            // A mixed sequence: USE switches the replay session; every
+            // statement is logged and must land in the right database.
+            db.execute(
+                "USE db1; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); \
+                 USE main; INSERT INTO t VALUES (10);",
+            )
+            .unwrap();
+            db.execute("USE db1; INSERT INTO t VALUES (3);").unwrap();
+            // A transaction whose statements switch databases.
+            db.execute("BEGIN; USE main; INSERT INTO t VALUES (20); USE db1; INSERT INTO t VALUES (4); COMMIT;")
+                .unwrap();
+            // Create + drop a database in the middle of the log.
+            db.execute("CREATE DATABASE db2; CREATE TABLE db2.t (a INTEGER); INSERT INTO db2.t VALUES (99);")
+                .unwrap();
+            db.execute("DROP DATABASE db2;").unwrap();
+            db.execute("USE main;").unwrap();
+        }
+        // The USE statements are in the WAL text (replay relies on them).
+        let records = records_of(&wal_path(&p));
+        assert!(
+            records.iter().any(|r| r.stmts.iter().any(|s| s.starts_with("USE "))),
+            "USE must be logged: {records:?}"
+        );
+        assert!(
+            records.iter().any(|r| r.stmts.iter().any(|s| s.contains("CREATE DATABASE"))),
+            "CREATE DATABASE must be logged"
+        );
+
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert!(info.replayed_records > 0);
+        assert_eq!(ints(&mut back, "SELECT a FROM main.t ORDER BY a;"), vec![10, 20]);
+        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 2, 3, 4]);
+        assert!(!back.database_exists("db2"), "db2 was dropped");
+        assert_eq!(back.current_db(), "main");
+        // Appends after recovery continue in the recovered session.
+        back.execute("INSERT INTO main.t VALUES (11);").unwrap();
+        drop(back);
+        let mut again = durable(&p);
+        assert_eq!(
+            ints(&mut again, "SELECT a FROM main.t ORDER BY a;"),
+            vec![10, 11, 20]
+        );
+        assert_eq!(
+            ints(&mut again, "SELECT a FROM db1.t ORDER BY a;"),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    /// A checkpoint publishes state and rolls the WAL: replay of the fresh
+    /// generation starts at the checkpoint's session default (the session is
+    /// not persisted), so appends after a checkpoint must `USE`-prefix again.
+    #[test]
+    fn checkpoint_resets_the_replay_session_to_the_checkpoint_default() {        let p = tmp_ckpt("ckptsession");
+        let mut db = durable(&p);
+        db.execute("CREATE DATABASE db1; CREATE TABLE db1.t (a INTEGER);")
+            .unwrap();
+        db.execute("USE db1;").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        db.checkpoint().unwrap();
+        // The session is still db1 in memory, but the fresh WAL replays from
+        // main: this insert must land in db1 after a reopen.
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 2]);
+        // Replay ends where the log left the session: the post-checkpoint
+        // insert was `USE`-prefixed, so the reopened session is db1.
+        assert_eq!(back.current_db(), "db1");
+    }
+
+    /// Databases created with quoted identifiers (spaces, keywords) must
+    /// survive a checkpoint + `USE`-prefixed replay: the prefix quotes the
+    /// name, so `USE "My Db"` parses on replay.
+    #[test]
+    fn quoted_database_names_replay_across_a_checkpoint() {
+        let p = tmp_ckpt("quoteddb");
+        let mut db = durable(&p);
+        db.execute("CREATE DATABASE \"My Db\";").unwrap();
+        db.execute("CREATE TABLE \"My Db\".t (a INTEGER);").unwrap();
+        db.execute("USE \"My Db\";").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM \"My Db\".t ORDER BY a;"),
+            vec![1, 2]
+        );
+    }
+
+    /// Two connections on different session databases share one WAL: every
+    /// record is self-contained (a `USE` prefix is emitted when the replay
+    /// session differs), so replay reproduces both databases exactly.
+    #[test]
+    fn multi_connection_sessions_replay_each_record_in_its_database() {        let p = tmp_ckpt("multidb");
+        {
+            let shared = crate::Database::open(p.to_str().unwrap()).unwrap();
+            let mut a = shared.connect();
+            let mut b = shared.connect();
+            a.execute("CREATE DATABASE db1; CREATE TABLE main.t (a INTEGER);")
+                .unwrap();
+            a.execute("CREATE TABLE db1.t (a INTEGER);").unwrap();
+            a.execute("USE db1;").unwrap();
+            a.execute("INSERT INTO t VALUES (1);").unwrap();
+            // b never issued USE: its statements belong to main.
+            b.execute("INSERT INTO t VALUES (2);").unwrap();
+            a.execute("INSERT INTO t VALUES (3);").unwrap();
+            b.execute("USE db1; INSERT INTO t VALUES (4);").unwrap();
+            b.execute("USE main; INSERT INTO t VALUES (5);").unwrap();
+            assert_eq!(a.current_db(), "db1");
+            assert_eq!(b.current_db(), "main");
+        }
+        let (mut back, _) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(ints(&mut back, "SELECT a FROM main.t ORDER BY a;"), vec![2, 5]);
+        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 3, 4]);
+        assert_eq!(back.current_db(), "main");
+    }
+
+    #[test]
+    fn save_snapshot_refuses_a_target_with_a_live_wal() {        let a = tmp_ckpt("snapa");
         let b = tmp_ckpt("snapb");
         // B has committed rows that only exist in its WAL.
         {

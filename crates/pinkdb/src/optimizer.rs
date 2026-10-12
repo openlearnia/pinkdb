@@ -147,7 +147,8 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Limit { input, limit } => {
             LogicalPlan::Limit { input: Box::new(fold_plan(db, *input)), limit }
         }
-        LogicalPlan::Insert { table, rows } => LogicalPlan::Insert {
+        LogicalPlan::Insert { db, table, rows } => LogicalPlan::Insert {
+            db,
             table,
             rows: rows
                 .into_iter()

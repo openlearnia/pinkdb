@@ -6,12 +6,17 @@ a random moment, then verify with repeated clean opens that every row whose
 ack-marker was printed before the kill is present exactly once and that later
 opens see the same rows (no delayed loss, no duplication).
 
+Multi-db mode (`--multi-db`): the same loop over `db1` + `USE` + a cross-db
+transaction — rows land in `main.t` and `db1.t`, and both must survive the
+kill exactly once.
+
 Targeted mode: kill exactly inside the checkpoint publish window (after the
 WAL roll, before the `.pink` rename) and verify the rows across repeated
 opens — the crash image that used to be "replayed into memory then deleted".
 
 Usage:
   python3 bench/kill_loop.py [ROUNDS] [--seed N] [--bin PATH]
+  python3 bench/kill_loop.py [ROUNDS] --multi-db [--seed N] [--bin PATH]
   python3 bench/kill_loop.py --targeted N [--seed N] [--bin PATH]
 """
 
@@ -173,6 +178,138 @@ def run_random(binary, rounds, seed):
     return kinds.get("ok", 0) == rounds
 
 
+# ---------- multi-database mode ----------
+
+def random_script_multi(rng):
+    """db1 + `USE` + a cross-db transaction, with random `.save`s.
+
+    Markers: `ACK n` = autocommit insert into `main.t`, `USE n` = insert into
+    `db1.t` via `USE`, `TXN n` = one transaction writing both tables. The
+    verifier maps each acked marker back to the table(s) it wrote.
+    """
+    units = []
+    nxt = 0
+    for _ in range(rng.randint(3, 10)):
+        r = rng.random()
+        if r < 0.3:
+            ids = [nxt, nxt + 1]
+            units.append((f"TXN {ids[0]}", ids))
+            nxt += 2
+        elif r < 0.6:
+            units.append((f"USE {nxt}", [nxt]))
+            nxt += 1
+        else:
+            units.append((f"ACK {nxt}", [nxt]))
+            nxt += 1
+    lines = [
+        "CREATE DATABASE db1;",
+        "CREATE TABLE main.t (a INTEGER, v VARCHAR);",
+        "CREATE TABLE db1.t (a INTEGER, v VARCHAR);",
+    ]
+    save_every = rng.choice([0, 3, 5])
+    for i, (marker, ids) in enumerate(units):
+        kind = marker.split()[0]
+        if kind == "TXN":
+            lines.append("BEGIN;")
+            for rid in ids:
+                lines.append(f"INSERT INTO main.t VALUES ({rid}, 'm{rid}');")
+                lines.append(f"INSERT INTO db1.t VALUES ({rid}, 'd{rid}');")
+            lines.append("COMMIT;")
+        elif kind == "USE":
+            rid = ids[0]
+            lines.append("USE db1;")
+            lines.append(f"INSERT INTO t VALUES ({rid}, 'd{rid}');")
+            lines.append("USE main;")
+        else:
+            rid = ids[0]
+            lines.append(f"INSERT INTO main.t VALUES ({rid}, 'm{rid}');")
+        lines.append(f"SELECT '{marker}' AS m;")
+        if save_every and i % save_every == save_every - 1:
+            lines.append(".save x.pink")
+    return units, "\n".join(lines) + "\n"
+
+
+def acked_rows_multi(out, units):
+    """(main_ids, db1_ids) whose ack-marker was printed before the kill."""
+    seen = set(ACK_RE.findall(out))
+    main, db1 = set(), set()
+    for marker, ids in units:
+        if tuple(marker.split()) not in seen:
+            continue
+        kind = marker.split()[0]
+        if kind == "ACK":
+            main.update(ids)
+        elif kind == "USE":
+            db1.update(ids)
+        else:  # TXN writes both tables
+            main.update(ids)
+            db1.update(ids)
+    return main, db1
+
+
+def open_rows_in(binary, cwd, table):
+    """(opened, rows, out) for `table` (qualified); rows None when missing."""
+    out = cli(binary, f".open x.pink\nSELECT a FROM {table} ORDER BY a;\n.quit\n", cwd)
+    if "Opened" not in out:
+        return False, None, out
+    if "Error" in out:
+        return True, None, out
+    return True, [int(x) for x in ROW_RE.findall(out)], out
+
+
+def verify_multi(binary, cwd, expected_main, expected_db1, opens=3):
+    """Returns (kind, detail) for both tables; kind is ok | open_fail |
+    missing | dup | drift."""
+    expected = {"main.t": expected_main, "db1.t": expected_db1}
+    first = {}
+    for table, want in expected.items():
+        opened, rows, out = open_rows_in(binary, cwd, table)
+        if not opened:
+            return "open_fail", f"first reopen failed: {out[:160]!r}"
+        if rows is None:
+            if want:
+                return "missing", f"{table} missing after ack: {out[:160]!r}"
+            rows = []
+        missing = sorted(set(want) - set(rows))
+        if missing:
+            return "missing", f"lost committed rows in {table}: {missing} (present={sorted(rows)})"
+        if len(rows) != len(set(rows)):
+            dups = sorted(x for x in set(rows) if rows.count(x) > 1)
+            return "dup", f"duplicate rows in {table}: {dups}"
+        first[table] = rows
+    for i in range(1, opens):
+        for table, rows0 in first.items():
+            opened, rows, out = open_rows_in(binary, cwd, table)
+            if not opened:
+                return "drift", f"open #{i + 1} failed after a successful open"
+            rows = rows if rows is not None else []
+            if rows != rows0:
+                return "drift", f"open #{i + 1} changed {table}: {len(rows0)} -> {len(rows)}"
+    return "ok", f"main={len(first['main.t'])} db1={len(first['db1.t'])}"
+
+
+def run_multi(binary, rounds, seed):
+    rng = random.Random(seed)
+    kinds = {}
+    for i in range(rounds):
+        units, cmds = random_script_multi(rng)
+        d = fresh(f"m{i}")
+        out = run_and_kill(binary, ".open x.pink\n" + cmds, d, rng.uniform(0.001, 0.05))
+        em, ed = acked_rows_multi(out, units)
+        kind, detail = verify_multi(binary, d, em, ed)
+        kinds[kind] = kinds.get(kind, 0) + 1
+        if kind != "ok":
+            keep = os.path.join(WORK, f"keep_m{i}")
+            shutil.rmtree(keep, ignore_errors=True)
+            shutil.copytree(d, keep)
+            print(f"FAIL multi iter {i}: {kind}: {detail}\n  kept: {keep}")
+        elif i % 50 == 0:
+            print(f"multi iter {i}: ok ({detail})")
+        shutil.rmtree(d, ignore_errors=True)
+    print(f"=== multi-db kill loop: {rounds} iterations, kinds={kinds} ===")
+    return kinds.get("ok", 0) == rounds
+
+
 def checkpoint_image(binary, d, prior_checkpoint):
     """A database whose next `.save` is killed in the roll->publish window."""
     big = "z" * 1_000_000
@@ -249,6 +386,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("rounds", nargs="?", type=int, default=100)
     ap.add_argument("--targeted", type=int, default=0)
+    ap.add_argument("--multi-db", action="store_true")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--bin", default=DEFAULT_BIN)
     args = ap.parse_args()
@@ -257,6 +395,8 @@ def main():
         return 2
     if args.targeted:
         ok = run_targeted(args.bin, args.targeted, args.seed)
+    elif args.multi_db:
+        ok = run_multi(args.bin, args.rounds, args.seed)
     else:
         ok = run_random(args.bin, args.rounds, args.seed)
     if ok:

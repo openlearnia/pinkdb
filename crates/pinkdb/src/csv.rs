@@ -238,10 +238,16 @@ fn new_chunk(types: &[DataType]) -> Vec<Vector> {
 
 /// Parse all CSV rows into `types`-shaped vectors, appending them to `table`
 /// in [`CHUNK_SIZE`]-row batches. `table` must already exist.
-fn parse_rows(db: &mut PinkDb, table: &str, data: &[u8], types: &[DataType]) -> Result<usize> {
+fn parse_rows(
+    db: &mut PinkDb,
+    db_name: &str,
+    table: &str,
+    data: &[u8],
+    types: &[DataType],
+) -> Result<usize> {
     let mut reader = open_reader(data);
     let _ = read_headers(&mut reader)?;
-    let tbl = db.table_mut(table)?;
+    let tbl = db.table_mut_in(db_name, table)?;
     let mut chunk = new_chunk(types);
     let mut in_chunk = 0usize;
     let mut count = 0usize;
@@ -348,6 +354,7 @@ fn parse_batch(
 /// dialect isn't provable, so the caller can fall back to the `csv` crate.
 fn parse_clean(
     db: &mut PinkDb,
+    db_name: &str,
     table: &str,
     data: &[u8],
     types: &[DataType],
@@ -406,7 +413,7 @@ fn parse_clean(
         .collect();
     // 4. Append chunks in file order; the first error (in file order) wins,
     //    matching the sequential pass. On error the caller drops the table.
-    let tbl = db.table_mut(table).map_err(CleanError::Db)?;
+    let tbl = db.table_mut_in(db_name, table).map_err(CleanError::Db)?;
     let mut count = 0usize;
     for chunk in parsed {
         match chunk {
@@ -440,7 +447,7 @@ enum Sampled {
 /// or a column is empty across the sample while rows continue (`NeedsFull`
 /// then also goes through whole-file inference). Drops the table on failure
 /// so the retry starts clean.
-fn load_sampled(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<Sampled> {
+fn load_sampled(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Result<Sampled> {
     let mut reader = open_reader(data);
     let headers = read_headers(&mut reader)?;
     let mut states = vec![InferState::new(); headers.len()];
@@ -469,16 +476,16 @@ fn load_sampled(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<Sampled> {
         .zip(states.iter().map(|st| st.dtype()))
         .collect();
     let types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
-    db.create_table(table, schema)?;
-    let result = match parse_clean(db, table, data, &types) {
+    db.create_table_in(db_name, table, schema)?;
+    let result = match parse_clean(db, db_name, table, data, &types) {
         Ok(n) => Ok(n),
-        Err(CleanError::NotClean) => parse_rows(db, table, data, &types),
+        Err(CleanError::NotClean) => parse_rows(db, db_name, table, data, &types),
         Err(CleanError::Db(e)) => Err(e),
     };
     match result {
         Ok(n) => Ok(Sampled::Done(n)),
         Err(e) => {
-            db.drop_table(table).ok();
+            db.drop_table_in(db_name, table).ok();
             Err(e)
         }
     }
@@ -486,7 +493,7 @@ fn load_sampled(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<Sampled> {
 
 /// Exact two-pass path: infer over every cell, then parse. Same result as the
 /// fast path; used when the sample can't be trusted.
-fn load_full(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<usize> {
+fn load_full(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Result<usize> {
     // Pass 1: headers + inference (record buffer reused across rows).
     let mut reader = open_reader(data);
     let headers = read_headers(&mut reader)?;
@@ -502,12 +509,12 @@ fn load_full(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<usize> {
         .zip(states.iter().map(|st| st.dtype()))
         .collect();
     let types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
-    db.create_table(table, schema)?;
+    db.create_table_in(db_name, table, schema)?;
     // Pass 2: parse + append (record buffer reused).
-    match parse_rows(db, table, data, &types) {
+    match parse_rows(db, db_name, table, data, &types) {
         Ok(n) => Ok(n),
         Err(e) => {
-            db.drop_table(table).ok();
+            db.drop_table_in(db_name, table).ok();
             Err(e)
         }
     }
@@ -515,13 +522,13 @@ fn load_full(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<usize> {
 
 /// Load CSV bytes into a fresh table (shared by file/string import).
 /// All-or-nothing: a failure drops the created table.
-fn load_bytes(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<usize> {
-    match load_sampled(db, table, data) {
+fn load_bytes(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Result<usize> {
+    match load_sampled(db, db_name, table, data) {
         Ok(Sampled::Done(n)) => Ok(n),
-        Ok(Sampled::NeedsFull) => load_full(db, table, data),
+        Ok(Sampled::NeedsFull) => load_full(db, db_name, table, data),
         // A row beyond the sample violated the sampled type (the table is
         // already dropped): rerun with exact whole-file inference.
-        Err(PinkDbError::Type(_)) => load_full(db, table, data),
+        Err(PinkDbError::Type(_)) => load_full(db, db_name, table, data),
         Err(e) => Err(e),
     }
 }
@@ -545,47 +552,141 @@ fn require_settled_import(db: &PinkDb) -> Result<()> {
 /// import returns still sees them. The import creates a fresh table, so a
 /// checkpoint failure rolls the table back out of memory — a failed import is
 /// never half-visible.
-fn make_import_durable(db: &mut PinkDb, table: &str, rows: usize) -> Result<usize> {
+fn make_import_durable(
+    db: &mut PinkDb,
+    db_name: &str,
+    table: &str,
+    rows: usize,
+) -> Result<usize> {
     if !db.is_durable() {
         return Ok(rows);
     }
     match db.checkpoint() {
         Ok(()) => Ok(rows),
         Err(e) => {
-            db.drop_table(table).ok();
+            db.drop_table_in(db_name, table).ok();
             Err(e)
         }
     }
 }
 
-/// Import a CSV file into `table` (default: file stem). Returns rows loaded.
-/// On a durable database the import is durable before returning (atomic
-/// checkpoint publish + WAL roll); in memory it is a no-op extra step.
+/// Parse one leading identifier: a bare token (up to `.` or whitespace) or a
+/// double-quoted identifier with `""` escapes. Returns the unquoted name and
+/// the unconsumed input.
+fn take_ident(input: &str) -> std::result::Result<(String, &str), String> {
+    let s = input.trim_start();
+    if s.starts_with('"') {
+        return take_quoted_ident(s);
+    }
+    let end = s
+        .find(|c: char| c == '.' || c.is_whitespace())
+        .unwrap_or(s.len());
+    if end == 0 {
+        return Err("expected an identifier".to_string());
+    }
+    Ok((s[..end].to_string(), &s[end..]))
+}
+
+/// Parse a double-quoted identifier (`""` is an embedded quote). The caller
+/// has checked the leading `"`.
+fn take_quoted_ident(s: &str) -> std::result::Result<(String, &str), String> {
+    let rest = s.strip_prefix('"').expect("caller checked the quote");
+    let mut name = String::new();
+    let mut chars = rest.char_indices();
+    while let Some((i, c)) = chars.next() {
+        if c == '"' {
+            if rest[i + 1..].starts_with('"') {
+                name.push('"');
+                chars.next();
+            } else {
+                return Ok((name, &rest[i + 1..]));
+            }
+        } else {
+            name.push(c);
+        }
+    }
+    Err("unterminated quoted identifier".to_string())
+}
+
+/// Parse the part after `db.`: a quoted identifier, or a bare token up to the
+/// next whitespace (dots included, so `a.b.c` splits once into `a` + `b.c`).
+fn take_target_tail(s: &str) -> std::result::Result<(String, &str), String> {
+    let s = s.trim_start();
+    if s.starts_with('"') {
+        return take_quoted_ident(s);
+    }
+    let end = s.find(char::is_whitespace).unwrap_or(s.len());
+    if end == 0 {
+        return Err("expected a table name after `.`".to_string());
+    }
+    Ok((s[..end].to_string(), &s[end..]))
+}
+
+/// Parse a table target that may be `db.table`, honoring double-quoted
+/// identifiers. Returns the parsed parts (both unquoted); a spec that is not
+/// a well-formed two-part name is a single unqualified table name. Whether
+/// the first part is a *database* is the caller's decision (see
+/// [`resolve_import_target`]).
+pub fn parse_table_target(spec: &str) -> Result<(Option<String>, String)> {
+    let spec = spec.trim();
+    let (first, rest) = take_ident(spec).map_err(PinkDbError::Parse)?;
+    let rest = rest.trim_start();
+    if let Some(rest) = rest.strip_prefix('.') {
+        if let Ok((second, tail)) = take_target_tail(rest) {
+            if tail.trim().is_empty() {
+                return Ok((Some(first), second));
+            }
+        }
+    } else if rest.is_empty() {
+        // A single (possibly quoted) name.
+        return Ok((None, first));
+    }
+    Ok((None, spec.to_string()))
+}
+
+/// Resolve an import target: `db.table` goes to that database only when `db`
+/// names an EXISTING database — otherwise the whole string is the table name
+/// (so a dotted file stem like `data.2024` stays one name). A plain name goes
+/// to the session's current database.
+fn resolve_import_target(db: &PinkDb, table: Option<&str>, path: &str) -> Result<(String, String)> {
+    let spec = match table {
+        Some(t) => t.to_string(),
+        None => default_table_name(path),
+    };
+    match parse_table_target(&spec)? {
+        (Some(q), name) if db.database_exists(&q) => {
+            Ok((q.to_ascii_lowercase(), name))
+        }
+        (Some(q), name) => Ok((db.current_db().to_string(), format!("{q}.{name}"))),
+        (None, name) => Ok((db.current_db().to_string(), name)),
+    }
+}
+
+/// Import a CSV file into `table` (default: file stem). `table` may be
+/// `db.table` to target a specific database; otherwise the current database
+/// is used. Returns rows loaded. On a durable database the import is durable
+/// before returning (atomic checkpoint publish + WAL roll); in memory it is a
+/// no-op extra step.
 pub fn import_csv(db: &mut PinkDb, path: &str, table: Option<&str>) -> Result<usize> {
     let data = std::fs::read(path)?;
-    let owned: String;
-    let table_name: &str = match table {
-        Some(t) => t,
-        None => {
-            owned = default_table_name(path);
-            &owned
-        }
-    };
+    let (db_name, table_name) = resolve_import_target(db, table, path)?;
     require_settled_import(db)?;
-    let rows = load_bytes(db, table_name, &data)?;
-    make_import_durable(db, table_name, rows)
+    let rows = load_bytes(db, &db_name, &table_name, &data)?;
+    make_import_durable(db, &db_name, &table_name, rows)
 }
 
 /// Import CSV text (header + rows) — used by tests and the REPL. Durable
 /// databases checkpoint the import before returning, like [`import_csv`].
+/// `table` may be `db.table` to target a specific database.
 pub fn import_csv_string(
     db: &mut PinkDb,
     table: &str,
     csv_text: &str,
 ) -> Result<usize> {
+    let (db_name, table_name) = resolve_import_target(db, Some(table), "")?;
     require_settled_import(db)?;
-    let rows = load_bytes(db, table, csv_text.as_bytes())?;
-    make_import_durable(db, table, rows)
+    let rows = load_bytes(db, &db_name, &table_name, csv_text.as_bytes())?;
+    make_import_durable(db, &db_name, &table_name, rows)
 }
 
 #[cfg(test)]
@@ -644,6 +745,82 @@ mod tests {
         assert_eq!(n, 3);
         assert!(db.table("pinkdb_test_sales").is_ok());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn parse_table_target_honors_quoting_and_single_split() {
+        assert_eq!(
+            parse_table_target("data.2024").unwrap(),
+            (Some("data".to_string()), "2024".to_string())
+        );
+        assert_eq!(
+            parse_table_target("a.b.c").unwrap(),
+            (Some("a".to_string()), "b.c".to_string()),
+            "split once, like the old behavior"
+        );
+        assert_eq!(
+            parse_table_target("\"My Db\".t").unwrap(),
+            (Some("My Db".to_string()), "t".to_string())
+        );
+        assert_eq!(
+            parse_table_target("\"a\"\"b\".\"c d\"").unwrap(),
+            (Some("a\"b".to_string()), "c d".to_string())
+        );
+        assert_eq!(
+            parse_table_target("plain").unwrap(),
+            (None, "plain".to_string())
+        );
+        assert_eq!(
+            parse_table_target("\"My Table\"").unwrap(),
+            (None, "My Table".to_string())
+        );
+        assert!(parse_table_target("\"unterminated").is_err());
+    }
+
+    /// M1: a dotted name is `db.table` only when the left side names an
+    /// EXISTING database; otherwise the whole string is the table name. A
+    /// dotted file stem (`data.2024.csv`) must import as `data.2024`.
+    #[test]
+    fn dotted_import_names_stay_whole_unless_the_left_side_is_a_database() {
+        let mut db = PinkDb::new();
+        // Dotted stem from the file name.
+        let dir = std::env::temp_dir().join(format!(
+            "pinkdb_dotted_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.2024.csv");
+        std::fs::write(&path, "a\n1\n2\n").unwrap();
+        assert_eq!(import_csv(&mut db, path.to_str().unwrap(), None).unwrap(), 2);
+        assert!(db.table("data.2024").is_ok(), "stem stays one table name");
+
+        // Dotted explicit table argument.
+        import_csv_string(&mut db, "data.2024", "a\n3\n").unwrap_err(); // already exists
+        import_csv_string(&mut db, "other.2024", "a\n3\n").unwrap();
+        assert!(db.table("other.2024").is_ok());
+
+        // An existing database name on the left IS a qualifier.
+        db.create_database("db1").unwrap();
+        import_csv_string(&mut db, "db1.t", "a\n5\n").unwrap();
+        assert_eq!(db.table_in("db1", "t").unwrap().num_rows(), 1);
+        assert!(db.table("db1.t").is_err(), "not a table in the current db");
+
+        // A missing database name is not: the whole string is the table name.
+        import_csv_string(&mut db, "nope.u", "a\n9\n").unwrap();
+        assert!(db.table("nope.u").is_ok());
+
+        // Quoted forms: a database with a space, and a quoted table name.
+        db.create_database("My Db").unwrap();
+        import_csv_string(&mut db, "\"My Db\".t", "a\n7\n").unwrap();
+        assert_eq!(db.table_in("My Db", "t").unwrap().num_rows(), 1);
+        import_csv_string(&mut db, "\"My Table\"", "a\n8\n").unwrap();
+        assert!(db.table("My Table").is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -828,9 +1005,9 @@ mod tests {
 
         for text in &corpus {
             let mut exact = PinkDb::new();
-            let exact_res = load_full(&mut exact, "t", text.as_bytes());
+            let exact_res = load_full(&mut exact, "main", "t", text.as_bytes());
             let mut fast = PinkDb::new();
-            let fast_res = load_bytes(&mut fast, "t", text.as_bytes());
+            let fast_res = load_bytes(&mut fast, "main", "t", text.as_bytes());
             match (exact_res, fast_res) {
                 (Ok(n0), Ok(n1)) => {
                     assert_eq!(n0, n1, "row count differs for {text:?}");
@@ -875,16 +1052,16 @@ mod tests {
         .unwrap();
         // Quoting and CR are not modeled: NotClean, table untouched.
         assert!(matches!(
-            parse_clean(&mut db, "t", b"a,b\n1,\"x\"\n", &types),
+            parse_clean(&mut db, "main", "t", b"a,b\n1,\"x\"\n", &types),
             Err(CleanError::NotClean)
         ));
         assert!(matches!(
-            parse_clean(&mut db, "t", b"a,b\n1,x\r\n", &types),
+            parse_clean(&mut db, "main", "t", b"a,b\n1,x\r\n", &types),
             Err(CleanError::NotClean)
         ));
         // Clean input parses (empty lines skipped, missing fields NULL).
         assert_eq!(
-            parse_clean(&mut db, "t", b"a,b\n1,x\n\n2\n", &types).unwrap(),
+            parse_clean(&mut db, "main", "t", b"a,b\n1,x\n\n2\n", &types).unwrap(),
             2
         );
         // More than one batch (BATCH_LINES + 3 data lines, one empty).
@@ -901,7 +1078,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let n = parse_clean(&mut db, "t2", &text, &types).unwrap();
+        let n = parse_clean(&mut db, "main", "t2", &text, &types).unwrap();
         assert_eq!(n, BATCH_LINES + 3);
         let t = db.table("t2").unwrap();
         for &i in &[0usize, BATCH_LINES - 1, BATCH_LINES, BATCH_LINES + 2] {

@@ -45,7 +45,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 20 | Outer joins: LEFT/RIGHT equi-joins (NULL-extended unmatched rows), join-kind-aware pushdown | done | 4637827 — 208 lib + 3 CLI tests, duckdiff 60/60, bench total 493 ms |
 | 21 | PEG parser (`peg` crate) in parallel with recursive descent; differential-tested; default flipped | done | f4ce500 — 223 lib + 3 CLI tests both parser modes, duckdiff 60/60 both modes; docs follow-ups 709ede4, 6dfb8c4 |
 | 22 | WAL / crash recovery (core) | done | 253 lib + 3 CLI unit + 9 CLI integration tests; duckdiff 60/60; kill loop 100/100 random + 40/40 targeted clean (dev runs: 600 + 190); bench ≈498 ms |
-| 23 | Multi-database: `USE <db>`, qualified `db.table`, per-database persistence (core) | queued | — |
+| 23 | Multi-database: `USE <db>`, qualified `db.table`, per-database persistence (core) | done | 288 lib + 3 CLI unit + 9 crash + 8 multi-db integration tests (both parser modes); duckdiff 60/60; kill loop 30/30 + 30/30 multi-db clean; bench ≈497 ms |
 | 24 | Network server: `pinkdb-server` binary + CLI `--host` client mode (separate crate; TLS optional feature) | queued | — |
 | 25 | At-rest encryption: encrypted `.pink` + WAL (AEAD + Argon2id, key via option/env) (core `encryption` feature) | queued | — |
 | 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) (separate crate; contained `unsafe`) | queued | — |
@@ -87,5 +87,12 @@ Java bindings.
   crash tests + kill-loop harness `bench/kill_loop.py`. 253 lib + 3 CLI unit + 9 CLI
   integration tests, duckdiff 60/60, kill loop 100/100 random + 40/40 targeted clean,
   bench ≈498 ms.
-- 2026-10-12 — Binary size: 2.11 MB (release CLI, measured after wave 22; pre-wave-17 was
+- 2026-10-12 — Wave 23: multi-database — `CREATE DATABASE`/`DROP DATABASE`/`USE` + qualified
+  `db.table` in both parsers; per-connection session scoping; `.pink` v2 (v1 back-compat
+  fixture); WAL session-prefixed records with the dropped-db replay hole fixed;
+  `.databases`/scoped `.tables`/`.schema`/quoted `.import`; view-body CTE isolation;
+  multi-db kill-loop mode in `bench/kill_loop.py`. 288 lib + 3 CLI unit + 9 crash + 8
+  multi-db integration tests (both parser modes), duckdiff 60/60, kill loop 30/30 + 30/30
+  multi-db clean, bench ≈497 ms.
+- 2026-10-12 — Binary size: 2.17 MB (release CLI, measured after wave 23; pre-wave-17 was
   2.26 MB).
