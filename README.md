@@ -166,7 +166,9 @@ isolation without predicate tracking (write-skew is possible). The plain
 
 Generated with `bench/gen_sales.py` (deterministic seed 42), measured with `cargo run --release -p pinkdb --example query_bench` (best of 5):
 
-| Query | Now (ms) | Before wave 17 (ms) |
+For the join rows, "before" is the pre-wave-19 baseline (join_self 66, join_group 68, join_probe 64); the materializing mixed-predicate join is new, so it has no comparable baseline ("—").
+
+| Query | Now (ms) | Before (ms) |
 |---|---|---|
 | `.import` 1M rows (24 MB CSV) | 25 | 28 |
 | `SELECT COUNT(*) FROM sales` | 0.01 | 0.02 |
@@ -181,7 +183,10 @@ Generated with `bench/gen_sales.py` (deterministic seed 42), measured with `carg
 | DISTINCT id (1M values) | 64 | 75 |
 | ROW_NUMBER() OVER (PARTITION BY region ORDER BY id) | 93 | 165 |
 | COUNT(*) OVER (PARTITION BY region) | 79 | minutes (O(n²)) |
-| 1M-row self hash join + COUNT | 64 | 143 |
+| 1M-row self hash join + COUNT (fused) | 9.0 | 66 |
+| 1M-row self join + GROUP BY region (fused) | 16 | 68 |
+| 1M-row self join, mixed predicate (materializing) | 26 | — |
+| 1M probes vs 4-row string-key side (fused) | 24 | 64 |
 
 For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 (`read_csv_auto` → table), single connection.

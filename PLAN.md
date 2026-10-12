@@ -121,6 +121,7 @@ LIMIT n;
 | 16 | CASE expressions (searched + simple, NULL semantics, type unification) | done (build+test+clippy green, 119 tests, duckdiff 54/54) |
 | 17 | Performance tuning: O(n²) window-aggregate fix, typed expression kernels, sort key arena + top-N, join/group hash paths, REPL display cap, thin LTO | done (build+test+clippy green, 148 tests, duckdiff 54/54, 1M-row query bench) |
 | 18 | Binder fix: UNION inside derived tables/CTEs/views/subqueries; ORDER BY/LIMIT apply to the whole set operation | done (build+test+clippy green, 162 lib + 3 CLI tests, duckdiff 56/56) |
+| 19 | Join fast path: integer-key specialization + fused join→aggregate (no row materialization) | done (build+test+clippy green, 193 lib + 3 CLI tests, duckdiff 56/56, join_self 64→~9 ms) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 

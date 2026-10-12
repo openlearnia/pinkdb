@@ -14,13 +14,14 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use crate::types::{FastMap, FastSet};
 
-use aggregate::aggregate;
+use aggregate::{aggregate, emit_groups, merge_partials, Acc, Group, Partial};
 use expr::{coerce_to, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
 
 use crate::plan::{LogicalPlan, agg_output_schema, compare_values, win_output_schema};
-use crate::sql::binder::{BoundExpr, common_numeric};
+use crate::sql::ast::BinaryOp;
+use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, common_numeric};
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
@@ -299,6 +300,13 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             Ok(Output { chunks, names, types })
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
+            // Fused join→aggregate: feed joined rows straight into per-group
+            // accumulators without ever materializing them. All fusibility
+            // checks are static, so a blocked shape falls through without
+            // having evaluated anything.
+            if let Some(out) = fused_join_aggregate(cx, input, keys, aggs)? {
+                return Ok(out);
+            }
             let inner = eval(cx, input)?;
             // Fast path: pure COUNT(*) with no keys counts chunk lengths —
             // no data touched at all.
@@ -306,6 +314,10 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 && !aggs.is_empty()
                 && aggs.iter().all(|a| a.func == crate::sql::binder::AggFunc::Count && a.arg.is_none())
             {
+                // The binder dedups identical aggregates, so the only
+                // all-COUNT(*) shape reaching here is a single COUNT(*) —
+                // and this path emits exactly one column.
+                debug_assert_eq!(aggs.len(), 1);
                 let total: i64 = inner.chunks.iter().map(|c| c.num_rows() as i64).sum();
                 let mut vec = Vector::new_empty(DataType::Bigint);
                 vec.push_valid(Value::Bigint(total))?;
@@ -419,6 +431,183 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
 
 // ---------- blocking operators ----------
 
+/// Sentinel ending a match chain in [`MatchTable`]'s arena.
+const NIL: u32 = u32::MAX;
+
+/// One arena node: (right chunk, right row, next node in the key's chain).
+type MatchNode = (u32, u32, u32);
+
+/// Key dtypes whose payload is a single integer that widens losslessly to
+/// i64. The int path requires BOTH dtypes in the integer family, so
+/// INTEGER=BIGINT is the only cross-type pairing (DATE and TIMESTAMP pair
+/// only with themselves); `int_key_at` therefore never truncates a value.
+fn is_int_key(t: DataType) -> bool {
+    matches!(
+        t,
+        DataType::Integer | DataType::Bigint | DataType::Date | DataType::Timestamp
+    )
+}
+
+/// Read one integer-payload key cell widened to i64 (the `i32` payloads —
+/// INTEGER/DATE — cannot overflow the cast).
+#[inline]
+fn int_key_at(v: &Vector, i: usize) -> i64 {
+    match v.data() {
+        VectorData::Int32(d) => d[i] as i64,
+        VectorData::Int64(d) => d[i],
+        VectorData::Date32(d) => d[i] as i64,
+        VectorData::TimestampMicros(d) => d[i],
+        _ => unreachable!("int_key_at called on a non-integer-payload key vector"),
+    }
+}
+
+/// Evaluate one side's join key over `chunk`. Integer-payload keys are read
+/// directly through `int_key_at`, so they never go through `coerce_to` or the
+/// byte encoding; byte-path keys are canonicalized to the common numeric type
+/// when the two sides differ (the binder allows `1 = 1.0`). Same-type keys
+/// skip the deep clone `coerce_to` would do.
+fn eval_join_key(
+    cx: &Cx,
+    key: &BoundExpr,
+    chunk: &DataChunk,
+    common: Option<DataType>,
+    ints: bool,
+) -> Result<Vector> {
+    let kv = eval_expr(key, chunk, cx)?;
+    if ints {
+        return Ok(kv);
+    }
+    match common {
+        Some(t) if kv.dtype() != t => coerce_to(&kv, t),
+        _ => Ok(kv),
+    }
+}
+
+/// Build-side match table of a hash join: key → (head, tail) of that key's
+/// match chain. The arena holds one `(right_chunk, right_row, next)` node per
+/// match in right input order (sentinel [`NIL`] ends a chain); appending links
+/// the new node after the tail. This replaces a small `Vec` allocation per
+/// distinct key while keeping one hash lookup per row. (A `(start, len)` slice
+/// into a flat arena cannot work in one pass: matches of distinct keys
+/// interleave, so a key's rows are not contiguous.)
+///
+/// Two key representations, chosen by the bound key dtypes:
+/// - `Ints`: INTEGER/BIGINT/DATE/TIMESTAMP payloads widened to i64 — no
+///   encoding and no `coerce_to`;
+/// - `Bytes`: the generic `Vector::encode_into` encoding for every other
+///   dtype (VARCHAR, DOUBLE, BOOLEAN, mixed numeric).
+///
+/// Probe/assembly reads either variant through the same accessors, so the
+/// future fused join→aggregate path can reuse the table as-is.
+enum MatchTable {
+    Ints {
+        map: FastMap<i64, (u32, u32)>,
+        arena: Vec<MatchNode>,
+    },
+    Bytes {
+        map: FastMap<Vec<u8>, (u32, u32)>,
+        arena: Vec<MatchNode>,
+    },
+}
+
+impl MatchTable {
+    /// Build over the right input. `reserve` is the caller's capacity policy
+    /// (distinct keys, not rows: a skewed join must not preallocate one slot
+    /// per right row; both containers grow on demand past the cap).
+    fn build(
+        cx: &Cx,
+        right_chunks: &[DataChunk],
+        right_key: &BoundExpr,
+        common: Option<DataType>,
+        ints: bool,
+        reserve: usize,
+    ) -> Result<MatchTable> {
+        let mut table = if ints {
+            MatchTable::Ints {
+                map: FastMap::with_capacity_and_hasher(reserve, Default::default()),
+                arena: Vec::with_capacity(reserve),
+            }
+        } else {
+            MatchTable::Bytes {
+                map: FastMap::with_capacity_and_hasher(reserve, Default::default()),
+                arena: Vec::with_capacity(reserve),
+            }
+        };
+        let mut buf = Vec::new();
+        for (ci, chunk) in right_chunks.iter().enumerate() {
+            let kv = eval_join_key(cx, right_key, chunk, common, ints)?;
+            for i in 0..chunk.num_rows() {
+                if kv.is_null(i) {
+                    continue;
+                }
+                match &mut table {
+                    MatchTable::Ints { map, arena } => {
+                        let key = int_key_at(&kv, i);
+                        let node = arena.len() as u32;
+                        arena.push((ci as u32, i as u32, NIL));
+                        match map.get_mut(&key) {
+                            Some(slot) => {
+                                arena[slot.1 as usize].2 = node;
+                                slot.1 = node;
+                            }
+                            None => {
+                                map.insert(key, (node, node));
+                            }
+                        }
+                    }
+                    MatchTable::Bytes { map, arena } => {
+                        // Borrowed encoding, get-first: hits allocate nothing.
+                        buf.clear();
+                        kv.encode_into(&mut buf, i);
+                        let node = arena.len() as u32;
+                        arena.push((ci as u32, i as u32, NIL));
+                        match map.get_mut(&buf) {
+                            Some(slot) => {
+                                arena[slot.1 as usize].2 = node;
+                                slot.1 = node;
+                            }
+                            None => {
+                                map.insert(buf.clone(), (node, node));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(table)
+    }
+
+    /// Probe accessor: head node of `key`'s match chain, if any. The caller
+    /// picks the accessor matching the representation the table was built
+    /// with (`ints`).
+    #[inline]
+    fn head_int(&self, key: i64) -> Option<u32> {
+        match self {
+            MatchTable::Ints { map, .. } => map.get(&key).map(|&(head, _)| head),
+            MatchTable::Bytes { .. } => unreachable!("int key probed against a byte match table"),
+        }
+    }
+
+    /// Probe accessor for byte-encoded keys.
+    #[inline]
+    fn head_bytes(&self, key: &[u8]) -> Option<u32> {
+        match self {
+            MatchTable::Bytes { map, .. } => map.get(key).map(|&(head, _)| head),
+            MatchTable::Ints { .. } => unreachable!("byte key probed against an int match table"),
+        }
+    }
+
+    /// `(right_chunk, right_row, next)` of arena node `node`.
+    #[inline]
+    fn node(&self, node: u32) -> MatchNode {
+        match self {
+            MatchTable::Ints { arena, .. } | MatchTable::Bytes { arena, .. } => {
+                arena[node as usize]
+            }
+        }
+    }
+}
+
 /// Inner hash join: build on the right, probe with the left (preserves
 /// left-row order). NULL keys never match on either side.
 fn hash_join(
@@ -430,16 +619,12 @@ fn hash_join(
     left_types: &[DataType],
     right_types: &[DataType],
 ) -> Result<Vec<DataChunk>> {
-    // Build: encoded key → (head, tail) of that key's match chain. The arena
-    // holds one `(right_chunk, right_row, next)` node per match in right
-    // input order (sentinel `NIL` ends a chain); appending links the new node
-    // after the tail. This replaces a small `Vec` allocation per distinct key
-    // while keeping one hash lookup per row. (A `(start, len)` slice into a
-    // flat arena cannot work in one pass: matches of distinct keys interleave,
-    // so a key's rows are not contiguous.) Cross-type numeric keys are
-    // canonicalized to their common type first (binder allows `1 = 1.0`);
-    // same-type keys skip the deep clone `coerce_to` would do.
-    const NIL: u32 = u32::MAX;
+    // Integer-payload keys take the i64-specialized match table: no byte
+    // encoding and no `coerce_to` (INTEGER=BIGINT widens per cell). Every
+    // other dtype keeps the byte path, canonicalized to the common numeric
+    // type first (binder allows `1 = 1.0`); same-type keys skip the deep
+    // clone `coerce_to` would do.
+    let ints = is_int_key(left_key.dtype()) && is_int_key(right_key.dtype());
     let common = common_numeric(left_key.dtype(), right_key.dtype()).ok();
     let right_rows: usize = right_chunks.iter().map(|c| c.num_rows()).sum();
     if right_rows > u32::MAX as usize {
@@ -451,37 +636,7 @@ fn hash_join(
     // allocate `right_rows` map/arena slots for a handful of keys. Both grow
     // on demand past the cap.
     let reserve = right_rows.min(1 << 20);
-    let mut map: FastMap<Vec<u8>, (u32, u32)> =
-        FastMap::with_capacity_and_hasher(reserve, Default::default());
-    let mut arena: Vec<(u32, u32, u32)> = Vec::with_capacity(reserve);
-    let mut buf = Vec::new();
-    for (ci, chunk) in right_chunks.iter().enumerate() {
-        let kv = eval_expr(right_key, chunk, cx)?;
-        let kv = match common {
-            Some(t) if kv.dtype() != t => coerce_to(&kv, t)?,
-            _ => kv,
-        };
-        for i in 0..chunk.num_rows() {
-            if kv.is_null(i) {
-                continue;
-            }
-            // Borrowed encoding, get-first: hits allocate nothing.
-            buf.clear();
-            kv.encode_into(&mut buf, i);
-            let node = arena.len() as u32;
-            match map.get_mut(&buf) {
-                Some(slot) => {
-                    arena.push((ci as u32, i as u32, NIL));
-                    arena[slot.1 as usize].2 = node;
-                    slot.1 = node;
-                }
-                None => {
-                    arena.push((ci as u32, i as u32, NIL));
-                    map.insert(buf.clone(), (node, node));
-                }
-            }
-        }
-    }
+    let table = MatchTable::build(cx, right_chunks, right_key, common, ints, reserve)?;
 
     // Probe + assemble, parallel per left chunk: matches push straight from
     // the source chunks into per-partition output vectors (no intermediate
@@ -494,11 +649,7 @@ fn hash_join(
     let partitions: Vec<Vec<DataChunk>> = left_chunks
         .par_iter()
         .map(|chunk| -> Result<Vec<DataChunk>> {
-            let kv = eval_expr(left_key, chunk, cx)?;
-            let kv = match common {
-                Some(t) if kv.dtype() != t => coerce_to(&kv, t)?,
-                _ => kv,
-            };
+            let kv = eval_join_key(cx, left_key, chunk, common, ints)?;
             let mut finished = Vec::new();
             let mut cur: Vec<Vector> =
                 dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
@@ -508,11 +659,16 @@ fn hash_join(
                 if kv.is_null(i) {
                     continue;
                 }
-                buf.clear();
-                kv.encode_into(&mut buf, i);
-                if let Some(&(mut node, _)) = map.get(&buf) {
+                let head = if ints {
+                    table.head_int(int_key_at(&kv, i))
+                } else {
+                    buf.clear();
+                    kv.encode_into(&mut buf, i);
+                    table.head_bytes(&buf)
+                };
+                if let Some(mut node) = head {
                     while node != NIL {
-                        let (rci, ri, next) = arena[node as usize];
+                        let (rci, ri, next) = table.node(node);
                         if cur_rows >= CHUNK_SIZE {
                             finished.push(DataChunk::new(std::mem::take(&mut cur))?);
                             cur = dtypes
@@ -540,6 +696,650 @@ fn hash_join(
         })
         .collect::<Result<_>>()?;
     Ok(partitions.into_iter().flatten().collect())
+}
+
+// ---------- fused join → aggregate ----------
+
+/// Which join input one rewritten aggregate expression reads from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    /// Every column reference is `< left_cols` (left input).
+    Left,
+    /// Every column reference is `>= left_cols` (right input).
+    Right,
+    /// No column references at all.
+    Constant,
+}
+
+/// Combine the sides of a binary/vector expression: a constant operand
+/// never conflicts; two different data sides do (not fusible).
+fn merge_sides(a: Side, b: Side) -> Option<Side> {
+    match (a, b) {
+        (Side::Constant, s) | (s, Side::Constant) => Some(s),
+        (a, b) if a == b => Some(a),
+        _ => None,
+    }
+}
+
+/// Side classification of a join-space expression: `Some(Left)`/`Some(Right)`
+/// when every column reference lies entirely on one side, `Some(Constant)`
+/// for column-free trees, `None` when the sides mix or the tree holds a
+/// subquery / AggRef / WindowRef (none of which the fused path can evaluate
+/// per side).
+fn classify_side(expr: &BoundExpr, left_cols: usize) -> Option<Side> {
+    match expr {
+        BoundExpr::Literal(_) => Some(Side::Constant),
+        BoundExpr::Column { index, .. } => {
+            Some(if *index < left_cols { Side::Left } else { Side::Right })
+        }
+        BoundExpr::Binary { left, right, .. } => {
+            merge_sides(classify_side(left, left_cols)?, classify_side(right, left_cols)?)
+        }
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. }
+        | BoundExpr::Cast { expr: e, .. } => classify_side(e, left_cols),
+        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            let mut side = Side::Constant;
+            for a in args {
+                side = merge_sides(side, classify_side(a, left_cols)?)?;
+            }
+            Some(side)
+        }
+        BoundExpr::Case { branches, else_, .. } => {
+            let mut side = Side::Constant;
+            for (c, v) in branches {
+                side = merge_sides(side, classify_side(c, left_cols)?)?;
+                side = merge_sides(side, classify_side(v, left_cols)?)?;
+            }
+            if let Some(e) = else_ {
+                side = merge_sides(side, classify_side(e, left_cols)?)?;
+            }
+            Some(side)
+        }
+        // Aggregate/window output columns and subqueries are not fusible.
+        BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::Exists { .. } => None,
+    }
+}
+
+/// Rewrite an aggregate expression from project-output space into join
+/// space: every `BoundExpr::Column { index, .. }` becomes
+/// `project.exprs[index]`. `None` (reject the fusion) when a subquery,
+/// AggRef, or WindowRef occurs anywhere — including inside a substituted
+/// project expression — or an index is out of range. `project` is `None`
+/// when the aggregate's input is the join itself (expressions are already
+/// join-space).
+fn rewrite_through_project(
+    expr: &BoundExpr,
+    project: Option<&[BoundExpr]>,
+) -> Option<BoundExpr> {
+    match expr {
+        BoundExpr::Literal(v) => Some(BoundExpr::Literal(v.clone())),
+        BoundExpr::Column { index, dtype } => match project {
+            None => Some(BoundExpr::Column { index: *index, dtype: *dtype }),
+            Some(pexprs) => {
+                let p = pexprs.get(*index)?;
+                if p.has_subquery() {
+                    return None;
+                }
+                Some(p.clone())
+            }
+        },
+        BoundExpr::Binary { op, left, right, dtype } => Some(BoundExpr::Binary {
+            op: *op,
+            left: Box::new(rewrite_through_project(left, project)?),
+            right: Box::new(rewrite_through_project(right, project)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::Not(e) => {
+            Some(BoundExpr::Not(Box::new(rewrite_through_project(e, project)?)))
+        }
+        BoundExpr::Negate { expr, dtype } => Some(BoundExpr::Negate {
+            expr: Box::new(rewrite_through_project(expr, project)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::IsNull { expr, negated } => Some(BoundExpr::IsNull {
+            expr: Box::new(rewrite_through_project(expr, project)?),
+            negated: *negated,
+        }),
+        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
+            func: *func,
+            args: args
+                .iter()
+                .map(|a| rewrite_through_project(a, project))
+                .collect::<Option<Vec<_>>>()?,
+            dtype: *dtype,
+        }),
+        BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
+            expr: Box::new(rewrite_through_project(expr, project)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::Coalesce { args, dtype } => Some(BoundExpr::Coalesce {
+            args: args
+                .iter()
+                .map(|a| rewrite_through_project(a, project))
+                .collect::<Option<Vec<_>>>()?,
+            dtype: *dtype,
+        }),
+        BoundExpr::Case { branches, else_, dtype } => Some(BoundExpr::Case {
+            branches: branches
+                .iter()
+                .map(|(c, v)| {
+                    Some((
+                        rewrite_through_project(c, project)?,
+                        rewrite_through_project(v, project)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            else_: match else_ {
+                Some(e) => Some(Box::new(rewrite_through_project(e, project)?)),
+                None => None,
+            },
+            dtype: *dtype,
+        }),
+        // Aggregate/window output columns and subqueries are not fusible.
+        BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::Exists { .. } => None,
+    }
+}
+
+/// Shift a joined-space expression down by `left_cols`: column index `i`
+/// becomes `i - left_cols`, so the expression evaluates against the right
+/// input alone (the same rewrite the optimizer applies to right-side
+/// predicates pushed below a join). Only right-side expressions are shifted,
+/// so no index underflows. Rejected variants clone through, keeping the walk
+/// total.
+fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::Column { index, dtype } => {
+            BoundExpr::Column { index: index - left_cols, dtype: *dtype }
+        }
+        BoundExpr::Literal(v) => BoundExpr::Literal(v.clone()),
+        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+            op: *op,
+            left: Box::new(shift_join_columns(left, left_cols)),
+            right: Box::new(shift_join_columns(right, left_cols)),
+            dtype: *dtype,
+        },
+        BoundExpr::Not(e) => BoundExpr::Not(Box::new(shift_join_columns(e, left_cols))),
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(shift_join_columns(expr, left_cols)),
+            dtype: *dtype,
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(shift_join_columns(expr, left_cols)),
+            negated: *negated,
+        },
+        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+            func: *func,
+            args: args.iter().map(|a| shift_join_columns(a, left_cols)).collect(),
+            dtype: *dtype,
+        },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(shift_join_columns(expr, left_cols)),
+            dtype: *dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args.iter().map(|a| shift_join_columns(a, left_cols)).collect(),
+            dtype: *dtype,
+        },
+        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+            branches: branches
+                .iter()
+                .map(|(c, v)| {
+                    (shift_join_columns(c, left_cols), shift_join_columns(v, left_cols))
+                })
+                .collect(),
+            else_: else_.as_ref().map(|e| Box::new(shift_join_columns(e, left_cols))),
+            dtype: *dtype,
+        },
+        BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::Exists { .. } => expr.clone(),
+    }
+}
+
+/// A rewritten key/argument expression plus the join side it reads from.
+struct FusedExpr {
+    expr: BoundExpr,
+    side: Side,
+}
+
+/// Where one key/agg-arg gets its runtime values.
+#[derive(Clone, Copy)]
+enum ExprSource {
+    /// Left-side or constant expression: index into the vectors evaluated
+    /// once per left chunk.
+    Left(usize),
+    /// Right-side expression: index into the per-right-chunk vectors.
+    Right(usize),
+}
+
+/// Rewrite + classify one aggregate key/argument. `None` ⇒ not fusible.
+fn fusible_expr(
+    expr: &BoundExpr,
+    project: Option<&[BoundExpr]>,
+    left_cols: usize,
+) -> Option<FusedExpr> {
+    let expr = rewrite_through_project(expr, project)?;
+    // The fused path pre-evaluates this expression over the *whole* left or
+    // right input, but the materialized path only evaluates it on matched
+    // join rows. A value-dependent error on a never-matched row would then
+    // surface only under fusion, so reject any expression that can error.
+    if !expr_is_total(&expr) {
+        return None;
+    }
+    let side = classify_side(&expr, left_cols)?;
+    Some(FusedExpr { expr, side })
+}
+
+/// True when evaluating `e` on any valid value of its input type cannot
+/// return an error (a panic-free, error-free evaluation). Used to keep the
+/// fused join→aggregate path from observing value-dependent errors on rows
+/// the materialized path never evaluates.
+///
+/// The rules mirror `exec::expr`'s evaluation:
+/// - `Literal` / `Column` are pure reads;
+/// - `Not` / `Negate` / `IsNull` only recurse (the binder types operands and
+///   rejects date/timestamp negation);
+/// - comparisons, `AND`/`OR`, `LIKE`, `+`/`-`/`*` never fail on well-typed
+///   operands (wrapping arithmetic; the binder rejects date shapes it cannot
+///   evaluate);
+/// - `/` avoids the integer divide-by-zero rule only when both operands are
+///   DOUBLE (pure IEEE); `%` is integer-only and errors on a zero divisor;
+/// - `CAST` can fail per value (VARCHAR→numeric parses, date parses,
+///   out-of-range timestamp widening);
+/// - `COALESCE`/`CASE` evaluate every arm, so all arms must be total;
+/// - only the scalar functions verified in `apply_scalar` to never return a
+///   value-dependent `Err` on binder-typed arguments are whitelisted
+///   (`substr` is left out with the rest; `date_trunc` errors on bad parts);
+/// - subqueries / aggregate / window refs are rejected before this point.
+fn expr_is_total(e: &BoundExpr) -> bool {
+    match e {
+        BoundExpr::Literal(_) | BoundExpr::Column { .. } => true,
+        BoundExpr::Not(x)
+        | BoundExpr::Negate { expr: x, .. }
+        | BoundExpr::IsNull { expr: x, .. } => expr_is_total(x),
+        BoundExpr::Binary { op, left, right, .. } => match op {
+            BinaryOp::Add
+            | BinaryOp::Subtract
+            | BinaryOp::Multiply
+            | BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
+            | BinaryOp::GtEq
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Like
+            | BinaryOp::NotLike => expr_is_total(left) && expr_is_total(right),
+            // int/int division errors on a zero divisor; only DOUBLE/DOUBLE
+            // (both sides, so the int-div rule can never trigger) is safe.
+            BinaryOp::Divide => {
+                left.dtype() == DataType::Double
+                    && right.dtype() == DataType::Double
+                    && expr_is_total(left)
+                    && expr_is_total(right)
+            }
+            BinaryOp::Modulo => false,
+        },
+        BoundExpr::Cast { .. } => false,
+        BoundExpr::Coalesce { args, .. } => args.iter().all(expr_is_total),
+        BoundExpr::Case { branches, else_, .. } => {
+            branches.iter().all(|(c, v)| expr_is_total(c) && expr_is_total(v))
+                && else_.as_ref().is_none_or(|e| expr_is_total(e))
+        }
+        BoundExpr::Scalar { func, args, .. } => {
+            matches!(
+                func,
+                ScalarFunc::Upper
+                    | ScalarFunc::Lower
+                    | ScalarFunc::Length
+                    | ScalarFunc::Abs
+                    | ScalarFunc::Round
+                    | ScalarFunc::Year
+                    | ScalarFunc::Month
+                    | ScalarFunc::Day
+                    | ScalarFunc::Hour
+                    | ScalarFunc::Minute
+                    | ScalarFunc::Second
+            ) && args.iter().all(expr_is_total)
+        }
+        BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
+        | BoundExpr::ScalarSubquery { .. }
+        | BoundExpr::InSubquery { .. }
+        | BoundExpr::Exists { .. } => false,
+    }
+}
+
+/// One evaluated key/arg vector: a bare column reference borrows its chunk's
+/// vector (no deep clone), anything else is an owned evaluation result.
+enum FusedVec<'a> {
+    Col(&'a Vector),
+    Owned(Vector),
+}
+
+impl FusedVec<'_> {
+    #[inline]
+    fn v(&self) -> &Vector {
+        match self {
+            FusedVec::Col(v) => v,
+            FusedVec::Owned(v) => v,
+        }
+    }
+}
+
+/// Evaluate one planned expression over `chunk`; bare `Column` refs borrow
+/// the chunk column instead of cloning it.
+fn eval_fused_vec<'a>(expr: &BoundExpr, chunk: &'a DataChunk, cx: &Cx) -> Result<FusedVec<'a>> {
+    match expr {
+        BoundExpr::Column { index, .. } => Ok(FusedVec::Col(chunk.column(*index))),
+        e => Ok(FusedVec::Owned(eval_expr(e, chunk, cx)?)),
+    }
+}
+
+/// Try to execute `Aggregate` over `Join` or `Project over Join` without
+/// materializing the joined rows: each match feeds one row into its group's
+/// accumulators directly. Returns `Ok(None)` — before evaluating anything —
+/// when the shape or any aggregate key/argument is not fusible.
+///
+/// Row feed order is exactly the materialized pipeline's: left chunks in
+/// order and, within a left row, matches in right-row order, so first-seen
+/// group order and accumulation order match. Group-key encoding, key
+/// `Value`s, and accumulator updates read the same source vectors the
+/// materialized path sees, so integer/exact results are bit-identical
+/// (float partials may differ at the ulp level — accepted).
+fn fused_join_aggregate(
+    cx: &Cx,
+    input: &LogicalPlan,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<Option<Output>> {
+    // Shape: Aggregate over Join, or over Project over Join. A Filter /
+    // Distinct / Window / Limit / Cte between the aggregate and the join
+    // (or any other input) keeps the materialized path.
+    let (left, right, left_key, right_key, left_cols, project) = match input {
+        LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
+            (&**left, &**right, left_key, right_key, *left_cols, None)
+        }
+        LogicalPlan::Project { input: inner, exprs, .. } => match &**inner {
+            LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
+                (&**left, &**right, left_key, right_key, *left_cols, Some(&exprs[..]))
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+
+    // With a Project in the shape, fusion rewrites only the aggregate's
+    // keys/args through it, so project exprs the aggregate does not reference
+    // are never evaluated — while the materialized path evaluates all of
+    // them. Evaluating a total, subquery-free expr has no observable effect,
+    // so skipping an unused one is safe; a non-total or subquery-bearing
+    // project expr must force the materialized path so it errors exactly as
+    // before. (Side classification is irrelevant for exprs nothing reads.)
+    if let Some(exprs) = project {
+        if exprs.iter().any(|e| e.has_subquery() || !expr_is_total(e)) {
+            return Ok(None);
+        }
+    }
+
+    // Static fusibility: rewrite every key/arg into join space and classify
+    // its side. Nothing is evaluated before all checks pass.
+    let mut key_exprs: Vec<FusedExpr> = Vec::with_capacity(keys.len());
+    for k in keys {
+        match fusible_expr(k, project, left_cols) {
+            Some(f) => key_exprs.push(f),
+            None => return Ok(None),
+        }
+    }
+    let mut arg_exprs: Vec<Option<FusedExpr>> = Vec::with_capacity(aggs.len());
+    for a in aggs {
+        let spec = match &a.arg {
+            None => None, // COUNT(*)
+            Some(e) => match fusible_expr(e, project, left_cols) {
+                Some(f) => Some(f),
+                None => return Ok(None),
+            },
+        };
+        arg_exprs.push(spec);
+    }
+    // Right-side expressions evaluate over the right input alone, so their
+    // joined-space column indices shift down by `left_cols`.
+    for f in key_exprs.iter_mut().chain(arg_exprs.iter_mut().flatten()) {
+        if f.side == Side::Right {
+            f.expr = shift_join_columns(&f.expr, left_cols);
+        }
+    }
+    // Left-side and constant expressions evaluate once per left chunk; right
+    // expressions once per right chunk.
+    let mut left_exprs: Vec<&BoundExpr> = Vec::new();
+    let mut right_exprs: Vec<&BoundExpr> = Vec::new();
+    let mut key_srcs: Vec<ExprSource> = Vec::with_capacity(key_exprs.len());
+    for k in &key_exprs {
+        key_srcs.push(match k.side {
+            Side::Right => {
+                right_exprs.push(&k.expr);
+                ExprSource::Right(right_exprs.len() - 1)
+            }
+            Side::Left | Side::Constant => {
+                left_exprs.push(&k.expr);
+                ExprSource::Left(left_exprs.len() - 1)
+            }
+        });
+    }
+    let mut arg_srcs: Vec<Option<ExprSource>> = Vec::with_capacity(arg_exprs.len());
+    for a in &arg_exprs {
+        arg_srcs.push(a.as_ref().map(|f| match f.side {
+            Side::Right => {
+                right_exprs.push(&f.expr);
+                ExprSource::Right(right_exprs.len() - 1)
+            }
+            Side::Left | Side::Constant => {
+                left_exprs.push(&f.expr);
+                ExprSource::Left(left_exprs.len() - 1)
+            }
+        }));
+    }
+
+    let l = eval(cx, left)?;
+    let r = eval(cx, right)?;
+
+    // Build the match table exactly like `hash_join`: same int
+    // specialization, `common_numeric` canonicalization, u32 guard, and
+    // capacity policy.
+    let ints = is_int_key(left_key.dtype()) && is_int_key(right_key.dtype());
+    let common = common_numeric(left_key.dtype(), right_key.dtype()).ok();
+    let right_rows: usize = r.chunks.iter().map(|c| c.num_rows()).sum();
+    if right_rows > u32::MAX as usize {
+        return Err(PinkDbError::Execution(
+            "hash join right side exceeds u32 rows".to_string(),
+        ));
+    }
+    let reserve = right_rows.min(1 << 20);
+    let table = MatchTable::build(cx, &r.chunks, right_key, common, ints, reserve)?;
+
+    // Fast path: keys-free pure COUNT(*) counts matched pairs by walking the
+    // match chains — no per-pair `Value` work, no group state.
+    if keys.is_empty()
+        && !aggs.is_empty()
+        && aggs.iter().all(|a| a.func == AggFunc::Count && a.arg.is_none())
+    {
+        // Binder dedup leaves exactly one COUNT(*); this path emits one
+        // column (and `agg_output_schema` below still reflects `aggs`).
+        debug_assert_eq!(aggs.len(), 1);
+        let total: i64 = l
+            .chunks
+            .par_iter()
+            .map(|chunk| -> Result<i64> {
+                let kv = eval_join_key(cx, left_key, chunk, common, ints)?;
+                let mut count = 0i64;
+                let mut buf = Vec::new();
+                for li in 0..chunk.num_rows() {
+                    if kv.is_null(li) {
+                        continue;
+                    }
+                    let head = if ints {
+                        table.head_int(int_key_at(&kv, li))
+                    } else {
+                        buf.clear();
+                        kv.encode_into(&mut buf, li);
+                        table.head_bytes(&buf)
+                    };
+                    let Some(mut node) = head else { continue };
+                    while node != NIL {
+                        count += 1;
+                        node = table.node(node).2;
+                    }
+                }
+                Ok(count)
+            })
+            .collect::<Result<Vec<i64>>>()?
+            .into_iter()
+            .sum();
+        let mut vec = Vector::new_empty(DataType::Bigint);
+        vec.push_valid(Value::Bigint(total))?;
+        let chunks = vec![DataChunk::new(vec![vec])?];
+        let (names, types) = agg_output_schema(keys, aggs);
+        return Ok(Some(Output { chunks, names, types }));
+    }
+
+    // Pre-evaluate every right-side key/arg expression once per right chunk
+    // (shared by all left chunks).
+    let right_vecs: Vec<Vec<FusedVec>> = r
+        .chunks
+        .par_iter()
+        .map(|chunk| {
+            right_exprs
+                .iter()
+                .map(|e| eval_fused_vec(e, chunk, cx))
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<_>>()?;
+
+    // Probe + accumulate, parallel per left chunk: each match feeds one row
+    // into its group's partial. A partition can cover arbitrarily many
+    // joined rows, so groups are created on first sight exactly like
+    // `aggregate()` does per chunk.
+    let partials: Vec<Partial> = l
+        .chunks
+        .par_iter()
+        .map(|chunk| -> Result<Partial> {
+            let left_vecs: Vec<FusedVec> = left_exprs
+                .iter()
+                .map(|e| eval_fused_vec(e, chunk, cx))
+                .collect::<Result<_>>()?;
+            let kv = eval_join_key(cx, left_key, chunk, common, ints)?;
+            let mut partial = Partial {
+                groups: Vec::new(),
+                index: FastMap::with_capacity_and_hasher(
+                    chunk.num_rows().min(1 << 16),
+                    Default::default(),
+                ),
+            };
+            let mut buf = Vec::new();
+            for li in 0..chunk.num_rows() {
+                if kv.is_null(li) {
+                    continue;
+                }
+                let head = if ints {
+                    table.head_int(int_key_at(&kv, li))
+                } else {
+                    buf.clear();
+                    kv.encode_into(&mut buf, li);
+                    table.head_bytes(&buf)
+                };
+                let Some(mut node) = head else { continue };
+                while node != NIL {
+                    let (rci, ri, next) = table.node(node);
+                    let (rci, ri) = (rci as usize, ri as usize);
+                    // Group key encoding byte-identical to `aggregate()`:
+                    // the same source vectors, indexed by the left row for
+                    // left/constant keys and the right row for right keys.
+                    buf.clear();
+                    for src in &key_srcs {
+                        match src {
+                            ExprSource::Left(s) => {
+                                left_vecs[*s].v().encode_into(&mut buf, li)
+                            }
+                            ExprSource::Right(s) => {
+                                right_vecs[rci][*s].v().encode_into(&mut buf, ri)
+                            }
+                        }
+                    }
+                    let idx = match partial.index.get(&buf) {
+                        Some(&idx) => idx,
+                        None => {
+                            let enc = buf.clone();
+                            let idx = partial.groups.len();
+                            partial.index.insert(enc.clone(), idx);
+                            partial.groups.push((
+                                enc,
+                                Group {
+                                    keys: key_srcs
+                                        .iter()
+                                        .map(|src| match src {
+                                            ExprSource::Left(s) => {
+                                                left_vecs[*s].v().get(li)
+                                            }
+                                            ExprSource::Right(s) => {
+                                                right_vecs[rci][*s].v().get(ri)
+                                            }
+                                        })
+                                        .collect(),
+                                    accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
+                                },
+                            ));
+                            idx
+                        }
+                    };
+                    let group = &mut partial.groups[idx].1;
+                    for (acc, src) in group.accs.iter_mut().zip(arg_srcs.iter()) {
+                        match src {
+                            None => acc.update(Some(&Value::Integer(1))), // COUNT(*)
+                            Some(ExprSource::Left(s)) => {
+                                let v = left_vecs[*s].v();
+                                if v.is_null(li) {
+                                    acc.update(None);
+                                } else {
+                                    acc.update(Some(&v.get(li)));
+                                }
+                            }
+                            Some(ExprSource::Right(s)) => {
+                                let v = right_vecs[rci][*s].v();
+                                if v.is_null(ri) {
+                                    acc.update(None);
+                                } else {
+                                    acc.update(Some(&v.get(ri)));
+                                }
+                            }
+                        }
+                    }
+                    node = next;
+                }
+            }
+            Ok(partial)
+        })
+        .collect::<Result<_>>()?;
+
+    // Merge in left-chunk order and emit through the shared post-partial
+    // phase, exactly like `aggregate()`.
+    let groups = merge_partials(partials, !keys.is_empty(), aggs);
+    let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
+    let chunks = emit_groups(groups, &key_types, aggs)?;
+    let (names, types) = agg_output_schema(keys, aggs);
+    Ok(Some(Output { chunks, names, types }))
 }
 
 fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
@@ -1394,6 +2194,184 @@ mod tests {
             let rv = (idx % 3) as i32;
             assert_eq!(row, &vec![V::Integer(lv), V::Integer(rv)], "row {idx}");
         }
+    }
+
+    // --- wave 19: integer-key specialization in the hash join ---
+
+    /// BIGINT keys with i64 extremes, negatives, duplicates, and NULLs on
+    /// both sides; NULL keys never match, duplicates keep right-row order.
+    #[test]
+    fn join_int_keys_extremes_nulls_and_duplicates() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k BIGINT, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k BIGINT, rv INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO l VALUES
+             (-9223372036854775807 - 1, 0), (-5, 1), (0, 2), (7, 3), (7, 4),
+             (9223372036854775807, 5), (NULL, 6);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO r VALUES
+             (7, 10), (-5, 11), (NULL, 12), (9223372036854775807, 13),
+             (-9223372036854775807 - 1, 14), (7, 15);",
+        )
+        .unwrap();
+        let rows = select(&mut db, "SELECT lv, rv FROM l JOIN r ON l.k = r.k;");
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Integer(0), V::Integer(14)],
+                vec![V::Integer(1), V::Integer(11)],
+                vec![V::Integer(3), V::Integer(10)],
+                vec![V::Integer(3), V::Integer(15)],
+                vec![V::Integer(4), V::Integer(10)],
+                vec![V::Integer(4), V::Integer(15)],
+                vec![V::Integer(5), V::Integer(13)],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM l JOIN r ON l.k = r.k;"),
+            vec![vec![V::Bigint(7)]]
+        );
+    }
+
+    /// INTEGER = BIGINT keys widen i32 → i64 per cell: a BIGINT outside the
+    /// i32 range must not collide with any INTEGER (2147483648 and 4294967297
+    /// would truncate to -2147483648 / 1).
+    #[test]
+    fn join_int_bigint_cross_type_widening() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE a (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE b (k BIGINT, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 1), (-1, 2), (NULL, 3), (2147483647, 4);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO b VALUES (1, 10), (-1, 11), (2147483648, 12),
+             (4294967297, 13), (2147483647, 14);",
+        )
+        .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM a JOIN b ON a.k = b.k;"),
+            vec![
+                vec![V::Integer(1), V::Integer(10)],
+                vec![V::Integer(2), V::Integer(11)],
+                vec![V::Integer(4), V::Integer(14)],
+            ]
+        );
+    }
+
+    /// TIMESTAMP keys take the int path too (i64 payload): matching is exact
+    /// at microsecond precision (including pre-epoch), NULLs skipped.
+    #[test]
+    fn join_timestamp_keys_match_micros() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (ts TIMESTAMP, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (ts TIMESTAMP, rv INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO l VALUES
+             (TIMESTAMP '2024-01-15 10:00:00', 1),
+             (TIMESTAMP '2024-01-15 10:00:00.000001', 2),
+             (TIMESTAMP '1969-12-31 23:59:59.999999', 3),
+             (NULL, 4);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO r VALUES
+             (TIMESTAMP '2024-01-15 10:00:00.000001', 10),
+             (TIMESTAMP '2024-01-15 10:00:00', 11),
+             (TIMESTAMP '1969-12-31 23:59:59.999999', 12),
+             (NULL, 13);",
+        )
+        .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l JOIN r ON l.ts = r.ts;"),
+            vec![
+                vec![V::Integer(1), V::Integer(11)],
+                vec![V::Integer(2), V::Integer(10)],
+                vec![V::Integer(3), V::Integer(12)],
+            ]
+        );
+    }
+
+    /// Empty right side: the match table builds over zero rows and every
+    /// probe misses (INTEGER and VARCHAR keys alike).
+    #[test]
+    fn join_empty_right_side() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k BIGINT);").unwrap();
+        db.execute("CREATE TABLE r (k BIGINT);").unwrap();
+        db.execute("INSERT INTO l VALUES (1), (NULL), (2);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM l JOIN r ON l.k = r.k;"),
+            vec![vec![V::Bigint(0)]]
+        );
+        db.execute("CREATE TABLE ls (k VARCHAR);").unwrap();
+        db.execute("CREATE TABLE rs (k VARCHAR);").unwrap();
+        db.execute("INSERT INTO ls VALUES ('a'), (NULL);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM ls JOIN rs ON ls.k = rs.k;"),
+            vec![vec![V::Bigint(0)]]
+        );
+    }
+
+    /// BIGINT expansion past CHUNK_SIZE: one left row matching 2500 right
+    /// rows (interleaved with another key across right chunks) emits multiple
+    /// output chunks in right-row order.
+    #[test]
+    fn join_bigint_expansion_spans_chunks() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k BIGINT);").unwrap();
+        db.execute("CREATE TABLE r (k BIGINT, rn INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1);").unwrap();
+        // Right input alternates keys 1/2: key 1 has 2500 matches (even rn).
+        insert_rows(&mut db, "r", 5000, |n| format!("({}, {n})", 1 + n % 2));
+        let rows = select(&mut db, "SELECT rn FROM l JOIN r ON l.k = r.k;");
+        assert_eq!(rows.len(), 2500);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], V::Integer((2 * i) as i32), "row {i}");
+        }
+    }
+
+    /// The int-specialized and byte-encoded match tables must produce
+    /// identical results over the same data shape (INTEGER vs VARCHAR keys).
+    #[test]
+    fn join_int_and_byte_paths_agree() {
+        fn run(key_type: &str, l: &str, r: &str) -> Vec<Vec<V>> {
+            let mut db = PinkDb::new();
+            db.execute(&format!("CREATE TABLE l (k {key_type}, lv INTEGER);")).unwrap();
+            db.execute(&format!("CREATE TABLE r (k {key_type}, rv INTEGER);")).unwrap();
+            db.execute(&format!("INSERT INTO l VALUES {l};")).unwrap();
+            db.execute(&format!("INSERT INTO r VALUES {r};")).unwrap();
+            select(&mut db, "SELECT lv, rv FROM l JOIN r ON l.k = r.k;")
+        }
+        let int_rows = run(
+            "INTEGER",
+            "(1, 0), (2, 1), (1, 2), (NULL, 3), (3, 4), (2, 5)",
+            "(2, 10), (1, 11), (3, 12), (1, 13), (NULL, 14), (2, 15)",
+        );
+        let byte_rows = run(
+            "VARCHAR",
+            "('1', 0), ('2', 1), ('1', 2), (NULL, 3), ('3', 4), ('2', 5)",
+            "('2', 10), ('1', 11), ('3', 12), ('1', 13), (NULL, 14), ('2', 15)",
+        );
+        assert_eq!(int_rows, byte_rows);
+        // Shared structure: left order, right-input order per key, NULL keys
+        // skipped on both sides.
+        assert_eq!(
+            int_rows,
+            vec![
+                vec![V::Integer(0), V::Integer(11)],
+                vec![V::Integer(0), V::Integer(13)],
+                vec![V::Integer(1), V::Integer(10)],
+                vec![V::Integer(1), V::Integer(15)],
+                vec![V::Integer(2), V::Integer(11)],
+                vec![V::Integer(2), V::Integer(13)],
+                vec![V::Integer(4), V::Integer(12)],
+                vec![V::Integer(5), V::Integer(10)],
+                vec![V::Integer(5), V::Integer(15)],
+            ]
+        );
     }
 
     #[test]
@@ -3020,5 +3998,1030 @@ mod tests {
         let topn = top_n(&cx, &chunks, &keys, 4096).unwrap().unwrap();
         assert_eq!(topn.len(), 2);
         assert!(topn.iter().all(|c| c.num_rows() == CHUNK_SIZE));
+    }
+
+    // --- wave 19 phase 2: fused join → aggregate ---
+
+    /// Two small tables with duplicate keys (INTEGER = BIGINT), NULL join
+    /// keys on both sides, NULL measures, and two group regions.
+    fn fused_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE fa (id INTEGER, region VARCHAR, x INTEGER);").unwrap();
+        db.execute("CREATE TABLE fb (id BIGINT, region VARCHAR, total DOUBLE);").unwrap();
+        db.execute(
+            "INSERT INTO fa VALUES
+             (1, 'west', 3), (2, 'east', 5), (1, 'west', 7), (NULL, 'west', 11), (2, 'east', NULL);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO fb VALUES
+             (1, 'W1', 10.5), (2, 'E1', NULL), (1, 'W2', 20.0), (3, 'X', 1.0),
+             (NULL, 'N', 2.5), (2, 'E2', 4.25);",
+        )
+        .unwrap();
+        db
+    }
+
+    /// Bind + optimize `sql` exactly like `PinkDb::execute` does.
+    fn bound_plan(db: &PinkDb, sql: &str) -> LogicalPlan {
+        let stmts = crate::sql::parse_statements(sql).unwrap();
+        crate::optimizer::optimize(db, crate::sql::bind(db, &stmts[0]).unwrap())
+    }
+
+    /// Descend to the topmost `Aggregate` (through Project/Cte wrappers).
+    fn top_aggregate(plan: &LogicalPlan) -> &LogicalPlan {
+        match plan {
+            LogicalPlan::Aggregate { .. } => plan,
+            LogicalPlan::Project { input, .. } => top_aggregate(input),
+            LogicalPlan::Cte { query, .. } => top_aggregate(query),
+            other => panic!("no aggregate in plan: {other:?}"),
+        }
+    }
+
+    /// Execute the top aggregate of `sql` through the fusion helper and
+    /// assert it fused and produced exactly the materialized path's output
+    /// (chunk for chunk, order included).
+    fn assert_fused_matches_materialized(db: &PinkDb, sql: &str) {
+        let plan = bound_plan(db, sql);
+        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            unreachable!()
+        };
+        let cx = Cx::new(db);
+        let fused = fused_join_aggregate(&cx, input, keys, aggs)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected a fusible plan: {sql}"));
+        let inner = eval(&cx, input).unwrap();
+        let materialized = aggregate(&cx, &inner.chunks, keys, aggs).unwrap();
+        // Rows (in order) + chunk boundaries; validity-mask padding can
+        // differ because the COUNT(*) fast path builds a tight vector while
+        // `aggregate()` preallocates CHUNK_SIZE — same observable rows.
+        let rows = |chunks: &[DataChunk]| -> Vec<Vec<Value>> {
+            let mut rows = Vec::new();
+            for c in chunks {
+                for i in 0..c.num_rows() {
+                    rows.push(c.columns.iter().map(|col| col.get(i)).collect());
+                }
+            }
+            rows
+        };
+        // Fused partial boundaries are per left chunk, the materialized ones
+        // per joined output chunk, so float SUM/AVG partials can sum in a
+        // different order and differ by a few ulps (accepted behavior).
+        // Compare Double cells with a small relative tolerance (absolute
+        // floor 1e-12, NaN == NaN); every other type stays exact.
+        let close = |a: &Value, b: &Value| -> bool {
+            match (a, b) {
+                (Value::Double(x), Value::Double(y)) => {
+                    (x.is_nan() && y.is_nan())
+                        || x == y
+                        || (x - y).abs() <= 1e-12_f64.max(1e-9 * x.abs().max(y.abs()))
+                }
+                _ => a == b,
+            }
+        };
+        let (fr, mr) = (rows(&fused.chunks), rows(&materialized));
+        assert_eq!(fr.len(), mr.len(), "row count: {sql}");
+        for (i, (a, b)) in fr.iter().zip(&mr).enumerate() {
+            assert_eq!(a.len(), b.len(), "width row {i}: {sql}");
+            for (j, (x, y)) in a.iter().zip(b).enumerate() {
+                assert!(
+                    close(x, y),
+                    "row {i} col {j}: fused {x:?} vs materialized {y:?}: {sql}"
+                );
+            }
+        }
+        assert_eq!(
+            fused.chunks.iter().map(|c| c.num_rows()).collect::<Vec<_>>(),
+            materialized.iter().map(|c| c.num_rows()).collect::<Vec<_>>(),
+            "{sql}"
+        );
+        assert_eq!(fused.names, agg_output_schema(keys, aggs).0, "{sql}");
+        assert_eq!(fused.types, agg_output_schema(keys, aggs).1, "{sql}");
+    }
+
+    #[test]
+    fn fused_count_star_over_join_counts_matches() {
+        let mut db = fused_db();
+        // Direct Aggregate-over-Join shape and the Project-over-Join shape
+        // (derived table) both count the 8 matched pairs.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;"),
+            vec![vec![V::Bigint(8)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM (SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id) s;"
+            ),
+            vec![vec![V::Bigint(8)]]
+        );
+        // Empty right side: zero matches through the fast path.
+        db.execute("CREATE TABLE fbe (id BIGINT, total DOUBLE);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM fa JOIN fbe ON fa.id = fbe.id;"),
+            vec![vec![V::Bigint(0)]]
+        );
+    }
+
+    #[test]
+    fn fused_group_by_matches_fallback_and_order() {
+        let mut db = fused_db();
+        let sql = "SELECT fa.region, COUNT(*), COUNT(fa.x), SUM(fa.x), AVG(fa.x), MIN(fa.x), MAX(fa.x)
+                   FROM fa JOIN fb ON fa.id = fb.id";
+        let fused = select(&mut db, &format!("{sql} GROUP BY fa.region;"));
+        // Same semantics with a mixed-side predicate above the join: the
+        // optimizer keeps it there, so the materialized path runs.
+        let fallback = select(&mut db, &format!("{sql} WHERE fa.id = fb.id GROUP BY fa.region;"));
+        assert_eq!(fused, fallback);
+        // First-seen group order (west before east); NULL args skipped by
+        // COUNT/SUM/AVG/MIN/MAX.
+        assert_eq!(
+            fused,
+            vec![
+                vec![
+                    V::Varchar("west".to_string()),
+                    V::Bigint(4),
+                    V::Bigint(4),
+                    V::Bigint(20),
+                    V::Double(5.0),
+                    V::Integer(3),
+                    V::Integer(7),
+                ],
+                vec![
+                    V::Varchar("east".to_string()),
+                    V::Bigint(4),
+                    V::Bigint(2),
+                    V::Bigint(10),
+                    V::Double(5.0),
+                    V::Integer(5),
+                    V::Integer(5),
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn fused_compound_single_side_args() {
+        let mut db = fused_db();
+        let sql = "SELECT COUNT(*), SUM(fb.total * 2), SUM(fa.x * 3) FROM fa JOIN fb ON fa.id = fb.id";
+        let fused = select(&mut db, &format!("{sql};"));
+        let fallback = select(&mut db, &format!("{sql} WHERE fa.id = fb.id;"));
+        assert_eq!(fused, fallback);
+        // 8 matches; totals sum 69.5 → ×2 = 139.0; x sums 30 → ×3 = 90.
+        assert_eq!(fused, vec![vec![V::Bigint(8), V::Double(139.0), V::Bigint(90)]]);
+    }
+
+    #[test]
+    fn fused_project_reorders_drops_and_right_keys() {
+        let mut db = fused_db();
+        // Reordering project: region (left) grouped, t (right) summed.
+        let fused = select(
+            &mut db,
+            "SELECT region, COUNT(*), SUM(t)
+             FROM (SELECT fa.region AS region, fb.total AS t FROM fa JOIN fb ON fa.id = fb.id) s
+             GROUP BY region;",
+        );
+        let fallback = select(
+            &mut db,
+            "SELECT region, COUNT(*), SUM(t)
+             FROM (SELECT fa.region AS region, fb.total AS t FROM fa JOIN fb ON fa.id = fb.id
+                   WHERE fa.id = fb.id) s
+             GROUP BY region;",
+        );
+        assert_eq!(fused, fallback);
+        assert_eq!(
+            fused,
+            vec![
+                vec![V::Varchar("west".to_string()), V::Bigint(4), V::Double(61.0)],
+                vec![V::Varchar("east".to_string()), V::Bigint(4), V::Double(8.5)],
+            ]
+        );
+        // Dropping project: only the left key survives.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT region, COUNT(*)
+                 FROM (SELECT fa.region AS region FROM fa JOIN fb ON fa.id = fb.id) s
+                 GROUP BY region;"
+            ),
+            vec![
+                vec![V::Varchar("west".to_string()), V::Bigint(4)],
+                vec![V::Varchar("east".to_string()), V::Bigint(4)],
+            ]
+        );
+        // Right-side group keys: bare column and a shifted scalar function.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT fb.region, COUNT(*), SUM(fa.x)
+                 FROM fa JOIN fb ON fa.id = fb.id GROUP BY fb.region;"
+            ),
+            vec![
+                vec![V::Varchar("W1".to_string()), V::Bigint(2), V::Bigint(10)],
+                vec![V::Varchar("W2".to_string()), V::Bigint(2), V::Bigint(10)],
+                vec![V::Varchar("E1".to_string()), V::Bigint(2), V::Bigint(5)],
+                vec![V::Varchar("E2".to_string()), V::Bigint(2), V::Bigint(5)],
+            ]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT upper(fb.region), COUNT(*)
+                 FROM fa JOIN fb ON fa.id = fb.id GROUP BY upper(fb.region);"
+            ),
+            vec![
+                vec![V::Varchar("W1".to_string()), V::Bigint(2)],
+                vec![V::Varchar("W2".to_string()), V::Bigint(2)],
+                vec![V::Varchar("E1".to_string()), V::Bigint(2)],
+                vec![V::Varchar("E2".to_string()), V::Bigint(2)],
+            ]
+        );
+    }
+
+    #[test]
+    fn fused_string_keys() {
+        let mut db = fused_db();
+        db.execute("CREATE TABLE fsa (k VARCHAR, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE fsb (k VARCHAR, w INTEGER);").unwrap();
+        db.execute("INSERT INTO fsa VALUES ('a', 1), ('b', 2), ('a', 3), (NULL, 4);").unwrap();
+        db.execute("INSERT INTO fsb VALUES ('a', 10), ('b', 20), ('a', 30), (NULL, 40);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM fsa JOIN fsb ON fsa.k = fsb.k;"),
+            vec![vec![V::Bigint(5)]]
+        );
+        let fused = select(
+            &mut db,
+            "SELECT fsa.k, COUNT(*), SUM(fsb.w) FROM fsa JOIN fsb ON fsa.k = fsb.k GROUP BY fsa.k;",
+        );
+        let fallback = select(
+            &mut db,
+            "SELECT fsa.k, COUNT(*), SUM(fsb.w)
+             FROM fsa JOIN fsb ON fsa.k = fsb.k WHERE fsa.k = fsb.k GROUP BY fsa.k;",
+        );
+        assert_eq!(fused, fallback);
+        // 'a': 2 left × 2 right = 4 matches, w sum 80; 'b': 1 match, 20.
+        assert_eq!(
+            fused,
+            vec![
+                vec![V::Varchar("a".to_string()), V::Bigint(4), V::Bigint(80)],
+                vec![V::Varchar("b".to_string()), V::Bigint(1), V::Bigint(20)],
+            ]
+        );
+    }
+
+    #[test]
+    fn fused_timestamp_and_double_keys() {
+        let mut db = PinkDb::new();
+        // TIMESTAMP keys take the int path (i64 micros, NULLs skipped).
+        db.execute("CREATE TABLE tl (ts TIMESTAMP, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE tr (ts TIMESTAMP, rv INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO tl VALUES
+             (TIMESTAMP '2024-01-15 10:00:00', 1),
+             (TIMESTAMP '2024-01-15 10:00:00.000001', 2), (NULL, 3);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tr VALUES
+             (TIMESTAMP '2024-01-15 10:00:00.000001', 10),
+             (TIMESTAMP '2024-01-15 10:00:00', 11);",
+        )
+        .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM tl JOIN tr ON tl.ts = tr.ts;"),
+            vec![vec![V::Bigint(2)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT tl.lv, COUNT(*), MIN(tr.rv)
+                 FROM tl JOIN tr ON tl.ts = tr.ts GROUP BY tl.lv;"
+            ),
+            vec![
+                vec![V::Integer(1), V::Bigint(1), V::Integer(11)],
+                vec![V::Integer(2), V::Bigint(1), V::Integer(10)],
+            ]
+        );
+        // DOUBLE keys take the byte path; -0.0 and 0.0 are one key.
+        db.execute("CREATE TABLE dl (k DOUBLE, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE dr (k DOUBLE, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO dl VALUES (1.5, 1), (2.5, 2), (-0.0, 3), (NULL, 4);").unwrap();
+        db.execute("INSERT INTO dr VALUES (1.5, 10), (2.5, 20), (0.0, 30), (NULL, 40);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM dl JOIN dr ON dl.k = dr.k;"),
+            vec![vec![V::Bigint(3)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT dl.lv, COUNT(*) FROM dl JOIN dr ON dl.k = dr.k GROUP BY dl.lv;"
+            ),
+            vec![
+                vec![V::Integer(1), V::Bigint(1)],
+                vec![V::Integer(2), V::Bigint(1)],
+                vec![V::Integer(3), V::Bigint(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn fused_empty_right_side_single_empty_group() {
+        let mut db = fused_db();
+        db.execute("CREATE TABLE fbe (id BIGINT, total DOUBLE);").unwrap();
+        // No keys: one row of zero/NULL results, like `aggregate()` over ∅.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(total), SUM(total), AVG(total), MIN(total), MAX(total)
+                 FROM fa JOIN fbe ON fa.id = fbe.id;"
+            ),
+            vec![vec![
+                V::Bigint(0),
+                V::Bigint(0),
+                V::Null,
+                V::Null,
+                V::Null,
+                V::Null
+            ]]
+        );
+        // With keys: zero rows (one empty chunk).
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT fa.region, COUNT(*) FROM fa JOIN fbe ON fa.id = fbe.id GROUP BY fa.region;"
+            ),
+            Vec::<Vec<V>>::new()
+        );
+        // Empty left side (`WHERE false` pushes below the join): same.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id WHERE false;"),
+            vec![vec![V::Bigint(0)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT fa.region, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id
+                 WHERE false GROUP BY fa.region;"
+            ),
+            Vec::<Vec<V>>::new()
+        );
+    }
+
+    #[test]
+    fn mixed_side_group_key_uses_fallback() {
+        let mut db = fused_db();
+        // Mixed-side key: fusion rejects statically; the materialized path
+        // groups fa.id + fb.id (BIGINT) in first-seen order.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT fa.id + fb.id, COUNT(*)
+                 FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.id + fb.id;"
+            ),
+            vec![vec![V::Bigint(2), V::Bigint(4)], vec![V::Bigint(4), V::Bigint(4)]]
+        );
+    }
+
+    #[test]
+    fn fused_agg_in_derived_table_and_cte() {
+        let mut db = fused_db();
+        // The grouped aggregate over the join sits inside the derived table.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*), SUM(c)
+                 FROM (SELECT fa.region, COUNT(*) AS c
+                       FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region) s;"
+            ),
+            vec![vec![V::Bigint(2), V::Bigint(8)]]
+        );
+        // Same shape inside a CTE.
+        assert_eq!(
+            select(
+                &mut db,
+                "WITH g AS (SELECT fa.region AS r, COUNT(*) AS c
+                            FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region)
+                 SELECT r, c FROM g;"
+            ),
+            vec![
+                vec![V::Varchar("west".to_string()), V::Bigint(4)],
+                vec![V::Varchar("east".to_string()), V::Bigint(4)],
+            ]
+        );
+    }
+
+    #[test]
+    fn fused_multi_chunk_order_matches_fallback() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE ml (k INTEGER, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE mr (k INTEGER, w INTEGER);").unwrap();
+        // 3000 rows each = 2 chunks per side; k cycles 0..6 on the left and
+        // 0..6 ×3 (coprime stride) on the right — duplicate keys interleave
+        // across chunks on both sides.
+        insert_rows(&mut db, "ml", 3000, |i| format!("({}, {i})", i % 7));
+        insert_rows(&mut db, "mr", 3000, |i| format!("({}, {i})", (i * 3) % 7));
+        let fused = select(
+            &mut db,
+            "SELECT ml.k, COUNT(*), SUM(ml.v), SUM(mr.w)
+             FROM ml JOIN mr ON ml.k = mr.k GROUP BY ml.k;",
+        );
+        let fallback = select(
+            &mut db,
+            "SELECT ml.k, COUNT(*), SUM(ml.v), SUM(mr.w)
+             FROM ml JOIN mr ON ml.k = mr.k WHERE ml.k = mr.k GROUP BY ml.k;",
+        );
+        assert_eq!(fused, fallback);
+        assert_eq!(fused.len(), 7);
+        // First-seen group order is 0, 1, ..., 6.
+        for (i, row) in fused.iter().enumerate() {
+            assert_eq!(row[0], V::Integer(i as i32), "group {i}");
+        }
+        // Independent count: left rows per key × right rows per key.
+        for k in 0..7i32 {
+            let l = (0..3000).filter(|i| i % 7 == k).count() as i64;
+            let r = (0..3000).filter(|i| (i * 3) % 7 == k).count() as i64;
+            assert_eq!(fused[k as usize][1], V::Bigint(l * r), "group {k}");
+        }
+    }
+
+    #[test]
+    fn fused_expansion_spans_right_chunks() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE xl (k INTEGER, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE xr (k INTEGER, w INTEGER);").unwrap();
+        db.execute("INSERT INTO xl VALUES (1, 5);").unwrap();
+        // 5000 right rows across 3 chunks; 2500 match key 1 (even i).
+        insert_rows(&mut db, "xr", 5000, |i| format!("({}, {i})", 1 + i % 2));
+        let fused = select(
+            &mut db,
+            "SELECT xl.k, COUNT(*), SUM(xr.w) FROM xl JOIN xr ON xl.k = xr.k GROUP BY xl.k;",
+        );
+        let fallback = select(
+            &mut db,
+            "SELECT xl.k, COUNT(*), SUM(xr.w)
+             FROM xl JOIN xr ON xl.k = xr.k WHERE xl.k = xr.k GROUP BY xl.k;",
+        );
+        assert_eq!(fused, fallback);
+        assert_eq!(fused, vec![vec![V::Integer(1), V::Bigint(2500), V::Bigint(6_247_500)]]);
+    }
+
+    #[test]
+    fn fused_join_aggregate_equals_materialized() {
+        let db = fused_db();
+        // Direct Aggregate-over-Join shapes.
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT fa.region, COUNT(*), SUM(fa.x), AVG(fb.total), MIN(fb.total), MAX(fb.total)
+             FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
+        );
+        // Compound left key (including the NULL+1 group) and right scalar key.
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT fa.x + 1, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.x + 1;",
+        );
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT upper(fb.region), COUNT(*), SUM(fb.total)
+             FROM fa JOIN fb ON fa.id = fb.id GROUP BY upper(fb.region);",
+        );
+        // Project-over-Join: reorder + drop + right-side arg through the project.
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT region, COUNT(*), SUM(t)
+             FROM (SELECT fa.region AS region, fb.total AS t
+                   FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;",
+        );
+        // Global aggregate with a compound right-side arg (keys-empty path).
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT COUNT(*), SUM(fb.total * 2) FROM fa JOIN fb ON fa.id = fb.id;",
+        );
+        // Keys-only aggregate (no accumulators).
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
+        );
+        // COUNT(*) fast path.
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;",
+        );
+    }
+
+    #[test]
+    fn fused_agg_over_filter_pushed_below_join() {
+        let mut db = fused_db();
+        // A right-side WHERE is pushed below the join by the optimizer, so
+        // the aggregate input is still Project-over-Join and fuses (the
+        // filter is not *between* the aggregate and the join).
+        let fused = select(
+            &mut db,
+            "SELECT COUNT(*), SUM(fb.total)
+             FROM fa JOIN fb ON fa.id = fb.id WHERE fb.total > 5;",
+        );
+        // Adding a mixed-side no-op conjunct keeps a Filter above the join,
+        // forcing the materialized path; semantics are identical.
+        let fallback = select(
+            &mut db,
+            "SELECT COUNT(*), SUM(fb.total)
+             FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = fb.id AND fb.total > 5;",
+        );
+        assert_eq!(fused, fallback);
+        // Matches only the (id=1, total>5) right rows: 2 left × 2 right.
+        assert_eq!(fused, vec![vec![V::Bigint(4), V::Double(61.0)]]);
+    }
+
+    #[test]
+    fn fusion_rejects_blocked_shapes() {
+        let db = fused_db();
+        let cx = Cx::new(&db);
+        let blocked = [
+            // Mixed-side group key.
+            "SELECT fa.id + fb.id, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.id + fb.id;",
+            // Mixed-side aggregate argument.
+            "SELECT SUM(fa.x + fb.total) FROM fa JOIN fb ON fa.id = fb.id;",
+            // Filter between the aggregate and the join.
+            "SELECT fa.region, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id
+             WHERE fa.id = fb.id GROUP BY fa.region;",
+            // Distinct between the aggregate and the join.
+            "SELECT COUNT(*) FROM (SELECT DISTINCT fa.region FROM fa JOIN fb ON fa.id = fb.id) s;",
+        ];
+        for sql in blocked {
+            let plan = bound_plan(&db, sql);
+            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+                unreachable!()
+            };
+            assert!(
+                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                "should not fuse: {sql}"
+            );
+        }
+    }
+
+    // --- wave 19 follow-up: value-dependent errors on unmatched rows ---
+
+    #[test]
+    fn fusion_falls_back_on_value_dependent_error() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t1 (k INTEGER, x INTEGER);").unwrap();
+        db.execute("CREATE TABLE t2 (k INTEGER, q INTEGER);").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 10);").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 2), (2, 0);").unwrap();
+        let sql = "SELECT SUM(100 / q) FROM t1 JOIN t2 ON t1.k = t2.k;";
+        // `100 / q` pre-evaluated over the whole right input would divide by
+        // zero on the never-matched q=0 row, so the helper must reject the
+        // shape...
+        let plan = bound_plan(&db, sql);
+        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            unreachable!()
+        };
+        let cx = Cx::new(&db);
+        assert!(fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none());
+        // ...and the query must keep materialized semantics: only the matched
+        // (q=2) row feeds the sum, so no error and 100/2 = 50.
+        assert_eq!(select(&mut db, sql), vec![vec![V::Double(50.0)]]);
+    }
+
+    #[test]
+    fn fusion_rejects_value_erroring_shapes() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE va (k INTEGER, x INTEGER);").unwrap();
+        db.execute("CREATE TABLE vb (k INTEGER, qty INTEGER, s VARCHAR, a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO va VALUES (1, 10);").unwrap();
+        // Key 2 rows never match; they hold the erroring values.
+        db.execute("INSERT INTO vb VALUES (1, 2, '3', 4, 2), (2, 0, 'nope', 5, 0);").unwrap();
+        let cx = Cx::new(&db);
+        let blocked = [
+            // Integer division by zero on an unmatched right row.
+            "SELECT SUM(100 / vb.qty) FROM va JOIN vb ON va.k = vb.k;",
+            // VARCHAR→INTEGER parse failure on an unmatched right row.
+            "SELECT SUM(CAST(vb.s AS INTEGER)) FROM va JOIN vb ON va.k = vb.k;",
+            // Modulo by zero on an unmatched group-key row.
+            "SELECT vb.a % vb.b, COUNT(*) FROM va JOIN vb ON va.k = vb.k GROUP BY vb.a % vb.b;",
+        ];
+        for sql in blocked {
+            let plan = bound_plan(&db, sql);
+            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+                unreachable!()
+            };
+            assert!(
+                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                "should not fuse: {sql}"
+            );
+        }
+        // Same queries through the engine run the materialized path and only
+        // see the matched (qty=2, s='3') row.
+        assert_eq!(
+            select(&mut db, "SELECT SUM(100 / vb.qty) FROM va JOIN vb ON va.k = vb.k;"),
+            vec![vec![V::Double(50.0)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT SUM(CAST(vb.s AS INTEGER)) FROM va JOIN vb ON va.k = vb.k;"),
+            vec![vec![V::Bigint(3)]]
+        );
+    }
+
+    #[test]
+    fn fusion_keeps_total_shapes() {
+        let db = fused_db();
+        // Each shape must still fuse (the helper asserts `Some`) and produce
+        // exactly the materialized output.
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;",
+        );
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT SUM(fb.total * 2) FROM fa JOIN fb ON fa.id = fb.id;",
+        );
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT SUM(abs(fa.x)) FROM fa JOIN fb ON fa.id = fb.id;",
+        );
+        // `upper(region)` reached through a Project over the join.
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT region, COUNT(*) FROM (SELECT upper(fa.region) AS region
+             FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;",
+        );
+    }
+
+    // --- wave 19 review follow-up: error equivalence, key coverage, edges ---
+
+    /// Unused erroring project expressions must force the materialized path
+    /// so the engine errors exactly like the fallback; a total unused
+    /// expression stays fusible and equivalent.
+    #[test]
+    fn fused_unused_project_expr_error_equivalence() {
+        let mut db = fused_db();
+        let erroring = [
+            "SELECT region, COUNT(*) FROM (SELECT fa.region AS region,
+                    CAST(fb.region AS INTEGER) AS junk
+             FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;",
+            "SELECT region, COUNT(*) FROM (SELECT fa.region AS region, 1/0 AS junk
+             FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;",
+        ];
+        // Static check: the fusion helper rejects the erroring shapes.
+        let cx = Cx::new(&db);
+        for sql in erroring {
+            let plan = bound_plan(&db, sql);
+            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+                unreachable!()
+            };
+            assert!(
+                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                "erroring projection must not fuse: {sql}"
+            );
+        }
+        // Engine check: both variants error, fused exactly like materialized.
+        for sql in erroring {
+            let fallback = sql.replace(
+                "FROM fa JOIN fb ON fa.id = fb.id) s",
+                "FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = fb.id) s",
+            );
+            assert_ne!(fallback, sql);
+            assert!(db.execute(sql).is_err(), "fused variant must error: {sql}");
+            assert!(
+                db.execute(&fallback).is_err(),
+                "materialized variant must error: {fallback}"
+            );
+        }
+        // A total unused projection expression is safe to skip: fusion
+        // proceeds and the engine matches the materialized variant.
+        let sql = "SELECT region, COUNT(*) FROM (SELECT fa.region AS region,
+                          upper(fb.region) AS junk
+                   FROM fa JOIN fb ON fa.id = fb.id) s GROUP BY region;";
+        assert_fused_matches_materialized(&db, sql);
+        let fused = select(&mut db, sql);
+        let fallback = sql.replace(
+            "FROM fa JOIN fb ON fa.id = fb.id) s",
+            "FROM fa JOIN fb ON fa.id = fb.id WHERE fa.id = fb.id) s",
+        );
+        assert_eq!(fused, select(&mut db, &fallback));
+        assert_eq!(
+            fused,
+            vec![
+                vec![V::Varchar("west".to_string()), V::Bigint(4)],
+                vec![V::Varchar("east".to_string()), V::Bigint(4)],
+            ]
+        );
+    }
+
+    /// Fused partial boundaries (per left chunk) differ from the
+    /// materialized ones (per joined output chunk), so float `SUM`/`AVG` can
+    /// differ by a few ulps; the differential helper's tolerance must absorb
+    /// that on a multi-chunk join.
+    #[test]
+    fn fused_float_partial_boundaries_within_tolerance() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE fl (k INTEGER, d DOUBLE);").unwrap();
+        db.execute("CREATE TABLE fr (k INTEGER);").unwrap();
+        // 3000 left rows (2 chunks) × 3 right rows = 9000 matches on one
+        // key; fractional doubles make the partial split visible.
+        insert_rows(&mut db, "fl", 3000, |i| format!("(1, {:?})", (i % 10) as f64 / 7.0));
+        insert_rows(&mut db, "fr", 3, |_| "(1)".to_string());
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k;",
+        );
+        // Both engine paths agree within the documented tolerance (the mixed
+        // WHERE keeps the fallback on the materialized path).
+        let fused = select(&mut db, "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k;");
+        let materialized = select(
+            &mut db,
+            "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k WHERE fl.k = fr.k;",
+        );
+        for (a, b) in fused[0].iter().zip(&materialized[0]) {
+            let (V::Double(x), V::Double(y)) = (a, b) else {
+                panic!("expected doubles: {a:?} vs {b:?}")
+            };
+            assert!(
+                (x - y).abs() <= 1e-12_f64.max(1e-9 * x.abs().max(y.abs())),
+                "float drift: fused {x:?} vs materialized {y:?}"
+            );
+        }
+    }
+
+    /// Cross-type numeric join keys: INTEGER = DOUBLE and DOUBLE = INTEGER
+    /// take the byte path (canonicalized to DOUBLE) and must group and count
+    /// exactly like the materialized pipeline.
+    #[test]
+    fn fused_int_double_cross_keys() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE ija (k INTEGER, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE ijb (k DOUBLE, w INTEGER);").unwrap();
+        db.execute("INSERT INTO ija VALUES (1, 10), (2, 20), (2, 21), (NULL, 30);").unwrap();
+        db.execute("INSERT INTO ijb VALUES (2.0, 1), (1.0, 2), (2.0, 3), (3.0, 4);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM ija JOIN ijb ON ija.k = ijb.k;"),
+            vec![vec![V::Bigint(5)]]
+        );
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT ija.k, COUNT(*), SUM(ijb.w) FROM ija JOIN ijb ON ija.k = ijb.k GROUP BY ija.k;",
+        );
+        let fused = select(
+            &mut db,
+            "SELECT ija.k, COUNT(*), SUM(ijb.w) FROM ija JOIN ijb ON ija.k = ijb.k GROUP BY ija.k;",
+        );
+        let fallback = select(
+            &mut db,
+            "SELECT ija.k, COUNT(*), SUM(ijb.w)
+             FROM ija JOIN ijb ON ija.k = ijb.k WHERE ija.k = ijb.k GROUP BY ija.k;",
+        );
+        assert_eq!(fused, fallback);
+        // Key 1: one match (w=2); key 2: 2×2 matches (1+3+1+3).
+        assert_eq!(
+            fused,
+            vec![
+                vec![V::Integer(1), V::Bigint(1), V::Bigint(2)],
+                vec![V::Integer(2), V::Bigint(4), V::Bigint(8)],
+            ]
+        );
+        // Mirrored DOUBLE = INTEGER: groups keyed by the left (DOUBLE) side,
+        // first-seen order 2.0 then 1.0.
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT ijb.k, COUNT(*), SUM(ija.v) FROM ijb JOIN ija ON ijb.k = ija.k GROUP BY ijb.k;",
+        );
+        let fused = select(
+            &mut db,
+            "SELECT ijb.k, COUNT(*), SUM(ija.v) FROM ijb JOIN ija ON ijb.k = ija.k GROUP BY ijb.k;",
+        );
+        assert_eq!(
+            fused,
+            vec![
+                vec![V::Double(2.0), V::Bigint(4), V::Bigint(82)],
+                vec![V::Double(1.0), V::Bigint(1), V::Bigint(10)],
+            ]
+        );
+    }
+
+    /// Extreme i64 keys (MIN/MAX, spelled as expressions because the lexer
+    /// cannot hold i64::MIN as a literal) and DATE keys (int path, raw day
+    /// payloads) must group and count correctly through fusion.
+    #[test]
+    fn fused_extreme_and_date_keys() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE ela (k BIGINT, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE elb (k BIGINT, w INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO ela VALUES
+             ((-9223372036854775807 - 1), 1), (9223372036854775807, 2), (0, 3), (NULL, 4);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO elb VALUES
+             (9223372036854775807, 10), ((-9223372036854775807 - 1), 20),
+             (9223372036854775807, 30), (NULL, 40);",
+        )
+        .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM ela JOIN elb ON ela.k = elb.k;"),
+            vec![vec![V::Bigint(3)]]
+        );
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT ela.k, COUNT(*), SUM(elb.w) FROM ela JOIN elb ON ela.k = elb.k GROUP BY ela.k;",
+        );
+        let fused = select(
+            &mut db,
+            "SELECT ela.k, COUNT(*), SUM(elb.w) FROM ela JOIN elb ON ela.k = elb.k GROUP BY ela.k;",
+        );
+        let fallback = select(
+            &mut db,
+            "SELECT ela.k, COUNT(*), SUM(elb.w)
+             FROM ela JOIN elb ON ela.k = elb.k WHERE ela.k = elb.k GROUP BY ela.k;",
+        );
+        assert_eq!(fused, fallback);
+        // First-seen: i64::MIN (1 match, w=20), then i64::MAX (2 matches, 40).
+        assert_eq!(
+            fused,
+            vec![
+                vec![V::Bigint(i64::MIN), V::Bigint(1), V::Bigint(20)],
+                vec![V::Bigint(i64::MAX), V::Bigint(2), V::Bigint(40)],
+            ]
+        );
+        // DATE keys ride the same int path (raw day payloads).
+        db.execute("CREATE TABLE dta (d DATE, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE dtb (d DATE, w INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO dta VALUES
+             (DATE '2024-01-15', 1), (DATE '1969-12-31', 2), (DATE '2024-01-15', 3), (NULL, 4);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO dtb VALUES
+             (DATE '2024-01-15', 10), (DATE '2000-01-01', 20), (DATE '2024-01-15', 30);",
+        )
+        .unwrap();
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT dta.d, COUNT(*), SUM(dtb.w) FROM dta JOIN dtb ON dta.d = dtb.d GROUP BY dta.d;",
+        );
+        let fused = select(
+            &mut db,
+            "SELECT dta.d, COUNT(*), SUM(dtb.w) FROM dta JOIN dtb ON dta.d = dtb.d GROUP BY dta.d;",
+        );
+        // 2 left × 2 right matches on 2024-01-15 → 4 rows, w sum 80; the
+        // unmatched 1969/2000 keys vanish.
+        assert_eq!(fused.len(), 1);
+        assert!(matches!(fused[0][0], V::Date(_)), "date key: {:?}", fused[0][0]);
+        assert_eq!(fused[0][1], V::Bigint(4));
+        assert_eq!(fused[0][2], V::Bigint(80));
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT dta.d, COUNT(*), SUM(dtb.w) FROM dta JOIN dtb ON dta.d = dtb.d
+                 WHERE dta.d = dtb.d GROUP BY dta.d;"
+            ),
+            fused
+        );
+    }
+
+    /// BOOLEAN, comparison, AND, CASE, COALESCE, LIKE, YEAR, and HOUR group
+    /// keys all fuse and match the materialized pipeline.
+    #[test]
+    fn fused_scalar_group_keys_match_materialized() {
+        let mut db = fused_db();
+        let keys = [
+            "fa.x > 4",
+            "fb.total > 10",
+            "fa.x > 4 AND fa.x < 10",
+            "CASE WHEN fa.x > 4 THEN 'big' ELSE 'small' END",
+            "COALESCE(fa.x, 0)",
+            "fa.region LIKE 'w%'",
+        ];
+        for k in keys {
+            let sql = format!(
+                "SELECT {k}, COUNT(*), SUM(fa.x) FROM fa JOIN fb ON fa.id = fb.id GROUP BY {k};"
+            );
+            assert_fused_matches_materialized(&db, &sql);
+            let fused = select(&mut db, &sql);
+            let fallback = select(
+                &mut db,
+                &format!(
+                    "SELECT {k}, COUNT(*), SUM(fa.x) FROM fa JOIN fb ON fa.id = fb.id
+                     WHERE fa.id = fb.id GROUP BY {k};"
+                ),
+            );
+            assert_eq!(fused, fallback, "key: {k}");
+            assert!(!fused.is_empty(), "key produced no groups: {k}");
+        }
+        // YEAR/HOUR keys need DATE/TIMESTAMP inputs.
+        db.execute("CREATE TABLE gka (d DATE, ts TIMESTAMP, k INTEGER, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE gkb (k INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO gka VALUES
+             (DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00', 1, 1),
+             (DATE '2024-02-20', TIMESTAMP '2024-01-15 11:30:00', 1, 2),
+             (DATE '2023-12-31', TIMESTAMP '2024-01-16 10:00:00', 2, 3);",
+        )
+        .unwrap();
+        db.execute("INSERT INTO gkb VALUES (1), (1), (2);").unwrap();
+        for k in ["year(gka.d)", "hour(gka.ts)"] {
+            let sql = format!(
+                "SELECT {k}, COUNT(*), SUM(gka.v) FROM gka JOIN gkb ON gka.k = gkb.k GROUP BY {k};"
+            );
+            assert_fused_matches_materialized(&db, &sql);
+            let fused = select(&mut db, &sql);
+            let fallback = select(
+                &mut db,
+                &format!(
+                    "SELECT {k}, COUNT(*), SUM(gka.v) FROM gka JOIN gkb ON gka.k = gkb.k
+                     WHERE gka.k = gkb.k GROUP BY {k};"
+                ),
+            );
+            assert_eq!(fused, fallback, "key: {k}");
+            assert!(!fused.is_empty(), "key produced no groups: {k}");
+        }
+    }
+
+    /// Both join sides empty through fusion: a global aggregate yields one
+    /// zero/NULL row, a grouped aggregate zero rows, and the
+    /// Project-over-Join shape stays equivalent to materialized execution.
+    #[test]
+    fn fused_both_sides_empty() {
+        let mut db = fused_db();
+        db.execute("CREATE TABLE lea (id INTEGER, x INTEGER);").unwrap();
+        db.execute("CREATE TABLE leb (id BIGINT, total DOUBLE);").unwrap();
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(lea.x), SUM(lea.x), AVG(lea.x),
+                        MIN(leb.total), MAX(leb.total)
+                 FROM lea JOIN leb ON lea.id = leb.id;"
+            ),
+            vec![vec![
+                V::Bigint(0),
+                V::Bigint(0),
+                V::Null,
+                V::Null,
+                V::Null,
+                V::Null
+            ]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT lea.id, COUNT(*) FROM lea JOIN leb ON lea.id = leb.id GROUP BY lea.id;"
+            ),
+            Vec::<Vec<V>>::new()
+        );
+        assert_fused_matches_materialized(
+            &db,
+            "SELECT g, COUNT(*), SUM(t) FROM (SELECT lea.id AS g, leb.total AS t
+             FROM lea JOIN leb ON lea.id = leb.id) s GROUP BY g;",
+        );
+    }
+
+    /// Aggregate over Project over Join whose left side is itself a
+    /// Project-over-Join: the outer join fuses, the deeper chain falls back
+    /// to materialized execution, and results match the all-materialized
+    /// variant.
+    #[test]
+    fn fused_nested_project_over_join_left() {
+        let mut db = fused_db();
+        let sql = "SELECT g, COUNT(*), SUM(v) FROM (SELECT x.id AS g, x.x AS v
+                   FROM (SELECT fa.id AS id, fa.x AS x FROM fa JOIN fb ON fa.id = fb.id) x
+                   JOIN fb f2 ON x.id = f2.id) s GROUP BY g;";
+        let fallback = "SELECT g, COUNT(*), SUM(v) FROM (SELECT x.id AS g, x.x AS v
+                        FROM (SELECT fa.id AS id, fa.x AS x FROM fa JOIN fb ON fa.id = fb.id) x
+                        JOIN fb f2 ON x.id = f2.id WHERE x.id = f2.id) s GROUP BY g;";
+        assert_fused_matches_materialized(&db, sql);
+        assert_eq!(select(&mut db, sql), select(&mut db, fallback));
+    }
+
+    /// Binder dedup: `COUNT(*), COUNT(*)` reaches the fused fast path with
+    /// one aggregate but must still emit the user-visible two columns;
+    /// `COUNT(*), COUNT(1)` takes the generic fused path (two aggregates).
+    #[test]
+    fn fused_duplicate_count_columns() {
+        let mut db = fused_db();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*), COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;"),
+            vec![vec![V::Bigint(8), V::Bigint(8)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(1), SUM(fa.x) FROM fa JOIN fb ON fa.id = fb.id;"
+            ),
+            vec![vec![V::Bigint(8), V::Bigint(8), V::Bigint(30)]]
+        );
+        // Fast-path shape: dedup leaves exactly one aggregate and the helper
+        // emits exactly one column (the outer Project duplicates it).
+        let sql = "SELECT COUNT(*), COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;";
+        let plan = bound_plan(&db, sql);
+        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            unreachable!()
+        };
+        assert_eq!(aggs.len(), 1);
+        let cx = Cx::new(&db);
+        let fused = fused_join_aggregate(&cx, input, keys, aggs).unwrap().unwrap();
+        assert_eq!(fused.chunks.len(), 1);
+        assert_eq!(fused.chunks[0].columns.len(), 1);
+        assert_eq!(fused.names.len(), 1);
     }
 }

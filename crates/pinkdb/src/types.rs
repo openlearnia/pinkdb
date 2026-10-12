@@ -30,6 +30,22 @@ impl std::hash::Hasher for FnvHash {
         }
     }
 
+    /// One FNV step over the whole word instead of the default 8-iteration
+    /// byte loop: integer-keyed maps (i64 join keys) hash through here.
+    /// Byte-slice hashing keeps the exact FNV-1a loop above, and this is just
+    /// as deterministic (no per-run seed), so results never depend on hash
+    /// order.
+    fn write_u64(&mut self, x: u64) {
+        self.0 ^= x;
+        self.0 = self.0.wrapping_mul(0x100000001b3);
+    }
+
+    /// `i64: Hash` calls `write_i64`, not `write_u64`: funnel it to the same
+    /// single-step mix.
+    fn write_i64(&mut self, x: i64) {
+        self.write_u64(x as u64);
+    }
+
     fn finish(&self) -> u64 {
         self.0
     }

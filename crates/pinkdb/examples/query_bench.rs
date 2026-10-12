@@ -70,6 +70,24 @@ const BATTERY: &[Bench] = &[
         name: "join_self",
         sql: "SELECT COUNT(*) FROM (SELECT a.region FROM sales a JOIN sales b ON a.id = b.id) AS s;",
     },
+    // Fused join→GROUP BY shape: the inner aggregate over the join is fused.
+    Bench {
+        name: "join_group",
+        sql: "SELECT COUNT(*) FROM (SELECT a.region FROM sales a JOIN sales b ON a.id = b.id GROUP BY a.region) AS s;",
+    },
+    // Mixed-side predicate (`a.total > b.total`) cannot be pushed below the
+    // join, so the Filter stays between the aggregate and the join and the
+    // shape does not fuse: isolates the materializing join with the integer
+    // key path.
+    Bench {
+        name: "join_mat",
+        sql: "SELECT COUNT(*) FROM (SELECT a.id, b.total FROM sales a JOIN sales b ON a.id = b.id WHERE a.total > b.total) AS s;",
+    },
+    // 1M probes against a 4-row string-key build side.
+    Bench {
+        name: "join_probe",
+        sql: "SELECT COUNT(*) FROM (SELECT s.id FROM sales s JOIN (SELECT DISTINCT region FROM sales) r ON s.region = r.region) AS s;",
+    },
 ];
 
 /// Print usage and exit with status 2.

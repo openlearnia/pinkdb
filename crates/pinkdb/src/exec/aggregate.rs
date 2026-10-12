@@ -242,9 +242,18 @@ impl Acc {
     }
 }
 
-struct Group {
-    keys: Vec<Value>,
-    accs: Vec<Acc>,
+/// One group: first-seen key `Value`s plus one live accumulator per agg.
+pub(crate) struct Group {
+    pub(crate) keys: Vec<Value>,
+    pub(crate) accs: Vec<Acc>,
+}
+
+/// One input chunk's (or one fused left chunk's) local groups: `groups` is
+/// in first-seen order (entries are only ever pushed when a key first
+/// appears), `index` maps each encoded key to its slot in `groups`.
+pub(crate) struct Partial {
+    pub(crate) groups: Vec<(Vec<u8>, Group)>,
+    pub(crate) index: FastMap<Vec<u8>, usize>,
 }
 
 /// Run hash aggregation over `inputs`. Output columns are
@@ -258,14 +267,6 @@ pub(crate) fn aggregate(
     keys: &[BoundExpr],
     aggs: &[BoundAgg],
 ) -> Result<Vec<DataChunk>> {
-    /// One chunk's local groups: `groups` is in first-seen order (entries
-    /// are only ever pushed when a key first appears), `index` maps each
-    /// encoded key to its slot in `groups`.
-    struct Partial {
-        groups: Vec<(Vec<u8>, Group)>,
-        index: FastMap<Vec<u8>, usize>,
-    }
-
     // Phase 1: per-chunk partials in parallel.
     let partials: Vec<Partial> = inputs
         .par_iter()
@@ -333,18 +334,30 @@ pub(crate) fn aggregate(
         })
         .collect::<Result<_>>()?;
 
-    // Phase 2: merge partials in chunk order (deterministic first-seen order).
-    // Partial groups already sit in first-seen order, so each partial is
-    // walked directly; the global table only maps encoded keys to slots for
-    // later partials. Reserve the upper bound (Σ local groups) so neither the
-    // table nor the output vec rehashes/regrows while it grows.
+    // Phase 2 + emit, shared with the fused join→aggregate executor (which
+    // builds the same `Partial`s from joined rows it never materializes).
+    let groups = merge_partials(partials, !keys.is_empty(), aggs);
+    let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
+    emit_groups(groups, &key_types, aggs)
+}
+
+/// Merge per-chunk partials in chunk order (deterministic first-seen order).
+/// Partial groups already sit in first-seen order, so each partial is walked
+/// directly; the global table only maps encoded keys to slots for later
+/// partials. Reserve the upper bound (Σ local groups) so neither the table
+/// nor the output vec rehashes/regrows while it grows.
+pub(crate) fn merge_partials(
+    partials: Vec<Partial>,
+    has_keys: bool,
+    aggs: &[BoundAgg],
+) -> Vec<Group> {
     let total_groups: usize = partials.iter().map(|p| p.groups.len()).sum();
     let mut table: FastMap<Vec<u8>, usize> =
         FastMap::with_capacity_and_hasher(total_groups, Default::default());
     let mut groups: Vec<Group> = Vec::with_capacity(total_groups);
     // Fast path: no keys means a single global group — merge accumulators
     // directly instead of probing the table per row.
-    if keys.is_empty() {
+    if !has_keys {
         let mut accs: Vec<Acc> = aggs.iter().map(|a| Acc::new(a.func)).collect();
         // Reuse the per-chunk partials computed above (each non-empty chunk
         // holds exactly one group; a fresh table scans as one 0-row chunk,
@@ -377,19 +390,26 @@ pub(crate) fn aggregate(
         }
     }
     // No input rows + no keys → single empty group (e.g. COUNT(*) over ∅).
-    if groups.is_empty() && keys.is_empty() {
+    if groups.is_empty() && !has_keys {
         groups.push(Group {
             keys: Vec::new(),
             accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
         });
     }
+    groups
+}
 
-    // Emit output chunks.
-    let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
+/// Emit merged groups as output chunks: `[keys..., aggs...]`, chunked at
+/// [`CHUNK_SIZE`]. `key_types` are the group keys' bound output dtypes.
+pub(crate) fn emit_groups(
+    groups: Vec<Group>,
+    key_types: &[DataType],
+    aggs: &[BoundAgg],
+) -> Result<Vec<DataChunk>> {
     let mut out_chunks = Vec::new();
     let fresh = || {
         let mut cols = Vec::with_capacity(key_types.len() + aggs.len());
-        for t in &key_types {
+        for t in key_types {
             cols.push(Vector::with_capacity(*t, CHUNK_SIZE));
         }
         for a in aggs {
