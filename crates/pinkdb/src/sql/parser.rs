@@ -473,28 +473,61 @@ impl Parser {
         }
     }
 
+    /// The join keyword sequence after a FROM source, if any:
+    /// `JOIN` / `INNER JOIN` / `LEFT [OUTER] JOIN` / `RIGHT [OUTER] JOIN`.
+    /// `FULL` and `CROSS` are rejected here (v1 has no such joins).
+    fn parse_join_kind(&mut self) -> Result<Option<JoinKind>> {
+        let kind = match self.peek_keyword() {
+            Some(Keyword::Join) => {
+                self.next();
+                JoinKind::Inner
+            }
+            Some(Keyword::Inner) => {
+                self.next();
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Inner
+            }
+            Some(Keyword::Left) => {
+                self.next();
+                self.eat_keyword(Keyword::Outer);
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Left
+            }
+            Some(Keyword::Right) => {
+                self.next();
+                self.eat_keyword(Keyword::Outer);
+                self.expect_keyword(Keyword::Join)?;
+                JoinKind::Right
+            }
+            Some(Keyword::Full) => {
+                return Err(self.error("FULL [OUTER] JOIN is not supported in v1".to_string()))
+            }
+            Some(Keyword::Cross) => {
+                return Err(self.error("CROSS JOIN is not supported in v1".to_string()))
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(kind))
+    }
+
     fn parse_from(&mut self) -> Result<FromClause> {
         let source = self.parse_source()?;
         let alias = self.parse_optional_alias()?;
         if matches!(source, FromSource::Derived(_)) && alias.is_none() {
             return Err(self.error("derived table needs an alias".to_string()));
         }
-        let join = if self.eat_keyword(Keyword::Join)
-            || (self.eat_keyword(Keyword::Inner) && {
-                self.expect_keyword(Keyword::Join)?;
-                true
-            })
-        {
-            let source = self.parse_source()?;
-            let alias = self.parse_optional_alias()?;
-            if matches!(source, FromSource::Derived(_)) && alias.is_none() {
-                return Err(self.error("derived table needs an alias".to_string()));
+        let join = match self.parse_join_kind()? {
+            None => None,
+            Some(kind) => {
+                let source = self.parse_source()?;
+                let alias = self.parse_optional_alias()?;
+                if matches!(source, FromSource::Derived(_)) && alias.is_none() {
+                    return Err(self.error("derived table needs an alias".to_string()));
+                }
+                self.expect_keyword(Keyword::On)?;
+                let on = self.parse_expr()?;
+                Some(JoinClause { kind, source, alias, on })
             }
-            self.expect_keyword(Keyword::On)?;
-            let on = self.parse_expr()?;
-            Some(JoinClause { source, alias, on })
-        } else {
-            None
         };
         Ok(FromClause { source, alias, join })
     }
@@ -1059,7 +1092,34 @@ mod tests {
     fn join_parses_for_wave3() {
         let s = parse_one("SELECT * FROM a JOIN b ON a.id = b.id;");
         let Statement::Select(sel) = s else { panic!() };
-        assert!(sel.from.unwrap().join.is_some());
+        let join = sel.from.unwrap().join.unwrap();
+        assert_eq!(join.kind, JoinKind::Inner);
+        let s = parse_one("SELECT * FROM a INNER JOIN b ON a.id = b.id;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.from.unwrap().join.unwrap().kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn outer_join_kinds_parse_and_full_cross_error() {
+        // LEFT / LEFT OUTER / RIGHT / RIGHT OUTER, case-insensitive.
+        for (sql, want) in [
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id;", JoinKind::Left),
+            ("SELECT * FROM a left outer join b ON a.id = b.id;", JoinKind::Left),
+            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.id;", JoinKind::Right),
+            ("SELECT * FROM a right OUTER join b ON a.id = b.id;", JoinKind::Right),
+        ] {
+            let Statement::Select(sel) = parse_one(sql) else { panic!() };
+            assert_eq!(sel.from.unwrap().join.unwrap().kind, want, "{sql}");
+        }
+        // LEFT/RIGHT without JOIN, FULL/CROSS always.
+        assert!(parse_statements("SELECT * FROM a LEFT b ON a.id = b.id;").is_err());
+        assert!(parse_statements("SELECT * FROM a FULL JOIN b ON a.id = b.id;").is_err());
+        assert!(parse_statements("SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id;").is_err());
+        assert!(parse_statements("SELECT * FROM a CROSS JOIN b;").is_err());
+        assert!(parse_statements("SELECT * FROM a CROSS JOIN b ON a.id = b.id;").is_err());
+        // USING / NATURAL stay errors.
+        assert!(parse_statements("SELECT * FROM a JOIN b USING (id);").is_err());
+        assert!(parse_statements("SELECT * FROM a NATURAL JOIN b;").is_err());
     }
 
     #[test]

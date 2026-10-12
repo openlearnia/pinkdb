@@ -1976,6 +1976,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 bind_join_keys(db, &binder.tables[0], &right, &join.on)?;
             binder.tables.push(right);
             base = LogicalPlan::Join {
+                kind: join.kind,
                 left: Box::new(base),
                 right: Box::new(right_plan),
                 left_key,

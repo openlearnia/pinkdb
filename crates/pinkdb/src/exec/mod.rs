@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use window::eval_window;
 
 use crate::plan::{LogicalPlan, agg_output_schema, compare_values, win_output_schema};
-use crate::sql::ast::BinaryOp;
+use crate::sql::ast::{BinaryOp, JoinKind};
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, common_numeric};
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -289,14 +289,21 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let chunks = chunks.into_iter().flatten().collect();
             Ok(Output { chunks, names: inner.names, types: inner.types })
         }
-        LogicalPlan::Join { left, right, left_key, right_key, .. } => {
+        LogicalPlan::Join { kind, left, right, left_key, right_key, .. } => {
             let l = eval(cx, left)?;
             let r = eval(cx, right)?;
             let mut names = l.names.clone();
             names.extend(r.names.iter().cloned());
             let mut types = l.types.clone();
             types.extend(r.types.iter().copied());
-            let chunks = hash_join(cx, &l.chunks, &r.chunks, left_key, right_key, &l.types, &r.types)?;
+            let chunks = hash_join(
+                cx,
+                JoinSide { chunks: &l.chunks, types: &l.types },
+                JoinSide { chunks: &r.chunks, types: &r.types },
+                *kind,
+                left_key,
+                right_key,
+            )?;
             Ok(Output { chunks, names, types })
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
@@ -608,67 +615,163 @@ impl MatchTable {
     }
 }
 
-/// Inner hash join: build on the right, probe with the left (preserves
-/// left-row order). NULL keys never match on either side.
+/// One hash-join input: its chunks plus its output dtypes.
+#[derive(Clone, Copy)]
+struct JoinSide<'a> {
+    chunks: &'a [DataChunk],
+    types: &'a [DataType],
+}
+
+/// Hash join dispatcher. Output columns are always left ++ right.
+/// - `Inner`: build on the right, probe with the left, emit matched pairs.
+/// - `Left`: same build/probe, plus left columns + NULLs for every unmatched
+///   left row.
+/// - `Right`: mirrored — build on the left, probe with the right, plus NULLs
+///   for the left columns + the right row for every unmatched right row.
+///
+/// NULL keys never match on either side, so they NULL-extend in outer joins.
 fn hash_join(
     cx: &Cx,
-    left_chunks: &[DataChunk],
-    right_chunks: &[DataChunk],
+    left: JoinSide<'_>,
+    right: JoinSide<'_>,
+    kind: JoinKind,
     left_key: &BoundExpr,
     right_key: &BoundExpr,
-    left_types: &[DataType],
-    right_types: &[DataType],
+) -> Result<Vec<DataChunk>> {
+    // The preserved side is the probing side: left for Inner/Left, right for
+    // Right. `preserved_is_right` places it in the declared left ++ right
+    // output order; `extend_unmatched` turns unmatched preserved rows into
+    // NULL-extended rows (outer) instead of dropping them (inner).
+    match kind {
+        JoinKind::Inner => hash_join_probe(cx, left, right, left_key, right_key, false, false),
+        JoinKind::Left => hash_join_probe(cx, left, right, left_key, right_key, false, true),
+        JoinKind::Right => hash_join_probe(cx, right, left, right_key, left_key, true, true),
+    }
+}
+
+/// Shared hash-join probe/assembly loop. `preserved` is the side whose rows
+/// all appear in the output, in input order (left for Inner/Left, right for
+/// Right); `build` feeds the match table. `preserved_is_right` says which
+/// side of the declared `left ++ right` output the preserved side is.
+/// `extend_unmatched` NULL-extends unmatched preserved rows (outer joins)
+/// instead of dropping them (inner). NULL keys never match, so they
+/// NULL-extend in outer joins and are skipped in an inner join.
+///
+/// Matched pairs emit build/probe columns in declared order (left ++ right);
+/// an unmatched preserved row emits its own columns plus NULLs for the other
+/// side. Probe order and per-key build-row order are deterministic (left-row
+/// order for Inner/Left, right-row order for Right).
+fn hash_join_probe(
+    cx: &Cx,
+    preserved: JoinSide<'_>,
+    build: JoinSide<'_>,
+    preserved_key: &BoundExpr,
+    build_key: &BoundExpr,
+    preserved_is_right: bool,
+    extend_unmatched: bool,
 ) -> Result<Vec<DataChunk>> {
     // Integer-payload keys take the i64-specialized match table: no byte
     // encoding and no `coerce_to` (INTEGER=BIGINT widens per cell). Every
     // other dtype keeps the byte path, canonicalized to the common numeric
     // type first (binder allows `1 = 1.0`); same-type keys skip the deep
-    // clone `coerce_to` would do.
-    let ints = is_int_key(left_key.dtype()) && is_int_key(right_key.dtype());
-    let common = common_numeric(left_key.dtype(), right_key.dtype()).ok();
-    let right_rows: usize = right_chunks.iter().map(|c| c.num_rows()).sum();
-    if right_rows > u32::MAX as usize {
+    // clone `coerce_to` would do. The int check and common-type resolution
+    // are symmetric in the two key dtypes.
+    let ints = is_int_key(preserved_key.dtype()) && is_int_key(build_key.dtype());
+    let common = common_numeric(preserved_key.dtype(), build_key.dtype()).ok();
+    let build_rows: usize = build.chunks.iter().map(|c| c.num_rows()).sum();
+    if build_rows > u32::MAX as usize {
         return Err(PinkDbError::Execution(
-            "hash join right side exceeds u32 rows".to_string(),
+            "hash join build side exceeds u32 rows".to_string(),
         ));
     }
     // Reserve for distinct keys, not rows: a skewed join would otherwise
-    // allocate `right_rows` map/arena slots for a handful of keys. Both grow
+    // allocate `build_rows` map/arena slots for a handful of keys. Both grow
     // on demand past the cap.
-    let reserve = right_rows.min(1 << 20);
-    let table = MatchTable::build(cx, right_chunks, right_key, common, ints, reserve)?;
+    let reserve = build_rows.min(1 << 20);
+    let table = MatchTable::build(cx, build.chunks, build_key, common, ints, reserve)?;
 
-    // Probe + assemble, parallel per left chunk: matches push straight from
-    // the source chunks into per-partition output vectors (no intermediate
-    // location tuples, no serial assembly pass). A partition can exceed
-    // CHUNK_SIZE rows, so it emits chunks as they fill; the caller
-    // concatenates partitions in order, preserving left-row order.
+    // Probe + assemble, parallel per preserved chunk: matches push straight
+    // from the source chunks into per-partition output vectors (no
+    // intermediate location tuples, no serial assembly pass). A partition can
+    // exceed CHUNK_SIZE rows, so it emits chunks as they fill; the caller
+    // concatenates partitions in order, preserving preserved-row order.
+    let (left_types, right_types) = if preserved_is_right {
+        (build.types, preserved.types)
+    } else {
+        (preserved.types, build.types)
+    };
     let mut dtypes: Vec<DataType> = left_types.to_vec();
     dtypes.extend(right_types.iter().copied());
     let n_left = left_types.len();
-    let partitions: Vec<Vec<DataChunk>> = left_chunks
+    let partitions: Vec<Vec<DataChunk>> = preserved
+        .chunks
         .par_iter()
         .map(|chunk| -> Result<Vec<DataChunk>> {
-            let kv = eval_join_key(cx, left_key, chunk, common, ints)?;
+            let kv = eval_join_key(cx, preserved_key, chunk, common, ints)?;
             let mut finished = Vec::new();
             let mut cur: Vec<Vector> =
                 dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
             let mut cur_rows = 0usize;
             let mut buf = Vec::new();
             for i in 0..chunk.num_rows() {
-                if kv.is_null(i) {
-                    continue;
-                }
-                let head = if ints {
+                let head = if kv.is_null(i) {
+                    if !extend_unmatched {
+                        continue;
+                    }
+                    None
+                } else if ints {
                     table.head_int(int_key_at(&kv, i))
                 } else {
                     buf.clear();
                     kv.encode_into(&mut buf, i);
                     table.head_bytes(&buf)
                 };
-                if let Some(mut node) = head {
-                    while node != NIL {
-                        let (rci, ri, next) = table.node(node);
+                match head {
+                    Some(mut node) => {
+                        while node != NIL {
+                            let (bci, bi, next) = table.node(node);
+                            if cur_rows >= CHUNK_SIZE {
+                                finished.push(DataChunk::new(std::mem::take(&mut cur))?);
+                                cur = dtypes
+                                    .iter()
+                                    .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                                    .collect();
+                                cur_rows = 0;
+                            }
+                            let bchunk = &build.chunks[bci as usize];
+                            if preserved_is_right {
+                                for (dst, col) in
+                                    cur.iter_mut().take(n_left).zip(bchunk.columns.iter())
+                                {
+                                    dst.push_from(col, bi as usize)?;
+                                }
+                                for (dst, col) in
+                                    cur.iter_mut().skip(n_left).zip(chunk.columns.iter())
+                                {
+                                    dst.push_from(col, i)?;
+                                }
+                            } else {
+                                for (dst, col) in
+                                    cur.iter_mut().take(n_left).zip(chunk.columns.iter())
+                                {
+                                    dst.push_from(col, i)?;
+                                }
+                                for (dst, col) in
+                                    cur.iter_mut().skip(n_left).zip(bchunk.columns.iter())
+                                {
+                                    dst.push_from(col, bi as usize)?;
+                                }
+                            }
+                            cur_rows += 1;
+                            node = next;
+                        }
+                    }
+                    None => {
+                        // Inner: no match, drop the row. Outer: unmatched (or
+                        // NULL-keyed) preserved row — NULL-extend.
+                        if !extend_unmatched {
+                            continue;
+                        }
                         if cur_rows >= CHUNK_SIZE {
                             finished.push(DataChunk::new(std::mem::take(&mut cur))?);
                             cur = dtypes
@@ -677,15 +780,26 @@ fn hash_join(
                                 .collect();
                             cur_rows = 0;
                         }
-                        let rchunk = &right_chunks[rci as usize];
-                        for (dst, col) in cur.iter_mut().take(n_left).zip(chunk.columns.iter()) {
-                            dst.push_from(col, i)?;
-                        }
-                        for (dst, col) in cur.iter_mut().skip(n_left).zip(rchunk.columns.iter()) {
-                            dst.push_from(col, ri as usize)?;
+                        if preserved_is_right {
+                            for dst in cur.iter_mut().take(n_left) {
+                                dst.push_null()?;
+                            }
+                            for (dst, col) in
+                                cur.iter_mut().skip(n_left).zip(chunk.columns.iter())
+                            {
+                                dst.push_from(col, i)?;
+                            }
+                        } else {
+                            for (dst, col) in
+                                cur.iter_mut().take(n_left).zip(chunk.columns.iter())
+                            {
+                                dst.push_from(col, i)?;
+                            }
+                            for dst in cur.iter_mut().skip(n_left) {
+                                dst.push_null()?;
+                            }
                         }
                         cur_rows += 1;
-                        node = next;
                     }
                 }
             }
@@ -1069,18 +1183,24 @@ fn fused_join_aggregate(
     // Shape: Aggregate over Join, or over Project over Join. A Filter /
     // Distinct / Window / Limit / Cte between the aggregate and the join
     // (or any other input) keeps the materialized path.
-    let (left, right, left_key, right_key, left_cols, project) = match input {
-        LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
-            (&**left, &**right, left_key, right_key, *left_cols, None)
+    let (kind, left, right, left_key, right_key, left_cols, project) = match input {
+        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
+            (*kind, &**left, &**right, left_key, right_key, *left_cols, None)
         }
         LogicalPlan::Project { input: inner, exprs, .. } => match &**inner {
-            LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
-                (&**left, &**right, left_key, right_key, *left_cols, Some(&exprs[..]))
+            LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
+                (*kind, &**left, &**right, left_key, right_key, *left_cols, Some(&exprs[..]))
             }
             _ => return Ok(None),
         },
         _ => return Ok(None),
     };
+    // Outer joins must materialize their NULL-extended rows: fusion only
+    // feeds matched pairs into the accumulators, so it would undercount.
+    // Static kind check — nothing has been evaluated yet.
+    if kind != JoinKind::Inner {
+        return Ok(None);
+    }
 
     // With a Project in the shape, fusion rewrites only the aggregate's
     // keys/args through it, so project exprs the aggregate does not reference
@@ -1164,7 +1284,7 @@ fn fused_join_aggregate(
     let right_rows: usize = r.chunks.iter().map(|c| c.num_rows()).sum();
     if right_rows > u32::MAX as usize {
         return Err(PinkDbError::Execution(
-            "hash join right side exceeds u32 rows".to_string(),
+            "hash join build side exceeds u32 rows".to_string(),
         ));
     }
     let reserve = right_rows.min(1 << 20);
@@ -2371,6 +2491,666 @@ mod tests {
                 vec![V::Integer(5), V::Integer(10)],
                 vec![V::Integer(5), V::Integer(15)],
             ]
+        );
+    }
+
+    // --- wave 20: LEFT / RIGHT outer joins ---
+
+    /// Matched pairs, unmatched rows, and NULL keys on both sides. Row order
+    /// is deterministic (left-row order for LEFT, right-row order for RIGHT)
+    /// and matches DuckDB's output for this data.
+    #[test]
+    fn outer_join_matched_unmatched_and_null_keys() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT l.k, lv, r.k, rv FROM l LEFT JOIN r ON l.k = r.k;"),
+            vec![
+                vec![V::Integer(1), V::Integer(10), V::Integer(1), V::Integer(100)],
+                vec![V::Integer(2), V::Integer(20), V::Integer(2), V::Null],
+                vec![V::Null, V::Integer(30), V::Null, V::Null],
+                vec![V::Integer(4), V::Integer(40), V::Null, V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT l.k, lv, r.k, rv FROM l LEFT OUTER JOIN r ON l.k = r.k;"),
+            select(&mut db, "SELECT l.k, lv, r.k, rv FROM l LEFT JOIN r ON l.k = r.k;")
+        );
+    }
+
+    /// RIGHT JOIN output columns stay in DECLARED order (left ++ right) even
+    /// though the right input is the preserved/probing side.
+    #[test]
+    fn right_join_keeps_declared_column_order() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT * FROM l RIGHT OUTER JOIN r ON l.k = r.k;"),
+            vec![
+                vec![V::Integer(1), V::Integer(10), V::Integer(1), V::Integer(100)],
+                vec![V::Integer(2), V::Integer(20), V::Integer(2), V::Null],
+                vec![V::Null, V::Null, V::Null, V::Integer(300)],
+                vec![V::Null, V::Null, V::Integer(5), V::Integer(500)],
+            ]
+        );
+    }
+
+    /// Empty left / right / both sides in either direction.
+    #[test]
+    fn outer_join_empty_sides() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE e (k INTEGER, ev INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10);").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 20);").unwrap();
+        // Empty right: LEFT keeps its left row NULL-extended; RIGHT is empty.
+        assert_eq!(
+            select(&mut db, "SELECT lv, ev FROM l LEFT JOIN e ON l.k = e.k;"),
+            vec![vec![V::Integer(10), V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM l RIGHT JOIN e ON l.k = e.k;"),
+            vec![vec![V::Bigint(0)]]
+        );
+        // Empty left: LEFT is empty; RIGHT keeps its right row NULL-extended.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM e LEFT JOIN r ON e.k = r.k;"),
+            vec![vec![V::Bigint(0)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT ev, rv FROM e RIGHT JOIN r ON e.k = r.k;"),
+            vec![vec![V::Null, V::Integer(20)]]
+        );
+        // Both empty.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM e LEFT JOIN e e2 ON e.k = e2.k;"),
+            vec![vec![V::Bigint(0)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM e RIGHT JOIN e e2 ON e.k = e2.k;"),
+            vec![vec![V::Bigint(0)]]
+        );
+    }
+
+    /// Disjoint keys: every probe row is NULL-extended.
+    #[test]
+    fn outer_join_all_unmatched() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20);").unwrap();
+        db.execute("INSERT INTO r VALUES (3, 30), (4, 40);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k;"),
+            vec![vec![V::Integer(10), V::Null], vec![V::Integer(20), V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k;"),
+            vec![vec![V::Null, V::Integer(30)], vec![V::Null, V::Integer(40)]]
+        );
+    }
+
+    /// Multi-chunk inputs (3000 left rows, 3000 right rows = 2 chunks each):
+    /// matches and NULL-extensions interleave across chunk boundaries.
+    #[test]
+    fn outer_join_multi_chunk_inputs() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        insert_rows(&mut db, "l", 3000, |i| format!("({i}, {})", i as i64 + 1));
+        insert_rows(&mut db, "r", 3000, |i| format!("({}, {})", i as i64 + 1000, i as i64 + 100));
+        // Keys overlap on 1000..3000: 2000 matches, 1000 NULL-extended left rows.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*), COUNT(r.rv) FROM l LEFT JOIN r ON l.k = r.k;"),
+            vec![vec![V::Bigint(3000), V::Bigint(2000)]]
+        );
+        let rows = select(&mut db, "SELECT l.k, r.k FROM l LEFT JOIN r ON l.k = r.k;");
+        assert_eq!(rows[0], vec![V::Integer(0), V::Null]);
+        assert_eq!(rows[999], vec![V::Integer(999), V::Null]);
+        assert_eq!(rows[1000], vec![V::Integer(1000), V::Integer(1000)]);
+        assert_eq!(rows[2999], vec![V::Integer(2999), V::Integer(2999)]);
+        // RIGHT mirrors: every right row survives, in right-row order.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*), COUNT(l.lv) FROM l RIGHT JOIN r ON l.k = r.k;"),
+            vec![vec![V::Bigint(3000), V::Bigint(2000)]]
+        );
+        let rows = select(&mut db, "SELECT l.k, r.k FROM l RIGHT JOIN r ON l.k = r.k;");
+        assert_eq!(rows[0], vec![V::Integer(1000), V::Integer(1000)]);
+        assert_eq!(rows[1999], vec![V::Integer(2999), V::Integer(2999)]);
+        assert_eq!(rows[2000], vec![V::Null, V::Integer(3000)]);
+        assert_eq!(rows[2999], vec![V::Null, V::Integer(3999)]);
+    }
+
+    /// One key expanding past CHUNK_SIZE on the preserved side.
+    #[test]
+    fn outer_join_expansion_spans_chunks() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t1 (id INTEGER);").unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER, rn INTEGER);").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1);").unwrap();
+        insert_rows(&mut db, "t2", 5000, |i| format!("(1, {i})"));
+        let rows = select(&mut db, "SELECT rn FROM t1 LEFT JOIN t2 ON t1.id = t2.id;");
+        assert_eq!(rows.len(), 5000);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], V::Integer(i as i32), "row {i}");
+        }
+        // RIGHT: one right row matching 2500 left rows, left-row order.
+        db.execute("CREATE TABLE t3 (id INTEGER, rn INTEGER);").unwrap();
+        db.execute("CREATE TABLE t4 (id INTEGER);").unwrap();
+        db.execute("INSERT INTO t4 VALUES (1);").unwrap();
+        insert_rows(&mut db, "t3", 2500, |i| format!("(1, {i})"));
+        let rows = select(&mut db, "SELECT t3.rn FROM t4 RIGHT JOIN t3 ON t4.id = t3.id;");
+        assert_eq!(rows.len(), 2500);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row[0], V::Integer(i as i32), "row {i}");
+        }
+    }
+
+    /// Cross-type INTEGER = BIGINT keys match on both outer kinds.
+    #[test]
+    fn outer_join_cross_type_keys() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE a (x INTEGER, av INTEGER);").unwrap();
+        db.execute("CREATE TABLE b (x BIGINT, bv INTEGER);").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 10), (2, 20);").unwrap();
+        db.execute("INSERT INTO b VALUES (2, 200), (3, 300);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT * FROM a LEFT JOIN b ON a.x = b.x;"),
+            vec![
+                vec![V::Integer(1), V::Integer(10), V::Null, V::Null],
+                vec![V::Integer(2), V::Integer(20), V::Bigint(2), V::Integer(200)],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT * FROM a RIGHT JOIN b ON a.x = b.x;"),
+            vec![
+                vec![V::Integer(2), V::Integer(20), V::Bigint(2), V::Integer(200)],
+                vec![V::Null, V::Null, V::Bigint(3), V::Integer(300)],
+            ]
+        );
+    }
+
+    /// VARCHAR keys take the byte-encoded match table; NULL keys never match.
+    #[test]
+    fn outer_join_string_keys() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE ls (k VARCHAR, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE rs (k VARCHAR, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO ls VALUES ('a', 1), ('b', 2), (NULL, 3);").unwrap();
+        db.execute("INSERT INTO rs VALUES ('b', 20), ('c', 30), (NULL, 40);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT ls.k, lv, rs.k, rv FROM ls LEFT JOIN rs ON ls.k = rs.k;"),
+            vec![
+                vec![V::Varchar("a".to_string()), V::Integer(1), V::Null, V::Null],
+                vec![
+                    V::Varchar("b".to_string()),
+                    V::Integer(2),
+                    V::Varchar("b".to_string()),
+                    V::Integer(20),
+                ],
+                vec![V::Null, V::Integer(3), V::Null, V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT rv, lv FROM ls RIGHT JOIN rs ON ls.k = rs.k;"),
+            vec![
+                vec![V::Integer(20), V::Integer(2)],
+                vec![V::Integer(30), V::Null],
+                vec![V::Integer(40), V::Null],
+            ]
+        );
+    }
+
+    /// WHERE on a LEFT JOIN (values bag-equal to DuckDB; row order is
+    /// pinkdb-deterministic as noted at the RIGHT case):
+    /// - a right-side predicate stays above the join and drops NULL-extended
+    ///   rows when it rejects NULL;
+    /// - `r.rv IS NULL` keeps exactly the unmatched/NULL-valued rows;
+    /// - a left-side predicate pushes into the preserved left input.
+    #[test]
+    fn left_join_where_predicates_match_duckdb() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE r.rv > 50;"),
+            vec![vec![V::Integer(10), V::Integer(100)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE r.rv IS NULL;"),
+            vec![
+                vec![V::Integer(20), V::Null],
+                vec![V::Integer(30), V::Null],
+                vec![V::Integer(40), V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE l.lv > 15;"),
+            vec![
+                vec![V::Integer(20), V::Null],
+                vec![V::Integer(30), V::Null],
+                vec![V::Integer(40), V::Null],
+            ]
+        );
+        // RIGHT mirrors: the right-side predicate pushes; a left-side one
+        // stays above (NULL-extended left rows survive `l.lv IS NULL`).
+        // Values below are bag-equal to DuckDB's, not order-identical:
+        // pinkdb emits deterministic right-row order ([10,100], [NULL,300],
+        // [NULL,500]) while DuckDB prints [10,100], [NULL,500], [NULL,300].
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k WHERE r.rv > 50;"),
+            vec![
+                vec![V::Integer(10), V::Integer(100)],
+                vec![V::Null, V::Integer(300)],
+                vec![V::Null, V::Integer(500)],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k WHERE l.lv IS NULL;"),
+            vec![vec![V::Null, V::Integer(300)], vec![V::Null, V::Integer(500)]]
+        );
+    }
+
+    /// NULL-extension covers every right-side dtype (not just INTEGER/VARCHAR):
+    /// BOOLEAN/DOUBLE/DATE/TIMESTAMP columns come back as typed NULLs, and the
+    /// `SELECT *` shape stays left ++ right.
+    #[test]
+    fn outer_join_null_extension_all_dtypes() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, b BOOLEAN, d DOUBLE, dt DATE, ts TIMESTAMP);")
+            .unwrap();
+        db.execute(
+            "INSERT INTO l VALUES
+             (1, true, 1.5, DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00.000001');",
+        )
+        .unwrap();
+        db.execute("CREATE TABLE e (k INTEGER, b BOOLEAN, d DOUBLE, dt DATE, ts TIMESTAMP);")
+            .unwrap();
+        let left = select(&mut db, "SELECT * FROM l;");
+        let sql = "SELECT * FROM l LEFT JOIN e ON l.k = e.k;";
+        let rows = select(&mut db, sql);
+        assert_eq!(rows.len(), 1);
+        // Left values survive; every right-side dtype NULL-extends.
+        assert_eq!(&rows[0][..5], &left[0][..]);
+        assert!(rows[0][5..].iter().all(|v| *v == V::Null));
+        // The NULLs are actually invalid values, not sentinels: COUNT skips all.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(e.b), COUNT(e.d), COUNT(e.dt), COUNT(e.ts)
+                 FROM l LEFT JOIN e ON l.k = e.k;"
+            ),
+            vec![vec![V::Bigint(0), V::Bigint(0), V::Bigint(0), V::Bigint(0)]]
+        );
+        let (names, types) = select_meta(&mut db, sql);
+        assert_eq!(names.len(), 10);
+        assert_eq!(
+            types,
+            vec![
+                DataType::Integer,
+                DataType::Boolean,
+                DataType::Double,
+                DataType::Date,
+                DataType::Timestamp,
+                DataType::Integer,
+                DataType::Boolean,
+                DataType::Double,
+                DataType::Date,
+                DataType::Timestamp,
+            ]
+        );
+        // RIGHT against an empty left mirrors: left dtypes NULL-extend first.
+        let rows = select(&mut db, "SELECT * FROM e RIGHT JOIN l ON e.k = l.k;");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0][..5].iter().all(|v| *v == V::Null));
+        assert_eq!(&rows[0][5..], &left[0][..]);
+    }
+
+    /// Outer joins on BOOLEAN keys (byte path), DATE / TIMESTAMP keys (int
+    /// path), and mixed INTEGER = DOUBLE keys (byte path, canonicalized to
+    /// DOUBLE); all values verified against DuckDB.
+    #[test]
+    fn outer_join_boolean_date_timestamp_and_double_keys() {
+        let mut db = PinkDb::new();
+        // BOOLEAN keys: RIGHT preserves right-row order, so the NULL-keyed
+        // right row stays between true and false.
+        db.execute("CREATE TABLE lb (k BOOLEAN, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE rb (k BOOLEAN, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO lb VALUES (true, 1), (false, 2), (NULL, 3);").unwrap();
+        db.execute("INSERT INTO rb VALUES (true, 10), (NULL, 11), (false, 12);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT lb.k, lv, rb.k, rv FROM lb LEFT JOIN rb ON lb.k = rb.k;"),
+            vec![
+                vec![V::Boolean(true), V::Integer(1), V::Boolean(true), V::Integer(10)],
+                vec![V::Boolean(false), V::Integer(2), V::Boolean(false), V::Integer(12)],
+                vec![V::Null, V::Integer(3), V::Null, V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT lb.k, lv, rb.k, rv FROM lb RIGHT JOIN rb ON lb.k = rb.k;"),
+            vec![
+                vec![V::Boolean(true), V::Integer(1), V::Boolean(true), V::Integer(10)],
+                vec![V::Null, V::Null, V::Null, V::Integer(11)],
+                vec![V::Boolean(false), V::Integer(2), V::Boolean(false), V::Integer(12)],
+            ]
+        );
+        // DATE keys.
+        db.execute("CREATE TABLE ld (k DATE, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE rd (k DATE, rv INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO ld VALUES (DATE '2024-01-15', 1), (DATE '2024-02-20', 2), (NULL, 3);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO rd VALUES (DATE '2024-01-15', 10), (DATE '2024-03-01', 11), (NULL, 12);",
+        )
+        .unwrap();
+        let jan15 = select(&mut db, "SELECT k FROM ld WHERE lv = 1;")[0][0].clone();
+        let feb20 = select(&mut db, "SELECT k FROM ld WHERE lv = 2;")[0][0].clone();
+        let mar01 = select(&mut db, "SELECT k FROM rd WHERE rv = 11;")[0][0].clone();
+        assert_eq!(
+            select(&mut db, "SELECT ld.k, lv, rd.k, rv FROM ld LEFT JOIN rd ON ld.k = rd.k;"),
+            vec![
+                vec![jan15.clone(), V::Integer(1), jan15.clone(), V::Integer(10)],
+                vec![feb20.clone(), V::Integer(2), V::Null, V::Null],
+                vec![V::Null, V::Integer(3), V::Null, V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT ld.k, lv, rd.k, rv FROM ld RIGHT JOIN rd ON ld.k = rd.k;"),
+            vec![
+                vec![jan15.clone(), V::Integer(1), jan15, V::Integer(10)],
+                vec![V::Null, V::Null, mar01, V::Integer(11)],
+                vec![V::Null, V::Null, V::Null, V::Integer(12)],
+            ]
+        );
+        // TIMESTAMP keys match at microsecond precision.
+        db.execute("CREATE TABLE lt (k TIMESTAMP, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE rt (k TIMESTAMP, rv INTEGER);").unwrap();
+        db.execute(
+            "INSERT INTO lt VALUES
+             (TIMESTAMP '2024-01-15 10:00:00.000001', 1),
+             (TIMESTAMP '2024-01-15 10:00:00', 2), (NULL, 3);",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO rt VALUES
+             (TIMESTAMP '2024-01-15 10:00:00', 10),
+             (TIMESTAMP '2024-01-15 10:00:00.000001', 11), (NULL, 12);",
+        )
+        .unwrap();
+        let us1 = select(&mut db, "SELECT k FROM lt WHERE lv = 1;")[0][0].clone();
+        let sec = select(&mut db, "SELECT k FROM lt WHERE lv = 2;")[0][0].clone();
+        assert_eq!(
+            select(&mut db, "SELECT lt.k, lv, rt.k, rv FROM lt LEFT JOIN rt ON lt.k = rt.k;"),
+            vec![
+                vec![us1.clone(), V::Integer(1), us1.clone(), V::Integer(11)],
+                vec![sec.clone(), V::Integer(2), sec.clone(), V::Integer(10)],
+                vec![V::Null, V::Integer(3), V::Null, V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT lt.k, lv, rt.k, rv FROM lt RIGHT JOIN rt ON lt.k = rt.k;"),
+            vec![
+                vec![sec.clone(), V::Integer(2), sec, V::Integer(10)],
+                vec![us1.clone(), V::Integer(1), us1, V::Integer(11)],
+                vec![V::Null, V::Null, V::Null, V::Integer(12)],
+            ]
+        );
+        // Mixed INTEGER = DOUBLE keys canonicalize to DOUBLE (1 matches 1.0).
+        db.execute("CREATE TABLE li (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE rdd (k DOUBLE, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO li VALUES (1, 10), (2, 20), (NULL, 30);").unwrap();
+        db.execute("INSERT INTO rdd VALUES (1.0, 100), (1.5, 150), (2.0, 200), (NULL, 300);")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT li.k, lv, rdd.k, rv FROM li LEFT JOIN rdd ON li.k = rdd.k;"),
+            vec![
+                vec![V::Integer(1), V::Integer(10), V::Double(1.0), V::Integer(100)],
+                vec![V::Integer(2), V::Integer(20), V::Double(2.0), V::Integer(200)],
+                vec![V::Null, V::Integer(30), V::Null, V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT li.k, lv, rdd.k, rv FROM li RIGHT JOIN rdd ON li.k = rdd.k;"),
+            vec![
+                vec![V::Integer(1), V::Integer(10), V::Double(1.0), V::Integer(100)],
+                vec![V::Null, V::Null, V::Double(1.5), V::Integer(150)],
+                vec![V::Integer(2), V::Integer(20), V::Double(2.0), V::Integer(200)],
+                vec![V::Null, V::Null, V::Null, V::Integer(300)],
+            ]
+        );
+    }
+
+    /// Probe rows interleave expanding matches, NULL keys, and unmatched keys,
+    /// so matches and NULL-extensions alternate across output-chunk flushes
+    /// (5000 probe rows → 6667 output rows, >3 flushes at CHUNK_SIZE 2048).
+    #[test]
+    fn outer_join_interleaved_probe_flushes() {
+        const N: usize = 5000;
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        // Key 1 has two matches; 8/9 are decoys for the unmatched probe rows.
+        db.execute("INSERT INTO r VALUES (1, 100), (8, 800), (1, 101), (9, 900);").unwrap();
+        insert_rows(&mut db, "l", N, |i| match i % 3 {
+            0 => format!("(1, {i})"),
+            1 => format!("(NULL, {i})"),
+            _ => format!("(7, {i})"),
+        });
+        let rows = select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k;");
+        let mut expected: Vec<Vec<V>> = Vec::new();
+        for i in 0..N {
+            if i % 3 == 0 {
+                expected.push(vec![V::Integer(i as i32), V::Integer(100)]);
+                expected.push(vec![V::Integer(i as i32), V::Integer(101)]);
+            } else {
+                expected.push(vec![V::Integer(i as i32), V::Null]);
+            }
+        }
+        assert_eq!(expected.len(), 6667);
+        assert_eq!(rows, expected);
+    }
+
+    /// RIGHT join determinism over a >CHUNK_SIZE preserved side with NULL
+    /// keys: two runs are identical and follow fixed right-row order.
+    #[test]
+    fn outer_join_large_right_output_is_deterministic() {
+        const N: usize = 5000;
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1, 100), (8, 800), (1, 101), (9, 900);").unwrap();
+        insert_rows(&mut db, "r", N, |i| match i % 4 {
+            0 => format!("(1, {i})"),
+            1 => format!("(NULL, {i})"),
+            2 => format!("(2, {i})"),
+            _ => format!("(7, {i})"),
+        });
+        let sql = "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k;";
+        let first = select(&mut db, sql);
+        let second = select(&mut db, sql);
+        assert_eq!(first, second);
+        // Fixed right-row order: key 1 expands to two left rows; NULL keys and
+        // unmatched keys (2, 7) NULL-extend the left side.
+        let mut expected: Vec<Vec<V>> = Vec::new();
+        for i in 0..N {
+            if i % 4 == 0 {
+                expected.push(vec![V::Integer(100), V::Integer(i as i32)]);
+                expected.push(vec![V::Integer(101), V::Integer(i as i32)]);
+            } else {
+                expected.push(vec![V::Null, V::Integer(i as i32)]);
+            }
+        }
+        assert_eq!(first, expected);
+    }
+
+    /// RIGHT join `SELECT *` with an empty left side: NULLs for the left
+    /// columns in declared order, right values, schema left ++ right.
+    #[test]
+    fn right_join_select_star_empty_left() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE e (k INTEGER, ev VARCHAR);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv DOUBLE);").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 1.5), (2, 2.5);").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT * FROM e RIGHT JOIN r ON e.k = r.k;"),
+            vec![
+                vec![V::Null, V::Null, V::Integer(1), V::Double(1.5)],
+                vec![V::Null, V::Null, V::Integer(2), V::Double(2.5)],
+            ]
+        );
+        let (names, types) = select_meta(&mut db, "SELECT * FROM e RIGHT JOIN r ON e.k = r.k;");
+        assert_eq!(
+            names,
+            vec!["k".to_string(), "ev".to_string(), "k".to_string(), "rv".to_string()]
+        );
+        assert_eq!(
+            types,
+            vec![DataType::Integer, DataType::Varchar, DataType::Integer, DataType::Double]
+        );
+    }
+
+    /// Wave-20 lexer regression: LEFT/RIGHT/OUTER/FULL/CROSS are keywords, so
+    /// bare `left`/`right` identifiers are rejected everywhere; quoting them
+    /// keeps working as column, table, and alias names.
+    #[test]
+    fn outer_join_reserved_words_reject_bare_identifiers() {
+        let mut db = PinkDb::new();
+        // Bare keyword in column position.
+        assert!(db.execute("CREATE TABLE t (left INTEGER);").is_err());
+        assert!(db.execute("CREATE TABLE t (right INTEGER);").is_err());
+        // Bare keyword in table position.
+        assert!(db.execute("CREATE TABLE left (x INTEGER);").is_err());
+        assert!(db.execute("SELECT * FROM left;").is_err());
+        assert!(db.execute("SELECT * FROM right;").is_err());
+        // Bare keyword as an alias.
+        assert!(db.execute("SELECT 1 AS left;").is_err());
+        assert!(db.execute("SELECT 1 AS right;").is_err());
+        // Quoted identifiers work as column, table, and alias names.
+        db.execute("CREATE TABLE \"left\" (\"right\" INTEGER, x VARCHAR);").unwrap();
+        db.execute("INSERT INTO \"left\" VALUES (1, 'a'), (2, 'b');").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT \"right\" FROM \"left\" ORDER BY 1;"),
+            vec![vec![V::Integer(1)], vec![V::Integer(2)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM \"left\" AS \"right\" ORDER BY x;"),
+            vec![vec![V::Varchar("a".to_string())], vec![V::Varchar("b".to_string())]]
+        );
+        let (names, _) = select_meta(&mut db, "SELECT 1 AS \"left\";");
+        assert_eq!(names, vec!["left".to_string()]);
+    }
+
+    /// Aggregates over a LEFT JOIN: NULL-extended rows count in `COUNT(*)`
+    /// but are skipped by `COUNT(x)`/`SUM`/`AVG`/`MIN`/`MAX` (DuckDB values).
+    #[test]
+    fn left_join_aggregates_skip_null_extended_rows() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (1, 25), (2, NULL), (NULL, 300), (5, 500);")
+            .unwrap();
+        // 5 joined rows: two matches for l.k=1, one for l.k=2, two NULL-extended.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(r.rv), SUM(r.rv), AVG(r.rv), MIN(r.rv), MAX(r.rv)
+                 FROM l LEFT JOIN r ON l.k = r.k;"
+            ),
+            vec![vec![
+                V::Bigint(5),
+                V::Bigint(2),
+                V::Bigint(125),
+                V::Double(62.5),
+                V::Integer(25),
+                V::Integer(100),
+            ]]
+        );
+        // Grouped over the NULL-extended side: the unmatched left rows land in
+        // a NULL group, and COUNT(r.rv) is 0 there. NULLS LAST on ORDER BY.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT r.rv, COUNT(*), COUNT(l.lv)
+                 FROM l LEFT JOIN r ON l.k = r.k GROUP BY r.rv ORDER BY r.rv;"
+            ),
+            vec![
+                vec![V::Integer(25), V::Bigint(1), V::Bigint(1)],
+                vec![V::Integer(100), V::Bigint(1), V::Bigint(1)],
+                vec![V::Null, V::Bigint(3), V::Bigint(3)],
+            ]
+        );
+        // All-unmatched: COUNT(*) still counts the NULL-extended rows.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(r.rv), SUM(r.rv), MIN(r.rv), MAX(r.rv)
+                 FROM l LEFT JOIN r ON l.k = r.k WHERE false;"
+            ),
+            vec![vec![V::Bigint(0), V::Bigint(0), V::Null, V::Null, V::Null]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(r.rv), SUM(r.rv), MIN(r.rv), MAX(r.rv)
+                 FROM (SELECT * FROM l WHERE k > 100) x LEFT JOIN r ON x.k = r.k;"
+            ),
+            vec![vec![V::Bigint(0), V::Bigint(0), V::Null, V::Null, V::Null]]
+        );
+    }
+
+    /// The fused join→aggregate path feeds only matched pairs, so it must
+    /// never fire for outer joins; the materialized path counts the
+    /// NULL-extended rows instead.
+    #[test]
+    fn fusion_rejects_outer_joins() {
+        let db = fused_db();
+        let cx = Cx::new(&db);
+        for sql in [
+            "SELECT COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id;",
+            "SELECT fa.region, COUNT(*), SUM(fb.total) FROM fa LEFT JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
+            "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;",
+        ] {
+            let plan = bound_plan(&db, sql);
+            let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+                unreachable!()
+            };
+            assert!(
+                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                "must not fuse: {sql}"
+            );
+        }
+        // Materialized correctness: 5 left rows, 4 matched pairs for id=1,
+        // 4 for id=2, one NULL-key left row NULL-extended → 9 rows.
+        let mut db = fused_db();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id;"),
+            vec![vec![V::Bigint(9)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(fb.total), SUM(fb.total) FROM fa LEFT JOIN fb ON fa.id = fb.id;"
+            ),
+            vec![vec![V::Bigint(6), V::Double(69.5)]]
+        );
+        // Same aggregate forced through the materialized path explicitly:
+        // the fusion helper must agree with `eval` + `aggregate` (it returns
+        // None, so the query above already ran materialized).
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;"),
+            vec![vec![V::Bigint(10)]]
         );
     }
 

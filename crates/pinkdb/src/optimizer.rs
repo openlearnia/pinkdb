@@ -8,7 +8,7 @@
 
 use crate::exec::expr::eval_expr;
 use crate::plan::LogicalPlan;
-use crate::sql::ast::BinaryOp;
+use crate::sql::ast::{BinaryOp, JoinKind};
 use crate::sql::binder::BoundExpr;
 use crate::types::DataType;
 use crate::vector::DataChunk;
@@ -94,8 +94,9 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(fold_plan(db, *input)),
             predicate: fold_expr(&cx, predicate),
         },
-        LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
+        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
             LogicalPlan::Join {
+                kind,
                 left: Box::new(fold_plan(db, *left)),
                 right: Box::new(fold_plan(db, *right)),
                 left_key: fold_expr(&cx, left_key),
@@ -333,7 +334,7 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             },
             true,
         ),
-        LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
+        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
             let mut keep = Vec::new();
@@ -342,12 +343,37 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             for c in conjuncts {
                 let mut cols = Vec::new();
                 columns_in(&c, &mut cols);
-                if cols.iter().all(|i| *i < left_cols) {
-                    left_push.push(c);
-                } else if cols.iter().all(|i| *i >= left_cols) {
-                    right_push.push(shift_columns(c, left_cols));
-                } else {
-                    keep.push(c);
+                let left_only = cols.iter().all(|i| *i < left_cols);
+                let right_only = cols.iter().all(|i| *i >= left_cols);
+                match kind {
+                    // Inner: split freely (unchanged since wave 3).
+                    JoinKind::Inner => {
+                        if left_only {
+                            left_push.push(c);
+                        } else if right_only {
+                            right_push.push(shift_columns(c, left_cols));
+                        } else {
+                            keep.push(c);
+                        }
+                    }
+                    // Outer joins: only conjuncts over the preserved side's
+                    // own columns may move into that input. Right-side and
+                    // mixed conjuncts stay above the join (they must observe
+                    // NULL-extended rows). Constant conjuncts stay too.
+                    JoinKind::Left => {
+                        if !cols.is_empty() && left_only {
+                            left_push.push(c);
+                        } else {
+                            keep.push(c);
+                        }
+                    }
+                    JoinKind::Right => {
+                        if !cols.is_empty() && right_only {
+                            right_push.push(shift_columns(c, left_cols));
+                        } else {
+                            keep.push(c);
+                        }
+                    }
                 }
             }
             let pushed = !left_push.is_empty() || !right_push.is_empty();
@@ -359,7 +385,7 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                 Some(p) => Box::new(LogicalPlan::Filter { input: right, predicate: p }),
                 None => right,
             };
-            let join = LogicalPlan::Join { left, right, left_key, right_key, left_cols };
+            let join = LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols };
             match and_all(keep) {
                 // Nothing moved below: report unmoved so pushdown terminates.
                 Some(p) => (
@@ -488,8 +514,9 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             exprs,
             names,
         },
-        LogicalPlan::Join { left, right, left_key, right_key, left_cols } => {
+        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
             LogicalPlan::Join {
+                kind,
                 left: Box::new(pushdown(*left)),
                 right: Box::new(pushdown(*right)),
                 left_key,
@@ -582,6 +609,7 @@ mod tests {
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::Join {
+                kind: JoinKind::Inner,
                 left: Box::new(LogicalPlan::SingleRow),
                 right: Box::new(LogicalPlan::SingleRow),
                 left_key: col(0),
@@ -634,6 +662,7 @@ mod tests {
         };
         let plan = LogicalPlan::Filter {
             input: Box::new(LogicalPlan::Join {
+                kind: JoinKind::Inner,
                 left: Box::new(LogicalPlan::SingleRow),
                 right: Box::new(LogicalPlan::SingleRow),
                 left_key: col(0),
@@ -658,6 +687,111 @@ mod tests {
                 }
             }
             _ => panic!("filter should stay above the join"),
+        }
+    }
+
+    fn bool_gt(c: BoundExpr, n: i32) -> BoundExpr {
+        B::Binary {
+            op: BinaryOp::Gt,
+            left: Box::new(c),
+            right: Box::new(B::Literal(Value::Integer(n))),
+            dtype: T::Boolean,
+        }
+    }
+
+    fn and(a: BoundExpr, b: BoundExpr) -> BoundExpr {
+        B::Binary { op: BinaryOp::And, left: Box::new(a), right: Box::new(b), dtype: T::Boolean }
+    }
+
+    fn outer_join(kind: JoinKind) -> LogicalPlan {
+        LogicalPlan::Join {
+            kind,
+            left: Box::new(LogicalPlan::SingleRow),
+            right: Box::new(LogicalPlan::SingleRow),
+            left_key: col(0),
+            right_key: col(0),
+            left_cols: 2,
+        }
+    }
+
+    /// LEFT JOIN: a left-side conjunct pushes into the preserved left input;
+    /// a right-side conjunct stays above (it must see NULL-extended rows).
+    #[test]
+    fn left_join_pushdown_is_kind_aware() {
+        let left_only = bool_gt(col(0), 5);
+        let right_only = bool_gt(col(3), 1);
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_join(JoinKind::Left)),
+            predicate: and(left_only, right_only),
+        };
+        let out = pushdown(plan);
+        // The right-side conjunct stays above the join; the left-side one moved.
+        match out {
+            LogicalPlan::Filter { input, predicate } => {
+                assert_eq!(predicate, bool_gt(col(3), 1));
+                let LogicalPlan::Join { left, right, kind, .. } = *input else { panic!() };
+                assert_eq!(kind, JoinKind::Left);
+                assert_eq!(*left, LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::SingleRow),
+                    predicate: bool_gt(col(0), 5),
+                });
+                assert!(matches!(*right, LogicalPlan::SingleRow));
+            }
+            _ => panic!("right-side predicate must stay above the join"),
+        }
+    }
+
+    /// RIGHT JOIN mirrors: only right-side-only conjuncts push into the
+    /// right input; left-side ones stay above.
+    #[test]
+    fn right_join_pushdown_is_kind_aware() {
+        let left_only = bool_gt(col(0), 5);
+        let right_only = bool_gt(col(3), 1);
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_join(JoinKind::Right)),
+            predicate: and(left_only, right_only),
+        };
+        let out = pushdown(plan);
+        match out {
+            LogicalPlan::Filter { input, predicate } => {
+                assert_eq!(predicate, bool_gt(col(0), 5));
+                let LogicalPlan::Join { left, right, kind, .. } = *input else { panic!() };
+                assert_eq!(kind, JoinKind::Right);
+                assert!(matches!(*left, LogicalPlan::SingleRow));
+                // Shifted into right-input space: index 3 → 1.
+                assert_eq!(*right, LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::SingleRow),
+                    predicate: bool_gt(col(1), 1),
+                });
+            }
+            _ => panic!("left-side predicate must stay above the join"),
+        }
+    }
+
+    /// A mixed-side conjunct never moves below an outer join; a constant
+    /// conjunct stays above too (only column-restricted ones move).
+    #[test]
+    fn outer_join_keeps_mixed_and_constant_conjuncts() {
+        let mixed = B::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(col(0)),
+            right: Box::new(col(3)),
+            dtype: T::Boolean,
+        };
+        let constant = B::Literal(Value::Boolean(false));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(outer_join(JoinKind::Left)),
+            predicate: and(mixed.clone(), constant.clone()),
+        };
+        let out = pushdown(plan);
+        match out {
+            LogicalPlan::Filter { input, predicate } => {
+                assert_eq!(predicate, and(mixed, constant));
+                let LogicalPlan::Join { left, right, .. } = *input else { panic!() };
+                assert!(matches!(*left, LogicalPlan::SingleRow));
+                assert!(matches!(*right, LogicalPlan::SingleRow));
+            }
+            _ => panic!("nothing should push below a LEFT join here"),
         }
     }
 }

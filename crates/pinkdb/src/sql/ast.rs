@@ -1,7 +1,7 @@
 //! SQL AST for the v1 surface.
 //!
 //! Statements: `CREATE TABLE`, `INSERT`, `SELECT` (with an optional single
-//! inner equi-`JOIN`).
+//! equi-`JOIN` — INNER / LEFT [OUTER] / RIGHT [OUTER]).
 
 use crate::types::Value;
 
@@ -97,8 +97,18 @@ pub struct FromClause {
     pub join: Option<JoinClause>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    /// `LEFT [OUTER] JOIN`: preserve every left row (NULL-extend unmatched).
+    Left,
+    /// `RIGHT [OUTER] JOIN`: preserve every right row (NULL-extend unmatched).
+    Right,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinClause {
+    pub kind: JoinKind,
     pub source: FromSource,
     pub alias: Option<String>,
     /// `ON` must be a single equi-condition `a = b` (checked in the binder).

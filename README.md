@@ -78,7 +78,8 @@ UPDATE t SET price = price * 1.1 WHERE id > 1;   -- SET exprs see pre-update val
 DELETE FROM t WHERE price IS NULL;               -- NULL never matches; both are statement-atomic
 BEGIN; UPDATE t SET price = 0; ROLLBACK;         -- flat snapshot transactions (in-memory only)
 SELECT [DISTINCT] expr [AS alias], ...
-FROM t [JOIN u ON t.x = u.y]      -- inner equi-join, single equality
+FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT [OUTER] / RIGHT [OUTER]
+                                  -- equi-join (single equality)
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
   | WITH w AS (SELECT ...) ...     -- CTEs, incl. WITH w(a, b) AS column aliases
 WHERE expr                        -- incl. IS [NOT] NULL, BETWEEN,
@@ -112,7 +113,8 @@ LIMIT n;
 - CSV auto-detects `YYYY-MM-DD` → DATE and `YYYY-MM-DD HH:MM:SS[.f]` → TIMESTAMP
 - Coercion: INTEGER → BIGINT → DOUBLE; `int / int` → DOUBLE (DuckDB rule)
 - Three-valued logic: NULL fails `WHERE`; `COUNT(x)`/`SUM`/`AVG` skip NULLs;
-  NULL group keys group together; NULL join keys never match
+  NULL group keys group together; NULL join keys never match; LEFT/RIGHT
+  joins NULL-extend the unmatched side's columns
 - Integer division/modulo by zero is an error; `0.0` float division is IEEE
 - `SUM` over integers accumulates in i64 (wraps on overflow)
 
@@ -195,7 +197,10 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 
 - No nested transactions or savepoints; snapshots live in memory only
   (crash recovery is future work); `.open` replaces the whole store
-- Correlated subqueries are rejected (uncorrelated only); no outer joins
+- Correlated subqueries are rejected (uncorrelated only); no FULL joins and
+  CROSS joins are rejected
+- `LEFT`/`RIGHT`/`OUTER`/`FULL`/`CROSS` are reserved words; quote identifiers
+  to use them as names (`"left"` works)
 - Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position
 - General ORDER BY expressions must be aliases, positions, or GROUP BY keys

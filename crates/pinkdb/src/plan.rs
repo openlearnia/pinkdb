@@ -1,7 +1,7 @@
 //! Logical plan: Scan → Filter → Join → Aggregate → Window → Project →
 //! Distinct → Sort → Limit (plus DDL/DML and set unions).
 
-use crate::sql::ast::Select;
+use crate::sql::ast::{JoinKind, Select};
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::types::{DataType, Value};
 
@@ -76,11 +76,14 @@ pub enum LogicalPlan {
         /// Input column count (window results start here).
         input_cols: usize,
     },
-    /// Inner equi-join on a single `left_key = right_key` condition.
+    /// Equi-join on a single `left_key = right_key` condition.
     /// Output columns are left ++ right. Keys are side-relative (evaluated
     /// against each input); every other expression above the join uses
-    /// joined-space indices. NULL keys never match.
+    /// joined-space indices. NULL keys never match. `Inner` emits matched
+    /// pairs only; `Left`/`Right` preserve every row of their side
+    /// (NULL-extending the other side's columns when unmatched).
     Join {
+        kind: JoinKind,
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
         left_key: BoundExpr,
