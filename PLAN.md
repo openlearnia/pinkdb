@@ -127,6 +127,28 @@ LIMIT n;
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 
+## Roadmap (post-wave 21)
+
+| Wave | Scope | Packaging |
+|---|---|---|
+| 22 | WAL / crash recovery | core |
+| 23 | Multi-database: `USE <db>`, qualified `db.table`, per-database persistence | core |
+| 24 | Network server: `pinkdb-server` binary + CLI `--host` client mode | separate crate; TLS optional feature |
+| 25 | At-rest encryption: encrypted `.pink` + WAL (AEAD + Argon2id, key via option/env) | core `encryption` feature |
+| 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) | separate crate; contained `unsafe` |
+| 27 | Python binding (cffi) | `bindings/python` |
+| 28 | Go binding (cgo) | `bindings/go` |
+| deferred | Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, Java bindings | separate crates |
+
+Packaging principles:
+- New capabilities ship as separate workspace crates and/or opt-in cargo features; the default
+  `cargo build` stays lean (~2 MB) and links no crypto/TLS/format code.
+- Every wave reports per-artifact release binary size; gates grow a build matrix (default,
+  each feature, each crate) plus a wasm check for the core (`pinkdb` and `pinkdb-parquet`
+  must stay wasm32-compatible; the server is target-gated out of wasm builds).
+- No hand-rolled crypto; audited RustCrypto crates only.
+- Zero-unsafe holds for the core; the C ABI crate is the single, contained exception.
+
 ## Known sharp edges (planned handling)
 
 - GROUP BY keys incl. strings: encode keys as `Vec<u8>` → `HashMap<Vec<u8>, AggState>`.
@@ -134,8 +156,4 @@ Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 - Type coercion matrix across arithmetic/comparison operators.
 - INTEGER overflow in SUM: accumulate integers in i64; document overflow policy.
 
-## Out of scope for v1 (post-v1 roadmap)
-
-UPDATE/DELETE, transactions, window functions, persistence (own on-disk columnar
-format w/ RLE+dictionary+bitpacking), Parquet reader, rayon parallel execution,
-DATE/TIMESTAMP types, subqueries/CTEs.
+Post-v1 roadmap: see "Roadmap (post-wave 21)" above.

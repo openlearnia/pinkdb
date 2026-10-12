@@ -220,8 +220,9 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
   `Parse` error (`expression nesting too deep`) in both parsers instead of
   overflowing the parser stack
 
-Post-v1 ideas: on-disk columnar format (RLE + dictionary + bitpacking),
-Parquet reader, parallel execution, DATE/TIMESTAMP, subqueries/CTEs.
+Post-v1 roadmap: WAL/crash recovery, multi-database (`USE`), network server
+(`pinkdb-server`), at-rest encryption, C/Python/Go language bindings, Parquet
+reader (see PLAN.md).
 
 ## Development
 
