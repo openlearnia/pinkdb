@@ -138,6 +138,18 @@ Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 | 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) | separate crate; contained `unsafe` |
 | 27 | Python binding (cffi) | `bindings/python` |
 | 28 | Go binding (cgo) | `bindings/go` |
+| 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks | separate `pinkdb-ext-loader` crate; contained `unsafe` |
+| 30 | C/C++ extension SDK: ABI headers, templates, examples | in-repo `ext-sdk/c` |
+| 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI | in-repo `ext-sdk/go` |
+| 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) | infra service |
+| 33 | Custom repositories: user-configurable extension repository URLs and config | core config + repo client |
+| 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) | separate crates (storage layer) |
+| 35 | Vortex file format as the default lake data format | format crate / extension |
+| 36 | S3 bucket support for lake storage and file reading | optional `s3` feature (storage provider) |
+| 37 | Documentation website | separate site/track |
+| 38 | Host the website and extension repository on Cloudflare Workers + R2 | infra |
+| 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) | infra/CI workflows |
+| 40 | Performance improvement: ongoing bench-driven speed rounds | core |
 | deferred | Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, Java bindings | separate crates |
 
 Packaging principles:
@@ -147,7 +159,10 @@ Packaging principles:
   each feature, each crate) plus a wasm check for the core (`pinkdb` and `pinkdb-parquet`
   must stay wasm32-compatible; the server is target-gated out of wasm builds).
 - No hand-rolled crypto; audited RustCrypto crates only.
-- Zero-unsafe holds for the core; the C ABI crate is the single, contained exception.
+- Zero-unsafe holds for the core; the C ABI crate is the first, contained exception.
+- Compile-time engine components ship as separate crates/features (waves 22-28) — distinct from
+  waves 29+ loadable extensions, which use a versioned C ABI and a runtime loader (the loader
+  crate is the second contained-`unsafe` location after `pinkdb-ffi`).
 
 ## Known sharp edges (planned handling)
 
