@@ -135,6 +135,22 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
     )
 }
 
+/// True for plans that mutate table data or the table catalog — exactly the
+/// statements a durable commit has to log (view DDL is exempt: views are
+/// session-local and never persisted, so replaying them would not match
+/// `save`/`open` semantics). Control plans (`BEGIN`/`COMMIT`/`ROLLBACK`) are
+/// also false: transaction boundaries are encoded in record shape.
+pub fn writes_tables(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::CreateTable { .. }
+            | LogicalPlan::Insert { .. }
+            | LogicalPlan::Update { .. }
+            | LogicalPlan::Delete { .. }
+            | LogicalPlan::DropTable { .. }
+    )
+}
+
 /// Compare two non-null values. Cross-type numerics compare in i64 when both
 /// are int-like, else f64. Used by comparisons, MIN/MAX, and Sort.
 pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {

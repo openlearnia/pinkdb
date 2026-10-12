@@ -11,7 +11,9 @@
 //! - Numeric widening: INTEGER → BIGINT → DOUBLE. `int / int` → DOUBLE.
 //! - Comparisons need both-numeric, both-VARCHAR, or both-BOOLEAN (equality).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use super::ast::*;
 use crate::plan::LogicalPlan;
@@ -482,6 +484,10 @@ struct Binder<'a> {
     windows: Vec<BoundWindow>,
     /// Visible CTEs: (name, output schema). CTEs shadow catalog tables.
     ctes: Vec<(String, Vec<(String, DataType)>)>,
+    /// Session-local views referenced while binding this statement. Shared
+    /// with child scopes: a mutating statement that depends on one is
+    /// refused on a durable database (the logged SQL could never replay).
+    views_used: Rc<RefCell<Vec<String>>>,
 }
 
 impl<'a> Binder<'a> {
@@ -496,6 +502,7 @@ impl<'a> Binder<'a> {
             in_window: false,
             windows: Vec::new(),
             ctes: Vec::new(),
+            views_used: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -512,7 +519,13 @@ impl<'a> Binder<'a> {
             in_window: false,
             windows: Vec::new(),
             ctes: self.ctes.clone(),
+            views_used: Rc::clone(&self.views_used),
         }
+    }
+
+    /// Session-local views referenced while binding, in first-use order.
+    fn views_used(&self) -> Vec<String> {
+        self.views_used.borrow().clone()
     }
 
     fn lookup_column(&self, table: Option<&str>, col: &str) -> Result<(usize, DataType)> {
@@ -1557,6 +1570,7 @@ fn bind_update(
             return Err(PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string()));
         }
     }
+    reject_view_dependency(db, &binder.views_used())?;
     Ok(LogicalPlan::Update {
         table: t.name.clone(),
         sets: bound_sets,
@@ -1584,6 +1598,7 @@ fn bind_delete(db: &PinkDb, table: &str, where_clause: &Option<Expr>) -> Result<
             return Err(PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string()));
         }
     }
+    reject_view_dependency(db, &binder.views_used())?;
     Ok(LogicalPlan::Delete { table: t.name.clone(), predicate })
 }
 
@@ -1618,6 +1633,7 @@ fn bind_insert(
     // Cells bind in an empty scope: only constants (literals, constant scalar
     // expressions) are accepted; column refs and aggregates fail here.
     let mut bound_rows = Vec::with_capacity(rows.len());
+    let mut views_used: Vec<String> = Vec::new();
     for row in rows {
         if row.len() != order.len() {
             return Err(PinkDbError::Execution(format!(
@@ -1633,11 +1649,32 @@ fn bind_insert(
             binder.allow_win = false;
             let mut aggs = Vec::new();
             let e = binder.bind_expr(cell, &mut aggs, false)?;
+            for v in binder.views_used() {
+                if !views_used.iter().any(|n| n.eq_ignore_ascii_case(&v)) {
+                    views_used.push(v);
+                }
+            }
             bound[order[pos]] = e;
         }
         bound_rows.push(bound);
     }
+    reject_view_dependency(db, &views_used)?;
     Ok(LogicalPlan::Insert { table: t.name.clone(), rows: bound_rows })
+}
+
+/// Durable databases replay committed SQL text, and views are never
+/// checkpointed — so a mutating statement that reads a session-local view
+/// could never be rebuilt during replay (recovery would hard-error
+/// "table not found"). Refuse it at bind time, before any change is made.
+fn reject_view_dependency(db: &PinkDb, views: &[String]) -> Result<()> {
+    if views.is_empty() || !db.is_durable() {
+        return Ok(());
+    }
+    Err(PinkDbError::Execution(format!(
+        "statement reads session-local view \"{}\", which is never persisted; a durable \
+         database cannot replay it — materialize the view into a table first",
+        views[0]
+    )))
 }
 
 /// Bind a top-level SELECT with a fresh binder.
@@ -1849,6 +1886,12 @@ fn bind_source(
                 // Views rebind per use (like derived tables): the scope always
                 // matches the freshly bound plan, so catalog drift surfaces
                 // as errors, never stale indices.
+                {
+                    let mut used = binder.views_used.borrow_mut();
+                    if !used.iter().any(|v| v.eq_ignore_ascii_case(name)) {
+                        used.push(name.clone());
+                    }
+                }
                 let view = view.clone();
                 let mut child = binder.child();
                 let sub = bind_select_in(child.db, &mut child, &view.query)?;

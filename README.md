@@ -147,6 +147,49 @@ rayon pool; anything else goes through the `csv` crate sequentially.
 Round-trips are bit-exact (including `-0.0` and NaN payloads); truncated or
 corrupt files return errors, never panics.
 
+Durable opens add a sidecar write-ahead log: `PinkDb::open_durable("x.pink")`
+(the REPL's `.open`) loads the checkpoint, recovers an interrupted checkpoint,
+replays `x.pink.wal`, then logs each committed transaction unit — an
+autocommit statement individually, `BEGIN..COMMIT` as one record at `COMMIT`
+(a `ROLLBACK` or conflict abort logs nothing). `SyncPolicy::Sync` fsyncs every
+record; `Batch` fsyncs on `flush_wal`/checkpoint. The `.pink` file format
+itself is unchanged.
+
+The WAL format is `PINKWAL1` + version `2` + a generation number, and rolled
+generations are named `<wal>.<gen>.roll`. A checkpoint writes `.pink.tmp`
+(fsynced, directory fsynced), renames the live WAL to
+`.wal.<gen>.roll` and starts a fresh WAL of generation `gen + 1`, publishes
+`.pink.tmp` with an atomic rename, then removes the roll. Recovery never
+removes anything before the recovered state is durable:
+
+- `.tmp` present and the live WAL still has records: the live WAL is
+  authoritative, `.tmp` (possibly a partial write) is discarded.
+- `.tmp` present and the live WAL is empty/absent/torn: the checkpoint
+  reached its WAL roll, which proves `.tmp` was fully written, so `.tmp` is
+  *published* first and the rolls are removed afterwards.
+- no `.tmp`: every roll is already folded into `.pink`; its generation (and
+  the live WAL generation) must prove that, otherwise recovery refuses rather
+  than delete uncertain records.
+
+Recovery is idempotent, a crash inside recovery re-runs from the same files,
+and a torn WAL header (a file no longer than one header) is recreated while
+invalid magic/version on a file that carries records is a hard error. A
+mid-file framing corruption (short record, bad CRC, or a non-continuous LSN)
+stops replay at the first bad record; later committed records are dropped and
+the discarded byte count is reported (`RecoveryInfo::truncated_bytes`). A
+CRC-valid record that fails to parse, bind, or execute is a hard error —
+committed data is never silently dropped.
+
+Durability notes: `.save <bound path>` checkpoints; the target is compared by
+filesystem identity, so `./x.pink`, absolute paths and case-only differences
+compare equal. `.save <other>` is a plain snapshot and is refused when the
+target has a sidecar WAL with committed records. `.import` is made durable by
+a checkpoint before it returns (and is refused inside a transaction), so an
+import survives a crash immediately after it acks. A mutating statement that
+reads a session-local view is refused on durable databases: views are never
+persisted, so replaying its logged SQL could not rebuild it. A database file
+is single-writer (no file locking); run one process per `.pink` path.
+
 Each ≤2048-row column chunk picks its smallest encoding: integers choose
 between raw, RLE, and bitpacking (min + width + packed bits); doubles raw or
 RLE; booleans bitpacked or RLE; strings raw, dictionary (u32 codes), or RLE.
@@ -203,8 +246,10 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 
 ## Known v1 limits
 
-- No nested transactions or savepoints; snapshots live in memory only
-  (crash recovery is future work); `.open` replaces the whole store
+- No nested transactions or savepoints; one process per `.pink` path
+  (single-writer: no file locking is taken); `.open` replaces the whole store
+- Durable commits refuse statements that read a session-local view (views are
+  never persisted); `.import` checkpoints, so it needs a settled transaction
 - Correlated subqueries are rejected (uncorrelated only); no FULL joins and
   CROSS joins are rejected
 - `LEFT`/`RIGHT`/`OUTER`/`FULL`/`CROSS` are reserved words; quote identifiers
@@ -220,7 +265,7 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
   `Parse` error (`expression nesting too deep`) in both parsers instead of
   overflowing the parser stack
 
-Post-v1 roadmap: WAL/crash recovery, multi-database (`USE`), network server
+Post-v1 roadmap: multi-database (`USE`), network server
 (`pinkdb-server`), at-rest encryption, C/Python/Go language bindings, Parquet
 reader (see PLAN.md).
 

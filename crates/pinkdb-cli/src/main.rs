@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use pinkdb::{DataType, PinkDb, QueryResult, Value};
+use pinkdb::{DataType, PinkDb, QueryResult, SyncPolicy, Value};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -21,8 +21,8 @@ fn print_help() {
     println!("  .tables                list tables");
     println!("  .schema <table>        show table schema");
     println!("  .import <file.csv> [table]  import CSV (table defaults to file stem)");
-    println!("  .save <file.pink>      persist every table to disk");
-    println!("  .open <file.pink>      replace the database with a saved file");
+    println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
+    println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     println!("SQL: end statements with `;`.");
 }
 
@@ -93,7 +93,20 @@ fn run_dot(db: &mut PinkDb, line: &str) -> bool {
                 println!("Usage: .save <file.pink>");
             } else {
                 let t0 = Instant::now();
-                match db.save(path) {
+                // Saving to the bound database is a checkpoint: atomic
+                // publish plus a WAL generation roll. The target is compared
+                // by filesystem identity, so `./x.pink`, absolute paths, and
+                // case-only differences on case-insensitive filesystems all
+                // checkpoint instead of silently snapshotting (which would
+                // let the WAL replay committed rows twice). Any other target
+                // is a snapshot, refused when it would clobber another
+                // database whose WAL still holds records.
+                let result = if db.is_bound_to(path) {
+                    db.checkpoint()
+                } else {
+                    db.save_snapshot(path)
+                };
+                match result {
                     Ok(()) => {
                         if !db.list_views().is_empty() {
                             println!("Note: views are session-local and were not saved.");
@@ -109,8 +122,23 @@ fn run_dot(db: &mut PinkDb, line: &str) -> bool {
             if path.is_empty() {
                 println!("Usage: .open <file.pink>");
             } else {
-                match PinkDb::open(path) {
-                    Ok(new_db) => {
+                match PinkDb::open_durable_with(path, SyncPolicy::Sync) {
+                    Ok((new_db, info)) => {
+                        if info.checkpoints_completed > 0 {
+                            println!("Completed an interrupted checkpoint from its .tmp state");
+                        }
+                        if info.replayed_records > 0 {
+                            println!(
+                                "Replayed {} WAL record(s) ({} statement(s))",
+                                info.replayed_records, info.replayed_statements
+                            );
+                        }
+                        if info.truncated_bytes > 0 {
+                            println!(
+                                "Truncated {} byte(s) of torn WAL tail",
+                                info.truncated_bytes
+                            );
+                        }
                         *db = new_db;
                         println!("Opened {path}");
                     }

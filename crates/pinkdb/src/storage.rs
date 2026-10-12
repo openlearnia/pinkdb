@@ -5,11 +5,12 @@
 //! thread. No persistence in v1.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::sql::ast::Select;
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
+use crate::wal::Wal;
 
 /// One column: its schema + its chunk list.
 #[derive(Debug, Clone)]
@@ -375,11 +376,23 @@ pub struct ViewDef {
 /// Holds an optional transaction snapshot (`BEGIN` clones the whole store;
 /// `ROLLBACK` restores it, `COMMIT` drops it). Single connection, so
 /// transactions give multi-statement atomicity, not isolation.
+///
+/// Durable databases (opened via [`PinkDb::open_durable`]) additionally carry
+/// a write-ahead log: committed statements are appended as records, and
+/// `COMMIT` flushes the transaction's statements as one record. Clones share
+/// the WAL handle (`Arc`), so transaction snapshots and multi-writer
+/// `txn.work` copies all log to the same file. In-memory databases have
+/// `wal == None` and are byte-for-byte unchanged.
 #[derive(Debug, Default, Clone)]
 pub struct PinkDb {
     tables: HashMap<String, DataTable>,
     views: HashMap<String, ViewDef>,
     txn_snapshot: Option<Box<PinkDb>>,
+    /// Durable WAL handle, shared by every clone of this store.
+    pub(crate) wal: Option<Arc<Mutex<Wal>>>,
+    /// SQL text of mutating statements executed since `BEGIN` of a durable
+    /// transaction; flushed as one WAL record by [`PinkDb::commit`].
+    wal_txn: Vec<String>,
 }
 
 impl PinkDb {
@@ -417,6 +430,46 @@ impl PinkDb {
         self.txn_snapshot.is_some()
     }
 
+    /// True when this database logs commits to a WAL.
+    pub fn is_durable(&self) -> bool {
+        self.wal.is_some()
+    }
+
+    pub(crate) fn durable_handle(&self) -> Option<Arc<Mutex<Wal>>> {
+        self.wal.clone()
+    }
+
+    /// WAL hook for one statement that has just committed successfully
+    /// (autocommit) — or was executed inside an open transaction, in which
+    /// case its text is buffered until `COMMIT`. Non-mutating statements
+    /// (queries, view DDL) never reach the WAL.
+    pub(crate) fn wal_log_statement(
+        &mut self,
+        plan: &crate::plan::LogicalPlan,
+        sql: &str,
+    ) -> Result<()> {
+        if !crate::plan::writes_tables(plan) {
+            return Ok(());
+        }
+        if self.in_transaction() {
+            self.wal_txn.push(sql.to_string());
+            return Ok(());
+        }
+        self.wal_append(&[sql.to_string()])
+    }
+
+    /// Append one committed unit (one autocommit statement, or every mutating
+    /// statement of a committed transaction) to the WAL. No-op in memory.
+    pub(crate) fn wal_append(&mut self, stmts: &[String]) -> Result<()> {
+        if let Some(wal) = self.durable_handle() {
+            let mut guard = wal.lock().map_err(|_| {
+                PinkDbError::Execution("internal lock error (poisoned)".to_string())
+            })?;
+            guard.append(stmts)?;
+        }
+        Ok(())
+    }
+
     /// Open a transaction: snapshot the whole store. Fails if one is open
     /// (flat transactions only — no savepoints in v1).
     pub fn begin(&mut self) -> Result<()> {
@@ -425,26 +478,41 @@ impl PinkDb {
                 "already in a transaction".to_string(),
             ));
         }
+        self.wal_txn.clear();
         self.txn_snapshot = Some(Box::new(self.clone()));
         Ok(())
     }
 
-    /// Commit: drop the snapshot, keeping all changes.
+    /// Commit: make the transaction's statements durable (one WAL record),
+    /// then drop the snapshot, keeping all changes. A WAL failure returns the
+    /// error and leaves the transaction open (nothing was published).
     pub fn commit(&mut self) -> Result<()> {
-        match self.txn_snapshot.take() {
-            Some(_) => Ok(()),
-            None => Err(PinkDbError::Execution(
+        if self.txn_snapshot.is_none() {
+            return Err(PinkDbError::Execution(
                 "no transaction in progress".to_string(),
-            )),
+            ));
         }
+        if !self.wal_txn.is_empty() {
+            let stmts = std::mem::take(&mut self.wal_txn);
+            if let Err(e) = self.wal_append(&stmts) {
+                // Keep the statements: a retried COMMIT must never publish
+                // changes that made it to memory but not to the WAL.
+                self.wal_txn = stmts;
+                return Err(e);
+            }
+        }
+        self.wal_txn.clear();
+        self.txn_snapshot = None;
+        Ok(())
     }
 
     /// Roll back: restore the snapshot, discarding all changes since BEGIN
-    /// (data and catalog alike).
+    /// (data and catalog alike); nothing is logged.
     pub fn rollback(&mut self) -> Result<()> {
         match self.txn_snapshot.take() {
             Some(snap) => {
                 *self = *snap;
+                self.wal_txn.clear();
                 Ok(())
             }
             None => Err(PinkDbError::Execution(

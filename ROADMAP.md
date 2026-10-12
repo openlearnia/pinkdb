@@ -44,7 +44,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 19 | Join fast path: integer-key specialization + fused join→aggregate (no row materialization) | done | 773bf10 — 193 lib + 3 CLI tests, duckdiff 56/56, join_self 64→~9 ms |
 | 20 | Outer joins: LEFT/RIGHT equi-joins (NULL-extended unmatched rows), join-kind-aware pushdown | done | 4637827 — 208 lib + 3 CLI tests, duckdiff 60/60, bench total 493 ms |
 | 21 | PEG parser (`peg` crate) in parallel with recursive descent; differential-tested; default flipped | done | f4ce500 — 223 lib + 3 CLI tests both parser modes, duckdiff 60/60 both modes; docs follow-ups 709ede4, 6dfb8c4 |
-| 22 | WAL / crash recovery (core) | in progress | — |
+| 22 | WAL / crash recovery (core) | done | 253 lib + 3 CLI unit + 9 CLI integration tests; duckdiff 60/60; kill loop 100/100 random + 40/40 targeted clean (dev runs: 600 + 190); bench ≈498 ms |
 | 23 | Multi-database: `USE <db>`, qualified `db.table`, per-database persistence (core) | queued | — |
 | 24 | Network server: `pinkdb-server` binary + CLI `--host` client mode (separate crate; TLS optional feature) | queued | — |
 | 25 | At-rest encryption: encrypted `.pink` + WAL (AEAD + Argon2id, key via option/env) (core `encryption` feature) | queued | — |
@@ -81,5 +81,11 @@ Java bindings.
 - 2026-10-12 — Wave 21 (f4ce500): PEG parser default (legacy via `PINKDB_PARSER=legacy`),
   differential-tested. 223 lib + 3 CLI tests both modes, duckdiff 60/60 both modes; docs
   follow-ups 709ede4 and 6dfb8c4.
-- 2026-10-12 — Binary size: 1.96 MB (release CLI, measured after wave 21; pre-wave-17 was
+- 2026-10-12 — Wave 22: WAL / crash recovery — WAL v2 generation scheme (sidecar `.pink.wal`,
+  roll files `<wal>.<gen>.roll`, recovery publishes before deleting, crash-idempotent); durable
+  `.import` checkpoints; `.save` path identity; view-dependent DML refused on durable DBs;
+  crash tests + kill-loop harness `bench/kill_loop.py`. 253 lib + 3 CLI unit + 9 CLI
+  integration tests, duckdiff 60/60, kill loop 100/100 random + 40/40 targeted clean,
+  bench ≈498 ms.
+- 2026-10-12 — Binary size: 2.11 MB (release CLI, measured after wave 22; pre-wave-17 was
   2.26 MB).

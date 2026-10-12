@@ -38,12 +38,37 @@ impl Database {
         Self::default()
     }
 
+    /// Open a durable database at `path`: load the `.pink` checkpoint (if
+    /// present), replay `<path>.pink.wal` (stopping at a torn tail), and log
+    /// every subsequent commit to that WAL.
+    pub fn open(path: &str) -> Result<Database> {
+        Ok(Database::from_store(PinkDb::open_durable(path)?))
+    }
+
     pub fn from_store(store: PinkDb) -> Self {
         Self { shared: Arc::new(RwLock::new(store)) }
     }
 
     pub fn connect(&self) -> Connection {
         Connection { db: self.clone(), txn: None }
+    }
+
+    /// True when this database logs commits to a WAL.
+    pub fn is_durable(&self) -> bool {
+        self.shared.read().map(|g| g.is_durable()).unwrap_or(false)
+    }
+
+    /// Checkpoint the durable store: atomically write the bound `.pink` and
+    /// roll the WAL generation. Errors for in-memory databases.
+    pub fn checkpoint(&self) -> Result<()> {
+        let mut shared = self.shared.write().map_err(lock_err)?;
+        shared.checkpoint()
+    }
+
+    /// fsync the WAL (meaningful with [`crate::SyncPolicy::Batch`]).
+    pub fn flush_wal(&self) -> Result<()> {
+        let mut shared = self.shared.write().map_err(lock_err)?;
+        shared.flush_wal()
     }
 }
 
@@ -56,6 +81,9 @@ struct Txn {
     /// Tables / views created, dropped, or written.
     table_writes: HashSet<String>,
     view_writes: HashSet<String>,
+    /// SQL text of this transaction's mutating statements: one WAL record at
+    /// COMMIT (empty for read-only transactions, which log nothing).
+    wal_stmts: Vec<String>,
 }
 
 /// One connection: single-threaded statement stream, own transaction state.
@@ -69,14 +97,32 @@ impl Connection {
     /// Multi-statement strings mix freely (each statement locks as needed).
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
         let stmts = crate::sql::parse_statements(sql)?;
+        // Only durable stores need the per-statement source text for the WAL.
+        let texts = if self.db.is_durable() {
+            let texts = crate::sql::statement_texts(sql)?;
+            if texts.len() != stmts.len() {
+                return Err(PinkDbError::Execution(
+                    "internal error: statement source split disagrees with the parser"
+                        .to_string(),
+                ));
+            }
+            Some(texts)
+        } else {
+            None
+        };
         let mut out = Vec::with_capacity(stmts.len());
-        for stmt in &stmts {
-            out.push(self.execute_one(stmt)?);
+        for (i, stmt) in stmts.iter().enumerate() {
+            let text = texts.as_ref().map(|t| t[i].as_str());
+            out.push(self.execute_one(stmt, text)?);
         }
         Ok(out)
     }
 
-    fn execute_one(&mut self, stmt: &crate::sql::ast::Statement) -> Result<QueryResult> {
+    fn execute_one(
+        &mut self,
+        stmt: &crate::sql::ast::Statement,
+        sql_text: Option<&str>,
+    ) -> Result<QueryResult> {
         // Transaction control never touches table data: handle first.
         match stmt {
             crate::sql::ast::Statement::Begin => return self.txn_begin(),
@@ -88,7 +134,15 @@ impl Connection {
             Some(txn) => {
                 let plan = crate::sql::bind(&txn.work, stmt)?;
                 record_writes(&plan, &mut txn.table_writes, &mut txn.view_writes);
-                crate::exec::run(&mut txn.work, &plan)
+                let result = crate::exec::run(&mut txn.work, &plan)?;
+                // Buffer the committed statement for the transaction's single
+                // WAL record (flushed by txn_commit; never by ROLLBACK).
+                if let Some(text) = sql_text {
+                    if crate::plan::writes_tables(&plan) {
+                        txn.wal_stmts.push(text.to_string());
+                    }
+                }
+                Ok(result)
             }
             None => {
                 // Bind under a read lock; run reads shared, writes exclusive.
@@ -103,7 +157,15 @@ impl Connection {
                     crate::exec::run_read(&shared, &plan)
                 } else {
                     let mut shared = self.db.shared.write().map_err(lock_err)?;
-                    crate::exec::run(&mut shared, &plan)
+                    let result = crate::exec::run(&mut shared, &plan)?;
+                    // The write is published: log it while still holding the
+                    // lock so WAL order matches commit order.
+                    if let Some(text) = sql_text {
+                        if crate::plan::writes_tables(&plan) {
+                            shared.wal_append(&[text.to_string()])?;
+                        }
+                    }
+                    Ok(result)
                 }
             }
         }
@@ -124,6 +186,7 @@ impl Connection {
             base_views: shared.clone_views(),
             table_writes: HashSet::new(),
             view_writes: HashSet::new(),
+            wal_stmts: Vec::new(),
         };
         drop(shared);
         self.txn = Some(txn);
@@ -153,6 +216,12 @@ impl Connection {
             if now != base {
                 return Err(conflict(&format!("view \"{name}\"")));
             }
+        }
+        // Validation passed: make the transaction durable first, then merge
+        // (the merge itself cannot fail). A conflict abort returns above and
+        // therefore never logs.
+        if !txn.wal_stmts.is_empty() {
+            shared.wal_append(&txn.wal_stmts)?;
         }
         // Merge: swap written tables (carrying bumped versions) and views.
         for name in &txn.table_writes {

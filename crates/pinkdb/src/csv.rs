@@ -526,7 +526,41 @@ fn load_bytes(db: &mut PinkDb, table: &str, data: &[u8]) -> Result<usize> {
     }
 }
 
+/// An import has no SQL text to log, so a durable database cannot replay it
+/// like a statement. Refuse an import inside an open transaction (the
+/// checkpoint that would make it durable needs a settled transaction).
+fn require_settled_import(db: &PinkDb) -> Result<()> {
+    if db.is_durable() && db.in_transaction() {
+        return Err(PinkDbError::Execution(
+            "cannot import into a durable database inside a transaction; commit or roll \
+             back first (a durable import needs its own checkpoint)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Make a successful import durable: in durable mode a checkpoint publishes
+/// the imported rows atomically and rolls the WAL, so a crash right after the
+/// import returns still sees them. The import creates a fresh table, so a
+/// checkpoint failure rolls the table back out of memory — a failed import is
+/// never half-visible.
+fn make_import_durable(db: &mut PinkDb, table: &str, rows: usize) -> Result<usize> {
+    if !db.is_durable() {
+        return Ok(rows);
+    }
+    match db.checkpoint() {
+        Ok(()) => Ok(rows),
+        Err(e) => {
+            db.drop_table(table).ok();
+            Err(e)
+        }
+    }
+}
+
 /// Import a CSV file into `table` (default: file stem). Returns rows loaded.
+/// On a durable database the import is durable before returning (atomic
+/// checkpoint publish + WAL roll); in memory it is a no-op extra step.
 pub fn import_csv(db: &mut PinkDb, path: &str, table: Option<&str>) -> Result<usize> {
     let data = std::fs::read(path)?;
     let owned: String;
@@ -537,16 +571,21 @@ pub fn import_csv(db: &mut PinkDb, path: &str, table: Option<&str>) -> Result<us
             &owned
         }
     };
-    load_bytes(db, table_name, &data)
+    require_settled_import(db)?;
+    let rows = load_bytes(db, table_name, &data)?;
+    make_import_durable(db, table_name, rows)
 }
 
-/// Import CSV text (header + rows) — used by tests and the REPL.
+/// Import CSV text (header + rows) — used by tests and the REPL. Durable
+/// databases checkpoint the import before returning, like [`import_csv`].
 pub fn import_csv_string(
     db: &mut PinkDb,
     table: &str,
     csv_text: &str,
 ) -> Result<usize> {
-    load_bytes(db, table, csv_text.as_bytes())
+    require_settled_import(db)?;
+    let rows = load_bytes(db, table, csv_text.as_bytes())?;
+    make_import_durable(db, table, rows)
 }
 
 #[cfg(test)]
@@ -869,5 +908,51 @@ mod tests {
             assert_eq!(t.get(i, 0), Some(Value::Integer(i as i32)));
             assert_eq!(t.get(i, 1), Some(Value::Varchar(format!("v{i}"))));
         }
+    }
+
+    /// Durable imports are made durable before returning (atomic `.pink`
+    /// publish + WAL roll): a reopen sees the rows with no import record to
+    /// replay, and later logged DML replays cleanly on top of them.
+    #[test]
+    fn durable_import_checkpoints_and_survives_reopen() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pinkdb_csv_durable_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ckpt = dir.join("imp.pink");
+        let path = ckpt.to_str().unwrap().to_string();
+        {
+            let (mut db, _) =
+                PinkDb::open_durable_with(&path, crate::SyncPolicy::Sync).unwrap();
+            // A brand-new table: without the checkpoint the import would
+            // vanish (and later DML would brick replay: "table not found").
+            assert_eq!(import_csv_string(&mut db, "imp", "a\n1\n2\n3\n").unwrap(), 3);
+            assert!(ckpt.exists(), "the import must publish a checkpoint");
+            // Logged DML after the import goes to the fresh WAL generation.
+            db.execute("INSERT INTO imp VALUES (4);").unwrap();
+            // An import inside a durable transaction is refused before it
+            // changes anything (it could not be replayed).
+            db.execute("BEGIN;").unwrap();
+            assert!(import_csv_string(&mut db, "inside", "a\n9\n").is_err());
+            db.execute("ROLLBACK;").unwrap();
+        }
+        let (back, info) =
+            PinkDb::open_durable_with(&path, crate::SyncPolicy::Sync).unwrap();
+        assert_eq!(info.replayed_records, 1, "only the post-import INSERT");
+        let t = back.table("imp").unwrap();
+        assert_eq!(t.num_rows(), 4);
+        let vals: Vec<i64> = (0..4)
+            .map(|r| match t.get(r, 0).unwrap() {
+                Value::Integer(i) => i as i64,
+                other => panic!("expected INTEGER, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec![1, 2, 3, 4]);
+        assert!(back.table("inside").is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

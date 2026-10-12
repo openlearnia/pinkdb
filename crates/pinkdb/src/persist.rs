@@ -735,9 +735,9 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
 // ---------- public API ----------
 
 impl PinkDb {
-    /// Write every table to `path` in the `.pink` columnar format.
-    /// Tables are stored in sorted name order (deterministic bytes).
-    pub fn save(&self, path: &str) -> Result<()> {
+    /// Serialize every table in the `.pink` columnar format. Tables are
+    /// stored in sorted name order (deterministic bytes).
+    fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut w = Writer::new();
         w.bytes(MAGIC);
         let mut names = self.list_tables();
@@ -790,7 +790,23 @@ impl PinkDb {
                 }
             }
         }
-        std::fs::write(path, &w.buf)?;
+        Ok(w.buf)
+    }
+
+    /// Write every table to `path` in the `.pink` columnar format.
+    /// Tables are stored in sorted name order (deterministic bytes).
+    pub fn save(&self, path: &str) -> Result<()> {
+        std::fs::write(path, self.to_bytes()?)?;
+        Ok(())
+    }
+
+    /// [`PinkDb::save`] plus `fsync` on the written file — the checkpoint
+    /// primitive (the WAL is only rolled once this returns).
+    pub(crate) fn save_sync(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(&self.to_bytes()?)?;
+        f.sync_all()?;
         Ok(())
     }
 
