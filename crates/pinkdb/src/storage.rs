@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::crypto::EncryptionKey;
 use crate::sql::ast::Select;
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
@@ -414,6 +415,10 @@ pub struct PinkDb {
     /// Session database before the first statement of the open transaction's
     /// WAL record (the record replays in that session).
     wal_txn_db: Option<String>,
+    /// At-rest key this store was opened/configured with. Checkpoints and
+    /// snapshots of a keyed store are written encrypted (feature
+    /// `encryption`); [`PinkDb::save`] stays a plaintext explicit API.
+    pub(crate) encryption_key: Option<EncryptionKey>,
 }
 
 impl Default for PinkDb {
@@ -448,7 +453,26 @@ impl PinkDb {
             wal: None,
             wal_txn: Vec::new(),
             wal_txn_db: None,
+            encryption_key: None,
         }
+    }
+
+    /// Configure the at-rest key used by checkpoints and snapshots of this
+    /// store (`None` = plaintext). The keyed APIs set this automatically;
+    /// this setter exists for stores that are configured before a file is
+    /// opened (e.g. the REPL reading `PINKDB_KEY` at startup). With the
+    /// `encryption` feature off, a keyed save fails clearly instead of
+    /// silently writing plaintext. Changing the key (or its presence) on a
+    /// store that already has a live WAL is refused at the next
+    /// [`PinkDb::checkpoint`]: the `.pink` and the WAL generation must stay
+    /// in one mode and under one key, so a mode/key change needs a reopen.
+    pub fn set_encryption_key(&mut self, key: Option<EncryptionKey>) {
+        self.encryption_key = key;
+    }
+
+    /// The at-rest key this store writes with, if any.
+    pub fn encryption_key(&self) -> Option<&EncryptionKey> {
+        self.encryption_key.as_ref()
     }
 
     /// The embedded session's current database (lowercased).

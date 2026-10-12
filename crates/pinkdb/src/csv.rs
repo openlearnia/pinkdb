@@ -693,6 +693,20 @@ pub fn import_csv_string(
 mod tests {
     use super::*;
 
+    /// A unique scratch directory per call (pid + process-wide counter):
+    /// concurrent tests and concurrent `cargo test` invocations cannot race.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "pinkdb_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     const SALES: &str = "id,region,total,active\n\
                          1,west,10.5,true\n\
                          2,east,,FALSE\n\
@@ -737,14 +751,16 @@ mod tests {
 
     #[test]
     fn import_csv_file_defaults_to_stem() {
-        let dir = std::env::temp_dir();
+        // The *stem* must stay stable (it names the table); a unique
+        // directory keeps concurrent invocations from racing on the file.
+        let dir = scratch_dir("csv_stem");
         let path = dir.join("pinkdb_test_sales.csv");
         std::fs::write(&path, SALES).unwrap();
         let mut db = PinkDb::new();
         let n = import_csv(&mut db, path.to_str().unwrap(), None).unwrap();
         assert_eq!(n, 3);
         assert!(db.table("pinkdb_test_sales").is_ok());
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -869,11 +885,12 @@ mod tests {
         let mut db = PinkDb::new();
         let bytes = b"a,b\n\xff\xfe,2\n";
         // load_bytes is private; exercise through a temp file.
-        let path = std::env::temp_dir().join("pinkdb_badutf.csv");
+        let dir = scratch_dir("csv_badutf");
+        let path = dir.join("badutf.csv");
         std::fs::write(&path, bytes).unwrap();
         assert!(import_csv(&mut db, path.to_str().unwrap(), None).is_err());
         assert!(db.list_tables().is_empty());
-        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -64,13 +64,16 @@ SQL text
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
 | `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
 | `pinkdb::persist` | `.pink` single-file columnar persistence, v2 (databases + RLE/dictionary/bitpack; v1 files load) |
+| `pinkdb::crypto` | optional at-rest encryption (`PINKENC1` container: AES-256-GCM + Argon2id) behind the `encryption` feature; a parse/identity stub otherwise |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
 
 Design rules: Rust edition 2021, zero async, no unsafe. Dependencies are
 `csv` + `rustyline`, plus `rayon` for parallel execution and `peg` for the
-SQL parser. The server crate adds no external dependencies.
+SQL parser. The server crate adds no external dependencies. With the
+`encryption` feature the audited RustCrypto crates `aes-gcm` + `argon2` are
+linked (optional dependencies: the default build stays crypto-free).
 
 SQL is parsed by a `peg`-generated grammar; the hand-written lexer +
 recursive-descent parser stays selectable via `PINKDB_PARSER=legacy`. A
@@ -237,7 +240,85 @@ a checkpoint before it returns (and is refused inside a transaction), so an
 import survives a crash immediately after it acks. A mutating statement that
 reads a session-local view is refused on durable databases: views are never
 persisted, so replaying its logged SQL could not rebuild it. A database file
-is single-writer (no file locking); run one process per `.pink` path.
+is single-writer: no file locking is taken, so run one process per `.pink`
+path. Two processes on one durable database corrupt the WAL framing at best;
+on an encrypted database they can also seal two records under one
+`(key, nonce)` (both writers append under the same container prefix), which is
+keystream reuse, not merely corruption. The keyed open rebuilds the WAL with a
+fresh nonce prefix at open time, which shrinks but does not remove that race; a
+lockfile is deliberately not taken (stale-lock handling would be fragile), so
+the single-writer precondition stays documented and enforced by convention.
+
+### Encryption (feature `encryption`)
+
+At-rest encryption is opt-in: `cargo build --features encryption` links the
+audited RustCrypto crates `aes-gcm` (AES-256-GCM) and `argon2` (Argon2id); the
+default build stays crypto-free and unencrypted files are byte-identical.
+`PinkDb::save_with_key` / `open_with_key` write and read `PINKENC1`
+containers; `open_durable_with_key` (and the multi-writer
+`Database::open_with_key`) apply the same key to the sidecar WAL, and a keyed
+store's checkpoints and snapshots encrypt as well.
+
+The container is a plaintext header (magic `PINKENC1`, version, cipher id,
+KDF id + parameters + salt, a random per-container nonce prefix, and an AEAD
+key-check block) followed by AEAD-sealed payloads: 1 MiB segments for a
+checkpoint, one unit per WAL record (with the LSN bound into the AAD). The
+nonce is `prefix || counter`, counters are unique per container. A keyed open
+rebuilds the WAL with a fresh random prefix on **every** open (re-sealing the
+intact records atomically), not only after a torn-tail truncation: a file cut
+exactly at a record boundary — a `Batch`-mode tail lost at a boundary, or a
+restored older backup — is byte-identical to a cleanly shorter WAL, so only a
+fresh prefix guarantees the discarded record's `(key, nonce, AAD)` is never
+handed out again. Checkpoint containers end with a terminal zero-length
+segment, so a container cut at a segment boundary is rejected instead of
+loading a silently shorter database. Encrypted WAL records always frame
+`crc = 0` (GCM authenticates the payload); a nonzero crc on a record whose
+ciphertext authenticates is refused as framing tampering. Keys are zeroed on
+drop on a best-effort basis (safe writes only, no unsafe).
+
+The key is a raw 32-byte key or a passphrase stretched with Argon2id (defaults
+m=19 MiB, t=2, p=1; the salt and parameters live in the header, so raising the
+defaults later keeps old files readable). Header parameters are validated on
+read against a small multiple of the defaults (m ≤ 76 MiB, t ≤ 4, p ≤ 4, and
+`m·t` ≤ 8× the default work), so a crafted header cannot make an open burn
+minutes deriving (the worst accepted combination costs ≈ 0.11 s in release
+here):
+
+```rust
+use pinkdb::{EncryptionKey, PinkDb};
+
+let key = EncryptionKey::from_passphrase("correct horse battery staple");
+db.save_with_key("x.pink", &key)?;                       // encrypted snapshot
+let db = PinkDb::open_with_key("x.pink", &key)?;         // decrypts
+let db = PinkDb::open_durable_with_key("x.pink", &key)?; // encrypted WAL
+```
+
+The REPL reads `PINKDB_KEY` from the environment: `.save` writes encrypted and
+`.open` decrypts (the durable WAL uses the same key); unset, behavior is
+byte-identical to an unkeyed build. The value must be valid UTF-8: a
+set-but-non-UTF-8 variable is a hard error (exit 2) instead of a silent
+fallback to plaintext, and remote mode (`--host`) warns that the variable is
+inert (the server's own configuration applies; `pinkdb-server` has no key
+option, so its `--file` must be a plaintext database). A wrong key (or a
+tampered header) fails the key-check block with a clear `wrong key` error,
+never "corrupt file". A tampered payload byte fails AEAD authentication: for a
+`.pink` checkpoint that is a hard error (loads are all-or-nothing), and for the
+WAL a complete record that fails authentication with more records after it is
+a hard error too — at the very tail it is indistinguishable from a torn write,
+so the wave-22 torn-tail policy applies and the tail is truncated. Encrypted
+and plaintext artifacts never mix: a keyed open refuses a plaintext
+checkpoint/WAL and a plaintext open refuses an encrypted one, so a key can
+never be silently ignored; without the feature, opening an encrypted file
+reports `file is encrypted; build with the encryption feature`. A live store's
+mode and key are fixed at open: changing `set_encryption_key` afterwards is
+refused at the next `checkpoint()` (`cannot change encryption mode on a live
+store; reopen it instead`), and `save_snapshot` refuses a target `.pink` or
+sidecar WAL in the other mode or under a different key. Nothing but the
+header is readable in the clear — payloads (rows, SQL text) are always
+ciphertext, covered by tests that grep the files for a known marker string.
+Release `pinkdb` binary: 2.21 MB default, 2.28 MB with `--features encryption`
+(Apple Silicon, thin LTO; the default build grows ~18 KB over the
+pre-encryption 2.19 MB — most of it segment page rounding, ~4.6 KB of code).
 
 Each ≤2048-row column chunk picks its smallest encoding: integers choose
 between raw, RLE, and bitpacking (min + width + packed bits); doubles raw or
@@ -269,8 +350,8 @@ isolation without predicate tracking (write-skew is possible). The plain
 `pinkdb-server` is a separate workspace crate (packaging: the core stays
 lean): a TCP server plus a blocking client for a hand-rolled binary protocol.
 No external dependencies, zero async (one std thread per connection), no
-unsafe. Release binaries: `pinkdb` 2.19 MB, `pinkdb-server` 1.84 MB (Apple
-Silicon, `--release`, thin LTO).
+unsafe. Release binaries: `pinkdb` 2.21 MB (2.28 MB with `--features
+encryption`), `pinkdb-server` 1.85 MB (Apple Silicon, `--release`, thin LTO).
 
 ```sh
 # in-memory server on 127.0.0.1:5433
@@ -354,6 +435,9 @@ The file and catalog dot-commands (`.import`, `.save`, `.open`, `.databases`,
 `.tables`, `.schema`) are not available in remote mode and report
 `Error: <cmd> is not available in remote mode`. The feature is opt-in: the
 default build rejects `--host` with "built without the client feature".
+`PINKDB_KEY` is inert in remote mode (the server's own at-rest configuration
+applies, and `pinkdb-server` currently has no key option), so a set value is
+reported as a warning instead of being silently ignored.
 
 ### Security posture
 
@@ -423,8 +507,9 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
   (limit 64)` — the AST is freed iteratively, so even a multi-megabyte chain
   cannot overflow the stack during rejection
 
-Post-v1 roadmap: at-rest encryption, C/Python/Go language bindings, Parquet
-reader (see PLAN.md). The network server (`pinkdb-server`) shipped in wave 24;
+Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
+PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
+feature; the network server (`pinkdb-server`) shipped in wave 24;
 authentication and TLS are deferred.
 
 ## Development
@@ -434,8 +519,11 @@ cargo build            # workspace
 cargo test             # 100+ unit + end-to-end tests
 cargo test -p pinkdb-server                          # protocol + server + durable tests
 cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
+cargo test --features encryption                     # encrypted round-trips + WAL recovery
+cargo build -p pinkdb-cli --features encryption      # REPL with PINKDB_KEY support
 cargo clippy --all-targets   # must stay clean
 python3 bench/duckdiff.py [--big sales.csv]  # differential test vs DuckDB
+PINKDB_KEY=pass python3 bench/kill_loop.py 30 --encrypted  # SIGKILL stress, encrypted WAL
 cargo run --release -p pinkdb --example import_bench  # CSV import timing
 cargo run --release -p pinkdb --example query_bench  # full query battery (ms)
 ```

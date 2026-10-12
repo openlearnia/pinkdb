@@ -36,6 +36,7 @@
 
 use std::collections::HashMap;
 
+use crate::crypto::EncryptionKey;
 use crate::storage::PinkDb;
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::Vector;
@@ -811,17 +812,54 @@ impl PinkDb {
     /// Write every database to `path` in the `.pink` columnar format.
     /// Databases and tables are stored in sorted name order (deterministic
     /// bytes). Views are session-local and never persisted.
+    ///
+    /// Always writes plaintext; use [`PinkDb::save_with_key`] (feature
+    /// `encryption`) for an encrypted container.
     pub fn save(&self, path: &str) -> Result<()> {
         std::fs::write(path, self.to_bytes()?)?;
         Ok(())
     }
 
+    /// [`PinkDb::save`] with at-rest encryption: the v2 bytes are sealed into
+    /// a `PINKENC1` container (AES-256-GCM, Argon2id for passphrases). Without
+    /// the `encryption` feature this fails with a clear "not compiled in"
+    /// error instead of writing plaintext.
+    pub fn save_with_key(&self, path: &str, key: &EncryptionKey) -> Result<()> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (path, key);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
+            std::fs::write(path, sealed)?;
+            Ok(())
+        }
+    }
+
     /// [`PinkDb::save`] plus `fsync` on the written file — the checkpoint
     /// primitive (the WAL is only rolled once this returns).
     pub(crate) fn save_sync(&self, path: &std::path::Path) -> Result<()> {
+        Self::write_sync(path, &self.to_bytes()?)
+    }
+
+    /// [`PinkDb::save_sync`] with at-rest encryption (checkpoint primitive for
+    /// a keyed durable database; the WAL is only rolled once this returns).
+    #[cfg(feature = "encryption")]
+    pub(crate) fn save_sync_with_key(
+        &self,
+        path: &std::path::Path,
+        key: &EncryptionKey,
+    ) -> Result<()> {
+        let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
+        Self::write_sync(path, &sealed)
+    }
+
+    fn write_sync(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
         let mut f = std::fs::File::create(path)?;
-        f.write_all(&self.to_bytes()?)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         Ok(())
     }
@@ -829,10 +867,46 @@ impl PinkDb {
     /// Load a database from a `.pink` file written by [`PinkDb::save`].
     /// Accepts the v1 format (a single, implicit `main` database) and the v2
     /// format (all databases). Truncated or malformed files return errors,
-    /// never panics.
+    /// never panics. An encrypted (`PINKENC1`) file is rejected: without the
+    /// `encryption` feature the error says to rebuild with it; with the
+    /// feature it points at [`PinkDb::open_with_key`].
     pub fn open(path: &str) -> Result<PinkDb> {
         let data = std::fs::read(path)?;
-        let mut r = Reader::new(&data);
+        if crate::crypto::is_container(&data) {
+            return Err(crate::crypto::encrypted_error(path));
+        }
+        Self::load_bytes(&data)
+    }
+
+    /// [`PinkDb::open`] for an encrypted container, decrypting with `key`.
+    /// The file must be encrypted (a `PINKENC1` container); a plaintext
+    /// `.pink` is refused so a key can never be silently ignored. A wrong key
+    /// fails the key-check block and reports `wrong key`. Without the
+    /// `encryption` feature this fails with a clear "not compiled in" error.
+    pub fn open_with_key(path: &str, key: &EncryptionKey) -> Result<PinkDb> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (path, key);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let data = std::fs::read(path)?;
+            if !crate::crypto::is_container(&data) {
+                return Err(PinkDbError::Execution(format!(
+                    "{path}: file is not encrypted (a key was supplied); open it without a key"
+                )));
+            }
+            let plain = crate::crypto::open_container(&data, key, 0)?;
+            let mut db = Self::load_bytes(&plain)?;
+            db.encryption_key = Some(key.clone());
+            Ok(db)
+        }
+    }
+
+    /// Decode a serialized `.pink` image (v1 or v2 magic).
+    fn load_bytes(data: &[u8]) -> Result<PinkDb> {
+        let mut r = Reader::new(data);
         let magic = r.take(8)?;
         let v2 = if magic == MAGIC_V2 {
             true
@@ -1047,19 +1121,26 @@ mod tests {
     use crate::vector::CHUNK_SIZE;
 
     fn roundtrip(db: &PinkDb) -> PinkDb {
-        // Pid + process-wide counter: concurrent tests in one process must
-        // not race on the same temp path.
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static RT_SEQ: AtomicUsize = AtomicUsize::new(0);
-        let seq = RT_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir()
-            .join(format!("pinkdb_rt_{}_{seq}.pink", std::process::id()));
+        let path = temp_file("rt");
         db.save(path.to_str().unwrap()).unwrap();
         let data = std::fs::read(&path).unwrap();
         assert!(data.starts_with(MAGIC_V2));
         let back = PinkDb::open(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
         back
+    }
+
+    /// A unique temp file per call: pid + a process-wide counter, so
+    /// concurrent tests *and* concurrent `cargo test` invocations cannot
+    /// race on one path.
+    fn temp_file(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "pinkdb_{tag}_{}_{}.pink",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     fn all_values(db: &PinkDb, table: &str) -> Vec<Vec<Value>> {
@@ -1198,8 +1279,7 @@ mod tests {
         let mut db = PinkDb::new();
         db.create_table("t", vec![("x".to_string(), DataType::Integer)]).unwrap();
         db.table_mut("t").unwrap().append_row(vec![Value::Integer(1)]).unwrap();
-        let dir = std::env::temp_dir();
-        let path = dir.join("pinkdb_corrupt.pink");
+        let path = temp_file("corrupt");
         db.save(path.to_str().unwrap()).unwrap();
         let full = std::fs::read(&path).unwrap();
         // Every truncation errors (never panics).
@@ -1222,7 +1302,7 @@ mod tests {
         let mut db = PinkDb::new();
         crate::csv::import_csv_string(&mut db, "s", "a,b\n1,x\n2,\n").unwrap();
         db.execute("INSERT INTO s VALUES (3, 'z');").unwrap();
-        let path = std::env::temp_dir().join("pinkdb_sql.pink");
+        let path = temp_file("sql");
         db.save(path.to_str().unwrap()).unwrap();
         let mut back = PinkDb::open(path.to_str().unwrap()).unwrap();
         let rows = back
@@ -1307,5 +1387,78 @@ mod tests {
         assert_eq!(back.list_databases(), vec!["db1".to_string()]);
         assert_eq!(back.current_db(), "db1", "session starts on the only database");
         assert_eq!(all_values(&back, "t"), vec![vec![Value::Integer(5)]]);
+    }
+
+    /// A hand-built but structurally valid `PINKENC1` header (raw-key KDF).
+    #[cfg(not(feature = "encryption"))]
+    fn fake_encrypted_container() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"PINKENC1");
+        v.extend_from_slice(&1u32.to_le_bytes()); // container version
+        v.push(1u8); // cipher: AES-256-GCM
+        v.push(0u8); // kdf: raw
+        v.extend_from_slice(&0u64.to_le_bytes()); // context: checkpoint
+        v.extend_from_slice(&[0x42u8; 8]); // nonce prefix
+        v.extend_from_slice(&30u32.to_le_bytes()); // key-check plaintext length
+        v.extend_from_slice(&[0xEEu8; 46]); // key-check ciphertext + tag
+        v.extend_from_slice(b"\x05\0\0\0hello"); // one bogus payload frame
+        v
+    }
+
+    /// With the `encryption` feature off, opening an encrypted file must say
+    /// exactly how to get support instead of "corrupt file".
+    #[cfg(not(feature = "encryption"))]
+    #[test]
+    fn encrypted_file_errors_clearly_without_the_feature() {
+        let path = temp_file("plain_enc");
+        std::fs::write(&path, fake_encrypted_container()).unwrap();
+        let err = PinkDb::open(path.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("file is encrypted; build with the encryption feature"),
+            "{msg}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A keyed open in a crypto-free build names the missing support before
+    /// it even looks at the file.
+    #[cfg(not(feature = "encryption"))]
+    #[test]
+    fn keyed_open_without_the_feature_names_the_missing_support() {
+        let key = EncryptionKey::from_passphrase("sesame");
+        let err = PinkDb::open_with_key("does-not-matter.pink", &key).unwrap_err();
+        assert!(
+            err.to_string().contains("not compiled in"),
+            "unexpected: {err}"
+        );
+        let err = PinkDb::open_durable_with_key("does-not-matter.pink", &key).unwrap_err();
+        assert!(
+            err.to_string().contains("not compiled in"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// With the feature on, an encrypted file opened without a key points at
+    /// the keyed API; `open_with_key` on a plaintext file is refused rather
+    /// than silently ignoring the key.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn encrypted_file_open_paths_points_at_the_key_api() {
+        let enc = temp_file("enc_paths");
+        let plain = temp_file("plain_paths");
+        let key = EncryptionKey::from_raw([5u8; 32]);
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)]).unwrap();
+        db.table_mut("t").unwrap().append_row(vec![Value::Integer(1)]).unwrap();
+        db.save_with_key(enc.to_str().unwrap(), &key).unwrap();
+        db.save(plain.to_str().unwrap()).unwrap();
+
+        let err = PinkDb::open(enc.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("open it with a key"), "{err}");
+        let err = PinkDb::open_with_key(plain.to_str().unwrap(), &key).unwrap_err();
+        assert!(err.to_string().contains("not encrypted"), "{err}");
+        std::fs::remove_file(&enc).ok();
+        std::fs::remove_file(&plain).ok();
     }
 }

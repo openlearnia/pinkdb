@@ -5,6 +5,7 @@
 //! no unsafe, no async.
 
 pub mod csv;
+pub mod crypto;
 pub mod db;
 pub mod exec;
 pub mod optimizer;
@@ -17,6 +18,7 @@ pub mod vector;
 pub mod wal;
 
 pub use db::{Connection, Database};
+pub use crypto::EncryptionKey;
 pub use exec::QueryResult;
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};

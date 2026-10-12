@@ -10,6 +10,9 @@ path = "src/main.rs"
 [features]
 # Opt-in remote mode: `pinkdb --host HOST:PORT` talks to a pinkdb-server.
 client = ["dep:pinkdb-server"]
+# Opt-in at-rest encryption: forwards to `pinkdb/encryption`; `PINKDB_KEY`
+# then encrypts `.save` and decrypts `.open`.
+encryption = ["pinkdb/encryption"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }

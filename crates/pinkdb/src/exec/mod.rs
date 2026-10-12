@@ -3348,7 +3348,15 @@ mod tests {
     #[test]
     fn dates_persist() {
         let db = date_db();
-        let path = std::env::temp_dir().join("pinkdb_dates.pink");
+        // Unique per process *and* per call: concurrent `cargo test`
+        // invocations must not race on one temp path.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "pinkdb_dates_{}_{}.pink",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         db.save(path.to_str().unwrap()).unwrap();
         let back = PinkDb::open(path.to_str().unwrap()).unwrap();
         let (a, b) = (db.table("ev").unwrap(), back.table("ev").unwrap());

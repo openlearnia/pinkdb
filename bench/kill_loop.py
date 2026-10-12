@@ -14,10 +14,18 @@ Targeted mode: kill exactly inside the checkpoint publish window (after the
 WAL roll, before the `.pink` rename) and verify the rows across repeated
 opens — the crash image that used to be "replayed into memory then deleted".
 
+Encrypted mode (`--encrypted`): the same random/multi-db/targeted loops with
+`PINKDB_KEY` set, so the checkpoint and the sidecar WAL are encrypted
+containers. The binary must be built with the encryption feature
+(`cargo build -p pinkdb-cli --features encryption`). The passphrase is read
+from the environment (`PINKDB_KEY=... python3 bench/kill_loop.py --encrypted`),
+never from the command line, so it stays out of the process table.
+
 Usage:
   python3 bench/kill_loop.py [ROUNDS] [--seed N] [--bin PATH]
   python3 bench/kill_loop.py [ROUNDS] --multi-db [--seed N] [--bin PATH]
   python3 bench/kill_loop.py --targeted N [--seed N] [--bin PATH]
+  PINKDB_KEY=pass python3 bench/kill_loop.py [ROUNDS] --encrypted [--bin PATH]
 """
 
 import argparse
@@ -38,9 +46,16 @@ WORK = tempfile.mkdtemp(prefix="pinkdb_killloop_")
 ACK_RE = re.compile(r"(ACK|TXN) (\d+)")
 ROW_RE = re.compile(r"^│\s*(-?\d+)\s*│", re.M)
 
+# Subprocess environment: None = inherit. `--encrypted` passes a copy with the
+# PINKDB_KEY taken from the environment (the passphrase never appears on a
+# command line).
+ENV = None
+
 
 def cli(binary, cmds, cwd):
-    p = subprocess.run([binary], input=cmds.encode(), capture_output=True, cwd=cwd)
+    p = subprocess.run(
+        [binary], input=cmds.encode(), capture_output=True, cwd=cwd, env=ENV
+    )
     return p.stdout.decode(errors="replace")
 
 
@@ -89,7 +104,8 @@ def verify(binary, cwd, expected, opens=3):
 def run_and_kill(binary, cmds, cwd, delay):
     """Feed cmds, sleep delay, SIGKILL, return all stdout."""
     p = subprocess.Popen(
-        [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=cwd, bufsize=0
+        [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=cwd, bufsize=0,
+        env=ENV,
     )
     chunks = []
 
@@ -329,7 +345,7 @@ def checkpoint_image(binary, d, prior_checkpoint):
     cli(binary, setup, d)
 
     p = subprocess.Popen(
-        [binary], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, cwd=d
+        [binary], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, cwd=d, env=ENV
     )
     try:
         p.stdin.write(b".open x.pink\n.save x.pink\n.quit\n")
@@ -383,16 +399,34 @@ def run_targeted(binary, rounds, seed):
 
 
 def main():
+    global ENV
     ap = argparse.ArgumentParser()
     ap.add_argument("rounds", nargs="?", type=int, default=100)
     ap.add_argument("--targeted", type=int, default=0)
     ap.add_argument("--multi-db", action="store_true")
+    ap.add_argument("--encrypted", action="store_true",
+                    help="run with the PINKDB_KEY from the environment "
+                         "(needs an encryption-feature binary)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--bin", default=DEFAULT_BIN)
     args = ap.parse_args()
     if not os.path.exists(args.bin):
         print(f"missing binary: {args.bin}", file=sys.stderr)
         return 2
+    if args.encrypted:
+        passphrase = os.environ.get("PINKDB_KEY", "")
+        if not passphrase:
+            print(
+                "--encrypted requires PINKDB_KEY in the environment; the "
+                "passphrase is read from the env, never from the command line",
+                file=sys.stderr,
+            )
+            return 2
+        ENV = dict(os.environ)
+        print(
+            f"encrypted mode: PINKDB_KEY from the environment "
+            f"({len(passphrase)} chars)"
+        )
     if args.targeted:
         ok = run_targeted(args.bin, args.targeted, args.seed)
     elif args.multi_db:

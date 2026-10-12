@@ -30,6 +30,9 @@ fn usage() -> &'static str {
      \x20 --port PORT   TCP port; 0 picks an ephemeral port (default 5433)\n\
      \x20 --file PATH   durable database (checkpoint + WAL); in-memory when omitted\n\
      \n\
+     At-rest encryption is not wired into the server: PINKDB_KEY is ignored and\n\
+     --file must be a plaintext database (an encrypted one is refused at startup).\n\
+     \n\
      Security: no authentication, no TLS. Keep the bind address on localhost\n\
      or a trusted network; anyone who can reach the port has full SQL access."
 }

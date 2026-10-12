@@ -87,11 +87,41 @@
 //! `<path>.pink.wal.roll` is refused: generations are what make a stale roll
 //! distinguishable from a current one, so an unnamed roll cannot be
 //! classified safely.
+//!
+//! # Encrypted WALs (feature `encryption`)
+//!
+//! With a key, every WAL file is a `PINKENC1` container (see [`crate::crypto`])
+//! whose `context` field is the generation, followed by records of the same
+//! `len | lsn | crc | body` framing, where `body` is the AEAD ciphertext of the
+//! payload (the crc field is zero and unused — GCM authentication replaces it,
+//! and a record that authenticates with a nonzero crc is refused as framing
+//! tampering). Each record is one AEAD unit with the LSN and the record ordinal
+//! bound into the AAD, and a per-file nonce prefix. Recovery policy (wave 22) is
+//! preserved:
+//!
+//! - a short/torn tail (framing or ciphertext cut short) stops the scan and
+//!   truncates at the last good record;
+//! - a complete record that fails authentication is a hard error when more
+//!   bytes follow (mid-file tampering), but at the very tail it is
+//!   indistinguishable from a torn write, so the tail policy applies;
+//! - a successfully decrypted record whose payload framing is broken is a
+//!   hard error, exactly like a CRC-valid plaintext record.
+//!
+//! Truncation of an encrypted WAL never reuses a counter: a keyed open
+//! rebuilds the file with a fresh random nonce prefix (re-sealing every
+//! intact record, atomically via a temp file) before any append continues.
+//! Reusing the old prefix after a tail loss would reuse the nonce of a
+//! discarded record, which GCM forbids — and a file cut exactly at a record
+//! boundary is indistinguishable from a cleanly shorter one, so the rebuild
+//! happens on every keyed open, not only when trailing bytes were discarded.
+//! A keyed open requires every artifact to be encrypted, and a plaintext
+//! open refuses encrypted ones, so a key can never be silently ignored.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::crypto::{self, EncryptionKey, RecordCipher, TAG_LEN};
 use crate::storage::PinkDb;
 use crate::types::{PinkDbError, Result};
 
@@ -170,6 +200,8 @@ pub struct Wal {
     /// Multi-connection appends emit a `USE` prefix whenever their session
     /// differs, so every record replays in the database it was executed in.
     session_db: Option<String>,
+    /// Per-record AEAD state for an encrypted WAL (`None` = plaintext).
+    cipher: Option<RecordCipher>,
 }
 
 /// One rolled-away WAL generation found on disk.
@@ -191,6 +223,10 @@ struct WalProbe {
 #[derive(Debug)]
 struct Header {
     gen: u64,
+    /// Offset where the first record begins.
+    records_start: usize,
+    /// Container header for an encrypted WAL.
+    enc: Option<crypto::ContainerHeader>,
 }
 
 #[derive(Debug)]
@@ -198,6 +234,9 @@ enum HeaderError {
     TooShort,
     BadMagic,
     BadVersion(u32),
+    /// A `PINKENC1` container whose public header did not parse.
+    #[cfg(feature = "encryption")]
+    Container(String),
 }
 
 impl Wal {
@@ -209,8 +248,15 @@ impl Wal {
         h
     }
 
-    /// Create (or recreate) the WAL file at `path` with just a header.
-    fn create_file(path: &Path, gen: u64) -> Result<File> {
+    /// Create (or recreate) the WAL file at `path` with just a header: the
+    /// plaintext `PINKWAL1` header or, when `cipher` is given, its encrypted
+    /// container header (which carries the generation as its context). The
+    /// cipher is returned so the caller can keep appending through it.
+    fn create_file(
+        path: &Path,
+        gen: u64,
+        cipher: Option<RecordCipher>,
+    ) -> Result<(File, Option<RecordCipher>)> {
         // No `append(true)` here: std rejects append+truncate on Unix, and a
         // fresh file needs only sequential writes from offset 0.
         let mut f = OpenOptions::new()
@@ -219,9 +265,12 @@ impl Wal {
             .create(true)
             .truncate(true)
             .open(path)?;
-        f.write_all(&Self::header_for(gen))?;
+        match &cipher {
+            Some(c) => f.write_all(c.header())?,
+            None => f.write_all(&Self::header_for(gen))?,
+        }
         f.sync_all()?;
-        Ok(f)
+        Ok((f, cipher))
     }
 
     /// Path of the `.pink` checkpoint this WAL belongs to.
@@ -229,20 +278,39 @@ impl Wal {
         &self.checkpoint_path
     }
 
+    /// True when this WAL is an encrypted container (the mode it was opened
+    /// in; a live WAL's mode never changes).
+    #[cfg(feature = "encryption")]
+    pub(crate) fn is_encrypted(&self) -> bool {
+        self.cipher.is_some()
+    }
+
+    /// True when `key` derives exactly the container key of this WAL. A
+    /// checkpoint must never publish a `.pink` under a different key than
+    /// the WAL generation it rolls into: the pair would be unopenable.
+    #[cfg(feature = "encryption")]
+    pub(crate) fn key_matches(&self, key: &EncryptionKey) -> bool {
+        self.cipher.as_ref().is_some_and(|c| c.matches_key(key))
+    }
+
     /// Open the WAL at `path` (creating it when absent) and parse every intact
     /// record. The file is truncated at the last intact record, so the handle
     /// returned appends right after it. `recreate_gen` is the generation used
     /// when the file is missing or its header is torn; recovery computes it
-    /// from the surviving roll files so the sequence never regresses.
-    /// Returns the records, the bytes discarded from the tail, and the
-    /// positioned handle.
+    /// from the surviving roll files so the sequence never regresses. With
+    /// `key` the WAL is an encrypted container: an existing encrypted WAL is
+    /// decrypted (a wrong key is a hard error) and rebuilt with a fresh nonce
+    /// prefix before appends continue; a missing/torn one is recreated
+    /// encrypted. Returns the records, the bytes discarded from the tail, and
+    /// the positioned handle.
     pub(crate) fn open(
         path: &Path,
         checkpoint_path: PathBuf,
         policy: SyncPolicy,
         recreate_gen: u64,
+        key: Option<&EncryptionKey>,
     ) -> Result<(Wal, Vec<Record>, u64)> {
-        let plain = |file: File, gen: u64, last_lsn: u64| Wal {
+        let build = |file: File, gen: u64, last_lsn: u64, cipher: Option<RecordCipher>| Wal {
             file,
             path: path.to_path_buf(),
             checkpoint_path: checkpoint_path.clone(),
@@ -251,22 +319,46 @@ impl Wal {
             last_lsn,
             poisoned: None,
             session_db: None,
+            cipher,
+        };
+        let fresh_cipher = |gen: u64| -> Result<Option<RecordCipher>> {
+            match key {
+                Some(k) => Ok(Some(RecordCipher::create(k, gen)?)),
+                None => Ok(None),
+            }
         };
         if !path.exists() {
-            return Ok((
-                plain(Self::create_file(path, recreate_gen)?, recreate_gen, 0),
-                Vec::new(),
-                0,
-            ));
+            let (file, cipher) =
+                Self::create_file(path, recreate_gen, fresh_cipher(recreate_gen)?)?;
+            return Ok((build(file, recreate_gen, 0, cipher), Vec::new(), 0));
         }
         let data = std::fs::read(path)?;
+        #[cfg(not(feature = "encryption"))]
+        refuse_container(path, &data)?;
         let header = match parse_header(&data) {
             Ok(h) => h,
+            #[cfg(feature = "encryption")]
+            Err(HeaderError::Container(msg)) if data.len() <= crypto::MAX_HEADER_LEN => {
+                // Torn container header (a crash while creating an encrypted
+                // WAL): no record can have been acknowledged yet, so the file
+                // is recreated. A container header that does not parse on a
+                // longer file is corruption and stays a hard error.
+                let _ = msg;
+                let (file, cipher) =
+                    Self::create_file(path, recreate_gen, fresh_cipher(recreate_gen)?)?;
+                return Ok((
+                    build(file, recreate_gen, 0, cipher),
+                    Vec::new(),
+                    data.len() as u64,
+                ));
+            }
             Err(e) => {
                 if data.len() <= HEADER_LEN {
                     // Torn header (crash while creating): start over.
+                    let (file, cipher) =
+                        Self::create_file(path, recreate_gen, fresh_cipher(recreate_gen)?)?;
                     return Ok((
-                        plain(Self::create_file(path, recreate_gen)?, recreate_gen, 0),
+                        build(file, recreate_gen, 0, cipher),
                         Vec::new(),
                         data.len() as u64,
                     ));
@@ -274,18 +366,67 @@ impl Wal {
                 return Err(PinkDbError::Execution(header_error(path, &e)));
             }
         };
-        let (records, good_end) =
-            parse_records(&data, HEADER_LEN).map_err(PinkDbError::Execution)?;
-        let file = OpenOptions::new().read(true).append(true).open(path)?;
+        let cipher = match (&header.enc, key) {
+            (None, Some(_)) => return Err(not_encrypted_with_key(path)),
+            (Some(_), None) => {
+                return Err(crypto::encrypted_error(&path.display().to_string()))
+            }
+            (Some(_), Some(k)) => {
+                // A wrong key fails the key-check here, before anything runs.
+                let (c, _) = RecordCipher::from_header(&data, k)?;
+                Some(c)
+            }
+            (None, None) => None,
+        };
+        let (records, good_end) = parse_records(&data, header.records_start, cipher.as_ref())
+            .map_err(PinkDbError::Execution)?;
         let truncated = (data.len() - good_end) as u64;
-        if truncated > 0 {
-            file.set_len(good_end as u64)?;
-            file.sync_all()?;
-        }
+        let (file, cipher) = match cipher {
+            Some(old) => {
+                // Every keyed open rebuilds the WAL with a fresh random nonce
+                // prefix, not only when a torn tail was discarded: a file
+                // that ends exactly at a record boundary is byte-identical to
+                // a cleanly shorter one (a Batch-mode unsynced tail lost at a
+                // boundary, or a restored older backup), so reusing the old
+                // prefix would hand out the discarded record's
+                // `(key, nonce, AAD)` again. The rebuild re-seals the intact
+                // records under the new prefix and is temp + rename, so a
+                // crash re-runs recovery from the same on-disk state.
+                let fresh = rewrite_truncated(path, header.gen, &records, &old)?;
+                (
+                    OpenOptions::new().read(true).append(true).open(path)?,
+                    Some(fresh),
+                )
+            }
+            None => {
+                if truncated > 0 {
+                    let f = OpenOptions::new().read(true).append(true).open(path)?;
+                    f.set_len(good_end as u64)?;
+                    f.sync_all()?;
+                    (f, None)
+                } else {
+                    (
+                        OpenOptions::new().read(true).append(true).open(path)?,
+                        None,
+                    )
+                }
+            }
+        };
         // Records are validated strictly increasing, so max == last; `max`
         // keeps the next append monotonic even if that ever changes.
         let last_lsn = records.iter().map(|r| r.lsn).max().unwrap_or(0);
-        Ok((plain(file, header.gen, last_lsn), records, truncated))
+        // A reopened encrypted WAL must not reuse the nonces of its existing
+        // records: position the counter after them.
+        let mut cipher = cipher;
+        if let Some(c) = cipher.as_mut() {
+            let next = u32::try_from(records.len()).map_err(|_| {
+                PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+            })?;
+            c.set_next_counter(next.checked_add(1).ok_or_else(|| {
+                PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+            })?);
+        }
+        Ok((build(file, header.gen, last_lsn, cipher), records, truncated))
     }
 
     /// Append one committed unit of statements as a single record.
@@ -298,11 +439,17 @@ impl Wal {
         let payload = encode_payload(stmts)?;
         let len = record_len_guard(payload.len())?;
         let lsn = self.last_lsn + 1;
-        let mut rec = Vec::with_capacity(RECORD_HEADER_LEN + payload.len());
+        let (crc, body): (u32, Vec<u8>) = match &mut self.cipher {
+            // The crc field stays in the framing for an encrypted record but
+            // is zero: GCM authentication replaces it.
+            Some(cipher) => (0, cipher.seal(lsn, &payload)?),
+            None => (crc32(&payload), payload),
+        };
+        let mut rec = Vec::with_capacity(RECORD_HEADER_LEN + body.len());
         rec.extend_from_slice(&len.to_le_bytes());
         rec.extend_from_slice(&lsn.to_le_bytes());
-        rec.extend_from_slice(&crc32(&payload).to_le_bytes());
-        rec.extend_from_slice(&payload);
+        rec.extend_from_slice(&crc.to_le_bytes());
+        rec.extend_from_slice(&body);
         let result = self.file.write_all(&rec).and_then(|()| match self.policy {
             SyncPolicy::Sync => self.file.sync_all(),
             SyncPolicy::Batch => Ok(()),
@@ -413,14 +560,20 @@ impl Wal {
         sync_parent_dir(&tmp);
         // 2. Roll the generation: the old records move to a name carrying
         //    their generation (never overwritten), a fresh WAL starts at
-        //    gen + 1.
-        std::fs::rename(&self.path, &roll)?;
+        //    gen + 1. The fresh container cipher is prepared before the
+        //    rename so a crypto failure cannot leave the WAL rolled.
         let fresh_gen = self.gen.checked_add(1).ok_or_else(|| {
             PinkDbError::Execution("WAL generation counter overflow".to_string())
         })?;
-        match Self::create_file(&self.path, fresh_gen) {
-            Ok(fresh) => {
+        let fresh_cipher = match &self.cipher {
+            Some(c) => Some(c.fork(fresh_gen)?),
+            None => None,
+        };
+        std::fs::rename(&self.path, &roll)?;
+        match Self::create_file(&self.path, fresh_gen, fresh_cipher) {
+            Ok((fresh, cipher)) => {
                 self.file = fresh;
+                self.cipher = cipher;
                 self.gen = fresh_gen;
                 self.last_lsn = 0;
             }
@@ -518,17 +671,24 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<Vec<String>, String> {
     Ok(stmts)
 }
 
-/// Parse records from `start` onward. A short read, a CRC mismatch, or an LSN
+/// Parse records from `start` onward. A short read, a CRC mismatch (plaintext)
+/// or failed authentication where more bytes follow (encrypted), or an LSN
 /// that does not continue the strictly increasing sequence stops the scan
-/// (torn tail / framing corruption); a malformed CRC-valid payload is a hard
-/// error. Returns the records and the offset just past the last intact
-/// record.
+/// (torn tail / framing corruption); a malformed CRC-valid/authenticated
+/// payload is a hard error. For an encrypted WAL an authentication failure on
+/// the last framed record is indistinguishable from a torn write, so the tail
+/// policy applies there; a complete mis-authenticating record with bytes after
+/// it is mid-file tampering and is a hard error. Returns the records and the
+/// offset just past the last intact record.
 fn parse_records(
     data: &[u8],
     start: usize,
+    cipher: Option<&RecordCipher>,
 ) -> std::result::Result<(Vec<Record>, usize), String> {
     let mut pos = start;
     let mut prev_lsn = 0u64;
+    // Encrypted records use their 1-based ordinal as the AEAD nonce counter.
+    let mut ordinal: u32 = 0;
     let mut out = Vec::new();
     while let Some(payload_start) = pos.checked_add(RECORD_HEADER_LEN) {
         if payload_start > data.len() {
@@ -543,23 +703,102 @@ fn parse_records(
         if lsn <= prev_lsn {
             break;
         }
-        let Some(end) = payload_start.checked_add(payload_len) else {
+        // For an encrypted record `payload_len` is the plaintext length and
+        // the ciphertext adds a tag.
+        let body_len = match cipher {
+            Some(_) => payload_len + TAG_LEN,
+            None => payload_len,
+        };
+        let Some(end) = payload_start.checked_add(body_len) else {
             break;
         };
         if end > data.len() {
             break;
         }
-        let payload = &data[payload_start..end];
-        if crc32(payload) != crc {
-            break;
-        }
-        let stmts = decode_payload(payload)
-            .map_err(|e| format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}"))?;
+        let stmts = match cipher {
+            Some(c) => {
+                let next = ordinal + 1;
+                match c.open(next, lsn, &data[payload_start..end]) {
+                    Some(plain) => {
+                        // Encrypted records always frame `crc = 0` (GCM
+                        // authentication replaces it) and the field is not
+                        // part of the AAD, so a nonzero value is framing
+                        // tampering: a torn write cannot produce a record
+                        // that authenticates *and* carries a nonzero CRC.
+                        // Hard error even at the tail (the ciphertext itself
+                        // authenticated, so this is not a torn record).
+                        if crc != 0 {
+                            return Err(format!(
+                                "corrupt WAL record at offset {pos} (lsn {lsn}): \
+                                 nonzero CRC field {crc} on an encrypted record"
+                            ));
+                        }
+                        decode_payload(&plain)
+                            .map_err(|e| format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}"))?
+                    }
+                    None => {
+                        if end == data.len() {
+                            // Tail: an auth failure here is indistinguishable
+                            // from a torn write — the tail policy applies.
+                            break;
+                        }
+                        return Err(format!(
+                            "corrupt WAL record at offset {pos} (lsn {lsn}): failed authentication \
+                             with more records after it (tampered or corrupted mid-file)"
+                        ));
+                    }
+                }
+            }
+            None => {
+                let payload = &data[payload_start..end];
+                if crc32(payload) != crc {
+                    break;
+                }
+                decode_payload(payload)
+                    .map_err(|e| format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}"))?
+            }
+        };
         out.push(Record { lsn, stmts });
         prev_lsn = lsn;
+        ordinal += 1;
         pos = end;
     }
     Ok((out, pos))
+}
+
+/// Rewrite an encrypted WAL whose tail was discarded: a fresh nonce prefix
+/// (same key, KDF parameters and generation), the kept records re-sealed in
+/// order, written to a temp file and renamed over the original. Returns the
+/// cipher positioned after the rewritten records.
+fn rewrite_truncated(
+    path: &Path,
+    gen: u64,
+    records: &[Record],
+    old: &RecordCipher,
+) -> Result<RecordCipher> {
+    let mut fresh = old.fork(gen)?;
+    let rewrite = rewrite_path(path);
+    {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&rewrite)?;
+        f.write_all(fresh.header())?;
+        for rec in records {
+            let payload = encode_payload(&rec.stmts)?;
+            let len = record_len_guard(payload.len())?;
+            let ct = fresh.seal(rec.lsn, &payload)?;
+            f.write_all(&len.to_le_bytes())?;
+            f.write_all(&rec.lsn.to_le_bytes())?;
+            f.write_all(&0u32.to_le_bytes())?;
+            f.write_all(&ct)?;
+        }
+        f.sync_all()?;
+    }
+    std::fs::rename(&rewrite, path)?;
+    sync_parent_dir(path);
+    Ok(fresh)
 }
 
 // ---------- file naming + header parsing ----------
@@ -576,6 +815,14 @@ fn tmp_path(checkpoint: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// `<wal>.rewrite`: temp file for the atomic rewrite of a truncated encrypted
+/// WAL (never matched by `scan_rolls`, which only looks at `.roll` names).
+fn rewrite_path(wal: &Path) -> PathBuf {
+    let mut s = wal.as_os_str().to_os_string();
+    s.push(".rewrite");
+    PathBuf::from(s)
+}
+
 /// `<wal>.<gen>.roll`: the generation in the name is what makes stale rolls
 /// distinguishable from a roll of the live generation.
 fn roll_path(wal: &Path, gen: u64) -> PathBuf {
@@ -584,7 +831,30 @@ fn roll_path(wal: &Path, gen: u64) -> PathBuf {
     PathBuf::from(s)
 }
 
+#[cfg(feature = "encryption")]
 fn parse_header(data: &[u8]) -> std::result::Result<Header, HeaderError> {
+    // Encrypted container header (`PINKENC1`): the generation is the
+    // container's context, and records start after the key-check block.
+    if crypto::is_container(data) {
+        let enc = crypto::parse_container_header(data)
+            .map_err(|e| HeaderError::Container(e.to_string()))?;
+        return Ok(Header {
+            gen: enc.context,
+            records_start: enc.payload_start,
+            enc: Some(enc),
+        });
+    }
+    parse_plain_header(data)
+}
+
+/// Without the `encryption` feature encrypted WALs are refused before this
+/// point (`encrypted_error`); the parser is exactly the pre-encryption one.
+#[cfg(not(feature = "encryption"))]
+fn parse_header(data: &[u8]) -> std::result::Result<Header, HeaderError> {
+    parse_plain_header(data)
+}
+
+fn parse_plain_header(data: &[u8]) -> std::result::Result<Header, HeaderError> {
     if data.len() < HEADER_LEN {
         return Err(HeaderError::TooShort);
     }
@@ -597,6 +867,8 @@ fn parse_header(data: &[u8]) -> std::result::Result<Header, HeaderError> {
     }
     Ok(Header {
         gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
+        records_start: HEADER_LEN,
+        enc: None,
     })
 }
 
@@ -609,7 +881,28 @@ fn header_error(path: &Path, e: &HeaderError) -> String {
         HeaderError::BadVersion(v) => {
             format!("WAL format version {v} is not supported (want {WAL_VERSION})")
         }
+        #[cfg(feature = "encryption")]
+        HeaderError::Container(msg) => format!("{}: {msg}", path.display()),
     }
+}
+
+/// Reject an encrypted WAL in a build without the `encryption` feature,
+/// before any torn-header recreation could silently replace the container.
+#[cfg(not(feature = "encryption"))]
+fn refuse_container(path: &Path, data: &[u8]) -> Result<()> {
+    if crypto::is_container(data) {
+        return Err(crypto::encrypted_error(&path.display().to_string()));
+    }
+    Ok(())
+}
+
+/// A keyed open over a plaintext artifact: refusing beats silently ignoring
+/// the key (which would keep writing plaintext).
+fn not_encrypted_with_key(path: &Path) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "{}: file is not encrypted, but a key was supplied; open it without a key",
+        path.display()
+    ))
 }
 
 fn parent_dir(path: &Path) -> PathBuf {
@@ -631,20 +924,43 @@ fn sync_parent_dir(path: &Path) {
 /// The live WAL's header state, before anything is replayed: `None` when the
 /// file is absent; a torn header reports no generation and no records (the
 /// file is recreated); invalid magic/version on a file that carries payload
-/// bytes is a hard error.
-fn probe_wal(path: &Path) -> Result<Option<WalProbe>> {
+/// bytes is a hard error. For an encrypted WAL the records are authenticated
+/// (so a wrong key fails here); a key over a plaintext WAL (or vice versa) is
+/// refused.
+fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe>> {
     if !path.exists() {
         return Ok(None);
     }
     let data = std::fs::read(path)?;
+    #[cfg(not(feature = "encryption"))]
+    refuse_container(path, &data)?;
     match parse_header(&data) {
         Ok(h) => {
-            let (records, _) = parse_records(&data, HEADER_LEN).map_err(PinkDbError::Execution)?;
+            let cipher = match (&h.enc, key) {
+                (None, Some(_)) => return Err(not_encrypted_with_key(path)),
+                (Some(_), None) => {
+                    return Err(crypto::encrypted_error(&path.display().to_string()))
+                }
+                (Some(_), Some(k)) => {
+                    let (c, _) = RecordCipher::from_header(&data, k)?;
+                    Some(c)
+                }
+                (None, None) => None,
+            };
+            let (records, _) = parse_records(&data, h.records_start, cipher.as_ref())
+                .map_err(PinkDbError::Execution)?;
             Ok(Some(WalProbe {
                 gen: Some(h.gen),
                 has_records: !records.is_empty(),
             }))
         }
+        #[cfg(feature = "encryption")]
+        Err(HeaderError::Container(_)) if data.len() <= crypto::MAX_HEADER_LEN => Ok(Some(
+            WalProbe {
+                gen: None,
+                has_records: false,
+            },
+        )),
         Err(e) => {
             if data.len() <= HEADER_LEN {
                 // A torn header (crash while creating the WAL): recreate it.
@@ -705,16 +1021,20 @@ fn scan_rolls(wal: &Path) -> Result<Vec<Roll>> {
 /// tampered with and nothing may be deleted. A roll whose header cannot be
 /// read (shorter than a header, or garbage) is accepted: its records are
 /// never replayed from here — recovery publishes the `.tmp` that contains
-/// them or proves the generation older than the live WAL.
+/// them or proves the generation older than the live WAL. Encrypted rolls
+/// parse their generation from the container's plaintext context field, so
+/// the self-identification check holds for both formats (no key needed).
 fn check_roll_header(roll: &Roll) -> Result<()> {
     let mut f = match File::open(&roll.path) {
         Ok(f) => f,
         Err(_) => return Ok(()),
     };
-    let mut buf = [0u8; HEADER_LEN];
-    if f.read_exact(&mut buf).is_err() {
-        return Ok(());
-    }
+    let mut buf = vec![0u8; crypto::MAX_HEADER_LEN];
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return Ok(()),
+    };
+    buf.truncate(n);
     match parse_header(&buf) {
         Ok(h) if h.gen == roll.gen => Ok(()),
         Ok(h) => Err(PinkDbError::Execution(format!(
@@ -750,14 +1070,71 @@ fn remove_rolls(rolls: &[Roll]) -> u64 {
     removed
 }
 
+/// The generation after every roll on disk (1 when there are none). Refuses
+/// to wrap past `u64::MAX`: a crafted roll name at the top of the range must
+/// yield a clean error, never a panic.
+fn next_gen_after_rolls(rolls: &[Roll]) -> Result<u64> {
+    match rolls.iter().map(|r| r.gen).max() {
+        Some(g) => g.checked_add(1).ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "cannot recover: rolled WAL generation {g} is the highest representable; \
+                 the generation sequence cannot continue"
+            ))
+        }),
+        None => Ok(1),
+    }
+}
+
 /// Recreate the live WAL when it is missing or has a torn header, continuing
-/// the generation sequence past every roll so future rolls stay unique.
-fn ensure_live_wal(wal: &Path, live_gen: Option<u64>, rolls: &[Roll]) -> Result<()> {
+/// the generation sequence past every roll so future rolls stay unique. With
+/// `key` the recreated WAL is encrypted.
+fn ensure_live_wal(
+    wal: &Path,
+    live_gen: Option<u64>,
+    rolls: &[Roll],
+    key: Option<&EncryptionKey>,
+) -> Result<()> {
     if live_gen.is_some() {
         return Ok(());
     }
-    let gen = rolls.iter().map(|r| r.gen).max().map_or(1, |g| g + 1);
-    Wal::create_file(wal, gen).map(|_| ())
+    let gen = next_gen_after_rolls(rolls)?;
+    let cipher = match key {
+        Some(k) => Some(RecordCipher::create(k, gen)?),
+        None => None,
+    };
+    Wal::create_file(wal, gen, cipher).map(|_| ())
+}
+
+/// A keyed store must never publish over (or consume) an artifact of the
+/// other at-rest mode: `.pink`/`.tmp` are checked by their first 8 bytes,
+/// which needs no key. An encrypted artifact names the missing support (or
+/// key) with the standard feature-aware wording.
+fn check_artifact_mode(path: &Path, key: Option<&EncryptionKey>) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut f = File::open(path)?;
+    let mut magic = [0u8; 8];
+    let n = f.read(&mut magic)?;
+    let encrypted = n == 8 && &magic == crypto::ENC_MAGIC;
+    if encrypted == key.is_some() {
+        return Ok(());
+    }
+    Err(if encrypted {
+        crypto::encrypted_error(&path.display().to_string())
+    } else {
+        not_encrypted_with_key(path)
+    })
+}
+
+/// A keyed open must never publish (or consume) an artifact of the other
+/// at-rest mode: the recovery would silently flip the encryption of the
+/// checkpoint.
+fn check_recovery_mode(ckpt: &Path, tmp: &Path, key: Option<&EncryptionKey>) -> Result<()> {
+    for path in [ckpt, tmp] {
+        check_artifact_mode(path, key)?;
+    }
+    Ok(())
 }
 
 /// Finish an interrupted checkpoint (see the module docs for the full state
@@ -769,7 +1146,9 @@ fn recover_checkpoint(
     rolls: &[Roll],
     probe: Option<&WalProbe>,
     info: &mut RecoveryInfo,
+    key: Option<&EncryptionKey>,
 ) -> Result<()> {
+    check_recovery_mode(ckpt, tmp, key)?;
     let live_gen = probe.and_then(|p| p.gen);
     let live_records = probe.map(|p| p.has_records).unwrap_or(false);
 
@@ -794,7 +1173,7 @@ fn recover_checkpoint(
             }
             info.stale_rolls_removed += remove_rolls(rolls);
         }
-        return ensure_live_wal(wal, live_gen, rolls);
+        return ensure_live_wal(wal, live_gen, rolls, key);
     }
 
     if live_records {
@@ -817,7 +1196,7 @@ fn recover_checkpoint(
         }
         let _ = std::fs::remove_file(tmp);
         info.stale_rolls_removed += remove_rolls(rolls);
-        return ensure_live_wal(wal, live_gen, rolls);
+        return ensure_live_wal(wal, live_gen, rolls, key);
     }
 
     if rolls.is_empty() {
@@ -825,7 +1204,7 @@ fn recover_checkpoint(
         // complete, so it must never be published. The live WAL is the
         // authority; skipping the removal repeats the same decision.
         let _ = std::fs::remove_file(tmp);
-        return ensure_live_wal(wal, live_gen, rolls);
+        return ensure_live_wal(wal, live_gen, rolls, key);
     }
 
     // `.tmp` + a roll: the roll rename happens only after `.tmp` was fully
@@ -850,7 +1229,7 @@ fn recover_checkpoint(
     sync_parent_dir(ckpt);
     info.checkpoints_completed += 1;
     info.stale_rolls_removed += remove_rolls(rolls);
-    ensure_live_wal(wal, live_gen, rolls)
+    ensure_live_wal(wal, live_gen, rolls, key)
 }
 
 // ---------- durable open / checkpoint on PinkDb ----------
@@ -862,7 +1241,7 @@ impl PinkDb {
     /// then log every commit to that WAL.
     /// A missing checkpoint *and* WAL starts a fresh durable database.
     pub fn open_durable(path: &str) -> Result<PinkDb> {
-        Ok(Self::open_durable_with(path, SyncPolicy::Sync)?.0)
+        Ok(Self::open_durable_impl(path, SyncPolicy::Sync, None)?.0)
     }
 
     /// [`PinkDb::open_durable`] with an explicit sync policy; also returns
@@ -871,6 +1250,55 @@ impl PinkDb {
         path: &str,
         policy: SyncPolicy,
     ) -> Result<(PinkDb, RecoveryInfo)> {
+        Self::open_durable_impl(path, policy, None)
+    }
+
+    /// [`PinkDb::open_durable`] with at-rest encryption: the checkpoint and
+    /// the sidecar WAL must be encrypted (or absent) and are decrypted with
+    /// `key`; commits are written encrypted. A plaintext artifact is refused
+    /// so the key can never be silently ignored, and a wrong key fails the
+    /// key-check block with a `wrong key` error before anything is replayed.
+    /// Without the `encryption` feature this always fails with a clear
+    /// "not compiled in" error.
+    pub fn open_durable_with_key(path: &str, key: &EncryptionKey) -> Result<PinkDb> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (path, key);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            Ok(Self::open_durable_impl(path, SyncPolicy::Sync, Some(key))?.0)
+        }
+    }
+
+    /// [`PinkDb::open_durable_with_key`] with an explicit sync policy and
+    /// recovery info.
+    pub fn open_durable_with_key_and_policy(
+        path: &str,
+        policy: SyncPolicy,
+        key: &EncryptionKey,
+    ) -> Result<(PinkDb, RecoveryInfo)> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (path, policy, key);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            Self::open_durable_impl(path, policy, Some(key))
+        }
+    }
+
+    /// Shared durable-open path for plaintext (`key == None`) and encrypted
+    /// (`key == Some`) databases. Everything on disk must match the key mode;
+    /// every artifact the open creates (fresh WAL, recreated WAL, completed
+    /// checkpoint) is written in the mode of the open.
+    fn open_durable_impl(
+        path: &str,
+        policy: SyncPolicy,
+        key: Option<&EncryptionKey>,
+    ) -> Result<(PinkDb, RecoveryInfo)> {
         let ckpt = PathBuf::from(path);
         let wal = wal_path(&ckpt);
         let tmp = tmp_path(&ckpt);
@@ -878,20 +1306,29 @@ impl PinkDb {
 
         // 1. Finish an interrupted checkpoint before loading anything.
         let rolls = scan_rolls(&wal)?;
-        let probe = probe_wal(&wal)?;
-        recover_checkpoint(&ckpt, &wal, &tmp, &rolls, probe.as_ref(), &mut info)?;
+        let probe = probe_wal(&wal, key)?;
+        recover_checkpoint(&ckpt, &wal, &tmp, &rolls, probe.as_ref(), &mut info, key)?;
 
         // 2. Checkpoint, if one exists, then replay the live WAL on top.
-        let mut db = if ckpt.exists() { PinkDb::open(path)? } else { PinkDb::new() };
+        //    `open`/`open_with_key` enforce the key mode of the checkpoint.
+        let mut db = if ckpt.exists() {
+            match key {
+                Some(k) => PinkDb::open_with_key(path, k)?,
+                None => PinkDb::open(path)?,
+            }
+        } else {
+            PinkDb::new()
+        };
+        db.encryption_key = key.cloned();
         // When the live WAL is missing or torn, continue the generation
         // sequence past every roll (recovery has already recreated the file
         // with this generation when that was needed).
-        let recreate_gen = probe
-            .as_ref()
-            .and_then(|p| p.gen)
-            .unwrap_or_else(|| rolls.iter().map(|r| r.gen).max().map_or(1, |g| g + 1));
+        let recreate_gen = match probe.as_ref().and_then(|p| p.gen) {
+            Some(g) => g,
+            None => next_gen_after_rolls(&rolls)?,
+        };
         let (handle, records, truncated) =
-            Wal::open(&wal, ckpt.clone(), policy, recreate_gen)?;
+            Wal::open(&wal, ckpt.clone(), policy, recreate_gen, key)?;
         for rec in &records {
             replay_record(&mut db, rec)?;
         }
@@ -926,7 +1363,41 @@ impl PinkDb {
         let mut guard = wal.lock().map_err(|_| {
             PinkDbError::Execution("internal lock error (poisoned)".to_string())
         })?;
-        guard.checkpoint(|tmp| self.save_sync(tmp))?;
+        // The live WAL's at-rest mode (and key) is fixed at open. A
+        // checkpoint must never publish a `.pink` in a different mode or
+        // under a different key than the WAL generation it rolls into — the
+        // pair would be unopenable. Refuse instead of writing a mixed pair.
+        // Without the `encryption` feature a keyed store refuses instead of
+        // silently writing a plaintext checkpoint.
+        #[cfg(feature = "encryption")]
+        {
+            let key = self.encryption_key.clone();
+            if key.is_some() != guard.is_encrypted() {
+                return Err(PinkDbError::Execution(
+                    "cannot change encryption mode on a live store; reopen it instead"
+                        .to_string(),
+                ));
+            }
+            if let Some(k) = &key {
+                if !guard.key_matches(k) {
+                    return Err(PinkDbError::Execution(
+                        "cannot change the encryption key on a live store; reopen it instead"
+                            .to_string(),
+                    ));
+                }
+            }
+            match key {
+                Some(k) => guard.checkpoint(|tmp| self.save_sync_with_key(tmp, &k))?,
+                None => guard.checkpoint(|tmp| self.save_sync(tmp))?,
+            }
+        }
+        #[cfg(not(feature = "encryption"))]
+        {
+            if self.encryption_key.is_some() {
+                return Err(crate::crypto::unavailable());
+            }
+            guard.checkpoint(|tmp| self.save_sync(tmp))?;
+        }
         // A fresh WAL generation replays from the checkpoint's session
         // default (the checkpoint does not store a session): reset the
         // tracked replay session so later appends `USE`-prefix correctly.
@@ -970,10 +1441,19 @@ impl PinkDb {
     /// next durable open would replay those records on top of this snapshot —
     /// duplicating or bricking that database. Saving to the *bound* path is a
     /// checkpoint, not a snapshot; see [`PinkDb::checkpoint`].
+    ///
+    /// Both the target `.pink` and its sidecar WAL must be in this store's
+    /// at-rest mode: overwriting an encrypted target with plaintext (or the
+    /// reverse) would silently flip the mode of the database that pays for
+    /// it. A keyed store writes an encrypted snapshot.
     pub fn save_snapshot(&self, path: &str) -> Result<()> {
-        let target_wal = wal_path(Path::new(path));
+        let target = Path::new(path);
+        check_artifact_mode(target, self.encryption_key.as_ref())?;
+        let target_wal = wal_path(target);
         if target_wal.exists()
-            && probe_wal(&target_wal)?.map(|p| p.has_records).unwrap_or(false)
+            && probe_wal(&target_wal, self.encryption_key.as_ref())?
+                .map(|p| p.has_records)
+                .unwrap_or(false)
         {
             return Err(PinkDbError::Execution(format!(
                 "refusing to save over {path}: {} holds committed WAL records; \
@@ -981,7 +1461,10 @@ impl PinkDb {
                 target_wal.display()
             )));
         }
-        self.save(path)
+        match &self.encryption_key {
+            Some(key) => self.save_with_key(path, key),
+            None => self.save(path),
+        }
     }
 }
 
@@ -1092,7 +1575,7 @@ mod tests {
 
     fn records_of(path: &Path) -> Vec<Record> {
         let data = std::fs::read(path).unwrap();
-        let (recs, _) = parse_records(&data, HEADER_LEN).unwrap();
+        let (recs, _) = parse_records(&data, HEADER_LEN, None).unwrap();
         recs
     }
 
@@ -1200,7 +1683,7 @@ mod tests {
 
         let data = std::fs::read(wal_path(&p)).unwrap();
         assert_eq!(&data[..HEADER_LEN], &Wal::header_for(1));
-        let (recs, good_end) = parse_records(&data, HEADER_LEN).unwrap();
+        let (recs, good_end) = parse_records(&data, HEADER_LEN, None).unwrap();
         assert_eq!(good_end, data.len());
         assert_eq!(recs.len(), 3);
         assert_eq!(
@@ -1605,7 +2088,7 @@ mod tests {
             // header-only WAL of generation 2. `.pink` never existed.
             db.save_sync(&tmp_path(&p)).unwrap();
             std::fs::rename(wal_path(&p), roll_path(&wal_path(&p), 1)).unwrap();
-            Wal::create_file(&wal_path(&p), 2).unwrap();
+            Wal::create_file(&wal_path(&p), 2, None).unwrap();
         }
         let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
             .unwrap();
@@ -1642,7 +2125,7 @@ mod tests {
             db.save_sync(&tmp_path(&p)).unwrap();
             std::fs::rename(tmp_path(&p), &p).unwrap();
             std::fs::rename(wal_path(&p), roll_path(&wal_path(&p), 1)).unwrap();
-            Wal::create_file(&wal_path(&p), 2).unwrap();
+            Wal::create_file(&wal_path(&p), 2, None).unwrap();
         }
         let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
             .unwrap();
@@ -1671,7 +2154,7 @@ mod tests {
             // Interrupted checkpoint image ...
             db.save_sync(&tmp_path(&p)).unwrap();
             std::fs::rename(wal_path(&p), roll_path(&wal_path(&p), 1)).unwrap();
-            Wal::create_file(&wal_path(&p), 2).unwrap();
+            Wal::create_file(&wal_path(&p), 2, None).unwrap();
         }
         // ... and recovery crashing right after its publish, before the roll
         // unlink (i.e. the exact intermediate state of the fix).
@@ -1693,7 +2176,7 @@ mod tests {
             db.save_sync(&tmp_path(&p2)).unwrap();
             db.execute("INSERT INTO t VALUES (2);").unwrap(); // live WAL: row 2
             std::fs::rename(wal_path(&p2), roll_path(&wal_path(&p2), 1)).unwrap();
-            Wal::create_file(&wal_path(&p2), 2).unwrap();
+            Wal::create_file(&wal_path(&p2), 2, None).unwrap();
         }
         let (mut db, info) = PinkDb::open_durable_with(p2.to_str().unwrap(), SyncPolicy::Sync)
             .unwrap();
@@ -2468,5 +2951,373 @@ mod tests {
         let same = upper.exists();
         let _ = std::fs::remove_file(&probe);
         same
+    }
+
+    /// A keyed store in a crypto-free build must refuse to write plaintext,
+    /// on both save paths.
+    #[cfg(not(feature = "encryption"))]
+    #[test]
+    fn keyed_writes_without_the_feature_are_refused() {
+        let p = tmp_ckpt("keyedwrite");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.set_encryption_key(Some(EncryptionKey::from_passphrase("sesame")));
+        let err = db.checkpoint().unwrap_err();
+        assert!(err.to_string().contains("not compiled in"), "{err}");
+        assert!(!p.exists(), "no plaintext checkpoint may appear");
+        let snap = p.parent().unwrap().join("snap.pink");
+        let err = db.save_snapshot(snap.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("not compiled in"), "{err}");
+        assert!(!snap.exists(), "no plaintext snapshot may appear");
+        cleanup(&p);
+    }
+
+    /// m7 regression: a crafted roll name at the top of the `u64` range must
+    /// produce a clean error, never an overflow panic, when recovery has to
+    /// continue the generation sequence.
+    #[test]
+    fn max_roll_generation_overflow_is_a_clean_error() {
+        let p = tmp_ckpt("genoverflow");
+        write_pink(&p, &[0]);
+        // A roll whose name and header agree on u64::MAX.
+        write_wal_lsns(
+            &roll_path(&wal_path(&p), u64::MAX),
+            u64::MAX,
+            &raw(&[vec!["INSERT INTO t VALUES (1);".to_string()]]),
+        );
+        // The live WAL is absent, so recovery must recreate it *after* the
+        // roll and cannot.
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("highest representable"), "{err}");
+
+        // The helper itself refuses the wrap (it backs both call sites).
+        let roll = Roll {
+            gen: u64::MAX,
+            path: PathBuf::from("x.pink.wal.18446744073709551615.roll"),
+        };
+        let err = next_gen_after_rolls(std::slice::from_ref(&roll)).unwrap_err();
+        assert!(err.to_string().contains("highest representable"), "{err}");
+        assert_eq!(next_gen_after_rolls(&[]).unwrap(), 1);
+        let roll = Roll { gen: 7, path: PathBuf::from("x") };
+        assert_eq!(next_gen_after_rolls(std::slice::from_ref(&roll)).unwrap(), 8);
+        cleanup(&p);
+    }
+
+    /// m5: a snapshot-only encrypted `.pink` (no sidecar WAL) opened through
+    /// the durable path in a crypto-free build must name the missing feature
+    /// with the standard wording, not the recovery-mode one.
+    #[cfg(not(feature = "encryption"))]
+    #[test]
+    fn durable_open_of_a_snapshot_only_encrypted_pink_names_the_feature() {
+        let p = tmp_ckpt("encsnapshotoff");
+        let mut bytes = crypto::ENC_MAGIC.to_vec();
+        bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&p, &bytes).unwrap();
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("file is encrypted; build with the encryption feature"),
+            "{err}"
+        );
+        cleanup(&p);
+    }
+
+    // ---------- encrypted WAL (feature `encryption`) ----------
+
+    #[cfg(feature = "encryption")]
+    mod encrypted {
+        use super::*;
+
+        fn key() -> EncryptionKey {
+            EncryptionKey::from_raw([0x33u8; 32])
+        }
+
+        fn durable_keyed(p: &Path) -> PinkDb {
+            PinkDb::open_durable_with_key(p.to_str().unwrap(), &key()).unwrap()
+        }
+
+        #[test]
+        fn records_are_encrypted_and_replay_exactly_once() {
+            let p = tmp_ckpt("encrecords");
+            let mut db = durable_keyed(&p);
+            db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);").unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'marker-plaintext');").unwrap();
+            let wal = std::fs::read(wal_path(&p)).unwrap();
+            assert!(wal.starts_with(crypto::ENC_MAGIC));
+            assert!(!wal.windows(8).any(|w| w == b"marker-p"));
+            drop(db);
+
+            let mut back = durable_keyed(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+            // The next append continues the ordinal nonce counter and replays.
+            back.execute("INSERT INTO t VALUES (2, 'x');").unwrap();
+            drop(back);
+            let mut again = durable_keyed(&p);
+            assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+            cleanup(&p);
+        }
+
+        #[test]
+        fn wrong_key_fails_before_anything_replays() {
+            let p = tmp_ckpt("encwrongkey");
+            let mut db = durable_keyed(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            drop(db);
+            let err = PinkDb::open_durable_with_key(
+                p.to_str().unwrap(),
+                &EncryptionKey::from_raw([0x44u8; 32]),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("wrong key"), "{err}");
+            cleanup(&p);
+        }
+
+        #[test]
+        fn encrypted_torn_header_is_recreated_encrypted() {
+            let p = tmp_ckpt("enctorn");
+            std::fs::write(wal_path(&p), b"PINKENC1\x01\x00\x00\x00").unwrap();
+            let (db, info) = PinkDb::open_durable_with_key_and_policy(
+                p.to_str().unwrap(),
+                SyncPolicy::Sync,
+                &key(),
+            )
+            .unwrap();
+            let wal = std::fs::read(wal_path(&p)).unwrap();
+            assert!(wal.starts_with(crypto::ENC_MAGIC), "recreated encrypted");
+            assert_eq!(wal.len(), 80, "raw-key container header is 80 bytes");
+            assert_eq!(info.truncated_bytes, 0);
+            drop(db);
+            cleanup(&p);
+        }
+
+        /// Wave-22 C1 on an encrypted database: the crash image after the WAL
+        /// roll but before the publish must be completed by recovery, the
+        /// recovered checkpoint must be durable, and a second open must see
+        /// the rows.
+        #[test]
+        fn encrypted_interrupted_checkpoint_is_published_before_rolls_are_removed() {
+            let p = tmp_ckpt("encckptcrash");
+            {
+                let mut db = durable_keyed(&p);
+                db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+                db.execute("INSERT INTO t VALUES (1);").unwrap();
+                db.save_sync_with_key(&tmp_path(&p), &key()).unwrap();
+                std::fs::rename(wal_path(&p), roll_path(&wal_path(&p), 1)).unwrap();
+                let cipher = RecordCipher::create(&key(), 2).unwrap();
+                Wal::create_file(&wal_path(&p), 2, Some(cipher)).unwrap();
+            }
+            let (mut back, info) = PinkDb::open_durable_with_key_and_policy(
+                p.to_str().unwrap(),
+                SyncPolicy::Sync,
+                &key(),
+            )
+            .unwrap();
+            assert_eq!(info.checkpoints_completed, 1, "recovery must publish .tmp");
+            assert_eq!(info.replayed_records, 0);
+            assert_eq!(info.stale_rolls_removed, 1);
+            assert!(std::fs::read(&p).unwrap().starts_with(crypto::ENC_MAGIC));
+            assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+            drop(back);
+
+            // The second clean open must not lose the recovered rows, and the
+            // live WAL (gen 2) must still be encrypted.
+            let (mut again, info) = PinkDb::open_durable_with_key_and_policy(
+                p.to_str().unwrap(),
+                SyncPolicy::Sync,
+                &key(),
+            )
+            .unwrap();
+            assert_eq!(info.replayed_records, 0);
+            assert_eq!(ints(&mut again, "SELECT a FROM t;"), vec![1]);
+            assert!(std::fs::read(wal_path(&p)).unwrap().starts_with(crypto::ENC_MAGIC));
+            assert!(!tmp_path(&p).exists());
+            assert!(scan_rolls(&wal_path(&p)).unwrap().is_empty());
+            drop(again);
+            cleanup(&p);
+        }
+
+        /// A checkpoint rolls into a fresh encrypted generation whose records
+        /// still replay (forked cipher: same key, fresh nonce prefix).
+        #[test]
+        fn encrypted_checkpoint_rolls_into_a_fresh_encrypted_generation() {
+            let p = tmp_ckpt("encroll");
+            let mut db = durable_keyed(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.checkpoint().unwrap();
+            let wal = std::fs::read(wal_path(&p)).unwrap();
+            assert!(wal.starts_with(crypto::ENC_MAGIC));
+            assert_eq!(wal.len(), 80, "fresh generation is header-only");
+            db.execute("INSERT INTO t VALUES (2);").unwrap();
+            drop(db);
+            let mut back = durable_keyed(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+            cleanup(&p);
+        }
+
+        /// A truncated encrypted WAL is rewritten atomically with a fresh
+        /// nonce prefix; a leftover `.rewrite` temp must never confuse roll
+        /// scanning or recovery.
+        #[test]
+        fn encrypted_truncation_rewrites_and_ignores_rewrite_leftovers() {
+            let p = tmp_ckpt("encrewrite");
+            let mut db = durable_keyed(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.execute("INSERT INTO t VALUES (2);").unwrap();
+            drop(db);
+            let before = std::fs::read(wal_path(&p)).unwrap();
+            std::fs::write(wal_path(&p), &before[..before.len() - 5]).unwrap();
+            // A stale rewrite temp from a hypothetical crash: harmless.
+            std::fs::write(rewrite_path(&wal_path(&p)), b"stale").unwrap();
+            let (mut back, info) = PinkDb::open_durable_with_key_and_policy(
+                p.to_str().unwrap(),
+                SyncPolicy::Sync,
+                &key(),
+            )
+            .unwrap();
+            assert!(info.truncated_bytes > 0);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1]);
+            let after = std::fs::read(wal_path(&p)).unwrap();
+            assert!(after.starts_with(crypto::ENC_MAGIC));
+            assert_ne!(&after[22..30], &before[22..30], "fresh nonce prefix");
+            back.execute("INSERT INTO t VALUES (3);").unwrap();
+            drop(back);
+            let mut again = durable_keyed(&p);
+            assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![1, 3]);
+            cleanup(&p);
+        }
+
+        /// A plaintext `.tmp` meeting a keyed open is refused before anything
+        /// is published or deleted.
+        #[test]
+        fn plaintext_tmp_meeting_a_keyed_open_is_refused() {
+            let p = tmp_ckpt("encmode");
+            write_pink(&tmp_path(&p), &[1]);
+            let err = PinkDb::open_durable_with_key(p.to_str().unwrap(), &key()).unwrap_err();
+            assert!(err.to_string().contains("not encrypted"), "{err}");
+            assert!(tmp_path(&p).exists(), "nothing may be removed");
+            cleanup(&p);
+        }
+
+        /// m5 (feature on): a snapshot-only encrypted `.pink` (no WAL) opened
+        /// without a key fails with the standard wording, not the recovery one.
+        #[test]
+        fn keyless_open_of_a_snapshot_only_encrypted_pink() {
+            let p = tmp_ckpt("encsnapshot");
+            let mut db = PinkDb::new();
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.save_with_key(p.to_str().unwrap(), &key()).unwrap();
+            let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("file is encrypted"), "{msg}");
+            assert!(!msg.contains("cannot recover"), "{msg}");
+            cleanup(&p);
+        }
+
+        /// M1 regression: switching the store's key mode (or its key) after a
+        /// durable open must be refused at the checkpoint — a `.pink` in one
+        /// mode beside a fresh WAL generation in the other is unopenable.
+        #[test]
+        fn changing_the_key_mode_or_key_on_a_live_store_is_refused() {
+            // Plaintext open -> key set: refused, nothing is published.
+            let p = tmp_ckpt("modeswitch1");
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            let wal_before = std::fs::read(wal_path(&p)).unwrap();
+            db.set_encryption_key(Some(key()));
+            let err = db.checkpoint().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot change encryption mode on a live store"),
+                "{err}"
+            );
+            assert!(!p.exists(), "no .pink may be published");
+            assert!(!tmp_path(&p).exists() && !roll_path(&wal_path(&p), 1).exists());
+            assert_eq!(
+                std::fs::read(wal_path(&p)).unwrap(),
+                wal_before,
+                "the live WAL is untouched"
+            );
+            // Appends keep working in the WAL's own mode.
+            db.execute("INSERT INTO t VALUES (2);").unwrap();
+            drop(db);
+            let mut back = durable(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+
+            // Keyed open -> key cleared: refused too.
+            let p = tmp_ckpt("modeswitch2");
+            let mut db = durable_keyed(&p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            db.execute("INSERT INTO t VALUES (1);").unwrap();
+            db.set_encryption_key(None);
+            let err = db.checkpoint().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot change encryption mode on a live store"),
+                "{err}"
+            );
+            assert!(!p.exists());
+            // Same mode but a different key: also refused (the pair would be
+            // sealed under two different keys).
+            db.set_encryption_key(Some(EncryptionKey::from_raw([0x55u8; 32])));
+            let err = db.checkpoint().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cannot change the encryption key on a live store"),
+                "{err}"
+            );
+            assert!(!p.exists());
+            // Restoring the live key lets the checkpoint through, encrypted.
+            db.set_encryption_key(Some(key()));
+            db.checkpoint().unwrap();
+            assert!(std::fs::read(&p).unwrap().starts_with(crypto::ENC_MAGIC));
+            drop(db);
+            let mut back = durable_keyed(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1]);
+            drop(back);
+            cleanup(&p);
+        }
+
+        /// M3 regression: `save_snapshot` refuses a target whose `.pink`
+        /// itself (not only its sidecar WAL) is in the other at-rest mode.
+        #[test]
+        fn snapshot_refuses_a_mode_mismatched_target_pink() {
+            // Plaintext store over an encrypted target `.pink`.
+            let p = tmp_ckpt("snapmode1");
+            let mut plain = durable(&p);
+            plain.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            let target = p.parent().unwrap().join("enc-target.pink");
+            let mut enc = PinkDb::new();
+            enc.execute("CREATE TABLE u (b INTEGER);").unwrap();
+            enc.execute("INSERT INTO u VALUES (7);").unwrap();
+            enc.save_with_key(target.to_str().unwrap(), &key()).unwrap();
+            let before = std::fs::read(&target).unwrap();
+            let err = plain.save_snapshot(target.to_str().unwrap()).unwrap_err();
+            assert!(err.to_string().contains("file is encrypted"), "{err}");
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                before,
+                "the encrypted target is untouched"
+            );
+            drop(plain);
+
+            // Keyed store over a plaintext target `.pink`.
+            let p2 = tmp_ckpt("snapmode2");
+            let mut mem = PinkDb::new();
+            mem.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            let pt = p2.parent().unwrap().join("plain-target.pink");
+            mem.save(pt.to_str().unwrap()).unwrap();
+            let before = std::fs::read(&pt).unwrap();
+            let mut keyed = durable_keyed(&p2);
+            keyed.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            let err = keyed.save_snapshot(pt.to_str().unwrap()).unwrap_err();
+            assert!(err.to_string().contains("not encrypted"), "{err}");
+            assert_eq!(std::fs::read(&pt).unwrap(), before);
+            drop(keyed);
+            cleanup(&p);
+            cleanup(&p2);
+        }
     }
 }

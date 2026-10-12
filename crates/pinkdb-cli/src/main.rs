@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use pinkdb::{DataType, PinkDb, QueryResult, SyncPolicy, Value};
+use pinkdb::{DataType, EncryptionKey, PinkDb, QueryResult, SyncPolicy, Value};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -28,6 +28,8 @@ fn print_help() {
     println!("                         db.table targets another database)");
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
+    println!("Encryption: PINKDB_KEY=<passphrase> (valid UTF-8) makes .save write and .open");
+    println!("            read an encrypted database (needs a build with the `encryption` feature).");
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases.");
 }
@@ -273,7 +275,15 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             if path.is_empty() {
                 println!("Usage: .open <file.pink>");
             } else {
-                match PinkDb::open_durable_with(path, SyncPolicy::Sync) {
+                // `PINKDB_KEY` (if set) is already installed on the store, so
+                // both the checkpoint and the snapshot path encrypt.
+                let result = match db.encryption_key() {
+                    Some(k) => {
+                        PinkDb::open_durable_with_key_and_policy(path, SyncPolicy::Sync, k)
+                    }
+                    None => PinkDb::open_durable_with(path, SyncPolicy::Sync),
+                };
+                match result {
                     Ok((new_db, info)) => {
                         if info.checkpoints_completed > 0 {
                             println!("Completed an interrupted checkpoint from its .tmp state");
@@ -508,10 +518,23 @@ fn parse_args() -> Result<Opts, String> {
 }
 
 /// Build the REPL session: local by default, remote when `--host` is given
-/// (the `client` feature; without it, `--host` is rejected).
-fn build_session(host: Option<String>) -> Session {
+/// (the `client` feature; without it, `--host` is rejected). The `PINKDB_KEY`
+/// passphrase, when set, becomes the store's at-rest key in local mode; in
+/// remote mode the variable is inert (the server's own at-rest configuration
+/// applies), so a set key is called out instead of being silently ignored.
+fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
+    if host.is_some() && key.is_some() {
+        eprintln!(
+            "warning: PINKDB_KEY is set but is not used in remote mode; \
+             the server's at-rest configuration applies"
+        );
+    }
     match host {
-        None => Session::Local(PinkDb::new()),
+        None => {
+            let mut db = PinkDb::new();
+            db.set_encryption_key(key);
+            Session::Local(db)
+        }
         #[cfg(feature = "client")]
         Some(host) => match Client::connect(&host) {
             Ok(client) => Session::Remote(client),
@@ -540,7 +563,15 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let mut session = build_session(host.clone());
+    let mut session = build_session(host.clone(), match EncryptionKey::from_env() {
+        Ok(key) => key,
+        Err(e) => {
+            // A set-but-non-UTF-8 PINKDB_KEY must not silently fall back to
+            // plaintext.
+            eprintln!("Error: {e}");
+            std::process::exit(2);
+        }
+    });
     let mut rl = DefaultEditor::new().unwrap_or_else(|e| {
         eprintln!("rustyline init failed ({e}); falling back to stdin");
         DefaultEditor::new().expect("rustyline fallback")

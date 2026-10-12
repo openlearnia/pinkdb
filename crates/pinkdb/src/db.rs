@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use crate::crypto::EncryptionKey;
 use crate::plan::{LogicalPlan, is_read_only};
 use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
@@ -78,6 +79,15 @@ impl Database {
     /// every subsequent commit to that WAL.
     pub fn open(path: &str) -> Result<Database> {
         Ok(Database::from_store(PinkDb::open_durable(path)?))
+    }
+
+    /// Open a durable database at `path` with at-rest encryption: the
+    /// checkpoint and the sidecar WAL must be encrypted and are decrypted
+    /// with `key`; commits are written encrypted. Requires the `encryption`
+    /// feature; a plaintext artifact is refused so the key cannot be silently
+    /// ignored.
+    pub fn open_with_key(path: &str, key: &EncryptionKey) -> Result<Database> {
+        Ok(Database::from_store(PinkDb::open_durable_with_key(path, key)?))
     }
 
     pub fn from_store(store: PinkDb) -> Self {
