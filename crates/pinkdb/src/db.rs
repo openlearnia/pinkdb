@@ -19,12 +19,47 @@
 //! no locks while open (only validation+merge serializes at commit).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::plan::{LogicalPlan, is_read_only};
 use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
 use crate::QueryResult;
+
+/// One-time warning flag for poisoned-lock recovery (see [`read_lock`]).
+static POISON_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Loudly (once per process) note that a poisoned lock is being recovered.
+fn warn_poisoned_once() {
+    if !POISON_WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "pinkdb: WARNING: recovering from a poisoned lock after a panic; \
+             the store may be inconsistent, but statements keep working"
+        );
+    }
+}
+
+/// Read-lock the shared store, recovering from poisoning.
+///
+/// A thread that panics while holding the write lock poisons it; refusing to
+/// lock afterwards would let one panic permanently DoS the store. Recovery is
+/// loud and the state may be inconsistent (the panicking statement is not
+/// guaranteed to have applied atomically), but reads and writes keep working.
+fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        warn_poisoned_once();
+        poisoned.into_inner()
+    })
+}
+
+/// Write-lock the shared store, recovering from poisoning (see [`read_lock`]).
+fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        warn_poisoned_once();
+        poisoned.into_inner()
+    })
+}
 
 /// A shared database handle. Clone it per thread; each thread then opens its
 /// own [`Connection`].
@@ -51,29 +86,25 @@ impl Database {
 
     pub fn connect(&self) -> Connection {
         // Start on the store's current database (fresh stores: `main`).
-        let current_db = self
-            .shared
-            .read()
-            .map(|g| g.current_db().to_string())
-            .unwrap_or_else(|_| "main".to_string());
+        let current_db = read_lock(&self.shared).current_db().to_string();
         Connection { db: self.clone(), txn: None, current_db }
     }
 
     /// True when this database logs commits to a WAL.
     pub fn is_durable(&self) -> bool {
-        self.shared.read().map(|g| g.is_durable()).unwrap_or(false)
+        read_lock(&self.shared).is_durable()
     }
 
     /// Checkpoint the durable store: atomically write the bound `.pink` and
     /// roll the WAL generation. Errors for in-memory databases.
     pub fn checkpoint(&self) -> Result<()> {
-        let mut shared = self.shared.write().map_err(lock_err)?;
+        let mut shared = write_lock(&self.shared);
         shared.checkpoint()
     }
 
     /// fsync the WAL (meaningful with [`crate::SyncPolicy::Batch`]).
     pub fn flush_wal(&self) -> Result<()> {
-        let mut shared = self.shared.write().map_err(lock_err)?;
+        let mut shared = write_lock(&self.shared);
         shared.flush_wal()
     }
 }
@@ -204,14 +235,14 @@ impl Connection {
                 // (A concurrent DROP between bind and run surfaces as a clean
                 // "not found" error — never corruption.)
                 let plan = {
-                    let shared = self.db.shared.read().map_err(lock_err)?;
+                    let shared = read_lock(&self.db.shared);
                     crate::sql::bind(&shared, stmt, &pre)?
                 };
                 let result = if is_read_only(&plan) {
-                    let shared = self.db.shared.read().map_err(lock_err)?;
+                    let shared = read_lock(&self.db.shared);
                     crate::exec::run_read(&shared, &plan)?
                 } else {
-                    let mut shared = self.db.shared.write().map_err(lock_err)?;
+                    let mut shared = write_lock(&self.db.shared);
                     let result = crate::exec::run(&mut shared, &plan)?;
                     // The write is published: log it while still holding the
                     // lock so WAL order matches commit order.
@@ -231,7 +262,7 @@ impl Connection {
                 // logged `USE` for a dead database could never replay.
                 if is_read_only(&plan) {
                     if let QueryResult::Used { .. } = &result {
-                        let shared = self.db.shared.read().map_err(lock_err)?;
+                        let shared = read_lock(&self.db.shared);
                         let after = session_after(&result, &pre, &shared);
                         if !shared.database_exists(&after) {
                             return Err(PinkDbError::Catalog(format!(
@@ -249,7 +280,7 @@ impl Connection {
                     QueryResult::DroppedDatabase { name }
                         if name.eq_ignore_ascii_case(&pre) =>
                     {
-                        self.db.shared.read().map_err(lock_err)?.fallback_db()
+                        read_lock(&self.db.shared).fallback_db()
                     }
                     _ => pre,
                 };
@@ -262,7 +293,7 @@ impl Connection {
         if self.txn.is_some() {
             return Err(PinkDbError::Execution("already in a transaction".to_string()));
         }
-        let shared = self.db.shared.read().map_err(lock_err)?;
+        let shared = read_lock(&self.db.shared);
         let mut base_tables = HashMap::new();
         for dbname in shared.list_databases() {
             for name in shared.list_tables_in(&dbname) {
@@ -301,7 +332,7 @@ impl Connection {
         let mut txn = self.txn.take().ok_or_else(|| {
             PinkDbError::Execution("no transaction in progress".to_string())
         })?;
-        let mut shared = self.db.shared.write().map_err(lock_err)?;
+        let mut shared = write_lock(&self.db.shared);
         // A database dropped since BEGIN makes the transaction's WAL record
         // unreplayable (its statements or `USE` targets name it): conflict
         // instead of logging a dead record or silently no-op'ing the merge.
@@ -380,10 +411,6 @@ fn conflict(what: &str) -> PinkDbError {
     PinkDbError::Execution(format!(
         "write conflict on {what}: changed concurrently, retry the transaction"
     ))
-}
-
-fn lock_err<T>(_: T) -> PinkDbError {
-    PinkDbError::Execution("internal lock error (poisoned)".to_string())
 }
 
 /// The session database after `result` ran from `before`: `USE` switches to
@@ -762,5 +789,93 @@ mod tests {
         // The transaction switched only its own session.
         assert_eq!(a.current_db(), "main");
         assert_eq!(b.current_db(), "main");
+    }
+
+    // ---------- robustness: depth guard + poisoned-lock recovery ----------
+
+    /// `SELECT 1+1+...;` with `terms - 1` additions.
+    fn chain_sql(terms: usize) -> String {
+        let mut sql = String::from("SELECT 1");
+        for _ in 1..terms {
+            sql.push_str("+1");
+        }
+        sql.push(';');
+        sql
+    }
+
+    /// The AST-depth guard at the engine level: a chain of
+    /// `MAX_AST_DEPTH - 3` terms sits exactly at the cap (statement + Select +
+    /// projection + one node per term), one more term is rejected cleanly,
+    /// and the connection keeps working either way. `PINKDB_PARSER=legacy
+    /// cargo test` exercises the same boundary through the legacy parser.
+    #[test]
+    fn ast_depth_cap_boundary_through_the_engine() {
+        let db = Database::new();
+        let mut c = db.connect();
+        let at_cap = chain_sql(crate::sql::MAX_AST_DEPTH - 3);
+        assert_eq!(
+            rows_of(c.execute(&at_cap).unwrap()),
+            vec![vec![Value::Integer((crate::sql::MAX_AST_DEPTH - 3) as i32)]]
+        );
+        let over_cap = chain_sql(crate::sql::MAX_AST_DEPTH - 2);
+        let err = c.execute(&over_cap).unwrap_err();
+        assert!(
+            err.to_string().contains("expression too deep"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(rows_of(c.execute("SELECT 2;").unwrap()), vec![vec![Value::Integer(2)]]);
+    }
+
+    /// A ~10k-term chain (far past the recursive-drop crash point on this
+    /// 2 MiB test thread) is a clean error, and the store stays usable.
+    #[test]
+    fn over_deep_chain_is_a_clean_error_and_leaves_the_store_usable() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut sql = String::from("INSERT INTO t VALUES (1");
+        for _ in 0..10_000 {
+            sql.push_str("+1");
+        }
+        sql.push_str(");");
+        let err = c.execute(&sql).unwrap_err();
+        assert!(err.to_string().contains("expression too deep"), "{err}");
+        c.execute("INSERT INTO t VALUES (7);").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT a FROM t;").unwrap()),
+            vec![vec![Value::Integer(7)]]
+        );
+    }
+
+    /// A panic while holding the write lock poisons it; statements must keep
+    /// working afterwards instead of failing forever.
+    #[test]
+    fn poisoned_lock_is_recovered_and_statements_still_work() {
+        let db = seeded();
+        let db2 = db.clone();
+        let poisoned = std::thread::spawn(move || {
+            let _guard = db2.shared.write().expect("unpoisoned write lock");
+            panic!("poison the store lock on purpose");
+        });
+        assert!(poisoned.join().is_err(), "the poisoning thread must panic");
+        assert!(db.shared.is_poisoned(), "the write lock must be poisoned");
+
+        // Reads and writes recover with the one-time loud warning.
+        let mut c = db.connect();
+        assert_eq!(
+            rows_of(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
+            vec![vec![Value::Bigint(2)]]
+        );
+        c.execute("INSERT INTO t VALUES (3, 'z');").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
+            vec![vec![Value::Bigint(3)]]
+        );
+        // Transactions take the same path.
+        c.execute("BEGIN; INSERT INTO t VALUES (4, 'w'); COMMIT;").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
+            vec![vec![Value::Bigint(4)]]
+        );
     }
 }

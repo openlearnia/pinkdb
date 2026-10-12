@@ -46,7 +46,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 21 | PEG parser (`peg` crate) in parallel with recursive descent; differential-tested; default flipped | done | f4ce500 — 223 lib + 3 CLI tests both parser modes, duckdiff 60/60 both modes; docs follow-ups 709ede4, 6dfb8c4 |
 | 22 | WAL / crash recovery (core) | done | 253 lib + 3 CLI unit + 9 CLI integration tests; duckdiff 60/60; kill loop 100/100 random + 40/40 targeted clean (dev runs: 600 + 190); bench ≈498 ms |
 | 23 | Multi-database: `USE <db>`, qualified `db.table`, per-database persistence (core) | done | 288 lib + 3 CLI unit + 9 crash + 8 multi-db integration tests (both parser modes); duckdiff 60/60; kill loop 30/30 + 30/30 multi-db clean; bench ≈497 ms |
-| 24 | Network server: `pinkdb-server` binary + CLI `--host` client mode (separate crate; TLS optional feature) | queued | — |
+| 24 | Network server: `pinkdb-server` binary + CLI `--host` client mode (separate crate) | done | pinkdb-server 1.84 MB; 366 tests both parser modes; duckdiff 60/60; live E2E (10k-term chain → clean error, server stays up); kill loop 30/30 clean; bench ≈488 ms |
 | 25 | At-rest encryption: encrypted `.pink` + WAL (AEAD + Argon2id, key via option/env) (core `encryption` feature) | queued | — |
 | 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) (separate crate; contained `unsafe`) | queued | — |
 | 27 | Python binding (cffi) (`bindings/python`) | queued | — |
@@ -63,6 +63,11 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra) | queued | — |
 | 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | queued | — |
 | 40 | Performance improvement: ongoing bench-driven speed rounds (core) | queued | — |
+| 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | queued | — |
+| 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
+| 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
+| 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + JavaScript procedures (optional embedded engine; WAL-replay determinism must be solved) | queued | — |
+| 45 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | queued | — |
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -94,5 +99,12 @@ Java bindings.
   multi-db kill-loop mode in `bench/kill_loop.py`. 288 lib + 3 CLI unit + 9 crash + 8
   multi-db integration tests (both parser modes), duckdiff 60/60, kill loop 30/30 + 30/30
   multi-db clean, bench ≈497 ms.
-- 2026-10-12 — Binary size: 2.17 MB (release CLI, measured after wave 23; pre-wave-17 was
-  2.26 MB).
+- 2026-10-12 — Wave 24: network server — new `crates/pinkdb-server` (protocol v2 framed
+  binary, explicit `BatchDone` terminator, typed values); thread-per-connection zero-async
+  server (16 MiB stacks, 128-connection cap, accept-error backoff); panic + poisoned-lock
+  isolation; AST-depth guard (limit 64) with iterative free in both parsers; remote CLI via
+  optional `client` feature; durable `--file` mode with WAL replay. 366 tests (incl.
+  server/durable/remote) both parser modes, duckdiff 60/60, kill loop 30/30 clean, bench
+  ≈488 ms; release sizes `pinkdb` 2.19 MB and `pinkdb-server` 1.84 MB.
+- 2026-10-12 — Binary size: `pinkdb` 2.19 MB + `pinkdb-server` 1.84 MB (release, after
+  wave 24; pre-wave-17 was 2.26 MB).

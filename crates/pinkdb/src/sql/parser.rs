@@ -147,6 +147,9 @@ pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
             }
         }
     }
+    // Post-parse depth guard (shared with the PEG parser): rejects over-deep
+    // ASTs before bind/execute/drop can recurse through them.
+    super::check_ast_depth(&mut out)?;
     Ok(out)
 }
 

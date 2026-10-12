@@ -1,0 +1,17 @@
+[package]
+name = "pinkdb-server"
+version = "0.1.0"
+edition = "2021"
+description = "pinkdb network server: TCP server + blocking client for the pinkdb engine"
+license = "MIT"
+
+[lib]
+name = "pinkdb_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pinkdb-server"
+path = "src/bin/pinkdb-server.rs"
+
+[dependencies]
+pinkdb = { path = "../pinkdb" }

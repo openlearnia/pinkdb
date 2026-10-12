@@ -2,7 +2,8 @@
 
 An embedded **analytical** SQL database: in-memory columnar storage, vectorized
 execution, SQL with aggregates and joins, CSV import. Ships as a library crate
-(`pinkdb`) and a CLI REPL (`pinkdb-cli`, a thin consumer of the library).
+(`pinkdb`), a CLI REPL (`pinkdb-cli`, a thin consumer of the library), and a
+network server (`pinkdb-server`, a separate crate so the core stays lean).
 
 ```sql
 .import sales.csv sales
@@ -65,10 +66,11 @@ SQL text
 | `pinkdb::persist` | `.pink` single-file columnar persistence, v2 (databases + RLE/dictionary/bitpack; v1 files load) |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
+| `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
 
 Design rules: Rust edition 2021, zero async, no unsafe. Dependencies are
 `csv` + `rustyline`, plus `rayon` for parallel execution and `peg` for the
-SQL parser.
+SQL parser. The server crate adds no external dependencies.
 
 SQL is parsed by a `peg`-generated grammar; the hand-written lexer +
 recursive-descent parser stays selectable via `PINKDB_PARSER=legacy`. A
@@ -262,6 +264,106 @@ error (retry the transaction) — never silent lost updates. This is snapshot
 isolation without predicate tracking (write-skew is possible). The plain
 `PinkDb` API remains for single-connection embedding.
 
+## Network server
+
+`pinkdb-server` is a separate workspace crate (packaging: the core stays
+lean): a TCP server plus a blocking client for a hand-rolled binary protocol.
+No external dependencies, zero async (one std thread per connection), no
+unsafe. Release binaries: `pinkdb` 2.19 MB, `pinkdb-server` 1.84 MB (Apple
+Silicon, `--release`, thin LTO).
+
+```sh
+# in-memory server on 127.0.0.1:5433
+cargo run --release -p pinkdb-server
+
+# durable server: same checkpoint + WAL guarantees as the embedded path
+cargo run --release -p pinkdb-server -- --file sales.pink
+
+# remote REPL: build the CLI with the optional `client` feature, then
+cargo build --release -p pinkdb-cli --features client
+./target/release/pinkdb --host 127.0.0.1:5433
+```
+
+`pinkdb-server --help` lists the flags: `--host` (default `127.0.0.1`),
+`--port` (default `5433`; `0` picks an ephemeral port), and `--file` (durable
+`.pink`: the checkpoint loads and the sidecar WAL replays on restart;
+in-memory when omitted). The server prints its listening address on startup
+and runs until terminated.
+
+Server robustness, in one place:
+
+- **16 MiB stack per connection thread.** The default 2 MiB thread stack sits
+  too close to the engine's worst-case recursion; connection threads ask for
+  16 MiB and the engine's depth guards (below) reject hostile statements
+  before they can recurse.
+- **Transient accept errors never stop the server.** `EMFILE`/`ENFILE`/`ECONNABORTED`/
+  `ENOBUFS`/... are logged and retried with a 10 ms→1 s backoff, so an fd
+  spike no longer kills the process (`ulimit -n` pressure, many short-lived
+  clients). Only the nonblocking poll and `EINTR` follow the fast path.
+- **128 concurrent connections** (`DEFAULT_MAX_CONNECTIONS`). Over the cap the
+  server sends a best-effort `Error` frame and closes, bounding fds/threads.
+- **Panics are isolated.** A panic while executing one statement is caught,
+  logged, and reported as an `Error` frame; the connection and every other
+  client stay alive. A panic while the store's write lock is held poisons it;
+  the engine logs once and recovers via `PoisonError::into_inner()`, so one
+  bad statement cannot permanently DoS the database (the state may be
+  inconsistent — recovery is loud).
+- **No read/write timeouts.** A slow or stalled client holds one thread and
+  one fd until it disconnects; a client that stops reading a large result
+  blocks only its own connection thread (the accept loop is never blocked).
+  The connection cap bounds that pressure.
+- **Depth guards.** Statements nested deeper than 24 units (parens, `CASE`,
+  prefix unary) or with an AST deeper than 64 nodes (left-associative
+  operator chains, `IN` lists, `AND`/`OR` runs, nested subqueries) are
+  rejected with a clean `Parse` error before bind/execute/drop can recurse.
+
+### Protocol
+
+One TCP connection is one session. Every message is a frame: `u32` little-
+endian length prefix + `u8` message type + body. Frames larger than 64 MiB
+are rejected before allocation, and every inner length (strings, columns,
+rows, values) is validated against the bytes remaining in the frame — a
+malformed or truncated peer can never make the decoder read out of bounds or
+over-allocate.
+
+Requests: `Hello { protocol_version }` (required first; a mismatched version
+is rejected with a clear error), `Execute { sql }`, `Ping`. Responses:
+`HelloOk { server_version, protocol_version }`, `Pong`, and per statement one
+result group — `ResultSet { names, types }`, then chunked `Rows { count,
+columns, values... }` frames (typed value encoding: a tag byte + payload for
+NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP; `DataType` tag byte), then
+`Done { kind }`. A successful `Execute` batch ends with exactly one
+`BatchDone { statements }` frame and the client reads result groups until it,
+so neither side parses SQL just to count statements. A failing statement ends
+the batch with a single `Error { message }` instead; SQL errors arrive as
+`Error` frames and the connection stays open. The protocol version is 2.
+
+The client (`pinkdb_server::Client`) reconstructs pinkdb's public
+`QueryResult`/`Value`/`DataType`, so the CLI renders remote results with the
+exact same renderer as local ones. Each connection gets its own
+`Connection`, so wave-23 sessions (`USE`, transactions) are isolated per TCP
+client. After a decode or transport error the client marks itself broken and
+fails fast on later calls instead of reading a desynchronized stream.
+
+### Remote CLI mode
+
+`pinkdb --host HOST:PORT` sends every SQL statement to the server and renders
+results with the same box-drawn output and timing line as the embedded REPL.
+SQL (including `USE`, `CREATE DATABASE`, `BEGIN`/`COMMIT`) works unchanged.
+The file and catalog dot-commands (`.import`, `.save`, `.open`, `.databases`,
+`.tables`, `.schema`) are not available in remote mode and report
+`Error: <cmd> is not available in remote mode`. The feature is opt-in: the
+default build rejects `--host` with "built without the client feature".
+
+### Security posture
+
+**No authentication, no TLS, no authorization in this wave.** Anyone who can
+open a TCP connection to the port gets the full SQL surface of the served
+database (queries, writes, DDL) on the one shared store. The server binds
+`127.0.0.1` by default and must stay on localhost or a trusted network: do
+not expose it to the internet or to untrusted clients. Auth and TLS are
+planned; they are explicitly out of scope for this wave.
+
 ## Benchmark (1M rows, release, Apple Silicon)
 
 Generated with `bench/gen_sales.py` (deterministic seed 42), measured with `cargo run --release -p pinkdb --example query_bench` (best of 5):
@@ -315,16 +417,23 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 - Expression nesting is capped at 24 levels (parentheses, `CASE` arms and
   consecutive unary operators counted together); deeper input returns a clean
   `Parse` error (`expression nesting too deep`) in both parsers instead of
-  overflowing the parser stack
+  overflowing the parser stack. Separately, the parser-to-AST depth is capped
+  at 64 nodes: left-associative operator chains (`1+1+...`), long `IN` lists,
+  `AND`/`OR` runs and deeply nested subqueries return `expression too deep
+  (limit 64)` — the AST is freed iteratively, so even a multi-megabyte chain
+  cannot overflow the stack during rejection
 
-Post-v1 roadmap: network server (`pinkdb-server`), at-rest encryption,
-C/Python/Go language bindings, Parquet reader (see PLAN.md).
+Post-v1 roadmap: at-rest encryption, C/Python/Go language bindings, Parquet
+reader (see PLAN.md). The network server (`pinkdb-server`) shipped in wave 24;
+authentication and TLS are deferred.
 
 ## Development
 
 ```sh
 cargo build            # workspace
 cargo test             # 100+ unit + end-to-end tests
+cargo test -p pinkdb-server                          # protocol + server + durable tests
+cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
 cargo clippy --all-targets   # must stay clean
 python3 bench/duckdiff.py [--big sales.csv]  # differential test vs DuckDB
 cargo run --release -p pinkdb --example import_bench  # CSV import timing

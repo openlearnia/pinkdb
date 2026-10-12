@@ -7,6 +7,11 @@ edition = "2021"
 name = "pinkdb"
 path = "src/main.rs"
 
+[features]
+# Opt-in remote mode: `pinkdb --host HOST:PORT` talks to a pinkdb-server.
+client = ["dep:pinkdb-server"]
+
 [dependencies]
 pinkdb = { path = "../pinkdb" }
 rustyline = "14"
+pinkdb-server = { path = "../pinkdb-server", optional = true }

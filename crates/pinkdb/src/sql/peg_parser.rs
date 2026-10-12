@@ -25,7 +25,11 @@ use crate::types::{DataType, PinkDbError, Result, Value};
 /// and position format differ (PEG reports the furthest expected token).
 pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
     super::parser::check_nesting_depth(sql)?;
-    peg_sql::statements(sql).map_err(|e| PinkDbError::Parse(format!("parse error: {e}")))
+    let mut out =
+        peg_sql::statements(sql).map_err(|e| PinkDbError::Parse(format!("parse error: {e}")))?;
+    // Post-parse depth guard (shared with the recursive-descent parser).
+    super::check_ast_depth(&mut out)?;
+    Ok(out)
 }
 
 /// What may follow the left operand of a comparison-level expression.
@@ -1874,7 +1878,11 @@ mod tests {
         }
     }
 
-    /// Two levels below the cap still parse to equal ASTs in both parsers.
+    /// Two levels below the text cap still parse to equal ASTs in both
+    /// parsers. Nested subqueries are the exception: each level costs three
+    /// AST nodes (Select, projection, scalar-subquery expression), so the
+    /// shared AST-depth guard can reject the deepest nestings before the text
+    /// cap does; both parsers must agree either way.
     #[test]
     fn nesting_just_below_cap_parses_in_both_parsers() {
         let depth = MAX_NESTING_DEPTH - 2;
@@ -1883,11 +1891,21 @@ mod tests {
             nested_calls("upper", depth),
             nested_coalesce(depth),
             nested_case(depth),
-            nested_subqueries(depth),
         ] {
             let l = legacy(&sql).unwrap_or_else(|e| panic!("legacy rejected {sql:?}: {e}"));
             let p = peg(&sql).unwrap_or_else(|e| panic!("PEG rejected {sql:?}: {e}"));
             assert_eq!(l, p, "AST mismatch for {sql:?}");
+        }
+        for subquery_depth in [1, depth - 1, depth] {
+            let sql = nested_subqueries(subquery_depth);
+            match (legacy(&sql), peg(&sql)) {
+                (Ok(l), Ok(p)) => assert_eq!(l, p, "AST mismatch for {sql:?}"),
+                (Err(l), Err(p)) => {
+                    assert_eq!(l.to_string(), p.to_string(), "guard message mismatch");
+                    assert!(l.to_string().contains("too deep"), "{l}");
+                }
+                (l, p) => panic!("parser disagreement for {sql:?}: {l:?} vs {p:?}"),
+            }
         }
     }
 

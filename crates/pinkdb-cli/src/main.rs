@@ -9,6 +9,9 @@ use pinkdb::{DataType, PinkDb, QueryResult, SyncPolicy, Value};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
+#[cfg(feature = "client")]
+use pinkdb_server::Client;
+
 const PROMPT: &str = "pinkdb> ";
 const CONT_PROMPT: &str = "   ...> ";
 /// Rows shown before truncating with a "(N more rows)" note.
@@ -202,8 +205,24 @@ fn cmd_import(db: &mut PinkDb, arg: &str) {
     }
 }
 
+/// One REPL session: in-process, or (with the `client` feature) remote.
+enum Session {
+    Local(PinkDb),
+    #[cfg(feature = "client")]
+    Remote(Client),
+}
+
 /// Returns false when the REPL should exit.
-fn run_dot(db: &mut PinkDb, line: &str) -> bool {
+fn run_dot(session: &mut Session, line: &str) -> bool {
+    match session {
+        Session::Local(db) => run_dot_local(db, line),
+        #[cfg(feature = "client")]
+        Session::Remote(_) => run_dot_remote(line),
+    }
+}
+
+/// Returns false when the REPL should exit.
+fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
     let (cmd, rest) = match line.find(char::is_whitespace) {
         Some(i) => (&line[..i], line[i..].trim()),
         None => (line, ""),
@@ -283,6 +302,36 @@ fn run_dot(db: &mut PinkDb, line: &str) -> bool {
     true
 }
 
+/// Remote-mode dot-commands: the file and catalog commands need the local
+/// store (`.import`/`.save`/`.open`/`.databases`/`.tables`/`.schema`) and are
+/// not available over the wire. SQL (including `USE`) works unchanged.
+#[cfg(feature = "client")]
+fn run_dot_remote(line: &str) -> bool {
+    let (cmd, _rest) = match line.find(char::is_whitespace) {
+        Some(i) => (&line[..i], line[i..].trim()),
+        None => (line, ""),
+    };
+    match cmd {
+        ".help" => print_help_remote(),
+        ".quit" | ".exit" => return false,
+        ".databases" | ".tables" | ".schema" | ".import" | ".save" | ".open" => {
+            println!("Error: {cmd} is not available in remote mode");
+        }
+        _ => println!("Unknown dot-command \"{cmd}\". Try .help"),
+    }
+    true
+}
+
+#[cfg(feature = "client")]
+fn print_help_remote() {
+    println!("Dot-commands (remote mode):");
+    println!("  .help                  show this help");
+    println!("  .quit | .exit          leave the shell");
+    println!("  .databases/.tables/.schema/.import/.save/.open are not available in remote mode");
+    println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
+    println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases.");
+}
+
 fn display_value(v: &Value) -> String {
     match v {
         Value::Null => "NULL".to_string(),
@@ -306,8 +355,9 @@ fn display_value(v: &Value) -> String {
 /// rows that are never displayed. The summary still reports the true total
 /// row count.
 ///
-/// The result has no trailing newline; `run_sql` prints it with `println!`
-/// so a single call reproduces the old per-line output byte for byte.
+/// The result has no trailing newline; `render_results` prints it with
+/// `println!` so a single call reproduces the old per-line output byte for
+/// byte.
 fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> String {
     let shown = rows.len().min(DISPLAY_CAP);
     let cells: Vec<Vec<String>> = rows
@@ -369,51 +419,143 @@ fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> S
     out
 }
 
-fn run_sql(db: &mut PinkDb, sql: &str) {
-    let t0 = Instant::now();
-    match db.execute(sql) {
-        Ok(results) => {
-            for r in &results {
-                match r {
-                    QueryResult::Created => println!("Table created."),
-                    QueryResult::Inserted { count } => println!("Inserted {count} row(s)."),
-                    QueryResult::Updated { count } => println!("Updated {count} row(s)."),
-                    QueryResult::Deleted { count } => println!("Deleted {count} row(s)."),
-                    QueryResult::Began => println!("Transaction started."),
-                    QueryResult::Committed => println!("Transaction committed."),
-                    QueryResult::RolledBack => println!("Transaction rolled back."),
-                    QueryResult::CreatedView { name } => println!("View {name} created."),
-                    QueryResult::DroppedTable { name } => println!("Table {name} dropped."),
-                    QueryResult::DroppedView { name } => println!("View {name} dropped."),
-                    QueryResult::CreatedDatabase { name } => {
-                        println!("Database {name} created.")
-                    }
-                    QueryResult::DroppedDatabase { name } => {
-                        println!("Database {name} dropped.")
-                    }
-                    QueryResult::Used { db } => println!("Using database {db}."),
-                    QueryResult::Selected { names, types, rows } => {
-                        if rows.is_empty() {
-                            println!("(no rows)");
-                        }
-                        let table = format_select(names, types, rows);
-                        println!("{table}");
-                    }
+/// Print each statement result with the shared DuckDB-style renderer.
+fn render_results(results: &[QueryResult]) {
+    for r in results {
+        match r {
+            QueryResult::Created => println!("Table created."),
+            QueryResult::Inserted { count } => println!("Inserted {count} row(s)."),
+            QueryResult::Updated { count } => println!("Updated {count} row(s)."),
+            QueryResult::Deleted { count } => println!("Deleted {count} row(s)."),
+            QueryResult::Began => println!("Transaction started."),
+            QueryResult::Committed => println!("Transaction committed."),
+            QueryResult::RolledBack => println!("Transaction rolled back."),
+            QueryResult::CreatedView { name } => println!("View {name} created."),
+            QueryResult::DroppedTable { name } => println!("Table {name} dropped."),
+            QueryResult::DroppedView { name } => println!("View {name} dropped."),
+            QueryResult::CreatedDatabase { name } => {
+                println!("Database {name} created.")
+            }
+            QueryResult::DroppedDatabase { name } => {
+                println!("Database {name} dropped.")
+            }
+            QueryResult::Used { db } => println!("Using database {db}."),
+            QueryResult::Selected { names, types, rows } => {
+                if rows.is_empty() {
+                    println!("(no rows)");
                 }
+                let table = format_select(names, types, rows);
+                println!("{table}");
             }
         }
-        Err(e) => println!("Error: {e}"),
+    }
+}
+
+/// Run one SQL string in the session's mode (local or remote) and print the
+/// results with the same renderer and the same timing line either way.
+fn run_sql_session(session: &mut Session, sql: &str) {
+    let t0 = Instant::now();
+    match session {
+        Session::Local(db) => match db.execute(sql) {
+            Ok(results) => render_results(&results),
+            Err(e) => println!("Error: {e}"),
+        },
+        #[cfg(feature = "client")]
+        Session::Remote(client) => match client.execute(sql) {
+            Ok(results) => render_results(&results),
+            Err(e) => println!("Error: {e}"),
+        },
     }
     println!("Run Time (s): real {:.3}", t0.elapsed().as_secs_f64());
 }
 
+/// Parsed command line.
+struct Opts {
+    host: Option<String>,
+}
+
+fn print_usage() {
+    println!("Usage: pinkdb [--host HOST:PORT]");
+    println!();
+    println!("  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)");
+    if cfg!(feature = "client") {
+        println!("                     [client feature: enabled]");
+    } else {
+        println!("                     [client feature: disabled in this build]");
+    }
+}
+
+fn parse_args() -> Result<Opts, String> {
+    let mut host = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            "--host" => {
+                let value = args.next().ok_or("--host requires HOST:PORT")?;
+                host = Some(value);
+            }
+            other if other.starts_with("--host=") => {
+                host = Some(other["--host=".len()..].to_string());
+            }
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    Ok(Opts { host })
+}
+
+/// Build the REPL session: local by default, remote when `--host` is given
+/// (the `client` feature; without it, `--host` is rejected).
+fn build_session(host: Option<String>) -> Session {
+    match host {
+        None => Session::Local(PinkDb::new()),
+        #[cfg(feature = "client")]
+        Some(host) => match Client::connect(&host) {
+            Ok(client) => Session::Remote(client),
+            Err(e) => {
+                eprintln!("Error: cannot connect to {host}: {e}");
+                std::process::exit(1);
+            }
+        },
+        #[cfg(not(feature = "client"))]
+        Some(_) => {
+            eprintln!(
+                "Error: --host was given, but this pinkdb binary was built without the client feature;"
+            );
+            eprintln!("       rebuild with `cargo build -p pinkdb-cli --features client`.");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn main() {
-    let mut db = PinkDb::new();
+    let host = match parse_args() {
+        Ok(opts) => opts.host,
+        Err(msg) => {
+            eprintln!("Error: {msg}");
+            print_usage();
+            std::process::exit(2);
+        }
+    };
+    let mut session = build_session(host.clone());
     let mut rl = DefaultEditor::new().unwrap_or_else(|e| {
         eprintln!("rustyline init failed ({e}); falling back to stdin");
         DefaultEditor::new().expect("rustyline fallback")
     });
-    println!("pinkdb v0.1.0 — mini DuckDB (in-memory). Type .help, end SQL with ;");
+    match &session {
+        Session::Local(_) => {
+            println!("pinkdb v0.1.0 — mini DuckDB (in-memory). Type .help, end SQL with ;")
+        }
+        #[cfg(feature = "client")]
+        Session::Remote(client) => println!(
+            "pinkdb v0.1.0 — mini DuckDB (remote {}, server v{}). Type .help, end SQL with ;",
+            host.as_deref().unwrap_or(""),
+            client.server_version()
+        ),
+    }
 
     let mut pending = String::new();
     loop {
@@ -431,7 +573,7 @@ fn main() {
                 // Dot-commands only at the start of a fresh statement.
                 if pending.is_empty() && trimmed.starts_with('.') {
                     rl.add_history_entry(line.as_str()).ok();
-                    if !run_dot(&mut db, trimmed) {
+                    if !run_dot(&mut session, trimmed) {
                         break;
                     }
                     continue;
@@ -442,7 +584,7 @@ fn main() {
                     rl.add_history_entry(pending.as_str()).ok();
                     let sql = pending.trim().to_string();
                     pending.clear();
-                    run_sql(&mut db, &sql);
+                    run_sql_session(&mut session, &sql);
                 }
             }
             Err(ReadlineError::Interrupted) => {

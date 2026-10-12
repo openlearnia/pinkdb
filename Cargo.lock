@@ -215,7 +215,15 @@ name = "pinkdb-cli"
 version = "0.1.0"
 dependencies = [
  "pinkdb",
+ "pinkdb-server",
  "rustyline",
+]
+
+[[package]]
+name = "pinkdb-server"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
 ]
 
 [[package]]
