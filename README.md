@@ -44,7 +44,7 @@ for result in db.execute("SELECT a, upper(b) FROM t WHERE a > 1;")? {
 
 ```
 SQL text
-  → Lexer + recursive-descent parser → AST
+  → PEG parser (or hand-written lexer + recursive descent) → AST
   → Binder (resolve tables/columns, assign types)
   → Logical plan (scan → filter → join → aggregate → project → sort → limit)
   → Optimizer (predicate pushdown, constant folding)
@@ -58,7 +58,7 @@ SQL text
 | `pinkdb::vector` | `Vector` (typed data + validity bitmask, bit = valid) + `gather`, `DataChunk` |
 | `pinkdb::storage` | `DataTable` (per-column `Vector` chunks), `PinkDb` catalog |
 | `pinkdb::csv` | CSV import + type inference (rayon-parallel parse) |
-| `pinkdb::sql` | Hand-written lexer, AST, recursive-descent parser, binder |
+| `pinkdb::sql` | PEG grammar + hand-written lexer/recursive-descent parser, AST, binder |
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
 | `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
@@ -67,7 +67,15 @@ SQL text
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 
 Design rules: Rust edition 2021, zero async, no unsafe. Dependencies are
-`csv` + `rustyline`, plus `rayon` for parallel execution.
+`csv` + `rustyline`, plus `rayon` for parallel execution and `peg` for the
+SQL parser.
+
+SQL is parsed by a `peg`-generated grammar; the hand-written lexer +
+recursive-descent parser stays selectable via `PINKDB_PARSER=legacy`. A
+committed differential corpus plus a seeded randomized differential test
+(`cargo test`) check that both parsers accept the same inputs with equal ASTs
+and reject the same inputs; PEG error messages are positional and worded
+differently.
 
 ## SQL surface (v1)
 
@@ -207,8 +215,10 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 - `%` is integer-only; `SUM` overflow wraps
 - Mixed DATE/TIMESTAMP comparison is rejected; timestamps never mix with
   integers (no INTERVAL type in v1); no time zones (naive UTC)
-- Very deeply nested expressions (tens of thousands of levels) can overflow
-  the parser stack instead of erroring gracefully
+- Expression nesting is capped at 24 levels (parentheses, `CASE` arms and
+  consecutive unary operators counted together); deeper input returns a clean
+  `Parse` error (`expression nesting too deep`) in both parsers instead of
+  overflowing the parser stack
 
 Post-v1 ideas: on-disk columnar format (RLE + dictionary + bitpacking),
 Parquet reader, parallel execution, DATE/TIMESTAMP, subqueries/CTEs.

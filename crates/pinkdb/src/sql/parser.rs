@@ -8,9 +8,125 @@ use super::ast::*;
 use super::lexer::{Keyword, Token, lex};
 use crate::types::{DataType, PinkDbError, Result, Value};
 
+/// Maximum nesting depth both parsers accept, measured in "nesting units":
+/// one unit per open `(`, open `CASE` arm, or consecutive prefix unary
+/// operator enclosing the current point. Deeper input is rejected with
+/// [`PinkDbError::Parse`] before any recursion starts.
+///
+/// Every recursive cycle in both grammars passes through one of those
+/// constructs, and debug builds (what `cargo test` uses, with its 2 MiB test
+/// threads) overflow the stack at 36+ units in the tightest measured case
+/// (nested subqueries), so the cap sits at two thirds of that.
+pub(crate) const MAX_NESTING_DEPTH: usize = 24;
+
+/// Reject `sql` when its estimated nesting depth exceeds
+/// [`MAX_NESTING_DEPTH`]. Shared by both parsers so they agree on the limit.
+pub(crate) fn check_nesting_depth(sql: &str) -> Result<()> {
+    if nesting_estimate(sql) > MAX_NESTING_DEPTH {
+        return Err(PinkDbError::Parse(format!(
+            "expression nesting too deep (limit {MAX_NESTING_DEPTH})"
+        )));
+    }
+    Ok(())
+}
+
+/// Upper bound on the parsers' recursion depth: the maximum over the input of
+/// `open_parens + open_case_arms + consecutive_prefix_unary_ops`.
+///
+/// Every recursive cycle in both grammars goes through at least one of those
+/// (`(` for parens, calls, `IN (...)`, `CAST`, `OVER (...)`, subqueries,
+/// derived tables and CTEs; `CASE` until its `END`; a `NOT`/unary `+`/`-`
+/// run), so this can never under-count. String literals, quoted identifiers
+/// and comments are skipped, and keyword matches are boundary-aware.
+fn nesting_estimate(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut parens = 0usize;
+    let mut cases = 0usize;
+    let mut unary = 0usize;
+    let mut max = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                // String literal / quoted identifier; `''` / `""` escapes.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                unary = 0;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                parens += 1;
+                i += 1;
+            }
+            b')' => {
+                parens = parens.saturating_sub(1);
+                unary = 0;
+                i += 1;
+            }
+            b'-' | b'+' => {
+                unary += 1;
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                if word.eq_ignore_ascii_case("case") {
+                    cases += 1;
+                } else if word.eq_ignore_ascii_case("end") {
+                    cases = cases.saturating_sub(1);
+                    unary = 0;
+                } else if word.eq_ignore_ascii_case("not") {
+                    unary += 1;
+                } else {
+                    unary = 0;
+                }
+            }
+            _ => {
+                // Whitespace is trivia (a `NOT` run spans it); anything else
+                // (operand start, comma, operator, ...) ends a unary run.
+                if !bytes[i].is_ascii_whitespace() {
+                    unary = 0;
+                }
+                i += 1;
+            }
+        }
+        max = max.max(parens + cases + unary);
+    }
+    max
+}
+
 /// Parse all statements in `sql`. Statements may be `;`-separated; the final
 /// `;` is optional. Empty input yields no statements.
 pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
+    check_nesting_depth(sql)?;
     let tokens = lex(sql)?;
     let mut p = Parser { tokens, pos: 0 };
     let mut out = Vec::new();

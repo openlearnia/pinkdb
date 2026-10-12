@@ -123,6 +123,7 @@ LIMIT n;
 | 18 | Binder fix: UNION inside derived tables/CTEs/views/subqueries; ORDER BY/LIMIT apply to the whole set operation | done (build+test+clippy green, 162 lib + 3 CLI tests, duckdiff 56/56) |
 | 19 | Join fast path: integer-key specialization + fused join→aggregate (no row materialization) | done (build+test+clippy green, 193 lib + 3 CLI tests, duckdiff 56/56, join_self 64→~9 ms) |
 | 20 | Outer joins: LEFT/RIGHT equi-joins (NULL-extended unmatched rows), join-kind-aware pushdown | done (build+test+clippy green, 208 lib + 3 CLI tests, duckdiff 60/60, bench total 493 ms, join entries unregressed) |
+| 21 | PEG parser (`peg` crate) in parallel with recursive descent; differential-tested; default flipped | done (build+test+clippy green under PEG default and `PINKDB_PARSER=legacy`, 223 lib + 3 CLI tests both ways, deterministic differential corpus + seeded fuzz differential test, duckdiff 60/60 both modes, bench total unchanged vs legacy; post-review: linear-time function calls, shared 24-level nesting cap, COALESCE `*` parity) |
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 
