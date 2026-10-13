@@ -55,7 +55,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | done | ext-sdk/c/ (vendored header + byte-identity sync test, template, 3 examples incl. C++, Makefile/CMake); smoke.sh 14/14 checks green through the real CLI; 434 tests; clippy clean |
 | 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | done | ext-sdk/go/ (cgo c-shared template + example, vendored header pinned by the sync test, README with sharp edges); smoke 15/15 incl. a 5,000-row multi-threaded callback query (3 rayon threads); gofmt/vet clean; 434 tests; clippy clean |
 | 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service) | done | live at https://pinkdb-ext-repo.defaultcms.workers.dev (Workers + R2 bucket pinkdb-extensions); index.json + immutable artifact streaming; first entry math_ext 0.1.0 darwin-arm64 (sha256 38abc8b3…, 17088 B) verified by verify.sh |
-| 33 | Custom repositories: user-configurable extension repository URLs and config (core config + repo client) | queued | — |
+| 33 | Custom repositories: user-configurable extension repository URLs and config (core config + repo client) | done | CLI `repo` feature: config `~/.pinkdb/repositories.json`, catalog client (platform/ABI resolve, atomic download, SHA-256 verify), `.install`/`.repositories`/`.installed`; 7 hermetic fixture-server tests + 24 unit tests + live `math_ext` install verified; default CLI 2.27 MB vs 4.33 MB with the feature |
 | 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer) | queued | — |
 | 35 | Vortex file format as the default lake data format (format crate / extension) | queued | — |
 | 36 | S3 bucket support for lake storage and file reading (optional `s3` feature, storage provider) | queued | — |
@@ -207,3 +207,15 @@ Java bindings.
   first entry `math_ext` 0.1.0 darwin-arm64 (sha256 38abc8b3…, 17088 B) verified by verify.sh.
 - 2026-10-14 — Binary size: unchanged — `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
   `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 32; pre-wave-17 was 2.26 MB).
+- 2026-10-14 — Wave 33: custom repositories + client-side INSTALL — `crates/pinkdb-cli` `repo`
+  feature (ureq/rustls + serde_json + sha2, feature-gated so the default binary stays lean,
+  +1.96 MiB with it); `~/.pinkdb/repositories.json` ordered list with atomic writes and URL
+  validation; client fetches the catalog with format-version/ABI/platform checks, resolves
+  `name[@version]` (first repo wins, highest version), downloads atomically and verifies
+  SHA-256, reuses verified cache, replaces corrupt copies; `.install`,
+  `.repositories list|add|remove`, `.installed` dot-commands (feature-aware help; clear errors
+  without the feature); durable-WAL replay picks up the stable cache path via the existing
+  touched-only `LOAD` prefixing. 7 hermetic fixture-server tests + 24 unit tests; live install
+  of the official `math_ext` verified; default CLI 2.27 MB vs 4.33 MB with the feature.
+- 2026-10-14 — Binary size: `pinkdb` 2.27 MB (4.33 MB with `--features repo`) + `pinkdb-server`
+  1.90 MB + `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 33; pre-wave-17 was 2.26 MB).

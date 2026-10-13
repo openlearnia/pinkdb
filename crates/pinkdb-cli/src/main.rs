@@ -12,6 +12,9 @@ use rustyline::DefaultEditor;
 #[cfg(feature = "client")]
 use pinkdb_server::Client;
 
+#[cfg(feature = "repo")]
+mod repo;
+
 const PROMPT: &str = "pinkdb> ";
 const CONT_PROMPT: &str = "   ...> ";
 /// Rows shown before truncating with a "(N more rows)" note.
@@ -28,11 +31,170 @@ fn print_help() {
     println!("                         db.table targets another database)");
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
+    if cfg!(feature = "repo") {
+        println!("  .install <name[@version]>   install from a repository, then load it");
+        println!("  .repositories [list | add <url> | remove <url>]  manage repositories");
+        println!("  .installed             list cached extensions under $PINKDB_HOME");
+    } else {
+        println!("  .install/.repositories/.installed  (not built; needs the `repo` feature)");
+    }
     println!("Encryption: PINKDB_KEY=<passphrase> (valid UTF-8) makes .save write and .open");
     println!("            read an encrypted database (needs a build with the `encryption` feature).");
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
     println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");
+}
+
+/// The `.install`/`.repositories`/`.installed` message when the binary was
+/// built without the opt-in `repo` feature.
+#[cfg(not(feature = "repo"))]
+fn repo_unavailable(cmd: &str) {
+    println!(
+        "Error: {cmd} is not available: this pinkdb binary was built without the repo feature;"
+    );
+    println!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
+}
+
+/// `.install <name[@version]>`: resolve, download, verify, cache, and load.
+#[cfg(feature = "repo")]
+fn cmd_install(db: &mut PinkDb, arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() || arg.split_whitespace().count() != 1 {
+        println!("Usage: .install <name[@version]>");
+        return;
+    }
+    let (name, version) = match arg.split_once('@') {
+        Some((name, version)) => (name, Some(version)),
+        None => (arg, None),
+    };
+    if name.is_empty() || version.is_some_and(str::is_empty) {
+        println!("Usage: .install <name[@version]>");
+        return;
+    }
+    let home = match repo::pinkdb_home() {
+        Ok(home) => home,
+        Err(e) => {
+            println!("Error: {e}");
+            return;
+        }
+    };
+    let repositories = match repo::load_repositories() {
+        Ok(repositories) => repositories,
+        Err(e) => {
+            println!("Error: {e}");
+            return;
+        }
+    };
+    let agent = repo::agent();
+    match repo::install(&agent, &repositories, &home, name, version) {
+        Ok(installed) => {
+            println!(
+                "Installed {} {} ({})",
+                installed.entry.name, installed.entry.version, installed.entry.platform
+            );
+            println!("  repository: {}", installed.repository);
+            println!("  path:       {}", installed.path.display());
+            println!("  sha256:     {}", installed.sha256);
+            if !installed.downloaded {
+                println!("  cached:     yes");
+            }
+            match db.load_extension(&installed.path.to_string_lossy()) {
+                Ok(loaded) => println!("Extension {loaded} loaded."),
+                Err(e) => println!("Error: {e}"),
+            }
+        }
+        Err(e) => println!("Error: {e}"),
+    }
+}
+
+/// `.repositories list | add <url> | remove <url>`: manage
+/// `$PINKDB_HOME/repositories.json`.
+#[cfg(feature = "repo")]
+fn cmd_repositories(arg: &str) {
+    let (sub, rest) = match arg.find(char::is_whitespace) {
+        Some(i) => (&arg[..i], arg[i..].trim()),
+        None => (arg, ""),
+    };
+    match sub {
+        "" | "list" => match repo::load_repositories() {
+            Ok(urls) => print_repositories(&urls),
+            Err(e) => println!("Error: {e}"),
+        },
+        "add" | "remove" => {
+            if rest.is_empty() || rest.split_whitespace().count() != 1 {
+                println!("Usage: .repositories {sub} <url>");
+                return;
+            }
+            let mut urls = match repo::load_repositories() {
+                Ok(urls) => urls,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            let result = if sub == "add" {
+                repo::add_repository(&mut urls, rest)
+            } else {
+                repo::remove_repository(&mut urls, rest)
+            };
+            let canonical = match result {
+                Ok(canonical) => canonical,
+                Err(e) => {
+                    println!("Error: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = repo::save_repositories(&urls) {
+                println!("Error: {e}");
+                return;
+            }
+            if sub == "add" {
+                println!("Added repository {canonical}");
+            } else {
+                println!("Removed repository {canonical}");
+                if urls.is_empty() {
+                    println!(
+                        "Note: no repositories are configured; .install will fail until one is added."
+                    );
+                }
+            }
+        }
+        _ => println!("Usage: .repositories [list | add <url> | remove <url>]"),
+    }
+}
+
+#[cfg(feature = "repo")]
+fn print_repositories(urls: &[String]) {
+    println!("Repositories (in order; the first repository with a match wins):");
+    if urls.is_empty() {
+        println!("  (none configured — add one with .repositories add <url>)");
+        return;
+    }
+    for (i, url) in urls.iter().enumerate() {
+        println!("  {}. {url}", i + 1);
+    }
+}
+
+/// `.installed`: list cached artifacts under `$PINKDB_HOME/extensions`.
+#[cfg(feature = "repo")]
+fn cmd_installed() {
+    let home = match repo::pinkdb_home() {
+        Ok(home) => home,
+        Err(e) => {
+            println!("Error: {e}");
+            return;
+        }
+    };
+    match repo::list_installed(&home) {
+        Ok(files) if files.is_empty() => println!("(no extensions installed)"),
+        Ok(files) => {
+            println!("Installed extensions ({}):", repo::extensions_dir(&home).display());
+            for f in files {
+                println!("  {} {} {} {}", f.name, f.version, f.platform, f.path.display());
+            }
+        }
+        Err(e) => println!("Error: {e}"),
+    }
 }
 
 fn cmd_databases(db: &PinkDb) {
@@ -237,6 +399,24 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
         ".tables" => cmd_tables(db),
         ".schema" => cmd_schema(db, rest),
         ".import" => cmd_import(db, rest),
+        ".install" => {
+            #[cfg(feature = "repo")]
+            cmd_install(db, rest);
+            #[cfg(not(feature = "repo"))]
+            repo_unavailable(".install");
+        }
+        ".repositories" => {
+            #[cfg(feature = "repo")]
+            cmd_repositories(rest);
+            #[cfg(not(feature = "repo"))]
+            repo_unavailable(".repositories");
+        }
+        ".installed" => {
+            #[cfg(feature = "repo")]
+            cmd_installed();
+            #[cfg(not(feature = "repo"))]
+            repo_unavailable(".installed");
+        }
         ".save" => {
             let path = rest.split_whitespace().next().unwrap_or("");
             if path.is_empty() {
@@ -315,7 +495,9 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
 
 /// Remote-mode dot-commands: the file and catalog commands need the local
 /// store (`.import`/`.save`/`.open`/`.databases`/`.tables`/`.schema`) and are
-/// not available over the wire. SQL (including `USE`) works unchanged.
+/// not available over the wire; the repository commands would load a native
+/// extension into the client process, not the server, so they are rejected
+/// too. SQL (including `USE`) works unchanged.
 #[cfg(feature = "client")]
 fn run_dot_remote(line: &str) -> bool {
     let (cmd, _rest) = match line.find(char::is_whitespace) {
@@ -325,7 +507,8 @@ fn run_dot_remote(line: &str) -> bool {
     match cmd {
         ".help" => print_help_remote(),
         ".quit" | ".exit" => return false,
-        ".databases" | ".tables" | ".schema" | ".import" | ".save" | ".open" => {
+        ".databases" | ".tables" | ".schema" | ".import" | ".save" | ".open" | ".install"
+        | ".repositories" | ".installed" => {
             println!("Error: {cmd} is not available in remote mode");
         }
         _ => println!("Unknown dot-command \"{cmd}\". Try .help"),
@@ -339,6 +522,7 @@ fn print_help_remote() {
     println!("  .help                  show this help");
     println!("  .quit | .exit          leave the shell");
     println!("  .databases/.tables/.schema/.import/.save/.open are not available in remote mode");
+    println!("  .install/.repositories/.installed are not available in remote mode");
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
     println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");

@@ -13,8 +13,17 @@ client = ["dep:pinkdb-server"]
 # Opt-in at-rest encryption: forwards to `pinkdb/encryption`; `PINKDB_KEY`
 # then encrypts `.save` and decrypts `.open`.
 encryption = ["pinkdb/encryption"]
+# Opt-in extension-repository client: `.install`, `.repositories`, `.installed`.
+# Keeps the default binary lean: HTTP + TLS, JSON parsing, and SHA-256 live
+# only behind this feature.
+repo = ["dep:ureq", "dep:serde_json", "dep:sha2"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
 rustyline = "14"
 pinkdb-server = { path = "../pinkdb-server", optional = true }
+# Repository client (repo feature): blocking HTTP over rustls (no gzip: the
+# repository serves raw artifacts), catalog JSON, and SHA-256 verification.
+ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }

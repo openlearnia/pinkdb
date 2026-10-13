@@ -595,7 +595,51 @@ format v1) at <https://pinkdb-ext-repo.defaultcms.workers.dev>: `GET
 `ext-repo/` directory holds the format spec (`ext-repo/FORMAT.md`), the
 publisher (`publish.sh`/`publish.py`), the verifier (`verify.sh`), and the
 worker source. The first published artifact is the C SDK example `math_ext`
-0.1.0 (`darwin-arm64`); an `INSTALL` client is wave 33.
+0.1.0 (`darwin-arm64`).
+
+#### Installing extensions (`.install`)
+
+The CLI can install extensions from repositories. The HTTP/TLS/JSON/SHA-256
+client is an opt-in feature so the default binary stays lean:
+
+```sh
+cargo build -p pinkdb-cli --features repo     # the `repo` feature
+```
+
+Then, inside the REPL:
+
+```text
+pinkdb> .install math_ext
+Installed math_ext 0.1.0 (darwin-arm64)
+  repository: https://pinkdb-ext-repo.defaultcms.workers.dev
+  path:       /Users/you/.pinkdb/extensions/math_ext/0.1.0/darwin-arm64/math_ext.dylib
+  sha256:     38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
+Extension math_ext loaded.
+pinkdb> SELECT ext_clamp(CAST(42 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT));
+```
+
+- **Config:** `$PINKDB_HOME/repositories.json` (default
+  `~/.pinkdb/repositories.json`) is a JSON object with an ordered list,
+  `{"repositories": ["https://…"]}`. When the file is absent the official
+  repository above is the default; the first mutation materializes it.
+  `.repositories list` / `.repositories add <url>` /
+  `.repositories remove <url>` manage it: URLs are validated and
+  canonicalized (trailing slashes stripped, `http://` only for local/testing),
+  duplicates are refused, order is preserved, and an empty list is allowed
+  (`.install` then says what to add). Writes are atomic (temp + rename).
+- **Resolution:** repositories are tried in config order and the first one
+  with a match wins. `.install <name>` picks the highest semver-ish version
+  for this platform — derived at runtime from the OS and architecture, e.g.
+  `darwin-arm64` — with ABI v1; `.install <name>@<version>` is exact.
+- **Cache + integrity:** artifacts land under
+  `$PINKDB_HOME/extensions/<name>/<version>/<platform>/<file>`, are written
+  atomically (temp file + rename), and are verified against the catalog's
+  SHA-256 before the rename; a mismatch is refused and leaves nothing behind.
+  Installing the same coordinates again reuses the verified copy (no
+  re-download). `.installed` lists the cache.
+- **Load:** `.install` finishes by `LOAD EXTENSION`-ing the artifact into the
+  current session; the extension then behaves exactly as described below
+  (process-level, WAL replay re-loads it by path).
 
 Semantics and persistence:
 

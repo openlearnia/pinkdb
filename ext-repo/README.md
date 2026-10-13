@@ -87,20 +87,38 @@ entry, or failed download exits non-zero.
 
 ## Consuming from a client
 
-`INSTALL` is **wave 33** — not implemented yet; nothing in pinkdb consumes this
-repository today. The intended flow for the future `INSTALL <name>` /
-repository client:
+The CLI consumes this repository through the opt-in `repo` feature
+(`cargo build -p pinkdb-cli --features repo`):
 
-1. fetch `<repo>/index.json` (the repository URL becomes configurable in wave 33);
+```text
+pinkdb> .install math_ext
+Installed math_ext 0.1.0 (darwin-arm64)
+  repository: https://pinkdb-ext-repo.defaultcms.workers.dev
+  path:       ~/.pinkdb/extensions/math_ext/0.1.0/darwin-arm64/math_ext.dylib
+  sha256:     38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
+Extension math_ext loaded.
+```
+
+What that client does (implemented in `crates/pinkdb-cli/src/repo/`):
+
+1. fetch `<repo>/index.json` — repositories come from
+   `$PINKDB_HOME/repositories.json` (default `~/.pinkdb`), which defaults to
+   the live repository above when absent; the client is a cargo feature, so
+   the default binary links no HTTP/TLS code;
 2. select the entry with `format_version == 1`, `abi == 1`, the client's
-   `platform`, and the wanted `name` (+ version, latest if unspecified);
-3. download `<repo>/<file>` and verify its `sha256` before touching it;
-4. write it to a local cache path and `LOAD EXTENSION` it (extensions stay
-   process-level; the loader re-resolves the path at WAL replay, so prefer a
-   stable cache location).
+   platform tag (derived at runtime, e.g. `darwin-arm64`), and the wanted
+   `name` (+ version; highest semver-ish version if unspecified) —
+   repositories are tried in config order and the first match wins;
+3. download `<repo>/<file>` (timeout and size caps) to a temp file, verify its
+   `sha256`, and only then rename it into
+   `$PINKDB_HOME/extensions/<name>/<version>/<platform>/<file>`; a mismatch is
+   refused and deletes the temp file (nothing left behind);
+4. `LOAD EXTENSION` the verified artifact into the session (extensions stay
+   process-level; the stable cache path is what WAL replay re-loads).
 
-The worker needs no changes for that: the catalog is plain JSON and artifacts
-are plain bytes.
+`.repositories list` / `add` / `remove` manages the repository list and
+`.installed` lists the cache. The worker needs no changes for that: the
+catalog is plain JSON and artifacts are plain bytes.
 
 ## Deploying the worker
 
