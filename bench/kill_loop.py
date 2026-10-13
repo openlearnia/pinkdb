@@ -24,8 +24,14 @@ never from the command line, so it stays out of the process table.
 Usage:
   python3 bench/kill_loop.py [ROUNDS] [--seed N] [--bin PATH]
   python3 bench/kill_loop.py [ROUNDS] --multi-db [--seed N] [--bin PATH]
+  python3 bench/kill_loop.py [ROUNDS] --extension PATH [--seed N] [--bin PATH]
   python3 bench/kill_loop.py --targeted N [--seed N] [--bin PATH]
   PINKDB_KEY=pass python3 bench/kill_loop.py [ROUNDS] --encrypted [--bin PATH]
+
+Extension mode (`--extension`): random mode only. Every iteration loads the
+extension after `.open` and computes every inserted VARCHAR value with one of
+its functions, so the WAL must carry `LOAD EXTENSION` prefixes across random
+`.save` checkpoints (the touched-only prefixing) for replay to succeed.
 """
 
 import argparse
@@ -145,7 +151,7 @@ def acked_ids(out, units):
     return acked
 
 
-def random_script(rng):
+def random_script(rng, extension=None):
     units = []
     nxt = 0
     for _ in range(rng.randint(4, 16)):
@@ -157,26 +163,38 @@ def random_script(rng):
             units.append((f"ACK {nxt}", [nxt]))
             nxt += 1
     lines = ["CREATE TABLE t (a INTEGER, v VARCHAR);"]
+    if extension:
+        # Load a native extension and make every insert call one of its
+        # functions: a checkpoint rolls the LOAD record away, so the
+        # post-checkpoint records must be `LOAD EXTENSION`-prefixed for
+        # replay (the C1 mechanism). The verifier only reads column `a`.
+        lines.insert(0, f"LOAD EXTENSION '{extension}';")
     save_every = rng.choice([0, 3, 5, 8])
     for i, (marker, ids) in enumerate(units):
         if marker.startswith("TXN"):
             lines.append("BEGIN;")
             for rid in ids:
-                lines.append(f"INSERT INTO t VALUES ({rid}, 'v{rid}');")
+                lines.append(insert_line(rid, extension))
             lines.append("COMMIT;")
         else:
-            lines.append(f"INSERT INTO t VALUES ({ids[0]}, 'v{ids[0]}');")
+            lines.append(insert_line(ids[0], extension))
         lines.append(f"SELECT '{marker}' AS m;")
         if save_every and i % save_every == save_every - 1:
             lines.append(".save x.pink")
     return units, "\n".join(lines) + "\n"
 
 
-def run_random(binary, rounds, seed):
+def insert_line(rid, extension):
+    """One insert; with `extension`, the VARCHAR value comes from ext_shout."""
+    v = f"ext_shout('v{rid}')" if extension else f"'v{rid}'"
+    return f"INSERT INTO t VALUES ({rid}, {v});"
+
+
+def run_random(binary, rounds, seed, extension=None):
     rng = random.Random(seed)
     kinds = {}
     for i in range(rounds):
-        units, cmds = random_script(rng)
+        units, cmds = random_script(rng, extension)
         d = fresh(f"q{i}")
         out = run_and_kill(binary, ".open x.pink\n" + cmds, d, rng.uniform(0.001, 0.05))
         acked = acked_ids(out, units)
@@ -409,10 +427,27 @@ def main():
                          "(needs an encryption-feature binary)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--bin", default=DEFAULT_BIN)
+    ap.add_argument(
+        "--extension",
+        default=None,
+        help="load this extension in every random-mode iteration and call it "
+             "from every insert (exercises the touched-only LOAD EXTENSION "
+             "WAL prefixing across checkpoints)",
+    )
     args = ap.parse_args()
     if not os.path.exists(args.bin):
         print(f"missing binary: {args.bin}", file=sys.stderr)
         return 2
+    extension = None
+    if args.extension:
+        extension = os.path.abspath(args.extension)
+        if not os.path.exists(extension):
+            print(f"missing extension: {extension}", file=sys.stderr)
+            return 2
+        if args.multi_db or args.targeted:
+            print("--extension supports the random mode only", file=sys.stderr)
+            return 2
+        print(f"extension mode: {extension}")
     if args.encrypted:
         passphrase = os.environ.get("PINKDB_KEY", "")
         if not passphrase:
@@ -432,7 +467,7 @@ def main():
     elif args.multi_db:
         ok = run_multi(args.bin, args.rounds, args.seed)
     else:
-        ok = run_random(args.bin, args.rounds, args.seed)
+        ok = run_random(args.bin, args.rounds, args.seed, extension)
     if ok:
         shutil.rmtree(WORK, ignore_errors=True)
     else:

@@ -51,7 +51,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) (separate crate; contained `unsafe`) | done | 7 FFI unit + 3 integration tests, C example runs; workspace suites both parser modes; duckdiff 60/60; sizes: dylib 1.70 MB, staticlib 15.53 MB, `pinkdb` 2.21 MB unchanged |
 | 27 | Python binding (cffi) (`bindings/python`) | done | stdlib ctypes binding (14 unittest tests, both default discovery and PINKDB_FFI_LIB override); all value types + statement kinds; 20k-iteration RSS flat; sizes unchanged (dylib 1.70 MB) |
 | 28 | Go binding (cgo) (`bindings/go`) | done | cgo binding over pinkdb-ffi: 15 tests pass + race clean, gofmt/vet clean; durable round-trip; goroutine-safe wrapper; sizes unchanged |
-| 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | queued | — |
+| 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | done | loader crate + C ABI v1 + SQL LOAD EXTENSION (both parsers) + result-kind ripple (CLI/server v3/C ABI/Python/Go); 432 tests / 25 suites green both parser modes; duckdiff 60/60; kill loop 30/30; wasm core build green; sizes pinkdb 2.25 MB (+1.0%) |
 | 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | queued | — |
 | 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | queued | — |
 | 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service) | queued | — |
@@ -70,6 +70,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 45 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | queued | — |
 | 46 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | queued | — |
 | 47 | RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), `CREATE USER`/`CREATE ROLE`/`GRANT`/`REVOKE` on databases/tables, session login on the network server, per-connection enforcement (embedded API stays trusted), grants persisted in the catalog + WAL | queued | — |
+| 48 | Extensions on wasm: support loadable/pluggable extensions for wasm targets — either wasm dynamic-linking (pre-built WASI side modules, per-runtime `dlopen` support) or a host-function registration path (JS/wasm-bindgen scripting surface); native `dlopen` extensions are impossible in the wasm sandbox, so a distinct ABI/loading model is required | queued | — |
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -153,3 +154,20 @@ Java bindings.
   gofmt/vet clean; durable round-trip; goroutine-safe wrapper; sizes unchanged.
 - 2026-10-13 — Binary size: unchanged — `pinkdb` 2.21 MB + `pinkdb-server` 1.84 MB +
   `libpinkdb_ffi.dylib` 1.70 MB (release, after wave 28; pre-wave-17 was 2.26 MB).
+- 2026-10-13 — Wave 29: extensions support — new `crates/pinkdb-ext-loader` (dlopen via
+  libloading; versioned `PinkdbHostApi`; `include/pinkdb_extension.h` value ABI with
+  alloc/free ownership; thread-safety contract) + dynamic scalar functions in
+  binder/executor/optimizer; SQL `LOAD EXTENSION '<path>'` in both parsers;
+  `QueryResult::LoadedExtension` rippled through CLI/server protocol v3/C ABI (kind 14)/
+  Python/Go; parse-time NUL-identifier rejection; wasm target-gating with a clean stub.
+  Post-review fixes: C1 checkpoint+extension-use brick fixed by touched-only
+  `LOAD EXTENSION` prefixing in the WAL (bind-time tracking, tracked-set reset at
+  checkpoint; verified end-to-end: checkpoint then ext-using INSERT reopens and replays),
+  H1 enclosed dynamic calls no longer constant-folded (`contains_dynamic_scalar` guard;
+  per-row semantics, 0 calls on empty input, 1 invocation for erroring calls), H2 NULL
+  callbacks rejected at registration instead of SIGSEGV, impure-predicate pushdown refused,
+  PEG/legacy NUL error parity, header/offset/ownership-edge tests. 432 tests / 25 suites
+  green both parser modes; duckdiff 60/60; kill loop 30/30; wasm core build green; sizes
+  `pinkdb` 2.25 MB (+1.0%).
+- 2026-10-13 — Binary size: `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
+  `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 29; pre-wave-17 was 2.26 MB).

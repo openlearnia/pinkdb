@@ -86,6 +86,7 @@ fn done_round_trips_every_kind() {
         DoneKind::CreatedDatabase,
         DoneKind::DroppedDatabase,
         DoneKind::Used,
+        DoneKind::LoadedExtension,
         DoneKind::Other,
     ];
     for kind in kinds {

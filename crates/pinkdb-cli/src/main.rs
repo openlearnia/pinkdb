@@ -31,7 +31,8 @@ fn print_help() {
     println!("Encryption: PINKDB_KEY=<passphrase> (valid UTF-8) makes .save write and .open");
     println!("            read an encrypted database (needs a build with the `encryption` feature).");
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
-    println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases.");
+    println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
+    println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");
 }
 
 fn cmd_databases(db: &PinkDb) {
@@ -339,7 +340,8 @@ fn print_help_remote() {
     println!("  .quit | .exit          leave the shell");
     println!("  .databases/.tables/.schema/.import/.save/.open are not available in remote mode");
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
-    println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases.");
+    println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
+    println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");
 }
 
 fn display_value(v: &Value) -> String {
@@ -450,6 +452,9 @@ fn render_results(results: &[QueryResult]) {
                 println!("Database {name} dropped.")
             }
             QueryResult::Used { db } => println!("Using database {db}."),
+            QueryResult::LoadedExtension { name } => {
+                println!("Extension {name} loaded.")
+            }
             QueryResult::Selected { names, types, rows } => {
                 if rows.is_empty() {
                     println!("(no rows)");

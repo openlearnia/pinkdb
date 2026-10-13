@@ -67,11 +67,11 @@ usable.
 
 - `Kind`: `selected`, `created`, `inserted`, `updated`, `deleted`, `began`,
   `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`,
-  `created_database`, `dropped_database`, `used`;
+  `created_database`, `dropped_database`, `used`, `loaded_extension`;
 - `Columns` / `ColumnTypes` (SELECT only; types `boolean`, `integer`,
   `bigint`, `double`, `varchar`, `date`, `timestamp`), `Rows`;
 - `Affected` (INSERT/UPDATE/DELETE row count), `Name` (view/table/database/`USE`
-  name; empty string when absent).
+  name, or the extension name for `LOAD EXTENSION`; empty string when absent).
 
 ## Value mapping
 

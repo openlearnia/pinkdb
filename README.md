@@ -69,11 +69,15 @@ SQL text
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
 
-Design rules: Rust edition 2021, zero async, no unsafe. Dependencies are
-`csv` + `rustyline`, plus `rayon` for parallel execution and `peg` for the
-SQL parser. The server crate adds no external dependencies. With the
-`encryption` feature the audited RustCrypto crates `aes-gcm` + `argon2` are
-linked (optional dependencies: the default build stays crypto-free).
+Design rules: Rust edition 2021, zero async; the core is zero-unsafe, with
+`unsafe` contained to exactly two crates (the C ABI `pinkdb-ffi` and the
+extension loader `pinkdb-ext-loader`). Dependencies are `csv` + `rustyline`,
+plus `rayon` for parallel execution and `peg` for the SQL parser. The server
+crate adds no external dependencies; the extension loader adds `libloading`
+(dlopen) and the core links it on native targets only (see Extensions below).
+With the `encryption` feature the audited RustCrypto crates `aes-gcm` +
+`argon2` are linked (optional dependencies: the default build stays
+crypto-free).
 
 SQL is parsed by a `peg`-generated grammar; the hand-written lexer +
 recursive-descent parser stays selectable via `PINKDB_PARSER=legacy`. A
@@ -95,6 +99,7 @@ CREATE DATABASE db1;                 -- new, empty database
 DROP DATABASE db1;                   -- last database cannot be dropped; dropping the
                                      -- current one switches the session to main
 USE db1;                             -- per-session current database (default: main)
+LOAD EXTENSION 'extensions/hello.dylib';   -- load a native extension (ABI v1)
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT [OUTER] / RIGHT [OUTER]
                                   -- equi-join (single equality)
@@ -417,7 +422,8 @@ NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP; `DataType` tag byte), then
 `BatchDone { statements }` frame and the client reads result groups until it,
 so neither side parses SQL just to count statements. A failing statement ends
 the batch with a single `Error { message }` instead; SQL errors arrive as
-`Error` frames and the connection stays open. The protocol version is 2.
+`Error` frames and the connection stays open. The protocol version is 3
+(v3 added the `Done` kind `LoadedExtension` for `LOAD EXTENSION`).
 
 The client (`pinkdb_server::Client`) reconstructs pinkdb's public
 `QueryResult`/`Value`/`DataType`, so the CLI renders remote results with the
@@ -474,6 +480,123 @@ make -C crates/pinkdb-ffi hello   # compiles and runs the C example
 Artifacts: `libpinkdb_ffi.dylib` ≈ 1.70 MB, `libpinkdb_ffi.a` ≈ 15.5 MB (build
 archive); nothing is added to the `pinkdb` binary.
 
+## Extensions (loadable)
+
+`pinkdb` can load shared libraries that register scalar SQL functions at
+runtime — no recompilation of the engine. This is the repo's second versioned
+C ABI: it is **separate** from the `pinkdb-ffi` embedding ABI above (which is
+host→foreign-binding); an extension is a foreign library→host callback ABI.
+
+- Header: `crates/pinkdb-ext-loader/include/pinkdb_extension.h` (ABI v1;
+  plain C99, no pinkdb libraries needed to build an extension).
+- Loader crate: `pinkdb-ext-loader` (owns every `unsafe` here: `dlopen`,
+  symbol lookup, callback invocation, result-text ownership).
+- Engine API: `PinkDb::load_extension(path) -> name`; the SQL statement is
+  `LOAD EXTENSION '<path>'` (string-literal path). Loaded functions resolve
+  case-insensitively like built-ins and cannot shadow one.
+
+A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
+
+```c
+/* hello_ext.c */
+#include "pinkdb_extension.h"
+
+static int32_t hello_add(void *user_data, const pinkdb_ext_value *args,
+                         size_t n_args, pinkdb_ext_value *out) {
+    (void)user_data; (void)n_args;
+    if (args[0].is_null || args[1].is_null) {   /* NULL in → NULL out */
+        out->is_null = 1;
+        return 0;
+    }
+    out->type_tag = PINKDB_EXT_TYPE_BIGINT;
+    out->is_null = 0;
+    out->int64 = args[0].int64 + args[1].int64;
+    return 0;
+}
+
+int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
+    static const int32_t arg_types[2] = {
+        PINKDB_EXT_TYPE_BIGINT, PINKDB_EXT_TYPE_BIGINT
+    };
+    return api->register_scalar(host_ctx, "hello_add", 2, arg_types,
+                                PINKDB_EXT_TYPE_BIGINT, hello_add, NULL);
+}
+
+uint32_t    pinkdb_extension_abi_version(void) { return PINKDB_EXT_ABI_VERSION; }
+const char *pinkdb_extension_name(void)        { return "hello_ext"; }
+```
+
+```sh
+cc -std=c99 -O2 -fPIC -shared -I crates/pinkdb-ext-loader/include \
+   -o hello_ext.dylib hello_ext.c          # .so on Linux, .dll with -shared on Windows
+./target/release/pinkdb
+```
+
+```sql
+LOAD EXTENSION 'hello_ext.dylib';
+-- Extension hello_ext loaded.
+SELECT hello_add(40, 2);                   -- 42
+```
+
+Contract highlights (the header is complete):
+
+- **Thread safety:** callbacks run concurrently on the executor's rayon
+  workers — a registered function may be invoked on several threads at once,
+  so its state must be guarded (atomics/locks/TLS). `alloc`/`free` are
+  thread-safe; `register_scalar` is only valid inside `pinkdb_extension_init`.
+- **Typing:** ABI v1 is strictly typed. Arguments must match the registered
+  types exactly (`NULL` literals are typeless and pass through as NULL; write
+  `CAST(...)` for a different numeric type) and the result must carry the
+  registered type tag.
+- **Result text:** a non-NULL VARCHAR result must be allocated with
+  `api->alloc(size)`; the host copies `text_len` bytes and frees it with
+  `api->free` immediately after the call — on every path, including error
+  returns and NULL results. A rejected registration (including a NULL `fn`)
+  fails the whole load atomically — nothing half-registers.
+- **Errors:** returning non-zero aborts the enclosing statement with an error
+  naming the function and code; `init` returning non-zero (or a rejected
+  registration) fails the load naming the code/reason. `init` and callbacks
+  must not panic/unwind across the ABI boundary.
+
+Semantics and persistence:
+
+- Extensions are **process-level**: they are not stored in `.pink` snapshots
+  and not part of a transaction. `LOAD EXTENSION` is refused inside
+  `BEGIN..COMMIT` (`LOAD EXTENSION is not allowed inside a transaction`), like
+  `CREATE DATABASE`. An accepted extension stays loaded (its library stays
+  mapped) for the lifetime of the store — even one that registers no functions
+  — and its declared name is pinned: loading it again is a clear
+  `extension "x" is already loaded` error (a failed load registers nothing).
+- For a **durable** database the statement *is* WAL-logged, and every logged
+  record that *calls* an extension function is prefixed with
+  `LOAD EXTENSION '<path>'` unless the current WAL generation already loaded
+  that path (touched-only prefixing; the logged `LOAD EXTENSION` itself is
+  never prefixed with itself). Replay therefore re-loads exactly the
+  extensions the replayed records need. A missing/unloadable file at replay
+  time is a hard recovery error naming the path (never a silent drop); prefer
+  absolute paths, since the recorded path is re-resolved against the
+  process's working directory at reopen.
+- A **checkpoint** rolls the WAL and never writes an extension into the
+  `.pink` (extensions are process-level). An open after a checkpoint starts
+  with no extension loaded; the first record that touches one re-loads it by
+  path, so its file must still exist. An extension loaded before the last
+  checkpoint is gone after a reopen until it is loaded again.
+- **Remote** use (`pinkdb-server`): `LOAD EXTENSION` loads native code into
+  the *server* process, not the client. The server trusts its clients, so
+  treat remote access as a trusted-clients posture — anyone who can send SQL
+  can load a shared library with the server's privileges.
+- **ABI policy:** the extension ABI version bumps only for breaking changes.
+  New result/statement kinds (e.g. `LOAD EXTENSION` itself, which added
+  `PINKDB_STMT_LOADED_EXTENSION = 14` to the `pinkdb-ffi` embedding ABI and a
+  `loaded_extension` kind to the Python/Go bindings) are additive and keep
+  ABI v1 — existing extensions and embedders keep working unchanged.
+- wasm32 builds do not link the loader: `LOAD EXTENSION` fails cleanly with
+  `extensions are not supported on wasm targets`.
+
+```sh
+cargo test -p pinkdb-ext-loader   # compiles the C test extensions with cc
+```
+
 ## Python binding (`bindings/python`)
 
 A thin, dependency-free wrapper over the C ABI, implemented with the standard
@@ -499,10 +622,11 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
 
 - `kind`: `selected`, `created`, `inserted`, `updated`, `deleted`, `began`,
   `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`,
-  `created_database`, `dropped_database`, `used`;
+  `created_database`, `dropped_database`, `used`, `loaded_extension`;
 - `columns` / `column_types` (SELECT only; types `boolean`, `integer`,
   `bigint`, `double`, `varchar`, `date`, `timestamp`), `rows`;
-- `affected` (INSERT/UPDATE/DELETE) and `name` (view/table/database/`USE`).
+- `affected` (INSERT/UPDATE/DELETE) and `name` (view/table/database/`USE`/
+  extension).
 
 Values map to `None`/`bool`/`int`/`float`/`str`/`datetime.date`/naive-UTC
 `datetime.datetime`; errors raise `pinkdb.Error` with the message from
@@ -588,12 +712,20 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 
 - No nested transactions or savepoints; one process per `.pink` path
   (single-writer: no file locking is taken); `.open` replaces the whole store
-- `CREATE DATABASE` / `DROP DATABASE` are refused inside a transaction; the
-  last database cannot be dropped; `DROP DATABASE` does not remove views from
-  other databases (views are per-database and session-local)
+- `CREATE DATABASE` / `DROP DATABASE` / `LOAD EXTENSION` are refused inside a
+  transaction; the last database cannot be dropped; `DROP DATABASE` does not
+  remove views from other databases (views are per-database and session-local)
+- Loadable extensions are native-only (wasm builds refuse `LOAD EXTENSION`),
+  process-level, and not part of `.pink` snapshots. A durable database
+  WAL-logs `LOAD EXTENSION`, and records that call an extension are prefixed
+  with the `LOAD EXTENSION` statements replay needs (touched-only; a
+  checkpoint resets that coverage). A missing file at replay time is a hard
+  error, and loading the same extension twice reports
+  `extension "x" is already loaded`
 - Three-part column references (`db.table.col`) are unsupported; use an alias
   (`SELECT x.col FROM db.table AS x`)
-- `USE`, `DATABASE` and `LEFT`/`RIGHT`/`OUTER`/`FULL`/`CROSS` are reserved
+- `USE`, `DATABASE`, `LOAD`, `EXTENSION` and
+  `LEFT`/`RIGHT`/`OUTER`/`FULL`/`CROSS` are reserved
   words; quote identifiers to use them as names (`"use"` works)
 - Durable commits refuse statements that read a session-local view (views are
   never persisted); `.import` checkpoints, so it needs a settled transaction
@@ -626,6 +758,7 @@ cargo build            # workspace
 cargo test             # 100+ unit + end-to-end tests
 cargo test -p pinkdb-server                          # protocol + server + durable tests
 cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
+cargo test -p pinkdb-ext-loader                      # loadable extensions (compiles C test extensions with cc)
 cargo test --features encryption                     # encrypted round-trips + WAL recovery
 cargo build -p pinkdb-cli --features encryption      # REPL with PINKDB_KEY support
 cargo clippy --all-targets   # must stay clean

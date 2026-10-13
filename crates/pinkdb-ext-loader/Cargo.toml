@@ -1,0 +1,23 @@
+[package]
+name = "pinkdb-ext-loader"
+version = "0.1.0"
+edition = "2021"
+description = "pinkdb loadable-extension ABI v1: dlopen-based loader and dynamic scalar registry"
+license = "MIT"
+
+[lib]
+name = "pinkdb_ext_loader"
+
+[dependencies]
+# The one dependency this wave adds, scoped to this crate: dlopen/dlsym.
+# (The host calls it, it calls nothing else back into Rust.)
+libloading = "0.8"
+
+[dev-dependencies]
+# Deliberate dev-dependency cycle: `pinkdb` depends on this crate (the
+# `PinkDb::load_extension` wrapper and the dynamic-function registry live in
+# the engine, next to the binder/executor integration). Cargo permits cycles
+# through dev-dependencies, which lets the integration tests here drive the
+# full engine end to end (load a compiled C extension, run SQL, assert the
+# results) without adding a production dependency back on `pinkdb`.
+pinkdb = { path = "../pinkdb" }

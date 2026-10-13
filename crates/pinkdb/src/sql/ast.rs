@@ -62,6 +62,12 @@ pub enum Statement {
     Use {
         name: String,
     },
+    /// `LOAD EXTENSION '<path>'`: load a native loadable extension (ABI v1)
+    /// and register its scalar functions. The path is a string literal kept
+    /// exactly as written (never canonicalized by the parser).
+    LoadExtension {
+        path: String,
+    },
     Select(Select),
 }
 

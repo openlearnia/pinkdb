@@ -117,6 +117,7 @@
 //! A keyed open requires every artifact to be encrypted, and a plaintext
 //! open refuses encrypted ones, so a key can never be silently ignored.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -200,6 +201,16 @@ pub struct Wal {
     /// Multi-connection appends emit a `USE` prefix whenever their session
     /// differs, so every record replays in the database it was executed in.
     session_db: Option<String>,
+    /// Extension paths whose `LOAD EXTENSION` the CURRENT WAL generation
+    /// already covers: a record touching such an extension is not prefixed
+    /// again. Seeded after recovery from the extensions replay loaded (the
+    /// live generation is exactly what replay saw), updated when a record
+    /// with a `LOAD EXTENSION` prefix or statement is appended, and RESET by
+    /// a checkpoint — a checkpoint never persists an extension, so the fresh
+    /// generation starts with nothing loaded and every extension a later
+    /// record needs is prefixed again. Compared as exact strings (the path
+    /// string is what replay passes to the loader).
+    tracked_extensions: HashSet<String>,
     /// Per-record AEAD state for an encrypted WAL (`None` = plaintext).
     cipher: Option<RecordCipher>,
 }
@@ -319,6 +330,7 @@ impl Wal {
             last_lsn,
             poisoned: None,
             session_db: None,
+            tracked_extensions: HashSet::new(),
             cipher,
         };
         let fresh_cipher = |gen: u64| -> Result<Option<RecordCipher>> {
@@ -484,12 +496,32 @@ impl Wal {
         self.session_db = Some(db.to_string());
     }
 
+    /// Mark extension paths as already covered by the current WAL generation.
+    /// Called right after recovery: every extension the replayed records
+    /// loaded (or kept mapped with zero functions) is covered by this
+    /// generation, so a later append touching it must not emit a redundant
+    /// `LOAD EXTENSION` prefix (replay would hit a duplicate load).
+    pub(crate) fn seed_tracked_extensions(&mut self, paths: impl IntoIterator<Item = String>) {
+        self.tracked_extensions.extend(paths);
+    }
+
     /// Append one committed unit executed in session database `db_before`
     /// (when it still exists), leaving the replay session at `db_after`. When
     /// the WAL's replay session differs from `db_before`, a `USE db_before`
     /// statement is prepended so the record replays against the same database
     /// (multi-connection stores: `USE` is per-connection but the WAL is
     /// shared).
+    ///
+    /// `touched_extensions` lists the extension paths whose functions the
+    /// statements call, `loaded_extensions` the paths the statements load
+    /// themselves (`LOAD EXTENSION` text already in `stmts`). Every touched
+    /// path the current generation has not covered yet — and that is not in
+    /// `loaded_extensions` — is prefixed as `LOAD EXTENSION '<path>'`, so
+    /// replay re-loads exactly the extensions this record needs (an
+    /// extension folded away by an earlier checkpoint is re-loaded from its
+    /// file; a missing file is then a hard recovery error). Both lists are
+    /// marked covered only after the record was durably appended, so a failed
+    /// append can never suppress a needed prefix later.
     ///
     /// `db_before` is `None` when that database no longer exists at append
     /// time: a `USE` prefix naming it could never replay (the `DROP` that
@@ -505,30 +537,43 @@ impl Wal {
         db_before: Option<&str>,
         db_after: &str,
         stmts: &[String],
+        touched_extensions: &[String],
+        loaded_extensions: &[String],
     ) -> Result<()> {
+        let mut rec: Vec<String> = Vec::with_capacity(
+            stmts.len() + touched_extensions.len() + 1,
+        );
+        if let Some(before) = db_before {
+            if !self
+                .session_db
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(before))
+            {
+                // Quote the name: databases may hold spaces/keywords when
+                // created with a quoted identifier (`CREATE DATABASE
+                // "My Db"`).
+                rec.push(format!("USE \"{}\"", before.replace('"', "\"\"")));
+            }
+        }
+        let mut prefixed: HashSet<&str> = HashSet::new();
+        for path in touched_extensions {
+            if self.tracked_extensions.contains(path)
+                || loaded_extensions.iter().any(|p| p == path)
+                || !prefixed.insert(path.as_str())
+            {
+                continue;
+            }
+            // Quote the path: `''` is the SQL escape for a single quote.
+            rec.push(format!("LOAD EXTENSION '{}'", path.replace('\'', "''")));
+        }
+        rec.extend_from_slice(stmts);
+        self.append(&rec)?;
+        // Covered only after a successful append.
+        self.tracked_extensions.extend(touched_extensions.iter().cloned());
+        self.tracked_extensions.extend(loaded_extensions.iter().cloned());
         match db_before {
-            Some(before) => {
-                if self
-                    .session_db
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case(before))
-                {
-                    self.append(stmts)?;
-                } else {
-                    // Quote the name: databases may hold spaces/keywords when
-                    // created with a quoted identifier (`CREATE DATABASE
-                    // "My Db"`).
-                    let mut rec = Vec::with_capacity(stmts.len() + 1);
-                    rec.push(format!("USE \"{}\"", before.replace('"', "\"\"")));
-                    rec.extend_from_slice(stmts);
-                    self.append(&rec)?;
-                }
-                self.session_db = Some(db_after.to_string());
-            }
-            None => {
-                self.append(stmts)?;
-                self.session_db = None;
-            }
+            Some(_) => self.session_db = Some(db_after.to_string()),
+            None => self.session_db = None,
         }
         Ok(())
     }
@@ -576,6 +621,11 @@ impl Wal {
                 self.cipher = cipher;
                 self.gen = fresh_gen;
                 self.last_lsn = 0;
+                // The rolled generation's `LOAD EXTENSION` records are folded
+                // into the checkpoint — but the checkpoint never stores an
+                // extension, so the fresh generation covers nothing: the next
+                // record touching an extension must be prefixed again.
+                self.tracked_extensions.clear();
             }
             Err(e) => {
                 // The old WAL is intact in `.roll`; refuse further appends
@@ -1339,6 +1389,10 @@ impl PinkDb {
         // Replay leaves the session wherever the last record did (a logged
         // `USE` or the start at `main`): later appends must know that.
         handle.set_session_db(db.current_db());
+        // Every extension replay loaded is covered by the current WAL
+        // generation (the live WAL is exactly what was just replayed): a
+        // later record touching it must not emit a redundant prefix.
+        handle.seed_tracked_extensions(db.loaded_extension_paths());
         db.wal = Some(std::sync::Arc::new(std::sync::Mutex::new(handle)));
         Ok((db, info))
     }

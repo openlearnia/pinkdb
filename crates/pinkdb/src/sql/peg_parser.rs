@@ -25,11 +25,35 @@ use crate::types::{DataType, PinkDbError, Result, Value};
 /// and position format differ (PEG reports the furthest expected token).
 pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
     super::parser::check_nesting_depth(sql)?;
+    reject_nul_in_quoted_identifier(sql)?;
     let mut out =
         peg_sql::statements(sql).map_err(|e| PinkDbError::Parse(format!("parse error: {e}")))?;
     // Post-parse depth guard (shared with the recursive-descent parser).
     super::check_ast_depth(&mut out)?;
     Ok(out)
+}
+
+/// Reject a NUL byte inside a quoted identifier with the *legacy* parser's
+/// exact positional message.
+///
+/// The PEG grammar also rejects it (see `quoted_ident`), but an action's
+/// `Err` can only enter peg's expected-set, which renders as
+/// `expected identifier contains a NUL byte` with the position of the
+/// *closing* quote. Running the shared lexer up front — only when the input
+/// contains a NUL at all — reproduces the legacy message byte for byte
+/// (`lex error at offset <opening quote>: identifier contains a NUL byte`).
+/// Any other lexer outcome is ignored: the PEG grammar stays the authority on
+/// every other malformed input.
+fn reject_nul_in_quoted_identifier(sql: &str) -> Result<()> {
+    if !sql.as_bytes().contains(&0) {
+        return Ok(());
+    }
+    match super::lexer::lex(sql) {
+        Err(PinkDbError::Parse(msg)) if msg.contains("identifier contains a NUL byte") => {
+            Err(PinkDbError::Parse(msg))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What may follow the left operand of a comparison-level expression.
@@ -206,7 +230,13 @@ peg::parser! {
               }
 
         rule quoted_ident() -> String
-            = "\"" c:quoted_ident_char()* "\"" ws() { c.into_iter().collect() }
+            = "\"" c:quoted_ident_char()* "\"" ws() {?
+                  if c.contains(&'\0') {
+                      Err("identifier contains a NUL byte")
+                  } else {
+                      Ok(c.into_iter().collect())
+                  }
+              }
 
         rule quoted_ident_char() -> char
             = "\"\"" { '"' }
@@ -258,6 +288,7 @@ peg::parser! {
             / delete()
             / txn()
             / use_stmt()
+            / load_extension()
             / drop()
             / select_statement()
 
@@ -265,6 +296,12 @@ peg::parser! {
 
         rule use_stmt() -> Statement
             = kw(Keyword::Use) name:ident() { Statement::Use { name } }
+
+        /// `LOAD EXTENSION '<path>'` — the path must be a string literal.
+        rule load_extension() -> Statement
+            = kw(Keyword::Load) kw(Keyword::Extension) path:string_lit() {
+                  Statement::LoadExtension { path }
+              }
 
         /// `name` or `db.name` — a table reference. Three-part names are
         /// rejected as soon as the second dot appears, with the same clear
@@ -744,7 +781,7 @@ mod tests {
     ///    CASE/CAST/COALESCE/LIKE/BETWEEN/IN/EXISTS;
     /// 3. deliberately invalid SQL (one list below) pinning rejection parity.
     ///
-    /// 807 valid + 146 invalid entries.
+    /// 812 valid + 157 invalid entries.
     /// Must parse with both parsers to identical ASTs.
     const VALID: &[&str] = &[
         "SELECT COUNT(*) FROM sales;",
@@ -1557,6 +1594,13 @@ mod tests {
         "SELECT COUNT(*) FROM (SELECT a FROM db1.t) s JOIN db2.u ON s.a = u.a;",
         "WITH c AS (SELECT 1 AS x) SELECT * FROM c JOIN db1.t ON c.x = t.a;",
         "SELECT * FROM main.m AS m JOIN analytics.m AS a ON m.k = a.k;",
+        // Loadable extensions: `LOAD EXTENSION '<path>'` (string-literal path,
+        // keywords case-insensitive, path kept verbatim).
+        "LOAD EXTENSION 'extensions/test_ext.dylib';",
+        "LOAD EXTENSION '/tmp/a b/ext.so';",
+        "load extension 'x';",
+        "LOAD   EXTENSION   'x.dylib' ;",
+        "SELECT 1; LOAD EXTENSION 'x'; SELECT 2;",
     ];
 
     /// Must be rejected by both parsers as `PinkDbError::Parse`.
@@ -1708,6 +1752,21 @@ mod tests {
         "DROP TABLE db1.;",
         "CREATE VIEW db1.;",
         "SELECT * FROM db1.t JOIN db2.u;",
+        // LOAD EXTENSION syntax errors: missing or non-literal path.
+        "LOAD EXTENSION;",
+        "LOAD EXTENSION ;",
+        "LOAD EXTENSION x;",
+        "LOAD EXTENSION 1;",
+        "LOAD EXTENSION 'x' 'y';",
+        "LOAD EXTENSION \"x\";",
+        "LOAD;",
+        "LOAD 'x';",
+        // NUL bytes are rejected inside quoted identifiers (the C bindings
+        // would silently truncate them at the NUL); string literals stay free
+        // to carry NUL bytes (see the parser-level tests).
+        "SELECT \"a\0b\";",
+        "CREATE TABLE \"a\0b\" (x INTEGER);",
+        "SELECT 1 AS \"a\0b\";",
     ];
 
     /// Parse `sql` with both parsers; valid entries must produce equal ASTs and
@@ -1761,6 +1820,69 @@ mod tests {
                 "PEG accepted invalid {sql:?}"
             );
         }
+    }
+
+    /// `LOAD EXTENSION '<path>'` produces the same AST in both parsers; the
+    /// path is kept exactly as written and keywords are case-insensitive.
+    #[test]
+    fn load_extension_ast_matches_and_keeps_the_path_verbatim() {
+        use crate::sql::ast::Statement;
+        for (sql, path) in [
+            ("LOAD EXTENSION '/a b/c.dylib';", "/a b/c.dylib"),
+            ("load extension 'x.so';", "x.so"),
+            ("LOAD EXTENSION 'it''s.dylib';", "it's.dylib"),
+        ] {
+            let l = legacy(sql).unwrap();
+            let p = peg(sql).unwrap();
+            assert_eq!(l, p, "AST mismatch for {sql:?}");
+            assert_eq!(
+                l,
+                vec![Statement::LoadExtension { path: path.to_string() }],
+                "{sql:?}"
+            );
+        }
+        // The path must be a string literal; the legacy parser names the fix.
+        let e = legacy("LOAD EXTENSION;").unwrap_err().to_string();
+        assert!(e.contains("LOAD EXTENSION needs a string literal path"), "{e}");
+        let e = legacy("LOAD EXTENSION ext;").unwrap_err().to_string();
+        assert!(e.contains("LOAD EXTENSION needs a string literal path"), "{e}");
+    }
+
+    /// NUL bytes inside quoted identifiers are rejected at parse time by both
+    /// parsers (the C bindings would silently truncate them at the NUL);
+    /// valid quoted identifiers are unchanged and NULs stay legal in string
+    /// literals, where they are value bytes rather than names.
+    #[test]
+    fn nul_in_quoted_identifier_is_rejected_by_both_parsers() {
+        for sql in [
+            "SELECT \"a\0b\";",
+            "CREATE TABLE \"a\0b\" (x INTEGER);",
+            "SELECT 1 AS \"a\0b\";",
+            "SELECT * FROM \"a\0b\";",
+            "USE \"a\0b\";",
+        ] {
+            let l = legacy(sql).expect_err("legacy must reject");
+            let p = peg(sql).expect_err("PEG must reject");
+            assert!(matches!(l, PinkDbError::Parse(_)), "{sql:?}: {l:?}");
+            assert!(matches!(p, PinkDbError::Parse(_)), "{sql:?}: {p:?}");
+            assert!(l.to_string().contains("identifier contains a NUL byte"), "{l}");
+            assert!(p.to_string().contains("identifier contains a NUL byte"), "{p}");
+            // The PEG parser reports the *legacy* positional message, not
+            // peg's "expected ..." rendering with the closing-quote position.
+            assert_eq!(p.to_string(), l.to_string(), "{sql:?}");
+        }
+        // Valid quoted identifiers are byte-identical across parsers.
+        for sql in [
+            "SELECT 1 AS \"a b\";",
+            "CREATE TABLE \"with space\" (\"col\" INTEGER);",
+            "SELECT \"\"\"quoted\"\"\";",
+        ] {
+            assert_eq!(legacy(sql).unwrap(), peg(sql).unwrap(), "{sql:?}");
+        }
+        // A NUL inside a string literal is value data, not a name: both
+        // parsers accept it and agree on the AST.
+        let sql = "SELECT 'a\0b';";
+        assert_eq!(legacy(sql).unwrap(), peg(sql).unwrap());
     }
 
     /// m2: the four three-part shapes must fail with the same message as the

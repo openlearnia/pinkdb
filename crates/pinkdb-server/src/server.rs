@@ -475,6 +475,9 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
         QueryResult::CreatedDatabase { name } => done(w, DoneKind::CreatedDatabase, 0, name),
         QueryResult::DroppedDatabase { name } => done(w, DoneKind::DroppedDatabase, 0, name),
         QueryResult::Used { db } => done(w, DoneKind::Used, 0, db),
+        QueryResult::LoadedExtension { name } => {
+            done(w, DoneKind::LoadedExtension, 0, name)
+        }
     }
 }
 

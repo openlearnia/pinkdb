@@ -43,6 +43,8 @@ pub enum QueryResult {
     DroppedDatabase { name: String },
     /// `USE <db>`: the session layer applies this to its current database.
     Used { db: String },
+    /// `LOAD EXTENSION '<path>'`: `name` is the extension's declared name.
+    LoadedExtension { name: String },
     Selected { names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>> },
 }
 
@@ -245,6 +247,13 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
         LogicalPlan::Use { name } => use_result(db, name),
+        LogicalPlan::LoadExtension { path } => {
+            // Process-level side effect: load the cdylib and register its
+            // functions (atomic; a failure registers nothing). The DB stays
+            // usable afterwards either way.
+            let name = db.load_extension(path)?;
+            Ok(QueryResult::LoadedExtension { name })
+        }
         _ => {
             let cx = Cx::new(db);
             run_read_with(&cx, plan)
@@ -290,6 +299,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::Use { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
@@ -921,11 +931,13 @@ fn classify_side(expr: &BoundExpr, left_cols: usize) -> Option<Side> {
             }
             Some(side)
         }
-        // Aggregate/window output columns and subqueries are not fusible.
+        // Aggregate/window output columns, subqueries, and extension calls
+        // (opaque: possibly impure and fallible) are not fusible.
         BoundExpr::AggRef { .. }
         | BoundExpr::WindowRef { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::InSubquery { .. }
+        | BoundExpr::DynamicScalar { .. }
         | BoundExpr::Exists { .. } => None,
     }
 }
@@ -1005,11 +1017,13 @@ fn rewrite_through_project(
             },
             dtype: *dtype,
         }),
-        // Aggregate/window output columns and subqueries are not fusible.
+        // Aggregate/window output columns, subqueries, and extension calls
+        // (opaque: possibly impure and fallible) are not fusible.
         BoundExpr::AggRef { .. }
         | BoundExpr::WindowRef { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::InSubquery { .. }
+        | BoundExpr::DynamicScalar { .. }
         | BoundExpr::Exists { .. } => None,
     }
 }
@@ -1062,6 +1076,15 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
                 })
                 .collect(),
             else_: else_.as_ref().map(|e| Box::new(shift_join_columns(e, left_cols))),
+            dtype: *dtype,
+        },
+        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| shift_join_columns(a, left_cols))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             dtype: *dtype,
         },
         BoundExpr::AggRef { .. }
@@ -1183,6 +1206,7 @@ fn expr_is_total(e: &BoundExpr) -> bool {
         | BoundExpr::WindowRef { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::InSubquery { .. }
+        | BoundExpr::DynamicScalar { .. }
         | BoundExpr::Exists { .. } => false,
     }
 }
@@ -5909,6 +5933,10 @@ mod tests {
         db.execute("BEGIN;").unwrap();
         let err = db.execute("CREATE DATABASE x;").unwrap_err();
         assert!(err.to_string().contains("not allowed inside a transaction"), "{err}");
+        // LOAD EXTENSION is process-level too; the refusal happens before the
+        // path is even looked at.
+        let err = db.execute("LOAD EXTENSION '/does/not/exist.dylib';").unwrap_err();
+        assert_eq!(err.to_string(), "LOAD EXTENSION is not allowed inside a transaction");
         db.execute("ROLLBACK;").unwrap();
     }
 

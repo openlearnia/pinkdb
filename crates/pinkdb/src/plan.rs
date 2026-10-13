@@ -62,6 +62,12 @@ pub enum LogicalPlan {
     Use {
         name: String,
     },
+    /// `LOAD EXTENSION '<path>'`: load a native extension (ABI v1) and
+    /// register its scalar functions. Process-level and not part of any
+    /// snapshot — but WAL-logged, because a durable reopen must re-load it.
+    LoadExtension {
+        path: String,
+    },
     /// Set union: output names come from the left branch; every column is
     /// coerced to the pairwise common type at execution.
     Union {
@@ -162,11 +168,21 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
 
 /// True for plans whose committed SQL text has to be logged — exactly the
 /// statements a durable commit must replay: table data/catalog mutations,
-/// database create/drop, and `USE` (replay starts at `main` and the logged
-/// `USE` records switch the replay session). View DDL is exempt: views are
-/// session-local and never persisted, so replaying them would not match
-/// `save`/`open` semantics. Control plans (`BEGIN`/`COMMIT`/`ROLLBACK`) are
-/// also false: transaction boundaries are encoded in record shape.
+/// database create/drop, `LOAD EXTENSION`, and `USE` (replay starts at
+/// `main` and the logged `USE` records switch the replay session). View DDL
+/// is exempt: views are session-local and never persisted, so replaying them
+/// would not match `save`/`open` semantics. Control plans
+/// (`BEGIN`/`COMMIT`/`ROLLBACK`) are also false: transaction boundaries are
+/// encoded in record shape.
+///
+/// Extensions are process-level and are never written into a checkpoint, so
+/// a record that calls a dynamic function is additionally prefixed with
+/// `LOAD EXTENSION '<path>'` for every extension the *current WAL generation*
+/// has not loaded yet (touched-only prefixing; see [`crate::wal::Wal`]). The
+/// logged `LOAD EXTENSION` statement itself is never prefixed with itself,
+/// but marks its path as covered. A checkpoint resets that coverage: after
+/// it, the next record touching an extension re-loads it by path — a missing
+/// file at replay time is then a hard recovery error, never a silent drop.
 pub fn writes_tables(plan: &LogicalPlan) -> bool {
     matches!(
         plan,
@@ -178,7 +194,20 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::CreateDatabase { .. }
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Use { .. }
+            | LogicalPlan::LoadExtension { .. }
     )
+}
+
+/// Statements refused inside a transaction: store/process-level operations a
+/// snapshot commit cannot undo. Returns the SQL statement name for the error
+/// message (`None` = allowed).
+pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str> {
+    Some(match plan {
+        LogicalPlan::CreateDatabase { .. } => "CREATE DATABASE",
+        LogicalPlan::DropDatabase { .. } => "DROP DATABASE",
+        LogicalPlan::LoadExtension { .. } => "LOAD EXTENSION",
+        _ => return None,
+    })
 }
 
 /// Compare two non-null values. Cross-type numerics compare in i64 when both

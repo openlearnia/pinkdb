@@ -21,3 +21,14 @@ rayon = "1.12.0"
 # Audited RustCrypto crates, only linked with the `encryption` feature.
 aes-gcm = { version = "0.10", optional = true }
 argon2 = { version = "0.5", optional = true }
+
+# Loadable extensions (ABI v1) are native-only by construction: the loader
+# crate links `libloading` (dlopen/dlsym), which does not build for wasm32.
+# The dependency edge is target-gated here, and the engine cfg-gates the
+# dynamic-function registry/binder/executor paths (a wasm build gets a clear
+# "extensions are not supported on wasm targets" error from
+# `PinkDb::load_extension`). Native builds are byte-identical.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The loader crate owns the only dlopen dependency; the engine side is the
+# dynamic scalar registry + binding + execution of registered callbacks.
+pinkdb-ext-loader = { path = "../pinkdb-ext-loader" }

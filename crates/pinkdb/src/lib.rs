@@ -3,11 +3,18 @@
 //! v1: in-memory columnar storage, vectorized execution (CHUNK_SIZE = 2048),
 //! hand-written SQL frontend, CSV import. Single connection, single thread,
 //! no unsafe, no async.
+//!
+//! Loadable extensions (ABI v1, `pinkdb-ext-loader`) add scalar functions at
+//! runtime through [`PinkDb::load_extension`]; the unsafe boundary (dlopen and
+//! callback invocation) lives entirely in that crate, the engine stays
+//! zero-unsafe, and the built-in binder/executor path is unchanged when no
+//! extension is loaded.
 
 pub mod csv;
 pub mod crypto;
 pub mod db;
 pub mod exec;
+mod ext;
 pub mod optimizer;
 pub mod persist;
 pub mod plan;
@@ -53,24 +60,19 @@ impl PinkDb {
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
             let session_db = self.current_db().to_string();
-            let plan = optimizer::optimize(self, sql::bind(self, stmt, &session_db)?);
-            // Database create/drop are store-level and cannot be undone by a
-            // snapshot commit of the multi-writer path: refuse inside a txn.
-            if self.in_transaction()
-                && matches!(
-                    plan,
-                    plan::LogicalPlan::CreateDatabase { .. }
-                        | plan::LogicalPlan::DropDatabase { .. }
-                )
-            {
-                return Err(types::PinkDbError::Execution(format!(
-                    "{} is not allowed inside a transaction",
-                    if matches!(plan, plan::LogicalPlan::CreateDatabase { .. }) {
-                        "CREATE DATABASE"
-                    } else {
-                        "DROP DATABASE"
-                    }
-                )));
+            let (plan, dynamic_functions_used) =
+                sql::bind_tracked(self, stmt, &session_db)?;
+            let plan = optimizer::optimize(self, plan);
+            // Store/process-level statements cannot be undone by a snapshot
+            // commit of the multi-writer path: refuse inside a txn.
+            // (LOAD EXTENSION is process-level too: the private snapshot's
+            // registry would be discarded at COMMIT/ROLLBACK.)
+            if self.in_transaction() {
+                if let Some(stmt) = plan::refused_in_transaction(&plan) {
+                    return Err(types::PinkDbError::Execution(format!(
+                        "{stmt} is not allowed inside a transaction"
+                    )));
+                }
             }
             let result = exec::run(self, &plan)?;
             // Session transitions are applied before WAL logging so the log
@@ -86,7 +88,7 @@ impl PinkDb {
                 _ => {}
             }
             if let Some(texts) = &texts {
-                self.wal_log_statement(&plan, &texts[i])?;
+                self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used)?;
             }
             out.push(result);
         }

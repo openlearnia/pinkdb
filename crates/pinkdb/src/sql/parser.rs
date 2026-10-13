@@ -259,6 +259,7 @@ impl Parser {
                 self.next();
                 Ok(Statement::Use { name: self.parse_ident()? })
             }
+            Some(Keyword::Load) => self.parse_load(),
             Some(Keyword::Begin) => {
                 self.next();
                 // `BEGIN` or `BEGIN TRANSACTION`.
@@ -280,8 +281,20 @@ impl Parser {
                 Ok(Statement::Select(self.parse_select()?))
             }
             _ => Err(self.error(format!(
-                "expected a statement (CREATE, INSERT, UPDATE, DELETE, DROP, USE, BEGIN, COMMIT, ROLLBACK, SELECT), found {:?}",
+                "expected a statement (CREATE, INSERT, UPDATE, DELETE, DROP, USE, LOAD, BEGIN, COMMIT, ROLLBACK, SELECT), found {:?}",
                 self.peek().0
+            ))),
+        }
+    }
+
+    /// `LOAD EXTENSION '<path>'` — the path must be a string literal.
+    fn parse_load(&mut self) -> Result<Statement> {
+        self.expect_keyword(Keyword::Load)?;
+        self.expect_keyword(Keyword::Extension)?;
+        match self.next() {
+            (Token::String(path), _) => Ok(Statement::LoadExtension { path }),
+            (tok, _) => Err(self.error(format!(
+                "LOAD EXTENSION needs a string literal path, found {tok:?}"
             ))),
         }
     }

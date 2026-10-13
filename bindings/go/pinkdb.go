@@ -75,6 +75,9 @@ const (
 	kindCreatedDatabase int32 = 11
 	kindDroppedDatabase int32 = 12
 	kindUsed            int32 = 13
+	// kindLoadedExtension is `LOAD EXTENSION '<path>'`; Name carries the
+	// extension's declared name.
+	kindLoadedExtension int32 = 14
 )
 
 var kindNames = map[int32]string{
@@ -92,6 +95,7 @@ var kindNames = map[int32]string{
 	kindCreatedDatabase: "created_database",
 	kindDroppedDatabase: "dropped_database",
 	kindUsed:            "used",
+	kindLoadedExtension: "loaded_extension",
 }
 
 // Value and column type tags; these mirror the PINKDB_TYPE_* values in
@@ -123,7 +127,7 @@ type Result struct {
 	// Kind is one of: "selected", "created", "inserted", "updated",
 	// "deleted", "began", "committed", "rolledback", "created_view",
 	// "dropped_table", "dropped_view", "created_database",
-	// "dropped_database", "used".
+	// "dropped_database", "used", "loaded_extension".
 	Kind string
 	// Columns and ColumnTypes describe a "selected" result (column names and
 	// one of "null", "boolean", "integer", "bigint", "double", "varchar",
@@ -137,8 +141,9 @@ type Result struct {
 	// statement; 0 otherwise.
 	Affected int64
 	// Name is the object/session name of a "created_view"/"dropped_table"/
-	// "dropped_view"/"created_database"/"dropped_database"/"used" statement;
-	// empty when absent.
+	// "dropped_view"/"created_database"/"dropped_database"/"used" statement,
+	// or the extension name of a "loaded_extension" statement; empty when
+	// absent.
 	Name string
 }
 

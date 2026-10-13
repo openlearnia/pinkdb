@@ -294,6 +294,7 @@ fn build_result(
         DoneKind::CreatedDatabase => QueryResult::CreatedDatabase { name },
         DoneKind::DroppedDatabase => QueryResult::DroppedDatabase { name },
         DoneKind::Used => QueryResult::Used { db: name },
+        DoneKind::LoadedExtension => QueryResult::LoadedExtension { name },
         DoneKind::Other => {
             return Err(ProtocolError::Malformed(
                 "server sent the reserved Done kind Other".to_string(),

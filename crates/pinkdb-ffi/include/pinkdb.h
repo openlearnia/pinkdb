@@ -54,7 +54,10 @@ enum {
     PINKDB_STMT_DROPPED_VIEW = 10,
     PINKDB_STMT_CREATED_DATABASE = 11,
     PINKDB_STMT_DROPPED_DATABASE = 12,
-    PINKDB_STMT_USED = 13
+    PINKDB_STMT_USED = 13,
+    /* LOAD EXTENSION '<path>': pinkdb_result_name returns the extension's
+     * declared name. */
+    PINKDB_STMT_LOADED_EXTENSION = 14
 };
 
 /* Value / column type tags. */
@@ -135,8 +138,8 @@ pink_value pinkdb_result_value(const pinkdb_result *result, size_t statement,
 /* INSERT/UPDATE/DELETE results: affected row count, else 0. */
 size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);
 
-/* CREATE/DROP VIEW/TABLE/DATABASE and USE results: the object/session name
- * (NUL-terminated), else NULL. */
+/* CREATE/DROP VIEW/TABLE/DATABASE, USE and LOAD EXTENSION results: the
+ * object/session/extension name (NUL-terminated), else NULL. */
 const char *pinkdb_result_name(const pinkdb_result *result, size_t statement);
 
 /* Last error on the calling thread (NUL-terminated), or NULL when the last

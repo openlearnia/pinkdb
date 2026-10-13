@@ -69,6 +69,7 @@ _STMT_KINDS = {
     11: "created_database",
     12: "dropped_database",
     13: "used",
+    14: "loaded_extension",
 }
 
 # ----- value / column type tags (PINKDB_TYPE_*) -----
@@ -299,7 +300,8 @@ class Result:
         One of ``selected``, ``created``, ``inserted``, ``updated``,
         ``deleted``, ``began``, ``committed``, ``rolledback``,
         ``created_view``, ``dropped_table``, ``dropped_view``,
-        ``created_database``, ``dropped_database``, ``used``.
+        ``created_database``, ``dropped_database``, ``used``,
+        ``loaded_extension``.
     columns / column_types:
         For ``selected``: column names and type names (``boolean``,
         ``integer``, ``bigint``, ``double``, ``varchar``, ``date``,
@@ -312,9 +314,9 @@ class Result:
     affected:
         Rows affected by ``inserted``/``updated``/``deleted``; 0 otherwise.
     name:
-        Object/session name for ``created_view``/``dropped_table``/
-        ``dropped_view``/``created_database``/``dropped_database``/``used``;
-        ``None`` otherwise.
+        Object/session/extension name for ``created_view``/``dropped_table``/
+        ``dropped_view``/``created_database``/``dropped_database``/``used``/
+        ``loaded_extension``; ``None`` otherwise.
     """
 
     __slots__ = ("kind", "columns", "column_types", "rows", "affected", "name")

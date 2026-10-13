@@ -1,7 +1,9 @@
 //! SQL lexer: raw text → token stream.
 //!
 //! Single quotes = string literals (`''` = escaped quote).
-//! Double quotes = quoted identifiers (`""` = escaped quote).
+//! Double quotes = quoted identifiers (`""` = escaped quote); a NUL byte
+//! inside a quoted identifier is a parse error (see `lex_quoted`), while
+//! string literals remain free to carry NUL bytes.
 //! `--` line comments and `/* */` block comments are skipped.
 
 use crate::types::{PinkDbError, Result};
@@ -74,6 +76,8 @@ pub enum Keyword {
     End,
     Use,
     Database,
+    Load,
+    Extension,
 }
 
 impl Keyword {
@@ -145,6 +149,8 @@ impl Keyword {
             "END" => Keyword::End,
             "USE" => Keyword::Use,
             "DATABASE" => Keyword::Database,
+            "LOAD" => Keyword::Load,
+            "EXTENSION" => Keyword::Extension,
             _ => return None,
         })
     }
@@ -409,6 +415,15 @@ fn lex_quoted(input: &str, start: usize, quote: u8) -> Result<(String, usize)> {
         }
         // Copy one UTF-8 char (strings may hold any text).
         let ch = input[i..].chars().next().expect("char boundary");
+        // Quoted identifiers cross into C bindings as NUL-terminated strings
+        // in several places; a NUL inside one would be silently truncated
+        // there, so it is rejected at parse time. String literals may hold
+        // NULs (they are byte data, not names).
+        if ch == '\0' && quote == b'"' {
+            return Err(PinkDbError::Parse(format!(
+                "lex error at offset {start}: identifier contains a NUL byte"
+            )));
+        }
         s.push(ch);
         i += ch.len_utf8();
     }
@@ -470,5 +485,20 @@ mod tests {
     fn bad_chars_error() {
         assert!(lex("select `x`").is_err());
         assert!(lex("select 'abc").is_err());
+    }
+
+    #[test]
+    fn nul_in_quoted_identifier_is_rejected_but_allowed_in_strings() {
+        let e = lex("SELECT \"a\0b\"").unwrap_err().to_string();
+        assert!(e.contains("identifier contains a NUL byte"), "{e}");
+        // A NUL inside a *string literal* is value bytes, not a name: allowed.
+        assert_eq!(
+            kinds("SELECT 'a\0b'"),
+            vec![
+                Token::Keyword(Keyword::Select),
+                Token::String("a\0b".to_string()),
+                Token::Eof,
+            ]
+        );
     }
 }

@@ -45,6 +45,9 @@ pub const PINKDB_STMT_DROPPED_VIEW: i32 = 10;
 pub const PINKDB_STMT_CREATED_DATABASE: i32 = 11;
 pub const PINKDB_STMT_DROPPED_DATABASE: i32 = 12;
 pub const PINKDB_STMT_USED: i32 = 13;
+/// `LOAD EXTENSION '<path>'`; `pinkdb_result_name` carries the extension's
+/// declared name.
+pub const PINKDB_STMT_LOADED_EXTENSION: i32 = 14;
 
 // ----- value / column type tags -----
 pub const PINKDB_TYPE_NULL: i32 = 0;
@@ -211,6 +214,7 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::CreatedDatabase { .. } => PINKDB_STMT_CREATED_DATABASE,
         QueryResult::DroppedDatabase { .. } => PINKDB_STMT_DROPPED_DATABASE,
         QueryResult::Used { .. } => PINKDB_STMT_USED,
+        QueryResult::LoadedExtension { .. } => PINKDB_STMT_LOADED_EXTENSION,
     }
 }
 
@@ -238,6 +242,7 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
                     | QueryResult::CreatedDatabase { name }
                     | QueryResult::DroppedDatabase { name } => (0, Some(nul_terminated(name))),
                     QueryResult::Used { db } => (0, Some(nul_terminated(db))),
+                    QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
                     _ => (0, None),
                 };
                 StmtData::Simple { kind, count, name }

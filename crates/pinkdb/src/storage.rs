@@ -7,6 +7,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(target_arch = "wasm32"))]
+use pinkdb_ext_loader::{DynamicFunction, LoadedExtension};
+
 use crate::crypto::EncryptionKey;
 use crate::sql::ast::Select;
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -404,6 +407,19 @@ pub struct DbCatalog {
 pub struct PinkDb {
     /// Key = lowercased database name.
     databases: HashMap<String, DbCatalog>,
+    /// Loadable-extension scalar functions (ABI v1, wave 29A), keyed by
+    /// lowercased name. Registered by [`PinkDb::load_extension`]; shared by
+    /// every clone of the store. Empty for a stock engine, in which case the
+    /// binder/executor behave exactly as before. Native-only: wasm32 links no
+    /// extension loader (`LOAD EXTENSION` errors there).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) dynamic_functions: HashMap<String, DynamicFunction>,
+    /// Every successfully loaded extension (ABI v1), keyed by lowercased
+    /// declared name. Holds the library handle, so an extension that
+    /// registered no functions still stays mapped; also pins duplicate loads
+    /// by name. Native-only, like [`PinkDb::dynamic_functions`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) loaded_extensions: HashMap<String, LoadedExtension>,
     /// Lowercased name of the embedded session's current database.
     current_db: String,
     txn_snapshot: Option<Box<PinkDb>>,
@@ -415,6 +431,16 @@ pub struct PinkDb {
     /// Session database before the first statement of the open transaction's
     /// WAL record (the record replays in that session).
     wal_txn_db: Option<String>,
+    /// Extension paths touched by the buffered statements (dynamic functions
+    /// they call), deduped, in first-use order. A record whose replay needs an
+    /// extension the current WAL generation has not loaded is prefixed with
+    /// `LOAD EXTENSION '<path>'` at append time.
+    wal_txn_ext_paths: Vec<String>,
+    /// Extension paths loaded by the buffered statements' own
+    /// `LOAD EXTENSION` text (empty in practice: `LOAD EXTENSION` is refused
+    /// inside a transaction; kept so a future relaxation still logs a
+    /// self-contained record).
+    wal_txn_ext_loaded: Vec<String>,
     /// At-rest key this store was opened/configured with. Checkpoints and
     /// snapshots of a keyed store are written encrypted (feature
     /// `encryption`); [`PinkDb::save`] stays a plaintext explicit API.
@@ -448,11 +474,17 @@ impl PinkDb {
         }
         Self {
             databases,
+            #[cfg(not(target_arch = "wasm32"))]
+            dynamic_functions: HashMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loaded_extensions: HashMap::new(),
             current_db: "main".to_string(),
             txn_snapshot: None,
             wal: None,
             wal_txn: Vec::new(),
             wal_txn_db: None,
+            wal_txn_ext_paths: Vec::new(),
+            wal_txn_ext_loaded: Vec::new(),
             encryption_key: None,
         }
     }
@@ -619,20 +651,33 @@ impl PinkDb {
     ///
     /// The record is made self-contained: when the WAL's replay session
     /// differs from the statement's session (after a checkpoint, or when
-    /// multiple connections share the file) a `USE` prefix is emitted.
+    /// multiple connections share the file) a `USE` prefix is emitted; and
+    /// when the statement calls a dynamic function whose extension the
+    /// current WAL generation has not loaded yet, a `LOAD EXTENSION '<path>'`
+    /// prefix is emitted so replay can re-load it (see
+    /// [`PinkDb::wal_append_session`]).
+    ///
+    /// `dynamic_functions_used` lists the dynamic-function names (lowercased
+    /// registry keys) the statement's expressions reference, collected at
+    /// bind time.
     pub(crate) fn wal_log_statement(
         &mut self,
         plan: &crate::plan::LogicalPlan,
         sql: &str,
+        dynamic_functions_used: &[String],
     ) -> Result<()> {
         if !crate::plan::writes_tables(plan) {
             return Ok(());
         }
+        let touched = self.dynamic_function_paths(dynamic_functions_used);
+        let loaded = loaded_extension_path(plan);
         if self.in_transaction() {
             if self.wal_txn_db.is_none() {
                 self.wal_txn_db = Some(self.current_db.clone());
             }
             self.wal_txn.push(sql.to_string());
+            push_unique(&mut self.wal_txn_ext_paths, touched);
+            push_unique(&mut self.wal_txn_ext_loaded, loaded);
             return Ok(());
         }
         // `USE` is self-contained: replaying it lands in the target session
@@ -648,7 +693,7 @@ impl PinkDb {
             return Ok(());
         }
         let db = self.current_db.clone();
-        self.wal_append_session(&db, &db, &[sql.to_string()])
+        self.wal_append_session(&db, &db, &[sql.to_string()], &touched, &loaded)
     }
 
     /// Append one committed unit executed in session database `db_before`,
@@ -657,6 +702,15 @@ impl PinkDb {
     /// statement is prepended so the record replays in the right database —
     /// used by the embedded path (after a checkpoint or recovery) and by
     /// [`crate::Connection`]s, whose session is not the store's.
+    ///
+    /// `touched_extensions` lists the extension paths whose functions the
+    /// statements call; every path the current WAL generation has not loaded
+    /// yet (and that the statements do not load themselves) is prefixed as
+    /// `LOAD EXTENSION '<path>'`, so replay re-loads exactly the extensions
+    /// the record needs. `loaded_extensions` lists paths loaded by the
+    /// statements' own `LOAD EXTENSION` text: those are already in the record
+    /// and are only marked covered. See [`crate::wal::Wal`] for the tracked
+    /// set's lifecycle (seeded from replay, reset by a checkpoint).
     ///
     /// A `USE` prefix naming a database that no longer exists could never
     /// replay (the `DROP` that removed it is already earlier in the WAL), so
@@ -669,13 +723,21 @@ impl PinkDb {
         db_before: &str,
         db_after: &str,
         stmts: &[String],
+        touched_extensions: &[String],
+        loaded_extensions: &[String],
     ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
             let mut guard = wal.lock().map_err(|_| {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
             let before = self.database_exists(db_before).then_some(db_before);
-            guard.append_in_session(before, db_after, stmts)?;
+            guard.append_in_session(
+                before,
+                db_after,
+                stmts,
+                touched_extensions,
+                loaded_extensions,
+            )?;
         }
         Ok(())
     }
@@ -690,6 +752,8 @@ impl PinkDb {
         }
         self.wal_txn.clear();
         self.wal_txn_db = None;
+        self.wal_txn_ext_paths.clear();
+        self.wal_txn_ext_loaded.clear();
         self.txn_snapshot = Some(Box::new(self.clone()));
         Ok(())
     }
@@ -705,18 +769,26 @@ impl PinkDb {
         }
         if !self.wal_txn.is_empty() {
             let stmts = std::mem::take(&mut self.wal_txn);
+            let touched = std::mem::take(&mut self.wal_txn_ext_paths);
+            let loaded = std::mem::take(&mut self.wal_txn_ext_loaded);
             let before = self.wal_txn_db.take().unwrap_or_else(|| self.current_db.clone());
             let after = self.current_db.clone();
-            if let Err(e) = self.wal_append_session(&before, &after, &stmts) {
+            if let Err(e) =
+                self.wal_append_session(&before, &after, &stmts, &touched, &loaded)
+            {
                 // Keep the statements: a retried COMMIT must never publish
                 // changes that made it to memory but not to the WAL.
                 self.wal_txn = stmts;
                 self.wal_txn_db = Some(before);
+                self.wal_txn_ext_paths = touched;
+                self.wal_txn_ext_loaded = loaded;
                 return Err(e);
             }
         }
         self.wal_txn.clear();
         self.wal_txn_db = None;
+        self.wal_txn_ext_paths.clear();
+        self.wal_txn_ext_loaded.clear();
         self.txn_snapshot = None;
         Ok(())
     }
@@ -732,6 +804,8 @@ impl PinkDb {
                 self.current_db = current;
                 self.wal_txn.clear();
                 self.wal_txn_db = None;
+                self.wal_txn_ext_paths.clear();
+                self.wal_txn_ext_loaded.clear();
                 Ok(())
             }
             None => Err(PinkDbError::Execution(
@@ -897,6 +971,26 @@ impl PinkDb {
             .unwrap_or_default();
         names.sort();
         names
+    }
+}
+
+/// The extension path a `LOAD EXTENSION` plan loads, if the plan is one.
+/// Such a path is already covered by the record's own statement text, so it
+/// is never prefixed — it is only marked as loaded for later records.
+pub(crate) fn loaded_extension_path(plan: &crate::plan::LogicalPlan) -> Vec<String> {
+    match plan {
+        crate::plan::LogicalPlan::LoadExtension { path } => vec![path.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Append `additions` to `out`, skipping entries already present (exact
+/// string match, like the WAL's extension-path bookkeeping).
+fn push_unique(out: &mut Vec<String>, additions: Vec<String>) {
+    for a in additions {
+        if !out.iter().any(|existing| existing == &a) {
+            out.push(a);
+        }
     }
 }
 

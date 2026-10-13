@@ -131,6 +131,14 @@ struct Txn {
     /// SQL text of this transaction's mutating statements: one WAL record at
     /// COMMIT (empty for read-only transactions, which log nothing).
     wal_stmts: Vec<String>,
+    /// Extension paths touched by those statements (dynamic functions they
+    /// call), deduped, in first-use order; the record is
+    /// `LOAD EXTENSION`-prefixed for every path the WAL generation has not
+    /// loaded yet.
+    wal_ext_paths: Vec<String>,
+    /// Extension paths loaded by those statements' own `LOAD EXTENSION` text
+    /// (empty in practice: the statement is refused inside a transaction).
+    wal_ext_loaded: Vec<String>,
     /// Session database before the first buffered statement, and after the
     /// last (the record is `USE`-prefixed when replay's session differs).
     wal_db_before: Option<String>,
@@ -196,24 +204,18 @@ impl Connection {
         }
         match &mut self.txn {
             Some(txn) => {
-                // Store-level DDL is refused inside a transaction: the
-                // per-table snapshot merge cannot undo a whole database.
-                if matches!(
-                    stmt,
-                    crate::sql::ast::Statement::CreateDatabase { .. }
-                        | crate::sql::ast::Statement::DropDatabase { .. }
-                ) {
+                // Store/process-level DDL is refused inside a transaction: the
+                // per-table snapshot merge cannot undo a whole database, and a
+                // LOAD EXTENSION into the private snapshot would be discarded
+                // at COMMIT/ROLLBACK.
+                if let Some(name) = refused_in_txn(stmt) {
                     return Err(PinkDbError::Execution(format!(
-                        "{} is not allowed inside a transaction",
-                        if matches!(stmt, crate::sql::ast::Statement::CreateDatabase { .. }) {
-                            "CREATE DATABASE"
-                        } else {
-                            "DROP DATABASE"
-                        }
+                        "{name} is not allowed inside a transaction"
                     )));
                 }
                 let pre = self.current_db.clone();
-                let plan = crate::sql::bind(&txn.work, stmt, &pre)?;
+                let (plan, dynamic_functions_used) =
+                    crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
                 record_writes(&plan, &pre, &mut txn.table_writes, &mut txn.view_writes);
                 let result = crate::exec::run(&mut txn.work, &plan)?;
                 let after = session_after(&result, &pre, &txn.work);
@@ -234,6 +236,24 @@ impl Connection {
                                 txn.wal_dbs.push(db.clone());
                             }
                         }
+                        // Extensions the statement calls: the record is
+                        // prefixed with `LOAD EXTENSION` for every path the
+                        // WAL generation has not loaded yet.
+                        let touched =
+                            txn.work.dynamic_function_paths(&dynamic_functions_used);
+                        for p in touched {
+                            if !txn.wal_ext_paths.contains(&p) {
+                                txn.wal_ext_paths.push(p);
+                            }
+                        }
+                        // `LOAD EXTENSION` is refused inside a transaction, so
+                        // this is unreachable today; keep the bookkeeping
+                        // correct if that refusal is ever relaxed.
+                        for p in crate::storage::loaded_extension_path(&plan) {
+                            if !txn.wal_ext_loaded.contains(&p) {
+                                txn.wal_ext_loaded.push(p);
+                            }
+                        }
                     }
                 }
                 self.current_db = after;
@@ -244,9 +264,9 @@ impl Connection {
                 // Bind under a read lock; run reads shared, writes exclusive.
                 // (A concurrent DROP between bind and run surfaces as a clean
                 // "not found" error — never corruption.)
-                let plan = {
+                let (plan, dynamic_functions_used) = {
                     let shared = read_lock(&self.db.shared);
-                    crate::sql::bind(&shared, stmt, &pre)?
+                    crate::sql::bind_tracked(&shared, stmt, &pre)?
                 };
                 let result = if is_read_only(&plan) {
                     let shared = read_lock(&self.db.shared);
@@ -259,7 +279,16 @@ impl Connection {
                     if let Some(text) = sql_text {
                         if crate::plan::writes_tables(&plan) {
                             let after = session_after(&result, &pre, &shared);
-                            shared.wal_append_session(&pre, &after, &[text.to_string()])?;
+                            let touched =
+                                shared.dynamic_function_paths(&dynamic_functions_used);
+                            let loaded = crate::storage::loaded_extension_path(&plan);
+                            shared.wal_append_session(
+                                &pre,
+                                &after,
+                                &[text.to_string()],
+                                &touched,
+                                &loaded,
+                            )?;
                         }
                     }
                     result
@@ -280,7 +309,13 @@ impl Connection {
                             )));
                         }
                         if let Some(text) = sql_text {
-                            shared.wal_append_session(&pre, &after, &[text.to_string()])?;
+                            shared.wal_append_session(
+                                &pre,
+                                &after,
+                                &[text.to_string()],
+                                &[],
+                                &[],
+                            )?;
                         }
                     }
                 }
@@ -329,6 +364,8 @@ impl Connection {
             table_writes: HashSet::new(),
             view_writes: HashSet::new(),
             wal_stmts: Vec::new(),
+            wal_ext_paths: Vec::new(),
+            wal_ext_loaded: Vec::new(),
             wal_db_before: None,
             wal_db_after: self.current_db.clone(),
             wal_dbs: Vec::new(),
@@ -385,7 +422,13 @@ impl Connection {
                 .wal_db_before
                 .clone()
                 .unwrap_or_else(|| txn.wal_db_after.clone());
-            shared.wal_append_session(&before, &txn.wal_db_after, &txn.wal_stmts)?;
+            shared.wal_append_session(
+                &before,
+                &txn.wal_db_after,
+                &txn.wal_stmts,
+                &txn.wal_ext_paths,
+                &txn.wal_ext_loaded,
+            )?;
         }
         // Merge: swap written tables (carrying bumped versions) and views.
         // The catalog is proven present by the validation above, so a missing
@@ -421,6 +464,19 @@ fn conflict(what: &str) -> PinkDbError {
     PinkDbError::Execution(format!(
         "write conflict on {what}: changed concurrently, retry the transaction"
     ))
+}
+
+/// Store/process-level statements refused inside a [`Connection`] transaction
+/// (a snapshot commit cannot undo them and would silently discard them).
+/// Returns the SQL statement name for the error message; `None` = allowed.
+fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
+    use crate::sql::ast::Statement;
+    Some(match stmt {
+        Statement::CreateDatabase { .. } => "CREATE DATABASE",
+        Statement::DropDatabase { .. } => "DROP DATABASE",
+        Statement::LoadExtension { .. } => "LOAD EXTENSION",
+        _ => return None,
+    })
 }
 
 /// The session database after `result` ran from `before`: `USE` switches to
@@ -745,6 +801,10 @@ mod tests {
         assert!(err.to_string().contains("not allowed inside a transaction"), "{err}");
         let err = c.execute("DROP DATABASE main;").unwrap_err();
         assert!(err.to_string().contains("not allowed inside a transaction"), "{err}");
+        // LOAD EXTENSION would only register in the private snapshot and then
+        // be discarded at COMMIT: refused like the database DDL above.
+        let err = c.execute("LOAD EXTENSION '/does/not/exist.dylib';").unwrap_err();
+        assert_eq!(err.to_string(), "LOAD EXTENSION is not allowed inside a transaction");
         c.execute("ROLLBACK;").unwrap();
         c.execute("CREATE DATABASE db1;").unwrap();
     }

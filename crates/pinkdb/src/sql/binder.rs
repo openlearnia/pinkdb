@@ -99,7 +99,7 @@ pub enum WindowFunc {
 }
 
 impl WindowFunc {
-    fn ranking(name: &str) -> Option<WindowFunc> {
+    pub(crate) fn ranking(name: &str) -> Option<WindowFunc> {
         Some(match name.to_ascii_lowercase().as_str() {
             "row_number" => WindowFunc::RowNumber,
             "rank" => WindowFunc::Rank,
@@ -207,6 +207,17 @@ pub enum BoundExpr {
     InSubquery { expr: Box<BoundExpr>, query: Box<LogicalPlan>, negated: bool },
     /// `[NOT] EXISTS (query)` — scope-independent.
     Exists { query: Box<LogicalPlan>, negated: bool },
+    /// Call into a scalar function registered by a loaded extension
+    /// (`PinkDb::load_extension`). `name` is the canonical lowercased
+    /// registry key; args and result are typed exactly as registered (no
+    /// implicit casts in ABI v1). Never constant-folded (an extension
+    /// callback is opaque: it may be impure and may fail).
+    ///
+    /// `Box<str>` + `Box<[BoundExpr]>` (not `String` + `Vec`) keep this
+    /// variant no larger than the biggest pre-existing one, so
+    /// `size_of::<BoundExpr>()` — and with it every expression tree and the
+    /// hot match dispatch on the static path — is unchanged.
+    DynamicScalar { name: Box<str>, args: Box<[BoundExpr]>, dtype: DataType },
 }
 
 impl BoundExpr {
@@ -226,6 +237,7 @@ impl BoundExpr {
             BoundExpr::Coalesce { dtype, .. } => *dtype,
             BoundExpr::Case { dtype, .. } => *dtype,
             BoundExpr::ScalarSubquery { dtype, .. } => *dtype,
+            BoundExpr::DynamicScalar { dtype, .. } => *dtype,
             BoundExpr::InSubquery { .. } | BoundExpr::Exists { .. } => DataType::Boolean,
         }
     }
@@ -253,6 +265,9 @@ impl BoundExpr {
                 left.is_aggregate_free() && right.is_aggregate_free()
             }
             BoundExpr::Scalar { args, .. } => args.iter().all(|a| a.is_aggregate_free()),
+            BoundExpr::DynamicScalar { args, .. } => {
+                args.iter().all(|a| a.is_aggregate_free())
+            }
         }
     }
 
@@ -281,6 +296,7 @@ impl BoundExpr {
                 left.has_column_ref() || right.has_column_ref()
             }
             BoundExpr::Scalar { args, .. } => args.iter().any(|a| a.has_column_ref()),
+            BoundExpr::DynamicScalar { args, .. } => args.iter().any(|a| a.has_column_ref()),
         }
     }
 
@@ -302,10 +318,54 @@ impl BoundExpr {
                 left.has_subquery() || right.has_subquery()
             }
             BoundExpr::Scalar { args, .. } => args.iter().any(|a| a.has_subquery()),
+            BoundExpr::DynamicScalar { args, .. } => args.iter().any(|a| a.has_subquery()),
             BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_subquery()),
             BoundExpr::Case { branches, else_, .. } => {
                 branches.iter().any(|(c, v)| c.has_subquery() || v.has_subquery())
                     || else_.as_ref().map(|e| e.has_subquery()).unwrap_or(false)
+            }
+        }
+    }
+
+    /// True if the tree contains a dynamic scalar call (anywhere in this
+    /// scope, including inside enclosing operators/`COALESCE`/`CASE`).
+    ///
+    /// A callback is opaque: it may be impure, non-deterministic, or fail, so
+    /// an expression tree containing one is never constant-folded and its
+    /// predicate is never pushed through a row-count-changing operator (a
+    /// join or a union would change how many times it runs). Subquery bodies
+    /// bind in their own scope (like [`Self::has_column_ref`]); they are not
+    /// descended into here — an `InSubquery`'s outer expression is.
+    pub fn contains_dynamic_scalar(&self) -> bool {
+        match self {
+            BoundExpr::DynamicScalar { .. } => true,
+            BoundExpr::Literal(_)
+            | BoundExpr::Column { .. }
+            | BoundExpr::AggRef { .. }
+            | BoundExpr::WindowRef { .. }
+            | BoundExpr::ScalarSubquery { .. }
+            | BoundExpr::Exists { .. } => false,
+            BoundExpr::InSubquery { expr, .. } => expr.contains_dynamic_scalar(),
+            BoundExpr::Not(e)
+            | BoundExpr::Negate { expr: e, .. }
+            | BoundExpr::IsNull { expr: e, .. }
+            | BoundExpr::Cast { expr: e, .. } => e.contains_dynamic_scalar(),
+            BoundExpr::Binary { left, right, .. } => {
+                left.contains_dynamic_scalar() || right.contains_dynamic_scalar()
+            }
+            BoundExpr::Scalar { args, .. } => {
+                args.iter().any(|a| a.contains_dynamic_scalar())
+            }
+            BoundExpr::Coalesce { args, .. } => {
+                args.iter().any(|a| a.contains_dynamic_scalar())
+            }
+            BoundExpr::Case { branches, else_, .. } => {
+                branches.iter().any(|(c, v)| {
+                    c.contains_dynamic_scalar() || v.contains_dynamic_scalar()
+                }) || else_
+                    .as_ref()
+                    .map(|e| e.contains_dynamic_scalar())
+                    .unwrap_or(false)
             }
         }
     }
@@ -490,6 +550,13 @@ struct Binder<'a> {
     /// with child scopes: a mutating statement that depends on one is
     /// refused on a durable database (the logged SQL could never replay).
     views_used: Rc<RefCell<Vec<String>>>,
+    /// Dynamic-function names (lowercased registry keys) referenced while
+    /// binding this statement, in first-use order. Shared with child scopes,
+    /// so subquery bodies inside `ScalarSubquery`/`InSubquery`/`Exists` (and
+    /// derived tables/views/CTE bodies) are covered. The WAL layer maps them
+    /// back to their extension paths so a logged record can be prefixed with
+    /// the `LOAD EXTENSION` statements its replay needs.
+    dynamic_functions_used: Rc<RefCell<Vec<String>>>,
 }
 
 impl<'a> Binder<'a> {
@@ -506,6 +573,7 @@ impl<'a> Binder<'a> {
             windows: Vec::new(),
             ctes: Vec::new(),
             views_used: Rc::new(RefCell::new(Vec::new())),
+            dynamic_functions_used: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -524,6 +592,7 @@ impl<'a> Binder<'a> {
             windows: Vec::new(),
             ctes: self.ctes.clone(),
             views_used: Rc::clone(&self.views_used),
+            dynamic_functions_used: Rc::clone(&self.dynamic_functions_used),
         }
     }
 
@@ -547,6 +616,12 @@ impl<'a> Binder<'a> {
     /// Session-local views referenced while binding, in first-use order.
     fn views_used(&self) -> Vec<String> {
         self.views_used.borrow().clone()
+    }
+
+    /// Dynamic-function names (lowercased registry keys) referenced while
+    /// binding, in first-use order.
+    fn dynamic_functions_used(&self) -> Vec<String> {
+        self.dynamic_functions_used.borrow().clone()
     }
 
     fn lookup_column(&self, table: Option<&str>, col: &str) -> Result<(usize, DataType)> {
@@ -966,7 +1041,86 @@ impl<'a> Binder<'a> {
             let dtype = scalar_dtype(func, &bound)?;
             return Ok(BoundExpr::Scalar { func, args: bound, dtype });
         }
-        Err(PinkDbError::Catalog(format!("unknown function \"{name}\"")))
+        // Not a built-in: a loaded extension may provide it (case-insensitive).
+        // (On wasm32 the extension loader is not linked: no dynamic functions
+        // can be registered, so the unknown-function error is the whole story.)
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.bind_dynamic_function(name, args, aggs, allow_agg);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (args, aggs, allow_agg);
+            Err(PinkDbError::Catalog(format!("unknown function \"{name}\"")))
+        }
+    }
+
+    /// Bind a call to a function registered by a loaded extension.
+    ///
+    /// ABI v1 is strictly typed: every argument's bound type must equal the
+    /// registered argument type (a bare `NULL` literal is typeless and is
+    /// passed as a NULL of the registered type), and the result type is the
+    /// registered return type.
+    ///
+    /// Native-only: the dynamic registry (and the loader that feeds it) does
+    /// not exist on wasm32.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn bind_dynamic_function(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<BoundExpr> {
+        let Some(func) = self.db.dynamic_scalar(name) else {
+            return Err(PinkDbError::Catalog(format!("unknown function \"{name}\"")));
+        };
+        // Copy the metadata out before binding arguments (which needs
+        // `&mut self`): `func` borrows `self.db`.
+        let func_name = func.name().to_string();
+        // Record the canonical registry key for the WAL layer: a logged
+        // statement that calls this function is prefixed with its extension's
+        // `LOAD EXTENSION` when the current WAL generation has not loaded it.
+        let key = func_name.to_ascii_lowercase();
+        {
+            let mut used = self.dynamic_functions_used.borrow_mut();
+            if !used.contains(&key) {
+                used.push(key.clone());
+            }
+        }
+        let want_args: Vec<crate::ext::ExtType> = func.arg_types().to_vec();
+        let dtype = crate::ext::dtype_of_ext(func.ret_type());
+        if args.len() != want_args.len() {
+            return Err(PinkDbError::Type(format!(
+                "{func_name} takes {} argument(s)",
+                want_args.len()
+            )));
+        }
+        let mut bound = Vec::with_capacity(args.len());
+        for (i, a) in args.iter().enumerate() {
+            if a == &Expr::Star {
+                return Err(PinkDbError::Parse("`*` is only valid in COUNT(*)".to_string()));
+            }
+            let b = self.bind_expr(a, aggs, allow_agg)?;
+            let want = want_args[i];
+            // A bare NULL literal is typeless: the executor hands the
+            // callback `is_null` with the registered type tag. Everything
+            // else must match the registered argument type exactly — ABI v1
+            // inserts no implicit casts.
+            if !matches!(b, BoundExpr::Literal(Value::Null))
+                && crate::ext::ext_type_of(b.dtype()) != want
+            {
+                return Err(PinkDbError::Type(format!(
+                    "{func_name} argument {} must be {want}, got {} (use CAST)",
+                    i + 1,
+                    b.dtype()
+                )));
+            }
+            bound.push(b);
+        }
+        Ok(BoundExpr::DynamicScalar {
+            name: func_name.to_ascii_lowercase().into_boxed_str(),
+            args: bound.into_boxed_slice(),
+            dtype,
+        })
     }
 }
 
@@ -1220,6 +1374,12 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
             }
             Ok(())
         }
+        BoundExpr::DynamicScalar { args, .. } => {
+            for a in args.iter() {
+                validate_grouped(a, keys)?;
+            }
+            Ok(())
+        }
         BoundExpr::Cast { expr, .. } => validate_grouped(expr, keys),
         BoundExpr::Coalesce { args, .. } => {
             for a in args {
@@ -1278,6 +1438,15 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
                 .iter()
                 .map(|a| rebase_to_keys(a, keys))
                 .collect::<Option<Vec<_>>>()?,
+            dtype: *dtype,
+        },
+        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rebase_to_keys(a, keys))
+                .collect::<Option<Vec<_>>>()?
+                .into_boxed_slice(),
             dtype: *dtype,
         },
         BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
@@ -1342,6 +1511,16 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             args: args.into_iter().map(|a| resolve_window_refs(a, input_width)).collect(),
             dtype,
         },
+        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+            name,
+            args: args
+                .into_vec()
+                .into_iter()
+                .map(|a| resolve_window_refs(a, input_width))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            dtype,
+        },
         BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
             expr: Box::new(resolve_window_refs(*expr, input_width)),
             query,
@@ -1393,6 +1572,16 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
         BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
             func,
             args: args.into_iter().map(|a| resolve_agg_refs(a, num_keys)).collect(),
+            dtype,
+        },
+        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+            name,
+            args: args
+                .into_vec()
+                .into_iter()
+                .map(|a| resolve_agg_refs(a, num_keys))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             dtype,
         },
         BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
@@ -1503,8 +1692,22 @@ fn scan_width(binder: &Binder<'_>) -> usize {
 /// current database for unqualified names. The returned plan borrows nothing
 /// from `db`.
 pub fn bind(db: &PinkDb, stmt: &Statement, default_db: &str) -> Result<LogicalPlan> {
+    Ok(bind_tracked(db, stmt, default_db)?.0)
+}
+
+/// [`bind`] plus the dynamic-function names (lowercased registry keys) the
+/// statement's expressions reference, in first-use order — collected by the
+/// binder (subquery bodies included) so the WAL layer can map them to
+/// extension paths and prefix a logged record with the `LOAD EXTENSION`
+/// statements its replay needs.
+pub(crate) fn bind_tracked(
+    db: &PinkDb,
+    stmt: &Statement,
+    default_db: &str,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let empty = |plan| Ok((plan, Vec::new()));
     match stmt {
-        Statement::CreateTable { db: qdb, name, columns } => Ok(LogicalPlan::CreateTable {
+        Statement::CreateTable { db: qdb, name, columns } => empty(LogicalPlan::CreateTable {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
             schema: columns.clone(),
@@ -1518,25 +1721,25 @@ pub fn bind(db: &PinkDb, stmt: &Statement, default_db: &str) -> Result<LogicalPl
         Statement::Delete { db: qdb, table, where_clause } => {
             bind_delete(db, default_db, qdb, table, where_clause)
         }
-        Statement::Begin => Ok(LogicalPlan::Begin),
-        Statement::Commit => Ok(LogicalPlan::Commit),
-        Statement::Rollback => Ok(LogicalPlan::Rollback),
+        Statement::Begin => empty(LogicalPlan::Begin),
+        Statement::Commit => empty(LogicalPlan::Commit),
+        Statement::Rollback => empty(LogicalPlan::Rollback),
         Statement::CreateView { db: qdb, name, cols, query } => {
             bind_create_view(db, default_db, qdb, name, cols, query)
         }
-        Statement::DropTable { db: qdb, name } => Ok(LogicalPlan::DropTable {
+        Statement::DropTable { db: qdb, name } => empty(LogicalPlan::DropTable {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
         }),
-        Statement::DropView { db: qdb, name } => Ok(LogicalPlan::DropView {
+        Statement::DropView { db: qdb, name } => empty(LogicalPlan::DropView {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
         }),
         Statement::CreateDatabase { name } => {
-            Ok(LogicalPlan::CreateDatabase { name: name.clone() })
+            empty(LogicalPlan::CreateDatabase { name: name.clone() })
         }
         Statement::DropDatabase { name } => {
-            Ok(LogicalPlan::DropDatabase { name: name.clone() })
+            empty(LogicalPlan::DropDatabase { name: name.clone() })
         }
         Statement::Use { name } => {
             // Validate at bind: USE must fail clearly before touching the
@@ -1546,7 +1749,12 @@ pub fn bind(db: &PinkDb, stmt: &Statement, default_db: &str) -> Result<LogicalPl
                     "database \"{name}\" not found"
                 )));
             }
-            Ok(LogicalPlan::Use { name: name.clone() })
+            empty(LogicalPlan::Use { name: name.clone() })
+        }
+        Statement::LoadExtension { path } => {
+            // Existence/success is checked at execution (loading has side
+            // effects); bind only carries the literal path through.
+            empty(LogicalPlan::LoadExtension { path: path.clone() })
         }
         Statement::Select(sel) => bind_select(db, default_db, sel),
     }
@@ -1562,7 +1770,7 @@ fn bind_create_view(
     name: &str,
     cols: &Option<Vec<String>>,
     query: &Select,
-) -> Result<LogicalPlan> {
+) -> Result<(LogicalPlan, Vec<String>)> {
     let view_db = Binder::new(db, default_db).resolve_db(qdb)?;
     let mut binder = Binder::new(db, &view_db);
     let bound = bind_select_in(db, &mut binder, query)?;
@@ -1576,12 +1784,16 @@ fn bind_create_view(
             )));
         }
     }
-    Ok(LogicalPlan::CreateView {
-        db: Some(view_db),
-        name: name.to_string(),
-        cols: cols.clone(),
-        query: Box::new(query.clone()),
-    })
+    let dynamic_functions = binder.dynamic_functions_used();
+    Ok((
+        LogicalPlan::CreateView {
+            db: Some(view_db),
+            name: name.to_string(),
+            cols: cols.clone(),
+            query: Box::new(query.clone()),
+        },
+        dynamic_functions,
+    ))
 }
 
 /// Bind UPDATE: resolve target columns, bind SET expressions in the table
@@ -1593,7 +1805,7 @@ fn bind_update(
     table: &str,
     sets: &[(String, Expr)],
     where_clause: &Option<Expr>,
-) -> Result<LogicalPlan> {
+) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     let t = db.table_in(&table_db, table)?;
     if sets.is_empty() {
@@ -1649,12 +1861,16 @@ fn bind_update(
         }
     }
     reject_view_dependency(db, &binder.views_used())?;
-    Ok(LogicalPlan::Update {
-        db: Some(table_db),
-        table: t.name.clone(),
-        sets: bound_sets,
-        predicate,
-    })
+    let dynamic_functions = binder.dynamic_functions_used();
+    Ok((
+        LogicalPlan::Update {
+            db: Some(table_db),
+            table: t.name.clone(),
+            sets: bound_sets,
+            predicate,
+        },
+        dynamic_functions,
+    ))
 }
 
 /// Bind DELETE: Boolean WHERE over the table scope (no aggregates/windows).
@@ -1664,7 +1880,7 @@ fn bind_delete(
     qdb: &Option<String>,
     table: &str,
     where_clause: &Option<Expr>,
-) -> Result<LogicalPlan> {
+) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     let t = db.table_in(&table_db, table)?;
     let mut binder = Binder::new(db, &table_db);
@@ -1685,7 +1901,11 @@ fn bind_delete(
         }
     }
     reject_view_dependency(db, &binder.views_used())?;
-    Ok(LogicalPlan::Delete { db: Some(table_db), table: t.name.clone(), predicate })
+    let dynamic_functions = binder.dynamic_functions_used();
+    Ok((
+        LogicalPlan::Delete { db: Some(table_db), table: t.name.clone(), predicate },
+        dynamic_functions,
+    ))
 }
 
 fn bind_insert(
@@ -1695,7 +1915,7 @@ fn bind_insert(
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
-) -> Result<LogicalPlan> {
+) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     let t = db.table_in(&table_db, table)?;
     let schema = t.schema();
@@ -1723,6 +1943,7 @@ fn bind_insert(
     // expressions) are accepted; column refs and aggregates fail here.
     let mut bound_rows = Vec::with_capacity(rows.len());
     let mut views_used: Vec<String> = Vec::new();
+    let mut dynamic_functions: Vec<String> = Vec::new();
     for row in rows {
         if row.len() != order.len() {
             return Err(PinkDbError::Execution(format!(
@@ -1743,16 +1964,24 @@ fn bind_insert(
                     views_used.push(v);
                 }
             }
+            for f in binder.dynamic_functions_used() {
+                if !dynamic_functions.iter().any(|n| n == &f) {
+                    dynamic_functions.push(f);
+                }
+            }
             bound[order[pos]] = e;
         }
         bound_rows.push(bound);
     }
     reject_view_dependency(db, &views_used)?;
-    Ok(LogicalPlan::Insert {
-        db: Some(table_db),
-        table: t.name.clone(),
-        rows: bound_rows,
-    })
+    Ok((
+        LogicalPlan::Insert {
+            db: Some(table_db),
+            table: t.name.clone(),
+            rows: bound_rows,
+        },
+        dynamic_functions,
+    ))
 }
 
 /// Durable databases replay committed SQL text, and views are never
@@ -1771,9 +2000,14 @@ fn reject_view_dependency(db: &PinkDb, views: &[String]) -> Result<()> {
 }
 
 /// Bind a top-level SELECT with a fresh binder.
-fn bind_select(db: &PinkDb, default_db: &str, sel: &Select) -> Result<LogicalPlan> {
+fn bind_select(
+    db: &PinkDb,
+    default_db: &str,
+    sel: &Select,
+) -> Result<(LogicalPlan, Vec<String>)> {
     let mut binder = Binder::new(db, default_db);
-    bind_select_in(db, &mut binder, sel)
+    let plan = bind_select_in(db, &mut binder, sel)?;
+    Ok((plan, binder.dynamic_functions_used()))
 }
 
 /// ORDER BY/LIMIT written before a UNION (on the head or a middle branch):
@@ -1924,6 +2158,7 @@ fn plan_schema(
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::Use { .. } => Ok(Vec::new()),
         LogicalPlan::Project { exprs, names, .. } => Ok(names
             .iter()

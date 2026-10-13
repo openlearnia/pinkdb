@@ -63,12 +63,35 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
             else_: else_.map(|e| Box::new(fold_expr(cx, *e))),
             dtype,
         },
+        // Extension calls are opaque: fold their arguments (those are pure
+        // expressions) but never the call itself. A callback may be impure,
+        // non-deterministic, or fail at runtime; folding it would run it at
+        // bind time — and once per execution instead of once per row.
+        BoundExpr::DynamicScalar { name, args, dtype } => {
+            return BoundExpr::DynamicScalar {
+                name,
+                args: args
+                    .into_vec()
+                    .into_iter()
+                    .map(|a| fold_expr(cx, a))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                dtype,
+            };
+        }
         leaf => return leaf,
     };
     // Only fully constant trees (no columns, no aggregate refs) fold.
     // Fold failures (e.g. `1/0`) keep the tree; execution reports them.
-    // Subqueries need runtime evaluation — never fold them.
-    if !rebuilt.has_column_ref() && rebuilt.is_aggregate_free() && !rebuilt.has_subquery() {
+    // Subqueries need runtime evaluation — never fold them, and never fold a
+    // tree containing a dynamic call: the root-level guard above only covers
+    // a bare call, but a call enclosed by an operator/COALESCE/CASE would
+    // otherwise be evaluated here at bind time (and frozen into a literal).
+    if !rebuilt.has_column_ref()
+        && rebuilt.is_aggregate_free()
+        && !rebuilt.has_subquery()
+        && !rebuilt.contains_dynamic_scalar()
+    {
         if let Ok(v) = eval_expr(&rebuilt, &const_chunk(), cx) {
             if v.len() == 1 {
                 return BoundExpr::Literal(v.get(0));
@@ -188,6 +211,11 @@ fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
                 columns_in(a, out);
             }
         }
+        BoundExpr::DynamicScalar { args, .. } => {
+            for a in args.iter() {
+                columns_in(a, out);
+            }
+        }
         BoundExpr::Cast { expr, .. } => columns_in(expr, out),
         BoundExpr::Case { branches, else_, .. } => {
             for (c, v) in branches {
@@ -292,6 +320,20 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             args: args.iter().map(|a| rewrite_through_project(a, exprs)).collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
         }),
+        // A dynamic call is row-wise like any other function: pushing a
+        // predicate through a projection is row-preserving (same rows, same
+        // order), so it is allowed as long as every referenced column is a
+        // passthrough (enforced per argument here). Pushing through a join,
+        // union, or distinct is refused — those change the call count.
+        BoundExpr::DynamicScalar { name, args, dtype } => Some(BoundExpr::DynamicScalar {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_through_project(a, exprs))
+                .collect::<Option<Vec<_>>>()?
+                .into_boxed_slice(),
+            dtype: *dtype,
+        }),
     }
 }
 
@@ -329,12 +371,26 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             },
             true,
         ),
-        LogicalPlan::Distinct { input: inner } => (
-            LogicalPlan::Distinct {
-                input: Box::new(LogicalPlan::Filter { input: inner, predicate: pred }),
-            },
-            true,
-        ),
+        LogicalPlan::Distinct { input: inner } => {
+            // Pushing the filter below a DISTINCT evaluates the predicate on
+            // every input row instead of once per distinct row: an impure
+            // dynamic call would change its call count, so it stays above.
+            if pred.contains_dynamic_scalar() {
+                return (
+                    LogicalPlan::Filter {
+                        input: Box::new(LogicalPlan::Distinct { input: inner }),
+                        predicate: pred,
+                    },
+                    false,
+                );
+            }
+            (
+                LogicalPlan::Distinct {
+                    input: Box::new(LogicalPlan::Filter { input: inner, predicate: pred }),
+                },
+                true,
+            )
+        }
         LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
@@ -342,6 +398,13 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             let mut left_push = Vec::new();
             let mut right_push = Vec::new();
             for c in conjuncts {
+                // A conjunct containing a dynamic call is opaque/impure:
+                // pushing it into a join input changes how many times (and on
+                // which rows) the callback runs, so it stays above the join.
+                if c.contains_dynamic_scalar() {
+                    keep.push(c);
+                    continue;
+                }
                 let mut cols = Vec::new();
                 columns_in(&c, &mut cols);
                 let left_only = cols.iter().all(|i| *i < left_cols);
@@ -400,22 +463,32 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
         // Never below Limit (changes semantics) or Aggregate (HAVING, v1).
         // Below Union: selection distributes over both branches (same
         // output width by construction; per-branch types were checked
-        // compatible at bind time).
-        LogicalPlan::Union { left, right, distinct, types } => (
-            LogicalPlan::Union {
-                left: Box::new(LogicalPlan::Filter {
-                    input: left,
-                    predicate: pred.clone(),
-                }),
-                right: Box::new(LogicalPlan::Filter {
-                    input: right,
-                    predicate: pred,
-                }),
-                distinct,
-                types,
-            },
-            true,
-        ),
+        // compatible at bind time) — but cloning the predicate into both
+        // branches would run a dynamic call once per branch instead of once
+        // per output row, so a predicate containing one stays above.
+        LogicalPlan::Union { left, right, distinct, types } => {
+            if pred.contains_dynamic_scalar() {
+                return (
+                    LogicalPlan::Filter {
+                        input: Box::new(LogicalPlan::Union { left, right, distinct, types }),
+                        predicate: pred,
+                    },
+                    false,
+                );
+            }
+            (
+                LogicalPlan::Union {
+                    left: Box::new(LogicalPlan::Filter {
+                        input: left,
+                        predicate: pred.clone(),
+                    }),
+                    right: Box::new(LogicalPlan::Filter { input: right, predicate: pred }),
+                    distinct,
+                    types,
+                },
+                true,
+            )
+        }
         LogicalPlan::Window { input, windows, input_cols } => {
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
@@ -495,6 +568,16 @@ fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
         BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
             func,
             args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
+            dtype,
+        },
+        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+            name,
+            args: args
+                .into_vec()
+                .into_iter()
+                .map(|a| shift_columns(a, by))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             dtype,
         },
         leaf => leaf,

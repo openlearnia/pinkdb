@@ -46,11 +46,11 @@ a list of `Result` objects, one per statement:
 
 | Attribute | Contents |
 |---|---|
-| `kind` | `selected`, `created`, `inserted`, `updated`, `deleted`, `began`, `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`, `created_database`, `dropped_database`, `used` |
+| `kind` | `selected`, `created`, `inserted`, `updated`, `deleted`, `began`, `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`, `created_database`, `dropped_database`, `used`, `loaded_extension` |
 | `columns` / `column_types` | SELECT column names and types (`boolean`, `integer`, `bigint`, `double`, `varchar`, `date`, `timestamp`) |
 | `rows` | SELECT rows as Python values (see mapping below) |
 | `affected` | row count for INSERT/UPDATE/DELETE, else 0 |
-| `name` | object/session name for view/table/database/`USE` results, else `None` |
+| `name` | object/session/extension name for view/table/database/`USE`/`LOAD EXTENSION` results, else `None` |
 
 Value mapping: `NULL` → `None`, `BOOLEAN` → `bool`, `INTEGER`/`BIGINT` →
 `int`, `DOUBLE` → `float`, `VARCHAR` → `str`, `DATE` → `datetime.date`,
