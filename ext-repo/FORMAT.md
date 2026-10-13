@@ -1,0 +1,127 @@
+# pinkdb extension repository — format v1
+
+The extension repository is a hosted, immutable catalog of built pinkdb
+extension artifacts (shared libraries exporting the pinkdb extension C ABI v1,
+loaded with `LOAD EXTENSION`). It is a plain static file tree served by a small
+Cloudflare Worker in front of an R2 bucket:
+
+```
+R2 bucket  pinkdb-extensions
+  index.json                                          ← the catalog
+  artifacts/<name>/<version>/<platform>/<file>        ← the artifact bytes
+
+Worker (binding EXT_BUCKET)
+  GET /index.json                                     ← catalog, served from R2
+  GET /artifacts/<name>/<version>/<platform>/<file>   ← artifact bytes
+```
+
+There are no directory listings, no query APIs, and no mutable state beyond
+"add a new immutable artifact + append it to the index". Format version 1 is
+the only version; `format_version` in `index.json` exists so a future format
+can be detected instead of mis-parsed.
+
+## `index.json`
+
+UTF-8 JSON. The top level is the catalog:
+
+```json
+{
+  "format_version": 1,
+  "updated": "2026-10-14T09:30:00Z",
+  "extensions": [
+    {
+      "name": "math_ext",
+      "version": "0.1.0",
+      "abi": 1,
+      "platform": "darwin-arm64",
+      "file": "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib",
+      "sha256": "38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2",
+      "description": "Clamp and degree/radian helpers (ext_clamp, ext_deg2rad)"
+    }
+  ]
+}
+```
+
+Field semantics:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `format_version` | integer | Always `1` for this format. Clients MUST refuse other values. |
+| `updated` | string | ISO-8601 UTC timestamp (`YYYY-MM-DDTHH:MM:SSZ`) of the last catalog change. Informational. |
+| `extensions` | array | All published artifacts. Sorted by `name`, then version (numeric part-wise), then `platform`. |
+
+Entry fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `name` | string | Extension name, exactly as `pinkdb_extension_name()` reports it (e.g. `math_ext`). |
+| `version` | string | Artifact version, semver-like (`0.1.0`, `1.2.0-rc1`). Chosen by the publisher. |
+| `abi` | integer | pinkdb extension C ABI version the artifact was built against. Format v1 accepts only `1`. |
+| `platform` | string | Platform tag (see below). |
+| `file` | string | Repository-relative path of the artifact; the URL path is `/<file>`. |
+| `sha256` | string | Lowercase hex SHA-256 of the artifact bytes (the exact file downloaded from `file`). |
+| `description` | string | One-line human-readable description. |
+
+## URL layout
+
+| URL | Content-Type | Cache | Notes |
+|---|---|---|---|
+| `/` | `text/html; charset=utf-8` | `no-store` | Tiny info page (name, format version, link to the catalog). |
+| `/index.json` | `application/json; charset=utf-8` | `public, max-age=60` | Catalog; carries `ETag`, supports `If-None-Match` → `304`. |
+| `/artifacts/<name>/<version>/<platform>/<file>` | `application/octet-stream` | `public, max-age=31536000, immutable` | Artifact bytes with `Content-Length` and `ETag`; supports `If-None-Match` → `304`. |
+| anything else | `text/plain` | `no-store` | `404`. Missing catalog / missing artifact are `404` with a one-line body. |
+
+The `file` field of an entry is exactly the URL path minus the leading `/`:
+entry `"file": "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib"` is
+served at `GET /artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib`.
+R2 keys are the same strings (`artifacts/...`, `index.json`).
+
+The index URL is the repository base URL: a client that knows only
+`https://<host>` fetches `https://<host>/index.json` first.
+
+## Versioning and immutability
+
+- An existing `name` + `version` + `platform` artifact is **immutable**. The
+  bytes at its `file` path never change; its `sha256` never changes.
+- Re-publishing the same coordinates is **refused**: `publish.py` checks the
+  current index and exits non-zero (naming the published artifact) instead of
+  overwriting. To change an artifact, publish a new `version` (or, for
+  breaking content changes, a new `name`); to target another platform, publish
+  under a different `platform` tag.
+- The catalog only grows by appending entries for new coordinates. `updated`
+  is refreshed on every successful publish. Removal/tombstones are not part of
+  v1 (reserved for a later format version).
+- Artifacts are cached aggressively because they are immutable; the catalog is
+  cached briefly (`max-age=60`) so a publish is visible within a minute.
+
+## Platform tags
+
+Tags are lowercase `<os>-<arch>` strings. Format v1 currently defines:
+
+| Tag | Status |
+|---|---|
+| `darwin-arm64` | published (the only tag produced today) |
+| `darwin-x64` | reserved |
+| `linux-x64` | reserved |
+| `linux-arm64` | reserved |
+| `windows-x64` | reserved |
+
+Reserved tags are allocated for future builds; publishing under them is
+accepted (the tag list is closed, unknown tags are rejected). A client MUST
+match its own platform exactly.
+
+## Integrity
+
+`sha256` is the SHA-256 of the raw artifact file as served. Clients MUST
+verify the download against the index entry before loading the library; the
+repository provides no signatures in v1 (reserved for a later format version).
+`verify.sh` in this directory performs exactly that check against the live
+repository.
+
+## Publishing
+
+Use `publish.py` (see `README.md` for the walkthrough). It computes the hash,
+enforces the immutability rule above against the current index, stages the
+artifact at `artifacts/<name>/<version>/<platform>/<file>`, rewrites
+`index.json` (sorted, fresh `updated`), and uploads both objects to the R2
+bucket with `wrangler r2 object put --remote`.

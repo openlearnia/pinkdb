@@ -1,0 +1,11 @@
+# pinkdb extension repository Worker — no build step, plain ES module.
+# Deploy from this directory:  wrangler deploy
+name = "pinkdb-ext-repo"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+# Catalog + artifact storage. Keys: index.json, artifacts/<name>/<version>/<platform>/<file>.
+[[r2_buckets]]
+binding = "EXT_BUCKET"
+bucket_name = "pinkdb-extensions"

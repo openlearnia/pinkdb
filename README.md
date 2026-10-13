@@ -587,6 +587,16 @@ boundary, and `-buildmode=c-shared` symbol-export rules — and
 `./ext-sdk/go/smoke.sh` builds and exercises the example end to end. Its
 header copy is pinned by the same `cargo test` check.
 
+### Extension repository
+
+Built extensions are published to a hosted catalog (Cloudflare Worker + R2,
+format v1) at <https://pinkdb-ext-repo.defaultcms.workers.dev>: `GET
+/index.json` is the catalog and `GET /artifacts/…` serves the bytes. The
+`ext-repo/` directory holds the format spec (`ext-repo/FORMAT.md`), the
+publisher (`publish.sh`/`publish.py`), the verifier (`verify.sh`), and the
+worker source. The first published artifact is the C SDK example `math_ext`
+0.1.0 (`darwin-arm64`); an `INSTALL` client is wave 33.
+
 Semantics and persistence:
 
 - Extensions are **process-level**: they are not stored in `.pink` snapshots

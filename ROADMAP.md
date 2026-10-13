@@ -54,7 +54,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | done | loader crate + C ABI v1 + SQL LOAD EXTENSION (both parsers) + result-kind ripple (CLI/server v3/C ABI/Python/Go); 432 tests / 25 suites green both parser modes; duckdiff 60/60; kill loop 30/30; wasm core build green; sizes pinkdb 2.25 MB (+1.0%) |
 | 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | done | ext-sdk/c/ (vendored header + byte-identity sync test, template, 3 examples incl. C++, Makefile/CMake); smoke.sh 14/14 checks green through the real CLI; 434 tests; clippy clean |
 | 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | done | ext-sdk/go/ (cgo c-shared template + example, vendored header pinned by the sync test, README with sharp edges); smoke 15/15 incl. a 5,000-row multi-threaded callback query (3 rayon threads); gofmt/vet clean; 434 tests; clippy clean |
-| 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service) | queued | — |
+| 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service) | done | live at https://pinkdb-ext-repo.defaultcms.workers.dev (Workers + R2 bucket pinkdb-extensions); index.json + immutable artifact streaming; first entry math_ext 0.1.0 darwin-arm64 (sha256 38abc8b3…, 17088 B) verified by verify.sh |
 | 33 | Custom repositories: user-configurable extension repository URLs and config (core config + repo client) | queued | — |
 | 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer) | queued | — |
 | 35 | Vortex file format as the default lake data format (format crate / extension) | queued | — |
@@ -195,3 +195,15 @@ Java bindings.
   (3 rayon threads); gofmt/vet clean; 434 tests; clippy clean.
 - 2026-10-14 — Binary size: unchanged — `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
   `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 31; pre-wave-17 was 2.26 MB).
+- 2026-10-14 — Wave 32: extensions repository — new `ext-repo/` track: format spec v1
+  (`index.json` with name/version/abi/platform/file/sha256; immutable coordinates; reserved
+  platform tags), dependency-free ES-module Worker bound to R2 (info page, cached
+  `GET /index.json` with ETag/304, artifact streaming with immutable cache, 404s, no write
+  API), stdlib `publish.py`/`publish.sh` (sha256, coordinate immutability, artifact-then-index
+  uploads via `wrangler r2 object put --remote`), `verify.sh` (download + hash check).
+  Deployed for real: bucket `pinkdb-extensions`, worker `pinkdb-ext-repo`, first artifact =
+  the wave-30 `math_ext` C example; live curl + verify.sh confirmed. Live at
+  https://pinkdb-ext-repo.defaultcms.workers.dev; index.json + immutable artifact streaming;
+  first entry `math_ext` 0.1.0 darwin-arm64 (sha256 38abc8b3…, 17088 B) verified by verify.sh.
+- 2026-10-14 — Binary size: unchanged — `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
+  `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 32; pre-wave-17 was 2.26 MB).

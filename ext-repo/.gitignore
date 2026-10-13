@@ -1,0 +1,4 @@
+# publish.py outputs (the canonical copies live in R2; the local index.json is
+# a mirror used to enforce coordinate immutability).
+/artifacts/
+/index.json
