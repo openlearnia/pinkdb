@@ -50,7 +50,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 25 | At-rest encryption: encrypted `.pink` + WAL (AEAD + Argon2id, key via option/env) (core `encryption` feature) | done | 376 default / 412 with `--features encryption` tests (both parser modes); clippy clean all feature sets; duckdiff 60/60; kill loops 30/30 plain + 30/30 encrypted + 15/15 encrypted multi-db; boundary-truncation nonce-reuse fix (fresh prefix per keyed open) proven by regression; sizes 2.21 MB default / 2.28 MB encrypted / `pinkdb-server` 1.84 MB |
 | 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) (separate crate; contained `unsafe`) | done | 7 FFI unit + 3 integration tests, C example runs; workspace suites both parser modes; duckdiff 60/60; sizes: dylib 1.70 MB, staticlib 15.53 MB, `pinkdb` 2.21 MB unchanged |
 | 27 | Python binding (cffi) (`bindings/python`) | done | stdlib ctypes binding (14 unittest tests, both default discovery and PINKDB_FFI_LIB override); all value types + statement kinds; 20k-iteration RSS flat; sizes unchanged (dylib 1.70 MB) |
-| 28 | Go binding (cgo) (`bindings/go`) | queued | — |
+| 28 | Go binding (cgo) (`bindings/go`) | done | cgo binding over pinkdb-ffi: 15 tests pass + race clean, gofmt/vet clean; durable round-trip; goroutine-safe wrapper; sizes unchanged |
 | 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | queued | — |
 | 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | queued | — |
 | 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | queued | — |
@@ -142,3 +142,14 @@ Java bindings.
   Cloudflare Workers as `pinkdb-docs` (11 files, ~1.99 s upload; `.html` links 307→canonical
   extensionless); live at https://pinkdb-docs.defaultcms.workers.dev. R2 still queued for the
   extension repository (wave 32/39).
+- 2026-10-13 — Wave 28: Go binding — new `bindings/go` package (module
+  `github.com/openlearnia/pinkdb/bindings/go`); cgo over `libpinkdb_ffi` with
+  ${SRCDIR}-relative link/rpath flags; `Open`/`OpenMemory`/`Close`/`Execute -> []Result`
+  (14 kind strings, columns/types/rows/affected/name); native value mapping incl. `time.Time`
+  for DATE/TIMESTAMP, bit-exact `-0.0`/NaN/±Inf, embedded-NUL strings; ABI-version guard at
+  Open; path validation; `sync.Mutex` + closed-flag making one DB safe to share across
+  goroutines; 15 tests incl. pre-epoch dates, errors, durable round-trip, 8×400 concurrent
+  executes, 1000-iteration loop; also green under `go test -race`. 15 tests pass + race clean,
+  gofmt/vet clean; durable round-trip; goroutine-safe wrapper; sizes unchanged.
+- 2026-10-13 — Binary size: unchanged — `pinkdb` 2.21 MB + `pinkdb-server` 1.84 MB +
+  `libpinkdb_ffi.dylib` 1.70 MB (release, after wave 28; pre-wave-17 was 2.26 MB).

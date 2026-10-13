@@ -516,6 +516,45 @@ PINKDB_FFI_LIB="$PWD/target/release/libpinkdb_ffi.dylib" \
     python3 -m unittest discover -s bindings/python/tests -v   # env override
 ```
 
+## Go binding (`bindings/go`)
+
+A cgo wrapper over the same C ABI v1 (module
+`github.com/openlearnia/pinkdb/bindings/go`). Build the shared library first:
+
+```sh
+cargo build --release -p pinkdb-ffi
+```
+
+```go
+import pinkdb "github.com/openlearnia/pinkdb/bindings/go"
+
+db, err := pinkdb.OpenMemory() // or pinkdb.Open("data.pink")
+if err != nil {
+	panic(err)
+}
+defer db.Close()
+results, err := db.Execute(
+	"CREATE TABLE t (x INTEGER, s VARCHAR);" +
+		"INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);" +
+		"SELECT x, s FROM t ORDER BY x;")
+if err != nil {
+	panic(err)
+}
+fmt.Println(results[2].Kind, results[2].Rows) // selected [[1 héllo] [<nil> <nil>]]
+```
+
+`Execute` returns materialized `[]Result`s (`Kind`, `Columns`, `ColumnTypes`,
+`Rows`, `Affected`, `Name`); values map to `nil`/`bool`/`int64`/`float64`/
+`string`/UTC `time.Time`, and errors carry the native `pinkdb_last_error`
+message. All native calls are serialized behind a per-`DB` mutex (the C
+handle itself is single-threaded), `Close` is idempotent, and use after close
+returns `ErrClosed`. See `bindings/go/README.md` for the value-mapping table
+and linking notes.
+
+```sh
+cd bindings/go && go test ./...
+```
+
 ## Benchmark (1M rows, release, Apple Silicon)
 
 Generated with `bench/gen_sales.py` (deterministic seed 42), measured with `cargo run --release -p pinkdb --example query_bench` (best of 5):
