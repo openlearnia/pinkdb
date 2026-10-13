@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<meta name="description" content="{{description}}">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="{{root}}assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="{{root}}index.html"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="{{root}}index.html"{{nav-home}}>Home</a></li>
+        <li><a href="{{root}}docs/getting-started.html"{{nav-getting-started}}>Getting started</a></li>
+        <li><a href="{{root}}docs/sql.html"{{nav-sql}}>SQL</a></li>
+        <li><a href="{{root}}docs/cli.html"{{nav-cli}}>CLI</a></li>
+        <li><a href="{{root}}docs/server.html"{{nav-server}}>Server</a></li>
+        <li><a href="{{root}}docs/persistence.html"{{nav-persistence}}>Persistence</a></li>
+        <li><a href="{{root}}docs/bindings.html"{{nav-bindings}}>Bindings</a></li>
+        <li><a href="{{root}}docs/architecture.html"{{nav-architecture}}>Architecture</a></li>
+        <li><a href="{{root}}docs/roadmap.html"{{nav-roadmap}}>Roadmap</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+{{content}}
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="{{root}}index.html">Home</a> · <a href="{{root}}docs/getting-started.html">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Persistence &amp; encryption — pinkdb</title>
+<meta name="description" content="The .pink columnar format, write-ahead log crash recovery, and optional at-rest encryption (PINKENC1, AES-256-GCM + Argon2id).">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../">Home</a></li>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL</a></li>
+        <li><a href="../docs/cli">CLI</a></li>
+        <li><a href="../docs/server">Server</a></li>
+        <li><a href="../docs/persistence" class="active" aria-current="page">Persistence</a></li>
+        <li><a href="../docs/bindings">Bindings</a></li>
+        <li><a href="../docs/architecture">Architecture</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+<h1>Persistence &amp; encryption</h1>
+
+<p class="doc-meta">Durable single-file storage with a write-ahead log — and optional
+at-rest encryption behind the <code>encryption</code> feature.</p>
+
+<h2>The <code>.pink</code> columnar format</h2>
+
+<p><code>db.save("x.pink")</code> writes every database and table in a single-file
+columnar format; <code>PinkDb::open("x.pink")</code> loads it back
+(<code>.save</code> / <code>.open</code> in the REPL). Version 2 (<code>PINKDB02</code>)
+stores the full multi-database catalog; v1 files (<code>PINKDB01</code>, a flat table
+list) still load — their tables become the single <code>main</code> database. Views are
+session-local and never persisted.</p>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::PinkDb;
+
+db.save("x.pink")?;                 // or db.save_snapshot("copy.pink")?
+let db = PinkDb::open("x.pink")?;   // plain open
+
+let (db, info) = PinkDb::open_durable_with("x.pink", SyncPolicy::Sync)?;</code></pre>
+
+<ul>
+  <li>Data is stored per-column in ≤2048-row chunks. Each chunk picks its smallest
+  encoding: integers choose between raw, RLE, and bitpacking (min + width + packed bits);
+  doubles raw or RLE; booleans bitpacked or RLE; strings raw, dictionary (u32 codes), or
+  RLE. NULLs ride in a separate validity bitmap.</li>
+  <li>Round-trips are bit-exact, including <code>-0.0</code> and NaN payloads; truncated
+  or corrupt files return errors, never panics.</li>
+  <li>1M-row sales table: 24.5 MB CSV → <strong>14.0 MB</strong> <code>.pink</code>,
+  saved in 0.16 s, reopened and queried in 0.25 s.</li>
+</ul>
+
+<h2>Write-ahead log and crash recovery</h2>
+
+<p>Durable opens add a sidecar write-ahead log. <code>PinkDb::open_durable("x.pink")</code>
+(the REPL's <code>.open</code>) loads the checkpoint, recovers an interrupted checkpoint,
+replays <code>x.pink.wal</code>, then logs each committed transaction unit — an autocommit
+statement individually, <code>BEGIN..COMMIT</code> as one record at <code>COMMIT</code>
+(a <code>ROLLBACK</code> or conflict abort logs nothing).</p>
+
+<ul>
+  <li>The WAL format is <code>PINKWAL1</code> + version <code>2</code> + a generation
+  number; rolled generations are named <code>&lt;wal&gt;.&lt;gen&gt;.roll</code>.</li>
+  <li><code>USE</code>, <code>CREATE DATABASE</code>, and <code>DROP DATABASE</code> are
+  logged like any other mutating statement. Because the WAL is shared by every connection
+  while <code>USE</code> is per-session, records are made self-contained: a
+  <code>USE &lt;db&gt;</code> statement is prepended when the replay session differs, so
+  replay always reproduces each statement in the database it ran in.</li>
+  <li><code>SyncPolicy::Sync</code> fsyncs every record; <code>Batch</code> fsyncs on
+  <code>flush_wal</code>/checkpoint.</li>
+  <li>Recovery is idempotent, a crash inside recovery re-runs from the same files, and a
+  torn WAL header (a file no longer than one header) is recreated while invalid
+  magic/version on a file that carries records is a hard error.</li>
+  <li>A mid-file framing corruption (short record, bad CRC, or a non-continuous LSN)
+  stops replay at the first bad record; later committed records are dropped and the
+  discarded byte count is reported (<code>RecoveryInfo::truncated_bytes</code>). A
+  CRC-valid record that fails to parse, bind, or execute is a hard error — committed data
+  is never silently dropped.</li>
+</ul>
+
+<h3>Checkpoint state machine</h3>
+
+<p>A checkpoint writes <code>x.pink.tmp</code> (fsynced, directory fsynced), renames the
+live WAL to <code>.wal.&lt;gen&gt;.roll</code>, starts a fresh WAL of generation
+<code>gen + 1</code>, publishes <code>.tmp</code> with an atomic rename, then removes the
+roll. Recovery never removes anything before the recovered state is durable:</p>
+
+<ol class="steps">
+  <li><code>.tmp</code> present and the live WAL still has records: the live WAL is
+  authoritative; <code>.tmp</code> (possibly a partial write) is discarded.</li>
+  <li><code>.tmp</code> present and the live WAL is empty/absent/torn: the checkpoint
+  reached its WAL roll, which proves <code>.tmp</code> was fully written, so
+  <code>.tmp</code> is published first and the rolls are removed afterwards.</li>
+  <li>no <code>.tmp</code>: every roll is already folded into <code>.pink</code>; its
+  generation (and the live WAL generation) must prove that — otherwise recovery refuses
+  rather than delete uncertain records.</li>
+</ol>
+
+<h3>Durability notes</h3>
+
+<ul>
+  <li><code>.save &lt;bound path&gt;</code> checkpoints; the target is compared by
+  filesystem identity, so <code>./x.pink</code>, absolute paths, and case-only differences
+  compare equal. <code>.save &lt;other&gt;</code> is a plain snapshot and is refused when
+  the target has a sidecar WAL with committed records.</li>
+  <li><code>.import</code> is made durable by a checkpoint before it returns (and is
+  refused inside a transaction), so an import survives a crash immediately after it
+  acknowledges.</li>
+  <li>A mutating statement that reads a session-local view is refused on durable
+  databases: views are never persisted, so replaying its logged SQL could not rebuild
+  it.</li>
+  <li>A database file is <strong>single-writer</strong>: no file locking is taken, so run
+  one process per <code>.pink</code> path. The crash-test harness
+  (<code>bench/kill_loop.py</code>) exercises recovery with repeated
+  <code>SIGKILL</code> iterations.</li>
+</ul>
+
+<h2>At-rest encryption</h2>
+
+<p>At-rest encryption is opt-in: <code>cargo build --features encryption</code> links the
+audited RustCrypto crates <code>aes-gcm</code> (AES-256-GCM) and <code>argon2</code>
+(Argon2id); the default build stays crypto-free and unencrypted files are byte-identical.</p>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{EncryptionKey, PinkDb};
+
+let key = EncryptionKey::from_passphrase("correct horse battery staple");
+db.save_with_key("x.pink", &amp;key)?;                       // encrypted snapshot
+let db = PinkDb::open_with_key("x.pink", &amp;key)?;         // decrypts
+let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?; // encrypted WAL</code></pre>
+
+<p>The REPL reads <code>PINKDB_KEY</code> from the environment: <code>.save</code> writes
+encrypted and <code>.open</code> decrypts (the durable WAL uses the same key). Unset,
+behavior is byte-identical to an unkeyed build. The value must be valid UTF-8: a
+set-but-non-UTF-8 variable is a hard error (exit 2) instead of a silent fallback to
+plaintext.</p>
+
+<ul>
+  <li>The container is a plaintext header (magic <code>PINKENC1</code>, version, cipher
+  id, KDF id + parameters + salt, a random per-container nonce prefix, and an AEAD
+  key-check block) followed by AEAD-sealed payloads: 1 MiB segments for a checkpoint, one
+  unit per WAL record (with the LSN bound into the AAD). The nonce is
+  <code>prefix || counter</code>, with counters unique per container.</li>
+  <li>A keyed open rebuilds the WAL with a fresh random prefix on <em>every</em> open
+  (re-sealing intact records atomically), so a discarded record's
+  <code>(key, nonce, AAD)</code> can never be handed out again. Checkpoint containers end
+  with a terminal zero-length segment, so a container cut at a segment boundary is
+  rejected instead of loading a silently shorter database.</li>
+  <li>The key is a raw 32-byte key or a passphrase stretched with Argon2id (defaults
+  m=19 MiB, t=2, p=1; salt and parameters live in the header, so raising the defaults
+  later keeps old files readable). Header parameters are validated on read against a
+  small multiple of the defaults, so a crafted header cannot make an open burn minutes
+  deriving.</li>
+  <li>A wrong key (or tampered header) fails the key-check block with a clear
+  <code>wrong key</code> error, never “corrupt file”. Encrypted and plaintext artifacts
+  never mix: a keyed open refuses a plaintext checkpoint/WAL and a plaintext open refuses
+  an encrypted one, so a key can never be silently ignored.</li>
+  <li>Nothing but the header is readable in the clear — payloads (rows, SQL text) are
+  always ciphertext.</li>
+  <li>Release binary sizes: <code>pinkdb</code> 2.21 MB default, 2.28 MB with
+  <code>--features encryption</code> (Apple Silicon, thin LTO).</li>
+</ul>
+
+<div class="callout">
+  <span class="callout-title">One process per file, still</span>
+  <p>On an encrypted database, two writers appending under the same container prefix
+  would seal two records under one <code>(key, nonce)</code> — keystream reuse, not merely
+  corruption. The keyed open shrinks but does not remove that race; the single-writer
+  precondition is documented and enforced by convention.</p>
+</div>
+
+<ul class="next-links">
+  <li><a href="../docs/cli">CLI &amp; REPL →</a></li>
+  <li><a href="../docs/server">Server &amp; protocol →</a></li>
+  <li><a href="../docs/architecture">Architecture →</a></li>
+</ul>
+
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

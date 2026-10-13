@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture — pinkdb</title>
+<meta name="description" content="The pinkdb query pipeline, module map, vectorized execution model, and design rules (zero async, zero unsafe in the core).">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../">Home</a></li>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL</a></li>
+        <li><a href="../docs/cli">CLI</a></li>
+        <li><a href="../docs/server">Server</a></li>
+        <li><a href="../docs/persistence">Persistence</a></li>
+        <li><a href="../docs/bindings">Bindings</a></li>
+        <li><a href="../docs/architecture" class="active" aria-current="page">Architecture</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+<h1>Architecture</h1>
+
+<p class="doc-meta">An embedded analytical database: everything runs in-process, on
+vectors, with zero async in the core.</p>
+
+<h2>Query pipeline</h2>
+
+<pre class="code" data-lang="text"><code>SQL text
+  → PEG parser (or hand-written lexer + recursive descent) → AST
+  → Binder (resolve tables/columns, assign types)
+  → Logical plan (scan → filter → join → aggregate → project → sort → limit)
+  → Optimizer (predicate pushdown, constant folding)
+  → Vectorized executor (operators exchange DataChunks of ≤2048 rows)
+  → In-memory columnar storage</code></pre>
+
+<p>SQL is parsed by a <code>peg</code>-generated grammar; the hand-written
+lexer + recursive-descent parser stays selectable via
+<code>PINKDB_PARSER=legacy</code>. A committed differential corpus plus a seeded
+randomized differential test check that both parsers accept the same inputs with equal
+ASTs and reject the same inputs.</p>
+
+<h2>Modules</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Crate / module</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>pinkdb::types</code></td><td><code>DataType</code>, <code>Value</code>, <code>PinkDbError</code></td></tr>
+    <tr><td><code>pinkdb::vector</code></td><td><code>Vector</code> (typed data + validity bitmask, bit = valid) + <code>gather</code>, <code>DataChunk</code></td></tr>
+    <tr><td><code>pinkdb::storage</code></td><td><code>DataTable</code> (per-column <code>Vector</code> chunks), <code>PinkDb</code> catalog (databases → tables/views)</td></tr>
+    <tr><td><code>pinkdb::csv</code></td><td>CSV import + type inference (rayon-parallel parse)</td></tr>
+    <tr><td><code>pinkdb::sql</code></td><td>PEG grammar + hand-written lexer/recursive-descent parser, AST, binder</td></tr>
+    <tr><td><code>pinkdb::plan</code></td><td>Logical plan tree</td></tr>
+    <tr><td><code>pinkdb::optimizer</code></td><td>Constant folding, predicate pushdown (incl. across joins)</td></tr>
+    <tr><td><code>pinkdb::exec</code></td><td>Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel)</td></tr>
+    <tr><td><code>pinkdb::persist</code></td><td><code>.pink</code> single-file columnar persistence, v2 (databases + RLE/dictionary/bitpack; v1 files load)</td></tr>
+    <tr><td><code>pinkdb::crypto</code></td><td>Optional at-rest encryption (<code>PINKENC1</code>: AES-256-GCM + Argon2id) behind the <code>encryption</code> feature; a parse/identity stub otherwise</td></tr>
+    <tr><td><code>pinkdb::db</code></td><td>Multi-writer <code>Database</code>/<code>Connection</code> over <code>Arc&lt;RwLock&lt;PinkDb&gt;&gt;</code></td></tr>
+    <tr><td><code>pinkdb-cli</code></td><td>rustyline REPL, dot-commands, box-drawn output</td></tr>
+    <tr><td><code>pinkdb-server</code></td><td>TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps</td></tr>
+    <tr><td><code>pinkdb-ffi</code></td><td>C ABI (cdylib + staticlib, hand-written header); contained <code>unsafe</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Execution model</h2>
+
+<ul>
+  <li><strong>Vectors, not rows.</strong> A <code>Vector</code> is a typed column chunk
+  plus a validity bitmask (bit set = valid, DuckDB-style). Every operator processes a
+  whole <code>DataChunk</code> (≤2048 rows) per call.</li>
+  <li><strong>Selection vectors.</strong> <code>WHERE</code> produces a selection vector
+  (no row copying); <code>Vector::gather</code> applies it downstream.</li>
+  <li><strong>Pull-based operators.</strong> Scan, Filter, Project, HashAggregate,
+  HashJoin, Sort, Limit — with typed expression kernels, a sort key arena + top-N, and
+  fused join→aggregate fast paths that avoid row materialization for integer keys.</li>
+  <li><strong>Parallelism.</strong> Queries run under a shared read lock (parallel
+  readers, parallel chunks via rayon inside each query); writes take the write lock per
+  statement. <code>BEGIN..COMMIT</code> runs on a private snapshot with write-conflict
+  detection — snapshot isolation without predicate tracking (write-skew is possible).</li>
+</ul>
+
+<h2>Design rules</h2>
+
+<ul>
+  <li>Rust edition 2021, <strong>zero async</strong>, <strong>no <code>unsafe</code></strong>
+  in the core. Contained <code>unsafe</code> is confined to <code>pinkdb-ffi</code>
+  (and, later, the extension loader crate).</li>
+  <li>Dependencies stay small: <code>csv</code> + <code>rustyline</code>, plus
+  <code>rayon</code> for parallel execution and <code>peg</code> for the SQL parser. The
+  server crate adds no external dependencies; <code>encryption</code> adds the audited
+  RustCrypto crates <code>aes-gcm</code> + <code>argon2</code> only when enabled.</li>
+  <li>New capabilities ship as separate workspace crates and/or opt-in cargo features,
+  so the default <code>cargo build</code> stays lean (~2 MB) and links no
+  crypto/TLS/format code. Every wave reports release binary sizes; CI grows a build
+  matrix (default, each feature, each crate) plus a wasm check — the core stays
+  wasm32-compatible and the server is target-gated out of wasm builds.</li>
+  <li>No hand-rolled crypto; audited RustCrypto crates only.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/sql">SQL reference →</a></li>
+  <li><a href="../docs/persistence">Persistence →</a></li>
+  <li><a href="../docs/roadmap">Roadmap →</a></li>
+</ul>
+
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

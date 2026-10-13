@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI &amp; REPL — pinkdb</title>
+<meta name="description" content="pinkdb-cli dot-commands, box-drawn output and timing, PINKDB_PARSER, PINKDB_KEY, and remote mode.">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../">Home</a></li>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL</a></li>
+        <li><a href="../docs/cli" class="active" aria-current="page">CLI</a></li>
+        <li><a href="../docs/server">Server</a></li>
+        <li><a href="../docs/persistence">Persistence</a></li>
+        <li><a href="../docs/bindings">Bindings</a></li>
+        <li><a href="../docs/architecture">Architecture</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+<h1>CLI &amp; REPL</h1>
+
+<p class="doc-meta"><code>pinkdb-cli</code> is a thin consumer of the library: a
+rustyline REPL with dot-commands and DuckDB-style box-drawn output. The release binary is
+named <code>pinkdb</code>.</p>
+
+<h2>Build and run</h2>
+
+<pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli                       # debug REPL
+cargo build --release -p pinkdb-cli
+./target/release/pinkdb                       # local (embedded) mode
+cargo build --release -p pinkdb-cli --features client
+./target/release/pinkdb --host 127.0.0.1:5433 # remote mode</code></pre>
+
+<p>You land at the <code>pinkdb&gt;</code> prompt. SQL statements run until a semicolon
+(a <code>   ...&gt;</code> continuation prompt appears while one is open);
+dot-commands are single-line and take no semicolon.</p>
+
+<h2>Dot-commands</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Command</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>.help</code></td>
+      <td>show the dot-command help (a shorter list in remote mode)</td>
+    </tr>
+    <tr>
+      <td><code>.quit</code> / <code>.exit</code></td>
+      <td>leave the shell</td>
+    </tr>
+    <tr>
+      <td><code>.databases</code></td>
+      <td>list databases; the current one is marked and table/view counts are shown
+      separately — <code>main (current) (2 tables, 1 view)</code></td>
+    </tr>
+    <tr>
+      <td><code>.tables</code></td>
+      <td>list tables (with row counts) and views of the current database</td>
+    </tr>
+    <tr>
+      <td><code>.schema &lt;table|view&gt;</code></td>
+      <td>show a schema; accepts <code>db.table</code>, views show their output columns,
+      double-quoted identifiers with spaces work (<code>"My Db".t</code>)</td>
+    </tr>
+    <tr>
+      <td><code>.import &lt;file.csv&gt; [table]</code></td>
+      <td>import a CSV; the table defaults to the file stem, and a
+      <code>db.table</code> target names another database when <code>db</code> exists</td>
+    </tr>
+    <tr>
+      <td><code>.save &lt;file.pink&gt;</code></td>
+      <td>write a checkpoint when the path is the bound database, otherwise a plain
+      snapshot (refused when the target has a sidecar WAL with committed records)</td>
+    </tr>
+    <tr>
+      <td><code>.open &lt;file.pink&gt;</code></td>
+      <td>open durably: load the checkpoint, recover an interrupted checkpoint, replay the
+      sidecar WAL, and replace the whole store</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>For <code>.import</code>, a dotted target is <code>db.table</code> only when the left
+side names an existing database — otherwise the whole string is the table name, so a file
+stem like <code>data.2024.csv</code> imports as <code>data.2024</code>. <code>.tables</code>
+and <code>.schema</code> scope to the current database; <code>USE &lt;db&gt;</code>
+switches it.</p>
+
+<h2>Output and timing</h2>
+
+<p>Results are box-drawn with a type row, then a row count and a timing line:</p>
+
+<pre class="code" data-lang="text"><code>┌─────────┬────────────┐
+│ region  │ avg(total) │
+│ VARCHAR │ DOUBLE     │
+├─────────┼────────────┤
+│ west    │ 175.0      │
+│ east    │ 50.5       │
+└─────────┴────────────┘
+2 rows
+Run Time (s): real 0.000</code></pre>
+
+<p>At most 10&nbsp;000 rows are printed; longer results end with a
+<code>(N more rows)</code> note.</p>
+
+<h2>Environment variables</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>PINKDB_PARSER=legacy</code></td>
+      <td>use the hand-written lexer + recursive-descent parser instead of the default
+      PEG grammar. Both parsers are differential-tested to accept the same inputs with
+      equal ASTs (error messages differ).</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_KEY</code></td>
+      <td>passphrase for at-rest encryption: <code>.save</code> writes encrypted and
+      <code>.open</code> decrypts (the durable WAL uses the same key). Requires a build
+      with the <code>encryption</code> feature. A set-but-non-UTF-8 value is a hard error
+      (exit 2) instead of a silent fallback to plaintext.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features encryption
+PINKDB_KEY='correct horse battery staple' ./target/release/pinkdb</code></pre>
+
+<h2>Remote mode</h2>
+
+<p>With the optional <code>client</code> feature, <code>--host HOST:PORT</code> sends
+every SQL statement to a <code>pinkdb-server</code> and renders results with the same
+renderer and timing line. SQL (including <code>USE</code>, <code>CREATE DATABASE</code>,
+and transactions) works unchanged; the file and catalog dot-commands
+(<code>.import</code>, <code>.save</code>, <code>.open</code>, <code>.databases</code>,
+<code>.tables</code>, <code>.schema</code>) are not available and report
+<code>Error: &lt;cmd&gt; is not available in remote mode</code>. Without the feature,
+<code>--host</code> is rejected with “built without the client feature”.
+<code>PINKDB_KEY</code> is inert in remote mode and is reported as a warning.</p>
+
+<ul class="next-links">
+  <li><a href="../docs/server">Server &amp; protocol →</a></li>
+  <li><a href="../docs/persistence">Persistence &amp; encryption →</a></li>
+  <li><a href="../docs/getting-started">Getting started →</a></li>
+</ul>
+
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

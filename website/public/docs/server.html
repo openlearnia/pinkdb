@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server &amp; protocol — pinkdb</title>
+<meta name="description" content="Run pinkdb-server over TCP, the framed binary protocol, remote CLI mode, robustness limits, and the security posture.">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../">Home</a></li>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL</a></li>
+        <li><a href="../docs/cli">CLI</a></li>
+        <li><a href="../docs/server" class="active" aria-current="page">Server</a></li>
+        <li><a href="../docs/persistence">Persistence</a></li>
+        <li><a href="../docs/bindings">Bindings</a></li>
+        <li><a href="../docs/architecture">Architecture</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+<h1>Server &amp; protocol</h1>
+
+<p class="doc-meta"><code>pinkdb-server</code> is a separate workspace crate (so the core
+stays lean): a TCP server plus a blocking client for a hand-rolled binary protocol — no
+external dependencies, zero async (one std thread per connection), no <code>unsafe</code>.
+Release binary: 1.84 MB.</p>
+
+<h2>Build and run</h2>
+
+<pre class="code" data-lang="sh"><code># in-memory server on 127.0.0.1:5433
+cargo run --release -p pinkdb-server
+
+# durable server: same checkpoint + WAL guarantees as the embedded path
+cargo run --release -p pinkdb-server -- --file sales.pink
+
+# explicit bind address and port (0 picks an ephemeral port)
+cargo run --release -p pinkdb-server -- --host 127.0.0.1 --port 5433</code></pre>
+
+<p><code>pinkdb-server --help</code> lists the flags: <code>--host</code> (default
+<code>127.0.0.1</code>), <code>--port</code> (default <code>5433</code>), and
+<code>--file</code> (a durable <code>.pink</code>: the checkpoint loads and the sidecar
+WAL replays on restart; in-memory when omitted). On startup the server prints its
+listening address and runs until terminated:</p>
+
+<pre class="code" data-lang="text"><code>pinkdb-server v0.1.0 listening on 127.0.0.1:5433 (in-memory)</code></pre>
+
+<p>Both modes share the wave-22 durability path: rows acknowledged to a client survive a
+server crash and are replayed on the next start with <code>--file</code>.</p>
+
+<h2>Remote CLI mode</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features client
+./target/release/pinkdb --host 127.0.0.1:5433</code></pre>
+
+<p>Every SQL statement is sent to the server and rendered with the same box-drawn output
+and timing line as the embedded REPL. SQL — including <code>USE</code>,
+<code>CREATE DATABASE</code>, and <code>BEGIN</code>/<code>COMMIT</code> — works
+unchanged; the file and catalog dot-commands (<code>.import</code>, <code>.save</code>,
+<code>.open</code>, <code>.databases</code>, <code>.tables</code>, <code>.schema</code>)
+are unavailable and report <code>Error: &lt;cmd&gt; is not available in remote mode</code>.
+The feature is opt-in; the default build rejects <code>--host</code> with “built without
+the client feature”.</p>
+
+<h2>Protocol</h2>
+
+<p>One TCP connection is one session. Every message is a frame: a <code>u32</code>
+little-endian length prefix + a <code>u8</code> message type + body. Frames larger than
+64 MiB are rejected before allocation, and every inner length (strings, columns, rows,
+values) is validated against the bytes remaining in the frame — a malformed or truncated
+peer can never make the decoder read out of bounds or over-allocate. The protocol version
+is 2.</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Direction</th><th>Frames</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Requests</td>
+      <td><code>Hello { protocol_version }</code> (required first; a mismatched version is
+      rejected with a clear error), <code>Execute { sql }</code>, <code>Ping</code></td>
+    </tr>
+    <tr>
+      <td>Responses</td>
+      <td><code>HelloOk { server_version, protocol_version }</code>, <code>Pong</code>,
+      and per statement a result group: <code>ResultSet { names, types }</code>, then
+      chunked <code>Rows { count, columns, values... }</code>, then
+      <code>Done { kind }</code></td>
+    </tr>
+    <tr>
+      <td>Batch terminator</td>
+      <td>exactly one <code>BatchDone { statements }</code> frame after a successful
+      <code>Execute</code> batch, so neither side parses SQL just to count statements; a
+      failing statement ends the batch with a single <code>Error { message }</code>
+      instead, and the connection stays open</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>Rows are encoded with typed values: a tag byte + payload for
+NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP, plus a <code>DataType</code> tag byte. The
+client reconstructs pinkdb's public <code>QueryResult</code>/<code>Value</code>/<code>DataType</code>,
+so remote results render exactly like local ones. Each connection gets its own
+<code>Connection</code>, so multi-database sessions (<code>USE</code>, transactions) are
+isolated per TCP client. After a decode or transport error the client marks itself broken
+and fails fast on later calls instead of reading a desynchronized stream.</p>
+
+<h2>Robustness</h2>
+
+<ul>
+  <li><strong>16 MiB stack per connection thread.</strong> The engine's depth guards
+  reject hostile statements before they can recurse.</li>
+  <li><strong>Transient accept errors never stop the server.</strong>
+  <code>EMFILE</code>/<code>ENFILE</code>/<code>ECONNABORTED</code>/<code>ENOBUFS</code>
+  are logged and retried with a 10 ms → 1 s backoff, so an fd spike no longer kills the
+  process.</li>
+  <li><strong>128 concurrent connections</strong>
+  (<code>DEFAULT_MAX_CONNECTIONS</code>). Over the cap the server sends a best-effort
+  <code>Error</code> frame and closes, bounding fds/threads.</li>
+  <li><strong>Panics are isolated.</strong> A panic while executing one statement is
+  caught, logged, and reported as an <code>Error</code> frame; the connection and every
+  other client stay alive. A poisoned store lock is logged once and recovered, so one bad
+  statement cannot permanently DoS the database (the state may be inconsistent — recovery
+  is loud).</li>
+  <li><strong>No read/write timeouts.</strong> A slow or stalled client holds one thread
+  and one fd until it disconnects; the connection cap bounds that pressure.</li>
+  <li><strong>Depth guards.</strong> Statements nested deeper than 24 units (parens,
+  <code>CASE</code>, prefix unary) or with an AST deeper than 64 nodes are rejected with
+  a clean <code>Parse</code> error before bind/execute/drop can recurse.</li>
+</ul>
+
+<h2>Security posture</h2>
+
+<div class="callout security">
+  <span class="callout-title">No authentication, no TLS, no authorization in this wave</span>
+  <p>Anyone who can open a TCP connection to the port gets the full SQL surface of the
+  served database (queries, writes, DDL) on the one shared store. The server binds
+  <code>127.0.0.1</code> by default and must stay on localhost or a trusted network: do
+  not expose it to the internet or to untrusted clients.</p>
+</div>
+
+<ul>
+  <li>TLS (rustls + certificate config) is on the roadmap as wave 45; users/roles with
+  Argon2id password hashes (RBAC) are wave 47.</li>
+  <li><code>pinkdb-server</code> has no encryption-key option: its
+  <code>--file</code> must be a plaintext database (an encrypted one is refused at
+  startup), and <code>PINKDB_KEY</code> is ignored by the server.</li>
+  <li>In remote CLI mode, <code>PINKDB_KEY</code> is reported as inert instead of being
+  silently ignored.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/cli">CLI &amp; REPL →</a></li>
+  <li><a href="../docs/persistence">Persistence &amp; WAL →</a></li>
+  <li><a href="../docs/roadmap">Roadmap →</a></li>
+</ul>
+
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

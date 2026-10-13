@@ -59,8 +59,8 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer) | queued | — |
 | 35 | Vortex file format as the default lake data format (format crate / extension) | queued | — |
 | 36 | S3 bucket support for lake storage and file reading (optional `s3` feature, storage provider) | queued | — |
-| 37 | Documentation website (separate site/track) | queued | — |
-| 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra) | queued | — |
+| 37 | Documentation website (separate site/track) | done | website/ generator (stdlib Python, layout+fragments), 10 pages + CSS, 86 KiB self-contained, extensionless canonical links, wrangler dry-run validated |
+| 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra; Workers half done, R2 deferred to the extensions-repository wave 32/39) | done | live at https://pinkdb-docs.defaultcms.workers.dev (Workers static assets; .html links 307→canonical extensionless; 404-page; assets 200) |
 | 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | queued | — |
 | 40 | Performance improvement: ongoing bench-driven speed rounds (core) | queued | — |
 | 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | queued | — |
@@ -135,3 +135,10 @@ Java bindings.
   override); all value types + statement kinds; 20k-iteration RSS flat; sizes unchanged.
 - 2026-10-13 — Binary size: unchanged — `pinkdb` 2.21 MB + `pinkdb-server` 1.84 MB +
   `libpinkdb_ffi.dylib` 1.70 MB (release, after wave 27; pre-wave-17 was 2.26 MB).
+- 2026-10-13 — Waves 37–38: documentation website + hosting — new `website/` track: stdlib-only
+  Python generator (`build.py`, layout + fragments) rendering 10 pages + CSS, dark/pink
+  self-contained output (~86 KiB), canonical extensionless links, generated 404 page; the
+  Python binding section is auto-included once `bindings/python` exists. Deployed to
+  Cloudflare Workers as `pinkdb-docs` (11 files, ~1.99 s upload; `.html` links 307→canonical
+  extensionless); live at https://pinkdb-docs.defaultcms.workers.dev. R2 still queued for the
+  extension repository (wave 32/39).

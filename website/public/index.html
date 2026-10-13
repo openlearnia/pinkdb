@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pinkdb — a mini DuckDB in Rust</title>
+<meta name="description" content="An embedded analytical SQL database in Rust: columnar vectors, vectorized execution, CSV import, durable .pink files with a WAL, a network server, and a C ABI.">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="./"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="./" class="active" aria-current="page">Home</a></li>
+        <li><a href="docs/getting-started">Getting started</a></li>
+        <li><a href="docs/sql">SQL</a></li>
+        <li><a href="docs/cli">CLI</a></li>
+        <li><a href="docs/server">Server</a></li>
+        <li><a href="docs/persistence">Persistence</a></li>
+        <li><a href="docs/bindings">Bindings</a></li>
+        <li><a href="docs/architecture">Architecture</a></li>
+        <li><a href="docs/roadmap">Roadmap</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+<section class="hero">
+  <p class="kicker">Embedded analytical SQL database in Rust</p>
+  <h1>pinkdb — a mini DuckDB in Rust</h1>
+  <p class="lede">In-memory columnar storage, vectorized execution, SQL with joins,
+  aggregates, window functions and CTEs, CSV import, durable <code>.pink</code> files with
+  a write-ahead log, an optional network server, and a C ABI — zero async in the core,
+  zero <code>unsafe</code> outside the FFI crate.</p>
+  <div class="hero-actions">
+    <a class="button primary" href="docs/getting-started">Get started</a>
+    <a class="button" href="docs/sql">SQL reference</a>
+    <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub &#8599;</a>
+  </div>
+</section>
+
+<p>pinkdb ships as a library crate (<code>pinkdb</code>), a CLI REPL
+(<code>pinkdb-cli</code>, a thin consumer of the library), a network server
+(<code>pinkdb-server</code>, a separate crate so the core stays lean), and a C ABI
+(<code>pinkdb-ffi</code>).</p>
+
+<h2>Quick start</h2>
+
+<pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli          # debug REPL
+cargo build --release -p pinkdb-cli</code></pre>
+
+<pre class="code" data-lang="sql"><code>.import sales.csv sales
+SELECT region, AVG(total) FROM sales GROUP BY region ORDER BY 2 DESC;</code></pre>
+
+<pre class="code" data-lang="text"><code>┌─────────┬────────────┐
+│ region  │ avg(total) │
+│ VARCHAR │ DOUBLE     │
+├─────────┼────────────┤
+│ west    │ 175.0      │
+│ east    │ 50.5       │
+└─────────┴────────────┘
+2 rows
+Run Time (s): real 0.000</code></pre>
+
+<h2>Benchmark highlight</h2>
+
+<p>1M rows, release build, Apple Silicon. Generated with <code>bench/gen_sales.py</code>
+(deterministic seed 42), measured with
+<code>cargo run --release -p pinkdb --example query_bench</code> (best of 5).</p>
+
+<div class="table-wrap">
+<table>
+  <thead>
+    <tr><th>Query</th><th class="num">Now (ms)</th><th class="num">Before (ms)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>.import</code> 1M rows (24 MB CSV)</td><td class="num">25</td><td class="num">28</td></tr>
+    <tr><td><code>SELECT COUNT(*) FROM sales</code></td><td class="num">0.01</td><td class="num">0.02</td></tr>
+    <tr><td><code>COUNT(*) ... WHERE total &gt; 500</code></td><td class="num">5.1</td><td class="num">5.8</td></tr>
+    <tr><td><code>COUNT(*) ... WHERE region = 'west'</code></td><td class="num">4.1</td><td class="num">27</td></tr>
+    <tr><td>GROUP BY region + 5 aggregates</td><td class="num">7.7</td><td class="num">9</td></tr>
+    <tr><td>ORDER BY total DESC LIMIT 10</td><td class="num">3.0</td><td class="num">100</td></tr>
+    <tr><td>1M-row self hash join + COUNT (fused)</td><td class="num">9.0</td><td class="num">66</td></tr>
+    <tr><td>COUNT(*) OVER (PARTITION BY region)</td><td class="num">79</td><td class="num">minutes (O(n²))</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p class="doc-meta">Full table in the repository README. For reference, DuckDB 1.5.6 imports
+the same file in 0.06 s on the same machine (<code>read_csv_auto</code> → table, single
+connection).</p>
+
+<h2>Explore the docs</h2>
+
+<ul class="cards">
+  <li class="card">
+    <h3><a href="docs/getting-started">Getting started</a></h3>
+    <p>Build the CLI, import a CSV, run your first queries, and learn the REPL basics.</p>
+  </li>
+  <li class="card">
+    <h3><a href="docs/sql">SQL reference</a></h3>
+    <p>DDL/DML, joins, CTEs, subqueries, windows, types, dates, and three-valued logic.</p>
+  </li>
+  <li class="card">
+    <h3><a href="docs/cli">CLI &amp; REPL</a></h3>
+    <p>Dot-commands, box-drawn output, the timing line, and environment variables.</p>
+  </li>
+  <li class="card">
+    <h3><a href="docs/server">Server &amp; protocol</a></h3>
+    <p><code>pinkdb-server</code> over TCP, the framed binary protocol, and remote mode.</p>
+  </li>
+  <li class="card">
+    <h3><a href="docs/persistence">Persistence &amp; encryption</a></h3>
+    <p>The columnar <code>.pink</code> format, WAL crash recovery, and at-rest encryption.</p>
+  </li>
+  <li class="card">
+    <h3><a href="docs/bindings">Bindings</a></h3>
+    <p>The C ABI today; Python and Go bindings on the roadmap.</p>
+  </li>
+  <li class="card">
+    <h3><a href="docs/architecture">Architecture</a></h3>
+    <p>The parser → binder → plan → optimizer → vectorized executor pipeline.</p>
+  </li>
+  <li class="card">
+    <h3><a href="docs/roadmap">Roadmap</a></h3>
+    <p>Waves 0–26 shipped; extensions, lake storage, TLS, and RBAC queued.</p>
+  </li>
+</ul>
+
+<div class="callout ok">
+  <span class="callout-title">Status</span>
+  <p>Waves 0–26 are done: the engine, persistence + WAL, multi-database, the network
+  server, at-rest encryption, and the C ABI. The default <code>cargo build</code> links no
+  crypto, TLS, or format code; optional capabilities ship as features or separate crates.</p>
+</div>
+
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="./">Home</a> · <a href="docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roadmap — pinkdb</title>
+<meta name="description" content="Waves 0-26 shipped, 27-47 queued: bindings, extensions, lake storage, TLS, RBAC, and more.">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../">Home</a></li>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL</a></li>
+        <li><a href="../docs/cli">CLI</a></li>
+        <li><a href="../docs/server">Server</a></li>
+        <li><a href="../docs/persistence">Persistence</a></li>
+        <li><a href="../docs/bindings">Bindings</a></li>
+        <li><a href="../docs/architecture">Architecture</a></li>
+        <li><a href="../docs/roadmap" class="active" aria-current="page">Roadmap</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+<h1>Roadmap</h1>
+
+<p class="doc-meta">A summary of the wave tracker as of wave 26 (Oct 2026). The single
+source of truth is
+<a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">ROADMAP.md</a>
+in the repository — see it for full evidence per wave.</p>
+
+<p>A wave is <span class="badge done">done</span> only when <code>cargo build</code> +
+<code>cargo test</code> + <code>cargo clippy</code> are green (plus the DuckDB
+differential suite and benchmarks where applicable). The differential suite currently
+matches <strong>60/60</strong> queries in both parser modes; the test suite is
+<strong>376 tests</strong> without the encryption feature and <strong>412</strong> with
+it.</p>
+
+<h2>Shipped (waves 0–26)</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Wave</th><th>Scope</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>Repo baseline (initial commit)</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>1</td><td>Scaffold; types/vector/storage/CSV; skeleton CLI</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>2</td><td>SQL frontend + single-table executor + aggregates/sort/DISTINCT + CLI output</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>3</td><td>Hash join, optimizer, README, benchmark, polish</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>4</td><td>Independent code review of the full codebase; fixes</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>5</td><td>Persistence: on-disk columnar format (RLE/dictionary/bitpack), <code>.save</code>/<code>.open</code></td><td><span class="badge done">done</span></td></tr>
+    <tr><td>6</td><td>Subqueries + CTEs: derived tables, scalar/IN/EXISTS, WITH</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>7</td><td>DATE/TIMESTAMP types: storage, literals, arithmetic, functions, CSV + persist</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>8</td><td>Window functions: ranking + aggregates OVER, PARTITION/ORDER/ROWS frames</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>9</td><td>UPDATE/DELETE: physical DML, simultaneous SET, statement-atomic</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>10</td><td>Transactions: BEGIN/COMMIT/ROLLBACK via whole-store snapshots</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>11</td><td>SQL completeness: UNION, views, CAST, COALESCE, LIKE, DROP</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>12</td><td>Parallel execution (rayon) + multi-writer Database/Connection</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>13</td><td>Differential testing vs DuckDB (<code>bench/duckdiff.py</code>)</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>14</td><td>Speed round: Arc storage, borrowed codecs, FNV hashing, COUNT(*) path</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>15</td><td>Import speed round: streaming inference, buffer-reused records (0.42 → 0.03 s)</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>16</td><td>CASE expressions (searched + simple, NULL semantics, type unification)</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>17</td><td>Performance tuning: O(n²) window-aggregate fix, typed kernels, sort arena + top-N, thin LTO</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>18</td><td>Binder fix: UNION inside derived tables/CTEs/views/subqueries</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>19</td><td>Join fast path: integer-key specialization + fused join→aggregate</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>20</td><td>Outer joins: LEFT/RIGHT equi-joins, join-kind-aware pushdown</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>21</td><td>PEG parser in parallel with recursive descent; differential-tested; default flipped</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>22</td><td>WAL / crash recovery (generation scheme, checkpoint state machine, kill-loop harness)</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>23</td><td>Multi-database: <code>USE</code>, qualified <code>db.table</code>, per-database persistence (<code>.pink</code> v2)</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>24</td><td>Network server: <code>pinkdb-server</code> + remote CLI mode</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>25</td><td>At-rest encryption: <code>PINKENC1</code> (AES-256-GCM + Argon2id), key via option/env</td><td><span class="badge done">done</span></td></tr>
+    <tr><td>26</td><td>C ABI: <code>pinkdb-ffi</code> (cdylib + staticlib, headers, C example)</td><td><span class="badge done">done</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Queued (waves 27–47)</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Wave</th><th>Scope</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>27</td><td>Python binding (cffi) — <code>bindings/python</code></td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>28</td><td>Go binding (cgo) — <code>bindings/go</code></td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>29</td><td>Extensions support: <code>LOAD</code>/<code>INSTALL</code>, versioned C ABI v1, manifest/signature checks</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>30</td><td>C/C++ extension SDK: ABI headers, templates, examples</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>31</td><td>Go extension SDK (cgo, c-shared libraries exporting the ABI)</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>32</td><td>Extensions repository: hosted catalog of built extension artifacts</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>33</td><td>Custom repositories: user-configurable extension repository URLs + config</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>34</td><td>Lake architecture: DuckLake-style decoupled metadata + data storage</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>35</td><td>Vortex file format as the default lake data format</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>36</td><td>S3 bucket support for lake storage and file reading</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>37</td><td>Documentation website — this site</td><td><span class="badge now">this site</span></td></tr>
+    <tr><td>38</td><td>Host the website and extension repository on Cloudflare Workers + R2</td><td><span class="badge now">this deploy</span></td></tr>
+    <tr><td>39</td><td>CI/CD publishing of extensions (build, test, sign, publish)</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>40</td><td>Performance improvement: ongoing bench-driven speed rounds</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>41</td><td>Primary/foreign keys, Snowflake-style: declarative constraints, persisted, optimizer-visible</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>42</td><td>Index support: <code>CREATE INDEX</code>/<code>DROP INDEX</code>, hash indexes + zone maps</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>43</td><td>Materialized views: <code>CREATE MATERIALIZED VIEW</code>, on-demand refresh</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>44</td><td>Stored procedures: SQL procedural language + JavaScript procedures</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>45</td><td>Network server TLS: rustls + certificate config, encrypted transport</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>46</td><td>Async I/O at the I/O boundary (object stores / async server variant), feature-gated</td><td><span class="badge queued">queued</span></td></tr>
+    <tr><td>47</td><td>RBAC: users + roles (Argon2id hashes), GRANT/REVOKE, session login on the server</td><td><span class="badge queued">queued</span></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Deferred</h2>
+
+<p>Not currently scheduled: Parquet read (<code>pinkdb-parquet</code>); JS/wasm,
+Node-native, and Java bindings.</p>
+
+<h2>Packaging principles</h2>
+
+<ul>
+  <li>New capabilities ship as separate workspace crates and/or opt-in cargo features;
+  the default <code>cargo build</code> stays lean (~2 MB) and links no crypto/TLS/format
+  code.</li>
+  <li>Every wave reports per-artifact release binary size; the build matrix covers the
+  default build, each feature, and each crate, plus a wasm check — <code>pinkdb</code>
+  (and <code>pinkdb-parquet</code>) must stay wasm32-compatible, and the server is
+  target-gated out of wasm builds.</li>
+  <li>No hand-rolled crypto; audited RustCrypto crates only.</li>
+  <li>Zero-<code>unsafe</code> holds for the core; contained <code>unsafe</code> is
+  confined to <code>pinkdb-ffi</code> and, later, the extension loader crate.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Full wave tracker on GitHub →</a></li>
+  <li><a href="../docs/architecture">Architecture →</a></li>
+  <li><a href="../docs/getting-started">Getting started →</a></li>
+</ul>
+
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

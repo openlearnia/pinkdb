@@ -1,0 +1,137 @@
+<h1>Getting started</h1>
+
+<p class="doc-meta">Get the REPL running, import a CSV, and run your first analytical
+queries in a few minutes.</p>
+
+<h2>Prerequisites</h2>
+
+<p>A recent stable <strong>Rust</strong> toolchain (the workspace uses edition 2021).
+Python 3 is only needed for the benchmark helpers and the docs site itself.</p>
+
+<pre class="code" data-lang="sh"><code>git clone https://github.com/openlearnia/pinkdb
+cd pinkdb</code></pre>
+
+<h2>Build and run the REPL</h2>
+
+<ol class="steps">
+  <li>
+    <p>Start the debug REPL straight from the workspace:</p>
+    <pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli</code></pre>
+    <p>You land at the <code>pinkdb&gt;</code> prompt. Statements run until a
+    semicolon; a continuation prompt (<code>   ...&gt;</code>) appears while a statement
+    is open.</p>
+  </li>
+  <li>
+    <p>For day-to-day use, build the release binary:</p>
+    <pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli
+./target/release/pinkdb</code></pre>
+  </li>
+</ol>
+
+<div class="callout">
+  <span class="callout-title">Optional: a 1M-row practice dataset</span>
+  <p>The benchmark CSV generator is deterministic (seed 42) and writes
+  <code>sales_1m.csv</code> (columns <code>id, region, total, active</code>):</p>
+  <pre class="code" data-lang="sh"><code>python3 bench/gen_sales.py            # 1M rows, ~24 MB
+python3 bench/gen_sales.py 5000 small.csv</code></pre>
+</div>
+
+<h2>Import a CSV</h2>
+
+<p>Create a tiny file and import it. Table names default to the file stem; a
+<code>db.table</code> argument targets another database when <code>db</code> already
+exists.</p>
+
+<pre class="code" data-lang="sh"><code>cat &gt; sales.csv &lt;&lt;'EOF'
+region,total
+west,10.5
+east,7.0
+north,
+EOF</code></pre>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .import sales.csv sales
+Imported 3 rows in 0.001s
+pinkdb&gt; .schema sales
+CREATE TABLE sales (
+  region VARCHAR,
+  total DOUBLE
+); -- 3 rows, 1 chunks</code></pre>
+
+<p>CSV import infers the schema per column over the non-empty cells in the file:
+all <code>i32</code> values → <code>INTEGER</code>, all <code>i64</code> →
+<code>BIGINT</code>, all floats → <code>DOUBLE</code>, all
+<code>true</code>/<code>false</code> (case-insensitive) → <code>BOOLEAN</code>,
+anything else → <code>VARCHAR</code>. An empty cell becomes
+<code>NULL</code>. Types are sampled from the first 20&nbsp;480 rows and the import
+transparently reruns with whole-file inference if a later row disagrees. Files without
+<code>"</code> or <code>\r</code> bytes are parsed in parallel across the rayon pool.</p>
+
+<h2>First queries</h2>
+
+<pre class="code" data-lang="sql"><code>SELECT * FROM sales;
+SELECT region, AVG(total) AS avg_total, COUNT(*) AS n
+  FROM sales
+  GROUP BY region
+  ORDER BY 3 DESC;
+SELECT COUNT(*) FROM sales WHERE total IS NULL;
+SELECT region, total * 2 AS doubled
+  FROM sales
+  WHERE total IS NOT NULL
+  ORDER BY doubled DESC
+  LIMIT 2;</code></pre>
+
+<p>Result tables are box-drawn with a type row (DuckDB-style) and followed by the row
+count and a timing line:</p>
+
+<pre class="code" data-lang="text"><code>┌─────────┬───────────┬────────┐
+│ region  │ avg_total │ n      │
+│ VARCHAR │ DOUBLE    │ BIGINT │
+├─────────┼───────────┼────────┤
+│ west    │ 10.5      │ 1      │
+│ east    │ 7.0       │ 1      │
+│ north   │ NULL      │ 1      │
+└─────────┴───────────┴────────┘
+3 rows
+Run Time (s): real 0.000</code></pre>
+
+<p>Long results are capped at 10&nbsp;000 displayed rows with a
+<code>(N more rows)</code> note; the query itself still runs over all of them.</p>
+
+<h2>REPL basics</h2>
+
+<ul>
+  <li>SQL statements end with <code>;</code> and may span lines.</li>
+  <li>Dot-commands (<code>.help</code>, <code>.tables</code>, <code>.import</code>, …)
+  are single-line and take no semicolon.</li>
+  <li><code>.help</code> lists every dot-command; <code>.quit</code> /
+  <code>.exit</code> leave the shell.</li>
+  <li>Timing: the SQL surface is local to the process; writes are statement-atomic,
+  and <code>BEGIN</code>/<code>COMMIT</code>/<code>ROLLBACK</code> work on a whole-store
+  snapshot.</li>
+</ul>
+
+<h2>Use it as a library</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::PinkDb;
+
+let mut db = PinkDb::new();
+pinkdb::csv::import_csv_string(&amp;mut db, "t", "a,b\n1,x\n2,y\n")?;
+for result in db.execute("SELECT a, upper(b) FROM t WHERE a &gt; 1;")? {
+    println!("{result:?}");
+}</code></pre>
+
+<p>The multi-writer API wraps the store in <code>Arc&lt;RwLock&lt;PinkDb&gt;&gt;</code>:
+one shared store, one <code>Connection</code> per thread, snapshot-isolated
+transactions.</p>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::Database;
+
+let db = Database::new();
+let mut c = db.connect();
+c.execute("CREATE TABLE t (a INTEGER);")?;</code></pre>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/sql.html">SQL reference →</a></li>
+  <li><a href="{{root}}docs/cli.html">CLI &amp; REPL →</a></li>
+  <li><a href="{{root}}docs/persistence.html">Save and reopen data →</a></li>
+</ul>
