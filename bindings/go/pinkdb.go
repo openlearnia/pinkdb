@@ -13,8 +13,11 @@
 //
 // A *DB wraps one native handle. The C ABI's handles are single-threaded:
 // this package serializes every native call with a per-DB mutex, so a single
-// *DB may be shared between goroutines. Close is idempotent, and using a *DB
-// after Close returns ErrClosed instead of touching freed memory.
+// *DB may be shared between goroutines. Close frees the native handle and is
+// idempotent: once closed, further Close calls are a no-op and ABI() stays
+// callable (it is library-wide and does not touch the handle). Execute is the
+// only method that reports a closed database, returning ErrClosed instead of
+// touching freed memory.
 package pinkdb
 
 /*
@@ -43,12 +46,15 @@ const SupportedABI = 1
 // Errors returned by this package in addition to the native error messages
 // from pinkdb_last_error.
 var (
-	// ErrClosed is returned by DB.Execute (and DB.Close is a no-op) after the
-	// database has been closed.
+	// ErrClosed is returned by DB.Execute after the database has been closed.
+	// Close itself is a no-op on an already-closed DB, and ABI() remains
+	// callable.
 	ErrClosed = errors.New("pinkdb: database is closed")
 
-	// ErrOutOfRange wraps DATE values whose day count cannot be represented
-	// by Go's time.Time. See dateFromDays.
+	// ErrOutOfRange wraps DATE and TIMESTAMP payloads that cannot be
+	// represented by Go's time.Time. The guard is defensive-only: no current
+	// producer path can emit such a payload. See dateFromDays and
+	// timestampFromMicros.
 	ErrOutOfRange = errors.New("pinkdb: value is outside time.Time's range")
 )
 
@@ -201,17 +207,14 @@ func (db *DB) ABI() uint32 {
 //
 // SQL is passed to the native library as (pointer, length), so embedded NUL
 // bytes are preserved. Errors carry the message from pinkdb_last_error and
-// leave the database usable. After Close, Execute returns ErrClosed.
+// leave the database usable. After Close, Execute returns ErrClosed (the only
+// method that fails on a closed DB).
 func (db *DB) Execute(sql string) ([]Result, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.closed {
 		return nil, ErrClosed
 	}
-	// The native error is thread-local: keep every C call of this Execute
-	// (including the pinkdb_last_error read below) on one OS thread.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 
 	// CBytes + explicit length keeps embedded NULs; free the copy below.
 	var sqlPtr *C.char
@@ -219,16 +222,33 @@ func (db *DB) Execute(sql string) ([]Result, error) {
 		sqlPtr = (*C.char)(C.CBytes([]byte(sql)))
 		defer C.free(unsafe.Pointer(sqlPtr))
 	}
-	result := C.pinkdb_execute(db.handle, sqlPtr, C.size_t(len(sql)))
-	if result == nil {
-		return nil, nativeError()
+	result, err := db.executeNative(sqlPtr, C.size_t(len(sql)))
+	if err != nil {
+		return nil, err
 	}
 	defer C.pinkdb_result_free(result) // freed on success and error paths
+	// materialize only reads the result's own memory, which is not
+	// thread-local, so it runs after the OS thread has been released.
 	return materialize(result)
 }
 
-// Close frees the native handle. It is idempotent and safe to call more than
-// once; any further Execute call returns ErrClosed.
+// executeNative runs pinkdb_execute and, when it fails, reads the thread-local
+// pinkdb_last_error on the same OS thread. Only that native call and the error
+// read need the pinned thread. The caller must hold db.mu and owns the
+// returned result (freed with pinkdb_result_free).
+func (db *DB) executeNative(sqlPtr *C.char, sqlLen C.size_t) (*C.pinkdb_result, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	result := C.pinkdb_execute(db.handle, sqlPtr, sqlLen)
+	if result == nil {
+		return nil, nativeError()
+	}
+	return result, nil
+}
+
+// Close frees the native handle. It is idempotent: after the first call,
+// further calls are a no-op (there is no handle left to free), and Execute
+// returns ErrClosed from then on. ABI() stays callable.
 func (db *DB) Close() {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -368,7 +388,8 @@ const (
 
 // dateFromDays converts a DATE payload (days since the Unix epoch) to a UTC
 // time.Time at midnight, or fails with ErrOutOfRange when the value cannot be
-// represented as an int64 count of seconds since Go's time zero.
+// represented as an int64 count of seconds since Go's time zero. The guard is
+// defensive-only: no current producer path emits such a day count.
 func dateFromDays(days int64) (time.Time, error) {
 	if days > maxDateDays || days < minDateDays {
 		return time.Time{}, fmt.Errorf(
@@ -380,8 +401,8 @@ func dateFromDays(days int64) (time.Time, error) {
 
 // timestampFromMicros converts a TIMESTAMP payload (microseconds since the
 // Unix epoch) to a UTC time.Time. Every int64 microsecond count is
-// representable as int64 seconds, so this only fails for values that overflow
-// time.Time's internal representation (which no ABI payload can reach).
+// representable as int64 seconds, so the ErrOutOfRange guard below is
+// defensive-only: no producer path can reach it.
 func timestampFromMicros(us int64) (time.Time, error) {
 	sec := us / 1_000_000
 	nsec := (us % 1_000_000) * 1_000

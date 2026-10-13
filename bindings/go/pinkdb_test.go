@@ -1,13 +1,17 @@
 package pinkdb
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -370,12 +374,30 @@ func TestErrorKeepsHandleUsable(t *testing.T) {
 	}
 }
 
-func TestEmptySQLReturnsNoResults(t *testing.T) {
+func TestEmptyAndCommentOnlySQLReturnsNoResults(t *testing.T) {
 	db := mustOpenMemory(t)
 	defer db.Close()
-	results := mustExecute(t, db, "")
-	if len(results) != 0 {
-		t.Fatalf("Execute(\"\") returned %d results, want 0", len(results))
+	for _, sql := range []string{
+		"",
+		";",
+		";;",
+		"  \t\n ",
+		"-- comment only\n",
+		"/* block comment */",
+		"-- one\n;\n/* two */",
+	} {
+		results, err := db.Execute(sql)
+		if err != nil {
+			t.Fatalf("Execute(%q) error = %v, want nil", sql, err)
+		}
+		if len(results) != 0 {
+			t.Fatalf("Execute(%q) returned %d results, want 0", sql, len(results))
+		}
+	}
+	// The handle stays fully usable afterwards.
+	results := mustExecute(t, db, "SELECT 1;")
+	if got := intAt(t, results[0].Rows[0], 0); got != 1 {
+		t.Fatalf("after empty inputs: SELECT 1 = %d, want 1", got)
 	}
 }
 
@@ -598,5 +620,427 @@ func TestThousandIterationExecuteLoop(t *testing.T) {
 		if got := stringAt(t, row, 1); got != fmt.Sprintf("v%d", i) {
 			t.Fatalf("iteration %d: s = %q", i, got)
 		}
+	}
+}
+
+// ----- review-fix coverage: races, exact errors, scale, leak pins -----
+
+// TestCloseRacingExecute hammers one DB with concurrent Execute calls while
+// many goroutines call Close. Every Execute either succeeds or returns
+// ErrClosed (never another error, never a crash), every executor eventually
+// observes the close, and a post-close Execute fails fast. Under -race this
+// pins the mutex/closed-flag protocol that makes use-after-close safe.
+func TestCloseRacingExecute(t *testing.T) {
+	const (
+		rounds    = 4
+		executors = 8
+		closers   = 16
+	)
+
+	for round := 0; round < rounds; round++ {
+		db := mustOpenMemory(t)
+		if _, err := db.Execute("CREATE TABLE t (x INTEGER);"); err != nil {
+			t.Fatalf("round %d: setup: %v", round, err)
+		}
+
+		var wg sync.WaitGroup
+		problems := make(chan error, executors)
+		var sawClosed, executes atomic.Int64
+
+		for g := 0; g < executors; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					executes.Add(1)
+					_, err := db.Execute("SELECT x FROM t;")
+					if err == nil {
+						continue
+					}
+					if errors.Is(err, ErrClosed) {
+						sawClosed.Add(1)
+						return
+					}
+					problems <- fmt.Errorf("round %d: Execute: %w", round, err)
+					return
+				}
+				problems <- fmt.Errorf("round %d: executor never observed ErrClosed", round)
+			}()
+		}
+
+		// Give the executors a moment to overlap with the closes.
+		time.Sleep(time.Millisecond)
+
+		var closerWG sync.WaitGroup
+		for c := 0; c < closers; c++ {
+			closerWG.Add(1)
+			go func() {
+				defer closerWG.Done()
+				db.Close()
+				db.Close() // no-op: the handle is already freed
+			}()
+		}
+		closerWG.Wait()
+		wg.Wait()
+
+		close(problems)
+		for err := range problems {
+			t.Fatal(err)
+		}
+		if got := sawClosed.Load(); got != executors {
+			t.Fatalf("round %d: %d/%d executors observed ErrClosed", round, got, executors)
+		}
+		if got := executes.Load(); got < executors {
+			t.Fatalf("round %d: only %d Execute calls ran", round, got)
+		}
+		if _, err := db.Execute("SELECT 1;"); !errors.Is(err, ErrClosed) {
+			t.Fatalf("round %d: post-close Execute = %v, want ErrClosed", round, err)
+		}
+		if got := db.ABI(); got != SupportedABI {
+			t.Fatalf("round %d: ABI() after close = %d, want %d", round, got, SupportedABI)
+		}
+	}
+}
+
+// TestNativeErrorMessagesExact asserts the exact, verbatim native messages
+// (the pinkdb_last_error string) for representative failing statements —
+// full-string equality, not substring checks.
+func TestNativeErrorMessagesExact(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup string
+		sql   string
+		want  string
+	}{
+		{"missing table", "", "SELECT * FROM nope;", `table "nope" not found`},
+		{"drop missing table", "", "DROP TABLE nope;", `table "nope" not found`},
+		{"missing database", "", "USE nope;", `database "nope" not found`},
+		{"duplicate table", "CREATE TABLE dup (a INTEGER);", "CREATE TABLE dup (a INTEGER);", `table "dup" already exists`},
+		{"missing column", "CREATE TABLE t (a INTEGER);", "SELECT nosuchcol FROM t;", `no column "nosuchcol"`},
+		{"nested transaction", "", "BEGIN; BEGIN;", "already in a transaction"},
+		{"integer division by zero", "", "SELECT 1 / 0;", "integer division by zero"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			db := mustOpenMemory(t)
+			defer db.Close()
+			if tc.setup != "" {
+				if _, err := db.Execute(tc.setup); err != nil {
+					t.Fatalf("setup %q: %v", tc.setup, err)
+				}
+			}
+			_, err := db.Execute(tc.sql)
+			if err == nil {
+				t.Fatalf("Execute(%q) = nil error, want %q", tc.sql, tc.want)
+			}
+			if err.Error() != tc.want {
+				t.Fatalf("Execute(%q) error = %q, want exactly %q", tc.sql, err, tc.want)
+			}
+			// A failed statement leaves the handle usable.
+			if _, err := db.Execute("SELECT 1;"); err != nil {
+				t.Fatalf("handle unusable after %q: %v", tc.sql, err)
+			}
+		})
+	}
+}
+
+// TestNonUTF8Inputs pins the native rejection of invalid UTF-8 in SQL and in
+// paths: the native message is returned verbatim and the rejected path never
+// reaches the filesystem.
+func TestNonUTF8Inputs(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+
+	for _, sql := range []string{
+		"\xff",
+		"SELECT 1;\xc3\x28", // truncated 2-byte sequence
+		"SELECT '\xfe' AS bad;",
+	} {
+		_, err := db.Execute(sql)
+		if err == nil {
+			t.Fatalf("Execute(%q) = nil error, want the UTF-8 error", sql)
+		}
+		if err.Error() != "SQL is not valid UTF-8" {
+			t.Fatalf("Execute(%q) error = %q, want exactly %q", sql, err, "SQL is not valid UTF-8")
+		}
+	}
+	// Rejected input leaves the handle usable.
+	results := mustExecute(t, db, "SELECT 7;")
+	if got := intAt(t, results[0].Rows[0], 0); got != 7 {
+		t.Fatalf("after invalid UTF-8: SELECT 7 = %d, want 7", got)
+	}
+
+	dir := t.TempDir()
+	_, err := Open(filepath.Join(dir, "bad\xffname.pink"))
+	if err == nil {
+		t.Fatal("Open(path with invalid UTF-8) = nil error")
+	}
+	if err.Error() != "path is not valid UTF-8" {
+		t.Fatalf("Open(path with invalid UTF-8) error = %q, want exactly %q", err, "path is not valid UTF-8")
+	}
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("rejected non-UTF-8 path created %d entries on disk", len(entries))
+	}
+}
+
+// TestLargeSelectMaterialization materializes a 20k-row SELECT into Go
+// values and spot-checks rows at both ends and the middle.
+func TestLargeSelectMaterialization(t *testing.T) {
+	const rows = 20000
+	db := mustOpenMemory(t)
+	defer db.Close()
+
+	var b strings.Builder
+	b.WriteString("CREATE TABLE big (i INTEGER, s VARCHAR);INSERT INTO big VALUES ")
+	for i := 0; i < rows; i++ {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "(%d,'row-%d')", i, i)
+	}
+	b.WriteString(";SELECT i, s FROM big ORDER BY i;")
+
+	results := mustExecute(t, db, b.String())
+	if len(results) != 3 {
+		t.Fatalf("got %d results, want 3", len(results))
+	}
+	selected := results[2]
+	if selected.Kind != "selected" {
+		t.Fatalf("kind = %q, want selected", selected.Kind)
+	}
+	if len(selected.Rows) != rows {
+		t.Fatalf("got %d rows, want %d", len(selected.Rows), rows)
+	}
+	for _, i := range []int{0, 1, rows / 2, rows - 2, rows - 1} {
+		if got := intAt(t, selected.Rows[i], 0); got != int64(i) {
+			t.Fatalf("row %d: i = %d, want %d", i, got, i)
+		}
+		if got := stringAt(t, selected.Rows[i], 1); got != fmt.Sprintf("row-%d", i) {
+			t.Fatalf("row %d: s = %q, want %q", i, got, fmt.Sprintf("row-%d", i))
+		}
+	}
+}
+
+// TestLargeMultiStatementExecute runs one Execute with 20k statements and
+// spot-checks the materialized results.
+func TestLargeMultiStatementExecute(t *testing.T) {
+	const statements = 20000
+	db := mustOpenMemory(t)
+	defer db.Close()
+
+	var b strings.Builder
+	for i := 0; i < statements; i++ {
+		fmt.Fprintf(&b, "SELECT %d AS n;", i)
+	}
+	results := mustExecute(t, db, b.String())
+	if len(results) != statements {
+		t.Fatalf("got %d results, want %d", len(results), statements)
+	}
+	for _, i := range []int{0, statements / 2, statements - 1} {
+		r := results[i]
+		if r.Kind != "selected" {
+			t.Fatalf("results[%d].Kind = %q, want selected", i, r.Kind)
+		}
+		if got := intAt(t, r.Rows[0], 0); got != int64(i) {
+			t.Fatalf("results[%d] n = %d, want %d", i, got, i)
+		}
+	}
+}
+
+// TestMultiMegabyteVarcharRoundTrip round-trips a multi-MB VARCHAR value
+// containing multibyte text and embedded NULs, compared by SHA-256 so a
+// mismatch does not dump megabytes into the test log.
+func TestMultiMegabyteVarcharRoundTrip(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+
+	unit := "pinkdb 🚀 多字节 multi-byte "
+	payload := "head\x00" + strings.Repeat(unit, 3<<20/len(unit)+1) + "\x00tail"
+	if len(payload) < 3<<20 {
+		t.Fatalf("payload is only %d bytes", len(payload))
+	}
+	if strings.ContainsRune(payload, '\'') {
+		t.Fatal("payload contains a quote")
+	}
+
+	results := mustExecute(t, db, "SELECT '"+payload+"' AS big;")
+	selected := results[0]
+	checkStrings(t, "column types", selected.ColumnTypes, []string{"varchar"})
+	got := stringAt(t, selected.Rows[0], 0)
+	if len(got) != len(payload) {
+		t.Fatalf("round-tripped %d bytes, want %d", len(got), len(payload))
+	}
+	if sha256.Sum256([]byte(got)) != sha256.Sum256([]byte(payload)) {
+		t.Fatalf("round-tripped payload differs (both %d bytes)", len(got))
+	}
+}
+
+// maxRSSBytes returns the process's peak resident set size (rusage
+// RUSAGE_SELF): bytes on darwin, kilobytes on linux.
+func maxRSSBytes(t *testing.T) uint64 {
+	t.Helper()
+	var ru syscall.Rusage
+	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+		t.Fatalf("Getrusage: %v", err)
+	}
+	if runtime.GOOS == "linux" {
+		return uint64(ru.Maxrss) * 1024
+	}
+	return uint64(ru.Maxrss)
+}
+
+// TestBoundedRSSAcrossSuccessAndErrorLoops pins that alternating successful
+// and failing Executes do not leak: peak RSS and Go heap growth over 20k
+// iterations stay under deliberately generous bounds (allocator and
+// race-build noise cannot flake them), while a missing pinkdb_result_free or
+// a leaked handle would blow past them.
+func TestBoundedRSSAcrossSuccessAndErrorLoops(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	if _, err := db.Execute(
+		"CREATE TABLE t (a INTEGER, s VARCHAR);" +
+			"INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	run := func(iterations int) {
+		for i := 0; i < iterations; i++ {
+			results, err := db.Execute("SELECT a, s FROM t ORDER BY a;")
+			if err != nil {
+				t.Fatalf("iteration %d: success path: %v", i, err)
+			}
+			if len(results) != 1 || len(results[0].Rows) != 3 {
+				t.Fatalf("iteration %d: got %d results / %d rows", i, len(results), len(results[0].Rows))
+			}
+			if _, err := db.Execute("SELECT * FROM missing;"); err == nil {
+				t.Fatalf("iteration %d: error path succeeded", i)
+			}
+		}
+	}
+
+	run(1000) // warm every allocator path before measuring
+	runtime.GC()
+	rssBefore := maxRSSBytes(t)
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	heapBefore := ms.HeapAlloc
+
+	const iterations = 20000
+	run(iterations)
+
+	runtime.GC()
+	rssAfter := maxRSSBytes(t)
+	runtime.ReadMemStats(&ms)
+
+	const rssLimit = 128 << 20 // generous: observed growth is well under 1 MB
+	const heapLimit = 32 << 20
+	if growth := int64(rssAfter) - int64(rssBefore); growth > rssLimit {
+		t.Fatalf("peak RSS grew %d bytes over %d success+error iterations (limit %d)", growth, iterations, rssLimit)
+	}
+	if growth := int64(ms.HeapAlloc) - int64(heapBefore); growth > heapLimit {
+		t.Fatalf("Go heap grew %d bytes over %d success+error iterations (limit %d)", growth, iterations, heapLimit)
+	}
+}
+
+// TestGoroutineStabilityAcrossExecutes runs 8k executes from 16 goroutines
+// and pins that the goroutine count returns to its baseline: the per-call
+// LockOSThread/UnlockOSThread pair and the cgo result materialization must
+// not leak goroutines or scheduling state.
+func TestGoroutineStabilityAcrossExecutes(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	if _, err := db.Execute("CREATE TABLE t (x INTEGER);"); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+
+	base := runtime.NumGoroutine()
+	const (
+		workers   = 16
+		perWorker = 500
+	)
+	var wg sync.WaitGroup
+	problems := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < perWorker; i++ {
+				if _, err := db.Execute("SELECT x FROM t;"); err != nil {
+					problems <- fmt.Errorf("worker %d iteration %d: %w", w, i, err)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(problems)
+	for err := range problems {
+		t.Fatal(err)
+	}
+
+	// Give runtime-internal goroutines a moment to exit.
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > base && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > base {
+		t.Fatalf("goroutines after %d executes: got %d, base %d", workers*perWorker, got, base)
+	}
+	// The DB is still healthy after the hammering (an unbalanced
+	// LockOSThread/UnlockOSThread pair would have panicked or wedged long
+	// before here).
+	results := mustExecute(t, db, "SELECT COUNT(*) FROM t;")
+	if got := intAt(t, results[0].Rows[0], 0); got != 0 {
+		t.Fatalf("COUNT(*) = %d, want 0", got)
+	}
+}
+
+// TestThreadLocalErrorIsolation runs one in-memory DB per goroutine, each
+// repeatedly failing with a statement unique to that goroutine. Every
+// goroutine must see exactly its own native message: a thread-local error
+// mix-up (or a cross-thread pinkdb_last_error read) would surface another
+// goroutine's message.
+func TestThreadLocalErrorIsolation(t *testing.T) {
+	const (
+		goroutines = 8
+		iterations = 200
+	)
+	var wg sync.WaitGroup
+	problems := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			db, err := OpenMemory()
+			if err != nil {
+				problems <- fmt.Errorf("goroutine %d: OpenMemory: %w", g, err)
+				return
+			}
+			defer db.Close()
+			missing := fmt.Sprintf("missing_%d", g)
+			want := fmt.Sprintf("table %q not found", missing)
+			sql := "SELECT * FROM " + missing + ";"
+			for i := 0; i < iterations; i++ {
+				_, err := db.Execute(sql)
+				if err == nil {
+					problems <- fmt.Errorf("goroutine %d iteration %d: nil error, want %q", g, i, want)
+					return
+				}
+				if err.Error() != want {
+					problems <- fmt.Errorf("goroutine %d iteration %d: error = %q, want exactly %q", g, i, err, want)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(problems)
+	for err := range problems {
+		t.Fatal(err)
 	}
 }

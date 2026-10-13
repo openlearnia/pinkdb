@@ -53,12 +53,15 @@ func main() {
 | `Open(path string) (*DB, error)` | Open a durable database (checkpoint + WAL) at `path`. |
 | `OpenMemory() (*DB, error)` | Open a fresh, empty in-memory database. |
 | `(*DB).Execute(sql string) ([]Result, error)` | Run one or more `;`-separated statements; one `Result` per statement. |
-| `(*DB).Close()` | Free the native handle. Idempotent. |
-| `(*DB).ABI() uint32` | ABI version reported by the linked library (1). |
+| `(*DB).Close()` | Free the native handle. Idempotent; a second call is a no-op. |
+| `(*DB).ABI() uint32` | ABI version reported by the linked library (1); stays callable after `Close`. |
 
 Both open functions check `pinkdb_abi_version()` first: a library that is not
 ABI 1 fails with an error naming both versions. `Open` rejects an empty path
-or one containing a NUL byte before any native call.
+or one containing a NUL byte before any native call; a path with invalid
+UTF-8 fails at the native boundary with `path is not valid UTF-8`. SQL that
+is not valid UTF-8 fails with `SQL is not valid UTF-8` and leaves the handle
+usable.
 
 `Result` mirrors one statement's outcome:
 
@@ -83,24 +86,38 @@ or one containing a NUL byte before any native call.
 | `DATE` | `time.Time` | UTC midnight; days since the Unix epoch. |
 | `TIMESTAMP` | `time.Time` | UTC; microseconds since the Unix epoch; pre-epoch instants exact. |
 
-DATE day counts that would overflow `time.Time`'s internal `int64` seconds
-representation wrap `ErrOutOfRange` instead of returning a wrong calendar
-value (the C ABI can carry them via `int64`; SQL expressions cannot reach that
-range). Every `int64` microsecond timestamp is representable in `time.Time`
-and converts exactly. Errors from the native library are returned verbatim
-(the message from `pinkdb_last_error`) and leave the handle usable.
+The `ErrOutOfRange` guard on the DATE and TIMESTAMP conversions is
+**defensive-only**: no current producer path can emit a payload outside
+`time.Time`'s range, so no SQL statement can currently trigger it. Should a
+DATE day count or TIMESTAMP microsecond count that overflows `time.Time`'s
+internal `int64` seconds representation ever reach the binding, the
+conversion returns `ErrOutOfRange` instead of a wrong calendar value. Every
+`int64` microsecond timestamp produced by the engine converts exactly.
+Errors from the native library are returned verbatim (the message from
+`pinkdb_last_error`) and leave the handle usable.
+
+## Limitations
+
+ABI v1 returns column names and object/session names (`Columns`, `Name`) as
+NUL-terminated C strings, so an **identifier containing a NUL byte is
+truncated at the first NUL** in those fields. The engine keeps the full
+identifier internally — subsequent statements using the full name still
+match the object — but the name reported back to Go is cut short. An
+engine-level fix is planned; until then, avoid NUL bytes in identifiers.
 
 ## Thread safety
 
 The C ABI's handles are **single-threaded**. `DB` serializes every native call
 behind a `sync.Mutex`, so one `*DB` may be shared between goroutines and each
 `Execute` is atomic with respect to the others. Native errors are
-thread-local, so the wrapper pins each operation to one OS thread
-(`runtime.LockOSThread`) while it runs the call and reads
-`pinkdb_last_error`.
+thread-local, so the wrapper pins only the native call itself and the
+`pinkdb_last_error` read to one OS thread (`runtime.LockOSThread`); result
+materialization happens after the thread is released.
 
-`Close` is idempotent; after it, `Execute` fails fast with `ErrClosed` instead
-of touching freed memory (`ABI()` stays callable because it is library-wide).
+`Close` frees the native handle and is idempotent: a second `Close` is a
+no-op (there is no handle left to free), and `ABI()` stays callable because
+it is library-wide. `Execute` is the only method that reports a closed
+database: it fails fast with `ErrClosed` instead of touching freed memory.
 
 ## Testing
 
@@ -114,9 +131,15 @@ go test ./...
 The tests cover all value types (NULLs, empty/multibyte/embedded-NUL strings,
 `-0.0`, `NaN`/`±Inf`, i32/i64 extremes), DATE/TIMESTAMP boundaries including
 pre-epoch values and the out-of-range mapping, all statement kinds with
-`Affected`/`Name`, errors with a still-usable handle, a durable round-trip
+`Affected`/`Name`, exact native error messages plus a still-usable handle,
+invalid UTF-8 SQL and paths, empty/comment-only input, a durable round-trip
 through `t.TempDir()`, idempotent close plus use-after-close errors, 8
-goroutines hammering one `DB`, and a 1000-iteration `Execute` loop.
+goroutines hammering one `DB`, a 1000-iteration `Execute` loop, an
+`Execute`-vs-`Close` race hammer (also under `-race`), per-goroutine
+thread-local error isolation, and scale/leak pins: a 20k-row SELECT, a 20k
+statement `Execute`, a multi-MB VARCHAR round-trip, a bounded peak-RSS and
+Go-heap check over 20k success+error loops, and goroutine-count stability
+over 8k concurrent executes.
 
 ## Linking notes
 
