@@ -619,9 +619,12 @@ fn wal_replay_reloads_the_extension() {
 
     // 2. The same round-trip through a *copy* of the library that is deleted
     //    before the reopen: a missing file at replay time is a hard recovery
-    //    error naming the path, never a silent drop.
+    //    error naming the path, never a silent drop. The copy is a FRESH
+    //    compile (not `fs::copy`) so it carries its own install name — a copy
+    //    would be resolved by dyld to the already-loaded original whenever
+    //    another test still holds it, defeating the deleted-file assertion.
     let copy = dir.join(format!("test_ext_copy{}", std::env::consts::DLL_SUFFIX));
-    std::fs::copy(&path, &copy).unwrap();
+    common::compile_to("test_ext", &copy);
     let ckpt2 = dir.join("missing.pink");
     let ckpt2 = ckpt2.to_str().unwrap();
     {

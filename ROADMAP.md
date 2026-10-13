@@ -53,7 +53,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 28 | Go binding (cgo) (`bindings/go`) | done | cgo binding over pinkdb-ffi: 15 tests pass + race clean, gofmt/vet clean; durable round-trip; goroutine-safe wrapper; sizes unchanged |
 | 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | done | loader crate + C ABI v1 + SQL LOAD EXTENSION (both parsers) + result-kind ripple (CLI/server v3/C ABI/Python/Go); 432 tests / 25 suites green both parser modes; duckdiff 60/60; kill loop 30/30; wasm core build green; sizes pinkdb 2.25 MB (+1.0%) |
 | 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | done | ext-sdk/c/ (vendored header + byte-identity sync test, template, 3 examples incl. C++, Makefile/CMake); smoke.sh 14/14 checks green through the real CLI; 434 tests; clippy clean |
-| 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | queued | — |
+| 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | done | ext-sdk/go/ (cgo c-shared template + example, vendored header pinned by the sync test, README with sharp edges); smoke 15/15 incl. a 5,000-row multi-threaded callback query (3 rayon threads); gofmt/vet clean; 434 tests; clippy clean |
 | 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service) | queued | — |
 | 33 | Custom repositories: user-configurable extension repository URLs and config (core config + repo client) | queued | — |
 | 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer) | queued | — |
@@ -181,3 +181,17 @@ Java bindings.
   434 tests; clippy clean.
 - 2026-10-14 — Binary size: unchanged — `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
   `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 30; pre-wave-17 was 2.26 MB).
+- 2026-10-14 — Wave 31: Go extension SDK — new `ext-sdk/go/` with a nested-module template
+  and a worked example (`ext_go_repeat`, `ext_go_len`), cgo patterns (exact-name `//export`ed
+  ABI symbols, `static inline` function-pointer shims, host-`alloc` VARCHAR results,
+  recover-in-every-export), a vendored header pinned by the loader's `header_sync` test, and
+  sharp edges documented (Go runtime in the host process, foreign-thread callbacks, no
+  panics, `-buildmode=c-shared` rules). `smoke.sh` 15/15 incl. NULLs, multibyte VARCHAR,
+  error paths, and a 5,000-row parallel query. Also fixed a flaky test
+  (`wal_replay_reloads_the_extension`): its "deleted file at replay" simulation used
+  `fs::copy`, whose inherited macOS install name made dyld alias the already-loaded original
+  under parallel tests; the copy is now a fresh compile with its own install name (15/15
+  clean after the fix). Numbers: smoke 15/15 incl. a 5,000-row multi-threaded callback query
+  (3 rayon threads); gofmt/vet clean; 434 tests; clippy clean.
+- 2026-10-14 — Binary size: unchanged — `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
+  `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 31; pre-wave-17 was 2.26 MB).

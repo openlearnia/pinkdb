@@ -11,3 +11,7 @@ __pycache__/
 /ext-sdk/c/template/build/
 /ext-sdk/c/template/my_extension.dylib
 /ext-sdk/c/template/my_extension.so
+
+# Go extension SDK build outputs
+/ext-sdk/go/build/
+/ext-sdk/go/template/build/

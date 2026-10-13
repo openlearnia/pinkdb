@@ -575,6 +575,18 @@ thread-safety, no unwinding) and the `LOAD EXTENSION '<path>'` workflow. The
 SDK's header is kept byte-identical to the loader crate's copy by a
 `cargo test` check.
 
+A Go SDK (`ext-sdk/go/`) builds the same ABI v1 with cgo
+(`go build -buildmode=c-shared`): the three exports come from `//export`
+directives, and small static C shims stand in for the host's function
+pointers (`register_scalar`/`alloc`/`free`), which Go cannot call directly.
+`ext-sdk/go/README.md` documents the cgo patterns and the sharp edges — the
+Go runtime is linked into the host process, callbacks are invoked from
+foreign rayon worker threads, VARCHAR results must be copied into
+host-`alloc` memory, panics must be recovered before they cross the ABI
+boundary, and `-buildmode=c-shared` symbol-export rules — and
+`./ext-sdk/go/smoke.sh` builds and exercises the example end to end. Its
+header copy is pinned by the same `cargo test` check.
+
 Semantics and persistence:
 
 - Extensions are **process-level**: they are not stored in `.pink` snapshots

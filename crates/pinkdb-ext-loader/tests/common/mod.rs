@@ -27,15 +27,36 @@ pub fn extension(name: &str) -> PathBuf {
         return path.clone();
     }
 
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let source = manifest.join("tests/c").join(format!("{name}.c"));
-    let include = manifest.join("include");
-    assert!(source.is_file(), "missing test extension source: {}", source.display());
-
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ext_loader_tests_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create test extension directory");
     let library = dir.join(format!("{name}{}", std::env::consts::DLL_SUFFIX));
+    compile(name, &library);
+
+    built.insert(name.to_string(), library.clone());
+    library
+}
+
+/// Compile `tests/c/<name>.c` into a fresh library at `output`.
+///
+/// Unlike copying an existing library, a fresh compile embeds `output` as the
+/// library's install name (LC_ID_DYLIB). That matters for "the file was
+/// deleted" tests on macOS: dyld resolves a `dlopen` by install name, so a
+/// copy would alias the already-loaded original image whenever any other test
+/// in the process still holds it — making the deleted-file behavior
+/// non-deterministic.
+pub fn compile_to(name: &str, output: &Path) {
+    compile(name, output);
+}
+
+fn compile(name: &str, library: &Path) {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = manifest.join("tests/c").join(format!("{name}.c"));
+    let include = manifest.join("include");
+    assert!(source.is_file(), "missing test extension source: {}", source.display());
+    if let Some(parent) = library.parent() {
+        std::fs::create_dir_all(parent).expect("create test extension directory");
+    }
 
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
     let output = Command::new(&cc)
@@ -46,7 +67,7 @@ pub fn extension(name: &str) -> PathBuf {
         .arg("-I")
         .arg(&include)
         .arg("-o")
-        .arg(&library)
+        .arg(library)
         .arg(&source)
         .output()
         .unwrap_or_else(|e| panic!("could not run the C compiler `{cc}`: {e} (set CC?)"));
@@ -55,9 +76,6 @@ pub fn extension(name: &str) -> PathBuf {
         "compiling {name}.c failed:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-
-    built.insert(name.to_string(), library.clone());
-    library
 }
 
 /// [`extension`] as a `&str`-friendly owned path string.
