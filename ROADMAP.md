@@ -49,7 +49,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 24 | Network server: `pinkdb-server` binary + CLI `--host` client mode (separate crate) | done | pinkdb-server 1.84 MB; 366 tests both parser modes; duckdiff 60/60; live E2E (10k-term chain → clean error, server stays up); kill loop 30/30 clean; bench ≈488 ms |
 | 25 | At-rest encryption: encrypted `.pink` + WAL (AEAD + Argon2id, key via option/env) (core `encryption` feature) | done | 376 default / 412 with `--features encryption` tests (both parser modes); clippy clean all feature sets; duckdiff 60/60; kill loops 30/30 plain + 30/30 encrypted + 15/15 encrypted multi-db; boundary-truncation nonce-reuse fix (fresh prefix per keyed open) proven by regression; sizes 2.21 MB default / 2.28 MB encrypted / `pinkdb-server` 1.84 MB |
 | 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) (separate crate; contained `unsafe`) | done | 7 FFI unit + 3 integration tests, C example runs; workspace suites both parser modes; duckdiff 60/60; sizes: dylib 1.70 MB, staticlib 15.53 MB, `pinkdb` 2.21 MB unchanged |
-| 27 | Python binding (cffi) (`bindings/python`) | queued | — |
+| 27 | Python binding (cffi) (`bindings/python`) | done | stdlib ctypes binding (14 unittest tests, both default discovery and PINKDB_FFI_LIB override); all value types + statement kinds; 20k-iteration RSS flat; sizes unchanged (dylib 1.70 MB) |
 | 28 | Go binding (cgo) (`bindings/go`) | queued | — |
 | 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | queued | — |
 | 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | queued | — |
@@ -125,5 +125,13 @@ Java bindings.
   workspace suites both parser modes; duckdiff 60/60; sizes: dylib 1.70 MB, staticlib
   15.53 MB, `pinkdb` 2.21 MB unchanged. Built inline by the orchestrator because subagent
   dispatch kept timing out (a recovery, not a design change).
-- 2026-10-13 — Binary size: `pinkdb` 2.21 MB + `pinkdb-server` 1.84 MB +
-  `libpinkdb_ffi.dylib` 1.70 MB (release, after wave 26; pre-wave-17 was 2.26 MB).
+- 2026-10-13 — Wave 27: Python binding — new `bindings/python` package (ctypes over
+  `libpinkdb_ffi`; documented deviation from "cffi": zero dependencies, same thin-wrapper
+  model); `connect`/`connect_memory`/`Database.execute -> [Result]` with kinds/columns/
+  types/rows/affected/name; Python-native values incl. `datetime.date`/`datetime.datetime`,
+  `None` NULLs, `-0.0` bit-exact, embedded NULs; `Error` from `pinkdb_last_error`;
+  owner-free discipline with leak-checked loops; library discovery via `PINKDB_FFI_LIB` or
+  the repo-relative dylib. 14 unittest tests (default discovery and `PINKDB_FFI_LIB`
+  override); all value types + statement kinds; 20k-iteration RSS flat; sizes unchanged.
+- 2026-10-13 — Binary size: unchanged — `pinkdb` 2.21 MB + `pinkdb-server` 1.84 MB +
+  `libpinkdb_ffi.dylib` 1.70 MB (release, after wave 27; pre-wave-17 was 2.26 MB).

@@ -474,6 +474,48 @@ make -C crates/pinkdb-ffi hello   # compiles and runs the C example
 Artifacts: `libpinkdb_ffi.dylib` ≈ 1.70 MB, `libpinkdb_ffi.a` ≈ 15.5 MB (build
 archive); nothing is added to the `pinkdb` binary.
 
+## Python binding (`bindings/python`)
+
+A thin, dependency-free wrapper over the C ABI, implemented with the standard
+library `ctypes` module (no `cffi`, no pip installs, no build step for the
+package itself — the roadmap's `cffi` wording is a deliberate deviation here;
+the binding model is the same). Build the shared library first:
+
+```sh
+cargo build --release -p pinkdb-ffi
+```
+
+```python
+import pinkdb
+
+with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
+    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+    db.execute("INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);")
+    result = db.execute("SELECT x, s FROM t ORDER BY x;")[0]
+    print(result.kind, result.rows)  # selected [[1, 'héllo'], [None, None]]
+```
+
+`Database.execute(sql)` returns one `Result` per `;`-separated statement:
+
+- `kind`: `selected`, `created`, `inserted`, `updated`, `deleted`, `began`,
+  `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`,
+  `created_database`, `dropped_database`, `used`;
+- `columns` / `column_types` (SELECT only; types `boolean`, `integer`,
+  `bigint`, `double`, `varchar`, `date`, `timestamp`), `rows`;
+- `affected` (INSERT/UPDATE/DELETE) and `name` (view/table/database/`USE`).
+
+Values map to `None`/`bool`/`int`/`float`/`str`/`datetime.date`/naive-UTC
+`datetime.datetime`; errors raise `pinkdb.Error` with the message from
+`pinkdb_last_error` and leave the handle usable. The library is located via
+`PINKDB_FFI_LIB` (full dylib/so path) or, by default, the repo-relative
+`target/release/libpinkdb_ffi.{dylib,so}`.
+
+```sh
+python3 -m unittest discover -s bindings/python/tests -v
+PINKDB_FFI_LIB="$PWD/target/release/libpinkdb_ffi.dylib" \
+    python3 -m unittest discover -s bindings/python/tests -v   # env override
+```
+
 ## Benchmark (1M rows, release, Apple Silicon)
 
 Generated with `bench/gen_sales.py` (deterministic seed 42), measured with `cargo run --release -p pinkdb --example query_bench` (best of 5):
