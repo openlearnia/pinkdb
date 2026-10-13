@@ -5,3 +5,9 @@
 .DS_Store
 __pycache__/
 *.swp
+
+# C/C++ extension SDK build outputs
+/ext-sdk/c/build/
+/ext-sdk/c/template/build/
+/ext-sdk/c/template/my_extension.dylib
+/ext-sdk/c/template/my_extension.so

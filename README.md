@@ -558,6 +558,23 @@ Contract highlights (the header is complete):
   registration) fails the load naming the code/reason. `init` and callbacks
   must not panic/unwind across the ABI boundary.
 
+### Writing extensions (C/C++)
+
+The in-repo C/C++ SDK (`ext-sdk/c/`) bundles the vendored ABI header, a
+commented skeleton (`ext-sdk/c/template/`), three worked examples (C numeric,
+C string, C++), a Makefile, and an end-to-end smoke test:
+
+```sh
+make -C ext-sdk/c        # builds the examples into ext-sdk/c/build/
+./ext-sdk/c/smoke.sh     # builds them, loads each via the release CLI, greps the results
+```
+
+`ext-sdk/c/README.md` walks through the contract (exports, the host API
+struct, value tags, VARCHAR `alloc`/`free` ownership, NULL semantics,
+thread-safety, no unwinding) and the `LOAD EXTENSION '<path>'` workflow. The
+SDK's header is kept byte-identical to the loader crate's copy by a
+`cargo test` check.
+
 Semantics and persistence:
 
 - Extensions are **process-level**: they are not stored in `.pink` snapshots

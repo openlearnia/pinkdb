@@ -52,7 +52,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 27 | Python binding (cffi) (`bindings/python`) | done | stdlib ctypes binding (14 unittest tests, both default discovery and PINKDB_FFI_LIB override); all value types + statement kinds; 20k-iteration RSS flat; sizes unchanged (dylib 1.70 MB) |
 | 28 | Go binding (cgo) (`bindings/go`) | done | cgo binding over pinkdb-ffi: 15 tests pass + race clean, gofmt/vet clean; durable round-trip; goroutine-safe wrapper; sizes unchanged |
 | 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | done | loader crate + C ABI v1 + SQL LOAD EXTENSION (both parsers) + result-kind ripple (CLI/server v3/C ABI/Python/Go); 432 tests / 25 suites green both parser modes; duckdiff 60/60; kill loop 30/30; wasm core build green; sizes pinkdb 2.25 MB (+1.0%) |
-| 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | queued | — |
+| 30 | C/C++ extension SDK: ABI headers, templates, examples (in-repo `ext-sdk/c`) | done | ext-sdk/c/ (vendored header + byte-identity sync test, template, 3 examples incl. C++, Makefile/CMake); smoke.sh 14/14 checks green through the real CLI; 434 tests; clippy clean |
 | 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | queued | — |
 | 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service) | queued | — |
 | 33 | Custom repositories: user-configurable extension repository URLs and config (core config + repo client) | queued | — |
@@ -171,3 +171,13 @@ Java bindings.
   `pinkdb` 2.25 MB (+1.0%).
 - 2026-10-13 — Binary size: `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
   `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 29; pre-wave-17 was 2.26 MB).
+- 2026-10-14 — Wave 30: C/C++ extension SDK — new `ext-sdk/c/` with a vendored
+  `pinkdb_extension.h` (byte-identity test in
+  `crates/pinkdb-ext-loader/tests/header_sync.rs`, verified to bite), a commented template
+  (Makefile + CMake), three warning-free examples (`math_ext.c`, `string_ext.c` with VARCHAR
+  alloc ownership, `cpp_ext.cpp` with layout static_asserts), an SDK README documenting the
+  ABI contract/ownership/thread-safety/LOAD usage, and `smoke.sh` (builds, loads all three
+  via `LOAD EXTENSION`, 14/14 checks incl. NULLs, multibyte VARCHAR, overflow error paths).
+  434 tests; clippy clean.
+- 2026-10-14 — Binary size: unchanged — `pinkdb` 2.25 MB + `pinkdb-server` 1.90 MB +
+  `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 30; pre-wave-17 was 2.26 MB).
