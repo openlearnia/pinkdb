@@ -448,6 +448,32 @@ database (queries, writes, DDL) on the one shared store. The server binds
 not expose it to the internet or to untrusted clients. Auth and TLS are
 planned; they are explicitly out of scope for this wave.
 
+## C ABI (`pinkdb-ffi`)
+
+The `pinkdb-ffi` crate exposes the engine over a small C ABI as
+`libpinkdb_ffi.dylib` / `libpinkdb_ffi.a` for foreign bindings (Python `cffi`,
+Go `cgo`, ...). It is the only crate in the repo that contains `unsafe`; the
+core stays zero-unsafe.
+
+```sh
+cargo build --release -p pinkdb-ffi
+make -C crates/pinkdb-ffi hello   # compiles and runs the C example
+```
+
+- Header: `crates/pinkdb-ffi/include/pinkdb.h` (ABI v1; `pinkdb_abi_version()`).
+- Handles (`pinkdb_open` for durable files, `pinkdb_open_memory`) are not
+  thread-safe — use one per thread. Errors are thread-local
+  (`pinkdb_last_error`).
+- `pinkdb_execute(handle, sql, len)` takes UTF-8 bytes (embedded NULs allowed)
+  and returns a result that round-trips every statement kind and value type:
+  typed `pink_value` by value, with VARCHAR text borrowed from the result.
+- Ownership: free results with `pinkdb_result_free`, handles with
+  `pinkdb_close`; the full contract (pointers, threading, text lifetimes) is in
+  the header.
+
+Artifacts: `libpinkdb_ffi.dylib` ≈ 1.70 MB, `libpinkdb_ffi.a` ≈ 15.5 MB (build
+archive); nothing is added to the `pinkdb` binary.
+
 ## Benchmark (1M rows, release, Apple Silicon)
 
 Generated with `bench/gen_sales.py` (deterministic seed 42), measured with `cargo run --release -p pinkdb --example query_bench` (best of 5):

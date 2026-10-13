@@ -1,0 +1,151 @@
+/*
+ * pinkdb C ABI v1 — https://github.com/openlearnia/pinkdb
+ *
+ * Built as `libpinkdb_ffi.dylib` (cdylib) and `libpinkdb_ffi.a` (staticlib)
+ * from the `pinkdb-ffi` crate. Link with `-lpinkdb_ffi`.
+ *
+ * Contract
+ * --------
+ * - Every pointer returned by this library is freed with the matching
+ *   `pinkdb_*_free` function (only `pinkdb_result_free` and `pinkdb_close`
+ *   exist in v1). Never free the same pointer twice.
+ * - Text pointers (`pinkdb_result_column_name`, `pinkdb_result_name`,
+ *   `pink_value.text_ptr`, `pinkdb_last_error`) borrow from their owning
+ *   result/handle/thread and stay valid only until that owner is freed or the
+ *   next FFI call on the same thread. Copy them if you need them longer.
+ *   `text_ptr` is followed by a NUL byte but may contain embedded NULs —
+ *   always trust `text_len`.
+ * - Handles are NOT thread-safe: use one handle per thread. Errors are
+ *   thread-local; `pinkdb_last_error` returns NULL when the last call on the
+ *   calling thread succeeded.
+ * - SQL is passed as (pointer, length) and must be valid UTF-8. Passing a
+ *   NULL pointer with a non-zero length, or invalid UTF-8, is an error.
+ * - Error reporting: functions that return a pointer return NULL on failure;
+ *   index/kind accessors return 0/-1 for out-of-range indices; call
+ *   `pinkdb_last_error` for the message.
+ */
+
+#ifndef PINKDB_H
+#define PINKDB_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Opaque types. */
+typedef struct pinkdb_handle pinkdb_handle;
+typedef struct pinkdb_result pinkdb_result;
+
+/* Statement kind tags (pinkdb_result_kind). */
+enum {
+    PINKDB_STMT_SELECTED = 0,
+    PINKDB_STMT_CREATED = 1,
+    PINKDB_STMT_INSERTED = 2,
+    PINKDB_STMT_UPDATED = 3,
+    PINKDB_STMT_DELETED = 4,
+    PINKDB_STMT_BEGAN = 5,
+    PINKDB_STMT_COMMITTED = 6,
+    PINKDB_STMT_ROLLEDBACK = 7,
+    PINKDB_STMT_CREATED_VIEW = 8,
+    PINKDB_STMT_DROPPED_TABLE = 9,
+    PINKDB_STMT_DROPPED_VIEW = 10,
+    PINKDB_STMT_CREATED_DATABASE = 11,
+    PINKDB_STMT_DROPPED_DATABASE = 12,
+    PINKDB_STMT_USED = 13
+};
+
+/* Value / column type tags. */
+enum {
+    PINKDB_TYPE_NULL = 0,
+    PINKDB_TYPE_BOOLEAN = 1,
+    PINKDB_TYPE_INTEGER = 2,
+    PINKDB_TYPE_BIGINT = 3,
+    PINKDB_TYPE_DOUBLE = 4,
+    PINKDB_TYPE_VARCHAR = 5,
+    PINKDB_TYPE_DATE = 6,
+    PINKDB_TYPE_TIMESTAMP = 7
+};
+
+/* One result value, passed by value.
+ *
+ * `int64` carries BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since epoch) and
+ * TIMESTAMP (microseconds since epoch). `double` carries DOUBLE. `text_ptr` /
+ * `text_len` carry VARCHAR (with a trailing NUL at text_ptr[text_len]).
+ * When `is_null` is non-zero only `type_tag` is meaningful. */
+typedef struct pink_value {
+    int32_t type_tag;
+    int32_t is_null;
+    int64_t int64;
+    double double_;
+    const char *text_ptr;
+    size_t text_len;
+} pink_value;
+
+/* ABI version of the linked library (currently 1). */
+uint32_t pinkdb_abi_version(void);
+
+/* Open a durable database (checkpoint + WAL) at a filesystem path.
+ * Returns NULL on error. */
+pinkdb_handle *pinkdb_open(const char *path);
+
+/* Open a fresh, empty in-memory database. Never returns NULL. */
+pinkdb_handle *pinkdb_open_memory(void);
+
+/* Close a handle. NULL-safe. */
+void pinkdb_close(pinkdb_handle *handle);
+
+/* Execute one or more `;`-separated SQL statements.
+ * Returns NULL on error (see pinkdb_last_error); free with
+ * pinkdb_result_free. */
+pinkdb_result *pinkdb_execute(pinkdb_handle *handle, const char *sql,
+                              size_t sql_len);
+
+/* Free a result. NULL-safe. */
+void pinkdb_result_free(pinkdb_result *result);
+
+/* Number of statements in the result. */
+size_t pinkdb_result_statement_count(const pinkdb_result *result);
+
+/* Statement kind (PINKDB_STMT_*), -1 when out of range. */
+int32_t pinkdb_result_kind(const pinkdb_result *result, size_t statement);
+
+/* SELECT results: column count, else 0. */
+size_t pinkdb_result_column_count(const pinkdb_result *result,
+                                  size_t statement);
+
+/* SELECT results: column name (NUL-terminated), NULL when out of range. */
+const char *pinkdb_result_column_name(const pinkdb_result *result,
+                                      size_t statement, size_t column);
+
+/* SELECT results: column type tag (PINKDB_TYPE_*), -1 when out of range. */
+int32_t pinkdb_result_column_type(const pinkdb_result *result,
+                                  size_t statement, size_t column);
+
+/* SELECT results: row count, else 0. */
+size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement);
+
+/* SELECT results: value at (statement, row, column); a NULL value when out of
+ * range or when the statement is not a SELECT. */
+pink_value pinkdb_result_value(const pinkdb_result *result, size_t statement,
+                               size_t row, size_t column);
+
+/* INSERT/UPDATE/DELETE results: affected row count, else 0. */
+size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);
+
+/* CREATE/DROP VIEW/TABLE/DATABASE and USE results: the object/session name
+ * (NUL-terminated), else NULL. */
+const char *pinkdb_result_name(const pinkdb_result *result, size_t statement);
+
+/* Last error on the calling thread (NUL-terminated), or NULL when the last
+ * call on this thread succeeded. Valid until the next FFI call on this
+ * thread. */
+const char *pinkdb_last_error(void);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* PINKDB_H */

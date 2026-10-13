@@ -1,0 +1,13 @@
+[package]
+name = "pinkdb-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "pinkdb C ABI v1: staticlib + cdylib over the pinkdb embedding API"
+license = "MIT"
+
+[lib]
+name = "pinkdb_ffi"
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+pinkdb = { path = "../pinkdb" }

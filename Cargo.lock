@@ -400,6 +400,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-ffi"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+]
+
+[[package]]
 name = "pinkdb-server"
 version = "0.1.0"
 dependencies = [

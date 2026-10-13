@@ -48,7 +48,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 23 | Multi-database: `USE <db>`, qualified `db.table`, per-database persistence (core) | done | 288 lib + 3 CLI unit + 9 crash + 8 multi-db integration tests (both parser modes); duckdiff 60/60; kill loop 30/30 + 30/30 multi-db clean; bench ≈497 ms |
 | 24 | Network server: `pinkdb-server` binary + CLI `--host` client mode (separate crate) | done | pinkdb-server 1.84 MB; 366 tests both parser modes; duckdiff 60/60; live E2E (10k-term chain → clean error, server stays up); kill loop 30/30 clean; bench ≈488 ms |
 | 25 | At-rest encryption: encrypted `.pink` + WAL (AEAD + Argon2id, key via option/env) (core `encryption` feature) | done | 376 default / 412 with `--features encryption` tests (both parser modes); clippy clean all feature sets; duckdiff 60/60; kill loops 30/30 plain + 30/30 encrypted + 15/15 encrypted multi-db; boundary-truncation nonce-reuse fix (fresh prefix per keyed open) proven by regression; sizes 2.21 MB default / 2.28 MB encrypted / `pinkdb-server` 1.84 MB |
-| 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) (separate crate; contained `unsafe`) | queued | — |
+| 26 | C ABI: `pinkdb-ffi` (staticlib + cdylib, C headers, example) (separate crate; contained `unsafe`) | done | 7 FFI unit + 3 integration tests, C example runs; workspace suites both parser modes; duckdiff 60/60; sizes: dylib 1.70 MB, staticlib 15.53 MB, `pinkdb` 2.21 MB unchanged |
 | 27 | Python binding (cffi) (`bindings/python`) | queued | — |
 | 28 | Go binding (cgo) (`bindings/go`) | queued | — |
 | 29 | Extensions support: loadable extensions (`LOAD`/`INSTALL`), versioned C ABI v1, manifest/signature checks (separate `pinkdb-ext-loader` crate; contained `unsafe`) | queued | — |
@@ -117,5 +117,13 @@ Java bindings.
   duckdiff 60/60; kill loops 30/30 plain + 30/30 encrypted + 15/15 encrypted multi-db;
   boundary-truncation nonce-reuse fix proven by regression; sizes 2.21 MB default /
   2.28 MB encrypted / `pinkdb-server` 1.84 MB.
-- 2026-10-12 — Binary size: `pinkdb` 2.21 MB (2.28 MB with `--features encryption`) +
-  `pinkdb-server` 1.84 MB (release, after wave 25; pre-wave-17 was 2.26 MB).
+- 2026-10-13 — Wave 26: C ABI — new `pinkdb-ffi` crate (rlib + cdylib + staticlib;
+  hand-written `include/pinkdb.h`, ABI v1); opaque handles, `pinkdb_execute` (UTF-8 ptr+len),
+  full typed result surface (`pink_value` returned by value, thread-local
+  `pinkdb_last_error`); contained `unsafe` (single documented allow), core stays zero-unsafe;
+  FFI tests + a runnable C example. 7 FFI unit + 3 integration tests, C example runs;
+  workspace suites both parser modes; duckdiff 60/60; sizes: dylib 1.70 MB, staticlib
+  15.53 MB, `pinkdb` 2.21 MB unchanged. Built inline by the orchestrator because subagent
+  dispatch kept timing out (a recovery, not a design change).
+- 2026-10-13 — Binary size: `pinkdb` 2.21 MB + `pinkdb-server` 1.84 MB +
+  `libpinkdb_ffi.dylib` 1.70 MB (release, after wave 26; pre-wave-17 was 2.26 MB).
