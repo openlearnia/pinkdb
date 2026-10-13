@@ -9,13 +9,16 @@ The shared library is found via ``PINKDB_FFI_LIB`` when set, else from the
 repo-relative ``target/release`` directory (see ``pinkdb/__init__.py``).
 """
 
+import copy
 import datetime
 import gc
 import math
 import os
+import pickle
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -26,6 +29,30 @@ if str(_BINDING_ROOT) not in sys.path:
     sys.path.insert(0, str(_BINDING_ROOT))
 
 import pinkdb  # noqa: E402
+
+
+def _non_pinkdb_library():
+    """Path to a real, loadable shared library that is not pinkdb-ffi."""
+    ctypes_ext = sys.modules.get("_ctypes")  # imported by ctypes via pinkdb
+    candidates = ["/usr/lib/libSystem.B.dylib"]
+    if ctypes_ext is not None:
+        candidates.append(getattr(ctypes_ext, "__file__", None))
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return candidate
+    raise unittest.SkipTest("no suitable non-pinkdb shared library found")
+
+
+def _run_child(code, **env_overrides):
+    """Run ``code`` in a child interpreter with the binding on sys.path."""
+    env = dict(os.environ)
+    env.update(env_overrides)
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(_BINDING_ROOT), env.get("PYTHONPATH")) if part
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
 
 
 class AbiTests(unittest.TestCase):
@@ -116,6 +143,56 @@ class MemoryValueTests(unittest.TestCase):
         # text_len (not NUL termination) defines the payload.
         self.assertEqual(selected.rows[0][2], "a\x00b")
 
+    def test_pre_epoch_and_epoch_boundaries(self):
+        selected = self.db.execute(
+            "SELECT DATE '1940-01-01', DATE '1969-12-31', DATE '1970-01-01', "
+            "TIMESTAMP '1969-12-31 23:59:59.999999', "
+            "TIMESTAMP '1970-01-01 00:00:00';"
+        )[0]
+        self.assertEqual(
+            selected.column_types,
+            ["date", "date", "date", "timestamp", "timestamp"],
+        )
+        self.assertEqual(
+            selected.rows,
+            [
+                [
+                    datetime.date(1940, 1, 1),
+                    datetime.date(1969, 12, 31),
+                    datetime.date(1970, 1, 1),
+                    datetime.datetime(1969, 12, 31, 23, 59, 59, 999999),
+                    datetime.datetime(1970, 1, 1, 0, 0, 0),
+                ]
+            ],
+        )
+
+    def test_double_nan_and_infinities(self):
+        selected = self.db.execute(
+            "SELECT 1.0 / 0.0 AS pos, -1.0 / 0.0 AS neg, 0.0 / 0.0 AS nan;"
+        )[0]
+        self.assertEqual(selected.column_types, ["double", "double", "double"])
+        pos, neg, nan = selected.rows[0]
+        self.assertTrue(math.isinf(pos))
+        self.assertGreater(pos, 0.0)
+        self.assertTrue(math.isinf(neg))
+        self.assertLess(neg, 0.0)
+        self.assertTrue(math.isnan(nan))
+
+    def test_out_of_range_date_and_timestamp_raise_error(self):
+        for sql, label in (
+            ("SELECT DATE '0000-01-01';", "DATE value"),
+            ("SELECT DATE '2024-01-01' + 2000000000;", "DATE value"),
+            ("SELECT TIMESTAMP '0000-01-01 00:00:00';", "TIMESTAMP value"),
+        ):
+            with self.subTest(sql=sql):
+                with self.assertRaises(pinkdb.Error) as ctx:
+                    self.db.execute(sql)
+                message = str(ctx.exception)
+                self.assertIn(label, message)
+                self.assertIn("outside Python's datetime range", message)
+        # The mapping error does not poison the handle.
+        self.assertEqual(self.db.execute("SELECT 1;")[0].rows, [[1]])
+
 
 class StatementKindTests(unittest.TestCase):
     def setUp(self):
@@ -203,6 +280,65 @@ class ErrorTests(unittest.TestCase):
             db.execute("SELECT 1;")
         db.close()  # idempotent
 
+    def test_error_paths_leave_handle_usable(self):
+        with pinkdb.connect_memory() as db:
+            with self.assertRaises(pinkdb.Error):
+                db.execute("SELECT DATE '0000-01-01';")  # Python mapping error
+            self.assertEqual(db.execute("SELECT 42;")[0].rows, [[42]])
+            with self.assertRaises(pinkdb.Error):
+                db.execute("SELECT * FROM missing;")  # native error
+            self.assertEqual(db.execute("SELECT 7;")[0].rows, [[7]])
+
+    def test_non_string_sql_is_a_type_error(self):
+        with pinkdb.connect_memory() as db:
+            for bad in (b"SELECT 1;", None, 42):
+                with self.subTest(bad=bad):
+                    with self.assertRaises(TypeError):
+                        db.execute(bad)
+
+    def test_empty_sql_returns_no_results(self):
+        with pinkdb.connect_memory() as db:
+            self.assertEqual(db.execute(""), [])
+
+    def test_lone_surrogate_sql_raises_error(self):
+        with pinkdb.connect_memory() as db:
+            with self.assertRaises(pinkdb.Error) as ctx:
+                db.execute("SELECT '\ud800';")
+            self.assertIn("not encodable as UTF-8", str(ctx.exception))
+            self.assertEqual(db.execute("SELECT 1;")[0].rows, [[1]])
+
+
+class PathArgumentTests(unittest.TestCase):
+    def test_empty_path_is_rejected(self):
+        for bad in ("", b""):
+            with self.subTest(path=bad):
+                with self.assertRaises(ValueError) as ctx:
+                    pinkdb.connect(bad)
+                self.assertIn("must not be empty", str(ctx.exception))
+
+    def test_nul_in_path_is_rejected_before_opening(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in (
+                os.path.join(tmp, "a\x00b.pink"),
+                os.path.join(tmp, "a").encode("utf-8") + b"\x00b.pink",
+            ):
+                with self.subTest(path=bad):
+                    with self.assertRaises(ValueError) as ctx:
+                        pinkdb.connect(bad)
+                    self.assertIn("NUL byte", str(ctx.exception))
+            # Rejected before the native call: nothing was created on disk.
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_lone_surrogate_path_raises_error(self):
+        with self.assertRaises(pinkdb.Error) as ctx:
+            pinkdb.connect("/tmp/\ud800.pink")
+        self.assertIn("cannot be encoded as UTF-8", str(ctx.exception))
+
+    def test_invalid_utf8_bytes_path_raises_error(self):
+        with self.assertRaises(pinkdb.Error) as ctx:
+            pinkdb.connect(b"/tmp/\xff.pink")
+        self.assertIn("UTF-8", str(ctx.exception))
+
 
 class DurableTests(unittest.TestCase):
     def test_durable_roundtrip(self):
@@ -261,6 +397,166 @@ class OwnershipTests(unittest.TestCase):
             self.assertEqual(count, 200)
 
 
+class FreeInstrumentationTests(unittest.TestCase):
+    """Shadow ``pinkdb._LIB`` symbols to prove native frees happen exactly once."""
+
+    _NAMES = ("pinkdb_execute", "pinkdb_result_free", "pinkdb_close")
+
+    def setUp(self):
+        self._originals = {
+            name: getattr(pinkdb._LIB, name) for name in self._NAMES
+        }
+        self.addCleanup(self._restore_instrumentation)
+        # Allocator addresses are reused after free, so "exactly once" is
+        # tracked with a live set (allocated but not yet freed), not by
+        # counting unique pointer values.
+        self.outstanding_results = set()
+        self.result_allocations = 0
+        self.result_frees = 0
+        self.double_frees = []
+        self.closed_pointers = []
+
+        def counting_execute(handle, sql, sql_len):
+            pointer = self._originals["pinkdb_execute"](handle, sql, sql_len)
+            if pointer:
+                if pointer in self.outstanding_results:
+                    raise AssertionError(f"result pointer still live: {pointer!r}")
+                self.result_allocations += 1
+                self.outstanding_results.add(pointer)
+            return pointer
+
+        def counting_result_free(pointer):
+            if pointer not in self.outstanding_results:
+                self.double_frees.append(pointer)
+                raise AssertionError(f"free of a not-outstanding result: {pointer!r}")
+            self.outstanding_results.discard(pointer)
+            self.result_frees += 1
+            return self._originals["pinkdb_result_free"](pointer)
+
+        def counting_close(pointer):
+            self.closed_pointers.append(pointer)
+            return self._originals["pinkdb_close"](pointer)
+
+        pinkdb._LIB.pinkdb_execute = counting_execute
+        pinkdb._LIB.pinkdb_result_free = counting_result_free
+        pinkdb._LIB.pinkdb_close = counting_close
+
+    def _restore_instrumentation(self):
+        for name, original in self._originals.items():
+            setattr(pinkdb._LIB, name, original)
+
+    def test_every_result_is_freed_exactly_once(self):
+        executes = 25
+        db = pinkdb.connect_memory()
+        db.execute("CREATE TABLE t (x INTEGER);")
+        for i in range(executes):
+            db.execute(f"INSERT INTO t VALUES ({i});")
+        db.close()
+        self.assertEqual(self.result_allocations, executes + 1)
+        self.assertEqual(self.result_frees, executes + 1)
+        self.assertEqual(self.double_frees, [])
+        self.assertEqual(self.outstanding_results, set())
+
+    def test_every_handle_is_closed_exactly_once(self):
+        databases = [pinkdb.connect_memory() for _ in range(10)]
+        raw_handles = [db._handle for db in databases]
+        self.assertTrue(all(raw_handles))
+        for db in databases:
+            db.close()
+            db.close()  # idempotent: must not reach the library again
+        for raw in raw_handles:
+            self.assertEqual(self.closed_pointers.count(raw), 1)
+        self.assertEqual(len(self.closed_pointers), len(databases))
+        self.assertNotIn(None, self.closed_pointers)
+
+
+class CopyAndPickleTests(unittest.TestCase):
+    def test_copy_and_deepcopy_raise_type_error(self):
+        with pinkdb.connect_memory() as db:
+            for copier in (copy.copy, copy.deepcopy):
+                with self.subTest(copier=copier.__name__):
+                    with self.assertRaises(TypeError) as ctx:
+                        copier(db)
+                    self.assertIn(
+                        "cannot copy a Database handle", str(ctx.exception)
+                    )
+            # The original still owns the only handle and stays usable.
+            self.assertEqual(db.execute("SELECT 1;")[0].rows, [[1]])
+        db.close()  # idempotent
+
+    def test_pickle_fails_safely(self):
+        db = pinkdb.connect_memory()
+        try:
+            with self.assertRaises((pickle.PicklingError, TypeError, AttributeError)):
+                pickle.dumps(db)
+            self.assertEqual(db.execute("SELECT 1;")[0].rows, [[1]])
+        finally:
+            db.close()
+
+
+class MemoryGrowthTests(unittest.TestCase):
+    def test_bounded_memory_over_many_executes(self):
+        try:
+            import resource
+        except ImportError:  # pragma: no cover - non-POSIX platforms
+            self.skipTest("resource module unavailable")
+
+        def peak_rss_bytes():
+            # ru_maxrss is bytes on macOS, kibibytes elsewhere.
+            max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            return max_rss if sys.platform == "darwin" else max_rss * 1024
+
+        with pinkdb.connect_memory() as db:
+            for i in range(50):  # warm up the allocator high-water mark
+                db.execute(f"SELECT {i};")
+            before = peak_rss_bytes()
+            for _ in range(2000):
+                self.assertEqual(db.execute("SELECT 1 + 1;")[0].rows, [[2]])
+            growth = peak_rss_bytes() - before
+        # Generous bound: catches egregious leaks without flakiness.
+        self.assertLess(growth, 256 * 1024 * 1024, f"RSS grew by {growth} bytes")
+
+
+class ThreadingTests(unittest.TestCase):
+    def test_one_database_per_thread_with_error_isolation(self):
+        thread_count = 8
+        failures = []
+        lock = threading.Lock()
+
+        def worker(worker_id):
+            try:
+                with pinkdb.connect_memory() as db:
+                    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+                    db.execute(
+                        f"INSERT INTO t VALUES ({worker_id}, 'w{worker_id}');"
+                    )
+                    try:
+                        db.execute("SELECT * FROM missing;")
+                    except pinkdb.Error as exc:
+                        if "not found" not in str(exc):
+                            raise AssertionError(f"unexpected error text: {exc}")
+                    else:
+                        raise AssertionError("missing table must raise Error")
+                    # The failed statement leaves this thread's handle usable.
+                    rows = db.execute("SELECT x, s FROM t;")[0].rows
+                    if rows != [[worker_id, f"w{worker_id}"]]:
+                        raise AssertionError(f"rows: {rows!r}")
+            except BaseException as exc:  # pragma: no cover - failure path
+                with lock:
+                    failures.append((worker_id, repr(exc)))
+
+        threads = [
+            threading.Thread(target=worker, args=(i,))
+            for i in range(thread_count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(failures, [])
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+
 class EnvOverrideTests(unittest.TestCase):
     def test_pinkdb_ffi_lib_override(self):
         """A child interpreter forced to load the library via PINKDB_FFI_LIB."""
@@ -284,6 +580,23 @@ class EnvOverrideTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(proc.returncode, 0, msg=proc.stdout + proc.stderr)
+
+    def test_wrong_but_loadable_dylib_is_an_error(self):
+        wrong = _non_pinkdb_library()
+        proc = _run_child("import pinkdb", PINKDB_FFI_LIB=wrong)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("pinkdb.Error", proc.stderr)
+        self.assertIn("is not a pinkdb-ffi library", proc.stderr)
+        self.assertIn("missing symbol pinkdb_", proc.stderr)
+
+    def test_nonexistent_ffi_lib_is_an_error(self):
+        missing = str(
+            Path(tempfile.gettempdir()) / "no_such_pinkdb_dir" / "libpinkdb_ffi.dylib"
+        )
+        proc = _run_child("import pinkdb", PINKDB_FFI_LIB=missing)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("pinkdb.Error", proc.stderr)
+        self.assertIn("does not point to an existing file", proc.stderr)
 
 
 if __name__ == "__main__":

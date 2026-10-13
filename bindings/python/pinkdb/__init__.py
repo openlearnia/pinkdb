@@ -21,10 +21,16 @@ use one database per thread.
 
 The shared library is located, in order, from:
 
-1. the ``PINKDB_FFI_LIB`` environment variable (full path to the dylib/so), or
+1. the ``PINKDB_FFI_LIB`` environment variable (full path to the
+   dylib/so/dll), or
 2. the repo checkout this package lives in
-   (``<repo>/target/release/libpinkdb_ffi.dylib`` / ``.so``, computed relative
-   to this file).
+   (``<repo>/target/release/libpinkdb_ffi.dylib`` / ``.so`` / ``.dll``,
+   computed relative to this file).
+
+All failures are reported as :class:`Error`: the loaded library must export
+the pinkdb ABI (version 1), out-of-range DATE/TIMESTAMP values raise instead
+of leaking :class:`OverflowError`, and bad arguments (empty or NUL-containing
+paths, strings that are not valid UTF-8) are rejected before the native call.
 """
 
 from __future__ import annotations
@@ -90,6 +96,9 @@ _TYPE_NAMES = {
 _EPOCH_DATE = _datetime.date(1970, 1, 1)
 _EPOCH_DATETIME = _datetime.datetime(1970, 1, 1)
 
+#: ABI version this binding targets (``pinkdb_abi_version``).
+_ABI_VERSION = 1
+
 
 class Error(Exception):
     """An error reported by the pinkdb C ABI (see ``pinkdb_last_error``)."""
@@ -119,7 +128,11 @@ def _candidate_library_paths():
         return [Path(override)]
     # <repo>/bindings/python/pinkdb/__init__.py -> parents[3] is <repo>.
     release_dir = Path(__file__).resolve().parents[3] / "target" / "release"
-    return [release_dir / "libpinkdb_ffi.dylib", release_dir / "libpinkdb_ffi.so"]
+    return [
+        release_dir / "libpinkdb_ffi.dylib",
+        release_dir / "libpinkdb_ffi.so",
+        release_dir / "libpinkdb_ffi.dll",
+    ]
 
 
 def _find_library() -> str:
@@ -136,82 +149,89 @@ def _find_library() -> str:
         "cannot find the pinkdb FFI shared library; build it with "
         "`cargo build --release -p pinkdb-ffi` from the repo root "
         f"(looked for {[str(p) for p in candidates]}), or set PINKDB_FFI_LIB "
-        "to the full path of libpinkdb_ffi.dylib / libpinkdb_ffi.so"
+        "to the full path of libpinkdb_ffi.dylib / libpinkdb_ffi.so / "
+        "libpinkdb_ffi.dll"
     )
 
 
-def _bind(lib: ctypes.CDLL) -> None:
-    """Declare argtypes/restype for every exported function in pinkdb.h."""
-    lib.pinkdb_abi_version.argtypes = []
-    lib.pinkdb_abi_version.restype = ctypes.c_uint32
+def _bind(lib: ctypes.CDLL, path: str) -> None:
+    """Declare argtypes/restype for every exported function in pinkdb.h.
 
-    lib.pinkdb_open.argtypes = [ctypes.c_char_p]
-    lib.pinkdb_open.restype = ctypes.c_void_p
+    Raises :class:`Error` when a symbol is missing, i.e. when ``path`` points
+    at a loadable library that is not pinkdb-ffi (a wrong dylib/so/dll).
+    """
 
-    lib.pinkdb_open_memory.argtypes = []
-    lib.pinkdb_open_memory.restype = ctypes.c_void_p
+    def declare(name: str, argtypes, restype) -> None:
+        try:
+            func = getattr(lib, name)
+        except AttributeError as exc:
+            raise Error(
+                f"{path!r} is not a pinkdb-ffi library (missing symbol {name})"
+            ) from exc
+        func.argtypes = argtypes
+        func.restype = restype
 
-    lib.pinkdb_close.argtypes = [ctypes.c_void_p]
-    lib.pinkdb_close.restype = None
-
-    lib.pinkdb_execute.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
-    lib.pinkdb_execute.restype = ctypes.c_void_p
-
-    lib.pinkdb_result_free.argtypes = [ctypes.c_void_p]
-    lib.pinkdb_result_free.restype = None
-
-    lib.pinkdb_result_statement_count.argtypes = [ctypes.c_void_p]
-    lib.pinkdb_result_statement_count.restype = ctypes.c_size_t
-
-    lib.pinkdb_result_kind.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    lib.pinkdb_result_kind.restype = ctypes.c_int32
-
-    lib.pinkdb_result_column_count.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    lib.pinkdb_result_column_count.restype = ctypes.c_size_t
-
-    lib.pinkdb_result_column_name.argtypes = [
+    declare("pinkdb_abi_version", [], ctypes.c_uint32)
+    declare("pinkdb_open", [ctypes.c_char_p], ctypes.c_void_p)
+    declare("pinkdb_open_memory", [], ctypes.c_void_p)
+    declare("pinkdb_close", [ctypes.c_void_p], None)
+    declare(
+        "pinkdb_execute",
+        [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t],
         ctypes.c_void_p,
+    )
+    declare("pinkdb_result_free", [ctypes.c_void_p], None)
+    declare("pinkdb_result_statement_count", [ctypes.c_void_p], ctypes.c_size_t)
+    declare("pinkdb_result_kind", [ctypes.c_void_p, ctypes.c_size_t], ctypes.c_int32)
+    declare(
+        "pinkdb_result_column_count",
+        [ctypes.c_void_p, ctypes.c_size_t],
         ctypes.c_size_t,
+    )
+    declare(
+        "pinkdb_result_column_name",
+        [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t],
+        ctypes.c_char_p,
+    )
+    declare(
+        "pinkdb_result_column_type",
+        [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t],
+        ctypes.c_int32,
+    )
+    declare(
+        "pinkdb_result_row_count",
+        [ctypes.c_void_p, ctypes.c_size_t],
         ctypes.c_size_t,
-    ]
-    lib.pinkdb_result_column_name.restype = ctypes.c_char_p
-
-    lib.pinkdb_result_column_type.argtypes = [
-        ctypes.c_void_p,
+    )
+    declare(
+        "pinkdb_result_value",
+        [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t],
+        _PinkValue,
+    )
+    declare(
+        "pinkdb_result_affected",
+        [ctypes.c_void_p, ctypes.c_size_t],
         ctypes.c_size_t,
-        ctypes.c_size_t,
-    ]
-    lib.pinkdb_result_column_type.restype = ctypes.c_int32
-
-    lib.pinkdb_result_row_count.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    lib.pinkdb_result_row_count.restype = ctypes.c_size_t
-
-    lib.pinkdb_result_value.argtypes = [
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-        ctypes.c_size_t,
-    ]
-    lib.pinkdb_result_value.restype = _PinkValue
-
-    lib.pinkdb_result_affected.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    lib.pinkdb_result_affected.restype = ctypes.c_size_t
-
-    lib.pinkdb_result_name.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    lib.pinkdb_result_name.restype = ctypes.c_char_p
-
-    lib.pinkdb_last_error.argtypes = []
-    lib.pinkdb_last_error.restype = ctypes.c_char_p
+    )
+    declare("pinkdb_result_name", [ctypes.c_void_p, ctypes.c_size_t], ctypes.c_char_p)
+    declare("pinkdb_last_error", [], ctypes.c_char_p)
 
 
 library_path = _find_library()
 
 try:
     _LIB = ctypes.CDLL(library_path)
-except OSError as exc:  # wrong architecture, missing symbols, ...
+except OSError as exc:  # wrong architecture, not a shared library, ...
     raise Error(f"failed to load {library_path!r}: {exc}") from exc
 
-_bind(_LIB)
+_bind(_LIB, library_path)
+
+_loaded_abi_version = int(_LIB.pinkdb_abi_version())
+if _loaded_abi_version != _ABI_VERSION:
+    raise Error(
+        f"pinkdb-ffi ABI version mismatch: {library_path!r} reports version "
+        f"{_loaded_abi_version}, this binding requires version {_ABI_VERSION}"
+    )
 
 
 def abi_version() -> int:
@@ -227,10 +247,18 @@ def _last_error(lib: ctypes.CDLL) -> str:
 
 
 def _value_to_python(v: _PinkValue):
-    """Map one ``pink_value`` to a Python object (NULL -> None)."""
+    """Map one ``pink_value`` to a Python object (NULL -> None).
+
+    Out-of-range DATE/TIMESTAMP counts raise :class:`Error` (the ``int64``
+    payload can exceed what :mod:`datetime` represents), and an unknown type
+    tag from the native library is an error, never a silent ``None``.
+    """
     if v.is_null:
         return None
     tag = v.type_tag
+    if tag == _TYPE_NULL:
+        # NULL tag with is_null == 0: still a null value.
+        return None
     if tag == _TYPE_BOOLEAN:
         return bool(v.int64)
     if tag in (_TYPE_INTEGER, _TYPE_BIGINT):
@@ -243,12 +271,23 @@ def _value_to_python(v: _PinkValue):
         # Trust text_len: the payload may contain embedded NULs.
         return ctypes.string_at(v.text_ptr, v.text_len).decode("utf-8")
     if tag == _TYPE_DATE:
-        return _EPOCH_DATE + _datetime.timedelta(days=v.int64)
+        try:
+            return _EPOCH_DATE + _datetime.timedelta(days=v.int64)
+        except OverflowError as exc:
+            raise Error(
+                f"DATE value {v.int64} (days since epoch) is outside "
+                "Python's datetime range"
+            ) from exc
     if tag == _TYPE_TIMESTAMP:
-        # Microseconds since the Unix epoch, naive UTC.
-        return _EPOCH_DATETIME + _datetime.timedelta(microseconds=v.int64)
-    # PINKDB_TYPE_NULL (with is_null == 0) or a future tag: value is unknown.
-    return None
+        try:
+            # Microseconds since the Unix epoch, naive UTC.
+            return _EPOCH_DATETIME + _datetime.timedelta(microseconds=v.int64)
+        except OverflowError as exc:
+            raise Error(
+                f"TIMESTAMP value {v.int64} (microseconds since epoch) is "
+                "outside Python's datetime range"
+            ) from exc
+    raise Error(f"unknown value type tag {tag} from the native library")
 
 
 class Result:
@@ -346,6 +385,8 @@ class Database:
     """A pinkdb database handle (durable file or in-memory).
 
     Not thread-safe, mirroring the C ABI: use one ``Database`` per thread.
+    Owns a native handle, so it cannot be copied: ``copy.copy`` and
+    ``copy.deepcopy`` raise :class:`TypeError`.
     Supports use as a context manager (closes on exit).
     """
 
@@ -354,6 +395,12 @@ class Database:
     def __init__(self, lib: ctypes.CDLL, handle):
         self._lib = lib
         self._handle = handle
+
+    def __copy__(self):
+        raise TypeError("cannot copy a Database handle")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("cannot copy a Database handle")
 
     def execute(self, sql: str) -> list:
         """Execute one or more ``;``-separated SQL statements.
@@ -366,7 +413,10 @@ class Database:
             raise Error("database is closed")
         if not isinstance(sql, str):
             raise TypeError("sql must be a str")
-        data = sql.encode("utf-8")
+        try:
+            data = sql.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise Error(f"sql is not encodable as UTF-8: {exc}") from exc
         result_ptr = self._lib.pinkdb_execute(self._handle, data, len(data))
         if not result_ptr:
             raise Error(_last_error(self._lib))
@@ -400,11 +450,46 @@ class Database:
         return f"<pinkdb.Database ({state})>"
 
 
-def connect(path) -> Database:
-    """Open a durable pinkdb database (checkpoint + WAL) at ``path``."""
+def _encode_path(path) -> bytes:
+    """Normalize ``path`` to UTF-8 bytes, rejecting unsafe arguments.
+
+    Raises :class:`ValueError` for an empty path or a NUL byte (the C ABI
+    takes a NUL-terminated path, so a NUL would silently truncate it) and
+    :class:`Error` for a string that cannot be encoded as UTF-8.
+    """
     raw = os.fspath(path)
     if isinstance(raw, str):
-        raw = raw.encode("utf-8")
+        try:
+            data = raw.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise Error(
+                f"database path {raw!r} cannot be encoded as UTF-8: {exc}"
+            ) from exc
+    elif isinstance(raw, bytes):
+        data = raw
+    else:  # pragma: no cover - os.fspath already rejects other types
+        raise TypeError(
+            f"path must be str, bytes or os.PathLike, not {type(raw).__name__}"
+        )
+    if not data:
+        raise ValueError("database path must not be empty")
+    if b"\x00" in data:
+        raise ValueError(
+            f"database path {path!r} contains a NUL byte; the native library "
+            "takes NUL-terminated C paths"
+        )
+    return data
+
+
+def connect(path) -> Database:
+    """Open a durable pinkdb database (checkpoint + WAL) at ``path``.
+
+    ``path`` is a ``str``, ``bytes`` or ``os.PathLike``. Raises
+    :class:`ValueError` for an empty path or one containing a NUL byte, and
+    :class:`Error` when the native open fails (or the path is not valid
+    UTF-8).
+    """
+    raw = _encode_path(path)
     handle = _LIB.pinkdb_open(raw)
     if not handle:
         raise Error(_last_error(_LIB))

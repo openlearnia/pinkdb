@@ -15,12 +15,15 @@ cargo build --release -p pinkdb-ffi
 
 The package looks for the shared library in this order:
 
-1. `PINKDB_FFI_LIB` — full path to `libpinkdb_ffi.dylib` / `libpinkdb_ffi.so`;
-2. `<repo>/target/release/libpinkdb_ffi.dylib` (or `.so`), computed relative
-   to this package's location.
+1. `PINKDB_FFI_LIB` — full path to `libpinkdb_ffi.dylib` /
+   `libpinkdb_ffi.so`, or `libpinkdb_ffi.dll` on Windows;
+2. `<repo>/target/release/libpinkdb_ffi.dylib` (or `.so` / `.dll`),
+   computed relative to this package's location.
 
 If neither exists, importing `pinkdb` raises a `pinkdb.Error` telling you to
-run the build above (or to set `PINKDB_FFI_LIB`).
+run the build above (or to set `PINKDB_FFI_LIB`). Importing also fails with
+`pinkdb.Error` when the file it loads is not a pinkdb-ffi library (it lacks
+the `pinkdb_*` symbols) or reports an ABI version other than 1.
 
 ## Usage
 
@@ -55,10 +58,20 @@ Value mapping: `NULL` → `None`, `BOOLEAN` → `bool`, `INTEGER`/`BIGINT` →
 epoch). SQL literals are always passed as strings.
 
 Errors are raised as `pinkdb.Error` carrying the message from
-`pinkdb_last_error`; a failed statement leaves the handle usable. Results and
-handles are freed on the Rust side (`pinkdb_result_free` / `pinkdb_close`) as
-soon as they are no longer needed, so loops do not leak. `Database.close()` is
-idempotent, `__del__` is safe, and the class works as a context manager.
+`pinkdb_last_error`; a failed statement leaves the handle usable. Values
+outside Python's `datetime` range (e.g. `DATE '0000-01-01'`, or a date
+expression whose day count exceeds `datetime.date`'s range) also raise
+`pinkdb.Error`, naming the raw native value. Strings that are not valid
+UTF-8 (lone surrogates in SQL or paths) are rejected as `pinkdb.Error`
+before the native call, and `connect()` rejects an empty path or one
+containing a NUL byte with `ValueError` (a NUL would otherwise silently
+truncate the path at the C boundary). Results and handles are freed on the
+Rust side (`pinkdb_result_free` / `pinkdb_close`) as soon as they are no
+longer needed, so loops do not leak. `Database.close()` is idempotent,
+`__del__` is safe, and the class works as a context manager. Handles cannot
+be copied: `copy.copy` / `copy.deepcopy` raise `TypeError`, because both
+objects would own the same native handle (pickling is not supported and
+fails safely).
 
 Like the C ABI, handles are **not thread-safe**: use one `Database` per
 thread.
