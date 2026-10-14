@@ -8,8 +8,8 @@
 //! - the session database is reset to `main` (the lake has no session state;
 //!   the output says so when it changes);
 //! - the session's `PINKDB_KEY` is carried over so a later `.save`/`.open`
-//!   stays encrypted, while the lake's own files stay plaintext in v1 (the
-//!   output says so when a key is set);
+//!   stays encrypted, while the lake's own files stay plaintext (the output
+//!   says so when a key is set);
 //! - a lake directory has **one live writer**: a `.lake save` whose handle
 //!   another writer outran fails with a conflict error naming the published
 //!   version — reopen the lake to continue;
@@ -78,7 +78,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             }
             if db.encryption_key().is_some() {
                 println!(
-                    "Note: lake data files are plaintext (v1); PINKDB_KEY does not encrypt them."
+                    "Note: lake data files are plaintext; PINKDB_KEY does not encrypt them."
                 );
             }
             println!(
@@ -154,7 +154,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
             }
             if keyed {
                 println!(
-                    "Note: lake data files are plaintext (v1); the session key applies to \
+                    "Note: lake data files are plaintext; the session key applies to \
                      .save/.open, not to the lake."
                 );
             }
