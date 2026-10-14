@@ -1,0 +1,48 @@
+# Deploy the documentation site to Cloudflare Workers (the `pinkdb-docs`
+# Worker, a static-assets deploy of `website/public`).
+#
+# Triggers on pushes to main that touch the site (or this workflow), plus a
+# manual dispatch. Requires the repository secrets CLOUDFLARE_API_TOKEN
+# (Workers Scripts: Edit) and CLOUDFLARE_ACCOUNT_ID — see the README "CI/CD".
+name: Deploy docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/deploy-docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-docs
+  cancel-in-progress: false # never cancel a deploy mid-flight
+
+jobs:
+  deploy:
+    name: build + wrangler deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: install wrangler
+        run: npm install -g wrangler@4
+
+      - name: python3 website/build.py
+        run: python3 website/build.py
+
+      - name: wrangler deploy (website/)
+        working-directory: website
+        run: wrangler deploy

@@ -1,0 +1,299 @@
+# Publish extension artifacts to the live extension repository
+# (https://pinkdb-ext-repo.defaultcms.workers.dev, R2 bucket
+# `pinkdb-extensions`) through `ext-repo/publish.sh` + wrangler.
+#
+# Manual only (workflow_dispatch) by design: publishing is immutable — an
+# existing name+version+platform is never re-published — so it must not run
+# automatically on push.
+#
+# Required repository secrets:
+#   CLOUDFLARE_API_TOKEN   Cloudflare API token with Workers Scripts: Edit
+#                          + R2: Edit (R2 is what the publisher uploads to)
+#   CLOUDFLARE_ACCOUNT_ID  the account that owns the R2 bucket
+#
+# Inputs (all optional):
+#   name      publish only this extension (default: every discovered one)
+#   version   artifact version (default: the version in crates/pinkdb/Cargo.toml)
+#   platform  force a platform tag; must match the runner (default: derived
+#             from it — darwin-arm64 on today's macos-latest)
+name: Publish extensions
+
+on:
+  workflow_dispatch:
+    inputs:
+      name:
+        description: "extension name to publish (default: all discovered)"
+        required: false
+        type: string
+      version:
+        description: "artifact version (default: version from crates/pinkdb/Cargo.toml)"
+        required: false
+        type: string
+      platform:
+        description: "platform tag (default: derived from the runner; must match it)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-extensions
+  cancel-in-progress: false # a publish must never be cancelled mid-flight
+
+env:
+  CARGO_TERM_COLOR: always
+  # Consumed by ext-repo/publish.py (BASE_URL) and by the steps below.
+  PINKDB_EXT_REPO_URL: https://pinkdb-ext-repo.defaultcms.workers.dev
+
+jobs:
+  publish:
+    name: build, smoke, publish
+    # macOS arm64 today: the live catalog's platform tag is darwin-arm64.
+    # Publishing for another platform means changing runs-on (and the
+    # `platform` input) so the built binaries really match their tag.
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-extensions
+
+      - name: install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ext-sdk/go/go.mod
+          cache: false # stdlib-only module: there is no go.sum to cache
+
+      - name: install wrangler
+        run: npm install -g wrangler@4
+
+      - name: resolve version and platform
+        id: coords
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PLATFORM: ${{ inputs.platform }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="$(grep -m1 '^version' crates/pinkdb/Cargo.toml | cut -d'"' -f2)"
+          fi
+          case "$(uname -sm)" in
+            "Darwin arm64")  derived=darwin-arm64 ;;
+            "Darwin x86_64") derived=darwin-x64 ;;
+            "Linux x86_64")  derived=linux-x64 ;;
+            "Linux aarch64") derived=linux-arm64 ;;
+            *) echo "::error::unsupported runner: $(uname -sm)"; exit 1 ;;
+          esac
+          platform="${INPUT_PLATFORM:-$derived}"
+          if [ "$platform" != "$derived" ]; then
+            echo "::error::platform '$platform' does not match this runner ($(uname -sm) -> $derived); change runs-on instead of forcing a tag"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "platform=$platform" >> "$GITHUB_OUTPUT"
+          echo "publishing version $version for $platform"
+
+      # Today the discovered artifacts are the C/C++ SDK worked examples;
+      # `extensions/*/` directories (built by their own Makefile when one is
+      # present) are picked up automatically once they exist.
+      - name: build SDK examples (ext-sdk/c, extensions/*/)
+        run: |
+          set -euo pipefail
+          make -C ext-sdk/c all
+          shopt -s nullglob
+          for dir in extensions/*/; do
+            if [ -f "$dir/Makefile" ]; then
+              echo "==> make -C $dir"
+              make -C "$dir"
+            fi
+          done
+
+      # Both smoke scripts build the release CLI themselves and run a
+      # deterministic LOAD EXTENSION session; nothing is published unless
+      # both pass.
+      - name: smoke-test the SDKs (C/C++ and Go)
+        run: |
+          set -euo pipefail
+          ./ext-sdk/c/smoke.sh
+          ./ext-sdk/go/smoke.sh
+
+      # publish.py decides immutability from ext-repo/index.json, which is
+      # gitignored (the canonical catalog lives in R2) — seed it with the
+      # live catalog first so an existing coordinate is refused via the
+      # index, not accidentally re-uploaded.
+      - name: fetch the live catalog
+        run: |
+          set -euo pipefail
+          mkdir -p ext-repo
+          if curl -fsSL "$PINKDB_EXT_REPO_URL/index.json" -o ext-repo/index.json; then
+            echo "fetched $PINKDB_EXT_REPO_URL/index.json"
+          else
+            echo "::warning::no catalog at $PINKDB_EXT_REPO_URL/index.json — starting from an empty one"
+            printf '{"format_version":1,"updated":null,"extensions":[]}\n' > ext-repo/index.json
+          fi
+
+      - name: discover artifacts and skip already-published coordinates
+        id: discover
+        env:
+          NAME_FILTER: ${{ inputs.name }}
+          ARTIFACT_VERSION: ${{ steps.coords.outputs.version }}
+          ARTIFACT_PLATFORM: ${{ steps.coords.outputs.platform }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import glob
+          import hashlib
+          import json
+          import os
+          import sys
+
+          name_filter = (os.environ.get("NAME_FILTER") or "").strip()
+          version = os.environ["ARTIFACT_VERSION"]
+          platform = os.environ["ARTIFACT_PLATFORM"]
+
+          if platform.startswith("darwin"):
+              lib_ext = ".dylib"
+          elif platform.startswith("linux"):
+              lib_ext = ".so"
+          else:
+              sys.exit(f"error: no shared-library convention for platform {platform!r}")
+
+          # Descriptions for the in-repo C/C++ SDK examples; extensions/*/
+          # may ship their own description.txt.
+          EXAMPLE_DESCRIPTIONS = {
+              "math_ext": "Clamp and degree/radian helpers (ext_clamp, ext_deg2rad)",
+              "string_ext": "String helpers (ext_repeat, ext_title)",
+              "cpp_ext": "Checked integer addition (ext_add_checked)",
+          }
+
+          candidates = []  # (name, artifact path, description)
+
+          # 1) The C/C++ SDK worked examples: examples/*.c(pp) -> build/<stem><ext>.
+          for src in sorted(glob.glob("ext-sdk/c/examples/*.c") + glob.glob("ext-sdk/c/examples/*.cpp")):
+              stem = os.path.splitext(os.path.basename(src))[0]
+              candidates.append((
+                  stem,
+                  f"ext-sdk/c/build/{stem}{lib_ext}",
+                  EXAMPLE_DESCRIPTIONS.get(stem, f"pinkdb C SDK example {stem}"),
+              ))
+
+          # 2) Repo extensions: extensions/<name>/ with exactly one built
+          #    library under build/ or dist/. None exist today — this is the
+          #    growth path, and the checks below keep it unambiguous.
+          for directory in sorted(glob.glob("extensions/*/")):
+              name = os.path.basename(directory.rstrip("/"))
+              libs = []
+              for sub in ("build", "dist"):
+                  libs += sorted(glob.glob(os.path.join(directory, sub, f"*{lib_ext}")))
+              if not libs:
+                  sys.exit(f"error: extensions/{name}/ has no {lib_ext} under build/ or dist/")
+              if len(libs) > 1:
+                  sys.exit(
+                      f"error: extensions/{name}/ has {len(libs)} {lib_ext} files under "
+                      "build//dist/ — expected exactly one, so a publish is never ambiguous"
+                  )
+              description_file = os.path.join(directory, "description.txt")
+              if os.path.isfile(description_file):
+                  with open(description_file, encoding="utf-8") as f:
+                      description = f.read().strip()
+                  if not description:
+                      sys.exit(f"error: extensions/{name}/description.txt is empty")
+              else:
+                  description = f"Extension built from extensions/{name}"
+              candidates.append((name, libs[0], description))
+
+          if name_filter:
+              candidates = [c for c in candidates if c[0] == name_filter]
+              if not candidates:
+                  sys.exit(f"error: no discovered extension named {name_filter!r}")
+
+          with open("ext-repo/index.json", encoding="utf-8") as f:
+              index = json.load(f)
+          published = {
+              (e.get("name"), e.get("version"), e.get("platform"))
+              for e in index.get("extensions", [])
+          }
+
+          rows = []
+          for name, artifact, description in candidates:
+              if not os.path.isfile(artifact):
+                  sys.exit(f"error: {name}: expected artifact {artifact} does not exist")
+              digest = hashlib.sha256(open(artifact, "rb").read()).hexdigest()
+              coordinate = (name, version, platform)
+              if coordinate in published:
+                  print(f"  skip    {name} {version} ({platform}) — already in the live catalog")
+                  continue
+              print(f"  publish {name} {version} ({platform}) {artifact}")
+              print(f"          sha256 {digest}")
+              rows.append((name, version, platform, artifact, description))
+
+          with open("/tmp/pinkdb-publish.tsv", "w", encoding="utf-8") as f:
+              for row in rows:
+                  f.write("\t".join(row) + "\n")
+
+          print(f"{len(rows)} artifact(s) to publish, {len(candidates) - len(rows)} skipped")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              out.write(f"count={len(rows)}\n")
+          PY
+
+      # The publisher refuses existing coordinates on its own too (it exits 1
+      # on a name+version+platform already present in the index); the
+      # discovery step above only turns "already published" into a skip so a
+      # default run stays idempotent.
+      - name: publish to the extension repository
+        if: steps.discover.outputs.count != '0'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r name version platform artifact description; do
+            [ -n "$name" ] || continue
+            echo "==> $name $version ($platform)"
+            ./ext-repo/publish.sh "$artifact" \
+              --name "$name" \
+              --version "$version" \
+              --platform "$platform" \
+              --description "$description"
+          done < /tmp/pinkdb-publish.tsv
+
+      - name: report artifact URLs
+        if: steps.discover.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r name version platform artifact _; do
+            [ -n "$name" ] || continue
+            echo "$PINKDB_EXT_REPO_URL/artifacts/$name/$version/$platform/$(basename "$artifact")"
+          done < /tmp/pinkdb-publish.tsv
+          echo "catalog: $PINKDB_EXT_REPO_URL/index.json"
+          curl -fsSL "$PINKDB_EXT_REPO_URL/index.json" -o /tmp/pinkdb-catalog.json
+          python3 - <<'PY'
+          import json
+          with open("/tmp/pinkdb-catalog.json", encoding="utf-8") as f:
+              catalog = json.load(f)
+          extensions = catalog.get("extensions", [])
+          print(f"live catalog: {len(extensions)} entries, updated {catalog.get('updated')}")
+          PY
+
+      # ── Future work: cryptographic signing ──────────────────────────────
+      # There is no signing yet, and this step does not fake one. Integrity
+      # today: ext-repo/publish.py writes the artifact's SHA-256 (and size)
+      # into the catalog entry, and ext-repo/verify.sh checks a download
+      # against it. A future wave would add a detached signature per
+      # artifact (e.g. minisign/sigstore) plus signer/key-id fields in the
+      # catalog schema (FORMAT.md v2), a host-side verification path in
+      # `.install`, and re-verification in this workflow before upload.
+      - name: signing — placeholder (checksums only)
+        run: |
+          echo "No cryptographic signing is configured."
+          echo "Integrity today is the SHA-256 recorded in the catalog by publish.py"
+          echo "and checked by ext-repo/verify.sh; artifact coordinates are immutable."
+          echo "See the comment above this step for the planned signing shape."

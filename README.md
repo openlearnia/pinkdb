@@ -1323,3 +1323,50 @@ PINKDB_KEY=pass python3 bench/kill_loop.py 30 --encrypted  # SIGKILL stress, enc
 cargo run --release -p pinkdb --example import_bench  # CSV import timing
 cargo run --release -p pinkdb --example query_bench  # full query battery (ms)
 ```
+
+## CI/CD
+
+Three GitHub Actions workflows in `.github/workflows/`, GitHub-hosted runners
+only:
+
+| Workflow | Trigger | Jobs / steps |
+|---|---|---|
+| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests that matter (`pink-lake --features s3`, `pinkdb-cli --features lake,s3`, `pinkdb-cli --features encryption`), the wasm check (`cargo build -p pinkdb --target wasm32-unknown-unknown`), then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI release binary and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi` + the Python `unittest` suite + `go test ./...`; `sdk-smokes` — `make -C ext-sdk/c` + both SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (round-trip/races against `adobe/s3mock` in Docker; a hard gate) |
+| `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
+| `publish-extensions.yml` | manual dispatch only | builds the C/C++ SDK examples (and any `extensions/*/` built by their own Makefile), runs both SDK smokes, fetches the live catalog, skips already-published coordinates, publishes new artifacts with `ext-repo/publish.sh` (wrangler → R2) and prints the artifact/catalog URLs |
+
+### Required repository secrets
+
+Set both under *Settings → Secrets and variables → Actions*:
+
+| Secret | Value | Used by |
+|---|---|---|
+| `CLOUDFLARE_API_TOKEN` | a Cloudflare API token scoped to **Workers Scripts: Edit** (docs Worker) and **R2: Edit** (extension artifact + catalog uploads) | `deploy-docs.yml`, `publish-extensions.yml` |
+| `CLOUDFLARE_ACCOUNT_ID` | the account that owns the `pinkdb-docs` / `pinkdb-ext-repo` Workers and the `pinkdb-extensions` R2 bucket — the current one is `b77114a81584db1664e9274f2e0f8232`; store it as a secret instead of hardcoding it in a workflow | same |
+
+### Publishing extensions by hand
+
+Actions → **Publish extensions** → *Run workflow*. Every input is optional:
+
+- `name` — publish a single discovered extension, e.g. `cpp_ext`;
+- `version` — artifact version (default: the version in `crates/pinkdb/Cargo.toml`);
+- `platform` — platform tag; it must match the runner (default derived from it:
+  `darwin-arm64` on `macos-latest`) — publishing for another platform means
+  changing `runs-on`, not forcing a tag.
+
+With no inputs the workflow publishes every discovered artifact. Publishing is
+immutable: coordinates already in the live catalog are skipped (the publisher,
+`ext-repo/publish.py`, refuses them on its own too), and every catalog entry
+carries the artifact's SHA-256 and size. There is no cryptographic signing yet —
+checksums are the integrity mechanism (`ext-repo/verify.sh` checks a download
+against the catalog); the workflow has a placeholder step documenting the
+planned signing shape rather than faking one.
+
+### Verifying the workflows
+
+Workflows can only be *truly* verified on GitHub — no local runner is used
+here. Locally we lint every workflow with `actionlint`, parse them as YAML, and
+run the individual commands they execute (the docs build, the SDK smokes, the
+wasm build, `bench/duckdiff.py`, the binding suites, and the publish workflow's
+discovery/report steps against the live catalog) by hand; the first GitHub run
+of a workflow is the real gate.
