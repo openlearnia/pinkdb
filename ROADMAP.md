@@ -1,6 +1,6 @@
 # pinkdb Roadmap
 
-Single source of truth for wave status; update after every wave.
+Single source of truth for wave status; update after every wave. Known gaps in done waves: [docs/GAPS.md](docs/GAPS.md).
 
 ## Packaging principles
 
@@ -64,6 +64,16 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra; Workers half done, R2 deferred to the extensions-repository wave 32/39) | done | live at https://pinkdb-docs.defaultcms.workers.dev (Workers static assets; .html links 307→canonical extensionless; 404-page; assets 200) |
 | 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | done | three GitHub Actions workflows (.github/workflows/{ci,publish-extensions,deploy-docs}.yml): CI build/test/clippy + feature matrices + wasm + duckdiff + Python/Go bindings + C/Go SDK smokes + Docker S3 job; manual-dispatch extension publishing to the live R2 repo (dup refusal, checksums today, signing hook documented); docs auto-deploy; actionlint-clean, YAML-parsed, steps executed locally where possible; secrets documented (CLOUDFLARE_API_TOKEN scopes + account id) |
 | 40 | Performance tuning (recurring every 5th wave): bench-driven speed work, no new features (core) | done | profile-driven: parallel vortex writes (2-2.7×, byte-identical), typed aggregate kernels + count-filter fast path (filter 50→24 ms @10M), window key rework (95→61 ms @1M); standing battery 493→447 ms; 494 tests, duckdiff 60/60; group-by @10M target missed (74 vs ≤60, parallel-ceiling analysis + breadcrumb); next-round breadcrumbs recorded |
+| 40a | Hardening — safety (docs/GAPS.md P0 #1–#10): server-side `LOAD EXTENSION` opt-in, publish catalog-wipe guard, store-wide table versions, read-set COMMIT validation, bounded `.pink` decoder, DuckDB-style overflow errors, CLI lake handle reuse, https-only `.install`, redacted S3 secrets, bounded server frames + idle timeout | in progress | — |
+| 40b | Hardening — durability/operability: auto-checkpoint + `CHECKPOINT`, `.pink` file lock, log-before-publish, single-lock write bind, Python handle lock, CLI exit codes/stderr/`-c`/EOF, S3 retries, honest `versions()`, `.lake` transaction/durable guards | queued | — |
+| 40c | Hardening — CI + docs truthfulness: macOS CI + fmt/audit/feature-test gaps, website refresh, committed-binary/account-id cleanup, wave 29/39 claims corrected | queued | — |
+| 40d | SQL completeness: multi-way/composite/non-equi/CROSS/FULL joins, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, INTERSECT/EXCEPT, COUNT(DISTINCT), EXPLAIN, SHOW/DESCRIBE, RANGE frames + frame validation | queued | — |
+| 40e | Prepared statements + parameters: placeholders, bind API, protocol v4, FFI prepare/bind, Python DB-API, Go database/sql | queued | — |
+| 40f | Functions + types: lag/lead/ntile/first/last_value, core scalar gaps, DECIMAL, INTERVAL | queued | — |
+| 40g | Optimizer: projection pushdown, LIMIT short-circuit, join build-side choice, filter through aggregate | queued | — |
+| 40h | Lake: incremental saves, `.lake gc`, `lake_scan` SQL access + time travel, bulk typed decode, encode panic guard | queued | — |
+| 40i | Extension trust + distribution: Ed25519 artifact signatures, SQL `INSTALL`, Linux artifacts, Python wheel, standalone Go module | queued | — |
+| 40j | Test depth: window/plan unit tests, WAL fuzz, persist property tests, duckdiff gated in CI | queued | — |
 | 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | queued | — |
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
