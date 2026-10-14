@@ -4,18 +4,50 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 1,
+//!   "format_version": 2,
 //!   "updated": "<iso8601>",
 //!   "version": 3,
-//!   "tables": { "main.t": { "files": ["data/main.t/<uuid>.pink"], "rows": 5 } }
+//!   "tables": {
+//!     "main.t": { "files": ["data/main.t/<uuid>.vortex"], "rows": 5, "format": "vortex" }
+//!   }
 //! }
 //! ```
+//!
+//! `format_version` 2 is the Vortex default: every table entry declares its
+//! data file `format` (`"vortex"`; a `"pink"` entry is still loadable). A
+//! `format_version` 1 manifest — written by the wave-34 writer — has no
+//! `format` field and implies the engine's `.pink` single-table bytes.
 //!
 //! Schema and typing live inside the data files, never here.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+/// The data-file format of one table entry.
+///
+/// `Pink` is the engine's own `.pink` single-table persistence bytes (the v1
+/// lake format, still readable); `Vortex` is a Vortex file (the v2 default).
+/// Serialized as a lowercase string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FileFormat {
+    /// The engine's `.pink` single-table persistence bytes (format_version 1).
+    Pink,
+    /// A Vortex file (format_version 2, the default for new writes).
+    Vortex,
+}
+
+impl FileFormat {
+    /// The file extension v2 writers use for this format (informational; the
+    /// catalog's `format` field is what selects a loader).
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            FileFormat::Pink => "pink",
+            FileFormat::Vortex => "vortex",
+        }
+    }
+}
 
 /// One version of a lake. Keys of `tables` are flat `db.table` names; a
 /// `BTreeMap` keeps the JSON deterministic (sorted).
@@ -32,10 +64,25 @@ pub(crate) struct Catalog {
 }
 
 /// One table of one version: the immutable data files it is made of and the
-/// total row count (checked on load). A v1 writer always emits exactly one
-/// file per table; the loader appends multiple in order (forward-compatible).
+/// total row count (checked on load).
+///
+/// A v2 writer always emits exactly one `.vortex` file per table; a v1
+/// manifest's entries have no `format` (they are engine `.pink` bytes), and
+/// the loader appends multiple files in order (forward-compatible).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableEntry {
     pub(crate) files: Vec<String>,
     pub(crate) rows: u64,
+    /// The data-file format; required in a `format_version` 2 manifest,
+    /// absent (⇒ [`FileFormat::Pink`]) in a `format_version` 1 manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) format: Option<FileFormat>,
+}
+
+impl TableEntry {
+    /// The format to load this entry's files with: v1 entries without a
+    /// `format` field are engine `.pink` bytes.
+    pub(crate) fn format(&self) -> FileFormat {
+        self.format.unwrap_or(FileFormat::Pink)
+    }
 }

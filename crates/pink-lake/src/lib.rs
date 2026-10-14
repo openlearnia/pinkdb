@@ -7,35 +7,48 @@
 //!
 //! ```text
 //! <lake>/
-//!   catalog.json              current catalog (authoritative for "latest")
-//!   snapshots/<version>.json  immutable manifests, one per published version
-//!   data/<table>/<uuid>.pink  immutable per-table data files
+//!   catalog.json                current catalog (authoritative for "latest")
+//!   snapshots/<version>.json    immutable manifests, one per published version
+//!   data/<table>/<uuid>.vortex  immutable per-table data files (v2, Vortex)
+//!   data/<table>/<uuid>.pink    v1 data files (engine persistence bytes)
 //! ```
 //!
 //! `catalog.json` and every snapshot manifest are JSON of the same shape:
 //!
 //! ```json
 //! {
-//!   "format_version": 1,
+//!   "format_version": 2,
 //!   "updated": "2026-10-14T12:34:56.789Z",
 //!   "version": 2,
 //!   "tables": {
-//!     "main.t":     { "files": ["data/main.t/3f2a….pink"], "rows": 5 },
-//!     "analytics.u": { "files": ["data/analytics.u/9c01….pink"], "rows": 1 }
+//!     "main.t":      { "files": ["data/main.t/3f2a….vortex"], "rows": 5, "format": "vortex" },
+//!     "analytics.u": { "files": ["data/analytics.u/9c01….vortex"], "rows": 1, "format": "vortex" }
 //!   }
 //! }
 //! ```
 //!
-//! Schema and typing stay inside the data files: each `.pink` file is exactly
-//! the engine's own persistence bytes ([`PinkDb::save`] / [`PinkDb::open`])
-//! for a single-table store, so round-trips are bit-exact (including `-0.0`
-//! and NaN payloads) and a data file opens standalone with `PinkDb::open`.
+//! Schema and typing stay inside the data files. **Vortex is the default
+//! format for new writes** ([`FORMAT_VERSION`] 2): every new data file is a
+//! plain Vortex file holding one struct array — one field per column, chunk
+//! boundaries preserved, `-0.0` and NaN payloads bit-exact — plus a
+//! `pinkdb.table` metadata segment carrying the table's `db`/`table` identity
+//! and its pinkdb column schema (the `vortex_file` module docs have the
+//! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
+//! `vortex.timestamp` extension cannot represent the full engine range).
+//! A `format_version` 1 lake — the wave-34 writer — stays readable: its
+//! entries have no `format` field and its data files are the engine's own
+//! `.pink` single-table persistence bytes ([`PinkDb::save`] / [`PinkDb::open`]),
+//! which a data file still opens standalone. Opening an old lake and saving
+//! again publishes a v2 snapshot: a full rewrite in Vortex (the migration
+//! path). A manifest with any other `format_version` — or a v2 entry without
+//! a `format` field — is a clear [`LakeError::Unsupported`]/[`LakeError::Corrupt`]
+//! error, never a guess.
 //!
 //! # Snapshots and versioning
 //!
 //! [`Lake::write_from_store`] writes a full snapshot: every table of every
 //! database of the store is written to a fresh data file (one file per table
-//! per version — v1 never appends and never reuses), then the manifest is
+//! per version — a writer never appends and never reuses), then the manifest is
 //! published as `snapshots/<version>.json`, then `catalog.json` is replaced
 //! with the same bytes. A version number is `previous + 1`, computed with
 //! `checked_add` and capped at [`MAX_VERSION`]; a lake whose next version
@@ -71,7 +84,7 @@
 //! always loads. It is deliberately *not* a power-loss guarantee on APFS:
 //! `File::sync_all`/`fsync(2)` may return before the drive's own cache is
 //! flushed; only `F_FULLFSYNC` pushes that through, and this crate does not
-//! add an `unsafe`/libc dependency for it in v1 (a future opt-in
+//! add an `unsafe`/libc dependency for it (a future opt-in
 //! `F_FULLFSYNC` mode could lift this).
 //!
 //! # Concurrent writers
@@ -85,7 +98,7 @@
 //! exactly one publishes `snapshots/<v>.json`, and `catalog.json` is
 //! byte-identical to the snapshot of its version.
 //!
-//! # Naming and scope (v1 decisions)
+//! # Naming and scope (lake decisions)
 //!
 //! - The catalog is **flat**: keys are `db.table`. Restoring splits on the
 //!   first `.` and recreates the databases. A database name that contains a
@@ -93,19 +106,20 @@
 //!   contain dots. Views are session-local in the engine and are not saved.
 //! - A lake records **tables**. A database with no tables (and the absence of
 //!   the default `main`, which [`Lake::load`] always recreates) is not
-//!   preserved — a v1 limitation.
+//!   preserved — a lake limitation.
 //! - The table part of a data path is percent-encoded from the catalog key,
 //!   so table names that contain `/`, `.`, spaces, or non-ASCII characters
 //!   can never escape the `data/` directory. [`validate_store`] refuses
 //!   names that would not fit a filesystem name (and dotted database names)
 //!   *before* a lake is created, so a store that `save_store`/`.lake save`
 //!   rejects leaves nothing behind.
-//! - Data files are **plaintext**; the engine's `encryption` feature is not
-//!   wired into a lake in v1 (the CLI keeps `PINKDB_KEY` for `.save`/`.open`
-//!   across `.lake open`, but lake files themselves stay plaintext). Data
-//!   files carry **no checksums**: mutating a data file in place is
-//!   undetected by design in v1 (cross-table/schema/row-count swaps *are*
-//!   detected on load).
+//! - Data files are **plaintext** (both `.pink` and Vortex); the engine's
+//!   `encryption` feature is not wired into a lake (the CLI keeps
+//!   `PINKDB_KEY` for `.save`/`.open` across `.lake open`, but lake files
+//!   themselves stay plaintext). Data files carry **no checksums**: mutating
+//!   a data file in place is undetected by design (cross-table/schema/
+//!   row-count swaps *are* detected on load; a v2 file additionally carries
+//!   its own table identity and schema in Vortex metadata).
 //! - **Single writer**: one live handle per lake directory; a stale handle's
 //!   save fails with [`LakeError::Conflict`], it never silently forks the
 //!   version chain.
@@ -118,17 +132,25 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pinkdb::{DataTable, PinkDb, Vector};
+use pinkdb::{DataTable, DataType, PinkDb, Vector};
 
 mod catalog;
 mod local;
 mod time;
+mod vortex_file;
 
-use catalog::{Catalog, TableEntry};
+use catalog::{Catalog, FileFormat, TableEntry};
 use local::{LocalStorage, CATALOG_FILE};
 
 /// The catalog format version this build reads and writes.
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 is the Vortex default: every table entry declares its data file
+/// `format` (`"vortex"`). Version 1 (the wave-34 writer) is still read — its
+/// entries carry no `format` and its data files are engine `.pink` bytes.
+pub const FORMAT_VERSION: u32 = 2;
+
+/// The oldest catalog format version this build still reads.
+pub const MIN_FORMAT_VERSION: u32 = 1;
 
 /// The largest manifest `version` this build reads or writes.
 ///
@@ -154,7 +176,7 @@ pub enum LakeError {
     Unsupported { path: PathBuf, found: u32 },
     /// The requested snapshot version does not exist.
     VersionNotFound { path: PathBuf, version: u64 },
-    /// The store's shape cannot be represented in the v1 flat catalog.
+    /// The store's shape cannot be represented in the flat lake catalog.
     NotRepresentable { message: String },
     /// Another writer changed the lake since this handle read the catalog, or
     /// a snapshot version already exists and must not be replaced. Reopen the
@@ -167,6 +189,10 @@ pub enum LakeError {
     Io { context: String, source: std::io::Error },
     /// The engine rejected the data or the store shape.
     Engine { context: String, source: pinkdb::PinkDbError },
+    /// The Vortex layer rejected data while encoding or decoding a data file
+    /// (the error is a string because Vortex errors are not `std` error
+    /// sources).
+    Vortex { context: String, message: String },
     /// A bug in this crate (e.g. serializing its own structs).
     Internal { message: String },
 }
@@ -189,7 +215,9 @@ impl fmt::Display for LakeError {
             }
             LakeError::Unsupported { path, found } => write!(
                 f,
-                "unsupported lake format_version {found} at {} (this build supports {FORMAT_VERSION})",
+                "unsupported lake format_version {found} at {} (this build reads format_version \
+                 {MIN_FORMAT_VERSION} in its v1 `.pink` form and reads/writes \
+                 format_version {FORMAT_VERSION} in its Vortex form)",
                 path.display()
             ),
             LakeError::VersionNotFound { path, version } => write!(
@@ -210,6 +238,9 @@ impl fmt::Display for LakeError {
             LakeError::Io { context, source } => write!(f, "lake I/O error ({context}): {source}"),
             LakeError::Engine { context, source } => {
                 write!(f, "lake data error ({context}): {source}")
+            }
+            LakeError::Vortex { context, message } => {
+                write!(f, "lake vortex error ({context}): {message}")
             }
             LakeError::Internal { message } => write!(f, "internal lake error: {message}"),
         }
@@ -256,14 +287,15 @@ pub struct Lake {
 
 impl Lake {
     /// Create a new lake at `dir`: the directory (and parents) plus an empty
-    /// version 1 catalog and its snapshot. Fails if `dir` already holds a
-    /// lake.
+    /// catalog at snapshot version 1 (a `format_version` 2 manifest) and its
+    /// snapshot. Fails if `dir` already holds a lake.
     ///
-    /// The empty v1 snapshot is *linked* into place (never replaced). If a
-    /// concurrent or crashed create already left a valid empty v1 snapshot,
-    /// it is adopted instead of rewritten — both concurrent creates can only
-    /// end with exactly one v1 catalog, byte-identical to its snapshot, and
-    /// the loser retries [`Lake::open`] via [`Lake::open_or_create`].
+    /// The empty version-1 snapshot is *linked* into place (never replaced).
+    /// If a concurrent or crashed create already left a valid empty version-1
+    /// snapshot, it is adopted instead of rewritten — both concurrent creates
+    /// can only end with exactly one version-1 catalog, byte-identical to its
+    /// snapshot, and the loser retries [`Lake::open`] via
+    /// [`Lake::open_or_create`].
     pub fn create(dir: impl AsRef<Path>) -> Result<Self> {
         let root = dir.as_ref().to_path_buf();
         let storage = LocalStorage::new(&root);
@@ -278,9 +310,9 @@ impl Lake {
             tables: BTreeMap::new(),
         };
         let bytes = manifest_json(&manifest, &root)?;
-        // Adopt (do not rewrite) an empty v1 a concurrent or interrupted
-        // create already linked: the catalog must stay byte-identical to the
-        // snapshot of its version.
+        // Adopt (do not rewrite) an empty version-1 snapshot a concurrent or
+        // interrupted create already linked: the catalog must stay
+        // byte-identical to the snapshot of its version.
         let bytes = if storage.publish_new("snapshots/1.json", &bytes)? {
             bytes
         } else {
@@ -346,7 +378,9 @@ impl Lake {
         &self.root
     }
 
-    /// The catalog `format_version` this lake was opened with.
+    /// The catalog `format_version` this handle last saw: the version the lake
+    /// was opened with, or [`FORMAT_VERSION`] after a successful save (a save
+    /// from a v1 lake migrates it to v2).
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
@@ -462,28 +496,23 @@ impl Lake {
                 let src = table_in(db, &dbname, &name)?;
                 let key = format!("{dbname}.{name}");
                 let dir = format!("data/{}", encode_key(&key));
-                self.storage.create_dir(&dir)?;
+                let format = FileFormat::Vortex;
                 let id = fresh_id();
-                let rel_tmp = format!("{dir}/{id}.pink.tmp");
-                let rel_file = format!("{dir}/{id}.pink");
-                // Claim the temp name with `create_new` before the engine
-                // writes it, so a planted symlink/tmp there is never
-                // followed or truncated.
-                self.storage.claim_tmp(&rel_tmp)?;
-                let mini = single_table_store(&dbname, &name, src)?;
-                let tmp_abs = self.storage.abs(&rel_tmp);
-                mini.save(path_str(&tmp_abs)?).map_err(|e| LakeError::Engine {
-                    context: format!("saving table \"{key}\""),
-                    source: e,
-                })?;
-                self.storage.publish_tmp(&rel_tmp, &rel_file)?;
-                bytes_written += self.storage.file_len(&rel_file)?;
+                let rel_file = format!("{dir}/{id}.{}", format.extension());
+                // v2 encodes the whole table into a Vortex file in memory,
+                // then publishes it atomically (unique `create_new` temp
+                // sibling, fsync, rename). Nothing is referenced by the
+                // catalog until the manifest below links into place.
+                let bytes = vortex_file::encode_table(&dbname, &name, src)?;
+                self.storage.write_atomic(&rel_file, &bytes)?;
+                bytes_written += bytes.len() as u64;
                 rows += src.num_rows() as u64;
                 tables.insert(
                     key,
                     TableEntry {
                         files: vec![rel_file],
                         rows: src.num_rows() as u64,
+                        format: Some(format),
                     },
                 );
             }
@@ -508,6 +537,9 @@ impl Lake {
         self.storage.write_atomic(CATALOG_FILE, &bytes)?;
         bytes_written += bytes.len() as u64;
         self.version = version;
+        // A save always publishes a v2 (Vortex) manifest, so a handle that
+        // opened a v1 lake reports v2 once it has migrated it.
+        self.format_version = FORMAT_VERSION;
         Ok(SaveReport {
             version,
             tables: manifest.tables.len(),
@@ -611,14 +643,27 @@ impl Lake {
                     message: format!("table \"{key}\" has no data files"),
                 });
             }
+            let format = entry.format();
             let mut created = false;
             for (i, rel) in entry.files.iter().enumerate() {
                 validate_rel_path(rel)?;
                 let path = self.root.join(rel);
-                let mini = PinkDb::open(path_str(&path)?).map_err(|e| LakeError::Engine {
-                    context: format!("loading data file \"{rel}\" for table \"{key}\""),
-                    source: e,
-                })?;
+                let mini = match format {
+                    // v1: the engine's own single-table persistence bytes.
+                    FileFormat::Pink => PinkDb::open(path_str(&path)?).map_err(|e| {
+                        LakeError::Engine {
+                            context: format!("loading data file \"{rel}\" for table \"{key}\""),
+                            source: e,
+                        }
+                    })?,
+                    // v2: a Vortex file that decodes into the same shape.
+                    FileFormat::Vortex => {
+                        let bytes = self
+                            .storage
+                            .read_context(rel, format!("loading data file \"{rel}\""))?;
+                        vortex_file::decode_table(&path, &bytes)?
+                    }
+                };
                 let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
                 if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(table)
                 {
@@ -677,15 +722,16 @@ pub fn save_store(db: &PinkDb, dir: impl AsRef<Path>) -> Result<u64> {
     Lake::open_or_create(dir)?.write_from_store(db)
 }
 
-/// The largest encoded `data/<table>` directory segment a v1 writer accepts,
-/// so `<segment>/<uuid>.pink.tmp` fits the common 255-byte name limit
-/// (36-char uuid + `.pink.tmp` = 45 bytes). Also enforced by
+/// The largest encoded `data/<table>` directory segment a writer accepts,
+/// so `<segment>/<uuid>.vortex.tmp` fits the common 255-byte name limit
+/// (36-char uuid + `.vortex.tmp` = 47 bytes). Also enforced by
 /// [`Lake::write_from_store`].
 const MAX_ENCODED_SEGMENT: usize = 200;
 
-/// Check that `db` can be represented in a v1 lake catalog: database names
+/// Check that `db` can be represented in a lake catalog: database names
 /// must not contain `.` (keys are flat `db.table`), and every table's
-/// percent-encoded `data/<key>` segment must fit [`MAX_ENCODED_SEGMENT`].
+/// percent-encoded `data/<key>` segment must fit the
+/// `MAX_ENCODED_SEGMENT` (200-byte) directory-name limit.
 ///
 /// [`save_store`] and the CLI's `.lake save` run this *before* touching the
 /// filesystem, so a store that cannot be saved never leaves a fresh empty
@@ -696,9 +742,9 @@ pub fn validate_store(db: &PinkDb) -> Result<()> {
         if dbname.contains('.') {
             return Err(LakeError::NotRepresentable {
                 message: format!(
-                    "database name \"{dbname}\" contains \".\" and cannot be stored in a v1 \
-                     lake catalog (keys are flat `db.table`); rename the database or save \
-                     the store to a .pink file instead"
+                    "database name \"{dbname}\" contains \".\" and cannot be stored in a \
+                     flat lake catalog (keys are flat `db.table`); rename the database or \
+                     save the store to a .pink file instead"
                 ),
             });
         }
@@ -741,12 +787,18 @@ fn read_catalog(storage: &LocalStorage, root: &Path) -> Result<Catalog> {
 /// must be in `1..=MAX_VERSION`: `0` is not a version this writer ever
 /// publishes, and a value at the top wraps `version + 1` — both are corrupt
 /// metadata, reported cleanly and never panicked on.
+///
+/// `format_version` must be in [`MIN_FORMAT_VERSION`]`..=`[`FORMAT_VERSION`].
+/// A version 1 manifest is all-`.pink` by definition: an entry there must not
+/// declare `"format": "vortex"`. A version 2 manifest must declare a `format`
+/// on every entry (a version 1 *reader* ignored the field entirely, so a
+/// missing one is corrupt v2 metadata, not a silent `.pink` downgrade).
 fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
     let manifest: Catalog = serde_json::from_slice(bytes).map_err(|e| LakeError::Corrupt {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
-    if manifest.format_version != FORMAT_VERSION {
+    if manifest.format_version < MIN_FORMAT_VERSION || manifest.format_version > FORMAT_VERSION {
         return Err(LakeError::Unsupported {
             path: path.to_path_buf(),
             found: manifest.format_version,
@@ -760,6 +812,29 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                 manifest.version
             ),
         });
+    }
+    for (key, entry) in &manifest.tables {
+        match (manifest.format_version, entry.format) {
+            (1, Some(FileFormat::Vortex)) => {
+                return Err(LakeError::Corrupt {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "table \"{key}\" declares a vortex data file in a format_version 1 \
+                         manifest (version 1 data files are engine `.pink` bytes)"
+                    ),
+                });
+            }
+            (2, None) => {
+                return Err(LakeError::Corrupt {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "table \"{key}\" does not declare a data file format (a format_version 2 \
+                         entry requires `\"format\": \"vortex\"`)"
+                    ),
+                });
+            }
+            _ => {}
+        }
     }
     Ok(manifest)
 }
@@ -913,31 +988,32 @@ fn copy_chunks(src: &DataTable, dst: &mut DataTable, context: &str) -> Result<()
     Ok(())
 }
 
-/// A one-table [`PinkDb`] holding `src` (the bytes a data file stores). The
-/// mini store holds exactly the source's database and table (the default
-/// `main` of a fresh store is dropped when the table lives elsewhere).
-fn single_table_store(dbname: &str, table: &str, src: &DataTable) -> Result<PinkDb> {
+/// An empty one-table [`PinkDb`]: `dbname.table` created with `schema`, the
+/// default `main` of a fresh store dropped when the table lives elsewhere.
+/// The v2 Vortex decoder builds one per data file, so a decoded file has
+/// exactly one database and table — the shape a v1 `.pink` data file opens
+/// as, which is what the loader's checks expect.
+fn empty_single_table_store(
+    dbname: &str,
+    table: &str,
+    schema: Vec<(String, DataType)>,
+) -> Result<PinkDb> {
     let mut mini = PinkDb::new();
     if !mini.database_exists(dbname) {
         mini.create_database(dbname).map_err(|e| LakeError::Engine {
-            context: format!("creating database \"{dbname}\" while saving"),
+            context: format!("creating database \"{dbname}\" while loading"),
             source: e,
         })?;
         mini.drop_database("main").map_err(|e| LakeError::Engine {
-            context: format!("dropping the default main database while saving \"{dbname}\""),
+            context: format!("dropping the default main database while loading \"{dbname}\""),
             source: e,
         })?;
     }
-    mini.create_table_in(dbname, table, src.schema())
+    mini.create_table_in(dbname, table, schema)
         .map_err(|e| LakeError::Engine {
-            context: format!("creating table \"{dbname}.{table}\" while saving"),
+            context: format!("creating table \"{dbname}.{table}\" while loading"),
             source: e,
         })?;
-    let dst = mini.table_mut_in(dbname, table).map_err(|e| LakeError::Engine {
-        context: format!("preparing table \"{dbname}.{table}\" while saving"),
-        source: e,
-    })?;
-    copy_chunks(src, dst, &format!("{dbname}.{table}"))?;
     Ok(mini)
 }
 

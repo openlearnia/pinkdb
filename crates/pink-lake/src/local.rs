@@ -52,12 +52,12 @@ impl LocalStorage {
         })
     }
 
-    pub(crate) fn file_len(&self, rel: &str) -> Result<u64> {
+    /// [`LocalStorage::read`] with a caller-supplied context, so a missing
+    /// data file is reported as "loading data file \"…\"" like the engine's
+    /// `.pink` path reports it.
+    pub(crate) fn read_context(&self, rel: &str, context: String) -> Result<Vec<u8>> {
         let path = self.abs(rel);
-        fs::metadata(&path).map(|m| m.len()).map_err(|e| LakeError::Io {
-            context: format!("stat {}", path.display()),
-            source: e,
-        })
+        fs::read(&path).map_err(|e| LakeError::Io { context, source: e })
     }
 
     pub(crate) fn create_dir(&self, rel: &str) -> Result<()> {
@@ -71,8 +71,9 @@ impl LocalStorage {
     /// Write `bytes` to `rel` atomically, replacing any previous file:
     /// a unique `<name>.<uuid>.tmp` sibling, fsync, rename over `rel`, then
     /// a best-effort parent-directory fsync. A crash before the rename
-    /// leaves only an unreferenced `.tmp` file. Only the catalog uses this
-    /// (the snapshot path refuses to replace an existing version).
+    /// leaves only an unreferenced `.tmp` file. Used by the catalog and by
+    /// v2 Vortex data files; the snapshot path refuses to replace an
+    /// existing version.
     pub(crate) fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
         let path = self.abs(rel);
         self.ensure_parent(&path)?;
@@ -140,51 +141,6 @@ impl LocalStorage {
                 source: e,
             }),
         }
-    }
-
-    /// Create `rel` as a unique temp file for a writer that fills it in place
-    /// (the engine's `PinkDb::save`): `create_new(true)` so a pre-existing
-    /// symlink or temp file at that name is never followed or truncated.
-    /// The caller passes a fresh-id name; a collision (or a planted file at
-    /// exactly that 128-bit-random name) fails closed.
-    pub(crate) fn claim_tmp(&self, rel: &str) -> Result<()> {
-        let path = self.abs(rel);
-        self.ensure_parent(&path)?;
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map(|_| ())
-            .map_err(|e| LakeError::Io {
-                context: format!("claiming temp file {}", path.display()),
-                source: e,
-            })
-    }
-
-    /// Publish a file another writer produced at `rel_tmp` (the engine's
-    /// `PinkDb::save` writes plain bytes): fsync it, rename it over
-    /// `rel_final`, then a best-effort parent-directory fsync. Both are
-    /// lake-relative and share a directory.
-    pub(crate) fn publish_tmp(&self, rel_tmp: &str, rel_final: &str) -> Result<()> {
-        let tmp = self.abs(rel_tmp);
-        let final_path = self.abs(rel_final);
-        let synced = OpenOptions::new()
-            .write(true)
-            .open(&tmp)
-            .and_then(|f| f.sync_all());
-        if let Err(e) = synced {
-            let _ = fs::remove_file(&tmp);
-            return Err(LakeError::Io {
-                context: format!("fsyncing {}", tmp.display()),
-                source: e,
-            });
-        }
-        fs::rename(&tmp, &final_path).map_err(|e| LakeError::Io {
-            context: format!("publishing {}", final_path.display()),
-            source: e,
-        })?;
-        self.sync_parent(&final_path);
-        Ok(())
     }
 
     /// File names directly inside `rel` (sorted; a missing directory reads as

@@ -68,7 +68,7 @@ SQL text
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
-| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table `.pink` data files (opt-in CLI `lake` feature) |
+| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table Vortex data files, v1 `.pink` files still readable (opt-in CLI `lake` feature) |
 
 Design rules: Rust edition 2021, zero async; the core is zero-unsafe, with
 `unsafe` contained to exactly two crates (the C ABI `pinkdb-ffi` and the
@@ -354,9 +354,8 @@ isolation without predicate tracking (write-skew is possible). The plain
 ## Lake layer (feature `lake`)
 
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
-JSON catalog plus immutable per-table data files, local disk first. It is the
-wave-34 ground for the roadmap's lake architecture (Vortex as the data format
-in wave 35, S3 storage in wave 36).
+JSON catalog plus immutable per-table data files, local disk first. Wave 35
+makes **Vortex the default data format**; wave 36 adds S3 storage.
 
 A lake is a directory:
 
@@ -364,28 +363,49 @@ A lake is a directory:
 mylake/
 ├── catalog.json               current state (authoritative "latest")
 ├── snapshots/<version>.json   immutable manifest per published version
-└── data/<table>/<uuid>.pink   immutable per-table data files
+├── data/<table>/<uuid>.vortex immutable per-table Vortex files (v2, default)
+└── data/<table>/<uuid>.pink   v1 data files (engine persistence bytes, still read)
 ```
 
 The manifests (`catalog.json` and every snapshot) share one shape:
 
 ```json
 {
-  "format_version": 1,
+  "format_version": 2,
   "updated": "2026-10-14T02:11:50.760Z",
   "version": 2,
   "tables": {
-    "analytics.u": { "files": ["data/analytics.u/e9a4….pink"], "rows": 1 },
-    "main.t":      { "files": ["data/main.t/831a….pink"], "rows": 2 }
+    "analytics.u": { "files": ["data/analytics.u/e9a4….vortex"], "rows": 1, "format": "vortex" },
+    "main.t":      { "files": ["data/main.t/831a….vortex"], "rows": 2, "format": "vortex" }
   }
 }
 ```
 
-- **Schema and typing live in the data files.** Each `.pink` file is exactly
-  the engine's persistence bytes for a single-table store, so round-trips are
-  bit-exact (`-0.0`, NaN payloads, all types, NULLs), a data file opens
-  standalone with `PinkDb::open`, and the catalog stays a tiny metadata
-  document. Metadata is the only serialization code here (`serde_json`).
+**Format history and defaults:**
+
+| catalog `format_version` | data file | written by | read by this build |
+|---|---|---|---|
+| 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`) |
+| 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry | this build (default) | yes |
+
+**Migration:** open an old lake and `.lake save` again — the next snapshot is a
+full rewrite in Vortex (`format_version` 2); old snapshots and their `.pink`
+files stay untouched, so every published version still loads. An unknown
+`format_version` (or a v2 entry without a `format` field) is a clear error,
+never a guess.
+
+- **Schema and typing live in the data files.** A v2 file is a plain Vortex
+  file: one struct array, one field per column, chunk boundaries preserved
+  (row blocks of exactly `CHUNK_SIZE` rows, one stream element per engine
+  chunk), so a loaded table re-saves to the same `.pink` bytes. DOUBLES keep
+  raw IEEE-754 bits (NaN payloads, `-0.0`), `i32`/`i64` cover their full
+  ranges, VARCHAR is `utf8`. DATE/TIMESTAMP are stored as their raw `i32`/`i64`
+  storage integers plus the exact pinkdb schema in a `pinkdb.table` metadata
+  segment (with the table's `db`/`table` identity, which is what rejects a
+  swapped data file): the native `vortex.timestamp` extension converts values
+  through a calendar type limited to about ±20 000 years and **panics** on
+  extreme timestamps (±6.31e17 µs) during statistics computation, so no bit
+  pattern is left to chance — see below.
 - **Every save is a full snapshot.** `write_from_store` writes every table of
   every database to a fresh data file, publishes `snapshots/<version>.json`
   (`version = previous + 1`, via `checked_add` and capped at `MAX_VERSION`,
@@ -395,10 +415,10 @@ The manifests (`catalog.json` and every snapshot) share one shape:
   already exists is never replaced: `save` that would land on a published
   version (e.g. after restoring an older `catalog.json`) fails with a
   conflict instead of clobbering it. `load(Some(v))` restores any published
-  version, `load(None)` the latest. The v1 writer emits exactly one data file
+  version, `load(None)` the latest. The writer emits exactly one data file
   per table per version — a very large table still becomes one file
-  (multi-file entries load fine; they are reserved for future writers). v1
-  has no appending, compaction or GC — each save costs one full rewrite, and
+  (multi-file entries load fine; they are reserved for future writers). There
+  is no appending, compaction or GC — each save costs one full rewrite, and
   old versions' files stay.
 - **Atomicity order: data files → snapshot → catalog.** Every write goes to a
   *unique* temp sibling (`<name>.<uuid>.tmp`, created with `create_new(true)`
@@ -416,20 +436,22 @@ The manifests (`catalog.json` and every snapshot) share one shape:
   visible: a stray manifest at exactly the *next* version can't be told apart
   from a published one, so a save landing on it refuses with a clear conflict
   ("if catalog.json still points at the previous version it was never
-  published — remove the stray snapshot and retry"). Corrupt metadata is a
-  clear error, never a panic.
+  published — remove the stray snapshot and retry"). Corrupt metadata (and a
+  truncated/corrupt Vortex data file, or one whose `pinkdb.table` metadata
+  does not parse) is a clear error, never a panic.
 - **Flat `db.table` names**, restored by splitting on the first dot; a table
   name may contain dots, a database name containing `.` is refused at save
-  time. Views are session-local and are not saved. A v1 lake records tables,
+  time. Views are session-local and are not saved. A lake records tables,
   so a database with no tables is not preserved and a dropped `main` comes
   back empty (loading always recreates it). Data files are plaintext
-  (`PINKDB_KEY` does not encrypt a lake in v1; the CLI keeps the session key
+  (`PINKDB_KEY` does not encrypt a lake; the CLI keeps the session key
   across `.lake open` for later `.save`/`.open`). Data files carry no
-  checksums: mutating one in place is undetected by design in v1, while
-  cross-table swaps, schema disagreement and row-count mismatches *are*
-  detected on load. `save_store`/`.lake save` pre-validate the store (dotted
-  database names, over-long encoded table names) *before* creating a lake, so
-  a rejected save leaves nothing behind.
+  checksums: mutating one in place is undetected by design, while
+  cross-table swaps (a v2 file names its own `db`/`table`), schema
+  disagreement and row-count mismatches *are* detected on load.
+  `save_store`/`.lake save` pre-validate the store (dotted database names,
+  over-long encoded table names) *before* creating a lake, so a rejected save
+  leaves nothing behind.
 - **One live writer handle per lake directory** (no file locking; concurrent
   readers of published versions are fine). A handle that saves after another
   handle/process moved the catalog fails with `LakeError::Conflict`
@@ -439,6 +461,20 @@ The manifests (`catalog.json` and every snapshot) share one shape:
   byte-identical to the snapshot of its version. All I/O goes through a
   private `LocalStorage` handle; a `Storage` trait is deliberately deferred
   until wave 36 needs a second (S3) implementation.
+- **Measured on this machine (2026-10, release, Apple Silicon, 1M-row
+  `bench/sales_1m.csv`: id/region/total/active):** one Vortex data file is
+  3,117,738 B vs 14,042,574 B for the equivalent `.pink` bytes (0.22×, ≈4.5×
+  smaller); a lake save takes 0.20 s vs 0.09 s (Vortex compresses on write)
+  and a load 0.07 s vs 0.11 s. Reproduce with
+  `cargo test --release -p pink-lake --test bench_1m -- --ignored --nocapture`.
+  **Dependency/build note:** `crates/pink-lake` now depends on the `vortex`
+  crate directly (`default-features = false, features = ["files"]`); that
+  pulls in ~218 additional crates (vortex-array/file/layout + encodings,
+  arrow, prost/flatbuffers, smol/async, jiff) and adds ≈1 m 53 s to a clean
+  debug build of `pink-lake` (≈6 min for the first release build with thin
+  LTO) and ≈42 MB to the release `pinkdb` binary built with `--features lake`
+  — the default binary is byte-for-byte the same size as before because the
+  dependency lives entirely behind the opt-in feature.
 
 Library:
 
@@ -451,7 +487,7 @@ db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
 
 let version = save_store(&db, "mylake")?;  // creates the lake, publishes v2
 let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
-let v3 = lake.write_from_store(&db)?;      // full snapshot, version 3
+let v3 = lake.write_from_store(&db)?;      // full snapshot in Vortex, version 3
 let tables = lake.tables()?;               // [("main.t", 2)]
 let versions = lake.versions()?;           // [1, 2, 3]
 let latest = lake.load(None)?;             // rebuild the latest
@@ -476,8 +512,9 @@ cargo build -p pinkdb-cli --features lake
 `.lake tables`/`.lake info` also warn about tables whose referenced data file
 is missing, instead of advertising data a load cannot read. Without the
 feature, `.lake` reports `this pinkdb binary was built without the lake
-feature`. Release `pinkdb`: 2,289,616 B default (unchanged) vs 2,470,272 B
-with `--features lake` (+180,656 B ≈ 176 KiB).
+feature`. Release `pinkdb`: 2,289,616 B default (**unchanged**) vs 44,639,248 B
+with `--features lake` (38,171,440 B stripped) — the Vortex array encodings
+dominate; see the dependency/build note above.
 
 ## Network server
 
@@ -961,8 +998,9 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
 feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
-layer (`pink-lake`, CLI `lake` feature) shipped in wave 34; authentication
-and TLS are deferred.
+layer (`pink-lake`, CLI `lake` feature) shipped in wave 34 and became
+Vortex-first in wave 35 (v1 `.pink` lakes still load; open + save migrates);
+authentication and TLS are deferred.
 
 ## Development
 

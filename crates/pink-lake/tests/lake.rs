@@ -1,5 +1,8 @@
 //! End-to-end tests of the public `pink-lake` API: round-trips, versioning,
-//! crash-atomicity leftovers, and corrupt-metadata handling.
+//! crash-atomicity leftovers, corrupt-metadata handling, and the v1 → v2
+//! (`.pink` → Vortex) format history.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,8 +132,8 @@ fn write_json(path: &Path, value: &serde_json::Value) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
-/// Every `*.pink` file under `dir`, recursively.
-fn pink_files(dir: &Path) -> Vec<PathBuf> {
+/// Every lake data file (`*.pink` or `*.vortex`) under `dir`, recursively.
+fn data_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if !dir.exists() {
         return out;
@@ -138,13 +141,22 @@ fn pink_files(dir: &Path) -> Vec<PathBuf> {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
-            out.extend(pink_files(&path));
-        } else if path.extension().map(|e| e == "pink").unwrap_or(false) {
+            out.extend(data_files(&path));
+        } else if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("pink") | Some("vortex")
+        ) {
             out.push(path);
         }
     }
     out.sort();
     out
+}
+
+/// The path of the lake fixture checked in under `tests/fixtures/lake_v1/`
+/// (written by the wave-34 writer, before Vortex).
+fn v1_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1")
 }
 
 #[test]
@@ -162,9 +174,10 @@ fn snapshot_roundtrip_is_bit_exact() {
     assert_eq!(report.rows, 3 + (CHUNK_SIZE as u64 + 100) + 1 + 2);
     assert!(report.bytes_written > 0);
 
-    // Catalog shape.
+    // Catalog shape: v2, one Vortex file per table, `format` declared.
     let catalog = read_json(&dir.join("catalog.json"));
     assert_eq!(catalog["format_version"], FORMAT_VERSION);
+    assert_eq!(FORMAT_VERSION, 2, "v2 is the Vortex default");
     assert_eq!(catalog["version"], 2);
     let updated = catalog["updated"].as_str().unwrap();
     assert_eq!(updated.len(), 24, "ISO-8601 millis: {updated}");
@@ -183,16 +196,20 @@ fn snapshot_roundtrip_is_bit_exact() {
         ]
     );
     for (key, entry) in tables {
+        assert_eq!(entry["format"], "vortex", "{key}");
         let files = entry["files"].as_array().unwrap();
-        assert_eq!(files.len(), 1, "v1 writes one file per table ({key})");
+        assert_eq!(files.len(), 1, "the writer emits one file per table ({key})");
         let rel = files[0].as_str().unwrap();
         assert!(rel.starts_with("data/"), "{rel}");
+        assert!(rel.ends_with(".vortex"), "{rel}");
         assert!(dir.join(rel).is_file(), "{rel} missing");
-        assert!(dir.join(rel).with_extension("").extension().is_none() || rel.ends_with(".pink"));
     }
     assert!(dir.join("snapshots/1.json").is_file());
     assert!(dir.join("snapshots/2.json").is_file());
-    assert_eq!(pink_files(&dir.join("data")).len(), 5);
+    assert_eq!(data_files(&dir.join("data")).len(), 5);
+    assert!(data_files(&dir.join("data"))
+        .iter()
+        .all(|p| p.extension().unwrap() == "vortex"));
 
     // Latest load is value- and byte-exact.
     let loaded = lake.load(None).unwrap();
@@ -269,7 +286,7 @@ fn versions_accumulate_and_old_versions_stay_loadable() {
     assert_eq!(lake.versions().unwrap(), vec![1, 2, 3]);
     // v2 wrote 5 files, v3 wrote 5 more (main.t changed, main.big dropped,
     // extra.e added): old data files are never touched.
-    assert_eq!(pink_files(&dir.join("data")).len(), 10, "old data files stay");
+    assert_eq!(data_files(&dir.join("data")).len(), 10, "old data files stay");
 
     let latest = lake.load(None).unwrap();
     assert_same_store(&db, &latest);
@@ -421,11 +438,34 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     assert!(lake.load(None).unwrap_err().to_string().contains("under data/"));
 
     // An unsupported format_version is named, not misparsed.
-    let mut v2fmt = read_json(&dir.join("catalog.json"));
-    v2fmt["format_version"] = serde_json::json!(2);
-    write_json(&dir.join("catalog.json"), &v2fmt);
+    let mut future = read_json(&dir.join("catalog.json"));
+    future["format_version"] = serde_json::json!(3);
+    write_json(&dir.join("catalog.json"), &future);
     let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("unsupported lake format_version 2"), "{err}");
+    assert!(err.contains("unsupported lake format_version 3"), "{err}");
+    assert!(err.contains("Vortex form"), "{err}");
+
+    // A version 2 manifest must declare a format on every entry; a missing
+    // one is corrupt v2 metadata, not a silent `.pink` downgrade.
+    let mut no_format = read_json(&dir.join("catalog.json"));
+    no_format["format_version"] = serde_json::json!(2);
+    no_format["tables"]["main.t"]
+        .as_object_mut()
+        .unwrap()
+        .remove("format");
+    write_json(&dir.join("catalog.json"), &no_format);
+    let err = Lake::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("corrupt lake metadata"), "{err}");
+    assert!(err.contains("does not declare a data file format"), "{err}");
+
+    // A version 1 manifest cannot reference a vortex data file.
+    let mut v1_vortex = read_json(&dir.join("catalog.json"));
+    v1_vortex["format_version"] = serde_json::json!(1);
+    v1_vortex["tables"]["main.t"]["format"] = serde_json::json!("vortex");
+    write_json(&dir.join("catalog.json"), &v1_vortex);
+    let err = Lake::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("corrupt lake metadata"), "{err}");
+    assert!(err.contains("vortex data file in a format_version 1 manifest"), "{err}");
 
     // A missing field is corrupt, not defaulted.
     write_json(
@@ -519,7 +559,7 @@ fn a_table_entry_can_list_several_data_files() {
             .unwrap();
     }
     lake2.write_from_store(&db2).unwrap();
-    let src = pink_files(&other.join("data"));
+    let src = data_files(&other.join("data"));
     assert_eq!(src.len(), 1);
     let grafted_name = src[0].file_name().unwrap().to_str().unwrap().to_string();
     let files_dir = dir.join("data/main.t");
@@ -613,7 +653,7 @@ fn table_names_stay_inside_the_data_directory() {
         .collect();
     segments.sort();
     assert_eq!(segments, vec!["main...", "main.a%2Fb", "main.odd%20name"]);
-    assert_eq!(pink_files(&dir.join("data")).len(), 3);
+    assert_eq!(data_files(&dir.join("data")).len(), 3);
     cleanup(&dir);
 }
 
@@ -708,7 +748,7 @@ fn stale_handles_conflict_instead_of_forking_the_version_chain() {
     let mut b = Lake::open(&dir).unwrap(); // sees v2
     a.write_from_store(&db).unwrap(); // v3
 
-    let data_files_before = pink_files(&dir.join("data")).len();
+    let data_files_before = data_files(&dir.join("data")).len();
     let snap3 = std::fs::read(dir.join("snapshots/3.json")).unwrap();
     let err = b.write_from_store(&db).unwrap_err();
     assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
@@ -718,7 +758,7 @@ fn stale_handles_conflict_instead_of_forking_the_version_chain() {
     assert!(msg.contains("reopen the lake"), "{msg}");
     assert_eq!(b.current_version(), 2, "the stale handle does not advance");
     assert_eq!(
-        pink_files(&dir.join("data")).len(),
+        data_files(&dir.join("data")).len(),
         data_files_before,
         "a stale save writes no data files"
     );
@@ -975,7 +1015,7 @@ fn missing_data_files_are_reported_but_metadata_still_reads() {
     lake.write_from_store(&db).unwrap();
     assert!(lake.missing_data_files().unwrap().is_empty());
 
-    let victim = pink_files(&dir.join("data/main.t")).remove(0);
+    let victim = data_files(&dir.join("data/main.t")).remove(0);
     std::fs::remove_file(&victim).unwrap();
     let missing = lake.missing_data_files().unwrap();
     assert_eq!(missing.len(), 1);
@@ -997,7 +1037,8 @@ fn error_paths_point_at_the_manifest_that_is_wrong() {
 
     // A snapshot with a flat key that is not `db.table` names the snapshot.
     let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["tables"] = serde_json::json!({"nodot": {"files": ["data/x.pink"], "rows": 1}});
+    snap["tables"] =
+        serde_json::json!({"nodot": {"files": ["data/x.vortex"], "rows": 1, "format": "vortex"}});
     write_json(&dir.join("snapshots/2.json"), &snap);
     let err = lake.load(Some(2)).unwrap_err().to_string();
     assert!(err.contains("snapshots/2.json"), "{err}");
@@ -1005,7 +1046,7 @@ fn error_paths_point_at_the_manifest_that_is_wrong() {
 
     // "no data files" in a snapshot names the snapshot, not the lake root.
     let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["tables"] = serde_json::json!({"main.t": {"files": [], "rows": 0}});
+    snap["tables"] = serde_json::json!({"main.t": {"files": [], "rows": 0, "format": "vortex"}});
     write_json(&dir.join("snapshots/2.json"), &snap);
     let err = lake.load(Some(2)).unwrap_err().to_string();
     assert!(err.contains("snapshots/2.json"), "{err}");
@@ -1014,7 +1055,8 @@ fn error_paths_point_at_the_manifest_that_is_wrong() {
     // A snapshot row-count mismatch names the snapshot too.
     let file = read_json(&dir.join("catalog.json"))["tables"]["main.t"]["files"][0].clone();
     let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["tables"]["main.t"] = serde_json::json!({"files": [file], "rows": 999});
+    snap["tables"]["main.t"] =
+        serde_json::json!({"files": [file], "rows": 999, "format": "vortex"});
     write_json(&dir.join("snapshots/2.json"), &snap);
     let err = lake.load(Some(2)).unwrap_err().to_string();
     assert!(err.contains("snapshots/2.json"), "{err}");
@@ -1062,5 +1104,243 @@ fn an_interrupted_create_is_healed_not_bricked() {
     assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
     assert!(err.to_string().contains("refusing to adopt"), "{err}");
     cleanup(&bad);
+    cleanup(&dir);
+}
+
+/// Every data-file path declared by the current catalog, sorted.
+fn catalog_data_files(dir: &Path) -> Vec<String> {
+    let catalog = read_json(&dir.join("catalog.json"));
+    let mut out = Vec::new();
+    for entry in catalog["tables"].as_object().unwrap().values() {
+        for file in entry["files"].as_array().unwrap() {
+            out.push(file.as_str().unwrap().to_string());
+        }
+    }
+    out.sort();
+    out
+}
+
+#[test]
+fn v1_fixture_lake_still_loads_bit_exactly() {
+    let fixture = v1_fixture_dir();
+    let scratch = scratch("v1_fixture_bits");
+    // The fixture is a v1 lake: v1 manifests, engine `.pink` data files.
+    let catalog = read_json(&fixture.join("catalog.json"));
+    assert_eq!(catalog["format_version"], 1, "fixture must stay v1");
+    let files = data_files(&fixture.join("data"));
+    assert_eq!(files.len(), 6);
+    for file in &files {
+        let bytes = std::fs::read(file).unwrap();
+        assert!(
+            bytes.starts_with(b"PINKDB0"),
+            "{} is not engine `.pink` bytes",
+            file.display()
+        );
+        assert_eq!(file.extension().unwrap(), "pink");
+    }
+
+    // It loads, and the loaded store is value- and bit-exact vs. a store
+    // rebuilt from the same builder.
+    let lake = Lake::open(&fixture).unwrap();
+    assert_eq!(lake.format_version(), 1);
+    assert_eq!(lake.current_version(), 2);
+    let expected = common::fidelity_store();
+    let loaded = lake.load(None).unwrap();
+    assert_same_store(&expected, &loaded);
+    assert_eq!(
+        store_bytes(&loaded, &scratch, "loaded"),
+        store_bytes(&expected, &scratch, "expected"),
+        "the loaded store re-saves byte-identically"
+    );
+
+    // Every data file is byte-exact: load the mini store and re-save it.
+    for rel in catalog_data_files(&fixture) {
+        let path = fixture.join(&rel);
+        let mini = PinkDb::open(path.to_str().unwrap()).unwrap();
+        let resaved = scratch.join("resaved.pink");
+        mini.save(resaved.to_str().unwrap()).unwrap();
+        assert_eq!(
+            std::fs::read(&resaved).unwrap(),
+            std::fs::read(&path).unwrap(),
+            "{rel} does not round-trip byte-exactly"
+        );
+    }
+    cleanup(&scratch);
+
+    // Spot-check the extremes the fixture pins (bit level).
+    let fid = loaded.table("fid").unwrap();
+    assert_eq!(fid.num_rows(), 6);
+    assert!(matches!(fid.get(0, 2), Some(Value::Bigint(i64::MIN))));
+    assert!(matches!(fid.get(1, 1), Some(Value::Integer(i32::MAX))));
+    assert!(matches!(
+        fid.get(1, 3),
+        Some(Value::Double(x)) if x.to_bits() == 0x7ff8_0000_dead_beef
+    ));
+    assert!(matches!(
+        fid.get(4, 3),
+        Some(Value::Double(x)) if x.to_bits() == 0xfff8_0000_0000_0001
+    ));
+    assert!(matches!(
+        fid.get(0, 3),
+        Some(Value::Double(x)) if x.to_bits() == (-0.0f64).to_bits()
+    ));
+    assert_eq!(fid.get(1, 4), Some(Value::Varchar("héllo wörld 🌍\0embedded".into())));
+    assert_eq!(fid.get(0, 4), Some(Value::Varchar(String::new())));
+    assert_eq!(fid.get(2, 0), Some(Value::Null));
+    assert!(matches!(fid.get(0, 5), Some(Value::Date(i32::MIN))));
+    assert!(matches!(fid.get(1, 6), Some(Value::Timestamp(i64::MAX))));
+
+    // The unicode table name survived its percent-encoded data directory.
+    assert_eq!(
+        loaded.table("héllo✓").unwrap().get(0, 0),
+        Some(Value::Varchar("π≈3.14".into()))
+    );
+    // Version 1 (create-time empty) still loads.
+    let v1 = lake.load(Some(1)).unwrap();
+    assert!(v1.list_tables().is_empty());
+    cleanup(&scratch);
+}
+
+#[test]
+fn v1_lake_migrates_to_vortex_on_save() {
+    let dir = scratch("v1_migrate");
+    // Work on a copy: the checked-in fixture stays untouched.
+    copy_dir(&v1_fixture_dir(), &dir);
+    let expected = common::fidelity_store();
+
+    let mut lake = Lake::open(&dir).unwrap();
+    assert_eq!(lake.format_version(), 1, "still the old lake");
+    let old = lake.load(None).unwrap();
+    assert_same_store(&expected, &old);
+
+    // Saving again publishes a v2 snapshot: a full rewrite in Vortex.
+    assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
+    assert_eq!(lake.format_version(), 2, "the handle now reports v2");
+    let catalog = read_json(&dir.join("catalog.json"));
+    assert_eq!(catalog["format_version"], 2);
+    for (key, entry) in catalog["tables"].as_object().unwrap() {
+        assert_eq!(entry["format"], "vortex", "{key}");
+        assert!(
+            entry["files"][0].as_str().unwrap().ends_with(".vortex"),
+            "{key}"
+        );
+    }
+    let data = data_files(&dir.join("data"));
+    assert_eq!(data.iter().filter(|p| p.extension().unwrap() == "vortex").count(), 6);
+    assert_eq!(
+        data.iter().filter(|p| p.extension().unwrap() == "pink").count(),
+        6,
+        "the v1 files stay untouched"
+    );
+
+    // The migrated version is value- and bit-exact, and old versions still
+    // load from their own (v1) files.
+    let migrated = lake.load(None).unwrap();
+    assert_same_store(&expected, &migrated);
+    let v2 = lake.load(Some(2)).unwrap();
+    assert_same_store(&expected, &v2);
+    assert_eq!(lake.load(Some(1)).unwrap().list_tables().len(), 0);
+    assert_eq!(lake.versions().unwrap(), vec![1, 2, 3]);
+
+    // The migrated chunking matches: the same `.pink` bytes come back out.
+    assert_eq!(
+        store_bytes(&migrated, &dir, "migrated"),
+        store_bytes(&expected, &dir, "expected")
+    );
+    cleanup(&dir);
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn vortex_roundtrip_preserves_every_bit_pattern() {
+    let dir = scratch("vortex_bits");
+    let db = common::fidelity_store();
+    let original_bytes = store_bytes(&db, &dir, "original");
+
+    let mut lake = Lake::create(&dir).unwrap();
+    assert_eq!(lake.format_version(), 2, "create publishes a v2 lake");
+    lake.write_from_store(&db).unwrap();
+    let loaded = lake.load(None).unwrap();
+
+    assert_same_store(&db, &loaded);
+    // Chunk boundaries (and thus the `.pink` bytes) round-trip exactly.
+    assert_eq!(loaded.table("big").unwrap().num_chunks(), 2);
+    assert_eq!(
+        loaded.table("empty").unwrap().num_chunks(),
+        db.table("empty").unwrap().num_chunks()
+    );
+    assert_eq!(
+        loaded.table("empty").unwrap().schema(),
+        vec![
+            ("x".to_string(), DataType::Integer),
+            ("y".to_string(), DataType::Varchar)
+        ]
+    );
+    assert_eq!(store_bytes(&loaded, &dir, "loaded"), original_bytes);
+
+    // The float extremes survive bit-exactly, including NaN payloads a
+    // naive writer would canonicalize.
+    let fid = loaded.table("fid").unwrap();
+    let codes: Vec<u64> = (0..fid.num_rows())
+        .filter_map(|r| match fid.get(r, 3) {
+            Some(Value::Double(x)) => Some(x.to_bits()),
+            _ => None,
+        })
+        .collect();
+    assert!(codes.contains(&(-0.0f64).to_bits()));
+    assert!(codes.contains(&0.0f64.to_bits()));
+    assert!(codes.contains(&0x7ff8_0000_dead_beef), "positive NaN payload");
+    assert!(codes.contains(&0xfff8_0000_0000_0001), "negative NaN payload");
+    assert!(codes.contains(&f64::INFINITY.to_bits()));
+
+    // DATE/TIMESTAMP extremes, i32/i64 extremes, NULLs, strings.
+    assert!(matches!(fid.get(0, 5), Some(Value::Date(i32::MIN))));
+    assert!(matches!(fid.get(1, 5), Some(Value::Date(i32::MAX))));
+    assert!(matches!(fid.get(0, 6), Some(Value::Timestamp(i64::MIN))));
+    assert!(matches!(fid.get(1, 6), Some(Value::Timestamp(i64::MAX))));
+    assert!(matches!(fid.get(0, 2), Some(Value::Bigint(i64::MIN))));
+    assert!(matches!(fid.get(1, 2), Some(Value::Bigint(i64::MAX))));
+    assert_eq!(fid.get(2, 0), Some(Value::Null));
+    assert_eq!(
+        fid.get(1, 4),
+        Some(Value::Varchar("héllo wörld 🌍\0embedded".into()))
+    );
+    assert_eq!(fid.get(5, 4), Some(Value::Varchar(String::new())));
+    cleanup(&dir);
+}
+
+#[test]
+fn a_corrupt_vortex_data_file_is_a_clear_error() {
+    let dir = scratch("vortex_corrupt");
+    let db = common::fidelity_store();
+    let mut lake = Lake::create(&dir).unwrap();
+    lake.write_from_store(&db).unwrap();
+
+    let victim = data_files(&dir.join("data/main.fid"))
+        .into_iter()
+        .next()
+        .expect("main.fid data file");
+    // Truncate it to a prefix: not a Vortex file anymore.
+    let bytes = std::fs::read(&victim).unwrap();
+    std::fs::write(&victim, &bytes[..bytes.len() / 2]).unwrap();
+    let lake = Lake::open(&dir).unwrap();
+    let err = lake.load(None).unwrap_err().to_string();
+    assert!(err.contains("not a valid Vortex file"), "{err}");
+    assert!(err.contains("main.fid"), "{err}");
+
+    // Metadata still reads; only a load fails.
+    assert!(lake.tables().unwrap().iter().any(|(k, _)| k == "main.fid"));
     cleanup(&dir);
 }
