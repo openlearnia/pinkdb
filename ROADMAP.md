@@ -275,6 +275,14 @@ Java bindings.
   mock-S3 test server + AWS SigV4 test vectors + a 3×3 race; the CLI accepts `s3://` lake
   URLs; an R2 cookbook in the README; documented limits (no multipart uploads, no object GC);
   the live S3 test is gated by `PINKDB_S3_LIVE`. Default CLI byte-identical (+1.96 MB with
-  `lake,s3`); 490 default tests, 79 pink-lake `s3` tests, clippy clean.
+  `lake,s3`); 490 default tests, 79 pink-lake `s3` tests, clippy clean. ; post-review
+  M2: the committed mock now verifies SigV4 for real (recomputes the canonical request + HMAC
+  chain from received bytes, body-hash + clock checks; hand-rolled std-only SHA-256/HMAC with
+  FIPS/RFC vectors) so a signing regression cannot hide; M1: endpoints that reject conditional
+  writes now REFUSE writes by default (UnsupportedEndpoint; opt-in PINKDB_S3_ALLOW_DEGRADED=1 keeps
+  a single-writer fallback with read-back verification + catalog/snapshot reconciliation, race
+  window documented); minors: client-side >5 GiB PUT refusal, timeout/no-retry docs, NoSuchBucket
+  mapping, session-token scoping, sticky-flag scoping, symlink-safe temp copies, http:// opt-in
+  (PINKDB_S3_ALLOW_HTTP), paging cap, bucket-rule alignment; 493 default / 104 pink-lake s3 tests
 - 2026-10-14 — Binary size: `pinkdb` 2.22 MB default; 44.6 MB with `--features lake`; 46.5 MB
   with `lake,s3` (release, after wave 36; pre-wave-17 was 2.26 MB).
