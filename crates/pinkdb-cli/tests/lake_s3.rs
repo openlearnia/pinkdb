@@ -34,6 +34,8 @@ fn run_with_env(cmds: &str, env: &[(&str, &str)]) -> String {
         "AWS_REGION",
         "AWS_DEFAULT_REGION",
         "AWS_S3_FORCE_PATH_STYLE",
+        "PINKDB_S3_ALLOW_DEGRADED",
+        "PINKDB_S3_ALLOW_HTTP",
     ] {
         command.env_remove(name);
     }
@@ -65,6 +67,8 @@ fn mock_env(mock: &mock_s3::MockS3) -> Vec<(&'static str, String)> {
         ("AWS_ENDPOINT_URL", mock.endpoint()),
         ("AWS_ENDPOINT_URL_S3", mock.endpoint()),
         ("AWS_REGION", "auto".to_string()),
+        // The mock is a local plain-http test server.
+        ("PINKDB_S3_ALLOW_HTTP", "1".to_string()),
     ]
 }
 
@@ -189,6 +193,7 @@ fn lake_s3_errors_are_clear() {
         ("AWS_ENDPOINT_URL", mock.endpoint()),
         ("AWS_ENDPOINT_URL_S3", mock.endpoint()),
         ("AWS_REGION", "auto".to_string()),
+        ("PINKDB_S3_ALLOW_HTTP", "1".to_string()),
     ];
     let borrowed: Vec<(&str, &str)> = wrong.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let out = run_with_env(".lake info s3://bucket/prefix\n.quit\n", &borrowed);
@@ -205,6 +210,55 @@ fn lake_s3_errors_are_clear() {
     let out = run_mock(&mock, ".lake save s3://\n.quit\n");
     assert!(out.contains("invalid lake location"), "{out}");
     assert_eq!(mock.requests().len(), before, "{:?}", mock.requests());
+}
+
+#[test]
+fn plain_http_and_degraded_endpoints_need_explicit_cli_opt_ins() {
+    let mock = mock_s3::MockS3::start();
+
+    // A plain-http endpoint is refused without the explicit test opt-in.
+    let endpoint = mock.endpoint();
+    let access_key = mock.access_key_id();
+    let out = run_with_env(
+        ".lake info s3://bucket/prefix\n.quit\n",
+        &[
+            ("AWS_ACCESS_KEY_ID", access_key.as_str()),
+            ("AWS_SECRET_ACCESS_KEY", "mock-secret"),
+            ("AWS_ENDPOINT_URL", endpoint.as_str()),
+            ("AWS_REGION", "auto"),
+        ],
+    );
+    assert!(out.contains("Error: "), "{out}");
+    assert!(out.contains("unencrypted"), "{out}");
+    assert!(out.contains("PINKDB_S3_ALLOW_HTTP"), "{out}");
+    assert!(mock.requests().is_empty(), "no request may go out: {:?}", mock.requests());
+
+    // An endpoint that rejects conditional writes refuses writes by default,
+    // with the single-writer opt-in named; PINKDB_S3_ALLOW_DEGRADED=1 accepts
+    // the fallback.
+    mock.reject_conditional_writes(true);
+    let url = mock.url("degraded-cli-bucket", "lakes/deg");
+    let out = run_mock(
+        &mock,
+        &format!("CREATE TABLE t (a INTEGER);\n.lake save {url}\n.quit\n"),
+    );
+    assert!(out.contains("Error: "), "{out}");
+    assert!(out.contains("does not support conditional writes"), "{out}");
+    assert!(out.contains("PINKDB_S3_ALLOW_DEGRADED"), "{out}");
+    assert!(mock.keys().is_empty(), "nothing was written: {:?}", mock.keys());
+
+    let owned = mock_env(&mock);
+    let mut borrowed: Vec<(&str, &str)> = owned
+        .iter()
+        .map(|(k, v)| (*k, v.as_str()))
+        .collect();
+    borrowed.push(("PINKDB_S3_ALLOW_DEGRADED", "1"));
+    let out = run_with_env(
+        &format!("CREATE TABLE t (a INTEGER);\n.lake save {url}\n.quit\n"),
+        &borrowed,
+    );
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    assert!(mock.keys().iter().any(|k| k == "lakes/deg/catalog.json"), "{:?}", mock.keys());
 }
 
 #[test]

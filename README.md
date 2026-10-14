@@ -548,11 +548,14 @@ is missing, instead of advertising data a load cannot read. Without the
 feature, `.lake` reports `this pinkdb binary was built without the lake
 feature`; without `s3`, an `s3://` location is `this pink-lake build does not
 include the `s3` feature` with the rebuild command. Release `pinkdb` on
-Apple Silicon (2026-10): 2,217,792 B default (unchanged, byte-identical to
-the pre-S3 build) vs 44,586,864 B with `--features lake` (38,121,864 B
-stripped) and 46,548,016 B with `--features lake,s3` (39,775,672 B stripped)
-— the Vortex array encodings dominate; S3 adds ≈1.96 MB raw (ureq/rustls +
-hmac/sha2). See the dependency/build note above.
+Apple Silicon (2026-10, after the S3 review fixes): 2,217,792 B default
+(unchanged, **byte-identical** to the pre-S3 build) vs 44,587,232 B with
+`--features lake` (38,121,880 B stripped) and 46,565,744 B with
+`--features lake,s3` (39,792,376 B stripped) — the Vortex array encodings
+dominate; S3 adds ≈1.98 MB raw (ureq/rustls + hmac/sha2). “Stripped” =
+copying the linked binary and running the system `strip` with no flags
+(`strip <file>`, macOS LLVM strip), then `stat -f%z`; `strip -x` gives the
+same size. See the dependency/build note above.
 
 ### Object storage (S3/R2)
 
@@ -579,10 +582,12 @@ Environment (the `s3://` URL form):
 | variable | meaning | R2 example |
 |---|---|---|
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | credentials (required) | R2 API token key id/secret |
-| `AWS_SESSION_TOKEN` | optional temporary-credential token (signed) | — |
+| `AWS_SESSION_TOKEN` | optional temporary-credential token (signed); used only with the environment's credential pair, ignored with explicit credentials | — |
 | `AWS_ENDPOINT_URL` (or `AWS_ENDPOINT_URL_S3`) | non-AWS endpoint | `https://<account>.r2.cloudflarestorage.com` |
-| `AWS_REGION` (or `AWS_DEFAULT_REGION`) | SigV4 region | `auto` |
+| `AWS_REGION` (or `AWS_DEFAULT_REGION`) | SigV4 region (`auto` requires a custom endpoint) | `auto` |
 | `AWS_S3_FORCE_PATH_STYLE` | force path-style (`1`/`true`/`yes`/`on`) | optional; path-style is already the default with a custom endpoint |
+| `PINKDB_S3_ALLOW_HTTP` | allow a plain `http://` endpoint (local tests only — credentials travel unencrypted) | — |
+| `PINKDB_S3_ALLOW_DEGRADED` | accept the single-writer check-then-put fallback on endpoints that reject conditional writes (see below) | — |
 
 R2 cookbook:
 
@@ -612,32 +617,74 @@ cargo build -p pinkdb-cli --features lake,s3
   chain: `create`/`save` are class-CRUD-safe for one live writer, with the
   same conflict error text as the local hard-link/rename path. The lake
   additionally re-reads and re-validates the catalog right before the
-  replace, so even a backend that cannot enforce conditionals still fails
-  stale saves cleanly.
-- **Endpoints without conditional writes degrade, once, with a documented
-  window.** If a conditional request is rejected with HTTP 501 or
-  `NotImplemented` (an old S3-compatible server), the client records that
-  and switches to check-then-put for `If-None-Match`/`If-Match`: it HEADs or
-  GETs the ETag, compares, and only then writes. That has a small
-  read-to-write window (a racing writer could slip in); conflict detection
-  still comes from the catalog version re-check, and the degradation is
-  sticky so later saves do not re-probe. Everything else — `create`,
-  `save`, `versions`, `tables`, `info`, `load` — behaves identically.
+  replace, and on an endpoint that cannot enforce conditionals it refuses
+  the write outright (see the next two bullets) instead of guessing.
+- **Endpoints without conditional writes are refused by default.** If a
+  conditional request is rejected with HTTP 501 or a 400
+  `NotImplemented`/`InvalidRequest` (an old S3-compatible server), writes are
+  refused with `this endpoint does not support conditional writes;
+  concurrent-safe saves are unavailable. Set PINKDB_S3_ALLOW_DEGRADED=1 (or
+  S3Config::allow_degraded(true)) to accept a SINGLE-WRITER guarantee with a
+  small race window`. Reads keep working. The refusal is sticky: once an
+  endpoint has proven it rejects conditionals, later writes fail immediately
+  without touching the bucket (a save that hits it mid-flight may have
+  uploaded already-written data files — unreferenced leftovers, harmless like
+  a crash; no snapshot or catalog is ever replaced).
+- **The degraded opt-in is single-writer only.** With
+  `S3Config::allow_degraded(true)` / `PINKDB_S3_ALLOW_DEGRADED=1` the client
+  falls back to check-then-put for `If-None-Match`/`If-Match`: it HEADs or
+  GETs the current ETag, compares, writes, then **reads the object back and
+  byte-compares** it (a mismatch is a conflict, never a silent success). The
+  lake additionally re-checks the catalog before the replace and verifies it
+  after, restoring `snapshots/<v>.json` from the authoritative
+  `catalog.json` bytes if a racing writer transiently replaced it. That keeps
+  the published pair consistent in the interleavings the fallback can reach,
+  but it cannot make a save atomic: **concurrent writers are unsupported with
+  the opt-in** — one save can lose with a `Conflict`, and a prior publish can
+  be replaced by a later one (never left as a catalog/snapshot mismatch). Use
+  it only for a strictly single-writer lake.
 - **Errors are clear:** HTTP 403 → `object storage access error at <lake>`
   (credentials/permissions, including the missing-credentials case before any
-  request); 404 on the catalog → `not a pink-lake directory`; a missing
+  request); 404 on the catalog → `not a pink-lake directory`, while a 404 on
+  a bucket the client has not yet seen answer successfully (the body says
+  `NoSuchBucket`, or a bodiless HEAD is followed by a bucket probe) → `the
+  bucket does not exist (or is not visible to these credentials)`; a missing
   snapshot → `has no snapshot version N`; a deleted data object is reported
   by `.lake tables`/`.lake info` and by `load` with the local
-  `loading data file "…"` context; 412 → `write conflict`. The host clock
-  must be within S3's allowed skew (~15 min) for SigV4.
+  `loading data file "…"` context; 412 → `write conflict`; `409 Conflict` on
+  a conditional PUT is retried up to 3 times (a concurrent delete raced the
+  write), everything else is a one-shot I/O error naming the S3 code. The
+  host clock must be within S3's allowed skew (~15 min) for SigV4. Every
+  request has one **120 s whole-request timeout** (connect + transfer), and
+  **nothing is retried on 429/503** (`SlowDown`/`ServiceUnavailable`), a
+  transport error, or a redirect (a 301 `PermanentRedirect` is an error —
+  fix the endpoint/region): retry the save yourself, reopening the lake
+  first.
+- **After a mid-save I/O error, reopen and inspect before retrying.** A
+  failed or interrupted save can leave three safe-but-visible states: the
+  data files are unreferenced (ignored); `snapshots/<v>.json` exists while
+  `catalog.json` still points at the previous version (an unpublished stray —
+  `.lake versions` omits it, and the next save refuses with `snapshot N
+  already exists … remove the stray snapshot and retry`); or the catalog PUT
+  landed and its response was lost, in which case the new version is
+  published and `catalog.json` is byte-identical to its snapshot. So: reopen
+  the lake and run `.lake versions`, compare it with what the error said, and
+  only then retry — never blindly re-run a save on the old handle (it will
+  fail with the version conflict, which is the safe outcome).
 - **What is not implemented:** multipart uploads — one `PutObject` per
   object, so a single table's data file must be ≤ 5 GiB (the S3 single-PUT
-  limit; the client refuses larger bodies and reads at the same cap); no
-  bucket creation, no lifecycle rules, no object versioning, no server-side
-  copy, no lake-side GC (old versions/data objects stay, exactly like
-  local), and lake data is plaintext (same as local). v1 `.pink` data files
+  limit; the client refuses larger bodies with a clear error before sending
+  them and caps reads at the same size); no bucket creation, no lifecycle
+  rules, no object versioning, no server-side copy, no lake-side GC (old
+  versions/data objects stay, exactly like local), and lake data is plaintext
+  (same as local). A dotted bucket name needs **path-style** addressing
+  (virtual-hosted TLS certificates do not cover `dots.in.bucket.<endpoint>`;
+  a custom endpoint already defaults to path-style and
+  `AWS_S3_FORCE_PATH_STYLE=1` forces it for AWS). v1 `.pink` data files
   stored in an S3 lake still load: the engine's loader needs a path, so the
-  object is downloaded to a unique temp file and removed when done.
+  object is downloaded to a unique temp file (created with `create_new`, so a
+  planted symlink is never followed; partial files are removed on error) and
+  removed when done.
 - **Live test (opt-in):** `PINKDB_S3_LIVE=1 PINKDB_S3_BUCKET=<bucket>
   PINKDB_S3_PREFIX=<prefix> AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
   AWS_ENDPOINT_URL=… AWS_REGION=auto cargo test -p pink-lake --features s3

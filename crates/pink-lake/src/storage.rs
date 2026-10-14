@@ -149,6 +149,25 @@ pub(crate) trait Storage: fmt::Debug {
     fn exists(&self, rel: &str) -> Result<bool> {
         Ok(!matches!(self.head(rel)?, Head::Missing))
     }
+
+    /// Restore `snapshots/<version>.json` to the authoritative
+    /// `catalog.json` bytes after a degraded (check-then-put) race left a
+    /// *published* snapshot replaced: catalog and snapshot are byte-identical
+    /// by construction, so the catalog bytes are the repair. `bytes` is the
+    /// catalog manifest the caller just read. The local backend and
+    /// conditional-write endpoints have nothing to repair and do nothing.
+    fn reconcile_snapshot(&self, _version: u64, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether this backend is currently using the explicit degraded
+    /// check-then-put fallback (only possible over S3, and only after the
+    /// endpoint rejected conditional writes in opt-in mode). The lake then
+    /// verifies the catalog replace and repairs the snapshot pair; local
+    /// storage and conditional-write endpoints answer `false`.
+    fn uses_degraded_fallback(&self) -> bool {
+        false
+    }
 }
 
 /// A parsed lake location: a local directory path or an `s3://` URL.
@@ -174,34 +193,44 @@ impl Location {
             Some((bucket, prefix)) => (bucket, prefix.trim_end_matches('/')),
             None => (rest, ""),
         };
-        let valid_bucket = !bucket.is_empty()
-            && bucket.len() <= 255
-            && bucket.bytes().all(|b| {
-                b.is_ascii_lowercase()
-                    || b.is_ascii_uppercase()
-                    || b.is_ascii_digit()
-                    || b == b'-'
-                    || b == b'.'
-            });
-        if !valid_bucket {
-            return Err(LakeError::BadLocation {
-                location: original.to_string(),
-                message: "the bucket name must be non-empty and made of ASCII letters, digits, \
-                          `.` and `-` (expected s3://bucket/prefix)"
-                    .to_string(),
-            });
-        }
-        if prefix.starts_with('/') {
-            return Err(LakeError::BadLocation {
-                location: original.to_string(),
-                message: "the prefix must not start with `/`".to_string(),
-            });
-        }
+        validate_bucket_name(bucket).map_err(|message| LakeError::BadLocation {
+            location: original.to_string(),
+            message,
+        })?;
+        validate_prefix(prefix, original)?;
         Ok(Location::S3 {
             bucket: bucket.to_string(),
             prefix: prefix.to_string(),
         })
     }
+}
+
+/// The S3 bucket-name shape this client accepts: 3–63 bytes of lowercase
+/// ASCII letters, digits, `.` and `-` (the DNS-compatible object-storage
+/// rule; shared by [`Location::parse`] and the `s3` feature's `S3Config`, so
+/// a URL and an explicit config reject exactly the same names).
+pub(crate) fn validate_bucket_name(bucket: &str) -> std::result::Result<(), String> {
+    let characters_ok = bucket.bytes().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'
+    });
+    if (3..=63).contains(&bucket.len()) && characters_ok {
+        Ok(())
+    } else {
+        Err("the bucket name must be 3–63 characters of lowercase ASCII letters, digits, \
+             `.` and `-` (expected s3://bucket/prefix)"
+            .to_string())
+    }
+}
+
+/// A key prefix: no leading `/` (trailing slashes are normalized away).
+pub(crate) fn validate_prefix(prefix: &str, original: &str) -> Result<()> {
+    if prefix.starts_with('/') {
+        return Err(LakeError::BadLocation {
+            location: original.to_string(),
+            message: "the prefix must not start with `/`".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -235,7 +264,6 @@ mod tests {
             ("s3://bucket/a/b/c", "bucket", "a/b/c"),
             ("s3://bucket/a/b/c/", "bucket", "a/b/c"),
             ("s3://my.bucket-1/x", "my.bucket-1", "x"),
-            ("s3://UPPER/x", "UPPER", "x"),
         ];
         for (url, bucket, prefix) in cases {
             assert_eq!(
@@ -251,10 +279,24 @@ mod tests {
 
     #[test]
     fn bad_s3_urls_are_clear_errors() {
-        for bad in ["s3://", "s3:///prefix", "s3://bucket//x", "s3://bad_bucket/x", "s3://b ck/x"] {
+        let long_bucket = "b".repeat(64);
+        let too_long = format!("s3://{long_bucket}/x");
+        for bad in [
+            "s3://",
+            "s3:///prefix",
+            "s3://bucket//x",
+            "s3://bad_bucket/x",
+            "s3://b ck/x",
+            // Uppercase is not a valid S3 bucket name (shared with S3Config).
+            "s3://UPPER/x",
+            // Shorter than 3 bytes.
+            "s3://ab/x",
+        ] {
             let err = Location::parse(bad).unwrap_err();
             assert!(matches!(err, LakeError::BadLocation { .. }), "{bad}: {err:?}");
             assert!(err.to_string().contains("invalid lake location"), "{err}");
         }
+        let err = Location::parse(&too_long).unwrap_err();
+        assert!(matches!(err, LakeError::BadLocation { .. }), "{err:?}");
     }
 }

@@ -4,8 +4,9 @@
 //! The lake itself lives in the `pink-lake` crate; this module is only the
 //! REPL surface. Locations are local directories, or `s3://bucket/prefix`
 //! URLs when the `s3` feature is built (AWS S3, Cloudflare R2; credentials
-//! and endpoint come from the usual `AWS_*` environment). `.lake open`
-//! replaces the in-memory store:
+//! and endpoint come from the usual `AWS_*` environment; the safety opt-ins
+//! `PINKDB_S3_ALLOW_HTTP` and `PINKDB_S3_ALLOW_DEGRADED` work exactly as the
+//! library documents). `.lake open` replaces the in-memory store:
 //!
 //! - the session database is reset to `main` (the lake has no session state;
 //!   the output says so when it changes);
@@ -27,8 +28,11 @@ use pinkdb::PinkDb;
 
 use crate::{plural, take_token, unquote};
 
-/// The one-line pointer to object-storage locations appended to usage text
-/// (the `lake` feature alone does not accept `s3://`; the `s3` feature does).
+/// The one-line pointer to object-storage locations appended to usage text:
+/// with the `s3` feature `s3://` URLs are accepted, without it they are not.
+#[cfg(feature = "s3")]
+const HINT: &str = "   (locations may be s3://bucket/prefix)";
+#[cfg(not(feature = "s3"))]
 const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature)";
 
 /// Dispatch `.lake <subcommand> ...`.

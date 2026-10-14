@@ -104,7 +104,13 @@
 //! reopen the lake") before its catalog replacement — and two writers racing
 //! for the same version cannot both win: the snapshot link is atomic, so
 //! exactly one publishes `snapshots/<v>.json`, and `catalog.json` is
-//! byte-identical to the snapshot of its version.
+//! byte-identical to the snapshot of its version. Over S3 both publications
+//! are conditional writes (`If-None-Match: *`, `If-Match: <etag>`), which
+//! AWS S3 / Cloudflare R2 evaluate atomically with the write commit. An
+//! endpoint that rejects conditionals refuses the write
+//! ([`LakeError::UnsupportedEndpoint`]) unless the single-writer degraded
+//! fallback is explicitly opted into — see the `s3` feature docs and the
+//! README.
 //!
 //! # Naming and scope (lake decisions)
 //!
@@ -145,8 +151,10 @@
 //!   snapshot `put_new` is `If-None-Match: *` and the catalog replace is
 //!   `If-Match: <etag>`, so AWS S3 / Cloudflare R2 evaluate conflict
 //!   detection atomically with the write; an endpoint that rejects
-//!   conditional writes degrades (once, noted) to a check-then-put with the
-//!   documented window. Single-PUT objects only: no multipart, so one table
+//!   conditional writes refuses the write with
+//!   [`LakeError::UnsupportedEndpoint`] unless the unsafe single-writer
+//!   fallback is explicitly accepted (see `S3Config::allow_degraded`).
+//!   Single-PUT objects only: no multipart, so one table
 //!   file must be ≤ 5 GiB (see the README).
 
 use std::collections::BTreeMap;
@@ -228,6 +236,13 @@ pub enum LakeError {
     /// Object storage denied the request (HTTP 403): credentials, bucket
     /// permissions, or a wrong endpoint.
     Auth { path: PathBuf, message: String },
+    /// The object-storage endpoint cannot support a safe write: it rejects
+    /// the conditional writes the single-writer contract needs and the
+    /// unsafe degraded fallback was not explicitly accepted. Writes are
+    /// refused; reads still work. Opt in with `S3Config::allow_degraded(true)`
+    /// (or `PINKDB_S3_ALLOW_DEGRADED=1` on the `s3://` URL path) to accept a
+    /// single-writer guarantee with a small race window.
+    UnsupportedEndpoint { path: PathBuf, message: String },
     /// Filesystem failure, with the operation that failed.
     Io { context: String, source: std::io::Error },
     /// The engine rejected the data or the store shape.
@@ -287,6 +302,9 @@ impl fmt::Display for LakeError {
             ),
             LakeError::Auth { path, message } => {
                 write!(f, "object storage access error at {}: {message}", path.display())
+            }
+            LakeError::UnsupportedEndpoint { path, message } => {
+                write!(f, "unsupported object-storage endpoint at {}: {message}", path.display())
             }
             LakeError::Io { context, source } => write!(f, "lake I/O error ({context}): {source}"),
             LakeError::Engine { context, source } => {
@@ -359,7 +377,10 @@ impl Lake {
     /// region come from the usual environment variables (`AWS_ACCESS_KEY_ID`,
     /// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ENDPOINT_URL`/
     /// `AWS_ENDPOINT_URL_S3`, `AWS_REGION`/`AWS_DEFAULT_REGION`,
-    /// `AWS_S3_FORCE_PATH_STYLE`); use `Lake::create_s3` (with the `s3`
+    /// `AWS_S3_FORCE_PATH_STYLE`), and the safety opt-ins
+    /// `PINKDB_S3_ALLOW_HTTP` (plain-http test endpoints) and
+    /// `PINKDB_S3_ALLOW_DEGRADED` (single-writer fallback on endpoints
+    /// without conditional writes); use `Lake::create_s3` (with the `s3`
     /// feature) for explicit configuration.
     pub fn create_url(location: &str) -> Result<Self> {
         Self::create_with(storage_for(Location::parse(location)?)?)
@@ -680,6 +701,33 @@ impl Lake {
             });
         }
         bytes_written += bytes.len() as u64;
+        // A degraded (check-then-put) endpoint cannot make the replace
+        // atomic, so verify what actually got published before reporting
+        // success: read the catalog back, and if another writer's catalog is
+        // authoritative now, report the conflict and restore the snapshot
+        // pair from the winning bytes. If ours landed, repair
+        // `snapshots/<version>.json` in case a racing writer replaced it
+        // between its PUT and this replace. No-op (and no extra requests) on
+        // local storage and conditional-write endpoints.
+        if self.storage.uses_degraded_fallback() {
+            let path = self.storage.abs(CATALOG_FILE);
+            let (current, _) = self
+                .storage
+                .read_tagged(CATALOG_FILE, &format!("reading {}", path.display()))?;
+            if current != bytes {
+                let winner = read_manifest(&path, &current)?;
+                self.storage.reconcile_snapshot(winner.version, &current)?;
+                return Err(LakeError::Conflict {
+                    path,
+                    message: format!(
+                        "catalog.json changed while this save was in flight (this handle is \
+                         based on version {}); reopen the lake",
+                        self.version
+                    ),
+                });
+            }
+            self.storage.reconcile_snapshot(version, &bytes)?;
+        }
         self.version = version;
         // A save always publishes a v2 (Vortex) manifest, so a handle that
         // opened a v1 lake reports v2 once it has migrated it.
@@ -762,6 +810,24 @@ impl Lake {
             .read_tagged(CATALOG_FILE, &format!("reading {}", path.display()))?;
         let current = read_manifest(&path, &bytes)?;
         if current.version != self.version {
+            // A degraded endpoint's check-then-put window can let this save
+            // overwrite a *published* snapshot (`snapshots/<current.version>`
+            // written from the catalog of the writer it raced). The catalog
+            // is authoritative and byte-identical to its snapshot by
+            // construction, so repair the pair before reporting the
+            // conflict. Local storage and conditional-write endpoints have
+            // nothing to repair (the default implementation is a no-op).
+            self.storage
+                .reconcile_snapshot(current.version, &bytes)
+                .map_err(|e| LakeError::Conflict {
+                    path: path.clone(),
+                    message: format!(
+                        "another writer published version {} (this handle is based on version \
+                         {}); reopen the lake — and the catalog/snapshot pair could not be \
+                         reconciled afterwards ({e})",
+                        current.version, self.version
+                    ),
+                })?;
             return Err(LakeError::Conflict {
                 path,
                 message: format!(
