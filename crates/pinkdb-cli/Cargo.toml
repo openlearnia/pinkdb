@@ -17,6 +17,11 @@ encryption = ["pinkdb/encryption"]
 # Keeps the default binary lean: HTTP + TLS, JSON parsing, and SHA-256 live
 # only behind this feature.
 repo = ["dep:ureq", "dep:serde_json", "dep:sha2"]
+# Opt-in lake layer: `.lake save/open/versions/tables/info` snapshot the store
+# into a `pink-lake` directory (JSON metadata + immutable `.pink` data files).
+# Keeps the default binary lean: lake + JSON metadata code lives only behind
+# this feature.
+lake = ["dep:pink-lake"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
@@ -27,3 +32,5 @@ pinkdb-server = { path = "../pinkdb-server", optional = true }
 ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+# Lake layer (lake feature): catalog + immutable data files.
+pink-lake = { path = "../pink-lake", optional = true }

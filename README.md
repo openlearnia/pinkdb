@@ -68,6 +68,7 @@ SQL text
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
+| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table `.pink` data files (opt-in CLI `lake` feature) |
 
 Design rules: Rust edition 2021, zero async; the core is zero-unsafe, with
 `unsafe` contained to exactly two crates (the C ABI `pinkdb-ffi` and the
@@ -349,6 +350,134 @@ succeed; overlapping writes abort the second committer with a write-conflict
 error (retry the transaction) — never silent lost updates. This is snapshot
 isolation without predicate tracking (write-skew is possible). The plain
 `PinkDb` API remains for single-connection embedding.
+
+## Lake layer (feature `lake`)
+
+`pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
+JSON catalog plus immutable per-table data files, local disk first. It is the
+wave-34 ground for the roadmap's lake architecture (Vortex as the data format
+in wave 35, S3 storage in wave 36).
+
+A lake is a directory:
+
+```text
+mylake/
+├── catalog.json               current state (authoritative "latest")
+├── snapshots/<version>.json   immutable manifest per published version
+└── data/<table>/<uuid>.pink   immutable per-table data files
+```
+
+The manifests (`catalog.json` and every snapshot) share one shape:
+
+```json
+{
+  "format_version": 1,
+  "updated": "2026-10-14T02:11:50.760Z",
+  "version": 2,
+  "tables": {
+    "analytics.u": { "files": ["data/analytics.u/e9a4….pink"], "rows": 1 },
+    "main.t":      { "files": ["data/main.t/831a….pink"], "rows": 2 }
+  }
+}
+```
+
+- **Schema and typing live in the data files.** Each `.pink` file is exactly
+  the engine's persistence bytes for a single-table store, so round-trips are
+  bit-exact (`-0.0`, NaN payloads, all types, NULLs), a data file opens
+  standalone with `PinkDb::open`, and the catalog stays a tiny metadata
+  document. Metadata is the only serialization code here (`serde_json`).
+- **Every save is a full snapshot.** `write_from_store` writes every table of
+  every database to a fresh data file, publishes `snapshots/<version>.json`
+  (`version = previous + 1`, via `checked_add` and capped at `MAX_VERSION`,
+  so a tampered `version: u64::MAX` or a lake at the cap is a clear error,
+  never a wrap), then replaces `catalog.json` with the same bytes. Old
+  versions and their data files are never modified — and a snapshot file that
+  already exists is never replaced: `save` that would land on a published
+  version (e.g. after restoring an older `catalog.json`) fails with a
+  conflict instead of clobbering it. `load(Some(v))` restores any published
+  version, `load(None)` the latest. The v1 writer emits exactly one data file
+  per table per version — a very large table still becomes one file
+  (multi-file entries load fine; they are reserved for future writers). v1
+  has no appending, compaction or GC — each save costs one full rewrite, and
+  old versions' files stay.
+- **Atomicity order: data files → snapshot → catalog.** Every write goes to a
+  *unique* temp sibling (`<name>.<uuid>.tmp`, created with `create_new(true)`
+  so a planted symlink or an older writer's temp file is never followed or
+  truncated), is fsynced, then renamed into place (catalog, data files) or
+  **hard-linked** into place (snapshots: an existing version can never be
+  replaced). The parent directory is fsynced afterwards, best-effort. This is
+  **process-crash safety**: after a `kill -9` the previous version always
+  loads, and stray data files, `.tmp` files and snapshots above the catalog's
+  version are ignored (`versions` lists only manifests that parse and declare
+  their own canonical version). It is *not* a power-loss guarantee on APFS:
+  `fsync(2)`/`File::sync_all` can return before the drive flushes its cache;
+  only `F_FULLFSYNC` would, and this crate deliberately adds no
+  unsafe/libc dependency for it (a future opt-in mode could). One leftover is
+  visible: a stray manifest at exactly the *next* version can't be told apart
+  from a published one, so a save landing on it refuses with a clear conflict
+  ("if catalog.json still points at the previous version it was never
+  published — remove the stray snapshot and retry"). Corrupt metadata is a
+  clear error, never a panic.
+- **Flat `db.table` names**, restored by splitting on the first dot; a table
+  name may contain dots, a database name containing `.` is refused at save
+  time. Views are session-local and are not saved. A v1 lake records tables,
+  so a database with no tables is not preserved and a dropped `main` comes
+  back empty (loading always recreates it). Data files are plaintext
+  (`PINKDB_KEY` does not encrypt a lake in v1; the CLI keeps the session key
+  across `.lake open` for later `.save`/`.open`). Data files carry no
+  checksums: mutating one in place is undetected by design in v1, while
+  cross-table swaps, schema disagreement and row-count mismatches *are*
+  detected on load. `save_store`/`.lake save` pre-validate the store (dotted
+  database names, over-long encoded table names) *before* creating a lake, so
+  a rejected save leaves nothing behind.
+- **One live writer handle per lake directory** (no file locking; concurrent
+  readers of published versions are fine). A handle that saves after another
+  handle/process moved the catalog fails with `LakeError::Conflict`
+  ("another writer published version N; reopen the lake") *before* replacing
+  the catalog, and two writers racing for one version cannot both win: the
+  snapshot link is atomic, so exactly one publishes it, and `catalog.json` is
+  byte-identical to the snapshot of its version. All I/O goes through a
+  private `LocalStorage` handle; a `Storage` trait is deliberately deferred
+  until wave 36 needs a second (S3) implementation.
+
+Library:
+
+```rust
+use pink_lake::{Lake, save_store};
+use pinkdb::PinkDb;
+
+let mut db = PinkDb::new();
+db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
+
+let version = save_store(&db, "mylake")?;  // creates the lake, publishes v2
+let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
+let v3 = lake.write_from_store(&db)?;      // full snapshot, version 3
+let tables = lake.tables()?;               // [("main.t", 2)]
+let versions = lake.versions()?;           // [1, 2, 3]
+let latest = lake.load(None)?;             // rebuild the latest
+let old = lake.load(Some(2))?;             // rebuild a specific snapshot
+```
+
+REPL (opt-in `lake` feature — the default binary stays lean):
+
+```sh
+cargo build -p pinkdb-cli --features lake
+```
+
+```text
+.lake save <dir>          snapshot the store (version, tables, rows, bytes)
+.lake open <dir> [ver]    replace the in-memory store with the lake
+                          (session database resets to main; PINKDB_KEY is kept)
+.lake versions <dir>      published versions (current marked)
+.lake tables <dir>        current version's db.table names + row counts
+.lake info <dir>          format version, current version, snapshots, tables
+```
+
+`.lake tables`/`.lake info` also warn about tables whose referenced data file
+is missing, instead of advertising data a load cannot read. Without the
+feature, `.lake` reports `this pinkdb binary was built without the lake
+feature`. Release `pinkdb`: 2,289,616 B default (unchanged) vs 2,470,272 B
+with `--features lake` (+180,656 B ≈ 176 KiB).
 
 ## Network server
 
@@ -831,8 +960,9 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
-feature; the network server (`pinkdb-server`) shipped in wave 24;
-authentication and TLS are deferred.
+feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
+layer (`pink-lake`, CLI `lake` feature) shipped in wave 34; authentication
+and TLS are deferred.
 
 ## Development
 
@@ -841,6 +971,9 @@ cargo build            # workspace
 cargo test             # 100+ unit + end-to-end tests
 cargo test -p pinkdb-server                          # protocol + server + durable tests
 cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
+cargo test -p pinkdb-cli --features lake             # lake round-trip + CLI tests
+cargo build -p pinkdb-cli --features lake            # REPL with .lake commands
+PINKDB_CLI_BIN=./target/release/pinkdb cargo test -p pinkdb-cli --features lake  # release CLI (overflow checks off)
 cargo test -p pinkdb-ext-loader                      # loadable extensions (compiles C test extensions with cc)
 cargo test --features encryption                     # encrypted round-trips + WAL recovery
 cargo build -p pinkdb-cli --features encryption      # REPL with PINKDB_KEY support

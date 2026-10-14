@@ -15,6 +15,9 @@ use pinkdb_server::Client;
 #[cfg(feature = "repo")]
 mod repo;
 
+#[cfg(feature = "lake")]
+mod lake;
+
 const PROMPT: &str = "pinkdb> ";
 const CONT_PROMPT: &str = "   ...> ";
 /// Rows shown before truncating with a "(N more rows)" note.
@@ -31,6 +34,15 @@ fn print_help() {
     println!("                         db.table targets another database)");
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
+    if cfg!(feature = "lake") {
+        println!("  .lake save <dir>       snapshot the store into a lake directory");
+        println!("  .lake open <dir> [v]   load the lake's latest (or version v) into memory");
+        println!("  .lake versions <dir>   list the lake's published versions");
+        println!("  .lake tables <dir>     list the current version's tables and row counts");
+        println!("  .lake info <dir>       show the lake's format version, versions, and tables");
+    } else {
+        println!("  .lake <subcommand>     (not built; needs the `lake` feature)");
+    }
     if cfg!(feature = "repo") {
         println!("  .install <name[@version]>   install from a repository, then load it");
         println!("  .repositories [list | add <url> | remove <url>]  manage repositories");
@@ -53,6 +65,16 @@ fn repo_unavailable(cmd: &str) {
         "Error: {cmd} is not available: this pinkdb binary was built without the repo feature;"
     );
     println!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
+}
+
+/// The `.lake` message when the binary was built without the opt-in `lake`
+/// feature.
+#[cfg(not(feature = "lake"))]
+fn lake_unavailable(cmd: &str) {
+    println!(
+        "Error: {cmd} is not available: this pinkdb binary was built without the lake feature;"
+    );
+    println!("       rebuild with `cargo build -p pinkdb-cli --features lake`.");
 }
 
 /// `.install <name[@version]>`: resolve, download, verify, cache, and load.
@@ -488,6 +510,12 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                 }
             }
         }
+        ".lake" => {
+            #[cfg(feature = "lake")]
+            lake::cmd_lake(db, rest);
+            #[cfg(not(feature = "lake"))]
+            lake_unavailable(".lake");
+        }
         _ => println!("Unknown dot-command \"{cmd}\". Try .help"),
     }
     true
@@ -508,7 +536,7 @@ fn run_dot_remote(line: &str) -> bool {
         ".help" => print_help_remote(),
         ".quit" | ".exit" => return false,
         ".databases" | ".tables" | ".schema" | ".import" | ".save" | ".open" | ".install"
-        | ".repositories" | ".installed" => {
+        | ".repositories" | ".installed" | ".lake" => {
             println!("Error: {cmd} is not available in remote mode");
         }
         _ => println!("Unknown dot-command \"{cmd}\". Try .help"),
@@ -523,6 +551,7 @@ fn print_help_remote() {
     println!("  .quit | .exit          leave the shell");
     println!("  .databases/.tables/.schema/.import/.save/.open are not available in remote mode");
     println!("  .install/.repositories/.installed are not available in remote mode");
+    println!("  .lake is not available in remote mode");
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
     println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");

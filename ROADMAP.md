@@ -56,7 +56,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 31 | Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo `ext-sdk/go`) | done | ext-sdk/go/ (cgo c-shared template + example, vendored header pinned by the sync test, README with sharp edges); smoke 15/15 incl. a 5,000-row multi-threaded callback query (3 rayon threads); gofmt/vet clean; 434 tests; clippy clean |
 | 32 | Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service) | done | live at https://pinkdb-ext-repo.defaultcms.workers.dev (Workers + R2 bucket pinkdb-extensions); index.json + immutable artifact streaming; first entry math_ext 0.1.0 darwin-arm64 (sha256 38abc8b3…, 17088 B) verified by verify.sh |
 | 33 | Custom repositories: user-configurable extension repository URLs and config (core config + repo client) | done | CLI `repo` feature: config `~/.pinkdb/repositories.json`, catalog client (platform/ABI resolve, atomic download, SHA-256 verify), `.install`/`.repositories`/`.installed`; 7 hermetic fixture-server tests + 24 unit tests + live `math_ext` install verified; default CLI 2.27 MB vs 4.33 MB with the feature |
-| 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer) | queued | — |
+| 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer) | done | crates/pink-lake + CLI lake feature: catalog.json + immutable snapshots/<v>.json + per-table data/<table>/<uuid>.pink (single-table engine bytes); snapshot/version/restore API; crash-atomic publication; 465 tests both parser modes, 35 CLI lake tests, clippy clean incl. lake,encryption; process-race harness 8×4/6×4/6×6 consistent; sizes default 2.29 MB / +lake 2.47 MB |
 | 35 | Vortex file format as the default lake data format (format crate / extension) | queued | — |
 | 36 | S3 bucket support for lake storage and file reading (optional `s3` feature, storage provider) | queued | — |
 | 37 | Documentation website (separate site/track) | done | website/ generator (stdlib Python, layout+fragments), 10 pages + CSS, 86 KiB self-contained, extensionless canonical links, wrangler dry-run validated |
@@ -73,6 +73,12 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 48 | RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), `CREATE USER`/`CREATE ROLE`/`GRANT`/`REVOKE` on databases/tables, session login on the network server, per-connection enforcement (embedded API stays trusted), grants persisted in the catalog + WAL | queued | — |
 | 49 | Extensions on wasm: support loadable/pluggable extensions for wasm targets — either wasm dynamic-linking (pre-built WASI side modules, per-runtime `dlopen` support) or a host-function registration path (JS/wasm-bindgen scripting surface); native `dlopen` extensions are impossible in the wasm sandbox, so a distinct ABI/loading model is required | queued | — |
 | 50 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | — |
+| 51 | Rust extension SDK: `ext-sdk/rust` safe wrapper + registration macros for first-party extensions; ABI v1 additive: a deterministic/volatile function flag (the engine refuses to WAL-log volatile calls, preventing replay divergence) | queued | in-repo `ext-sdk/rust` |
+| 52 | Core extension: **json** — `json_extract`, `json_value`, `json_valid`, `json_array_length`, `json_object`, `json_array` (JSON as VARCHAR in v1) | queued | `extensions/json` |
+| 53 | Core extension: **string** — `split_part`, trim variants, `replace`, `reverse`, `left`/`right`, `strpos`, `starts_with`/`ends_with`, `regexp_match`/`regexp_extract` | queued | `extensions/string` |
+| 54 | Core extension: **math** — `sqrt`, `pow`, `log`/`ln`/`exp`, trig, `floor`/`ceil`, `sign`, `greatest`/`least`, `random` (volatile-flagged) | queued | `extensions/math` |
+| 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | core |
+| 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
@@ -223,3 +229,23 @@ Java bindings.
   of the official `math_ext` verified; default CLI 2.27 MB vs 4.33 MB with the feature.
 - 2026-10-14 — Binary size: `pinkdb` 2.27 MB (4.33 MB with `--features repo`) + `pinkdb-server`
   1.90 MB + `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 33; pre-wave-17 was 2.26 MB).
+- 2026-10-14 — Wave 34: pink-lake minimal lake layer — new `crates/pink-lake` + CLI `lake`
+  feature, non-default: option 1 — own catalog + own columnar data files (`serde_json`
+  crate-local; no engine changes); layout `catalog.json` + immutable `snapshots/<v>.json`
+  + per-table `data/<table>/<uuid>.pink` (single-table engine bytes, bit-exact); flat
+  `db.table` keys; atomic publish order (data → snapshot → catalog); full-snapshot
+  versioning; snapshot/version/restore API; `.lake save/open/versions/tables/info`.
+  Post-review fixes: M1 version-overflow (validated 1..=u64::MAX-1, `checked_add`, clean
+  errors; release-mode proof), M2 concurrent saves (unique `create_new` tmp files, hard-link
+  snapshot publication with no replace, catalog re-read conflict detection → `write
+  conflict … reopen the lake`; process-race harness green), M3 `.lake open` retains the
+  session `PINKDB_KEY` (encrypted `.save` after lake open) with a plaintext-lake note,
+  M4 durability wording precise + parent-dir fsyncs (process-crash safe; APFS power-loss
+  not guaranteed by fsync alone), plus minors (no snapshot replacement, required `tables`,
+  canonical `versions()`, validate-before-create, missing-file warnings, real error paths,
+  symlink-resistant tmp). 465 tests both parser modes, 35 CLI lake tests, clippy clean
+  incl. lake,encryption; process-race harness 8×4/6×4/6×6 consistent; sizes default
+  2.29 MB / +lake 2.47 MB.
+- 2026-10-14 — Binary size: `pinkdb` 2.29 MB (2.47 MB with `--features lake`) +
+  `pinkdb-server` 1.90 MB + `libpinkdb_ffi.dylib` 1.76 MB (release, after wave 34;
+  pre-wave-17 was 2.26 MB).

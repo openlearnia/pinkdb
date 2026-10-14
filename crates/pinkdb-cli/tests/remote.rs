@@ -38,6 +38,7 @@ fn remote_repl_round_trip() {
               .import nope.csv\n\
               .save nope.pink\n\
               .open nope.pink\n\
+              .lake info nope\n\
               SELECT * FROM missing;\n\
               SELECT 1;\n\
               .quit\n",
@@ -62,7 +63,9 @@ fn remote_repl_round_trip() {
     assert!(text.contains("missing"), "{text}");
 
     // File/catalog dot-commands are rejected in remote mode.
-    for cmd in [".tables", ".schema", ".databases", ".import", ".save", ".open"] {
+    for cmd in [
+        ".tables", ".schema", ".databases", ".import", ".save", ".open", ".lake",
+    ] {
         assert!(
             text.contains(&format!("Error: {cmd} is not available in remote mode")),
             "missing remote-mode rejection for {cmd}:\n{text}"
