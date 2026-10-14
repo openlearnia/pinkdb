@@ -62,7 +62,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 36 | S3 bucket support for lake storage and file reading (optional `s3` feature, storage provider) | done | pink-lake `Storage` trait + `s3` feature (hand-rolled SigV4 over ureq/hmac/sha2, AWS + R2 path/virtual-hosted, conditional writes: create-only snapshots + `If-Match` catalog CAS with conflict errors, documented `501`→check-then-put degradation); mock-S3 test server + AWS SigV4 vectors + 3×3 race; CLI `s3://` URLs; default CLI byte-identical, +1.96 MB with `lake,s3`; 490 default tests, 79 pink-lake `s3` tests, clippy clean |
 | 37 | Documentation website (separate site/track) | done | website/ generator (stdlib Python, layout+fragments), 10 pages + CSS, 86 KiB self-contained, extensionless canonical links, wrangler dry-run validated |
 | 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra; Workers half done, R2 deferred to the extensions-repository wave 32/39) | done | live at https://pinkdb-docs.defaultcms.workers.dev (Workers static assets; .html links 307→canonical extensionless; 404-page; assets 200) |
-| 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | queued | — |
+| 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | done | three GitHub Actions workflows (.github/workflows/{ci,publish-extensions,deploy-docs}.yml): CI build/test/clippy + feature matrices + wasm + duckdiff + Python/Go bindings + C/Go SDK smokes + Docker S3 job; manual-dispatch extension publishing to the live R2 repo (dup refusal, checksums today, signing hook documented); docs auto-deploy; actionlint-clean, YAML-parsed, steps executed locally where possible; secrets documented (CLOUDFLARE_API_TOKEN scopes + account id) |
 | 40 | Performance tuning (recurring every 5th wave): bench-driven speed work, no new features (core) | queued | — |
 | 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | queued | — |
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
@@ -294,3 +294,14 @@ Java bindings.
   unpullable without auth (documented)
 - 2026-10-14 — Binary size: `pinkdb` 2.22 MB default; 44.6 MB with `--features lake`; 46.5 MB
   with `lake,s3` (release, after wave 36; pre-wave-17 was 2.26 MB).
+- 2026-10-14 — Wave 39: CI/CD publishing of extensions — three GitHub Actions workflows
+  (`.github/workflows/ci.yml`, `publish-extensions.yml`, `deploy-docs.yml`): CI build/test/
+  clippy + feature matrices + wasm + duckdiff + Python/Go bindings + C/Go SDK smokes + Docker S3
+  job; manual-dispatch extension publishing to the live R2 repo (duplicate refusal, checksums
+  today, signing hook documented); docs auto-deploy. actionlint-clean, YAML-parsed, steps
+  executed locally where possible; secrets documented (`CLOUDFLARE_API_TOKEN` scopes +
+  account id). Can only be verified on GitHub: real runner action execution
+  (checkout/setup/matrix scheduling), real R2 uploads, and `docker pull` in CI.
+- 2026-10-14 — Binary size: unchanged — no crate changes this wave (`pinkdb` 2.22 MB default /
+  44.6 MB with `--features lake` / 46.5 MB with `lake,s3` + `pinkdb-server` 1.90 MB +
+  `libpinkdb_ffi.dylib` 1.76 MB, release, after wave 39; pre-wave-17 was 2.26 MB).
