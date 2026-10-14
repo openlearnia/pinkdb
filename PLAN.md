@@ -221,6 +221,39 @@ bytes on any server. MinIO images are not anonymously pullable right now
 (Docker Hub: `pull access denied … may require 'docker login'`; quay.io:
 `401 UNAUTHORIZED`), so s3mock is the documented recipe.
 
+**Wave 41 follow-up — `SERVER=s3mock|seaweedfs|rustfs`:** the harness now
+runs against three real servers and derives its enforcement policy from
+per-endpoint capability probes (unsigned PUT → 403? sequential conditionals?
+bounded two-writer `If-None-Match: *`/`If-Match` races, 4+4 trials). s3mock
+stays the lenient default (no SigV4 verification, check-then-act conditionals:
+duplicates reported). `SERVER=seaweedfs` and `SERVER=rustfs` are **strict**: on
+those the one-winner-per-version race assertion, the raced
+`catalog.json == snapshots/<v>.json` byte check, and the unsigned-must-403
+signature check are hard failures. Measured on this machine (2026-10-14):
+both strict servers reject unsigned and wrong-key PUTs with 403, evaluate
+conditionals atomically (0/4 both-200 trials in the harness probe; 0/20 in the
+raw two-writer race), and both full runs pass under the strict policy
+(typed-CSV round-trip; 3×3 race → one winner per version, gapless 1..6 with the
+settle save; slow-vs-quick conflict; planted-stray refusal;
+`catalog.json == snapshots/{2,3,5,6}.json` via `cmp`). Two measured surprises:
+(1) **SeaweedFS's default `server -s3` config does not verify SigV4 at all**
+(unsigned and even garbage-signed PUTs → 200), so `SERVER=seaweedfs` probes a
+pre-existing `pk-seaweed`, reports it as anonymous, leaves it untouched, and
+starts its own identity-configured `pinkdb-seaweed-itest` (`-s3.config`;
+unsigned → 403, any configured key pair accepted) — a `pk-seaweed` that does
+enforce SigV4 is reused; (2) the deterministic slow-vs-quick pair needed a
+wider conflict window: a local RustFS saves 400k rows in ~0.085 s, so the
+quick writer read the catalog after the slow publish (two clean saves of
+*different* versions, no race) — `SLOWROWS` now defaults to 4 000 000 (≈1.5 s
+of encoding on RustFS) with a 0.3 s head start, and a missed window is
+reported as a harness timing miss, not a client bug. Container lifecycle:
+`KEEP=1` unchanged; a container this run started is removed on exit, a reused
+one (`pk-rustfs`, a SigV4-verifying `pk-seaweed`) is left running, and the
+script never touches another server's container. The CLI never creates
+buckets; the harness creates `BUCKET` up front (signed on the strict servers),
+tolerating 409/200-already-exists. `cargo test -q` unchanged: 494 passed /
+0 failed / 1 ignored; the s3mock regression run stays green.
+
 ## Roadmap (post-wave 21)
 
 | Wave | Scope | Packaging |

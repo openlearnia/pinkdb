@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# pink-lake real-S3 integration test: adobe/s3mock in Docker, release CLI.
+# pink-lake real-S3 integration test: a real S3 server in Docker, release CLI.
 # ============================================================================
 #
 # The in-repo `mock_s3.rs` (used by `cargo test -p pink-lake --features s3`
@@ -10,88 +10,168 @@
 # server in a container, speaking real S3 semantics over a socket, driven
 # through the release CLI just like a user would.
 #
-# It needs Docker, python3 and curl (plus cargo for the default CLI build):
-#   * starts its own s3mock container (`pinkdb-s3mock-itest`, initial bucket
-#     `pinklake`) on 127.0.0.1; an already-running container of that name is
-#     reused (`KEEP=1` leaves one behind on exit, the next run picks it up),
-#   * waits for a PUT/GET readiness probe,
-#   * checks the server implements conditional writes (`If-None-Match: *` /
-#     `If-Match`, the single-writer contract), so the safe (non-degraded)
-#     client path is exercised, not the opt-in fallback,
-#   * probes whether those conditionals are ATOMIC under true concurrency
-#     (two racing PUTs to a fresh key: an atomic server lets exactly one
-#     win). s3mock's PutObject precondition check runs *outside* its
-#     per-object lock, so it is check-then-act: both racers can get 200. The
-#     harness reports that as the server quirk it is (see
-#     `s3_docker_notes.md`) and enforces the one-winner-per-version
-#     assertion only on servers that can uphold it (AWS S3 / R2 — use
-#     `PINKDB_S3_LIVE=1` for the real-service run; the in-repo mock verifies
-#     the client logic against atomic conditionals),
-#   * roundtrip: a typed CSV (NULL, `-0.0`, bigint, DATE/TIMESTAMP, multibyte)
-#     imported and saved from one CLI process, then reopened and SELECTed in a
-#     fresh process; exact values are compared by python3, and the published
-#     objects are listed over the unsigned REST API (`?list-type=2`),
-#   * concurrency: (a) 3 writer processes x 3 rounds against one prefix; every
-#     attempt must win or get the documented `write conflict`, the published
-#     version chain must be gapless, and a settle save afterwards pins the
-#     prefix's final version to one claimant (the documented recovery: reopen
-#     and continue), so the final-version byte check is enforced; (b) a
-#     deterministic slow-save vs quick-save pair racing for the *same* next
-#     version — exactly one winner there, and the loser's conflict asserted;
-#     `catalog.json` is byte-identical to `snapshots/<v>.json` for the
-#     single-claimant versions (fetched with curl, `cmp`),
-#   * refusal: a second `.lake save` (the CLI opens a fresh handle per save,
-#     so it publishes a new version — pinned explicitly) and the
-#     snapshot-exists refusal on a planted stray `snapshots/<v>.json`
-#     (removed afterwards; the next save then succeeds).
+# It needs Docker, python3 and curl 7.75+ (for `--aws-sigv4`, the harness's
+# own signed probes) plus cargo for the default CLI build:
+#   * SERVER=s3mock     adobe/s3mock:latest — accepts unsigned requests (no
+#                       SigV4 verification) and evaluates conditional PUTs
+#                       non-atomically under true concurrency. The one-winner
+#                       race assertion is REPORTED there, as before (the
+#                       in-repo atomic mock and the strict servers below pin
+#                       the client logic).
+#   * SERVER=seaweedfs  chrislusf/seaweedfs:latest — a container started with
+#                       `-s3.config` identities verifies SigV4 (unsigned PUT
+#                       -> 403) and evaluates conditionals atomically: STRICT.
+#                       A pre-existing `pk-seaweed` running SeaweedFS's
+#                       DEFAULT config is measured to accept anonymous writes
+#                       and is therefore NOT reused: the harness leaves it
+#                       untouched and starts its own identity-configured
+#                       `pinkdb-seaweed-itest`. (A `pk-seaweed` that verifies
+#                       SigV4 is reused.)
+#   * SERVER=rustfs     rustfs/rustfs:latest — verifies SigV4 (unsigned and
+#                       wrong-key puts -> 403) and evaluates conditionals
+#                       atomically: STRICT.
+#   Strict means: an unsigned PUT must be answered 403 (asserted), the
+#   two-writer atomicity probe must show one winner per trial (asserted), and
+#   the race's exactly-one-winner-per-version + catalog==snapshot byte checks
+#   are hard failures, not reports.
 #
-# MinIO note: MinIO images are currently NOT anonymously pullable (Docker Hub
-# answers "pull access denied ... may require 'docker login'", quay.io answers
-# 401 UNAUTHORIZED), so s3mock is the documented recipe. Anything
-# S3-compatible works otherwise; for a real AWS/R2 bucket use the opt-in
-# `PINKDB_S3_LIVE=1` test (README "Object storage").
+# Container recipes (equivalent manual `docker run` commands; the client
+# never creates buckets, so the harness creates $BUCKET itself):
+#   s3mock:
+#     docker run -d --name pinkdb-s3mock-itest -p 127.0.0.1:9090:9090 \
+#       -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS=pinklake \
+#       adobe/s3mock:latest
+#   seaweedfs (strict; the identity file is written into the run's temp dir):
+#     docker run -d --name pinkdb-seaweed-itest -p 127.0.0.1:8333:8333 \
+#       -v <tmp>/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro \
+#       chrislusf/seaweedfs:latest server -s3 -dir=/data \
+#         -s3.config=/etc/seaweedfs/s3.json
+#   rustfs:
+#     docker run -d --name pk-rustfs -p 127.0.0.1:9100:9000 \
+#       -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
+#       rustfs/rustfs:latest
+#
+# On this machine (2026-10-14) seaweedfs and rustfs both answered the
+# two-writer conditional race with exactly one 200 in every trial, while
+# s3mock let both racers win (its precondition check is check-then-act);
+# see `s3_docker_notes.md` for the evidence and the capability matrix.
+#
+# Per-server container lifecycle:
+#   * s3mock uses `pinkdb-s3mock-itest` (initial bucket via env); reuse of an
+#     existing container of that name works like before.
+#   * rustfs prefers `pk-rustfs` (the documented manual container); reuse when
+#     present, otherwise start it on :9100 -> :9000.
+#   * seaweedfs prefers `pk-seaweed` ONLY when it verifies SigV4; otherwise
+#     it starts `pinkdb-seaweed-itest` (identity config) and leaves any other
+#     container untouched. Host ports default to 9090 / 8333 / 9100 and fall
+#     back to a free port when busy.
+#   * Cleanup: a container THIS RUN STARTED is removed unless KEEP=1; a
+#     container that already existed is reused and left running on exit (it
+#     was not started by this run). The script never touches another
+#     server's container.
 #
 # Usage:
-#   crates/pink-lake/tests/s3_docker.sh
+#   crates/pink-lake/tests/s3_docker.sh                  # s3mock (default)
+#   SERVER=seaweedfs crates/pink-lake/tests/s3_docker.sh # strict
+#   SERVER=rustfs    crates/pink-lake/tests/s3_docker.sh # strict
 #
 # Environment knobs:
-#   PORT=9090            host port; a free one is auto-picked if 9090 is busy
-#   CONTAINER=pinkdb-s3mock-itest   container name
-#   BUCKET=pinklake                 initial bucket
-#   KEEP=1               leave the container running on exit (reused next run)
-#                        and keep the run's temp dir (raw CLI logs + CSVs)
+#   SERVER=s3mock|seaweedfs|rustfs   server under test (default s3mock)
+#   PORT=9090            host port; the per-server default, or a free port
+#                        auto-picked when the default is busy
+#   CONTAINER=...        container name (defaults per server; setting it
+#                        explicitly reuses that container and only REPORTS
+#                        whether it verifies SigV4)
+#   BUCKET=pinklake      bucket the harness creates if missing (the CLI never
+#                        creates buckets — see s3_docker_notes.md)
+#   KEEP=1               leave a container this run started running on exit
+#                        (reused next run) and keep the run's temp dir
 #   PINKDB_BIN=...       use this CLI binary (default: build lake,s3 release)
 #   SKIP_BUILD=1         do not run cargo build (use target/release/pinkdb)
+#   ACCESS_KEY/SECRET_KEY  per-server credentials (s3mock: any dummy pair —
+#                        but defaults are pinned; seaweedfs/rustfs: must match
+#                        the container)
 #   WROWS=20000          rows per racing writer's table
-#   SLOWROWS=400000      rows of the slow save in the deterministic conflict
+#   SLOWROWS=4000000     rows of the slow save in the deterministic conflict
+#                        (must encode for long enough that the quick writer
+#                        reads the catalog while it is still in flight; a
+#                        local RustFS encodes 400k rows in ~0.1s, which is
+#                        too narrow a window)
 #   QUICKROWS=1000       rows of the quick save that wins that version
 #
-# Every failure prints the failing step and the raw output and exits non-zero.
-# The container is removed on exit unless KEEP=1. `cargo test` is untouched:
-# this script is not wired into the test suite (it needs Docker).
+# Every failure prints the failing step, the raw output and exits non-zero.
+# The script is not wired into the test suite (it needs Docker).
 
 set -u -o pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-IMAGE="adobe/s3mock:latest"
-CONTAINER="${CONTAINER:-pinkdb-s3mock-itest}"
+SERVER="${SERVER:-s3mock}"
 BUCKET="${BUCKET:-pinklake}"
 KEEP="${KEEP:-0}"
 WROWS="${WROWS:-20000}"
-SLOWROWS="${SLOWROWS:-400000}"
+SLOWROWS="${SLOWROWS:-4000000}"
 QUICKROWS="${QUICKROWS:-1000}"
 PORT="${PORT:-}"
 REGION="us-east-1"
-ACCESS_KEY="pinkdb-itest"
-SECRET_KEY="pinkdb-itest-secret"
+
+case "$SERVER" in
+s3mock)
+    IMAGE="adobe/s3mock:latest"
+    CONTAINER_DEFAULT="pinkdb-s3mock-itest"
+    DEFAULT_PORT=9090
+    CONTAINER_PORT=9090
+    STRICT=0
+    ACCESS_KEY="${ACCESS_KEY:-pinkdb-itest}"
+    SECRET_KEY="${SECRET_KEY:-pinkdb-itest-secret}"
+    ;;
+seaweedfs)
+    IMAGE="chrislusf/seaweedfs:latest"
+    CONTAINER_DEFAULT="pk-seaweed"
+    CONTAINER_FALLBACK="pinkdb-seaweed-itest"
+    DEFAULT_PORT=8333
+    CONTAINER_PORT=8333
+    STRICT=1
+    ACCESS_KEY="${ACCESS_KEY:-anykey}"
+    SECRET_KEY="${SECRET_KEY:-anysecret}"
+    ;;
+rustfs)
+    IMAGE="rustfs/rustfs:latest"
+    CONTAINER_DEFAULT="pk-rustfs"
+    DEFAULT_PORT=9100
+    CONTAINER_PORT=9000
+    STRICT=1
+    ACCESS_KEY="${ACCESS_KEY:-rustfsadmin}"
+    SECRET_KEY="${SECRET_KEY:-rustfsadmin}"
+    ;;
+*)
+    printf 'unknown SERVER=%s (expected: s3mock, seaweedfs or rustfs)\n' "$SERVER" >&2
+    exit 2
+    ;;
+esac
+CONTAINER="${CONTAINER:-}"
+
+# `s3curl` auth: empty for s3mock (its REST probes are unsigned on purpose —
+# s3mock does not verify SigV4), SigV4 for the strict servers (which reject
+# unsigned writes). A plain space-separated option string, expanded unquoted
+# inside s3curl() below (no value contains a space).
+AUTH_ARGS=""
+case "$SERVER" in
+seaweedfs|rustfs) AUTH_ARGS="--aws-sigv4 aws:amz:us-east-1:s3 --user $ACCESS_KEY:$SECRET_KEY" ;;
+esac
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/pinkdb_s3_docker.XXXXXX")" || exit 1
 CURRENT_LOG=""
 STEP=""
 ENDPOINT=""
-ATOMIC=1
+OWNED=0          # 1 when this run created the container
+SIG_EXPECTED=0   # 1 when the run requires a SigV4-verifying endpoint
+SIG_VERIFIED=0   # probe result: unsigned PUT answered 403
+RACE_ATOMIC=""   # probe result: one winner per racing conditional PUT
+ENFORCE_ATOMIC="$STRICT"
+BUCKET_READY=0
+BUCKET_CODE=""
 
 # ---------------------------------------------------------------------------
 # output helpers
@@ -118,25 +198,30 @@ fail() {
         printf -- '--- race summary ---\n' >&2
         cat "$TMP/conc.state" >&2
     fi
-    if docker inspect "$CONTAINER" >/dev/null 2>&1; then
+    if [ -n "${CONTAINER:-}" ] && docker inspect "$CONTAINER" >/dev/null 2>&1; then
         printf -- '--- last container log lines ---\n' >&2
         docker logs --tail 20 "$CONTAINER" >&2 2>&1 || true
         printf -- '--- (end container log) ---\n' >&2
     fi
+    printf '  hint: raw CLI logs and probe evidence: %s\n' "$TMP" >&2
     exit 1
 }
 
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
-    if docker inspect "$CONTAINER" >/dev/null 2>&1; then
-        if [ "$KEEP" = "1" ]; then
-            printf '\nkept container %s (KEEP=1) on port %s' "$CONTAINER" "${PORT:-?}"
-            printf ' — remove it with: docker rm -f %s\n' "$CONTAINER"
-            printf 'kept run directory %s (raw CLI logs + generated CSVs, KEEP=1)\n' "$TMP"
+    if [ -n "${CONTAINER:-}" ] && docker inspect "$CONTAINER" >/dev/null 2>&1; then
+        if [ "$OWNED" = "1" ]; then
+            if [ "$KEEP" = "1" ]; then
+                printf '\nkept container %s (KEEP=1) on port %s' "$CONTAINER" "${PORT:-?}"
+                printf ' — remove it with: docker rm -f %s\n' "$CONTAINER"
+                printf 'kept run directory %s (raw CLI logs + generated CSVs, KEEP=1)\n' "$TMP"
+            else
+                docker rm -f "$CONTAINER" >/dev/null 2>&1 \
+                    && printf '\nremoved container %s (started by this run)\n' "$CONTAINER"
+            fi
         else
-            docker rm -f "$CONTAINER" >/dev/null 2>&1 \
-                && printf '\nremoved container %s\n' "$CONTAINER"
+            printf '\nleft the reused container %s running (it was not started by this run)\n' "$CONTAINER"
         fi
     fi
     if [ "$KEEP" != "1" ]; then
@@ -150,9 +235,9 @@ trap cleanup EXIT INT TERM
 # CLI driving
 # ---------------------------------------------------------------------------
 
-# Run the CLI with exactly the s3mock environment (the AWS variables are
-# pinned so a developer's real credentials can never leak into s3mock), stdin
-# from the caller, combined output into <log>. Returns the CLI's exit status.
+# Run the CLI with exactly the pinned S3 environment (a developer's real AWS
+# credentials can never leak into the test server), stdin from the caller,
+# combined output into <log>. Returns the CLI's exit status.
 cli_run() {
     local log="$1"
     CURRENT_LOG="$log"
@@ -194,15 +279,23 @@ assert_status_zero() { # <log> <status>
 }
 
 # ---------------------------------------------------------------------------
-# REST helpers (all unsigned: s3mock accepts them; the CLI itself signs)
+# REST helpers
 # ---------------------------------------------------------------------------
 
-# Unsigned `?list-type=2` GET, one key per line (≤1000 keys — plenty here; a
-# full prefix is refused below rather than silently truncated).
+# curl with this server's request auth: unsigned for s3mock, SigV4-signed for
+# seaweedfs/rustfs (their capability probes and this harness's REST calls all
+# go through here).
+s3curl() {
+    # shellcheck disable=SC2086  # $AUTH_ARGS is a deliberate option list
+    curl $AUTH_ARGS "$@"
+}
+
+# `?list-type=2` GET, one key per line (≤1000 keys — plenty here; a full
+# prefix is refused below rather than silently truncated).
 list_keys() {
     local enc body
     enc="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1")" || return 1
-    body="$(curl -fsS --max-time 30 "$ENDPOINT/$BUCKET/?list-type=2&prefix=$enc&max-keys=1000")" || return 1
+    body="$(s3curl -fsS --max-time 30 "$ENDPOINT/$BUCKET/?list-type=2&prefix=$enc&max-keys=1000")" || return 1
     printf '%s' "$body" | python3 -c '
 import html, re, sys
 body = sys.stdin.read()
@@ -223,8 +316,8 @@ wipe_prefix() { # <prefix>
     keys="$(list_keys "$1")" || fail "listing $1 failed"
     n=0
     for k in $keys; do
-        curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$k" -o /dev/null \
-            || fail "unsigned DELETE of $k failed"
+        s3curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$k" -o /dev/null \
+            || fail "DELETE of $k failed"
         n=$((n + 1))
     done
     note "wiped $n object(s) under $1"
@@ -257,21 +350,110 @@ s.close()
 PY
 }
 
-start_or_reuse_container() {
-    local state image mapped
+# docker reports `repo` for a container created from `repo:latest`
+same_image() { # <observed image>
+    local observed="$1"
+    [ "$observed" = "$IMAGE" ] || [ "$observed" = "${IMAGE%:latest}" ]
+}
+
+mapped_port() { # <container> <container-port> — host port of a TCP mapping
+    docker port "$1" "$2/tcp" 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1
+}
+
+unsigned_put_403() { # <endpoint> — true when an unsigned PUT is rejected 403
+    local code
+    code="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+        -X PUT --data-binary 'unsigned' "$1/$BUCKET/itest-unsigned-probe-retry" 2>/dev/null)" \
+        || return 1
+    if [ "$code" = "403" ]; then
+        return 0
+    fi
+    curl -sS --max-time 5 -X DELETE "$1/$BUCKET/itest-unsigned-probe-retry" -o /dev/null 2>/dev/null || true
+    return 1
+}
+
+pick_port() {
+    if [ -n "$PORT" ]; then
+        port_free "$PORT" || fail "PORT=$PORT is already in use on 127.0.0.1; choose another port or unset PORT (nothing was started)"
+    elif port_free "$DEFAULT_PORT"; then
+        PORT="$DEFAULT_PORT"
+    else
+        PORT="$(free_port)"
+        note "port $DEFAULT_PORT is busy (another container?); using free port $PORT instead"
+    fi
+}
+
+# SeaweedFS verifies SigV4 only when it is started with identities; the
+# default `server -s3` config serves anonymous requests (measured — unsigned
+# and even garbage-signed PUTs get 200). The harness's own container uses
+# this file so the strict SigV4 assertion has teeth.
+write_seaweedfs_config() {
+    SEAWEEDFS_CONFIG="$TMP/seaweedfs-s3.json"
+    cat >"$SEAWEEDFS_CONFIG" <<JSON
+{
+  "identities": [
+    {
+      "name": "pinkdb-itest",
+      "credentials": [
+        { "accessKey": "$ACCESS_KEY", "secretKey": "$SECRET_KEY" }
+      ],
+      "actions": ["Admin", "Read", "Write", "List"]
+    }
+  ]
+}
+JSON
+}
+
+docker_run_container() {
+    case "$SERVER" in
+    s3mock)
+        docker run -d --name "$CONTAINER" \
+            --label pinkdb-s3-itest=1 \
+            -p "127.0.0.1:${PORT}:${CONTAINER_PORT}" \
+            -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS="$BUCKET" \
+            "$IMAGE" >/dev/null || fail "docker run $IMAGE failed"
+        ;;
+    seaweedfs)
+        write_seaweedfs_config
+        docker run -d --name "$CONTAINER" \
+            --label pinkdb-s3-itest=1 \
+            -p "127.0.0.1:${PORT}:${CONTAINER_PORT}" \
+            -v "$SEAWEEDFS_CONFIG:/etc/seaweedfs/s3.json:ro" \
+            "$IMAGE" server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json \
+            >/dev/null || fail "docker run $IMAGE failed"
+        ;;
+    rustfs)
+        docker run -d --name "$CONTAINER" \
+            --label pinkdb-s3-itest=1 \
+            -p "127.0.0.1:${PORT}:${CONTAINER_PORT}" \
+            -e RUSTFS_ACCESS_KEY="$ACCESS_KEY" \
+            -e RUSTFS_SECRET_KEY="$SECRET_KEY" \
+            "$IMAGE" >/dev/null || fail "docker run $IMAGE failed"
+        ;;
+    esac
+    ok "container $CONTAINER started"
+}
+
+# Use <container>: start it when stopped, reuse it as-is when running, create
+# it when absent. $2=1 means the run requires an endpoint that verifies SigV4
+# (asserted by check_signature_enforcement); $2=0 only reports it.
+use_container() { # <container> <sig-expected>
+    local name="$1" sig="$2" image state mapped
+    CONTAINER="$name"
+    SIG_EXPECTED="$sig"
     if docker inspect "$CONTAINER" >/dev/null 2>&1; then
         image="$(docker inspect -f '{{.Config.Image}}' "$CONTAINER" 2>/dev/null || true)"
-        [ "$image" = "$IMAGE" ] \
+        same_image "$image" \
             || fail "container $CONTAINER already exists but runs \"$image\", not $IMAGE; remove it first (docker rm -f $CONTAINER)"
         state="$(docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || true)"
         if [ "$state" != "running" ]; then
             note "container $CONTAINER exists but is $state; starting it (reuse)"
             docker start "$CONTAINER" >/dev/null || fail "docker start $CONTAINER failed"
         else
-            note "reusing running container $CONTAINER (left by an earlier run, KEEP=1)"
+            note "reusing running container $CONTAINER"
         fi
-        mapped="$(docker port "$CONTAINER" 9090/tcp 2>/dev/null | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p' | head -1)"
-        [ -n "$mapped" ] || fail "container $CONTAINER has no host mapping for 9090/tcp"
+        mapped="$(mapped_port "$CONTAINER" "$CONTAINER_PORT")"
+        [ -n "$mapped" ] || fail "container $CONTAINER has no host mapping for $CONTAINER_PORT/tcp"
         if [ -n "$PORT" ] && [ "$PORT" != "$mapped" ]; then
             fail "PORT=$PORT was requested but the running container is mapped to $mapped; remove it (docker rm -f $CONTAINER) or unset PORT"
         fi
@@ -280,94 +462,180 @@ start_or_reuse_container() {
         return 0
     fi
 
-    # Fresh container: pick a port (explicit PORT must be free; otherwise the
-    # default 9090, or a free port — clearly logged — when 9090 is taken).
-    if [ -n "$PORT" ]; then
-        port_free "$PORT" || fail "PORT=$PORT is already in use on 127.0.0.1; choose another port or unset PORT (nothing was started)"
-    else
-        if port_free 9090; then
-            PORT=9090
-        else
-            PORT="$(free_port)"
-            note "port 9090 is busy (another container?); using free port $PORT instead"
-        fi
-    fi
-
+    pick_port
     if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-        note "image $IMAGE is not local; pulling it (MinIO images are not anonymously pullable right now — see the README)"
+        note "image $IMAGE is not local; pulling it (MinIO images are not anonymously pullable right now — see s3_docker_notes.md)"
         docker pull "$IMAGE" >/dev/null || fail "docker pull $IMAGE failed"
         ok "pulled $IMAGE"
     fi
 
     note "creating container $CONTAINER on 127.0.0.1:$PORT (bucket $BUCKET)"
-    docker run -d --name "$CONTAINER" \
-        --label pinkdb-s3-itest=1 \
-        -p "127.0.0.1:${PORT}:9090" \
-        -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS="$BUCKET" \
-        "$IMAGE" >/dev/null || fail "docker run $IMAGE failed"
-    ok "container $CONTAINER started"
+    docker_run_container
+    OWNED=1
+}
+
+select_container() {
+    if [ -n "$CONTAINER" ]; then
+        # An explicit CONTAINER=... is the caller's choice: reuse it and only
+        # report whether that container verifies SigV4.
+        use_container "$CONTAINER" 0
+        return
+    fi
+    case "$SERVER" in
+    s3mock)
+        use_container "$CONTAINER_DEFAULT" 0
+        ;;
+    rustfs)
+        use_container "$CONTAINER_DEFAULT" 1
+        ;;
+    seaweedfs)
+        # Prefer a running `pk-seaweed` only when it actually verifies SigV4
+        # (probed, not assumed); default-config SeaweedFS accepts anonymous
+        # writes, so such a container is reported and left untouched while
+        # the harness starts its own identity-configured container.
+        if docker inspect "$CONTAINER_DEFAULT" >/dev/null 2>&1 \
+            && [ "$(docker inspect -f '{{.State.Status}}' "$CONTAINER_DEFAULT" 2>/dev/null || true)" = "running" ]; then
+            local probe_port
+            probe_port="$(mapped_port "$CONTAINER_DEFAULT" "$CONTAINER_PORT")"
+            if [ -n "$probe_port" ] && unsigned_put_403 "http://127.0.0.1:$probe_port"; then
+                use_container "$CONTAINER_DEFAULT" 1
+                return
+            fi
+            note "$CONTAINER_DEFAULT is running but accepts unsigned writes (SeaweedFS default anonymous config)"
+            note "=> starting the SigV4-enforcing $CONTAINER_FALLBACK instead; $CONTAINER_DEFAULT is left untouched"
+        fi
+        use_container "$CONTAINER_FALLBACK" 1
+        ;;
+    esac
 }
 
 wait_ready() {
-    local tries=0 probe body
+    local tries=0 probe body code
     probe="itest-readiness-probe"
     while [ "$tries" -lt 120 ]; do
-        # CreateBucket when the initial-bucket env did not stick (reused
-        # container); 200/409/405 all mean "the endpoint answered".
-        curl -sS --max-time 5 -X PUT "$ENDPOINT/$BUCKET" -o /dev/null 2>/dev/null || true
-        if body="$(curl -fsS --max-time 5 "$ENDPOINT/$BUCKET/$probe" 2>/dev/null)"; then
+        # CreateBucket when the container did not come with the bucket;
+        # 200/201/204/405/409 all mean "the endpoint answered".
+        if [ "$BUCKET_READY" != "1" ]; then
+            code="$(s3curl -sS --max-time 5 -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/$BUCKET" 2>/dev/null)" || true
+            case "$code" in
+            200|201|204|405|409)
+                BUCKET_READY=1
+                BUCKET_CODE="$code"
+                ;;
+            esac
+        fi
+        if body="$(s3curl -fsS --max-time 5 "$ENDPOINT/$BUCKET/$probe" 2>/dev/null)"; then
             if [ "$body" = "ready" ]; then
-                curl -sS --max-time 5 -X DELETE "$ENDPOINT/$BUCKET/$probe" -o /dev/null 2>/dev/null || true
-                ok "s3mock answered the readiness GET ($tries retries)"
+                s3curl -sS --max-time 5 -X DELETE "$ENDPOINT/$BUCKET/$probe" -o /dev/null 2>/dev/null || true
+                ok "$SERVER answered the readiness GET ($tries retries at $ENDPOINT)"
                 return 0
             fi
         fi
-        printf 'ready' | curl -fsS --max-time 5 -X PUT --data-binary @- "$ENDPOINT/$BUCKET/$probe" -o /dev/null 2>/dev/null || true
+        printf 'ready' | s3curl -fsS --max-time 5 -X PUT --data-binary @- "$ENDPOINT/$BUCKET/$probe" -o /dev/null 2>/dev/null || true
         tries=$((tries + 1))
         sleep 0.5
     done
-    fail "s3mock did not become ready at $ENDPOINT within 60s"
+    fail "$SERVER did not become ready at $ENDPOINT within 60s"
 }
 
-# s3mock must enforce the conditional writes the single-writer contract needs
-# (the client refuses a degraded endpoint by default; this proves the safe
-# path is the one being tested).
+# The client never creates buckets; the harness creates $BUCKET up front
+# (200/201/204 created, 405/409 already exists). Point BUCKET= at an existing
+# bucket if you do not want this.
+ensure_bucket() {
+    local code
+    if [ "$BUCKET_READY" = "1" ]; then
+        ok "bucket $BUCKET ready (CreateBucket -> $BUCKET_CODE; the CLI never creates buckets)"
+        return 0
+    fi
+    code="$(s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT "$ENDPOINT/$BUCKET" 2>/dev/null)" \
+        || fail "CreateBucket for $BUCKET failed"
+    case "$code" in
+    200|201|204|405|409)
+        ok "bucket $BUCKET ready (CreateBucket -> $code; the CLI never creates buckets)"
+        ;;
+    *)
+        fail "could not create bucket $BUCKET (HTTP $code); the CLI never creates buckets, create it yourself and retry"
+        ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# capability probes -> enforcement policy
+# ---------------------------------------------------------------------------
+
+# A real signature check: a SigV4-enforcing endpoint rejects an unsigned PUT
+# with 403. s3mock accepts unsigned requests (documented; the in-repo mock
+# verifies SigV4 separately), and a default-config SeaweedFS does too — which
+# is exactly why the harness's own seaweedfs container uses -s3.config.
+check_signature_enforcement() {
+    local key="itest-unsigned-probe" code
+    code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' \
+        -X PUT --data-binary 'unsigned' "$ENDPOINT/$BUCKET/$key")" \
+        || fail "the unsigned signature probe PUT failed"
+    if [ "$code" = "403" ]; then
+        SIG_VERIFIED=1
+        ok "unsigned PUT -> 403: the server verifies SigV4 (enforced for this run)"
+        return 0
+    fi
+    SIG_VERIFIED=0
+    if [ "$SIG_EXPECTED" = "1" ]; then
+        fail "unsigned PUT -> $code, expected 403: this run requires a SigV4-verifying endpoint (SERVER=$SERVER)"
+    fi
+    case "$SERVER" in
+    s3mock)
+        ok "unsigned PUT -> $code: s3mock does not verify SigV4 (documented; the in-repo mock does)"
+        ;;
+    *)
+        warn "unsigned PUT -> $code: this endpoint does NOT verify SigV4"
+        warn "  (a plain SeaweedFS 'server -s3' without -s3.config serves anonymous requests;"
+        warn "   SERVER=seaweedfs starts its own identity-configured container — see s3_docker_notes.md)"
+        ;;
+    esac
+    case "$code" in
+    200|201|204) s3curl -sS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null 2>/dev/null || true ;;
+    esac
+    ok "the unsigned-403 assertion is reported, not enforced, on this endpoint"
+}
+
+# The single-writer contract needs conditional writes (the client refuses a
+# degraded endpoint by default; this proves the safe path is the one tested).
 check_conditional_writes() {
     local key="itest-conditional-probe" code etag headers
-    headers="$(curl -sS --max-time 30 -D - -o /dev/null -X PUT --data-binary 'first' "$ENDPOINT/$BUCKET/$key")" \
+    headers="$(s3curl -sS --max-time 30 -D - -o /dev/null -X PUT --data-binary 'first' "$ENDPOINT/$BUCKET/$key")" \
         || fail "conditional probe PUT failed"
     etag="$(printf '%s' "$headers" | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2; exit }')"
     [ -n "$etag" ] || fail "conditional probe: the server returned no ETag"
 
-    code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' --data-binary 'second' "$ENDPOINT/$BUCKET/$key")"
+    code="$(s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' --data-binary 'second' "$ENDPOINT/$BUCKET/$key")"
     [ "$code" = "412" ] || fail "If-None-Match: * on an existing key returned $code, expected 412 (conditional writes not enforced?)"
 
-    code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $etag" --data-binary 'third' "$ENDPOINT/$BUCKET/$key")"
+    code="$(s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $etag" --data-binary 'third' "$ENDPOINT/$BUCKET/$key")"
     [ "$code" = "200" ] || fail "If-Match with the current ETag returned $code, expected 200"
 
-    code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-Match: "deadbeefdeadbeef"' --data-binary 'fourth' "$ENDPOINT/$BUCKET/$key")"
+    code="$(s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-Match: "deadbeefdeadbeef"' --data-binary 'fourth' "$ENDPOINT/$BUCKET/$key")"
     [ "$code" = "412" ] || fail "If-Match with a wrong ETag returned $code, expected 412"
 
-    curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null || fail "conditional probe DELETE failed"
+    s3curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null || fail "conditional probe DELETE failed"
     ok "server enforces If-None-Match: * (412) and If-Match (200 / 412) — checked sequentially"
 }
 
 # Is the server's conditional evaluation atomic with the write? Two racing
 # conditional PUTs to one fresh key must leave exactly one 200 for a
-# concurrent-safe endpoint (AWS S3 / Cloudflare R2 evaluate the precondition
-# as part of the write). s3mock's PutObject checks the precondition outside
-# its per-object lock (check-then-act), so both racers can be told 200; the
-# harness reports that and does not pretend the one-winner assertion ran.
+# concurrent-safe endpoint (AWS S3 / Cloudflare R2 / SeaweedFS / RustFS
+# evaluate the precondition as part of the write; measured here on this
+# machine). s3mock's PutObject checks the precondition outside its
+# per-object lock (check-then-act), so both racers can be told 200 — on the
+# strict servers that would be a hard failure of the run's contract.
 probe_conditional_atomicity() {
     local trials=4 t a b both=0 create_dup=0 replace_dup=0 key
     for t in 1 2 3 4; do
         key="itest-atomic-probe-$t"
         (
-            curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' \
+            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' \
                 --data-binary "racer-a-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_a.$t"
         ) &
         (
-            curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' \
+            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H 'If-None-Match: *' \
                 --data-binary "racer-b-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_b.$t"
         ) &
         wait
@@ -379,15 +647,15 @@ probe_conditional_atomicity() {
         fi
         # If-Match race: two concurrent replaces of one key with the same ETag.
         key="itest-atomic-probe-replace-$t"
-        curl -fsS --max-time 30 -o /dev/null -X PUT --data-binary 'base' "$ENDPOINT/$BUCKET/$key" || fail "atomic probe PUT failed"
-        a="$(curl -sS --max-time 30 -D - -o /dev/null -X PUT --data-binary 'base2' "$ENDPOINT/$BUCKET/$key" | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2; exit }')"
+        s3curl -fsS --max-time 30 -o /dev/null -X PUT --data-binary 'base' "$ENDPOINT/$BUCKET/$key" || fail "atomic probe PUT failed"
+        a="$(s3curl -sS --max-time 30 -D - -o /dev/null -X PUT --data-binary 'base2' "$ENDPOINT/$BUCKET/$key" | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2; exit }')"
         [ -n "$a" ] || fail "atomic probe: no ETag"
         (
-            curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $a" \
+            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $a" \
                 --data-binary "repl-a-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_c.$t"
         ) &
         (
-            curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $a" \
+            s3curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X PUT -H "If-Match: $a" \
                 --data-binary "repl-b-$t" "$ENDPOINT/$BUCKET/$key" >"$TMP/atomic_d.$t"
         ) &
         wait
@@ -399,21 +667,26 @@ probe_conditional_atomicity() {
         fi
     done
     for key in $(list_keys "itest-atomic-probe"); do
-        curl -sS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null || true
+        s3curl -sS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/$key" -o /dev/null || true
     done
 
     if [ "$both" = "0" ] && [ "$replace_dup" = "0" ]; then
-        ATOMIC=1
-        ok "conditional PUTs are atomic under concurrency (4+4 racing trials, one winner each)"
+        RACE_ATOMIC=1
+        ENFORCE_ATOMIC=1
+        ok "conditional PUTs are atomic under concurrency (4+4 racing trials, exactly one winner each)"
     else
-        ATOMIC=0
+        RACE_ATOMIC=0
+        if [ "$STRICT" = "1" ]; then
+            fail "conditional PUTs are NOT atomic on $SERVER (If-None-Match both-200: $both/4, If-Match both-200: $replace_dup/4); this run requires the atomic-conditional contract"
+        fi
+        ENFORCE_ATOMIC=0
         warn "conditional PUTs are NOT atomic under concurrency on this server"
         warn "  If-None-Match races with both PUTs answered 200: $both/4"
         warn "  If-Match races with both PUTs answered 200:      $replace_dup/4"
         warn "  (s3mock checks the precondition outside the store lock: adobe/S3Mock"
         warn "   ObjectController.putObject -> verifyObjectMatching, then putObject)"
         warn "  the race's one-winner-per-version assertion is REPORTED here, not enforced;"
-        warn "  use AWS S3/R2 (PINKDB_S3_LIVE=1) or the in-repo atomic mock for the enforced check"
+        warn "  use SERVER=seaweedfs, SERVER=rustfs or AWS S3/R2 (PINKDB_S3_LIVE=1) for the enforced check"
     fi
 }
 
@@ -421,20 +694,23 @@ probe_conditional_atomicity() {
 # main
 # ===========================================================================
 
-printf 'pink-lake real-S3 integration test (s3mock in Docker)\n'
+printf 'pink-lake real-S3 integration test (SERVER=%s)\n' "$SERVER"
 printf 'repo: %s\n' "$ROOT"
 
 # --- CLI binary ------------------------------------------------------------
 if [ -n "${PINKDB_BIN:-}" ]; then
     BIN="$PINKDB_BIN"
     [ -x "$BIN" ] || fail "PINKDB_BIN=$BIN is not executable"
-    if ! printf '.lake\n.quit\n' | "$BIN" 2>/dev/null | grep -qF 'lake save <dir|s3://bucket/prefix>'; then
+    if ! printf '.help\n.quit\n' | "$BIN" 2>/dev/null | grep -qF 'lake save <dir|s3://bucket/prefix>'; then
         fail "PINKDB_BIN=$BIN lacks the lake+s3 features (build with --features lake,s3)"
     fi
     note "using PINKDB_BIN=$BIN"
 elif [ "${SKIP_BUILD:-0}" = "1" ]; then
     BIN="$ROOT/target/release/pinkdb"
     [ -x "$BIN" ] || fail "SKIP_BUILD=1 but $BIN does not exist"
+    if ! printf '.help\n.quit\n' | "$BIN" 2>/dev/null | grep -qF 'lake save <dir|s3://bucket/prefix>'; then
+        fail "SKIP_BUILD=1 but $BIN lacks the lake+s3 features (another build may have overwritten it; rebuild with: cargo build --release -p pinkdb-cli --features lake,s3)"
+    fi
     note "SKIP_BUILD=1: using $BIN"
 else
     step "build the CLI (cargo build --release -p pinkdb-cli --features lake,s3)"
@@ -444,17 +720,24 @@ else
     ok "built $BIN"
 fi
 
-# --- container -------------------------------------------------------------
-step "s3mock container"
-start_or_reuse_container
+# --- container + capability probes -----------------------------------------
+step "container ($SERVER)"
+select_container
 ENDPOINT="http://127.0.0.1:$PORT"
 note "endpoint: $ENDPOINT (bucket $BUCKET)"
 wait_ready
+ensure_bucket
+check_signature_enforcement
 check_conditional_writes
 probe_conditional_atomicity
+if [ "$STRICT" = "1" ]; then
+    note "policy: STRICT — one winner per version and catalog==snapshot bytes are hard assertions"
+else
+    note "policy: lenient — duplicates are reported as the measured server limitation"
+fi
 
 # --- clean slate for the run's prefixes ------------------------------------
-step "clean slate (unsigned list + delete of the run's prefixes)"
+step "clean slate (list + delete of the run's prefixes)"
 for p in "itest/" "conc/" "conflict/" "refuse/"; do
     wipe_prefix "$p"
 done
@@ -547,7 +830,7 @@ print("  ok: values and types match exactly (3 rows, incl. NULL row, -0.0, multi
 print("  ok: types row: " + ", ".join(types))
 PY
 
-# Published objects, over the unsigned REST API.
+# Published objects, listed over the REST API (signed for the strict servers).
 KEYS="$(list_keys "itest/")" || fail "listing itest/ failed"
 printf '%s\n' "$KEYS" | grep -qxF "itest/catalog.json" || fail "itest/catalog.json is missing"
 printf '%s\n' "$KEYS" | grep -qxF "itest/snapshots/1.json" || fail "itest/snapshots/1.json is missing"
@@ -557,12 +840,12 @@ printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.vortex$' \
 assert_listing_count "$KEYS" "itest/" 4
 note "keys: $(printf '%s ' $KEYS)"
 
-# catalog.json == snapshots/<version>.json (bytes), fetched unsigned + cmp.
-curl -fsS --max-time 30 -o "$TMP/rt_catalog.json" "$ENDPOINT/$BUCKET/itest/catalog.json" || fail "fetching catalog.json failed"
-curl -fsS --max-time 30 -o "$TMP/rt_snapshot.json" "$ENDPOINT/$BUCKET/itest/snapshots/2.json" || fail "fetching snapshots/2.json failed"
+# catalog.json == snapshots/<version>.json (bytes), fetched + cmp.
+s3curl -fsS --max-time 30 -o "$TMP/rt_catalog.json" "$ENDPOINT/$BUCKET/itest/catalog.json" || fail "fetching catalog.json failed"
+s3curl -fsS --max-time 30 -o "$TMP/rt_snapshot.json" "$ENDPOINT/$BUCKET/itest/snapshots/2.json" || fail "fetching snapshots/2.json failed"
 cmp -s "$TMP/rt_catalog.json" "$TMP/rt_snapshot.json" \
     || fail "catalog.json is not byte-identical to snapshots/2.json"
-ok "catalog.json == snapshots/2.json (bytes)"
+ok "catalog.json == snapshots/2.json (bytes; enforced)"
 
 # --- concurrency (a): 3 writers x 3 rounds ---------------------------------
 step "concurrency (a): 3 writers x 3 rounds on $CONC (one distinct table each)"
@@ -610,7 +893,7 @@ for f in "$TMP"/conc_r*_w*.log; do
     assert_contains "$f" "Imported $WROWS rows"
 done
 
-python3 - "$TMP" "$ATOMIC" <<'PY' || fail "the race did not behave as documented (see above)"
+python3 - "$TMP" "$ENFORCE_ATOMIC" <<'PY' || fail "the race did not behave as documented (see above)"
 import glob, os, re, sys
 
 tmp, atomic = sys.argv[1], sys.argv[2] == "1"
@@ -688,10 +971,32 @@ DUPES="$(sed -n 's/^duplicates=//p' "$TMP/conc.state")"
 RACE_FINAL_CLAIMANTS="$(sed -n 's/^final_claimants=//p' "$TMP/conc.state")"
 note "final race version: $FINAL ($CLAIMS claims, $RACE_CONFLICTS conflicts, $DUPES duplicate claim(s), $RACE_FINAL_CLAIMANTS claimant(s))"
 
+# The raced catalog must name a snapshot that exists and is byte-identical:
+# on an atomic-conditional server that is a hard invariant (the one-winner
+# snapshot PUT is what the catalog's If-Match replace published, and neither
+# can be overwritten); on s3mock it is reported as the measured limitation.
+step "race byte check: catalog.json vs the snapshot it names"
+RACE_CATALOG="$TMP/conc_race_catalog.json"
+RACE_CATALOG_V=""
+if s3curl -fsS --max-time 30 -o "$RACE_CATALOG" "$ENDPOINT/$BUCKET/conc/catalog.json"; then
+    RACE_CATALOG_V="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$RACE_CATALOG" 2>/dev/null)" || RACE_CATALOG_V=""
+fi
+if [ -n "$RACE_CATALOG_V" ] \
+    && s3curl -fsS --max-time 30 -o "$TMP/conc_race_snapshot.json" "$ENDPOINT/$BUCKET/conc/snapshots/$RACE_CATALOG_V.json" \
+    && cmp -s "$RACE_CATALOG" "$TMP/conc_race_snapshot.json"; then
+    ok "catalog.json == snapshots/$RACE_CATALOG_V.json (bytes)"
+else
+    if [ "$STRICT" = "1" ]; then
+        fail "race: catalog.json is not byte-identical to the snapshot it names (catalog version ${RACE_CATALOG_V:-unreadable})"
+    fi
+    warn "race: catalog.json vs snapshots/${RACE_CATALOG_V:-?}.json mismatch (non-atomic server; reported, not enforced — see s3_docker_notes.md)"
+fi
+
 # Reopen and continue (the documented recovery after a conflict): one fresh
 # save settles the chain. Its version has exactly one claimant by
 # construction, so the catalog/snapshot byte-equality below is enforced even
 # on a server with non-atomic conditionals.
+step "settle save after the race (reopen and continue)"
 { echo ".lake info $CONC"; echo "CREATE TABLE settle (x INTEGER);"; echo "INSERT INTO settle VALUES (7);"; echo ".lake save $CONC"; echo ".quit"; } \
     | cli_run "$TMP/conc_settle.log"
 assert_status_zero "$TMP/conc_settle.log" "$?"
@@ -733,15 +1038,15 @@ PY
 assert_contains "$TMP/conc_metadata.log" "main.settle (1 row)"
 
 # catalog.json == snapshots/<final>.json (bytes) for the final version.
-curl -fsS --max-time 30 -o "$TMP/conc_catalog.json" "$ENDPOINT/$BUCKET/conc/catalog.json" || fail "fetching conc/catalog.json failed"
-curl -fsS --max-time 30 -o "$TMP/conc_snapshot.json" "$ENDPOINT/$BUCKET/conc/snapshots/$FINAL.json" \
+s3curl -fsS --max-time 30 -o "$TMP/conc_catalog.json" "$ENDPOINT/$BUCKET/conc/catalog.json" || fail "fetching conc/catalog.json failed"
+s3curl -fsS --max-time 30 -o "$TMP/conc_snapshot.json" "$ENDPOINT/$BUCKET/conc/snapshots/$FINAL.json" \
     || fail "fetching conc/snapshots/$FINAL.json failed"
 V_JSON="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$TMP/conc_catalog.json")" \
     || fail "conc/catalog.json does not parse as JSON"
 [ "$V_JSON" = "$FINAL" ] || fail "catalog.json declares version $V_JSON, expected $FINAL"
 cmp -s "$TMP/conc_catalog.json" "$TMP/conc_snapshot.json" \
     || fail "conc: catalog.json is not byte-identical to snapshots/$FINAL.json"
-ok "catalog.json == snapshots/$FINAL.json (bytes, version field $V_JSON, single claimant)"
+ok "catalog.json == snapshots/$FINAL.json (bytes, version field $V_JSON, single claimant; enforced)"
 
 CONC_KEYS="$(list_keys "conc/")" || fail "listing conc/ failed"
 for v in $(seq 1 "$FINAL"); do
@@ -773,6 +1078,9 @@ note "writer publishes v3 while it is busy. Exactly one of them may win v3; the"
 note "loser must get a documented write conflict (this is deterministic by"
 note "construction: the winner's snapshot is already published when the slow"
 note "writer gets to its own snapshot PUT — no atomicity needed for that PUT)."
+note "SLOWROWS is sized so the slow save is still in flight when the quick"
+note "writer reads the catalog even on a fast local server (measured: a local"
+note "RustFS saves 400k rows in ~0.1s, which was too short)."
 
 python3 - "$TMP/slow.csv" "$SLOWROWS" <<'PY'
 import sys
@@ -800,7 +1108,11 @@ assert_contains "$TMP/conflict_seed.log" "Saved lake version 2"
     echo "$?" >"$TMP/conflict_slow.exit"
 ) &
 SLOW_PID=$!
-sleep 0.1
+# Head start: long enough that the slow writer has read the catalog (v2) and
+# is inside its encode/upload when the quick writer reads it too, short
+# enough that the slow writer has not published v3 yet. With SLOWROWS sized
+# to ~1s of encoding the window is wide on any local server.
+sleep 0.3
 { echo ".import $TMP/quick.csv tquick"; echo ".lake save $CONFLICT"; echo ".quit"; } \
     | cli_run "$TMP/conflict_quick.log"
 assert_status_zero "$TMP/conflict_quick.log" "$?"
@@ -825,7 +1137,15 @@ if winners == [] or losers == []:
     print("expected exactly one winner and one loser", file=sys.stderr)
     sys.exit(1)
 if len(winners) != 1:
-    print(f"both writers won: {saved}", file=sys.stderr)
+    if len(winners) == 2 and saved["slow"] != saved["quick"]:
+        print(f"both writers published, but different versions (slow {saved['slow']}, "
+              f"quick {saved['quick']}): the quick writer read the catalog after the slow "
+              "writer had already published, so the two never raced for the same version — "
+              "the harness's timing window was missed. Raise SLOWROWS (and/or lower the "
+              "quick writer's head start) until the slow save is still in flight when the "
+              "quick writer reads the catalog.", file=sys.stderr)
+    else:
+        print(f"expected exactly one winner of one version, got: {saved}", file=sys.stderr)
     sys.exit(1)
 winner, loser = winners[0], losers[0]
 if saved[winner] != [3]:
@@ -847,12 +1167,12 @@ print(f"  ok: the {loser} save got the documented conflict: {message[:110]}")
 PY
 WINNER="$(sed -n 's/^winner=//p' "$TMP/conflict.state")"
 
-curl -fsS --max-time 30 -o "$TMP/conflict_catalog.json" "$ENDPOINT/$BUCKET/conflict/catalog.json" || fail "fetching conflict/catalog.json failed"
-curl -fsS --max-time 30 -o "$TMP/conflict_snapshot.json" "$ENDPOINT/$BUCKET/conflict/snapshots/3.json" \
+s3curl -fsS --max-time 30 -o "$TMP/conflict_catalog.json" "$ENDPOINT/$BUCKET/conflict/catalog.json" || fail "fetching conflict/catalog.json failed"
+s3curl -fsS --max-time 30 -o "$TMP/conflict_snapshot.json" "$ENDPOINT/$BUCKET/conflict/snapshots/3.json" \
     || fail "fetching conflict/snapshots/3.json failed"
 cmp -s "$TMP/conflict_catalog.json" "$TMP/conflict_snapshot.json" \
     || fail "conflict: catalog.json is not byte-identical to snapshots/3.json"
-ok "catalog.json == snapshots/3.json (bytes; single claimant)"
+ok "catalog.json == snapshots/3.json (bytes; single claimant; enforced)"
 
 { echo ".lake versions $CONFLICT"; echo ".lake tables $CONFLICT"; echo ".lake open $CONFLICT"; echo ".quit"; } \
     | cli_run "$TMP/conflict_state.log"
@@ -886,7 +1206,7 @@ ok "a second .lake save in the same session published version 3 (no stale view)"
 # Plant an unpublished stray at exactly the next version: the save must
 # refuse to replace it instead of clobbering (either an existing snapshot or a
 # crash leftover).
-curl -fsS --max-time 30 -X PUT --data-binary 'not a manifest' \
+s3curl -fsS --max-time 30 -X PUT --data-binary 'not a manifest' \
     "$ENDPOINT/$BUCKET/refuse/snapshots/4.json" -o /dev/null || fail "planting the stray snapshot failed"
 ok "planted stray refuse/snapshots/4.json"
 
@@ -902,7 +1222,7 @@ assert_re "$TMP/refuse_versions.log" '^3 \(current\)$'
 assert_no_match "$TMP/refuse_versions.log" '^4'
 ok "the unpublished stray is not advertised (.lake versions stays 1..3)"
 
-curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/refuse/snapshots/4.json" -o /dev/null \
+s3curl -fsS --max-time 30 -X DELETE "$ENDPOINT/$BUCKET/refuse/snapshots/4.json" -o /dev/null \
     || fail "removing the stray snapshot failed"
 { echo ".lake save $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_retry.log"
 assert_status_zero "$TMP/refuse_retry.log" "$?"
@@ -911,7 +1231,18 @@ ok "after removing the stray, the next save published version 4"
 
 # --- summary ---------------------------------------------------------------
 step "summary"
-printf '  roundtrip:     version 2, 3 rows round-tripped through a fresh process; 4 objects listed unsigned\n'
+printf '  server:        %s (container %s at %s)\n' "$SERVER" "$CONTAINER" "$ENDPOINT"
+if [ "$SIG_VERIFIED" = "1" ]; then
+    printf '  signatures:    SigV4 enforced — unsigned PUT -> 403 (asserted)\n'
+else
+    printf '  signatures:    not verified by this endpoint (unsigned accepted; reported, not asserted — see s3_docker_notes.md)\n'
+fi
+if [ "$STRICT" = "1" ]; then
+    printf '  enforcement:   STRICT — one winner per version and catalog == snapshot bytes are hard assertions\n'
+else
+    printf '  enforcement:   lenient — duplicate race publications reported as the measured s3mock limitation\n'
+fi
+printf '  roundtrip:     version 2, 3 rows round-tripped through a fresh process; 4 objects listed over REST\n'
 if [ "$DUPES" = "0" ]; then
     printf '  concurrency:   race: 9 attempts, %s claims, %s conflict(s), one winner per version;\n' "$CLAIMS" "$RACE_CONFLICTS"
 else
