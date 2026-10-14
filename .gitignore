@@ -15,3 +15,6 @@ __pycache__/
 # Go extension SDK build outputs
 /ext-sdk/go/build/
 /ext-sdk/go/template/build/
+
+# C ABI example binary (built by the README recipe)
+/crates/pinkdb-ffi/hello

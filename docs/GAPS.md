@@ -27,7 +27,7 @@ All ten items are fixed in wave 40a, each with a regression test (see the ROADMA
 
 ## P1 — promised but missing, or operationally broken (waves 40b — closed, 40c)
 
-The 40b items below (WAL growth, write-before-log, bind/execute race, file locking, Python thread safety, CLI scripting, lake retries/versions/guards) are fixed in wave 40b; the CI, wave-claim and window-frame items remain for 40c/40d.
+The 40b items below (WAL growth, write-before-log, bind/execute race, file locking, Python thread safety, CLI scripting, lake retries/versions/guards) are fixed in wave 40b, and the CI and wave-claim items in wave 40c (darwin-only extension publishing moves to 40i); the window-frame items remain for 40d.
 
 - **Wave 29 and 39 claims vs code (40c, 40i).**
   - Wave 29's title promises "manifest/signature checks" and SQL `INSTALL`. Neither exists: the loader only checks the ABI version and symbols (`crates/pinkdb-ext-loader/src/lib.rs:56-75`), and the grammar has only `LOAD EXTENSION`.
@@ -81,7 +81,7 @@ The 40b items below (WAL growth, write-before-log, bind/execute race, file locki
   - No WAL decoder fuzz and no property tests.
   - duckdiff runs outside the gated jobs.
 
-## Docs drift and hygiene (wave 40c)
+## Docs drift and hygiene (wave 40c — closed)
 
 - `website/` still describes the deleted hand-written parser (`architecture.html`), protocol v2 (`server.html`), "wave 26 shipped" (`index.html`), stale test counts (`roadmap.html`), and TLS/RBAC as waves 45/47.
 - `crates/pinkdb-ffi/hello` is a committed Mach-O binary with an absolute rpath to the author's machine.

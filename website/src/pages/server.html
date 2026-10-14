@@ -53,8 +53,11 @@ the client feature”.</p>
 little-endian length prefix + a <code>u8</code> message type + body. Frames larger than
 64 MiB are rejected before allocation, and every inner length (strings, columns, rows,
 values) is validated against the bytes remaining in the frame — a malformed or truncated
-peer can never make the decoder read out of bounds or over-allocate. The protocol version
-is 2.</p>
+peer can never make the decoder read out of bounds or over-allocate; frame bodies are
+buffered as bytes arrive, and idle clients are disconnected (<code>--idle-timeout</code>,
+default 300 s). The protocol version is 4 (v3 added <code>LoadedExtension</code>, v4
+<code>Checkpointed</code>). <code>LOAD EXTENSION</code> is refused for remote clients unless
+the server runs with <code>--allow-load-extension</code>.</p>
 
 <div class="table-wrap">
 <table>
@@ -126,8 +129,8 @@ and fails fast on later calls instead of reading a desynchronized stream.</p>
 </div>
 
 <ul>
-  <li>TLS (rustls + certificate config) is on the roadmap as wave 45; users/roles with
-  Argon2id password hashes (RBAC) are wave 47.</li>
+  <li>TLS (rustls + certificate config) is on the roadmap as wave 46; users/roles with
+  Argon2id password hashes (RBAC) are wave 48.</li>
   <li><code>pinkdb-server</code> has no encryption-key option: its
   <code>--file</code> must be a plaintext database (an encrypted one is refused at
   startup), and <code>PINKDB_KEY</code> is ignored by the server.</li>

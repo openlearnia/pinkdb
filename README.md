@@ -1408,6 +1408,17 @@ ties in ORDER BY have no stable order on either engine).
   (limit 64)` — the AST is freed iteratively, so even a multi-megabyte chain
   cannot overflow the stack during rejection
 
+- Lake (`lake`/`s3` features): every `.lake save` writes a full snapshot of
+  every table; old versions and orphaned data files are never garbage
+  collected; the lake is reached only through `.lake open` (whole store into
+  memory — no SQL access, time travel or column projection yet); lake files
+  are plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
+  credentials come only from the environment or explicit config (no
+  profiles/IMDS/SSO)
+- Extensions repository: artifacts are verified by SHA-256 from the catalog
+  (no signatures yet), and only `darwin-arm64` builds are published
+- Known gaps and their scheduled waves are tracked in `docs/GAPS.md`
+
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
 feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
@@ -1446,7 +1457,7 @@ only:
 
 | Workflow | Trigger | Jobs / steps |
 |---|---|---|
-| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests that matter (`pink-lake --features s3`, `pinkdb-cli --features lake,s3`, `pinkdb-cli --features encryption`), the wasm check (`cargo build -p pinkdb --target wasm32-unknown-unknown`), then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI release binary and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi` + the Python `unittest` suite + `go test ./...`; `sdk-smokes` — `make -C ext-sdk/c` + both SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (round-trip/races against `adobe/s3mock` in Docker, the default `SERVER`; `SERVER=seaweedfs|rustfs` run the strict variants locally; a hard gate) |
+| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3`, `pinkdb-cli --features lake,s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + both SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the core crates on Rust 1.89; `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
 | `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
 | `publish-extensions.yml` | manual dispatch only | builds the C/C++ SDK examples (and any `extensions/*/` built by their own Makefile), runs both SDK smokes, fetches the live catalog, skips already-published coordinates, publishes new artifacts with `ext-repo/publish.sh` (wrangler → R2) and prints the artifact/catalog URLs |
 
@@ -1457,7 +1468,7 @@ Set both under *Settings → Secrets and variables → Actions*:
 | Secret | Value | Used by |
 |---|---|---|
 | `CLOUDFLARE_API_TOKEN` | a Cloudflare API token scoped to **Workers Scripts: Edit** (docs Worker) and **R2: Edit** (extension artifact + catalog uploads) | `deploy-docs.yml`, `publish-extensions.yml` |
-| `CLOUDFLARE_ACCOUNT_ID` | the account that owns the `pinkdb-docs` / `pinkdb-ext-repo` Workers and the `pinkdb-extensions` R2 bucket — the current one is `b77114a81584db1664e9274f2e0f8232`; store it as a secret instead of hardcoding it in a workflow | same |
+| `CLOUDFLARE_ACCOUNT_ID` | the account that owns the `pinkdb-docs` / `pinkdb-ext-repo` Workers and the `pinkdb-extensions` R2 bucket (find it in the Cloudflare dashboard); store it as a secret, never in the repository | same |
 
 ### Publishing extensions by hand
 

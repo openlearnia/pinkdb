@@ -34,16 +34,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          components: clippy
+          toolchain: stable
+          components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: default
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
 
       - name: cargo build
         run: cargo build
@@ -64,6 +68,34 @@ jobs:
       - name: cargo test -p pinkdb-cli --features encryption
         run: cargo test -p pinkdb-cli --features encryption
 
+      - name: cargo test -p pinkdb --features encryption
+        run: cargo test -p pinkdb --features encryption
+
+      - name: cargo test -p pinkdb-cli --features client
+        run: cargo test -p pinkdb-cli --features client
+
+      - name: cargo test -p pinkdb-cli --features repo
+        run: cargo test -p pinkdb-cli --features repo
+
+      - name: cargo clippy, feature sets (-D warnings)
+        run: |
+          cargo clippy --all-targets -p pinkdb --features encryption -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features s3 -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features lake,s3,repo,client,encryption -- -D warnings
+
+      # SIGKILL crash-recovery loops against the dev CLI (plain, multi-db,
+      # kill-during-checkpoint, encrypted).
+      - name: kill loops (bench/kill_loop.py)
+        env:
+          PINKDB_KEY: ci-kill-loop-passphrase
+        run: |
+          cargo build -p pinkdb-cli
+          python3 bench/kill_loop.py 20
+          python3 bench/kill_loop.py 20 --multi-db
+          python3 bench/kill_loop.py --targeted 10
+          cargo build -p pinkdb-cli --features encryption
+          python3 bench/kill_loop.py 15 --encrypted
+
       - name: wasm check (the core must stay wasm32-compatible)
         run: |
           rustup target add wasm32-unknown-unknown
@@ -73,7 +105,7 @@ jobs:
         run: cargo build --release -p pinkdb-cli
 
       - name: upload the release CLI for the duckdiff job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pinkdb-cli-release
           path: target/release/pinkdb
@@ -88,10 +120,10 @@ jobs:
     needs: build-test
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: download the release CLI
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: pinkdb-cli-release
           path: target/release
@@ -117,30 +149,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: bindings
 
       - name: cargo build --release -p pinkdb-ffi
         run: cargo build --release -p pinkdb-ffi
 
+      - name: C ABI example (make -C crates/pinkdb-ffi hello)
+        run: make -C crates/pinkdb-ffi hello
+
       - name: python3 -m unittest discover -s bindings/python/tests
         run: python3 -m unittest discover -s bindings/python/tests -v
 
       - name: install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: bindings/go/go.mod
           cache: false # stdlib-only module: there is no go.sum to cache
 
-      - name: go test ./...
+      - name: go vet + go test -race ./...
         working-directory: bindings/go
-        run: go test ./...
+        run: |
+          test -z "$(gofmt -l .)"
+          go vet ./...
+          go test -race ./...
 
   # The two extension SDKs, end to end: each smoke script builds the release
   # CLI and runs a deterministic LOAD EXTENSION session against the compared
@@ -150,17 +190,19 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: sdk-smokes
 
       - name: install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: ext-sdk/go/go.mod
           cache: false # stdlib-only module: there is no go.sum to cache
@@ -187,12 +229,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: lake-s3
 
@@ -201,3 +245,86 @@ jobs:
 
       - name: crates/pink-lake/tests/s3_docker.sh
         run: SKIP_BUILD=1 crates/pink-lake/tests/s3_docker.sh
+
+  # macOS (arm64) is the development platform and the only published
+  # extension platform today: run the core suites there too.
+  macos:
+    name: macOS tests
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: macos
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      - name: cargo test -p pinkdb-cli --features lake,s3
+        run: cargo test -p pinkdb-cli --features lake,s3
+
+      - name: cargo test -p pinkdb --features encryption
+        run: cargo test -p pinkdb --features encryption
+
+      - name: python binding on macOS
+        run: |
+          cargo build --release -p pinkdb-ffi
+          python3 -m unittest discover -s bindings/python/tests -v
+
+  # Declared minimum Rust versions: 1.89 for the core crates (std file
+  # locking), 1.95 for pink-lake (the vortex dependency's own floor).
+  msrv:
+    name: MSRV (1.89 core)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust 1.89
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: "1.89"
+
+      - name: cargo check (default features, core crates)
+        run: cargo check -p pinkdb -p pinkdb-cli -p pinkdb-server -p pinkdb-ffi -p pinkdb-ext-loader
+
+  # Known-vulnerability scan of Cargo.lock (RustSec advisory database).
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - name: cargo install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: cargo audit
+        run: cargo audit
+
+  # The docs site must keep building on every change (deploy-docs only runs
+  # on main).
+  docs:
+    name: docs site builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: python3 website/build.py
+        run: python3 website/build.py
+
+      - name: roadmap page matches ROADMAP.md
+        run: python3 website/tools/sync_roadmap.py --check

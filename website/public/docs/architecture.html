@@ -16,7 +16,7 @@
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, lake.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
@@ -75,7 +75,7 @@ vectors, with zero async in the core.</p>
       <path class="sk-stroke" d="M124 44 C 120 52, 128 58, 124 64" marker-end="url(#sk-arrowhead)"/>
       <rect class="sk-box" x="0" y="64" width="240" height="42" rx="9" transform="rotate(0.35)"/>
       <text class="sk-label" x="14" y="90">PEG parser &#8594; AST</text>
-      <text class="sk-label-sm" x="262" y="90">hand-written lexer + recursive descent too</text>
+      <text class="sk-label-sm" x="262" y="90">the only parser (rust-peg grammar)</text>
 
       <path class="sk-stroke" d="M124 108 C 120 116, 128 122, 124 128" marker-end="url(#sk-arrowhead)"/>
       <rect class="sk-box" x="0" y="128" width="240" height="42" rx="9" transform="rotate(-0.35)"/>
@@ -155,7 +155,7 @@ and invalid input returns a clean <code>Parse</code> error.</p>
     <tr><td><code>pinkdb::plan</code></td><td>Logical plan tree</td></tr>
     <tr><td><code>pinkdb::optimizer</code></td><td>Constant folding, predicate pushdown (incl. across joins)</td></tr>
     <tr><td><code>pinkdb::exec</code></td><td>Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel)</td></tr>
-    <tr><td><code>pinkdb::persist</code></td><td><code>.pink</code> single-file columnar persistence, v2 (databases + RLE/dictionary/bitpack; v1 files load)</td></tr>
+    <tr><td><code>pinkdb::persist</code></td><td><code>.pink</code> single-file columnar persistence, v3 (databases + RLE/dictionary/bitpack + CRC-32 trailer; v1/v2 files load)</td></tr>
     <tr><td><code>pinkdb::crypto</code></td><td>Optional at-rest encryption (<code>PINKENC1</code>: AES-256-GCM + Argon2id) behind the <code>encryption</code> feature; a parse/identity stub otherwise</td></tr>
     <tr><td><code>pinkdb::db</code></td><td>Multi-writer <code>Database</code>/<code>Connection</code> over <code>Arc&lt;RwLock&lt;PinkDb&gt;&gt;</code></td></tr>
     <tr><td><code>pinkdb-cli</code></td><td>rustyline REPL, dot-commands, box-drawn output</td></tr>
@@ -216,7 +216,7 @@ and invalid input returns a clean <code>Parse</code> error.</p>
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs track ROADMAP.md (Oct 2026).</p>
     <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>

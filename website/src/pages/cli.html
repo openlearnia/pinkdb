@@ -33,6 +33,14 @@ dot-commands are single-line and take no semicolon.</p>
       <td>show the dot-command help (a shorter list in remote mode)</td>
     </tr>
     <tr>
+      <td><code>.read &lt;file.sql&gt;</code></td>
+      <td>run SQL and dot-commands from a file</td>
+    </tr>
+    <tr>
+      <td><code>.timer on|off</code></td>
+      <td>print each statement's run time (default: on in a terminal)</td>
+    </tr>
+    <tr>
       <td><code>.quit</code> / <code>.exit</code></td>
       <td>leave the shell</td>
     </tr>
@@ -77,7 +85,8 @@ switches it.</p>
 
 <h2>Output and timing</h2>
 
-<p>Results are box-drawn with a type row, then a row count and a timing line:</p>
+<p>Results are box-drawn with a type row, then a row count and, in an interactive
+terminal, a timing line (<code>.timer on|off</code> toggles it):</p>
 
 <pre class="code" data-lang="text"><code>┌─────────┬────────────┐
 │ region  │ avg(total) │
@@ -91,6 +100,17 @@ Run Time (s): real 0.000</code></pre>
 
 <p>At most 10&nbsp;000 rows are printed; longer results end with a
 <code>(N more rows)</code> note.</p>
+
+<h2>Scripting</h2>
+
+<p>Piped input and <code>-c COMMAND</code> (repeatable) follow sqlite3/duckdb conventions:
+errors go to stderr, there is no banner or timing, and the process exits
+<code>1</code> if any statement or dot-command failed. A statement still open at end of
+input runs as if terminated, and <code>;</code> is recognized outside strings and comments.
+<code>.read file.sql</code> runs a script in the current session.</p>
+
+<pre class="code" data-lang="shell"><code>pinkdb -c ".open sales.pink" -c "SELECT COUNT(*) FROM sales;"
+pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
 
 <h2>Environment variables</h2>
 

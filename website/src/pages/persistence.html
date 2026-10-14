@@ -95,10 +95,16 @@ roll. Recovery never removes anything before the recovered state is durable:</p>
   <li>A mutating statement that reads a session-local view is refused on durable
   databases: views are never persisted, so replaying its logged SQL could not rebuild
   it.</li>
-  <li>A database file is <strong>single-writer</strong>: no file locking is taken, so run
-  one process per <code>.pink</code> path. The crash-test harness
+  <li>A durable database has <strong>one live handle</strong>: opening takes an exclusive
+  advisory lock on <code>x.pink.lock</code> (released by the OS on exit or crash), and a
+  second open fails with <code>already open</code>. The crash-test harness
   (<code>bench/kill_loop.py</code>) exercises recovery with repeated
   <code>SIGKILL</code> iterations.</li>
+  <li><code>CHECKPOINT</code> (SQL, from any front-end) persists and rolls the WAL; a
+  committed write also checkpoints automatically once the WAL passes 64&nbsp;MiB.</li>
+  <li>A failed WAL append is <strong>fail-stop</strong>: every later statement and save
+  is refused until the database is reopened, which recovers exactly the durable
+  prefix.</li>
 </ul>
 
 <h2>At-rest encryption</h2>

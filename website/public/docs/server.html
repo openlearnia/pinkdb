@@ -16,7 +16,7 @@
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, lake.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
@@ -104,8 +104,11 @@ the client feature”.</p>
 little-endian length prefix + a <code>u8</code> message type + body. Frames larger than
 64 MiB are rejected before allocation, and every inner length (strings, columns, rows,
 values) is validated against the bytes remaining in the frame — a malformed or truncated
-peer can never make the decoder read out of bounds or over-allocate. The protocol version
-is 2.</p>
+peer can never make the decoder read out of bounds or over-allocate; frame bodies are
+buffered as bytes arrive, and idle clients are disconnected (<code>--idle-timeout</code>,
+default 300 s). The protocol version is 4 (v3 added <code>LoadedExtension</code>, v4
+<code>Checkpointed</code>). <code>LOAD EXTENSION</code> is refused for remote clients unless
+the server runs with <code>--allow-load-extension</code>.</p>
 
 <div class="table-wrap">
 <table>
@@ -177,8 +180,8 @@ and fails fast on later calls instead of reading a desynchronized stream.</p>
 </div>
 
 <ul>
-  <li>TLS (rustls + certificate config) is on the roadmap as wave 45; users/roles with
-  Argon2id password hashes (RBAC) are wave 47.</li>
+  <li>TLS (rustls + certificate config) is on the roadmap as wave 46; users/roles with
+  Argon2id password hashes (RBAC) are wave 48.</li>
   <li><code>pinkdb-server</code> has no encryption-key option: its
   <code>--file</code> must be a plaintext database (an encrypted one is refused at
   startup), and <code>PINKDB_KEY</code> is ignored by the server.</li>
@@ -196,7 +199,7 @@ and fails fast on later calls instead of reading a desynchronized stream.</p>
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs track ROADMAP.md (Oct 2026).</p>
     <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>

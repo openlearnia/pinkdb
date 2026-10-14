@@ -2,6 +2,7 @@
 name = "pinkdb-server"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.89"
 description = "pinkdb network server: TCP server + blocking client for the pinkdb engine"
 license = "MIT"
 

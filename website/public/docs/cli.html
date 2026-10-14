@@ -16,7 +16,7 @@
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, lake.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
@@ -84,6 +84,14 @@ dot-commands are single-line and take no semicolon.</p>
       <td>show the dot-command help (a shorter list in remote mode)</td>
     </tr>
     <tr>
+      <td><code>.read &lt;file.sql&gt;</code></td>
+      <td>run SQL and dot-commands from a file</td>
+    </tr>
+    <tr>
+      <td><code>.timer on|off</code></td>
+      <td>print each statement's run time (default: on in a terminal)</td>
+    </tr>
+    <tr>
       <td><code>.quit</code> / <code>.exit</code></td>
       <td>leave the shell</td>
     </tr>
@@ -128,7 +136,8 @@ switches it.</p>
 
 <h2>Output and timing</h2>
 
-<p>Results are box-drawn with a type row, then a row count and a timing line:</p>
+<p>Results are box-drawn with a type row, then a row count and, in an interactive
+terminal, a timing line (<code>.timer on|off</code> toggles it):</p>
 
 <pre class="code" data-lang="text"><code>┌─────────┬────────────┐
 │ region  │ avg(total) │
@@ -142,6 +151,17 @@ Run Time (s): real 0.000</code></pre>
 
 <p>At most 10&nbsp;000 rows are printed; longer results end with a
 <code>(N more rows)</code> note.</p>
+
+<h2>Scripting</h2>
+
+<p>Piped input and <code>-c COMMAND</code> (repeatable) follow sqlite3/duckdb conventions:
+errors go to stderr, there is no banner or timing, and the process exits
+<code>1</code> if any statement or dot-command failed. A statement still open at end of
+input runs as if terminated, and <code>;</code> is recognized outside strings and comments.
+<code>.read file.sql</code> runs a script in the current session.</p>
+
+<pre class="code" data-lang="shell"><code>pinkdb -c ".open sales.pink" -c "SELECT COUNT(*) FROM sales;"
+pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
 
 <h2>Environment variables</h2>
 
@@ -185,7 +205,7 @@ and transactions) works unchanged; the file and catalog dot-commands
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs track ROADMAP.md (Oct 2026).</p>
     <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>

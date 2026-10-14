@@ -16,7 +16,7 @@
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, lake.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
@@ -146,10 +146,16 @@ roll. Recovery never removes anything before the recovered state is durable:</p>
   <li>A mutating statement that reads a session-local view is refused on durable
   databases: views are never persisted, so replaying its logged SQL could not rebuild
   it.</li>
-  <li>A database file is <strong>single-writer</strong>: no file locking is taken, so run
-  one process per <code>.pink</code> path. The crash-test harness
+  <li>A durable database has <strong>one live handle</strong>: opening takes an exclusive
+  advisory lock on <code>x.pink.lock</code> (released by the OS on exit or crash), and a
+  second open fails with <code>already open</code>. The crash-test harness
   (<code>bench/kill_loop.py</code>) exercises recovery with repeated
   <code>SIGKILL</code> iterations.</li>
+  <li><code>CHECKPOINT</code> (SQL, from any front-end) persists and rolls the WAL; a
+  committed write also checkpoints automatically once the WAL passes 64&nbsp;MiB.</li>
+  <li>A failed WAL append is <strong>fail-stop</strong>: every later statement and save
+  is refused until the database is reopened, which recovers exactly the durable
+  prefix.</li>
 </ul>
 
 <h2>At-rest encryption</h2>
@@ -215,7 +221,7 @@ plaintext.</p>
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs track ROADMAP.md (Oct 2026).</p>
     <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>
