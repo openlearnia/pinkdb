@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pink_lake::{save_store, validate_store, Lake, LakeError, FORMAT_VERSION};
-use pinkdb::{DataType, PinkDb, Value, CHUNK_SIZE};
+use pinkdb::{DataTable, DataType, PinkDb, Value, Vector, CHUNK_SIZE};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -611,6 +611,34 @@ fn files_with_mismatched_table_names_are_rejected() {
     let lake = Lake::open(&dir).unwrap();
     let err = lake.load(None).unwrap_err().to_string();
     assert!(err.contains("data file holds analytics.u"), "{err}");
+    cleanup(&dir);
+}
+
+#[test]
+fn same_schema_equal_rows_swaps_are_detected_by_identity() {
+    let dir = scratch("identity_swap");
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE a (x INTEGER);").unwrap();
+    db.execute("CREATE TABLE b (x INTEGER);").unwrap();
+    db.execute("INSERT INTO a VALUES (1);").unwrap();
+    db.execute("INSERT INTO b VALUES (2);").unwrap();
+    let mut lake = Lake::create(&dir).unwrap();
+    lake.write_from_store(&db).unwrap();
+
+    // Point `main.a` at `main.b`'s data file: name, schema and row count all
+    // match, so only the `pinkdb.table` identity can reject the swap.
+    let mut catalog = read_json(&dir.join("catalog.json"));
+    let b_file = catalog["tables"]["main.b"]["files"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    catalog["tables"]["main.a"]["files"] = serde_json::json!([b_file]);
+    write_json(&dir.join("catalog.json"), &catalog);
+
+    let lake = Lake::open(&dir).unwrap();
+    let err = lake.load(None).unwrap_err().to_string();
+    assert!(err.contains("data file holds main.b"), "{err}");
+    assert!(err.contains("catalog says \"main.a\""), "{err}");
     cleanup(&dir);
 }
 
@@ -1342,5 +1370,214 @@ fn a_corrupt_vortex_data_file_is_a_clear_error() {
 
     // Metadata still reads; only a load fails.
     assert!(lake.tables().unwrap().iter().any(|(k, _)| k == "main.fid"));
+    cleanup(&dir);
+}
+
+#[test]
+fn catalog_format_fields_are_validated() {
+    let dir = scratch("format_fields");
+    let db = fixture_store();
+    let mut lake = Lake::create(&dir).unwrap();
+    lake.write_from_store(&db).unwrap();
+    let good = std::fs::read(dir.join("catalog.json")).unwrap();
+
+    // `format_version` 0 and `u32::MAX` are unsupported, never guessed at.
+    for bad in [0u32, u32::MAX] {
+        let mut cat = read_json(&dir.join("catalog.json"));
+        cat["format_version"] = serde_json::json!(bad);
+        write_json(&dir.join("catalog.json"), &cat);
+        let err = Lake::open(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("unsupported lake format_version {bad}")),
+            "format_version {bad}: {err}"
+        );
+    }
+
+    // An unknown `format` string is stopped by serde, not silently treated
+    // as one of the known formats.
+    std::fs::write(dir.join("catalog.json"), &good).unwrap();
+    let mut cat = read_json(&dir.join("catalog.json"));
+    cat["tables"]["main.t"]["format"] = serde_json::json!("parquet");
+    write_json(&dir.join("catalog.json"), &cat);
+    let err = Lake::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("corrupt lake metadata"), "{err}");
+    assert!(err.contains("parquet"), "{err}");
+
+    // A v2 entry declaring `"pink"` is corrupt: the v2 writer emits Vortex
+    // only, so this is tampered metadata, not a downgrade.
+    let mut cat = read_json(&dir.join("catalog.json"));
+    cat["tables"]["main.t"]["format"] = serde_json::json!("pink");
+    write_json(&dir.join("catalog.json"), &cat);
+    let err = Lake::open(&dir).unwrap_err().to_string();
+    assert!(
+        err.contains("declares a pink data file in a format_version 2 manifest"),
+        "{err}"
+    );
+    assert!(err.contains("v2 writer emits Vortex only"), "{err}");
+
+    // A `format` of the wrong JSON type is corrupt too.
+    let mut cat = read_json(&dir.join("catalog.json"));
+    cat["tables"]["main.t"]["format"] = serde_json::json!(3);
+    write_json(&dir.join("catalog.json"), &cat);
+    let err = Lake::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("corrupt lake metadata"), "{err}");
+
+    // The untouched catalog still opens (the tampering was on disk only).
+    std::fs::write(dir.join("catalog.json"), &good).unwrap();
+    assert_eq!(Lake::open(&dir).unwrap().current_version(), 2);
+    cleanup(&dir);
+}
+
+#[test]
+fn extreme_values_and_chunk_shapes_roundtrip() {
+    let dir = scratch("extreme_values");
+    let mut db = PinkDb::new();
+
+    // Subnormals, infinities, signaling NaNs, f64::MAX/MIN, and a 1 MiB
+    // string (DOUBLEs are compared by bit pattern throughout).
+    db.execute("CREATE TABLE m (d DOUBLE, s VARCHAR);").unwrap();
+    {
+        let t = db.table_mut("m").unwrap();
+        let doubles = [
+            f64::from_bits(1),                     // min positive subnormal
+            f64::from_bits(0x000f_ffff_ffff_ffff), // max subnormal
+            f64::from_bits(0x8000_0000_0000_0001), // min negative subnormal
+            f64::NEG_INFINITY,
+            f64::MAX,
+            f64::MIN,                              // most negative finite
+            f64::from_bits(0x7ff0_0000_0000_0001), // signaling NaN
+            f64::from_bits(0xfff0_0000_0000_0001), // negative signaling NaN
+        ];
+        for (i, d) in doubles.into_iter().enumerate() {
+            t.append_row(vec![Value::Double(d), Value::Varchar(format!("v{i}"))])
+                .unwrap();
+        }
+        t.append_row(vec![
+            Value::Double(1.0),
+            Value::Varchar("x".repeat(1 << 20)),
+        ])
+        .unwrap();
+    }
+
+    // 0-, 1-, and >CHUNK_SIZE-row tables; the big one is built through the
+    // `append_chunk` bulk path, which fills the tail chunk to CHUNK_SIZE
+    // before opening a new one (2000 + 1049 rows land as [2048, 1001]).
+    db.execute("CREATE TABLE zero (x INTEGER, y VARCHAR);")
+        .unwrap();
+    db.execute("CREATE TABLE one (x INTEGER);").unwrap();
+    db.execute("INSERT INTO one VALUES (7);").unwrap();
+    db.execute("CREATE TABLE many (x INTEGER, s VARCHAR);")
+        .unwrap();
+    {
+        let t = db.table_mut("many").unwrap();
+        let build = |rows: usize, offset: i32| {
+            let mut x = Vector::with_capacity(DataType::Integer, rows);
+            let mut s = Vector::with_capacity(DataType::Varchar, rows);
+            for i in 0..rows {
+                x.push_value(Value::Integer(offset + i as i32)).unwrap();
+                s.push_str(&format!("r{}", offset + i as i32)).unwrap();
+            }
+            vec![x, s]
+        };
+        t.append_chunk(build(2000, 0)).unwrap();
+        t.append_chunk(build(1049, 2000)).unwrap();
+    }
+
+    // An all-NULL table with two full chunks (the all-NULL multi-chunk
+    // shape), built through the same bulk path.
+    db.execute("CREATE TABLE nulls (a INTEGER, s VARCHAR);")
+        .unwrap();
+    {
+        let t = db.table_mut("nulls").unwrap();
+        for _ in 0..2 {
+            let mut a = Vector::with_capacity(DataType::Integer, CHUNK_SIZE);
+            let mut s = Vector::with_capacity(DataType::Varchar, CHUNK_SIZE);
+            for _ in 0..CHUNK_SIZE {
+                a.push_null().unwrap();
+                s.push_null().unwrap();
+            }
+            t.append_chunk(vec![a, s]).unwrap();
+        }
+    }
+
+    let mut lake = Lake::create(&dir).unwrap();
+    lake.write_from_store(&db).unwrap();
+    let loaded = lake.load(None).unwrap();
+    assert_same_store(&db, &loaded);
+
+    // The 1 MiB string came back byte for byte, and the signaling-NaN and
+    // f64::MIN bits survived.
+    let m = loaded.table("m").unwrap();
+    match m.get(8, 1) {
+        Some(Value::Varchar(s)) => {
+            assert_eq!(s.len(), 1 << 20);
+            assert!(s.bytes().all(|b| b == b'x'));
+        }
+        other => panic!("expected the 1 MiB string, got {other:?}"),
+    }
+    assert!(matches!(
+        m.get(6, 0),
+        Some(Value::Double(x)) if x.to_bits() == 0x7ff0_0000_0000_0001
+    ));
+    assert!(matches!(
+        m.get(5, 0),
+        Some(Value::Double(x)) if x.to_bits() == f64::MIN.to_bits()
+    ));
+
+    // Chunk boundaries survive: 0 (schema-only file), 1, 2 via the bulk
+    // path, 2 all-NULL.
+    let sizes = |t: &DataTable| -> Vec<usize> {
+        (0..t.num_chunks())
+            .map(|i| t.scan_chunk(i).unwrap().num_rows())
+            .collect()
+    };
+    assert_eq!(loaded.table("zero").unwrap().num_rows(), 0);
+    assert_eq!(
+        loaded.table("zero").unwrap().num_chunks(),
+        db.table("zero").unwrap().num_chunks()
+    );
+    assert_eq!(loaded.table("one").unwrap().num_rows(), 1);
+    assert_eq!(sizes(loaded.table("many").unwrap()), vec![2048, 1001]);
+    assert_eq!(sizes(loaded.table("nulls").unwrap()), vec![CHUNK_SIZE; 2]);
+    let null_chunk = loaded.table("nulls").unwrap().scan_chunk(0).unwrap();
+    assert!(
+        (0..null_chunk.num_rows)
+            .all(|r| (0..null_chunk.columns.len()).all(|c| null_chunk.columns[c].is_null(r))),
+        "every value of the all-NULL chunk must stay NULL"
+    );
+
+    // The loaded store still re-saves to the same `.pink` bytes.
+    assert_eq!(
+        store_bytes(&loaded, &dir, "loaded"),
+        store_bytes(&db, &dir, "orig")
+    );
+    cleanup(&dir);
+}
+
+#[test]
+fn csv_import_chunk_boundaries_roundtrip() {
+    let dir = scratch("csv_chunks");
+    let mut db = PinkDb::new();
+    let mut csv = String::from("id,name\n");
+    for i in 0..(CHUNK_SIZE + 123) {
+        csv.push_str(&format!("{i},row-{i}\n"));
+    }
+    let rows = pinkdb::csv::import_csv_string(&mut db, "t", &csv).unwrap();
+    assert_eq!(rows, CHUNK_SIZE + 123);
+
+    let sizes = |t: &DataTable| -> Vec<usize> {
+        (0..t.num_chunks())
+            .map(|i| t.scan_chunk(i).unwrap().num_rows())
+            .collect()
+    };
+    assert_eq!(sizes(db.table("t").unwrap()), vec![CHUNK_SIZE, 123]);
+
+    let mut lake = Lake::create(&dir).unwrap();
+    lake.write_from_store(&db).unwrap();
+    let loaded = lake.load(None).unwrap();
+    assert_same_store(&db, &loaded);
+    // The CSV loader's chunk boundary (full chunk + remainder) is the same
+    // after a Vortex round-trip.
+    assert_eq!(sizes(loaded.table("t").unwrap()), vec![CHUNK_SIZE, 123]);
     cleanup(&dir);
 }

@@ -388,9 +388,10 @@ The manifests (`catalog.json` and every snapshot) share one shape:
 
 **Migration:** open an old lake and `.lake save` again — the next snapshot is a
 full rewrite in Vortex (`format_version` 2); old snapshots and their `.pink`
-files stay untouched, so every published version still loads. An unknown
-`format_version` (or a v2 entry without a `format` field) is a clear error,
-never a guess.
+files stay untouched, so every published version still loads. Any unknown
+`format_version`, a v2 entry without a `format` field, and a v2 entry
+declaring anything but `"vortex"` (the v2 writer emits Vortex only) are clear
+errors, never a guess.
 
 - **Schema and typing live in the data files.** A v2 file is a plain Vortex
   file: one struct array, one field per column, chunk boundaries preserved
@@ -400,7 +401,8 @@ never a guess.
   ranges, VARCHAR is `utf8`. DATE/TIMESTAMP are stored as their raw `i32`/`i64`
   storage integers plus the exact pinkdb schema in a `pinkdb.table` metadata
   segment (with the table's `db`/`table` identity, which is what rejects a
-  swapped data file): the native `vortex.timestamp` extension converts values
+  data file swapped in from a *differently named* table): the native
+  `vortex.timestamp` extension converts values
   through a calendar type limited to about ±20 000 years and **panics** on
   extreme timestamps (±6.31e17 µs) during statistics computation, so no bit
   pattern is left to chance — see below.
@@ -434,9 +436,16 @@ never a guess.
   visible: a stray manifest at exactly the *next* version can't be told apart
   from a published one, so a save landing on it refuses with a clear conflict
   ("if catalog.json still points at the previous version it was never
-  published — remove the stray snapshot and retry"). Corrupt metadata (and a
-  truncated/corrupt Vortex data file, or one whose `pinkdb.table` metadata
-  does not parse) is a clear error, never a panic.
+  published — remove the stray snapshot and retry"). Corrupt metadata is a
+  clear error; a truncated/corrupt Vortex data file, or one whose
+  `pinkdb.table` metadata does not parse, is the same `Corrupt` error. Panics
+  inside Vortex's decoder for malformed layouts (there are several, including
+  `debug_assert!` sites) are caught — the whole decode boundary (`open_buffer`,
+  metadata/schema checks, scan, per-column decode) runs under
+  `catch_unwind` — and surfaced as a `Corrupt` error naming the data file, so
+  a decoder panic is an error, not a process death. The default panic hook may
+  still print one line to stderr before the caught error; the library does not
+  swap the global hook (that would race other threads).
 - **Flat `db.table` names**, restored by splitting on the first dot; a table
   name may contain dots, a database name containing `.` is refused at save
   time. Views are session-local and are not saved. A lake records tables,
@@ -444,9 +453,14 @@ never a guess.
   back empty (loading always recreates it). Data files are plaintext
   (`PINKDB_KEY` does not encrypt a lake; the CLI keeps the session key
   across `.lake open` for later `.save`/`.open`). Data files carry no
-  checksums: mutating one in place is undetected by design, while
-  cross-table swaps (a v2 file names its own `db`/`table`), schema
-  disagreement and row-count mismatches *are* detected on load.
+  checksums: mutating one in place is undetected by design. The checks that
+  do run on load are structural — a v2 file's `pinkdb.table` metadata must
+  name the catalog's table, agree with the Vortex field names/types, and the
+  file's row count must match the catalog — so a file swapped in from a
+  *differently named* table is rejected. Swapping two files of the **same**
+  table (same name, same schema, same row count) cannot be detected, and a
+  tampered file may still decode to different values or fail with a clean
+  `Corrupt` error (caught decoder panics included).
   `save_store`/`.lake save` pre-validate the store (dotted database names,
   over-long encoded table names) *before* creating a lake, so a rejected save
   leaves nothing behind.
@@ -468,11 +482,14 @@ never a guess.
   **Dependency/build note:** `crates/pink-lake` now depends on the `vortex`
   crate directly (`default-features = false, features = ["files"]`); that
   pulls in ~218 additional crates (vortex-array/file/layout + encodings,
-  arrow, prost/flatbuffers, smol/async, jiff) and adds ≈1 m 53 s to a clean
-  debug build of `pink-lake` (≈6 min for the first release build with thin
-  LTO) and ≈42 MB to the release `pinkdb` binary built with `--features lake`
-  — the default binary is byte-for-byte the same size as before because the
-  dependency lives entirely behind the opt-in feature.
+  arrow, prost/flatbuffers, smol/async, jiff) and adds ≈42 MB to the release
+  `pinkdb` binary built with `--features lake`. A cold build is
+  machine-dependent (minutes for the debug and release trees on Apple
+  Silicon; the exact numbers were not reproduced precisely). Note that
+  `pink-lake` is a workspace member, so root workspace commands
+  (`cargo build`/`cargo test` at the repo root) compile the Vortex tree as
+  well — only the feature-less `pinkdb-cli` binary itself is Vortex-free and
+  keeps its size (the default release `pinkdb` is unchanged).
 
 Library:
 

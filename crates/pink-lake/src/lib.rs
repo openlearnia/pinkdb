@@ -40,9 +40,14 @@
 //! `.pink` single-table persistence bytes ([`PinkDb::save`] / [`PinkDb::open`]),
 //! which a data file still opens standalone. Opening an old lake and saving
 //! again publishes a v2 snapshot: a full rewrite in Vortex (the migration
-//! path). A manifest with any other `format_version` — or a v2 entry without
-//! a `format` field — is a clear [`LakeError::Unsupported`]/[`LakeError::Corrupt`]
-//! error, never a guess.
+//! path). A manifest with any other `format_version` — or a v2 entry that
+//! omits `format` or declares anything but `"vortex"` — is a clear
+//! [`LakeError::Unsupported`]/[`LakeError::Corrupt`] error, never a guess.
+//! Decoding a corrupt Vortex data file is the same clear [`LakeError::Corrupt`]
+//! error: the whole decoder boundary is guarded, so a panic inside Vortex's
+//! malformed-layout paths is caught and reported (the default panic hook may
+//! still print one line to stderr first; the crate does not swap the global
+//! hook).
 //!
 //! # Snapshots and versioning
 //!
@@ -117,9 +122,14 @@
 //!   `encryption` feature is not wired into a lake (the CLI keeps
 //!   `PINKDB_KEY` for `.save`/`.open` across `.lake open`, but lake files
 //!   themselves stay plaintext). Data files carry **no checksums**: mutating
-//!   a data file in place is undetected by design (cross-table/schema/
-//!   row-count swaps *are* detected on load; a v2 file additionally carries
-//!   its own table identity and schema in Vortex metadata).
+//!   a data file in place is undetected by design. The checks that do run on
+//!   load are structural: a v2 file's `pinkdb.table` metadata must name the
+//!   catalog's table, agree with the Vortex field names/types, and the chunk
+//!   and row counts must match — so a file swapped in from a *differently
+//!   named* table is rejected. Swapping two files of the *same* table
+//!   (same name, same schema, same row count) is not detectable, and a
+//!   tampered file can still decode to different values or fail with a
+//!   [`LakeError::Corrupt`] (a caught decoder panic included).
 //! - **Single writer**: one live handle per lake directory; a stale handle's
 //!   save fails with [`LakeError::Conflict`], it never silently forks the
 //!   version chain.
@@ -498,7 +508,10 @@ impl Lake {
                 let dir = format!("data/{}", encode_key(&key));
                 let format = FileFormat::Vortex;
                 let id = fresh_id();
-                let rel_file = format!("{dir}/{id}.{}", format.extension());
+                // The v2 writer emits exactly one Vortex file per table (the
+                // loader is driven by the catalog's `format` field, never by
+                // the extension).
+                let rel_file = format!("{dir}/{id}.vortex");
                 // v2 encodes the whole table into a Vortex file in memory,
                 // then publishes it atomically (unique `create_new` temp
                 // sibling, fsync, rename). Nothing is referenced by the
@@ -786,13 +799,15 @@ fn read_catalog(storage: &LocalStorage, root: &Path) -> Result<Catalog> {
 /// Parse + validate one manifest (`catalog.json` or a snapshot). The version
 /// must be in `1..=MAX_VERSION`: `0` is not a version this writer ever
 /// publishes, and a value at the top wraps `version + 1` — both are corrupt
-/// metadata, reported cleanly and never panicked on.
+/// metadata, reported as a clean [`LakeError::Corrupt`] (this path is plain
+/// JSON, no Vortex decode involved).
 ///
 /// `format_version` must be in [`MIN_FORMAT_VERSION`]`..=`[`FORMAT_VERSION`].
 /// A version 1 manifest is all-`.pink` by definition: an entry there must not
 /// declare `"format": "vortex"`. A version 2 manifest must declare a `format`
-/// on every entry (a version 1 *reader* ignored the field entirely, so a
-/// missing one is corrupt v2 metadata, not a silent `.pink` downgrade).
+/// on every entry, and that format must be `"vortex"` — the v2 writer emits
+/// Vortex only, so a missing field or a `"pink"` entry is corrupt v2
+/// metadata, not a silent `.pink` downgrade.
 fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
     let manifest: Catalog = serde_json::from_slice(bytes).map_err(|e| LakeError::Corrupt {
         path: path.to_path_buf(),
@@ -830,6 +845,16 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                     message: format!(
                         "table \"{key}\" does not declare a data file format (a format_version 2 \
                          entry requires `\"format\": \"vortex\"`)"
+                    ),
+                });
+            }
+            (2, Some(FileFormat::Pink)) => {
+                return Err(LakeError::Corrupt {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "table \"{key}\" declares a pink data file in a format_version 2 \
+                         manifest (the v2 writer emits Vortex only; `.pink` data files are \
+                         format_version 1)"
                     ),
                 });
             }

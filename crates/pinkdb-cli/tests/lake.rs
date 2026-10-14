@@ -65,6 +65,29 @@ fn run_with_env(cmds: &str, env: &[(&str, &str)]) -> String {
     String::from_utf8(out.stdout).expect("CLI stdout is UTF-8")
 }
 
+/// Like [`run`], but captures stderr too and returns the exit code instead of
+/// asserting success (the caller decides what a clean exit means).
+fn run_captured(cmds: &str) -> (String, String, i32) {
+    let mut child = Command::new(cli_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn pinkdb CLI");
+    child
+        .stdin
+        .take()
+        .expect("child stdin")
+        .write_all(cmds.as_bytes())
+        .expect("write to CLI stdin");
+    let out = child.wait_with_output().expect("wait for the CLI");
+    (
+        String::from_utf8(out.stdout).expect("CLI stdout is UTF-8"),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
 /// The `version` field of a manifest, dependency-free: the manifests are
 /// `serde_json` pretty output with a single `"version": <digits>` line.
 fn declared_version(json: &str) -> u64 {
@@ -495,5 +518,105 @@ fn concurrent_lake_saves_stay_consistent() {
         let expected: Vec<String> = (1..=version).map(|v| format!("{v}.json")).collect();
         assert_eq!(names, expected, "round {round}");
     }
+    cleanup(&dir);
+}
+
+/// A tampered lake data file must produce a clean CLI error and leave the
+/// REPL (and the process) alive: `.lake open` runs the guarded Vortex decode,
+/// so even a flip that panics the decoder is caught as a corrupt-file error.
+#[test]
+fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
+    let dir = scratch("tamper_data");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (b BOOLEAN, i INTEGER, g BIGINT, d DOUBLE, v VARCHAR);\n\
+         INSERT INTO t VALUES (true, 1, 2, 3.5, 'x'), (false, -2, -3, 0.25, 'héllo'),\n\
+         (NULL, NULL, NULL, NULL, NULL);\n\
+         .lake save {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    let file = std::fs::read_dir(lake.join("data/main.t"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .next()
+        .expect("one data file");
+    let original = std::fs::read(&file).unwrap();
+    assert!(original.len() > 512, "fixture file unexpectedly small");
+
+    let mut tampers: Vec<(&str, Vec<u8>)> = Vec::new();
+    // Single-byte flips at a few offsets, including the kind of layout
+    // metadata position the review found panicking the decoder.
+    for pos in [74usize, original.len() / 3, original.len() / 2] {
+        let mut b = original.clone();
+        b[pos] ^= 0x80;
+        tampers.push(("byte flip", b));
+    }
+    // A zeroed window in the middle of the encoded data.
+    {
+        let mut b = original.clone();
+        let start = original.len() / 4;
+        for x in &mut b[start..start + 64] {
+            *x = 0;
+        }
+        tampers.push(("zeroed window", b));
+    }
+    // Broken `pinkdb.table` JSON (the identity/schema segment).
+    {
+        let needle = b"{\"db\":";
+        let pos = original
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .expect("pinkdb.table metadata JSON");
+        let mut b = original.clone();
+        b[pos + 1] = b'x';
+        tampers.push(("metadata JSON", b));
+    }
+
+    let mut saw_error = false;
+    for (what, bytes) in &tampers {
+        std::fs::write(&file, bytes).unwrap();
+        let (stdout, stderr, code) = run_captured(&format!(
+            ".lake open {lake}\n.databases\n.quit\n",
+            lake = lake.display()
+        ));
+        assert_eq!(
+            code, 0,
+            "{what}: the CLI must exit cleanly, got {code} (stderr: {stderr})"
+        );
+        assert!(
+            !stdout.contains("panicked"),
+            "{what}: a panic reached the REPL: {stdout}"
+        );
+        assert!(
+            stdout.contains("main (current)"),
+            "{what}: the REPL died after the failed open: {stdout}"
+        );
+        if stdout.contains("Error:") {
+            saw_error = true;
+            assert!(
+                stdout.contains("corrupt lake metadata")
+                    || stdout.contains("lake vortex error")
+                    || stdout.contains("not a valid Vortex file"),
+                "{what}: error is not a clean corrupt-file error: {stdout}"
+            );
+        }
+    }
+    assert!(
+        saw_error,
+        "at least one tamper must fail `.lake open` with a clean error"
+    );
+
+    // Restoring the file heals the lake.
+    std::fs::write(&file, &original).unwrap();
+    let (stdout, stderr, code) = run_captured(&format!(
+        ".lake open {lake}\nSELECT count(*) FROM t;\n.quit\n",
+        lake = lake.display()
+    ));
+    assert_eq!(
+        code, 0,
+        "restored open exited with {code} (stderr: {stderr})"
+    );
+    assert!(stdout.contains("Opened lake version 2"), "{stdout}");
     cleanup(&dir);
 }
