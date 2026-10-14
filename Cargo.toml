@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pinkdb", "crates/pinkdb-cli", "crates/pinkdb-server", "crates/pinkdb-ffi", "crates/pinkdb-ext-loader"]
+members = ["crates/pinkdb", "crates/pinkdb-cli", "crates/pinkdb-server", "crates/pinkdb-ffi", "crates/pinkdb-ext-loader", "crates/pink-lake"]
 resolver = "2"
 
 [profile.release]

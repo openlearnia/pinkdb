@@ -446,6 +446,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pink-lake"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pinkdb"
 version = "0.1.0"
 dependencies = [
@@ -461,6 +470,7 @@ dependencies = [
 name = "pinkdb-cli"
 version = "0.1.0"
 dependencies = [
+ "pink-lake",
  "pinkdb",
  "pinkdb-server",
  "rustyline",
@@ -657,6 +667,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]
