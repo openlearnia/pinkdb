@@ -215,7 +215,7 @@ fn encode_table_with_metadata(
     let fields = field_names(&schema);
 
     let mut chunks: Vec<ArrayRef> = Vec::with_capacity(src.num_chunks().max(1));
-    for i in 0..src.num_chunks() {
+    for (i, any_null) in chunk_nulls.iter().enumerate() {
         let chunk = src.scan_chunk(i).ok_or_else(|| LakeError::Internal {
             message: format!("chunk {i} of \"{dbname}.{table}\" disappeared while encoding"),
         })?;
@@ -223,7 +223,7 @@ fn encode_table_with_metadata(
             &chunk,
             &schema,
             &nulls,
-            &chunk_nulls[i],
+            any_null,
             dbname,
             table,
         )?);

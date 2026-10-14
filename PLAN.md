@@ -155,6 +155,27 @@ LIMIT n;
 
 Each wave must end with `cargo build` + `cargo test` + `cargo clippy` green.
 
+## Lake benchmark note (Vortex vs DuckLake, Oct 2026)
+
+`bench/lake_bench.py` (stdlib-only) compares pink-lake (Vortex) with DuckLake
+(DuckDB v1.5.5 `ducklake` extension) on the same CSV and the same four
+queries, both storing `lake.sales`: 1M rows — pink-lake ingest 0.243 s vs
+0.125 s, stored 3.12 MB vs 13.26 MB, cold open 0.061 s (eager) vs ATTACH
+≈3 ms (lazy), first-query cold wall 0.077 s vs 0.036 s, queries best-of-5
+<1/10/5/3 ms (count/group-by/filter/order-by) vs 7/12/11/12 ms printed
+(36–41 ms as fresh-process wall); 10M rows — 1.943 s vs 0.368 s ingest,
+31.1 MB vs 97.1 MB stored, cold open 0.724 s vs 0.036 s, group-by 93 ms vs
+37 ms, filter 48 ms vs 24 ms, order-by 30 ms vs 28 ms, `COUNT(*)` <1 ms vs
+8 ms. So at 10M DuckLake wins ingest, cold start and three of four queries
+while pink-lake keeps the compactness (≈3× smaller) and the in-session
+`COUNT(*)` fast path. Caveat: architectures differ — pink-lake eagerly
+loads Vortex into the in-memory engine at `.lake open`, DuckLake scans
+Parquet lazily at query time; not an apples-to-apples product comparison.
+Reproduce: `python3 bench/lake_bench.py --rows 1000000 --runs 5` (add
+`--rows 10000000` for the larger run). Follow-up candidate for wave 40:
+Vortex scan/decode speed at 10M (the engine's in-memory scans lose to
+Parquet for filter/group-by/order-by there).
+
 ## Roadmap (post-wave 21)
 
 | Wave | Scope | Packaging |

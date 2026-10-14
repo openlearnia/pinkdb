@@ -972,6 +972,63 @@ For the join rows, "before" is the pre-wave-19 baseline (join_self 66, join_grou
 For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 (`read_csv_auto` → table), single connection.
 
+### Lake format comparison (Vortex vs DuckLake)
+
+`bench/lake_bench.py` (stdlib-only Python, one file) runs the same 1M-row CSV
+through both lake formats and the same four queries, and prints the raw
+numbers as JSON:
+
+```sh
+cargo build --release -p pinkdb-cli --features lake
+python3 bench/lake_bench.py --rows 1000000 --runs 5
+```
+
+Both arms store the table as `lake.sales`, so the SQL text is identical
+(pink-lake is told to import into a database named `lake`; DuckLake attaches
+a catalog named `lake`). Measured 2026-10-14 on this machine (macOS 26.6.2,
+Apple Silicon, 10 CPUs, load average ≈3 during the run; `pinkdb`
+44,567,680 B with `--features lake`; `duckdb` v1.5.5 with the `ducklake`
+extension already cached, `INSTALL` ≈1 ms):
+
+| Metric (1M rows) | pink-lake (Vortex) | DuckLake (DuckDB) |
+|---|---|---|
+| ingest wall (s) | 0.243 (import 0.031 + lake save 0.174) | 0.125 (CTAS 0.091) |
+| stored total | 3.12 MB (4 files) | 13.26 MB (2 files) |
+|  data | 3,117,735 B Vortex (1 file) | 9,313,736 B Parquet (1 file) |
+|  metadata | 643 B (catalog 272 B + 2 snapshots) | 3,944,448 B SQLite catalog |
+| cold open printed (s) | 0.061 (`.lake open`) | n/a (ATTACH ≈3 ms, lazy) |
+| cold end-to-end wall (s) | 0.077 (start→open→first query→exit) | 0.036 (start→attach→query→exit) |
+| `COUNT(*)` best-of-5 (ms) | <1 | 7 (printed; 36 as fresh-process wall) |
+| GROUP BY region + 5 aggs (ms) | 10 | 12 (printed; 41 as fresh-process wall) |
+| `WHERE total > 500` (ms) | 5 | 11 (printed; 39 as fresh-process wall) |
+| ORDER BY total DESC LIMIT 10 (ms) | 3 | 12 (printed; 41 as fresh-process wall) |
+
+Both CLIs print `real X.XXX` (1 ms resolution; 0.000 means <1 ms), both
+numbers above are best-of-5, and the run-to-run spread is ±1 ms at this
+resolution. A 10M-row run (`--rows 10000000`, generated
+deterministically, 243 MB CSV) shows DuckLake winning the larger scans:
+ingest 0.368 s vs 1.943 s, stored 97.1 MB (93.1 MB Parquet + 3.9 MB catalog)
+vs 31.1 MB Vortex, cold open 0.036 s vs 0.724 s, and query best-of-5
+group-by 37 ms vs 93 ms, filter 24 ms vs 48 ms, order-by 28 ms vs 30 ms —
+pink-lake keeps only `COUNT(*)` (<1 ms vs 8 ms). No cherry-picking: at 10M
+DuckLake wins ingest, cold start and three of the four queries.
+
+**Fairness caveat — this is "same data, same queries, different
+architectures", not an apples-to-apples product comparison.** `.lake open`
+eagerly loads the whole table from Vortex back into pinkdb's in-memory
+engine, so pink-lake's per-query lines are in-memory scans and the load cost
+is the separate open row; DuckLake is lazy — ATTACH only opens the SQL
+catalog and every query scans Parquet at query time, so its printed query
+times include the scan and its fresh-process wall adds ~30 ms of process
+start + LOAD + ATTACH at 1M on top of the query. DuckLake is a full
+lakehouse format (transactional SQL
+catalog, MVCC-ish snapshots, time travel) and its catalog DB grows with
+every write/snapshot (this run is a single ingest), while pink-lake
+publishes a full snapshot per save and keeps old versions' files. No cache
+was dropped on either side, and both engines returned matching results
+(float sums differ in the last few digits from different summation orders;
+ties in ORDER BY have no stable order on either engine).
+
 ## Known v1 limits
 
 - No nested transactions or savepoints; one process per `.pink` path
