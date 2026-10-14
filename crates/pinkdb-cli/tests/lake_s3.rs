@@ -10,8 +10,9 @@
 #[path = "../../pink-lake/src/mock_s3.rs"]
 mod mock_s3;
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+mod common;
+
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -39,23 +40,12 @@ fn run_with_env(cmds: &str, env: &[(&str, &str)]) -> String {
     ] {
         command.env_remove(name);
     }
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut child = command.spawn().expect("spawn pinkdb CLI");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(cmds.as_bytes())
-        .expect("write to CLI stdin");
-    let out = child.wait_with_output().expect("wait for the CLI");
-    assert!(out.status.success(), "CLI exited with {}", out.status);
-    String::from_utf8(out.stdout).expect("CLI stdout is UTF-8")
+    let (out, status) = common::run_merged(command, cmds);
+    common::assert_script_exit(status);
+    out
 }
 
 /// The mock environment for one run.

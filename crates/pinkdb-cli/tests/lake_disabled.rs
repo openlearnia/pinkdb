@@ -6,26 +6,15 @@
 
 #![cfg(not(feature = "lake"))]
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+mod common;
+
+use std::process::Command;
 
 #[test]
 fn lake_dot_commands_report_the_missing_feature() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn pinkdb CLI");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(b".help\n.lake save /tmp/x\n.lake open /tmp/x\n.lake versions /tmp/x\n.lake tables /tmp/x\n.lake info /tmp/x\n.quit\n")
-        .expect("write to CLI stdin");
-    let out = child.wait_with_output().expect("wait for the CLI");
-    assert!(out.status.success(), "CLI exited with {}", out.status);
-    let text = String::from_utf8(out.stdout).expect("CLI stdout is UTF-8");
+    let input = String::from_utf8_lossy(b".help\n.lake save /tmp/x\n.lake open /tmp/x\n.lake versions /tmp/x\n.lake tables /tmp/x\n.lake info /tmp/x\n.quit\n").into_owned();
+    let (text, status) = common::run_merged(Command::new(env!("CARGO_BIN_EXE_pinkdb")), &input);
+    common::assert_script_exit(status);
     assert!(
         text.contains(
             "Error: .lake is not available: this pinkdb binary was built without the lake feature;"

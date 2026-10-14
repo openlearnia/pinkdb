@@ -68,6 +68,10 @@ pub enum Statement {
     LoadExtension {
         path: String,
     },
+    /// `CHECKPOINT`: persist a durable database and roll its WAL (a no-op
+    /// for in-memory databases). Not a reserved word: only the bare
+    /// statement form is recognized.
+    Checkpoint,
     Select(Select),
 }
 

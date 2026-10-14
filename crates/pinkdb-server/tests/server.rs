@@ -1002,3 +1002,11 @@ fn idle_clients_are_disconnected_and_announced_frames_are_not_preallocated() {
 
     assert_server_healthy(&addr);
 }
+
+#[test]
+fn checkpoint_round_trips_as_its_own_done_kind() {
+    let (_handle, addr) = start();
+    let mut c = Client::connect(&addr).unwrap();
+    // In-memory: a no-op that still reports its own statement kind (v4).
+    assert_eq!(c.execute("CHECKPOINT;").unwrap(), vec![QueryResult::Checkpointed]);
+}

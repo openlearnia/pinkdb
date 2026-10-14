@@ -25,7 +25,9 @@ All ten items are fixed in wave 40a, each with a regression test (see the ROADMA
 | 9 ✔ | S3 `Credentials` and `S3Config` derive `Debug`, so `{:?}` on a `Lake` prints the secret key. | `crates/pink-lake/src/s3/sigv4.rs:26`, `crates/pink-lake/src/s3/mod.rs:124` |
 | 10 ✔ | The server allocates the full declared frame (up to 64 MiB) before any body bytes arrive, and sets no read timeout. 128 idle sockets block every other client; 128 bare headers reserve about 8 GiB. | `crates/pinkdb-server/src/protocol.rs:470`, `crates/pinkdb-server/src/server.rs:27` |
 
-## P1 — promised but missing, or operationally broken (waves 40b, 40c)
+## P1 — promised but missing, or operationally broken (waves 40b — closed, 40c)
+
+The 40b items below (WAL growth, write-before-log, bind/execute race, file locking, Python thread safety, CLI scripting, lake retries/versions/guards) are fixed in wave 40b; the CI, wave-claim and window-frame items remain for 40c/40d.
 
 - **Wave 29 and 39 claims vs code (40c, 40i).**
   - Wave 29's title promises "manifest/signature checks" and SQL `INSTALL`. Neither exists: the loader only checks the ABI version and symbols (`crates/pinkdb-ext-loader/src/lib.rs:56-75`), and the grammar has only `LOAD EXTENSION`.

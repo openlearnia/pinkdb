@@ -841,6 +841,9 @@ impl PinkDb {
     /// Always writes plaintext; use [`PinkDb::save_with_key`] (feature
     /// `encryption`) for an encrypted container.
     pub fn save(&self, path: &str) -> Result<()> {
+        // Never serialize a store holding a non-durable write (fail-stop).
+        // (Checkpoints check the same flag under the WAL lock they hold.)
+        self.ensure_wal_healthy()?;
         std::fs::write(path, self.to_bytes()?)?;
         Ok(())
     }
@@ -857,6 +860,7 @@ impl PinkDb {
         }
         #[cfg(feature = "encryption")]
         {
+            self.ensure_wal_healthy()?;
             let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
             std::fs::write(path, sealed)?;
             Ok(())

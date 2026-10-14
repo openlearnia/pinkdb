@@ -1030,8 +1030,9 @@ fn s3_error_taxonomy_slowdown_redirect_and_missing_bucket() {
     let mut lake = Lake::create_s3(mock_config(&mock, bucket, "lake")).unwrap();
     lake.write_from_store(&db).unwrap(); // v2
 
-    // 503 SlowDown: an I/O error naming the code; not retried (the caller
-    // retries the save after reopening).
+    // A transient 503 SlowDown is retried with backoff (S3 returns it before
+    // applying the request, so even the create-only snapshot PUT is safe to
+    // repeat) and the save goes through.
     mock.inject_error(
         "PUT",
         "lake/snapshots/3.json",
@@ -1040,13 +1041,26 @@ fn s3_error_taxonomy_slowdown_redirect_and_missing_bucket() {
         "Please reduce your request rate.",
         1,
     );
+    lake.write_from_store(&db).unwrap();
+    assert_eq!(lake.current_version(), 3);
+
+    // A persistent 503 outlasts the retries: an I/O error naming the code
+    // (the caller retries the save after reopening).
+    mock.inject_error(
+        "PUT",
+        "lake/snapshots/4.json",
+        503,
+        "SlowDown",
+        "Please reduce your request rate.",
+        pink_lake::DEFAULT_RETRIES as usize + 1,
+    );
     let err = lake.write_from_store(&db).unwrap_err();
     assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
     let message = err.to_string();
     assert!(message.contains("503"), "{message}");
     assert!(message.contains("SlowDown"), "{message}");
     // The failed save changed no metadata.
-    assert_eq!(lake.current_version(), 2);
+    assert_eq!(lake.current_version(), 3);
 
     // A redirect-shaped 301 on the catalog read is reported with its code.
     mock.inject_error(
@@ -1168,4 +1182,41 @@ fn live_s3_roundtrip_is_opt_in() {
     assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
     std::fs::remove_dir_all(&scratch).ok();
     eprintln!("live S3 round-trip ok (bucket {bucket}, prefix {prefix})");
+}
+
+/// `500 InternalError` is retried only where repeating is safe: an
+/// unconditional data-file PUT recovers, while a conditional catalog PUT
+/// (which may have landed) surfaces the error instead of risking a false
+/// self-conflict.
+#[test]
+fn ambiguous_failures_retry_only_idempotent_requests() {
+    let mock = MockS3::start();
+    let db = small_store();
+    let mut lake = Lake::create_s3(mock_config(&mock, "retry-bucket", "lake")).unwrap();
+    lake.write_from_store(&db).unwrap(); // v2
+
+    // Data files are unconditional PUTs under fresh names: retried.
+    mock.inject_error("PUT", "lake/data/", 500, "InternalError", "try again", 1);
+    lake.write_from_store(&db).unwrap();
+    assert_eq!(lake.current_version(), 3);
+
+    // The catalog replace is an If-Match PUT: not retried on a 500.
+    mock.inject_error("PUT", "lake/catalog.json", 500, "InternalError", "try again", 1);
+    let err = lake.write_from_store(&db).unwrap_err();
+    assert!(err.to_string().contains("InternalError"), "{err}");
+}
+
+/// A snapshot that cannot be read is an error from `versions()`, never a
+/// version that silently disappears from the listing.
+#[test]
+fn versions_reports_unreadable_snapshots() {
+    let mock = MockS3::start();
+    let db = small_store();
+    let mut lake = Lake::create_s3(mock_config(&mock, "versions-bucket", "lake")).unwrap();
+    lake.write_from_store(&db).unwrap();
+    assert_eq!(lake.versions().unwrap(), vec![1, 2]);
+    mock.inject_error("GET", "lake/snapshots/1.json", 403, "AccessDenied", "nope", 1);
+    let err = lake.versions().unwrap_err();
+    assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
+    assert_eq!(lake.versions().unwrap(), vec![1, 2]);
 }

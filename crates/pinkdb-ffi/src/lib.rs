@@ -48,6 +48,8 @@ pub const PINKDB_STMT_USED: i32 = 13;
 /// `LOAD EXTENSION '<path>'`; `pinkdb_result_name` carries the extension's
 /// declared name.
 pub const PINKDB_STMT_LOADED_EXTENSION: i32 = 14;
+/// `CHECKPOINT` (a no-op for in-memory databases).
+pub const PINKDB_STMT_CHECKPOINTED: i32 = 15;
 
 // ----- value / column type tags -----
 pub const PINKDB_TYPE_NULL: i32 = 0;
@@ -215,6 +217,7 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::DroppedDatabase { .. } => PINKDB_STMT_DROPPED_DATABASE,
         QueryResult::Used { .. } => PINKDB_STMT_USED,
         QueryResult::LoadedExtension { .. } => PINKDB_STMT_LOADED_EXTENSION,
+        QueryResult::Checkpointed => PINKDB_STMT_CHECKPOINTED,
     }
 }
 

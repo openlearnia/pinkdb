@@ -182,6 +182,11 @@ pub(crate) struct Record {
     stmts: Vec<String>,
 }
 
+/// Default WAL size that triggers an automatic checkpoint after a commit
+/// (64 MiB): bounds WAL growth and restart replay time for long-running
+/// servers and embedders that never call `checkpoint()` themselves.
+pub const DEFAULT_AUTO_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
 /// An open WAL file positioned for appends (shared by every clone of the
 /// owning store, so `txn.work` snapshots log to the same file).
 #[derive(Debug)]
@@ -213,6 +218,12 @@ pub struct Wal {
     tracked_extensions: HashSet<String>,
     /// Per-record AEAD state for an encrypted WAL (`None` = plaintext).
     cipher: Option<RecordCipher>,
+    /// WAL size (bytes) at which a committed write triggers an automatic
+    /// checkpoint (`None` = never; see [`DEFAULT_AUTO_CHECKPOINT_BYTES`]).
+    auto_checkpoint_bytes: Option<u64>,
+    /// The exclusive advisory lock on `<db>.pink.lock`, held for as long as
+    /// any clone of the store lives (released by the OS on exit or crash).
+    _lock: Option<File>,
 }
 
 /// One rolled-away WAL generation found on disk.
@@ -332,6 +343,8 @@ impl Wal {
             session_db: None,
             tracked_extensions: HashSet::new(),
             cipher,
+            auto_checkpoint_bytes: Some(DEFAULT_AUTO_CHECKPOINT_BYTES),
+            _lock: None,
         };
         let fresh_cipher = |gen: u64| -> Result<Option<RecordCipher>> {
             match key {
@@ -439,6 +452,32 @@ impl Wal {
             })?);
         }
         Ok((build(file, header.gen, last_lsn, cipher), records, truncated))
+    }
+
+    /// Test hook: simulate an append that failed on disk.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&mut self, msg: &str) {
+        self.poisoned = Some(msg.to_string());
+    }
+
+    /// Set the automatic-checkpoint threshold (`None` disables it).
+    pub(crate) fn set_auto_checkpoint_bytes(&mut self, bytes: Option<u64>) {
+        self.auto_checkpoint_bytes = bytes;
+    }
+
+    /// True when the live WAL has grown past the auto-checkpoint threshold.
+    pub(crate) fn wants_checkpoint(&self) -> bool {
+        match self.auto_checkpoint_bytes {
+            Some(limit) if self.poisoned.is_none() => {
+                self.file.metadata().is_ok_and(|m| m.len() >= limit)
+            }
+            _ => false,
+        }
+    }
+
+    /// Why the WAL stopped accepting writes, if it did (see `poisoned`).
+    pub(crate) fn failure(&self) -> Option<&str> {
+        self.poisoned.as_deref()
     }
 
     /// Append one committed unit of statements as a single record.
@@ -852,6 +891,31 @@ fn rewrite_truncated(
 }
 
 // ---------- file naming + header parsing ----------
+
+/// Take the exclusive advisory lock on `<checkpoint>.lock` (created if
+/// missing, never deleted: removing it could let two openers lock different
+/// inodes). `Ok(None)` where the platform or filesystem cannot lock.
+fn acquire_db_lock(checkpoint: &Path) -> Result<Option<File>> {
+    let path = PathBuf::from(format!("{}.lock", checkpoint.display()));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(PinkDbError::Execution(format!(
+            "database {} is already open by another handle or process \
+             (lock {} is held); close it first",
+            checkpoint.display(),
+            path.display()
+        ))),
+        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+            Ok(None)
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(PinkDbError::Io(e)),
+    }
+}
 
 fn wal_path(checkpoint: &Path) -> PathBuf {
     let mut s = checkpoint.as_os_str().to_os_string();
@@ -1354,6 +1418,11 @@ impl PinkDb {
         let tmp = tmp_path(&ckpt);
         let mut info = RecoveryInfo::default();
 
+        // 0. One live handle per durable database: recovery and appends from
+        //    two handles (two processes, or two opens in one process) would
+        //    corrupt the WAL. The lock is taken before recovery touches files.
+        let lock = acquire_db_lock(&ckpt)?;
+
         // 1. Finish an interrupted checkpoint before loading anything.
         let rolls = scan_rolls(&wal)?;
         let probe = probe_wal(&wal, key)?;
@@ -1393,8 +1462,40 @@ impl PinkDb {
         // generation (the live WAL is exactly what was just replayed): a
         // later record touching it must not emit a redundant prefix.
         handle.seed_tracked_extensions(db.loaded_extension_paths());
+        handle._lock = lock;
         db.wal = Some(std::sync::Arc::new(std::sync::Mutex::new(handle)));
         Ok((db, info))
+    }
+
+    /// Set the WAL size that triggers an automatic checkpoint after a
+    /// committed write (`None` disables it; default
+    /// [`DEFAULT_AUTO_CHECKPOINT_BYTES`]). No-op for in-memory databases.
+    pub fn set_auto_checkpoint_bytes(&self, bytes: Option<u64>) {
+        if let Some(wal) = self.durable_handle() {
+            wal.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_auto_checkpoint_bytes(bytes);
+        }
+    }
+
+    /// Checkpoint when the WAL has outgrown the auto-checkpoint threshold
+    /// (outside transactions only). Called after a write is durable, so a
+    /// checkpoint failure must not fail that statement: it is reported on
+    /// stderr, and a failure that poisons the WAL stops the database
+    /// (fail-stop) exactly like a failed append.
+    pub(crate) fn maybe_auto_checkpoint(&mut self) {
+        if self.in_transaction() {
+            return;
+        }
+        let Some(wal) = self.durable_handle() else {
+            return;
+        };
+        let due = wal.lock().unwrap_or_else(|p| p.into_inner()).wants_checkpoint();
+        if due {
+            if let Err(e) = self.checkpoint() {
+                eprintln!("pinkdb: automatic checkpoint failed: {e}");
+            }
+        }
     }
 
     /// Checkpoint: atomically persist the current state to the bound `.pink`
@@ -1631,6 +1732,78 @@ mod tests {
         let data = std::fs::read(path).unwrap();
         let (recs, _) = parse_records(&data, HEADER_LEN, None).unwrap();
         recs
+    }
+
+    #[test]
+    fn checkpoint_statement_and_auto_checkpoint_bound_the_wal() {
+        let ckpt = tmp_ckpt("ckpt_stmt");
+        let db = crate::Database::open(ckpt.to_str().unwrap()).unwrap();
+        let mut c = db.connect();
+        // `checkpoint` stays an ordinary identifier.
+        c.execute("CREATE TABLE checkpoint (checkpoint INTEGER);").unwrap();
+        c.execute("INSERT INTO checkpoint VALUES (1), (2);").unwrap();
+        assert!(!records_of(&wal_path(&ckpt)).is_empty());
+        let out = c.execute("checkpoint;").unwrap();
+        assert_eq!(out, vec![QueryResult::Checkpointed]);
+        assert!(records_of(&wal_path(&ckpt)).is_empty(), "CHECKPOINT rolls the WAL");
+        // Refused inside a transaction (uncommitted state must not persist).
+        c.execute("BEGIN;").unwrap();
+        let err = c.execute("CHECKPOINT;").unwrap_err().to_string();
+        assert!(err.contains("not allowed inside a transaction"), "{err}");
+        c.execute("ROLLBACK;").unwrap();
+        // Auto-checkpoint: with a tiny threshold every commit checkpoints.
+        db.flush_wal().unwrap();
+        crate::Database::set_auto_checkpoint_bytes(&db, Some(1));
+        c.execute("INSERT INTO checkpoint VALUES (3);").unwrap();
+        assert!(records_of(&wal_path(&ckpt)).is_empty(), "auto checkpoint rolled the WAL");
+        c.execute("BEGIN; INSERT INTO checkpoint VALUES (4); COMMIT;").unwrap();
+        assert!(records_of(&wal_path(&ckpt)).is_empty());
+        drop(c);
+        drop(db);
+        let mut back = durable(&ckpt);
+        assert_eq!(ints(&mut back, "SELECT SUM(checkpoint) FROM checkpoint;"), vec![10]);
+        // In-memory: CHECKPOINT is a harmless no-op.
+        let mut mem = PinkDb::new();
+        assert_eq!(mem.execute("CHECKPOINT").unwrap(), vec![QueryResult::Checkpointed]);
+    }
+
+    #[test]
+    fn a_durable_database_has_one_live_handle() {
+        let ckpt = tmp_ckpt("lock");
+        let first = durable(&ckpt);
+        let err = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("already open"), "{err}");
+        // Clones (transaction snapshots, Database handles) share the lock.
+        let shared = crate::Database::from_store(first.clone());
+        drop(first);
+        assert!(PinkDb::open_durable(ckpt.to_str().unwrap()).is_err());
+        drop(shared);
+        // The last clone releases it.
+        let mut again = durable(&ckpt);
+        again.execute("CREATE TABLE t (a INTEGER);").unwrap();
+    }
+
+    #[test]
+    fn a_failed_wal_write_stops_reads_writes_and_saves() {
+        let ckpt = tmp_ckpt("failstop");
+        let mut db = durable(&ckpt);
+        db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);").unwrap();
+        let shared = crate::Database::from_store(db.clone());
+        db.durable_handle().unwrap().lock().unwrap().poison_for_test("disk full");
+        // Embedded and multi-writer reads alike are refused: the failed
+        // statement's in-memory effect must never be observable.
+        let err = db.execute("SELECT * FROM t;").unwrap_err().to_string();
+        assert!(err.contains("stopped after a WAL write failure"), "{err}");
+        let err = shared.connect().execute("SELECT 1;").unwrap_err().to_string();
+        assert!(err.contains("stopped after a WAL write failure"), "{err}");
+        let snap = ckpt.with_extension("snap.pink");
+        assert!(db.save(snap.to_str().unwrap()).is_err());
+        assert!(!snap.exists());
+        drop(db);
+        drop(shared);
+        // Reopening recovers the durable prefix.
+        let mut db = durable(&ckpt);
+        assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
     }
 
     fn durable(p: &Path) -> PinkDb {

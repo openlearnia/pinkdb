@@ -59,8 +59,15 @@ ENV = None
 
 
 def cli(binary, cmds, cwd):
+    # Errors go to stderr (sqlite3/duckdb convention): merge it so the
+    # "Error" checks below still see them.
     p = subprocess.run(
-        [binary], input=cmds.encode(), capture_output=True, cwd=cwd, env=ENV
+        [binary],
+        input=cmds.encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=cwd,
+        env=ENV,
     )
     return p.stdout.decode(errors="replace")
 
@@ -110,7 +117,8 @@ def verify(binary, cwd, expected, opens=3):
 def run_and_kill(binary, cmds, cwd, delay):
     """Feed cmds, sleep delay, SIGKILL, return all stdout."""
     p = subprocess.Popen(
-        [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, cwd=cwd, bufsize=0,
+        [binary], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=cwd, bufsize=0,
         env=ENV,
     )
     chunks = []

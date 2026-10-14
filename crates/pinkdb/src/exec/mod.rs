@@ -49,6 +49,8 @@ pub enum QueryResult {
     Used { db: String },
     /// `LOAD EXTENSION '<path>'`: `name` is the extension's declared name.
     LoadedExtension { name: String },
+    /// `CHECKPOINT` finished (a no-op for in-memory databases).
+    Checkpointed,
     Selected { names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>> },
 }
 
@@ -251,6 +253,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
         LogicalPlan::Use { name } => use_result(db, name),
+        LogicalPlan::Checkpoint => {
+            if db.is_durable() {
+                db.checkpoint()?;
+            }
+            Ok(QueryResult::Checkpointed)
+        }
         LogicalPlan::LoadExtension { path } => {
             if !db.allow_sql_load_extension() {
                 return Err(PinkDbError::Execution(
@@ -311,6 +319,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),

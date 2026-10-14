@@ -179,7 +179,7 @@ use local::{LocalStorage, CATALOG_FILE};
 use storage::{Head, Location, Storage, VersionTag};
 
 #[cfg(feature = "s3")]
-pub use s3::S3Config;
+pub use s3::{S3Config, DEFAULT_RETRIES};
 
 /// The catalog format version this build reads and writes.
 ///
@@ -538,7 +538,10 @@ impl Lake {
     /// its own version `v`, and parses. A leftover manifest from an
     /// interrupted publish (`v > current`) is ignored, as are corrupt
     /// manifests, `01.json`-style names, and non-numeric names — they are
-    /// never loadable through this handle.
+    /// never loadable through this handle. A snapshot that cannot be *read*
+    /// (permissions, a transient object-store error) is an error, never a
+    /// silently missing version; one deleted between listing and reading is
+    /// skipped.
     pub fn versions(&self) -> Result<Vec<u64>> {
         let mut out = Vec::new();
         for name in self.storage.list("snapshots")? {
@@ -553,8 +556,14 @@ impl Lake {
             }
             let rel = format!("snapshots/{name}");
             let path = self.storage.abs(&rel);
-            let Ok(bytes) = self.storage.read(&rel, &format!("reading {}", path.display())) else {
-                continue;
+            let bytes = match self.storage.read(&rel, &format!("reading {}", path.display())) {
+                Ok(bytes) => bytes,
+                Err(LakeError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e),
             };
             match read_manifest(&path, &bytes) {
                 Ok(manifest) if manifest.version == v => out.push(v),

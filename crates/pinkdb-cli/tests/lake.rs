@@ -9,6 +9,8 @@
 
 #![cfg(feature = "lake")]
 
+mod common;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -46,23 +48,12 @@ fn run(cmds: &str) -> String {
 /// [`run`] with extra environment variables (e.g. `PINKDB_KEY`).
 fn run_with_env(cmds: &str, env: &[(&str, &str)]) -> String {
     let mut command = Command::new(cli_binary());
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
     for (key, value) in env {
         command.env(key, value);
     }
-    let mut child = command.spawn().expect("spawn pinkdb CLI");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(cmds.as_bytes())
-        .expect("write to CLI stdin");
-    let out = child.wait_with_output().expect("wait for the CLI");
-    assert!(out.status.success(), "CLI exited with {}", out.status);
-    String::from_utf8(out.stdout).expect("CLI stdout is UTF-8")
+    let (out, status) = common::run_merged(command, cmds);
+    common::assert_script_exit(status);
+    out
 }
 
 /// Like [`run`], but captures stderr too and returns the exit code instead of
@@ -265,7 +256,7 @@ fn lake_errors_are_clear() {
 
     // Unknown subcommand.
     let out = run(".lake dunno\n.quit\n");
-    assert!(out.contains("Unknown .lake subcommand \"dunno\""), "{out}");
+    assert!(out.contains("unknown .lake subcommand \"dunno\""), "{out}");
 
     // A missing version names the lake and the version.
     run(&format!(
@@ -580,8 +571,9 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
             ".lake open {lake}\n.databases\n.quit\n",
             lake = lake.display()
         ));
-        assert_eq!(
-            code, 0,
+        // A failed `.lake open` is a script error (exit 1), never a crash.
+        assert!(
+            code == 0 || code == 1,
             "{what}: the CLI must exit cleanly, got {code} (stderr: {stderr})"
         );
         assert!(
@@ -592,13 +584,14 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
             stdout.contains("main (current)"),
             "{what}: the REPL died after the failed open: {stdout}"
         );
-        if stdout.contains("Error:") {
+        if stderr.contains("Error:") {
             saw_error = true;
+            assert_eq!(code, 1, "{what}: a failed open must fail the script");
             assert!(
-                stdout.contains("corrupt lake metadata")
-                    || stdout.contains("lake vortex error")
-                    || stdout.contains("not a valid Vortex file"),
-                "{what}: error is not a clean corrupt-file error: {stdout}"
+                stderr.contains("corrupt lake metadata")
+                    || stderr.contains("lake vortex error")
+                    || stderr.contains("not a valid Vortex file"),
+                "{what}: error is not a clean corrupt-file error: {stderr}"
             );
         }
     }
@@ -671,14 +664,15 @@ fn second_session_save_conflicts_instead_of_losing_an_update() {
     assert!(out.contains("Saved lake version"), "{out}");
 
     // Session A: open the lake and pause.
+    let (a_reader, a_writer) = std::io::pipe().unwrap();
     let mut a = Command::new(cli_binary())
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stdout(a_writer.try_clone().unwrap())
+        .stderr(a_writer)
         .spawn()
         .expect("spawn session A");
     let mut a_in = a.stdin.take().unwrap();
-    let mut a_out = BufReader::new(a.stdout.take().unwrap());
+    let mut a_out = BufReader::new(a_reader);
     writeln!(a_in, ".lake open {}", lake.display()).unwrap();
     a_in.flush().unwrap();
     let mut seen = String::new();
@@ -708,8 +702,11 @@ fn second_session_save_conflicts_instead_of_losing_an_update() {
     .unwrap();
     drop(a_in);
     let mut rest = String::new();
+    let status = a.wait().unwrap();
     std::io::Read::read_to_string(&mut a_out, &mut rest).unwrap();
-    assert!(a.wait().unwrap().success());
+    // The refused save makes the script fail (exit 1), after the forced
+    // save still ran.
+    assert_eq!(status.code(), Some(1), "{rest}");
     assert!(rest.contains("Error: write conflict"), "{rest}");
     assert!(rest.contains("Saved lake version"), "forced save publishes: {rest}");
 
@@ -719,5 +716,27 @@ fn second_session_save_conflicts_instead_of_losing_an_update() {
         lake = lake.display()
     ));
     assert!(!out.contains("Error:"), "{out}");
+    cleanup(&dir);
+}
+
+/// `.lake save`/`.lake open` refuse inside a transaction, and `.lake open`
+/// refuses to detach a durable database.
+#[test]
+fn lake_commands_respect_transactions_and_durable_sessions() {
+    let dir = scratch("guards");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (a INTEGER);\nBEGIN;\nINSERT INTO t VALUES (1);\n\
+         .lake save {lake}\n.lake open {lake}\nROLLBACK;\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert_eq!(out.matches("not allowed inside a transaction").count(), 2, "{out}");
+    assert!(out.contains("Saved lake version"), "{out}");
+    let out = run(&format!(
+        ".open {db}\n.lake open {lake}\n.quit\n",
+        db = dir.join("x.pink").display(),
+        lake = lake.display()
+    ));
+    assert!(out.contains("would detach this session"), "{out}");
     cleanup(&dir);
 }

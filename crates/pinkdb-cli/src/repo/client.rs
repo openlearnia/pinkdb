@@ -209,7 +209,17 @@ fn ensure_artifact(
         .ok_or_else(|| format!("cannot determine the parent directory of {}", dest.display()))?;
     fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     let tmp = temp_path(dest);
-    if let Err(e) = fs::write(&tmp, &bytes) {
+    // `create_new` (O_EXCL) never follows a planted symlink or reuses an
+    // existing file; the name is unique per process and call.
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            std::io::Write::write_all(&mut f, &bytes)?;
+            f.sync_all()
+        });
+    if let Err(e) = written {
         let _ = fs::remove_file(&tmp);
         return Err(format!("cannot write {}: {e}", tmp.display()));
     }
@@ -240,7 +250,9 @@ fn temp_path(dest: &Path) -> PathBuf {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "artifact".to_string());
-    dest.with_file_name(format!("{name}.tmp-{}", process::id()))
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    dest.with_file_name(format!("{name}.tmp-{}-{seq}", process::id()))
 }
 
 /// Hex SHA-256 of a byte slice.

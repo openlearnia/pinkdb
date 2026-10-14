@@ -4,7 +4,8 @@
 
 #![cfg(feature = "client")]
 
-use std::io::Write;
+mod common;
+
 use std::process::{Command, Stdio};
 
 use pinkdb::Database;
@@ -16,19 +17,8 @@ fn remote_repl_round_trip() {
     let addr = server.local_addr().to_string();
     let handle = server.spawn().expect("spawn");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb"))
-        .args(["--host", &addr])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn pinkdb CLI");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(
-            b"CREATE TABLE t (a INTEGER, v VARCHAR);\n\
+    let input = String::from_utf8_lossy(
+        b"CREATE TABLE t (a INTEGER, v VARCHAR);\n\
               INSERT INTO t VALUES (1, 'x'), (2, NULL);\n\
               SELECT a, v FROM t ORDER BY a;\n\
               USE main;\n\
@@ -42,11 +32,12 @@ fn remote_repl_round_trip() {
               SELECT * FROM missing;\n\
               SELECT 1;\n\
               .quit\n",
-        )
-        .expect("write commands to CLI stdin");
-    let out = child.wait_with_output().expect("wait for CLI");
-    assert!(out.status.success(), "CLI exited with {}", out.status);
-    let text = String::from_utf8(out.stdout).expect("CLI stdout is UTF-8");
+    )
+    .into_owned();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
+    command.args(["--host", &addr]);
+    let (text, status) = common::run_merged(command, &input);
+    common::assert_script_exit(status);
 
     // SQL ran on the server and rendered with the local renderer.
     assert!(text.contains("Table created."), "{text}");
@@ -56,7 +47,8 @@ fn remote_repl_round_trip() {
     assert!(text.contains("│ 2       │ NULL    │"), "{text}");
     assert!(text.contains("2 rows"), "{text}");
     assert!(text.contains("Using database main."), "{text}");
-    assert!(text.contains("Run Time (s): real "), "{text}");
+    // Non-interactive runs print no timing unless asked (.timer on).
+    assert!(!text.contains("Run Time (s): real "), "{text}");
 
     // The session survived the SQL error (the next statement still ran).
     assert!(text.contains("Error:"), "{text}");
@@ -107,22 +99,11 @@ fn remote_and_local_rendering_are_identical() {
                   .quit\n";
 
     let run = |args: &[&str]| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb"))
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawn pinkdb CLI");
-        child
-            .stdin
-            .take()
-            .expect("child stdin")
-            .write_all(script.as_bytes())
-            .expect("write script");
-        let out = child.wait_with_output().expect("wait for CLI");
-        assert!(out.status.success(), "CLI exited with {}", out.status);
-        String::from_utf8(out.stdout).expect("CLI stdout is UTF-8")
+        let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
+        command.args(args);
+        let (out, status) = common::run_merged(command, script);
+        common::assert_script_exit(status);
+        out
     };
 
     let local = run(&[]);

@@ -38,6 +38,7 @@ from __future__ import annotations
 import ctypes
 import datetime as _datetime
 import os
+import threading
 from pathlib import Path
 
 __all__ = [
@@ -70,6 +71,7 @@ _STMT_KINDS = {
     12: "dropped_database",
     13: "used",
     14: "loaded_extension",
+    15: "checkpointed",
 }
 
 # ----- value / column type tags (PINKDB_TYPE_*) -----
@@ -301,7 +303,7 @@ class Result:
         ``deleted``, ``began``, ``committed``, ``rolledback``,
         ``created_view``, ``dropped_table``, ``dropped_view``,
         ``created_database``, ``dropped_database``, ``used``,
-        ``loaded_extension``.
+        ``loaded_extension``, ``checkpointed``.
     columns / column_types:
         For ``selected``: column names and type names (``boolean``,
         ``integer``, ``bigint``, ``double``, ``varchar``, ``date``,
@@ -386,17 +388,21 @@ def _snapshot(lib: ctypes.CDLL, result_ptr) -> list:
 class Database:
     """A pinkdb database handle (durable file or in-memory).
 
-    Not thread-safe, mirroring the C ABI: use one ``Database`` per thread.
+    Safe to share across threads: calls are serialized by an internal lock
+    (ctypes releases the GIL during native calls, and the C handle itself is
+    not thread-safe). A durable file can be open in only one handle at a time,
+    so share one ``Database`` rather than opening the file per thread.
     Owns a native handle, so it cannot be copied: ``copy.copy`` and
     ``copy.deepcopy`` raise :class:`TypeError`.
     Supports use as a context manager (closes on exit).
     """
 
-    __slots__ = ("_lib", "_handle")
+    __slots__ = ("_lib", "_handle", "_lock")
 
     def __init__(self, lib: ctypes.CDLL, handle):
         self._lib = lib
         self._handle = handle
+        self._lock = threading.Lock()
 
     def __copy__(self):
         raise TypeError("cannot copy a Database handle")
@@ -411,28 +417,30 @@ class Database:
         the message from ``pinkdb_last_error`` if any statement fails; the
         handle remains usable afterwards.
         """
-        if self._handle is None:
-            raise Error("database is closed")
         if not isinstance(sql, str):
             raise TypeError("sql must be a str")
         try:
             data = sql.encode("utf-8")
         except UnicodeEncodeError as exc:
             raise Error(f"sql is not encodable as UTF-8: {exc}") from exc
-        result_ptr = self._lib.pinkdb_execute(self._handle, data, len(data))
-        if not result_ptr:
-            raise Error(_last_error(self._lib))
-        try:
-            return _snapshot(self._lib, result_ptr)
-        finally:
-            self._lib.pinkdb_result_free(result_ptr)
+        with self._lock:
+            if self._handle is None:
+                raise Error("database is closed")
+            result_ptr = self._lib.pinkdb_execute(self._handle, data, len(data))
+            if not result_ptr:
+                raise Error(_last_error(self._lib))
+            try:
+                return _snapshot(self._lib, result_ptr)
+            finally:
+                self._lib.pinkdb_result_free(result_ptr)
 
     def close(self) -> None:
         """Close the handle. Idempotent and safe to call more than once."""
-        handle = self._handle
-        if handle is not None:
-            self._handle = None
-            self._lib.pinkdb_close(handle)
+        with self._lock:
+            handle = self._handle
+            if handle is not None:
+                self._handle = None
+                self._lib.pinkdb_close(handle)
 
     def __enter__(self) -> "Database":
         return self

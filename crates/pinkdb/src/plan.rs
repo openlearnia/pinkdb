@@ -68,6 +68,9 @@ pub enum LogicalPlan {
     LoadExtension {
         path: String,
     },
+    /// `CHECKPOINT`: persist + roll the WAL of a durable store (no-op
+    /// otherwise). Never WAL-logged and refused inside a transaction.
+    Checkpoint,
     /// Set union: output names come from the left branch; every column is
     /// coerced to the pairwise common type at execution.
     Union {
@@ -206,6 +209,7 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         LogicalPlan::CreateDatabase { .. } => "CREATE DATABASE",
         LogicalPlan::DropDatabase { .. } => "DROP DATABASE",
         LogicalPlan::LoadExtension { .. } => "LOAD EXTENSION",
+        LogicalPlan::Checkpoint => "CHECKPOINT",
         _ => return None,
     })
 }
@@ -243,7 +247,8 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
-        | LogicalPlan::LoadExtension { .. } => {}
+        | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::Checkpoint => {}
         LogicalPlan::Insert { rows, .. } => {
             for e in rows.iter().flatten() {
                 expr_tables_read(e, default_db, out);

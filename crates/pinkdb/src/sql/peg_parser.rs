@@ -285,12 +285,24 @@ peg::parser! {
             / use_stmt()
             / load_extension()
             / drop()
+            / checkpoint()
             / select_statement()
 
         rule select_statement() -> Statement = s:select() { Statement::Select(s) }
 
         rule use_stmt() -> Statement
             = kw(Keyword::Use) name:ident() { Statement::Use { name } }
+
+        /// `CHECKPOINT` — matched as a word, not a reserved keyword, so
+        /// `checkpoint` stays usable as a table or column name.
+        rule checkpoint() -> Statement
+            = s:ident_raw() ws() &(";" / ![_]) {?
+                  if s.eq_ignore_ascii_case("checkpoint") {
+                      Ok(Statement::Checkpoint)
+                  } else {
+                      Err("CHECKPOINT")
+                  }
+              }
 
         /// `LOAD EXTENSION '<path>'` — the path must be a string literal.
         rule load_extension() -> Statement

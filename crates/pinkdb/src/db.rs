@@ -117,6 +117,13 @@ impl Database {
         shared.checkpoint()
     }
 
+    /// WAL size that triggers an automatic checkpoint after a committed
+    /// write (`None` disables it; default
+    /// [`crate::DEFAULT_AUTO_CHECKPOINT_BYTES`]). No-op when in-memory.
+    pub fn set_auto_checkpoint_bytes(&self, bytes: Option<u64>) {
+        read_lock(&self.shared).set_auto_checkpoint_bytes(bytes);
+    }
+
     /// Allow or refuse the SQL `LOAD EXTENSION` statement for every
     /// connection of this database (default: allowed). Network servers turn
     /// it off unless the operator opts in.
@@ -181,6 +188,7 @@ impl Connection {
     /// Parse and run every statement, returning one result each.
     /// Multi-statement strings mix freely (each statement locks as needed).
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
+        read_lock(&self.db.shared).ensure_wal_healthy()?;
         let stmts = crate::sql::parse_statements(sql)?;
         // Only durable stores need the per-statement source text for the WAL.
         let texts = if self.db.is_durable() {
@@ -280,18 +288,22 @@ impl Connection {
             }
             None => {
                 let pre = self.current_db.clone();
-                // Bind under a read lock; run reads shared, writes exclusive.
-                // (A concurrent DROP between bind and run surfaces as a clean
-                // "not found" error — never corruption.)
-                let (plan, dynamic_functions_used) = {
-                    let shared = read_lock(&self.db.shared);
-                    crate::sql::bind_tracked(&shared, stmt, &pre)?
-                };
+                // Bind and run under one lock, so the plan always matches the
+                // catalog it executes against (a concurrent DROP + CREATE can
+                // never leave stale column indices). Reads bind and run under
+                // a shared lock; a write rebinds under the exclusive lock.
+                let shared = read_lock(&self.db.shared);
+                let (plan, _) = crate::sql::bind_tracked(&shared, stmt, &pre)?;
                 let result = if is_read_only(&plan) {
-                    let shared = read_lock(&self.db.shared);
-                    crate::exec::run_read(&shared, &plan)?
+                    let result = crate::exec::run_read(&shared, &plan);
+                    // Release before the `USE` logging below re-locks.
+                    drop(shared);
+                    result?
                 } else {
+                    drop(shared);
                     let mut shared = write_lock(&self.db.shared);
+                    let (plan, dynamic_functions_used) =
+                        crate::sql::bind_tracked(&shared, stmt, &pre)?;
                     let result = crate::exec::run(&mut shared, &plan)?;
                     // The write is published: log it while still holding the
                     // lock so WAL order matches commit order.
@@ -308,6 +320,7 @@ impl Connection {
                                 &touched,
                                 &loaded,
                             )?;
+                            shared.maybe_auto_checkpoint();
                         }
                     }
                     result
@@ -485,6 +498,9 @@ impl Connection {
                 }
             }
         }
+        if !txn.wal_stmts.is_empty() {
+            shared.maybe_auto_checkpoint();
+        }
         Ok(QueryResult::Committed)
     }
 
@@ -511,6 +527,7 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
         Statement::CreateDatabase { .. } => "CREATE DATABASE",
         Statement::DropDatabase { .. } => "DROP DATABASE",
         Statement::LoadExtension { .. } => "LOAD EXTENSION",
+        Statement::Checkpoint => "CHECKPOINT",
         _ => return None,
     })
 }

@@ -30,7 +30,7 @@ pub use exec::QueryResult;
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};
 pub use vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
-pub use wal::{RecoveryInfo, SyncPolicy};
+pub use wal::{RecoveryInfo, SyncPolicy, DEFAULT_AUTO_CHECKPOINT_BYTES};
 
 impl PinkDb {
     /// Parse and run every statement in `sql`, returning one result each.
@@ -43,6 +43,7 @@ impl PinkDb {
     /// The embedded session's current database (`USE`) applies to every later
     /// statement in the same string; unqualified names resolve against it.
     pub fn execute(&mut self, sql: &str) -> types::Result<Vec<QueryResult>> {
+        self.ensure_wal_healthy()?;
         let stmts = sql::parse_statements(sql)?;
         // Only durable databases need per-statement source text for the WAL.
         let texts = if self.is_durable() {
@@ -89,6 +90,7 @@ impl PinkDb {
             }
             if let Some(texts) = &texts {
                 self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used)?;
+                self.maybe_auto_checkpoint();
             }
             out.push(result);
         }

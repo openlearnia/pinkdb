@@ -1,9 +1,10 @@
 //! Multi-database CLI surface: `.databases`, `USE`, qualified names, and
 //! per-database scoping of `.tables` / `.schema` / `.import`.
 
-use std::io::Write;
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -26,22 +27,12 @@ fn cleanup(dir: &Path) {
 /// Run the REPL to a clean exit and return its stdout.
 fn run_in(cwd: Option<&Path>, cmds: &str) -> String {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let mut child = cmd.spawn().expect("spawn pinkdb CLI");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(cmds.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().expect("wait for CLI");
-    assert!(out.status.success(), "CLI exited with {}", out.status);
-    String::from_utf8(out.stdout).expect("CLI stdout is UTF-8")
+    let (out, status) = common::run_merged(cmd, cmds);
+    common::assert_script_exit(status);
+    out
 }
 
 fn run(cmds: &str) -> String {

@@ -519,6 +519,7 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
         QueryResult::LoadedExtension { name } => {
             done(w, DoneKind::LoadedExtension, 0, name)
         }
+        QueryResult::Checkpointed => done(w, DoneKind::Checkpointed, 0, ""),
     }
 }
 

@@ -123,8 +123,10 @@ def rows_equal(pink_rows, duck_rows, ordered):
 def pink_query(setup, sql):
     """Returns ("rows", types, rows) | ("error", msg)."""
     script = setup + "\n" + sql + "\n.quit\n"
-    p = subprocess.run(PINKDB, input=script, capture_output=True, text=True,
-                       timeout=300)
+    # Errors go to stderr; merge it so an error stays in sequence with the
+    # result tables.
+    p = subprocess.run(PINKDB, input=script, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True, timeout=300)
     tables = []
     types, rows, state = None, [], 0  # 0 idle, 1 header, 2 types, 3 data
     for line in p.stdout.splitlines():

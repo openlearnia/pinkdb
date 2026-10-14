@@ -2,8 +2,30 @@
 //!
 //! Line editing via rustyline, multi-line input until `;`, dot-commands,
 //! and DuckDB-style box-drawn result tables with a type row.
+//!
+//! Scripting follows sqlite3/duckdb conventions: errors go to stderr; when
+//! stdin is not a terminal (or with `-c`), the banner and per-statement
+//! timing are off and the process exits 1 if any statement or dot-command
+//! failed. A statement still open at end of input runs as if terminated.
 
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+/// Set by [`cli_error!`]; decides the exit status of a non-interactive run.
+static HAD_ERROR: AtomicBool = AtomicBool::new(false);
+
+/// `.timer on|off` (default: on for an interactive terminal, else off).
+static TIMER: AtomicBool = AtomicBool::new(false);
+
+/// Report a failed statement or command: `Error: …` on stderr, and remember
+/// it for the exit status.
+macro_rules! cli_error {
+    ($($arg:tt)*) => {{
+        $crate::HAD_ERROR.store(true, ::std::sync::atomic::Ordering::Relaxed);
+        eprintln!("Error: {}", format_args!($($arg)*));
+    }};
+}
 
 use pinkdb::{DataType, EncryptionKey, PinkDb, QueryResult, SyncPolicy, Value};
 use rustyline::error::ReadlineError;
@@ -27,6 +49,8 @@ fn print_help() {
     println!("Dot-commands:");
     println!("  .help                  show this help");
     println!("  .quit | .exit          leave the shell");
+    println!("  .read <file.sql>       run SQL and dot-commands from a file");
+    println!("  .timer on|off          print each statement's run time");
     println!("  .databases             list databases (the current one is marked)");
     println!("  .tables                list tables and views of the current database");
     println!("  .schema <table|view>   show a schema (accepts db.table; quoting honored)");
@@ -69,20 +93,20 @@ fn print_help() {
 /// built without the opt-in `repo` feature.
 #[cfg(not(feature = "repo"))]
 fn repo_unavailable(cmd: &str) {
-    println!(
-        "Error: {cmd} is not available: this pinkdb binary was built without the repo feature;"
+    cli_error!(
+        "{cmd} is not available: this pinkdb binary was built without the repo feature;"
     );
-    println!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
+    eprintln!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
 }
 
 /// The `.lake` message when the binary was built without the opt-in `lake`
 /// feature.
 #[cfg(not(feature = "lake"))]
 fn lake_unavailable(cmd: &str) {
-    println!(
-        "Error: {cmd} is not available: this pinkdb binary was built without the lake feature;"
+    cli_error!(
+        "{cmd} is not available: this pinkdb binary was built without the lake feature;"
     );
-    println!(
+    eprintln!(
         "       rebuild with `cargo build -p pinkdb-cli --features lake` (add `,s3` for \
          s3://bucket/prefix URLs)."
     );
@@ -107,14 +131,14 @@ fn cmd_install(db: &mut PinkDb, arg: &str) {
     let home = match repo::pinkdb_home() {
         Ok(home) => home,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
     let repositories = match repo::load_repositories() {
         Ok(repositories) => repositories,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
@@ -133,10 +157,10 @@ fn cmd_install(db: &mut PinkDb, arg: &str) {
             }
             match db.load_extension(&installed.path.to_string_lossy()) {
                 Ok(loaded) => println!("Extension {loaded} loaded."),
-                Err(e) => println!("Error: {e}"),
+                Err(e) => cli_error!("{e}"),
             }
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }
 
@@ -151,7 +175,7 @@ fn cmd_repositories(arg: &str) {
     match sub {
         "" | "list" => match repo::load_repositories() {
             Ok(urls) => print_repositories(&urls),
-            Err(e) => println!("Error: {e}"),
+            Err(e) => cli_error!("{e}"),
         },
         "add" | "remove" => {
             if rest.is_empty() || rest.split_whitespace().count() != 1 {
@@ -161,7 +185,7 @@ fn cmd_repositories(arg: &str) {
             let mut urls = match repo::load_repositories() {
                 Ok(urls) => urls,
                 Err(e) => {
-                    println!("Error: {e}");
+                    cli_error!("{e}");
                     return;
                 }
             };
@@ -173,12 +197,12 @@ fn cmd_repositories(arg: &str) {
             let canonical = match result {
                 Ok(canonical) => canonical,
                 Err(e) => {
-                    println!("Error: {e}");
+                    cli_error!("{e}");
                     return;
                 }
             };
             if let Err(e) = repo::save_repositories(&urls) {
-                println!("Error: {e}");
+                cli_error!("{e}");
                 return;
             }
             if sub == "add" {
@@ -214,7 +238,7 @@ fn cmd_installed() {
     let home = match repo::pinkdb_home() {
         Ok(home) => home,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
@@ -226,7 +250,7 @@ fn cmd_installed() {
                 println!("  {} {} {} {}", f.name, f.version, f.platform, f.path.display());
             }
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }
 
@@ -283,7 +307,7 @@ fn cmd_schema(db: &mut PinkDb, arg: &str) {
     let (qdb, table) = match pinkdb::csv::parse_table_target(name) {
         Ok(parsed) => parsed,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
@@ -334,13 +358,13 @@ fn cmd_schema(db: &mut PinkDb, arg: &str) {
                                 println!("); -- view (session-local)");
                             }
                             _ => {
-                                println!("Error: view \"{view_name}\" did not produce a schema")
+                                cli_error!("view \"{view_name}\" did not produce a schema")
                             }
                         },
-                        Err(e) => println!("Error: {e}"),
+                        Err(e) => cli_error!("{e}"),
                     }
                 }
-                Err(_) => println!("Error: {table_err}; no such view either"),
+                Err(_) => cli_error!("{table_err}; no such view either"),
             }
         }
     }
@@ -399,7 +423,7 @@ fn cmd_import(db: &mut PinkDb, arg: &str) {
     let t0 = Instant::now();
     match pinkdb::csv::import_csv(db, &file, table.as_deref()) {
         Ok(n) => println!("Imported {n} rows in {:.3}s", t0.elapsed().as_secs_f64()),
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }
 
@@ -415,6 +439,30 @@ enum Session {
 
 /// Returns false when the REPL should exit.
 fn run_dot(session: &mut Session, line: &str) -> bool {
+    let (cmd, rest) = match line.find(char::is_whitespace) {
+        Some(i) => (&line[..i], line[i..].trim()),
+        None => (line, ""),
+    };
+    // Session-independent commands (local and remote alike).
+    match cmd {
+        ".timer" => {
+            match rest {
+                "on" => TIMER.store(true, Ordering::Relaxed),
+                "off" => TIMER.store(false, Ordering::Relaxed),
+                _ => println!("Usage: .timer on|off"),
+            }
+            return true;
+        }
+        ".read" => {
+            let path = unquote(rest);
+            if path.is_empty() {
+                println!("Usage: .read <file.sql>");
+                return true;
+            }
+            return run_script_file(session, &path);
+        }
+        _ => {}
+    }
     match session {
         Session::Local(db) => run_dot_local(db, line),
         #[cfg(feature = "client")]
@@ -483,7 +531,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                         }
                         println!("Saved in {:.3}s", t0.elapsed().as_secs_f64())
                     }
-                    Err(e) => println!("Error: {e}"),
+                    Err(e) => cli_error!("{e}"),
                 }
             }
         }
@@ -492,6 +540,14 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             if path.is_empty() {
                 println!("Usage: .open <file.pink>");
             } else {
+                // Re-opening the database this session already holds: the
+                // durable lock is per handle, so release the current store
+                // first (its state is durable; the reopen replays it).
+                if db.is_bound_to(path) {
+                    let key = db.encryption_key().cloned();
+                    *db = PinkDb::new();
+                    db.set_encryption_key(key);
+                }
                 // `PINKDB_KEY` (if set) is already installed on the store, so
                 // both the checkpoint and the snapshot path encrypt.
                 let result = match db.encryption_key() {
@@ -520,7 +576,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                         *db = new_db;
                         println!("Opened {path}");
                     }
-                    Err(e) => println!("Error: {e}"),
+                    Err(e) => cli_error!("{e}"),
                 }
             }
         }
@@ -530,7 +586,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             #[cfg(not(feature = "lake"))]
             lake_unavailable(".lake");
         }
-        _ => println!("Unknown dot-command \"{cmd}\". Try .help"),
+        _ => cli_error!("unknown dot-command \"{cmd}\". Try .help"),
     }
     true
 }
@@ -551,9 +607,9 @@ fn run_dot_remote(line: &str) -> bool {
         ".quit" | ".exit" => return false,
         ".databases" | ".tables" | ".schema" | ".import" | ".save" | ".open" | ".install"
         | ".repositories" | ".installed" | ".lake" => {
-            println!("Error: {cmd} is not available in remote mode");
+            cli_error!("{cmd} is not available in remote mode");
         }
-        _ => println!("Unknown dot-command \"{cmd}\". Try .help"),
+        _ => cli_error!("unknown dot-command \"{cmd}\". Try .help"),
     }
     true
 }
@@ -563,6 +619,8 @@ fn print_help_remote() {
     println!("Dot-commands (remote mode):");
     println!("  .help                  show this help");
     println!("  .quit | .exit          leave the shell");
+    println!("  .read <file.sql>       run SQL and dot-commands from a file");
+    println!("  .timer on|off          print each statement's run time");
     println!("  .databases/.tables/.schema/.import/.save/.open are not available in remote mode");
     println!("  .install/.repositories/.installed are not available in remote mode");
     println!("  .lake is not available in remote mode");
@@ -682,6 +740,7 @@ fn render_results(results: &[QueryResult]) {
             QueryResult::LoadedExtension { name } => {
                 println!("Extension {name} loaded.")
             }
+            QueryResult::Checkpointed => println!("Checkpoint complete."),
             QueryResult::Selected { names, types, rows } => {
                 if rows.is_empty() {
                     println!("(no rows)");
@@ -700,25 +759,30 @@ fn run_sql_session(session: &mut Session, sql: &str) {
     match session {
         Session::Local(db) => match db.execute(sql) {
             Ok(results) => render_results(&results),
-            Err(e) => println!("Error: {e}"),
+            Err(e) => cli_error!("{e}"),
         },
         #[cfg(feature = "client")]
         Session::Remote(client) => match client.execute(sql) {
             Ok(results) => render_results(&results),
-            Err(e) => println!("Error: {e}"),
+            Err(e) => cli_error!("{e}"),
         },
     }
-    println!("Run Time (s): real {:.3}", t0.elapsed().as_secs_f64());
+    if TIMER.load(Ordering::Relaxed) {
+        println!("Run Time (s): real {:.3}", t0.elapsed().as_secs_f64());
+    }
 }
 
 /// Parsed command line.
 struct Opts {
     host: Option<String>,
+    /// `-c` arguments, run in order instead of reading stdin.
+    commands: Vec<String>,
 }
 
 fn print_usage() {
-    println!("Usage: pinkdb [--host HOST:PORT]");
+    println!("Usage: pinkdb [--host HOST:PORT] [-c COMMAND]...");
     println!();
+    println!("  -c COMMAND         run SQL or a dot-command, then exit (repeatable)");
     println!("  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)");
     if cfg!(feature = "client") {
         println!("                     [client feature: enabled]");
@@ -729,6 +793,7 @@ fn print_usage() {
 
 fn parse_args() -> Result<Opts, String> {
     let mut host = None;
+    let mut commands = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -743,10 +808,14 @@ fn parse_args() -> Result<Opts, String> {
             other if other.starts_with("--host=") => {
                 host = Some(other["--host=".len()..].to_string());
             }
+            "-c" => {
+                let value = args.next().ok_or("-c requires a command")?;
+                commands.push(value);
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(Opts { host })
+    Ok(Opts { host, commands })
 }
 
 /// Build the REPL session: local by default, remote when `--host` is given
@@ -787,14 +856,15 @@ fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
 }
 
 fn main() {
-    let host = match parse_args() {
-        Ok(opts) => opts.host,
+    let opts = match parse_args() {
+        Ok(opts) => opts,
         Err(msg) => {
             eprintln!("Error: {msg}");
             print_usage();
             std::process::exit(2);
         }
     };
+    let host = opts.host;
     let mut session = build_session(host.clone(), match EncryptionKey::from_env() {
         Ok(key) => key,
         Err(e) => {
@@ -804,64 +874,272 @@ fn main() {
             std::process::exit(2);
         }
     });
-    let mut rl = DefaultEditor::new().unwrap_or_else(|e| {
-        eprintln!("rustyline init failed ({e}); falling back to stdin");
-        DefaultEditor::new().expect("rustyline fallback")
-    });
-    match &session {
-        Session::Local(_) => {
-            println!("pinkdb v0.1.0 — mini DuckDB (in-memory). Type .help, end SQL with ;")
+
+    // `-c`: run the given commands as one script and exit.
+    if !opts.commands.is_empty() {
+        let mut input = Input::new();
+        for command in &opts.commands {
+            for line in command.lines() {
+                if !input.feed(&mut session, line) {
+                    exit_for_script();
+                }
+            }
+            // Each -c argument is complete on its own.
+            input.finish(&mut session);
         }
-        #[cfg(feature = "client")]
-        Session::Remote(client) => println!(
-            "pinkdb v0.1.0 — mini DuckDB (remote {}, server v{}). Type .help, end SQL with ;",
-            host.as_deref().unwrap_or(""),
-            client.server_version()
-        ),
+        exit_for_script();
     }
 
-    let mut pending = String::new();
+    let interactive = std::io::stdin().is_terminal();
+    TIMER.store(interactive, Ordering::Relaxed);
+    if interactive {
+        match &session {
+            Session::Local(_) => {
+                println!("pinkdb v0.1.0 — mini DuckDB (in-memory). Type .help, end SQL with ;")
+            }
+            #[cfg(feature = "client")]
+            Session::Remote(client) => println!(
+                "pinkdb v0.1.0 — mini DuckDB (remote {}, server v{}). Type .help, end SQL with ;",
+                host.as_deref().unwrap_or(""),
+                client.server_version()
+            ),
+        }
+    }
+    let mut rl = match DefaultEditor::new() {
+        Ok(rl) => rl,
+        Err(e) => {
+            // No line editor (unusual terminal): read plain lines.
+            eprintln!("rustyline init failed ({e}); reading plain stdin");
+            run_plain_stdin(&mut session);
+            exit_for_script();
+        }
+    };
+
+    let mut input = Input::new();
     loop {
-        let prompt = if pending.is_empty() {
-            PROMPT
-        } else {
-            CONT_PROMPT
-        };
+        let prompt = if input.is_empty() { PROMPT } else { CONT_PROMPT };
         match rl.readline(prompt) {
             Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                // Dot-commands only at the start of a fresh statement.
-                if pending.is_empty() && trimmed.starts_with('.') {
-                    rl.add_history_entry(line.as_str()).ok();
-                    if !run_dot(&mut session, trimmed) {
-                        break;
+                if !line.trim().is_empty() {
+                    if let Some(entry) = input.history_entry(&line) {
+                        rl.add_history_entry(entry.as_str()).ok();
                     }
-                    continue;
                 }
-                pending.push_str(&line);
-                pending.push('\n');
-                if trimmed.ends_with(';') {
-                    rl.add_history_entry(pending.as_str()).ok();
-                    let sql = pending.trim().to_string();
-                    pending.clear();
-                    run_sql_session(&mut session, &sql);
+                if !input.feed(&mut session, &line) {
+                    break;
                 }
             }
             Err(ReadlineError::Interrupted) => {
                 // Ctrl-C: drop pending input, stay in shell.
-                pending.clear();
+                input.clear();
                 println!("(^C — input cleared)");
             }
-            Err(ReadlineError::Eof) => break,
+            Err(ReadlineError::Eof) => {
+                input.finish(&mut session);
+                break;
+            }
             Err(e) => {
                 eprintln!("Readline error: {e}");
                 break;
             }
         }
     }
+    if !interactive {
+        exit_for_script();
+    }
+}
+
+/// Run a script file's SQL and dot-commands in this session (`.read`).
+/// Nested `.read` works; false when the script asked to quit.
+fn run_script_file(session: &mut Session, path: &str) -> bool {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) => {
+            cli_error!("cannot read {path}: {e}");
+            return true;
+        }
+    };
+    let mut input = Input::new();
+    for line in text.lines() {
+        if !input.feed(session, line) {
+            return false;
+        }
+    }
+    input.finish(session);
+    true
+}
+
+/// Exit after a script: status 1 when anything failed (sqlite3/duckdb
+/// convention), else 0.
+fn exit_for_script() -> ! {
+    std::process::exit(i32::from(HAD_ERROR.load(Ordering::Relaxed)));
+}
+
+/// Line-by-line stdin without rustyline (fallback).
+fn run_plain_stdin(session: &mut Session) {
+    let mut input = Input::new();
+    for line in std::io::stdin().lines() {
+        let Ok(line) = line else { break };
+        if !input.feed(session, &line) {
+            return;
+        }
+    }
+    input.finish(session);
+}
+
+/// Accumulates input lines into statements: dot-commands at the start of a
+/// fresh statement run immediately; SQL runs once a line completes it.
+struct Input {
+    pending: String,
+}
+
+impl Input {
+    fn new() -> Self {
+        Input { pending: String::new() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// The history entry `line` completes (a dot-command or a whole
+    /// statement), computed before [`Input::feed`] consumes it.
+    fn history_entry(&self, line: &str) -> Option<String> {
+        let trimmed = line.trim();
+        if self.pending.is_empty() && trimmed.starts_with('.') {
+            return Some(line.to_string());
+        }
+        let mut joined = self.pending.clone();
+        joined.push_str(line);
+        joined.push('\n');
+        statement_is_complete(&joined).then_some(joined)
+    }
+
+    /// Feed one line; false when the session should end (`.quit`).
+    fn feed(&mut self, session: &mut Session, line: &str) -> bool {
+        let trimmed = line.trim();
+        if trimmed.is_empty() && self.pending.is_empty() {
+            return true;
+        }
+        // Dot-commands only at the start of a fresh statement.
+        if self.pending.is_empty() && trimmed.starts_with('.') {
+            return run_dot(session, trimmed);
+        }
+        self.pending.push_str(line);
+        self.pending.push('\n');
+        if statement_is_complete(&self.pending) {
+            let sql = std::mem::take(&mut self.pending);
+            run_sql_session(session, sql.trim());
+        }
+        true
+    }
+
+    /// End of input: a statement still open runs as if terminated (unless
+    /// it is only whitespace and comments).
+    fn finish(&mut self, session: &mut Session) {
+        let sql = std::mem::take(&mut self.pending);
+        if has_sql_content(&sql) {
+            run_sql_session(session, sql.trim());
+        }
+    }
+}
+
+/// Lexical state while scanning SQL for statement ends.
+#[derive(Clone, Copy, PartialEq)]
+enum Lex {
+    Code,
+    Str,
+    Ident,
+    LineComment,
+    BlockComment,
+}
+
+/// Scan `sql`, returning the final lexical state and whether the last
+/// significant (non-space, non-comment) character in code was `;` — plus
+/// whether any code at all was seen.
+fn scan_sql(sql: &str) -> (Lex, bool, bool) {
+    let mut state = Lex::Code;
+    let mut last_semicolon = false;
+    let mut any_code = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let next = bytes.get(i + 1).copied();
+        match state {
+            Lex::Code => match c {
+                b'\'' => {
+                    state = Lex::Str;
+                    last_semicolon = false;
+                    any_code = true;
+                }
+                b'"' => {
+                    state = Lex::Ident;
+                    last_semicolon = false;
+                    any_code = true;
+                }
+                b'-' if next == Some(b'-') => {
+                    state = Lex::LineComment;
+                    i += 1;
+                }
+                b'/' if next == Some(b'*') => {
+                    state = Lex::BlockComment;
+                    i += 1;
+                }
+                b';' => {
+                    last_semicolon = true;
+                    any_code = true;
+                }
+                c if c.is_ascii_whitespace() => {}
+                _ => {
+                    last_semicolon = false;
+                    any_code = true;
+                }
+            },
+            // `''` inside a string is an escaped quote: leaving and
+            // re-entering the string state handles it naturally.
+            Lex::Str => {
+                if c == b'\'' {
+                    state = Lex::Code;
+                }
+            }
+            Lex::Ident => {
+                if c == b'"' {
+                    state = Lex::Code;
+                }
+            }
+            Lex::LineComment => {
+                if c == b'\n' {
+                    state = Lex::Code;
+                }
+            }
+            Lex::BlockComment => {
+                if c == b'*' && next == Some(b'/') {
+                    state = Lex::Code;
+                    i += 1;
+                }
+            }
+        }
+        i += 1;
+    }
+    (state, last_semicolon, any_code)
+}
+
+/// True when `sql` ends a statement: the last significant character outside
+/// strings, quoted identifiers and comments is `;` (so `SELECT 1; -- note`
+/// is complete, and `SELECT ';'` is not).
+fn statement_is_complete(sql: &str) -> bool {
+    let (state, last_semicolon, _) = scan_sql(sql);
+    matches!(state, Lex::Code | Lex::LineComment) && last_semicolon
+}
+
+/// True when `sql` holds anything besides whitespace and comments.
+fn has_sql_content(sql: &str) -> bool {
+    scan_sql(sql).2
 }
 
 #[cfg(test)]

@@ -42,14 +42,19 @@
 //!
 //! - Every request has one whole-request (connect + transfer) timeout of
 //!   [`HTTP_TIMEOUT`] (120 s); large data objects must fit inside it.
-//! - There is **no retry on 429/503** (`SlowDown`/`ServiceUnavailable`) or on
-//!   a transport error: the operation fails with an I/O error naming the S3
-//!   code, and the caller retries (reopening the lake first — a catalog PUT
-//!   may have landed; see the README's recovery note). The one retry is the
-//!   documented `PutObject` retry for a `409 Conflict` on a conditional
-//!   write (a concurrent delete raced the write), bounded by
-//!   [`CONFLICT_RETRIES`]. Redirects are not followed: a 301 (wrong
-//!   region/endpoint) surfaces as an I/O error naming `PermanentRedirect`.
+//! - **Retries** (exponential backoff with jitter, [`DEFAULT_RETRIES`]
+//!   retries after the first attempt; `S3Config::with_retries` /
+//!   `PINKDB_S3_RETRIES`): `429`/`503` (`SlowDown`/`ServiceUnavailable`,
+//!   which S3 returns before applying a request) are retried for every
+//!   request; `500`/`502`/`504` and transport errors are retried only for
+//!   requests that are safe to repeat — reads, deletes, and unconditional
+//!   PUTs (data files are written once under fresh names). A *conditional*
+//!   PUT that failed ambiguously is never retried: if it landed, a retry
+//!   would see its own write as a `412` conflict; the caller reopens the
+//!   lake instead (see the README's recovery note). The `409 Conflict` retry
+//!   for a conditional write is separate, bounded by [`CONFLICT_RETRIES`].
+//!   Redirects are not followed: a 301 (wrong region/endpoint) surfaces as
+//!   an I/O error naming `PermanentRedirect`.
 //! - Plain `http://` endpoints send credentials unencrypted: they are
 //!   refused unless explicitly allowed (`S3Config::allow_http(true)` /
 //!   `PINKDB_S3_ALLOW_HTTP=1`, for local test endpoints). Region `auto`
@@ -93,6 +98,12 @@ const MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// broken endpoint repeating its continuation token must not loop forever).
 /// At 1000 keys per page this covers a million objects per directory.
 const MAX_LIST_PAGES: usize = 10_000;
+
+/// Default retries after a retryable failure (so up to 4 attempts).
+pub const DEFAULT_RETRIES: u32 = 3;
+
+/// First backoff delay; doubles per retry (plus up to 50% jitter).
+const RETRY_BASE: Duration = Duration::from_millis(100);
 
 /// Retries for a retryable conditional-write race (`409 Conflict` when a
 /// concurrent delete raced the write; AWS documents retrying `PutObject`).
@@ -154,6 +165,8 @@ pub struct S3Config {
     pub allow_degraded: bool,
     /// Explicitly allow a plain `http://` endpoint (local test endpoints).
     pub allow_http: bool,
+    /// Retries after a retryable failure (see the module docs).
+    pub retries: u32,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -172,6 +185,7 @@ impl std::fmt::Debug for S3Config {
             .field("session_token", &redact(&self.session_token))
             .field("allow_degraded", &self.allow_degraded)
             .field("allow_http", &self.allow_http)
+            .field("retries", &self.retries)
             .finish()
     }
 }
@@ -192,6 +206,7 @@ impl S3Config {
             session_token: None,
             allow_degraded: false,
             allow_http: false,
+            retries: DEFAULT_RETRIES,
         }
     }
 
@@ -210,7 +225,16 @@ impl S3Config {
         config.path_style = env_truthy("AWS_S3_FORCE_PATH_STYLE");
         config.allow_degraded = env_truthy("PINKDB_S3_ALLOW_DEGRADED").unwrap_or(false);
         config.allow_http = env_truthy("PINKDB_S3_ALLOW_HTTP").unwrap_or(false);
+        if let Some(retries) = env_var("PINKDB_S3_RETRIES").and_then(|v| v.parse().ok()) {
+            config.retries = retries;
+        }
         config
+    }
+
+    /// Retries after a retryable failure (0 disables retrying).
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = retries;
+        self
     }
 
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
@@ -364,6 +388,7 @@ impl S3Config {
                 session_token,
             },
             allow_degraded: self.allow_degraded,
+            retries: self.retries,
         })
     }
 }
@@ -376,6 +401,7 @@ struct ResolvedConfig {
     endpoint: Endpoint,
     credentials: Credentials,
     allow_degraded: bool,
+    retries: u32,
 }
 
 /// One S3 backend rooted at `s3://bucket/prefix`.
@@ -437,6 +463,7 @@ impl S3Storage {
                     .build()
                     .into(),
                 max_object_bytes: MAX_OBJECT_BYTES,
+                retries: resolved.retries,
             },
             prefix: resolved.prefix,
             root,
@@ -1194,6 +1221,19 @@ enum S3Error {
     },
 }
 
+/// Exponential backoff for retry `attempt` (1-based): `RETRY_BASE * 2^(n-1)`
+/// plus up to 50% jitter (so racing writers do not retry in lockstep), capped
+/// at 5 s.
+fn backoff(attempt: u32) -> Duration {
+    let base = RETRY_BASE.saturating_mul(1u32 << (attempt - 1).min(6));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let jitter = base.mul_f64(f64::from(nanos % 500) / 1000.0);
+    (base + jitter).min(Duration::from_secs(5))
+}
+
 /// One S3 client (bucket + region + endpoint + credentials + connection pool).
 #[derive(Debug)]
 struct S3Client {
@@ -1205,12 +1245,43 @@ struct S3Client {
     /// The read/write body cap (tests lower it to exercise the overflow path
     /// without transferring gigabytes).
     max_object_bytes: u64,
+    /// Retries after a retryable failure (see the module docs).
+    retries: u32,
 }
 
 impl S3Client {
+    /// One signed request with retries: `429`/`503` always, `500`/`502`/
+    /// `504` and transport errors only when repeating the request is safe
+    /// (not a conditional write — see the module docs). Each attempt is
+    /// re-signed (fresh date).
+    fn execute(
+        &self,
+        method: &str,
+        key: &str,
+        query_pairs: &[(&str, &str)],
+        extra: &[(&'static str, String)],
+        body: &[u8],
+    ) -> std::result::Result<(u16, Option<String>, Vec<u8>), S3Error> {
+        let conditional = extra.iter().any(|(name, _)| name.starts_with("if-"));
+        let mut attempt = 0u32;
+        loop {
+            let outcome = self.execute_once(method, key, query_pairs, extra, body);
+            let retryable = match &outcome {
+                Ok((429 | 503, _, _)) => true,
+                Ok((500 | 502 | 504, _, _)) | Err(S3Error::Transport { .. }) => !conditional,
+                _ => false,
+            };
+            if !retryable || attempt >= self.retries {
+                return outcome;
+            }
+            attempt += 1;
+            std::thread::sleep(backoff(attempt));
+        }
+    }
+
     /// One signed request. `extra` headers are sent and signed (conditional
     /// preconditions must not be tamperable).
-    fn execute(
+    fn execute_once(
         &self,
         method: &str,
         key: &str,

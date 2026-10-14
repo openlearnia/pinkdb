@@ -667,6 +667,24 @@ impl PinkDb {
         self.wal.is_some()
     }
 
+    /// Fail-stop after a WAL write failure. The statement whose append failed
+    /// was already applied in memory but is not durable; refusing every later
+    /// statement (reads included) and every serialization keeps that state
+    /// from ever being observed or saved. The database must be reopened,
+    /// which recovers exactly the durable prefix.
+    pub(crate) fn ensure_wal_healthy(&self) -> Result<()> {
+        if let Some(wal) = self.durable_handle() {
+            let guard = wal.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(msg) = guard.failure() {
+                return Err(PinkDbError::Execution(format!(
+                    "the database stopped after a WAL write failure ({msg}); \
+                     reopen it to recover the durable state"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn durable_handle(&self) -> Option<Arc<Mutex<Wal>>> {
         self.wal.clone()
     }

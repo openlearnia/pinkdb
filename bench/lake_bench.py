@@ -208,7 +208,8 @@ def preflight(pinkdb: Path, duckdb: str) -> dict:
     if not os.access(pinkdb, os.X_OK):
         die(f"pinkdb binary is not executable: {pinkdb}")
 
-    wall, out, err, rc = run_cmd([str(pinkdb)], ".lake\n.quit\n")
+    wall, out, err, rc = run_cmd([str(pinkdb)], ".timer on
+" + ".lake\n.quit\n")
     check_output(out, err, rc, "pinkdb preflight")
     if "built without the lake feature" in out:
         die(
@@ -256,7 +257,8 @@ def measure_pink_lake(
         f".import {dot_str(str(csv))} sales\n"
         f".lake save {dot_str(str(lake_dir))}\n"
     )
-    wall, out, err, rc = run_cmd([str(pinkdb)], ingest_in, cwd=ROOT)
+    wall, out, err, rc = run_cmd([str(pinkdb)], ".timer on
+" + ingest_in, cwd=ROOT)
     check_output(out, err, rc, "pink-lake ingest")
     imp = PINK_IMPORT_RE.search(out)
     sav = PINK_SAVE_RE.search(out)
@@ -281,7 +283,8 @@ def measure_pink_lake(
     open_wall: list[float] = []
     open_in = f".lake open {dot_str(str(lake_dir))}\n.quit\n"
     for _ in range(runs):
-        wall, out, err, rc = run_cmd([str(pinkdb)], open_in, cwd=ROOT)
+        wall, out, err, rc = run_cmd([str(pinkdb)], ".timer on
+" + open_in, cwd=ROOT)
         check_output(out, err, rc, "pink-lake .lake open")
         m = PINK_OPEN_RE.search(out)
         if not m:
@@ -297,7 +300,8 @@ def measure_pink_lake(
         for _, template in QUERIES:
             session_in += template.format(t=table) + "\n"
     session_in += ".quit\n"
-    wall, out, err, rc = run_cmd([str(pinkdb)], session_in, cwd=ROOT)
+    wall, out, err, rc = run_cmd([str(pinkdb)], ".timer on
+" + session_in, cwd=ROOT)
     check_output(out, err, rc, "pink-lake query session")
     times = real_times_for(out, len(QUERIES) * runs, "pink-lake query session")
     queries = {}
@@ -320,7 +324,8 @@ def measure_pink_lake(
         + "\n.quit\n"
     )
     for _ in range(runs):
-        wall, out, err, rc = run_cmd([str(pinkdb)], cold_in, cwd=ROOT)
+        wall, out, err, rc = run_cmd([str(pinkdb)], ".timer on
+" + cold_in, cwd=ROOT)
         check_output(out, err, rc, "pink-lake cold end-to-end")
         cold_wall.append(wall)
 

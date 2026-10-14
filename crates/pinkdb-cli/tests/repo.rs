@@ -10,12 +10,14 @@
 
 #![cfg(feature = "repo")]
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -57,22 +59,11 @@ impl Drop for TempHome {
 /// Run the real CLI binary with `PINKDB_HOME` pointed at `home`, feeding it
 /// `script` on stdin; returns stdout.
 fn run_cli(home: &Path, script: &str) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb"))
-        .env("PINKDB_HOME", home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn pinkdb CLI");
-    child
-        .stdin
-        .take()
-        .expect("child stdin")
-        .write_all(script.as_bytes())
-        .expect("write script to the CLI");
-    let out = child.wait_with_output().expect("wait for the CLI");
-    assert!(out.status.success(), "CLI exited with {}", out.status);
-    String::from_utf8(out.stdout).expect("CLI stdout is UTF-8")
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
+    command.env("PINKDB_HOME", home);
+    let (out, status) = common::run_merged(command, script);
+    common::assert_script_exit(status);
+    out
 }
 
 /// A loopback HTTP server serving `/index.json` and the artifact paths, with

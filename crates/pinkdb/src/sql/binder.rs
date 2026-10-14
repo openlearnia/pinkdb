@@ -1756,6 +1756,7 @@ pub(crate) fn bind_tracked(
             // effects); bind only carries the literal path through.
             empty(LogicalPlan::LoadExtension { path: path.clone() })
         }
+        Statement::Checkpoint => empty(LogicalPlan::Checkpoint),
         Statement::Select(sel) => bind_select(db, default_db, sel),
     }
 }
@@ -2159,6 +2160,7 @@ fn plan_schema(
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. } => Ok(Vec::new()),
         LogicalPlan::Project { exprs, names, .. } => Ok(names
             .iter()

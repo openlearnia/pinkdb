@@ -557,6 +557,43 @@ class ThreadingTests(unittest.TestCase):
         self.assertTrue(all(not thread.is_alive() for thread in threads))
 
 
+class SharedHandleTests(unittest.TestCase):
+    def test_one_database_shared_by_many_threads(self):
+        # The handle serializes calls internally; concurrent use must neither
+        # crash nor lose rows.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared.pink"
+            with pinkdb.connect(path) as db:
+                db.execute("CREATE TABLE t (x INTEGER);")
+                failures = []
+
+                def worker(worker_id):
+                    try:
+                        for i in range(50):
+                            db.execute(f"INSERT INTO t VALUES ({worker_id * 1000 + i});")
+                            db.execute("SELECT COUNT(*) FROM t;")
+                    except BaseException as exc:  # pragma: no cover
+                        failures.append(repr(exc))
+
+                threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=60)
+                self.assertEqual(failures, [])
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM t;")[0].rows, [[400]])
+
+    def test_a_durable_file_has_one_live_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "locked.pink"
+            with pinkdb.connect(path):
+                with self.assertRaises(pinkdb.Error) as ctx:
+                    pinkdb.connect(path)
+                self.assertIn("already open", str(ctx.exception))
+            # Closing releases the lock.
+            pinkdb.connect(path).close()
+
+
 class EnvOverrideTests(unittest.TestCase):
     def test_pinkdb_ffi_lib_override(self):
         """A child interpreter forced to load the library via PINKDB_FFI_LIB."""

@@ -15,9 +15,13 @@
  *   next FFI call on the same thread. Copy them if you need them longer.
  *   `text_ptr` is followed by a NUL byte but may contain embedded NULs —
  *   always trust `text_len`.
- * - Handles are NOT thread-safe: use one handle per thread. Errors are
- *   thread-local; `pinkdb_last_error` returns NULL when the last call on the
- *   calling thread succeeded.
+ * - Handles are NOT thread-safe: never call into one handle from two threads
+ *   at once (serialize calls, e.g. with a mutex — the Go and Python bindings
+ *   do). A durable file is open in at most one handle at a time (an exclusive
+ *   lock on `<file>.lock`; a second `pinkdb_open` of it fails until the
+ *   first is closed), so share that one handle; in-memory handles are
+ *   independent. Errors are thread-local; `pinkdb_last_error` returns NULL
+ *   when the last call on the calling thread succeeded.
  * - SQL is passed as (pointer, length) and must be valid UTF-8. Passing a
  *   NULL pointer with a non-zero length, or invalid UTF-8, is an error.
  * - Error reporting: functions that return a pointer return NULL on failure;
@@ -57,7 +61,9 @@ enum {
     PINKDB_STMT_USED = 13,
     /* LOAD EXTENSION '<path>': pinkdb_result_name returns the extension's
      * declared name. */
-    PINKDB_STMT_LOADED_EXTENSION = 14
+    PINKDB_STMT_LOADED_EXTENSION = 14,
+    /* CHECKPOINT (a no-op for in-memory databases). */
+    PINKDB_STMT_CHECKPOINTED = 15
 };
 
 /* Value / column type tags. */

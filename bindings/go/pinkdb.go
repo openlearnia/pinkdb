@@ -78,6 +78,8 @@ const (
 	// kindLoadedExtension is `LOAD EXTENSION '<path>'`; Name carries the
 	// extension's declared name.
 	kindLoadedExtension int32 = 14
+	// kindCheckpointed is `CHECKPOINT` (a no-op for in-memory databases).
+	kindCheckpointed int32 = 15
 )
 
 var kindNames = map[int32]string{
@@ -96,6 +98,7 @@ var kindNames = map[int32]string{
 	kindDroppedDatabase: "dropped_database",
 	kindUsed:            "used",
 	kindLoadedExtension: "loaded_extension",
+	kindCheckpointed:    "checkpointed",
 }
 
 // Value and column type tags; these mirror the PINKDB_TYPE_* values in
@@ -127,7 +130,7 @@ type Result struct {
 	// Kind is one of: "selected", "created", "inserted", "updated",
 	// "deleted", "began", "committed", "rolledback", "created_view",
 	// "dropped_table", "dropped_view", "created_database",
-	// "dropped_database", "used", "loaded_extension".
+	// "dropped_database", "used", "loaded_extension", "checkpointed".
 	Kind string
 	// Columns and ColumnTypes describe a "selected" result (column names and
 	// one of "null", "boolean", "integer", "bigint", "double", "varchar",

@@ -164,7 +164,15 @@ database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
   `SUM` over integers accumulates in 128 bits and errors only when the final
   result does not fit BIGINT
 
-REPL dot-commands: `.help`, `.quit` / `.exit`, `.databases`, `.tables`,
+Scripting follows sqlite3/duckdb conventions: errors go to **stderr**; when
+stdin is not a terminal (or with `-c COMMAND`, repeatable) there is no banner
+and no per-statement timing (`.timer on` turns it back on), and the process
+**exits 1** if any statement or dot-command failed. A statement still open at
+end of input runs as if terminated, and `;` is recognized outside strings and
+comments (`SELECT 1; -- note` completes; `SELECT ';'` does not).
+`.read <file.sql>` runs a script in the current session.
+
+REPL dot-commands: `.help`, `.quit` / `.exit`, `.read`, `.timer`, `.databases`, `.tables`,
 `.schema <t|v>` (accepts `db.table`; views show their output columns),
 `.import <file.csv> [table]` (table defaults to the file stem; `db.table`
 targets another database), `.save <file.pink>`, `.open <file.pink>`.
@@ -249,15 +257,26 @@ target has a sidecar WAL with committed records. `.import` is made durable by
 a checkpoint before it returns (and is refused inside a transaction), so an
 import survives a crash immediately after it acks. A mutating statement that
 reads a session-local view is refused on durable databases: views are never
-persisted, so replaying its logged SQL could not rebuild it. A database file
-is single-writer: no file locking is taken, so run one process per `.pink`
-path. Two processes on one durable database corrupt the WAL framing at best;
-on an encrypted database they can also seal two records under one
-`(key, nonce)` (both writers append under the same container prefix), which is
-keystream reuse, not merely corruption. The keyed open rebuilds the WAL with a
-fresh nonce prefix at open time, which shrinks but does not remove that race; a
-lockfile is deliberately not taken (stale-lock handling would be fragile), so
-the single-writer precondition stays documented and enforced by convention.
+persisted, so replaying its logged SQL could not rebuild it.
+
+A durable database has **one live handle**: opening takes an exclusive
+advisory lock on `<file>.pink.lock` (an OS `flock`, released automatically
+when the process exits or crashes, so there is no stale-lock cleanup), and a
+second open — from another process or the same one — fails with `already
+open`. Clones of the store (`Database` handles, transaction snapshots) share
+the lock. Two writers on one WAL would corrupt its framing and, encrypted,
+could reuse a `(key, nonce)`; the lock makes that impossible rather than a
+convention.
+
+The WAL is bounded: `CHECKPOINT` (SQL, any front-end — server, FFI,
+bindings; a no-op in memory, refused inside a transaction) persists the store
+and rolls the WAL, and a committed write checkpoints automatically once the
+WAL passes 64 MiB (`set_auto_checkpoint_bytes`, `None` disables).
+
+A failed WAL append is **fail-stop**: the statement already changed memory
+but is not durable, so every later statement — reads included — and every
+save is refused until the database is reopened, which recovers exactly the
+durable prefix. Nobody can observe or persist the non-durable state.
 
 ### Encryption (feature `encryption`)
 
@@ -599,6 +618,7 @@ Environment (the `s3://` URL form):
 | `AWS_S3_FORCE_PATH_STYLE` | force path-style (`1`/`true`/`yes`/`on`) | optional; path-style is already the default with a custom endpoint |
 | `PINKDB_S3_ALLOW_HTTP` | allow a plain `http://` endpoint (local tests only — credentials travel unencrypted) | — |
 | `PINKDB_S3_ALLOW_DEGRADED` | accept the single-writer check-then-put fallback on endpoints that reject conditional writes (see below) | — |
+| `PINKDB_S3_RETRIES` | retries after a retryable failure (default 3; `0` disables) | — |
 
 R2 cookbook:
 
@@ -664,13 +684,18 @@ cargo build -p pinkdb-cli --features lake,s3
   by `.lake tables`/`.lake info` and by `load` with the local
   `loading data file "…"` context; 412 → `write conflict`; `409 Conflict` on
   a conditional PUT is retried up to 3 times (a concurrent delete raced the
-  write), everything else is a one-shot I/O error naming the S3 code. The
-  host clock must be within S3's allowed skew (~15 min) for SigV4. Every
-  request has one **120 s whole-request timeout** (connect + transfer), and
-  **nothing is retried on 429/503** (`SlowDown`/`ServiceUnavailable`), a
-  transport error, or a redirect (a 301 `PermanentRedirect` is an error —
-  fix the endpoint/region): retry the save yourself, reopening the lake
-  first.
+  write), everything else is an I/O error naming the S3 code. The host clock
+  must be within S3's allowed skew (~15 min) for SigV4. Every request has one
+  **120 s whole-request timeout** (connect + transfer). **Retries** use
+  exponential backoff with jitter (default 3, `PINKDB_S3_RETRIES`):
+  `429`/`503` (`SlowDown`/`ServiceUnavailable`, returned before S3 applies a
+  request) are retried for every request; `500`/`502`/`504` and transport
+  errors only for requests that are safe to repeat (reads, deletes, the
+  unconditional data-file PUTs). A conditional PUT that failed ambiguously is
+  never retried — it may have landed, and a retry would report its own write
+  as a conflict — and a redirect (301 `PermanentRedirect`) is an error (fix
+  the endpoint/region). After a failure, reopen the lake before retrying the
+  save.
 - **After a mid-save I/O error, reopen and inspect before retrying.** A
   failed or interrupted save can leave three safe-but-visible states: the
   data files are unreferenced (ignored); `snapshots/<v>.json` exists while
@@ -1345,8 +1370,10 @@ ties in ORDER BY have no stable order on either engine).
 
 ## Known v1 limits
 
-- No nested transactions or savepoints; one process per `.pink` path
-  (single-writer: no file locking is taken); `.open` replaces the whole store
+- No nested transactions or savepoints; one live handle per durable `.pink`
+  path (an exclusive `<file>.lock`; a second open fails); `.open` replaces the
+  whole store; `.lake save`/`.lake open` are refused inside a transaction and
+  `.lake open` refuses to detach a durable session
 - `CREATE DATABASE` / `DROP DATABASE` / `LOAD EXTENSION` are refused inside a
   transaction; the last database cannot be dropped; `DROP DATABASE` does not
   remove views from other databases (views are per-database and session-local)

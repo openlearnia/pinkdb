@@ -65,7 +65,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | done | three GitHub Actions workflows (.github/workflows/{ci,publish-extensions,deploy-docs}.yml): CI build/test/clippy + feature matrices + wasm + duckdiff + Python/Go bindings + C/Go SDK smokes + Docker S3 job; manual-dispatch extension publishing to the live R2 repo (dup refusal, checksums today, signing hook documented); docs auto-deploy; actionlint-clean, YAML-parsed, steps executed locally where possible; secrets documented (CLOUDFLARE_API_TOKEN scopes + account id) |
 | 40 | Performance tuning (recurring every 5th wave): bench-driven speed work, no new features (core) | done | profile-driven: parallel vortex writes (2-2.7×, byte-identical), typed aggregate kernels + count-filter fast path (filter 50→24 ms @10M), window key rework (95→61 ms @1M); standing battery 493→447 ms; 494 tests, duckdiff 60/60; group-by @10M target missed (74 vs ≤60, parallel-ceiling analysis + breadcrumb); next-round breadcrumbs recorded |
 | 40a | Hardening — safety (docs/GAPS.md P0 #1–#10): server-side `LOAD EXTENSION` opt-in, publish catalog-wipe guard, store-wide table versions, read-set COMMIT validation, bounded `.pink` decoder + v3 CRC trailer, DuckDB-style overflow errors, CLI lake handle baselines, https-only `.install`, redacted S3 secrets, bounded server frames + idle timeout | done | 502 workspace tests (+8 regression tests, each shown to fail without its fix where the platform allows); feature matrix green (pink-lake s3 106, cli lake,s3 44, cli encryption 27, core encryption 352, cli client 27, cli repo 54); clippy -D warnings clean all feature sets; duckdiff 60/60; kill loops 30/30 plain + 30/30 multi-db + 20/20 targeted + 30/30 encrypted; bench parity vs main interleaved (418–422 vs 419–425 ms); sizes `pinkdb` 2.14 MB (unchanged) / `pinkdb-server` 1.80 MB (+0.02) |
-| 40b | Hardening — durability/operability: auto-checkpoint + `CHECKPOINT`, `.pink` file lock, log-before-publish, single-lock write bind, Python handle lock, CLI exit codes/stderr/`-c`/EOF, S3 retries, honest `versions()`, `.lake` transaction/durable guards | queued | — |
+| 40b | Hardening — durability/operability: auto-checkpoint + `CHECKPOINT`, `.pink` file lock, fail-stop after a WAL write failure, single-lock bind+run, Python handle lock, CLI exit codes/stderr/`-c`/`.read`/EOF/`;` scanning, S3 retries, honest `versions()`, `.lake` transaction/durable guards | done | 512 workspace tests; feature matrix green (pink-lake s3 108, cli lake,s3 51, cli encryption 33, core encryption 356, cli client 33, cli repo 60); Python 37 + Go (-race) green; clippy -D warnings clean all feature sets; duckdiff 60/60; kill loops 30/30 + 30/30 multi-db + 20/20 targeted + 30/30 encrypted; C/Go SDK smokes 14/14 + 15/15; bench parity (421–424 vs 418–424 ms); sizes `pinkdb` 2.15 / `pinkdb-server` 1.83 / dylib 1.68 MB |
 | 40c | Hardening — CI + docs truthfulness: macOS CI + fmt/audit/feature-test gaps, website refresh, committed-binary/account-id cleanup, wave 29/39 claims corrected | queued | — |
 | 40d | SQL completeness: multi-way/composite/non-equi/CROSS/FULL joins, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, INTERSECT/EXCEPT, COUNT(DISTINCT), EXPLAIN, SHOW/DESCRIBE, RANGE frames + frame validation | queued | — |
 | 40e | Prepared statements + parameters: placeholders, bind API, protocol v4, FFI prepare/bind, Python DB-API, Go database/sql | queued | — |
@@ -352,3 +352,24 @@ Java bindings.
   `Debug` redact secrets. 502 tests, feature matrix + clippy green, duckdiff 60/60, kill
   loops clean, bench at parity (the first i128 SUM accumulator cost ~7% on group_id via
   16-byte alignment; the wrap-counter design recovers it).
+- 2026-10-14 — Wave 40b: durability and operability (docs/GAPS.md P1). Engine: SQL
+  `CHECKPOINT` (protocol v4 `Checkpointed`, FFI kind 15, Python/Go `checkpointed`) and an
+  automatic checkpoint once the WAL passes 64 MiB (`set_auto_checkpoint_bytes`); an
+  exclusive advisory lock on `<file>.pink.lock` gives a durable database one live handle
+  (OS-released on exit/crash; the CLI releases its own before re-opening the bound path);
+  a failed WAL append is fail-stop — every later statement and save is refused until
+  reopen, so the non-durable change is never observed; autocommit statements bind and run
+  under one lock (writes rebind under the write lock). Found and fixed during the wave: a
+  first fail-stop check inside `to_bytes` re-locked the WAL mutex a checkpoint already
+  held (deadlock, caught by the new CHECKPOINT test before commit). Bindings: the Python
+  `Database` serializes calls with a lock (ctypes drops the GIL); FFI/Python docs now say
+  to share one handle. CLI: sqlite3/duckdb scripting conventions — errors on stderr, exit
+  1 after any failure in non-interactive runs, banner/timing only on a TTY (`.timer`),
+  `-c`, `.read`, unterminated final statements run, `;` detection that understands
+  strings and comments; test helpers merge stdout+stderr in order; duckdiff/kill_loop/
+  lake_bench/SDK smokes updated. Lake: S3 retries with jittered backoff (429/503 always;
+  500/502/504/transport only for idempotent requests — never an ambiguous conditional
+  PUT; `PINKDB_S3_RETRIES`), `versions()` reports unreadable snapshots instead of hiding
+  them, `.lake save`/`.lake open` refused inside a transaction and `.lake open` refuses to
+  detach a durable session; repo downloads use `create_new` temp files. 512 tests, gates
+  green, bench at parity.

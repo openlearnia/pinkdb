@@ -43,7 +43,8 @@ use pinkdb::{DataType, Value};
 /// v2: `Execute` batches end with an explicit [`Response::BatchDone`]
 /// terminator (the client no longer parses SQL locally to count statements).
 /// v3: [`DoneKind::LoadedExtension`] (tag 15) reports `LOAD EXTENSION`.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// v4: [`DoneKind::Checkpointed`] (tag 16) reports `CHECKPOINT`.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -263,6 +264,8 @@ pub enum DoneKind {
     /// `LOAD EXTENSION '<path>'` (v3); `name` is the extension's declared
     /// name.
     LoadedExtension = 15,
+    /// `CHECKPOINT` (v4).
+    Checkpointed = 16,
 }
 
 impl DoneKind {
@@ -284,6 +287,7 @@ impl DoneKind {
             13 => DoneKind::Used,
             14 => DoneKind::Other,
             15 => DoneKind::LoadedExtension,
+            16 => DoneKind::Checkpointed,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"

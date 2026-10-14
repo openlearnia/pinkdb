@@ -78,7 +78,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!("Usage: .lake <save|open|versions|tables|info> ..."),
-        other => println!("Unknown .lake subcommand \"{other}\". Try .help"),
+        other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
     }
 }
 
@@ -98,25 +98,31 @@ fn cmd_save(db: &PinkDb, arg: &str) {
         }
     };
     let dir = unquote(&dir);
+    // An open transaction's rows are applied in place but uncommitted: a
+    // lake snapshot must never publish them.
+    if db.in_transaction() {
+        cli_error!(".lake save is not allowed inside a transaction; COMMIT or ROLLBACK first");
+        return;
+    }
     // Reject an unrepresentable store before `open_or_create` can leave a
     // fresh empty lake behind (e.g. a dotted database name or a table name
     // whose encoded data directory would exceed the filesystem's limit).
     if let Err(e) = pink_lake::validate_store(db) {
-        println!("Error: {e}");
+        cli_error!("{e}");
         return;
     }
     let mut lake = match Lake::open_or_create_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
     if let Some(base) = baseline(&lake) {
         let current = lake.current_version();
         if current != base && !force {
-            println!(
-                "Error: write conflict: lake {dir} moved from version {base} to {current} \
+            cli_error!(
+                "write conflict: lake {dir} moved from version {base} to {current} \
                  since this session opened or saved it; saving would overwrite that \
                  work. Reopen it with .lake open, save elsewhere, or use \
                  .lake save <dir> force"
@@ -152,7 +158,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             );
             println!("  lake: {}", lake.path().display());
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }
 
@@ -175,10 +181,24 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
             }
         }
     };
+    // `.lake open` replaces the whole store: refuse when that would silently
+    // discard an open transaction or detach a durable database (later
+    // statements would no longer be logged to its WAL).
+    if db.in_transaction() {
+        cli_error!(".lake open is not allowed inside a transaction; COMMIT or ROLLBACK first");
+        return;
+    }
+    if db.is_durable() {
+        cli_error!(
+            ".lake open would detach this session from its durable database (later \
+             statements would not be written to its WAL); start a new session for the lake"
+        );
+        return;
+    }
     let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
@@ -221,7 +241,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
                 );
             }
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }
 
@@ -239,7 +259,7 @@ fn cmd_versions(arg: &str) {
     let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
@@ -254,7 +274,7 @@ fn cmd_versions(arg: &str) {
                 }
             }
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }
 
@@ -272,7 +292,7 @@ fn cmd_tables(arg: &str) {
     let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
@@ -284,7 +304,7 @@ fn cmd_tables(arg: &str) {
             }
             warn_missing_data_files(&lake);
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }
 
@@ -302,14 +322,14 @@ fn cmd_info(arg: &str) {
     let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
     let tables = match lake.tables() {
         Ok(tables) => tables,
         Err(e) => {
-            println!("Error: {e}");
+            cli_error!("{e}");
             return;
         }
     };
@@ -347,6 +367,6 @@ fn warn_missing_data_files(lake: &Lake) {
                 );
             }
         }
-        Err(e) => println!("Error: {e}"),
+        Err(e) => cli_error!("{e}"),
     }
 }

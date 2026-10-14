@@ -383,6 +383,8 @@ fn empty_encrypted_wal_opens_and_replays() {
         PinkDb::open_durable_with_key_and_policy(s.path(), SyncPolicy::Sync, &raw_key()).unwrap();
     assert_eq!(info.replayed_records, 2);
     assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+    // One live handle per durable database: release it before reopening.
+    drop(back);
 
     // Wrong key and missing key are refused before replay.
     let err = PinkDb::open_durable_with_key(s.path(), &EncryptionKey::from_raw([9u8; 32]))
@@ -425,6 +427,7 @@ fn encrypted_wal_replays_and_truncates_a_torn_tail() {
     assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![1, 3]);
     let after = std::fs::read(s.wal()).unwrap();
     assert_ne!(&after[..80], &full[..80], "the rewrite uses a fresh header");
+    drop(again);
 
     // Garbage appended after a valid tail: torn tail, same policy.
     let mut with_garbage = std::fs::read(s.wal()).unwrap();

@@ -74,8 +74,13 @@ statements=(
 )
 
 echo "==> running the session in $tmp"
-if ! out="$(printf '%s\n' "${statements[@]}" ".quit" | (cd "$tmp" && "$cli") 2>&1)"; then
-    printf 'FAIL: pinkdb exited non-zero\n--- output:\n%s\n' "$out" >&2
+# The session deliberately includes failing statements (error paths), so
+# the CLI exits 1 by the scripting convention; anything else (a crash, a
+# signal) is a failure.
+status=0
+out="$(printf '%s\n' "${statements[@]}" ".quit" | (cd "$tmp" && "$cli") 2>&1)" || status=$?
+if [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+    printf 'FAIL: pinkdb exited with %s\n--- output:\n%s\n' "$status" "$out" >&2
     exit 1
 fi
 
