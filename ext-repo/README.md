@@ -5,15 +5,28 @@ libraries exporting the pinkdb extension C ABI v1, loaded with
 `LOAD EXTENSION`). The repository is an R2 bucket (`pinkdb-extensions`) fronted
 by a small Cloudflare Worker that serves the catalog and the artifact bytes.
 
-**Live: <https://pinkdb-ext-repo.defaultcms.workers.dev>** —
-catalog at <https://pinkdb-ext-repo.defaultcms.workers.dev/index.json>
+**Live: <https://pinkdb-ext-repo.defaultcms.workers.dev>** — a short info page
+linking the raw catalog (`/index.json`) and the browsable catalog UI in the
+docs: **<https://pinkdb-docs.defaultcms.workers.dev/extensions>** (search,
+per-extension details, install commands, downloads).
 
 The format is specified in [`FORMAT.md`](FORMAT.md) (format v1): URL layout,
 `index.json` schema, content types, caching, platform tags, and the
 versioning/immutability rules. Short version:
 
 - `GET /index.json` — the catalog:
-  `{ format_version, updated, extensions: [{ name, version, abi, platform, file, sha256, description }] }`.
+  `{ format_version, updated, extensions: [{ name, version, abi, platform, file, sha256, size?, description }] }`
+  (`size` in bytes is optional but recommended; `publish.py` always writes it,
+  the live `math_ext` 0.1.0 entry predates it). Carries
+  `Access-Control-Allow-Origin: *` so the docs page can fetch it cross-origin;
+  `OPTIONS /index.json` answers the preflight.
+- `GET /` — a short info page: repository title, format version, and links to
+  the docs catalog UI and `/index.json`. The catalog UI itself (search over
+  name, description and platform; per-extension details with
+  `.install <name>` / `.install <name>@<version>`, the download link, SHA-256,
+  the all-versions table and the raw entry) lives at
+  <https://pinkdb-docs.defaultcms.workers.dev/extensions>; it fetches
+  `/index.json` client-side.
 - `GET /artifacts/<name>/<version>/<platform>/<file>` — artifact bytes
   (`application/octet-stream`, correct `Content-Length`/`ETag`, immutable cache).
 - An existing `name`+`version`+`platform` artifact is **immutable**;
@@ -29,7 +42,11 @@ README.md    this file
 publish.py   publish one built extension (Python stdlib only; drives wrangler)
 publish.sh   wrapper:  ./publish.sh <dylib> --name … --version … --platform … --description …
 verify.sh    download an artifact URL and check its SHA-256 against the index
-worker/      the Cloudflare Worker (wrangler.toml + src/index.js; no build step)
+worker/      the Cloudflare Worker: src/index.js (info page + machine
+             endpoints) and verify-ui.mjs (checks the info page, CORS,
+             catalog and artifacts against a live repository; also runs the
+             pure helpers from the generated docs Extensions page against the
+             live catalog); wrangler.toml; no build step
 index.json   local mirror of the catalog (gitignored; canonical copy lives in R2)
 artifacts/   local mirror of published artifacts (gitignored)
 ```
@@ -48,7 +65,7 @@ make -C ext-sdk/c    # build the C SDK examples (if not built yet)
 
 `publish.py` then:
 
-1. computes the artifact's SHA-256;
+1. computes the artifact's SHA-256 and size in bytes;
 2. checks the current `index.json` and **refuses** (exit 1) if
    `name`+`version`+`platform` is already published;
 3. copies the artifact to `artifacts/<name>/<version>/<platform>/<file>`
@@ -63,6 +80,7 @@ uploaded pinkdb-extensions/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
 uploaded pinkdb-extensions/index.json
 published math_ext 0.1.0 (darwin-arm64)
   sha256:   38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
+  size:     17088 bytes
   artifact: https://pinkdb-ext-repo.defaultcms.workers.dev/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
   catalog:  https://pinkdb-ext-repo.defaultcms.workers.dev/index.json
   staged:   /…/ext-repo/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
@@ -130,4 +148,9 @@ cd ext-repo/worker && wrangler deploy          # prints the workers.dev URL
 The worker is a single ES module (`worker/src/index.js`, no build step, no
 dependencies) bound to the bucket as `EXT_BUCKET`. It only ever reads; there is
 no write API. Local checks: `node --check src/index.js` and
-`wrangler deploy --dry-run`.
+`wrangler deploy --dry-run`. After deploying, `node worker/verify-ui.mjs
+[repo-url] [docs-url]` checks the info page, the CORS header on `/index.json`,
+the catalog headers/ETag and every artifact download against a live
+repository, plus the docs Extensions page (run `python3 website/build.py`
+first) — defaults: the live repository and the live docs. The headless-browser
+pass lives in `website/verify-browser.mjs` (`node website/verify-browser.mjs`).

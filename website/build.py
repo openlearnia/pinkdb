@@ -8,9 +8,14 @@ verbatim to ``public/assets/``.
 
 Output mapping
 --------------
-- ``src/pages/index.html``  -> ``public/index.html``
-- ``src/pages/404.html``    -> ``public/404.html``
-- any other fragment        -> ``public/docs/<same name>``
+- ``src/pages/index.html``          -> ``public/index.html``
+- ``src/pages/404.html``            -> ``public/404.html``
+- ``src/pages/extensions.html``     -> ``public/extensions.html`` (top level, so
+  the page is served at ``/extensions``)
+- any other fragment                -> ``public/docs/<same name>``
+
+The first three have explicit ``out`` entries in ``PAGES``; every other
+fragment uses the ``docs/`` default.
 
 Template placeholders
 ---------------------
@@ -123,6 +128,16 @@ PAGES = {
         "description": (
             "Waves 0-26 shipped, 27-47 queued: bindings, extensions, lake "
             "storage, TLS, RBAC, and more."
+        ),
+    },
+    "extensions.html": {
+        "out": "extensions.html",
+        "nav": "extensions",
+        "title": "Extensions — pinkdb",
+        "description": (
+            "The pinkdb extension repository: browse published extension "
+            "artifacts (name, version, platform, ABI, SHA-256), install with "
+            ".install <name>, and download the immutable bytes."
         ),
     },
     "404.html": {

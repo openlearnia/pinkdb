@@ -8,11 +8,12 @@ Usage:
                --description DESC [--repo-dir DIR]
 
 What it does:
-  1. computes the SHA-256 of <dylib>;
+  1. computes the SHA-256 and size (bytes) of <dylib>;
   2. refuses the publish if name+version+platform already exists in the current
      index (published coordinates are immutable — bump the version instead);
   3. copies the artifact to artifacts/<name>/<version>/<platform>/<file>;
-  4. appends the entry to index.json (sorted, fresh `updated` timestamp);
+  4. appends the entry to index.json (sorted, fresh `updated` timestamp;
+     the entry records `sha256` and the optional-but-recommended `size`);
   5. uploads the artifact and the catalog to the R2 bucket with
      `wrangler r2 object put --remote` (artifact first, catalog second);
   6. prints the resulting URLs.
@@ -187,7 +188,16 @@ def main(argv=None) -> int:
             )
 
     sha = sha256_file(args.dylib)
+    size = os.path.getsize(args.dylib)
     file_field = f"artifacts/{args.name}/{args.version}/{args.platform}/{file_name}"
+
+    # Stage the artifact locally (a mirror of what goes to R2).
+    staged = os.path.join(repo_dir, *file_field.split("/"))
+    os.makedirs(os.path.dirname(staged), exist_ok=True)
+    shutil.copyfile(args.dylib, staged)
+    if sha256_file(staged) != sha or os.path.getsize(staged) != size:
+        die(f"staged copy {staged} does not match the source (copy failed)")
+
     entry = {
         "name": args.name,
         "version": args.version,
@@ -195,15 +205,9 @@ def main(argv=None) -> int:
         "platform": args.platform,
         "file": file_field,
         "sha256": sha,
+        "size": size,  # optional-but-recommended in format v1
         "description": description,
     }
-
-    # Stage the artifact locally (a mirror of what goes to R2).
-    staged = os.path.join(repo_dir, *file_field.split("/"))
-    os.makedirs(os.path.dirname(staged), exist_ok=True)
-    shutil.copyfile(args.dylib, staged)
-    if sha256_file(staged) != sha:
-        die(f"staged copy {staged} does not match the source (copy failed)")
 
     # New catalog in memory: append, sort, timestamp.
     entries.append(entry)
@@ -232,6 +236,7 @@ def main(argv=None) -> int:
 
     print(f"published {args.name} {args.version} ({args.platform})")
     print(f"  sha256:   {sha}")
+    print(f"  size:     {size} bytes")
     print(f"  artifact: {BASE_URL}/{file_field}")
     print(f"  catalog:  {BASE_URL}/index.json")
     print(f"  staged:   {staged}")

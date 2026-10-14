@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Extensions — pinkdb</title>
+<meta name="description" content="The pinkdb extension repository: browse published extension artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
+<meta name="color-scheme" content="dark">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="./"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="./">Home</a></li>
+        <li><a href="docs/getting-started">Getting started</a></li>
+        <li><a href="docs/sql">SQL</a></li>
+        <li><a href="docs/cli">CLI</a></li>
+        <li><a href="docs/server">Server</a></li>
+        <li><a href="docs/persistence">Persistence</a></li>
+        <li><a href="docs/bindings">Bindings</a></li>
+        <li><a href="docs/architecture">Architecture</a></li>
+        <li><a href="docs/roadmap">Roadmap</a></li>
+        <li><a href="extensions" class="active" aria-current="page">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+  <div class="container">
+<!-- Catalog UI ported from the repository Worker's former `/` page
+     (ext-repo/worker/src/index.js). The catalog is fetched client-side,
+     cross-origin, from the repository Worker; the pure helper section
+     (marked __PURE_END__) is lifted and tested by
+     ext-repo/worker/verify-ui.mjs. -->
+
+<div id="ext-intro">
+  <p class="kicker">extension repository</p>
+  <h1>Extensions</h1>
+  <p class="lede">Built extension artifacts from the pinkdb extension repository —
+  search the catalog, inspect metadata, and install one in a pinkdb shell with
+  <code>.install &lt;name&gt;</code>. The catalog is fetched live, cross-origin, from
+  <a href="https://pinkdb-ext-repo.defaultcms.workers.dev/index.json" rel="noopener">index.json</a>.</p>
+  <p class="doc-meta">Artifacts are immutable and verified by SHA-256 before loading (format v1;
+  see the repository's <code>FORMAT.md</code>). The
+  <a href="https://pinkdb-ext-repo.defaultcms.workers.dev/" rel="noopener">repository Worker</a>
+  serves the machine endpoints only.</p>
+</div>
+
+<div id="catalog">
+  <p class="lede"><span class="spinner" aria-hidden="true"></span>Loading catalog&hellip;</p>
+</div>
+
+<p id="catalog-status" class="sr-only" role="status" aria-live="polite"></p>
+
+<noscript>
+  <div class="callout warn">
+    <span class="callout-title">JavaScript required</span>
+    <p>This page renders the catalog with a small inline script. Without JavaScript,
+    fetch <a href="https://pinkdb-ext-repo.defaultcms.workers.dev/index.json" rel="noopener">index.json</a>
+    directly — it is plain JSON (format v1).</p>
+  </div>
+</noscript>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------ */
+  /* Pure helpers: no DOM access. verify-ui.mjs lifts this whole        */
+  /* section (everything before the __PURE_END__ marker), evaluates it  */
+  /* and runs it against the live catalog.                              */
+  /* ------------------------------------------------------------------ */
+
+  var REPO = "https://pinkdb-ext-repo.defaultcms.workers.dev";
+  var INDEX_URL = REPO + "/index.json";
+  var BASE_TITLE = "Extensions — pinkdb";
+
+  function isDigits(part) {
+    if (part === "") return false;
+    for (var i = 0; i < part.length; i++) {
+      var code = part.charCodeAt(i);
+      if (code < 48 || code > 57) return false;
+    }
+    return true;
+  }
+
+  function esc(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function compareVersions(a, b) {
+    var pa = String(a).split(".");
+    var pb = String(b).split(".");
+    var n = Math.max(pa.length, pb.length);
+    for (var i = 0; i < n; i++) {
+      var xa = i < pa.length ? pa[i] : "";
+      var xb = i < pb.length ? pb[i] : "";
+      var da = isDigits(xa);
+      var db = isDigits(xb);
+      if (da && db) {
+        var diff = parseInt(xa, 10) - parseInt(xb, 10);
+        if (diff !== 0) return diff;
+      } else if (da !== db) {
+        return da ? -1 : 1;
+      } else if (xa !== xb) {
+        return xa < xb ? -1 : 1;
+      }
+    }
+    return 0;
+  }
+
+  function sortEntries(entries) {
+    return entries.slice().sort(function (a, b) {
+      var diff = compareVersions(b.version, a.version);
+      if (diff !== 0) return diff;
+      return a.platform < b.platform ? -1 : a.platform > b.platform ? 1 : 0;
+    });
+  }
+
+  function pickPrimary(entries) {
+    var best = null;
+    for (var i = 0; i < entries.length; i++) {
+      if (best === null || compareVersions(entries[i].version, best.version) > 0) {
+        best = entries[i];
+      }
+    }
+    return best;
+  }
+
+  function artifactPath(entry) {
+    var file = typeof entry.file === "string" ? entry.file : "";
+    while (file.charAt(0) === "/") file = file.slice(1);
+    return "/" + file;
+  }
+
+  function artifactUrl(entry) {
+    return REPO + artifactPath(entry);
+  }
+
+  function shortHash(sha) {
+    var value = typeof sha === "string" ? sha : "";
+    if (value === "") return "—";
+    return value.length > 12 ? value.slice(0, 12) + "…" : value;
+  }
+
+  function formatSize(bytes) {
+    if (typeof bytes !== "number" || !isFinite(bytes) || bytes < 0) return "—";
+    if (bytes < 1024) return String(bytes) + " B";
+    var value = bytes;
+    var unit = "B";
+    var units = ["KiB", "MiB", "GiB", "TiB"];
+    for (var i = 0; i < units.length; i++) {
+      value = value / 1024;
+      unit = units[i];
+      if (value < 1024) break;
+    }
+    var rounded = value >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
+    return String(rounded) + " " + unit;
+  }
+
+  function fmtTimestamp(iso) {
+    if (typeof iso !== "string" || iso === "") return "—";
+    return iso.replace("T", " ").replace("Z", " UTC");
+  }
+
+  function matchesQuery(entry, query) {
+    var wanted = String(query == null ? "" : query).trim().toLowerCase();
+    if (wanted === "") return true;
+    var haystack = [entry.name, entry.description, entry.platform].join(" ").toLowerCase();
+    return haystack.indexOf(wanted) !== -1;
+  }
+
+  function filterEntries(entries, query) {
+    return (entries || []).filter(function (entry) {
+      return matchesQuery(entry, query);
+    });
+  }
+
+  function entriesByName(catalog, name) {
+    var found = [];
+    var all = catalog && Array.isArray(catalog.extensions) ? catalog.extensions : [];
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].name === name) found.push(all[i]);
+    }
+    return found;
+  }
+
+  function countText(shown, total, query) {
+    var unit = total === 1 ? "extension" : "extensions";
+    if (String(query == null ? "" : query).trim() === "") return total + " " + unit;
+    return shown + " of " + total + " " + unit;
+  }
+
+  function badgeHtml(text, kind) {
+    return '<span class="badge' + (kind ? " " + kind : "") + '">' + esc(text) + "</span>";
+  }
+
+  function copyButtonHtml(text, label) {
+    return '<button type="button" class="copy" data-copy="' + esc(text) +
+      '" aria-label="' + esc(label) + '">copy</button>';
+  }
+
+  function nameHref(name) {
+    return "#/" + esc(encodeURIComponent(String(name)));
+  }
+
+  function cardHtml(entry) {
+    var name = String(entry.name);
+    var sha = typeof entry.sha256 === "string" ? entry.sha256 : "";
+    var lines = [];
+    lines.push('<li class="card">');
+    lines.push('<div class="badges">' +
+      badgeHtml(entry.platform, "now") +
+      badgeHtml("abi " + entry.abi) +
+      badgeHtml("v" + entry.version) +
+      "</div>");
+    lines.push('<h3 class="card-title"><a href="' + nameHref(name) + '">' + esc(name) + "</a></h3>");
+    lines.push('<p class="card-desc">' + esc(entry.description == null ? "" : entry.description) + "</p>");
+    lines.push('<div class="hash-row"><code class="hash" title="' + esc(sha) + '">' +
+      esc(shortHash(sha)) + "</code>" +
+      copyButtonHtml(sha, "Copy SHA-256 of " + name + " " + entry.version) +
+      "</div>");
+    lines.push('<div class="card-foot">');
+    lines.push('<a class="button primary small" href="' + esc(artifactUrl(entry)) + '" download>Download</a>');
+    lines.push('<a class="button small" href="' + nameHref(name) + '">Details</a>');
+    lines.push('<span class="size" title="artifact size">' + esc(formatSize(entry.size)) + "</span>");
+    lines.push("</div>");
+    lines.push("</li>");
+    return lines.join("");
+  }
+
+  function cardsHtml(entries, query, total) {
+    if (entries.length === 0) {
+      if (total > 0) {
+        return '<li class="empty"><p>No extensions match &ldquo;' + esc(String(query).trim()) +
+          '&rdquo;.</p><button type="button" class="button small" data-clear-filter>Clear filter</button></li>';
+      }
+      return '<li class="empty"><p>No extensions have been published yet.</p>' +
+        '<p class="empty-note">Publish one with <code>ext-repo/publish.sh &lt;dylib&gt; --name &hellip; --version &hellip; --platform &hellip; --description &hellip;</code>.</p></li>';
+    }
+    var out = [];
+    for (var i = 0; i < entries.length; i++) out.push(cardHtml(entries[i]));
+    return out.join("");
+  }
+
+  function cmdHtml(command, tag) {
+    return '<div class="cmd"><code>' + esc(command) + "</code>" +
+      copyButtonHtml(command, "Copy command: " + command) +
+      '<span class="cmd-tag">' + esc(tag) + "</span></div>";
+  }
+
+  function installPanelHtml(entry) {
+    var name = String(entry.name);
+    return [
+      '<section class="panel" aria-labelledby="install-h">',
+      '<h2 id="install-h">Install</h2>',
+      '<p class="panel-note">From a pinkdb shell built with the opt-in <code>repo</code> feature:</p>',
+      cmdHtml(".install " + name, "latest"),
+      cmdHtml(".install " + name + "@" + entry.version, "pinned " + entry.version),
+      "</section>",
+    ].join("");
+  }
+
+  function metaRow(label, valueHtml) {
+    return '<tr><th scope="row">' + esc(label) + "</th><td>" + valueHtml + "</td></tr>";
+  }
+
+  function metaTableHtml(entry) {
+    var sha = typeof entry.sha256 === "string" ? entry.sha256 : "";
+    var rows = [
+      metaRow("Name", "<code>" + esc(entry.name) + "</code>"),
+      metaRow("Version", esc(entry.version)),
+      metaRow("ABI", esc(entry.abi)),
+      metaRow("Platform", "<code>" + esc(entry.platform) + "</code>"),
+      metaRow("Size", esc(formatSize(entry.size))),
+      metaRow("SHA-256", '<code class="wrap">' + esc(sha) + "</code> " +
+        copyButtonHtml(sha, "Copy SHA-256 of " + entry.name + " " + entry.version)),
+      metaRow("File", "<code>" + esc(entry.file) + "</code>"),
+      metaRow("Description", esc(entry.description == null ? "" : entry.description)),
+    ];
+    return '<div class="table-wrap"><table><tbody>' + rows.join("") + "</tbody></table></div>";
+  }
+
+  function downloadPanelHtml(entry) {
+    return [
+      '<section class="panel" aria-labelledby="download-h">',
+      '<h2 id="download-h">Download</h2>',
+      '<p class="panel-note">Immutable artifact — verify the SHA-256 after downloading.</p>',
+      '<p><a class="button primary" href="' + esc(artifactUrl(entry)) + '" download>Download ' +
+        esc(entry.name + " " + entry.version) + "</a></p>",
+      '<p class="panel-note"><code class="wrap">' + esc(artifactUrl(entry)) + "</code> <span>(" +
+        esc(formatSize(entry.size)) + ")</span></p>",
+      "</section>",
+    ].join("");
+  }
+
+  function versionsPanelHtml(entries) {
+    var rows = sortEntries(entries).map(function (entry) {
+      return "<tr><td><code>" + esc(entry.version) + "</code></td>" +
+        "<td><code>" + esc(entry.platform) + "</code></td>" +
+        '<td class="num">' + esc(formatSize(entry.size)) + "</td>" +
+        '<td><code class="hash">' + esc(shortHash(entry.sha256)) + "</code></td>" +
+        '<td><a class="button small" href="' + esc(artifactUrl(entry)) + '" download>Download</a></td></tr>';
+    }).join("");
+    return [
+      '<section class="panel" aria-labelledby="versions-h">',
+      '<h2 id="versions-h">All versions and platforms</h2>',
+      '<div class="table-wrap"><table><thead><tr>' +
+        '<th scope="col">Version</th><th scope="col">Platform</th>' +
+        '<th scope="col" class="num">Size</th><th scope="col">SHA-256</th>' +
+        '<th scope="col">Artifact</th></tr></thead><tbody>',
+      rows,
+      "</tbody></table></div>",
+      "</section>",
+    ].join("");
+  }
+
+  function rawPanelHtml(entries) {
+    var raw = entries.length === 1 ? entries[0] : entries;
+    return [
+      '<section class="panel" aria-labelledby="raw-h">',
+      '<h2 id="raw-h">Raw catalog entry</h2>',
+      '<pre class="code" data-lang="json"><code>' + esc(JSON.stringify(raw, null, 2)) + "</code></pre>",
+      "</section>",
+    ].join("");
+  }
+
+  function detailHtml(entries) {
+    var primary = pickPrimary(entries);
+    var parts = [
+      '<a class="backlink" href="#/"><span aria-hidden="true">&#8592;</span> All extensions</a>',
+      '<p class="kicker">extension</p>',
+      "<h1>" + esc(primary.name) + "</h1>",
+      '<p class="lede">' + esc(primary.description == null ? "" : primary.description) + "</p>",
+      '<div class="badges">' +
+        badgeHtml(primary.platform, "now") +
+        badgeHtml("abi " + primary.abi) +
+        badgeHtml("v" + primary.version) +
+        "</div>",
+      installPanelHtml(primary),
+      downloadPanelHtml(primary),
+      '<section class="panel" aria-labelledby="meta-h"><h2 id="meta-h">Metadata</h2>' +
+        metaTableHtml(primary) + "</section>",
+      versionsPanelHtml(entries),
+    ];
+    parts.push(rawPanelHtml(entries));
+    return parts.join("");
+  }
+
+  function listView(catalog, query) {
+    var all = Array.isArray(catalog.extensions) ? catalog.extensions : [];
+    var shown = filterEntries(all, query);
+    var parts = [
+      '<p class="doc-meta">format v' + esc(catalog.format_version) +
+        " &middot; catalog updated " + esc(fmtTimestamp(catalog.updated)) + "</p>",
+    ];
+    if (all.length === 0) {
+      parts.push('<div class="empty"><p>No extensions have been published yet.</p>' +
+        '<p class="empty-note">The first publish turns this page into a browsable catalog.</p></div>');
+      return parts.join("");
+    }
+    parts.push('<form class="toolbar" role="search">' +
+      '<label class="sr-only" for="filter">Filter extensions by name, description, or platform</label>' +
+      '<input id="filter" type="search" name="filter" autocomplete="off" spellcheck="false" ' +
+      'placeholder="Filter by name, description, or platform&hellip;" value="' +
+      esc(query == null ? "" : String(query)) + '">' +
+      '<span class="count" id="count">' + esc(countText(shown.length, all.length, query)) + "</span>" +
+      "</form>");
+    parts.push('<ul class="cards" id="grid">' + cardsHtml(shown, query, all.length) + "</ul>");
+    return parts.join("");
+  }
+
+  function loadingView() {
+    return '<p class="lede"><span class="spinner" aria-hidden="true"></span>Fetching <a href="' +
+      esc(INDEX_URL) + '" rel="noopener">index.json</a>&hellip;</p>';
+  }
+
+  function errorView(message) {
+    return [
+      '<p class="kicker">repository</p>',
+      "<h1>Catalog unavailable</h1>",
+      '<div class="empty error">',
+      "<p>" + esc(message) + "</p>",
+      '<p class="empty-note">The catalog is fetched from <a href="' + esc(INDEX_URL) +
+        '" rel="noopener">' + esc(INDEX_URL) + "</a>; if the repository or its R2 bucket is " +
+        "unavailable, this page has nothing to show.</p>",
+      '<p><button type="button" class="button primary" id="retry">Retry</button></p>',
+      "</div>",
+    ].join("");
+  }
+
+  function notFoundView(kind, value) {
+    var heading = kind === "name" ? "No such extension" : "No such page";
+    var lead = kind === "name"
+      ? "Nothing in the catalog matches the extension name <code>" + esc(value) + "</code>."
+      : "The page has no route for <code>" + esc(value) + "</code>.";
+    return [
+      '<p class="kicker">not found</p>',
+      "<h1>" + heading + "</h1>",
+      '<p class="lede">' + lead + "</p>",
+      '<p><a class="button" href="#/">Back to the catalog</a> ' +
+        '<a class="button ghost" href="' + esc(INDEX_URL) + '" rel="noopener">View index.json</a></p>',
+    ].join("");
+  }
+
+  var pure = {
+    REPO: REPO,
+    indexUrl: INDEX_URL,
+    isDigits: isDigits,
+    esc: esc,
+    compareVersions: compareVersions,
+    sortEntries: sortEntries,
+    pickPrimary: pickPrimary,
+    artifactPath: artifactPath,
+    artifactUrl: artifactUrl,
+    shortHash: shortHash,
+    formatSize: formatSize,
+    fmtTimestamp: fmtTimestamp,
+    matchesQuery: matchesQuery,
+    filterEntries: filterEntries,
+    entriesByName: entriesByName,
+    countText: countText,
+    cardHtml: cardHtml,
+    cardsHtml: cardsHtml,
+    detailHtml: detailHtml,
+    versionsPanelHtml: versionsPanelHtml,
+    listView: listView,
+    loadingView: loadingView,
+    errorView: errorView,
+    notFoundView: notFoundView,
+  };
+  /* __PURE_END__ */
+
+  /* ------------------------------------------------------------------ */
+  /* DOM wiring (not part of the tested pure section).                  */
+  /* ------------------------------------------------------------------ */
+
+  var viewEl = document.getElementById("catalog");
+  var introEl = document.getElementById("ext-intro");
+  var statusEl = document.getElementById("catalog-status");
+  var state = { status: "loading", catalog: null, error: "", query: "" };
+
+  function setStatus(text) {
+    if (statusEl) statusEl.textContent = text;
+  }
+
+  function showIntro(show) {
+    if (introEl) introEl.hidden = !show;
+  }
+
+  function currentRoute() {
+    var raw = String(location.hash || "");
+    if (raw.charAt(0) === "#") raw = raw.slice(1);
+    if (raw === "" || raw === "/") return { view: "list" };
+    if (raw.charAt(0) !== "/") return { view: "bad", path: raw };
+    var rest = raw.slice(1);
+    if (rest.length > 1 && rest.charAt(rest.length - 1) === "/") {
+      rest = rest.slice(0, rest.length - 1);
+    }
+    if (rest === "" || rest.indexOf("/") !== -1) return { view: "bad", path: raw };
+    try {
+      return { view: "detail", name: decodeURIComponent(rest) };
+    } catch (err) {
+      return { view: "bad", path: raw };
+    }
+  }
+
+  function render(options) {
+    if (state.status === "loading") {
+      showIntro(true);
+      viewEl.innerHTML = loadingView();
+      document.title = BASE_TITLE;
+      return;
+    }
+    if (state.status === "error") {
+      showIntro(false);
+      viewEl.innerHTML = errorView(state.error);
+      document.title = "Catalog unavailable — pinkdb";
+      var retry = document.getElementById("retry");
+      if (retry) retry.addEventListener("click", load);
+      return;
+    }
+    var route = currentRoute();
+    if (route.view === "list") {
+      showIntro(true);
+      viewEl.innerHTML = listView(state.catalog, state.query);
+      document.title = BASE_TITLE;
+      wireList();
+    } else if (route.view === "detail") {
+      var entries = entriesByName(state.catalog, route.name);
+      showIntro(false);
+      if (entries.length === 0) {
+        viewEl.innerHTML = notFoundView("name", route.name);
+        document.title = "Not found — pinkdb";
+      } else {
+        viewEl.innerHTML = detailHtml(entries);
+        document.title = pickPrimary(entries).name + " — pinkdb";
+      }
+    } else {
+      showIntro(false);
+      viewEl.innerHTML = notFoundView("path", route.path);
+      document.title = "Not found — pinkdb";
+    }
+    if (options && options.focus) {
+      var heading = viewEl.querySelector("h1");
+      if (heading) {
+        heading.setAttribute("tabindex", "-1");
+        heading.focus();
+      }
+    }
+  }
+
+  function refreshGrid() {
+    var all = state.catalog && Array.isArray(state.catalog.extensions) ? state.catalog.extensions : [];
+    var shown = filterEntries(all, state.query);
+    var grid = document.getElementById("grid");
+    var count = document.getElementById("count");
+    if (grid) grid.innerHTML = cardsHtml(shown, state.query, all.length);
+    if (count) count.textContent = countText(shown.length, all.length, state.query);
+  }
+
+  function wireList() {
+    var form = viewEl.querySelector(".toolbar");
+    var input = document.getElementById("filter");
+    if (form) {
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+      });
+    }
+    if (input) {
+      input.addEventListener("input", function () {
+        state.query = input.value;
+        refreshGrid();
+      });
+    }
+  }
+
+  function copyFallback(text) {
+    return new Promise(function (resolve, reject) {
+      try {
+        var area = document.createElement("textarea");
+        area.value = text;
+        area.setAttribute("readonly", "");
+        area.style.position = "fixed";
+        area.style.top = "-1000px";
+        document.body.appendChild(area);
+        area.select();
+        var ok = document.execCommand("copy");
+        document.body.removeChild(area);
+        if (ok) resolve();
+        else reject(new Error("copy rejected"));
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text).catch(function () {
+        return copyFallback(text);
+      });
+    }
+    return copyFallback(text);
+  }
+
+  document.addEventListener("click", function (event) {
+    var target = event.target;
+    if (!target || !target.closest) return;
+    if (target.closest("[data-clear-filter]")) {
+      state.query = "";
+      var input = document.getElementById("filter");
+      if (input) {
+        input.value = "";
+        input.focus();
+      }
+      refreshGrid();
+      return;
+    }
+    var button = target.closest("[data-copy]");
+    if (!button) return;
+    var text = button.getAttribute("data-copy") || "";
+    var original = button.textContent;
+    copyText(text).then(function () {
+      button.textContent = "copied";
+      button.classList.add("copied");
+      setStatus("Copied to clipboard: " + text);
+      setTimeout(function () {
+        button.textContent = original;
+        button.classList.remove("copied");
+      }, 1400);
+    }, function () {
+      setStatus("Copy failed — select the text and copy it manually.");
+    });
+  });
+
+  function load() {
+    state.status = "loading";
+    state.error = "";
+    render();
+    setStatus("Loading the catalog");
+    fetch(INDEX_URL, { headers: { accept: "application/json" } })
+      .then(function (response) {
+        if (!response.ok) {
+          throw new Error("the repository answered HTTP " + response.status + " for index.json");
+        }
+        return response.json();
+      })
+      .then(function (data) {
+        if (!data || typeof data !== "object") throw new Error("index.json is not a JSON object");
+        if (data.format_version !== 1) {
+          throw new Error("unsupported catalog format version " + String(data.format_version) +
+            " (this page understands format v1)");
+        }
+        if (!Array.isArray(data.extensions)) throw new Error("index.json has no extensions array");
+        state.catalog = data;
+        state.status = "ready";
+        setStatus(data.extensions.length + (data.extensions.length === 1 ? " extension" : " extensions") +
+          " in the catalog");
+        render();
+      })
+      .catch(function (error) {
+        state.status = "error";
+        state.error = error && error.message ? error.message : "the catalog could not be loaded";
+        render();
+      });
+  }
+
+  window.addEventListener("hashchange", function () {
+    render({ focus: true });
+  });
+
+  load();
+})();
+</script>
+
+  </div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p><a href="./">Home</a> · <a href="docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+  </div>
+</footer>
+</body>
+</html>

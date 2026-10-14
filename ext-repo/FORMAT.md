@@ -18,7 +18,11 @@ Worker (binding EXT_BUCKET)
 There are no directory listings, no query APIs, and no mutable state beyond
 "add a new immutable artifact + append it to the index". Format version 1 is
 the only version; `format_version` in `index.json` exists so a future format
-can be detected instead of mis-parsed.
+can be detected instead of mis-parsed. The `GET /` page is a short info page
+(version + links); the browsable catalog UI lives in the docs site at
+<https://pinkdb-docs.defaultcms.workers.dev/extensions> and renders the same
+files client-side (it fetches `index.json` cross-origin and links the
+artifact URLs). Neither adds server-side API surface.
 
 ## `index.json`
 
@@ -36,11 +40,15 @@ UTF-8 JSON. The top level is the catalog:
       "platform": "darwin-arm64",
       "file": "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib",
       "sha256": "38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2",
+      "size": 17088,
       "description": "Clamp and degree/radian helpers (ext_clamp, ext_deg2rad)"
     }
   ]
 }
 ```
+
+The example above includes `size`; the currently published `math_ext` 0.1.0
+entry predates the field and omits it (consumers must tolerate that).
 
 Field semantics:
 
@@ -60,14 +68,15 @@ Entry fields:
 | `platform` | string | Platform tag (see below). |
 | `file` | string | Repository-relative path of the artifact; the URL path is `/<file>`. |
 | `sha256` | string | Lowercase hex SHA-256 of the artifact bytes (the exact file downloaded from `file`). |
+| `size` | integer | Artifact size in bytes. **Optional but recommended**: `publish.py` always writes it, but entries published before the field existed omit it. Consumers MUST tolerate its absence and MUST NOT use it for correctness (the `sha256` is authoritative); it is meant for display and pre-download checks. |
 | `description` | string | One-line human-readable description. |
 
 ## URL layout
 
 | URL | Content-Type | Cache | Notes |
 |---|---|---|---|
-| `/` | `text/html; charset=utf-8` | `no-store` | Tiny info page (name, format version, link to the catalog). |
-| `/index.json` | `application/json; charset=utf-8` | `public, max-age=60` | Catalog; carries `ETag`, supports `If-None-Match` → `304`. |
+| `/` | `text/html; charset=utf-8` | `no-store` | Short info page: repository title, format version, links to the docs catalog UI and `/index.json`. The browsable UI lives in the docs site and fetches `/index.json` client-side. |
+| `/index.json` | `application/json; charset=utf-8` | `public, max-age=60` | Catalog; carries `ETag`, supports `If-None-Match` → `304`, and `Access-Control-Allow-Origin: *`. `OPTIONS /index.json` answers `204` with `Access-Control-Allow-Methods: GET, HEAD, OPTIONS`. |
 | `/artifacts/<name>/<version>/<platform>/<file>` | `application/octet-stream` | `public, max-age=31536000, immutable` | Artifact bytes with `Content-Length` and `ETag`; supports `If-None-Match` → `304`. |
 | anything else | `text/plain` | `no-store` | `404`. Missing catalog / missing artifact are `404` with a one-line body. |
 
@@ -120,8 +129,8 @@ repository.
 
 ## Publishing
 
-Use `publish.py` (see `README.md` for the walkthrough). It computes the hash,
-enforces the immutability rule above against the current index, stages the
-artifact at `artifacts/<name>/<version>/<platform>/<file>`, rewrites
+Use `publish.py` (see `README.md` for the walkthrough). It computes the hash
+and size, enforces the immutability rule above against the current index,
+stages the artifact at `artifacts/<name>/<version>/<platform>/<file>`, rewrites
 `index.json` (sorted, fresh `updated`), and uploads both objects to the R2
 bucket with `wrangler r2 object put --remote`.

@@ -359,6 +359,133 @@ ol.steps > li::marker { color: var(--pink-strong); font-weight: 700; }
 }
 .footer-row p { margin: 0; }
 
+/* ---------- Extensions catalog (extensions page) ---------- */
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem 1rem;
+  margin: 1.5rem 0 1.25rem;
+}
+.toolbar input {
+  flex: 1 1 18rem;
+  min-width: 0;
+  background: var(--bg-code);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.55rem 0.85rem;
+}
+.toolbar input::placeholder { color: var(--muted); }
+.toolbar input:focus {
+  outline: none;
+  border-color: var(--pink);
+  box-shadow: 0 0 0 3px var(--pink-dim);
+}
+.count { color: var(--muted); font-family: var(--mono); font-size: 0.85rem; white-space: nowrap; }
+
+#catalog .cards { margin: 1.25rem 0 0.5rem; }
+#catalog .card { display: flex; flex-direction: column; }
+#catalog .card-title { margin: 0 0 0.35rem; font-size: 1.02rem; }
+#catalog .card-title a { text-decoration: none; }
+#catalog .card-title a:hover { text-decoration: underline; }
+#catalog .card-desc { color: var(--muted); font-size: 0.92rem; margin: 0 0 0.8rem; flex: 1 1 auto; }
+
+.badges { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.1rem 0 0.55rem; }
+
+.hash-row { display: flex; align-items: center; gap: 0.45rem; margin: 0 0 0.8rem; min-width: 0; }
+code.hash { font-size: 0.78rem; color: var(--muted); }
+
+.copy {
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.1rem 0.45rem;
+  cursor: pointer;
+  line-height: 1.6;
+}
+.copy:hover { color: var(--pink-strong); border-color: rgba(255, 95, 143, 0.45); }
+.copy.copied { color: var(--green); border-color: rgba(127, 224, 168, 0.4); }
+
+.card-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin-top: auto; }
+.card-foot .size { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 0.78rem; }
+.button.small { padding: 0.28rem 0.6rem; font-size: 0.82rem; border-radius: 8px; }
+
+.backlink { display: inline-block; margin-bottom: 1rem; font-size: 0.9rem; text-decoration: none; }
+
+.panel {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: 0.9rem 1.1rem 1.1rem;
+  margin: 1.25rem 0;
+}
+.panel h2 { margin: 0.35rem 0 0.6rem; padding-bottom: 0; border-bottom: 0; font-size: 1.15rem; }
+.panel-note { color: var(--muted); font-size: 0.88rem; }
+.cmd { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0; }
+.cmd .cmd-tag {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.spinner {
+  display: inline-block;
+  width: 0.85em;
+  height: 0.85em;
+  border: 2px solid var(--border);
+  border-top-color: var(--pink);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  vertical-align: -0.08em;
+  margin-right: 0.45rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.empty {
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-soft);
+  padding: 1.6rem 1.4rem;
+  color: var(--muted);
+  text-align: center;
+  grid-column: 1 / -1;
+  margin: 1.25rem 0;
+}
+.empty p { margin: 0.4rem 0; }
+.empty-note { font-size: 0.88rem; }
+.empty.error { border-style: solid; border-color: rgba(255, 95, 143, 0.4); }
+.empty.error p:first-child { color: var(--text); }
+
+#catalog tbody th { color: var(--muted); font-weight: 600; white-space: nowrap; }
+#catalog code.wrap { overflow-wrap: anywhere; white-space: normal; }
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner { animation: none; }
+}
+
 /* ---------- Small screens ---------- */
 
 @media (max-width: 40rem) {
@@ -366,4 +493,6 @@ ol.steps > li::marker { color: var(--pink-strong); font-weight: 700; }
   .site-nav a { padding: 0.18rem 0.4rem; font-size: 0.85rem; }
   pre.code { padding: 0.8rem 0.85rem; }
   h2 { margin-top: 2.1rem; }
+  .panel h2 { margin-top: 0.35rem; }
+  .card-foot .size { margin-left: 0; }
 }
