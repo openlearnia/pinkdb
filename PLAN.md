@@ -178,6 +178,48 @@ Reproduce: `python3 bench/lake_bench.py --rows 1000000 --runs 5` (add
 Vortex scan/decode speed at 10M (the engine's in-memory scans lose to
 Parquet for filter/group-by/order-by there).
 
+## Real-S3 integration harness (Oct 2026, wave 36 follow-up)
+
+`crates/pink-lake/tests/s3_docker.sh` (new; bash + python3 + Docker, not
+wired into `cargo test`) is the independent, real-socket counterpart of the
+hermetic `mock_s3.rs` suite. It manages its own `adobe/s3mock:latest`
+container (`pinkdb-s3mock-itest`, initial bucket `pinklake`; auto-picks a free
+host port when 9090 is busy; removed on exit, while `KEEP=1` leaves it for the
+next run to reuse), waits for an unsigned PUT/GET readiness probe, probes the
+server's conditional-write behaviour (sequential semantics + a concurrency
+**atomicity** probe), then drives the release CLI
+(`cargo build --release -p pinkdb-cli --features lake,s3`): a typed-CSV
+round-trip (NULL/`-0.0`/BIGINT/DATE/TIMESTAMP/multibyte) with a fresh-process
+`.lake open` exact-value compare and an unsigned REST object listing; a
+3-writer × 3-round race plus a deterministic slow-vs-quick same-version
+conflict with a settle save afterwards (win-xor-conflict per attempt, gapless
+catalog chain, exactly one winner for the controlled version,
+`catalog.json` == `snapshots/<v>.json` bytes via curl + `cmp`); and the
+snapshot-exists refusal (planted stray snapshot, then a clean save after
+removing it). First full runs on this machine: 493/493 default `cargo test`
+still green (36 binaries, 1 ignored); harness runs ~5–8 s each, four clean
+runs incl. `KEEP=1` reuse and a default-port-9090 run, container removed each
+time.
+
+**Finding (the reason the harness probes first):** s3mock evaluates a
+conditional PutObject's precondition *outside* its per-object lock
+(`ObjectController.putObject` → `verifyObjectMatching` → `putObject`), so two
+truly concurrent conditional PUTs can both be answered 200 — its documented
+conditional semantics are sequential-only, unlike AWS S3 / R2, whose
+evaluation is atomic with the write commit (what the single-writer contract
+relies on). Measured: 60/60 raw curl trials (fresh key, two parallel
+`If-None-Match: *` PUTs → both 200) and 3–4/4 in the harness's per-run probe;
+in the 3×3 race this shows up as 0–3 duplicate claims per run depending on
+writer overlap. The harness therefore reports duplicate race publications as
+the measured server limitation (probe evidence + source reference in
+`s3_docker_notes.md`), enforces the one-winner assertion on servers that can
+uphold it (the in-repo atomic mock pins the client logic today;
+`PINKDB_S3_LIVE=1` is the real-service check), and asserts the deterministic
+same-version conflict + final-version `catalog.json` == `snapshots/<v>.json`
+bytes on any server. MinIO images are not anonymously pullable right now
+(Docker Hub: `pull access denied … may require 'docker login'`; quay.io:
+`401 UNAUTHORIZED`), so s3mock is the documented recipe.
+
 ## Roadmap (post-wave 21)
 
 | Wave | Scope | Packaging |

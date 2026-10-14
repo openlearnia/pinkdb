@@ -692,6 +692,71 @@ cargo build -p pinkdb-cli --features lake,s3
   against the real service (it is skipped by default and leaves objects under
   the prefix — there is no GC).
 
+### Testing against a real S3 server (Docker)
+
+The in-repo mock (`mock_s3.rs`) is the hermetic protocol suite — it verifies
+SigV4 and the conditional-write machinery in-process. For an independent
+end-to-end check over a real socket, `crates/pink-lake/tests/s3_docker.sh`
+manages its own **s3mock** container, drives the release CLI through it, and
+removes the container again:
+
+```sh
+crates/pink-lake/tests/s3_docker.sh          # KEEP=1 leaves the container up (the next run reuses it)
+```
+
+The container it creates (equivalent to the manual recipe):
+
+```sh
+docker run -d --name pinkdb-s3mock-itest -p 127.0.0.1:9090:9090 \
+  -e COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS=pinklake \
+  adobe/s3mock:latest
+```
+
+The CLI environment the script pins (any dummy credentials work — s3mock does
+not verify SigV4; the harness's own `curl` calls are unsigned on purpose):
+
+```sh
+AWS_ACCESS_KEY_ID=anything AWS_SECRET_ACCESS_KEY=anything
+AWS_ENDPOINT_URL=http://127.0.0.1:9090 AWS_REGION=us-east-1
+PINKDB_S3_ALLOW_HTTP=1     # plain http:// endpoint: local test servers only
+```
+
+`PINKDB_S3_ALLOW_HTTP=1` is required for an `http://` endpoint (credentials
+travel unencrypted); `PINKDB_S3_ALLOW_DEGRADED` must stay **unset** — s3mock
+enforces the conditional headers, so the safe path applies, and the script
+proves that before any lake write (`If-None-Match: *` on an existing key →
+412; a wrong `If-Match` → 412). The script then runs a typed-CSV round-trip
+with a fresh-process `.lake open` + exact value comparison (NULL, `-0.0`,
+BIGINT, DATE/TIMESTAMP, multibyte) and an unsigned REST listing of the
+published objects; a 3-writer × 3-round race plus a deterministic
+slow-vs-quick save racing for the *same* version (win-xor-conflict per
+attempt, gapless version chain, exactly one winner for the controlled
+version); and the snapshot-exists refusal (a planted stray snapshot, then a
+clean save after removing it). Ports/names/row counts are environment knobs
+in the script header (`PORT`, `CONTAINER`, `KEEP`, `PINKDB_BIN`,
+`SKIP_BUILD`, `WROWS`, `SLOWROWS`).
+
+**Measured s3mock caveat:** s3mock checks a conditional PutObject's
+precondition *before* taking the store's per-object lock
+(`ObjectController.putObject` → `verifyObjectMatching` → `putObject`), so two
+truly concurrent conditional PUTs can both be answered 200 — unlike AWS S3 /
+R2, which evaluate the condition atomically with the write commit. The script
+probes this (racing `If-None-Match: *` and `If-Match` PUTs) and, on a server
+that cannot uphold it, reports the race's duplicate publications as the
+measured server limitation instead of failing; the one-winner-per-version
+assertion is enforced where the server is atomic, and the *controlled*
+same-version conflict is asserted regardless. Raw evidence, the source
+reference, and the full assert/caveat matrix:
+`crates/pink-lake/tests/s3_docker_notes.md`.
+
+**MinIO note:** MinIO images cannot be pulled anonymously right now —
+`docker pull minio/minio` fails with `pull access denied … may require
+'docker login'` and `quay.io/minio/minio` answers `401 UNAUTHORIZED` — which
+is why s3mock is the documented recipe. Any S3-compatible endpoint works the
+same way; for a real AWS/R2 bucket use the opt-in `PINKDB_S3_LIVE=1` test
+above, which is also where the atomic-conditional one-winner guarantee is
+checked against a real service.
+
 ## Network server
 
 `pinkdb-server` is a separate workspace crate (packaging: the core stays
@@ -1245,6 +1310,7 @@ cargo test -p pinkdb-server                          # protocol + server + durab
 cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
 cargo test -p pinkdb-cli --features lake             # lake round-trip + CLI tests
 cargo test -p pinkdb-cli --features lake,s3          # + S3/R2 over a hermetic mock S3
+crates/pink-lake/tests/s3_docker.sh                  # real S3 round-trip/race vs s3mock in Docker (not cargo test)
 cargo build -p pinkdb-cli --features lake            # REPL with .lake commands
 cargo build -p pinkdb-cli --features lake,s3         # REPL with .lake s3:// URLs
 PINKDB_CLI_BIN=./target/release/pinkdb cargo test -p pinkdb-cli --features lake  # release CLI (overflow checks off)
