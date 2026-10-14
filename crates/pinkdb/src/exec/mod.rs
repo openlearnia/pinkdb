@@ -14,8 +14,12 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 use crate::types::{FastMap, FastSet};
 
-use aggregate::{aggregate, emit_groups, merge_partials, Acc, Group, Partial};
-use expr::{coerce_to, eval_expr, select_true};
+use aggregate::{
+    aggregate, emit_groups, local_index_capacity, merge_partials, Acc, Group, Partial,
+    HIGH_CARDINALITY_KEYS,
+};
+use aggregate::{eval_agg_vec as eval_fused_vec, EvalVec as FusedVec};
+use expr::{coerce_to, count_true, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
 
@@ -374,9 +378,10 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             if let Some(out) = fused_join_aggregate(cx, input, keys, aggs)? {
                 return Ok(out);
             }
-            let inner = eval(cx, input)?;
-            // Fast path: pure COUNT(*) with no keys counts chunk lengths —
-            // no data touched at all.
+            // Fast path: pure COUNT(*) with no keys counts rows — no data
+            // touched at all. Over a Filter, count the predicate's TRUE rows
+            // per chunk straight away: the filtered chunks are never
+            // materialized (no selection vector, no gathered columns).
             if keys.is_empty()
                 && !aggs.is_empty()
                 && aggs.iter().all(|a| a.func == crate::sql::binder::AggFunc::Count && a.arg.is_none())
@@ -385,7 +390,25 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 // all-COUNT(*) shape reaching here is a single COUNT(*) —
                 // and this path emits exactly one column.
                 debug_assert_eq!(aggs.len(), 1);
-                let total: i64 = inner.chunks.iter().map(|c| c.num_rows() as i64).sum();
+                let total: i64 = match &**input {
+                    LogicalPlan::Filter { input: fin, predicate } => {
+                        let inner = eval(cx, fin)?;
+                        inner
+                            .chunks
+                            .par_iter()
+                            .map(|chunk| {
+                                let pred = eval_expr(predicate, chunk, cx)?;
+                                count_true(&pred)
+                            })
+                            .collect::<Result<Vec<i64>>>()?
+                            .into_iter()
+                            .sum()
+                    }
+                    _ => {
+                        let inner = eval(cx, input)?;
+                        inner.chunks.iter().map(|c| c.num_rows() as i64).sum()
+                    }
+                };
                 let mut vec = Vector::new_empty(DataType::Bigint);
                 vec.push_valid(Value::Bigint(total))?;
                 let chunks = vec![DataChunk::new(vec![vec])?];
@@ -397,6 +420,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 }
                 return Ok(Output { chunks, names, types });
             }
+            let inner = eval(cx, input)?;
             let chunks = aggregate(cx, &inner.chunks, keys, aggs)?;
             let (names, types) = agg_output_schema(keys, aggs);
             Ok(Output { chunks, names, types })
@@ -442,12 +466,22 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let chunks = inner
                 .chunks
                 .par_iter()
-                .map(|chunk| {
-                    let cols = exprs
+                .map(|chunk| -> Result<DataChunk> {
+                    // Pass-through column references (and aggregate/window
+                    // output columns) share the input chunk's `Arc<Vector>`
+                    // instead of deep-copying the payload.
+                    let cols: Vec<std::sync::Arc<Vector>> = exprs
                         .iter()
-                        .map(|e| eval_expr(e, chunk, cx))
-                        .collect::<Result<Vec<_>>>()?;
-                    DataChunk::new(cols)
+                        .map(|e| match e {
+                            BoundExpr::Column { index, .. }
+                            | BoundExpr::AggRef { index, .. }
+                            | BoundExpr::WindowRef { index, .. } => Ok(chunk.columns[*index].clone()),
+                            e => Ok(std::sync::Arc::new(eval_expr(e, chunk, cx)?)),
+                        })
+                        .collect::<Result<_>>()?;
+                    DataChunk::from_arcs(cols).ok_or_else(|| {
+                        PinkDbError::Execution("project column length mismatch".to_string())
+                    })
                 })
                 .collect::<Result<_>>()?;
             Ok(Output { chunks, names: names.clone(), types })
@@ -1211,32 +1245,6 @@ fn expr_is_total(e: &BoundExpr) -> bool {
     }
 }
 
-/// One evaluated key/arg vector: a bare column reference borrows its chunk's
-/// vector (no deep clone), anything else is an owned evaluation result.
-enum FusedVec<'a> {
-    Col(&'a Vector),
-    Owned(Vector),
-}
-
-impl FusedVec<'_> {
-    #[inline]
-    fn v(&self) -> &Vector {
-        match self {
-            FusedVec::Col(v) => v,
-            FusedVec::Owned(v) => v,
-        }
-    }
-}
-
-/// Evaluate one planned expression over `chunk`; bare `Column` refs borrow
-/// the chunk column instead of cloning it.
-fn eval_fused_vec<'a>(expr: &BoundExpr, chunk: &'a DataChunk, cx: &Cx) -> Result<FusedVec<'a>> {
-    match expr {
-        BoundExpr::Column { index, .. } => Ok(FusedVec::Col(chunk.column(*index))),
-        e => Ok(FusedVec::Owned(eval_expr(e, chunk, cx)?)),
-    }
-}
-
 /// Try to execute `Aggregate` over `Join` or `Project over Join` without
 /// materializing the joined rows: each match feeds one row into its group's
 /// accumulators directly. Returns `Ok(None)` — before evaluating anything —
@@ -1438,11 +1446,12 @@ fn fused_join_aggregate(
             let mut partial = Partial {
                 groups: Vec::new(),
                 index: FastMap::with_capacity_and_hasher(
-                    chunk.num_rows().min(1 << 16),
+                    local_index_capacity(chunk.num_rows()),
                     Default::default(),
                 ),
             };
             let mut buf = Vec::new();
+            let mut full_reserved = false;
             for li in 0..chunk.num_rows() {
                 if kv.is_null(li) {
                     continue;
@@ -1477,6 +1486,14 @@ fn fused_join_aggregate(
                         None => {
                             let enc = buf.clone();
                             let idx = partial.groups.len();
+                            if !full_reserved
+                                && partial.index.len() >= HIGH_CARDINALITY_KEYS
+                            {
+                                partial
+                                    .index
+                                    .reserve(chunk.num_rows().saturating_sub(partial.index.len()));
+                                full_reserved = true;
+                            }
                             partial.index.insert(enc.clone(), idx);
                             partial.groups.push((
                                 enc,
@@ -1501,22 +1518,15 @@ fn fused_join_aggregate(
                     let group = &mut partial.groups[idx].1;
                     for (acc, src) in group.accs.iter_mut().zip(arg_srcs.iter()) {
                         match src {
-                            None => acc.update(Some(&Value::Integer(1))), // COUNT(*)
+                            // COUNT(*): every row counts.
+                            None => acc.count_star(),
+                            // Typed read of the cell (NULL skips), the same
+                            // accumulator update the materialized path makes.
                             Some(ExprSource::Left(s)) => {
-                                let v = left_vecs[*s].v();
-                                if v.is_null(li) {
-                                    acc.update(None);
-                                } else {
-                                    acc.update(Some(&v.get(li)));
-                                }
+                                acc.update_vec(left_vecs[*s].v(), li)
                             }
                             Some(ExprSource::Right(s)) => {
-                                let v = right_vecs[rci][*s].v();
-                                if v.is_null(ri) {
-                                    acc.update(None);
-                                } else {
-                                    acc.update(Some(&v.get(ri)));
-                                }
+                                acc.update_vec(right_vecs[rci][*s].v(), ri)
                             }
                         }
                     }
@@ -1613,17 +1623,18 @@ impl PartialOrd for Candidate<'_> {
 }
 
 /// Evaluate every sort key over every chunk in parallel, preserving chunk
-/// order (the same per-chunk assembly the old `Row` build used).
-fn eval_sort_keys(
+/// order (the same per-chunk assembly the old `Row` build used). A bare
+/// column key borrows its chunk's vector instead of deep-copying it.
+fn eval_sort_keys<'a>(
     cx: &Cx,
-    chunks: &[DataChunk],
+    chunks: &'a [DataChunk],
     keys: &[(BoundExpr, bool)],
-) -> Result<Vec<Vec<Vector>>> {
+) -> Result<Vec<Vec<FusedVec<'a>>>> {
     chunks
         .par_iter()
         .map(|chunk| {
             keys.iter()
-                .map(|(k, _)| eval_expr(k, chunk, cx))
+                .map(|(k, _)| eval_fused_vec(k, chunk, cx))
                 .collect::<Result<Vec<_>>>()
         })
         .collect()
@@ -1711,7 +1722,7 @@ fn encode_key_into(v: &Vector, idx: usize, desc: bool, out: &mut Vec<u8>) -> boo
 /// comparator path.
 fn encode_sort_keys(
     chunks: &[DataChunk],
-    keyed: &[Vec<Vector>],
+    keyed: &[Vec<FusedVec>],
     keys: &[(BoundExpr, bool)],
 ) -> Option<SortArena> {
     let n: usize = chunks.iter().map(|c| c.num_rows()).sum();
@@ -1724,8 +1735,8 @@ fn encode_sort_keys(
     for ks in keyed {
         for (ki, v) in ks.iter().enumerate() {
             match dtypes.get(ki) {
-                None => dtypes.push(v.dtype()),
-                Some(t) if *t == v.dtype() => {}
+                None => dtypes.push(v.v().dtype()),
+                Some(t) if *t == v.v().dtype() => {}
                 Some(_) => return None,
             }
         }
@@ -1745,7 +1756,7 @@ fn encode_sort_keys(
                 }
                 offsets.push(bytes.len() as u32);
                 for (ki, (_, desc)) in keys.iter().enumerate() {
-                    if !encode_key_into(&ks[ki], i, *desc, &mut bytes) {
+                    if !encode_key_into(ks[ki].v(), i, *desc, &mut bytes) {
                         return None;
                     }
                 }
@@ -1906,7 +1917,7 @@ fn top_n(
 fn sort_legacy(
     chunks: &[DataChunk],
     keys: &[(BoundExpr, bool)],
-    keyed: &[Vec<Vector>],
+    keyed: &[Vec<FusedVec>],
 ) -> Result<Vec<DataChunk>> {
     struct Row {
         key: Vec<Value>,
@@ -1919,7 +1930,7 @@ fn sort_legacy(
         for i in 0..chunk.num_rows() {
             let seq = rows.len();
             rows.push(Row {
-                key: keyed[ci].iter().map(|v| v.get(i)).collect(),
+                key: keyed[ci].iter().map(|v| v.v().get(i)).collect(),
                 chunk: ci,
                 row: i,
                 seq,

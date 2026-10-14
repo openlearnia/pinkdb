@@ -245,7 +245,9 @@ pub(crate) fn win_output_schema(
     (names, types)
 }
 
-fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {
+/// Numeric ordering shared by [`compare_values`] and the aggregators' typed
+/// MIN/MAX fast path.
+pub(crate) fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {
     // NaN sorts equal to itself here (grouping/display edge, not ORDER truth).
     x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
 }

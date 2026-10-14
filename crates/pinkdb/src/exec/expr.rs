@@ -1154,6 +1154,24 @@ pub fn select_true(pred: &Vector) -> Result<Vec<usize>> {
     Ok(sel)
 }
 
+/// Number of rows where `pred` (Boolean) is TRUE. NULL/missing → not
+/// counted. Same row set as [`select_true`] without building the vector.
+pub fn count_true(pred: &Vector) -> Result<i64> {
+    ensure_dtype(pred, DataType::Boolean, "WHERE")?;
+    let bits = match pred.data() {
+        VectorData::Boolean(b) => b,
+        _ => unreachable!("BOOLEAN dtype implies BOOLEAN layout"),
+    };
+    let mut n = 0i64;
+    for (i, &is_true) in bits.iter().enumerate() {
+        // Validity bit + payload bit directly; no `Value` per row.
+        if is_true && pred.is_valid(i) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 fn cast_value(v: Value, target: DataType) -> Result<Value> {
     match (v, target) {
         (v, t) if v.data_type() == Some(t) => Ok(v),

@@ -8,8 +8,8 @@
 use std::cmp::Ordering;
 use crate::types::FastMap;
 
-use super::aggregate::{Acc, encode_row};
-use super::expr::eval_expr;
+use super::aggregate::{eval_agg_vec, Acc};
+use super::aggregate::EvalVec as FusedVec;
 use super::Cx;
 use crate::plan::compare_values;
 use crate::sql::binder::{BoundWindow, FrameBound, WindowFunc};
@@ -18,10 +18,62 @@ use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
 use rayon::prelude::*;
 
 struct Row {
-    part: Vec<Value>,
-    ord: Vec<Value>,
+    /// Chunk index and row index of this input row (the partition key is
+    /// encoded straight from the chunk's evaluated key vectors, so no
+    /// per-row partition `Value`s exist at all).
+    chunk: usize,
+    row: usize,
+    ord: KeyVals,
     /// None = NULL input (COUNT(*) materializes a dummy Some).
     arg: Option<Value>,
+}
+
+/// The 0/1/N `Value`s of one window order key. Window keys are almost always
+/// zero or one expression, so this keeps them inline instead of heap-
+/// allocating a `Vec` per input row.
+enum KeyVals {
+    None,
+    One(Value),
+    Many(Vec<Value>),
+}
+
+impl KeyVals {
+    fn as_slice(&self) -> &[Value] {
+        match self {
+            KeyVals::None => &[],
+            KeyVals::One(v) => std::slice::from_ref(v),
+            KeyVals::Many(v) => v,
+        }
+    }
+}
+
+/// Read one row of a window order key out of the evaluated vectors, without a
+/// temporary `Vec` for the common 0/1-key shapes.
+fn key_vals(vecs: &[FusedVec], i: usize) -> KeyVals {
+    let mut it = vecs.iter();
+    let Some(first) = it.next() else {
+        return KeyVals::None;
+    };
+    match (it.next(), it.next()) {
+        (None, _) => KeyVals::One(first.v().get(i)),
+        (Some(b), None) => KeyVals::Many(vec![first.v().get(i), b.v().get(i)]),
+        (Some(b), Some(c)) => {
+            let mut v = Vec::with_capacity(4);
+            v.push(first.v().get(i));
+            v.push(b.v().get(i));
+            v.push(c.v().get(i));
+            v.extend(it.map(|v| v.v().get(i)));
+            KeyVals::Many(v)
+        }
+    }
+}
+
+/// One input chunk's evaluated window key/order/arg vectors. Bare column
+/// references borrow the chunk's vectors; anything else is an owned result.
+struct ChunkVecs<'a> {
+    part: Vec<FusedVec<'a>>,
+    ord: Vec<FusedVec<'a>>,
+    arg: Option<FusedVec<'a>>,
 }
 
 /// Evaluate all windows, appending one column each (sequentially, so later
@@ -44,50 +96,56 @@ fn eval_one_window(
     chunks: &[DataChunk],
     w: &BoundWindow,
 ) -> Result<Vec<DataChunk>> {
-    // 1. Materialize partition/order/arg values in global row order
-    // (per-chunk evaluation parallelizes; assembly preserves order).
-    let per_chunk: Vec<Vec<Row>> = chunks
+    // 1. Evaluate the partition/order/arg expressions per chunk in parallel
+    // (assembly preserves chunk order); rows stay as (chunk, row) indices.
+    let per_chunk: Vec<ChunkVecs> = chunks
         .par_iter()
         .map(|chunk| {
-            let parts: Vec<Vector> = w
+            let part = w
                 .partition
                 .iter()
-                .map(|e| eval_expr(e, chunk, cx))
-                .collect::<Result<_>>()?;
-            let ords: Vec<Vector> = w
+                .map(|e| eval_agg_vec(e, chunk, cx))
+                .collect::<Result<Vec<_>>>()?;
+            let ord = w
                 .order
                 .iter()
-                .map(|(e, _)| eval_expr(e, chunk, cx))
-                .collect::<Result<_>>()?;
+                .map(|(e, _)| eval_agg_vec(e, chunk, cx))
+                .collect::<Result<Vec<_>>>()?;
             let arg = match &w.arg {
-                Some(e) => Some(eval_expr(e, chunk, cx)?),
+                Some(e) => Some(eval_agg_vec(e, chunk, cx)?),
                 None => None,
             };
-            Ok((0..chunk.num_rows())
-                .map(|i| Row {
-                    part: parts.iter().map(|v| v.get(i)).collect(),
-                    ord: ords.iter().map(|v| v.get(i)).collect(),
-                    arg: match &arg {
-                        None => Some(Value::Integer(1)), // COUNT(*): every row counts
-                        Some(v) if v.is_null(i) => None,
-                        Some(v) => Some(v.get(i)),
-                    },
-                })
-                .collect::<Vec<_>>())
+            Ok(ChunkVecs { part, ord, arg })
         })
         .collect::<Result<_>>()?;
-    let mut rows: Vec<Row> = Vec::new();
-    for part in per_chunk {
-        rows.extend(part);
+    let mut rows: Vec<Row> = Vec::with_capacity(chunks.iter().map(|c| c.num_rows()).sum());
+    for (ci, chunk) in chunks.iter().enumerate() {
+        let cv = &per_chunk[ci];
+        for i in 0..chunk.num_rows() {
+            rows.push(Row {
+                chunk: ci,
+                row: i,
+                ord: key_vals(&cv.ord, i),
+                arg: match &cv.arg {
+                    None => Some(Value::Integer(1)), // COUNT(*): every row counts
+                    Some(v) if v.v().is_null(i) => None,
+                    Some(v) => Some(v.v().get(i)),
+                },
+            });
+        }
     }
     let n = rows.len();
 
     // 2. Group global indices by partition encoding (NULL keys group together).
+    // The partition key encodes straight from the evaluated vectors — byte
+    // for byte the same encoding the old per-row `Value`s produced.
     let mut groups: FastMap<Vec<u8>, Vec<usize>> = FastMap::default();
     let mut buf = Vec::new();
     for (g, row) in rows.iter().enumerate() {
         buf.clear();
-        encode_row(&mut buf, &row.part);
+        for v in &per_chunk[row.chunk].part {
+            v.v().encode_into(&mut buf, row.row);
+        }
         groups.entry(buf.clone()).or_default().push(g);
     }
 
@@ -101,7 +159,7 @@ fn eval_one_window(
         let members = &groups[&k];
         let mut seq: Vec<usize> = members.clone();
         if !w.order.is_empty() {
-            seq.sort_by(|&a, &b| order_rows(&rows[a].ord, &rows[b].ord, w));
+            seq.sort_by(|&a, &b| order_rows(rows[a].ord.as_slice(), rows[b].ord.as_slice(), w));
         }
         match w.func {
             WindowFunc::RowNumber => {
@@ -113,7 +171,7 @@ fn eval_one_window(
                 let mut rank: i64 = 1;
                 let mut dense: i64 = 1;
                 for (pos, g) in seq.iter().enumerate() {
-                    if pos > 0 && !is_peer(&rows[seq[pos - 1]].ord, &rows[*g].ord) {
+                    if pos > 0 && !is_peer(rows[seq[pos - 1]].ord.as_slice(), rows[*g].ord.as_slice()) {
                         rank = pos as i64 + 1;
                         dense += 1;
                     }

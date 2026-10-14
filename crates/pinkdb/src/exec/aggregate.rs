@@ -8,11 +8,11 @@ use crate::types::FastMap;
 
 use super::expr::eval_expr;
 use super::Cx;
-use crate::plan::compare_values;
+use crate::plan::{compare_values, num_cmp};
 use rayon::prelude::*;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
 use crate::types::{DataType, Result, Value};
-use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
+use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
 
 fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
@@ -66,6 +66,54 @@ pub(crate) fn encode_row(buf: &mut Vec<u8>, row: &[Value]) {
     }
 }
 
+/// One evaluated aggregate key/argument vector: a bare column reference
+/// borrows its chunk's vector (no deep clone), anything else owns the
+/// evaluation result. Shared by the materialized `aggregate` loop and the
+/// fused join→aggregate loop.
+pub(crate) enum EvalVec<'a> {
+    Col(&'a Vector),
+    Owned(Vector),
+}
+
+/// Initial capacity for one chunk's local group table. Deliberately small:
+/// the table is per chunk, and preallocating one slot per row (up to 2048)
+/// makes every chunk allocate and initialize a multi-hundred-kilobyte table
+/// even when the chunk holds four distinct keys. A chunk that outgrows this
+/// is treated as high-cardinality and jumps to the full size in one rehash
+/// (see [`HIGH_CARDINALITY_KEYS`]).
+pub(crate) fn local_index_capacity(rows: usize) -> usize {
+    rows.min(16)
+}
+
+/// A chunk whose local table reaches this many distinct keys is treated as
+/// high-cardinality: the next insert reserves the whole per-chunk size in one
+/// rehash (see `aggregate`).
+pub(crate) const HIGH_CARDINALITY_KEYS: usize = 64;
+
+impl EvalVec<'_> {
+    #[inline]
+    pub(crate) fn v(&self) -> &Vector {
+        match self {
+            EvalVec::Col(v) => v,
+            EvalVec::Owned(v) => v,
+        }
+    }
+}
+
+/// Evaluate one aggregate key/argument expression over `chunk`, borrowing the
+/// chunk column for a bare column reference (the common case) instead of
+/// deep-copying it.
+pub(crate) fn eval_agg_vec<'a>(
+    expr: &BoundExpr,
+    chunk: &'a DataChunk,
+    cx: &Cx,
+) -> Result<EvalVec<'a>> {
+    match expr {
+        BoundExpr::Column { index, .. } => Ok(EvalVec::Col(chunk.column(*index))),
+        e => Ok(EvalVec::Owned(eval_expr(e, chunk, cx)?)),
+    }
+}
+
 pub(crate) enum Acc {
     Count(i64),
     SumInt { sum: i64, non_null: bool },
@@ -82,6 +130,94 @@ impl Acc {
             AggFunc::Avg => Acc::Avg { sum: 0.0, count: 0 },
             AggFunc::Min => Acc::MinMax { cur: None, is_min: true },
             AggFunc::Max => Acc::MinMax { cur: None, is_min: false },
+        }
+    }
+
+    /// COUNT(*) fast path: every row counts, no argument to look at and no
+    /// `Value` to materialize. (`COUNT(*)` is the only aggregate the binder
+    /// builds without an argument; anything else keeps the generic path.)
+    #[inline]
+    pub(crate) fn count_star(&mut self) {
+        match self {
+            Acc::Count(n) => *n += 1,
+            other => other.update(Some(&Value::Integer(1))),
+        }
+    }
+
+    /// Typed per-row update: exactly `update(Some(&v.get(i)))` (or
+    /// `update(None)` when the cell is NULL) with the cell read straight out
+    /// of the vector payload — no `Value` materialization per row.
+    #[inline]
+    pub(crate) fn update_vec(&mut self, v: &Vector, i: usize) {
+        if v.is_null(i) {
+            return self.update(None);
+        }
+        match self {
+            // `update(Some(_))` increments for every non-NULL payload.
+            Acc::Count(n) => *n += 1,
+            Acc::SumInt { sum, non_null } => match v.data() {
+                VectorData::Int32(d) => {
+                    *sum = sum.wrapping_add(d[i] as i64);
+                    *non_null = true;
+                }
+                VectorData::Int64(d) => {
+                    *sum = sum.wrapping_add(d[i]);
+                    *non_null = true;
+                }
+                // A DOUBLE cell flips the accumulator to float (same rule as
+                // `update`).
+                VectorData::Float64(d) => {
+                    *self = Acc::SumFloat { sum: *sum as f64 + d[i], non_null: true };
+                }
+                // BOOLEAN/VARCHAR/DATE/TIMESTAMP cells are non-numeric and
+                // ignored (`update`'s `_ => {}`).
+                _ => {}
+            },
+            Acc::SumFloat { sum, non_null } => match v.data() {
+                VectorData::Int32(d) => {
+                    *sum += d[i] as f64;
+                    *non_null = true;
+                }
+                VectorData::Int64(d) => {
+                    *sum += d[i] as f64;
+                    *non_null = true;
+                }
+                VectorData::Float64(d) => {
+                    *sum += d[i];
+                    *non_null = true;
+                }
+                _ => {}
+            },
+            Acc::Avg { sum, count } => match v.data() {
+                VectorData::Int32(d) => {
+                    *sum += d[i] as f64;
+                    *count += 1;
+                }
+                VectorData::Int64(d) => {
+                    *sum += d[i] as f64;
+                    *count += 1;
+                }
+                VectorData::Float64(d) => {
+                    *sum += d[i];
+                    *count += 1;
+                }
+                _ => {}
+            },
+            Acc::MinMax { cur, is_min } => {
+                let data = v.data();
+                let wins = match cur {
+                    None => true,
+                    Some(c) => {
+                        let ord = compare_cell(data, i, c);
+                        (ord == std::cmp::Ordering::Less) == *is_min
+                            && ord != std::cmp::Ordering::Equal
+                    }
+                };
+                if wins {
+                    // Only a winning cell materializes a `Value`.
+                    *cur = Some(v.get(i));
+                }
+            }
         }
     }
 
@@ -242,6 +378,36 @@ impl Acc {
     }
 }
 
+/// Compare one raw cell of `data` against a `Value`, exactly like
+/// `compare_values(&Vector::get(i), c)` for that cell. Cross-layout pairings
+/// (which the binder's one-dtype-per-slot rule cannot produce) fall back to
+/// the generic comparator, so the result never depends on the fast path.
+fn compare_cell(data: &VectorData, i: usize, c: &Value) -> std::cmp::Ordering {
+    match (data, c) {
+        (VectorData::Boolean(d), Value::Boolean(y)) => d[i].cmp(y),
+        (VectorData::Int32(d), Value::Integer(y)) => d[i].cmp(y),
+        (VectorData::Int64(d), Value::Bigint(y)) => d[i].cmp(y),
+        (VectorData::Float64(d), Value::Double(y)) => num_cmp(d[i], *y),
+        (VectorData::VarChar(d), Value::Varchar(y)) => d[i].as_ref().cmp(y.as_str()),
+        (VectorData::Date32(d), Value::Date(y)) => d[i].cmp(y),
+        (VectorData::TimestampMicros(d), Value::Timestamp(y)) => d[i].cmp(y),
+        _ => compare_values(&cell_value(data, i), c),
+    }
+}
+
+/// Materialize one raw cell as a `Value` (the cross-layout compare fallback).
+fn cell_value(data: &VectorData, i: usize) -> Value {
+    match data {
+        VectorData::Boolean(d) => Value::Boolean(d[i]),
+        VectorData::Int32(d) => Value::Integer(d[i]),
+        VectorData::Int64(d) => Value::Bigint(d[i]),
+        VectorData::Float64(d) => Value::Double(d[i]),
+        VectorData::VarChar(d) => Value::Varchar(d[i].to_string()),
+        VectorData::Date32(d) => Value::Date(d[i]),
+        VectorData::TimestampMicros(d) => Value::Timestamp(d[i]),
+    }
+}
+
 /// One group: first-seen key `Value`s plus one live accumulator per agg.
 pub(crate) struct Group {
     pub(crate) keys: Vec<Value>,
@@ -271,45 +437,60 @@ pub(crate) fn aggregate(
     let partials: Vec<Partial> = inputs
         .par_iter()
         .map(|chunk| {
-            let key_vecs: Vec<Vector> = keys
+            let key_vecs: Vec<EvalVec> = keys
                 .iter()
-                .map(|k| eval_expr(k, chunk, cx))
+                .map(|k| eval_agg_vec(k, chunk, cx))
                 .collect::<Result<_>>()?;
-            let arg_vecs: Vec<Option<Vector>> = aggs
+            let arg_vecs: Vec<Option<EvalVec>> = aggs
                 .iter()
                 .map(|a| match &a.arg {
-                    Some(e) => eval_expr(e, chunk, cx).map(Some),
+                    Some(e) => eval_agg_vec(e, chunk, cx).map(Some),
                     None => Ok(None),
                 })
                 .collect::<Result<_>>()?;
             let mut partial = Partial {
                 groups: Vec::new(),
-                // At most one entry per distinct key in the chunk; reserving
-                // up front keeps the map from rehashing as groups appear.
+                // Start small: most analytic chunks hold a handful of
+                // distinct keys, and preallocating one slot per row makes
+                // every chunk allocate (and later free, on the merging
+                // thread) a multi-hundred-kilobyte table. A chunk that
+                // outgrows this is high-cardinality and pays one jump to the
+                // full size instead (see the insert below).
                 index: FastMap::with_capacity_and_hasher(
-                    chunk.num_rows().min(1 << 16),
+                    local_index_capacity(chunk.num_rows()),
                     Default::default(),
                 ),
             };
             let mut buf = Vec::new();
+            let mut full_reserved = false;
             for i in 0..chunk.num_rows() {
                 // Borrowed encoding + get-first lookup: hits (the common
                 // case) allocate nothing and probe the map exactly once;
                 // only misses materialize Values and insert.
                 buf.clear();
                 for kv in &key_vecs {
-                    kv.encode_into(&mut buf, i);
+                    kv.v().encode_into(&mut buf, i);
                 }
                 let idx = match partial.index.get(&buf) {
                     Some(&idx) => idx,
                     None => {
                         let enc = buf.clone();
                         let idx = partial.groups.len();
+                        // Adaptive growth: once a chunk proves it holds many
+                        // distinct keys (> HIGH_CARDINALITY_KEYS), reserve the
+                        // rest of the chunk's slots in one rehash instead of
+                        // growing doubling by doubling.
+                        if !full_reserved && partial.index.len() >= HIGH_CARDINALITY_KEYS {
+                            partial
+                                .index
+                                .reserve(chunk.num_rows().saturating_sub(partial.index.len()));
+                            full_reserved = true;
+                        }
                         partial.index.insert(enc.clone(), idx);
                         partial.groups.push((
                             enc,
                             Group {
-                                keys: key_vecs.iter().map(|kv| kv.get(i)).collect(),
+                                keys: key_vecs.iter().map(|kv| kv.v().get(i)).collect(),
                                 accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
                             },
                         ));
@@ -319,14 +500,11 @@ pub(crate) fn aggregate(
                 let group = &mut partial.groups[idx].1;
                 for (acc, av) in group.accs.iter_mut().zip(arg_vecs.iter()) {
                     match av {
-                        None => acc.update(Some(&Value::Integer(1))), // COUNT(*)
-                        Some(v) => {
-                            if v.is_null(i) {
-                                acc.update(None);
-                            } else {
-                                acc.update(Some(&v.get(i)));
-                            }
-                        }
+                        // COUNT(*): every row counts.
+                        None => acc.count_star(),
+                        // Typed read of the cell (NULL skips, exactly like
+                        // `update(None)`).
+                        Some(v) => acc.update_vec(v.v(), i),
                     }
                 }
             }
@@ -373,16 +551,19 @@ pub(crate) fn merge_partials(
     } else {
         for partial in partials {
             for (enc, g) in partial.groups {
-                match table.get(&enc) {
-                    Some(&idx) => {
-                        let target = &mut groups[idx];
+                // Entry API: one hash per group (a lookup + insert pair would
+                // hash twice), which matters when the merged table is large
+                // (one slot per distinct key across the whole input).
+                match table.entry(enc) {
+                    std::collections::hash_map::Entry::Occupied(slot) => {
+                        let target = &mut groups[*slot.get()];
                         for (a, b) in target.accs.iter_mut().zip(g.accs) {
                             a.merge(b);
                         }
                     }
-                    None => {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
                         let idx = groups.len();
-                        table.insert(enc, idx);
+                        slot.insert(idx);
                         groups.push(g);
                     }
                 }

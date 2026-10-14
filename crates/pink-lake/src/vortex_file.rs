@@ -73,7 +73,7 @@ use vortex::buffer::{BitBuffer, Buffer, ByteBuffer};
 use vortex::dtype::{DType, FieldNames, Nullability, PType, StructFields};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::io::runtime::BlockingRuntime;
-use vortex::io::runtime::current::CurrentThreadRuntime;
+use vortex::io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
@@ -144,13 +144,33 @@ struct TableMetadata {
     columns: Vec<ColumnMeta>,
 }
 
-/// A blocking runtime + a session bound to it. The session is created per
-/// call: a lake operation is I/O dominated and the registration cost is
-/// negligible next to encoding/compressing a table.
+/// The decoding side's runtime + session. Created per call: a lake read is
+/// dominated by decoding column chunk into engine vectors, and the session
+/// registration cost is negligible against that. (The writer uses
+/// [`write_session`], which adds the worker pool its compression needs.)
 fn session() -> (CurrentThreadRuntime, VortexSession) {
     let runtime = CurrentThreadRuntime::new();
     let session = VortexSession::default().with_handle(runtime.handle());
     (runtime, session)
+}
+
+/// The writing side's runtime: the same current-thread runtime, plus — when
+/// `parallel` — a worker pool that drives the writer's spawned CPU tasks
+/// (per-block compression) on background threads. Without the pool every
+/// compression job runs inline on the calling thread and a table save is
+/// single-threaded; with it the main-thread `block_on` still runs the
+/// writer's sequential state machine while the pool executes the compression
+/// cascade in parallel. The encoding itself is deterministic and
+/// scheduling-independent, so the file bytes are unchanged
+/// (`parallel_writing_emits_identical_bytes`).
+fn write_session(parallel: bool) -> (CurrentThreadRuntime, CurrentThreadWorkerPool, VortexSession) {
+    let runtime = CurrentThreadRuntime::new();
+    let pool = runtime.new_pool();
+    if parallel {
+        pool.set_workers_to_available_parallelism();
+    }
+    let session = VortexSession::default().with_handle(runtime.handle());
+    (runtime, pool, session)
 }
 
 fn corrupt(path: &Path, message: String) -> LakeError {
@@ -248,7 +268,20 @@ fn encode_table_with_metadata(
     let chunked = ChunkedArray::try_new(chunks, dtype)
         .map_err(|e| vortex_error(&format!("assembling table \"{dbname}.{table}\""), e))?;
 
-    let (runtime, session) = session();
+    write_chunked(dbname, table, chunked.into_array(), metadata, true)
+}
+
+/// The writer tail: strategy + metadata segment + the blocking write.
+/// `parallel` selects the worker-pool runtime (production) or the bare
+/// current-thread runtime (test-only pin); both must emit identical bytes.
+fn write_chunked(
+    dbname: &str,
+    table: &str,
+    chunked: ArrayRef,
+    metadata: Option<Vec<u8>>,
+    parallel: bool,
+) -> Result<Vec<u8>> {
+    let (runtime, _pool, session) = write_session(parallel);
     // One stream element per engine chunk, and row blocks of exactly
     // `CHUNK_SIZE` rows: chunk boundaries round-trip unchanged.
     let strategy = WriteStrategyBuilder::from_session(&session)
@@ -263,7 +296,7 @@ fn encode_table_with_metadata(
     let mut bytes: Vec<u8> = Vec::new();
     options
         .blocking(&runtime)
-        .write(&mut bytes, chunked.into_array().to_array_iterator())
+        .write(&mut bytes, chunked.to_array_iterator())
         .map_err(|e| vortex_error(&format!("writing table \"{dbname}.{table}\""), e))?;
     Ok(bytes)
 }
@@ -940,6 +973,69 @@ mod tests {
                 "the fixture should contain nullable columns"
             );
         }
+    }
+
+    /// Parallel writing (the worker-pool runtime) must be byte-identical to
+    /// single-threaded writing: compression *scheduling* may not change the
+    /// encoding, or every lake file made on one machine would differ from the
+    /// same data saved on another. Runs the writer both ways over a table
+    /// wide enough to span several chunks and several compressions.
+    #[test]
+    fn parallel_writing_emits_identical_bytes() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE TABLE t (i INTEGER, g BIGINT, d DOUBLE, s VARCHAR, b BOOLEAN);",
+        )
+        .unwrap();
+        let t = db.table_mut("t").unwrap();
+        for i in 0..5_000i64 {
+            // A mix of shapes (runs, repeats, nulls, long strings) so the
+            // compressor has real work and real decisions to make.
+            t.append_row(vec![
+                Value::Integer((i % 1000) as i32),
+                Value::Bigint(if i % 97 == 0 { 0 } else { i * 2654435761 }),
+                Value::Double(if i % 41 == 0 { 0.0 } else { i as f64 / 3.0 }),
+                Value::Varchar(if i % 13 == 0 {
+                    "x".repeat((i % 40) as usize)
+                } else {
+                    format!("row-{}-{}", i % 250, i % 7)
+                }),
+                Value::Boolean(i % 2 == 0),
+            ])
+            .unwrap();
+        }
+        let src = db.table("t").unwrap();
+        let schema = src.schema();
+        assert!(src.num_chunks() >= 3, "fixture should span several chunks");
+        let (nulls, chunk_nulls) = column_nullability(src, &schema, "main", "t").unwrap();
+        let dtype = struct_dtype(&schema, &nulls);
+        let mut chunks: Vec<ArrayRef> = Vec::new();
+        for (i, any_null) in chunk_nulls.iter().enumerate() {
+            let chunk = src.scan_chunk(i).unwrap();
+            chunks.push(encode_chunk(&chunk, &schema, &nulls, any_null, "main", "t").unwrap());
+        }
+        let chunked = ChunkedArray::try_new(chunks, dtype).unwrap().into_array();
+        let meta = metadata_json(
+            "main",
+            "t",
+            r#"{"name":"i","type":"integer"},{"name":"g","type":"bigint"},{"name":"d","type":"double"},{"name":"s","type":"varchar"},{"name":"b","type":"boolean"}"#,
+        );
+        // The metadata segment content is irrelevant to layout; reuse one.
+        let serial = write_chunked("main", "t", chunked.clone(), Some(meta.clone()), false)
+            .unwrap();
+        let parallel = write_chunked("main", "t", chunked.clone(), Some(meta.clone()), true)
+            .unwrap();
+        let parallel_again = write_chunked("main", "t", chunked, Some(meta), true).unwrap();
+        assert_eq!(
+            serial, parallel,
+            "a worker-pool write changed the file bytes ({} bytes vs {})",
+            serial.len(),
+            parallel.len()
+        );
+        assert_eq!(parallel_again, parallel, "parallel writes must be deterministic");
+        // And the bytes still decode to the same table (all rows/chunks).
+        let out = decode(&serial).unwrap();
+        assert_eq!(out.table("t").unwrap().num_rows(), 5000);
     }
 
     /// The whole decode boundary is guarded: flipping a byte at an offset the
