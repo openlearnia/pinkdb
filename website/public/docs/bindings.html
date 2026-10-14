@@ -5,7 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Bindings — pinkdb</title>
 <meta name="description" content="The pinkdb C ABI (pinkdb-ffi): artifacts, ownership and threading contract, and the C example.">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/bindings.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Bindings — pinkdb">
+<meta property="og:description" content="The pinkdb C ABI (pinkdb-ffi): artifacts, ownership and threading contract, and the C example.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/bindings.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -53,6 +70,12 @@ make -C crates/pinkdb-ffi hello   # compiles and runs the C example</code></pre>
 ≈ 15.5 MB (build archive).</p>
 
 <h3>Contract</h3>
+
+<aside class="marginalia">
+  <span class="margin-tag">one handle, one thread</span>
+  <p>Handles are not thread-safe; errors are thread-local and read back with
+  <code>pinkdb_last_error()</code>.</p>
+</aside>
 
 <ul>
   <li><strong>Handles</strong>: <code>pinkdb_open</code> (durable files),
@@ -109,6 +132,7 @@ ABI directly.</p>
 <footer class="site-footer">
   <div class="container footer-row">
     <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>
 </footer>

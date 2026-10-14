@@ -16,6 +16,13 @@ cargo build --release -p pinkdb-cli --features client
 (a <code>   ...&gt;</code> continuation prompt appears while one is open);
 dot-commands are single-line and take no semicolon.</p>
 
+<aside class="marginalia">
+  <span class="margin-tag">environment switches</span>
+  <p><code>PINKDB_PARSER=legacy</code> selects the hand-written parser;
+  <code>PINKDB_KEY</code> opens encrypted files. Both are documented under
+  <em>Environment variables</em>.</p>
+</aside>
+
 <h2>Dot-commands</h2>
 
 <div class="table-wrap">

@@ -20,6 +20,7 @@ fragment uses the ``docs/`` default.
 Template placeholders
 ---------------------
 - ``{{title}}`` / ``{{description}}`` — page metadata (HTML-escaped)
+- ``{{url}}`` — the page's canonical URL on the live docs origin
 - ``{{content}}`` — the page fragment
 - ``{{root}}`` — relative path to the site root (``""`` or ``"../"``)
 - ``{{nav-<key>}}`` — expanded to the active-link attributes on the page
@@ -43,6 +44,9 @@ OUT = ROOT / "public"
 LAYOUT = SRC / "layout.html"
 
 PLACEHOLDER = re.compile(r"\{\{[a-z0-9-]+\}\}")
+
+# Live origin of the docs site; used for canonical + OpenGraph URLs.
+SITE_URL = "https://pinkdb-docs.defaultcms.workers.dev"
 
 # Per-page metadata. Fragments without an entry still generate (under
 # docs/) with a title derived from the file name and no nav highlight.
@@ -223,6 +227,14 @@ def extensionless_links(page: str) -> str:
     return _HREF_RE.sub(replace, page)
 
 
+def canonical_url(out_rel: str) -> str:
+    """The page's canonical URL: ``index.html`` collapses to the site root."""
+    path = out_rel
+    if path.endswith("index.html"):
+        path = path[: -len("index.html")]
+    return f"{SITE_URL}/{path}"
+
+
 def render(layout: str, nav_keys: list[str], fragment_name: str,
            meta: dict[str, str]) -> str:
     out_rel = meta["out"]
@@ -239,6 +251,7 @@ def render(layout: str, nav_keys: list[str], fragment_name: str,
     replacements = {
         "{{title}}": html.escape(meta["title"]),
         "{{description}}": html.escape(meta["description"]),
+        "{{url}}": html.escape(canonical_url(out_rel)),
         "{{root}}": root,
         "{{python-binding}}": python_binding_section(),
         "{{content}}": fragment,

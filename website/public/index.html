@@ -5,7 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pinkdb — a mini DuckDB in Rust</title>
 <meta name="description" content="An embedded analytical SQL database in Rust: columnar vectors, vectorized execution, CSV import, durable .pink files with a WAL, a network server, and a C ABI.">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="pinkdb — a mini DuckDB in Rust">
+<meta property="og:description" content="An embedded analytical SQL database in Rust: columnar vectors, vectorized execution, CSV import, durable .pink files with a WAL, a network server, and a C ABI.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="assets/favicon.png">
+<link rel="preload" href="assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
@@ -32,9 +49,31 @@
 </header>
 <main id="main">
   <div class="container">
+<div class="ticker" aria-hidden="true">
+  <div class="ticker-track">
+    <span>wave 26 shipped &#183; waves 27&#8211;47 queued</span>
+    <span>zero async &#183; zero unsafe in the core</span>
+    <span>1M-row CSV import in 25 ms</span>
+    <span>durable .pink files with a WAL</span>
+    <span>C ABI v1 &#183; extensions catalog live</span>
+    <span>pinkdb 1.0.0-dev &#183; rust edition 2021</span>
+    <span>wave 26 shipped &#183; waves 27&#8211;47 queued</span>
+    <span>zero async &#183; zero unsafe in the core</span>
+    <span>1M-row CSV import in 25 ms</span>
+    <span>durable .pink files with a WAL</span>
+    <span>C ABI v1 &#183; extensions catalog live</span>
+    <span>pinkdb 1.0.0-dev &#183; rust edition 2021</span>
+  </div>
+</div>
+
 <section class="hero">
-  <p class="kicker">Embedded analytical SQL database in Rust</p>
-  <h1>pinkdb — a mini DuckDB in Rust</h1>
+  <div class="hero-sun" aria-hidden="true"></div>
+  <p class="kicker">embedded analytical SQL database in rust</p>
+  <h1>pinkdb — a mini <span class="hero-mark">DuckDB</span> in Rust</h1>
+  <svg class="sketch-underline" viewBox="0 0 260 18" aria-hidden="true" focusable="false">
+    <path class="sk-pink-stroke" d="M4 12 C 40 6, 70 14, 104 9 S 168 4, 204 10 S 246 12, 256 7"/>
+    <path class="sk-stroke" d="M12 15 C 62 11, 122 16, 182 12" opacity="0.35"/>
+  </svg>
   <p class="lede">In-memory columnar storage, vectorized execution, SQL with joins,
   aggregates, window functions and CTEs, CSV import, durable <code>.pink</code> files with
   a write-ahead log, an optional network server, and a C ABI — zero async in the core,
@@ -42,9 +81,20 @@
   <div class="hero-actions">
     <a class="button primary" href="docs/getting-started">Get started</a>
     <a class="button" href="docs/sql">SQL reference</a>
+    <a class="button ghost" href="docs/extensions">Extension catalog</a>
     <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub &#8599;</a>
   </div>
+  <ul class="chips">
+    <li class="chip"><span class="chip-num">1M</span> rows &#8594; import <span class="chip-num">25 ms</span></li>
+    <li class="chip">binary <span class="chip-num">~2 MB</span></li>
+    <li class="chip"><span class="chip-num">0</span> async</li>
+    <li class="chip"><span class="chip-num">0</span> unsafe in core</li>
+    <li class="chip">C ABI <span class="chip-num">v1</span></li>
+  </ul>
 </section>
+
+<p class="doc-meta">Filed under: engine · crates pinkdb, pinkdb-cli, pinkdb-server,
+pinkdb-ffi · docs reflect wave 26 (Oct 2026)</p>
 
 <p>pinkdb ships as a library crate (<code>pinkdb</code>), a CLI REPL
 (<code>pinkdb-cli</code>, a thin consumer of the library), a network server
@@ -71,9 +121,60 @@ Run Time (s): real 0.000</code></pre>
 
 <h2>Benchmark highlight</h2>
 
+<aside class="marginalia">
+  <span class="margin-tag">how to read this</span>
+  <p>Numbers are the best of five runs on Apple Silicon, release build, 1M
+  generated rows (seed 42). The dashed bars are the pre-wave numbers the
+  repository README records.</p>
+</aside>
+
 <p>1M rows, release build, Apple Silicon. Generated with <code>bench/gen_sales.py</code>
 (deterministic seed 42), measured with
 <code>cargo run --release -p pinkdb --example query_bench</code> (best of 5).</p>
+
+<figure class="plate">
+  <svg class="sketch" viewBox="0 0 660 372" role="img" aria-label="Speedups at 1M rows: WHERE region equals west 27 to 4.1 milliseconds, ORDER BY with LIMIT 100 to 3.0 milliseconds, self hash join 66 to 9.0 milliseconds, window function from quadratic minutes to 79 milliseconds">
+    <text class="sk-label-sm" x="0" y="14">before &#8212; dashed / now &#8212; pink (ms)</text>
+    <text class="sk-label-sm" x="196" y="14">bar = milliseconds, 1 px &#8776; 0.24 ms</text>
+    <line class="sk-dash" x1="200" y1="24" x2="200" y2="352"/>
+
+    <g transform="translate(0, 34)">
+      <text class="sk-label" x="0" y="12">WHERE region = 'west'</text>
+      <rect class="sk-before" x="200" y="22" width="113" height="12" rx="4"/>
+      <text class="sk-label-sm" x="321" y="32">27</text>
+      <rect class="sk-after" x="200" y="40" width="19" height="12" rx="4"/>
+      <text class="sk-label-sm" x="227" y="50">4.1</text>
+      <text class="sk-mult" x="650" y="44" text-anchor="end">6.6&#215;</text>
+    </g>
+    <g transform="translate(0, 116)">
+      <text class="sk-label" x="0" y="12">ORDER BY total DESC LIMIT 10</text>
+      <rect class="sk-before" x="200" y="22" width="420" height="12" rx="4"/>
+      <text class="sk-label-sm" x="212" y="32">100</text>
+      <rect class="sk-after" x="200" y="40" width="13" height="12" rx="4"/>
+      <text class="sk-label-sm" x="221" y="50">3.0</text>
+      <text class="sk-mult" x="650" y="44" text-anchor="end">33&#215;</text>
+    </g>
+    <g transform="translate(0, 198)">
+      <text class="sk-label" x="0" y="12">1M-row self hash join + COUNT</text>
+      <rect class="sk-before" x="200" y="22" width="277" height="12" rx="4"/>
+      <text class="sk-label-sm" x="212" y="32">66</text>
+      <rect class="sk-after" x="200" y="40" width="38" height="12" rx="4"/>
+      <text class="sk-label-sm" x="246" y="50">9.0</text>
+      <text class="sk-mult" x="650" y="44" text-anchor="end">7.3&#215;</text>
+    </g>
+    <g transform="translate(0, 280)">
+      <text class="sk-label" x="0" y="12">COUNT(*) OVER (PARTITION BY region)</text>
+      <rect class="sk-before" x="200" y="22" width="402" height="12" rx="4"/>
+      <text class="sk-label-sm" x="212" y="32">minutes &#8212; O(n&#178;) rescans</text>
+      <rect class="sk-after" x="200" y="40" width="332" height="12" rx="4"/>
+      <text class="sk-label-sm" x="212" y="50" fill="var(--paper-2)">79 ms, single pass</text>
+      <text class="sk-mult" x="650" y="44" text-anchor="end">&#8734;</text>
+    </g>
+    <text class="sk-label-sm" x="0" y="366">Fig. 1 — same machine, best of 5; the window step left minutes behind</text>
+  </svg>
+  <figcaption class="sk-figure-caption">Tail-latency wins came from fusion: filters stop copying rows,
+  sorts use a top-N arena, and the window step no longer rescans per partition.</figcaption>
+</figure>
 
 <div class="table-wrap">
 <table>
@@ -88,7 +189,7 @@ Run Time (s): real 0.000</code></pre>
     <tr><td>GROUP BY region + 5 aggregates</td><td class="num">7.7</td><td class="num">9</td></tr>
     <tr><td>ORDER BY total DESC LIMIT 10</td><td class="num">3.0</td><td class="num">100</td></tr>
     <tr><td>1M-row self hash join + COUNT (fused)</td><td class="num">9.0</td><td class="num">66</td></tr>
-    <tr><td>COUNT(*) OVER (PARTITION BY region)</td><td class="num">79</td><td class="num">minutes (O(n²))</td></tr>
+    <tr><td>COUNT(*) OVER (PARTITION BY region)</td><td class="num">79</td><td class="num">minutes (O(n&#178;))</td></tr>
   </tbody>
 </table>
 </div>
@@ -99,7 +200,7 @@ connection).</p>
 
 <h2>Explore the docs</h2>
 
-<ul class="cards">
+<ul class="cards zig">
   <li class="card">
     <h3><a href="docs/getting-started">Getting started</a></h3>
     <p>Build the CLI, import a CSV, run your first queries, and learn the REPL basics.</p>
@@ -129,6 +230,10 @@ connection).</p>
     <p>The parser → binder → plan → optimizer → vectorized executor pipeline.</p>
   </li>
   <li class="card">
+    <h3><a href="extensions">Extensions</a></h3>
+    <p>The extension repository: browse artifacts, verify hashes, install with one command.</p>
+  </li>
+  <li class="card">
     <h3><a href="docs/roadmap">Roadmap</a></h3>
     <p>Waves 0–26 shipped; extensions, lake storage, TLS, and RBAC queued.</p>
   </li>
@@ -146,6 +251,7 @@ connection).</p>
 <footer class="site-footer">
   <div class="container footer-row">
     <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="./">Home</a> · <a href="docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>
 </footer>

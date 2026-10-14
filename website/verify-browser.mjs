@@ -16,8 +16,16 @@
 //   - the #/<name> details route: `.install <name>` / `.install
 //     <name>@<version>` commands, metadata table, download URL, raw entry;
 //   - the not-found hash route;
-//   - the Worker `/` info page: heading, docs link, and /index.json answering
-//     200 with Access-Control-Allow-Origin: * (from the page context);
+//   - the "soft data-zine" design pass: the three self-hosted fonts load,
+//     headings use the display face, the active nav item is marked, margin
+//     notes and the ticker render, all requests stay first-party, body text
+//     keeps a readable column;
+//   - responsive: no horizontal overflow at 390px and 1280px on the landing
+//     page, a docs page, the extensions page and the Worker info page;
+//   - reduced motion: the ticker stops and entry animations short-circuit;
+//   - the Worker `/` info page: heading, docs link, paper/ink palette,
+//     favicon, script-free, and /index.json answering 200 with
+//     Access-Control-Allow-Origin: * (from the page context);
 //   - no console errors (CORS failures, exceptions, failed resources) during
 //     the whole pass, favicon noise excepted.
 //
@@ -358,6 +366,107 @@ try {
     check(true, "back to the list route renders the cards again");
   }
 
+  // ------------------------------------------------- design & type checks
+
+  const design = await cdp.evaluate(`(() => {
+    const h1 = document.querySelector("h1");
+    const activeNav = document.querySelector(".site-nav a.active");
+    const hosts = Array.from(new Set(performance.getEntriesByType("resource")
+      .map((entry) => { try { return new URL(entry.name).host; } catch (e) { return ""; } })));
+    return {
+      headingFont: h1 ? getComputedStyle(h1).fontFamily : "",
+      bricolage: document.fonts.check('700 32px "Bricolage Grotesque"'),
+      publicSans: document.fonts.check('400 16px "Public Sans"'),
+      mono: document.fonts.check('400 13px "JetBrains Mono"'),
+      skip: Boolean(document.querySelector(".skip-link")),
+      activeNav: activeNav ? activeNav.getAttribute("aria-current") : null,
+      ticker: Boolean(document.querySelector(".ticker-track")),
+      hosts,
+      scrollWidth: document.documentElement.scrollWidth,
+      viewport: document.documentElement.clientWidth,
+    };
+  })()`);
+  check(
+    design.bricolage && design.publicSans && design.mono,
+    "the three self-hosted fonts load (Bricolage Grotesque / Public Sans / JetBrains Mono)",
+    JSON.stringify(design),
+  );
+  check(
+    /Bricolage Grotesque/.test(design.headingFont),
+    "headings render in the display face",
+    design.headingFont,
+  );
+  check(design.skip, "the skip link is present");
+  check(design.ticker, "the ticker strip is present on the catalog page");
+  const docsHost = new URL(DOCS).host;
+  const repoHost = new URL(REPO).host;
+  const thirdParty = design.hosts.filter(
+    (host) => host && host !== docsHost && host !== repoHost && host !== "127.0.0.1" && host !== "localhost",
+  );
+  check(thirdParty.length === 0, "no third-party requests on the catalog page", thirdParty.join(", "));
+
+  await cdp.navigate(`${DOCS}/docs/sql`);
+  const docsPage = await cdp.evaluate(`(() => {
+    const active = document.querySelector(".site-nav a.active");
+    const paragraph = document.querySelector("main p");
+    return {
+      active: active ? active.textContent : null,
+      ariaCurrent: active ? active.getAttribute("aria-current") : null,
+      headingSize: parseFloat(getComputedStyle(document.querySelector("h1")).fontSize),
+      paragraphWidth: paragraph ? paragraph.getBoundingClientRect().width : 0,
+      marginalia: Boolean(document.querySelector(".marginalia")),
+      fontHosts: Array.from(new Set(performance.getEntriesByType("resource")
+        .filter((entry) => /\\.woff2/.test(entry.name))
+        .map((entry) => { try { return new URL(entry.name).host; } catch (e) { return ""; } }))),
+      inlineSvgs: document.querySelectorAll("main svg").length,
+    };
+  })()`);
+  check(docsPage.active === "SQL" && docsPage.ariaCurrent === "page",
+    "docs pages mark the active nav item", `${docsPage.active} / ${docsPage.ariaCurrent}`);
+  check(docsPage.headingSize >= 30, "docs headings keep a display scale", String(docsPage.headingSize));
+  check(docsPage.paragraphWidth <= 760, "body text stays in a readable column", String(docsPage.paragraphWidth));
+  check(docsPage.marginalia, "docs pages carry margin notes");
+  check(docsPage.fontHosts.length === 1 && docsPage.fontHosts[0] === docsHost,
+    "webfonts are served from the docs origin itself", docsPage.fontHosts.join(", "));
+
+  // ------------------------------------------------------ responsive pass
+
+  for (const [width, height] of [[390, 844], [1280, 900]]) {
+    await cdp.send("Emulation.setDeviceMetricsOverride", {
+      width, height, deviceScaleFactor: 2, mobile: width < 500,
+    });
+    for (const [label, url] of [
+      ["landing page", `${DOCS}/`],
+      ["docs page", `${DOCS}/docs/architecture`],
+      ["extensions page", `${DOCS}/extensions`],
+      ["repository info page", `${REPO}/`],
+    ]) {
+      await cdp.navigate(url);
+      await sleep(350);
+      const scroll = await cdp.evaluate("document.documentElement.scrollWidth");
+      check(scroll <= width + 1, `${label} has no horizontal overflow at ${width}px`, `scrollWidth ${scroll}`);
+    }
+  }
+  await cdp.send("Emulation.clearDeviceMetricsOverride");
+
+  // --------------------------------------------------- reduced motion pass
+
+  await cdp.send("Emulation.setEmulatedMedia", {
+    features: [{ name: "prefers-reduced-motion", value: "reduce" }],
+  });
+  await cdp.navigate(`${DOCS}/`);
+  const reduced = await cdp.evaluate(`(() => {
+    const ticker = document.querySelector(".ticker-track");
+    const card = document.querySelector(".card");
+    return {
+      ticker: ticker ? getComputedStyle(ticker).animationName : "missing",
+      card: card ? getComputedStyle(card).animationDuration : "missing",
+    };
+  })()`);
+  check(reduced.ticker === "none", "reduced motion stops the ticker", reduced.ticker);
+  check(parseFloat(reduced.card) < 0.01, "reduced motion short-circuits card entry", reduced.card);
+  await cdp.send("Emulation.setEmulatedMedia", { features: [] });
+
   // ----------------------------------------------------------- worker page
 
   await cdp.navigate(`${REPO}/`);
@@ -377,6 +486,19 @@ try {
   check(indexFetch.status === 200 && indexFetch.cors === "*",
     "info page context: /index.json answers 200 with Access-Control-Allow-Origin: *",
     JSON.stringify(indexFetch));
+  const workerDesign = await cdp.evaluate(`({
+    paper: getComputedStyle(document.documentElement).getPropertyValue("--paper").trim(),
+    ink: getComputedStyle(document.documentElement).getPropertyValue("--ink").trim(),
+    favicon: Boolean(document.querySelector('link[rel="icon"]')),
+    script: document.querySelectorAll("script").length,
+    bodyFont: getComputedStyle(document.body).fontFamily,
+  })`);
+  check(workerDesign.paper === "#f7f1e8" && workerDesign.ink === "#241f1c",
+    "info page uses the paper/ink palette", JSON.stringify(workerDesign));
+  check(workerDesign.favicon, "info page carries a favicon");
+  check(workerDesign.script === 0, "info page stays script-free", String(workerDesign.script));
+  check(/ui-sans-serif|system-ui/.test(workerDesign.bodyFont),
+    "info page keeps to a system type stack", workerDesign.bodyFont);
 
   // ------------------------------------------------------------- console
 

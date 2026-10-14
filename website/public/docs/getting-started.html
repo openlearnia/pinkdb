@@ -5,7 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Getting started — pinkdb</title>
 <meta name="description" content="Build the pinkdb CLI, import a CSV, run your first queries, and learn the REPL basics.">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/getting-started.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Getting started — pinkdb">
+<meta property="og:description" content="Build the pinkdb CLI, import a CSV, run your first queries, and learn the REPL basics.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/getting-started.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -41,6 +58,12 @@ queries in a few minutes.</p>
 
 <p>A recent stable <strong>Rust</strong> toolchain (the workspace uses edition 2021).
 Python 3 is only needed for the benchmark helpers and the docs site itself.</p>
+
+<aside class="marginalia">
+  <span class="margin-tag">debug vs release</span>
+  <p>The debug REPL is fine for the first steps; every benchmark quoted in these docs
+  comes from a release build (<code>cargo build --release</code>).</p>
+</aside>
 
 <pre class="code" data-lang="sh"><code>git clone https://github.com/openlearnia/pinkdb
 cd pinkdb</code></pre>
@@ -175,6 +198,7 @@ c.execute("CREATE TABLE t (a INTEGER);")?;</code></pre>
 <footer class="site-footer">
   <div class="container footer-row">
     <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>
 </footer>

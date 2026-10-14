@@ -5,19 +5,90 @@ vectors, with zero async in the core.</p>
 
 <h2>Query pipeline</h2>
 
-<pre class="code" data-lang="text"><code>SQL text
-  → PEG parser (or hand-written lexer + recursive descent) → AST
-  → Binder (resolve tables/columns, assign types)
-  → Logical plan (scan → filter → join → aggregate → project → sort → limit)
-  → Optimizer (predicate pushdown, constant folding)
-  → Vectorized executor (operators exchange DataChunks of ≤2048 rows)
-  → In-memory columnar storage</code></pre>
+<figure class="plate">
+  <svg viewBox="0 0 720 668" role="img" aria-label="Sketch of the query pipeline: SQL text, PEG parser, binder, logical plan, optimizer, vectorized executor and columnar storage, drawn as a chain with notes; below, a DataChunk drawn with columns, a validity bitmask and a selection vector.">
+    <defs>
+      <marker id="sk-arrowhead" markerWidth="8" markerHeight="8" refX="5.5" refY="5" orient="auto">
+        <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--ink)" stroke-width="1.8" stroke-linecap="round"/>
+      </marker>
+    </defs>
 
-<p>SQL is parsed by a <code>peg</code>-generated grammar; the hand-written
-lexer + recursive-descent parser stays selectable via
-<code>PINKDB_PARSER=legacy</code>. A committed differential corpus plus a seeded
-randomized differential test check that both parsers accept the same inputs with equal
-ASTs and reject the same inputs.</p>
+    <text class="sk-num" x="8" y="26">01</text>
+    <text class="sk-label-sm" x="44" y="24">the pipeline, top to bottom</text>
+
+    <g transform="translate(8, 44)">
+      <rect class="sk-box-pink" x="0" y="0" width="240" height="42" rx="9" transform="rotate(-0.4)"/>
+      <text class="sk-label" x="14" y="26">SQL text</text>
+      <text class="sk-label-sm" x="262" y="26">strings, files or the REPL</text>
+
+      <path class="sk-stroke" d="M124 44 C 120 52, 128 58, 124 64" marker-end="url(#sk-arrowhead)"/>
+      <rect class="sk-box" x="0" y="64" width="240" height="42" rx="9" transform="rotate(0.35)"/>
+      <text class="sk-label" x="14" y="90">PEG parser &#8594; AST</text>
+      <text class="sk-label-sm" x="262" y="90">hand-written lexer + recursive descent too</text>
+
+      <path class="sk-stroke" d="M124 108 C 120 116, 128 122, 124 128" marker-end="url(#sk-arrowhead)"/>
+      <rect class="sk-box" x="0" y="128" width="240" height="42" rx="9" transform="rotate(-0.35)"/>
+      <text class="sk-label" x="14" y="154">Binder</text>
+      <text class="sk-label-sm" x="262" y="154">resolve tables/columns, assign types</text>
+
+      <path class="sk-stroke" d="M124 172 C 120 180, 128 186, 124 192" marker-end="url(#sk-arrowhead)"/>
+      <rect class="sk-box" x="0" y="192" width="240" height="42" rx="9" transform="rotate(0.3)"/>
+      <text class="sk-label" x="14" y="218">Logical plan</text>
+      <text class="sk-label-sm" x="262" y="218">scan &#183; filter &#183; join &#183; aggregate &#183; project &#183; sort &#183; limit</text>
+
+      <path class="sk-stroke" d="M124 236 C 120 244, 128 250, 124 256" marker-end="url(#sk-arrowhead)"/>
+      <rect class="sk-box-alt" x="0" y="256" width="240" height="42" rx="9" transform="rotate(-0.4)"/>
+      <text class="sk-label" x="14" y="282">Optimizer</text>
+      <text class="sk-label-sm" x="262" y="282">predicate pushdown (incl. across joins), constant folding</text>
+
+      <path class="sk-stroke" d="M124 300 C 120 308, 128 314, 124 320" marker-end="url(#sk-arrowhead)"/>
+      <rect class="sk-box" x="0" y="320" width="240" height="42" rx="9" transform="rotate(0.35)"/>
+      <text class="sk-label" x="14" y="346">Vectorized executor</text>
+      <text class="sk-label-sm" x="262" y="346">operators exchange DataChunks</text>
+
+      <path class="sk-stroke" d="M124 364 C 120 372, 128 378, 124 384" marker-end="url(#sk-arrowhead)"/>
+      <rect class="sk-box-pink" x="0" y="384" width="240" height="42" rx="9" transform="rotate(-0.3)"/>
+      <text class="sk-label" x="14" y="410">Columnar storage</text>
+      <text class="sk-label-sm" x="262" y="410">chunks per column, validity bitmask</text>
+      <path class="sk-dash" d="M262 432 C 200 452, 96 452, 60 424" marker-end="url(#sk-arrowhead)"/>
+      <text class="sk-label-sm" x="266" y="446">pull-based: operators ask, storage answers</text>
+    </g>
+
+    <text class="sk-num" x="8" y="520">02</text>
+    <text class="sk-label-sm" x="44" y="518">one DataChunk, unpacked</text>
+
+    <rect class="sk-box" x="8" y="534" width="704" height="100" rx="12" transform="rotate(-0.2)"/>
+    <rect class="sk-box-alt" x="24" y="546" width="160" height="76" rx="6"/>
+    <rect class="sk-box-alt" x="198" y="546" width="160" height="76" rx="6"/>
+    <rect class="sk-box-alt" x="372" y="546" width="160" height="76" rx="6"/>
+    <rect class="sk-box-pink" x="546" y="546" width="150" height="76" rx="6"/>
+    <text class="sk-label" x="36" y="570">region</text>
+    <text class="sk-label" x="210" y="570">total</text>
+    <text class="sk-label" x="384" y="570">validity</text>
+    <text class="sk-label" x="558" y="570">selection</text>
+    <text class="sk-label-sm" x="36" y="586">VARCHAR</text>
+    <text class="sk-label-sm" x="210" y="586">DOUBLE</text>
+    <text class="sk-label-sm" x="384" y="586">bitmask</text>
+    <text class="sk-label-sm" x="558" y="586">row ids</text>
+    <text class="sk-label-sm" x="36" y="610">west &#183; east &#183; &#8230;</text>
+    <text class="sk-label-sm" x="210" y="610">175.0 &#183; 50.5 &#183; &#8230;</text>
+    <text class="sk-label-sm" x="384" y="610">1 0 1 1 &#8230;</text>
+    <text class="sk-label-sm" x="558" y="610">0 &#183; 2 &#183; 3 &#8230;</text>
+
+    <text class="sk-label-sm" x="8" y="656">every operator call moves &#8804; 2048 rows &#183; gather(vector, selection) never copies a row</text>
+  </svg>
+  <figcaption class="sk-figure-caption">Fig. 2 — the pipeline and the shape of the data it moves.
+  Both parsers (PEG and the legacy lexer) produce the same AST.</figcaption>
+</figure>
+
+<aside class="marginalia">
+  <span class="margin-tag">two parsers</span>
+  <p>SQL is parsed by a <code>peg</code>-generated grammar; the hand-written lexer +
+  recursive-descent parser stays selectable with <code>PINKDB_PARSER=legacy</code>.</p>
+</aside>
+
+<p>A committed differential corpus plus a seeded randomized differential test check
+that both parsers accept the same inputs with equal ASTs and reject the same inputs.</p>
 
 <h2>Modules</h2>
 
@@ -44,6 +115,12 @@ ASTs and reject the same inputs.</p>
 </div>
 
 <h2>Execution model</h2>
+
+<aside class="marginalia">
+  <span class="margin-tag">isolation, honestly</span>
+  <p><code>BEGIN..COMMIT</code> runs on a private snapshot with write-conflict
+  detection — snapshot isolation without predicate tracking.</p>
+</aside>
 
 <ul>
   <li><strong>Vectors, not rows.</strong> A <code>Vector</code> is a typed column chunk

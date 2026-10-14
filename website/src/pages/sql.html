@@ -25,6 +25,12 @@ pre-update values and either applies completely or not at all. <code>BEGIN</code
 commits to disjoint tables all succeed, and overlapping writes abort the second committer
 with a write-conflict error instead of a silent lost update.</p>
 
+<aside class="marginalia">
+  <span class="margin-tag">dml shorthand</span>
+  <p><code>SET</code> expressions see the pre-update values, <code>DELETE</code>
+  never matches <code>NULL</code>, and a statement is atomic: all rows or none.</p>
+</aside>
+
 <h2>SELECT</h2>
 
 <pre class="code" data-lang="sql"><code>SELECT [DISTINCT] expr [AS alias], ...

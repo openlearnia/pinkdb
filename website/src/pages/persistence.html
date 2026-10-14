@@ -19,6 +19,12 @@ let db = PinkDb::open("x.pink")?;   // plain open
 
 let (db, info) = PinkDb::open_durable_with("x.pink", SyncPolicy::Sync)?;</code></pre>
 
+<aside class="marginalia">
+  <span class="margin-tag">views are session-local</span>
+  <p>Views are never persisted; v1 (<code>PINKDB01</code>) files still load and their
+  tables become the single <code>main</code> database.</p>
+</aside>
+
 <ul>
   <li>Data is stored per-column in ≤2048-row chunks. Each chunk picks its smallest
   encoding: integers choose between raw, RLE, and bitpacking (min + width + packed bits);

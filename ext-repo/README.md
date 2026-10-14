@@ -21,7 +21,9 @@ versioning/immutability rules. Short version:
   `Access-Control-Allow-Origin: *` so the docs page can fetch it cross-origin;
   `OPTIONS /index.json` answers the preflight.
 - `GET /` — a short info page: repository title, format version, and links to
-  the docs catalog UI and `/index.json`. The catalog UI itself (search over
+  the docs catalog UI and `/index.json`. It is styled in the docs site's
+  "soft data-zine" paper palette with system fonts only (no webfont requests,
+  no scripts). The catalog UI itself (search over
   name, description and platform; per-extension details with
   `.install <name>` / `.install <name>@<version>`, the download link, SHA-256,
   the all-versions table and the raw entry) lives at

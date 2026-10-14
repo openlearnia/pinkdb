@@ -5,6 +5,12 @@ stays lean): a TCP server plus a blocking client for a hand-rolled binary protoc
 external dependencies, zero async (one std thread per connection), no <code>unsafe</code>.
 Release binary: 1.84 MB.</p>
 
+<aside class="marginalia">
+  <span class="margin-tag">threads, not tasks</span>
+  <p>One <code>std::thread</code> per connection with blocking I/O: no runtime, no
+  <code>async</code>, and the framing is small enough to read over a coffee.</p>
+</aside>
+
 <h2>Build and run</h2>
 
 <pre class="code" data-lang="sh"><code># in-memory server on 127.0.0.1:5433

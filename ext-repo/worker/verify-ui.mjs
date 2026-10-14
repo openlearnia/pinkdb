@@ -7,9 +7,10 @@
 // (https://pinkdb-ext-repo.defaultcms.workers.dev) and the live docs
 // (https://pinkdb-docs.defaultcms.workers.dev). Checks, in order:
 //   1. local Worker: GET / is the short info page — self-contained, no
-//      catalog script, links to the docs Extensions page and /index.json;
-//      OPTIONS /index.json answers the CORS preflight; with a stubbed R2
-//      binding GET /index.json (200/304/404) carries
+//      catalog script, links to the docs Extensions page and /index.json,
+//      styled with the docs' "soft data-zine" palette using system fonts
+//      only; OPTIONS /index.json answers the CORS preflight; with a stubbed
+//      R2 binding GET /index.json (200/304/404) carries
 //      Access-Control-Allow-Origin: *; /artifacts/… keeps the 405 for
 //      OPTIONS (only the catalog is CORS-enabled);
 //   2. live Worker: GET / matches the page this checkout generates and keeps
@@ -27,10 +28,14 @@
 //      not-found views; every generated page carries the Extensions nav entry
 //      (the extensions page marks it active); no generated page loads an
 //      external asset;
-//   4. live docs: GET <docs>/extensions answers 200 text/html with the
+//   4. design system: the generated stylesheet and font files are the
+//      "soft data-zine" set (paper/ink/pink tokens, three self-hosted OFL
+//      families with licences, swap, tabular numerals, reduced-motion
+//      guards); every page carries favicon + canonical + OpenGraph metadata;
+//   5. live docs: GET <docs>/extensions answers 200 text/html with the
 //      catalog script and the repository URL; a regular docs page keeps the
 //      nav entry;
-//   5. the local index.json mirror (gitignored) is compared as a warning.
+//   6. the local index.json mirror (gitignored) is compared as a warning.
 //
 // The docs-side checks assume the generated page points at the default live
 // repository; they are skipped (with a warning) when a custom repo base URL
@@ -84,10 +89,12 @@ function loadPure(page) {
   }
 }
 
-// No external stylesheets/scripts/fonts/images on any generated page.
+// No external stylesheets/scripts/fonts/images on any generated page. The
+// canonical <link rel="canonical"> is metadata (it points at the page's own
+// URL), not an asset, so it is excluded.
 const ASSET_PATTERNS = [
   [/<script\b[^>]*\bsrc=/i, "<script src="],
-  [/<link\b[^>]*\bhref="https?:/i, '<link href="http…"'],
+  [/<link\b(?![^>]*\brel="canonical")[^>]*\bhref="https?:/i, '<link href="http…"'],
   [/<img\b/i, "<img"],
   [/<iframe\b/i, "<iframe"],
   [/@import/i, "@import"],
@@ -160,6 +167,27 @@ check(
   assetViolations(localPage).length === 0,
   "info page loads no external assets",
   assetViolations(localPage).join(", "),
+);
+check(localPage.includes("--paper: #f7f1e8"), "info page uses the docs' paper palette");
+check(
+  localPage.includes("ui-sans-serif") && localPage.includes("ui-monospace"),
+  "info page keeps to a system type stack",
+);
+check(
+  !localPage.includes("@font-face") && !localPage.includes("fonts.googleapis"),
+  "info page requests no webfonts (system stack only)",
+);
+check(
+  localPage.includes("prefers-reduced-motion"),
+  "info page guards its transitions behind prefers-reduced-motion",
+);
+check(
+  localPage.includes('rel="icon"') && localPage.includes("data:image/svg+xml"),
+  "info page carries an inline (data URI) favicon",
+);
+check(
+  localPage.includes('class="tape"') && localPage.includes('class="sun"'),
+  "info page keeps the zine motifs (tape strip, pink sun)",
 );
 
 const preflight = await localFetch("/index.json", { method: "OPTIONS" });
@@ -327,9 +355,11 @@ if (existsSync(SITE)) {
     const html = readFileSync(file, "utf8");
     const plain = `<a href="${expected}">Extensions</a>`;
     const active = `<a href="${expected}" class="active" aria-current="page">Extensions</a>`;
-    const occurrences = html.split(">Extensions</a>").length - 1;
+    // Count inside the site nav only: pages may also link here from content.
+    const nav = (html.match(/<nav[\s\S]*?<\/nav>/) || [""])[0];
+    const occurrences = nav.split(">Extensions</a>").length - 1;
     check(
-      (html.includes(plain) || html.includes(active)) && occurrences === 1,
+      (nav.includes(plain) || nav.includes(active)) && occurrences === 1,
       `${rel} carries exactly one Extensions nav entry`,
       `${occurrences} occurrences`,
     );
@@ -338,8 +368,91 @@ if (existsSync(SITE)) {
       `${rel} loads no external assets`,
       assetViolations(html).join(", "),
     );
+    check(
+      html.includes('rel="icon"') &&
+        html.includes('rel="canonical"') &&
+        html.includes('property="og:image"') &&
+        html.includes('property="og:title"') &&
+        html.includes("assets/style.css"),
+      `${rel} carries favicon + canonical + OpenGraph + the stylesheet`,
+    );
   }
 }
+
+// ------------------------------------------------ design-system static checks
+
+const cssPath = join(SITE, "assets", "style.css");
+if (existsSync(cssPath)) {
+  const css = readFileSync(cssPath, "utf8");
+  check(css.includes("font-display: swap"), "stylesheet uses font-display: swap");
+  for (const family of ["Bricolage Grotesque", "Public Sans", "JetBrains Mono"]) {
+    check(css.includes(`font-family: "${family}"`),
+      `stylesheet declares the self-hosted ${family} face`);
+  }
+  check(css.includes("--paper: #f7f1e8") && css.includes("--ink: #241f1c"),
+    "stylesheet keeps the paper/ink palette tokens");
+  check(/font-variant-numeric:\s*tabular-nums/.test(css),
+    "data surfaces use tabular numerals");
+  check(css.includes("prefers-reduced-motion"),
+    "stylesheet guards motion behind prefers-reduced-motion");
+  check(!/@import|url\(\s*["']?https?:/i.test(css),
+    "stylesheet loads no external fonts or imports");
+  check(css.includes("dvh") || !css.includes("100vh"),
+    "no 100vh sections (viewport-relative heights only)");
+  check(/\.ticker-track\s*\{[^}]*animation/.test(css),
+    "stylesheet animates the ticker strip");
+} else {
+  check(false, "generated stylesheet is present", `missing ${cssPath}`);
+}
+
+for (const [font, min] of [
+  ["bricolage-grotesque.woff2", 20000],
+  ["public-sans.woff2", 20000],
+  ["public-sans-italic.woff2", 20000],
+  ["jetbrains-mono.woff2", 20000],
+]) {
+  const path = join(SITE, "assets", "fonts", font);
+  check(
+    existsSync(path) && statSync(path).size > min,
+    `self-hosted font ${font} ships in the generated site`,
+    existsSync(path) ? `${statSync(path).size} bytes` : "missing",
+  );
+}
+check(
+  existsSync(join(SITE, "assets", "fonts", "OFL-Bricolage-Grotesque.txt")) &&
+    existsSync(join(SITE, "assets", "fonts", "OFL-Public-Sans.md")) &&
+    existsSync(join(SITE, "assets", "fonts", "OFL-JetBrains-Mono.txt")),
+  "OFL licence texts ship next to the woff2 files",
+);
+check(
+  existsSync(join(SITE, "assets", "favicon.svg")) &&
+    existsSync(join(SITE, "assets", "favicon.png")) &&
+    existsSync(join(SITE, "assets", "og.png")),
+  "branded favicon (SVG + PNG) and the OpenGraph card are generated",
+);
+
+const landing = readFileSync(join(SITE, "index.html"), "utf8");
+check(
+  landing.includes('class="ticker"') && landing.includes("ticker-track"),
+  "landing page carries the ticker strip",
+);
+check(landing.includes("cards zig"), "landing page uses the broken-grid card arrangement");
+check(
+  landing.includes('role="img"') && landing.includes("sk-before") && landing.includes("sk-after"),
+  "landing page draws the benchmark as an inline sketch (before/after bars)",
+);
+check(
+  readFileSync(join(SITE, "docs", "architecture.html"), "utf8").includes("sk-arrowhead"),
+  "architecture page redraws the pipeline as an inline sketch",
+);
+check(
+  readFileSync(join(SITE, "404.html"), "utf8").includes("404 — page not found"),
+  "404 page is branded and self-describing",
+);
+check(
+  readFileSync(join(SITE, "docs", "sql.html"), "utf8").includes('class="marginalia"'),
+  "docs pages carry margin notes (marginalia)",
+);
 
 // ------------------------------------- pure helpers vs. the live catalog
 

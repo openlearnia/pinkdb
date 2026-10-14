@@ -5,7 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Persistence &amp; encryption — pinkdb</title>
 <meta name="description" content="The .pink columnar format, write-ahead log crash recovery, and optional at-rest encryption (PINKENC1, AES-256-GCM + Argon2id).">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/persistence.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Persistence &amp; encryption — pinkdb">
+<meta property="og:description" content="The .pink columnar format, write-ahead log crash recovery, and optional at-rest encryption (PINKENC1, AES-256-GCM + Argon2id).">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/persistence.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -52,6 +69,12 @@ db.save("x.pink")?;                 // or db.save_snapshot("copy.pink")?
 let db = PinkDb::open("x.pink")?;   // plain open
 
 let (db, info) = PinkDb::open_durable_with("x.pink", SyncPolicy::Sync)?;</code></pre>
+
+<aside class="marginalia">
+  <span class="margin-tag">views are session-local</span>
+  <p>Views are never persisted; v1 (<code>PINKDB01</code>) files still load and their
+  tables become the single <code>main</code> database.</p>
+</aside>
 
 <ul>
   <li>Data is stored per-column in ≤2048-row chunks. Each chunk picks its smallest
@@ -193,6 +216,7 @@ plaintext.</p>
 <footer class="site-footer">
   <div class="container footer-row">
     <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>
 </footer>

@@ -5,7 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Page not found — pinkdb</title>
 <meta name="description" content="That page does not exist. Head back to the pinkdb docs.">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/404.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Page not found — pinkdb">
+<meta property="og:description" content="That page does not exist. Head back to the pinkdb docs.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/404.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="assets/favicon.png">
+<link rel="preload" href="assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
@@ -32,13 +49,19 @@
 </header>
 <main id="main">
   <div class="container">
+<p class="kicker">off the page</p>
 <h1>404 — page not found</h1>
+
+<svg class="sketch-underline" viewBox="0 0 260 18" aria-hidden="true" focusable="false">
+  <path class="sk-pink-stroke" d="M4 12 C 40 6, 70 14, 104 9 S 168 4, 204 10 S 246 12, 256 7"/>
+  <path class="sk-stroke" d="M12 15 C 62 11, 122 16, 182 12" opacity="0.35"/>
+</svg>
 
 <p class="lede">That page does not exist (or moved while the docs were being rebuilt).</p>
 
 <p>Try the <a href="./">home page</a> or jump straight into the docs:</p>
 
-<ul class="cards">
+<ul class="cards zig">
   <li class="card">
     <h3><a href="docs/getting-started">Getting started</a></h3>
     <p>Build the CLI and run your first queries.</p>
@@ -48,16 +71,24 @@
     <p>The v1 SQL surface in one page.</p>
   </li>
   <li class="card">
+    <h3><a href="extensions">Extensions</a></h3>
+    <p>Browse the extension catalog and install one.</p>
+  </li>
+  <li class="card">
     <h3><a href="docs/roadmap">Roadmap</a></h3>
     <p>What has shipped and what is queued.</p>
   </li>
 </ul>
+
+<p class="doc-meta">If a docs link brought you here, the page may have been renamed — the
+navigation above is the full map.</p>
 
   </div>
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
     <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="./">Home</a> · <a href="docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>
 </footer>

@@ -5,7 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Extensions — pinkdb</title>
 <meta name="description" content="The pinkdb extension repository: browse published extension artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
-<meta name="color-scheme" content="dark">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/extensions.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Extensions — pinkdb">
+<meta property="og:description" content="The pinkdb extension repository: browse published extension artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/extensions.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, wave 26.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="assets/favicon.png">
+<link rel="preload" href="assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="assets/style.css">
 </head>
 <body>
@@ -38,6 +55,21 @@
      (marked __PURE_END__) is lifted and tested by
      ext-repo/worker/verify-ui.mjs. -->
 
+<div class="ticker" aria-hidden="true">
+  <div class="ticker-track">
+    <span>format v1 &#183; immutable artifacts</span>
+    <span>sha-256 verified before loading</span>
+    <span>install in one line: .install &lt;name&gt;</span>
+    <span>catalog is plain JSON behind CORS *</span>
+    <span>publish with ext-repo/publish.sh</span>
+    <span>format v1 &#183; immutable artifacts</span>
+    <span>sha-256 verified before loading</span>
+    <span>install in one line: .install &lt;name&gt;</span>
+    <span>catalog is plain JSON behind CORS *</span>
+    <span>publish with ext-repo/publish.sh</span>
+  </div>
+</div>
+
 <div id="ext-intro">
   <p class="kicker">extension repository</p>
   <h1>Extensions</h1>
@@ -49,6 +81,53 @@
   see the repository's <code>FORMAT.md</code>). The
   <a href="https://pinkdb-ext-repo.defaultcms.workers.dev/" rel="noopener">repository Worker</a>
   serves the machine endpoints only.</p>
+
+  <figure class="plate">
+    <svg viewBox="0 0 720 262" role="img" aria-label="Sketch of the route an extension takes: publish.sh uploads the dylib to the R2 bucket, the Worker serves index.json and the artifact bytes, this page renders the catalog, and a pinkdb shell installs the extension by name.">
+      <defs>
+        <marker id="sk-arrowhead" markerWidth="8" markerHeight="8" refX="5.5" refY="5" orient="auto">
+          <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--ink)" stroke-width="1.8" stroke-linecap="round"/>
+        </marker>
+      </defs>
+
+      <text class="sk-label-sm" x="4" y="14">from a dylib to .install &lt;name&gt;</text>
+
+      <rect class="sk-box-pink" x="4" y="30" width="150" height="58" rx="9" transform="rotate(-0.6)"/>
+      <text class="sk-label" x="18" y="54">publish.sh</text>
+      <text class="sk-label-sm" x="18" y="72">dylib + metadata</text>
+
+      <path class="sk-stroke" d="M160 56 C 176 52, 186 66, 202 60" marker-end="url(#sk-arrowhead)"/>
+      <text class="sk-label-sm" x="158" y="92">sha-256</text>
+
+      <rect class="sk-box" x="210" y="28" width="164" height="62" rx="9" transform="rotate(0.5)"/>
+      <text class="sk-label" x="224" y="52">r2 bucket</text>
+      <text class="sk-label-sm" x="224" y="70">immutable keys</text>
+
+      <path class="sk-stroke" d="M380 58 C 396 54, 406 68, 422 62" marker-end="url(#sk-arrowhead)"/>
+
+      <rect class="sk-box" x="430" y="20" width="180" height="46" rx="9" transform="rotate(-0.4)"/>
+      <text class="sk-label" x="444" y="48">worker &#183; /index.json</text>
+      <path class="sk-dash" d="M430 80 L 606 80" marker-end="url(#sk-arrowhead)"/>
+      <text class="sk-label-sm" x="440" y="98">cors * for the catalog</text>
+      <rect class="sk-box-alt" x="430" y="110" width="180" height="40" rx="9" transform="rotate(0.4)"/>
+      <text class="sk-label" x="444" y="135">/artifacts/&#8230;</text>
+
+      <path class="sk-stroke" d="M250 120 C 250 140, 268 148, 262 166" marker-end="url(#sk-arrowhead)"/>
+      <rect class="sk-box-alt" x="140" y="172" width="194" height="52" rx="9" transform="rotate(-0.5)"/>
+      <text class="sk-label" x="154" y="196">this page &#183; catalog</text>
+      <text class="sk-label-sm" x="154" y="214">search &#183; hashes &#183; download</text>
+
+      <path class="sk-stroke" d="M340 198 C 360 194, 368 206, 386 200" marker-end="url(#sk-arrowhead)"/>
+
+      <rect class="sk-box-pink" x="394" y="170" width="238" height="56" rx="9" transform="rotate(0.6)"/>
+      <text class="sk-label" x="408" y="194">pinkdb shell</text>
+      <text class="sk-label-sm" x="408" y="212">.install &lt;name&gt; &#8594; verify &#8594; call</text>
+
+      <text class="sk-label-sm" x="4" y="252">write-once: publish, hash, never touch the bytes again</text>
+    </svg>
+    <figcaption class="sk-figure-caption">Fig. 3 — the repository is a write-once store; the catalog is the
+    index of what exists, and every shell re-verifies the hash before calling into the dylib.</figcaption>
+  </figure>
 </div>
 
 <div id="catalog">
@@ -382,7 +461,10 @@
 
   function loadingView() {
     return '<p class="lede"><span class="spinner" aria-hidden="true"></span>Fetching <a href="' +
-      esc(INDEX_URL) + '" rel="noopener">index.json</a>&hellip;</p>';
+      esc(INDEX_URL) + '" rel="noopener">index.json</a>&hellip;</p>' +
+      '<ul class="cards skeleton" aria-hidden="true">' +
+      '<li class="skel-card"></li><li class="skel-card"></li><li class="skel-card"></li>' +
+      "</ul>";
   }
 
   function errorView(message) {
@@ -649,6 +731,7 @@
 <footer class="site-footer">
   <div class="container footer-row">
     <p>pinkdb — an embedded analytical SQL database in Rust. Docs reflect wave 26 (Oct 2026).</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
     <p><a href="./">Home</a> · <a href="docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
   </div>
 </footer>

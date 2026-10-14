@@ -20,6 +20,12 @@ make -C crates/pinkdb-ffi hello   # compiles and runs the C example</code></pre>
 
 <h3>Contract</h3>
 
+<aside class="marginalia">
+  <span class="margin-tag">one handle, one thread</span>
+  <p>Handles are not thread-safe; errors are thread-local and read back with
+  <code>pinkdb_last_error()</code>.</p>
+</aside>
+
 <ul>
   <li><strong>Handles</strong>: <code>pinkdb_open</code> (durable files),
   <code>pinkdb_open_memory</code>, and <code>pinkdb_close</code>. Handles are
