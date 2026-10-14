@@ -14,8 +14,13 @@
 //!   the second committer with a write-conflict error (no silent lost
 //!   updates). `ROLLBACK` discards the snapshot.
 //!
-//! This is snapshot isolation without predicate tracking: write-write
-//! conflicts abort, but write-skew anomalies are possible. Transactions hold
+//! A transaction that writes is also validated on its read set: every
+//! catalog table any of its statements read (subqueries and DML predicates
+//! included) must be unchanged at COMMIT. That makes writing transactions
+//! serializable at table granularity — and, crucially, keeps the WAL honest:
+//! replay re-runs the committed SQL text after every earlier commit, so a
+//! stale read would otherwise replay to different data than the session saw.
+//! Read-only transactions log nothing and never conflict. Transactions hold
 //! no locks while open (only validation+merge serializes at commit).
 
 use std::collections::{HashMap, HashSet};
@@ -112,6 +117,13 @@ impl Database {
         shared.checkpoint()
     }
 
+    /// Allow or refuse the SQL `LOAD EXTENSION` statement for every
+    /// connection of this database (default: allowed). Network servers turn
+    /// it off unless the operator opts in.
+    pub fn set_allow_sql_load_extension(&self, allow: bool) {
+        write_lock(&self.shared).set_allow_sql_load_extension(allow);
+    }
+
     /// fsync the WAL (meaningful with [`crate::SyncPolicy::Batch`]).
     pub fn flush_wal(&self) -> Result<()> {
         let mut shared = write_lock(&self.shared);
@@ -127,6 +139,12 @@ struct Txn {
     base_views: HashMap<(String, String), ViewDef>,
     /// Tables / views created, dropped, or written, keyed `(database, name)`.
     table_writes: HashSet<(String, String)>,
+    /// Catalog tables read by any statement of the transaction (including
+    /// subqueries and DML predicates). A transaction that writes must find
+    /// them unchanged at COMMIT: its WAL record replays its SQL text *after*
+    /// every earlier commit, so a read of state another commit changed would
+    /// replay to different data than this session saw.
+    table_reads: HashSet<(String, String)>,
     view_writes: HashSet<(String, String)>,
     /// SQL text of this transaction's mutating statements: one WAL record at
     /// COMMIT (empty for read-only transactions, which log nothing).
@@ -217,6 +235,7 @@ impl Connection {
                 let (plan, dynamic_functions_used) =
                     crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
                 record_writes(&plan, &pre, &mut txn.table_writes, &mut txn.view_writes);
+                crate::plan::collect_tables_read(&plan, &pre, &mut txn.table_reads);
                 let result = crate::exec::run(&mut txn.work, &plan)?;
                 let after = session_after(&result, &pre, &txn.work);
                 // Buffer the committed statement for the transaction's single
@@ -362,6 +381,7 @@ impl Connection {
             base_tables,
             base_views,
             table_writes: HashSet::new(),
+            table_reads: HashSet::new(),
             view_writes: HashSet::new(),
             wal_stmts: Vec::new(),
             wal_ext_paths: Vec::new(),
@@ -394,6 +414,22 @@ impl Connection {
             let now = shared.table_version_in(db, name).ok();
             if base != now {
                 return Err(conflict(&format!("table \"{db}.{name}\"")));
+            }
+        }
+        // Serializable reads: a writing transaction's reads must be unchanged
+        // too (versions are store-unique, so a drop + recreate is a change).
+        // Read-only transactions log nothing and never conflict.
+        let writes = !txn.table_writes.is_empty() || !txn.view_writes.is_empty();
+        if writes {
+            for (db, name) in &txn.table_reads {
+                if txn.table_writes.contains(&(db.clone(), name.clone())) {
+                    continue;
+                }
+                let base = txn.base_tables.get(&(db.clone(), name.clone())).copied();
+                let now = shared.table_version_in(db, name).ok();
+                if base != now {
+                    return Err(conflict(&format!("table \"{db}.{name}\" (read)")));
+                }
             }
         }
         // Validate views by definition (no version counter on views).
@@ -602,7 +638,7 @@ mod tests {
         b.execute("BEGIN;").unwrap();
         b.execute("INSERT INTO t VALUES (4, 'w');").unwrap();
         b.execute("COMMIT;").unwrap();
-        // A now conflicts (t moved from v0 to v1 without it).
+        // A now conflicts (t's version moved without it).
         assert!(a.execute("COMMIT;").is_err());
         // B's row survived; A's did not.
         let mut c = db.connect();
@@ -634,6 +670,59 @@ mod tests {
         assert_eq!(
             rows_of(b.execute("SELECT COUNT(*) FROM t;").unwrap()),
             vec![vec![Value::Bigint(3)]]
+        );
+    }
+
+    #[test]
+    fn recreated_table_never_reuses_a_version() {
+        let db = seeded();
+        let mut a = db.connect();
+        a.execute("BEGIN;").unwrap();
+        a.execute("INSERT INTO t VALUES (3, 'z');").unwrap();
+        // Another session replaces t with a same-shaped table that has seen
+        // the same number of mutation batches as the original.
+        let mut b = db.connect();
+        b.execute("DROP TABLE t;").unwrap();
+        b.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
+        b.execute("INSERT INTO t VALUES (9, 'n');").unwrap();
+        let err = a.execute("COMMIT;").expect_err("recreated table must conflict");
+        assert!(err.to_string().contains("write conflict"), "{err}");
+        assert_eq!(
+            rows_of(b.execute("SELECT a FROM t;").unwrap()),
+            vec![vec![Value::Integer(9)]]
+        );
+    }
+
+    #[test]
+    fn writing_transaction_conflicts_when_its_reads_changed() {
+        let db = seeded();
+        let mut a = db.connect();
+        a.execute("BEGIN;").unwrap();
+        // A's write depends on t, which A does not write.
+        a.execute("UPDATE u SET a = (SELECT MAX(a) FROM t);").unwrap();
+        let mut b = db.connect();
+        b.execute("INSERT INTO t VALUES (50, 'late');").unwrap();
+        // Committing would log SQL that replays against the new t (u = 50)
+        // while this session computed u = 2: refuse instead.
+        let err = a.execute("COMMIT;").expect_err("stale read must conflict");
+        assert!(err.to_string().contains("(read)"), "{err}");
+        assert_eq!(
+            rows_of(b.execute("SELECT a FROM u;").unwrap()),
+            vec![vec![Value::Integer(10)]]
+        );
+        // Read-only transactions never conflict on reads.
+        a.execute("BEGIN;").unwrap();
+        a.execute("SELECT COUNT(*) FROM t;").unwrap();
+        b.execute("INSERT INTO t VALUES (51, 'later');").unwrap();
+        a.execute("COMMIT;").unwrap();
+        // An unrelated table changing does not abort a writer.
+        a.execute("BEGIN;").unwrap();
+        a.execute("UPDATE u SET a = (SELECT MAX(a) FROM t);").unwrap();
+        b.execute("CREATE TABLE other (x INTEGER);").unwrap();
+        a.execute("COMMIT;").unwrap();
+        assert_eq!(
+            rows_of(b.execute("SELECT a FROM u;").unwrap()),
+            vec![vec![Value::Integer(51)]]
         );
     }
 

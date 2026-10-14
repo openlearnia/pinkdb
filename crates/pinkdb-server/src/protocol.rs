@@ -452,8 +452,14 @@ pub fn write_frame<W: Write>(w: &mut W, msg_type: u8, body: &[u8]) -> Result<(),
     Ok(())
 }
 
+/// Bytes read per step while receiving a frame body. The body buffer grows
+/// with the bytes that actually arrived, so a peer that announces a large
+/// frame and then stalls pins at most one step, not the announced size.
+const FRAME_READ_STEP: usize = 64 * 1024;
+
 /// Read one frame; returns `(type, body)`. The length prefix is validated
-/// against [`MAX_FRAME_SIZE`] before any allocation.
+/// against [`MAX_FRAME_SIZE`], and the body buffer grows with received bytes
+/// (never pre-sized from the untrusted prefix).
 pub fn read_frame<R: Read>(r: &mut R) -> Result<(u8, Vec<u8>), ProtocolError> {
     let mut prefix = [0u8; 4];
     r.read_exact(&mut prefix)?;
@@ -468,8 +474,14 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<(u8, Vec<u8>), ProtocolError> {
     }
     let mut tag = [0u8; 1];
     read_exact(r, &mut tag, "frame type byte")?;
-    let mut body = vec![0u8; len - 1];
-    read_exact(r, &mut body, "frame body")?;
+    let want = len - 1;
+    let mut body = Vec::with_capacity(want.min(FRAME_READ_STEP));
+    while body.len() < want {
+        let start = body.len();
+        let step = (want - start).min(FRAME_READ_STEP);
+        body.resize(start + step, 0);
+        read_exact(r, &mut body[start..], "frame body")?;
+    }
     Ok((tag[0], body))
 }
 

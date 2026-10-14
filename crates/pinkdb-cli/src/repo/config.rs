@@ -155,8 +155,10 @@ pub fn remove_repository(urls: &mut Vec<String>, url: &str) -> Result<String, St
 /// `https://host/` and `https://host` are the same repository. Rejected:
 /// other schemes, empty hosts, whitespace, backslashes, `?`/`#` (the client
 /// appends `/index.json` and `/<file>` itself), and userinfo (`@`). Plain
-/// `http://` is allowed for local/testing repositories; use `https://` for
-/// anything remote.
+/// `http://` is only accepted for loopback hosts (`localhost`, `127.x.y.z`,
+/// `[::1]`) unless `PINKDB_REPO_ALLOW_HTTP=1` is set: installed artifacts are
+/// loaded as native code, so a network attacker must not be able to swap
+/// them in transit.
 pub fn validate_repository_url(url: &str) -> Result<String, String> {
     let url = url.trim();
     if url.is_empty() {
@@ -186,7 +188,38 @@ pub fn validate_repository_url(url: &str) -> Result<String, String> {
             "repository URL {url:?} must not contain userinfo ('@')"
         ));
     }
+    if url.starts_with("http://") && !is_loopback_host(host) && !allow_plain_http() {
+        return Err(format!(
+            "repository URL {url:?} uses plain http:// for a non-loopback host; use https:// \
+             (or set PINKDB_REPO_ALLOW_HTTP=1 for a trusted local network)"
+        ));
+    }
     Ok(url.trim_end_matches('/').to_string())
+}
+
+/// `PINKDB_REPO_ALLOW_HTTP=1` opts into plain-HTTP repositories off loopback.
+fn allow_plain_http() -> bool {
+    std::env::var("PINKDB_REPO_ALLOW_HTTP").is_ok_and(|v| v == "1")
+}
+
+/// `host[:port]` names the local machine: `localhost`, an IPv4 address in
+/// 127.0.0.0/8, or `[::1]`.
+fn is_loopback_host(host_port: &str) -> bool {
+    let host = if let Some(rest) = host_port.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 /// One cached artifact file found under `$PINKDB_HOME/extensions`.
@@ -385,6 +418,14 @@ mod tests {
                 validate_repository_url(bad).is_err(),
                 "{bad:?} should be rejected"
             );
+        }
+        // Plain http:// only for loopback (the env opt-in is not set in tests).
+        for ok in ["http://localhost:8080", "http://127.0.0.2/x", "http://[::1]:9"] {
+            assert!(validate_repository_url(ok).is_ok(), "{ok:?} should be accepted");
+        }
+        for bad in ["http://example.com", "http://10.0.0.1:80", "http://localhost.evil.com"] {
+            let err = validate_repository_url(bad).unwrap_err();
+            assert!(err.contains("plain http://"), "{bad:?}: {err}");
         }
     }
 

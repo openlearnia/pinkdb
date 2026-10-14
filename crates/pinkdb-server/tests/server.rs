@@ -953,3 +953,52 @@ fn client_rejects_malformed_responses_and_marks_itself_broken() {
     // A server-reported SQL error must NOT break the client: covered against
     // a real server by `sql_errors_are_reported_without_dropping_the_connection`.
 }
+
+#[test]
+fn load_extension_is_refused_for_remote_clients_by_default() {
+    let (_handle, addr) = start();
+    let mut c = Client::connect(&addr).unwrap();
+    let err = c
+        .execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+        .expect_err("remote LOAD EXTENSION must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("LOAD EXTENSION is disabled"), "{msg}");
+    // The refusal happens before any dlopen attempt: an opted-in server
+    // instead reports the loader's own error for the missing file.
+    let server = Server::bind("127.0.0.1:0", Database::new())
+        .unwrap()
+        .allow_load_extension(true);
+    let addr = server.local_addr().to_string();
+    let _handle = server.spawn().unwrap();
+    let mut c = Client::connect(&addr).unwrap();
+    let msg = c
+        .execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+        .expect_err("missing library still errors")
+        .to_string();
+    assert!(!msg.contains("LOAD EXTENSION is disabled"), "{msg}");
+}
+
+#[test]
+fn idle_clients_are_disconnected_and_announced_frames_are_not_preallocated() {
+    let server = Server::bind("127.0.0.1:0", Database::new())
+        .unwrap()
+        .idle_timeout(Some(Duration::from_millis(300)));
+    let addr = server.local_addr().to_string();
+    let _handle = server.spawn().unwrap();
+
+    // A client that handshakes and then goes silent is dropped.
+    let mut idle = Raw::connect(&addr);
+    idle.expect_eof();
+
+    // A client that announces a maximum-size frame and sends nothing more:
+    // the server must time it out (the body is never sized from the prefix).
+    let mut stalled = Raw::connect(&addr);
+    stalled
+        .writer
+        .write_all(&(MAX_FRAME_SIZE as u32).to_le_bytes())
+        .unwrap();
+    stalled.writer.write_all(&[msg_type::EXECUTE]).unwrap();
+    stalled.expect_eof();
+
+    assert_server_healthy(&addr);
+}

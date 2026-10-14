@@ -55,11 +55,28 @@ pub fn platform_tag() -> Result<String, String> {
     Ok(format!("{os}-{arch}"))
 }
 
-/// One shared HTTP agent (connection pool + timeouts).
+/// One shared HTTPS agent (connection pool + timeouts). `https_only` also
+/// covers redirects: an `https://` repository can never be downgraded to
+/// plain HTTP by a redirect, since the artifact it serves is loaded as native
+/// code.
 pub fn agent() -> Agent {
     Agent::config_builder()
         .timeout_global(Some(HTTP_TIMEOUT))
         .user_agent(concat!("pinkdb-cli/", env!("CARGO_PKG_VERSION")))
+        .https_only(true)
+        .build()
+        .into()
+}
+
+/// Agent for a plain `http://` repository (loopback, or opted in with
+/// `PINKDB_REPO_ALLOW_HTTP=1`; see `validate_repository_url`). Redirects are
+/// not followed, so such a repository cannot bounce a download to another
+/// host.
+fn plain_http_agent() -> Agent {
+    Agent::config_builder()
+        .timeout_global(Some(HTTP_TIMEOUT))
+        .user_agent(concat!("pinkdb-cli/", env!("CARGO_PKG_VERSION")))
+        .max_redirects(0)
         .build()
         .into()
 }
@@ -111,6 +128,13 @@ pub fn install(
     let platform = platform_tag()?;
     let mut reasons = Vec::with_capacity(repositories.len());
     for base in repositories {
+        let plain;
+        let agent = if base.starts_with("http://") {
+            plain = plain_http_agent();
+            &plain
+        } else {
+            agent
+        };
         let catalog = fetch_catalog(agent, base)?;
         match lookup(&catalog, name, version, &platform, ABI_VERSION) {
             Lookup::Found(entry) => {

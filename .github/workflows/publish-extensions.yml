@@ -133,12 +133,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ext-repo
-          if curl -fsSL "$PINKDB_EXT_REPO_URL/index.json" -o ext-repo/index.json; then
-            echo "fetched $PINKDB_EXT_REPO_URL/index.json"
-          else
-            echo "::warning::no catalog at $PINKDB_EXT_REPO_URL/index.json — starting from an empty one"
-            printf '{"format_version":1,"updated":null,"extensions":[]}\n' > ext-repo/index.json
-          fi
+          # Only a definite 404 means "no catalog yet". Any other failure
+          # (5xx, timeout, DNS) must stop the job: publishing an index built
+          # from an empty list would wipe every live entry.
+          status=$(curl -sSL --retry 3 --retry-all-errors -o ext-repo/index.json \
+            -w '%{http_code}' "$PINKDB_EXT_REPO_URL/index.json" || echo "000")
+          case "$status" in
+            200)
+              python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert isinstance(d.get("extensions"), list)' ext-repo/index.json \
+                || { echo "::error::fetched index.json is not a valid catalog"; exit 1; }
+              echo "fetched $PINKDB_EXT_REPO_URL/index.json" ;;
+            404)
+              echo "::warning::no catalog at $PINKDB_EXT_REPO_URL/index.json — starting from an empty one"
+              printf '{"format_version":1,"updated":null,"extensions":[]}\n' > ext-repo/index.json ;;
+            *)
+              echo "::error::fetching $PINKDB_EXT_REPO_URL/index.json failed (HTTP $status); refusing to publish over the live catalog"
+              exit 1 ;;
+          esac
 
       - name: discover artifacts and skip already-published coordinates
         id: discover

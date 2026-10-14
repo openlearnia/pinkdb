@@ -64,7 +64,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra; Workers half done, R2 deferred to the extensions-repository wave 32/39) | done | live at https://pinkdb-docs.defaultcms.workers.dev (Workers static assets; .html links 307→canonical extensionless; 404-page; assets 200) |
 | 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | done | three GitHub Actions workflows (.github/workflows/{ci,publish-extensions,deploy-docs}.yml): CI build/test/clippy + feature matrices + wasm + duckdiff + Python/Go bindings + C/Go SDK smokes + Docker S3 job; manual-dispatch extension publishing to the live R2 repo (dup refusal, checksums today, signing hook documented); docs auto-deploy; actionlint-clean, YAML-parsed, steps executed locally where possible; secrets documented (CLOUDFLARE_API_TOKEN scopes + account id) |
 | 40 | Performance tuning (recurring every 5th wave): bench-driven speed work, no new features (core) | done | profile-driven: parallel vortex writes (2-2.7×, byte-identical), typed aggregate kernels + count-filter fast path (filter 50→24 ms @10M), window key rework (95→61 ms @1M); standing battery 493→447 ms; 494 tests, duckdiff 60/60; group-by @10M target missed (74 vs ≤60, parallel-ceiling analysis + breadcrumb); next-round breadcrumbs recorded |
-| 40a | Hardening — safety (docs/GAPS.md P0 #1–#10): server-side `LOAD EXTENSION` opt-in, publish catalog-wipe guard, store-wide table versions, read-set COMMIT validation, bounded `.pink` decoder, DuckDB-style overflow errors, CLI lake handle reuse, https-only `.install`, redacted S3 secrets, bounded server frames + idle timeout | in progress | — |
+| 40a | Hardening — safety (docs/GAPS.md P0 #1–#10): server-side `LOAD EXTENSION` opt-in, publish catalog-wipe guard, store-wide table versions, read-set COMMIT validation, bounded `.pink` decoder + v3 CRC trailer, DuckDB-style overflow errors, CLI lake handle baselines, https-only `.install`, redacted S3 secrets, bounded server frames + idle timeout | done | 502 workspace tests (+8 regression tests, each shown to fail without its fix where the platform allows); feature matrix green (pink-lake s3 106, cli lake,s3 44, cli encryption 27, core encryption 352, cli client 27, cli repo 54); clippy -D warnings clean all feature sets; duckdiff 60/60; kill loops 30/30 plain + 30/30 multi-db + 20/20 targeted + 30/30 encrypted; bench parity vs main interleaved (418–422 vs 419–425 ms); sizes `pinkdb` 2.14 MB (unchanged) / `pinkdb-server` 1.80 MB (+0.02) |
 | 40b | Hardening — durability/operability: auto-checkpoint + `CHECKPOINT`, `.pink` file lock, log-before-publish, single-lock write bind, Python handle lock, CLI exit codes/stderr/`-c`/EOF, S3 retries, honest `versions()`, `.lake` transaction/durable guards | queued | — |
 | 40c | Hardening — CI + docs truthfulness: macOS CI + fmt/audit/feature-test gaps, website refresh, committed-binary/account-id cleanup, wave 29/39 claims corrected | queued | — |
 | 40d | SQL completeness: multi-way/composite/non-equi/CROSS/FULL joins, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, INTERSECT/EXCEPT, COUNT(DISTINCT), EXPLAIN, SHOW/DESCRIBE, RANGE frames + frame validation | queued | — |
@@ -332,3 +332,23 @@ Java bindings.
   skips / NaN rules exactly. Breadcrumbs for the next perf round: SoA accumulators for the
   parallel group-by ceiling; bulk typed lake decode (no per-row push/`from_utf8`) for the
   ~0.63 s 10M `.lake open`.
+- 2026-10-14 — Wave 40a: safety hardening from the waves 0–40 gap audit (docs/GAPS.md P0).
+  Server: SQL `LOAD EXTENSION` refused for remote clients unless `--allow-load-extension`
+  (library `Server::allow_load_extension`), idle socket timeout (default 300 s,
+  `--idle-timeout`), `--max-connections`, frame bodies buffered as they arrive (never
+  pre-sized from the prefix). Publishing: the workflow fails on any catalog fetch error
+  except 404, and `publish.py` refuses to upload an index missing live entries. Engine:
+  table versions drawn from a store-wide counter (DROP+CREATE can no longer alias a
+  version); writing transactions validate their read set at COMMIT so WAL replay always
+  matches the session; `.pink` v3 = v2 + CRC-32 trailer (v1/v2 still load) and chunk-sized
+  counts capped at CHUNK_SIZE before allocating; integer `+ - *`, negation, `abs`,
+  `date ± n` and narrowing casts error on overflow like DuckDB (DOUBLE→int casts round
+  half away from zero), `SUM` is exact via an i64 + wrap-counter accumulator and errors
+  only when the final value leaves BIGINT; the fused join→aggregate totality check now
+  treats integer arithmetic as fallible. CLI: per-lake session baselines turn a stale
+  `.lake save` into a conflict (`force` overrides); repositories accept plain `http://`
+  only on loopback (or `PINKDB_REPO_ALLOW_HTTP=1`), `https://` agents are https-only
+  through redirects, plain-http agents follow none. Lake: `S3Config`/`Credentials`
+  `Debug` redact secrets. 502 tests, feature matrix + clippy green, duckdiff 60/60, kill
+  loops clean, bench at parity (the first i128 SUM accumulator cost ~7% on group_id via
+  16-byte alignment; the wrap-counter design recovers it).

@@ -654,3 +654,70 @@ fn s3_urls_need_the_s3_feature() {
     assert!(out.contains("Error:"), "{out}");
     assert!(out.contains("invalid lake location"), "{out}");
 }
+
+/// Two REPL sessions open the same lake version; the first to save wins and
+/// the second gets a conflict instead of silently overwriting that work.
+/// `force` saves on purpose.
+#[test]
+fn second_session_save_conflicts_instead_of_losing_an_update() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = scratch("lost_update");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version"), "{out}");
+
+    // Session A: open the lake and pause.
+    let mut a = Command::new(cli_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn session A");
+    let mut a_in = a.stdin.take().unwrap();
+    let mut a_out = BufReader::new(a.stdout.take().unwrap());
+    writeln!(a_in, ".lake open {}", lake.display()).unwrap();
+    a_in.flush().unwrap();
+    let mut seen = String::new();
+    loop {
+        let mut line = String::new();
+        assert!(a_out.read_line(&mut line).unwrap() > 0, "session A exited early: {seen}");
+        seen.push_str(&line);
+        if line.starts_with("Opened lake version") || line.starts_with("Error:") {
+            break;
+        }
+    }
+    assert!(seen.contains("Opened lake version"), "{seen}");
+
+    // Session B: open, change, save (publishes the next version).
+    let out = run(&format!(
+        ".lake open {lake}\nINSERT INTO t VALUES (2);\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version"), "{out}");
+
+    // Session A saves its own change: refused, then forced.
+    writeln!(
+        a_in,
+        "INSERT INTO t VALUES (3);\n.lake save {lake}\n.lake save {lake} force\n.quit",
+        lake = lake.display()
+    )
+    .unwrap();
+    drop(a_in);
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut a_out, &mut rest).unwrap();
+    assert!(a.wait().unwrap().success());
+    assert!(rest.contains("Error: write conflict"), "{rest}");
+    assert!(rest.contains("Saved lake version"), "forced save publishes: {rest}");
+
+    // After a successful save the session's base moved: a plain save works.
+    let out = run(&format!(
+        ".lake open {lake}\n.lake save {lake}\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(!out.contains("Error:"), "{out}");
+    cleanup(&dir);
+}

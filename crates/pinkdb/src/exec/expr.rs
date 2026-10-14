@@ -69,13 +69,15 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             let v = eval_expr(expr, chunk, cx)?;
             let mut out = Vector::new_empty(*dtype);
             match (v.data(), *dtype) {
-                // Typed wrapping loops; DATE/TIMESTAMP stay unsupported below.
+                // Typed checked loops; DATE/TIMESTAMP stay unsupported below.
                 (VectorData::Int32(src), DataType::Integer) => {
                     for (i, &x) in src.iter().enumerate() {
                         if v.is_null(i) {
                             out.push_null()?;
                         } else {
-                            out.push_int32(x.wrapping_neg())?;
+                            out.push_int32(x.checked_neg().ok_or_else(|| {
+                                overflow_err("negation", "INTEGER", format_args!("-({x})"))
+                            })?)?;
                         }
                     }
                 }
@@ -84,7 +86,9 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
                         if v.is_null(i) {
                             out.push_null()?;
                         } else {
-                            out.push_int64(x.wrapping_neg())?;
+                            out.push_int64(x.checked_neg().ok_or_else(|| {
+                                overflow_err("negation", "BIGINT", format_args!("-({x})"))
+                            })?)?;
                         }
                     }
                 }
@@ -546,8 +550,12 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
 
 fn negate_value(v: Value, dtype: DataType) -> Result<Value> {
     match (v, dtype) {
-        (Value::Integer(i), DataType::Integer) => Ok(Value::Integer(i.wrapping_neg())),
-        (Value::Bigint(i), DataType::Bigint) => Ok(Value::Bigint(i.wrapping_neg())),
+        (Value::Integer(i), DataType::Integer) => i.checked_neg().map(Value::Integer).ok_or_else(
+            || overflow_err("negation", "INTEGER", format_args!("-({i})")),
+        ),
+        (Value::Bigint(i), DataType::Bigint) => i.checked_neg().map(Value::Bigint).ok_or_else(
+            || overflow_err("negation", "BIGINT", format_args!("-({i})")),
+        ),
         (Value::Double(x), DataType::Double) => Ok(Value::Double(-x)),
         (v, t) => Err(PinkDbError::Execution(format!("cannot negate {v} as {t}"))),
     }
@@ -620,7 +628,40 @@ fn arith_typed(op: BinaryOp, int_div: bool, l: &Vector, r: &Vector) -> Result<Op
     }
 }
 
-/// INTEGER `+`/`-`/`*`/`%` with `arith_values`' wrapping semantics.
+/// DuckDB-style integer overflow error (`+`/`-`/`*`, negation, `abs`).
+fn overflow_err(what: &str, ty: &str, detail: std::fmt::Arguments) -> PinkDbError {
+    PinkDbError::Execution(format!("Overflow in {what} of {ty} ({detail})"))
+}
+
+/// Checked INTEGER/BIGINT binary arithmetic shared by the typed kernels and
+/// the per-value path: overflow is an error (DuckDB semantics), never a
+/// wrapped result. `%` keeps `wrapping_rem` (only `MIN % -1` wraps, and its
+/// mathematical result 0 is exactly what wrapping returns).
+macro_rules! checked_int_arith {
+    ($op:expr, $x:expr, $y:expr, $ty:literal) => {{
+        let (x, y) = ($x, $y);
+        match $op {
+            BinaryOp::Add => x
+                .checked_add(y)
+                .ok_or_else(|| overflow_err("addition", $ty, format_args!("{x} + {y}")))?,
+            BinaryOp::Subtract => x
+                .checked_sub(y)
+                .ok_or_else(|| overflow_err("subtraction", $ty, format_args!("{x} - {y}")))?,
+            BinaryOp::Multiply => x
+                .checked_mul(y)
+                .ok_or_else(|| overflow_err("multiplication", $ty, format_args!("{x} * {y}")))?,
+            BinaryOp::Modulo => {
+                if y == 0 {
+                    return Err(PinkDbError::Execution("integer modulo by zero".to_string()));
+                }
+                x.wrapping_rem(y)
+            }
+            op => unreachable!("binder types {op:?} on {}", $ty),
+        }
+    }};
+}
+
+/// INTEGER `+`/`-`/`*`/`%` with `arith_values`' checked semantics.
 fn arith_int32(op: BinaryOp, l: &Vector, r: &Vector, a: &[i32], b: &[i32]) -> Result<Vector> {
     let mut out = Vector::new_empty(DataType::Integer);
     for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
@@ -628,24 +669,13 @@ fn arith_int32(op: BinaryOp, l: &Vector, r: &Vector, a: &[i32], b: &[i32]) -> Re
             out.push_null()?;
             continue;
         }
-        let v = match op {
-            BinaryOp::Add => x.wrapping_add(y),
-            BinaryOp::Subtract => x.wrapping_sub(y),
-            BinaryOp::Multiply => x.wrapping_mul(y),
-            BinaryOp::Modulo => {
-                if y == 0 {
-                    return Err(PinkDbError::Execution("integer modulo by zero".to_string()));
-                }
-                x.wrapping_rem(y)
-            }
-            _ => unreachable!("arith_int32: {op:?}"),
-        };
+        let v = checked_int_arith!(op, x, y, "INTEGER");
         out.push_int32(v)?;
     }
     Ok(out)
 }
 
-/// BIGINT `+`/`-`/`*`/`%` with `arith_values`' wrapping semantics.
+/// BIGINT `+`/`-`/`*`/`%` with `arith_values`' checked semantics.
 fn arith_int64(op: BinaryOp, l: &Vector, r: &Vector, a: &[i64], b: &[i64]) -> Result<Vector> {
     let mut out = Vector::new_empty(DataType::Bigint);
     for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
@@ -653,18 +683,7 @@ fn arith_int64(op: BinaryOp, l: &Vector, r: &Vector, a: &[i64], b: &[i64]) -> Re
             out.push_null()?;
             continue;
         }
-        let v = match op {
-            BinaryOp::Add => x.wrapping_add(y),
-            BinaryOp::Subtract => x.wrapping_sub(y),
-            BinaryOp::Multiply => x.wrapping_mul(y),
-            BinaryOp::Modulo => {
-                if y == 0 {
-                    return Err(PinkDbError::Execution("integer modulo by zero".to_string()));
-                }
-                x.wrapping_rem(y)
-            }
-            _ => unreachable!("arith_int64: {op:?}"),
-        };
+        let v = checked_int_arith!(op, x, y, "BIGINT");
         out.push_int64(v)?;
     }
     Ok(out)
@@ -711,15 +730,13 @@ fn eval_date_arith(op: BinaryOp, l: &Vector, r: &Vector, dtype: DataType) -> Res
             continue;
         }
         let v = match (op, l.get(i), r.get(i)) {
-            (BinaryOp::Add, Value::Date(d), Value::Integer(n)) => {
-                Value::Date(d.wrapping_add(n))
-            }
-            (BinaryOp::Add, Value::Integer(n), Value::Date(d)) => {
-                Value::Date(d.wrapping_add(n))
-            }
-            (BinaryOp::Subtract, Value::Date(d), Value::Integer(n)) => {
-                Value::Date(d.wrapping_sub(n))
-            }
+            (BinaryOp::Add, Value::Date(d), Value::Integer(n))
+            | (BinaryOp::Add, Value::Integer(n), Value::Date(d)) => Value::Date(
+                d.checked_add(n).ok_or_else(|| date_out_of_range(d, "+", n))?,
+            ),
+            (BinaryOp::Subtract, Value::Date(d), Value::Integer(n)) => Value::Date(
+                d.checked_sub(n).ok_or_else(|| date_out_of_range(d, "-", n))?,
+            ),
             (BinaryOp::Subtract, Value::Date(a), Value::Date(b)) => {
                 Value::Bigint(a as i64 - b as i64)
             }
@@ -734,37 +751,20 @@ fn eval_date_arith(op: BinaryOp, l: &Vector, r: &Vector, dtype: DataType) -> Res
     Ok(out)
 }
 
+fn date_out_of_range(d: i32, sym: &str, n: i32) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "date out of range: {} {sym} {n} days",
+        Value::Date(d)
+    ))
+}
+
 fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
     match (l, r) {
         (Value::Integer(a), Value::Integer(b)) => {
-            let v = match op {
-                BinaryOp::Add => a.wrapping_add(b),
-                BinaryOp::Subtract => a.wrapping_sub(b),
-                BinaryOp::Multiply => a.wrapping_mul(b),
-                BinaryOp::Modulo => {
-                    if b == 0 {
-                        return Err(PinkDbError::Execution("integer modulo by zero".to_string()));
-                    }
-                    a.wrapping_rem(b)
-                }
-                _ => unreachable!("binder types {op:?} on INTEGER"),
-            };
-            Ok(Value::Integer(v))
+            Ok(Value::Integer(checked_int_arith!(op, a, b, "INTEGER")))
         }
         (Value::Bigint(a), Value::Bigint(b)) => {
-            let v = match op {
-                BinaryOp::Add => a.wrapping_add(b),
-                BinaryOp::Subtract => a.wrapping_sub(b),
-                BinaryOp::Multiply => a.wrapping_mul(b),
-                BinaryOp::Modulo => {
-                    if b == 0 {
-                        return Err(PinkDbError::Execution("integer modulo by zero".to_string()));
-                    }
-                    a.wrapping_rem(b)
-                }
-                _ => unreachable!("binder types {op:?} on BIGINT"),
-            };
-            Ok(Value::Bigint(v))
+            Ok(Value::Bigint(checked_int_arith!(op, a, b, "BIGINT")))
         }
         (Value::Double(a), Value::Double(b)) => {
             let v = match op {
@@ -893,7 +893,9 @@ fn eval_scalar_fast(
                         if v.is_null(i) {
                             out.push_null()?;
                         } else {
-                            out.push_int32(x.wrapping_abs())?;
+                            out.push_int32(x.checked_abs().ok_or_else(|| {
+                                overflow_err("abs", "INTEGER", format_args!("abs({x})"))
+                            })?)?;
                         }
                     }
                     Ok(Some(out))
@@ -903,7 +905,9 @@ fn eval_scalar_fast(
                         if v.is_null(i) {
                             out.push_null()?;
                         } else {
-                            out.push_int64(x.wrapping_abs())?;
+                            out.push_int64(x.checked_abs().ok_or_else(|| {
+                                overflow_err("abs", "BIGINT", format_args!("abs({x})"))
+                            })?)?;
                         }
                     }
                     Ok(Some(out))
@@ -946,8 +950,12 @@ fn eval_scalar_fast(
 fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
     match func {
         ScalarFunc::Abs => match &row[0] {
-            Value::Integer(i) => Ok(Value::Integer(i.wrapping_abs())),
-            Value::Bigint(i) => Ok(Value::Bigint(i.wrapping_abs())),
+            Value::Integer(i) => i.checked_abs().map(Value::Integer).ok_or_else(|| {
+                overflow_err("abs", "INTEGER", format_args!("abs({i})"))
+            }),
+            Value::Bigint(i) => i.checked_abs().map(Value::Bigint).ok_or_else(|| {
+                overflow_err("abs", "BIGINT", format_args!("abs({i})"))
+            }),
             Value::Double(x) => Ok(Value::Double(x.abs())),
             v => Err(PinkDbError::Execution(format!("abs of {v}"))),
         },
@@ -1172,16 +1180,39 @@ pub fn count_true(pred: &Vector) -> Result<i64> {
     Ok(n)
 }
 
+fn cast_out_of_range(v: &Value, target: DataType) -> PinkDbError {
+    PinkDbError::Execution(format!("cannot CAST {v} AS {target}: value out of range"))
+}
+
 fn cast_value(v: Value, target: DataType) -> Result<Value> {
     match (v, target) {
         (v, t) if v.data_type() == Some(t) => Ok(v),
-        // Numeric tower (float→int truncates toward zero, wrapping on overflow).
+        // Numeric tower (DuckDB rules): narrowing out of range is an error,
+        // and float→int rounds half away from zero (NaN/±Inf error).
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
-        (Value::Bigint(i), DataType::Integer) => Ok(Value::Integer(i as i32)),
-        (Value::Double(x), DataType::Integer) => Ok(Value::Integer(x as i32)),
-        (Value::Double(x), DataType::Bigint) => Ok(Value::Bigint(x as i64)),
+        (Value::Bigint(i), DataType::Integer) => i32::try_from(i)
+            .map(Value::Integer)
+            .map_err(|_| cast_out_of_range(&Value::Bigint(i), DataType::Integer)),
+        (Value::Double(x), DataType::Integer) => {
+            let r = x.round();
+            if (i32::MIN as f64..=i32::MAX as f64).contains(&r) {
+                Ok(Value::Integer(r as i32))
+            } else {
+                Err(cast_out_of_range(&Value::Double(x), DataType::Integer))
+            }
+        }
+        (Value::Double(x), DataType::Bigint) => {
+            let r = x.round();
+            // i64::MAX is not representable in f64; 2^63 is the first value
+            // out of range.
+            if (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&r) {
+                Ok(Value::Bigint(r as i64))
+            } else {
+                Err(cast_out_of_range(&Value::Double(x), DataType::Bigint))
+            }
+        }
         (Value::Double(x), DataType::Double) => Ok(Value::Double(x)),
         // Boolean ↔ numeric.
         (Value::Boolean(b), DataType::Integer) => Ok(Value::Integer(b as i32)),
@@ -1461,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn arith_wrapping_and_division_errors() {
+    fn arith_overflow_and_division_errors() {
         let mut a = Vector::new_empty(DataType::Integer);
         a.push_valid(V::Integer(i32::MAX)).unwrap();
         a.push_valid(V::Integer(7)).unwrap();
@@ -1478,9 +1509,16 @@ mod tests {
             dtype,
         };
 
-        // i32::MAX + 1 wraps to i32::MIN (`arith_values` parity).
-        let add = eval_expr(&bin(BinaryOp::Add, DataType::Integer), &chunk, &cx).unwrap();
-        assert_eq!(add.get(0), V::Integer(i32::MIN));
+        // i32::MAX + 1 is an overflow error (DuckDB semantics), with the
+        // same message as the per-value path.
+        let err = eval_expr(&bin(BinaryOp::Add, DataType::Integer), &chunk, &cx).unwrap_err();
+        assert_eq!(err.to_string(), "Overflow in addition of INTEGER (2147483647 + 1)");
+        assert_eq!(
+            arith_values(BinaryOp::Add, V::Integer(i32::MAX), V::Integer(1))
+                .unwrap_err()
+                .to_string(),
+            err.to_string()
+        );
 
         // 7 % 0 errors with the same message as the generic path.
         let err = eval_expr(&bin(BinaryOp::Modulo, DataType::Integer), &chunk, &cx).unwrap_err();
@@ -1563,7 +1601,7 @@ mod tests {
         assert_eq!(len.get(1), V::Null);
         assert_eq!(len.get(2), V::Integer(0));
 
-        // ABS (wrapping) and one-arg ROUND on numeric columns.
+        // ABS (checked) and one-arg ROUND on numeric columns.
         let mut d = Vector::new_empty(DataType::Integer);
         d.push_valid(V::Integer(i32::MIN)).unwrap();
         d.push_null().unwrap();
@@ -1576,8 +1614,16 @@ mod tests {
             args: vec![B::Column { index: 0, dtype: DataType::Integer }],
             dtype: DataType::Integer,
         };
-        let a = eval_expr(&abs, &chunk2, &cx).unwrap();
-        assert_eq!(a.get(0), V::Integer(i32::MIN)); // wrapping_abs parity
+        let err = eval_expr(&abs, &chunk2, &cx).unwrap_err();
+        assert!(err.to_string().starts_with("Overflow in abs of INTEGER"), "{err}");
+        let mut ok = Vector::new_empty(DataType::Integer);
+        ok.push_valid(V::Integer(-5)).unwrap();
+        ok.push_null().unwrap();
+        let mut f2 = Vector::new_empty(DataType::Double);
+        f2.push_valid(V::Double(0.0)).unwrap();
+        f2.push_valid(V::Double(0.0)).unwrap();
+        let a = eval_expr(&abs, &DataChunk::new(vec![ok, f2]).unwrap(), &cx).unwrap();
+        assert_eq!(a.get(0), V::Integer(5));
         assert_eq!(a.get(1), V::Null);
         let round = B::Scalar {
             func: ScalarFunc::Round,

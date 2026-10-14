@@ -26,4 +26,4 @@ pub use protocol::{
     read_response, write_request, write_response, DoneKind, ProtocolError, Request, Response,
     MAX_FRAME_SIZE, PROTOCOL_VERSION, ROWS_PER_FRAME,
 };
-pub use server::{Server, ServerHandle};
+pub use server::{Server, ServerHandle, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS};

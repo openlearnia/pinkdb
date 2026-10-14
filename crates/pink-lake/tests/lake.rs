@@ -1187,9 +1187,16 @@ fn v1_fixture_lake_still_loads_bit_exactly() {
         let mini = PinkDb::open(path.to_str().unwrap()).unwrap();
         let resaved = scratch.join("resaved.pink");
         mini.save(resaved.to_str().unwrap()).unwrap();
+        // The engine now writes `.pink` v3 = the v2 payload with the
+        // `PINKDB03` magic and a CRC-32 trailer; the payload must be
+        // byte-identical to the fixture's v2 bytes.
+        let resaved = std::fs::read(&resaved).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        assert!(original.starts_with(b"PINKDB02"), "{rel}");
+        assert!(resaved.starts_with(b"PINKDB03"), "{rel}");
         assert_eq!(
-            std::fs::read(&resaved).unwrap(),
-            std::fs::read(&path).unwrap(),
+            &resaved[8..resaved.len() - 4],
+            &original[8..],
             "{rel} does not round-trip byte-exactly"
         );
     }

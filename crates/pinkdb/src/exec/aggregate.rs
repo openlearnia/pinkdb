@@ -11,7 +11,7 @@ use super::Cx;
 use crate::plan::{compare_values, num_cmp};
 use rayon::prelude::*;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
-use crate::types::{DataType, Result, Value};
+use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
 
 fn encode_value(buf: &mut Vec<u8>, v: &Value) {
@@ -116,17 +116,39 @@ pub(crate) fn eval_agg_vec<'a>(
 
 pub(crate) enum Acc {
     Count(i64),
-    SumInt { sum: i64, non_null: bool },
+    /// Integer SUM is exact like DuckDB's HUGEINT sum: the true total is
+    /// `sum + wraps * 2^64` (`sum` wraps, `wraps` counts the signed
+    /// wraparounds), so intermediate excursions past BIGINT are harmless and
+    /// only a final value outside BIGINT is an overflow error. Two i64s keep
+    /// the accumulator 8-byte aligned (an i128 would widen every `Acc`).
+    SumInt { sum: i64, wraps: i64, non_null: bool },
     SumFloat { sum: f64, non_null: bool },
     Avg { sum: f64, count: i64 },
     MinMax { cur: Option<Value>, is_min: bool },
+}
+
+/// Add `x` to a wrapping i64 sum, counting signed wraparounds so the exact
+/// total stays `sum + wraps * 2^64` (see [`Acc::SumInt`]).
+#[inline]
+fn sum_add(sum: &mut i64, wraps: &mut i64, x: i64) {
+    let (next, wrapped) = sum.overflowing_add(x);
+    if wrapped {
+        // Adding a positive value can only wrap upward, a negative downward.
+        *wraps = wraps.wrapping_add(if x > 0 { 1 } else { -1 });
+    }
+    *sum = next;
+}
+
+/// The exact value of a [`sum_add`] accumulator.
+fn exact_sum(sum: i64, wraps: i64) -> i128 {
+    sum as i128 + ((wraps as i128) << 64)
 }
 
 impl Acc {
     pub(crate) fn new(func: AggFunc) -> Acc {
         match func {
             AggFunc::Count => Acc::Count(0),
-            AggFunc::Sum => Acc::SumInt { sum: 0, non_null: false },
+            AggFunc::Sum => Acc::SumInt { sum: 0, wraps: 0, non_null: false },
             AggFunc::Avg => Acc::Avg { sum: 0.0, count: 0 },
             AggFunc::Min => Acc::MinMax { cur: None, is_min: true },
             AggFunc::Max => Acc::MinMax { cur: None, is_min: false },
@@ -155,19 +177,22 @@ impl Acc {
         match self {
             // `update(Some(_))` increments for every non-NULL payload.
             Acc::Count(n) => *n += 1,
-            Acc::SumInt { sum, non_null } => match v.data() {
+            Acc::SumInt { sum, wraps, non_null } => match v.data() {
                 VectorData::Int32(d) => {
-                    *sum = sum.wrapping_add(d[i] as i64);
+                    sum_add(sum, wraps, d[i] as i64);
                     *non_null = true;
                 }
                 VectorData::Int64(d) => {
-                    *sum = sum.wrapping_add(d[i]);
+                    sum_add(sum, wraps, d[i]);
                     *non_null = true;
                 }
                 // A DOUBLE cell flips the accumulator to float (same rule as
                 // `update`).
                 VectorData::Float64(d) => {
-                    *self = Acc::SumFloat { sum: *sum as f64 + d[i], non_null: true };
+                    *self = Acc::SumFloat {
+                        sum: exact_sum(*sum, *wraps) as f64 + d[i],
+                        non_null: true,
+                    };
                 }
                 // BOOLEAN/VARCHAR/DATE/TIMESTAMP cells are non-numeric and
                 // ignored (`update`'s `_ => {}`).
@@ -229,17 +254,20 @@ impl Acc {
                     *n += 1;
                 }
             }
-            Acc::SumInt { sum, non_null } => match arg {
+            Acc::SumInt { sum, wraps, non_null } => match arg {
                 Some(Value::Integer(i)) => {
-                    *sum = sum.wrapping_add(*i as i64);
+                    sum_add(sum, wraps, *i as i64);
                     *non_null = true;
                 }
                 Some(Value::Bigint(i)) => {
-                    *sum = sum.wrapping_add(*i);
+                    sum_add(sum, wraps, *i);
                     *non_null = true;
                 }
                 Some(Value::Double(x)) => {
-                    *self = Acc::SumFloat { sum: *sum as f64 + *x, non_null: true };
+                    *self = Acc::SumFloat {
+                        sum: exact_sum(*sum, *wraps) as f64 + *x,
+                        non_null: true,
+                    };
                 }
                 _ => {}
             },
@@ -299,9 +327,13 @@ impl Acc {
         *self = match (mine, other) {
             (Acc::Count(a), Acc::Count(b)) => Acc::Count(a + b),
             (
-                Acc::SumInt { sum: a, non_null: an },
-                Acc::SumInt { sum: b, non_null: bn },
-            ) => Acc::SumInt { sum: a.wrapping_add(b), non_null: an || bn },
+                Acc::SumInt { sum: a, wraps: aw, non_null: an },
+                Acc::SumInt { sum: b, wraps: bw, non_null: bn },
+            ) => {
+                let (mut sum, mut wraps) = (a, aw.wrapping_add(bw));
+                sum_add(&mut sum, &mut wraps, b);
+                Acc::SumInt { sum, wraps, non_null: an || bn }
+            }
             (
                 Acc::SumFloat { sum: a, non_null: an },
                 Acc::SumFloat { sum: b, non_null: bn },
@@ -309,13 +341,13 @@ impl Acc {
             // Mixed int/float partials (one side saw a DOUBLE first): fold
             // the int side in as float. Either direction lands in SumFloat.
             (
-                Acc::SumInt { sum: a, non_null: an },
+                Acc::SumInt { sum: a, wraps: aw, non_null: an },
                 Acc::SumFloat { sum: b, non_null: bn },
             )
             | (
                 Acc::SumFloat { sum: b, non_null: bn },
-                Acc::SumInt { sum: a, non_null: an },
-            ) => Acc::SumFloat { sum: a as f64 + b, non_null: an || bn },
+                Acc::SumInt { sum: a, wraps: aw, non_null: an },
+            ) => Acc::SumFloat { sum: exact_sum(a, aw) as f64 + b, non_null: an || bn },
             (
                 Acc::Avg { sum: a, count: ac },
                 Acc::Avg { sum: b, count: bc },
@@ -341,17 +373,22 @@ impl Acc {
     }
     /// Finalize by reference: identical results to [`Acc::finalize`], for
     /// callers (window frames) that must keep the accumulator live.
-    pub(crate) fn finalize_ref(&self, dtype: DataType) -> Value {
-        match self {
+    pub(crate) fn finalize_ref(&self, dtype: DataType) -> Result<Value> {
+        Ok(match self {
             Acc::Count(n) => Value::Bigint(*n),
             // SUM of zero/all-NULL inputs is NULL (like AVG/MIN/MAX).
-            Acc::SumInt { sum, non_null } => {
+            Acc::SumInt { sum, wraps, non_null } => {
                 if !*non_null {
                     Value::Null
                 } else {
+                    let exact = exact_sum(*sum, *wraps);
                     match dtype {
-                        DataType::Double => Value::Double(*sum as f64),
-                        _ => Value::Bigint(*sum),
+                        DataType::Double => Value::Double(exact as f64),
+                        _ => Value::Bigint(i64::try_from(exact).map_err(|_| {
+                            PinkDbError::Execution(format!(
+                                "Overflow in SUM: {exact} is out of range for BIGINT"
+                            ))
+                        })?),
                     }
                 }
             }
@@ -370,10 +407,10 @@ impl Acc {
                 }
             }
             Acc::MinMax { cur, .. } => cur.clone().unwrap_or(Value::Null),
-        }
+        })
     }
 
-    pub(crate) fn finalize(self, dtype: DataType) -> Value {
+    pub(crate) fn finalize(self, dtype: DataType) -> Result<Value> {
         self.finalize_ref(dtype)
     }
 }
@@ -611,7 +648,7 @@ pub(crate) fn emit_groups(
             .into_iter()
             .zip(aggs.iter())
             .map(|(acc, a)| acc.finalize(a.dtype))
-            .collect();
+            .collect::<Result<_>>()?;
         for (col, v) in cur.iter_mut().zip(g.keys.into_iter().chain(finalized)) {
             col.push_value(v)?;
         }
@@ -637,5 +674,32 @@ mod tests {
         let mut c = Vec::new();
         encode_value(&mut c, &Value::Integer(0));
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn integer_sum_is_exact_across_many_wraps_and_merges() {
+        let mut acc = Acc::new(AggFunc::Sum);
+        for _ in 0..5 {
+            acc.update(Some(&Value::Bigint(i64::MAX)));
+        }
+        let mut other = Acc::new(AggFunc::Sum);
+        for _ in 0..5 {
+            other.update(Some(&Value::Bigint(i64::MIN)));
+        }
+        other.update(Some(&Value::Integer(7)));
+        // 5*MAX + 5*MIN + 7 = 7 - 5: exact despite multiple wraps both ways.
+        acc.merge(other);
+        assert_eq!(acc.finalize_ref(DataType::Bigint).unwrap(), Value::Bigint(2));
+        // Out of range at the end is an error, never a wrapped value.
+        let mut big = Acc::new(AggFunc::Sum);
+        big.update(Some(&Value::Bigint(i64::MAX)));
+        big.update(Some(&Value::Bigint(1)));
+        assert!(big.finalize_ref(DataType::Bigint).is_err());
+        // Flipping to float keeps the exact integer prefix.
+        big.update(Some(&Value::Double(0.5)));
+        assert_eq!(
+            big.finalize(DataType::Double).unwrap(),
+            Value::Double(i64::MAX as f64 + 1.0 + 0.5)
+        );
     }
 }

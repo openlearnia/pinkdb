@@ -13,14 +13,18 @@
 //! - the session's `PINKDB_KEY` is carried over so a later `.save`/`.open`
 //!   stays encrypted, while the lake's own files stay plaintext (the output
 //!   says so when a key is set);
-//! - a lake has **one live writer**: a `.lake save` whose handle another
-//!   writer outran fails with a conflict error naming the published version
-//!   — reopen the lake to continue (over S3 the catalog replace is a
-//!   conditional `If-Match` write, so the check is atomic with the write);
+//! - a lake has **one live writer**: the session remembers the version it
+//!   last opened or saved per lake, and a later `.lake save` to that lake
+//!   fails with a conflict error when another writer published in between
+//!   (no silent lost update); `.lake save <dir> force` overrides it on
+//!   purpose. Inside one save the handle check is atomic with the write
+//!   (over S3 the catalog replace is a conditional `If-Match` write);
 //! - `.lake save` validates the store *before* creating a lake, so a store
 //!   the catalog cannot represent (dotted database name, over-long table
 //!   name) leaves no stray empty lake behind.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use pink_lake::Lake;
@@ -34,6 +38,32 @@ use crate::{plural, take_token, unquote};
 const HINT: &str = "   (locations may be s3://bucket/prefix)";
 #[cfg(not(feature = "s3"))]
 const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature)";
+
+/// Per-lake base version of this REPL session (one session per process):
+/// the version `.lake open` last loaded from or `.lake save` last published
+/// to, keyed by the lake's resolved location. A save checks that the lake
+/// has not moved past it, so two sessions that opened the same version can
+/// never silently overwrite each other's work.
+static BASELINES: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+fn baseline_key(lake: &Lake) -> String {
+    lake.path().display().to_string()
+}
+
+fn baseline(lake: &Lake) -> Option<u64> {
+    BASELINES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&baseline_key(lake))
+        .copied()
+}
+
+fn set_baseline(lake: &Lake, version: u64) {
+    BASELINES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(baseline_key(lake), version);
+}
 
 /// Dispatch `.lake <subcommand> ...`.
 pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
@@ -56,13 +86,17 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
 /// store (a directory or an `s3://bucket/prefix` URL with the `s3` feature).
 fn cmd_save(db: &PinkDb, arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake save <dir>{HINT}");
+        println!("Usage: .lake save <dir> [force]{HINT}");
         return;
     };
-    if !rest.trim().is_empty() {
-        println!("Usage: .lake save <dir>{HINT}");
-        return;
-    }
+    let force = match rest.trim() {
+        "" => false,
+        "force" => true,
+        _ => {
+            println!("Usage: .lake save <dir> [force]{HINT}");
+            return;
+        }
+    };
     let dir = unquote(&dir);
     // Reject an unrepresentable store before `open_or_create` can leave a
     // fresh empty lake behind (e.g. a dotted database name or a table name
@@ -78,9 +112,22 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             return;
         }
     };
+    if let Some(base) = baseline(&lake) {
+        let current = lake.current_version();
+        if current != base && !force {
+            println!(
+                "Error: write conflict: lake {dir} moved from version {base} to {current} \
+                 since this session opened or saved it; saving would overwrite that \
+                 work. Reopen it with .lake open, save elsewhere, or use \
+                 .lake save <dir> force"
+            );
+            return;
+        }
+    }
     let t0 = Instant::now();
     match lake.write_from_store_report(db) {
         Ok(report) => {
+            set_baseline(&lake, report.version);
             if db
                 .list_databases()
                 .iter()
@@ -153,6 +200,9 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
                 .sum();
             let shown = version.unwrap_or_else(|| lake.current_version());
             *db = new_db;
+            // Saving after opening an older version deliberately publishes
+            // on top of the latest one (a restore), so the base is current.
+            set_baseline(&lake, lake.current_version());
             println!(
                 "Opened lake version {shown} in {:.3}s ({tables} table{}) from {dir}",
                 t0.elapsed().as_secs_f64(),

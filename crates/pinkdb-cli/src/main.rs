@@ -36,11 +36,11 @@ fn print_help() {
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     if cfg!(feature = "lake") {
         if cfg!(feature = "s3") {
-            println!("  .lake save <dir|s3://bucket/prefix>   snapshot the store into a lake");
+            println!("  .lake save <dir|s3://bucket/prefix> [force]   snapshot the store into a lake");
             println!("  .lake open <dir|s3://…> [v]  load the lake's latest (or version v) into memory");
         } else {
-            println!("  .lake save <dir>       snapshot the store into a lake directory");
-            println!("  .lake open <dir> [v]   load the lake's latest (or version v) into memory");
+            println!("  .lake save <dir> [force]  snapshot the store into a lake directory");
+            println!("  .lake open <dir> [v]      load the lake's latest (or version v) into memory");
         }
         println!("  .lake versions <dir|s3://…>  list the lake's published versions");
         println!("  .lake tables <dir|s3://…>    list the current version's tables and row counts");
@@ -404,6 +404,9 @@ fn cmd_import(db: &mut PinkDb, arg: &str) {
 }
 
 /// One REPL session: in-process, or (with the `client` feature) remote.
+/// Exactly one exists per process, so the size gap between the variants is
+/// irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum Session {
     Local(PinkDb),
     #[cfg(feature = "client")]

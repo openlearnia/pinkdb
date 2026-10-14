@@ -36,6 +36,8 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 
 FORMAT_VERSION = 1
 BUCKET = os.environ.get("PINKDB_EXT_BUCKET", "pinkdb-extensions")
@@ -121,6 +123,40 @@ def r2_put(key: str, file_path: str, content_type: str, cwd: str) -> None:
     print(f"uploaded {BUCKET}/{key}")
 
 
+def coordinates(entries: list) -> set:
+    return {(e.get("name"), e.get("version"), e.get("platform")) for e in entries}
+
+
+def check_against_live(entries: list) -> None:
+    """Refuse to upload a catalog that would drop entries the live one has.
+
+    Only a definite HTTP 404 means "no live catalog yet"; any other failure
+    stops the publish (an index built from a stale or empty local copy would
+    otherwise wipe live entries).
+    """
+    url = f"{BASE_URL}/index.json"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            live = json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return
+        die(f"cannot fetch the live catalog {url} (HTTP {e.code}); refusing to publish")
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        die(f"cannot fetch the live catalog {url} ({e}); refusing to publish")
+    live_entries = live.get("extensions") if isinstance(live, dict) else None
+    if not isinstance(live_entries, list):
+        die(f"live catalog {url} is malformed; refusing to publish")
+    missing = coordinates(live_entries) - coordinates(entries)
+    if missing:
+        shown = ", ".join(f"{n} {v} ({p})" for n, v, p in sorted(missing, key=str)[:5])
+        die(
+            f"the local index.json lacks {len(missing)} live entr"
+            f"{'y' if len(missing) == 1 else 'ies'} ({shown}); fetch the live "
+            "catalog first — publishing would remove them"
+        )
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="publish.py",
@@ -136,6 +172,11 @@ def main(argv=None) -> int:
     )
     parser.add_argument(
         "--description", required=True, help="one-line description of the extension"
+    )
+    parser.add_argument(
+        "--skip-live-check",
+        action="store_true",
+        help="do not compare against the live catalog (offline/testing only)",
     )
     parser.add_argument(
         "--repo-dir",
@@ -216,6 +257,9 @@ def main(argv=None) -> int:
     index["updated"] = datetime.datetime.now(datetime.timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
+
+    if not args.skip_live_check:
+        check_against_live(entries)
 
     index_tmp = index_path + ".tmp"
     with open(index_tmp, "w", encoding="utf-8") as f:

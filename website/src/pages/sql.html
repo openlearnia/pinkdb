@@ -142,8 +142,10 @@ TIMESTAMP '2024-03-15 12:30:45.5'</code></pre>
 <ul>
   <li><code>INTEGER → BIGINT → DOUBLE</code>.</li>
   <li><code>int / int → DOUBLE</code> (the DuckDB rule).</li>
-  <li><code>%</code> is integer-only; <code>SUM</code> over integers accumulates in i64
-  and wraps on overflow.</li>
+  <li><code>%</code> is integer-only. Integer overflow is an error, like DuckDB
+  (<code>+</code>/<code>-</code>/<code>*</code>, negation, <code>abs</code>, date ± n,
+  narrowing casts); <code>SUM</code> over integers accumulates in 128 bits and errors
+  only when the final result does not fit BIGINT.</li>
   <li>Integer division/modulo by zero is an error; <code>0.0</code> float division is
   IEEE.</li>
   <li>Mixed <code>DATE</code>/<code>TIMESTAMP</code> comparison is rejected; timestamps

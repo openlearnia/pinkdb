@@ -139,7 +139,8 @@ database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
   with ORDER BY, whole partition without; no `RANGE` frames, no nesting)
 - Scalar functions: `abs`, `round` (1–2 args), `upper`, `lower`, `length`, `substr`
 - `CAST(x AS type)` (numeric tower both ways, bool↔numeric, varchar parse/format,
-  date↔timestamp; bad input errors), `COALESCE(a, b, ...)` (common type),
+  date↔timestamp; bad input and out-of-range narrowing error; DOUBLE → integer
+  rounds half away from zero, like DuckDB), `COALESCE(a, b, ...)` (common type),
   `LIKE`/`NOT LIKE` (`%`/`_` patterns)
 - `CASE WHEN c THEN v ... [ELSE e] END` + simple `CASE x WHEN v` form
   (NULL conditions never match; result types unify like COALESCE)
@@ -158,7 +159,10 @@ database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
   NULL group keys group together; NULL join keys never match; LEFT/RIGHT
   joins NULL-extend the unmatched side's columns
 - Integer division/modulo by zero is an error; `0.0` float division is IEEE
-- `SUM` over integers accumulates in i64 (wraps on overflow)
+- Integer overflow is an error, like DuckDB: `+`/`-`/`*`, negation, `abs`,
+  `date ± n` and narrowing casts report `Overflow in …` instead of wrapping;
+  `SUM` over integers accumulates in 128 bits and errors only when the final
+  result does not fit BIGINT
 
 REPL dot-commands: `.help`, `.quit` / `.exit`, `.databases`, `.tables`,
 `.schema <t|v>` (accepts `db.table`; views show their output columns),
@@ -185,12 +189,14 @@ rayon pool; anything else goes through the `csv` crate sequentially.
 ## Persistence
 
 `db.save("x.pink")` writes every database and table in a single-file
-columnar format (v2: `PINKDB02`); `PinkDb::open("x.pink")` loads it back
-(`.save` / `.open` in the REPL). v1 files (`PINKDB01`, a flat table list)
-still load: their tables become the single `main` database. Views are
-session-local and never persisted. Round-trips are bit-exact (including
-`-0.0` and NaN payloads); truncated or corrupt files return errors, never
-panics.
+columnar format (v3: `PINKDB03`, ending in a CRC-32 of the whole image);
+`PinkDb::open("x.pink")` loads it back (`.save` / `.open` in the REPL). v2
+files (`PINKDB02`, the same layout without the checksum) and v1 files
+(`PINKDB01`, a flat table list) still load; v1 tables become the single
+`main` database. Views are session-local and never persisted. Round-trips are
+bit-exact (including `-0.0` and NaN payloads); truncated or corrupt files
+return errors, never panics — a damaged v3 file fails its checksum before
+any decoding, and no allocation is sized from an unvalidated length.
 
 Durable opens add a sidecar write-ahead log: `PinkDb::open_durable("x.pink")`
 (the REPL's `.open`) loads the checkpoint, recovers an interrupted checkpoint,
@@ -345,9 +351,14 @@ Queries run under a shared read lock (parallel readers, parallel chunks via
 rayon inside each query). Writes take the write lock per statement.
 `BEGIN..COMMIT` works on a private snapshot: commits to disjoint tables all
 succeed; overlapping writes abort the second committer with a write-conflict
-error (retry the transaction) — never silent lost updates. This is snapshot
-isolation without predicate tracking (write-skew is possible). The plain
-`PinkDb` API remains for single-connection embedding.
+error (retry the transaction) — never silent lost updates. A transaction that
+writes also has its *reads* validated at COMMIT (every table any of its
+statements read, subqueries included, must be unchanged), so the WAL — which
+replays committed SQL in commit order — always reproduces exactly what the
+session computed; read-only transactions never conflict. Table versions are
+store-unique, so a table dropped and recreated underneath a transaction is
+always a conflict. The plain `PinkDb` API remains for single-connection
+embedding.
 
 ## Lake layer (feature `lake`)
 
@@ -809,10 +820,12 @@ cargo build --release -p pinkdb-cli --features client
 ```
 
 `pinkdb-server --help` lists the flags: `--host` (default `127.0.0.1`),
-`--port` (default `5433`; `0` picks an ephemeral port), and `--file` (durable
+`--port` (default `5433`; `0` picks an ephemeral port), `--file` (durable
 `.pink`: the checkpoint loads and the sidecar WAL replays on restart;
-in-memory when omitted). The server prints its listening address on startup
-and runs until terminated.
+in-memory when omitted), `--max-connections N` (default 128),
+`--idle-timeout SECS` (default 300; `0` = never) and
+`--allow-load-extension` (off by default; see Security posture). The server
+prints its listening address on startup and runs until terminated.
 
 Server robustness, in one place:
 
@@ -832,10 +845,11 @@ Server robustness, in one place:
   the engine logs once and recovers via `PoisonError::into_inner()`, so one
   bad statement cannot permanently DoS the database (the state may be
   inconsistent — recovery is loud).
-- **No read/write timeouts.** A slow or stalled client holds one thread and
-  one fd until it disconnects; a client that stops reading a large result
-  blocks only its own connection thread (the accept loop is never blocked).
-  The connection cap bounds that pressure.
+- **Idle timeout (default 300 s).** A client that sends nothing between
+  requests, or stops reading a result, for longer than `--idle-timeout` is
+  disconnected, so stalled peers cannot pin the connection cap. Frame bodies
+  are buffered as bytes arrive (64 KiB steps), never pre-sized from the
+  length prefix, so announcing a 64 MiB frame and stalling costs nothing.
 - **Depth guards.** Statements nested deeper than 24 units (parens, `CASE`,
   prefix unary) or with an AST deeper than 64 nodes (left-associative
   operator chains, `IN` lists, `AND`/`OR` runs, nested subqueries) are
@@ -891,6 +905,13 @@ database (queries, writes, DDL) on the one shared store. The server binds
 `127.0.0.1` by default and must stay on localhost or a trusted network: do
 not expose it to the internet or to untrusted clients. Auth and TLS are
 planned; they are explicitly out of scope for this wave.
+
+`LOAD EXTENSION` is refused for remote clients unless the server runs with
+`--allow-load-extension` (library: `Server::allow_load_extension(true)`):
+the statement makes the server process load and run a native library from
+its own filesystem, which without authentication would be remote code
+execution. WAL replay at startup still re-loads extensions a durable
+database already recorded.
 
 ## C ABI (`pinkdb-ffi`)
 
@@ -1062,7 +1083,9 @@ pinkdb> SELECT ext_clamp(CAST(42 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGIN
   repository above is the default; the first mutation materializes it.
   `.repositories list` / `.repositories add <url>` /
   `.repositories remove <url>` manage it: URLs are validated and
-  canonicalized (trailing slashes stripped, `http://` only for local/testing),
+  canonicalized (trailing slashes stripped; plain `http://` only for loopback
+  hosts unless `PINKDB_REPO_ALLOW_HTTP=1`; `https://` repositories never follow
+  a redirect to `http://`, and `http://` ones follow no redirects),
   duplicates are refused, order is preserved, and an empty list is allowed
   (`.install` then says what to add). Writes are atomic (temp + rename).
 - **Resolution:** repositories are tried in config order and the first one
@@ -1346,7 +1369,7 @@ ties in ORDER BY have no stable order on either engine).
 - Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position
 - General ORDER BY expressions must be aliases, positions, or GROUP BY keys
-- `%` is integer-only; `SUM` overflow wraps
+- `%` is integer-only
 - Mixed DATE/TIMESTAMP comparison is rejected; timestamps never mix with
   integers (no INTERVAL type in v1); no time zones (naive UTC)
 - Expression nesting is capped at 24 levels (parentheses, `CASE` arms and

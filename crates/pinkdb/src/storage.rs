@@ -16,6 +16,12 @@ use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
 use crate::wal::Wal;
 
+/// Next store-unique table version stamp (see [`DataTable::version`]).
+fn next_table_version() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// One column: its schema + its chunk list.
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -44,9 +50,12 @@ pub struct DataTable {
     pub name: String,
     pub columns: Vec<Column>,
     pub num_rows: usize,
-    /// Mutation counter for optimistic-concurrency conflict detection.
-    /// Bumped on every append/update/delete batch; process-lifetime only
-    /// (not persisted — save/load starts fresh).
+    /// Mutation stamp for optimistic-concurrency conflict detection. Drawn
+    /// from a process-wide counter on creation and on every
+    /// append/update/delete batch, so it is unique across tables: a table
+    /// dropped and recreated under the same name never repeats an earlier
+    /// stamp (a transaction based on the old table must conflict).
+    /// Process-lifetime only (not persisted — save/load draws fresh stamps).
     pub version: u64,
 }
 
@@ -73,7 +82,7 @@ impl DataTable {
                 .map(|(name, dtype)| Column::new(name, dtype))
                 .collect(),
             num_rows: 0,
-            version: 0,
+            version: next_table_version(),
         })
     }
 
@@ -156,7 +165,7 @@ impl DataTable {
                 .push_value(coerced)?;
         }
         self.num_rows += 1;
-        self.version += 1;
+        self.version = next_table_version();
         Ok(())
     }
 
@@ -214,7 +223,7 @@ impl DataTable {
                 *col.chunks.last_mut().expect("tail chunk exists") = Arc::new(src);
             }
             self.num_rows += rows;
-            self.version += 1;
+            self.version = next_table_version();
             return Ok(());
         }
         // Partial tail: merge, splitting at chunk boundaries as needed.
@@ -246,7 +255,7 @@ impl DataTable {
             offset += take;
             self.num_rows += take;
         }
-        self.version += 1;
+        self.version = next_table_version();
         Ok(())
     }
 
@@ -287,7 +296,7 @@ impl DataTable {
             Arc::make_mut(&mut self.columns[col].chunks[chunk]).set_value(row, v)?;
         }
         if !updates.is_empty() {
-            self.version += 1;
+            self.version = next_table_version();
         }
         Ok(())
     }
@@ -331,7 +340,7 @@ impl DataTable {
         }
         self.num_rows -= removed;
         if removed > 0 {
-            self.version += 1;
+            self.version = next_table_version();
         }
         Ok(removed)
     }
@@ -445,6 +454,12 @@ pub struct PinkDb {
     /// snapshots of a keyed store are written encrypted (feature
     /// `encryption`); [`PinkDb::save`] stays a plaintext explicit API.
     pub(crate) encryption_key: Option<EncryptionKey>,
+    /// Whether the SQL `LOAD EXTENSION` statement may run (default `true`:
+    /// the embedded API is trusted). Network front-ends turn it off so a
+    /// remote client cannot make the host process `dlopen` a library. WAL
+    /// replay is unaffected: it runs at open, before a front-end can flip
+    /// this, and the Rust [`PinkDb::load_extension`] API is never gated.
+    allow_sql_load_extension: bool,
 }
 
 impl Default for PinkDb {
@@ -486,7 +501,19 @@ impl PinkDb {
             wal_txn_ext_paths: Vec::new(),
             wal_txn_ext_loaded: Vec::new(),
             encryption_key: None,
+            allow_sql_load_extension: true,
         }
+    }
+
+    /// Allow or refuse the SQL `LOAD EXTENSION` statement on this store
+    /// (see the field docs; the Rust load API stays available either way).
+    pub fn set_allow_sql_load_extension(&mut self, allow: bool) {
+        self.allow_sql_load_extension = allow;
+    }
+
+    /// Whether the SQL `LOAD EXTENSION` statement may run on this store.
+    pub fn allow_sql_load_extension(&self) -> bool {
+        self.allow_sql_load_extension
     }
 
     /// Configure the at-rest key used by checkpoints and snapshots of this

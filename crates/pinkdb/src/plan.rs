@@ -210,6 +210,162 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
     })
 }
 
+/// Collect every catalog table `plan` reads, as lowercased
+/// `(database, table)` keys, including tables scanned by subqueries in
+/// expressions and by DML predicates. CTE scans (`db: None`) are skipped:
+/// their bodies are walked through [`LogicalPlan::Cte`]. Used by COMMIT's
+/// read-set validation. The matches are exhaustive on purpose: a new plan or
+/// expression variant must decide here whether it reads tables.
+pub(crate) fn collect_tables_read(
+    plan: &LogicalPlan,
+    default_db: &str,
+    out: &mut std::collections::HashSet<(String, String)>,
+) {
+    let key = |db: &Option<String>, table: &str| {
+        (
+            db.as_deref().unwrap_or(default_db).to_ascii_lowercase(),
+            table.to_ascii_lowercase(),
+        )
+    };
+    match plan {
+        LogicalPlan::Scan { db: Some(db), table } => {
+            out.insert((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
+        }
+        LogicalPlan::Scan { db: None, .. }
+        | LogicalPlan::SingleRow
+        | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::Begin
+        | LogicalPlan::Commit
+        | LogicalPlan::Rollback
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Use { .. }
+        | LogicalPlan::LoadExtension { .. } => {}
+        LogicalPlan::Insert { rows, .. } => {
+            for e in rows.iter().flatten() {
+                expr_tables_read(e, default_db, out);
+            }
+        }
+        LogicalPlan::Update { db, table, sets, predicate } => {
+            out.insert(key(db, table));
+            for (_, e) in sets {
+                expr_tables_read(e, default_db, out);
+            }
+            if let Some(p) = predicate {
+                expr_tables_read(p, default_db, out);
+            }
+        }
+        LogicalPlan::Delete { db, table, predicate } => {
+            out.insert(key(db, table));
+            if let Some(p) = predicate {
+                expr_tables_read(p, default_db, out);
+            }
+        }
+        LogicalPlan::Union { left, right, .. } => {
+            collect_tables_read(left, default_db, out);
+            collect_tables_read(right, default_db, out);
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            collect_tables_read(input, default_db, out);
+            expr_tables_read(predicate, default_db, out);
+        }
+        LogicalPlan::Cte { query, body, .. } => {
+            collect_tables_read(query, default_db, out);
+            collect_tables_read(body, default_db, out);
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            collect_tables_read(input, default_db, out);
+            for w in windows {
+                let exprs = w
+                    .arg
+                    .iter()
+                    .chain(w.partition.iter())
+                    .chain(w.order.iter().map(|(e, _)| e));
+                for e in exprs {
+                    expr_tables_read(e, default_db, out);
+                }
+            }
+        }
+        LogicalPlan::Join { left, right, left_key, right_key, .. } => {
+            collect_tables_read(left, default_db, out);
+            collect_tables_read(right, default_db, out);
+            expr_tables_read(left_key, default_db, out);
+            expr_tables_read(right_key, default_db, out);
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            collect_tables_read(input, default_db, out);
+            for e in keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())) {
+                expr_tables_read(e, default_db, out);
+            }
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            collect_tables_read(input, default_db, out);
+            for e in exprs {
+                expr_tables_read(e, default_db, out);
+            }
+        }
+        LogicalPlan::Sort { input, keys } => {
+            collect_tables_read(input, default_db, out);
+            for (e, _) in keys {
+                expr_tables_read(e, default_db, out);
+            }
+        }
+        LogicalPlan::Distinct { input } | LogicalPlan::Limit { input, .. } => {
+            collect_tables_read(input, default_db, out);
+        }
+    }
+}
+
+fn expr_tables_read(
+    expr: &BoundExpr,
+    default_db: &str,
+    out: &mut std::collections::HashSet<(String, String)>,
+) {
+    match expr {
+        BoundExpr::Literal(_)
+        | BoundExpr::Column { .. }
+        | BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. } => {}
+        BoundExpr::Binary { left, right, .. } => {
+            expr_tables_read(left, default_db, out);
+            expr_tables_read(right, default_db, out);
+        }
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. }
+        | BoundExpr::Cast { expr: e, .. } => expr_tables_read(e, default_db, out),
+        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            for a in args {
+                expr_tables_read(a, default_db, out);
+            }
+        }
+        BoundExpr::DynamicScalar { args, .. } => {
+            for a in args.iter() {
+                expr_tables_read(a, default_db, out);
+            }
+        }
+        BoundExpr::Case { branches, else_, .. } => {
+            for (c, v) in branches {
+                expr_tables_read(c, default_db, out);
+                expr_tables_read(v, default_db, out);
+            }
+            if let Some(e) = else_ {
+                expr_tables_read(e, default_db, out);
+            }
+        }
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            collect_tables_read(query, default_db, out);
+        }
+        BoundExpr::InSubquery { expr, query, .. } => {
+            expr_tables_read(expr, default_db, out);
+            collect_tables_read(query, default_db, out);
+        }
+    }
+}
+
 /// Compare two non-null values. Cross-type numerics compare in i64 when both
 /// are int-like, else f64. Used by comparisons, MIN/MAX, and Sort.
 pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {

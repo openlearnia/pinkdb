@@ -202,7 +202,7 @@ fn eval_one_window(
                                 next_to_add += 1;
                             }
                         }
-                        out_vals[*g] = acc.finalize_ref(w.dtype);
+                        out_vals[*g] = acc.finalize_ref(w.dtype)?;
                     }
                 } else {
                     // Bounded start: frames are bounded by the spec, so a
@@ -214,7 +214,7 @@ fn eval_one_window(
                                 acc.update(rows[seq[k]].arg.as_ref());
                             }
                         }
-                        out_vals[*g] = acc.finalize(w.dtype);
+                        out_vals[*g] = acc.finalize(w.dtype)?;
                     }
                 }
             }

@@ -299,7 +299,7 @@ fn feature_on_keeps_plaintext_backcompat() {
     seed_all_types(&mut db);
     db.save(s.path()).unwrap();
     let bytes = std::fs::read(s.ckpt()).unwrap();
-    assert!(bytes.starts_with(b"PINKDB02"), "plain save stays v2");
+    assert!(bytes.starts_with(b"PINKDB03"), "plain save stays unencrypted v3");
     assert!(!bytes.starts_with(ENC_MAGIC));
     let back = PinkDb::open(s.path()).unwrap();
     assert_same_values(&all_values(&db, "t"), &all_values(&back, "t"));
@@ -537,7 +537,7 @@ fn keyed_database_reports_its_key_and_snapshots_encrypt() {
     let mut mem = PinkDb::new();
     mem.execute("CREATE TABLE t (a INTEGER);").unwrap();
     mem.save_snapshot(p.to_str().unwrap()).unwrap();
-    assert!(std::fs::read(&p).unwrap().starts_with(b"PINKDB02"));
+    assert!(std::fs::read(&p).unwrap().starts_with(b"PINKDB03"));
 }
 
 /// The keyed WAL survives the crash state machine: `.tmp` publishing, roll
@@ -909,7 +909,7 @@ fn save_stays_explicitly_plaintext_for_a_keyed_store() {
     let out = s.dir.join("explicit-plaintext.pink");
     db.save(out.to_str().unwrap()).unwrap();
     let bytes = std::fs::read(&out).unwrap();
-    assert!(bytes.starts_with(b"PINKDB02"), "save() is the explicit plaintext API");
+    assert!(bytes.starts_with(b"PINKDB03"), "save() is the explicit plaintext API");
     assert!(!bytes.starts_with(ENC_MAGIC));
     let marker = b"save-pin-marker";
     assert!(bytes.windows(marker.len()).any(|w| w == marker));

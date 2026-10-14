@@ -8,7 +8,9 @@ code by hand.
 The remediation waves are **40a–40j** in ROADMAP.md, all scheduled ahead of wave 41. Each
 item below names the wave that closes it.
 
-## P0 — correctness, data loss, security (wave 40a)
+## P0 — correctness, data loss, security (wave 40a — closed)
+
+All ten items are fixed in wave 40a, each with a regression test (see the ROADMAP progress log).
 
 | # | Gap | Evidence |
 |---|---|---|

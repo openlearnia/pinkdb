@@ -24,8 +24,14 @@
 //!   over the cap the server sends an `Error` frame and closes.
 //! - A panic while executing one statement is caught, reported as an `Error`
 //!   frame, and does not kill the server or the connection.
-//! - No read/write timeouts: a stalled client holds one connection thread
-//!   and one fd until it disconnects. The cap bounds that pressure.
+//! - Sockets carry an idle timeout ([`DEFAULT_IDLE_TIMEOUT`], configurable
+//!   via [`Server::idle_timeout`]): a client that sends nothing (or reads
+//!   nothing) for that long is disconnected, so stalled peers cannot pin the
+//!   connection cap. Frame bodies are buffered as they arrive, never sized
+//!   from the untrusted length prefix.
+//! - SQL `LOAD EXTENSION` is refused unless the operator opts in with
+//!   [`Server::allow_load_extension`]: without authentication, letting a
+//!   remote client `dlopen` a host library would be remote code execution.
 
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -54,6 +60,9 @@ const CONNECTION_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Concurrent connections served at once (fd/thread pressure bound).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
+
+/// Default idle timeout for client sockets (reads and writes).
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Soft cap on the encoded size of one streamed `Rows` frame; batches are
 /// flushed before they grow past it (the hard protocol cap is 64 MiB).
@@ -110,6 +119,7 @@ pub struct Server {
     shutdown: Arc<AtomicBool>,
     max_connections: usize,
     active: Arc<AtomicUsize>,
+    idle_timeout: Option<Duration>,
 }
 
 impl Server {
@@ -123,6 +133,10 @@ impl Server {
     /// Bind `addr` and serve `db` with an explicit concurrent-connection cap.
     /// Over the cap, `run` sends a best-effort `Error` frame and closes the
     /// accepted socket, so fd and thread pressure stay bounded.
+    ///
+    /// Binding turns SQL `LOAD EXTENSION` off on `db` (every clone of it,
+    /// including embedded connections sharing the handle); see
+    /// [`Server::allow_load_extension`].
     pub fn bind_with_max_connections(
         addr: impl ToSocketAddrs,
         db: Database,
@@ -131,6 +145,7 @@ impl Server {
         let listener = TcpListener::bind(addr)?;
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
+        db.set_allow_sql_load_extension(false);
         Ok(Server {
             listener,
             local_addr,
@@ -138,7 +153,25 @@ impl Server {
             shutdown: Arc::new(AtomicBool::new(false)),
             max_connections,
             active: Arc::new(AtomicUsize::new(0)),
+            idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
         })
+    }
+
+    /// Let remote clients run SQL `LOAD EXTENSION` (default: refused). Only
+    /// for trusted networks: the statement makes the server process load and
+    /// run a native library from its own filesystem.
+    pub fn allow_load_extension(self, allow: bool) -> Self {
+        self.db.set_allow_sql_load_extension(allow);
+        self
+    }
+
+    /// Per-socket idle timeout for reads and writes (`None` = wait forever).
+    /// A client that stays silent between requests, or stops reading results,
+    /// for longer than this is disconnected. A zero duration is treated as
+    /// `None` (the OS rejects a zero socket timeout).
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout.filter(|t| !t.is_zero());
+        self
     }
 
     /// The address the server is listening on.
@@ -173,12 +206,13 @@ impl Server {
                     let guard = ActiveGuard(Arc::clone(&self.active));
                     self.active.fetch_add(1, Ordering::SeqCst);
                     let db = self.db.clone();
+                    let idle_timeout = self.idle_timeout;
                     if let Err(e) = thread::Builder::new()
                         .name("pinkdb-server-conn".to_string())
                         .stack_size(CONNECTION_STACK_SIZE)
                         .spawn(move || {
                             let _guard = guard;
-                            serve_connection(stream, db);
+                            serve_connection(stream, db, idle_timeout);
                         })
                     {
                         // On a spawn failure the closure (and with it the
@@ -275,16 +309,23 @@ impl Drop for ServerHandle {
 /// Serve one client: handshake, then request/response until EOF.
 ///
 /// The connection owns a fresh `db.connect()`: its `USE` session, open
-/// transaction, and prepared session state are private to this TCP client.
+/// transaction and session state are private to this TCP client.
 ///
 /// Statement execution runs inside `catch_unwind`: an engine panic becomes an
 /// `Error` frame and a stderr log instead of killing the connection (or, for
 /// a panicking connection thread, the whole process).
-fn serve_connection(stream: TcpStream, db: Database) {
+fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Duration>) {
     // BSD-derived kernels (macOS) inherit the listener's O_NONBLOCK on
     // accepted sockets; the connection thread wants blocking IO.
     if let Err(e) = stream.set_nonblocking(false) {
         eprintln!("pinkdb-server: cannot switch an accepted socket to blocking mode: {e}");
+    }
+    if let Err(e) = stream
+        .set_read_timeout(idle_timeout)
+        .and_then(|()| stream.set_write_timeout(idle_timeout))
+    {
+        eprintln!("pinkdb-server: cannot set the idle timeout on an accepted socket: {e}");
+        return;
     }
     if let Err(e) = stream.set_nodelay(true) {
         eprintln!("pinkdb-server: cannot set TCP_NODELAY on an accepted socket: {e}");

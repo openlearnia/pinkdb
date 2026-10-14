@@ -23,11 +23,22 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Long-lived S3 credentials (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
 /// optional `AWS_SESSION_TOKEN`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` redacts the secret access key and the session token.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Credentials {
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
     pub(crate) session_token: Option<String>,
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// One request to sign, with everything SigV4 hashes already in canonical

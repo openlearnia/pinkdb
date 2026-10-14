@@ -252,6 +252,13 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         }
         LogicalPlan::Use { name } => use_result(db, name),
         LogicalPlan::LoadExtension { path } => {
+            if !db.allow_sql_load_extension() {
+                return Err(PinkDbError::Execution(
+                    "LOAD EXTENSION is disabled on this connection (the server \
+                     must be started with --allow-load-extension)"
+                        .to_string(),
+                ));
+            }
             // Process-level side effect: load the cdylib and register its
             // functions (atomic; a failure registers nothing). The DB stays
             // usable afterwards either way.
@@ -1170,11 +1177,12 @@ fn fusible_expr(
 ///
 /// The rules mirror `exec::expr`'s evaluation:
 /// - `Literal` / `Column` are pure reads;
-/// - `Not` / `Negate` / `IsNull` only recurse (the binder types operands and
-///   rejects date/timestamp negation);
-/// - comparisons, `AND`/`OR`, `LIKE`, `+`/`-`/`*` never fail on well-typed
-///   operands (wrapping arithmetic; the binder rejects date shapes it cannot
-///   evaluate);
+/// - `Not` / `IsNull` only recurse; `Negate` is total only on DOUBLE
+///   (integer negation of `MIN` is an overflow error);
+/// - comparisons, `AND`/`OR`, `LIKE` never fail on well-typed operands;
+///   `+`/`-`/`*` are total only when they produce DOUBLE (IEEE) or subtract
+///   two DATEs (an i32 difference always fits BIGINT) — integer arithmetic
+///   and DATE ± n raise overflow errors;
 /// - `/` avoids the integer divide-by-zero rule only when both operands are
 ///   DOUBLE (pure IEEE); `%` is integer-only and errors on a zero divisor;
 /// - `CAST` can fail per value (VARCHAR→numeric parses, date parses,
@@ -1182,19 +1190,24 @@ fn fusible_expr(
 /// - `COALESCE`/`CASE` evaluate every arm, so all arms must be total;
 /// - only the scalar functions verified in `apply_scalar` to never return a
 ///   value-dependent `Err` on binder-typed arguments are whitelisted
-///   (`substr` is left out with the rest; `date_trunc` errors on bad parts);
+///   (`substr` is left out with the rest; `date_trunc` errors on bad parts;
+///   `abs` only on DOUBLE, since integer `abs(MIN)` overflows);
 /// - subqueries / aggregate / window refs are rejected before this point.
 fn expr_is_total(e: &BoundExpr) -> bool {
     match e {
         BoundExpr::Literal(_) | BoundExpr::Column { .. } => true,
-        BoundExpr::Not(x)
-        | BoundExpr::Negate { expr: x, .. }
-        | BoundExpr::IsNull { expr: x, .. } => expr_is_total(x),
-        BoundExpr::Binary { op, left, right, .. } => match op {
-            BinaryOp::Add
-            | BinaryOp::Subtract
-            | BinaryOp::Multiply
-            | BinaryOp::Eq
+        BoundExpr::Not(x) | BoundExpr::IsNull { expr: x, .. } => expr_is_total(x),
+        BoundExpr::Negate { expr, dtype } => *dtype == DataType::Double && expr_is_total(expr),
+        BoundExpr::Binary { op, left, right, dtype } => match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => {
+                let date_diff = *op == BinaryOp::Subtract
+                    && left.dtype() == DataType::Date
+                    && right.dtype() == DataType::Date;
+                (*dtype == DataType::Double || date_diff)
+                    && expr_is_total(left)
+                    && expr_is_total(right)
+            }
+            BinaryOp::Eq
             | BinaryOp::NotEq
             | BinaryOp::Lt
             | BinaryOp::LtEq
@@ -1221,7 +1234,10 @@ fn expr_is_total(e: &BoundExpr) -> bool {
                 && else_.as_ref().is_none_or(|e| expr_is_total(e))
         }
         BoundExpr::Scalar { func, args, .. } => {
-            matches!(
+            let abs_ok = *func != ScalarFunc::Abs
+                || args.first().is_some_and(|a| a.dtype() == DataType::Double);
+            abs_ok
+                && matches!(
                 func,
                 ScalarFunc::Upper
                     | ScalarFunc::Lower
@@ -2036,6 +2052,42 @@ mod tests {
             }
         }
         last.unwrap()
+    }
+
+    #[test]
+    fn integer_overflow_errors_like_duckdb() {
+        let mut db = PinkDb::new();
+        let err = |db: &mut PinkDb, sql: &str| -> String {
+            db.execute(sql).expect_err(sql).to_string()
+        };
+        assert!(err(&mut db, "SELECT 2147483647 + 1;").contains("Overflow in addition of INTEGER"));
+        assert!(err(&mut db, "SELECT -2147483647 - 2;").contains("Overflow in subtraction"));
+        assert!(err(&mut db, "SELECT 9223372036854775807 * 2;").contains("multiplication of BIGINT"));
+        assert!(err(&mut db, "SELECT abs(CAST(-2147483648 AS INTEGER));").contains("Overflow in abs"));
+        assert!(err(&mut db, "SELECT CAST(3000000000 AS INTEGER);").contains("out of range"));
+        assert!(err(&mut db, "SELECT CAST(1e300 AS BIGINT);").contains("out of range"));
+        assert!(err(&mut db, "SELECT DATE '2024-01-01' + 2147483647;").contains("date out of range"));
+        // In range stays exact; float→int rounds half away from zero.
+        assert_eq!(select(&mut db, "SELECT 2147483646 + 1;"), vec![vec![V::Integer(i32::MAX)]]);
+        assert_eq!(
+            select(&mut db, "SELECT CAST(2.5 AS INTEGER), CAST(-2.5 AS INTEGER), CAST(2.4 AS BIGINT);"),
+            vec![vec![V::Integer(3), V::Integer(-3), V::Bigint(2)]]
+        );
+        // Column data takes the same checked kernels as literals.
+        db.execute("CREATE TABLE o (x INTEGER, y BIGINT);").unwrap();
+        db.execute("INSERT INTO o VALUES (2147483647, 9223372036854775807), (1, 1);").unwrap();
+        assert!(err(&mut db, "SELECT x + 1 FROM o;").contains("Overflow in addition of INTEGER"));
+        assert!(err(&mut db, "SELECT -x - 2 FROM o;").contains("Overflow"));
+        // SUM accumulates wide: only a final result outside BIGINT errors…
+        assert!(err(&mut db, "SELECT SUM(y) FROM o;").contains("Overflow in SUM"));
+        // …and an intermediate excursion that comes back in range is exact.
+        db.execute("INSERT INTO o VALUES (0, -9223372036854775807);").unwrap();
+        assert_eq!(select(&mut db, "SELECT SUM(y) FROM o;"), vec![vec![V::Bigint(1)]]);
+        // SUM(INTEGER) never overflows BIGINT at realistic row counts.
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) FROM o;"),
+            vec![vec![V::Bigint(2147483648)]]
+        );
     }
 
     #[test]
@@ -5347,10 +5399,12 @@ mod tests {
             "SELECT fa.region, COUNT(*), SUM(fa.x), AVG(fb.total), MIN(fb.total), MAX(fb.total)
              FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
         );
-        // Compound left key (including the NULL+1 group) and right scalar key.
+        // Compound left key (including the NULL+1 group) and right scalar
+        // key. DOUBLE arithmetic is total; integer `+` can overflow and is
+        // covered by `fusion_rejects_value_erroring_shapes`.
         assert_fused_matches_materialized(
             &db,
-            "SELECT fa.x + 1, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.x + 1;",
+            "SELECT fa.x + 1.5, COUNT(*) FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.x + 1.5;",
         );
         assert_fused_matches_materialized(
             &db,
@@ -5472,6 +5526,11 @@ mod tests {
             "SELECT SUM(CAST(vb.s AS INTEGER)) FROM va JOIN vb ON va.k = vb.k;",
             // Modulo by zero on an unmatched group-key row.
             "SELECT vb.a % vb.b, COUNT(*) FROM va JOIN vb ON va.k = vb.k GROUP BY vb.a % vb.b;",
+            // Integer arithmetic, negation and abs can overflow (DuckDB
+            // semantics), so they are value-dependent errors too.
+            "SELECT vb.a + 1, COUNT(*) FROM va JOIN vb ON va.k = vb.k GROUP BY vb.a + 1;",
+            "SELECT SUM(-vb.a) FROM va JOIN vb ON va.k = vb.k;",
+            "SELECT SUM(abs(vb.a)) FROM va JOIN vb ON va.k = vb.k;",
         ];
         for sql in blocked {
             let plan = bound_plan(&db, sql);
@@ -5510,7 +5569,7 @@ mod tests {
         );
         assert_fused_matches_materialized(
             &db,
-            "SELECT SUM(abs(fa.x)) FROM fa JOIN fb ON fa.id = fb.id;",
+            "SELECT SUM(abs(fb.total)) FROM fa JOIN fb ON fa.id = fb.id;",
         );
         // `upper(region)` reached through a Project over the join.
         assert_fused_matches_materialized(

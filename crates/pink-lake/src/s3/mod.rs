@@ -121,7 +121,8 @@ const DEGRADED_HINT: &str = "this endpoint does not support conditional writes; 
 /// # }
 /// # Ok::<(), pink_lake::LakeError>(())
 /// ```
-#[derive(Debug, Clone)]
+/// `Debug` redacts the secret access key and the session token.
+#[derive(Clone)]
 pub struct S3Config {
     /// Bucket name (required): 3–63 lowercase ASCII letters, digits, `.` and
     /// `-` (the same rule `Lake::open_url` applies to `s3://` URLs).
@@ -153,6 +154,26 @@ pub struct S3Config {
     pub allow_degraded: bool,
     /// Explicitly allow a plain `http://` endpoint (local test endpoints).
     pub allow_http: bool,
+}
+
+impl std::fmt::Debug for S3Config {
+    // Hand-written so `{:?}` on a config (or a `Lake` holding one) can never
+    // print credentials into logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redact = |v: &Option<String>| v.as_ref().map(|_| "<redacted>");
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("path_style", &self.path_style)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &redact(&self.secret_access_key))
+            .field("session_token", &redact(&self.session_token))
+            .field("allow_degraded", &self.allow_degraded)
+            .field("allow_http", &self.allow_http)
+            .finish()
+    }
 }
 
 impl S3Config {
@@ -1545,6 +1566,22 @@ mod tests {
     /// explicit `allow_http`.
     fn storage(mock: &crate::mock_s3::MockS3, bucket: &str, prefix: &str) -> S3Storage {
         storage_with_secret(mock, bucket, prefix, "mock-secret")
+    }
+
+    #[test]
+    fn debug_output_never_contains_credentials() {
+        let config = S3Config::new("bucket")
+            .with_credentials("AKIDVISIBLE", "TOP-SECRET-KEY")
+            .with_session_token("SESSION-TOKEN-VALUE");
+        let shown = format!("{config:?}");
+        assert!(shown.contains("AKIDVISIBLE"), "{shown}");
+        assert!(!shown.contains("TOP-SECRET-KEY"), "{shown}");
+        assert!(!shown.contains("SESSION-TOKEN-VALUE"), "{shown}");
+        // The resolved storage (and anything embedding it) redacts too.
+        let mock = crate::mock_s3::MockS3::start();
+        let storage = storage_with_secret(&mock, "bucket", "p", "TOP-SECRET-KEY");
+        let shown = format!("{storage:?}");
+        assert!(!shown.contains("TOP-SECRET-KEY"), "{shown}");
     }
 
     fn storage_with_secret(

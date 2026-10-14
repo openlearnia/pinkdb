@@ -1,8 +1,8 @@
 //! Persistence: a single-file on-disk columnar format (`.pink`).
 //!
-//! Layout v2 (all integers little-endian):
+//! Layout v3 (all integers little-endian):
 //! ```text
-//! magic "PINKDB02" (8 bytes)
+//! magic "PINKDB03" (8 bytes)
 //! db_count u32
 //! per database:
 //!   name_len u32 + name bytes
@@ -17,10 +17,13 @@
 //!         encoding u8 (0=Plain, 1=RLE, 2=Dict, 3=Bitpack)
 //!         validity_len u32 + validity bytes (bit set = valid)
 //!         payload (encoding-specific)
+//! crc32 u32 (IEEE, over every preceding byte including the magic)
 //! ```
 //!
-//! v1 files (`PINKDB01`) hold a flat table list and load as a single `main`
-//! database; `open` accepts both. Views are session-local and never written.
+//! v2 files (`PINKDB02`) are the same layout without the CRC trailer; v1
+//! files (`PINKDB01`) hold a flat table list and load as a single `main`
+//! database. `open` accepts all three; writes are always v3. Views are
+//! session-local and never written.
 //!
 //! Payloads store every row including NULL placeholders; validity is applied
 //! afterwards. Per-chunk encoding is picked by size (smallest wins):
@@ -32,18 +35,23 @@
 //!   codes) vs RLE.
 //!
 //! The reader never panics on corrupt input: every read is bounds-checked and
-//! surfaces `PinkDbError::Execution("...")`.
+//! surfaces `PinkDbError::Execution("...")`, and no allocation is sized from
+//! an unvalidated length (chunk row counts are capped at [`CHUNK_SIZE`], the
+//! writer's maximum; per-table column counts by the bytes left). A v3 CRC
+//! mismatch is reported before any decoding.
 
 use std::collections::HashMap;
 
 use crate::crypto::EncryptionKey;
 use crate::storage::PinkDb;
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::vector::Vector;
+use crate::vector::{Vector, CHUNK_SIZE};
 
 const MAGIC: &[u8; 8] = b"PINKDB01";
 /// Version 2 adds the database dimension: one file holds every database.
 const MAGIC_V2: &[u8; 8] = b"PINKDB02";
+/// Version 3 = v2 + a trailing CRC-32 over the whole image (bit-rot check).
+const MAGIC_V3: &[u8; 8] = b"PINKDB03";
 
 const ENC_PLAIN: u8 = 0;
 const ENC_RLE: u8 = 1;
@@ -177,6 +185,21 @@ impl<'a> Reader<'a> {
 
     fn end(&self) -> bool {
         self.pos == self.data.len()
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
+    /// A per-chunk element count (rows, runs, dictionary entries): the writer
+    /// never emits more than [`CHUNK_SIZE`], so anything larger is corrupt
+    /// and is refused before it can size an allocation.
+    fn chunk_count(&mut self, what: &str) -> Result<usize> {
+        let n = self.u32()? as usize;
+        if n > CHUNK_SIZE {
+            return self.err(&format!("{what} {n} exceeds the chunk size {CHUNK_SIZE}"));
+        }
+        Ok(n)
     }
 }
 
@@ -556,7 +579,7 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
     // Decode payload into placeholder values + separate validity.
     let (values, valid) = match (dtype, tag) {
         (DataType::Integer, ENC_PLAIN) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 out.push(Value::Integer(reader.i32()?));
@@ -564,7 +587,7 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Date, ENC_PLAIN) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 out.push(Value::Date(reader.i32()?));
@@ -572,7 +595,7 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Bigint, ENC_PLAIN) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 out.push(Value::Bigint(reader.i64()?));
@@ -580,7 +603,7 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Timestamp, ENC_PLAIN) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 out.push(Value::Timestamp(reader.i64()?));
@@ -591,8 +614,8 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
         | (DataType::Bigint, ENC_RLE)
         | (DataType::Date, ENC_RLE)
         | (DataType::Timestamp, ENC_RLE) => {
-            let n = reader.u32()? as usize;
-            let runs = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
+            let runs = reader.chunk_count("run count")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..runs {
                 let v = if dtype == DataType::Integer {
@@ -619,7 +642,7 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
         | (DataType::Bigint, ENC_BITPACK)
         | (DataType::Date, ENC_BITPACK)
         | (DataType::Timestamp, ENC_BITPACK) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let min = reader.i64()?;
             let width = reader.u8()? as u32;
             if width > 64 {
@@ -644,7 +667,7 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Double, ENC_PLAIN) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 out.push(Value::Double(reader.f64()?));
@@ -652,8 +675,8 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Double, ENC_RLE) => {
-            let n = reader.u32()? as usize;
-            let runs = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
+            let runs = reader.chunk_count("run count")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..runs {
                 let v = Value::Double(reader.f64()?);
@@ -669,15 +692,15 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Boolean, ENC_PLAIN) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let need = n.div_ceil(8);
             let bytes = reader.take(need)?;
             let out = (0..n).map(|i| Value::Boolean((bytes[i / 8] >> (i % 8)) & 1 == 1)).collect();
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Boolean, ENC_RLE) => {
-            let n = reader.u32()? as usize;
-            let runs = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
+            let runs = reader.chunk_count("run count")?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..runs {
                 let v = Value::Boolean(reader.u8()? != 0);
@@ -693,13 +716,13 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Varchar, ENC_PLAIN) => {
-            let n = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
             let strs = decode_strs(reader, n)?;
             (strs.into_iter().map(Value::Varchar).collect(), decode_validity(&mut vr, n)?)
         }
         (DataType::Varchar, ENC_DICT) => {
-            let n = reader.u32()? as usize;
-            let dict_len = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
+            let dict_len = reader.chunk_count("dictionary size")?;
             let dict = decode_strs(reader, dict_len)?;
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
@@ -711,8 +734,8 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Varchar, ENC_RLE) => {
-            let n = reader.u32()? as usize;
-            let runs = reader.u32()? as usize;
+            let n = reader.chunk_count("chunk length")?;
+            let runs = reader.chunk_count("run count")?;
             let vals = decode_strs(reader, runs)?;
             let mut out = Vec::with_capacity(n);
             for v in vals {
@@ -749,7 +772,7 @@ impl PinkDb {
     /// (deterministic bytes). Views are session-local and never persisted.
     fn to_bytes(&self) -> Result<Vec<u8>> {
         let mut w = Writer::new();
-        w.bytes(MAGIC_V2);
+        w.bytes(MAGIC_V3);
         let mut dbs = self.list_databases();
         dbs.sort();
         w.u32(dbs.len() as u32);
@@ -806,6 +829,8 @@ impl PinkDb {
                 }
             }
         }
+        let crc = crate::wal::crc32(&w.buf);
+        w.u32(crc);
         Ok(w.buf)
     }
 
@@ -904,11 +929,29 @@ impl PinkDb {
         }
     }
 
-    /// Decode a serialized `.pink` image (v1 or v2 magic).
+    /// Decode a serialized `.pink` image (v1, v2 or v3 magic).
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
+        let data = if data.starts_with(MAGIC_V3) {
+            // Verify the trailer before decoding anything.
+            if data.len() < MAGIC_V3.len() + 4 {
+                return Err(PinkDbError::Execution(
+                    "corrupt file: truncated before the checksum".to_string(),
+                ));
+            }
+            let (body, trailer) = data.split_at(data.len() - 4);
+            let want = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+            if crate::wal::crc32(body) != want {
+                return Err(PinkDbError::Execution(
+                    "corrupt file: checksum mismatch (the file is damaged)".to_string(),
+                ));
+            }
+            body
+        } else {
+            data
+        };
         let mut r = Reader::new(data);
         let magic = r.take(8)?;
-        let v2 = if magic == MAGIC_V2 {
+        let v2 = if magic == MAGIC_V2 || magic == MAGIC_V3 {
             true
         } else if magic == MAGIC {
             false
@@ -958,6 +1001,10 @@ impl PinkDb {
 fn load_table(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
     let name = r.str()?;
     let n_cols = r.u32()? as usize;
+    // Each column costs at least 5 bytes (name length + dtype tag).
+    if n_cols > r.remaining() / 5 {
+        return r.err("column count exceeds the remaining file");
+    }
     let mut schema = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
         let col = r.str()?;
@@ -1124,7 +1171,7 @@ mod tests {
         let path = temp_file("rt");
         db.save(path.to_str().unwrap()).unwrap();
         let data = std::fs::read(&path).unwrap();
-        assert!(data.starts_with(MAGIC_V2));
+        assert!(data.starts_with(MAGIC_V3));
         let back = PinkDb::open(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
         back
@@ -1295,6 +1342,53 @@ mod tests {
         std::fs::write(&path, &bad).unwrap();
         assert!(PinkDb::open(path.to_str().unwrap()).is_err());
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn v3_checksum_catches_bit_rot_and_v2_still_loads() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)]).unwrap();
+        db.table_mut("t").unwrap().append_row(vec![Value::Integer(7)]).unwrap();
+        let full = db.to_bytes().unwrap();
+        assert!(full.starts_with(MAGIC_V3));
+        // A flipped payload bit is a checksum error, not a silent wrong value.
+        for i in MAGIC_V3.len()..full.len() {
+            let mut bad = full.clone();
+            bad[i] ^= 0x01;
+            let err = PinkDb::load_bytes(&bad).expect_err("bit flip must be detected");
+            assert!(err.to_string().contains("checksum") || i >= full.len() - 4, "{i}: {err}");
+        }
+        // The same image without the trailer and with the v2 magic still loads.
+        let mut v2 = full[..full.len() - 4].to_vec();
+        v2[..8].copy_from_slice(MAGIC_V2);
+        let back = PinkDb::load_bytes(&v2).unwrap();
+        assert_eq!(back.table("t").unwrap().num_rows(), 1);
+    }
+
+    #[test]
+    fn forged_lengths_never_size_allocations() {
+        // v2 has no checksum, so forged lengths reach the decoder: plant
+        // u32::MAX at every offset of a multi-type image. Each load must
+        // return (Ok or Err) instead of aborting on a giant allocation.
+        let mut db = PinkDb::new();
+        crate::csv::import_csv_string(&mut db, "s", "a,b,c,d\n1,x,1.5,true\n2,y,2.5,false\n")
+            .unwrap();
+        let full = db.to_bytes().unwrap();
+        let mut v2 = full[..full.len() - 4].to_vec();
+        v2[..8].copy_from_slice(MAGIC_V2);
+        // (Overcommitting allocators may not abort on the old code path, so
+        // also require that the chunk-length cap actually fires.)
+        let mut capped = 0;
+        for i in 8..v2.len().saturating_sub(3) {
+            let mut bad = v2.clone();
+            bad[i..i + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+            if let Err(e) = PinkDb::load_bytes(&bad) {
+                if e.to_string().contains("exceeds the chunk size") {
+                    capped += 1;
+                }
+            }
+        }
+        assert!(capped >= 4, "every column's chunk length must hit the cap ({capped})");
     }
 
     #[test]
