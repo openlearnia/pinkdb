@@ -63,7 +63,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 37 | Documentation website (separate site/track) | done | website/ generator (stdlib Python, layout+fragments), 10 pages + CSS, 86 KiB self-contained, extensionless canonical links, wrangler dry-run validated |
 | 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra; Workers half done, R2 deferred to the extensions-repository wave 32/39) | done | live at https://pinkdb-docs.defaultcms.workers.dev (Workers static assets; .html links 307→canonical extensionless; 404-page; assets 200) |
 | 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) | done | three GitHub Actions workflows (.github/workflows/{ci,publish-extensions,deploy-docs}.yml): CI build/test/clippy + feature matrices + wasm + duckdiff + Python/Go bindings + C/Go SDK smokes + Docker S3 job; manual-dispatch extension publishing to the live R2 repo (dup refusal, checksums today, signing hook documented); docs auto-deploy; actionlint-clean, YAML-parsed, steps executed locally where possible; secrets documented (CLOUDFLARE_API_TOKEN scopes + account id) |
-| 40 | Performance tuning (recurring every 5th wave): bench-driven speed work, no new features (core) | queued | — |
+| 40 | Performance tuning (recurring every 5th wave): bench-driven speed work, no new features (core) | done | profile-driven: parallel vortex writes (2-2.7×, byte-identical), typed aggregate kernels + count-filter fast path (filter 50→24 ms @10M), window key rework (95→61 ms @1M); standing battery 493→447 ms; 494 tests, duckdiff 60/60; group-by @10M target missed (74 vs ≤60, parallel-ceiling analysis + breadcrumb); next-round breadcrumbs recorded |
 | 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | queued | — |
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
@@ -305,3 +305,20 @@ Java bindings.
 - 2026-10-14 — Binary size: unchanged — no crate changes this wave (`pinkdb` 2.22 MB default /
   44.6 MB with `--features lake` / 46.5 MB with `lake,s3` + `pinkdb-server` 1.90 MB +
   `libpinkdb_ffi.dylib` 1.76 MB, release, after wave 39; pre-wave-17 was 2.26 MB).
+- 2026-10-14 — Wave 40 (de1dcc7): performance tuning — profile-driven round, no new features.
+  Standing 1M battery (`cargo run --release -p pinkdb --example query_bench`, best-of-5;
+  measured run: TOTAL 447 ms paired / 421 ms quiet): filter_num 5.5→2.4,
+  window_row_number 95→61, window_count_star 80→65, group_region 9.2→7.0, order_num_topn
+  3.4→2.8, order_str 42→39; join entries flat (10.3/17.3/28.1/25.8); TOTAL 493→447.
+  `.lake save` writes Vortex byte-identically (sha256 unchanged) but now through a driven
+  worker pool: 1M 0.180→0.088 s, 10M 1.562→0.76–1.22 s (2.0–2.7×) — the vortex
+  compression cascade ran inline on the main thread because `CurrentThreadRuntime` does not
+  drive `spawn_cpu`; fixed by a pool that does. 10M in-memory queries (interleaved):
+  filter 50→23–25 ms (target ≤30 ✓), order-by 36→24–32 ms, group-by 100→68–74 ms (target
+  ≤60 ✗ — 444 ms single-thread at the measured 6.0× ceiling of a 4P+6E M4; merge is 3 ms).
+  vs DuckLake at 10M: save 0.76 vs 0.37 s, filter ~equal, group-by still ~1.7×. Semantics
+  pinned: 494 tests (one new byte-stability test for parallel writes), duckdiff 60/60,
+  clippy clean; default binary +1.0% (2.24 MB); typed kernels preserve wrapping sums / NULL
+  skips / NaN rules exactly. Breadcrumbs for the next perf round: SoA accumulators for the
+  parallel group-by ceiling; bulk typed lake decode (no per-row push/`from_utf8`) for the
+  ~0.63 s 10M `.lake open`.

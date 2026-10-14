@@ -1229,6 +1229,27 @@ For the join rows, "before" is the pre-wave-19 baseline (join_self 66, join_grou
 For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
 (`read_csv_auto` → table), single connection.
 
+### Wave 40 refresh (Oct 2026)
+
+Wave 40 was a performance round (no new features). Same machine, same battery,
+best-of-5; "before" = the same battery immediately before the wave:
+
+| Query | Pre-wave-40 (ms) | Wave 40 (ms) |
+|---|---|---|
+| `SELECT COUNT(*) ... WHERE total > 500` | 5.5 | 2.4 |
+| GROUP BY region + 5 aggregates | 9.2 | 7.0 |
+| ORDER BY total DESC LIMIT 10 | 3.4 | 2.8 |
+| ORDER BY region (full sort) | 42 | 39 |
+| ROW_NUMBER() OVER (PARTITION BY region ORDER BY id) | 95 | 61 |
+| COUNT(*) OVER (PARTITION BY region) | 80 | 65 |
+| 1M-row self joins (fused / +GROUP BY / mixed / probe) | 10.3 / 17.3 / 28.1 / 25.8 | flat (unchanged) |
+| **battery total** | **493** | **447** (421 on a quiet host) |
+
+The wins are profile-driven: typed aggregate kernels + a count-filter fast path
+(`WHERE total > 500`), a window-key rework (the `OVER` rows) and parallel Vortex
+lake writes (see below). The typed kernels keep semantics pinned exactly
+(wrapping integer `SUM`, NULL skips, NaN rules), and no join row regressed.
+
 ### Lake format comparison (Vortex vs DuckLake)
 
 `bench/lake_bench.py` (stdlib-only Python, one file) runs the same 1M-row CSV
@@ -1269,6 +1290,19 @@ vs 31.1 MB Vortex, cold open 0.036 s vs 0.724 s, and query best-of-5
 group-by 37 ms vs 93 ms, filter 24 ms vs 48 ms, order-by 28 ms vs 30 ms —
 pink-lake keeps only `COUNT(*)` (<1 ms vs 8 ms). No cherry-picking: at 10M
 DuckLake wins ingest, cold start and three of the four queries.
+
+**Wave 40 refresh (Oct 2026):** `.lake save` now runs the Vortex compression
+cascade on a driven worker pool instead of inline on the main thread, and the
+written files are **byte-identical** (sha256 unchanged): 1M save 0.180 s →
+**0.088 s**, 10M 1.562 s → **0.76–1.22 s** (2.0–2.7×). At 10M, pink-lake's
+in-memory queries moved too: filter 50 → **23–25 ms** (now ~equal to
+DuckLake's 24 ms), order-by 36 → 24–32 ms, group-by 100 → **68–74 ms** (still
+~1.7× DuckLake's 37 ms). Targets were ≤30 ms filter (met) and ≤60 ms
+group-by (missed; 444 ms single-thread at the measured 6.0× parallel ceiling
+of this 4P+6E M4, merge 3 ms) — SoA accumulators are the next round's
+breadcrumb. At 10M, lake save is still behind DuckLake's ingest (0.76 s vs
+0.37 s), and the `.lake open` decode (~0.63 s) is the last obvious lake gap
+(bulk typed decode is the other breadcrumb).
 
 **Fairness caveat — this is "same data, same queries, different
 architectures", not an apples-to-apples product comparison.** `.lake open`
