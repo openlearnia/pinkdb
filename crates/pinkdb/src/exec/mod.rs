@@ -3094,9 +3094,9 @@ mod tests {
         );
     }
 
-    /// Wave-20 lexer regression: LEFT/RIGHT/OUTER/FULL/CROSS are keywords, so
-    /// bare `left`/`right` identifiers are rejected everywhere; quoting them
-    /// keeps working as column, table, and alias names.
+    /// Wave-20 parser regression: LEFT/RIGHT/OUTER/FULL/CROSS are keywords,
+    /// so bare `left`/`right` identifiers are rejected everywhere; quoting
+    /// them keeps working as column, table, and alias names.
     #[test]
     fn outer_join_reserved_words_reject_bare_identifiers() {
         let mut db = PinkDb::new();
@@ -5660,9 +5660,9 @@ mod tests {
         );
     }
 
-    /// Extreme i64 keys (MIN/MAX, spelled as expressions because the lexer
-    /// cannot hold i64::MIN as a literal) and DATE keys (int path, raw day
-    /// payloads) must group and count correctly through fusion.
+    /// Extreme i64 keys (MIN/MAX, spelled as expressions because a literal
+    /// cannot hold i64::MIN) and DATE keys (int path, raw day payloads) must
+    /// group and count correctly through fusion.
     #[test]
     fn fused_extreme_and_date_keys() {
         let mut db = PinkDb::new();

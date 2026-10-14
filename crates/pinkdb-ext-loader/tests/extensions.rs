@@ -510,8 +510,8 @@ fn load_extension_statement_failures_are_clear_errors() {
     assert!(e.contains("registration failed"), "{e}");
     assert_eq!(error(&mut db, "SELECT innocent(1);"), "unknown function \"innocent\"");
 
-    // The non-literal path form is refused at parse time (message wording
-    // depends on the parser `PINKDB_PARSER` selects; the kind does not).
+    // The non-literal path form is refused at parse time (the kind is
+    // `PinkDbError::Parse`; the wording is the PEG parser's).
     match db.execute("LOAD EXTENSION ext;") {
         Err(pinkdb::PinkDbError::Parse(_)) => {}
         other => panic!("expected a Parse error for a non-literal path, got {other:?}"),

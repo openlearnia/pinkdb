@@ -1,64 +1,60 @@
-//! PEG-based SQL parser (`peg` crate), running in parallel with the hand-written
-//! lexer + recursive-descent parser in [`super::parser`].
+//! PEG-based SQL parser (`peg` crate) — the engine's only parser path
+//! (see [`super::parse_statements`]).
 //!
-//! Selected per call through `PINKDB_PARSER` (see [`super::parse_statements`]);
-//! the hand-written parser stays intact and selectable. The grammar lexes and
-//! parses `&str` in one pass and mirrors `lexer.rs` + `parser.rs` token for
-//! token: same keyword case-insensitivity, identifier rules, string quoting and
-//! escapes, number formats and comments, and the same AST values for the same
-//! input (verified by the differential tests at the bottom of this file).
+//! The grammar lexes and parses `&str` in one pass with the same rules the
+//! SQL surface documents: case-insensitive keywords ([`super::keyword`]),
+//! `''`/`""` escapes, `--`/`/* */` comments, leading-dot and exponent
+//! floats, and i64-range integers. The corpus and seeded-fuzz tests at the
+//! bottom of this file pin that valid input parses and invalid input is a
+//! clean [`PinkDbError::Parse`].
 //!
-//! Grammar shape (low → high precedence, matching the recursive-descent parser):
-//! OR → AND → NOT → comparison (`= <> != < <= > >=`, `IS [NOT] NULL`,
-//! `[NOT] BETWEEN`, `[NOT] IN (list|subquery)`, `[NOT] LIKE`) → additive →
-//! multiplicative → unary → primary. Every token rule consumes trailing
-//! whitespace/comments, so composite rules read as bare token sequences.
+//! Grammar shape (low → high precedence): OR → AND → NOT → comparison
+//! (`= <> != < <= > >=`, `IS [NOT] NULL`, `[NOT] BETWEEN`, `[NOT] IN
+//! (list|subquery)`, `[NOT] LIKE`) → additive → multiplicative → unary →
+//! primary. Every token rule consumes trailing whitespace/comments, so
+//! composite rules read as bare token sequences.
 
 use super::ast::*;
-use super::lexer::Keyword;
+use super::keyword::Keyword;
 use crate::types::{DataType, PinkDbError, Result, Value};
 
 /// Parse all statements in `sql` with the PEG grammar. Statements may be
 /// `;`-separated (the final `;` is optional); empty input yields no statements.
 ///
-/// Errors are [`PinkDbError::Parse`] like the legacy parser; the message wording
-/// and position format differ (PEG reports the furthest expected token).
+/// Errors are [`PinkDbError::Parse`]; messages are positional and worded as
+/// PEG reports them (the furthest expected token).
 pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
-    super::parser::check_nesting_depth(sql)?;
+    super::check_nesting_depth(sql)?;
     reject_nul_in_quoted_identifier(sql)?;
     let mut out =
         peg_sql::statements(sql).map_err(|e| PinkDbError::Parse(format!("parse error: {e}")))?;
-    // Post-parse depth guard (shared with the recursive-descent parser).
+    // Post-parse depth guard (shared with the pre-parse nesting cap).
     super::check_ast_depth(&mut out)?;
     Ok(out)
 }
 
-/// Reject a NUL byte inside a quoted identifier with the *legacy* parser's
-/// exact positional message.
+/// Reject a NUL byte inside a quoted identifier with its exact position.
 ///
-/// The PEG grammar also rejects it (see `quoted_ident`), but an action's
-/// `Err` can only enter peg's expected-set, which renders as
+/// The PEG grammar also rejects it (see `quoted_ident`), but an action's `Err`
+/// can only enter peg's expected-set, which renders as
 /// `expected identifier contains a NUL byte` with the position of the
-/// *closing* quote. Running the shared lexer up front — only when the input
-/// contains a NUL at all — reproduces the legacy message byte for byte
-/// (`lex error at offset <opening quote>: identifier contains a NUL byte`).
-/// Any other lexer outcome is ignored: the PEG grammar stays the authority on
-/// every other malformed input.
+/// *closing* quote. Scanning the raw text up front — only when the input
+/// contains a NUL at all — reports the opening quote instead, the positional
+/// error the NUL-in-name contract (C bindings) is pinned to.
 fn reject_nul_in_quoted_identifier(sql: &str) -> Result<()> {
     if !sql.as_bytes().contains(&0) {
         return Ok(());
     }
-    match super::lexer::lex(sql) {
-        Err(PinkDbError::Parse(msg)) if msg.contains("identifier contains a NUL byte") => {
-            Err(PinkDbError::Parse(msg))
-        }
-        _ => Ok(()),
+    match super::split::nul_in_quoted_identifier(sql) {
+        Some(off) => Err(PinkDbError::Parse(format!(
+            "parse error at offset {off}: identifier contains a NUL byte"
+        ))),
+        None => Ok(()),
     }
 }
 
 /// What may follow the left operand of a comparison-level expression.
-/// `apply_cmp` turns `(left, tail)` into the same AST the recursive-descent
-/// parser builds.
+/// `apply_cmp` turns `(left, tail)` into the AST node the tail describes.
 enum CmpTail {
     IsNull { negated: bool },
     Between { negated: bool, low: Expr, high: Expr },
@@ -100,7 +96,6 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
 }
 
 /// `x IN (a, b)` → `(x = a) OR (x = b)`; `IN ()` → FALSE.
-/// (Identical to the recursive-descent parser's desugaring.)
 fn desugar_in_list(left: Expr, items: Vec<Expr>, negated: bool) -> Expr {
     let mut acc = Expr::Literal(Value::Boolean(false));
     for item in items {
@@ -123,7 +118,7 @@ fn desugar_in_list(left: Expr, items: Vec<Expr>, negated: bool) -> Expr {
 }
 
 /// Simple `CASE x WHEN c THEN v` desugars each `WHEN c` to `WHEN x = c`
-/// (same as the recursive-descent parser; `x` is cloned per branch).
+/// (`x` is cloned per branch).
 fn desugar_case(operand: Option<Expr>, branches: Vec<(Expr, Expr)>) -> Vec<(Expr, Expr)> {
     match operand {
         None => branches,
@@ -304,10 +299,9 @@ peg::parser! {
               }
 
         /// `name` or `db.name` — a table reference. Three-part names are
-        /// rejected as soon as the second dot appears, with the same clear
-        /// error as the recursive-descent parser (this alternative reaches
-        /// furthest and wins, whatever follows the dot: `.col`, `.*`, or
-        /// nothing at all).
+        /// rejected as soon as the second dot appears, with a clear error
+        /// (this alternative reaches furthest and wins, whatever follows the
+        /// dot: `.col`, `.*`, or nothing at all).
         rule table_ref() -> (Option<String>, String)
             = _db:ident() dot() _t:ident() dot() {?
                   Err("three-part names (db.table.col) are not supported")
@@ -433,7 +427,7 @@ peg::parser! {
               }
 
         /// `*` / `t.*` are whole-list-only in v1; a mid-list `*` is rejected by
-        /// `projection`'s top-level check, same as the recursive-descent parser.
+        /// `projection`'s top-level check.
         rule projection_list() -> Vec<Projection>
             = star() !"," { vec![Projection::Star] }
             / t:ident() dot() star() !"," { vec![Projection::QualifiedStar(t)] }
@@ -470,8 +464,8 @@ peg::parser! {
             = lparen() q:select() rparen() { FromSource::Derived(Box::new(q)) }
             / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
 
-        /// FULL/CROSS/USING/NATURAL are not part of the grammar: like the
-        /// recursive-descent parser, they fail to parse.
+        /// FULL/CROSS/USING/NATURAL are not part of the grammar: they fail
+        /// to parse.
         rule join_clause() -> JoinClause
             = kind:join_kind() source:from_source() alias:alias()? kw(Keyword::On) on:expr() {?
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
@@ -654,11 +648,10 @@ peg::parser! {
         /// The function name decides the form *before* the argument list is
         /// parsed, so no alternative parses `fn_args` twice (same-prefix
         /// alternatives that both parse args re-parse nested calls
-        /// exponentially). COALESCE parses a plain expression list like the
-        /// recursive-descent parser, so `*` is an ordinary expression there
-        /// (`COALESCE(*, 1)` parses and the binder rejects it), while a
-        /// generic call treats a leading `*` as the whole argument list
-        /// (`f(*, 1)` is a parse error in both parsers).
+        /// exponentially). COALESCE parses a plain expression list, so `*` is
+        /// an ordinary expression there (`COALESCE(*, 1)` parses and the
+        /// binder rejects it), while a generic call treats a leading `*` as
+        /// the whole argument list (`f(*, 1)` is a parse error).
         rule ident_expr() -> Expr
             = coalesce_call()
             / fn_call()
@@ -667,10 +660,9 @@ peg::parser! {
             / name:ident() dot() star() { Expr::QualifiedStar(Some(name)) }
             / name:ident() { Expr::Column { table: None, name } }
 
-        /// `db.table.col` / `db.table.*` are not supported: fail with the
-        /// same clear message as the recursive-descent parser. This
-        /// alternative consumes one token further than the valid two-part
-        /// forms, so its error is the one that surfaces.
+        /// `db.table.col` / `db.table.*` are not supported: fail with a clear
+        /// message. This alternative consumes one token further than the
+        /// valid two-part forms, so its error is the one that surfaces.
         rule three_part_column() -> Expr
             = _db:ident() dot() _t:ident() dot() _c:ident() {?
                   Err("three-part column references (db.table.col) are not supported")
@@ -767,22 +759,47 @@ peg::parser! {
 
 #[cfg(test)]
 mod tests {
-    use super::super::parser::parse_statements as legacy;
-    use super::super::parser::MAX_NESTING_DEPTH;
-    use super::parse_statements as peg;
-    use crate::types::PinkDbError;
+    use super::super::ast::*;
+    use super::super::MAX_NESTING_DEPTH;
+    use super::parse_statements as parse;
+    use crate::types::{PinkDbError, Value};
 
-    /// Differential corpus, curated from three sources:
+    fn parse_one(sql: &str) -> Statement {
+        let stmts = parse(sql).unwrap_or_else(|e| panic!("rejected {sql:?}: {e}"));
+        assert_eq!(stmts.len(), 1, "expected one statement in {sql:?}");
+        stmts.into_iter().next().unwrap()
+    }
+
+    /// The first projection of a parsed `SELECT`, unwrapped to its `Expr`.
+    fn projection_expr(stmt: Statement) -> Expr {
+        let Statement::Select(sel) = stmt else {
+            panic!("not a SELECT: {stmt:?}");
+        };
+        match sel.projections.into_iter().next().unwrap() {
+            Projection::Expr { expr, .. } => expr,
+            other => panic!("not an expression projection: {other:?}"),
+        }
+    }
+
+    /// The first projection of a parsed `SELECT` that must be a literal.
+    fn lit(sql: &str) -> Value {
+        match projection_expr(parse_one(sql)) {
+            Expr::Literal(v) => v,
+            other => panic!("not a literal: {other:?}"),
+        }
+    }
+
+    /// Corpus of valid SQL, curated from three sources:
     /// 1. every SQL string in the repo's tests, examples and benches
     ///    (`crates/**/*.rs`, `bench/duckdiff.py` queries);
-    /// 2. hand-written edge cases covering lexical parity (keywords, quoting,
+    /// 2. hand-written edge cases covering lexical rules (keywords, quoting,
     ///    escapes, numbers, comments), expression precedence/associativity,
     ///    joins, unions, CTEs, derived tables, subqueries, windows and
     ///    CASE/CAST/COALESCE/LIKE/BETWEEN/IN/EXISTS;
-    /// 3. deliberately invalid SQL (one list below) pinning rejection parity.
+    /// 3. multi-database and `LOAD EXTENSION` forms.
     ///
     /// 812 valid + 157 invalid entries.
-    /// Must parse with both parsers to identical ASTs.
+    /// Every valid entry must parse (and split into the same statement count).
     const VALID: &[&str] = &[
         "SELECT COUNT(*) FROM sales;",
         "SELECT COUNT(*) FROM sales WHERE total > 500;",
@@ -1603,7 +1620,7 @@ mod tests {
         "SELECT 1; LOAD EXTENSION 'x'; SELECT 2;",
     ];
 
-    /// Must be rejected by both parsers as `PinkDbError::Parse`.
+    /// Must be rejected as [`PinkDbError::Parse`] (the invalid list below).
     const INVALID: &[&str] = &[
         "INSERT cell did not evaluate to one value",
         "INSERT INTO t2 VALUES",
@@ -1769,91 +1786,537 @@ mod tests {
         "SELECT 1 AS \"a\0b\";",
     ];
 
-    /// Parse `sql` with both parsers; valid entries must produce equal ASTs and
-    /// invalid entries must be rejected by both with the same error kind.
-    fn check(sql: &str) {
-        let l = legacy(sql);
-        let p = peg(sql);
-        match (l, p) {
-            (Ok(a), Ok(b)) => assert_eq!(a, b, "AST mismatch for {sql:?}"),
-            (Err(a), Err(b)) => {
-                assert!(
-                    matches!(a, PinkDbError::Parse(_)),
-                    "legacy error kind for {sql:?}: {a:?}"
-                );
-                assert!(
-                    matches!(b, PinkDbError::Parse(_)),
-                    "PEG error kind for {sql:?}: {b:?}"
+    /// Every valid entry parses, and the raw statement split agrees with the
+    /// parser (same count; every split text parses to exactly one statement).
+    #[test]
+    fn valid_corpus_parses() {
+        for sql in VALID {
+            let stmts = parse(sql).unwrap_or_else(|e| panic!("rejected {sql:?}: {e}"));
+            let texts = super::super::statement_texts(sql)
+                .unwrap_or_else(|e| panic!("split failed for {sql:?}: {e}"));
+            assert_eq!(
+                stmts.len(),
+                texts.len(),
+                "statement/split count mismatch for {sql:?}"
+            );
+            for text in &texts {
+                assert_eq!(
+                    parse(text).unwrap_or_else(|e| panic!("rejected split {text:?}: {e}")).len(),
+                    1,
+                    "split text {text:?} of {sql:?}"
                 );
             }
-            (a, b) => panic!(
-                "parser disagreement for {sql:?}\nlegacy: {a:?}\npeg:    {b:?}"
-            ),
         }
     }
 
+    /// Every invalid entry is rejected, and always as [`PinkDbError::Parse`].
     #[test]
-    fn differential_corpus_parity() {
-        for sql in VALID.iter().chain(INVALID.iter()) {
-            check(sql);
-        }
-    }
-
-    #[test]
-    fn valid_corpus_parses_to_equal_asts() {
-        for sql in VALID {
-            let l = legacy(sql).unwrap_or_else(|e| panic!("legacy rejected {sql:?}: {e}"));
-            let p = peg(sql).unwrap_or_else(|e| panic!("PEG rejected {sql:?}: {e}"));
-            assert_eq!(l, p, "AST mismatch for {sql:?}");
-        }
-    }
-
-    #[test]
-    fn invalid_corpus_is_rejected_by_both() {
+    fn invalid_corpus_is_rejected_with_parse_errors() {
         for sql in INVALID {
-            assert!(
-                matches!(legacy(sql), Err(PinkDbError::Parse(_))),
-                "legacy accepted invalid {sql:?}"
-            );
-            assert!(
-                matches!(peg(sql), Err(PinkDbError::Parse(_))),
-                "PEG accepted invalid {sql:?}"
-            );
+            match parse(sql) {
+                Err(PinkDbError::Parse(_)) => {}
+                other => panic!("expected a Parse error for {sql:?}, got {other:?}"),
+            }
         }
     }
 
-    /// `LOAD EXTENSION '<path>'` produces the same AST in both parsers; the
-    /// path is kept exactly as written and keywords are case-insensitive.
+    // ---------- lexical rules ----------
+
     #[test]
-    fn load_extension_ast_matches_and_keeps_the_path_verbatim() {
-        use crate::sql::ast::Statement;
+    fn keywords_are_case_insensitive() {
+        assert_eq!(parse_one("select 1;"), parse_one("SeLeCt 1;"));
+        assert_eq!(
+            parse_one("select distinct a from t where a = 1;"),
+            parse_one("SELECT DISTINCT a FROM t WHERE a = 1;")
+        );
+    }
+
+    #[test]
+    fn identifiers_keep_keyword_prefixes_and_boundaries() {
+        let Statement::Select(sel) =
+            parse_one("SELECT selected, select_, s_elect, ALLS, orderby FROM t;")
+        else {
+            panic!()
+        };
+        let names: Vec<&str> = sel
+            .projections
+            .iter()
+            .map(|p| match p {
+                Projection::Expr { expr: Expr::Column { name, .. }, .. } => name.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["selected", "select_", "s_elect", "ALLS", "orderby"]);
+        // Reserved keywords are never identifiers, bare or aliased.
+        for sql in [
+            "SELECT left FROM t;",
+            "SELECT a AS select FROM t;",
+            "CREATE TABLE select (a INT);",
+        ] {
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
+        }
+    }
+
+    #[test]
+    fn number_formats_and_i64_overflow() {
+        assert_eq!(lit("SELECT .5;"), Value::Double(0.5));
+        assert_eq!(lit("SELECT 1e+2;"), Value::Double(100.0));
+        assert_eq!(lit("SELECT 1E-2;"), Value::Double(0.01));
+        assert_eq!(lit("SELECT 0.5E-3;"), Value::Double(0.0005));
+        assert_eq!(lit("SELECT 3e2;"), Value::Double(300.0));
+        // i32-fitting integers stay INTEGER, larger ones BIGINT.
+        assert_eq!(lit("SELECT 2147483647;"), Value::Integer(i32::MAX));
+        assert_eq!(lit("SELECT 2147483648;"), Value::Bigint(2147483648));
+        assert_eq!(lit("SELECT 9223372036854775807;"), Value::Bigint(i64::MAX));
+        // `1.` is not a float (the dot stays a token), a bare exponent marker
+        // is not a number, and out-of-i64-range text is a parse error — so
+        // i64::MIN cannot be spelled as a literal.
+        for sql in [
+            "SELECT 1.;",
+            "SELECT 1.e2;",
+            "SELECT 5.;",
+            "SELECT 1e+;",
+            "SELECT 9223372036854775808;",
+            "SELECT 99999999999999999999;",
+            "SELECT -9223372036854775808;",
+        ] {
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
+        }
+    }
+
+    #[test]
+    fn string_escaping() {
+        assert_eq!(lit("SELECT 'it''s';"), Value::Varchar("it's".to_string()));
+        assert_eq!(lit("SELECT '';"), Value::Varchar(String::new()));
+        assert_eq!(lit("SELECT '''';"), Value::Varchar("'".to_string()));
+        assert!(matches!(parse("SELECT 'abc"), Err(PinkDbError::Parse(_))));
+    }
+
+    #[test]
+    fn comments_are_skipped_and_unterminated_blocks_error() {
+        assert_eq!(lit("SELECT 1 -- hi\n;"), Value::Integer(1));
+        assert_eq!(lit("SELECT -- comment\n1;"), Value::Integer(1));
+        assert_eq!(lit("SELECT /* c */ 1;"), Value::Integer(1));
+        // A line comment runs to end-of-input when there is no newline.
+        assert!(parse("SELECT 1 -- trailing").is_ok());
+        assert!(parse("SELECT a/*x*/+1;").is_ok());
+        for sql in ["SELECT 1 /* unterminated", "SELECT a/*x"] {
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
+        }
+    }
+
+    #[test]
+    fn semicolons_split_empty_and_trailing_statements() {
+        assert!(parse("").unwrap().is_empty());
+        assert!(parse(";").unwrap().is_empty());
+        assert!(parse(";;;").unwrap().is_empty());
+        assert_eq!(parse("SELECT 1; SELECT 2;").unwrap().len(), 2);
+        assert_eq!(parse(";;SELECT 1;;;").unwrap().len(), 1);
+        // The final `;` is optional.
+        assert_eq!(parse("SELECT 1").unwrap().len(), 1);
+        // `;` inside strings, quoted identifiers and comments never splits.
+        let stmts = parse("SELECT ';', \"a;b\"; -- c;\n/* d; */ SELECT 2").unwrap();
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn bad_sql_errors_are_parse_kind() {
+        for sql in [
+            "select `x`",
+            "select 'abc",
+            "SELECT FROM;",
+            "SELECT 1 SELECT 2;",
+            "CREATE TABLE t (a NOPE);",
+            "SELECT 1 LIMIT -1;",
+            "SELECT 1)",
+            "SELECT (1;",
+        ] {
+            match parse(sql) {
+                Err(PinkDbError::Parse(_)) => {}
+                other => panic!("expected a Parse error for {sql:?}, got {other:?}"),
+            }
+        }
+    }
+
+    // ---------- operator precedence and literals ----------
+
+    #[test]
+    fn comparison_operators_and_literals() {
+        let Statement::Select(sel) =
+            parse_one("SELECT 1 <> 2, 1 != 2, 2.5, 'x', 3e2, TRUE, FALSE, NULL;")
+        else {
+            panic!()
+        };
+        let exprs: Vec<&Expr> = sel
+            .projections
+            .iter()
+            .map(|p| match p {
+                Projection::Expr { expr, .. } => expr,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(matches!(
+            exprs[0],
+            Expr::Binary { op: BinaryOp::NotEq, .. }
+        ));
+        assert!(matches!(
+            exprs[1],
+            Expr::Binary { op: BinaryOp::NotEq, .. }
+        ));
+        assert!(matches!(exprs[2], Expr::Literal(Value::Double(v)) if *v == 2.5));
+        assert!(matches!(exprs[3], Expr::Literal(Value::Varchar(v)) if v == "x"));
+        assert!(matches!(exprs[4], Expr::Literal(Value::Double(v)) if *v == 300.0));
+        assert!(matches!(exprs[5], Expr::Literal(Value::Boolean(true))));
+        assert!(matches!(exprs[6], Expr::Literal(Value::Boolean(false))));
+        assert!(matches!(exprs[7], Expr::Literal(Value::Null)));
+    }
+
+    #[test]
+    fn precedence_mul_before_add() {
+        let s = parse_one("SELECT 1 + 2 * 3;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.projections.len(), 1);
+        // 1 + (2 * 3)
+        match &sel.projections[0] {
+            Projection::Expr { expr, .. } => match expr {
+                Expr::Binary { op: BinaryOp::Add, right, .. } => {
+                    assert!(matches!(**right, Expr::Binary { op: BinaryOp::Multiply, .. }));
+                }
+                _ => panic!("wrong shape: {expr:?}"),
+            },
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn precedence_comparison_below_additive() {
+        // `1 + 2 = 3` parses as `(1 + 2) = 3`.
+        let Expr::Binary { op: BinaryOp::Eq, left, .. } =
+            projection_expr(parse_one("SELECT 1 + 2 = 3;"))
+        else {
+            panic!()
+        };
+        assert!(matches!(*left, Expr::Binary { op: BinaryOp::Add, .. }));
+        // `NOT a = b` parses as `NOT (a = b)` (NOT sits above comparison).
+        let Expr::Unary { op: UnaryOp::Not, expr } =
+            projection_expr(parse_one("SELECT NOT a = b;"))
+        else {
+            panic!()
+        };
+        assert!(matches!(*expr, Expr::Binary { op: BinaryOp::Eq, .. }));
+        // Subtraction is left-associative: `(10 - 3) - 2`.
+        let Expr::Binary { left, .. } = projection_expr(parse_one("SELECT 10 - 3 - 2;")) else {
+            panic!()
+        };
+        assert!(matches!(*left, Expr::Binary { op: BinaryOp::Subtract, .. }));
+    }
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        let Expr::Binary { op: BinaryOp::Or, left, right } =
+            projection_expr(parse_one("SELECT a AND b OR c AND d;"))
+        else {
+            panic!()
+        };
+        assert!(matches!(*left, Expr::Binary { op: BinaryOp::And, .. }));
+        assert!(matches!(*right, Expr::Binary { op: BinaryOp::And, .. }));
+    }
+
+    // ---------- statement shapes ----------
+
+    #[test]
+    fn where_between_and_is_null() {
+        let s = parse_one("SELECT a FROM t WHERE x BETWEEN 1 AND 5 AND y IS NOT NULL;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(sel.where_clause.is_some());
+        assert!(sel.from.is_some());
+    }
+
+    #[test]
+    fn insert_and_create_shapes() {
+        assert!(matches!(
+            parse_one("CREATE TABLE t (a BIGINT, b VARCHAR);"),
+            Statement::CreateTable { .. }
+        ));
+        assert!(matches!(
+            parse_one("INSERT INTO t VALUES (1, 'x'), (2, 'y');"),
+            Statement::Insert { .. }
+        ));
+    }
+
+    #[test]
+    fn join_parses_for_wave3() {
+        let s = parse_one("SELECT * FROM a JOIN b ON a.id = b.id;");
+        let Statement::Select(sel) = s else { panic!() };
+        let join = sel.from.unwrap().join.unwrap();
+        assert_eq!(join.kind, JoinKind::Inner);
+        let s = parse_one("SELECT * FROM a INNER JOIN b ON a.id = b.id;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.from.unwrap().join.unwrap().kind, JoinKind::Inner);
+    }
+
+    #[test]
+    fn outer_join_kinds_parse_and_full_cross_error() {
+        // LEFT / LEFT OUTER / RIGHT / RIGHT OUTER, case-insensitive.
+        for (sql, want) in [
+            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id;", JoinKind::Left),
+            ("SELECT * FROM a left outer join b ON a.id = b.id;", JoinKind::Left),
+            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.id;", JoinKind::Right),
+            ("SELECT * FROM a right OUTER join b ON a.id = b.id;", JoinKind::Right),
+        ] {
+            let Statement::Select(sel) = parse_one(sql) else { panic!() };
+            assert_eq!(sel.from.unwrap().join.unwrap().kind, want, "{sql}");
+        }
+        // LEFT/RIGHT without JOIN, FULL/CROSS always.
+        for sql in [
+            "SELECT * FROM a LEFT b ON a.id = b.id;",
+            "SELECT * FROM a FULL JOIN b ON a.id = b.id;",
+            "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id;",
+            "SELECT * FROM a CROSS JOIN b;",
+            "SELECT * FROM a CROSS JOIN b ON a.id = b.id;",
+            // USING / NATURAL stay errors.
+            "SELECT * FROM a JOIN b USING (id);",
+            "SELECT * FROM a NATURAL JOIN b;",
+        ] {
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
+        }
+    }
+
+    #[test]
+    fn date_time_literals_and_types() {
+        let s = parse_one("SELECT DATE '2024-02-29', TIMESTAMP '2024-03-15 12:00:00.5';");
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.projections.len(), 2);
+        assert!(matches!(parse("SELECT DATE '2023-02-29';"), Err(PinkDbError::Parse(_))));
+        assert!(matches!(parse("SELECT DATE 123;"), Err(PinkDbError::Parse(_))));
+        assert!(matches!(
+            parse_one("CREATE TABLE t (d DATE, ts TIMESTAMP);"),
+            Statement::CreateTable { .. }
+        ));
+    }
+
+    #[test]
+    fn window_shapes() {
+        let s = parse_one("SELECT rank() OVER (PARTITION BY a ORDER BY b DESC) FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        match &sel.projections[0] {
+            Projection::Expr { expr: Expr::Window { name, over, .. }, .. } => {
+                assert_eq!(name, "rank");
+                assert_eq!(over.partition.len(), 1);
+                assert_eq!(over.order.len(), 1);
+                assert!(over.order[0].desc);
+                assert!(over.frame.is_none());
+            }
+            _ => panic!(),
+        }
+        let s = parse_one("SELECT sum(x) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Window { .. }, .. }
+        ));
+        assert!(matches!(
+            parse("SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;"),
+            Err(PinkDbError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn case_shapes() {
+        // Searched form.
+        let s = parse_one(
+            "SELECT CASE WHEN a > 1 THEN 'big' WHEN a = 1 THEN 'one' ELSE 'other' END FROM t;",
+        );
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Case { branches, else_ }, .. }
+            if branches.len() == 2 && else_.is_some()
+        ));
+        // Simple form parses (desugars in the same node shape).
+        let s = parse_one("SELECT CASE a WHEN 1 THEN 'one' END FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr { expr: Expr::Case { branches, else_ }, .. }
+            if branches.len() == 1 && else_.is_none()
+        ));
+        assert!(matches!(parse("SELECT CASE WHEN 1 THEN 2;"), Err(PinkDbError::Parse(_))));
+        assert!(matches!(parse("SELECT CASE END FROM t;"), Err(PinkDbError::Parse(_))));
+    }
+
+    #[test]
+    fn update_delete_shapes() {
+        match parse_one("UPDATE t SET a = 1, b = a + 2 WHERE a > 0;") {
+            Statement::Update { db, table, sets, where_clause } => {
+                assert_eq!(db, None);
+                assert_eq!(table, "t");
+                assert_eq!(sets.len(), 2);
+                assert!(where_clause.is_some());
+            }
+            _ => panic!(),
+        }
+        match parse_one("UPDATE db1.t SET a = 1;") {
+            Statement::Update { db, table, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(table, "t");
+            }
+            _ => panic!(),
+        }
+        match parse_one("DELETE FROM t;") {
+            Statement::Delete { db, table, where_clause } => {
+                assert_eq!(db, None);
+                assert_eq!(table, "t");
+                assert!(where_clause.is_none());
+            }
+            _ => panic!(),
+        }
+        assert!(matches!(parse("UPDATE t SET;"), Err(PinkDbError::Parse(_))));
+        assert!(matches!(parse("DELETE t;"), Err(PinkDbError::Parse(_))));
+    }
+
+    #[test]
+    fn multi_database_statements() {
+        assert!(matches!(
+            parse_one("CREATE DATABASE analytics;"),
+            Statement::CreateDatabase { name } if name == "analytics"
+        ));
+        assert!(matches!(
+            parse_one("DROP DATABASE analytics;"),
+            Statement::DropDatabase { name } if name == "analytics"
+        ));
+        assert!(matches!(
+            parse_one("USE analytics;"),
+            Statement::Use { name } if name == "analytics"
+        ));
+        // Qualified DDL/DML.
+        match parse_one("CREATE TABLE db1.t (a INTEGER);") {
+            Statement::CreateTable { db, name, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "t");
+            }
+            _ => panic!(),
+        }
+        match parse_one("INSERT INTO db1.t VALUES (1);") {
+            Statement::Insert { db, table, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(table, "t");
+            }
+            _ => panic!(),
+        }
+        match parse_one("CREATE VIEW db1.v AS SELECT 1;") {
+            Statement::CreateView { db, name, .. } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "v");
+            }
+            _ => panic!(),
+        }
+        match parse_one("DROP TABLE db1.t;") {
+            Statement::DropTable { db, name } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "t");
+            }
+            _ => panic!(),
+        }
+        match parse_one("DROP VIEW db1.v;") {
+            Statement::DropView { db, name } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "v");
+            }
+            _ => panic!(),
+        }
+        // Qualified FROM source.
+        let Statement::Select(sel) = parse_one("SELECT a FROM db1.t;") else { panic!() };
+        match sel.from.unwrap().source {
+            FromSource::Table { db, name } => {
+                assert_eq!(db, Some("db1".to_string()));
+                assert_eq!(name, "t");
+            }
+            other => panic!("{other:?}"),
+        }
+        // Three-part references are rejected with a clear message.
+        let e = parse("SELECT db1.t.a FROM db1.t;").unwrap_err();
+        assert!(e.to_string().contains("three-part"), "{e}");
+        let e = parse("SELECT db1.t.* FROM db1.t;").unwrap_err();
+        assert!(e.to_string().contains("three-part"), "{e}");
+    }
+
+    #[test]
+    fn txn_statements() {
+        assert!(matches!(parse_one("BEGIN;"), Statement::Begin));
+        assert!(matches!(parse_one("BEGIN TRANSACTION;"), Statement::Begin));
+        assert!(matches!(parse_one("COMMIT;"), Statement::Commit));
+        assert!(matches!(parse_one("ROLLBACK TRANSACTION;"), Statement::Rollback));
+    }
+
+    #[test]
+    fn with_in_exists_shapes() {
+        let s = parse_one(
+            "WITH a AS (SELECT 1 AS x), b(y) AS (SELECT x FROM a) SELECT * FROM b;",
+        );
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.with.len(), 2);
+        assert_eq!(sel.with[1].cols, Some(vec!["y".to_string()]));
+
+        let s = parse_one("SELECT * FROM (SELECT 1 AS x) AS s;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            sel.from.unwrap().source,
+            FromSource::Derived(_)
+        ));
+
+        let s = parse_one("SELECT a FROM t WHERE a IN (SELECT b FROM u) AND EXISTS (SELECT 1);");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(sel.where_clause.is_some());
+
+        // IN-list desugars to an OR chain.
+        let s = parse_one("SELECT * FROM t WHERE a IN (1, 2);");
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(matches!(
+            sel.where_clause,
+            Some(Expr::Binary { op: BinaryOp::Or, .. })
+        ));
+
+        // Scalar subquery in an expression.
+        let s = parse_one("SELECT (SELECT MAX(x) FROM u) + 1;");
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.projections.len(), 1);
+    }
+
+    /// `LOAD EXTENSION '<path>'` keeps the path exactly as written and
+    /// keywords are case-insensitive; anything but a string-literal path is a
+    /// parse error.
+    #[test]
+    fn load_extension_keeps_the_path_verbatim() {
         for (sql, path) in [
             ("LOAD EXTENSION '/a b/c.dylib';", "/a b/c.dylib"),
             ("load extension 'x.so';", "x.so"),
             ("LOAD EXTENSION 'it''s.dylib';", "it's.dylib"),
         ] {
-            let l = legacy(sql).unwrap();
-            let p = peg(sql).unwrap();
-            assert_eq!(l, p, "AST mismatch for {sql:?}");
             assert_eq!(
-                l,
+                parse(sql).unwrap(),
                 vec![Statement::LoadExtension { path: path.to_string() }],
                 "{sql:?}"
             );
         }
-        // The path must be a string literal; the legacy parser names the fix.
-        let e = legacy("LOAD EXTENSION;").unwrap_err().to_string();
-        assert!(e.contains("LOAD EXTENSION needs a string literal path"), "{e}");
-        let e = legacy("LOAD EXTENSION ext;").unwrap_err().to_string();
-        assert!(e.contains("LOAD EXTENSION needs a string literal path"), "{e}");
+        for sql in [
+            "LOAD EXTENSION;",
+            "LOAD EXTENSION ;",
+            "LOAD EXTENSION ext;",
+            "LOAD EXTENSION 1;",
+            "LOAD EXTENSION 'x' 'y';",
+            "LOAD EXTENSION \"x\";",
+        ] {
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
+        }
     }
 
-    /// NUL bytes inside quoted identifiers are rejected at parse time by both
-    /// parsers (the C bindings would silently truncate them at the NUL);
-    /// valid quoted identifiers are unchanged and NULs stay legal in string
-    /// literals, where they are value bytes rather than names.
+    /// NUL bytes inside quoted identifiers are rejected at parse time (the C
+    /// bindings would silently truncate them at the NUL); valid quoted
+    /// identifiers are unchanged and NULs stay legal in string literals, where
+    /// they are value bytes rather than names.
     #[test]
-    fn nul_in_quoted_identifier_is_rejected_by_both_parsers() {
+    fn nul_in_quoted_identifier_is_rejected() {
         for sql in [
             "SELECT \"a\0b\";",
             "CREATE TABLE \"a\0b\" (x INTEGER);",
@@ -1861,34 +2324,43 @@ mod tests {
             "SELECT * FROM \"a\0b\";",
             "USE \"a\0b\";",
         ] {
-            let l = legacy(sql).expect_err("legacy must reject");
-            let p = peg(sql).expect_err("PEG must reject");
-            assert!(matches!(l, PinkDbError::Parse(_)), "{sql:?}: {l:?}");
-            assert!(matches!(p, PinkDbError::Parse(_)), "{sql:?}: {p:?}");
-            assert!(l.to_string().contains("identifier contains a NUL byte"), "{l}");
-            assert!(p.to_string().contains("identifier contains a NUL byte"), "{p}");
-            // The PEG parser reports the *legacy* positional message, not
-            // peg's "expected ..." rendering with the closing-quote position.
-            assert_eq!(p.to_string(), l.to_string(), "{sql:?}");
+            let e = parse(sql).expect_err("must reject");
+            assert!(matches!(e, PinkDbError::Parse(_)), "{sql:?}: {e:?}");
+            assert!(
+                e.to_string().contains("identifier contains a NUL byte"),
+                "{sql:?}: {e}"
+            );
         }
-        // Valid quoted identifiers are byte-identical across parsers.
-        for sql in [
-            "SELECT 1 AS \"a b\";",
-            "CREATE TABLE \"with space\" (\"col\" INTEGER);",
-            "SELECT \"\"\"quoted\"\"\";",
-        ] {
-            assert_eq!(legacy(sql).unwrap(), peg(sql).unwrap(), "{sql:?}");
+        // The error points at the *opening* quote of the identifier.
+        let e = parse("SELECT \"a\0b\";").unwrap_err().to_string();
+        assert_eq!(e, "parse error at offset 7: identifier contains a NUL byte");
+        // Valid quoted identifiers keep their text (including `""` escapes).
+        let Statement::Select(sel) =
+            parse_one("SELECT \"select\", \"\", \"we\"\"ird\" FROM \"tab le\";")
+        else {
+            panic!()
+        };
+        let names: Vec<&str> = sel
+            .projections
+            .iter()
+            .map(|p| match p {
+                Projection::Expr { expr: Expr::Column { name, .. }, .. } => name.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, ["select", "", "we\"ird"]);
+        match sel.from.unwrap().source {
+            FromSource::Table { db: None, name } => assert_eq!(name, "tab le"),
+            other => panic!("{other:?}"),
         }
-        // A NUL inside a string literal is value data, not a name: both
-        // parsers accept it and agree on the AST.
-        let sql = "SELECT 'a\0b';";
-        assert_eq!(legacy(sql).unwrap(), peg(sql).unwrap());
+        // A NUL inside a string literal is value data, not a name: accepted.
+        assert_eq!(lit("SELECT 'a\0b';"), Value::Varchar("a\0b".to_string()));
     }
 
-    /// m2: the four three-part shapes must fail with the same message as the
-    /// recursive-descent parser, not a generic PEG error.
+    /// The four three-part shapes fail with a clear, specific message, not a
+    /// generic PEG error.
     #[test]
-    fn three_part_reference_errors_match_legacy() {
+    fn three_part_reference_errors_are_clear() {
         let cases = [
             "SELECT * FROM db1.t.*;",
             "SELECT a FROM db1.t.;",
@@ -1896,15 +2368,10 @@ mod tests {
             "CREATE VIEW db1.t.col AS SELECT 1;",
         ];
         for sql in cases {
-            let legacy_err = legacy(sql).unwrap_err().to_string();
-            let peg_err = peg(sql).unwrap_err().to_string();
+            let e = parse(sql).unwrap_err().to_string();
             assert!(
-                legacy_err.contains("three-part names (db.table.col) are not supported"),
-                "{sql}: legacy message changed: {legacy_err}"
-            );
-            assert!(
-                peg_err.contains("three-part names (db.table.col) are not supported"),
-                "{sql}: PEG message not aligned: {peg_err}"
+                e.contains("three-part names (db.table.col) are not supported"),
+                "{sql}: {e}"
             );
         }
     }
@@ -1956,9 +2423,7 @@ mod tests {
         ];
         let start = std::time::Instant::now();
         for sql in &inputs {
-            let l = legacy(sql).unwrap_or_else(|e| panic!("legacy rejected {sql:?}: {e}"));
-            let p = peg(sql).unwrap_or_else(|e| panic!("PEG rejected {sql:?}: {e}"));
-            assert_eq!(l, p, "AST mismatch for {sql:?}");
+            parse(sql).unwrap_or_else(|e| panic!("rejected {sql:?}: {e}"));
         }
         let elapsed = start.elapsed();
         assert!(
@@ -1967,10 +2432,10 @@ mod tests {
         );
     }
 
-    /// Inputs beyond the shared cap are rejected with a parse error by both
-    /// parsers instead of recursing until the stack overflows.
+    /// Inputs beyond the cap are rejected with a clean parse error instead of
+    /// recursing until the stack overflows.
     #[test]
-    fn nesting_above_cap_is_a_clean_error_in_both_parsers() {
+    fn nesting_above_cap_is_a_clean_error() {
         let too_deep = MAX_NESTING_DEPTH + 1;
         let inputs = [
             nested_parens(too_deep),
@@ -1986,27 +2451,25 @@ mod tests {
             nested_subqueries(200),
         ];
         for sql in &inputs {
-            for (label, r) in [("legacy", legacy(sql)), ("peg", peg(sql))] {
-                match r {
-                    Err(PinkDbError::Parse(msg)) => assert!(
+            match parse(sql) {
+                Err(PinkDbError::Parse(msg)) => {
+                    assert!(
                         msg.contains("nesting too deep"),
-                        "{label}: unexpected error for too-deep input: {msg}"
-                    ),
-                    other => {
-                        panic!("{label}: too-deep input not rejected cleanly: {other:?}")
-                    }
+                        "unexpected error for too-deep input: {msg}"
+                    );
                 }
+                other => panic!("too-deep input not rejected cleanly: {other:?}"),
             }
         }
     }
 
-    /// Two levels below the text cap still parse to equal ASTs in both
-    /// parsers. Nested subqueries are the exception: each level costs three
-    /// AST nodes (Select, projection, scalar-subquery expression), so the
-    /// shared AST-depth guard can reject the deepest nestings before the text
-    /// cap does; both parsers must agree either way.
+    /// Two levels below the text cap still parse. Nested subqueries are the
+    /// exception: each level costs three AST nodes (Select, projection,
+    /// scalar-subquery expression), so the AST-depth guard can reject the
+    /// deepest nestings before the text cap does; both are clean `Parse`
+    /// errors either way.
     #[test]
-    fn nesting_just_below_cap_parses_in_both_parsers() {
+    fn nesting_just_below_cap_parses() {
         let depth = MAX_NESTING_DEPTH - 2;
         for sql in [
             nested_parens(depth),
@@ -2014,25 +2477,22 @@ mod tests {
             nested_coalesce(depth),
             nested_case(depth),
         ] {
-            let l = legacy(&sql).unwrap_or_else(|e| panic!("legacy rejected {sql:?}: {e}"));
-            let p = peg(&sql).unwrap_or_else(|e| panic!("PEG rejected {sql:?}: {e}"));
-            assert_eq!(l, p, "AST mismatch for {sql:?}");
+            parse(&sql).unwrap_or_else(|e| panic!("rejected {sql:?}: {e}"));
         }
         for subquery_depth in [1, depth - 1, depth] {
             let sql = nested_subqueries(subquery_depth);
-            match (legacy(&sql), peg(&sql)) {
-                (Ok(l), Ok(p)) => assert_eq!(l, p, "AST mismatch for {sql:?}"),
-                (Err(l), Err(p)) => {
-                    assert_eq!(l.to_string(), p.to_string(), "guard message mismatch");
-                    assert!(l.to_string().contains("too deep"), "{l}");
+            match parse(&sql) {
+                Ok(_) => {}
+                Err(PinkDbError::Parse(msg)) => {
+                    assert!(msg.contains("too deep"), "{sql:?}: {msg}");
                 }
-                (l, p) => panic!("parser disagreement for {sql:?}: {l:?} vs {p:?}"),
+                other => panic!("too-deep input not rejected cleanly: {other:?}"),
             }
         }
     }
 
     /// The depth estimate ignores parens inside strings, quoted identifiers
-    /// and comments, which the parsers never recurse into.
+    /// and comments, which the parser never recurses into.
     #[test]
     fn guard_ignores_nesting_inside_strings_and_comments() {
         let many = MAX_NESTING_DEPTH * 3;
@@ -2043,19 +2503,17 @@ mod tests {
             ")".repeat(many),
             ")".repeat(many),
         );
-        let l = legacy(&sql).unwrap_or_else(|e| panic!("legacy rejected: {e}"));
-        let p = peg(&sql).unwrap_or_else(|e| panic!("PEG rejected: {e}"));
-        assert_eq!(l, p);
+        parse(&sql).unwrap_or_else(|e| panic!("rejected: {e}"));
     }
 
     // ---------- COALESCE `*` arguments ----------
 
-    /// COALESCE parses a plain expression list like the recursive-descent
-    /// parser, so `*` is an ordinary expression in its arguments: the parser
-    /// accepts these and the binder rejects them. A generic call keeps the
-    /// leading-`*`-as-whole-argument-list rule (`f(*, 1)` is a parse error).
+    /// COALESCE parses a plain expression list, so `*` is an ordinary
+    /// expression in its arguments: the parser accepts these and the binder
+    /// rejects them. A generic call keeps the leading-`*`-as-whole-argument-
+    /// list rule (`f(*, 1)` is a parse error).
     #[test]
-    fn coalesce_star_arguments_match_legacy() {
+    fn coalesce_star_arguments_are_accepted() {
         for sql in [
             "SELECT COALESCE(*, 1);",
             "SELECT COALESCE(* + 1, 2);",
@@ -2064,23 +2522,14 @@ mod tests {
             "SELECT CoAlEsCe(*/did, -1);",
             "SELECT COALESCE(*);",
         ] {
-            let l = legacy(sql).unwrap_or_else(|e| panic!("legacy rejected {sql:?}: {e}"));
-            let p = peg(sql).unwrap_or_else(|e| panic!("PEG rejected {sql:?}: {e}"));
-            assert_eq!(l, p, "AST mismatch for {sql:?}");
+            parse(sql).unwrap_or_else(|e| panic!("rejected {sql:?}: {e}"));
         }
         for sql in ["SELECT f(*, 1);", "SELECT COALESCE();"] {
-            assert!(
-                matches!(legacy(sql), Err(PinkDbError::Parse(_))),
-                "legacy accepted {sql:?}"
-            );
-            assert!(
-                matches!(peg(sql), Err(PinkDbError::Parse(_))),
-                "PEG accepted {sql:?}"
-            );
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
         }
     }
 
-    // ---------- seeded differential fuzzing ----------
+    // ---------- seeded fuzzing ----------
 
     /// Deterministic splitmix64 PRNG for the seeded fuzz test (no new deps).
     struct SplitMix64(u64);
@@ -2202,12 +2651,14 @@ mod tests {
         chars.into_iter().collect()
     }
 
-    /// Seeded randomized differential test: every generated or mutated input
-    /// must produce equal ASTs or a parse error from both parsers. Fixed seed,
-    /// so parity is reproducible in CI.
+    /// Seeded randomized fuzz: every generated or mutated input must parse
+    /// deterministically (two runs produce equal results) and every error must
+    /// be a [`PinkDbError::Parse`] — never a panic. Fixed seed, so a failure
+    /// is reproducible in CI.
     #[test]
-    fn seeded_fuzz_differential() {
+    fn seeded_fuzz_is_deterministic_and_flawless() {
         let mut rng = SplitMix64(0x5EED_2026_0000_0001);
+        let (mut valid, mut invalid) = (0usize, 0usize);
         for i in 0..4_000 {
             let sql = if i % 3 == 0 {
                 fuzz_input(&mut rng)
@@ -2219,7 +2670,26 @@ mod tests {
                 };
                 fuzz_mutate(&mut rng, base)
             };
-            check(&sql);
+            let first = parse(&sql);
+            let second = parse(&sql);
+            match (&first, &second) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "unstable AST for {sql:?}"),
+                (Err(a), Err(b)) => {
+                    assert_eq!(a.to_string(), b.to_string(), "unstable error for {sql:?}");
+                }
+                _ => panic!("unstable result for {sql:?}: {first:?} vs {second:?}"),
+            }
+            match first {
+                Ok(_) => valid += 1,
+                Err(e) => {
+                    assert!(matches!(e, PinkDbError::Parse(_)), "{sql:?}: {e:?}");
+                    invalid += 1;
+                }
+            }
         }
+        assert!(
+            valid > 0 && invalid > 0,
+            "expected a valid/invalid mix: {valid} valid, {invalid} invalid"
+        );
     }
 }

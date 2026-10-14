@@ -78,17 +78,17 @@ vectors, with zero async in the core.</p>
     <text class="sk-label-sm" x="8" y="656">every operator call moves &#8804; 2048 rows &#183; gather(vector, selection) never copies a row</text>
   </svg>
   <figcaption class="sk-figure-caption">Fig. 2 — the pipeline and the shape of the data it moves.
-  Both parsers (PEG and the legacy lexer) produce the same AST.</figcaption>
+  One PEG grammar parses every statement into the AST the binder consumes.</figcaption>
 </figure>
 
 <aside class="marginalia">
-  <span class="margin-tag">two parsers</span>
-  <p>SQL is parsed by a <code>peg</code>-generated grammar; the hand-written lexer +
-  recursive-descent parser stays selectable with <code>PINKDB_PARSER=legacy</code>.</p>
+  <span class="margin-tag">one parser</span>
+  <p>SQL is parsed by a <code>peg</code>-generated grammar; it is the only
+  parser path.</p>
 </aside>
 
-<p>A committed differential corpus plus a seeded randomized differential test check
-that both parsers accept the same inputs with equal ASTs and reject the same inputs.</p>
+<p>A committed corpus plus a seeded randomized fuzz test pin that valid input parses
+and invalid input returns a clean <code>Parse</code> error.</p>
 
 <h2>Modules</h2>
 
@@ -100,7 +100,7 @@ that both parsers accept the same inputs with equal ASTs and reject the same inp
     <tr><td><code>pinkdb::vector</code></td><td><code>Vector</code> (typed data + validity bitmask, bit = valid) + <code>gather</code>, <code>DataChunk</code></td></tr>
     <tr><td><code>pinkdb::storage</code></td><td><code>DataTable</code> (per-column <code>Vector</code> chunks), <code>PinkDb</code> catalog (databases → tables/views)</td></tr>
     <tr><td><code>pinkdb::csv</code></td><td>CSV import + type inference (rayon-parallel parse)</td></tr>
-    <tr><td><code>pinkdb::sql</code></td><td>PEG grammar + hand-written lexer/recursive-descent parser, AST, binder</td></tr>
+    <tr><td><code>pinkdb::sql</code></td><td>PEG grammar, AST, binder</td></tr>
     <tr><td><code>pinkdb::plan</code></td><td>Logical plan tree</td></tr>
     <tr><td><code>pinkdb::optimizer</code></td><td>Constant folding, predicate pushdown (incl. across joins)</td></tr>
     <tr><td><code>pinkdb::exec</code></td><td>Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel)</td></tr>

@@ -2700,7 +2700,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
 
 #[cfg(test)]
 mod tests {
-    use super::super::parser::parse_statements;
+    use super::super::parse_statements;
     use super::*;
 
     fn test_db() -> PinkDb {

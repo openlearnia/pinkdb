@@ -45,7 +45,7 @@ for result in db.execute("SELECT a, upper(b) FROM t WHERE a > 1;")? {
 
 ```
 SQL text
-  → PEG parser (or hand-written lexer + recursive descent) → AST
+  → PEG parser → AST
   → Binder (resolve tables/columns, assign types)
   → Logical plan (scan → filter → join → aggregate → project → sort → limit)
   → Optimizer (predicate pushdown, constant folding)
@@ -59,7 +59,7 @@ SQL text
 | `pinkdb::vector` | `Vector` (typed data + validity bitmask, bit = valid) + `gather`, `DataChunk` |
 | `pinkdb::storage` | `DataTable` (per-column `Vector` chunks), `PinkDb` catalog (databases → tables/views) |
 | `pinkdb::csv` | CSV import + type inference (rayon-parallel parse) |
-| `pinkdb::sql` | PEG grammar + hand-written lexer/recursive-descent parser, AST, binder |
+| `pinkdb::sql` | PEG grammar, AST, binder |
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
 | `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
@@ -80,12 +80,10 @@ With the `encryption` feature the audited RustCrypto crates `aes-gcm` +
 `argon2` are linked (optional dependencies: the default build stays
 crypto-free).
 
-SQL is parsed by a `peg`-generated grammar; the hand-written lexer +
-recursive-descent parser stays selectable via `PINKDB_PARSER=legacy`. A
-committed differential corpus plus a seeded randomized differential test
-(`cargo test`) check that both parsers accept the same inputs with equal ASTs
-and reject the same inputs; PEG error messages are positional and worded
-differently.
+SQL is parsed by a `peg`-generated grammar — the only parser path. A committed
+corpus plus a seeded randomized fuzz test (`cargo test`) check that valid input
+parses and invalid input returns a clean `Parse` error; parse-error messages are
+positional.
 
 ## SQL surface (v1)
 
@@ -988,7 +986,7 @@ For reference, DuckDB 1.5.6 imports the same file in 0.06 s on this machine
   integers (no INTERVAL type in v1); no time zones (naive UTC)
 - Expression nesting is capped at 24 levels (parentheses, `CASE` arms and
   consecutive unary operators counted together); deeper input returns a clean
-  `Parse` error (`expression nesting too deep`) in both parsers instead of
+  `Parse` error (`expression nesting too deep`) instead of
   overflowing the parser stack. Separately, the parser-to-AST depth is capped
   at 64 nodes: left-associative operator chains (`1+1+...`), long `IN` lists,
   `AND`/`OR` runs and deeply nested subqueries return `expression too deep

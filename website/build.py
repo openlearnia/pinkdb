@@ -86,7 +86,7 @@ PAGES = {
         "title": "CLI & REPL — pinkdb",
         "description": (
             "pinkdb-cli dot-commands, box-drawn output and timing, "
-            "PINKDB_PARSER, PINKDB_KEY, and remote mode."
+            "PINKDB_KEY, and remote mode."
         ),
     },
     "server.html": {

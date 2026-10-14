@@ -18,8 +18,7 @@ dot-commands are single-line and take no semicolon.</p>
 
 <aside class="marginalia">
   <span class="margin-tag">environment switches</span>
-  <p><code>PINKDB_PARSER=legacy</code> selects the hand-written parser;
-  <code>PINKDB_KEY</code> opens encrypted files. Both are documented under
+  <p><code>PINKDB_KEY</code> opens encrypted files; it is documented under
   <em>Environment variables</em>.</p>
 </aside>
 
@@ -99,12 +98,6 @@ Run Time (s): real 0.000</code></pre>
 <table>
   <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
   <tbody>
-    <tr>
-      <td><code>PINKDB_PARSER=legacy</code></td>
-      <td>use the hand-written lexer + recursive-descent parser instead of the default
-      PEG grammar. Both parsers are differential-tested to accept the same inputs with
-      equal ASTs (error messages differ).</td>
-    </tr>
     <tr>
       <td><code>PINKDB_KEY</code></td>
       <td>passphrase for at-rest encryption: <code>.save</code> writes encrypted and

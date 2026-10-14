@@ -876,8 +876,7 @@ mod tests {
     /// The AST-depth guard at the engine level: a chain of
     /// `MAX_AST_DEPTH - 3` terms sits exactly at the cap (statement + Select +
     /// projection + one node per term), one more term is rejected cleanly,
-    /// and the connection keeps working either way. `PINKDB_PARSER=legacy
-    /// cargo test` exercises the same boundary through the legacy parser.
+    /// and the connection keeps working either way.
     #[test]
     fn ast_depth_cap_boundary_through_the_engine() {
         let db = Database::new();

@@ -1,8 +1,8 @@
 //! pinkdb — mini DuckDB: embedded analytical SQL in Rust.
 //!
 //! v1: in-memory columnar storage, vectorized execution (CHUNK_SIZE = 2048),
-//! hand-written SQL frontend, CSV import. Single connection, single thread,
-//! no unsafe, no async.
+//! PEG SQL frontend, CSV import. Single connection, single thread, no unsafe,
+//! no async.
 //!
 //! Loadable extensions (ABI v1, `pinkdb-ext-loader`) add scalar functions at
 //! runtime through [`PinkDb::load_extension`]; the unsafe boundary (dlopen and

@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CLI &amp; REPL — pinkdb</title>
-<meta name="description" content="pinkdb-cli dot-commands, box-drawn output and timing, PINKDB_PARSER, PINKDB_KEY, and remote mode.">
+<meta name="description" content="pinkdb-cli dot-commands, box-drawn output and timing, PINKDB_KEY, and remote mode.">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#F7F1E8">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/cli.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
 <meta property="og:title" content="CLI &amp; REPL — pinkdb">
-<meta property="og:description" content="pinkdb-cli dot-commands, box-drawn output and timing, PINKDB_PARSER, PINKDB_KEY, and remote mode.">
+<meta property="og:description" content="pinkdb-cli dot-commands, box-drawn output and timing, PINKDB_KEY, and remote mode.">
 <meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/cli.html">
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
@@ -69,8 +69,7 @@ dot-commands are single-line and take no semicolon.</p>
 
 <aside class="marginalia">
   <span class="margin-tag">environment switches</span>
-  <p><code>PINKDB_PARSER=legacy</code> selects the hand-written parser;
-  <code>PINKDB_KEY</code> opens encrypted files. Both are documented under
+  <p><code>PINKDB_KEY</code> opens encrypted files; it is documented under
   <em>Environment variables</em>.</p>
 </aside>
 
@@ -150,12 +149,6 @@ Run Time (s): real 0.000</code></pre>
 <table>
   <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
   <tbody>
-    <tr>
-      <td><code>PINKDB_PARSER=legacy</code></td>
-      <td>use the hand-written lexer + recursive-descent parser instead of the default
-      PEG grammar. Both parsers are differential-tested to accept the same inputs with
-      equal ASTs (error messages differ).</td>
-    </tr>
     <tr>
       <td><code>PINKDB_KEY</code></td>
       <td>passphrase for at-rest encryption: <code>.save</code> writes encrypted and

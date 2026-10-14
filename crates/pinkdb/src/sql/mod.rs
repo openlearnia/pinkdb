@@ -1,20 +1,21 @@
-//! SQL frontend: lexer → parser → binder.
+//! SQL frontend: PEG parser → binder.
 //!
-//! Two parsers coexist: the hand-written lexer + recursive-descent parser
-//! ([`parser`]) and the PEG grammar ([`peg_parser`]). `PINKDB_PARSER` selects
-//! one per call: `legacy` → hand-written parser, anything else (default) → PEG.
+//! One parser path: the PEG grammar ([`peg_parser`]); [`parse_statements`]
+//! goes straight through to it. Keyword lookup lives in `keyword`, and the
+//! remaining raw-text scans (WAL statement splitting, the quoted-identifier
+//! NUL check) live in `split`.
 
 pub mod ast;
 pub mod binder;
-pub mod lexer;
-pub mod parser;
+pub(crate) mod keyword;
 pub mod peg_parser;
+mod split;
 
 pub use binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, bind};
 pub(crate) use binder::bind_tracked;
 use crate::types::{PinkDbError, Result, Value};
 
-/// Maximum AST depth both parsers accept (see [`check_ast_depth`]).
+/// Maximum AST depth the parser accepts (see [`check_ast_depth`]).
 ///
 /// Measured in nodes along the deepest root-to-leaf path: every statement,
 /// `Select`, `Expr`, `FromClause`/`FromSource`, projection, CTE, join, order
@@ -27,29 +28,139 @@ use crate::types::{PinkDbError, Result, Value};
 /// smallest measured crash point.
 pub(crate) const MAX_AST_DEPTH: usize = 64;
 
-/// Parse all statements in `sql` with the parser selected by the
-/// `PINKDB_PARSER` environment variable (read per call): `legacy` selects the
-/// hand-written lexer + recursive-descent parser; the default is the PEG
-/// grammar. Both produce the same AST for the same input (differential-tested
-/// in [`peg_parser`]); PEG error messages are positional and worded
-/// differently.
+/// Maximum nesting depth the parser accepts, measured in "nesting units":
+/// one unit per open `(`, open `CASE` arm, or consecutive prefix unary
+/// operator enclosing the current point. Deeper input is rejected with
+/// [`PinkDbError::Parse`] before any recursion starts.
 ///
-/// Both parsers apply the same two depth guards: the pre-parse nesting
-/// estimate (parens/CASE/unary, protects parser recursion) and the post-parse
-/// [`check_ast_depth`] (AST depth, protects bind/execute/drop recursion).
-pub fn parse_statements(sql: &str) -> Result<Vec<ast::Statement>> {
-    match std::env::var("PINKDB_PARSER").ok().as_deref() {
-        Some("legacy") => parser::parse_statements(sql),
-        _ => peg_parser::parse_statements(sql),
+/// Every recursive cycle in the PEG grammar passes through one of those
+/// constructs, and debug builds (what `cargo test` uses, with its 2 MiB test
+/// threads) overflow the stack at 36+ units in the tightest measured case
+/// (nested subqueries), so the cap sits at two thirds of that.
+pub(crate) const MAX_NESTING_DEPTH: usize = 24;
+
+/// Reject `sql` when its estimated nesting depth exceeds
+/// [`MAX_NESTING_DEPTH`].
+pub(crate) fn check_nesting_depth(sql: &str) -> Result<()> {
+    if nesting_estimate(sql) > MAX_NESTING_DEPTH {
+        return Err(PinkDbError::Parse(format!(
+            "expression nesting too deep (limit {MAX_NESTING_DEPTH})"
+        )));
     }
+    Ok(())
+}
+
+/// Upper bound on the parser's recursion depth: the maximum over the input of
+/// `open_parens + open_case_arms + consecutive_prefix_unary_ops`.
+///
+/// Every recursive cycle in the PEG grammar goes through at least one of those
+/// (`(` for parens, calls, `IN (...)`, `CAST`, `OVER (...)`, subqueries,
+/// derived tables and CTEs; `CASE` until its `END`; a `NOT`/unary `+`/`-`
+/// run), so this can never under-count. String literals, quoted identifiers
+/// and comments are skipped, and keyword matches are boundary-aware.
+fn nesting_estimate(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    let mut parens = 0usize;
+    let mut cases = 0usize;
+    let mut unary = 0usize;
+    let mut max = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            quote @ (b'\'' | b'"') => {
+                // String literal / quoted identifier; `''` / `""` escapes.
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == quote {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == quote {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                unary = 0;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'(' => {
+                parens += 1;
+                i += 1;
+            }
+            b')' => {
+                parens = parens.saturating_sub(1);
+                unary = 0;
+                i += 1;
+            }
+            b'-' | b'+' => {
+                unary += 1;
+                i += 1;
+            }
+            c if c.is_ascii_alphabetic() || c == b'_' => {
+                let start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let word = &sql[start..i];
+                if word.eq_ignore_ascii_case("case") {
+                    cases += 1;
+                } else if word.eq_ignore_ascii_case("end") {
+                    cases = cases.saturating_sub(1);
+                    unary = 0;
+                } else if word.eq_ignore_ascii_case("not") {
+                    unary += 1;
+                } else {
+                    unary = 0;
+                }
+            }
+            _ => {
+                // Whitespace is trivia (a `NOT` run spans it); anything else
+                // (operand start, comma, operator, ...) ends a unary run.
+                if !bytes[i].is_ascii_whitespace() {
+                    unary = 0;
+                }
+                i += 1;
+            }
+        }
+        max = max.max(parens + cases + unary);
+    }
+    max
+}
+
+/// Parse all statements in `sql` with the PEG grammar. Statements may be
+/// `;`-separated (the final `;` is optional); empty input yields no
+/// statements. Errors are [`PinkDbError::Parse`] with PEG's positional,
+/// furthest-token wording.
+///
+/// The parser applies two depth guards: the pre-parse nesting estimate
+/// (parens/CASE/unary, protecting grammar recursion) and the post-parse
+/// [`check_ast_depth`] (AST depth, protecting bind/execute/drop recursion).
+pub fn parse_statements(sql: &str) -> Result<Vec<ast::Statement>> {
+    peg_parser::parse_statements(sql)
 }
 
 /// Reject an AST whose depth exceeds [`MAX_AST_DEPTH`], iteratively.
 ///
-/// Called by both parsers after building the AST, so they agree on the limit
-/// and every entry point (including direct `parser`/`peg_parser` calls) is
-/// guarded. The walk uses an explicit worklist — never recursion — because a
-/// hostile input can be arbitrarily deep.
+/// Called by the parser after building the AST, so the limit applies to every
+/// entry point (including a direct [`peg_parser::parse_statements`] call).
+/// The walk uses an explicit worklist — never recursion — because a hostile
+/// input can be arbitrarily deep.
 ///
 /// A rejected AST is dismantled with an explicit worklist before the error is
 /// returned: dropping an over-deep tree would otherwise recurse through the
@@ -413,32 +524,14 @@ fn take_expr_children(
     }
 }
 
-/// Split `sql` into one source text per statement, mirroring the parsers'
+/// Split `sql` into one source text per statement, mirroring the parser's
 /// top-level `;` splitting (strings, quoted identifiers and comments are
-/// lexed, so a `;` inside them never splits). Returns the raw source of every
-/// non-empty statement, in order — used to write exact statement text to the
-/// WAL. Lex errors surface exactly as [`parse_statements`] would report them.
-/// Call only after [`parse_statements`] succeeded; the two lists are then
-/// guaranteed to have the same length.
+/// skipped, so a `;` inside them never splits). Returns the raw source of
+/// every non-empty statement, in order — used to write exact statement text
+/// to the WAL. Call only after [`parse_statements`] succeeded; the two lists
+/// are then guaranteed to have the same length.
 pub fn statement_texts(sql: &str) -> Result<Vec<String>> {
-    let tokens = lexer::lex(sql)?;
-    let mut out = Vec::new();
-    let mut start: Option<usize> = None;
-    for (tok, off) in &tokens {
-        match tok {
-            lexer::Token::Eof | lexer::Token::Semicolon => {
-                if let Some(s) = start.take() {
-                    out.push(sql[s..*off].trim_end().to_string());
-                }
-            }
-            _ => {
-                if start.is_none() {
-                    start = Some(*off);
-                }
-            }
-        }
-    }
-    Ok(out)
+    Ok(split::statement_texts(sql))
 }
 
 #[cfg(test)]
@@ -467,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn statement_texts_agree_with_parse_for_both_parsers() {
+    fn statement_texts_agree_with_parse() {
         let corpus = [
             "SELECT 1;",
             "CREATE TABLE t (a INTEGER, b VARCHAR); INSERT INTO t VALUES (1, 'x');",
@@ -499,48 +592,37 @@ mod tests {
         sql
     }
 
-    /// The cap and cap+1 chain are the same boundary for both parsers: at the
-    /// cap the ASTs are equal, one term over both parsers reject with the
-    /// shared message.
+    /// At the cap the chain parses; one term over is rejected with the shared
+    /// guard message. A direct [`peg_parser::parse_statements`] call applies
+    /// the same guard as the [`parse_statements`] entry point.
     #[test]
-    fn ast_depth_guard_boundary_is_shared_by_both_parsers() {
+    fn ast_depth_guard_boundary() {
         let at_cap = chain_sql(MAX_AST_DEPTH - 3);
         let over_cap = chain_sql(MAX_AST_DEPTH - 2);
-        let l = parser::parse_statements(&at_cap).expect("legacy accepts the cap");
-        let p = peg_parser::parse_statements(&at_cap).expect("PEG accepts the cap");
-        assert_eq!(l, p);
-        for sql in [&over_cap] {
-            for (label, e) in [
-                ("legacy", parser::parse_statements(sql)),
-                ("peg", peg_parser::parse_statements(sql)),
-            ] {
-                let msg = e.expect_err(label).to_string();
-                assert_eq!(
-                    msg,
-                    format!("expression too deep (limit {MAX_AST_DEPTH})"),
-                    "{label}"
-                );
-            }
+        for p in [
+            parse_statements(&at_cap),
+            peg_parser::parse_statements(&at_cap),
+        ] {
+            p.expect("the cap parses");
         }
-        // The selected-parser entry point applies the same guard.
-        assert!(parse_statements(&at_cap).is_ok());
-        assert!(parse_statements(&over_cap).is_err());
+        for e in [
+            parse_statements(&over_cap),
+            peg_parser::parse_statements(&over_cap),
+        ] {
+            let msg = e.expect_err("one term over the cap").to_string();
+            assert_eq!(msg, format!("expression too deep (limit {MAX_AST_DEPTH})"));
+        }
     }
 
     /// Chains, `IN` lists and `AND` runs all grow the AST without growing the
-    /// pre-parse nesting estimate; both parsers reject deep ones cleanly.
+    /// pre-parse nesting estimate; the guard rejects deep ones cleanly.
     #[test]
     fn deep_operator_chains_in_lists_and_and_runs_are_rejected() {
         let in_list = format!("SELECT 1 IN (1{});", ", 1".repeat(1000));
         let and_run = format!("SELECT true{};", " AND true".repeat(1000));
         for sql in [in_list, and_run] {
-            for (label, e) in [
-                ("legacy", parser::parse_statements(&sql)),
-                ("peg", peg_parser::parse_statements(&sql)),
-            ] {
-                let msg = e.expect_err(label).to_string();
-                assert!(msg.contains("expression too deep"), "{label}: {msg}");
-            }
+            let msg = parse_statements(&sql).expect_err("too deep").to_string();
+            assert!(msg.contains("expression too deep"), "{msg}");
         }
     }
 
@@ -550,12 +632,7 @@ mod tests {
     #[test]
     fn huge_chain_is_rejected_and_freed_without_recursion() {
         let sql = chain_sql(100_000);
-        for (label, e) in [
-            ("legacy", parser::parse_statements(&sql)),
-            ("peg", peg_parser::parse_statements(&sql)),
-        ] {
-            let msg = e.expect_err(label).to_string();
-            assert!(msg.contains("expression too deep"), "{label}: {msg}");
-        }
+        let msg = parse_statements(&sql).expect_err("too deep").to_string();
+        assert!(msg.contains("expression too deep"), "{msg}");
     }
 }
