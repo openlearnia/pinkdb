@@ -41,7 +41,9 @@ fn statement_counts_match_executed_statements() {
     let mut writer = stream.try_clone().unwrap();
     protocol::write_request(
         &mut writer,
-        &Request::Hello { protocol_version: PROTOCOL_VERSION },
+        &Request::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
     )
     .unwrap();
     let mut reader = BufReader::new(stream);
@@ -77,8 +79,13 @@ fn statement_counts_match_executed_statements() {
 
     // Zero statements (empty and all-empty batches): exactly one frame.
     for sql in ["", "  ;;  "] {
-        protocol::write_request(&mut writer, &Request::Execute { sql: sql.to_string() })
-            .unwrap();
+        protocol::write_request(
+            &mut writer,
+            &Request::Execute {
+                sql: sql.to_string(),
+            },
+        )
+        .unwrap();
         assert_eq!(
             protocol::read_response(&mut reader).unwrap(),
             Response::BatchDone { statements: 0 },

@@ -41,9 +41,7 @@ use crate::types::{PinkDbError, Result};
 use crate::types::{DataType, Value};
 
 #[cfg(not(target_arch = "wasm32"))]
-use pinkdb_ext_loader::{
-    DynamicFunction, ExtArg, ExtError, ExtHost, ExtValue, LoadedExtension,
-};
+use pinkdb_ext_loader::{DynamicFunction, ExtArg, ExtError, ExtHost, ExtValue, LoadedExtension};
 
 /// Re-exported so the binder and executor can name registered ABI types.
 #[cfg(not(target_arch = "wasm32"))]
@@ -166,10 +164,7 @@ impl PinkDb {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ExtHost for PinkDb {
-    fn register_extension(
-        &mut self,
-        ext: LoadedExtension,
-    ) -> std::result::Result<(), ExtError> {
+    fn register_extension(&mut self, ext: LoadedExtension) -> std::result::Result<(), ExtError> {
         // Pin duplicate loads by name: a second load of the same extension
         // must fail even if it were to register a disjoint set of functions
         // (init would run twice against shared state).
@@ -334,7 +329,9 @@ mod tests {
         assert!(db.dynamic_functions.is_empty());
         assert!(db.loaded_extensions.is_empty());
         assert!(db.dynamic_scalar("ext_double_it").is_none());
-        assert!(db.dynamic_function_paths(&["ext_double_it".to_string()]).is_empty());
+        assert!(db
+            .dynamic_function_paths(&["ext_double_it".to_string()])
+            .is_empty());
         assert!(db.loaded_extension_paths().is_empty());
         // Built-ins are not in the dynamic registry either.
         assert!(db.dynamic_scalar("upper").is_none());
@@ -347,18 +344,24 @@ mod tests {
         let null = ext_value_to_value("f", DataType::Varchar, ExtValue::Null).unwrap();
         assert_eq!(null, Value::Null);
         let text =
-            ext_value_to_value("f", DataType::Varchar, ExtValue::Varchar(b"hi".to_vec()))
-                .unwrap();
+            ext_value_to_value("f", DataType::Varchar, ExtValue::Varchar(b"hi".to_vec())).unwrap();
         assert_eq!(text, Value::Varchar("hi".to_string()));
         // A VARCHAR result where INTEGER was bound (and registered) is a
         // contract violation, not a silent coercion.
         let err = ext_value_to_value("shout", DataType::Integer, ExtValue::Varchar(b"x".to_vec()))
             .unwrap_err();
-        assert!(err.to_string().contains("returned VARCHAR, expected INTEGER"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("returned VARCHAR, expected INTEGER"),
+            "{err}"
+        );
         // Invalid UTF-8 gets its own clear error.
-        let err =
-            ext_value_to_value("shout", DataType::Varchar, ExtValue::Varchar(vec![0xff, 0xfe]))
-                .unwrap_err();
+        let err = ext_value_to_value(
+            "shout",
+            DataType::Varchar,
+            ExtValue::Varchar(vec![0xff, 0xfe]),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("invalid UTF-8"), "{err}");
     }
 }

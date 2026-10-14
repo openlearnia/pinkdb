@@ -11,9 +11,7 @@ use std::fmt;
 use std::slice;
 use std::sync::Arc;
 
-use crate::abi::{
-    ExtArg, ExtType, ExtValue, PinkdbExtScalarFn, PinkdbExtValue,
-};
+use crate::abi::{ExtArg, ExtType, ExtValue, PinkdbExtScalarFn, PinkdbExtValue};
 use crate::ExtError;
 
 /// One scalar function provided by a loaded extension.
@@ -163,11 +161,7 @@ impl DynamicFunction {
         if args.len() != self.n_args {
             return Err(ExtError::BadResult {
                 function: self.name.clone(),
-                message: format!(
-                    "expected {} argument(s), got {}",
-                    self.n_args,
-                    args.len()
-                ),
+                message: format!("expected {} argument(s), got {}", self.n_args, args.len()),
             });
         }
         for (i, a) in args.iter().enumerate() {
@@ -186,7 +180,11 @@ impl DynamicFunction {
 
         let abi_args: Vec<PinkdbExtValue> = args.iter().map(|a| a.to_abi()).collect();
         // Zero-argument callbacks receive a NULL array, per the header.
-        let args_ptr = if abi_args.is_empty() { std::ptr::null() } else { abi_args.as_ptr() };
+        let args_ptr = if abi_args.is_empty() {
+            std::ptr::null()
+        } else {
+            abi_args.as_ptr()
+        };
         let mut out = PinkdbExtValue::null(self.ret_type.tag());
 
         // SAFETY: `callback` is the function pointer the extension exported
@@ -198,9 +196,7 @@ impl DynamicFunction {
         // writable, host-owned struct. The callback may not unwind (the ABI
         // forbids panics across it), may not modify `args`, and returns 0 or a
         // non-zero error code we validate below.
-        let code = unsafe {
-            (self.callback)(self.user_data, args_ptr, abi_args.len(), &mut out)
-        };
+        let code = unsafe { (self.callback)(self.user_data, args_ptr, abi_args.len(), &mut out) };
 
         // Freeing contract: a non-NULL text pointer was allocated with
         // `api->alloc`, and the host owns it — always release it, regardless
@@ -213,7 +209,10 @@ impl DynamicFunction {
             if free_text {
                 (self.free_fn)(out.text_ptr as *mut c_void);
             }
-            return Err(ExtError::Callback { function: self.name.clone(), code });
+            return Err(ExtError::Callback {
+                function: self.name.clone(),
+                code,
+            });
         }
 
         // Decode before freeing: the VARCHAR copy reads the extension buffer.

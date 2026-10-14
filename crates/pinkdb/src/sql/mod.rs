@@ -11,9 +11,9 @@ pub(crate) mod keyword;
 pub mod peg_parser;
 mod split;
 
-pub use binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, bind};
-pub(crate) use binder::bind_tracked;
 use crate::types::{PinkDbError, Result, Value};
+pub(crate) use binder::bind_tracked;
+pub use binder::{bind, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
 
 /// Maximum AST depth the parser accepts (see [`check_ast_depth`]).
 ///
@@ -208,7 +208,9 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                         }
                     }
                 }
-                ast::Statement::Update { sets, where_clause, .. } => {
+                ast::Statement::Update {
+                    sets, where_clause, ..
+                } => {
                     for (_, e) in sets {
                         work.push((NodeRef::Expr(e), child));
                     }
@@ -216,7 +218,10 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                         work.push((NodeRef::Expr(e), child));
                     }
                 }
-                ast::Statement::Delete { where_clause: Some(e), .. } => {
+                ast::Statement::Delete {
+                    where_clause: Some(e),
+                    ..
+                } => {
                     work.push((NodeRef::Expr(e), child));
                 }
                 ast::Statement::CreateView { query, .. } => {
@@ -263,7 +268,9 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                 | ast::Expr::Cast { expr, .. } => {
                     work.push((NodeRef::Expr(expr), child));
                 }
-                ast::Expr::Between { expr, low, high, .. } => {
+                ast::Expr::Between {
+                    expr, low, high, ..
+                } => {
                     work.push((NodeRef::Expr(expr), child));
                     work.push((NodeRef::Expr(low), child));
                     work.push((NodeRef::Expr(high), child));
@@ -400,7 +407,9 @@ fn take_statement_children(
                 exprs.extend(row);
             }
         }
-        ast::Statement::Update { sets, where_clause, .. } => {
+        ast::Statement::Update {
+            sets, where_clause, ..
+        } => {
             for (_, e) in sets.drain(..) {
                 exprs.push(e);
             }
@@ -487,7 +496,9 @@ fn take_expr_children(
         | ast::Expr::Cast { expr, .. } => {
             exprs.push(std::mem::replace(&mut **expr, null_expr()));
         }
-        ast::Expr::Between { expr, low, high, .. } => {
+        ast::Expr::Between {
+            expr, low, high, ..
+        } => {
             exprs.push(std::mem::replace(&mut **expr, null_expr()));
             exprs.push(std::mem::replace(&mut **low, null_expr()));
             exprs.push(std::mem::replace(&mut **high, null_expr()));

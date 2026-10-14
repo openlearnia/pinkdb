@@ -60,15 +60,23 @@ fn print_help() {
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     if cfg!(feature = "lake") {
         if cfg!(feature = "s3") {
-            println!("  .lake save <dir|s3://bucket/prefix> [force]   snapshot the store into a lake");
-            println!("  .lake open <dir|s3://…> [v]  load the lake's latest (or version v) into memory");
+            println!(
+                "  .lake save <dir|s3://bucket/prefix> [force]   snapshot the store into a lake"
+            );
+            println!(
+                "  .lake open <dir|s3://…> [v]  load the lake's latest (or version v) into memory"
+            );
         } else {
             println!("  .lake save <dir> [force]  snapshot the store into a lake directory");
-            println!("  .lake open <dir> [v]      load the lake's latest (or version v) into memory");
+            println!(
+                "  .lake open <dir> [v]      load the lake's latest (or version v) into memory"
+            );
         }
         println!("  .lake versions <dir|s3://…>  list the lake's published versions");
         println!("  .lake tables <dir|s3://…>    list the current version's tables and row counts");
-        println!("  .lake info <dir|s3://…>      show the lake's format version, versions, and tables");
+        println!(
+            "  .lake info <dir|s3://…>      show the lake's format version, versions, and tables"
+        );
         if !cfg!(feature = "s3") {
             println!("  .lake s3:// URLs need a build with the `s3` feature");
         }
@@ -83,7 +91,9 @@ fn print_help() {
         println!("  .install/.repositories/.installed  (not built; needs the `repo` feature)");
     }
     println!("Encryption: PINKDB_KEY=<passphrase> (valid UTF-8) makes .save write and .open");
-    println!("            read an encrypted database (needs a build with the `encryption` feature).");
+    println!(
+        "            read an encrypted database (needs a build with the `encryption` feature)."
+    );
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
     println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");
@@ -93,9 +103,7 @@ fn print_help() {
 /// built without the opt-in `repo` feature.
 #[cfg(not(feature = "repo"))]
 fn repo_unavailable(cmd: &str) {
-    cli_error!(
-        "{cmd} is not available: this pinkdb binary was built without the repo feature;"
-    );
+    cli_error!("{cmd} is not available: this pinkdb binary was built without the repo feature;");
     eprintln!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
 }
 
@@ -103,9 +111,7 @@ fn repo_unavailable(cmd: &str) {
 /// feature.
 #[cfg(not(feature = "lake"))]
 fn lake_unavailable(cmd: &str) {
-    cli_error!(
-        "{cmd} is not available: this pinkdb binary was built without the lake feature;"
-    );
+    cli_error!("{cmd} is not available: this pinkdb binary was built without the lake feature;");
     eprintln!(
         "       rebuild with `cargo build -p pinkdb-cli --features lake` (add `,s3` for \
          s3://bucket/prefix URLs)."
@@ -245,9 +251,18 @@ fn cmd_installed() {
     match repo::list_installed(&home) {
         Ok(files) if files.is_empty() => println!("(no extensions installed)"),
         Ok(files) => {
-            println!("Installed extensions ({}):", repo::extensions_dir(&home).display());
+            println!(
+                "Installed extensions ({}):",
+                repo::extensions_dir(&home).display()
+            );
             for f in files {
-                println!("  {} {} {} {}", f.name, f.version, f.platform, f.path.display());
+                println!(
+                    "  {} {} {} {}",
+                    f.name,
+                    f.version,
+                    f.platform,
+                    f.path.display()
+                );
             }
         }
         Err(e) => cli_error!("{e}"),
@@ -551,9 +566,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                 // `PINKDB_KEY` (if set) is already installed on the store, so
                 // both the checkpoint and the snapshot path encrypt.
                 let result = match db.encryption_key() {
-                    Some(k) => {
-                        PinkDb::open_durable_with_key_and_policy(path, SyncPolicy::Sync, k)
-                    }
+                    Some(k) => PinkDb::open_durable_with_key_and_policy(path, SyncPolicy::Sync, k),
                     None => PinkDb::open_durable_with(path, SyncPolicy::Sync),
                 };
                 match result {
@@ -865,15 +878,18 @@ fn main() {
         }
     };
     let host = opts.host;
-    let mut session = build_session(host.clone(), match EncryptionKey::from_env() {
-        Ok(key) => key,
-        Err(e) => {
-            // A set-but-non-UTF-8 PINKDB_KEY must not silently fall back to
-            // plaintext.
-            eprintln!("Error: {e}");
-            std::process::exit(2);
-        }
-    });
+    let mut session = build_session(
+        host.clone(),
+        match EncryptionKey::from_env() {
+            Ok(key) => key,
+            Err(e) => {
+                // A set-but-non-UTF-8 PINKDB_KEY must not silently fall back to
+                // plaintext.
+                eprintln!("Error: {e}");
+                std::process::exit(2);
+            }
+        },
+    );
 
     // `-c`: run the given commands as one script and exit.
     if !opts.commands.is_empty() {
@@ -917,7 +933,11 @@ fn main() {
 
     let mut input = Input::new();
     loop {
-        let prompt = if input.is_empty() { PROMPT } else { CONT_PROMPT };
+        let prompt = if input.is_empty() {
+            PROMPT
+        } else {
+            CONT_PROMPT
+        };
         match rl.readline(prompt) {
             Ok(line) => {
                 if !line.trim().is_empty() {
@@ -995,7 +1015,9 @@ struct Input {
 
 impl Input {
     fn new() -> Self {
-        Input { pending: String::new() }
+        Input {
+            pending: String::new(),
+        }
     }
 
     fn is_empty(&self) -> bool {

@@ -24,24 +24,34 @@ pub fn optimize(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
 // ---------- constant folding ----------
 
 fn const_chunk() -> DataChunk {
-    DataChunk { columns: Vec::new(), num_rows: 1 }
+    DataChunk {
+        columns: Vec::new(),
+        num_rows: 1,
+    }
 }
 
 fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
     let rebuilt = match expr {
-        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
             op,
             left: Box::new(fold_expr(cx, *left)),
             right: Box::new(fold_expr(cx, *right)),
             dtype,
         },
         BoundExpr::Not(e) => BoundExpr::Not(Box::new(fold_expr(cx, *e))),
-        BoundExpr::Negate { expr, dtype } => {
-            BoundExpr::Negate { expr: Box::new(fold_expr(cx, *expr)), dtype }
-        }
-        BoundExpr::IsNull { expr, negated } => {
-            BoundExpr::IsNull { expr: Box::new(fold_expr(cx, *expr)), negated }
-        }
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(fold_expr(cx, *expr)),
+            dtype,
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(fold_expr(cx, *expr)),
+            negated,
+        },
         BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
             func,
             args: args.into_iter().map(|a| fold_expr(cx, a)).collect(),
@@ -55,7 +65,11 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
             args: args.into_iter().map(|a| fold_expr(cx, a)).collect(),
             dtype,
         },
-        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
             branches: branches
                 .into_iter()
                 .map(|(c, v)| (fold_expr(cx, c), fold_expr(cx, v)))
@@ -101,7 +115,10 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
     rebuilt
 }
 
-fn fold_aggs(cx: &crate::exec::Cx, aggs: Vec<crate::sql::binder::BoundAgg>) -> Vec<crate::sql::binder::BoundAgg> {
+fn fold_aggs(
+    cx: &crate::exec::Cx,
+    aggs: Vec<crate::sql::binder::BoundAgg>,
+) -> Vec<crate::sql::binder::BoundAgg> {
     aggs.into_iter()
         .map(|mut a| {
             a.arg = a.arg.map(|e| fold_expr(cx, e));
@@ -117,29 +134,37 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(fold_plan(db, *input)),
             predicate: fold_expr(&cx, predicate),
         },
-        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
-            LogicalPlan::Join {
-                kind,
-                left: Box::new(fold_plan(db, *left)),
-                right: Box::new(fold_plan(db, *right)),
-                left_key: fold_expr(&cx, left_key),
-                right_key: fold_expr(&cx, right_key),
-                left_cols,
-            }
-        }
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+            left_cols,
+        } => LogicalPlan::Join {
+            kind,
+            left: Box::new(fold_plan(db, *left)),
+            right: Box::new(fold_plan(db, *right)),
+            left_key: fold_expr(&cx, left_key),
+            right_key: fold_expr(&cx, right_key),
+            left_cols,
+        },
         LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
             input: Box::new(fold_plan(db, *input)),
             keys: keys.into_iter().map(|k| fold_expr(&cx, k)).collect(),
             aggs: fold_aggs(&cx, aggs),
         },
-        LogicalPlan::Window { input, windows, input_cols } => LogicalPlan::Window {
+        LogicalPlan::Window {
+            input,
+            windows,
+            input_cols,
+        } => LogicalPlan::Window {
             input: Box::new(fold_plan(db, *input)),
             windows: windows
                 .into_iter()
                 .map(|mut w| {
                     w.arg = w.arg.map(|e| fold_expr(&cx, e));
-                    w.partition =
-                        w.partition.into_iter().map(|e| fold_expr(&cx, e)).collect();
+                    w.partition = w.partition.into_iter().map(|e| fold_expr(&cx, e)).collect();
                     w.order = w
                         .order
                         .into_iter()
@@ -150,7 +175,11 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
                 .collect(),
             input_cols,
         },
-        LogicalPlan::Project { input, exprs, names } => LogicalPlan::Project {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => LogicalPlan::Project {
             input: Box::new(fold_plan(db, *input)),
             exprs: exprs.into_iter().map(|e| fold_expr(&cx, e)).collect(),
             names,
@@ -160,16 +189,20 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             query: Box::new(fold_plan(db, *query)),
             body: Box::new(fold_plan(db, *body)),
         },
-        LogicalPlan::Distinct { input } => {
-            LogicalPlan::Distinct { input: Box::new(fold_plan(db, *input)) }
-        }
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(fold_plan(db, *input)),
+        },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(fold_plan(db, *input)),
-            keys: keys.into_iter().map(|(k, d)| (fold_expr(&cx, k), d)).collect(),
+            keys: keys
+                .into_iter()
+                .map(|(k, d)| (fold_expr(&cx, k), d))
+                .collect(),
         },
-        LogicalPlan::Limit { input, limit } => {
-            LogicalPlan::Limit { input: Box::new(fold_plan(db, *input)), limit }
-        }
+        LogicalPlan::Limit { input, limit } => LogicalPlan::Limit {
+            input: Box::new(fold_plan(db, *input)),
+            limit,
+        },
         LogicalPlan::Insert { db, table, rows } => LogicalPlan::Insert {
             db,
             table,
@@ -178,7 +211,12 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
                 .map(|r| r.into_iter().map(|e| fold_expr(&cx, e)).collect())
                 .collect(),
         },
-        LogicalPlan::Union { left, right, distinct, types } => LogicalPlan::Union {
+        LogicalPlan::Union {
+            left,
+            right,
+            distinct,
+            types,
+        } => LogicalPlan::Union {
             left: Box::new(fold_plan(db, *left)),
             right: Box::new(fold_plan(db, *right)),
             distinct,
@@ -199,7 +237,9 @@ fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
         BoundExpr::Literal(_) | BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
         BoundExpr::InSubquery { expr, .. } => columns_in(expr, out),
         BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => out.push(usize::MAX),
-        BoundExpr::Not(e) | BoundExpr::Negate { expr: e, .. } | BoundExpr::IsNull { expr: e, .. } => {
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. } => {
             columns_in(e, out);
         }
         BoundExpr::Binary { left, right, .. } => {
@@ -217,7 +257,9 @@ fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
             }
         }
         BoundExpr::Cast { expr, .. } => columns_in(expr, out),
-        BoundExpr::Case { branches, else_, .. } => {
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
             for (c, v) in branches {
                 columns_in(c, out);
                 columns_in(v, out);
@@ -237,7 +279,12 @@ fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
 /// Split `a AND b AND ...` into conjuncts.
 fn split_conjuncts(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
     match expr {
-        BoundExpr::Binary { op: BinaryOp::And, left, right, .. } => {
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
             split_conjuncts(*left, out);
             split_conjuncts(*right, out);
         }
@@ -252,7 +299,12 @@ fn and_all(mut exprs: Vec<BoundExpr>) -> Option<BoundExpr> {
     let mut acc = exprs.remove(0);
     for e in exprs {
         let dtype = DataType::Boolean;
-        acc = BoundExpr::Binary { op: BinaryOp::And, left: Box::new(acc), right: Box::new(e), dtype };
+        acc = BoundExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(acc),
+            right: Box::new(e),
+            dtype,
+        };
     }
     Some(acc)
 }
@@ -272,7 +324,11 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             expr: Box::new(rewrite_through_project(expr, exprs)?),
             dtype: *dtype,
         }),
-        BoundExpr::Case { branches, else_, dtype } => Some(BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => Some(BoundExpr::Case {
             branches: branches
                 .iter()
                 .map(|(c, v)| {
@@ -289,13 +345,20 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             dtype: *dtype,
         }),
         BoundExpr::Coalesce { args, dtype } => Some(BoundExpr::Coalesce {
-            args: args.iter().map(|a| rewrite_through_project(a, exprs)).collect::<Option<Vec<_>>>()?,
+            args: args
+                .iter()
+                .map(|a| rewrite_through_project(a, exprs))
+                .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
         }),
         // Subqueries are scope-independent: pass through (IN's outer expr
         // still rewrites below).
         BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => Some(pred.clone()),
-        BoundExpr::InSubquery { expr, query, negated } => Some(BoundExpr::InSubquery {
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => Some(BoundExpr::InSubquery {
             expr: Box::new(rewrite_through_project(expr, exprs)?),
             query: query.clone(),
             negated: *negated,
@@ -309,7 +372,12 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
             expr: Box::new(rewrite_through_project(expr, exprs)?),
             negated: *negated,
         }),
-        BoundExpr::Binary { op, left, right, dtype } => Some(BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => Some(BoundExpr::Binary {
             op: *op,
             left: Box::new(rewrite_through_project(left, exprs)?),
             right: Box::new(rewrite_through_project(right, exprs)?),
@@ -317,7 +385,10 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
         }),
         BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
             func: *func,
-            args: args.iter().map(|a| rewrite_through_project(a, exprs)).collect::<Option<Vec<_>>>()?,
+            args: args
+                .iter()
+                .map(|a| rewrite_through_project(a, exprs))
+                .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
         }),
         // A dynamic call is row-wise like any other function: pushing a
@@ -341,32 +412,43 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
 /// applies, the filter stays above the input — never dropped.
 fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
     match input {
-        LogicalPlan::Project { input: inner, exprs, names } => {
-            match rewrite_through_project(&pred, &exprs) {
-                Some(rewritten) => (
-                    LogicalPlan::Project {
-                        input: Box::new(LogicalPlan::Filter {
-                            input: inner,
-                            predicate: rewritten,
-                        }),
-                        exprs,
-                        names,
+        LogicalPlan::Project {
+            input: inner,
+            exprs,
+            names,
+        } => match rewrite_through_project(&pred, &exprs) {
+            Some(rewritten) => (
+                LogicalPlan::Project {
+                    input: Box::new(LogicalPlan::Filter {
+                        input: inner,
+                        predicate: rewritten,
+                    }),
+                    exprs,
+                    names,
+                },
+                true,
+            ),
+            None => {
+                let input = LogicalPlan::Project {
+                    input: Box::new(pushdown(*inner)),
+                    exprs,
+                    names,
+                };
+                (
+                    LogicalPlan::Filter {
+                        input: Box::new(input),
+                        predicate: pred,
                     },
-                    true,
-                ),
-                None => {
-                    let input = LogicalPlan::Project {
-                        input: Box::new(pushdown(*inner)),
-                        exprs,
-                        names,
-                    };
-                    (LogicalPlan::Filter { input: Box::new(input), predicate: pred }, false)
-                }
+                    false,
+                )
             }
-        }
+        },
         LogicalPlan::Sort { input: inner, keys } => (
             LogicalPlan::Sort {
-                input: Box::new(LogicalPlan::Filter { input: inner, predicate: pred }),
+                input: Box::new(LogicalPlan::Filter {
+                    input: inner,
+                    predicate: pred,
+                }),
                 keys,
             },
             true,
@@ -386,12 +468,22 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             }
             (
                 LogicalPlan::Distinct {
-                    input: Box::new(LogicalPlan::Filter { input: inner, predicate: pred }),
+                    input: Box::new(LogicalPlan::Filter {
+                        input: inner,
+                        predicate: pred,
+                    }),
                 },
                 true,
             )
         }
-        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+            left_cols,
+        } => {
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
             let mut keep = Vec::new();
@@ -442,18 +534,34 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             }
             let pushed = !left_push.is_empty() || !right_push.is_empty();
             let left = match and_all(left_push) {
-                Some(p) => Box::new(LogicalPlan::Filter { input: left, predicate: p }),
+                Some(p) => Box::new(LogicalPlan::Filter {
+                    input: left,
+                    predicate: p,
+                }),
                 None => left,
             };
             let right = match and_all(right_push) {
-                Some(p) => Box::new(LogicalPlan::Filter { input: right, predicate: p }),
+                Some(p) => Box::new(LogicalPlan::Filter {
+                    input: right,
+                    predicate: p,
+                }),
                 None => right,
             };
-            let join = LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols };
+            let join = LogicalPlan::Join {
+                kind,
+                left,
+                right,
+                left_key,
+                right_key,
+                left_cols,
+            };
             match and_all(keep) {
                 // Nothing moved below: report unmoved so pushdown terminates.
                 Some(p) => (
-                    LogicalPlan::Filter { input: Box::new(join), predicate: p },
+                    LogicalPlan::Filter {
+                        input: Box::new(join),
+                        predicate: p,
+                    },
                     pushed,
                 ),
                 // Everything pushed: filter node disappears (still progress).
@@ -466,11 +574,21 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
         // compatible at bind time) — but cloning the predicate into both
         // branches would run a dynamic call once per branch instead of once
         // per output row, so a predicate containing one stays above.
-        LogicalPlan::Union { left, right, distinct, types } => {
+        LogicalPlan::Union {
+            left,
+            right,
+            distinct,
+            types,
+        } => {
             if pred.contains_dynamic_scalar() {
                 return (
                     LogicalPlan::Filter {
-                        input: Box::new(LogicalPlan::Union { left, right, distinct, types }),
+                        input: Box::new(LogicalPlan::Union {
+                            left,
+                            right,
+                            distinct,
+                            types,
+                        }),
                         predicate: pred,
                     },
                     false,
@@ -482,14 +600,21 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                         input: left,
                         predicate: pred.clone(),
                     }),
-                    right: Box::new(LogicalPlan::Filter { input: right, predicate: pred }),
+                    right: Box::new(LogicalPlan::Filter {
+                        input: right,
+                        predicate: pred,
+                    }),
                     distinct,
                     types,
                 },
                 true,
             )
         }
-        LogicalPlan::Window { input, windows, input_cols } => {
+        LogicalPlan::Window {
+            input,
+            windows,
+            input_cols,
+        } => {
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
             let mut keep = Vec::new();
@@ -505,14 +630,24 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             }
             let pushed = !push.is_empty();
             let input = match and_all(push) {
-                Some(p) => Box::new(LogicalPlan::Filter { input, predicate: p }),
+                Some(p) => Box::new(LogicalPlan::Filter {
+                    input,
+                    predicate: p,
+                }),
                 None => input,
             };
-            let window = LogicalPlan::Window { input, windows, input_cols };
+            let window = LogicalPlan::Window {
+                input,
+                windows,
+                input_cols,
+            };
             match and_all(keep) {
                 // Nothing moved below: report unmoved so pushdown terminates.
                 Some(p) => (
-                    LogicalPlan::Filter { input: Box::new(window), predicate: p },
+                    LogicalPlan::Filter {
+                        input: Box::new(window),
+                        predicate: p,
+                    },
                     pushed,
                 ),
                 None => (window, true),
@@ -520,7 +655,10 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
         }
         // Anything else keeps the filter where it is.
         other => (
-            LogicalPlan::Filter { input: Box::new(other), predicate: pred },
+            LogicalPlan::Filter {
+                input: Box::new(other),
+                predicate: pred,
+            },
             false,
         ),
     }
@@ -529,8 +667,15 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
 /// Subtract `by` from every column index (right-side conjuncts of a join).
 fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
     match expr {
-        BoundExpr::Column { index, dtype } => BoundExpr::Column { index: index - by, dtype },
-        BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
+        BoundExpr::Column { index, dtype } => BoundExpr::Column {
+            index: index - by,
+            dtype,
+        },
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => BoundExpr::InSubquery {
             expr: Box::new(shift_columns(*expr, by)),
             query,
             negated,
@@ -539,7 +684,11 @@ fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
             expr: Box::new(shift_columns(*expr, by)),
             dtype,
         },
-        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
             branches: branches
                 .into_iter()
                 .map(|(c, v)| (shift_columns(c, by), shift_columns(v, by)))
@@ -551,16 +700,22 @@ fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
             args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
             dtype,
         },
-        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
             op,
             left: Box::new(shift_columns(*left, by)),
             right: Box::new(shift_columns(*right, by)),
             dtype,
         },
         BoundExpr::Not(e) => BoundExpr::Not(Box::new(shift_columns(*e, by))),
-        BoundExpr::Negate { expr, dtype } => {
-            BoundExpr::Negate { expr: Box::new(shift_columns(*expr, by)), dtype }
-        }
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(shift_columns(*expr, by)),
+            dtype,
+        },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(shift_columns(*expr, by)),
             negated,
@@ -591,34 +746,56 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             // Literals: `WHERE false` still needs the row stream shaped
             // correctly — keep the Filter node (it yields zero rows).
             let (plan, moved) = push_one_level(input, predicate);
-            if moved { pushdown(plan) } else { plan }
+            if moved {
+                pushdown(plan)
+            } else {
+                plan
+            }
         }
-        LogicalPlan::Project { input, exprs, names } => LogicalPlan::Project {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => LogicalPlan::Project {
             input: Box::new(pushdown(*input)),
             exprs,
             names,
         },
-        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
-            LogicalPlan::Join {
-                kind,
-                left: Box::new(pushdown(*left)),
-                right: Box::new(pushdown(*right)),
-                left_key,
-                right_key,
-                left_cols,
-            }
-        }
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+            left_cols,
+        } => LogicalPlan::Join {
+            kind,
+            left: Box::new(pushdown(*left)),
+            right: Box::new(pushdown(*right)),
+            left_key,
+            right_key,
+            left_cols,
+        },
         LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
             input: Box::new(pushdown(*input)),
             keys,
             aggs,
         },
-        LogicalPlan::Window { input, windows, input_cols } => LogicalPlan::Window {
+        LogicalPlan::Window {
+            input,
+            windows,
+            input_cols,
+        } => LogicalPlan::Window {
             input: Box::new(pushdown(*input)),
             windows,
             input_cols,
         },
-        LogicalPlan::Union { left, right, distinct, types } => LogicalPlan::Union {
+        LogicalPlan::Union {
+            left,
+            right,
+            distinct,
+            types,
+        } => LogicalPlan::Union {
             left: Box::new(pushdown(*left)),
             right: Box::new(pushdown(*right)),
             distinct,
@@ -631,16 +808,17 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             query: Box::new(pushdown(*query)),
             body: Box::new(pushdown(*body)),
         },
-        LogicalPlan::Distinct { input } => {
-            LogicalPlan::Distinct { input: Box::new(pushdown(*input)) }
-        }
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(pushdown(*input)),
+        },
         LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
             input: Box::new(pushdown(*input)),
             keys,
         },
-        LogicalPlan::Limit { input, limit } => {
-            LogicalPlan::Limit { input: Box::new(pushdown(*input)), limit }
-        }
+        LogicalPlan::Limit { input, limit } => LogicalPlan::Limit {
+            input: Box::new(pushdown(*input)),
+            limit,
+        },
         leaf => leaf,
     }
 }
@@ -652,7 +830,10 @@ mod tests {
     use crate::types::{DataType as T, Value};
 
     fn col(i: usize) -> BoundExpr {
-        B::Column { index: i, dtype: T::Integer }
+        B::Column {
+            index: i,
+            dtype: T::Integer,
+        }
     }
 
     #[test]
@@ -784,7 +965,12 @@ mod tests {
     }
 
     fn and(a: BoundExpr, b: BoundExpr) -> BoundExpr {
-        B::Binary { op: BinaryOp::And, left: Box::new(a), right: Box::new(b), dtype: T::Boolean }
+        B::Binary {
+            op: BinaryOp::And,
+            left: Box::new(a),
+            right: Box::new(b),
+            dtype: T::Boolean,
+        }
     }
 
     fn outer_join(kind: JoinKind) -> LogicalPlan {
@@ -813,12 +999,20 @@ mod tests {
         match out {
             LogicalPlan::Filter { input, predicate } => {
                 assert_eq!(predicate, bool_gt(col(3), 1));
-                let LogicalPlan::Join { left, right, kind, .. } = *input else { panic!() };
+                let LogicalPlan::Join {
+                    left, right, kind, ..
+                } = *input
+                else {
+                    panic!()
+                };
                 assert_eq!(kind, JoinKind::Left);
-                assert_eq!(*left, LogicalPlan::Filter {
-                    input: Box::new(LogicalPlan::SingleRow),
-                    predicate: bool_gt(col(0), 5),
-                });
+                assert_eq!(
+                    *left,
+                    LogicalPlan::Filter {
+                        input: Box::new(LogicalPlan::SingleRow),
+                        predicate: bool_gt(col(0), 5),
+                    }
+                );
                 assert!(matches!(*right, LogicalPlan::SingleRow));
             }
             _ => panic!("right-side predicate must stay above the join"),
@@ -839,14 +1033,22 @@ mod tests {
         match out {
             LogicalPlan::Filter { input, predicate } => {
                 assert_eq!(predicate, bool_gt(col(0), 5));
-                let LogicalPlan::Join { left, right, kind, .. } = *input else { panic!() };
+                let LogicalPlan::Join {
+                    left, right, kind, ..
+                } = *input
+                else {
+                    panic!()
+                };
                 assert_eq!(kind, JoinKind::Right);
                 assert!(matches!(*left, LogicalPlan::SingleRow));
                 // Shifted into right-input space: index 3 → 1.
-                assert_eq!(*right, LogicalPlan::Filter {
-                    input: Box::new(LogicalPlan::SingleRow),
-                    predicate: bool_gt(col(1), 1),
-                });
+                assert_eq!(
+                    *right,
+                    LogicalPlan::Filter {
+                        input: Box::new(LogicalPlan::SingleRow),
+                        predicate: bool_gt(col(1), 1),
+                    }
+                );
             }
             _ => panic!("left-side predicate must stay above the join"),
         }
@@ -871,7 +1073,9 @@ mod tests {
         match out {
             LogicalPlan::Filter { input, predicate } => {
                 assert_eq!(predicate, and(mixed, constant));
-                let LogicalPlan::Join { left, right, .. } = *input else { panic!() };
+                let LogicalPlan::Join { left, right, .. } = *input else {
+                    panic!()
+                };
                 assert!(matches!(*left, LogicalPlan::SingleRow));
                 assert!(matches!(*right, LogicalPlan::SingleRow));
             }

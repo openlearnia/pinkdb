@@ -13,13 +13,13 @@ use std::cmp::Ordering;
 use pinkdb_ext_loader::ExtArg;
 
 use super::aggregate::encode_row;
-use super::{Cx, Memo, eval};
+use super::{eval, Cx, Memo};
 use crate::plan::compare_values;
-use crate::sql::binder::{BoundExpr, ScalarFunc, common_numeric};
 use crate::sql::ast::BinaryOp;
+use crate::sql::binder::{common_numeric, BoundExpr, ScalarFunc};
+use crate::types::FastSet;
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, VectorData};
-use crate::types::FastSet;
 
 /// Evaluate `expr` over every row of `chunk`.
 pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<Vector> {
@@ -41,12 +41,16 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             }
             eval_coalesce(*dtype, &vecs)
         }
-        BoundExpr::Case { branches, else_, dtype } => {
-            eval_case(branches, else_, *dtype, chunk, cx)
-        }
-        BoundExpr::InSubquery { expr, query, negated } => {
-            eval_in_subquery(expr, query, *negated, chunk, cx)
-        }
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => eval_case(branches, else_, *dtype, chunk, cx),
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => eval_in_subquery(expr, query, *negated, chunk, cx),
         BoundExpr::Exists { query, negated } => eval_exists(query, *negated, chunk, cx),
         BoundExpr::Not(e) => {
             let v = eval_expr(e, chunk, cx)?;
@@ -123,10 +127,19 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             }
             Ok(out)
         }
-        BoundExpr::Binary { op, left, right, dtype } => match op {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => match op {
             BinaryOp::And | BinaryOp::Or => eval_logic(*op, left, right, chunk, cx),
             BinaryOp::Like | BinaryOp::NotLike => eval_like(*op, left, right, chunk, cx),
-            BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt
+            BinaryOp::Eq
+            | BinaryOp::NotEq
+            | BinaryOp::Lt
+            | BinaryOp::LtEq
+            | BinaryOp::Gt
             | BinaryOp::GtEq => eval_comparison(*op, left, right, chunk, cx),
             _ => eval_arith(*op, *dtype, left, right, chunk, cx),
         },
@@ -232,7 +245,10 @@ fn eval_scalar_subquery(
             value = col.get(i);
         }
     }
-    cx.memo.lock().expect("memo").insert(key, Memo::Scalar(value.clone()));
+    cx.memo
+        .lock()
+        .expect("memo")
+        .insert(key, Memo::Scalar(value.clone()));
     const_vector(value, chunk.num_rows())
 }
 
@@ -277,7 +293,10 @@ fn eval_in_subquery(
         }
     }
     let result = probe_in(&l, &set, has_null, common, negated)?;
-    cx.memo.lock().expect("memo").insert(key, Memo::Set(set, has_null, common));
+    cx.memo
+        .lock()
+        .expect("memo")
+        .insert(key, Memo::Set(set, has_null, common));
     Ok(result)
 }
 
@@ -354,7 +373,9 @@ fn ensure_dtype(v: &Vector, want: DataType, ctx: &str) -> Result<()> {
 fn as_bool(v: &Vector, i: usize) -> Result<bool> {
     match v.get(i) {
         Value::Boolean(b) => Ok(b),
-        other => Err(PinkDbError::Execution(format!("expected BOOLEAN, got {other}"))),
+        other => Err(PinkDbError::Execution(format!(
+            "expected BOOLEAN, got {other}"
+        ))),
     }
 }
 
@@ -550,12 +571,14 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
 
 fn negate_value(v: Value, dtype: DataType) -> Result<Value> {
     match (v, dtype) {
-        (Value::Integer(i), DataType::Integer) => i.checked_neg().map(Value::Integer).ok_or_else(
-            || overflow_err("negation", "INTEGER", format_args!("-({i})")),
-        ),
-        (Value::Bigint(i), DataType::Bigint) => i.checked_neg().map(Value::Bigint).ok_or_else(
-            || overflow_err("negation", "BIGINT", format_args!("-({i})")),
-        ),
+        (Value::Integer(i), DataType::Integer) => i
+            .checked_neg()
+            .map(Value::Integer)
+            .ok_or_else(|| overflow_err("negation", "INTEGER", format_args!("-({i})"))),
+        (Value::Bigint(i), DataType::Bigint) => i
+            .checked_neg()
+            .map(Value::Bigint)
+            .ok_or_else(|| overflow_err("negation", "BIGINT", format_args!("-({i})"))),
         (Value::Double(x), DataType::Double) => Ok(Value::Double(-x)),
         (v, t) => Err(PinkDbError::Execution(format!("cannot negate {v} as {t}"))),
     }
@@ -577,10 +600,19 @@ fn eval_arith(
     }
     // Integer division by zero errors even though `/` widens to DOUBLE
     // (DuckDB rule); 0.0/0.0 with a float operand stays IEEE Inf/NaN.
-    let int_div = op == BinaryOp::Divide && l.dtype() != DataType::Double && r.dtype() != DataType::Double;
+    let int_div =
+        op == BinaryOp::Divide && l.dtype() != DataType::Double && r.dtype() != DataType::Double;
     // Move instead of deep-cloning when a side already has the target dtype.
-    let l = if l.dtype() == dtype { l } else { coerce_to(&l, dtype)? };
-    let r = if r.dtype() == dtype { r } else { coerce_to(&r, dtype)? };
+    let l = if l.dtype() == dtype {
+        l
+    } else {
+        coerce_to(&l, dtype)?
+    };
+    let r = if r.dtype() == dtype {
+        r
+    } else {
+        coerce_to(&r, dtype)?
+    };
     // Typed kernel when both sides now share one layout; otherwise the
     // generic per-row loop below (semantics unchanged).
     if let Some(out) = arith_typed(op, int_div, &l, &r)? {
@@ -593,7 +625,9 @@ fn eval_arith(
             continue;
         }
         if int_div && r.get(i) == Value::Double(0.0) {
-            return Err(PinkDbError::Execution("integer division by zero".to_string()));
+            return Err(PinkDbError::Execution(
+                "integer division by zero".to_string(),
+            ));
         }
         out.push_valid(arith_values(op, l.get(i), r.get(i))?)?;
     }
@@ -707,7 +741,9 @@ fn arith_f64(
             continue;
         }
         if int_div && y == 0.0 {
-            return Err(PinkDbError::Execution("integer division by zero".to_string()));
+            return Err(PinkDbError::Execution(
+                "integer division by zero".to_string(),
+            ));
         }
         let v = match op {
             BinaryOp::Add => x + y,
@@ -732,10 +768,12 @@ fn eval_date_arith(op: BinaryOp, l: &Vector, r: &Vector, dtype: DataType) -> Res
         let v = match (op, l.get(i), r.get(i)) {
             (BinaryOp::Add, Value::Date(d), Value::Integer(n))
             | (BinaryOp::Add, Value::Integer(n), Value::Date(d)) => Value::Date(
-                d.checked_add(n).ok_or_else(|| date_out_of_range(d, "+", n))?,
+                d.checked_add(n)
+                    .ok_or_else(|| date_out_of_range(d, "+", n))?,
             ),
             (BinaryOp::Subtract, Value::Date(d), Value::Integer(n)) => Value::Date(
-                d.checked_sub(n).ok_or_else(|| date_out_of_range(d, "-", n))?,
+                d.checked_sub(n)
+                    .ok_or_else(|| date_out_of_range(d, "-", n))?,
             ),
             (BinaryOp::Subtract, Value::Date(a), Value::Date(b)) => {
                 Value::Bigint(a as i64 - b as i64)
@@ -807,7 +845,9 @@ fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vec
     let n = args.first().map(|v| v.len()).unwrap_or(0);
     for v in args {
         if v.len() != n {
-            return Err(PinkDbError::Execution("scalar arg length mismatch".to_string()));
+            return Err(PinkDbError::Execution(
+                "scalar arg length mismatch".to_string(),
+            ));
         }
     }
     // Common single-arg functions read typed payloads directly (no per-row
@@ -839,15 +879,9 @@ fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vec
 /// Typed fast paths for the common scalar functions. `Ok(None)` ⇒ arg
 /// shape not covered: caller runs the generic `apply_scalar` loop, which
 /// preserves the old errors for bad shapes/types.
-fn eval_scalar_fast(
-    func: ScalarFunc,
-    dtype: DataType,
-    args: &[Vector],
-) -> Result<Option<Vector>> {
+fn eval_scalar_fast(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Option<Vector>> {
     match func {
-        ScalarFunc::Upper | ScalarFunc::Lower
-            if args.len() == 1 && dtype == DataType::Varchar =>
-        {
+        ScalarFunc::Upper | ScalarFunc::Lower if args.len() == 1 && dtype == DataType::Varchar => {
             let v = &args[0];
             let src = match v.data() {
                 VectorData::VarChar(s) => s,
@@ -950,12 +984,14 @@ fn eval_scalar_fast(
 fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
     match func {
         ScalarFunc::Abs => match &row[0] {
-            Value::Integer(i) => i.checked_abs().map(Value::Integer).ok_or_else(|| {
-                overflow_err("abs", "INTEGER", format_args!("abs({i})"))
-            }),
-            Value::Bigint(i) => i.checked_abs().map(Value::Bigint).ok_or_else(|| {
-                overflow_err("abs", "BIGINT", format_args!("abs({i})"))
-            }),
+            Value::Integer(i) => i
+                .checked_abs()
+                .map(Value::Integer)
+                .ok_or_else(|| overflow_err("abs", "INTEGER", format_args!("abs({i})"))),
+            Value::Bigint(i) => i
+                .checked_abs()
+                .map(Value::Bigint)
+                .ok_or_else(|| overflow_err("abs", "BIGINT", format_args!("abs({i})"))),
             Value::Double(x) => Ok(Value::Double(x.abs())),
             v => Err(PinkDbError::Execution(format!("abs of {v}"))),
         },
@@ -1037,7 +1073,8 @@ fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
                         "hour" => day_us + h as i64 * 3_600_000_000,
                         "minute" => day_us + h as i64 * 3_600_000_000 + mi as i64 * 60_000_000,
                         "second" => {
-                            day_us + h as i64 * 3_600_000_000
+                            day_us
+                                + h as i64 * 3_600_000_000
                                 + mi as i64 * 60_000_000
                                 + s as i64 * 1_000_000
                         }
@@ -1051,7 +1088,8 @@ fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
                 }
                 v => Err(PinkDbError::Execution(format!("date_trunc of {v}"))),
             }
-        }        ScalarFunc::Substr => {
+        }
+        ScalarFunc::Substr => {
             let s = match &row[0] {
                 Value::Varchar(s) => s.clone(),
                 v => return Err(PinkDbError::Execution(format!("substr of {v}"))),
@@ -1096,7 +1134,11 @@ fn eval_like(
             }
         };
         let hit = like_match(&s, &p);
-        out.push_valid(Value::Boolean(if op == BinaryOp::Like { hit } else { !hit }))?;
+        out.push_valid(Value::Boolean(if op == BinaryOp::Like {
+            hit
+        } else {
+            !hit
+        }))?;
     }
     Ok(out)
 }
@@ -1227,17 +1269,25 @@ fn cast_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Varchar(s), DataType::Boolean) => match s.to_ascii_lowercase().as_str() {
             "true" => Ok(Value::Boolean(true)),
             "false" => Ok(Value::Boolean(false)),
-            _ => Err(PinkDbError::Execution(format!("cannot CAST \"{s}\" AS BOOLEAN"))),
+            _ => Err(PinkDbError::Execution(format!(
+                "cannot CAST \"{s}\" AS BOOLEAN"
+            ))),
         },
-        (Value::Varchar(s), DataType::Integer) => s.trim().parse::<i32>().map(Value::Integer).map_err(|_| {
-            PinkDbError::Execution(format!("cannot CAST \"{s}\" AS INTEGER"))
-        }),
-        (Value::Varchar(s), DataType::Bigint) => s.trim().parse::<i64>().map(Value::Bigint).map_err(|_| {
-            PinkDbError::Execution(format!("cannot CAST \"{s}\" AS BIGINT"))
-        }),
-        (Value::Varchar(s), DataType::Double) => s.trim().parse::<f64>().map(Value::Double).map_err(|_| {
-            PinkDbError::Execution(format!("cannot CAST \"{s}\" AS DOUBLE"))
-        }),
+        (Value::Varchar(s), DataType::Integer) => s
+            .trim()
+            .parse::<i32>()
+            .map(Value::Integer)
+            .map_err(|_| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS INTEGER"))),
+        (Value::Varchar(s), DataType::Bigint) => s
+            .trim()
+            .parse::<i64>()
+            .map(Value::Bigint)
+            .map_err(|_| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS BIGINT"))),
+        (Value::Varchar(s), DataType::Double) => s
+            .trim()
+            .parse::<f64>()
+            .map(Value::Double)
+            .map_err(|_| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS DOUBLE"))),
         (Value::Varchar(s), DataType::Date) => crate::types::parse_date(s.trim())
             .map(Value::Date)
             .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS DATE"))),
@@ -1342,8 +1392,14 @@ mod tests {
     fn null_propagates_through_arith() {
         let e = B::Binary {
             op: BinaryOp::Add,
-            left: Box::new(B::Column { index: 0, dtype: DataType::Integer }),
-            right: Box::new(B::Column { index: 1, dtype: DataType::Double }),
+            left: Box::new(B::Column {
+                index: 0,
+                dtype: DataType::Integer,
+            }),
+            right: Box::new(B::Column {
+                index: 1,
+                dtype: DataType::Double,
+            }),
             dtype: DataType::Double,
         };
         let db = PinkDb::new();
@@ -1364,15 +1420,34 @@ mod tests {
         r.push_valid(V::Boolean(true)).unwrap();
         r.push_valid(V::Boolean(true)).unwrap();
         let c = DataChunk::new(vec![l, r]).unwrap();
-        let col = |i| B::Column { index: i, dtype: DataType::Boolean };
-        let and = B::Binary { op: BinaryOp::And, left: Box::new(col(0)), right: Box::new(col(1)), dtype: DataType::Boolean };
-        let or = B::Binary { op: BinaryOp::Or, left: Box::new(col(0)), right: Box::new(col(1)), dtype: DataType::Boolean };
+        let col = |i| B::Column {
+            index: i,
+            dtype: DataType::Boolean,
+        };
+        let and = B::Binary {
+            op: BinaryOp::And,
+            left: Box::new(col(0)),
+            right: Box::new(col(1)),
+            dtype: DataType::Boolean,
+        };
+        let or = B::Binary {
+            op: BinaryOp::Or,
+            left: Box::new(col(0)),
+            right: Box::new(col(1)),
+            dtype: DataType::Boolean,
+        };
         let db = PinkDb::new();
         let cx = test_cx(&db);
         let a = eval_expr(&and, &c, &cx).unwrap();
-        assert_eq!((a.get(0), a.get(1), a.get(2)), (V::Boolean(false), V::Null, V::Boolean(true)));
+        assert_eq!(
+            (a.get(0), a.get(1), a.get(2)),
+            (V::Boolean(false), V::Null, V::Boolean(true))
+        );
         let o = eval_expr(&or, &c, &cx).unwrap();
-        assert_eq!((o.get(0), o.get(1), o.get(2)), (V::Null, V::Boolean(true), V::Boolean(true)));
+        assert_eq!(
+            (o.get(0), o.get(1), o.get(2)),
+            (V::Null, V::Boolean(true), V::Boolean(true))
+        );
     }
 
     #[test]
@@ -1404,8 +1479,14 @@ mod tests {
         let cmp = |op: BinaryOp| {
             let e = B::Binary {
                 op,
-                left: Box::new(B::Column { index: 0, dtype: DataType::Double }),
-                right: Box::new(B::Column { index: 1, dtype: DataType::Double }),
+                left: Box::new(B::Column {
+                    index: 0,
+                    dtype: DataType::Double,
+                }),
+                right: Box::new(B::Column {
+                    index: 1,
+                    dtype: DataType::Double,
+                }),
                 dtype: DataType::Boolean,
             };
             eval_expr(&e, &chunk, &cx).unwrap()
@@ -1415,11 +1496,20 @@ mod tests {
         let eq = cmp(BinaryOp::Eq);
         assert_eq!((eq.get(0), eq.get(1)), (V::Boolean(true), V::Boolean(true)));
         let ne = cmp(BinaryOp::NotEq);
-        assert_eq!((ne.get(0), ne.get(1)), (V::Boolean(false), V::Boolean(false)));
+        assert_eq!(
+            (ne.get(0), ne.get(1)),
+            (V::Boolean(false), V::Boolean(false))
+        );
         let lt = cmp(BinaryOp::Lt);
-        assert_eq!((lt.get(0), lt.get(1)), (V::Boolean(false), V::Boolean(false)));
+        assert_eq!(
+            (lt.get(0), lt.get(1)),
+            (V::Boolean(false), V::Boolean(false))
+        );
         let gt = cmp(BinaryOp::Gt);
-        assert_eq!((gt.get(0), gt.get(1)), (V::Boolean(false), V::Boolean(false)));
+        assert_eq!(
+            (gt.get(0), gt.get(1)),
+            (V::Boolean(false), V::Boolean(false))
+        );
         let le = cmp(BinaryOp::LtEq);
         assert_eq!((le.get(0), le.get(1)), (V::Boolean(true), V::Boolean(true)));
         let ge = cmp(BinaryOp::GtEq);
@@ -1462,8 +1552,14 @@ mod tests {
         let cmp = |op: BinaryOp| {
             let e = B::Binary {
                 op,
-                left: Box::new(B::Column { index: 0, dtype: DataType::Varchar }),
-                right: Box::new(B::Column { index: 1, dtype: DataType::Varchar }),
+                left: Box::new(B::Column {
+                    index: 0,
+                    dtype: DataType::Varchar,
+                }),
+                right: Box::new(B::Column {
+                    index: 1,
+                    dtype: DataType::Varchar,
+                }),
                 dtype: DataType::Boolean,
             };
             eval_expr(&e, &chunk, &cx).unwrap()
@@ -1504,15 +1600,24 @@ mod tests {
         let cx = test_cx(&db);
         let bin = |op: BinaryOp, dtype: DataType| B::Binary {
             op,
-            left: Box::new(B::Column { index: 0, dtype: DataType::Integer }),
-            right: Box::new(B::Column { index: 1, dtype: DataType::Integer }),
+            left: Box::new(B::Column {
+                index: 0,
+                dtype: DataType::Integer,
+            }),
+            right: Box::new(B::Column {
+                index: 1,
+                dtype: DataType::Integer,
+            }),
             dtype,
         };
 
         // i32::MAX + 1 is an overflow error (DuckDB semantics), with the
         // same message as the per-value path.
         let err = eval_expr(&bin(BinaryOp::Add, DataType::Integer), &chunk, &cx).unwrap_err();
-        assert_eq!(err.to_string(), "Overflow in addition of INTEGER (2147483647 + 1)");
+        assert_eq!(
+            err.to_string(),
+            "Overflow in addition of INTEGER (2147483647 + 1)"
+        );
         assert_eq!(
             arith_values(BinaryOp::Add, V::Integer(i32::MAX), V::Integer(1))
                 .unwrap_err()
@@ -1535,7 +1640,10 @@ mod tests {
         let chunk_f = DataChunk::new(vec![f]).unwrap();
         let div_f = B::Binary {
             op: BinaryOp::Divide,
-            left: Box::new(B::Column { index: 0, dtype: DataType::Double }),
+            left: Box::new(B::Column {
+                index: 0,
+                dtype: DataType::Double,
+            }),
             right: Box::new(B::Literal(V::Double(0.0))),
             dtype: DataType::Double,
         };
@@ -1585,7 +1693,10 @@ mod tests {
         let call = |func: ScalarFunc, dtype: DataType| {
             let e = B::Scalar {
                 func,
-                args: vec![B::Column { index: 0, dtype: DataType::Varchar }],
+                args: vec![B::Column {
+                    index: 0,
+                    dtype: DataType::Varchar,
+                }],
                 dtype,
             };
             eval_expr(&e, &chunk, &cx).unwrap()
@@ -1611,11 +1722,17 @@ mod tests {
         let chunk2 = DataChunk::new(vec![d, f]).unwrap();
         let abs = B::Scalar {
             func: ScalarFunc::Abs,
-            args: vec![B::Column { index: 0, dtype: DataType::Integer }],
+            args: vec![B::Column {
+                index: 0,
+                dtype: DataType::Integer,
+            }],
             dtype: DataType::Integer,
         };
         let err = eval_expr(&abs, &chunk2, &cx).unwrap_err();
-        assert!(err.to_string().starts_with("Overflow in abs of INTEGER"), "{err}");
+        assert!(
+            err.to_string().starts_with("Overflow in abs of INTEGER"),
+            "{err}"
+        );
         let mut ok = Vector::new_empty(DataType::Integer);
         ok.push_valid(V::Integer(-5)).unwrap();
         ok.push_null().unwrap();
@@ -1627,7 +1744,10 @@ mod tests {
         assert_eq!(a.get(1), V::Null);
         let round = B::Scalar {
             func: ScalarFunc::Round,
-            args: vec![B::Column { index: 1, dtype: DataType::Double }],
+            args: vec![B::Column {
+                index: 1,
+                dtype: DataType::Double,
+            }],
             dtype: DataType::Double,
         };
         let out = eval_expr(&round, &chunk2, &cx).unwrap();

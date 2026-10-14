@@ -172,7 +172,10 @@ pub struct BoundWindow {
 pub enum BoundExpr {
     Literal(Value),
     /// Column of the current stage input (scan, agg output, or project output).
-    Column { index: usize, dtype: DataType },
+    Column {
+        index: usize,
+        dtype: DataType,
+    },
     Binary {
         op: BinaryOp,
         left: Box<BoundExpr>,
@@ -180,20 +183,42 @@ pub enum BoundExpr {
         dtype: DataType,
     },
     Not(Box<BoundExpr>),
-    Negate { expr: Box<BoundExpr>, dtype: DataType },
-    IsNull { expr: Box<BoundExpr>, negated: bool },
-    Scalar { func: ScalarFunc, args: Vec<BoundExpr>, dtype: DataType },
+    Negate {
+        expr: Box<BoundExpr>,
+        dtype: DataType,
+    },
+    IsNull {
+        expr: Box<BoundExpr>,
+        negated: bool,
+    },
+    Scalar {
+        func: ScalarFunc,
+        args: Vec<BoundExpr>,
+        dtype: DataType,
+    },
     /// Aggregate output column. Index is relative to the agg list until
     /// [`resolve_agg_refs`] rebases it past the group keys.
-    AggRef { index: usize, dtype: DataType },
+    AggRef {
+        index: usize,
+        dtype: DataType,
+    },
     /// Window output column. Index is relative to the window list until
     /// rebased past the window input columns.
-    WindowRef { index: usize, dtype: DataType },
+    WindowRef {
+        index: usize,
+        dtype: DataType,
+    },
     /// `CAST(x AS type)`.
-    Cast { expr: Box<BoundExpr>, dtype: DataType },
+    Cast {
+        expr: Box<BoundExpr>,
+        dtype: DataType,
+    },
     /// `COALESCE(a, b, ...)` — all args share `dtype` (narrower sides are
     /// wrapped in [`BoundExpr::Cast`] at bind time).
-    Coalesce { args: Vec<BoundExpr>, dtype: DataType },
+    Coalesce {
+        args: Vec<BoundExpr>,
+        dtype: DataType,
+    },
     /// `CASE WHEN c THEN v ... [ELSE e]` — results share `dtype`
     /// (narrower sides wrapped in [`BoundExpr::Cast`]); missing ELSE is NULL.
     Case {
@@ -202,11 +227,21 @@ pub enum BoundExpr {
         dtype: DataType,
     },
     /// Uncorrelated scalar subquery (1 col by construction; rows at runtime).
-    ScalarSubquery { query: Box<LogicalPlan>, dtype: DataType },
+    ScalarSubquery {
+        query: Box<LogicalPlan>,
+        dtype: DataType,
+    },
     /// `expr [NOT] IN (query)` — `expr` may reference the outer scope.
-    InSubquery { expr: Box<BoundExpr>, query: Box<LogicalPlan>, negated: bool },
+    InSubquery {
+        expr: Box<BoundExpr>,
+        query: Box<LogicalPlan>,
+        negated: bool,
+    },
     /// `[NOT] EXISTS (query)` — scope-independent.
-    Exists { query: Box<LogicalPlan>, negated: bool },
+    Exists {
+        query: Box<LogicalPlan>,
+        negated: bool,
+    },
     /// Call into a scalar function registered by a loaded extension
     /// (`PinkDb::load_extension`). `name` is the canonical lowercased
     /// registry key; args and result are typed exactly as registered (no
@@ -217,7 +252,11 @@ pub enum BoundExpr {
     /// variant no larger than the biggest pre-existing one, so
     /// `size_of::<BoundExpr>()` — and with it every expression tree and the
     /// hot match dispatch on the static path — is unchanged.
-    DynamicScalar { name: Box<str>, args: Box<[BoundExpr]>, dtype: DataType },
+    DynamicScalar {
+        name: Box<str>,
+        args: Box<[BoundExpr]>,
+        dtype: DataType,
+    },
 }
 
 impl BoundExpr {
@@ -249,9 +288,16 @@ impl BoundExpr {
             BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => false,
             BoundExpr::Cast { expr, .. } => expr.is_aggregate_free(),
             BoundExpr::Coalesce { args, .. } => args.iter().all(|a| a.is_aggregate_free()),
-            BoundExpr::Case { branches, else_, .. } => {
-                branches.iter().all(|(c, v)| c.is_aggregate_free() && v.is_aggregate_free())
-                    && else_.as_ref().map(|e| e.is_aggregate_free()).unwrap_or(true)
+            BoundExpr::Case {
+                branches, else_, ..
+            } => {
+                branches
+                    .iter()
+                    .all(|(c, v)| c.is_aggregate_free() && v.is_aggregate_free())
+                    && else_
+                        .as_ref()
+                        .map(|e| e.is_aggregate_free())
+                        .unwrap_or(true)
             }
             BoundExpr::Literal(_)
             | BoundExpr::Column { .. }
@@ -265,9 +311,7 @@ impl BoundExpr {
                 left.is_aggregate_free() && right.is_aggregate_free()
             }
             BoundExpr::Scalar { args, .. } => args.iter().all(|a| a.is_aggregate_free()),
-            BoundExpr::DynamicScalar { args, .. } => {
-                args.iter().all(|a| a.is_aggregate_free())
-            }
+            BoundExpr::DynamicScalar { args, .. } => args.iter().all(|a| a.is_aggregate_free()),
         }
     }
 
@@ -285,8 +329,12 @@ impl BoundExpr {
             BoundExpr::InSubquery { expr, .. } => expr.has_column_ref(),
             BoundExpr::Cast { expr, .. } => expr.has_column_ref(),
             BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_column_ref()),
-            BoundExpr::Case { branches, else_, .. } => {
-                branches.iter().any(|(c, v)| c.has_column_ref() || v.has_column_ref())
+            BoundExpr::Case {
+                branches, else_, ..
+            } => {
+                branches
+                    .iter()
+                    .any(|(c, v)| c.has_column_ref() || v.has_column_ref())
                     || else_.as_ref().map(|e| e.has_column_ref()).unwrap_or(false)
             }
             BoundExpr::Not(e)
@@ -314,14 +362,16 @@ impl BoundExpr {
             | BoundExpr::Negate { expr: e, .. }
             | BoundExpr::IsNull { expr: e, .. }
             | BoundExpr::Cast { expr: e, .. } => e.has_subquery(),
-            BoundExpr::Binary { left, right, .. } => {
-                left.has_subquery() || right.has_subquery()
-            }
+            BoundExpr::Binary { left, right, .. } => left.has_subquery() || right.has_subquery(),
             BoundExpr::Scalar { args, .. } => args.iter().any(|a| a.has_subquery()),
             BoundExpr::DynamicScalar { args, .. } => args.iter().any(|a| a.has_subquery()),
             BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.has_subquery()),
-            BoundExpr::Case { branches, else_, .. } => {
-                branches.iter().any(|(c, v)| c.has_subquery() || v.has_subquery())
+            BoundExpr::Case {
+                branches, else_, ..
+            } => {
+                branches
+                    .iter()
+                    .any(|(c, v)| c.has_subquery() || v.has_subquery())
                     || else_.as_ref().map(|e| e.has_subquery()).unwrap_or(false)
             }
         }
@@ -353,19 +403,18 @@ impl BoundExpr {
             BoundExpr::Binary { left, right, .. } => {
                 left.contains_dynamic_scalar() || right.contains_dynamic_scalar()
             }
-            BoundExpr::Scalar { args, .. } => {
-                args.iter().any(|a| a.contains_dynamic_scalar())
-            }
-            BoundExpr::Coalesce { args, .. } => {
-                args.iter().any(|a| a.contains_dynamic_scalar())
-            }
-            BoundExpr::Case { branches, else_, .. } => {
-                branches.iter().any(|(c, v)| {
-                    c.contains_dynamic_scalar() || v.contains_dynamic_scalar()
-                }) || else_
-                    .as_ref()
-                    .map(|e| e.contains_dynamic_scalar())
-                    .unwrap_or(false)
+            BoundExpr::Scalar { args, .. } => args.iter().any(|a| a.contains_dynamic_scalar()),
+            BoundExpr::Coalesce { args, .. } => args.iter().any(|a| a.contains_dynamic_scalar()),
+            BoundExpr::Case {
+                branches, else_, ..
+            } => {
+                branches
+                    .iter()
+                    .any(|(c, v)| c.contains_dynamic_scalar() || v.contains_dynamic_scalar())
+                    || else_
+                        .as_ref()
+                        .map(|e| e.contains_dynamic_scalar())
+                        .unwrap_or(false)
             }
         }
     }
@@ -398,12 +447,8 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
     match (op, l, r) {
         (BinaryOp::Add, DataType::Date, DataType::Integer)
         | (BinaryOp::Add, DataType::Integer, DataType::Date)
-        | (BinaryOp::Subtract, DataType::Date, DataType::Integer) => {
-            return Ok(DataType::Date)
-        }
-        (BinaryOp::Subtract, DataType::Date, DataType::Date) => {
-            return Ok(DataType::Bigint)
-        }
+        | (BinaryOp::Subtract, DataType::Date, DataType::Integer) => return Ok(DataType::Date),
+        (BinaryOp::Subtract, DataType::Date, DataType::Date) => return Ok(DataType::Bigint),
         _ => {}
     }
     if l == DataType::Date
@@ -432,14 +477,15 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
                 )));
             }
             if l == DataType::Double || r == DataType::Double {
-                return Err(PinkDbError::Type("`%` needs integer operands in v1".to_string()));
+                return Err(PinkDbError::Type(
+                    "`%` needs integer operands in v1".to_string(),
+                ));
             }
             common_numeric(l, r)
         }
         _ => common_numeric(l, r),
     }
 }
-
 
 /// Fold one result arm into the common type, skipping NULL literals (a bare
 /// NULL fits any result type instead of forcing INTEGER).
@@ -458,9 +504,8 @@ fn coalesce_common(a: DataType, b: DataType) -> Result<DataType> {
     if a == b {
         return Ok(a);
     }
-    common_numeric(a, b).map_err(|_| {
-        PinkDbError::Type(format!("incompatible types {a} and {b} (use CAST)"))
-    })
+    common_numeric(a, b)
+        .map_err(|_| PinkDbError::Type(format!("incompatible types {a} and {b} (use CAST)")))
 }
 
 /// Whether `CAST(from AS to)` is allowed in v1.
@@ -488,10 +533,13 @@ fn check_cast(from: DataType, to: DataType) -> Result<()> {
     {
         return Ok(());
     }
-    Err(PinkDbError::Type(format!("cannot CAST {from} AS {to} in v1")))
+    Err(PinkDbError::Type(format!(
+        "cannot CAST {from} AS {to} in v1"
+    )))
 }
 
-fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {    if (is_numeric(l) && is_numeric(r))
+fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
+    if (is_numeric(l) && is_numeric(r))
         || (l == DataType::Varchar && r == DataType::Varchar)
         || (l == DataType::Date && r == DataType::Date)
         || (l == DataType::Timestamp && r == DataType::Timestamp)
@@ -501,7 +549,9 @@ fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {    if (
             BinaryOp::Like | BinaryOp::NotLike
                 if l != DataType::Varchar || r != DataType::Varchar =>
             {
-                Err(PinkDbError::Type("LIKE needs VARCHAR on both sides".to_string()))
+                Err(PinkDbError::Type(
+                    "LIKE needs VARCHAR on both sides".to_string(),
+                ))
             }
             _ => Ok(()),
         };
@@ -603,9 +653,7 @@ impl<'a> Binder<'a> {
         match db {
             Some(q) => {
                 if !self.db.database_exists(q) {
-                    return Err(PinkDbError::Catalog(format!(
-                        "database \"{q}\" not found"
-                    )));
+                    return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
                 }
                 Ok(q.to_ascii_lowercase())
             }
@@ -704,8 +752,14 @@ impl<'a> Binder<'a> {
                         }
                         DataType::Boolean
                     }
-                    BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::Lt | BinaryOp::LtEq
-                    | BinaryOp::Gt | BinaryOp::GtEq | BinaryOp::Like | BinaryOp::NotLike => {
+                    BinaryOp::Eq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::Like
+                    | BinaryOp::NotLike => {
                         comparison_ok(*op, l.dtype(), r.dtype())?;
                         DataType::Boolean
                     }
@@ -736,16 +790,27 @@ impl<'a> Binder<'a> {
                             ));
                         }
                         let dtype = e.dtype();
-                        Ok(BoundExpr::Negate { expr: Box::new(e), dtype })
+                        Ok(BoundExpr::Negate {
+                            expr: Box::new(e),
+                            dtype,
+                        })
                     }
                     UnaryOp::Plus => Ok(e),
                 }
             }
             Expr::IsNull { expr, negated } => {
                 let e = self.bind_expr(expr, aggs, allow_agg)?;
-                Ok(BoundExpr::IsNull { expr: Box::new(e), negated: *negated })
+                Ok(BoundExpr::IsNull {
+                    expr: Box::new(e),
+                    negated: *negated,
+                })
             }
-            Expr::Between { expr, low, high, negated } => {
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 // Desugar: `x BETWEEN l AND h` → `x >= l AND x <= h`.
                 let desugared = Expr::Binary {
                     op: BinaryOp::And,
@@ -768,7 +833,9 @@ impl<'a> Binder<'a> {
                 }
             }
             Expr::Function { name, args } => self.bind_function(name, args, aggs, allow_agg),
-            Expr::Window { name, args, over } => self.bind_window(name, args, over, aggs, allow_agg),
+            Expr::Window { name, args, over } => {
+                self.bind_window(name, args, over, aggs, allow_agg)
+            }
             Expr::Coalesce(args) => {
                 let mut bound = Vec::with_capacity(args.len());
                 for a in args {
@@ -784,21 +851,28 @@ impl<'a> Binder<'a> {
                 let args = bound
                     .into_iter()
                     .map(|b| {
-                        if b.dtype() == common
-                            || matches!(b, BoundExpr::Literal(Value::Null))
-                        {
+                        if b.dtype() == common || matches!(b, BoundExpr::Literal(Value::Null)) {
                             b
                         } else {
-                            BoundExpr::Cast { expr: Box::new(b), dtype: common }
+                            BoundExpr::Cast {
+                                expr: Box::new(b),
+                                dtype: common,
+                            }
                         }
                     })
                     .collect();
-                Ok(BoundExpr::Coalesce { args, dtype: common })
+                Ok(BoundExpr::Coalesce {
+                    args,
+                    dtype: common,
+                })
             }
             Expr::Cast { expr, dtype } => {
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 check_cast(bound.dtype(), *dtype)?;
-                Ok(BoundExpr::Cast { expr: Box::new(bound), dtype: *dtype })
+                Ok(BoundExpr::Cast {
+                    expr: Box::new(bound),
+                    dtype: *dtype,
+                })
             }
             Expr::Case { branches, else_ } => {
                 let mut bound_branches = Vec::with_capacity(branches.len());
@@ -831,7 +905,10 @@ impl<'a> Binder<'a> {
                         let v = if v.dtype() == common {
                             v
                         } else {
-                            BoundExpr::Cast { expr: Box::new(v), dtype: common }
+                            BoundExpr::Cast {
+                                expr: Box::new(v),
+                                dtype: common,
+                            }
                         };
                         (c, v)
                     })
@@ -840,25 +917,38 @@ impl<'a> Binder<'a> {
                     Box::new(if e.dtype() == common {
                         e
                     } else {
-                        BoundExpr::Cast { expr: Box::new(e), dtype: common }
+                        BoundExpr::Cast {
+                            expr: Box::new(e),
+                            dtype: common,
+                        }
                     })
                 });
-                Ok(BoundExpr::Case { branches, else_, dtype: common })
+                Ok(BoundExpr::Case {
+                    branches,
+                    else_,
+                    dtype: common,
+                })
             }
             Expr::ScalarSubquery(q) => {
                 let mut child = self.child();
                 let query = bind_select_in(child.db, &mut child, q)?;
-                let schema =
-                    plan_schema(child.db, &child.default_db, &child.ctes, &query)?;
+                let schema = plan_schema(child.db, &child.default_db, &child.ctes, &query)?;
                 if schema.len() != 1 {
                     return Err(PinkDbError::Execution(
                         "scalar subquery must return exactly one column".to_string(),
                     ));
                 }
                 let dtype = schema[0].1;
-                Ok(BoundExpr::ScalarSubquery { query: Box::new(query), dtype })
+                Ok(BoundExpr::ScalarSubquery {
+                    query: Box::new(query),
+                    dtype,
+                })
             }
-            Expr::InSubquery { expr, query, negated } => {
+            Expr::InSubquery {
+                expr,
+                query,
+                negated,
+            } => {
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 let mut child = self.child();
                 let sub = bind_select_in(child.db, &mut child, query)?;
@@ -884,7 +974,10 @@ impl<'a> Binder<'a> {
             Expr::Exists { query, negated } => {
                 let mut child = self.child();
                 let sub = bind_select_in(child.db, &mut child, query)?;
-                Ok(BoundExpr::Exists { query: Box::new(sub), negated: *negated })
+                Ok(BoundExpr::Exists {
+                    query: Box::new(sub),
+                    negated: *negated,
+                })
             }
         }
     }
@@ -899,7 +992,8 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundExpr> {
         if !self.allow_win {
             return Err(PinkDbError::Execution(
-                "window functions are not allowed in WHERE, GROUP BY, or HAVING (use a subquery)".to_string(),
+                "window functions are not allowed in WHERE, GROUP BY, or HAVING (use a subquery)"
+                    .to_string(),
             ));
         }
         if self.in_window {
@@ -916,13 +1010,19 @@ impl<'a> Binder<'a> {
         } else if let Some(f) = AggFunc::from_name(name) {
             let is_star = args.len() == 1 && args[0] == Expr::Star;
             if args.iter().any(|a| a == &Expr::Star) && !is_star {
-                return Err(PinkDbError::Parse("`*` is only valid in COUNT(*)".to_string()));
+                return Err(PinkDbError::Parse(
+                    "`*` is only valid in COUNT(*)".to_string(),
+                ));
             }
             if f != AggFunc::Count && is_star {
-                return Err(PinkDbError::Type(format!("only COUNT supports *, not {name}")));
+                return Err(PinkDbError::Type(format!(
+                    "only COUNT supports *, not {name}"
+                )));
             }
             if !is_star && args.len() != 1 {
-                return Err(PinkDbError::Type(format!("{name} takes exactly 1 argument in v1")));
+                return Err(PinkDbError::Type(format!(
+                    "{name} takes exactly 1 argument in v1"
+                )));
             }
             WindowKind::Agg(f)
         } else {
@@ -973,7 +1073,14 @@ impl<'a> Binder<'a> {
                 (WindowFunc::Agg(f), dtype)
             }
         };
-        let win = BoundWindow { func, arg, partition, order, frame, dtype };
+        let win = BoundWindow {
+            func,
+            arg,
+            partition,
+            order,
+            frame,
+            dtype,
+        };
         let index = match self.windows.iter().position(|w| w == &win) {
             Some(i) => i,
             None => {
@@ -999,13 +1106,19 @@ impl<'a> Binder<'a> {
             }
             let is_star = args.len() == 1 && args[0] == Expr::Star;
             if args.iter().any(|a| a == &Expr::Star) && !is_star {
-                return Err(PinkDbError::Parse("`*` is only valid in COUNT(*)".to_string()));
+                return Err(PinkDbError::Parse(
+                    "`*` is only valid in COUNT(*)".to_string(),
+                ));
             }
             if func != AggFunc::Count && is_star {
-                return Err(PinkDbError::Type(format!("only COUNT supports *, not {name}")));
+                return Err(PinkDbError::Type(format!(
+                    "only COUNT supports *, not {name}"
+                )));
             }
             if !is_star && args.len() != 1 {
-                return Err(PinkDbError::Type(format!("{name} takes exactly 1 argument in v1")));
+                return Err(PinkDbError::Type(format!(
+                    "{name} takes exactly 1 argument in v1"
+                )));
             }
             let arg = if is_star {
                 None
@@ -1034,12 +1147,18 @@ impl<'a> Binder<'a> {
             let mut bound = Vec::with_capacity(args.len());
             for a in args {
                 if a == &Expr::Star {
-                    return Err(PinkDbError::Parse("`*` is only valid in COUNT(*)".to_string()));
+                    return Err(PinkDbError::Parse(
+                        "`*` is only valid in COUNT(*)".to_string(),
+                    ));
                 }
                 bound.push(self.bind_expr(a, aggs, allow_agg)?);
             }
             let dtype = scalar_dtype(func, &bound)?;
-            return Ok(BoundExpr::Scalar { func, args: bound, dtype });
+            return Ok(BoundExpr::Scalar {
+                func,
+                args: bound,
+                dtype,
+            });
         }
         // Not a built-in: a loaded extension may provide it (case-insensitive).
         // (On wasm32 the extension loader is not linked: no dynamic functions
@@ -1097,7 +1216,9 @@ impl<'a> Binder<'a> {
         let mut bound = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
             if a == &Expr::Star {
-                return Err(PinkDbError::Parse("`*` is only valid in COUNT(*)".to_string()));
+                return Err(PinkDbError::Parse(
+                    "`*` is only valid in COUNT(*)".to_string(),
+                ));
             }
             let b = self.bind_expr(a, aggs, allow_agg)?;
             let want = want_args[i];
@@ -1130,14 +1251,18 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
         AggFunc::Avg => {
             let t = arg.expect("avg has an arg");
             if !is_numeric(t) {
-                return Err(PinkDbError::Type("AVG needs a numeric argument".to_string()));
+                return Err(PinkDbError::Type(
+                    "AVG needs a numeric argument".to_string(),
+                ));
             }
             Ok(DataType::Double)
         }
         AggFunc::Sum => match arg.expect("sum has an arg") {
             DataType::Integer | DataType::Bigint => Ok(DataType::Bigint),
             DataType::Double => Ok(DataType::Double),
-            _ => Err(PinkDbError::Type("SUM needs a numeric argument".to_string())),
+            _ => Err(PinkDbError::Type(
+                "SUM needs a numeric argument".to_string(),
+            )),
         },
         AggFunc::Min | AggFunc::Max => {
             let t = arg.expect("min/max has an arg");
@@ -1147,7 +1272,9 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 && t != DataType::Date
                 && t != DataType::Timestamp
             {
-                return Err(PinkDbError::Type("MIN/MAX need an orderable argument".to_string()));
+                return Err(PinkDbError::Type(
+                    "MIN/MAX need an orderable argument".to_string(),
+                ));
             }
             Ok(t)
         }
@@ -1159,8 +1286,14 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
         if allowed.contains(&args.len()) {
             Ok(())
         } else {
-            let want = allowed.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" or ");
-            Err(PinkDbError::Type(format!("{func:?} takes {want} argument(s) in v1")))
+            let want = allowed
+                .iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(" or ");
+            Err(PinkDbError::Type(format!(
+                "{func:?} takes {want} argument(s) in v1"
+            )))
         }
     };
     match func {
@@ -1168,17 +1301,23 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             arity(&[1])?;
             let t = args[0].dtype();
             if !is_numeric(t) {
-                return Err(PinkDbError::Type("abs needs a numeric argument".to_string()));
+                return Err(PinkDbError::Type(
+                    "abs needs a numeric argument".to_string(),
+                ));
             }
             Ok(t)
         }
         ScalarFunc::Round => {
             arity(&[1, 2])?;
             if !is_numeric(args[0].dtype()) {
-                return Err(PinkDbError::Type("round needs a numeric argument".to_string()));
+                return Err(PinkDbError::Type(
+                    "round needs a numeric argument".to_string(),
+                ));
             }
             if args.len() == 2 && !is_numeric(args[1].dtype()) {
-                return Err(PinkDbError::Type("round digits must be numeric".to_string()));
+                return Err(PinkDbError::Type(
+                    "round digits must be numeric".to_string(),
+                ));
             }
             Ok(DataType::Double)
         }
@@ -1214,14 +1353,18 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             arity(&[1])?;
             match args[0].dtype() {
                 DataType::Date | DataType::Timestamp => Ok(DataType::Integer),
-                t => Err(PinkDbError::Type(format!("{func:?} needs DATE or TIMESTAMP, got {t}"))),
+                t => Err(PinkDbError::Type(format!(
+                    "{func:?} needs DATE or TIMESTAMP, got {t}"
+                ))),
             }
         }
         ScalarFunc::Hour | ScalarFunc::Minute | ScalarFunc::Second => {
             arity(&[1])?;
             match args[0].dtype() {
                 DataType::Timestamp => Ok(DataType::Integer),
-                t => Err(PinkDbError::Type(format!("{func:?} needs TIMESTAMP, got {t}"))),
+                t => Err(PinkDbError::Type(format!(
+                    "{func:?} needs TIMESTAMP, got {t}"
+                ))),
             }
         }
         ScalarFunc::DateTrunc => {
@@ -1233,7 +1376,9 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             }
             match args[1].dtype() {
                 DataType::Date | DataType::Timestamp => Ok(args[1].dtype()),
-                t => Err(PinkDbError::Type(format!("date_trunc needs DATE or TIMESTAMP, got {t}"))),
+                t => Err(PinkDbError::Type(format!(
+                    "date_trunc needs DATE or TIMESTAMP, got {t}"
+                ))),
             }
         }
     }
@@ -1281,7 +1426,12 @@ fn default_name(expr: &Expr) -> String {
             let not = if *negated { " NOT" } else { "" };
             format!("({}{not} IS NULL)", default_name(expr))
         }
-        Expr::Between { expr, low, high, negated } => {
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let not = if *negated { "NOT " } else { "" };
             format!(
                 "({} {not}BETWEEN {} AND {})",
@@ -1328,10 +1478,16 @@ fn default_name(expr: &Expr) -> String {
             format!("coalesce({})", inner.join(", "))
         }
         Expr::Cast { expr, dtype } => format!("cast({} as {dtype})", default_name(expr)),
-        Expr::Case { branches, else_, .. } => {
+        Expr::Case {
+            branches, else_, ..
+        } => {
             let mut s = String::from("CASE");
             for (c, v) in branches {
-                s.push_str(&format!(" WHEN {} THEN {}", default_name(c), default_name(v)));
+                s.push_str(&format!(
+                    " WHEN {} THEN {}",
+                    default_name(c),
+                    default_name(v)
+                ));
             }
             if let Some(e) = else_ {
                 s.push_str(&format!(" ELSE {}", default_name(e)));
@@ -1361,9 +1517,9 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
         | BoundExpr::Column { .. }
         | BoundExpr::ScalarSubquery { .. }
         | BoundExpr::Exists { .. } => Ok(()),
-        BoundExpr::Not(e) | BoundExpr::Negate { expr: e, .. } | BoundExpr::IsNull { expr: e, .. } => {
-            validate_grouped(e, keys)
-        }
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. } => validate_grouped(e, keys),
         BoundExpr::Binary { left, right, .. } => {
             validate_grouped(left, keys)?;
             validate_grouped(right, keys)
@@ -1387,7 +1543,9 @@ fn validate_grouped(expr: &BoundExpr, keys: &[BoundExpr]) -> Result<()> {
             }
             Ok(())
         }
-        BoundExpr::Case { branches, else_, .. } => {
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
             for (c, v) in branches {
                 validate_grouped(c, keys)?;
                 validate_grouped(v, keys)?;
@@ -1410,10 +1568,13 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
         if !expr.has_column_ref() {
             return Some(expr.clone());
         }
-        return keys.iter().position(|k| k == expr).map(|pos| BoundExpr::Column {
-            index: pos,
-            dtype: expr.dtype(),
-        });
+        return keys
+            .iter()
+            .position(|k| k == expr)
+            .map(|pos| BoundExpr::Column {
+                index: pos,
+                dtype: expr.dtype(),
+            });
     }
     Some(match expr {
         BoundExpr::AggRef { .. } => expr.clone(),
@@ -1426,7 +1587,12 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
             expr: Box::new(rebase_to_keys(e, keys)?),
             negated: *negated,
         },
-        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
             op: *op,
             left: Box::new(rebase_to_keys(left, keys)?),
             right: Box::new(rebase_to_keys(right, keys)?),
@@ -1449,7 +1615,11 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
                 .into_boxed_slice(),
             dtype: *dtype,
         },
-        BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => BoundExpr::InSubquery {
             expr: Box::new(rebase_to_keys(expr, keys)?),
             query: query.clone(),
             negated: *negated,
@@ -1465,7 +1635,11 @@ fn rebase_to_keys(expr: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
         },
-        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
             branches: branches
                 .iter()
                 .map(|(c, v)| Some((rebase_to_keys(c, keys)?, rebase_to_keys(v, keys)?)))
@@ -1492,23 +1666,32 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             index: input_width + index,
             dtype,
         },
-        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
             op,
             left: Box::new(resolve_window_refs(*left, input_width)),
             right: Box::new(resolve_window_refs(*right, input_width)),
             dtype,
         },
         BoundExpr::Not(e) => BoundExpr::Not(Box::new(resolve_window_refs(*e, input_width))),
-        BoundExpr::Negate { expr, dtype } => {
-            BoundExpr::Negate { expr: Box::new(resolve_window_refs(*expr, input_width)), dtype }
-        }
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(resolve_window_refs(*expr, input_width)),
+            dtype,
+        },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(resolve_window_refs(*expr, input_width)),
             negated,
         },
         BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
             func,
-            args: args.into_iter().map(|a| resolve_window_refs(a, input_width)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| resolve_window_refs(a, input_width))
+                .collect(),
             dtype,
         },
         BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
@@ -1521,7 +1704,11 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
                 .into_boxed_slice(),
             dtype,
         },
-        BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => BoundExpr::InSubquery {
             expr: Box::new(resolve_window_refs(*expr, input_width)),
             query,
             negated,
@@ -1531,14 +1718,24 @@ fn resolve_window_refs(expr: BoundExpr, input_width: usize) -> BoundExpr {
             dtype,
         },
         BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
-            args: args.into_iter().map(|a| resolve_window_refs(a, input_width)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| resolve_window_refs(a, input_width))
+                .collect(),
             dtype,
         },
-        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
             branches: branches
                 .into_iter()
                 .map(|(c, v)| {
-                    (resolve_window_refs(c, input_width), resolve_window_refs(v, input_width))
+                    (
+                        resolve_window_refs(c, input_width),
+                        resolve_window_refs(v, input_width),
+                    )
                 })
                 .collect(),
             else_: else_.map(|e| Box::new(resolve_window_refs(*e, input_width))),
@@ -1555,23 +1752,32 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
             index: num_keys + index,
             dtype,
         },
-        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
             op,
             left: Box::new(resolve_agg_refs(*left, num_keys)),
             right: Box::new(resolve_agg_refs(*right, num_keys)),
             dtype,
         },
         BoundExpr::Not(e) => BoundExpr::Not(Box::new(resolve_agg_refs(*e, num_keys))),
-        BoundExpr::Negate { expr, dtype } => {
-            BoundExpr::Negate { expr: Box::new(resolve_agg_refs(*expr, num_keys)), dtype }
-        }
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(resolve_agg_refs(*expr, num_keys)),
+            dtype,
+        },
         BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
             expr: Box::new(resolve_agg_refs(*expr, num_keys)),
             negated,
         },
         BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
             func,
-            args: args.into_iter().map(|a| resolve_agg_refs(a, num_keys)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| resolve_agg_refs(a, num_keys))
+                .collect(),
             dtype,
         },
         BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
@@ -1584,7 +1790,11 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
                 .into_boxed_slice(),
             dtype,
         },
-        BoundExpr::InSubquery { expr, query, negated } => BoundExpr::InSubquery {
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => BoundExpr::InSubquery {
             expr: Box::new(resolve_agg_refs(*expr, num_keys)),
             query,
             negated,
@@ -1594,10 +1804,17 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
             dtype,
         },
         BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
-            args: args.into_iter().map(|a| resolve_agg_refs(a, num_keys)).collect(),
+            args: args
+                .into_iter()
+                .map(|a| resolve_agg_refs(a, num_keys))
+                .collect(),
             dtype,
         },
-        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
             branches: branches
                 .into_iter()
                 .map(|(c, v)| (resolve_agg_refs(c, num_keys), resolve_agg_refs(v, num_keys)))
@@ -1624,7 +1841,11 @@ fn bind_join_keys(
     on: &Expr,
 ) -> Result<(BoundExpr, BoundExpr)> {
     let (l, r) = match on {
-        Expr::Binary { op: BinaryOp::Eq, left, right } => (left.as_ref(), right.as_ref()),
+        Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } => (left.as_ref(), right.as_ref()),
         _ => {
             return Err(PinkDbError::Execution(
                 "JOIN ON must be a single equality `left_col = right_col` in v1".to_string(),
@@ -1707,26 +1928,41 @@ pub(crate) fn bind_tracked(
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let empty = |plan| Ok((plan, Vec::new()));
     match stmt {
-        Statement::CreateTable { db: qdb, name, columns } => empty(LogicalPlan::CreateTable {
+        Statement::CreateTable {
+            db: qdb,
+            name,
+            columns,
+        } => empty(LogicalPlan::CreateTable {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
             schema: columns.clone(),
         }),
-        Statement::Insert { db: qdb, table, columns, rows } => {
-            bind_insert(db, default_db, qdb, table, columns, rows)
-        }
-        Statement::Update { db: qdb, table, sets, where_clause } => {
-            bind_update(db, default_db, qdb, table, sets, where_clause)
-        }
-        Statement::Delete { db: qdb, table, where_clause } => {
-            bind_delete(db, default_db, qdb, table, where_clause)
-        }
+        Statement::Insert {
+            db: qdb,
+            table,
+            columns,
+            rows,
+        } => bind_insert(db, default_db, qdb, table, columns, rows),
+        Statement::Update {
+            db: qdb,
+            table,
+            sets,
+            where_clause,
+        } => bind_update(db, default_db, qdb, table, sets, where_clause),
+        Statement::Delete {
+            db: qdb,
+            table,
+            where_clause,
+        } => bind_delete(db, default_db, qdb, table, where_clause),
         Statement::Begin => empty(LogicalPlan::Begin),
         Statement::Commit => empty(LogicalPlan::Commit),
         Statement::Rollback => empty(LogicalPlan::Rollback),
-        Statement::CreateView { db: qdb, name, cols, query } => {
-            bind_create_view(db, default_db, qdb, name, cols, query)
-        }
+        Statement::CreateView {
+            db: qdb,
+            name,
+            cols,
+            query,
+        } => bind_create_view(db, default_db, qdb, name, cols, query),
         Statement::DropTable { db: qdb, name } => empty(LogicalPlan::DropTable {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
@@ -1738,9 +1974,7 @@ pub(crate) fn bind_tracked(
         Statement::CreateDatabase { name } => {
             empty(LogicalPlan::CreateDatabase { name: name.clone() })
         }
-        Statement::DropDatabase { name } => {
-            empty(LogicalPlan::DropDatabase { name: name.clone() })
-        }
+        Statement::DropDatabase { name } => empty(LogicalPlan::DropDatabase { name: name.clone() }),
         Statement::Use { name } => {
             // Validate at bind: USE must fail clearly before touching the
             // session (and before any later statement in the same string).
@@ -1810,7 +2044,9 @@ fn bind_update(
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     let t = db.table_in(&table_db, table)?;
     if sets.is_empty() {
-        return Err(PinkDbError::Parse("UPDATE needs at least one SET assignment".to_string()));
+        return Err(PinkDbError::Parse(
+            "UPDATE needs at least one SET assignment".to_string(),
+        ));
     }
     let mut seen = std::collections::HashSet::new();
     for (col, _) in sets {
@@ -1828,9 +2064,9 @@ fn bind_update(
     });
     let mut bound_sets = Vec::with_capacity(sets.len());
     for (col, expr) in sets {
-        let idx = t.column_index(col).map_err(|_| {
-            PinkDbError::Catalog(format!("no column \"{col}\""))
-        })?;
+        let idx = t
+            .column_index(col)
+            .map_err(|_| PinkDbError::Catalog(format!("no column \"{col}\"")))?;
         let (_, target) = t.schema()[idx].clone();
         let mut aggs = Vec::new();
         let bound = binder.bind_expr(expr, &mut aggs, false)?;
@@ -1858,7 +2094,9 @@ fn bind_update(
         .transpose()?;
     if let Some(p) = &predicate {
         if p.dtype() != DataType::Boolean {
-            return Err(PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string()));
+            return Err(PinkDbError::Type(
+                "WHERE needs a BOOLEAN expression".to_string(),
+            ));
         }
     }
     reject_view_dependency(db, &binder.views_used())?;
@@ -1898,13 +2136,19 @@ fn bind_delete(
         .transpose()?;
     if let Some(p) = &predicate {
         if p.dtype() != DataType::Boolean {
-            return Err(PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string()));
+            return Err(PinkDbError::Type(
+                "WHERE needs a BOOLEAN expression".to_string(),
+            ));
         }
     }
     reject_view_dependency(db, &binder.views_used())?;
     let dynamic_functions = binder.dynamic_functions_used();
     Ok((
-        LogicalPlan::Delete { db: Some(table_db), table: t.name.clone(), predicate },
+        LogicalPlan::Delete {
+            db: Some(table_db),
+            table: t.name.clone(),
+            predicate,
+        },
         dynamic_functions,
     ))
 }
@@ -2001,11 +2245,7 @@ fn reject_view_dependency(db: &PinkDb, views: &[String]) -> Result<()> {
 }
 
 /// Bind a top-level SELECT with a fresh binder.
-fn bind_select(
-    db: &PinkDb,
-    default_db: &str,
-    sel: &Select,
-) -> Result<(LogicalPlan, Vec<String>)> {
+fn bind_select(db: &PinkDb, default_db: &str, sel: &Select) -> Result<(LogicalPlan, Vec<String>)> {
     let mut binder = Binder::new(db, default_db);
     let plan = bind_select_in(db, &mut binder, sel)?;
     Ok((plan, binder.dynamic_functions_used()))
@@ -2016,8 +2256,7 @@ fn bind_select(
 /// would silently change semantics. DuckDB rejects them too.
 fn union_clause_error() -> PinkDbError {
     PinkDbError::Parse(
-        "ORDER BY/LIMIT before UNION is not supported; place it after the last branch"
-            .to_string(),
+        "ORDER BY/LIMIT before UNION is not supported; place it after the last branch".to_string(),
     )
 }
 
@@ -2133,8 +2372,10 @@ fn plan_schema(
     match plan {
         LogicalPlan::Scan { db: qdb, table } => {
             if qdb.is_none() {
-                if let Some((_, schema)) =
-                    ctes.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case(table))
+                if let Some((_, schema)) = ctes
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(table))
                 {
                     return Ok(schema.clone());
                 }
@@ -2179,7 +2420,11 @@ fn plan_schema(
         LogicalPlan::Union { left, types, .. } => {
             // Output names come from the left branch.
             let left_schema = plan_schema(db, default_db, ctes, left)?;
-            Ok(left_schema.into_iter().zip(types.iter().copied()).map(|((n, _), t)| (n, t)).collect())
+            Ok(left_schema
+                .into_iter()
+                .zip(types.iter().copied())
+                .map(|((n, _), t)| (n, t))
+                .collect())
         }
         LogicalPlan::Cte { name, query, body } => {
             let mut inner: Vec<(String, Vec<(String, DataType)>)> = ctes.to_vec();
@@ -2219,8 +2464,14 @@ fn bind_source(
                 {
                     let eff = alias.clone().unwrap_or_else(|| name.clone());
                     return Ok((
-                        ScopeTable { name: eff.to_ascii_lowercase(), columns: schema.clone() },
-                        LogicalPlan::Scan { db: None, table: name.clone() },
+                        ScopeTable {
+                            name: eff.to_ascii_lowercase(),
+                            columns: schema.clone(),
+                        },
+                        LogicalPlan::Scan {
+                            db: None,
+                            table: name.clone(),
+                        },
                     ));
                 }
             }
@@ -2253,26 +2504,38 @@ fn bind_source(
                 }
                 let eff = alias.clone().unwrap_or_else(|| name.clone());
                 return Ok((
-                    ScopeTable { name: eff.to_ascii_lowercase(), columns: schema },
+                    ScopeTable {
+                        name: eff.to_ascii_lowercase(),
+                        columns: schema,
+                    },
                     sub,
                 ));
             }
             let columns = db.table_in(&lookup_db, name)?.schema();
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             Ok((
-                ScopeTable { name: eff.to_ascii_lowercase(), columns },
-                LogicalPlan::Scan { db: Some(lookup_db), table: name.clone() },
+                ScopeTable {
+                    name: eff.to_ascii_lowercase(),
+                    columns,
+                },
+                LogicalPlan::Scan {
+                    db: Some(lookup_db),
+                    table: name.clone(),
+                },
             ))
         }
         FromSource::Derived(q) => {
-            let alias = alias.clone().ok_or_else(|| {
-                PinkDbError::Parse("derived table needs an alias".to_string())
-            })?;
+            let alias = alias
+                .clone()
+                .ok_or_else(|| PinkDbError::Parse("derived table needs an alias".to_string()))?;
             let mut child = binder.child();
             let sub = bind_select_in(db, &mut child, q)?;
             let schema = plan_schema(db, &child.default_db, &binder.ctes, &sub)?;
             Ok((
-                ScopeTable { name: alias.to_ascii_lowercase(), columns: schema },
+                ScopeTable {
+                    name: alias.to_ascii_lowercase(),
+                    columns: schema,
+                },
                 sub,
             ))
         }
@@ -2298,14 +2561,14 @@ fn bind_select_with(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
 /// Bind the WITH clause of `sel`: each CTE in order (seeing previous +
 /// ancestor CTEs), pushed onto `binder.ctes` so the caller's body — including
 /// every UNION branch — can reference them. Pair with [`wrap_ctes`].
-fn bind_ctes(
-    db: &PinkDb,
-    binder: &mut Binder,
-    sel: &Select,
-) -> Result<Vec<(String, LogicalPlan)>> {
+fn bind_ctes(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Vec<(String, LogicalPlan)>> {
     let mut cte_plans: Vec<(String, LogicalPlan)> = Vec::new();
     for cte in &sel.with {
-        if binder.ctes.iter().any(|(n, _)| n.eq_ignore_ascii_case(&cte.name)) {
+        if binder
+            .ctes
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case(&cte.name))
+        {
             return Err(PinkDbError::Catalog(format!(
                 "duplicate CTE name \"{}\"",
                 cte.name
@@ -2343,7 +2606,11 @@ fn wrap_ctes(
 ) -> LogicalPlan {
     let mut plan = plan;
     for (name, query) in cte_plans.into_iter().rev() {
-        plan = LogicalPlan::Cte { name, query: Box::new(query), body: Box::new(plan) };
+        plan = LogicalPlan::Cte {
+            name,
+            query: Box::new(query),
+            body: Box::new(plan),
+        };
     }
     binder.ctes.truncate(cte_base);
     plan
@@ -2382,7 +2649,11 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     }
 
     for proj in &sel.projections {
-        if let Projection::Expr { expr, alias: Some(a) } = proj {
+        if let Projection::Expr {
+            expr,
+            alias: Some(a),
+        } = proj
+        {
             binder.aliases.insert(a.to_ascii_lowercase(), expr.clone());
         }
     }
@@ -2402,7 +2673,9 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     debug_assert!(where_aggs.is_empty());
     if let Some(f) = &filter {
         if f.dtype() != DataType::Boolean {
-            return Err(PinkDbError::Type("WHERE needs a BOOLEAN expression".to_string()));
+            return Err(PinkDbError::Type(
+                "WHERE needs a BOOLEAN expression".to_string(),
+            ));
         }
     }
 
@@ -2416,7 +2689,10 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     let q = t.name.clone();
                     for (name, _) in &t.columns.clone() {
                         pending.push((
-                            Expr::Column { table: Some(q.clone()), name: name.clone() },
+                            Expr::Column {
+                                table: Some(q.clone()),
+                                name: name.clone(),
+                            },
                             name.clone(),
                         ));
                     }
@@ -2431,18 +2707,26 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     .ok_or_else(|| PinkDbError::Catalog(format!("no table \"{q}\" for `{q}.*`")))?;
                 for (name, _) in &cols {
                     pending.push((
-                        Expr::Column { table: Some(q.clone()), name: name.clone() },
+                        Expr::Column {
+                            table: Some(q.clone()),
+                            name: name.clone(),
+                        },
                         name.clone(),
                     ));
                 }
             }
             Projection::Expr { expr, alias } => {
-                pending.push((expr.clone(), alias.clone().unwrap_or_else(|| default_name(expr))));
+                pending.push((
+                    expr.clone(),
+                    alias.clone().unwrap_or_else(|| default_name(expr)),
+                ));
             }
         }
     }
     if pending.is_empty() {
-        return Err(PinkDbError::Parse("SELECT needs at least one projection".to_string()));
+        return Err(PinkDbError::Parse(
+            "SELECT needs at least one projection".to_string(),
+        ));
     }
 
     let mut aggs: Vec<BoundAgg> = Vec::new();
@@ -2496,7 +2780,9 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         .transpose()?;
     if let Some(h) = &having {
         if h.dtype() != DataType::Boolean {
-            return Err(PinkDbError::Type("HAVING needs a BOOLEAN expression".to_string()));
+            return Err(PinkDbError::Type(
+                "HAVING needs a BOOLEAN expression".to_string(),
+            ));
         }
         // HAVING without aggregation (`SELECT a ... HAVING ...`) is rejected:
         // without GROUP BY, fragments can't validate.
@@ -2569,12 +2855,22 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // Scan / join → filter → aggregate → having-filter → window.
     let mut plan = base;
     if let Some(pred) = filter {
-        plan = LogicalPlan::Filter { input: Box::new(plan), predicate: pred };
+        plan = LogicalPlan::Filter {
+            input: Box::new(plan),
+            predicate: pred,
+        };
     }
     if is_agg {
-        plan = LogicalPlan::Aggregate { input: Box::new(plan), keys, aggs };
+        plan = LogicalPlan::Aggregate {
+            input: Box::new(plan),
+            keys,
+            aggs,
+        };
         if let Some(h) = having {
-            plan = LogicalPlan::Filter { input: Box::new(plan), predicate: h };
+            plan = LogicalPlan::Filter {
+                input: Box::new(plan),
+                predicate: h,
+            };
         }
     }
     // Windows see the aggregate output (or the scan). Their results append
@@ -2589,7 +2885,11 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         _ => scan_width(binder),
     };
     if !windows.is_empty() {
-        plan = LogicalPlan::Window { input: Box::new(plan), windows, input_cols };
+        plan = LogicalPlan::Window {
+            input: Box::new(plan),
+            windows,
+            input_cols,
+        };
     }
     // NOTE: select items are rebound below (resolve_window_refs) once the
     // projection is built — see the projection section.
@@ -2617,16 +2917,25 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 )));
             }
             sort_keys.push((
-                BoundExpr::Column { index: idx, dtype: visible_dtypes[idx] },
+                BoundExpr::Column {
+                    index: idx,
+                    dtype: visible_dtypes[idx],
+                },
                 item.desc,
             ));
             continue;
         }
         // Select alias → reuse that output (no hidden column).
         if let Expr::Column { table: None, name } = &item.expr {
-            if let Some(pos) = proj_names[..visible].iter().position(|n| n.eq_ignore_ascii_case(name)) {
+            if let Some(pos) = proj_names[..visible]
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(name))
+            {
                 sort_keys.push((
-                    BoundExpr::Column { index: pos, dtype: visible_dtypes[pos] },
+                    BoundExpr::Column {
+                        index: pos,
+                        dtype: visible_dtypes[pos],
+                    },
                     item.desc,
                 ));
                 continue;
@@ -2666,36 +2975,54 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 proj_names.push(format!("__order{hidden}"));
                 hidden += 1;
                 sort_keys.push((
-                    BoundExpr::Column { index: proj_exprs.len() - 1, dtype },
+                    BoundExpr::Column {
+                        index: proj_exprs.len() - 1,
+                        dtype,
+                    },
                     item.desc,
                 ));
             }
         }
     }
 
-    plan = LogicalPlan::Project { input: Box::new(plan), exprs: proj_exprs, names: proj_names };
+    plan = LogicalPlan::Project {
+        input: Box::new(plan),
+        exprs: proj_exprs,
+        names: proj_names,
+    };
     if sel.distinct {
         if hidden > 0 {
             return Err(PinkDbError::Execution(
                 "ORDER BY expression must appear in the select list with DISTINCT".to_string(),
             ));
         }
-        plan = LogicalPlan::Distinct { input: Box::new(plan) };
+        plan = LogicalPlan::Distinct {
+            input: Box::new(plan),
+        };
     }
     if !sort_keys.is_empty() {
-        plan = LogicalPlan::Sort { input: Box::new(plan), keys: sort_keys };
+        plan = LogicalPlan::Sort {
+            input: Box::new(plan),
+            keys: sort_keys,
+        };
         if hidden > 0 {
             plan = LogicalPlan::Project {
                 input: Box::new(plan),
                 exprs: (0..visible)
-                    .map(|i| BoundExpr::Column { index: i, dtype: visible_dtypes[i] })
+                    .map(|i| BoundExpr::Column {
+                        index: i,
+                        dtype: visible_dtypes[i],
+                    })
                     .collect(),
                 names: visible_names,
             };
         }
     }
     if let Some(n) = sel.limit {
-        plan = LogicalPlan::Limit { input: Box::new(plan), limit: n };
+        plan = LogicalPlan::Limit {
+            input: Box::new(plan),
+            limit: n,
+        };
     }
     Ok(plan)
 }
@@ -2783,13 +3110,14 @@ mod tests {
     fn join_binding() {
         let db = test_db();
         // Self-join without aliases is rejected (name used twice).
-        let err = bind_one(&db, "SELECT * FROM sales JOIN sales ON sales.id = sales.id;")
-            .unwrap_err();
+        let err = bind_one(
+            &db,
+            "SELECT * FROM sales JOIN sales ON sales.id = sales.id;",
+        )
+        .unwrap_err();
         assert!(matches!(err, PinkDbError::Catalog(_)));
         // Non-equi ON is rejected.
-        assert!(
-            bind_one(&db, "SELECT * FROM sales s JOIN sales o ON s.id > o.id;").is_err()
-        );
+        assert!(bind_one(&db, "SELECT * FROM sales s JOIN sales o ON s.id > o.id;").is_err());
         // Aliased equi-join binds.
         let plan = bind_one(&db, "SELECT * FROM sales s JOIN sales o ON s.id = o.id;").unwrap();
         assert!(matches!(plan, LogicalPlan::Project { .. }));
@@ -2800,8 +3128,11 @@ mod tests {
     #[test]
     fn union_branches_must_bind_via_bind_select_in() {
         let db = test_db();
-        let stmts = parse_statements("SELECT id FROM sales UNION ALL SELECT id FROM sales;").unwrap();
-        let Statement::Select(sel) = &stmts[0] else { panic!("expected SELECT") };
+        let stmts =
+            parse_statements("SELECT id FROM sales UNION ALL SELECT id FROM sales;").unwrap();
+        let Statement::Select(sel) = &stmts[0] else {
+            panic!("expected SELECT")
+        };
         let mut binder = Binder::new(&db, "main");
         let err = bind_select_with(&db, &mut binder, sel).unwrap_err();
         assert!(matches!(err, PinkDbError::Execution(_)), "{err:?}");
@@ -2812,7 +3143,8 @@ mod tests {
     fn multi_db() -> PinkDb {
         let mut db = PinkDb::new();
         db.create_database("db1").unwrap();
-        db.create_table("t", vec![("a".to_string(), DataType::Integer)]).unwrap();
+        db.create_table("t", vec![("a".to_string(), DataType::Integer)])
+            .unwrap();
         db.create_table_in(
             "db1",
             "t",
@@ -2831,10 +3163,7 @@ mod tests {
         // `main.t` has one column; `db1.t` has two.
         let main_plan = bind_in(&db, "SELECT * FROM t;", "main").unwrap();
         assert_eq!(scan_db(&main_plan).as_deref(), Some("main"));
-        assert_eq!(
-            plan_schema(&db, "main", &[], &main_plan).unwrap().len(),
-            1
-        );
+        assert_eq!(plan_schema(&db, "main", &[], &main_plan).unwrap().len(), 1);
         let db1_plan = bind_in(&db, "SELECT * FROM t;", "db1").unwrap();
         assert_eq!(scan_db(&db1_plan).as_deref(), Some("db1"));
         assert_eq!(plan_schema(&db, "db1", &[], &db1_plan).unwrap().len(), 2);
@@ -2854,9 +3183,15 @@ mod tests {
         assert_eq!(scan_db(&plan).as_deref(), Some("main"));
         // Unknown database / table errors are clear.
         let err = bind_in(&db, "SELECT * FROM nope.t;", "main").unwrap_err();
-        assert!(err.to_string().contains("database \"nope\" not found"), "{err}");
+        assert!(
+            err.to_string().contains("database \"nope\" not found"),
+            "{err}"
+        );
         let err = bind_in(&db, "SELECT * FROM db1.missing;", "main").unwrap_err();
-        assert!(err.to_string().contains("table \"missing\" not found"), "{err}");
+        assert!(
+            err.to_string().contains("table \"missing\" not found"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2893,7 +3228,10 @@ mod tests {
             LogicalPlan::Use { .. }
         ));
         let err = bind_one(&db, "USE nope;").unwrap_err();
-        assert!(err.to_string().contains("database \"nope\" not found"), "{err}");
+        assert!(
+            err.to_string().contains("database \"nope\" not found"),
+            "{err}"
+        );
         assert!(matches!(
             bind_one(&db, "CREATE DATABASE db2;").unwrap(),
             LogicalPlan::CreateDatabase { name } if name == "db2"
@@ -2941,18 +3279,16 @@ mod tests {
     fn views_are_per_database_and_resolve_their_body_there() {
         let mut db = multi_db();
         // A view in db1 over db1.t; db1.t and main.t differ in shape.
-        db.create_table_in(
-            "db1",
-            "src",
-            vec![("v".to_string(), DataType::Bigint)],
-        )
-        .unwrap();
+        db.create_table_in("db1", "src", vec![("v".to_string(), DataType::Bigint)])
+            .unwrap();
         db.create_view_in(
             "db1",
             "v",
             {
                 let stmts = parse_statements("SELECT v FROM src;").unwrap();
-                let Statement::Select(sel) = &stmts[0] else { panic!() };
+                let Statement::Select(sel) = &stmts[0] else {
+                    panic!()
+                };
                 sel.clone()
             },
             None,

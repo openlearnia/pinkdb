@@ -36,7 +36,10 @@ impl std::fmt::Debug for Credentials {
         f.debug_struct("Credentials")
             .field("access_key_id", &self.access_key_id)
             .field("secret_access_key", &"<redacted>")
-            .field("session_token", &self.session_token.as_ref().map(|_| "<redacted>"))
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
     }
 }
@@ -93,7 +96,10 @@ pub(crate) fn sign(credentials: &Credentials, input: &SigningInput<'_>) -> Signa
     if let Some(token) = &credentials.session_token {
         // The token is part of the request; make sure it is signed even when
         // the caller forgot to list it.
-        if !headers.iter().any(|(name, _)| name == "x-amz-security-token") {
+        if !headers
+            .iter()
+            .any(|(name, _)| name == "x-amz-security-token")
+        {
             headers.push(("x-amz-security-token".to_string(), token.trim().to_string()));
         }
     }
@@ -197,8 +203,7 @@ mod tests {
     /// meaningful for the published vectors.
     const ACCESS_KEY: &str = "AKIDEXAMPLE";
     const SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
-    const EMPTY_HASH: &str =
-        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const EMPTY_HASH: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     fn creds() -> Credentials {
         Credentials {
@@ -224,10 +229,7 @@ mod tests {
                 method: "GET",
                 canonical_uri: "/",
                 canonical_query: "",
-                headers: vec![
-                    ("host", "example.amazonaws.com"),
-                    ("x-amz-date", &amz_date),
-                ],
+                headers: vec![("host", "example.amazonaws.com"), ("x-amz-date", &amz_date)],
                 payload_hash: EMPTY_HASH,
                 amz_date: &amz_date,
                 date_stamp: &date_stamp,
@@ -270,10 +272,7 @@ mod tests {
                 method: "GET",
                 canonical_uri: "/",
                 canonical_query: "Param1=value1&Param2=value2",
-                headers: vec![
-                    ("host", "example.amazonaws.com"),
-                    ("x-amz-date", &amz_date),
-                ],
+                headers: vec![("host", "example.amazonaws.com"), ("x-amz-date", &amz_date)],
                 payload_hash: EMPTY_HASH,
                 amz_date: &amz_date,
                 date_stamp: &date_stamp,

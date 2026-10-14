@@ -393,9 +393,7 @@ impl Wal {
         };
         let cipher = match (&header.enc, key) {
             (None, Some(_)) => return Err(not_encrypted_with_key(path)),
-            (Some(_), None) => {
-                return Err(crypto::encrypted_error(&path.display().to_string()))
-            }
+            (Some(_), None) => return Err(crypto::encrypted_error(&path.display().to_string())),
             (Some(_), Some(k)) => {
                 // A wrong key fails the key-check here, before anything runs.
                 let (c, _) = RecordCipher::from_header(&data, k)?;
@@ -430,10 +428,7 @@ impl Wal {
                     f.sync_all()?;
                     (f, None)
                 } else {
-                    (
-                        OpenOptions::new().read(true).append(true).open(path)?,
-                        None,
-                    )
+                    (OpenOptions::new().read(true).append(true).open(path)?, None)
                 }
             }
         };
@@ -451,7 +446,11 @@ impl Wal {
                 PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
             })?);
         }
-        Ok((build(file, header.gen, last_lsn, cipher), records, truncated))
+        Ok((
+            build(file, header.gen, last_lsn, cipher),
+            records,
+            truncated,
+        ))
     }
 
     /// Test hook: simulate an append that failed on disk.
@@ -579,9 +578,7 @@ impl Wal {
         touched_extensions: &[String],
         loaded_extensions: &[String],
     ) -> Result<()> {
-        let mut rec: Vec<String> = Vec::with_capacity(
-            stmts.len() + touched_extensions.len() + 1,
-        );
+        let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
         if let Some(before) = db_before {
             if !self
                 .session_db
@@ -608,8 +605,10 @@ impl Wal {
         rec.extend_from_slice(stmts);
         self.append(&rec)?;
         // Covered only after a successful append.
-        self.tracked_extensions.extend(touched_extensions.iter().cloned());
-        self.tracked_extensions.extend(loaded_extensions.iter().cloned());
+        self.tracked_extensions
+            .extend(touched_extensions.iter().cloned());
+        self.tracked_extensions
+            .extend(loaded_extensions.iter().cloned());
         match db_before {
             Some(_) => self.session_db = Some(db_after.to_string()),
             None => self.session_db = None,
@@ -646,9 +645,10 @@ impl Wal {
         //    their generation (never overwritten), a fresh WAL starts at
         //    gen + 1. The fresh container cipher is prepared before the
         //    rename so a crypto failure cannot leave the WAL rolled.
-        let fresh_gen = self.gen.checked_add(1).ok_or_else(|| {
-            PinkDbError::Execution("WAL generation counter overflow".to_string())
-        })?;
+        let fresh_gen = self
+            .gen
+            .checked_add(1)
+            .ok_or_else(|| PinkDbError::Execution("WAL generation counter overflow".to_string()))?;
         let fresh_cipher = match &self.cipher {
             Some(c) => Some(c.fork(fresh_gen)?),
             None => None,
@@ -783,7 +783,8 @@ fn parse_records(
         if payload_start > data.len() {
             break;
         }
-        let payload_len = u32::from_le_bytes(data[pos..pos + 4].try_into().expect("4 bytes")) as usize;
+        let payload_len =
+            u32::from_le_bytes(data[pos..pos + 4].try_into().expect("4 bytes")) as usize;
         let lsn = u64::from_le_bytes(data[pos + 4..pos + 12].try_into().expect("8 bytes"));
         let crc = u32::from_le_bytes(data[pos + 12..pos + 16].try_into().expect("4 bytes"));
         // The LSN is not covered by the payload CRC; a record that regresses
@@ -822,8 +823,9 @@ fn parse_records(
                                  nonzero CRC field {crc} on an encrypted record"
                             ));
                         }
-                        decode_payload(&plain)
-                            .map_err(|e| format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}"))?
+                        decode_payload(&plain).map_err(|e| {
+                            format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
+                        })?
                     }
                     None => {
                         if end == data.len() {
@@ -1069,12 +1071,12 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
             }))
         }
         #[cfg(feature = "encryption")]
-        Err(HeaderError::Container(_)) if data.len() <= crypto::MAX_HEADER_LEN => Ok(Some(
-            WalProbe {
+        Err(HeaderError::Container(_)) if data.len() <= crypto::MAX_HEADER_LEN => {
+            Ok(Some(WalProbe {
                 gen: None,
                 has_records: false,
-            },
-        )),
+            }))
+        }
         Err(e) => {
             if data.len() <= HEADER_LEN {
                 // A torn header (crash while creating the WAL): recreate it.
@@ -1114,7 +1116,10 @@ fn scan_rolls(wal: &Path) -> Result<Vec<Roll>> {
                 entry.path().display()
             )));
         }
-        if let Some(mid) = name.strip_prefix(&prefix).and_then(|r| r.strip_suffix(ROLL_SUFFIX)) {
+        if let Some(mid) = name
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix(ROLL_SUFFIX))
+        {
             if let Ok(gen) = mid.parse::<u64>() {
                 rolls.push(Roll {
                     gen,
@@ -1326,7 +1331,11 @@ fn recover_checkpoint(
     // records. Publish it *first* — this is the crash window where an older
     // recovery replayed the roll into memory, deleted `.tmp`/`.roll`, and
     // lost everything on the next open.
-    let max_roll = rolls.iter().map(|r| r.gen).max().expect("rolls is non-empty");
+    let max_roll = rolls
+        .iter()
+        .map(|r| r.gen)
+        .max()
+        .expect("rolls is non-empty");
     if let Some(lgen) = live_gen {
         if max_roll >= lgen {
             let path = rolls
@@ -1360,10 +1369,7 @@ impl PinkDb {
 
     /// [`PinkDb::open_durable`] with an explicit sync policy; also returns
     /// what recovery replayed (for callers like the REPL that report it).
-    pub fn open_durable_with(
-        path: &str,
-        policy: SyncPolicy,
-    ) -> Result<(PinkDb, RecoveryInfo)> {
+    pub fn open_durable_with(path: &str, policy: SyncPolicy) -> Result<(PinkDb, RecoveryInfo)> {
         Self::open_durable_impl(path, policy, None)
     }
 
@@ -1490,7 +1496,10 @@ impl PinkDb {
         let Some(wal) = self.durable_handle() else {
             return;
         };
-        let due = wal.lock().unwrap_or_else(|p| p.into_inner()).wants_checkpoint();
+        let due = wal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .wants_checkpoint();
         if due {
             if let Err(e) = self.checkpoint() {
                 eprintln!("pinkdb: automatic checkpoint failed: {e}");
@@ -1515,9 +1524,9 @@ impl PinkDb {
                 ))
             }
         };
-        let mut guard = wal.lock().map_err(|_| {
-            PinkDbError::Execution("internal lock error (poisoned)".to_string())
-        })?;
+        let mut guard = wal
+            .lock()
+            .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
         // The live WAL's at-rest mode (and key) is fixed at open. A
         // checkpoint must never publish a `.pink` in a different mode or
         // under a different key than the WAL generation it rolls into — the
@@ -1529,8 +1538,7 @@ impl PinkDb {
             let key = self.encryption_key.clone();
             if key.is_some() != guard.is_encrypted() {
                 return Err(PinkDbError::Execution(
-                    "cannot change encryption mode on a live store; reopen it instead"
-                        .to_string(),
+                    "cannot change encryption mode on a live store; reopen it instead".to_string(),
                 ));
             }
             if let Some(k) = &key {
@@ -1740,12 +1748,17 @@ mod tests {
         let db = crate::Database::open(ckpt.to_str().unwrap()).unwrap();
         let mut c = db.connect();
         // `checkpoint` stays an ordinary identifier.
-        c.execute("CREATE TABLE checkpoint (checkpoint INTEGER);").unwrap();
-        c.execute("INSERT INTO checkpoint VALUES (1), (2);").unwrap();
+        c.execute("CREATE TABLE checkpoint (checkpoint INTEGER);")
+            .unwrap();
+        c.execute("INSERT INTO checkpoint VALUES (1), (2);")
+            .unwrap();
         assert!(!records_of(&wal_path(&ckpt)).is_empty());
         let out = c.execute("checkpoint;").unwrap();
         assert_eq!(out, vec![QueryResult::Checkpointed]);
-        assert!(records_of(&wal_path(&ckpt)).is_empty(), "CHECKPOINT rolls the WAL");
+        assert!(
+            records_of(&wal_path(&ckpt)).is_empty(),
+            "CHECKPOINT rolls the WAL"
+        );
         // Refused inside a transaction (uncommitted state must not persist).
         c.execute("BEGIN;").unwrap();
         let err = c.execute("CHECKPOINT;").unwrap_err().to_string();
@@ -1755,23 +1768,35 @@ mod tests {
         db.flush_wal().unwrap();
         crate::Database::set_auto_checkpoint_bytes(&db, Some(1));
         c.execute("INSERT INTO checkpoint VALUES (3);").unwrap();
-        assert!(records_of(&wal_path(&ckpt)).is_empty(), "auto checkpoint rolled the WAL");
-        c.execute("BEGIN; INSERT INTO checkpoint VALUES (4); COMMIT;").unwrap();
+        assert!(
+            records_of(&wal_path(&ckpt)).is_empty(),
+            "auto checkpoint rolled the WAL"
+        );
+        c.execute("BEGIN; INSERT INTO checkpoint VALUES (4); COMMIT;")
+            .unwrap();
         assert!(records_of(&wal_path(&ckpt)).is_empty());
         drop(c);
         drop(db);
         let mut back = durable(&ckpt);
-        assert_eq!(ints(&mut back, "SELECT SUM(checkpoint) FROM checkpoint;"), vec![10]);
+        assert_eq!(
+            ints(&mut back, "SELECT SUM(checkpoint) FROM checkpoint;"),
+            vec![10]
+        );
         // In-memory: CHECKPOINT is a harmless no-op.
         let mut mem = PinkDb::new();
-        assert_eq!(mem.execute("CHECKPOINT").unwrap(), vec![QueryResult::Checkpointed]);
+        assert_eq!(
+            mem.execute("CHECKPOINT").unwrap(),
+            vec![QueryResult::Checkpointed]
+        );
     }
 
     #[test]
     fn a_durable_database_has_one_live_handle() {
         let ckpt = tmp_ckpt("lock");
         let first = durable(&ckpt);
-        let err = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap_err().to_string();
+        let err = PinkDb::open_durable(ckpt.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("already open"), "{err}");
         // Clones (transaction snapshots, Database handles) share the lock.
         let shared = crate::Database::from_store(first.clone());
@@ -1787,14 +1812,23 @@ mod tests {
     fn a_failed_wal_write_stops_reads_writes_and_saves() {
         let ckpt = tmp_ckpt("failstop");
         let mut db = durable(&ckpt);
-        db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
         let shared = crate::Database::from_store(db.clone());
-        db.durable_handle().unwrap().lock().unwrap().poison_for_test("disk full");
+        db.durable_handle()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .poison_for_test("disk full");
         // Embedded and multi-writer reads alike are refused: the failed
         // statement's in-memory effect must never be observable.
         let err = db.execute("SELECT * FROM t;").unwrap_err().to_string();
         assert!(err.contains("stopped after a WAL write failure"), "{err}");
-        let err = shared.connect().execute("SELECT 1;").unwrap_err().to_string();
+        let err = shared
+            .connect()
+            .execute("SELECT 1;")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("stopped after a WAL write failure"), "{err}");
         let snap = ckpt.with_extension("snap.pink");
         assert!(db.save(snap.to_str().unwrap()).is_err());
@@ -1899,10 +1933,11 @@ mod tests {
     #[test]
     fn autocommit_records_roundtrip_with_monotonic_lsn() {
         let p = tmp_ckpt("autocommit");
-        let (mut db, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut db, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info, RecoveryInfo::default());
-        db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);")
+            .unwrap();
         db.execute("INSERT INTO t VALUES (1, 'x');").unwrap();
         db.execute("INSERT INTO t VALUES (2, 'y');").unwrap();
         // Read-only statements are never logged.
@@ -1924,8 +1959,7 @@ mod tests {
         // CRC field verifies against the payload of every record.
         let mut pos = HEADER_LEN;
         for rec in &recs {
-            let payload_len =
-                u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            let payload_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(data[pos + 12..pos + 16].try_into().unwrap());
             let payload = &data[pos + 16..pos + 16 + payload_len];
             assert_eq!(crc32(payload), crc, "record {rec:?}");
@@ -1933,8 +1967,8 @@ mod tests {
         }
         drop(db);
 
-        let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 3);
         assert_eq!(info.replayed_statements, 3);
         assert_eq!(info.truncated_bytes, 0);
@@ -1982,7 +2016,8 @@ mod tests {
         let p = tmp_ckpt("multistmt");
         let mut db = durable(&p);
         // Autocommit statements inside one `execute` string: one record each.
-        db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
         assert_eq!(records_of(&wal_path(&p)).len(), 2);
         // BEGIN..COMMIT inside one string: the whole transaction is one record.
         db.execute("BEGIN; INSERT INTO t VALUES (2); INSERT INTO t VALUES (3); COMMIT;")
@@ -1999,7 +2034,10 @@ mod tests {
         drop(db);
 
         let mut back = durable(&p);
-        assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 3]);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 3]
+        );
         cleanup(&p);
     }
 
@@ -2008,28 +2046,34 @@ mod tests {
         let p = tmp_ckpt("dmlreplay");
         {
             let mut db = durable(&p);
-            db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
-            db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');").unwrap();
+            db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, 'z');")
+                .unwrap();
             db.execute("BEGIN;").unwrap();
             db.execute("UPDATE t SET a = a * 10;").unwrap();
             db.execute("DELETE FROM t WHERE a = 20;").unwrap();
             db.execute("COMMIT;").unwrap();
             // Catalog churn replays too: create + drop cancel out.
-            db.execute("CREATE TABLE u (a INTEGER); DROP TABLE u;").unwrap();
+            db.execute("CREATE TABLE u (a INTEGER); DROP TABLE u;")
+                .unwrap();
         }
         // No checkpoint: the entire state comes from replaying the WAL.
-        let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 5);
         assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![10, 30]);
         assert!(back.execute("SELECT * FROM u;").is_err(), "u was dropped");
         // Checkpointing the replayed state round-trips exactly, no replay.
         back.checkpoint().unwrap();
         drop(back);
-        let (mut again, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut again, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 0);
-        assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![10, 30]);
+        assert_eq!(
+            ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+            vec![10, 30]
+        );
         cleanup(&p);
     }
 
@@ -2067,8 +2111,8 @@ mod tests {
         data[len5 - 1] ^= 0xFF; // inside the last statement text
         std::fs::write(wal_path(&p), &data).unwrap();
 
-        let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 2, "stops at the last good record");
         assert_eq!(info.truncated_bytes, (len5 as u64) - after_two);
         assert_eq!(wal_len(&p), after_two, "file truncated to last good offset");
@@ -2077,10 +2121,7 @@ mod tests {
         back.execute("INSERT INTO t VALUES (3);").unwrap();
         drop(back);
         let mut again = durable(&p);
-        assert_eq!(
-            ints(&mut again, "SELECT a FROM t ORDER BY a;"),
-            vec![1, 3]
-        );
+        assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![1, 3]);
         cleanup(&p);
 
         // Truncated (short) record: same recovery.
@@ -2093,8 +2134,8 @@ mod tests {
         drop(db);
         let data = std::fs::read(wal_path(&p)).unwrap();
         std::fs::write(wal_path(&p), &data[..data.len() - 5]).unwrap();
-        let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 2);
         assert_eq!(wal_len(&p), after_two);
         assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1]);
@@ -2115,8 +2156,8 @@ mod tests {
                 (4, vec!["INSERT INTO t VALUES (2);".to_string()]),
             ],
         );
-        let (mut db, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut db, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 1);
         assert!(info.truncated_bytes > 0);
         assert_eq!(records_of(&wal_path(&p)).len(), 1);
@@ -2214,8 +2255,7 @@ mod tests {
         let mut bytes = Wal::header_for(7).to_vec();
         bytes.extend_from_slice(b"garbage-bytes-here");
         std::fs::write(wal_path(&p), &bytes).unwrap();
-        let (db, info) =
-            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let (db, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.truncated_bytes, 18);
         assert_eq!(wal_len(&p), HEADER_LEN as u64);
         drop(db);
@@ -2241,7 +2281,10 @@ mod tests {
         let legacy = PathBuf::from(format!("{}.roll", wal_path(&p).display()));
         std::fs::write(&legacy, b"not a gen-named roll").unwrap();
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
-        assert!(err.to_string().contains("pre-generation roll name"), "{err}");
+        assert!(
+            err.to_string().contains("pre-generation roll name"),
+            "{err}"
+        );
         cleanup(&p);
     }
 
@@ -2280,13 +2323,17 @@ mod tests {
 
         db.checkpoint().unwrap();
         assert!(p.exists(), "checkpoint file written");
-        assert_eq!(wal_len(&p), HEADER_LEN as u64, "WAL rolled to a fresh header");
+        assert_eq!(
+            wal_len(&p),
+            HEADER_LEN as u64,
+            "WAL rolled to a fresh header"
+        );
         assert!(records_of(&wal_path(&p)).is_empty());
         assert!(!tmp_path(&p).exists() && !roll_path(&wal_path(&p), 1).exists());
         drop(db);
 
-        let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 0, "checkpoint needs no replay");
         assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
         // Post-checkpoint commits land in the fresh WAL generation.
@@ -2317,19 +2364,25 @@ mod tests {
             std::fs::rename(wal_path(&p), roll_path(&wal_path(&p), 1)).unwrap();
             Wal::create_file(&wal_path(&p), 2, None).unwrap();
         }
-        let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.checkpoints_completed, 1, "recovery must publish .tmp");
-        assert_eq!(info.replayed_records, 0, "the roll is folded by the publish");
+        assert_eq!(
+            info.replayed_records, 0,
+            "the roll is folded by the publish"
+        );
         assert_eq!(info.stale_rolls_removed, 1);
-        assert!(p.exists(), "the recovered checkpoint must be a durable .pink");
+        assert!(
+            p.exists(),
+            "the recovered checkpoint must be a durable .pink"
+        );
         assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
         drop(back);
 
         // The second clean open (no crash in between) must not lose the rows
         // that the old recovery kept only in memory.
-        let (mut again, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut again, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 0);
         assert_eq!(info.checkpoints_completed, 0);
         assert_eq!(ints(&mut again, "SELECT a FROM t;"), vec![1]);
@@ -2354,8 +2407,8 @@ mod tests {
             std::fs::rename(wal_path(&p), roll_path(&wal_path(&p), 1)).unwrap();
             Wal::create_file(&wal_path(&p), 2, None).unwrap();
         }
-        let (mut back, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 0, "stale roll must not be replayed");
         assert_eq!(info.checkpoints_completed, 0);
         assert_eq!(info.stale_rolls_removed, 1);
@@ -2386,8 +2439,8 @@ mod tests {
         // ... and recovery crashing right after its publish, before the roll
         // unlink (i.e. the exact intermediate state of the fix).
         std::fs::rename(tmp_path(&p), &p).unwrap();
-        let (mut db, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut db, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.checkpoints_completed, 0);
         assert_eq!(info.stale_rolls_removed, 1);
         assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
@@ -2405,8 +2458,8 @@ mod tests {
             std::fs::rename(wal_path(&p2), roll_path(&wal_path(&p2), 1)).unwrap();
             Wal::create_file(&wal_path(&p2), 2, None).unwrap();
         }
-        let (mut db, info) = PinkDb::open_durable_with(p2.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
+        let (mut db, info) =
+            PinkDb::open_durable_with(p2.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 0);
         assert_eq!(info.stale_rolls_removed, 1);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1]);
@@ -2440,17 +2493,23 @@ mod tests {
         // while the live WAL still has records).
         write_pink(&tmp_path(&p), &[0, 1, 2]);
 
-        let (mut db, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
-        assert_eq!(info.checkpoints_completed, 0, ".tmp is not provably complete");
+        let (mut db, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(
+            info.checkpoints_completed, 0,
+            ".tmp is not provably complete"
+        );
         assert_eq!(info.replayed_records, 1, "only the live WAL record");
         assert_eq!(info.stale_rolls_removed, 1);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
         drop(db);
         // Idempotent: no re-application, no duplicate.
-        let (mut again, _) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
-            .unwrap();
-        assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
+        let (mut again, _) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(
+            ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+            vec![0, 1, 2]
+        );
         cleanup(&p);
     }
 
@@ -2482,33 +2541,249 @@ mod tests {
         use Expect::{Error, Rows};
 
         let cases = vec![
-            Image { name: "empty", pink: None, tmp: None, rolls: vec![], wal: None, torn_wal: false, expect: Rows(vec![]) },
-            Image { name: "pink_only", pink: Some(vec![0]), tmp: None, rolls: vec![], wal: None, torn_wal: false, expect: Rows(vec![0]) },
-            Image { name: "wal_only", pink: None, tmp: None, rolls: vec![], wal: Some((1, vec![cr.clone(), i0.clone()])), torn_wal: false, expect: Rows(vec![0]) },
-            Image { name: "pink_wal", pink: Some(vec![0]), tmp: None, rolls: vec![], wal: Some((1, vec![i1.clone()])), torn_wal: false, expect: Rows(vec![0, 1]) },
-            Image { name: "tmp_only", pink: None, tmp: Some(vec![0]), rolls: vec![], wal: None, torn_wal: false, expect: Rows(vec![]) },
-            Image { name: "tmp_pink", pink: Some(vec![0]), tmp: Some(vec![0]), rolls: vec![], wal: None, torn_wal: false, expect: Rows(vec![0]) },
-            Image { name: "tmp_wal_records", pink: None, tmp: Some(vec![0, 1]), rolls: vec![], wal: Some((1, vec![cr.clone(), i0.clone(), i1.clone()])), torn_wal: false, expect: Rows(vec![0, 1]) },
-            Image { name: "tmp_pink_wal_records", pink: Some(vec![0]), tmp: Some(vec![0, 1]), rolls: vec![], wal: Some((1, vec![i1.clone()])), torn_wal: false, expect: Rows(vec![0, 1]) },
-            Image { name: "roll_without_checkpoint", pink: None, tmp: None, rolls: vec![(1, vec![cr.clone(), i0.clone()])], wal: Some((2, vec![])), torn_wal: false, expect: Error("checkpoint is missing") },
-            Image { name: "roll_no_live_no_pink", pink: None, tmp: None, rolls: vec![(1, vec![cr.clone(), i0.clone()])], wal: None, torn_wal: false, expect: Error("checkpoint is missing") },
-            Image { name: "roll_pink_no_live", pink: Some(vec![0]), tmp: None, rolls: vec![(1, vec![cr.clone(), i0.clone()])], wal: None, torn_wal: false, expect: Rows(vec![0]) },
-            Image { name: "roll_pink_live_empty", pink: Some(vec![0]), tmp: None, rolls: vec![(1, vec![cr.clone(), i0.clone()])], wal: Some((2, vec![])), torn_wal: false, expect: Rows(vec![0]) },
-            Image { name: "roll_stale_live_records", pink: Some(vec![0, 1]), tmp: None, rolls: vec![(1, vec![i1.clone()])], wal: Some((2, vec![i2.clone()])), torn_wal: false, expect: Rows(vec![0, 1, 2]) },
-            Image { name: "roll_not_older", pink: Some(vec![0]), tmp: None, rolls: vec![(2, vec![i1.clone()])], wal: Some((2, vec![])), torn_wal: false, expect: Error("does not precede") },
-            Image { name: "tmp_roll_no_pink", pink: None, tmp: Some(vec![0, 1]), rolls: vec![(1, vec![cr.clone(), i0.clone(), i1.clone()])], wal: None, torn_wal: false, expect: Rows(vec![0, 1]) },
-            Image { name: "tmp_roll_live_no_pink", pink: None, tmp: Some(vec![0, 1]), rolls: vec![(1, vec![cr.clone(), i0.clone(), i1.clone()])], wal: Some((2, vec![])), torn_wal: false, expect: Rows(vec![0, 1]) },
-            Image { name: "tmp_roll_pink", pink: Some(vec![0]), tmp: Some(vec![0, 1]), rolls: vec![(1, vec![i1.clone()])], wal: Some((2, vec![])), torn_wal: false, expect: Rows(vec![0, 1]) },
-            Image { name: "tmp_roll_pink_no_live", pink: Some(vec![0]), tmp: Some(vec![0, 1]), rolls: vec![(1, vec![i1.clone()])], wal: None, torn_wal: false, expect: Rows(vec![0, 1]) },
-            Image { name: "tmp_stale_roll_live_records", pink: Some(vec![0, 1]), tmp: Some(vec![0, 1, 2]), rolls: vec![(1, vec![i1.clone()])], wal: Some((2, vec![i2.clone()])), torn_wal: false, expect: Rows(vec![0, 1, 2]) },
-            Image { name: "tmp_roll_torn_live", pink: None, tmp: Some(vec![0, 1]), rolls: vec![(1, vec![cr.clone(), i0.clone(), i1.clone()])], wal: None, torn_wal: true, expect: Rows(vec![0, 1]) },
-            Image { name: "tmp_torn_live_no_roll", pink: None, tmp: Some(vec![0]), rolls: vec![], wal: None, torn_wal: true, expect: Rows(vec![]) },
-            Image { name: "torn_live", pink: None, tmp: None, rolls: vec![], wal: None, torn_wal: true, expect: Rows(vec![]) },
-            Image { name: "torn_live_roll_pink", pink: Some(vec![0]), tmp: None, rolls: vec![(1, vec![cr.clone(), i0.clone()])], wal: None, torn_wal: true, expect: Rows(vec![0]) },
-            Image { name: "tmp_pink_torn_live", pink: Some(vec![0]), tmp: Some(vec![0]), rolls: vec![], wal: None, torn_wal: true, expect: Rows(vec![0]) },
-            Image { name: "tmp_roll_stale_high_live", pink: Some(vec![0, 1]), tmp: Some(vec![0, 1, 2]), rolls: vec![(1, vec![i1.clone()])], wal: Some((3, vec![i2.clone()])), torn_wal: false, expect: Rows(vec![0, 1, 2]) },
-            Image { name: "tmp_roll_not_older", pink: Some(vec![0]), tmp: Some(vec![0, 1]), rolls: vec![(2, vec![i1.clone()])], wal: Some((2, vec![])), torn_wal: false, expect: Error("does not precede") },
-            Image { name: "roll_generation_equal_live", pink: Some(vec![0, 1]), tmp: None, rolls: vec![(1, vec![i1.clone()])], wal: Some((1, vec![i2.clone()])), torn_wal: false, expect: Error("does not precede") },
+            Image {
+                name: "empty",
+                pink: None,
+                tmp: None,
+                rolls: vec![],
+                wal: None,
+                torn_wal: false,
+                expect: Rows(vec![]),
+            },
+            Image {
+                name: "pink_only",
+                pink: Some(vec![0]),
+                tmp: None,
+                rolls: vec![],
+                wal: None,
+                torn_wal: false,
+                expect: Rows(vec![0]),
+            },
+            Image {
+                name: "wal_only",
+                pink: None,
+                tmp: None,
+                rolls: vec![],
+                wal: Some((1, vec![cr.clone(), i0.clone()])),
+                torn_wal: false,
+                expect: Rows(vec![0]),
+            },
+            Image {
+                name: "pink_wal",
+                pink: Some(vec![0]),
+                tmp: None,
+                rolls: vec![],
+                wal: Some((1, vec![i1.clone()])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "tmp_only",
+                pink: None,
+                tmp: Some(vec![0]),
+                rolls: vec![],
+                wal: None,
+                torn_wal: false,
+                expect: Rows(vec![]),
+            },
+            Image {
+                name: "tmp_pink",
+                pink: Some(vec![0]),
+                tmp: Some(vec![0]),
+                rolls: vec![],
+                wal: None,
+                torn_wal: false,
+                expect: Rows(vec![0]),
+            },
+            Image {
+                name: "tmp_wal_records",
+                pink: None,
+                tmp: Some(vec![0, 1]),
+                rolls: vec![],
+                wal: Some((1, vec![cr.clone(), i0.clone(), i1.clone()])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "tmp_pink_wal_records",
+                pink: Some(vec![0]),
+                tmp: Some(vec![0, 1]),
+                rolls: vec![],
+                wal: Some((1, vec![i1.clone()])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "roll_without_checkpoint",
+                pink: None,
+                tmp: None,
+                rolls: vec![(1, vec![cr.clone(), i0.clone()])],
+                wal: Some((2, vec![])),
+                torn_wal: false,
+                expect: Error("checkpoint is missing"),
+            },
+            Image {
+                name: "roll_no_live_no_pink",
+                pink: None,
+                tmp: None,
+                rolls: vec![(1, vec![cr.clone(), i0.clone()])],
+                wal: None,
+                torn_wal: false,
+                expect: Error("checkpoint is missing"),
+            },
+            Image {
+                name: "roll_pink_no_live",
+                pink: Some(vec![0]),
+                tmp: None,
+                rolls: vec![(1, vec![cr.clone(), i0.clone()])],
+                wal: None,
+                torn_wal: false,
+                expect: Rows(vec![0]),
+            },
+            Image {
+                name: "roll_pink_live_empty",
+                pink: Some(vec![0]),
+                tmp: None,
+                rolls: vec![(1, vec![cr.clone(), i0.clone()])],
+                wal: Some((2, vec![])),
+                torn_wal: false,
+                expect: Rows(vec![0]),
+            },
+            Image {
+                name: "roll_stale_live_records",
+                pink: Some(vec![0, 1]),
+                tmp: None,
+                rolls: vec![(1, vec![i1.clone()])],
+                wal: Some((2, vec![i2.clone()])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1, 2]),
+            },
+            Image {
+                name: "roll_not_older",
+                pink: Some(vec![0]),
+                tmp: None,
+                rolls: vec![(2, vec![i1.clone()])],
+                wal: Some((2, vec![])),
+                torn_wal: false,
+                expect: Error("does not precede"),
+            },
+            Image {
+                name: "tmp_roll_no_pink",
+                pink: None,
+                tmp: Some(vec![0, 1]),
+                rolls: vec![(1, vec![cr.clone(), i0.clone(), i1.clone()])],
+                wal: None,
+                torn_wal: false,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "tmp_roll_live_no_pink",
+                pink: None,
+                tmp: Some(vec![0, 1]),
+                rolls: vec![(1, vec![cr.clone(), i0.clone(), i1.clone()])],
+                wal: Some((2, vec![])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "tmp_roll_pink",
+                pink: Some(vec![0]),
+                tmp: Some(vec![0, 1]),
+                rolls: vec![(1, vec![i1.clone()])],
+                wal: Some((2, vec![])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "tmp_roll_pink_no_live",
+                pink: Some(vec![0]),
+                tmp: Some(vec![0, 1]),
+                rolls: vec![(1, vec![i1.clone()])],
+                wal: None,
+                torn_wal: false,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "tmp_stale_roll_live_records",
+                pink: Some(vec![0, 1]),
+                tmp: Some(vec![0, 1, 2]),
+                rolls: vec![(1, vec![i1.clone()])],
+                wal: Some((2, vec![i2.clone()])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1, 2]),
+            },
+            Image {
+                name: "tmp_roll_torn_live",
+                pink: None,
+                tmp: Some(vec![0, 1]),
+                rolls: vec![(1, vec![cr.clone(), i0.clone(), i1.clone()])],
+                wal: None,
+                torn_wal: true,
+                expect: Rows(vec![0, 1]),
+            },
+            Image {
+                name: "tmp_torn_live_no_roll",
+                pink: None,
+                tmp: Some(vec![0]),
+                rolls: vec![],
+                wal: None,
+                torn_wal: true,
+                expect: Rows(vec![]),
+            },
+            Image {
+                name: "torn_live",
+                pink: None,
+                tmp: None,
+                rolls: vec![],
+                wal: None,
+                torn_wal: true,
+                expect: Rows(vec![]),
+            },
+            Image {
+                name: "torn_live_roll_pink",
+                pink: Some(vec![0]),
+                tmp: None,
+                rolls: vec![(1, vec![cr.clone(), i0.clone()])],
+                wal: None,
+                torn_wal: true,
+                expect: Rows(vec![0]),
+            },
+            Image {
+                name: "tmp_pink_torn_live",
+                pink: Some(vec![0]),
+                tmp: Some(vec![0]),
+                rolls: vec![],
+                wal: None,
+                torn_wal: true,
+                expect: Rows(vec![0]),
+            },
+            Image {
+                name: "tmp_roll_stale_high_live",
+                pink: Some(vec![0, 1]),
+                tmp: Some(vec![0, 1, 2]),
+                rolls: vec![(1, vec![i1.clone()])],
+                wal: Some((3, vec![i2.clone()])),
+                torn_wal: false,
+                expect: Rows(vec![0, 1, 2]),
+            },
+            Image {
+                name: "tmp_roll_not_older",
+                pink: Some(vec![0]),
+                tmp: Some(vec![0, 1]),
+                rolls: vec![(2, vec![i1.clone()])],
+                wal: Some((2, vec![])),
+                torn_wal: false,
+                expect: Error("does not precede"),
+            },
+            Image {
+                name: "roll_generation_equal_live",
+                pink: Some(vec![0, 1]),
+                tmp: None,
+                rolls: vec![(1, vec![i1.clone()])],
+                wal: Some((1, vec![i2.clone()])),
+                torn_wal: false,
+                expect: Error("does not precede"),
+            },
         ];
 
         for img in &cases {
@@ -2532,15 +2807,16 @@ mod tests {
             match &img.expect {
                 Expect::Rows(want) => {
                     // Open #1: recovery.
-                    let (mut db, _) = PinkDb::open_durable_with(
-                        p.to_str().unwrap(),
-                        SyncPolicy::Sync,
-                    )
-                    .unwrap_or_else(|e| panic!("{}: first open failed: {e}", img.name));
+                    let (mut db, _) =
+                        PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
+                            .unwrap_or_else(|e| panic!("{}: first open failed: {e}", img.name));
                     assert_eq!(matrix_rows(&mut db), *want, "{}: first open", img.name);
-                    let live_has = img.wal.as_ref().map(|(_, r)| !r.is_empty()).unwrap_or(false);
-                    let published =
-                        img.tmp.is_some() && !live_has && !img.rolls.is_empty();
+                    let live_has = img
+                        .wal
+                        .as_ref()
+                        .map(|(_, r)| !r.is_empty())
+                        .unwrap_or(false);
+                    let published = img.tmp.is_some() && !live_has && !img.rolls.is_empty();
                     assert_eq!(
                         p.exists(),
                         img.pink.is_some() || published,
@@ -2551,11 +2827,11 @@ mod tests {
 
                     // Open #2 and #3: idempotent, same rows.
                     for open in 2..=3 {
-                        let (mut again, info) = PinkDb::open_durable_with(
-                            p.to_str().unwrap(),
-                            SyncPolicy::Sync,
-                        )
-                        .unwrap_or_else(|e| panic!("{}: open #{open} failed: {e}", img.name));
+                        let (mut again, info) =
+                            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync)
+                                .unwrap_or_else(|e| {
+                                    panic!("{}: open #{open} failed: {e}", img.name)
+                                });
                         assert_eq!(
                             matrix_rows(&mut again),
                             *want,
@@ -2625,7 +2901,10 @@ mod tests {
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         db.execute("BEGIN;").unwrap();
         db.execute("INSERT INTO t VALUES (1);").unwrap();
-        assert!(db.checkpoint().is_err(), "open transaction refuses checkpoint");
+        assert!(
+            db.checkpoint().is_err(),
+            "open transaction refuses checkpoint"
+        );
         db.execute("COMMIT;").unwrap();
         db.checkpoint().unwrap();
         assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
@@ -2639,8 +2918,7 @@ mod tests {
     #[test]
     fn dropped_session_database_does_not_brick_replay() {
         let p = tmp_ckpt("dropsession");
-        let (db, _) =
-            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let (db, _) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         let db = crate::Database::from_store(db);
         let mut a = db.connect();
         a.execute("CREATE DATABASE db1;").unwrap();
@@ -2692,8 +2970,10 @@ mod tests {
         db.execute("INSERT INTO main.t VALUES (1);").unwrap();
         let recs = records_of(&wal_path(&p));
         assert!(
-            recs.iter()
-                .all(|r| !r.stmts.iter().any(|s| s.to_ascii_uppercase().contains("USE"))),
+            recs.iter().all(|r| !r
+                .stmts
+                .iter()
+                .any(|s| s.to_ascii_uppercase().contains("USE"))),
             "record for a vanished session must not carry a USE prefix: {recs:?}"
         );
         drop(db);
@@ -2709,8 +2989,7 @@ mod tests {
     #[test]
     fn dropped_database_before_commit_conflicts() {
         let p = tmp_ckpt("droptxn");
-        let (db, _) =
-            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let (db, _) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         let db = crate::Database::from_store(db);
         let mut a = db.connect();
         a.execute("CREATE DATABASE db1;").unwrap();
@@ -2744,8 +3023,7 @@ mod tests {
     #[test]
     fn dropped_use_target_before_commit_conflicts() {
         let p = tmp_ckpt("dropuse");
-        let (db, _) =
-            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let (db, _) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         let db = crate::Database::from_store(db);
         let mut a = db.connect();
         a.execute("CREATE DATABASE db1;").unwrap();
@@ -2790,7 +3068,10 @@ mod tests {
         assert_eq!(back.list_databases(), vec!["db1".to_string()]);
         assert_eq!(back.current_db(), "db1");
         assert_eq!(info.replayed_records, 1, "only the post-checkpoint insert");
-        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 2]);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"),
+            vec![1, 2]
+        );
         // Appends after the reopen keep replaying in the no-main store.
         back.execute("INSERT INTO db1.t VALUES (3);").unwrap();
         drop(back);
@@ -2805,8 +3086,7 @@ mod tests {
     #[test]
     fn two_connections_commit_in_order_and_both_survive_reopen() {
         let p = tmp_ckpt("multi");
-        let (db, _) =
-            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let (db, _) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         let db = crate::Database::from_store(db);
         db.connect().execute("CREATE TABLE t (a INTEGER);").unwrap();
         let mut a = db.connect();
@@ -2817,8 +3097,14 @@ mod tests {
         b.execute("BEGIN;").unwrap();
         b.execute("INSERT INTO t VALUES (2);").unwrap();
         a.execute("INSERT INTO t VALUES (1);").unwrap();
-        assert_eq!(ints_conn(&mut db.connect(), "SELECT COUNT(*) FROM t;"), vec![1]);
-        assert!(b.execute("COMMIT;").is_err(), "stale transaction must conflict");
+        assert_eq!(
+            ints_conn(&mut db.connect(), "SELECT COUNT(*) FROM t;"),
+            vec![1]
+        );
+        assert!(
+            b.execute("COMMIT;").is_err(),
+            "stale transaction must conflict"
+        );
         // Retry against the new state; this commit takes.
         b.execute("BEGIN;").unwrap();
         b.execute("INSERT INTO t VALUES (2);").unwrap();
@@ -2830,18 +3116,14 @@ mod tests {
         // Both connections' committed rows survive reopen: a's autocommit
         // record and b's retried transaction record are replayed in order.
         let mut back = durable(&p);
-        assert_eq!(
-            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
-            vec![1, 2]
-        );
+        assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
         cleanup(&p);
     }
 
     #[test]
     fn write_conflict_abort_is_not_logged() {
         let p = tmp_ckpt("conflict");
-        let (db, _) =
-            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        let (db, _) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         let db = crate::Database::from_store(db);
         db.connect().execute("CREATE TABLE t (a INTEGER);").unwrap();
         // Winner commits first; the loser aborts on the version check.
@@ -2963,7 +3245,8 @@ mod tests {
         mem.execute("CREATE TABLE t (a INTEGER);").unwrap();
         mem.execute("INSERT INTO t VALUES (1);").unwrap();
         mem.execute("CREATE VIEW v AS SELECT a FROM t;").unwrap();
-        mem.execute("UPDATE t SET a = 2 WHERE a IN (SELECT a FROM v);").unwrap();
+        mem.execute("UPDATE t SET a = 2 WHERE a IN (SELECT a FROM v);")
+            .unwrap();
         assert_eq!(ints(&mut mem, "SELECT a FROM t;"), vec![2]);
         cleanup(&p);
     }
@@ -2999,19 +3282,29 @@ mod tests {
         // The USE statements are in the WAL text (replay relies on them).
         let records = records_of(&wal_path(&p));
         assert!(
-            records.iter().any(|r| r.stmts.iter().any(|s| s.starts_with("USE "))),
+            records
+                .iter()
+                .any(|r| r.stmts.iter().any(|s| s.starts_with("USE "))),
             "USE must be logged: {records:?}"
         );
         assert!(
-            records.iter().any(|r| r.stmts.iter().any(|s| s.contains("CREATE DATABASE"))),
+            records
+                .iter()
+                .any(|r| r.stmts.iter().any(|s| s.contains("CREATE DATABASE"))),
             "CREATE DATABASE must be logged"
         );
 
         let (mut back, info) =
             PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
         assert!(info.replayed_records > 0);
-        assert_eq!(ints(&mut back, "SELECT a FROM main.t ORDER BY a;"), vec![10, 20]);
-        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 2, 3, 4]);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM main.t ORDER BY a;"),
+            vec![10, 20]
+        );
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"),
+            vec![1, 2, 3, 4]
+        );
         assert!(!back.database_exists("db2"), "db2 was dropped");
         assert_eq!(back.current_db(), "main");
         // Appends after recovery continue in the recovered session.
@@ -3032,7 +3325,8 @@ mod tests {
     /// generation starts at the checkpoint's session default (the session is
     /// not persisted), so appends after a checkpoint must `USE`-prefix again.
     #[test]
-    fn checkpoint_resets_the_replay_session_to_the_checkpoint_default() {        let p = tmp_ckpt("ckptsession");
+    fn checkpoint_resets_the_replay_session_to_the_checkpoint_default() {
+        let p = tmp_ckpt("ckptsession");
         let mut db = durable(&p);
         db.execute("CREATE DATABASE db1; CREATE TABLE db1.t (a INTEGER);")
             .unwrap();
@@ -3044,7 +3338,10 @@ mod tests {
         db.execute("INSERT INTO t VALUES (2);").unwrap();
         drop(db);
         let mut back = durable(&p);
-        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 2]);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"),
+            vec![1, 2]
+        );
         // Replay ends where the log left the session: the post-checkpoint
         // insert was `USE`-prefixed, so the reopened session is db1.
         assert_eq!(back.current_db(), "db1");
@@ -3075,7 +3372,8 @@ mod tests {
     /// record is self-contained (a `USE` prefix is emitted when the replay
     /// session differs), so replay reproduces both databases exactly.
     #[test]
-    fn multi_connection_sessions_replay_each_record_in_its_database() {        let p = tmp_ckpt("multidb");
+    fn multi_connection_sessions_replay_each_record_in_its_database() {
+        let p = tmp_ckpt("multidb");
         {
             let shared = crate::Database::open(p.to_str().unwrap()).unwrap();
             let mut a = shared.connect();
@@ -3095,13 +3393,20 @@ mod tests {
         }
         let (mut back, _) =
             PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
-        assert_eq!(ints(&mut back, "SELECT a FROM main.t ORDER BY a;"), vec![2, 5]);
-        assert_eq!(ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"), vec![1, 3, 4]);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM main.t ORDER BY a;"),
+            vec![2, 5]
+        );
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM db1.t ORDER BY a;"),
+            vec![1, 3, 4]
+        );
         assert_eq!(back.current_db(), "main");
     }
 
     #[test]
-    fn save_snapshot_refuses_a_target_with_a_live_wal() {        let a = tmp_ckpt("snapa");
+    fn save_snapshot_refuses_a_target_with_a_live_wal() {
+        let a = tmp_ckpt("snapa");
         let b = tmp_ckpt("snapb");
         // B has committed rows that only exist in its WAL.
         {
@@ -3225,8 +3530,14 @@ mod tests {
         let err = next_gen_after_rolls(std::slice::from_ref(&roll)).unwrap_err();
         assert!(err.to_string().contains("highest representable"), "{err}");
         assert_eq!(next_gen_after_rolls(&[]).unwrap(), 1);
-        let roll = Roll { gen: 7, path: PathBuf::from("x") };
-        assert_eq!(next_gen_after_rolls(std::slice::from_ref(&roll)).unwrap(), 8);
+        let roll = Roll {
+            gen: 7,
+            path: PathBuf::from("x"),
+        };
+        assert_eq!(
+            next_gen_after_rolls(std::slice::from_ref(&roll)).unwrap(),
+            8
+        );
         cleanup(&p);
     }
 
@@ -3267,8 +3578,10 @@ mod tests {
         fn records_are_encrypted_and_replay_exactly_once() {
             let p = tmp_ckpt("encrecords");
             let mut db = durable_keyed(&p);
-            db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);").unwrap();
-            db.execute("INSERT INTO t VALUES (1, 'marker-plaintext');").unwrap();
+            db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);")
+                .unwrap();
+            db.execute("INSERT INTO t VALUES (1, 'marker-plaintext');")
+                .unwrap();
             let wal = std::fs::read(wal_path(&p)).unwrap();
             assert!(wal.starts_with(crypto::ENC_MAGIC));
             assert!(!wal.windows(8).any(|w| w == b"marker-p"));
@@ -3356,7 +3669,9 @@ mod tests {
             .unwrap();
             assert_eq!(info.replayed_records, 0);
             assert_eq!(ints(&mut again, "SELECT a FROM t;"), vec![1]);
-            assert!(std::fs::read(wal_path(&p)).unwrap().starts_with(crypto::ENC_MAGIC));
+            assert!(std::fs::read(wal_path(&p))
+                .unwrap()
+                .starts_with(crypto::ENC_MAGIC));
             assert!(!tmp_path(&p).exists());
             assert!(scan_rolls(&wal_path(&p)).unwrap().is_empty());
             drop(again);

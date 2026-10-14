@@ -171,11 +171,14 @@ fn bit_exact_roundtrip_multi_database() {
     let mut db = PinkDb::new();
     seed_all_types(&mut db);
     db.execute("CREATE DATABASE analytics;").unwrap();
-    db.execute("CREATE TABLE analytics.u (k BIGINT, s VARCHAR);").unwrap();
-    db.execute("INSERT INTO analytics.u VALUES (7, 'x'), (8, NULL);").unwrap();
+    db.execute("CREATE TABLE analytics.u (k BIGINT, s VARCHAR);")
+        .unwrap();
+    db.execute("INSERT INTO analytics.u VALUES (7, 'x'), (8, NULL);")
+        .unwrap();
     db.execute("CREATE DATABASE empty;").unwrap();
     db.execute("CREATE TABLE empty.t2 (x DOUBLE);").unwrap();
-    db.execute("INSERT INTO empty.t2 VALUES (1.5), (-0.0);").unwrap();
+    db.execute("INSERT INTO empty.t2 VALUES (1.5), (-0.0);")
+        .unwrap();
 
     db.save_with_key(s.path(), &raw_key()).unwrap();
     let bytes = std::fs::read(s.ckpt()).unwrap();
@@ -183,8 +186,14 @@ fn bit_exact_roundtrip_multi_database() {
 
     let back = PinkDb::open_with_key(s.path(), &raw_key()).unwrap();
     assert_eq!(back.list_databases(), vec!["analytics", "empty", "main"]);
-    assert_eq!(ints(&mut back.clone(), "SELECT k FROM analytics.u ORDER BY k;"), vec![7, 8]);
-    let a = rows_of(&mut back.clone(), "SELECT b,i,g,d,v,dt,ts FROM main.t ORDER BY i;");
+    assert_eq!(
+        ints(&mut back.clone(), "SELECT k FROM analytics.u ORDER BY k;"),
+        vec![7, 8]
+    );
+    let a = rows_of(
+        &mut back.clone(),
+        "SELECT b,i,g,d,v,dt,ts FROM main.t ORDER BY i;",
+    );
     let b = rows_of(&mut db, "SELECT b,i,g,d,v,dt,ts FROM main.t ORDER BY i;");
     for (ra, rb) in a.iter().zip(b.iter()) {
         for (va, vb) in ra.iter().zip(rb.iter()) {
@@ -214,7 +223,8 @@ fn bit_exact_roundtrip_multi_database() {
 fn multi_segment_roundtrip_over_one_mib() {
     let s = Scratch::new("segments");
     let mut db = PinkDb::new();
-    db.create_table("big", vec![("v".to_string(), DataType::Varchar)]).unwrap();
+    db.create_table("big", vec![("v".to_string(), DataType::Varchar)])
+        .unwrap();
     {
         let t = db.table_mut("big").unwrap();
         for i in 0..1500 {
@@ -225,7 +235,10 @@ fn multi_segment_roundtrip_over_one_mib() {
     db.save_with_key(s.path(), &raw_key()).unwrap();
     let sealed_len = std::fs::metadata(s.ckpt()).unwrap().len() as usize;
     // > 1 MiB of plaintext ensures more than one AEAD segment.
-    assert!(sealed_len > 1 << 20, "payload must span segments: {sealed_len}");
+    assert!(
+        sealed_len > 1 << 20,
+        "payload must span segments: {sealed_len}"
+    );
     let back = PinkDb::open_with_key(s.path(), &raw_key()).unwrap();
     assert_same_values(&all_values(&db, "big"), &all_values(&back, "big"));
     assert_eq!(back.table("big").unwrap().num_rows(), 1500);
@@ -280,7 +293,19 @@ fn tampered_bytes_and_truncation_are_hard_errors() {
     assert!(err.to_string().contains("wrong key"), "{err}");
 
     // Truncations at every scale error, never panic.
-    for cut in [0, 4, 8, 33, 34, 40, 79, 80, 81, full.len() / 2, full.len() - 1] {
+    for cut in [
+        0,
+        4,
+        8,
+        33,
+        34,
+        40,
+        79,
+        80,
+        81,
+        full.len() / 2,
+        full.len() - 1,
+    ] {
         std::fs::write(s.ckpt(), &full[..cut]).unwrap();
         assert!(
             PinkDb::open_with_key(s.path(), &raw_key()).is_err(),
@@ -299,7 +324,10 @@ fn feature_on_keeps_plaintext_backcompat() {
     seed_all_types(&mut db);
     db.save(s.path()).unwrap();
     let bytes = std::fs::read(s.ckpt()).unwrap();
-    assert!(bytes.starts_with(b"PINKDB03"), "plain save stays unencrypted v3");
+    assert!(
+        bytes.starts_with(b"PINKDB03"),
+        "plain save stays unencrypted v3"
+    );
     assert!(!bytes.starts_with(ENC_MAGIC));
     let back = PinkDb::open(s.path()).unwrap();
     assert_same_values(&all_values(&db, "t"), &all_values(&back, "t"));
@@ -335,7 +363,10 @@ fn v1_fixture_re_saves_encrypted() {
     db.save_with_key(s.path(), &raw_key()).unwrap();
     let back = PinkDb::open_with_key(s.path(), &raw_key()).unwrap();
     assert_eq!(back.list_databases(), vec!["main".to_string()]);
-    assert_eq!(back.list_tables(), vec!["empty".to_string(), "t".to_string()]);
+    assert_eq!(
+        back.list_tables(),
+        vec!["empty".to_string(), "t".to_string()]
+    );
     assert_same_values(&all_values(&db, "t"), &all_values(&back, "t"));
 }
 
@@ -373,7 +404,10 @@ fn empty_encrypted_wal_opens_and_replays() {
     assert_eq!(info.replayed_records, 0);
     assert!(s.wal().exists(), "durable open creates the WAL");
     let wal = std::fs::read(s.wal()).unwrap();
-    assert!(wal.starts_with(ENC_MAGIC), "WAL must be an encrypted container");
+    assert!(
+        wal.starts_with(ENC_MAGIC),
+        "WAL must be an encrypted container"
+    );
     assert_eq!(wal.len(), payload_start(&wal), "header-only WAL");
     db.execute("CREATE TABLE t (a INTEGER);").unwrap();
     db.execute("INSERT INTO t VALUES (1);").unwrap();
@@ -387,8 +421,8 @@ fn empty_encrypted_wal_opens_and_replays() {
     drop(back);
 
     // Wrong key and missing key are refused before replay.
-    let err = PinkDb::open_durable_with_key(s.path(), &EncryptionKey::from_raw([9u8; 32]))
-        .unwrap_err();
+    let err =
+        PinkDb::open_durable_with_key(s.path(), &EncryptionKey::from_raw([9u8; 32])).unwrap_err();
     assert!(err.to_string().contains("wrong key"), "{err}");
     let err = PinkDb::open_durable(s.path()).unwrap_err();
     assert!(err.to_string().contains("file is encrypted"), "{err}");
@@ -398,8 +432,7 @@ fn empty_encrypted_wal_opens_and_replays() {
 fn encrypted_wal_replays_and_truncates_a_torn_tail() {
     let s = Scratch::new("waltail");
     {
-        let mut db =
-            PinkDb::open_durable_with_key(s.path(), &raw_key()).unwrap();
+        let mut db = PinkDb::open_durable_with_key(s.path(), &raw_key()).unwrap();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1);").unwrap();
         db.execute("INSERT INTO t VALUES (2);").unwrap();
@@ -467,8 +500,10 @@ fn encrypted_checkpoint_roundtrips_and_leaks_no_plaintext() {
     let marker = "ultra-secret-marker-string";
     {
         let mut db = PinkDb::open_durable_with_key(s.path(), &raw_key()).unwrap();
-        db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);").unwrap();
-        db.execute(&format!("INSERT INTO t VALUES (1, '{marker}');")).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);")
+            .unwrap();
+        db.execute(&format!("INSERT INTO t VALUES (1, '{marker}');"))
+            .unwrap();
         db.checkpoint().unwrap();
         assert!(s.ckpt().exists());
         let pink = std::fs::read(s.ckpt()).unwrap();
@@ -481,7 +516,8 @@ fn encrypted_checkpoint_roundtrips_and_leaks_no_plaintext() {
         assert!(!wal.windows(marker.len()).any(|w| w == marker.as_bytes()));
         // The rolled WAL is a fresh encrypted generation.
         assert_eq!(wal.len(), payload_start(&wal));
-        db.execute(&format!("INSERT INTO t VALUES (2, '{marker}');")).unwrap();
+        db.execute(&format!("INSERT INTO t VALUES (2, '{marker}');"))
+            .unwrap();
     }
     let (mut back, info) =
         PinkDb::open_durable_with_key_and_policy(s.path(), SyncPolicy::Sync, &raw_key()).unwrap();
@@ -501,7 +537,11 @@ fn plaintext_artifacts_are_refused_in_keyed_opens() {
         db.execute("INSERT INTO t VALUES (1);").unwrap();
     }
     let err = PinkDb::open_durable_with_key(s.path(), &raw_key()).unwrap_err();
-    assert!(err.to_string().contains("not encrypted, but a key was supplied"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("not encrypted, but a key was supplied"),
+        "{err}"
+    );
 
     // The mirror: an encrypted checkpoint + an unrelated plaintext WAL.
     let s2 = Scratch::new("mode2");
@@ -531,7 +571,10 @@ fn keyed_database_reports_its_key_and_snapshots_encrypt() {
     let snap = s.dir.join("snap.pink");
     db.save_snapshot(snap.to_str().unwrap()).unwrap();
     let bytes = std::fs::read(&snap).unwrap();
-    assert!(bytes.starts_with(ENC_MAGIC), "snapshot of a keyed store encrypts");
+    assert!(
+        bytes.starts_with(ENC_MAGIC),
+        "snapshot of a keyed store encrypts"
+    );
     let back = PinkDb::open_with_key(snap.to_str().unwrap(), &raw_key()).unwrap();
     assert_eq!(ints(&mut back.clone(), "SELECT a FROM t;"), vec![1]);
 
@@ -741,10 +784,17 @@ fn normal_reopen_and_checkpoint_cycles_never_seal_two_records_under_one_nonce() 
 
     let mut again = PinkDb::open_durable_with_key(s.path(), &key).unwrap();
     scan(&mut seen);
-    assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 3, 4]);
+    assert_eq!(
+        ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+        vec![1, 2, 3, 4]
+    );
     // CREATE + INSERT 1 were the two records visible in the pre-checkpoint
     // snapshot; the checkpoint fork, both rebuilds, and the appends add more.
-    assert!(seen.len() >= 7, "snapshots covered several records: {}", seen.len());
+    assert!(
+        seen.len() >= 7,
+        "snapshots covered several records: {}",
+        seen.len()
+    );
 }
 
 /// Checkpoint segments are `(counter, index)`-bound AEAD units with a
@@ -755,11 +805,13 @@ fn normal_reopen_and_checkpoint_cycles_never_seal_two_records_under_one_nonce() 
 fn duplicated_skipped_or_boundary_truncated_checkpoint_segments_are_rejected() {
     let s = Scratch::new("segsegments");
     let mut db = PinkDb::new();
-    db.create_table("big", vec![("v".to_string(), DataType::Varchar)]).unwrap();
+    db.create_table("big", vec![("v".to_string(), DataType::Varchar)])
+        .unwrap();
     {
         let t = db.table_mut("big").unwrap();
         for i in 0..3000 {
-            t.append_row(vec![Value::Varchar(format!("{}-{:0>900}", i % 7, i))]).unwrap();
+            t.append_row(vec![Value::Varchar(format!("{}-{:0>900}", i % 7, i))])
+                .unwrap();
         }
     }
     db.save_with_key(s.path(), &raw_key()).unwrap();
@@ -772,10 +824,15 @@ fn duplicated_skipped_or_boundary_truncated_checkpoint_segments_are_rejected() {
         bounds.push(pos + 4 + n + 16);
     }
     let frames = bounds.len() - 1;
-    assert!(frames >= 4, "need >= 3 data segments + terminal, got {frames}");
+    assert!(
+        frames >= 4,
+        "need >= 3 data segments + terminal, got {frames}"
+    );
     let last_frame = frames - 1;
     let last_len = u32::from_le_bytes(
-        full[bounds[last_frame]..bounds[last_frame] + 4].try_into().unwrap(),
+        full[bounds[last_frame]..bounds[last_frame] + 4]
+            .try_into()
+            .unwrap(),
     );
     assert_eq!(last_len, 0, "the terminal frame is zero-length");
     // Sanity: the untouched container opens.
@@ -891,7 +948,10 @@ fn a_partial_rewrite_temp_never_corrupts_the_wal() {
     assert_eq!(info.replayed_records, 2, "the intact WAL is authoritative");
     assert_eq!(info.truncated_bytes, 0);
     assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
-    assert!(!temp.exists(), "the rebuild replaces the partial temp by rename");
+    assert!(
+        !temp.exists(),
+        "the rebuild replaces the partial temp by rename"
+    );
     db.execute("INSERT INTO t VALUES (2);").unwrap();
     drop(db);
     let mut back = PinkDb::open_durable_with_key(s.path(), &key).unwrap();
@@ -907,12 +967,17 @@ fn save_stays_explicitly_plaintext_for_a_keyed_store() {
     let s = Scratch::new("savepin");
     let key = raw_key();
     let mut db = PinkDb::open_durable_with_key(s.path(), &key).unwrap();
-    db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);").unwrap();
-    db.execute("INSERT INTO t VALUES (1, 'save-pin-marker');").unwrap();
+    db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'save-pin-marker');")
+        .unwrap();
     let out = s.dir.join("explicit-plaintext.pink");
     db.save(out.to_str().unwrap()).unwrap();
     let bytes = std::fs::read(&out).unwrap();
-    assert!(bytes.starts_with(b"PINKDB03"), "save() is the explicit plaintext API");
+    assert!(
+        bytes.starts_with(b"PINKDB03"),
+        "save() is the explicit plaintext API"
+    );
     assert!(!bytes.starts_with(ENC_MAGIC));
     let marker = b"save-pin-marker";
     assert!(bytes.windows(marker.len()).any(|w| w == marker));

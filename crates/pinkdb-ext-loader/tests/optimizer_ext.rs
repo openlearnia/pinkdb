@@ -33,7 +33,8 @@ fn enclosed_dynamic_calls_are_never_folded() {
     let library = common::extension("test_ext");
     let mut db = PinkDb::new();
     db.load_extension(&path).unwrap();
-    db.execute("CREATE TABLE t3 (a INTEGER); INSERT INTO t3 VALUES (1), (2), (3);").unwrap();
+    db.execute("CREATE TABLE t3 (a INTEGER); INSERT INTO t3 VALUES (1), (2), (3);")
+        .unwrap();
     db.execute("CREATE TABLE empty (a INTEGER);").unwrap();
 
     let ticks = |before: i64| common::symbol_i64(&library, "pinkdb_test_ticks") - before;
@@ -43,7 +44,10 @@ fn enclosed_dynamic_calls_are_never_folded() {
     let before = common::symbol_i64(&library, "pinkdb_test_ticks");
     let values = ints(&rows(&mut db, "SELECT ext_tick() + 0 FROM t3;"));
     assert_eq!(ticks(before), 3, "one call per row (not frozen)");
-    assert!(values.windows(2).all(|w| w[0] < w[1]), "fresh value per row: {values:?}");
+    assert!(
+        values.windows(2).all(|w| w[0] < w[1]),
+        "fresh value per row: {values:?}"
+    );
 
     // COALESCE arm (the enclosing node is column-free).
     let before = common::symbol_i64(&library, "pinkdb_test_ticks");
@@ -70,7 +74,10 @@ fn enclosed_dynamic_calls_are_never_folded() {
 
     // Empty input: no rows, no calls (folding used to call twice at bind).
     let before = common::symbol_i64(&library, "pinkdb_test_ticks");
-    assert_eq!(rows(&mut db, "SELECT ext_tick() + 0 FROM empty;"), Vec::<Vec<Value>>::new());
+    assert_eq!(
+        rows(&mut db, "SELECT ext_tick() + 0 FROM empty;"),
+        Vec::<Vec<Value>>::new()
+    );
     assert_eq!(ticks(before), 0, "empty input must not call the callback");
     let before = common::symbol_i64(&library, "pinkdb_test_ticks");
     assert_eq!(
@@ -87,13 +94,22 @@ fn enclosed_dynamic_calls_are_never_folded() {
     assert_eq!(ticks(before), 3, "one call per inserted row");
     let values = ints(&rows(&mut db, "SELECT a FROM ins ORDER BY a;"));
     assert_eq!(values.len(), 3);
-    assert!(values.windows(2).all(|w| w[0] < w[1]), "frozen values: {values:?}");
+    assert!(
+        values.windows(2).all(|w| w[0] < w[1]),
+        "frozen values: {values:?}"
+    );
 
     // An erroring constant call runs exactly ONCE (at execution). Before the
     // fix, the two optimizer passes each evaluated it at bind time.
     let before = common::symbol_i64(&library, "pinkdb_test_fail_calls");
-    let e = db.execute("SELECT ext_fail_on_negative(-3) + 0;").unwrap_err().to_string();
-    assert!(e.contains("ext_fail_on_negative() failed with code 7"), "{e}");
+    let e = db
+        .execute("SELECT ext_fail_on_negative(-3) + 0;")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("ext_fail_on_negative() failed with code 7"),
+        "{e}"
+    );
     let calls = common::symbol_i64(&library, "pinkdb_test_fail_calls") - before;
     assert_eq!(calls, 1, "the erroring call must run exactly once");
 }

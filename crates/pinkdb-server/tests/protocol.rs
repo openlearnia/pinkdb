@@ -32,11 +32,17 @@ fn frame(tag: u8, body: &[u8]) -> Vec<u8> {
 
 #[test]
 fn requests_round_trip() {
-    request_round_trip(Request::Hello { protocol_version: PROTOCOL_VERSION });
+    request_round_trip(Request::Hello {
+        protocol_version: PROTOCOL_VERSION,
+    });
     request_round_trip(Request::Ping);
     request_round_trip(Request::Execute { sql: String::new() });
-    request_round_trip(Request::Execute { sql: "SELECT 'a;b' -- ;".to_string() });
-    request_round_trip(Request::Execute { sql: "SELECT 'héllo ✓';".to_string() });
+    request_round_trip(Request::Execute {
+        sql: "SELECT 'a;b' -- ;".to_string(),
+    });
+    request_round_trip(Request::Execute {
+        sql: "SELECT 'héllo ✓';".to_string(),
+    });
 }
 
 #[test]
@@ -46,17 +52,26 @@ fn responses_round_trip() {
         protocol_version: PROTOCOL_VERSION,
     });
     response_round_trip(Response::Pong);
-    response_round_trip(Response::Error { message: "database \"x\" not found".to_string() });
-    response_round_trip(Response::ResultSet { names: vec![], types: vec![] });
+    response_round_trip(Response::Error {
+        message: "database \"x\" not found".to_string(),
+    });
+    response_round_trip(Response::ResultSet {
+        names: vec![],
+        types: vec![],
+    });
     response_round_trip(Response::Rows { rows: vec![] });
     response_round_trip(Response::BatchDone { statements: 0 });
     response_round_trip(Response::BatchDone { statements: 3 });
-    response_round_trip(Response::BatchDone { statements: u32::MAX });
+    response_round_trip(Response::BatchDone {
+        statements: u32::MAX,
+    });
 }
 
 #[test]
 fn result_set_round_trips_every_data_type() {
-    let names = ["b", "i", "bi", "d", "v", "dt", "ts"].map(String::from).to_vec();
+    let names = ["b", "i", "bi", "d", "v", "dt", "ts"]
+        .map(String::from)
+        .to_vec();
     let types = vec![
         DataType::Boolean,
         DataType::Integer,
@@ -146,12 +161,18 @@ fn float_bits_round_trip_exactly() {
     // NaN and -0.0 do not compare equal under `Value`'s PartialEq, so check
     // the raw bits.
     let nan = f64::from_bits(0x7ff8_0000_0000_0001);
-    let response = Response::Rows { rows: vec![vec![Value::Double(nan), Value::Double(-0.0)]] };
+    let response = Response::Rows {
+        rows: vec![vec![Value::Double(nan), Value::Double(-0.0)]],
+    };
     let bytes = encode_response(&response).unwrap();
     match decode_response(&bytes).unwrap() {
         Response::Rows { rows } => {
-            let Value::Double(x) = rows[0][0] else { panic!("expected Double") };
-            let Value::Double(y) = rows[0][1] else { panic!("expected Double") };
+            let Value::Double(x) = rows[0][0] else {
+                panic!("expected Double")
+            };
+            let Value::Double(y) = rows[0][1] else {
+                panic!("expected Double")
+            };
             assert_eq!(x.to_bits(), nan.to_bits());
             assert_eq!(y.to_bits(), (-0.0f64).to_bits());
         }
@@ -170,12 +191,29 @@ fn multi_result_stream_round_trips_in_order() {
             names: vec!["a".to_string()],
             types: vec![DataType::Integer],
         },
-        Response::Rows { rows: vec![vec![Value::Integer(1)], vec![Value::Integer(2)]] },
-        Response::Done { kind: DoneKind::Selected, count: 0, name: String::new() },
-        Response::Done { kind: DoneKind::Inserted, count: 2, name: String::new() },
-        Response::ResultSet { names: vec![], types: vec![] },
+        Response::Rows {
+            rows: vec![vec![Value::Integer(1)], vec![Value::Integer(2)]],
+        },
+        Response::Done {
+            kind: DoneKind::Selected,
+            count: 0,
+            name: String::new(),
+        },
+        Response::Done {
+            kind: DoneKind::Inserted,
+            count: 2,
+            name: String::new(),
+        },
+        Response::ResultSet {
+            names: vec![],
+            types: vec![],
+        },
         Response::Rows { rows: vec![] },
-        Response::Done { kind: DoneKind::Selected, count: 0, name: String::new() },
+        Response::Done {
+            kind: DoneKind::Selected,
+            count: 0,
+            name: String::new(),
+        },
         Response::BatchDone { statements: 3 },
     ];
     for response in &frames {
@@ -207,7 +245,11 @@ fn empty_result_set_round_trips() {
             names: vec!["a".to_string()],
             types: vec![DataType::Integer],
         },
-        Response::Done { kind: DoneKind::Selected, count: 0, name: String::new() },
+        Response::Done {
+            kind: DoneKind::Selected,
+            count: 0,
+            name: String::new(),
+        },
     ];
     for response in &frames {
         write_response(&mut stream, response).unwrap();
@@ -300,9 +342,16 @@ fn oversized_frames_are_rejected() {
 #[test]
 fn unknown_message_types_are_rejected() {
     let err = decode_request(&frame(200, &[])).unwrap_err();
-    assert!(err.to_string().contains("unknown request message type 200"), "{err}");
+    assert!(
+        err.to_string().contains("unknown request message type 200"),
+        "{err}"
+    );
     let err = decode_response(&frame(200, &[])).unwrap_err();
-    assert!(err.to_string().contains("unknown response message type 200"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("unknown response message type 200"),
+        "{err}"
+    );
     // A response tag is not a valid request, and vice versa.
     assert!(decode_request(&frame(msg_type::PONG, &[])).is_err());
     assert!(decode_response(&frame(msg_type::PING, &[])).is_err());
@@ -323,7 +372,10 @@ fn unknown_value_and_type_tags_are_rejected() {
     body.push(b'a');
     body.push(99);
     let err = decode_response(&frame(msg_type::RESULT_SET, &body)).unwrap_err();
-    assert!(err.to_string().contains("unknown data type tag 99"), "{err}");
+    assert!(
+        err.to_string().contains("unknown data type tag 99"),
+        "{err}"
+    );
 
     // Done: kind 99.
     let err = decode_response(&frame(msg_type::DONE, &[99])).unwrap_err();
@@ -380,7 +432,10 @@ fn rows_frame_columns_field_is_enforced() {
 #[test]
 fn ragged_rows_frames_do_not_encode() {
     let response = Response::Rows {
-        rows: vec![vec![Value::Integer(1)], vec![Value::Integer(1), Value::Integer(2)]],
+        rows: vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(1), Value::Integer(2)],
+        ],
     };
     let err = encode_response(&response).unwrap_err();
     assert!(err.to_string().contains("ragged"), "{err}");

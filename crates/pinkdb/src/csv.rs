@@ -19,7 +19,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::storage::PinkDb;
-use crate::types::{DataType, PinkDbError, Result, Value, parse_date, parse_timestamp};
+use crate::types::{parse_date, parse_timestamp, DataType, PinkDbError, Result, Value};
 use crate::vector::{Vector, CHUNK_SIZE};
 
 /// Rows inspected for head-sample inference (DuckDB's documented default).
@@ -61,7 +61,12 @@ impl InferState {
             return;
         }
         self.non_empty += 1;
-        if !(self.is_bool || self.is_i32 || self.is_i64 || self.is_f64 || self.is_date || self.is_ts)
+        if !(self.is_bool
+            || self.is_i32
+            || self.is_i64
+            || self.is_f64
+            || self.is_date
+            || self.is_ts)
         {
             return; // Every flag is dead: the column is VARCHAR already.
         }
@@ -168,15 +173,21 @@ fn push_field(col: &mut Vector, field: &str, dtype: DataType) -> Result<()> {
                 "cannot parse \"{c}\" as BOOLEAN"
             ))),
         },
-        DataType::Integer => c.parse::<i32>().map(Value::Integer).map_err(|_| {
-            PinkDbError::Type(format!("cannot parse \"{c}\" as INTEGER"))
-        }).and_then(|v| col.push_valid(v)),
-        DataType::Bigint => c.parse::<i64>().map(Value::Bigint).map_err(|_| {
-            PinkDbError::Type(format!("cannot parse \"{c}\" as BIGINT"))
-        }).and_then(|v| col.push_valid(v)),
-        DataType::Double => c.parse::<f64>().map(Value::Double).map_err(|_| {
-            PinkDbError::Type(format!("cannot parse \"{c}\" as DOUBLE"))
-        }).and_then(|v| col.push_valid(v)),
+        DataType::Integer => c
+            .parse::<i32>()
+            .map(Value::Integer)
+            .map_err(|_| PinkDbError::Type(format!("cannot parse \"{c}\" as INTEGER")))
+            .and_then(|v| col.push_valid(v)),
+        DataType::Bigint => c
+            .parse::<i64>()
+            .map(Value::Bigint)
+            .map_err(|_| PinkDbError::Type(format!("cannot parse \"{c}\" as BIGINT")))
+            .and_then(|v| col.push_valid(v)),
+        DataType::Double => c
+            .parse::<f64>()
+            .map(Value::Double)
+            .map_err(|_| PinkDbError::Type(format!("cannot parse \"{c}\" as DOUBLE")))
+            .and_then(|v| col.push_valid(v)),
         DataType::Varchar => col.push_str(c),
         DataType::Date => parse_date(c)
             .map(Value::Date)
@@ -252,7 +263,10 @@ fn parse_rows(
     let mut in_chunk = 0usize;
     let mut count = 0usize;
     let mut rec = csv::ByteRecord::new();
-    while reader.read_byte_record(&mut rec).map_err(PinkDbError::Csv)? {
+    while reader
+        .read_byte_record(&mut rec)
+        .map_err(PinkDbError::Csv)?
+    {
         if rec.len() > types.len() {
             return Err(PinkDbError::Catalog(format!(
                 "CSV row has {} fields but the header has {}",
@@ -453,7 +467,10 @@ fn load_sampled(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Res
     let mut states = vec![InferState::new(); headers.len()];
     let mut rec = csv::ByteRecord::new();
     let mut sampled = 0usize;
-    while sampled < INFER_SAMPLE_ROWS && reader.read_byte_record(&mut rec).map_err(PinkDbError::Csv)?
+    while sampled < INFER_SAMPLE_ROWS
+        && reader
+            .read_byte_record(&mut rec)
+            .map_err(PinkDbError::Csv)?
     {
         for (i, st) in states.iter_mut().enumerate() {
             st.feed(field_str(&rec, i)?);
@@ -462,7 +479,9 @@ fn load_sampled(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Res
     }
     // Does the file continue past the sample?
     let more_rows = if sampled == INFER_SAMPLE_ROWS {
-        reader.read_byte_record(&mut rec).map_err(PinkDbError::Csv)?
+        reader
+            .read_byte_record(&mut rec)
+            .map_err(PinkDbError::Csv)?
     } else {
         false
     };
@@ -499,7 +518,10 @@ fn load_full(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Result
     let headers = read_headers(&mut reader)?;
     let mut states = vec![InferState::new(); headers.len()];
     let mut rec = csv::ByteRecord::new();
-    while reader.read_byte_record(&mut rec).map_err(PinkDbError::Csv)? {
+    while reader
+        .read_byte_record(&mut rec)
+        .map_err(PinkDbError::Csv)?
+    {
         for (i, st) in states.iter_mut().enumerate() {
             st.feed(field_str(&rec, i)?);
         }
@@ -552,12 +574,7 @@ fn require_settled_import(db: &PinkDb) -> Result<()> {
 /// import returns still sees them. The import creates a fresh table, so a
 /// checkpoint failure rolls the table back out of memory — a failed import is
 /// never half-visible.
-fn make_import_durable(
-    db: &mut PinkDb,
-    db_name: &str,
-    table: &str,
-    rows: usize,
-) -> Result<usize> {
+fn make_import_durable(db: &mut PinkDb, db_name: &str, table: &str, rows: usize) -> Result<usize> {
     if !db.is_durable() {
         return Ok(rows);
     }
@@ -654,9 +671,7 @@ fn resolve_import_target(db: &PinkDb, table: Option<&str>, path: &str) -> Result
         None => default_table_name(path),
     };
     match parse_table_target(&spec)? {
-        (Some(q), name) if db.database_exists(&q) => {
-            Ok((q.to_ascii_lowercase(), name))
-        }
+        (Some(q), name) if db.database_exists(&q) => Ok((q.to_ascii_lowercase(), name)),
         (Some(q), name) => Ok((db.current_db().to_string(), format!("{q}.{name}"))),
         (None, name) => Ok((db.current_db().to_string(), name)),
     }
@@ -678,11 +693,7 @@ pub fn import_csv(db: &mut PinkDb, path: &str, table: Option<&str>) -> Result<us
 /// Import CSV text (header + rows) — used by tests and the REPL. Durable
 /// databases checkpoint the import before returning, like [`import_csv`].
 /// `table` may be `db.table` to target a specific database.
-pub fn import_csv_string(
-    db: &mut PinkDb,
-    table: &str,
-    csv_text: &str,
-) -> Result<usize> {
+pub fn import_csv_string(db: &mut PinkDb, table: &str, csv_text: &str) -> Result<usize> {
     let (db_name, table_name) = resolve_import_target(db, Some(table), "")?;
     require_settled_import(db)?;
     let rows = load_bytes(db, &db_name, &table_name, csv_text.as_bytes())?;
@@ -811,7 +822,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("data.2024.csv");
         std::fs::write(&path, "a\n1\n2\n").unwrap();
-        assert_eq!(import_csv(&mut db, path.to_str().unwrap(), None).unwrap(), 2);
+        assert_eq!(
+            import_csv(&mut db, path.to_str().unwrap(), None).unwrap(),
+            2
+        );
         assert!(db.table("data.2024").is_ok(), "stem stays one table name");
 
         // Dotted explicit table argument.
@@ -906,7 +920,10 @@ mod tests {
             (&["1", "2024-01-01"], DataType::Varchar),
             (&["2024-01-01", "2024-02-29"], DataType::Date),
             (&["2024-01-01", "2024-01-02 10:00:00"], DataType::Varchar),
-            (&["2024-01-01 10:00:00", "2024-01-02T00:00:00.5"], DataType::Timestamp),
+            (
+                &["2024-01-01 10:00:00", "2024-01-02T00:00:00.5"],
+                DataType::Timestamp,
+            ),
             (&["", ""], DataType::Varchar),
             (&["1e5", "2"], DataType::Double),
         ];
@@ -929,7 +946,10 @@ mod tests {
         assert_eq!(t.num_rows(), INFER_SAMPLE_ROWS + 3);
         // Whole-file inference: the tail cell makes the column VARCHAR.
         assert_eq!(t.schema()[0], ("id".to_string(), DataType::Varchar));
-        assert_eq!(t.get(INFER_SAMPLE_ROWS + 2, 0), Some(Value::Varchar("oops".to_string())));
+        assert_eq!(
+            t.get(INFER_SAMPLE_ROWS + 2, 0),
+            Some(Value::Varchar("oops".to_string()))
+        );
     }
 
     #[test]
@@ -946,7 +966,10 @@ mod tests {
         let t = db.table("t").unwrap();
         assert_eq!(t.schema()[1], ("b".to_string(), DataType::Integer));
         assert_eq!(t.get(INFER_SAMPLE_ROWS + 5, 1), Some(Value::Integer(5)));
-        assert_eq!(t.get(INFER_SAMPLE_ROWS + 5, 0), Some(Value::Varchar("x".to_string())));
+        assert_eq!(
+            t.get(INFER_SAMPLE_ROWS + 5, 0),
+            Some(Value::Varchar("x".to_string()))
+        );
     }
 
     #[test]
@@ -981,21 +1004,21 @@ mod tests {
     fn fast_path_matches_exact_two_pass() {
         let mut corpus: Vec<String> = vec![
             SALES.to_string(),
-            "a,b\n1,2\n\n3,4\n".to_string(),   // empty line
+            "a,b\n1,2\n\n3,4\n".to_string(),    // empty line
             "a,b\n1,2\n   \n3,4\n".to_string(), // whitespace-only line
             "a,b\n\n".to_string(),
             "a,b\n".to_string(),
             "a,b\n \n".to_string(),
-            "a,b\n1,2".to_string(),            // no trailing newline
-            "a,b\n1,2\n3".to_string(),         // ragged last row
+            "a,b\n1,2".to_string(),    // no trailing newline
+            "a,b\n1,2\n3".to_string(), // ragged last row
             "a,b\n1,2\n,\n".to_string(),
             "a,b\n1,2\n\n\n".to_string(),
             "a\n1\n\n".to_string(),
-            "a,b\r\n1,2\r\n".to_string(),      // CRLF → csv path
-            "a,b\n\"x\",\"y\"\n".to_string(),  // quoted → csv path
-            "a,b\n\"x\ny\",2\n".to_string(),   // embedded newline → csv path
+            "a,b\r\n1,2\r\n".to_string(),     // CRLF → csv path
+            "a,b\n\"x\",\"y\"\n".to_string(), // quoted → csv path
+            "a,b\n\"x\ny\",2\n".to_string(),  // embedded newline → csv path
             "a,b\n1\n,2\n".to_string(),
-            "a,b\n1,2,3\n".to_string(),        // structural error
+            "a,b\n1,2,3\n".to_string(), // structural error
             "a,b\n,5\nx,\n".to_string(),
             "d,note\n2024-02-29,ok\n2024-03-01,\n".to_string(),
             "t,big\n2024-02-29 10:00:00.25,9999999999\n2024-03-01 00:00:00,-5\n".to_string(),
@@ -1120,11 +1143,13 @@ mod tests {
         let ckpt = dir.join("imp.pink");
         let path = ckpt.to_str().unwrap().to_string();
         {
-            let (mut db, _) =
-                PinkDb::open_durable_with(&path, crate::SyncPolicy::Sync).unwrap();
+            let (mut db, _) = PinkDb::open_durable_with(&path, crate::SyncPolicy::Sync).unwrap();
             // A brand-new table: without the checkpoint the import would
             // vanish (and later DML would brick replay: "table not found").
-            assert_eq!(import_csv_string(&mut db, "imp", "a\n1\n2\n3\n").unwrap(), 3);
+            assert_eq!(
+                import_csv_string(&mut db, "imp", "a\n1\n2\n3\n").unwrap(),
+                3
+            );
             assert!(ckpt.exists(), "the import must publish a checkpoint");
             // Logged DML after the import goes to the fresh WAL generation.
             db.execute("INSERT INTO imp VALUES (4);").unwrap();
@@ -1134,8 +1159,7 @@ mod tests {
             assert!(import_csv_string(&mut db, "inside", "a\n9\n").is_err());
             db.execute("ROLLBACK;").unwrap();
         }
-        let (back, info) =
-            PinkDb::open_durable_with(&path, crate::SyncPolicy::Sync).unwrap();
+        let (back, info) = PinkDb::open_durable_with(&path, crate::SyncPolicy::Sync).unwrap();
         assert_eq!(info.replayed_records, 1, "only the post-import INSERT");
         let t = back.table("imp").unwrap();
         assert_eq!(t.num_rows(), 4);

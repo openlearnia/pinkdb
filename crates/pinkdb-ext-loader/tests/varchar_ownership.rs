@@ -22,7 +22,9 @@ fn varchar_results_are_copied_and_freed_without_leaks() {
 
     // Through SQL: every row allocates one buffer per VARCHAR result.
     for _ in 0..sql_iterations {
-        let result = db.execute("SELECT ext_shout('ownership'), ext_concat2('a', 'b');").unwrap();
+        let result = db
+            .execute("SELECT ext_shout('ownership'), ext_concat2('a', 'b');")
+            .unwrap();
         match result.into_iter().next().unwrap() {
             QueryResult::Selected { rows, .. } => assert_eq!(
                 rows,

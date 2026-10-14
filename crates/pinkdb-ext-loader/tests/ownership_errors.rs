@@ -22,7 +22,10 @@ fn ownership_violations_still_free_the_buffer_and_report_cleanly() {
     let before = text_allocation_stats();
 
     // 1. Error return with a buffer: the code is reported, the buffer freed.
-    let e = db.execute("SELECT own_err_with_buf();").unwrap_err().to_string();
+    let e = db
+        .execute("SELECT own_err_with_buf();")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("own_err_with_buf() failed with code 9"), "{e}");
 
     // 2. NULL result with a buffer: NULL is returned, the buffer freed.
@@ -35,12 +38,21 @@ fn ownership_violations_still_free_the_buffer_and_report_cleanly() {
     }
 
     // 3. Invalid UTF-8: reported by the engine's value conversion, freed.
-    let e = db.execute("SELECT own_bad_utf8();").unwrap_err().to_string();
+    let e = db
+        .execute("SELECT own_bad_utf8();")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("returned invalid UTF-8"), "{e}");
 
     // 4. NULL pointer with a non-zero length: an ABI violation, never read.
-    let e = db.execute("SELECT own_null_ptr_with_len();").unwrap_err().to_string();
-    assert!(e.contains("returned a NULL text pointer with text_len 5"), "{e}");
+    let e = db
+        .execute("SELECT own_null_ptr_with_len();")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("returned a NULL text pointer with text_len 5"),
+        "{e}"
+    );
 
     // 5. Zero length is a valid empty string, not a violation.
     let result = db.execute("SELECT own_zero_len();").unwrap();
@@ -65,8 +77,14 @@ fn ownership_violations_still_free_the_buffer_and_report_cleanly() {
     assert!(e.to_string().contains("failed with code 9"), "{e}");
     assert_eq!(call("own_null_with_buf").call(&[]).unwrap(), ExtValue::Null);
     let e = call("own_null_ptr_with_len").call(&[]).unwrap_err();
-    assert!(e.to_string().contains("NULL text pointer with text_len 5"), "{e}");
-    assert_eq!(call("own_zero_len").call(&[]).unwrap(), ExtValue::Varchar(Vec::new()));
+    assert!(
+        e.to_string().contains("NULL text pointer with text_len 5"),
+        "{e}"
+    );
+    assert_eq!(
+        call("own_zero_len").call(&[]).unwrap(),
+        ExtValue::Varchar(Vec::new())
+    );
 
     let after = text_allocation_stats();
     assert_eq!(

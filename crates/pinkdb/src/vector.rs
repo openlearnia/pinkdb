@@ -144,7 +144,11 @@ impl Vector {
     pub(crate) fn from_parts(data: VectorData, mut validity: Vec<u64>, len: usize) -> Vector {
         debug_assert_eq!(data.len(), len);
         validity.resize(mask_len(len), 0);
-        Vector { data, validity, len }
+        Vector {
+            data,
+            validity,
+            len,
+        }
     }
 
     fn ensure_mask(&mut self) {
@@ -496,9 +500,7 @@ impl Vector {
             (VectorData::Float64(d), VectorData::Float64(s)) => d.push(s[idx]),
             (VectorData::VarChar(d), VectorData::VarChar(s)) => d.push(s[idx].clone()),
             (VectorData::Date32(d), VectorData::Date32(s)) => d.push(s[idx]),
-            (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => {
-                d.push(s[idx])
-            }
+            (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => d.push(s[idx]),
             _ => {
                 return Err(PinkDbError::Execution(
                     "push_from needs matching vector types".to_string(),
@@ -520,7 +522,8 @@ impl Vector {
         for &i in selection {
             debug_assert!(i < self.len);
             // push_from shares string Arcs instead of cloning.
-            out.push_from(self, i).expect("gather push_from cannot fail");
+            out.push_from(self, i)
+                .expect("gather push_from cannot fail");
         }
         out
     }
@@ -587,7 +590,11 @@ impl DataChunk {
 
     /// Apply a selection vector to every column.
     pub fn gather(&self, selection: &[usize]) -> DataChunk {
-        let columns = self.columns.iter().map(|c| Arc::new(c.gather(selection))).collect();
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| Arc::new(c.gather(selection)))
+            .collect();
         DataChunk {
             columns,
             num_rows: selection.len(),
@@ -767,8 +774,10 @@ mod tests {
         v.push_valid(Value::Double(-0.0)).unwrap();
         v.push_valid(Value::Double(0.0)).unwrap();
         // Two NaNs with different sign/payload bits.
-        v.push_valid(Value::Double(f64::from_bits(0x7ff8_0000_0000_0001))).unwrap();
-        v.push_valid(Value::Double(f64::from_bits(0xfff8_0000_0000_0042))).unwrap();
+        v.push_valid(Value::Double(f64::from_bits(0x7ff8_0000_0000_0001)))
+            .unwrap();
+        v.push_valid(Value::Double(f64::from_bits(0xfff8_0000_0000_0042)))
+            .unwrap();
         let enc = |i: usize| {
             let mut b = Vec::new();
             v.encode_into(&mut b, i);

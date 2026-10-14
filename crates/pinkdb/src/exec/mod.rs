@@ -10,9 +10,9 @@ pub mod aggregate;
 pub mod expr;
 pub(crate) mod window;
 
+use crate::types::{FastMap, FastSet};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
-use crate::types::{FastMap, FastSet};
 
 use aggregate::{
     aggregate, emit_groups, local_index_capacity, merge_partials, Acc, Group, Partial,
@@ -23,9 +23,9 @@ use expr::{coerce_to, count_true, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
 
-use crate::plan::{LogicalPlan, agg_output_schema, compare_values, win_output_schema};
+use crate::plan::{agg_output_schema, compare_values, win_output_schema, LogicalPlan};
 use crate::sql::ast::{BinaryOp, JoinKind};
-use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, common_numeric};
+use crate::sql::binder::{common_numeric, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
@@ -34,24 +34,48 @@ use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
     Created,
-    Inserted { count: usize },
-    Updated { count: usize },
-    Deleted { count: usize },
+    Inserted {
+        count: usize,
+    },
+    Updated {
+        count: usize,
+    },
+    Deleted {
+        count: usize,
+    },
     Began,
     Committed,
     RolledBack,
-    CreatedView { name: String },
-    DroppedTable { name: String },
-    DroppedView { name: String },
-    CreatedDatabase { name: String },
-    DroppedDatabase { name: String },
+    CreatedView {
+        name: String,
+    },
+    DroppedTable {
+        name: String,
+    },
+    DroppedView {
+        name: String,
+    },
+    CreatedDatabase {
+        name: String,
+    },
+    DroppedDatabase {
+        name: String,
+    },
     /// `USE <db>`: the session layer applies this to its current database.
-    Used { db: String },
+    Used {
+        db: String,
+    },
     /// `LOAD EXTENSION '<path>'`: `name` is the extension's declared name.
-    LoadedExtension { name: String },
+    LoadedExtension {
+        name: String,
+    },
     /// `CHECKPOINT` finished (a no-op for in-memory databases).
     Checkpointed,
-    Selected { names: Vec<String>, types: Vec<DataType>, rows: Vec<Vec<Value>> },
+    Selected {
+        names: Vec<String>,
+        types: Vec<DataType>,
+        rows: Vec<Vec<Value>>,
+    },
 }
 
 #[derive(Clone)]
@@ -80,7 +104,11 @@ pub(crate) enum Memo {
 
 impl<'a> Cx<'a> {
     pub(crate) fn new(db: &'a PinkDb) -> Self {
-        Self { db, ctes: HashMap::new(), memo: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())) }
+        Self {
+            db,
+            ctes: HashMap::new(),
+            memo: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -99,22 +127,35 @@ fn use_result(db: &PinkDb, name: &str) -> Result<QueryResult> {
             "database \"{name}\" not found"
         )));
     }
-    Ok(QueryResult::Used { db: name.to_ascii_lowercase() })
+    Ok(QueryResult::Used {
+        db: name.to_ascii_lowercase(),
+    })
 }
 
 /// Execute a bound plan.
 pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
     match plan {
-        LogicalPlan::CreateTable { db: qdb, name, schema } => {
+        LogicalPlan::CreateTable {
+            db: qdb,
+            name,
+            schema,
+        } => {
             let target = resolve_db(db, qdb);
             db.create_table_in(&target, name, schema.clone())?;
             Ok(QueryResult::Created)
         }
-        LogicalPlan::Insert { db: qdb, table, rows } => {
+        LogicalPlan::Insert {
+            db: qdb,
+            table,
+            rows,
+        } => {
             let target = resolve_db(db, qdb);
             // Evaluate constant cells against an empty single-row chunk, then
             // append (storage coerces INTEGER → BIGINT → DOUBLE).
-            let single = DataChunk { columns: Vec::new(), num_rows: 1 };
+            let single = DataChunk {
+                columns: Vec::new(),
+                num_rows: 1,
+            };
             let mut staged = Vec::with_capacity(rows.len());
             {
                 let cx = Cx::new(db);
@@ -155,7 +196,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             Ok(QueryResult::Inserted { count })
         }
-        LogicalPlan::Update { db: qdb, table, sets, predicate } => {
+        LogicalPlan::Update {
+            db: qdb,
+            table,
+            sets,
+            predicate,
+        } => {
             let target = resolve_db(db, qdb);
             // Phase 1: evaluate predicates + SET exprs over current chunks
             // (subqueries see pre-mutation state). Phase 2: write back.
@@ -189,7 +235,11 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             Ok(QueryResult::Updated { count })
         }
-        LogicalPlan::Delete { db: qdb, table, predicate } => {
+        LogicalPlan::Delete {
+            db: qdb,
+            table,
+            predicate,
+        } => {
             let target = resolve_db(db, qdb);
             // Phase 1: collect per-chunk drop lists. Phase 2: apply from the
             // highest chunk down (emptied chunks are removed, shifting lower
@@ -220,7 +270,8 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         LogicalPlan::Begin => {
             db.begin()?;
             Ok(QueryResult::Began)
-        }        LogicalPlan::Commit => {
+        }
+        LogicalPlan::Commit => {
             db.commit()?;
             Ok(QueryResult::Committed)
         }
@@ -228,7 +279,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db.rollback()?;
             Ok(QueryResult::RolledBack)
         }
-        LogicalPlan::CreateView { db: qdb, name, cols, query } => {
+        LogicalPlan::CreateView {
+            db: qdb,
+            name,
+            cols,
+            query,
+        } => {
             let target = resolve_db(db, qdb);
             // Validated at bind time; store the AST for per-use rebinding.
             db.create_view_in(&target, name, (**query).clone(), cols.clone())?;
@@ -283,7 +339,10 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 /// Execute a read-only plan against a shared store (used under a read lock
 /// by concurrent readers; also backs [`run`]'s query arm).
 pub fn run_read(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
-    debug_assert!(crate::plan::is_read_only(plan), "run_read needs a query plan");
+    debug_assert!(
+        crate::plan::is_read_only(plan),
+        "run_read needs a query plan"
+    );
     let cx = Cx::new(db);
     run_read_with(&cx, plan)
 }
@@ -301,7 +360,11 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
             rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
         }
     }
-    Ok(QueryResult::Selected { names: out.names, types: out.types, rows })
+    Ok(QueryResult::Selected {
+        names: out.names,
+        types: out.types,
+        rows,
+    })
 }
 
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
@@ -340,11 +403,18 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 }
             }
             let (names, types) = t.schema().into_iter().unzip();
-            Ok(Output { chunks, names, types })
+            Ok(Output {
+                chunks,
+                names,
+                types,
+            })
         }
         LogicalPlan::SingleRow => Ok(Output {
             // One row, zero columns: literals evaluate to 1-row vectors.
-            chunks: vec![DataChunk { columns: Vec::new(), num_rows: 1 }],
+            chunks: vec![DataChunk {
+                columns: Vec::new(),
+                num_rows: 1,
+            }],
             names: vec![],
             types: vec![],
         }),
@@ -367,9 +437,20 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 })
                 .collect::<Result<_>>()?;
             let chunks = chunks.into_iter().flatten().collect();
-            Ok(Output { chunks, names: inner.names, types: inner.types })
+            Ok(Output {
+                chunks,
+                names: inner.names,
+                types: inner.types,
+            })
         }
-        LogicalPlan::Join { kind, left, right, left_key, right_key, .. } => {
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+            ..
+        } => {
             let l = eval(cx, left)?;
             let r = eval(cx, right)?;
             let mut names = l.names.clone();
@@ -378,13 +459,23 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             types.extend(r.types.iter().copied());
             let chunks = hash_join(
                 cx,
-                JoinSide { chunks: &l.chunks, types: &l.types },
-                JoinSide { chunks: &r.chunks, types: &r.types },
+                JoinSide {
+                    chunks: &l.chunks,
+                    types: &l.types,
+                },
+                JoinSide {
+                    chunks: &r.chunks,
+                    types: &r.types,
+                },
                 *kind,
                 left_key,
                 right_key,
             )?;
-            Ok(Output { chunks, names, types })
+            Ok(Output {
+                chunks,
+                names,
+                types,
+            })
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
             // Fused join→aggregate: feed joined rows straight into per-group
@@ -400,14 +491,19 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // materialized (no selection vector, no gathered columns).
             if keys.is_empty()
                 && !aggs.is_empty()
-                && aggs.iter().all(|a| a.func == crate::sql::binder::AggFunc::Count && a.arg.is_none())
+                && aggs
+                    .iter()
+                    .all(|a| a.func == crate::sql::binder::AggFunc::Count && a.arg.is_none())
             {
                 // The binder dedups identical aggregates, so the only
                 // all-COUNT(*) shape reaching here is a single COUNT(*) —
                 // and this path emits exactly one column.
                 debug_assert_eq!(aggs.len(), 1);
                 let total: i64 = match &**input {
-                    LogicalPlan::Filter { input: fin, predicate } => {
+                    LogicalPlan::Filter {
+                        input: fin,
+                        predicate,
+                    } => {
                         let inner = eval(cx, fin)?;
                         inner
                             .chunks
@@ -434,12 +530,20 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     names.push(format!("__agg{i}"));
                     types.push(a.dtype);
                 }
-                return Ok(Output { chunks, names, types });
+                return Ok(Output {
+                    chunks,
+                    names,
+                    types,
+                });
             }
             let inner = eval(cx, input)?;
             let chunks = aggregate(cx, &inner.chunks, keys, aggs)?;
             let (names, types) = agg_output_schema(keys, aggs);
-            Ok(Output { chunks, names, types })
+            Ok(Output {
+                chunks,
+                names,
+                types,
+            })
         }
         LogicalPlan::Window { input, windows, .. } => {
             let inner = eval(cx, input)?;
@@ -449,9 +553,18 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             all_names.extend(names);
             let mut all_types = inner.types.clone();
             all_types.extend(types);
-            Ok(Output { chunks, names: all_names, types: all_types })
+            Ok(Output {
+                chunks,
+                names: all_names,
+                types: all_types,
+            })
         }
-        LogicalPlan::Union { left, right, distinct: is_distinct, types } => {
+        LogicalPlan::Union {
+            left,
+            right,
+            distinct: is_distinct,
+            types,
+        } => {
             let l = eval(cx, left)?;
             let r = eval(cx, right)?;
             // Coerce each side to the common column types, then concatenate.
@@ -464,17 +577,33 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 }
                 chunks.push(DataChunk::new(cols)?);
             }
-            let chunks = if *is_distinct { distinct(&chunks)? } else { chunks };
-            Ok(Output { chunks, names: l.names.clone(), types: types.clone() })
+            let chunks = if *is_distinct {
+                distinct(&chunks)?
+            } else {
+                chunks
+            };
+            Ok(Output {
+                chunks,
+                names: l.names.clone(),
+                types: types.clone(),
+            })
         }
         LogicalPlan::Cte { name, query, body } => {
             let out = eval(cx, query)?;
             let mut ctes = cx.ctes.clone();
             ctes.insert(name.clone(), out);
-            let child = Cx { db: cx.db, ctes, memo: cx.memo.clone() };
+            let child = Cx {
+                db: cx.db,
+                ctes,
+                memo: cx.memo.clone(),
+            };
             eval(&child, body)
         }
-        LogicalPlan::Project { input, exprs, names } => {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => {
             let inner = eval(cx, input)?;
             let types: Vec<DataType> = exprs.iter().map(|e| e.dtype()).collect();
             // Project over zero input chunks → zero output chunks (0 rows).
@@ -491,7 +620,9 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         .map(|e| match e {
                             BoundExpr::Column { index, .. }
                             | BoundExpr::AggRef { index, .. }
-                            | BoundExpr::WindowRef { index, .. } => Ok(chunk.columns[*index].clone()),
+                            | BoundExpr::WindowRef { index, .. } => {
+                                Ok(chunk.columns[*index].clone())
+                            }
                             e => Ok(std::sync::Arc::new(eval_expr(e, chunk, cx)?)),
                         })
                         .collect::<Result<_>>()?;
@@ -500,17 +631,29 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     })
                 })
                 .collect::<Result<_>>()?;
-            Ok(Output { chunks, names: names.clone(), types })
+            Ok(Output {
+                chunks,
+                names: names.clone(),
+                types,
+            })
         }
         LogicalPlan::Distinct { input } => {
             let inner = eval(cx, input)?;
             let chunks = distinct(&inner.chunks)?;
-            Ok(Output { chunks, names: inner.names, types: inner.types })
+            Ok(Output {
+                chunks,
+                names: inner.names,
+                types: inner.types,
+            })
         }
         LogicalPlan::Sort { input, keys } => {
             let inner = eval(cx, input)?;
             let chunks = sort(cx, &inner.chunks, keys)?;
-            Ok(Output { chunks, names: inner.names, types: inner.types })
+            Ok(Output {
+                chunks,
+                names: inner.names,
+                types: inner.types,
+            })
         }
         LogicalPlan::Limit { input, limit } => {
             // Top-N fast path: LIMIT directly over SORT selects the first
@@ -518,7 +661,11 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // sort. Only worth it when the limit is much smaller than the row
             // count; otherwise — or when a NaN float key disables the byte
             // encoding — fall back to the full sort + truncate.
-            if let LogicalPlan::Sort { input: sort_in, keys } = &**input {
+            if let LogicalPlan::Sort {
+                input: sort_in,
+                keys,
+            } = &**input
+            {
                 if *limit > 0 {
                     // Evaluate the sort input once: the top-N path and the
                     // fallback full sort below both consume these chunks
@@ -536,7 +683,11 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                         // Limit too large for top-N: full sort + truncate.
                         sort(cx, &inner.chunks, keys)?
                     };
-                    let out = Output { chunks, names: inner.names, types: inner.types };
+                    let out = Output {
+                        chunks,
+                        names: inner.names,
+                        types: inner.types,
+                    };
                     return Ok(truncate_output(out, *limit));
                 }
             }
@@ -819,8 +970,10 @@ fn hash_join_probe(
         .map(|chunk| -> Result<Vec<DataChunk>> {
             let kv = eval_join_key(cx, preserved_key, chunk, common, ints)?;
             let mut finished = Vec::new();
-            let mut cur: Vec<Vector> =
-                dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
+            let mut cur: Vec<Vector> = dtypes
+                .iter()
+                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                .collect();
             let mut cur_rows = 0usize;
             let mut buf = Vec::new();
             for i in 0..chunk.num_rows() {
@@ -894,14 +1047,12 @@ fn hash_join_probe(
                             for dst in cur.iter_mut().take(n_left) {
                                 dst.push_null()?;
                             }
-                            for (dst, col) in
-                                cur.iter_mut().skip(n_left).zip(chunk.columns.iter())
+                            for (dst, col) in cur.iter_mut().skip(n_left).zip(chunk.columns.iter())
                             {
                                 dst.push_from(col, i)?;
                             }
                         } else {
-                            for (dst, col) in
-                                cur.iter_mut().take(n_left).zip(chunk.columns.iter())
+                            for (dst, col) in cur.iter_mut().take(n_left).zip(chunk.columns.iter())
                             {
                                 dst.push_from(col, i)?;
                             }
@@ -953,12 +1104,15 @@ fn merge_sides(a: Side, b: Side) -> Option<Side> {
 fn classify_side(expr: &BoundExpr, left_cols: usize) -> Option<Side> {
     match expr {
         BoundExpr::Literal(_) => Some(Side::Constant),
-        BoundExpr::Column { index, .. } => {
-            Some(if *index < left_cols { Side::Left } else { Side::Right })
-        }
-        BoundExpr::Binary { left, right, .. } => {
-            merge_sides(classify_side(left, left_cols)?, classify_side(right, left_cols)?)
-        }
+        BoundExpr::Column { index, .. } => Some(if *index < left_cols {
+            Side::Left
+        } else {
+            Side::Right
+        }),
+        BoundExpr::Binary { left, right, .. } => merge_sides(
+            classify_side(left, left_cols)?,
+            classify_side(right, left_cols)?,
+        ),
         BoundExpr::Not(e)
         | BoundExpr::Negate { expr: e, .. }
         | BoundExpr::IsNull { expr: e, .. }
@@ -970,7 +1124,9 @@ fn classify_side(expr: &BoundExpr, left_cols: usize) -> Option<Side> {
             }
             Some(side)
         }
-        BoundExpr::Case { branches, else_, .. } => {
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
             let mut side = Side::Constant;
             for (c, v) in branches {
                 side = merge_sides(side, classify_side(c, left_cols)?)?;
@@ -999,14 +1155,14 @@ fn classify_side(expr: &BoundExpr, left_cols: usize) -> Option<Side> {
 /// project expression — or an index is out of range. `project` is `None`
 /// when the aggregate's input is the join itself (expressions are already
 /// join-space).
-fn rewrite_through_project(
-    expr: &BoundExpr,
-    project: Option<&[BoundExpr]>,
-) -> Option<BoundExpr> {
+fn rewrite_through_project(expr: &BoundExpr, project: Option<&[BoundExpr]>) -> Option<BoundExpr> {
     match expr {
         BoundExpr::Literal(v) => Some(BoundExpr::Literal(v.clone())),
         BoundExpr::Column { index, dtype } => match project {
-            None => Some(BoundExpr::Column { index: *index, dtype: *dtype }),
+            None => Some(BoundExpr::Column {
+                index: *index,
+                dtype: *dtype,
+            }),
             Some(pexprs) => {
                 let p = pexprs.get(*index)?;
                 if p.has_subquery() {
@@ -1015,15 +1171,20 @@ fn rewrite_through_project(
                 Some(p.clone())
             }
         },
-        BoundExpr::Binary { op, left, right, dtype } => Some(BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => Some(BoundExpr::Binary {
             op: *op,
             left: Box::new(rewrite_through_project(left, project)?),
             right: Box::new(rewrite_through_project(right, project)?),
             dtype: *dtype,
         }),
-        BoundExpr::Not(e) => {
-            Some(BoundExpr::Not(Box::new(rewrite_through_project(e, project)?)))
-        }
+        BoundExpr::Not(e) => Some(BoundExpr::Not(Box::new(rewrite_through_project(
+            e, project,
+        )?))),
         BoundExpr::Negate { expr, dtype } => Some(BoundExpr::Negate {
             expr: Box::new(rewrite_through_project(expr, project)?),
             dtype: *dtype,
@@ -1051,7 +1212,11 @@ fn rewrite_through_project(
                 .collect::<Option<Vec<_>>>()?,
             dtype: *dtype,
         }),
-        BoundExpr::Case { branches, else_, dtype } => Some(BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => Some(BoundExpr::Case {
             branches: branches
                 .iter()
                 .map(|(c, v)| {
@@ -1086,11 +1251,17 @@ fn rewrite_through_project(
 /// total.
 fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
     match expr {
-        BoundExpr::Column { index, dtype } => {
-            BoundExpr::Column { index: index - left_cols, dtype: *dtype }
-        }
+        BoundExpr::Column { index, dtype } => BoundExpr::Column {
+            index: index - left_cols,
+            dtype: *dtype,
+        },
         BoundExpr::Literal(v) => BoundExpr::Literal(v.clone()),
-        BoundExpr::Binary { op, left, right, dtype } => BoundExpr::Binary {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
             op: *op,
             left: Box::new(shift_join_columns(left, left_cols)),
             right: Box::new(shift_join_columns(right, left_cols)),
@@ -1107,7 +1278,10 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
         },
         BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
             func: *func,
-            args: args.iter().map(|a| shift_join_columns(a, left_cols)).collect(),
+            args: args
+                .iter()
+                .map(|a| shift_join_columns(a, left_cols))
+                .collect(),
             dtype: *dtype,
         },
         BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
@@ -1115,17 +1289,29 @@ fn shift_join_columns(expr: &BoundExpr, left_cols: usize) -> BoundExpr {
             dtype: *dtype,
         },
         BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
-            args: args.iter().map(|a| shift_join_columns(a, left_cols)).collect(),
+            args: args
+                .iter()
+                .map(|a| shift_join_columns(a, left_cols))
+                .collect(),
             dtype: *dtype,
         },
-        BoundExpr::Case { branches, else_, dtype } => BoundExpr::Case {
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
             branches: branches
                 .iter()
                 .map(|(c, v)| {
-                    (shift_join_columns(c, left_cols), shift_join_columns(v, left_cols))
+                    (
+                        shift_join_columns(c, left_cols),
+                        shift_join_columns(v, left_cols),
+                    )
                 })
                 .collect(),
-            else_: else_.as_ref().map(|e| Box::new(shift_join_columns(e, left_cols))),
+            else_: else_
+                .as_ref()
+                .map(|e| Box::new(shift_join_columns(e, left_cols))),
             dtype: *dtype,
         },
         BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
@@ -1207,7 +1393,12 @@ fn expr_is_total(e: &BoundExpr) -> bool {
         BoundExpr::Literal(_) | BoundExpr::Column { .. } => true,
         BoundExpr::Not(x) | BoundExpr::IsNull { expr: x, .. } => expr_is_total(x),
         BoundExpr::Negate { expr, dtype } => *dtype == DataType::Double && expr_is_total(expr),
-        BoundExpr::Binary { op, left, right, dtype } => match op {
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => match op {
             BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply => {
                 let date_diff = *op == BinaryOp::Subtract
                     && left.dtype() == DataType::Date
@@ -1238,8 +1429,12 @@ fn expr_is_total(e: &BoundExpr) -> bool {
         },
         BoundExpr::Cast { .. } => false,
         BoundExpr::Coalesce { args, .. } => args.iter().all(expr_is_total),
-        BoundExpr::Case { branches, else_, .. } => {
-            branches.iter().all(|(c, v)| expr_is_total(c) && expr_is_total(v))
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
+            branches
+                .iter()
+                .all(|(c, v)| expr_is_total(c) && expr_is_total(v))
                 && else_.as_ref().is_none_or(|e| expr_is_total(e))
         }
         BoundExpr::Scalar { func, args, .. } => {
@@ -1247,19 +1442,20 @@ fn expr_is_total(e: &BoundExpr) -> bool {
                 || args.first().is_some_and(|a| a.dtype() == DataType::Double);
             abs_ok
                 && matches!(
-                func,
-                ScalarFunc::Upper
-                    | ScalarFunc::Lower
-                    | ScalarFunc::Length
-                    | ScalarFunc::Abs
-                    | ScalarFunc::Round
-                    | ScalarFunc::Year
-                    | ScalarFunc::Month
-                    | ScalarFunc::Day
-                    | ScalarFunc::Hour
-                    | ScalarFunc::Minute
-                    | ScalarFunc::Second
-            ) && args.iter().all(expr_is_total)
+                    func,
+                    ScalarFunc::Upper
+                        | ScalarFunc::Lower
+                        | ScalarFunc::Length
+                        | ScalarFunc::Abs
+                        | ScalarFunc::Round
+                        | ScalarFunc::Year
+                        | ScalarFunc::Month
+                        | ScalarFunc::Day
+                        | ScalarFunc::Hour
+                        | ScalarFunc::Minute
+                        | ScalarFunc::Second
+                )
+                && args.iter().all(expr_is_total)
         }
         BoundExpr::AggRef { .. }
         | BoundExpr::WindowRef { .. }
@@ -1291,13 +1487,37 @@ fn fused_join_aggregate(
     // Distinct / Window / Limit / Cte between the aggregate and the join
     // (or any other input) keeps the materialized path.
     let (kind, left, right, left_key, right_key, left_cols, project) = match input {
-        LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
-            (*kind, &**left, &**right, left_key, right_key, *left_cols, None)
-        }
-        LogicalPlan::Project { input: inner, exprs, .. } => match &**inner {
-            LogicalPlan::Join { kind, left, right, left_key, right_key, left_cols } => {
-                (*kind, &**left, &**right, left_key, right_key, *left_cols, Some(&exprs[..]))
-            }
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_key,
+            right_key,
+            left_cols,
+        } => (
+            *kind, &**left, &**right, left_key, right_key, *left_cols, None,
+        ),
+        LogicalPlan::Project {
+            input: inner,
+            exprs,
+            ..
+        } => match &**inner {
+            LogicalPlan::Join {
+                kind,
+                left,
+                right,
+                left_key,
+                right_key,
+                left_cols,
+            } => (
+                *kind,
+                &**left,
+                &**right,
+                left_key,
+                right_key,
+                *left_cols,
+                Some(&exprs[..]),
+            ),
             _ => return Ok(None),
         },
         _ => return Ok(None),
@@ -1401,7 +1621,9 @@ fn fused_join_aggregate(
     // match chains — no per-pair `Value` work, no group state.
     if keys.is_empty()
         && !aggs.is_empty()
-        && aggs.iter().all(|a| a.func == AggFunc::Count && a.arg.is_none())
+        && aggs
+            .iter()
+            .all(|a| a.func == AggFunc::Count && a.arg.is_none())
     {
         // Binder dedup leaves exactly one COUNT(*); this path emits one
         // column (and `agg_output_schema` below still reflects `aggs`).
@@ -1439,7 +1661,11 @@ fn fused_join_aggregate(
         vec.push_valid(Value::Bigint(total))?;
         let chunks = vec![DataChunk::new(vec![vec])?];
         let (names, types) = agg_output_schema(keys, aggs);
-        return Ok(Some(Output { chunks, names, types }));
+        return Ok(Some(Output {
+            chunks,
+            names,
+            types,
+        }));
     }
 
     // Pre-evaluate every right-side key/arg expression once per right chunk
@@ -1498,9 +1724,7 @@ fn fused_join_aggregate(
                     buf.clear();
                     for src in &key_srcs {
                         match src {
-                            ExprSource::Left(s) => {
-                                left_vecs[*s].v().encode_into(&mut buf, li)
-                            }
+                            ExprSource::Left(s) => left_vecs[*s].v().encode_into(&mut buf, li),
                             ExprSource::Right(s) => {
                                 right_vecs[rci][*s].v().encode_into(&mut buf, ri)
                             }
@@ -1511,9 +1735,7 @@ fn fused_join_aggregate(
                         None => {
                             let enc = buf.clone();
                             let idx = partial.groups.len();
-                            if !full_reserved
-                                && partial.index.len() >= HIGH_CARDINALITY_KEYS
-                            {
+                            if !full_reserved && partial.index.len() >= HIGH_CARDINALITY_KEYS {
                                 partial
                                     .index
                                     .reserve(chunk.num_rows().saturating_sub(partial.index.len()));
@@ -1526,12 +1748,8 @@ fn fused_join_aggregate(
                                     keys: key_srcs
                                         .iter()
                                         .map(|src| match src {
-                                            ExprSource::Left(s) => {
-                                                left_vecs[*s].v().get(li)
-                                            }
-                                            ExprSource::Right(s) => {
-                                                right_vecs[rci][*s].v().get(ri)
-                                            }
+                                            ExprSource::Left(s) => left_vecs[*s].v().get(li),
+                                            ExprSource::Right(s) => right_vecs[rci][*s].v().get(ri),
                                         })
                                         .collect(),
                                     accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
@@ -1547,9 +1765,7 @@ fn fused_join_aggregate(
                             None => acc.count_star(),
                             // Typed read of the cell (NULL skips), the same
                             // accumulator update the materialized path makes.
-                            Some(ExprSource::Left(s)) => {
-                                acc.update_vec(left_vecs[*s].v(), li)
-                            }
+                            Some(ExprSource::Left(s)) => acc.update_vec(left_vecs[*s].v(), li),
                             Some(ExprSource::Right(s)) => {
                                 acc.update_vec(right_vecs[rci][*s].v(), ri)
                             }
@@ -1568,7 +1784,11 @@ fn fused_join_aggregate(
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
     let chunks = emit_groups(groups, &key_types, aggs)?;
     let (names, types) = agg_output_schema(keys, aggs);
-    Ok(Some(Output { chunks, names, types }))
+    Ok(Some(Output {
+        chunks,
+        names,
+        types,
+    }))
 }
 
 fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
@@ -1589,11 +1809,19 @@ fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
             }
             seen.insert(buf.clone());
             if out.is_empty() {
-                out = chunk.columns.iter().map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE)).collect();
+                out = chunk
+                    .columns
+                    .iter()
+                    .map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE))
+                    .collect();
             }
             if out_rows >= CHUNK_SIZE {
                 finished.push(DataChunk::new(std::mem::take(&mut out))?);
-                out = chunk.columns.iter().map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE)).collect();
+                out = chunk
+                    .columns
+                    .iter()
+                    .map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE))
+                    .collect();
                 out_rows = 0;
             }
             for (col, src) in out.iter_mut().zip(chunk.columns.iter()) {
@@ -1722,7 +1950,11 @@ fn encode_key_into(v: &Vector, idx: usize, desc: bool, out: &mut Vec<u8>) -> boo
             }
             let x = if x == 0.0 { 0.0 } else { x }; // −0.0 == +0.0 in compare_values
             let b = x.to_bits();
-            let b = if b & (1u64 << 63) != 0 { !b } else { b | (1u64 << 63) };
+            let b = if b & (1u64 << 63) != 0 {
+                !b
+            } else {
+                b | (1u64 << 63)
+            };
             push_be(out, b, 8, desc);
         }
         VectorData::VarChar(d) => {
@@ -1789,7 +2021,10 @@ fn encode_sort_keys(
             Some((bytes, offsets))
         })
         .collect();
-    let mut arena = SortArena { bytes: Vec::new(), offsets: Vec::with_capacity(n + 1) };
+    let mut arena = SortArena {
+        bytes: Vec::new(),
+        offsets: Vec::with_capacity(n + 1),
+    };
     for part in encoded {
         let (bytes, offsets) = part?;
         if arena.bytes.len() + bytes.len() > u32::MAX as usize {
@@ -1831,12 +2066,18 @@ fn rebuild_sorted(chunks: &[DataChunk], rows: &[u32]) -> Result<Vec<DataChunk>> 
         map
     });
     let mut finished = Vec::new();
-    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
+    let mut cur: Vec<Vector> = dtypes
+        .iter()
+        .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+        .collect();
     let mut cur_rows = 0;
     for &g in rows {
         if cur_rows >= CHUNK_SIZE {
             finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-            cur = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
+            cur = dtypes
+                .iter()
+                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                .collect();
             cur_rows = 0;
         }
         let g = g as usize;
@@ -1906,7 +2147,10 @@ fn top_n(
         .map(|part| {
             let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(limit + 1);
             for &row in part {
-                let cand = Candidate { key: arena.key(row), row };
+                let cand = Candidate {
+                    key: arena.key(row),
+                    row,
+                };
                 if heap.len() < limit {
                     heap.push(cand);
                 } else if let Some(&max) = heap.peek() {
@@ -1971,7 +2215,11 @@ fn sort_legacy(
                 (_, Value::Null) => Ordering::Less,
                 _ => {
                     let c = compare_values(ka, kb);
-                    if *desc { c.reverse() } else { c }
+                    if *desc {
+                        c.reverse()
+                    } else {
+                        c
+                    }
                 }
             };
             if ord != Ordering::Equal {
@@ -1984,12 +2232,18 @@ fn sort_legacy(
     // Rebuild columns in sorted order.
     let dtypes: Vec<DataType> = chunks[0].columns.iter().map(|c| c.dtype()).collect();
     let mut finished = Vec::new();
-    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
+    let mut cur: Vec<Vector> = dtypes
+        .iter()
+        .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+        .collect();
     let mut cur_rows = 0;
     for r in rows {
         if cur_rows >= CHUNK_SIZE {
             finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-            cur = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
+            cur = dtypes
+                .iter()
+                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                .collect();
             cur_rows = 0;
         }
         let src = &chunks[r.chunk];
@@ -2022,7 +2276,11 @@ fn truncate_output(mut out: Output, limit: usize) -> Output {
             left = 0;
         }
     }
-    Output { chunks, names: out.names, types: out.types }
+    Output {
+        chunks,
+        names: out.names,
+        types: out.types,
+    }
 }
 
 #[cfg(test)]
@@ -2066,32 +2324,48 @@ mod tests {
     #[test]
     fn integer_overflow_errors_like_duckdb() {
         let mut db = PinkDb::new();
-        let err = |db: &mut PinkDb, sql: &str| -> String {
-            db.execute(sql).expect_err(sql).to_string()
-        };
+        let err =
+            |db: &mut PinkDb, sql: &str| -> String { db.execute(sql).expect_err(sql).to_string() };
         assert!(err(&mut db, "SELECT 2147483647 + 1;").contains("Overflow in addition of INTEGER"));
         assert!(err(&mut db, "SELECT -2147483647 - 2;").contains("Overflow in subtraction"));
-        assert!(err(&mut db, "SELECT 9223372036854775807 * 2;").contains("multiplication of BIGINT"));
-        assert!(err(&mut db, "SELECT abs(CAST(-2147483648 AS INTEGER));").contains("Overflow in abs"));
+        assert!(
+            err(&mut db, "SELECT 9223372036854775807 * 2;").contains("multiplication of BIGINT")
+        );
+        assert!(
+            err(&mut db, "SELECT abs(CAST(-2147483648 AS INTEGER));").contains("Overflow in abs")
+        );
         assert!(err(&mut db, "SELECT CAST(3000000000 AS INTEGER);").contains("out of range"));
         assert!(err(&mut db, "SELECT CAST(1e300 AS BIGINT);").contains("out of range"));
-        assert!(err(&mut db, "SELECT DATE '2024-01-01' + 2147483647;").contains("date out of range"));
+        assert!(
+            err(&mut db, "SELECT DATE '2024-01-01' + 2147483647;").contains("date out of range")
+        );
         // In range stays exact; float→int rounds half away from zero.
-        assert_eq!(select(&mut db, "SELECT 2147483646 + 1;"), vec![vec![V::Integer(i32::MAX)]]);
         assert_eq!(
-            select(&mut db, "SELECT CAST(2.5 AS INTEGER), CAST(-2.5 AS INTEGER), CAST(2.4 AS BIGINT);"),
+            select(&mut db, "SELECT 2147483646 + 1;"),
+            vec![vec![V::Integer(i32::MAX)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT CAST(2.5 AS INTEGER), CAST(-2.5 AS INTEGER), CAST(2.4 AS BIGINT);"
+            ),
             vec![vec![V::Integer(3), V::Integer(-3), V::Bigint(2)]]
         );
         // Column data takes the same checked kernels as literals.
         db.execute("CREATE TABLE o (x INTEGER, y BIGINT);").unwrap();
-        db.execute("INSERT INTO o VALUES (2147483647, 9223372036854775807), (1, 1);").unwrap();
+        db.execute("INSERT INTO o VALUES (2147483647, 9223372036854775807), (1, 1);")
+            .unwrap();
         assert!(err(&mut db, "SELECT x + 1 FROM o;").contains("Overflow in addition of INTEGER"));
         assert!(err(&mut db, "SELECT -x - 2 FROM o;").contains("Overflow"));
         // SUM accumulates wide: only a final result outside BIGINT errors…
         assert!(err(&mut db, "SELECT SUM(y) FROM o;").contains("Overflow in SUM"));
         // …and an intermediate excursion that comes back in range is exact.
-        db.execute("INSERT INTO o VALUES (0, -9223372036854775807);").unwrap();
-        assert_eq!(select(&mut db, "SELECT SUM(y) FROM o;"), vec![vec![V::Bigint(1)]]);
+        db.execute("INSERT INTO o VALUES (0, -9223372036854775807);")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT SUM(y) FROM o;"),
+            vec![vec![V::Bigint(1)]]
+        );
         // SUM(INTEGER) never overflows BIGINT at realistic row counts.
         assert_eq!(
             select(&mut db, "SELECT SUM(x) FROM o;"),
@@ -2142,7 +2416,8 @@ mod tests {
     #[test]
     fn group_first_seen_order_across_chunks_and_null_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE g (k INTEGER, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE g (k INTEGER, v INTEGER);")
+            .unwrap();
         // 3000 rows = 2 chunks; key cycles 0,7,1,8,2,9,3,10,4,11,5,12,6.
         insert_rows(&mut db, "g", 3000, |n| format!("({}, {n})", (n * 7) % 13));
         let rows = select(&mut db, "SELECT k, COUNT(*) FROM g GROUP BY k;");
@@ -2151,11 +2426,16 @@ mod tests {
         for (i, (row, key)) in rows.iter().zip(expected_order).enumerate() {
             assert_eq!(row[0], V::Integer(key), "group {i}");
             // 3000 = 13 × 230 + 10: the first 10 cycle keys occur 231×.
-            assert_eq!(row[1], V::Bigint(if i < 10 { 231 } else { 230 }), "group {i}");
+            assert_eq!(
+                row[1],
+                V::Bigint(if i < 10 { 231 } else { 230 }),
+                "group {i}"
+            );
         }
         // NULL keys are one group, in first-seen position.
         db.execute("CREATE TABLE nn (k INTEGER);").unwrap();
-        db.execute("INSERT INTO nn VALUES (1), (NULL), (2), (NULL);").unwrap();
+        db.execute("INSERT INTO nn VALUES (1), (NULL), (2), (NULL);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT k, COUNT(*) FROM nn GROUP BY k;"),
             vec![
@@ -2174,11 +2454,18 @@ mod tests {
     }
 
     #[test]
-    fn distinct_and_order_nulls_last() {        let mut db = sales_db();
-        let rows = select(&mut db, "SELECT DISTINCT region FROM sales ORDER BY region;");
+    fn distinct_and_order_nulls_last() {
+        let mut db = sales_db();
+        let rows = select(
+            &mut db,
+            "SELECT DISTINCT region FROM sales ORDER BY region;",
+        );
         assert_eq!(
             rows,
-            vec![vec![V::Varchar("east".to_string())], vec![V::Varchar("west".to_string())]]
+            vec![
+                vec![V::Varchar("east".to_string())],
+                vec![V::Varchar("west".to_string())]
+            ]
         );
         let rows = select(&mut db, "SELECT total FROM sales ORDER BY total;");
         assert_eq!(rows.last().unwrap(), &vec![V::Null]);
@@ -2191,7 +2478,10 @@ mod tests {
     #[test]
     fn scalar_functions_and_coercion() {
         let mut db = sales_db();
-        let rows = select(&mut db, "SELECT 1 / 2, upper(region), length(region) FROM sales LIMIT 1;");
+        let rows = select(
+            &mut db,
+            "SELECT 1 / 2, upper(region), length(region) FROM sales LIMIT 1;",
+        );
         assert_eq!(rows[0][0], V::Double(0.5));
         assert_eq!(rows[0][1], V::Varchar("WEST".to_string()));
         assert_eq!(rows[0][2], V::Integer(4));
@@ -2201,7 +2491,8 @@ mod tests {
     fn create_insert_select_roundtrip() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a BIGINT, b VARCHAR);").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'yy');").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'yy');")
+            .unwrap();
         let rows = select(&mut db, "SELECT a, b FROM t ORDER BY a DESC;");
         assert_eq!(
             rows,
@@ -2236,13 +2527,22 @@ mod tests {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (x INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
-        assert_eq!(select(&mut db, "SELECT SUM(x) + (1+1) FROM t;"), vec![vec![V::Bigint(5)]]);
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) + (1+1) FROM t;"),
+            vec![vec![V::Bigint(5)]]
+        );
         assert_eq!(
             select(&mut db, "SELECT 1+1, SUM(x) FROM t;"),
             vec![vec![V::Integer(2), V::Bigint(3)]]
         );
-        assert_eq!(select(&mut db, "SELECT SUM(x) + abs(1) FROM t;"), vec![vec![V::Bigint(4)]]);
-        assert_eq!(select(&mut db, "SELECT SUM(x) FROM t HAVING SUM(x) > 1+1;"), vec![vec![V::Bigint(3)]]);
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) + abs(1) FROM t;"),
+            vec![vec![V::Bigint(4)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) FROM t HAVING SUM(x) > 1+1;"),
+            vec![vec![V::Bigint(3)]]
+        );
     }
 
     #[test]
@@ -2251,15 +2551,20 @@ mod tests {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (x INTEGER);").unwrap();
         db.execute("INSERT INTO t VALUES (1);").unwrap();
-        assert_eq!(select(&mut db, "SELECT x AS x FROM t;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT x AS x FROM t;"),
+            vec![vec![V::Integer(1)]]
+        );
     }
 
     #[test]
     fn where_ignores_select_aliases() {
         // M1: WHERE binds table columns, never select aliases.
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE u (a INTEGER, b INTEGER);").unwrap();
-        db.execute("INSERT INTO u VALUES (1, 100), (2, 0);").unwrap();
+        db.execute("CREATE TABLE u (a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO u VALUES (1, 100), (2, 0);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT a AS b FROM u WHERE b > 50;"),
             vec![vec![V::Integer(1)]]
@@ -2272,11 +2577,23 @@ mod tests {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE e (x INTEGER);").unwrap();
         db.execute("INSERT INTO e VALUES (NULL), (NULL);").unwrap();
-        assert_eq!(select(&mut db, "SELECT SUM(x) FROM e;"), vec![vec![V::Null]]);
-        assert_eq!(select(&mut db, "SELECT SUM(x) FROM e WHERE false;"), vec![vec![V::Null]]);
-        assert_eq!(select(&mut db, "SELECT SUM(x + 1) FROM e;"), vec![vec![V::Null]]);
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) FROM e;"),
+            vec![vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) FROM e WHERE false;"),
+            vec![vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x + 1) FROM e;"),
+            vec![vec![V::Null]]
+        );
         // Non-empty sums still work.
-        assert_eq!(select(&mut db, "SELECT SUM(x) FROM e WHERE x IS NULL;"), vec![vec![V::Null]]);
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) FROM e WHERE x IS NULL;"),
+            vec![vec![V::Null]]
+        );
     }
 
     /// Regression: a fresh table scans as one 0-row chunk, so with no GROUP
@@ -2287,16 +2604,37 @@ mod tests {
     fn global_aggregates_over_truly_empty_table() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE e (x INTEGER);").unwrap();
-        assert_eq!(select(&mut db, "SELECT SUM(x) FROM e;"), vec![vec![V::Null]]);
-        assert_eq!(select(&mut db, "SELECT AVG(x) FROM e;"), vec![vec![V::Null]]);
-        assert_eq!(select(&mut db, "SELECT MIN(x) FROM e;"), vec![vec![V::Null]]);
-        assert_eq!(select(&mut db, "SELECT MAX(x) FROM e;"), vec![vec![V::Null]]);
-        assert_eq!(select(&mut db, "SELECT COUNT(x) FROM e;"), vec![vec![V::Bigint(0)]]);
-        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM e;"), vec![vec![V::Bigint(0)]]);
+        assert_eq!(
+            select(&mut db, "SELECT SUM(x) FROM e;"),
+            vec![vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT AVG(x) FROM e;"),
+            vec![vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT MIN(x) FROM e;"),
+            vec![vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT MAX(x) FROM e;"),
+            vec![vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(x) FROM e;"),
+            vec![vec![V::Bigint(0)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM e;"),
+            vec![vec![V::Bigint(0)]]
+        );
         // Same path once the 0-row chunk comes from a derived table: the
         // inner grouped aggregate emits no groups over the empty table.
         assert_eq!(
-            select(&mut db, "SELECT SUM(c) FROM (SELECT x, COUNT(*) AS c FROM e GROUP BY x) s;"),
+            select(
+                &mut db,
+                "SELECT SUM(c) FROM (SELECT x, COUNT(*) AS c FROM e GROUP BY x) s;"
+            ),
             vec![vec![V::Null]]
         );
     }
@@ -2328,7 +2666,8 @@ mod tests {
     fn float_key_encoding_matches_equality() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE d (v DOUBLE);").unwrap();
-        db.execute("INSERT INTO d VALUES (-0.0), (0.0), (1.0);").unwrap();
+        db.execute("INSERT INTO d VALUES (-0.0), (0.0), (1.0);")
+            .unwrap();
         let rows = select(&mut db, "SELECT v, COUNT(*) FROM d GROUP BY v;");
         assert_eq!(rows.len(), 2);
         let zero = rows
@@ -2349,12 +2688,16 @@ mod tests {
             vec![vec![V::Bigint(5)]]
         );
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM d a JOIN d b ON a.v = b.v WHERE a.v = 0.0;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM d a JOIN d b ON a.v = b.v WHERE a.v = 0.0;"
+            ),
             vec![vec![V::Bigint(4)]]
         );
         // Different NaN payloads are one DISTINCT row.
         db.execute("CREATE TABLE n (v DOUBLE);").unwrap();
-        db.execute("INSERT INTO n VALUES (0.0 / 0.0), (-0.0 / 0.0);").unwrap();
+        db.execute("INSERT INTO n VALUES (0.0 / 0.0), (-0.0 / 0.0);")
+            .unwrap();
         assert_eq!(select(&mut db, "SELECT DISTINCT v FROM n;").len(), 1);
     }
 
@@ -2365,7 +2708,8 @@ mod tests {
     fn join_match_expansion_spans_chunks_in_order() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t1 (id INTEGER);").unwrap();
-        db.execute("CREATE TABLE t2 (id INTEGER, rn INTEGER);").unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER, rn INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO t1 VALUES (1);").unwrap();
         let mut sql = String::from("INSERT INTO t2 VALUES");
         for rn in 0..5000 {
@@ -2388,10 +2732,14 @@ mod tests {
     #[test]
     fn join_interleaved_duplicate_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv VARCHAR);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv VARCHAR);").unwrap();
-        db.execute("INSERT INTO l VALUES (1, 'a'), (2, 'b'), (1, 'c');").unwrap();
-        db.execute("INSERT INTO r VALUES (1, 'x'), (2, 'y'), (1, 'z');").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv VARCHAR);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO l VALUES (1, 'a'), (2, 'b'), (1, 'c');")
+            .unwrap();
+        db.execute("INSERT INTO r VALUES (1, 'x'), (2, 'y'), (1, 'z');")
+            .unwrap();
         let rows = select(&mut db, "SELECT lv, rv FROM l JOIN r ON l.k = r.k;");
         assert_eq!(
             rows,
@@ -2411,10 +2759,12 @@ mod tests {
     #[test]
     fn join_cross_type_string_and_null_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE ig (k INTEGER, lv INTEGER);").unwrap();
+        db.execute("CREATE TABLE ig (k INTEGER, lv INTEGER);")
+            .unwrap();
         db.execute("CREATE TABLE bg (k BIGINT);").unwrap();
         db.execute("CREATE TABLE dg (k DOUBLE);").unwrap();
-        db.execute("CREATE TABLE sv (k VARCHAR, rn INTEGER);").unwrap();
+        db.execute("CREATE TABLE sv (k VARCHAR, rn INTEGER);")
+            .unwrap();
         db.execute("CREATE TABLE s (k VARCHAR);").unwrap();
         // 100 rows per side: k cycles 0..3 (25 rows each).
         insert_rows(&mut db, "ig", 100, |n| format!("({}, {n})", n % 4));
@@ -2430,8 +2780,10 @@ mod tests {
         );
         // String keys: duplicate matches preserve right-input order; NULLs
         // never match.
-        db.execute("INSERT INTO sv VALUES ('x', 1), ('y', 2), (NULL, 3);").unwrap();
-        db.execute("INSERT INTO s VALUES ('x'), ('x'), ('y'), (NULL);").unwrap();
+        db.execute("INSERT INTO sv VALUES ('x', 1), ('y', 2), (NULL, 3);")
+            .unwrap();
+        db.execute("INSERT INTO s VALUES ('x'), ('x'), ('y'), (NULL);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT rn FROM sv JOIN s ON sv.k = s.k;"),
             vec![
@@ -2448,8 +2800,10 @@ mod tests {
     #[test]
     fn join_multi_left_chunk_expansion_preserves_order() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
         insert_rows(&mut db, "l", 3000, |n| format!("({}, {n})", n % 2));
         // Right rows in input order per key: rv 0, 1, 2.
         insert_rows(&mut db, "r", 6, |n| format!("({}, {})", n % 2, n / 2));
@@ -2469,8 +2823,10 @@ mod tests {
     #[test]
     fn join_int_keys_extremes_nulls_and_duplicates() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k BIGINT, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k BIGINT, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE l (k BIGINT, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k BIGINT, rv INTEGER);")
+            .unwrap();
         db.execute(
             "INSERT INTO l VALUES
              (-9223372036854775807 - 1, 0), (-5, 1), (0, 2), (7, 3), (7, 4),
@@ -2508,8 +2864,10 @@ mod tests {
     #[test]
     fn join_int_bigint_cross_type_widening() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE a (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE b (k BIGINT, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE a (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE b (k BIGINT, rv INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO a VALUES (1, 1), (-1, 2), (NULL, 3), (2147483647, 4);")
             .unwrap();
         db.execute(
@@ -2532,8 +2890,10 @@ mod tests {
     #[test]
     fn join_timestamp_keys_match_micros() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (ts TIMESTAMP, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (ts TIMESTAMP, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE l (ts TIMESTAMP, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (ts TIMESTAMP, rv INTEGER);")
+            .unwrap();
         db.execute(
             "INSERT INTO l VALUES
              (TIMESTAMP '2024-01-15 10:00:00', 1),
@@ -2567,7 +2927,8 @@ mod tests {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE l (k BIGINT);").unwrap();
         db.execute("CREATE TABLE r (k BIGINT);").unwrap();
-        db.execute("INSERT INTO l VALUES (1), (NULL), (2);").unwrap();
+        db.execute("INSERT INTO l VALUES (1), (NULL), (2);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT COUNT(*) FROM l JOIN r ON l.k = r.k;"),
             vec![vec![V::Bigint(0)]]
@@ -2588,7 +2949,8 @@ mod tests {
     fn join_bigint_expansion_spans_chunks() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE l (k BIGINT);").unwrap();
-        db.execute("CREATE TABLE r (k BIGINT, rn INTEGER);").unwrap();
+        db.execute("CREATE TABLE r (k BIGINT, rn INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO l VALUES (1);").unwrap();
         // Right input alternates keys 1/2: key 1 has 2500 matches (even rn).
         insert_rows(&mut db, "r", 5000, |n| format!("({}, {n})", 1 + n % 2));
@@ -2605,8 +2967,10 @@ mod tests {
     fn join_int_and_byte_paths_agree() {
         fn run(key_type: &str, l: &str, r: &str) -> Vec<Vec<V>> {
             let mut db = PinkDb::new();
-            db.execute(&format!("CREATE TABLE l (k {key_type}, lv INTEGER);")).unwrap();
-            db.execute(&format!("CREATE TABLE r (k {key_type}, rv INTEGER);")).unwrap();
+            db.execute(&format!("CREATE TABLE l (k {key_type}, lv INTEGER);"))
+                .unwrap();
+            db.execute(&format!("CREATE TABLE r (k {key_type}, rv INTEGER);"))
+                .unwrap();
             db.execute(&format!("INSERT INTO l VALUES {l};")).unwrap();
             db.execute(&format!("INSERT INTO r VALUES {r};")).unwrap();
             select(&mut db, "SELECT lv, rv FROM l JOIN r ON l.k = r.k;")
@@ -2648,22 +3012,40 @@ mod tests {
     #[test]
     fn outer_join_matched_unmatched_and_null_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
-        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);")
+            .unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);")
+            .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT l.k, lv, r.k, rv FROM l LEFT JOIN r ON l.k = r.k;"),
+            select(
+                &mut db,
+                "SELECT l.k, lv, r.k, rv FROM l LEFT JOIN r ON l.k = r.k;"
+            ),
             vec![
-                vec![V::Integer(1), V::Integer(10), V::Integer(1), V::Integer(100)],
+                vec![
+                    V::Integer(1),
+                    V::Integer(10),
+                    V::Integer(1),
+                    V::Integer(100)
+                ],
                 vec![V::Integer(2), V::Integer(20), V::Integer(2), V::Null],
                 vec![V::Null, V::Integer(30), V::Null, V::Null],
                 vec![V::Integer(4), V::Integer(40), V::Null, V::Null],
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT l.k, lv, r.k, rv FROM l LEFT OUTER JOIN r ON l.k = r.k;"),
-            select(&mut db, "SELECT l.k, lv, r.k, rv FROM l LEFT JOIN r ON l.k = r.k;")
+            select(
+                &mut db,
+                "SELECT l.k, lv, r.k, rv FROM l LEFT OUTER JOIN r ON l.k = r.k;"
+            ),
+            select(
+                &mut db,
+                "SELECT l.k, lv, r.k, rv FROM l LEFT JOIN r ON l.k = r.k;"
+            )
         );
     }
 
@@ -2672,14 +3054,23 @@ mod tests {
     #[test]
     fn right_join_keeps_declared_column_order() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
-        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);")
+            .unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT * FROM l RIGHT OUTER JOIN r ON l.k = r.k;"),
             vec![
-                vec![V::Integer(1), V::Integer(10), V::Integer(1), V::Integer(100)],
+                vec![
+                    V::Integer(1),
+                    V::Integer(10),
+                    V::Integer(1),
+                    V::Integer(100)
+                ],
                 vec![V::Integer(2), V::Integer(20), V::Integer(2), V::Null],
                 vec![V::Null, V::Null, V::Null, V::Integer(300)],
                 vec![V::Null, V::Null, V::Integer(5), V::Integer(500)],
@@ -2691,9 +3082,12 @@ mod tests {
     #[test]
     fn outer_join_empty_sides() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
-        db.execute("CREATE TABLE e (k INTEGER, ev INTEGER);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE e (k INTEGER, ev INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO l VALUES (1, 10);").unwrap();
         db.execute("INSERT INTO r VALUES (1, 20);").unwrap();
         // Empty right: LEFT keeps its left row NULL-extended; RIGHT is empty.
@@ -2716,11 +3110,17 @@ mod tests {
         );
         // Both empty.
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM e LEFT JOIN e e2 ON e.k = e2.k;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM e LEFT JOIN e e2 ON e.k = e2.k;"
+            ),
             vec![vec![V::Bigint(0)]]
         );
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM e RIGHT JOIN e e2 ON e.k = e2.k;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM e RIGHT JOIN e e2 ON e.k = e2.k;"
+            ),
             vec![vec![V::Bigint(0)]]
         );
     }
@@ -2729,10 +3129,14 @@ mod tests {
     #[test]
     fn outer_join_all_unmatched() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO l VALUES (1, 10), (2, 20);").unwrap();
-        db.execute("INSERT INTO r VALUES (3, 30), (4, 40);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20);")
+            .unwrap();
+        db.execute("INSERT INTO r VALUES (3, 30), (4, 40);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k;"),
             vec![vec![V::Integer(10), V::Null], vec![V::Integer(20), V::Null]]
@@ -2748,13 +3152,20 @@ mod tests {
     #[test]
     fn outer_join_multi_chunk_inputs() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
         insert_rows(&mut db, "l", 3000, |i| format!("({i}, {})", i as i64 + 1));
-        insert_rows(&mut db, "r", 3000, |i| format!("({}, {})", i as i64 + 1000, i as i64 + 100));
+        insert_rows(&mut db, "r", 3000, |i| {
+            format!("({}, {})", i as i64 + 1000, i as i64 + 100)
+        });
         // Keys overlap on 1000..3000: 2000 matches, 1000 NULL-extended left rows.
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*), COUNT(r.rv) FROM l LEFT JOIN r ON l.k = r.k;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(r.rv) FROM l LEFT JOIN r ON l.k = r.k;"
+            ),
             vec![vec![V::Bigint(3000), V::Bigint(2000)]]
         );
         let rows = select(&mut db, "SELECT l.k, r.k FROM l LEFT JOIN r ON l.k = r.k;");
@@ -2764,7 +3175,10 @@ mod tests {
         assert_eq!(rows[2999], vec![V::Integer(2999), V::Integer(2999)]);
         // RIGHT mirrors: every right row survives, in right-row order.
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*), COUNT(l.lv) FROM l RIGHT JOIN r ON l.k = r.k;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(l.lv) FROM l RIGHT JOIN r ON l.k = r.k;"
+            ),
             vec![vec![V::Bigint(3000), V::Bigint(2000)]]
         );
         let rows = select(&mut db, "SELECT l.k, r.k FROM l RIGHT JOIN r ON l.k = r.k;");
@@ -2779,7 +3193,8 @@ mod tests {
     fn outer_join_expansion_spans_chunks() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t1 (id INTEGER);").unwrap();
-        db.execute("CREATE TABLE t2 (id INTEGER, rn INTEGER);").unwrap();
+        db.execute("CREATE TABLE t2 (id INTEGER, rn INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO t1 VALUES (1);").unwrap();
         insert_rows(&mut db, "t2", 5000, |i| format!("(1, {i})"));
         let rows = select(&mut db, "SELECT rn FROM t1 LEFT JOIN t2 ON t1.id = t2.id;");
@@ -2788,11 +3203,15 @@ mod tests {
             assert_eq!(row[0], V::Integer(i as i32), "row {i}");
         }
         // RIGHT: one right row matching 2500 left rows, left-row order.
-        db.execute("CREATE TABLE t3 (id INTEGER, rn INTEGER);").unwrap();
+        db.execute("CREATE TABLE t3 (id INTEGER, rn INTEGER);")
+            .unwrap();
         db.execute("CREATE TABLE t4 (id INTEGER);").unwrap();
         db.execute("INSERT INTO t4 VALUES (1);").unwrap();
         insert_rows(&mut db, "t3", 2500, |i| format!("(1, {i})"));
-        let rows = select(&mut db, "SELECT t3.rn FROM t4 RIGHT JOIN t3 ON t4.id = t3.id;");
+        let rows = select(
+            &mut db,
+            "SELECT t3.rn FROM t4 RIGHT JOIN t3 ON t4.id = t3.id;",
+        );
         assert_eq!(rows.len(), 2500);
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row[0], V::Integer(i as i32), "row {i}");
@@ -2803,10 +3222,14 @@ mod tests {
     #[test]
     fn outer_join_cross_type_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE a (x INTEGER, av INTEGER);").unwrap();
-        db.execute("CREATE TABLE b (x BIGINT, bv INTEGER);").unwrap();
-        db.execute("INSERT INTO a VALUES (1, 10), (2, 20);").unwrap();
-        db.execute("INSERT INTO b VALUES (2, 200), (3, 300);").unwrap();
+        db.execute("CREATE TABLE a (x INTEGER, av INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE b (x BIGINT, bv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO a VALUES (1, 10), (2, 20);")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (2, 200), (3, 300);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT * FROM a LEFT JOIN b ON a.x = b.x;"),
             vec![
@@ -2827,12 +3250,19 @@ mod tests {
     #[test]
     fn outer_join_string_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE ls (k VARCHAR, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE rs (k VARCHAR, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO ls VALUES ('a', 1), ('b', 2), (NULL, 3);").unwrap();
-        db.execute("INSERT INTO rs VALUES ('b', 20), ('c', 30), (NULL, 40);").unwrap();
+        db.execute("CREATE TABLE ls (k VARCHAR, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE rs (k VARCHAR, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO ls VALUES ('a', 1), ('b', 2), (NULL, 3);")
+            .unwrap();
+        db.execute("INSERT INTO rs VALUES ('b', 20), ('c', 30), (NULL, 40);")
+            .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT ls.k, lv, rs.k, rv FROM ls LEFT JOIN rs ON ls.k = rs.k;"),
+            select(
+                &mut db,
+                "SELECT ls.k, lv, rs.k, rv FROM ls LEFT JOIN rs ON ls.k = rs.k;"
+            ),
             vec![
                 vec![V::Varchar("a".to_string()), V::Integer(1), V::Null, V::Null],
                 vec![
@@ -2845,7 +3275,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT rv, lv FROM ls RIGHT JOIN rs ON ls.k = rs.k;"),
+            select(
+                &mut db,
+                "SELECT rv, lv FROM ls RIGHT JOIN rs ON ls.k = rs.k;"
+            ),
             vec![
                 vec![V::Integer(20), V::Integer(2)],
                 vec![V::Integer(30), V::Null],
@@ -2863,16 +3296,26 @@ mod tests {
     #[test]
     fn left_join_where_predicates_match_duckdb() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
-        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);")
+            .unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (2, NULL), (NULL, 300), (5, 500);")
+            .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE r.rv > 50;"),
+            select(
+                &mut db,
+                "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE r.rv > 50;"
+            ),
             vec![vec![V::Integer(10), V::Integer(100)]]
         );
         assert_eq!(
-            select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE r.rv IS NULL;"),
+            select(
+                &mut db,
+                "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE r.rv IS NULL;"
+            ),
             vec![
                 vec![V::Integer(20), V::Null],
                 vec![V::Integer(30), V::Null],
@@ -2880,7 +3323,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE l.lv > 15;"),
+            select(
+                &mut db,
+                "SELECT lv, rv FROM l LEFT JOIN r ON l.k = r.k WHERE l.lv > 15;"
+            ),
             vec![
                 vec![V::Integer(20), V::Null],
                 vec![V::Integer(30), V::Null],
@@ -2893,7 +3339,10 @@ mod tests {
         // pinkdb emits deterministic right-row order ([10,100], [NULL,300],
         // [NULL,500]) while DuckDB prints [10,100], [NULL,500], [NULL,300].
         assert_eq!(
-            select(&mut db, "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k WHERE r.rv > 50;"),
+            select(
+                &mut db,
+                "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k WHERE r.rv > 50;"
+            ),
             vec![
                 vec![V::Integer(10), V::Integer(100)],
                 vec![V::Null, V::Integer(300)],
@@ -2901,8 +3350,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k WHERE l.lv IS NULL;"),
-            vec![vec![V::Null, V::Integer(300)], vec![V::Null, V::Integer(500)]]
+            select(
+                &mut db,
+                "SELECT lv, rv FROM l RIGHT JOIN r ON l.k = r.k WHERE l.lv IS NULL;"
+            ),
+            vec![
+                vec![V::Null, V::Integer(300)],
+                vec![V::Null, V::Integer(500)]
+            ]
         );
     }
 
@@ -2969,24 +3424,54 @@ mod tests {
         let mut db = PinkDb::new();
         // BOOLEAN keys: RIGHT preserves right-row order, so the NULL-keyed
         // right row stays between true and false.
-        db.execute("CREATE TABLE lb (k BOOLEAN, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE rb (k BOOLEAN, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO lb VALUES (true, 1), (false, 2), (NULL, 3);").unwrap();
-        db.execute("INSERT INTO rb VALUES (true, 10), (NULL, 11), (false, 12);").unwrap();
+        db.execute("CREATE TABLE lb (k BOOLEAN, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE rb (k BOOLEAN, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO lb VALUES (true, 1), (false, 2), (NULL, 3);")
+            .unwrap();
+        db.execute("INSERT INTO rb VALUES (true, 10), (NULL, 11), (false, 12);")
+            .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT lb.k, lv, rb.k, rv FROM lb LEFT JOIN rb ON lb.k = rb.k;"),
+            select(
+                &mut db,
+                "SELECT lb.k, lv, rb.k, rv FROM lb LEFT JOIN rb ON lb.k = rb.k;"
+            ),
             vec![
-                vec![V::Boolean(true), V::Integer(1), V::Boolean(true), V::Integer(10)],
-                vec![V::Boolean(false), V::Integer(2), V::Boolean(false), V::Integer(12)],
+                vec![
+                    V::Boolean(true),
+                    V::Integer(1),
+                    V::Boolean(true),
+                    V::Integer(10)
+                ],
+                vec![
+                    V::Boolean(false),
+                    V::Integer(2),
+                    V::Boolean(false),
+                    V::Integer(12)
+                ],
                 vec![V::Null, V::Integer(3), V::Null, V::Null],
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT lb.k, lv, rb.k, rv FROM lb RIGHT JOIN rb ON lb.k = rb.k;"),
+            select(
+                &mut db,
+                "SELECT lb.k, lv, rb.k, rv FROM lb RIGHT JOIN rb ON lb.k = rb.k;"
+            ),
             vec![
-                vec![V::Boolean(true), V::Integer(1), V::Boolean(true), V::Integer(10)],
+                vec![
+                    V::Boolean(true),
+                    V::Integer(1),
+                    V::Boolean(true),
+                    V::Integer(10)
+                ],
                 vec![V::Null, V::Null, V::Null, V::Integer(11)],
-                vec![V::Boolean(false), V::Integer(2), V::Boolean(false), V::Integer(12)],
+                vec![
+                    V::Boolean(false),
+                    V::Integer(2),
+                    V::Boolean(false),
+                    V::Integer(12)
+                ],
             ]
         );
         // DATE keys.
@@ -3004,7 +3489,10 @@ mod tests {
         let feb20 = select(&mut db, "SELECT k FROM ld WHERE lv = 2;")[0][0].clone();
         let mar01 = select(&mut db, "SELECT k FROM rd WHERE rv = 11;")[0][0].clone();
         assert_eq!(
-            select(&mut db, "SELECT ld.k, lv, rd.k, rv FROM ld LEFT JOIN rd ON ld.k = rd.k;"),
+            select(
+                &mut db,
+                "SELECT ld.k, lv, rd.k, rv FROM ld LEFT JOIN rd ON ld.k = rd.k;"
+            ),
             vec![
                 vec![jan15.clone(), V::Integer(1), jan15.clone(), V::Integer(10)],
                 vec![feb20.clone(), V::Integer(2), V::Null, V::Null],
@@ -3012,7 +3500,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT ld.k, lv, rd.k, rv FROM ld RIGHT JOIN rd ON ld.k = rd.k;"),
+            select(
+                &mut db,
+                "SELECT ld.k, lv, rd.k, rv FROM ld RIGHT JOIN rd ON ld.k = rd.k;"
+            ),
             vec![
                 vec![jan15.clone(), V::Integer(1), jan15, V::Integer(10)],
                 vec![V::Null, V::Null, mar01, V::Integer(11)],
@@ -3020,8 +3511,10 @@ mod tests {
             ]
         );
         // TIMESTAMP keys match at microsecond precision.
-        db.execute("CREATE TABLE lt (k TIMESTAMP, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE rt (k TIMESTAMP, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE lt (k TIMESTAMP, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE rt (k TIMESTAMP, rv INTEGER);")
+            .unwrap();
         db.execute(
             "INSERT INTO lt VALUES
              (TIMESTAMP '2024-01-15 10:00:00.000001', 1),
@@ -3037,7 +3530,10 @@ mod tests {
         let us1 = select(&mut db, "SELECT k FROM lt WHERE lv = 1;")[0][0].clone();
         let sec = select(&mut db, "SELECT k FROM lt WHERE lv = 2;")[0][0].clone();
         assert_eq!(
-            select(&mut db, "SELECT lt.k, lv, rt.k, rv FROM lt LEFT JOIN rt ON lt.k = rt.k;"),
+            select(
+                &mut db,
+                "SELECT lt.k, lv, rt.k, rv FROM lt LEFT JOIN rt ON lt.k = rt.k;"
+            ),
             vec![
                 vec![us1.clone(), V::Integer(1), us1.clone(), V::Integer(11)],
                 vec![sec.clone(), V::Integer(2), sec.clone(), V::Integer(10)],
@@ -3045,7 +3541,10 @@ mod tests {
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT lt.k, lv, rt.k, rv FROM lt RIGHT JOIN rt ON lt.k = rt.k;"),
+            select(
+                &mut db,
+                "SELECT lt.k, lv, rt.k, rv FROM lt RIGHT JOIN rt ON lt.k = rt.k;"
+            ),
             vec![
                 vec![sec.clone(), V::Integer(2), sec, V::Integer(10)],
                 vec![us1.clone(), V::Integer(1), us1, V::Integer(11)],
@@ -3053,25 +3552,54 @@ mod tests {
             ]
         );
         // Mixed INTEGER = DOUBLE keys canonicalize to DOUBLE (1 matches 1.0).
-        db.execute("CREATE TABLE li (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE rdd (k DOUBLE, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO li VALUES (1, 10), (2, 20), (NULL, 30);").unwrap();
+        db.execute("CREATE TABLE li (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE rdd (k DOUBLE, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO li VALUES (1, 10), (2, 20), (NULL, 30);")
+            .unwrap();
         db.execute("INSERT INTO rdd VALUES (1.0, 100), (1.5, 150), (2.0, 200), (NULL, 300);")
             .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT li.k, lv, rdd.k, rv FROM li LEFT JOIN rdd ON li.k = rdd.k;"),
+            select(
+                &mut db,
+                "SELECT li.k, lv, rdd.k, rv FROM li LEFT JOIN rdd ON li.k = rdd.k;"
+            ),
             vec![
-                vec![V::Integer(1), V::Integer(10), V::Double(1.0), V::Integer(100)],
-                vec![V::Integer(2), V::Integer(20), V::Double(2.0), V::Integer(200)],
+                vec![
+                    V::Integer(1),
+                    V::Integer(10),
+                    V::Double(1.0),
+                    V::Integer(100)
+                ],
+                vec![
+                    V::Integer(2),
+                    V::Integer(20),
+                    V::Double(2.0),
+                    V::Integer(200)
+                ],
                 vec![V::Null, V::Integer(30), V::Null, V::Null],
             ]
         );
         assert_eq!(
-            select(&mut db, "SELECT li.k, lv, rdd.k, rv FROM li RIGHT JOIN rdd ON li.k = rdd.k;"),
+            select(
+                &mut db,
+                "SELECT li.k, lv, rdd.k, rv FROM li RIGHT JOIN rdd ON li.k = rdd.k;"
+            ),
             vec![
-                vec![V::Integer(1), V::Integer(10), V::Double(1.0), V::Integer(100)],
+                vec![
+                    V::Integer(1),
+                    V::Integer(10),
+                    V::Double(1.0),
+                    V::Integer(100)
+                ],
                 vec![V::Null, V::Null, V::Double(1.5), V::Integer(150)],
-                vec![V::Integer(2), V::Integer(20), V::Double(2.0), V::Integer(200)],
+                vec![
+                    V::Integer(2),
+                    V::Integer(20),
+                    V::Double(2.0),
+                    V::Integer(200)
+                ],
                 vec![V::Null, V::Null, V::Null, V::Integer(300)],
             ]
         );
@@ -3084,10 +3612,13 @@ mod tests {
     fn outer_join_interleaved_probe_flushes() {
         const N: usize = 5000;
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
         // Key 1 has two matches; 8/9 are decoys for the unmatched probe rows.
-        db.execute("INSERT INTO r VALUES (1, 100), (8, 800), (1, 101), (9, 900);").unwrap();
+        db.execute("INSERT INTO r VALUES (1, 100), (8, 800), (1, 101), (9, 900);")
+            .unwrap();
         insert_rows(&mut db, "l", N, |i| match i % 3 {
             0 => format!("(1, {i})"),
             1 => format!("(NULL, {i})"),
@@ -3113,9 +3644,12 @@ mod tests {
     fn outer_join_large_right_output_is_deterministic() {
         const N: usize = 5000;
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO l VALUES (1, 100), (8, 800), (1, 101), (9, 900);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO l VALUES (1, 100), (8, 800), (1, 101), (9, 900);")
+            .unwrap();
         insert_rows(&mut db, "r", N, |i| match i % 4 {
             0 => format!("(1, {i})"),
             1 => format!("(NULL, {i})"),
@@ -3145,9 +3679,12 @@ mod tests {
     #[test]
     fn right_join_select_star_empty_left() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE e (k INTEGER, ev VARCHAR);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv DOUBLE);").unwrap();
-        db.execute("INSERT INTO r VALUES (1, 1.5), (2, 2.5);").unwrap();
+        db.execute("CREATE TABLE e (k INTEGER, ev VARCHAR);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv DOUBLE);")
+            .unwrap();
+        db.execute("INSERT INTO r VALUES (1, 1.5), (2, 2.5);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT * FROM e RIGHT JOIN r ON e.k = r.k;"),
             vec![
@@ -3158,11 +3695,21 @@ mod tests {
         let (names, types) = select_meta(&mut db, "SELECT * FROM e RIGHT JOIN r ON e.k = r.k;");
         assert_eq!(
             names,
-            vec!["k".to_string(), "ev".to_string(), "k".to_string(), "rv".to_string()]
+            vec![
+                "k".to_string(),
+                "ev".to_string(),
+                "k".to_string(),
+                "rv".to_string()
+            ]
         );
         assert_eq!(
             types,
-            vec![DataType::Integer, DataType::Varchar, DataType::Integer, DataType::Double]
+            vec![
+                DataType::Integer,
+                DataType::Varchar,
+                DataType::Integer,
+                DataType::Double
+            ]
         );
     }
 
@@ -3183,15 +3730,20 @@ mod tests {
         assert!(db.execute("SELECT 1 AS left;").is_err());
         assert!(db.execute("SELECT 1 AS right;").is_err());
         // Quoted identifiers work as column, table, and alias names.
-        db.execute("CREATE TABLE \"left\" (\"right\" INTEGER, x VARCHAR);").unwrap();
-        db.execute("INSERT INTO \"left\" VALUES (1, 'a'), (2, 'b');").unwrap();
+        db.execute("CREATE TABLE \"left\" (\"right\" INTEGER, x VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO \"left\" VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT \"right\" FROM \"left\" ORDER BY 1;"),
             vec![vec![V::Integer(1)], vec![V::Integer(2)]]
         );
         assert_eq!(
             select(&mut db, "SELECT x FROM \"left\" AS \"right\" ORDER BY x;"),
-            vec![vec![V::Varchar("a".to_string())], vec![V::Varchar("b".to_string())]]
+            vec![
+                vec![V::Varchar("a".to_string())],
+                vec![V::Varchar("b".to_string())]
+            ]
         );
         let (names, _) = select_meta(&mut db, "SELECT 1 AS \"left\";");
         assert_eq!(names, vec!["left".to_string()]);
@@ -3202,9 +3754,12 @@ mod tests {
     #[test]
     fn left_join_aggregates_skip_null_extended_rows() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);").unwrap();
+        db.execute("CREATE TABLE l (k INTEGER, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO l VALUES (1, 10), (2, 20), (NULL, 30), (4, 40);")
+            .unwrap();
         db.execute("INSERT INTO r VALUES (1, 100), (1, 25), (2, NULL), (NULL, 300), (5, 500);")
             .unwrap();
         // 5 joined rows: two matches for l.k=1, one for l.k=2, two NULL-extended.
@@ -3281,7 +3836,10 @@ mod tests {
         // 4 for id=2, one NULL-key left row NULL-extended → 9 rows.
         let mut db = fused_db();
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM fa LEFT JOIN fb ON fa.id = fb.id;"
+            ),
             vec![vec![V::Bigint(9)]]
         );
         assert_eq!(
@@ -3295,7 +3853,10 @@ mod tests {
         // the fusion helper must agree with `eval` + `aggregate` (it returns
         // None, so the query above already ran materialized).
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM fa RIGHT JOIN fb ON fa.id = fb.id;"
+            ),
             vec![vec![V::Bigint(10)]]
         );
     }
@@ -3307,14 +3868,18 @@ mod tests {
         db.execute("CREATE TABLE p (a INTEGER);").unwrap();
         db.execute("INSERT INTO p VALUES (1);").unwrap();
         assert!(db.execute("INSERT INTO p VALUES (2), ('bad');").is_err());
-        assert_eq!(select(&mut db, "SELECT * FROM p;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT * FROM p;"),
+            vec![vec![V::Integer(1)]]
+        );
     }
 
     // --- phase 7: dates + timestamps ---
 
     fn date_db() -> PinkDb {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE ev (id INTEGER, d DATE, ts TIMESTAMP);").unwrap();
+        db.execute("CREATE TABLE ev (id INTEGER, d DATE, ts TIMESTAMP);")
+            .unwrap();
         db.execute(
             "INSERT INTO ev VALUES
              (1, DATE '2024-01-15', TIMESTAMP '2024-01-15 10:00:00'),
@@ -3351,7 +3916,9 @@ mod tests {
         assert!(db.execute("SELECT ts + 1 FROM ev;").is_err());
         assert!(db.execute("SELECT d + d FROM ev;").is_err());
         assert!(db.execute("SELECT * FROM ev WHERE d = ts;").is_err());
-        assert!(db.execute("SELECT * FROM ev WHERE d = '2024-01-15';").is_err());
+        assert!(db
+            .execute("SELECT * FROM ev WHERE d = '2024-01-15';")
+            .is_err());
     }
 
     /// Extreme DATE → TIMESTAMP casts must error, not wrap: `i32::MAX` days
@@ -3384,13 +3951,21 @@ mod tests {
                 V::Integer(59)
             ]]
         );
-        let rows = select(&mut db, "SELECT date_trunc('month', d), date_trunc('day', ts) FROM ev WHERE id = 1;");
+        let rows = select(
+            &mut db,
+            "SELECT date_trunc('month', d), date_trunc('day', ts) FROM ev WHERE id = 1;",
+        );
         assert_eq!(rows[0][0].to_string(), "2024-01-01");
         assert_eq!(rows[0][1].to_string(), "2024-01-15 00:00:00");
-        let rows = select(&mut db, "SELECT date_trunc('year', TIMESTAMP '2024-05-06 07:08:09');");
+        let rows = select(
+            &mut db,
+            "SELECT date_trunc('year', TIMESTAMP '2024-05-06 07:08:09');",
+        );
         assert_eq!(rows[0][0].to_string(), "2024-01-01 00:00:00");
         assert!(db.execute("SELECT hour(d) FROM ev;").is_err());
-        assert!(db.execute("SELECT date_trunc('century', d) FROM ev;").is_err());
+        assert!(db
+            .execute("SELECT date_trunc('century', d) FROM ev;")
+            .is_err());
         assert!(db.execute("SELECT SUM(d) FROM ev;").is_err());
     }
 
@@ -3409,9 +3984,14 @@ mod tests {
         assert_eq!(rows.len(), 3); // two months + NULL group
         assert_eq!(rows[2][0], V::Null);
         // Ordering + join on dates.
-        db.execute("CREATE TABLE h (d DATE, note VARCHAR);").unwrap();
-        db.execute("INSERT INTO h VALUES (DATE '2024-01-15', 'x');").unwrap();
-        let rows = select(&mut db, "SELECT note FROM ev JOIN h ON ev.d = h.d ORDER BY id;");
+        db.execute("CREATE TABLE h (d DATE, note VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO h VALUES (DATE '2024-01-15', 'x');")
+            .unwrap();
+        let rows = select(
+            &mut db,
+            "SELECT note FROM ev JOIN h ON ev.d = h.d ORDER BY id;",
+        );
         assert_eq!(rows, vec![vec![V::Varchar("x".to_string())]]);
         let rows = select(&mut db, "SELECT DISTINCT d FROM ev ORDER BY d;");
         assert_eq!(rows.last().unwrap(), &vec![V::Null]);
@@ -3420,12 +4000,8 @@ mod tests {
     #[test]
     fn csv_inflects_dates() {
         let mut db = PinkDb::new();
-        crate::csv::import_csv_string(
-            &mut db,
-            "c",
-            "d,ts\n2024-01-15,2024-01-15 10:00:00\n,",
-        )
-        .unwrap();
+        crate::csv::import_csv_string(&mut db, "c", "d,ts\n2024-01-15,2024-01-15 10:00:00\n,")
+            .unwrap();
         let t = db.table("c").unwrap();
         assert_eq!(
             t.schema(),
@@ -3469,7 +4045,8 @@ mod tests {
 
     fn sub_db() -> PinkDb {
         let mut db = PinkDb::new();
-        crate::csv::import_csv_string(&mut db, "emp", "id,name,did\n1,ann,10\n2,bob,20\n3,cat,").unwrap();
+        crate::csv::import_csv_string(&mut db, "emp", "id,name,did\n1,ann,10\n2,bob,20\n3,cat,")
+            .unwrap();
         crate::csv::import_csv_string(&mut db, "dept", "did,dname\n10,eng\n20,ops\n").unwrap();
         db
     }
@@ -3483,7 +4060,10 @@ mod tests {
         );
         assert_eq!(
             rows,
-            vec![vec![V::Varchar("bob".to_string())], vec![V::Varchar("cat".to_string())]]
+            vec![
+                vec![V::Varchar("bob".to_string())],
+                vec![V::Varchar("cat".to_string())]
+            ]
         );
         let rows = select(
             &mut db,
@@ -3516,7 +4096,10 @@ mod tests {
         );
         assert_eq!(
             rows,
-            vec![vec![V::Varchar("eng".to_string())], vec![V::Varchar("ops".to_string())]]
+            vec![
+                vec![V::Varchar("eng".to_string())],
+                vec![V::Varchar("ops".to_string())]
+            ]
         );
     }
 
@@ -3524,17 +4107,26 @@ mod tests {
     fn derived_table_needs_alias() {
         let mut db = sub_db();
         assert!(db.execute("SELECT * FROM (SELECT * FROM emp);").is_err());
-        let rows = select(&mut db, "SELECT name FROM (SELECT * FROM emp WHERE id = 2) AS s;");
+        let rows = select(
+            &mut db,
+            "SELECT name FROM (SELECT * FROM emp WHERE id = 2) AS s;",
+        );
         assert_eq!(rows, vec![vec![V::Varchar("bob".to_string())]]);
     }
 
     #[test]
     fn scalar_subquery() {
         let mut db = sub_db();
-        let rows = select(&mut db, "SELECT name FROM emp WHERE did = (SELECT did FROM dept WHERE dname = 'ops');");
+        let rows = select(
+            &mut db,
+            "SELECT name FROM emp WHERE did = (SELECT did FROM dept WHERE dname = 'ops');",
+        );
         assert_eq!(rows, vec![vec![V::Varchar("bob".to_string())]]);
         // Empty → NULL → no rows.
-        let rows = select(&mut db, "SELECT name FROM emp WHERE did = (SELECT did FROM dept WHERE false);");
+        let rows = select(
+            &mut db,
+            "SELECT name FROM emp WHERE did = (SELECT did FROM dept WHERE false);",
+        );
         assert!(rows.is_empty());
         // Multi-row → error.
         assert!(db.execute("SELECT (SELECT id FROM emp);").is_err());
@@ -3552,7 +4144,10 @@ mod tests {
         );
         assert_eq!(
             rows,
-            vec![vec![V::Varchar("ann".to_string())], vec![V::Varchar("bob".to_string())]]
+            vec![
+                vec![V::Varchar("ann".to_string())],
+                vec![V::Varchar("bob".to_string())]
+            ]
         );
         let rows = select(
             &mut db,
@@ -3562,10 +4157,16 @@ mod tests {
         // NULLs (dept.did all non-null) → cat (NULL did) → NULL → filtered.
         assert!(rows.is_empty());
         // List form.
-        let rows = select(&mut db, "SELECT name FROM emp WHERE id IN (1, 3) ORDER BY name;");
+        let rows = select(
+            &mut db,
+            "SELECT name FROM emp WHERE id IN (1, 3) ORDER BY name;",
+        );
         assert_eq!(
             rows,
-            vec![vec![V::Varchar("ann".to_string())], vec![V::Varchar("cat".to_string())]]
+            vec![
+                vec![V::Varchar("ann".to_string())],
+                vec![V::Varchar("cat".to_string())]
+            ]
         );
         let rows = select(&mut db, "SELECT COUNT(*) FROM emp WHERE id NOT IN (2);");
         assert_eq!(rows, vec![vec![V::Bigint(2)]]);
@@ -3577,11 +4178,20 @@ mod tests {
     #[test]
     fn uncorrelated_exists() {
         let mut db = sub_db();
-        let rows = select(&mut db, "SELECT COUNT(*) FROM emp WHERE EXISTS (SELECT * FROM dept);");
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM emp WHERE EXISTS (SELECT * FROM dept);",
+        );
         assert_eq!(rows, vec![vec![V::Bigint(3)]]);
-        let rows = select(&mut db, "SELECT COUNT(*) FROM emp WHERE NOT EXISTS (SELECT * FROM dept WHERE false);");
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM emp WHERE NOT EXISTS (SELECT * FROM dept WHERE false);",
+        );
         assert_eq!(rows, vec![vec![V::Bigint(3)]]);
-        let rows = select(&mut db, "SELECT COUNT(*) FROM emp WHERE EXISTS (SELECT * FROM dept WHERE false);");
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM emp WHERE EXISTS (SELECT * FROM dept WHERE false);",
+        );
         assert_eq!(rows, vec![vec![V::Bigint(0)]]);
     }
 
@@ -3589,14 +4199,18 @@ mod tests {
     fn correlated_is_rejected() {
         let mut db = sub_db();
         assert!(db
-            .execute("SELECT dname FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.did = dept.did);")
+            .execute(
+                "SELECT dname FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.did = dept.did);"
+            )
             .is_err());
     }
 
     fn join_db() -> PinkDb {
         let mut db = PinkDb::new();
-        crate::csv::import_csv_string(&mut db, "emp", "id,name,did\n1,ann,10\n2,bob,20\n3,cat,").unwrap();
-        crate::csv::import_csv_string(&mut db, "dept", "did,dname\n10,eng\n20,ops\n30,hr\n").unwrap();
+        crate::csv::import_csv_string(&mut db, "emp", "id,name,did\n1,ann,10\n2,bob,20\n3,cat,")
+            .unwrap();
+        crate::csv::import_csv_string(&mut db, "dept", "did,dname\n10,eng\n20,ops\n30,hr\n")
+            .unwrap();
         db
     }
 
@@ -3620,7 +4234,10 @@ mod tests {
     fn join_null_keys_never_match() {
         let mut db = join_db();
         // cat has NULL did: inner join drops her.
-        let rows = select(&mut db, "SELECT COUNT(*) FROM emp JOIN dept ON emp.did = dept.did;");
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM emp JOIN dept ON emp.did = dept.did;",
+        );
         assert_eq!(rows, vec![vec![V::Bigint(2)]]);
     }
 
@@ -3740,7 +4357,8 @@ mod tests {
     fn window_preceding_end_before_partition_is_empty() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (x INTEGER);").unwrap();
-        db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5);")
+            .unwrap();
         let rows = select(
             &mut db,
             "SELECT COUNT(*) OVER (ORDER BY x ROWS BETWEEN UNBOUNDED PRECEDING AND 2 PRECEDING) FROM t;",
@@ -3787,7 +4405,8 @@ mod tests {
     fn window_following_bounds_and_float_minmax() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (x INTEGER);").unwrap();
-        db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3), (4), (5);")
+            .unwrap();
         let rows = select(
             &mut db,
             "SELECT COUNT(*) OVER (ORDER BY x ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t;",
@@ -3823,7 +4442,8 @@ mod tests {
         assert!(rows.iter().all(|r| r[0] == V::Bigint(5)));
         // Exact float sums/avgs over a sliding frame.
         db.execute("CREATE TABLE f (d DOUBLE);").unwrap();
-        db.execute("INSERT INTO f VALUES (0.5), (1.5), (2.0);").unwrap();
+        db.execute("INSERT INTO f VALUES (0.5), (1.5), (2.0);")
+            .unwrap();
         let rows = select(
             &mut db,
             "SELECT SUM(d) OVER (ORDER BY d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW),
@@ -3894,7 +4514,8 @@ mod tests {
     }
 
     #[test]
-    fn window_over_agg_and_rejections() {        let mut db = win_db();
+    fn window_over_agg_and_rejections() {
+        let mut db = win_db();
         let rows = select(
             &mut db,
             "SELECT region, SUM(amount) AS s, RANK() OVER (ORDER BY SUM(amount) DESC) AS r
@@ -3903,8 +4524,12 @@ mod tests {
         assert_eq!(rows[0][0], V::Varchar("west".to_string()));
         assert_eq!(rows[0][2], V::Bigint(1));
         // Windows forbidden in WHERE / GROUP BY / HAVING.
-        assert!(db.execute("SELECT * FROM sales WHERE RANK() OVER () > 1;").is_err());
-        assert!(db.execute("SELECT * FROM sales GROUP BY RANK() OVER ();").is_err());
+        assert!(db
+            .execute("SELECT * FROM sales WHERE RANK() OVER () > 1;")
+            .is_err());
+        assert!(db
+            .execute("SELECT * FROM sales GROUP BY RANK() OVER ();")
+            .is_err());
         assert!(db
             .execute("SELECT SUM(amount) FROM sales HAVING RANK() OVER () > 1;")
             .is_err());
@@ -3912,15 +4537,19 @@ mod tests {
         assert!(db
             .execute("SELECT RANK() OVER (ORDER BY SUM(amount) OVER ()) FROM sales;")
             .is_err());
-        assert!(db.execute("SELECT MEDIAN(amount) OVER () FROM sales;").is_err());
+        assert!(db
+            .execute("SELECT MEDIAN(amount) OVER () FROM sales;")
+            .is_err());
     }
 
     // --- phase 9: UPDATE / DELETE ---
 
     fn ud_db() -> PinkDb {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, NULL);").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y'), (3, NULL);")
+            .unwrap();
         db
     }
 
@@ -3948,23 +4577,31 @@ mod tests {
         assert_eq!(updated(&mut db, "UPDATE t SET b = 'z';"), 3);
         // NULL assignment + expression to NULL.
         assert_eq!(updated(&mut db, "UPDATE t SET b = NULL WHERE a = 1;"), 1);
-        assert_eq!(select(&mut db, "SELECT b FROM t WHERE a = 1;"), vec![vec![V::Null]]);
+        assert_eq!(
+            select(&mut db, "SELECT b FROM t WHERE a = 1;"),
+            vec![vec![V::Null]]
+        );
     }
 
     #[test]
     fn update_sets_are_simultaneous() {
         let mut db = ud_db();
         // a=b, b=a swaps (both read pre-update values).
-        db.execute("CREATE TABLE s (a INTEGER, b INTEGER);").unwrap();
+        db.execute("CREATE TABLE s (a INTEGER, b INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO s VALUES (1, 2);").unwrap();
         assert_eq!(updated(&mut db, "UPDATE s SET a = b, b = a;"), 1);
-        assert_eq!(select(&mut db, "SELECT a, b FROM s;"), vec![vec![V::Integer(2), V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT a, b FROM s;"),
+            vec![vec![V::Integer(2), V::Integer(1)]]
+        );
     }
 
     #[test]
     fn update_type_rules() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE n (i INTEGER, g BIGINT, d DOUBLE);").unwrap();
+        db.execute("CREATE TABLE n (i INTEGER, g BIGINT, d DOUBLE);")
+            .unwrap();
         db.execute("INSERT INTO n VALUES (1, 1, 1.0);").unwrap();
         // Widening allowed.
         assert_eq!(updated(&mut db, "UPDATE n SET g = i, d = g;"), 1);
@@ -3984,22 +4621,35 @@ mod tests {
     fn delete_basic_and_all() {
         let mut db = ud_db();
         assert_eq!(updated(&mut db, "DELETE FROM t WHERE a >= 2;"), 2);
-        assert_eq!(select(&mut db, "SELECT a FROM t;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT a FROM t;"),
+            vec![vec![V::Integer(1)]]
+        );
         // Delete everything, then reinsert (empty chunks are dropped cleanly).
         assert_eq!(updated(&mut db, "DELETE FROM t;"), 1);
         assert!(select(&mut db, "SELECT * FROM t;").is_empty());
-        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(0)]]);
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM t;"),
+            vec![vec![V::Bigint(0)]]
+        );
         db.execute("INSERT INTO t VALUES (9, 'q');").unwrap();
-        assert_eq!(select(&mut db, "SELECT a FROM t;"), vec![vec![V::Integer(9)]]);
+        assert_eq!(
+            select(&mut db, "SELECT a FROM t;"),
+            vec![vec![V::Integer(9)]]
+        );
         // Unknown table / bad predicate.
         assert!(db.execute("DELETE FROM missing;").is_err());
         assert!(db.execute("DELETE FROM t WHERE a;").is_err());
     }
 
     #[test]
-    fn update_delete_with_subquery() {        let mut db = ud_db();
+    fn update_delete_with_subquery() {
+        let mut db = ud_db();
         assert_eq!(
-            updated(&mut db, "UPDATE t SET b = 'top' WHERE a = (SELECT MAX(a) FROM t);"),
+            updated(
+                &mut db,
+                "UPDATE t SET b = 'top' WHERE a = (SELECT MAX(a) FROM t);"
+            ),
             1
         );
         assert_eq!(
@@ -4008,8 +4658,17 @@ mod tests {
         );
         // Fresh DB: row 3 still has NULL b, so the IN-set is {3}.
         let mut db = ud_db();
-        assert_eq!(updated(&mut db, "DELETE FROM t WHERE a IN (SELECT a FROM t WHERE b IS NULL);"), 1);
-        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(2)]]);
+        assert_eq!(
+            updated(
+                &mut db,
+                "DELETE FROM t WHERE a IN (SELECT a FROM t WHERE b IS NULL);"
+            ),
+            1
+        );
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM t;"),
+            vec![vec![V::Bigint(2)]]
+        );
     }
 
     // --- phase 10: transactions ---
@@ -4024,19 +4683,31 @@ mod tests {
         db.execute("DELETE FROM t WHERE a = 2;").unwrap();
         db.execute("CREATE TABLE tmp (x INTEGER);").unwrap();
         // Inside: changes visible.
-        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(2)]]);
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM t;"),
+            vec![vec![V::Bigint(2)]]
+        );
         db.execute("ROLLBACK;").unwrap();
         assert!(!db.in_transaction());
         // Outside: everything reverted, data and catalog alike.
-        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(3)]]);
-        assert_eq!(select(&mut db, "SELECT a FROM t WHERE a = 1;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM t;"),
+            vec![vec![V::Bigint(3)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT a FROM t WHERE a = 1;"),
+            vec![vec![V::Integer(1)]]
+        );
         assert!(db.table("tmp").is_err());
 
         db.execute("BEGIN;").unwrap();
         db.execute("DELETE FROM t;").unwrap();
         db.execute("COMMIT;").unwrap();
         assert!(!db.in_transaction());
-        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(0)]]);
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM t;"),
+            vec![vec![V::Bigint(0)]]
+        );
     }
 
     #[test]
@@ -4049,17 +4720,23 @@ mod tests {
         assert!(db.execute("BEGIN TRANSACTION;").is_err());
         db.execute("ROLLBACK;").unwrap();
         // Reads and writes work fine outside transactions too.
-        assert_eq!(select(&mut db, "SELECT COUNT(*) FROM t;"), vec![vec![V::Bigint(3)]]);
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM t;"),
+            vec![vec![V::Bigint(3)]]
+        );
     }
 
     // --- phase 11: UNION, views, CAST, COALESCE, LIKE, DROP ---
 
     fn uv_db() -> PinkDb {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE a (x INTEGER, s VARCHAR);").unwrap();
+        db.execute("CREATE TABLE a (x INTEGER, s VARCHAR);")
+            .unwrap();
         db.execute("CREATE TABLE b (y BIGINT, t VARCHAR);").unwrap();
-        db.execute("INSERT INTO a VALUES (1, 'one'), (2, 'two'), (NULL, 'nil');").unwrap();
-        db.execute("INSERT INTO b VALUES (2, 'TWO'), (3, 'three');").unwrap();
+        db.execute("INSERT INTO a VALUES (1, 'one'), (2, 'two'), (NULL, 'nil');")
+            .unwrap();
+        db.execute("INSERT INTO b VALUES (2, 'TWO'), (3, 'three');")
+            .unwrap();
         db
     }
 
@@ -4081,7 +4758,10 @@ mod tests {
             ]
         );
         // INTEGER unifies to BIGINT (left names win).
-        let rows = select(&mut db, "SELECT x AS n FROM a WHERE x = 1 UNION SELECT y AS m FROM b WHERE y = 3;");
+        let rows = select(
+            &mut db,
+            "SELECT x AS n FROM a WHERE x = 1 UNION SELECT y AS m FROM b WHERE y = 3;",
+        );
         assert_eq!(rows.len(), 2);
         // UNION (distinct) dedupes, NULLs dedupe together; NULLS LAST.
         let rows = select(&mut db, "SELECT x FROM a UNION SELECT y FROM b ORDER BY x;");
@@ -4095,8 +4775,12 @@ mod tests {
             ]
         );
         // Arity + type mismatches.
-        assert!(db.execute("SELECT x FROM a UNION SELECT y, t FROM b;").is_err());
-        assert!(db.execute("SELECT s FROM a UNION SELECT y FROM b;").is_err());
+        assert!(db
+            .execute("SELECT x FROM a UNION SELECT y, t FROM b;")
+            .is_err());
+        assert!(db
+            .execute("SELECT s FROM a UNION SELECT y FROM b;")
+            .is_err());
     }
 
     /// {1, 3, 5} + {2, 4}: odd/even split so concatenation order is visible.
@@ -4129,30 +4813,47 @@ mod tests {
         let mut db = union_db();
         // Trailing ORDER BY/LIMIT apply to the whole set operation (DuckDB: 5,4,3).
         assert_eq!(
-            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 3;"),
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 3;"
+            ),
             int_rows(&[5, 4, 3])
         );
         // LIMIT without ORDER BY takes the first rows of the concatenation.
         assert_eq!(
-            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 LIMIT 2;"),
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION ALL SELECT x FROM a2 LIMIT 2;"
+            ),
             int_rows(&[1, 3])
         );
         // UNION (distinct) + chain ORDER BY/LIMIT.
         assert_eq!(
-            select(&mut db, "SELECT x FROM a1 UNION SELECT x FROM a2 ORDER BY x DESC LIMIT 3;"),
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION SELECT x FROM a2 ORDER BY x DESC LIMIT 3;"
+            ),
             int_rows(&[5, 4, 3])
         );
         // Positional and head-alias forms bind against the set-op output.
         assert_eq!(
-            select(&mut db, "SELECT x AS n FROM a1 UNION ALL SELECT x FROM a2 ORDER BY 1 DESC LIMIT 2;"),
+            select(
+                &mut db,
+                "SELECT x AS n FROM a1 UNION ALL SELECT x FROM a2 ORDER BY 1 DESC LIMIT 2;"
+            ),
             int_rows(&[5, 4])
         );
         assert_eq!(
-            select(&mut db, "SELECT x AS n FROM a1 UNION ALL SELECT x FROM a2 ORDER BY n DESC LIMIT 2;"),
+            select(
+                &mut db,
+                "SELECT x AS n FROM a1 UNION ALL SELECT x FROM a2 ORDER BY n DESC LIMIT 2;"
+            ),
             int_rows(&[5, 4])
         );
         // Clauses before a UNION (head or middle branch) are rejected.
-        assert!(db.execute("SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;").is_err());
+        assert!(db
+            .execute("SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;")
+            .is_err());
         assert!(db
             .execute("SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a1;")
             .is_err());
@@ -4163,7 +4864,10 @@ mod tests {
         let mut db = union_db();
         // Every branch survives inside a derived table (was: only the first).
         assert_eq!(
-            select(&mut db, "SELECT x FROM (SELECT x FROM a1 UNION ALL SELECT x FROM a2) s ORDER BY x;"),
+            select(
+                &mut db,
+                "SELECT x FROM (SELECT x FROM a1 UNION ALL SELECT x FROM a2) s ORDER BY x;"
+            ),
             int_rows(&[1, 2, 3, 4, 5])
         );
         // Chain-level ORDER BY/LIMIT apply to the derived result.
@@ -4176,11 +4880,17 @@ mod tests {
         );
         // Scalar / IN / EXISTS subqueries bind the whole chain.
         assert_eq!(
-            select(&mut db, "SELECT (SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 1);"),
+            select(
+                &mut db,
+                "SELECT (SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 1);"
+            ),
             vec![vec![V::Integer(5)]]
         );
         assert_eq!(
-            select(&mut db, "SELECT x FROM a1 WHERE x IN (SELECT x FROM a1 UNION SELECT x FROM a2) ORDER BY x;"),
+            select(
+                &mut db,
+                "SELECT x FROM a1 WHERE x IN (SELECT x FROM a1 UNION SELECT x FROM a2) ORDER BY x;"
+            ),
             int_rows(&[1, 3, 5])
         );
         // EXISTS must see the second branch (its only row lives there).
@@ -4206,12 +4916,19 @@ mod tests {
         );
         // The head's WITH is visible to every UNION branch (DuckDB semantics).
         assert_eq!(
-            select(&mut db, "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION ALL SELECT x FROM c;"),
+            select(
+                &mut db,
+                "WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION ALL SELECT x FROM c;"
+            ),
             vec![vec![V::Integer(1)], vec![V::Integer(1)]]
         );
         // View definition validates + stores the full chain; view use binds it.
-        db.execute("CREATE VIEW uv AS SELECT x FROM a1 UNION ALL SELECT x FROM a2;").unwrap();
-        assert_eq!(select(&mut db, "SELECT x FROM uv ORDER BY x DESC LIMIT 3;"), int_rows(&[5, 4, 3]));
+        db.execute("CREATE VIEW uv AS SELECT x FROM a1 UNION ALL SELECT x FROM a2;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT x FROM uv ORDER BY x DESC LIMIT 3;"),
+            int_rows(&[5, 4, 3])
+        );
         // Chain clauses in the view definition apply per use.
         db.execute("CREATE VIEW uv2 AS SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x DESC LIMIT 3;")
             .unwrap();
@@ -4229,7 +4946,10 @@ mod tests {
         db.execute("INSERT INTO a3 VALUES (2), (4);").unwrap();
         // INTEGER UNION ALL BIGINT unifies to BIGINT through a derived table.
         assert_eq!(
-            select(&mut db, "SELECT * FROM (SELECT x FROM a1 UNION ALL SELECT y FROM a3) s ORDER BY x;"),
+            select(
+                &mut db,
+                "SELECT * FROM (SELECT x FROM a1 UNION ALL SELECT y FROM a3) s ORDER BY x;"
+            ),
             vec![
                 vec![V::Bigint(1)],
                 vec![V::Bigint(2)],
@@ -4247,11 +4967,17 @@ mod tests {
     fn union_chain_order_by_hidden_expressions() {
         let mut db = union_db();
         assert_eq!(
-            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY -x LIMIT 2;"),
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY -x LIMIT 2;"
+            ),
             int_rows(&[5, 4])
         );
         assert_eq!(
-            select(&mut db, "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x + 1 DESC LIMIT 2;"),
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x + 1 DESC LIMIT 2;"
+            ),
             int_rows(&[5, 4])
         );
         let (names, types) = select_meta(
@@ -4308,8 +5034,10 @@ mod tests {
             "SELECT * FROM (SELECT x FROM ti UNION ALL SELECT x FROM td) s WHERE x = 3;",
         );
         assert_eq!(rows, vec![vec![V::Double(3.0)], vec![V::Double(3.0)]]);
-        let (names, types) =
-            select_meta(&mut db, "SELECT * FROM (SELECT x FROM ti UNION ALL SELECT x FROM td) s;");
+        let (names, types) = select_meta(
+            &mut db,
+            "SELECT * FROM (SELECT x FROM ti UNION ALL SELECT x FROM td) s;",
+        );
         assert_eq!(names, vec!["x".to_string()]);
         assert_eq!(types, vec![DataType::Double]);
     }
@@ -4344,7 +5072,10 @@ mod tests {
         db.execute("CREATE TABLE a3 (x INTEGER);").unwrap();
         db.execute("INSERT INTO a3 VALUES (3), (5), (7);").unwrap();
         assert_eq!(
-            select(&mut db, "SELECT x FROM a1 UNION SELECT x FROM a3 ORDER BY x DESC LIMIT 2;"),
+            select(
+                &mut db,
+                "SELECT x FROM a1 UNION SELECT x FROM a3 ORDER BY x DESC LIMIT 2;"
+            ),
             int_rows(&[7, 5])
         );
     }
@@ -4402,8 +5133,12 @@ mod tests {
     #[test]
     fn views_create_use_drop() {
         let mut db = uv_db();
-        db.execute("CREATE VIEW evens AS SELECT x FROM a WHERE x % 2 = 0;").unwrap();
-        assert_eq!(select(&mut db, "SELECT * FROM evens;"), vec![vec![V::Integer(2)]]);
+        db.execute("CREATE VIEW evens AS SELECT x FROM a WHERE x % 2 = 0;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT * FROM evens;"),
+            vec![vec![V::Integer(2)]]
+        );
         // Views compose with joins, CTEs, and aliases.
         let rows = select(
             &mut db,
@@ -4411,8 +5146,12 @@ mod tests {
         );
         assert_eq!(rows, vec![vec![V::Integer(2), V::Bigint(2)]]);
         // Column aliases.
-        db.execute("CREATE VIEW named(n) AS SELECT x FROM a WHERE x = 1;").unwrap();
-        assert_eq!(select(&mut db, "SELECT n FROM named;"), vec![vec![V::Integer(1)]]);
+        db.execute("CREATE VIEW named(n) AS SELECT x FROM a WHERE x = 1;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT n FROM named;"),
+            vec![vec![V::Integer(1)]]
+        );
         // Name clashes + dupes rejected.
         assert!(db.execute("CREATE VIEW a AS SELECT 1;").is_err());
         assert!(db.execute("CREATE TABLE evens (x INTEGER);").is_err());
@@ -4435,20 +5174,28 @@ mod tests {
         );
         assert_eq!(rows, vec![vec![V::Bigint(1), V::Double(1.0)]]);
         // 'one' does not parse as INTEGER.
-        assert!(db.execute("SELECT CAST(s AS INTEGER) FROM a WHERE x = 1;").is_err());
+        assert!(db
+            .execute("SELECT CAST(s AS INTEGER) FROM a WHERE x = 1;")
+            .is_err());
         assert!(db.execute("SELECT CAST(x AS DATE) FROM a;").is_err());
-        let rows = select(&mut db, "SELECT COALESCE(x, 99), COALESCE(s, 'dflt') FROM a ORDER BY 1;");
+        let rows = select(
+            &mut db,
+            "SELECT COALESCE(x, 99), COALESCE(s, 'dflt') FROM a ORDER BY 1;",
+        );
         assert_eq!(rows[0], vec![V::Integer(1), V::Varchar("one".to_string())]);
         assert_eq!(rows[2], vec![V::Integer(99), V::Varchar("nil".to_string())]);
         let rows = select(&mut db, "SELECT s FROM a WHERE s LIKE 'o%' ORDER BY s;");
-        assert_eq!(
-            rows,
-            vec![vec![V::Varchar("one".to_string())]]
+        assert_eq!(rows, vec![vec![V::Varchar("one".to_string())]]);
+        let rows = select(
+            &mut db,
+            "SELECT s FROM a WHERE s NOT LIKE '%o%' ORDER BY s;",
         );
-        let rows = select(&mut db, "SELECT s FROM a WHERE s NOT LIKE '%o%' ORDER BY s;");
         assert_eq!(rows, vec![vec![V::Varchar("nil".to_string())]]);
         // LIKE is NULL-propagating; mixed types rejected.
-        assert_eq!(select(&mut db, "SELECT CAST(NULL AS VARCHAR) LIKE 'a';"), vec![vec![V::Null]]);
+        assert_eq!(
+            select(&mut db, "SELECT CAST(NULL AS VARCHAR) LIKE 'a';"),
+            vec![vec![V::Null]]
+        );
         assert!(db.execute("SELECT x LIKE '1' FROM a;").is_err());
     }
 
@@ -4456,8 +5203,10 @@ mod tests {
 
     fn case_db() -> PinkDb {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (id INTEGER, name VARCHAR);").unwrap();
-        db.execute("INSERT INTO t VALUES (1, 'ann'), (2, 'bob'), (3, NULL);").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER, name VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'ann'), (2, 'bob'), (3, NULL);")
+            .unwrap();
         db
     }
 
@@ -4477,7 +5226,10 @@ mod tests {
                 vec![V::Integer(3), V::Varchar("other".to_string())],
             ]
         );
-        let rows = select(&mut db, "SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t ORDER BY id;");
+        let rows = select(
+            &mut db,
+            "SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' END FROM t ORDER BY id;",
+        );
         assert_eq!(
             rows,
             vec![
@@ -4511,7 +5263,11 @@ mod tests {
         );
         assert_eq!(
             rows,
-            vec![vec![V::Double(1.0)], vec![V::Double(2.5)], vec![V::Double(0.0)]]
+            vec![
+                vec![V::Double(1.0)],
+                vec![V::Double(2.5)],
+                vec![V::Double(0.0)]
+            ]
         );
         let rows = select(
             &mut db,
@@ -4526,8 +5282,12 @@ mod tests {
             ]
         );
         // Non-boolean conditions + incompatible results rejected.
-        assert!(db.execute("SELECT CASE WHEN id THEN 1 END FROM t;").is_err());
-        assert!(db.execute("SELECT CASE WHEN true THEN 1 ELSE 'x' END FROM t;").is_err());
+        assert!(db
+            .execute("SELECT CASE WHEN id THEN 1 END FROM t;")
+            .is_err());
+        assert!(db
+            .execute("SELECT CASE WHEN true THEN 1 ELSE 'x' END FROM t;")
+            .is_err());
     }
 
     #[test]
@@ -4535,7 +5295,10 @@ mod tests {
         let mut db = case_db();
         // CASE in WHERE, GROUP BY, aggregates, and ORDER BY position.
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM t WHERE CASE WHEN id = 1 THEN true ELSE false END;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM t WHERE CASE WHEN id = 1 THEN true ELSE false END;"
+            ),
             vec![vec![V::Bigint(1)]]
         );
         let rows = select(
@@ -4584,7 +5347,8 @@ mod tests {
     fn order_limit_ties_match_full_sort_and_keep_input_order() {
         const N: usize = 5000;
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, id INTEGER);").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, id INTEGER);")
+            .unwrap();
         insert_rows(&mut db, "t", N, |i| {
             let a = (i % 4) as i32;
             let b = ((i / 4) % 3) as i32;
@@ -4594,7 +5358,14 @@ mod tests {
         });
         // Independent expectation: smallest (a,b,c), then earliest insertion.
         let mut expected_all: Vec<(i32, i32, i32, usize)> = (0..N)
-            .map(|i| ((i % 4) as i32, ((i / 4) % 3) as i32, ((i / 12) % 5) as i32, i))
+            .map(|i| {
+                (
+                    (i % 4) as i32,
+                    ((i / 4) % 3) as i32,
+                    ((i / 12) % 5) as i32,
+                    i,
+                )
+            })
             .collect();
         expected_all.sort_by_key(|&(a, b, c, i)| (a, b, c, i));
         let expected: Vec<Vec<V>> = expected_all[..2]
@@ -4608,7 +5379,10 @@ mod tests {
                 ]
             })
             .collect();
-        let topn = select(&mut db, "SELECT a, b, c, id FROM t ORDER BY a, b, c LIMIT 2;");
+        let topn = select(
+            &mut db,
+            "SELECT a, b, c, id FROM t ORDER BY a, b, c LIMIT 2;",
+        );
         assert_eq!(topn, expected);
         let full = select(&mut db, "SELECT a, b, c, id FROM t ORDER BY a, b, c;");
         assert_eq!(topn, full[..2].to_vec());
@@ -4625,7 +5399,8 @@ mod tests {
         const N: usize = 5000;
         const LIMIT: usize = 25; // 25 × 16 = 400 ≤ 5000 → top-N path
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (a INTEGER, b INTEGER, c VARCHAR, id INTEGER);").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER, c VARCHAR, id INTEGER);")
+            .unwrap();
         insert_rows(&mut db, "t", N, |i| {
             let a = (i % 7) as i32;
             let b = ((i / 7) % 11) as i32;
@@ -4640,7 +5415,10 @@ mod tests {
             &mut db,
             "SELECT a, b, c, id FROM t ORDER BY a ASC, b DESC, c ASC LIMIT 25;",
         );
-        let full = select(&mut db, "SELECT a, b, c, id FROM t ORDER BY a ASC, b DESC, c ASC;");
+        let full = select(
+            &mut db,
+            "SELECT a, b, c, id FROM t ORDER BY a ASC, b DESC, c ASC;",
+        );
         assert_eq!(topn.len(), LIMIT);
         assert_eq!(topn, full[..LIMIT].to_vec());
     }
@@ -4653,7 +5431,8 @@ mod tests {
     fn limit_over_sort_routing_boundary() {
         for n in [32usize, 31, 33] {
             let mut db = PinkDb::new();
-            db.execute("CREATE TABLE t (a INTEGER, id INTEGER);").unwrap();
+            db.execute("CREATE TABLE t (a INTEGER, id INTEGER);")
+                .unwrap();
             insert_rows(&mut db, "t", n, |i| format!("({}, {i})", (i * 5) % 9));
             let limited = select(&mut db, "SELECT a, id FROM t ORDER BY a LIMIT 2;");
             let full = select(&mut db, "SELECT a, id FROM t ORDER BY a;");
@@ -4668,7 +5447,8 @@ mod tests {
     fn order_limit_desc_strings_and_oversized_limit() {
         const N: usize = 5000;
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE s (k VARCHAR, id INTEGER);").unwrap();
+        db.execute("CREATE TABLE s (k VARCHAR, id INTEGER);")
+            .unwrap();
         insert_rows(&mut db, "s", N, |i| match i % 3 {
             0 => format!("(NULL, {i})"),
             1 => format!("('a', {i})"),
@@ -4686,8 +5466,14 @@ mod tests {
         assert_eq!(topn, full[..2].to_vec());
         // NULLS LAST, and every 'ab' beats every 'a' (prefix pair).
         assert!(full.last().unwrap()[0].is_null());
-        let last_ab = full.iter().rposition(|r| r[0] == V::Varchar("ab".to_string())).unwrap();
-        let first_a = full.iter().position(|r| r[0] == V::Varchar("a".to_string())).unwrap();
+        let last_ab = full
+            .iter()
+            .rposition(|r| r[0] == V::Varchar("ab".to_string()))
+            .unwrap();
+        let first_a = full
+            .iter()
+            .position(|r| r[0] == V::Varchar("a".to_string()))
+            .unwrap();
         assert!(last_ab < first_a);
         // Limit larger than the table: the generic full-sort path still
         // returns everything in sorted order.
@@ -4701,7 +5487,8 @@ mod tests {
     #[test]
     fn order_nan_float_uses_legacy_comparator() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE f (d DOUBLE, id INTEGER);").unwrap();
+        db.execute("CREATE TABLE f (d DOUBLE, id INTEGER);")
+            .unwrap();
         db.execute(
             "INSERT INTO f VALUES (3.0, 1), (1.0, 2), (NULL, 3), (2.0, 4), (1.5, 5), (0.0 / 0.0, 6);",
         )
@@ -4709,8 +5496,16 @@ mod tests {
         // Encoding (and top-N over it) must refuse the NaN key...
         let cx = Cx::new(&db);
         let t = db.table("f").unwrap();
-        let chunks: Vec<DataChunk> = (0..t.num_chunks()).map(|i| t.scan_chunk(i).unwrap()).collect();
-        let keys = vec![(BoundExpr::Column { index: 0, dtype: DataType::Double }, false)];
+        let chunks: Vec<DataChunk> = (0..t.num_chunks())
+            .map(|i| t.scan_chunk(i).unwrap())
+            .collect();
+        let keys = vec![(
+            BoundExpr::Column {
+                index: 0,
+                dtype: DataType::Double,
+            },
+            false,
+        )];
         let keyed = eval_sort_keys(&cx, &chunks, &keys).unwrap();
         assert!(encode_sort_keys(&chunks, &keyed, &keys).is_none());
         assert!(top_n(&cx, &chunks, &keys, 1).unwrap().is_none());
@@ -4724,10 +5519,13 @@ mod tests {
             }
         }
         // `Value::Double(NaN) != Value::Double(NaN)`, so compare Debug forms.
-        let debug_rows = |rows: &[Vec<V>]| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
+        let debug_rows =
+            |rows: &[Vec<V>]| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
         assert_eq!(debug_rows(&rows), debug_rows(&expected));
         assert_eq!(rows.len(), 6);
-        assert!(rows.iter().any(|r| matches!(r[0], V::Double(x) if x.is_nan())));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r[0], V::Double(x) if x.is_nan())));
     }
 
     /// End-to-end `LIMIT` over `ORDER BY` with a NaN key: top-N refuses the
@@ -4737,7 +5535,8 @@ mod tests {
     fn order_nan_limit_end_to_end() {
         const N: usize = 100;
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE f (d DOUBLE, id INTEGER);").unwrap();
+        db.execute("CREATE TABLE f (d DOUBLE, id INTEGER);")
+            .unwrap();
         insert_rows(&mut db, "f", N, |i| {
             if i == 7 {
                 "(0.0 / 0.0, 7)".to_string()
@@ -4750,7 +5549,8 @@ mod tests {
         let full = select(&mut db, "SELECT d, id FROM f ORDER BY d;");
         assert_eq!(limited.len(), 2);
         // `Value::Double(NaN) != Value::Double(NaN)`, so compare Debug forms.
-        let debug_rows = |rows: &[Vec<V>]| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
+        let debug_rows =
+            |rows: &[Vec<V>]| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
         assert_eq!(debug_rows(&limited), debug_rows(&full[..2]));
     }
 
@@ -4767,9 +5567,17 @@ mod tests {
         )
         .unwrap();
         insert_rows(&mut db, "m", N, |i| {
-            let i_col = if i % 13 == 0 { "NULL".to_string() } else { format!("{}", (i % 5) as i32 - 2) };
+            let i_col = if i % 13 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("{}", (i % 5) as i32 - 2)
+            };
             let g = format!("{}", ((i * 7) % 11) as i64 - 5);
-            let d = if i % 17 == 0 { "-0.0".to_string() } else { format!("{:.1}", ((i % 9) as f64) - 4.0) };
+            let d = if i % 17 == 0 {
+                "-0.0".to_string()
+            } else {
+                format!("{:.1}", ((i % 9) as f64) - 4.0)
+            };
             let s = match i % 5 {
                 0 => "''",
                 1 => "'a'",
@@ -4778,13 +5586,23 @@ mod tests {
                 _ => "'b'",
             };
             let b = if i % 3 == 0 { "true" } else { "false" };
-            let dt = if i % 7 == 0 { "NULL".to_string() } else { format!("DATE '2024-01-01' + {}", (i % 6) as i32) };
-            let ts = if i % 11 == 0 { "NULL".to_string() } else { format!("TIMESTAMP '2024-01-01 00:00:0{}.5'", i % 10) };
+            let dt = if i % 7 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("DATE '2024-01-01' + {}", (i % 6) as i32)
+            };
+            let ts = if i % 11 == 0 {
+                "NULL".to_string()
+            } else {
+                format!("TIMESTAMP '2024-01-01 00:00:0{}.5'", i % 10)
+            };
             format!("({i_col}, {g}, {d}, {s}, {b}, {dt}, {ts})")
         });
         let cx = Cx::new(&db);
         let t = db.table("m").unwrap();
-        let chunks: Vec<DataChunk> = (0..t.num_chunks()).map(|i| t.scan_chunk(i).unwrap()).collect();
+        let chunks: Vec<DataChunk> = (0..t.num_chunks())
+            .map(|i| t.scan_chunk(i).unwrap())
+            .collect();
         let asc = |index: usize, dtype: DataType| (BoundExpr::Column { index, dtype }, false);
         let desc = |index: usize, dtype: DataType| (BoundExpr::Column { index, dtype }, true);
         let cases: Vec<Vec<(BoundExpr, bool)>> = vec![
@@ -4797,13 +5615,20 @@ mod tests {
             vec![asc(3, DataType::Varchar), asc(0, DataType::Integer)],
             vec![desc(3, DataType::Varchar), desc(1, DataType::Bigint)],
             vec![asc(4, DataType::Boolean), asc(3, DataType::Varchar)],
-            vec![desc(0, DataType::Integer), desc(3, DataType::Varchar), asc(2, DataType::Double)],
+            vec![
+                desc(0, DataType::Integer),
+                desc(3, DataType::Varchar),
+                asc(2, DataType::Double),
+            ],
             vec![asc(5, DataType::Date)],
             vec![desc(6, DataType::Timestamp)],
         ];
         for keys in cases {
             let keyed = eval_sort_keys(&cx, &chunks, &keys).unwrap();
-            assert!(encode_sort_keys(&chunks, &keyed, &keys).is_some(), "{keys:?}");
+            assert!(
+                encode_sort_keys(&chunks, &keyed, &keys).is_some(),
+                "{keys:?}"
+            );
             let arena = sort(&cx, &chunks, &keys).unwrap();
             let legacy = sort_legacy(&chunks, &keys, &keyed).unwrap();
             assert_eq!(arena, legacy, "{keys:?}");
@@ -4833,7 +5658,13 @@ mod tests {
         ];
         let db = PinkDb::new();
         let cx = Cx::new(&db);
-        let keys = vec![(BoundExpr::Column { index: 0, dtype: DataType::Varchar }, false)];
+        let keys = vec![(
+            BoundExpr::Column {
+                index: 0,
+                dtype: DataType::Varchar,
+            },
+            false,
+        )];
         let keyed = eval_sort_keys(&cx, &chunks, &keys).unwrap();
         let arena = sort(&cx, &chunks, &keys).unwrap();
         let legacy = sort_legacy(&chunks, &keys, &keyed).unwrap();
@@ -4870,7 +5701,8 @@ mod tests {
         const N: usize = 5000;
         const LIMIT: usize = 312; // 312 × 16 = 4992 ≤ 5000 → top-N path
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t (v INTEGER, id INTEGER);").unwrap();
+        db.execute("CREATE TABLE t (v INTEGER, id INTEGER);")
+            .unwrap();
         insert_rows(&mut db, "t", N, |i| {
             if i % 25 == 0 {
                 format!("({}, {i})", (i / 25) % 10)
@@ -4879,7 +5711,10 @@ mod tests {
             }
         });
         for dir in ["", "DESC"] {
-            let topn = select(&mut db, &format!("SELECT v, id FROM t ORDER BY v {dir} LIMIT {LIMIT};"));
+            let topn = select(
+                &mut db,
+                &format!("SELECT v, id FROM t ORDER BY v {dir} LIMIT {LIMIT};"),
+            );
             let full = select(&mut db, &format!("SELECT v, id FROM t ORDER BY v {dir};"));
             assert_eq!(topn.len(), LIMIT);
             assert_eq!(topn, full[..LIMIT].to_vec(), "dir={dir}");
@@ -4894,7 +5729,11 @@ mod tests {
                 })
                 .collect();
             let ordered = vals.windows(2).all(|w| {
-                if dir.is_empty() { w[0] <= w[1] } else { w[0] >= w[1] }
+                if dir.is_empty() {
+                    w[0] <= w[1]
+                } else {
+                    w[0] >= w[1]
+                }
             });
             assert!(ordered, "dir={dir}: {vals:?}");
         }
@@ -4911,7 +5750,8 @@ mod tests {
         for c in 0..40usize {
             let mut v = Vector::new_empty(dtype);
             for r in 0..CHUNK_SIZE {
-                v.push_valid(V::Integer(((c * 37 + r * 11) % 1000) as i32)).unwrap();
+                v.push_valid(V::Integer(((c * 37 + r * 11) % 1000) as i32))
+                    .unwrap();
             }
             chunks.push(DataChunk::new(vec![v]).unwrap());
         }
@@ -4920,10 +5760,17 @@ mod tests {
         let keys = vec![(BoundExpr::Column { index: 0, dtype }, false)];
         let full = sort(&cx, &chunks, &keys).unwrap();
         for limit in [1usize, 2, 4096, 5000] {
-            assert!(limit * 16 <= 40 * CHUNK_SIZE, "limit={limit} must use top-N");
+            assert!(
+                limit * 16 <= 40 * CHUNK_SIZE,
+                "limit={limit} must use top-N"
+            );
             let topn = top_n(&cx, &chunks, &keys, limit).unwrap().unwrap();
             let expected = truncate_output(
-                Output { chunks: full.clone(), names: vec![], types: vec![] },
+                Output {
+                    chunks: full.clone(),
+                    names: vec![],
+                    types: vec![],
+                },
                 limit,
             );
             assert_eq!(topn, expected.chunks, "limit={limit}");
@@ -4940,8 +5787,10 @@ mod tests {
     /// keys on both sides, NULL measures, and two group regions.
     fn fused_db() -> PinkDb {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE fa (id INTEGER, region VARCHAR, x INTEGER);").unwrap();
-        db.execute("CREATE TABLE fb (id BIGINT, region VARCHAR, total DOUBLE);").unwrap();
+        db.execute("CREATE TABLE fa (id INTEGER, region VARCHAR, x INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE fb (id BIGINT, region VARCHAR, total DOUBLE);")
+            .unwrap();
         db.execute(
             "INSERT INTO fa VALUES
              (1, 'west', 3), (2, 'east', 5), (1, 'west', 7), (NULL, 'west', 11), (2, 'east', NULL);",
@@ -4959,7 +5808,10 @@ mod tests {
     /// Bind + optimize `sql` exactly like `PinkDb::execute` does.
     fn bound_plan(db: &PinkDb, sql: &str) -> LogicalPlan {
         let stmts = crate::sql::parse_statements(sql).unwrap();
-        crate::optimizer::optimize(db, crate::sql::bind(db, &stmts[0], db.current_db()).unwrap())
+        crate::optimizer::optimize(
+            db,
+            crate::sql::bind(db, &stmts[0], db.current_db()).unwrap(),
+        )
     }
 
     /// Descend to the topmost `Aggregate` (through Project/Cte wrappers).
@@ -5025,8 +5877,15 @@ mod tests {
             }
         }
         assert_eq!(
-            fused.chunks.iter().map(|c| c.num_rows()).collect::<Vec<_>>(),
-            materialized.iter().map(|c| c.num_rows()).collect::<Vec<_>>(),
+            fused
+                .chunks
+                .iter()
+                .map(|c| c.num_rows())
+                .collect::<Vec<_>>(),
+            materialized
+                .iter()
+                .map(|c| c.num_rows())
+                .collect::<Vec<_>>(),
             "{sql}"
         );
         assert_eq!(fused.names, agg_output_schema(keys, aggs).0, "{sql}");
@@ -5050,9 +5909,13 @@ mod tests {
             vec![vec![V::Bigint(8)]]
         );
         // Empty right side: zero matches through the fast path.
-        db.execute("CREATE TABLE fbe (id BIGINT, total DOUBLE);").unwrap();
+        db.execute("CREATE TABLE fbe (id BIGINT, total DOUBLE);")
+            .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM fa JOIN fbe ON fa.id = fbe.id;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM fa JOIN fbe ON fa.id = fbe.id;"
+            ),
             vec![vec![V::Bigint(0)]]
         );
     }
@@ -5060,12 +5923,16 @@ mod tests {
     #[test]
     fn fused_group_by_matches_fallback_and_order() {
         let mut db = fused_db();
-        let sql = "SELECT fa.region, COUNT(*), COUNT(fa.x), SUM(fa.x), AVG(fa.x), MIN(fa.x), MAX(fa.x)
+        let sql =
+            "SELECT fa.region, COUNT(*), COUNT(fa.x), SUM(fa.x), AVG(fa.x), MIN(fa.x), MAX(fa.x)
                    FROM fa JOIN fb ON fa.id = fb.id";
         let fused = select(&mut db, &format!("{sql} GROUP BY fa.region;"));
         // Same semantics with a mixed-side predicate above the join: the
         // optimizer keeps it there, so the materialized path runs.
-        let fallback = select(&mut db, &format!("{sql} WHERE fa.id = fb.id GROUP BY fa.region;"));
+        let fallback = select(
+            &mut db,
+            &format!("{sql} WHERE fa.id = fb.id GROUP BY fa.region;"),
+        );
         assert_eq!(fused, fallback);
         // First-seen group order (west before east); NULL args skipped by
         // COUNT/SUM/AVG/MIN/MAX.
@@ -5097,12 +5964,16 @@ mod tests {
     #[test]
     fn fused_compound_single_side_args() {
         let mut db = fused_db();
-        let sql = "SELECT COUNT(*), SUM(fb.total * 2), SUM(fa.x * 3) FROM fa JOIN fb ON fa.id = fb.id";
+        let sql =
+            "SELECT COUNT(*), SUM(fb.total * 2), SUM(fa.x * 3) FROM fa JOIN fb ON fa.id = fb.id";
         let fused = select(&mut db, &format!("{sql};"));
         let fallback = select(&mut db, &format!("{sql} WHERE fa.id = fb.id;"));
         assert_eq!(fused, fallback);
         // 8 matches; totals sum 69.5 → ×2 = 139.0; x sums 30 → ×3 = 90.
-        assert_eq!(fused, vec![vec![V::Bigint(8), V::Double(139.0), V::Bigint(90)]]);
+        assert_eq!(
+            fused,
+            vec![vec![V::Bigint(8), V::Double(139.0), V::Bigint(90)]]
+        );
     }
 
     #[test]
@@ -5126,7 +5997,11 @@ mod tests {
         assert_eq!(
             fused,
             vec![
-                vec![V::Varchar("west".to_string()), V::Bigint(4), V::Double(61.0)],
+                vec![
+                    V::Varchar("west".to_string()),
+                    V::Bigint(4),
+                    V::Double(61.0)
+                ],
                 vec![V::Varchar("east".to_string()), V::Bigint(4), V::Double(8.5)],
             ]
         );
@@ -5175,12 +6050,19 @@ mod tests {
     #[test]
     fn fused_string_keys() {
         let mut db = fused_db();
-        db.execute("CREATE TABLE fsa (k VARCHAR, v INTEGER);").unwrap();
-        db.execute("CREATE TABLE fsb (k VARCHAR, w INTEGER);").unwrap();
-        db.execute("INSERT INTO fsa VALUES ('a', 1), ('b', 2), ('a', 3), (NULL, 4);").unwrap();
-        db.execute("INSERT INTO fsb VALUES ('a', 10), ('b', 20), ('a', 30), (NULL, 40);").unwrap();
+        db.execute("CREATE TABLE fsa (k VARCHAR, v INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE fsb (k VARCHAR, w INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO fsa VALUES ('a', 1), ('b', 2), ('a', 3), (NULL, 4);")
+            .unwrap();
+        db.execute("INSERT INTO fsb VALUES ('a', 10), ('b', 20), ('a', 30), (NULL, 40);")
+            .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM fsa JOIN fsb ON fsa.k = fsb.k;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM fsa JOIN fsb ON fsa.k = fsb.k;"
+            ),
             vec![vec![V::Bigint(5)]]
         );
         let fused = select(
@@ -5207,8 +6089,10 @@ mod tests {
     fn fused_timestamp_and_double_keys() {
         let mut db = PinkDb::new();
         // TIMESTAMP keys take the int path (i64 micros, NULLs skipped).
-        db.execute("CREATE TABLE tl (ts TIMESTAMP, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE tr (ts TIMESTAMP, rv INTEGER);").unwrap();
+        db.execute("CREATE TABLE tl (ts TIMESTAMP, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE tr (ts TIMESTAMP, rv INTEGER);")
+            .unwrap();
         db.execute(
             "INSERT INTO tl VALUES
              (TIMESTAMP '2024-01-15 10:00:00', 1),
@@ -5237,10 +6121,14 @@ mod tests {
             ]
         );
         // DOUBLE keys take the byte path; -0.0 and 0.0 are one key.
-        db.execute("CREATE TABLE dl (k DOUBLE, lv INTEGER);").unwrap();
-        db.execute("CREATE TABLE dr (k DOUBLE, rv INTEGER);").unwrap();
-        db.execute("INSERT INTO dl VALUES (1.5, 1), (2.5, 2), (-0.0, 3), (NULL, 4);").unwrap();
-        db.execute("INSERT INTO dr VALUES (1.5, 10), (2.5, 20), (0.0, 30), (NULL, 40);").unwrap();
+        db.execute("CREATE TABLE dl (k DOUBLE, lv INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE dr (k DOUBLE, rv INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO dl VALUES (1.5, 1), (2.5, 2), (-0.0, 3), (NULL, 4);")
+            .unwrap();
+        db.execute("INSERT INTO dr VALUES (1.5, 10), (2.5, 20), (0.0, 30), (NULL, 40);")
+            .unwrap();
         assert_eq!(
             select(&mut db, "SELECT COUNT(*) FROM dl JOIN dr ON dl.k = dr.k;"),
             vec![vec![V::Bigint(3)]]
@@ -5261,7 +6149,8 @@ mod tests {
     #[test]
     fn fused_empty_right_side_single_empty_group() {
         let mut db = fused_db();
-        db.execute("CREATE TABLE fbe (id BIGINT, total DOUBLE);").unwrap();
+        db.execute("CREATE TABLE fbe (id BIGINT, total DOUBLE);")
+            .unwrap();
         // No keys: one row of zero/NULL results, like `aggregate()` over ∅.
         assert_eq!(
             select(
@@ -5288,7 +6177,10 @@ mod tests {
         );
         // Empty left side (`WHERE false` pushes below the join): same.
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id WHERE false;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id WHERE false;"
+            ),
             vec![vec![V::Bigint(0)]]
         );
         assert_eq!(
@@ -5312,7 +6204,10 @@ mod tests {
                 "SELECT fa.id + fb.id, COUNT(*)
                  FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.id + fb.id;"
             ),
-            vec![vec![V::Bigint(2), V::Bigint(4)], vec![V::Bigint(4), V::Bigint(4)]]
+            vec![
+                vec![V::Bigint(2), V::Bigint(4)],
+                vec![V::Bigint(4), V::Bigint(4)]
+            ]
         );
     }
 
@@ -5347,8 +6242,10 @@ mod tests {
     #[test]
     fn fused_multi_chunk_order_matches_fallback() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE ml (k INTEGER, v INTEGER);").unwrap();
-        db.execute("CREATE TABLE mr (k INTEGER, w INTEGER);").unwrap();
+        db.execute("CREATE TABLE ml (k INTEGER, v INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE mr (k INTEGER, w INTEGER);")
+            .unwrap();
         // 3000 rows each = 2 chunks per side; k cycles 0..6 on the left and
         // 0..6 ×3 (coprime stride) on the right — duplicate keys interleave
         // across chunks on both sides.
@@ -5381,8 +6278,10 @@ mod tests {
     #[test]
     fn fused_expansion_spans_right_chunks() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE xl (k INTEGER, v INTEGER);").unwrap();
-        db.execute("CREATE TABLE xr (k INTEGER, w INTEGER);").unwrap();
+        db.execute("CREATE TABLE xl (k INTEGER, v INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE xr (k INTEGER, w INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO xl VALUES (1, 5);").unwrap();
         // 5000 right rows across 3 chunks; 2500 match key 1 (even i).
         insert_rows(&mut db, "xr", 5000, |i| format!("({}, {i})", 1 + i % 2));
@@ -5396,7 +6295,10 @@ mod tests {
              FROM xl JOIN xr ON xl.k = xr.k WHERE xl.k = xr.k GROUP BY xl.k;",
         );
         assert_eq!(fused, fallback);
-        assert_eq!(fused, vec![vec![V::Integer(1), V::Bigint(2500), V::Bigint(6_247_500)]]);
+        assert_eq!(
+            fused,
+            vec![vec![V::Integer(1), V::Bigint(2500), V::Bigint(6_247_500)]]
+        );
     }
 
     #[test]
@@ -5438,10 +6340,7 @@ mod tests {
             "SELECT fa.region FROM fa JOIN fb ON fa.id = fb.id GROUP BY fa.region;",
         );
         // COUNT(*) fast path.
-        assert_fused_matches_materialized(
-            &db,
-            "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;",
-        );
+        assert_fused_matches_materialized(&db, "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;");
     }
 
     #[test]
@@ -5488,7 +6387,9 @@ mod tests {
                 unreachable!()
             };
             assert!(
-                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                fused_join_aggregate(&cx, input, keys, aggs)
+                    .unwrap()
+                    .is_none(),
                 "should not fuse: {sql}"
             );
         }
@@ -5499,8 +6400,10 @@ mod tests {
     #[test]
     fn fusion_falls_back_on_value_dependent_error() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE t1 (k INTEGER, x INTEGER);").unwrap();
-        db.execute("CREATE TABLE t2 (k INTEGER, q INTEGER);").unwrap();
+        db.execute("CREATE TABLE t1 (k INTEGER, x INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE t2 (k INTEGER, q INTEGER);")
+            .unwrap();
         db.execute("INSERT INTO t1 VALUES (1, 10);").unwrap();
         db.execute("INSERT INTO t2 VALUES (1, 2), (2, 0);").unwrap();
         let sql = "SELECT SUM(100 / q) FROM t1 JOIN t2 ON t1.k = t2.k;";
@@ -5512,7 +6415,9 @@ mod tests {
             unreachable!()
         };
         let cx = Cx::new(&db);
-        assert!(fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none());
+        assert!(fused_join_aggregate(&cx, input, keys, aggs)
+            .unwrap()
+            .is_none());
         // ...and the query must keep materialized semantics: only the matched
         // (q=2) row feeds the sum, so no error and 100/2 = 50.
         assert_eq!(select(&mut db, sql), vec![vec![V::Double(50.0)]]);
@@ -5521,12 +6426,14 @@ mod tests {
     #[test]
     fn fusion_rejects_value_erroring_shapes() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE va (k INTEGER, x INTEGER);").unwrap();
+        db.execute("CREATE TABLE va (k INTEGER, x INTEGER);")
+            .unwrap();
         db.execute("CREATE TABLE vb (k INTEGER, qty INTEGER, s VARCHAR, a INTEGER, b INTEGER);")
             .unwrap();
         db.execute("INSERT INTO va VALUES (1, 10);").unwrap();
         // Key 2 rows never match; they hold the erroring values.
-        db.execute("INSERT INTO vb VALUES (1, 2, '3', 4, 2), (2, 0, 'nope', 5, 0);").unwrap();
+        db.execute("INSERT INTO vb VALUES (1, 2, '3', 4, 2), (2, 0, 'nope', 5, 0);")
+            .unwrap();
         let cx = Cx::new(&db);
         let blocked = [
             // Integer division by zero on an unmatched right row.
@@ -5547,18 +6454,26 @@ mod tests {
                 unreachable!()
             };
             assert!(
-                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                fused_join_aggregate(&cx, input, keys, aggs)
+                    .unwrap()
+                    .is_none(),
                 "should not fuse: {sql}"
             );
         }
         // Same queries through the engine run the materialized path and only
         // see the matched (qty=2, s='3') row.
         assert_eq!(
-            select(&mut db, "SELECT SUM(100 / vb.qty) FROM va JOIN vb ON va.k = vb.k;"),
+            select(
+                &mut db,
+                "SELECT SUM(100 / vb.qty) FROM va JOIN vb ON va.k = vb.k;"
+            ),
             vec![vec![V::Double(50.0)]]
         );
         assert_eq!(
-            select(&mut db, "SELECT SUM(CAST(vb.s AS INTEGER)) FROM va JOIN vb ON va.k = vb.k;"),
+            select(
+                &mut db,
+                "SELECT SUM(CAST(vb.s AS INTEGER)) FROM va JOIN vb ON va.k = vb.k;"
+            ),
             vec![vec![V::Bigint(3)]]
         );
     }
@@ -5568,10 +6483,7 @@ mod tests {
         let db = fused_db();
         // Each shape must still fuse (the helper asserts `Some`) and produce
         // exactly the materialized output.
-        assert_fused_matches_materialized(
-            &db,
-            "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;",
-        );
+        assert_fused_matches_materialized(&db, "SELECT COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;");
         assert_fused_matches_materialized(
             &db,
             "SELECT SUM(fb.total * 2) FROM fa JOIN fb ON fa.id = fb.id;",
@@ -5611,7 +6523,9 @@ mod tests {
                 unreachable!()
             };
             assert!(
-                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                fused_join_aggregate(&cx, input, keys, aggs)
+                    .unwrap()
+                    .is_none(),
                 "erroring projection must not fuse: {sql}"
             );
         }
@@ -5656,11 +6570,14 @@ mod tests {
     #[test]
     fn fused_float_partial_boundaries_within_tolerance() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE fl (k INTEGER, d DOUBLE);").unwrap();
+        db.execute("CREATE TABLE fl (k INTEGER, d DOUBLE);")
+            .unwrap();
         db.execute("CREATE TABLE fr (k INTEGER);").unwrap();
         // 3000 left rows (2 chunks) × 3 right rows = 9000 matches on one
         // key; fractional doubles make the partial split visible.
-        insert_rows(&mut db, "fl", 3000, |i| format!("(1, {:?})", (i % 10) as f64 / 7.0));
+        insert_rows(&mut db, "fl", 3000, |i| {
+            format!("(1, {:?})", (i % 10) as f64 / 7.0)
+        });
         insert_rows(&mut db, "fr", 3, |_| "(1)".to_string());
         assert_fused_matches_materialized(
             &db,
@@ -5668,7 +6585,10 @@ mod tests {
         );
         // Both engine paths agree within the documented tolerance (the mixed
         // WHERE keeps the fallback on the materialized path).
-        let fused = select(&mut db, "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k;");
+        let fused = select(
+            &mut db,
+            "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k;",
+        );
         let materialized = select(
             &mut db,
             "SELECT SUM(fl.d), AVG(fl.d) FROM fl JOIN fr ON fl.k = fr.k WHERE fl.k = fr.k;",
@@ -5690,12 +6610,19 @@ mod tests {
     #[test]
     fn fused_int_double_cross_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE ija (k INTEGER, v INTEGER);").unwrap();
-        db.execute("CREATE TABLE ijb (k DOUBLE, w INTEGER);").unwrap();
-        db.execute("INSERT INTO ija VALUES (1, 10), (2, 20), (2, 21), (NULL, 30);").unwrap();
-        db.execute("INSERT INTO ijb VALUES (2.0, 1), (1.0, 2), (2.0, 3), (3.0, 4);").unwrap();
+        db.execute("CREATE TABLE ija (k INTEGER, v INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE ijb (k DOUBLE, w INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO ija VALUES (1, 10), (2, 20), (2, 21), (NULL, 30);")
+            .unwrap();
+        db.execute("INSERT INTO ijb VALUES (2.0, 1), (1.0, 2), (2.0, 3), (3.0, 4);")
+            .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM ija JOIN ijb ON ija.k = ijb.k;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM ija JOIN ijb ON ija.k = ijb.k;"
+            ),
             vec![vec![V::Bigint(5)]]
         );
         assert_fused_matches_materialized(
@@ -5745,8 +6672,10 @@ mod tests {
     #[test]
     fn fused_extreme_and_date_keys() {
         let mut db = PinkDb::new();
-        db.execute("CREATE TABLE ela (k BIGINT, v INTEGER);").unwrap();
-        db.execute("CREATE TABLE elb (k BIGINT, w INTEGER);").unwrap();
+        db.execute("CREATE TABLE ela (k BIGINT, v INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE elb (k BIGINT, w INTEGER);")
+            .unwrap();
         db.execute(
             "INSERT INTO ela VALUES
              ((-9223372036854775807 - 1), 1), (9223372036854775807, 2), (0, 3), (NULL, 4);",
@@ -5759,7 +6688,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*) FROM ela JOIN elb ON ela.k = elb.k;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM ela JOIN elb ON ela.k = elb.k;"
+            ),
             vec![vec![V::Bigint(3)]]
         );
         assert_fused_matches_materialized(
@@ -5808,7 +6740,11 @@ mod tests {
         // 2 left × 2 right matches on 2024-01-15 → 4 rows, w sum 80; the
         // unmatched 1969/2000 keys vanish.
         assert_eq!(fused.len(), 1);
-        assert!(matches!(fused[0][0], V::Date(_)), "date key: {:?}", fused[0][0]);
+        assert!(
+            matches!(fused[0][0], V::Date(_)),
+            "date key: {:?}",
+            fused[0][0]
+        );
         assert_eq!(fused[0][1], V::Bigint(4));
         assert_eq!(fused[0][2], V::Bigint(80));
         assert_eq!(
@@ -5851,7 +6787,8 @@ mod tests {
             assert!(!fused.is_empty(), "key produced no groups: {k}");
         }
         // YEAR/HOUR keys need DATE/TIMESTAMP inputs.
-        db.execute("CREATE TABLE gka (d DATE, ts TIMESTAMP, k INTEGER, v INTEGER);").unwrap();
+        db.execute("CREATE TABLE gka (d DATE, ts TIMESTAMP, k INTEGER, v INTEGER);")
+            .unwrap();
         db.execute("CREATE TABLE gkb (k INTEGER);").unwrap();
         db.execute(
             "INSERT INTO gka VALUES
@@ -5885,8 +6822,10 @@ mod tests {
     #[test]
     fn fused_both_sides_empty() {
         let mut db = fused_db();
-        db.execute("CREATE TABLE lea (id INTEGER, x INTEGER);").unwrap();
-        db.execute("CREATE TABLE leb (id BIGINT, total DOUBLE);").unwrap();
+        db.execute("CREATE TABLE lea (id INTEGER, x INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE leb (id BIGINT, total DOUBLE);")
+            .unwrap();
         assert_eq!(
             select(
                 &mut db,
@@ -5941,7 +6880,10 @@ mod tests {
     fn fused_duplicate_count_columns() {
         let mut db = fused_db();
         assert_eq!(
-            select(&mut db, "SELECT COUNT(*), COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;"),
+            select(
+                &mut db,
+                "SELECT COUNT(*), COUNT(*) FROM fa JOIN fb ON fa.id = fb.id;"
+            ),
             vec![vec![V::Bigint(8), V::Bigint(8)]]
         );
         assert_eq!(
@@ -5960,7 +6902,9 @@ mod tests {
         };
         assert_eq!(aggs.len(), 1);
         let cx = Cx::new(&db);
-        let fused = fused_join_aggregate(&cx, input, keys, aggs).unwrap().unwrap();
+        let fused = fused_join_aggregate(&cx, input, keys, aggs)
+            .unwrap()
+            .unwrap();
         assert_eq!(fused.chunks.len(), 1);
         assert_eq!(fused.chunks[0].columns.len(), 1);
         assert_eq!(fused.names.len(), 1);
@@ -5982,15 +6926,34 @@ mod tests {
         let results = db
             .execute("USE db1; INSERT INTO t VALUES (1); USE main; INSERT INTO t VALUES (2);")
             .unwrap();
-        assert_eq!(results[0], QueryResult::Used { db: "db1".to_string() });
-        assert_eq!(results[2], QueryResult::Used { db: "main".to_string() });
-        assert_eq!(select(&mut db, "SELECT a FROM main.t;"), vec![vec![V::Integer(2)]]);
-        assert_eq!(select(&mut db, "SELECT a FROM db1.t;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            results[0],
+            QueryResult::Used {
+                db: "db1".to_string()
+            }
+        );
+        assert_eq!(
+            results[2],
+            QueryResult::Used {
+                db: "main".to_string()
+            }
+        );
+        assert_eq!(
+            select(&mut db, "SELECT a FROM main.t;"),
+            vec![vec![V::Integer(2)]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT a FROM db1.t;"),
+            vec![vec![V::Integer(1)]]
+        );
         assert_eq!(db.current_db(), "main");
         // Case-insensitive database names.
         db.execute("USE DB1;").unwrap();
         assert_eq!(db.current_db(), "db1");
-        assert_eq!(select(&mut db, "SELECT a FROM t;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT a FROM t;"),
+            vec![vec![V::Integer(1)]]
+        );
     }
 
     #[test]
@@ -5998,7 +6961,9 @@ mod tests {
         let mut db = PinkDb::new();
         // Last database / duplicate / missing.
         assert!(db.execute("DROP DATABASE main;").is_err());
-        assert!(db.execute("CREATE DATABASE db1; CREATE DATABASE DB1;").is_err());
+        assert!(db
+            .execute("CREATE DATABASE db1; CREATE DATABASE DB1;")
+            .is_err());
         assert!(db.execute("USE nope;").is_err());
         db.execute("CREATE DATABASE db2;").unwrap();
         // Dropping the current database switches to main.
@@ -6011,11 +6976,19 @@ mod tests {
         // CREATE/DROP DATABASE inside a transaction is refused.
         db.execute("BEGIN;").unwrap();
         let err = db.execute("CREATE DATABASE x;").unwrap_err();
-        assert!(err.to_string().contains("not allowed inside a transaction"), "{err}");
+        assert!(
+            err.to_string().contains("not allowed inside a transaction"),
+            "{err}"
+        );
         // LOAD EXTENSION is process-level too; the refusal happens before the
         // path is even looked at.
-        let err = db.execute("LOAD EXTENSION '/does/not/exist.dylib';").unwrap_err();
-        assert_eq!(err.to_string(), "LOAD EXTENSION is not allowed inside a transaction");
+        let err = db
+            .execute("LOAD EXTENSION '/does/not/exist.dylib';")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "LOAD EXTENSION is not allowed inside a transaction"
+        );
         db.execute("ROLLBACK;").unwrap();
     }
 
@@ -6034,7 +7007,10 @@ mod tests {
              CREATE VIEW main.v AS SELECT v FROM src;",
         )
         .unwrap();
-        assert_eq!(select(&mut db, "SELECT * FROM v;"), vec![vec![V::Integer(1)]]);
+        assert_eq!(
+            select(&mut db, "SELECT * FROM v;"),
+            vec![vec![V::Integer(1)]]
+        );
         assert_eq!(
             select(&mut db, "SELECT * FROM db1.v ORDER BY v;"),
             vec![vec![V::Integer(10)], vec![V::Integer(20)]]

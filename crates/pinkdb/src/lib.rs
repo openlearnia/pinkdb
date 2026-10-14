@@ -10,8 +10,8 @@
 //! zero-unsafe, and the built-in binder/executor path is unchanged when no
 //! extension is loaded.
 
-pub mod csv;
 pub mod crypto;
+pub mod csv;
 pub mod db;
 pub mod exec;
 mod ext;
@@ -24,8 +24,8 @@ pub mod types;
 pub mod vector;
 pub mod wal;
 
-pub use db::{Connection, Database};
 pub use crypto::EncryptionKey;
+pub use db::{Connection, Database};
 pub use exec::QueryResult;
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};
@@ -50,8 +50,7 @@ impl PinkDb {
             let texts = sql::statement_texts(sql)?;
             if texts.len() != stmts.len() {
                 return Err(types::PinkDbError::Execution(
-                    "internal error: statement source split disagrees with the parser"
-                        .to_string(),
+                    "internal error: statement source split disagrees with the parser".to_string(),
                 ));
             }
             Some(texts)
@@ -61,8 +60,7 @@ impl PinkDb {
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
             let session_db = self.current_db().to_string();
-            let (plan, dynamic_functions_used) =
-                sql::bind_tracked(self, stmt, &session_db)?;
+            let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
             let plan = optimizer::optimize(self, plan);
             // Store/process-level statements cannot be undone by a snapshot
             // commit of the multi-writer path: refuse inside a txn.

@@ -299,11 +299,12 @@ impl S3Config {
         } else {
             format!("s3://{}/{}", self.bucket, self.prefix)
         };
-        crate::storage::validate_bucket_name(&self.bucket)
-            .map_err(|message| LakeError::BadLocation {
+        crate::storage::validate_bucket_name(&self.bucket).map_err(|message| {
+            LakeError::BadLocation {
                 location: location.clone(),
                 message,
-            })?;
+            }
+        })?;
         let prefix = self.prefix.trim_end_matches('/');
         crate::storage::validate_prefix(prefix, &location)?;
         // Credentials: explicit pair, else both from the environment. The
@@ -338,16 +339,13 @@ impl S3Config {
                 })
             }
         };
-        let session_token = self
-            .session_token
-            .filter(|t| !t.is_empty())
-            .or_else(|| {
-                if credentials_from_env {
-                    env("AWS_SESSION_TOKEN")
-                } else {
-                    None
-                }
-            });
+        let session_token = self.session_token.filter(|t| !t.is_empty()).or_else(|| {
+            if credentials_from_env {
+                env("AWS_SESSION_TOKEN")
+            } else {
+                None
+            }
+        });
         if self.endpoint.is_none() && self.region == "auto" {
             return Err(LakeError::BadLocation {
                 location: self.region.clone(),
@@ -520,21 +518,15 @@ impl S3Storage {
     /// conflict, never a silent success.
     fn verify_written(&self, key: &str, rel: &str, bytes: &[u8]) -> Result<()> {
         match self.client.get_object(key) {
-            Ok(Get::Found {
-                bytes: current, ..
-            }) if current == bytes => Ok(()),
+            Ok(Get::Found { bytes: current, .. }) if current == bytes => Ok(()),
             Ok(Get::Found { .. }) => Err(self.degraded_conflict(
                 rel,
                 "the object changed again between this write and its read-back",
             )),
-            Ok(Get::NotFound) => Err(self.degraded_conflict(
-                rel,
-                "the object disappeared right after this write",
-            )),
-            Err(e) => Err(self.map(
-                &format!("GET s3://{}/{key}", self.client.bucket),
-                e,
-            )),
+            Ok(Get::NotFound) => {
+                Err(self.degraded_conflict(rel, "the object disappeared right after this write"))
+            }
+            Err(e) => Err(self.map(&format!("GET s3://{}/{key}", self.client.bucket), e)),
         }
     }
 
@@ -705,7 +697,10 @@ impl Storage for S3Storage {
     fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
         self.check_write_allowed()?;
         let context = format!("PUT {}", self.abs(rel).display());
-        match self.client.put_object(&self.key(rel), bytes, Condition::None) {
+        match self
+            .client
+            .put_object(&self.key(rel), bytes, Condition::None)
+        {
             Ok(Put::Written) => {
                 self.bucket_confirmed.store(true, Ordering::Relaxed);
                 Ok(())
@@ -726,10 +721,7 @@ impl Storage for S3Storage {
         let key = self.key(rel);
         let context = format!("PUT {}", self.abs(rel).display());
         if !self.degraded.load(Ordering::Relaxed) {
-            match self
-                .client
-                .put_object(&key, bytes, Condition::IfNoneMatch)
-            {
+            match self.client.put_object(&key, bytes, Condition::IfNoneMatch) {
                 Ok(Put::Written) => {
                     self.bucket_confirmed.store(true, Ordering::Relaxed);
                     return Ok(true);
@@ -845,9 +837,7 @@ impl Storage for S3Storage {
         let key = self.key(&rel);
         let context = format!("GET {}", self.abs(&rel).display());
         match self.client.get_object(&key) {
-            Ok(Get::Found {
-                bytes: current, ..
-            }) if current == bytes => Ok(()),
+            Ok(Get::Found { bytes: current, .. }) if current == bytes => Ok(()),
             Ok(Get::Found { .. }) | Ok(Get::NotFound) => {
                 let put_context = format!("PUT {}", self.abs(&rel).display());
                 match self.client.put_object(&key, bytes, Condition::None) {
@@ -1118,11 +1108,8 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(input.len());
     for &b in input.as_bytes() {
-        let unreserved = b.is_ascii_alphanumeric()
-            || b == b'-'
-            || b == b'_'
-            || b == b'.'
-            || b == b'~';
+        let unreserved =
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~';
         if unreserved || (b == b'/' && !encode_slash) {
             out.push(b as char);
         } else {
@@ -1690,7 +1677,10 @@ mod tests {
         // put replaces; put_new is create-only, and the object key carries
         // the prefix.
         storage.put("snapshots/1.json", b"one").unwrap();
-        assert_eq!(storage.read("snapshots/1.json", "reading one").unwrap(), b"one");
+        assert_eq!(
+            storage.read("snapshots/1.json", "reading one").unwrap(),
+            b"one"
+        );
         assert_eq!(mock.object("ops/snapshots/1.json").unwrap(), b"one");
         assert!(!storage.put_new("snapshots/1.json", b"two").unwrap());
         assert_eq!(
@@ -1711,14 +1701,18 @@ mod tests {
             .put_if_match("catalog.json", b"cat-2", &tag)
             .unwrap());
         assert_eq!(
-            storage.read("catalog.json", "reading catalog.json").unwrap(),
+            storage
+                .read("catalog.json", "reading catalog.json")
+                .unwrap(),
             b"cat-2"
         );
         assert!(!storage
             .put_if_match("catalog.json", b"cat-3", &tag)
             .unwrap());
         assert_eq!(
-            storage.read("catalog.json", "reading catalog.json").unwrap(),
+            storage
+                .read("catalog.json", "reading catalog.json")
+                .unwrap(),
             b"cat-2",
             "a stale conditional replace does not land"
         );
@@ -1813,7 +1807,10 @@ mod tests {
         // A port and a base path survive both styles.
         let with_port = Endpoint::parse("http://127.0.0.1:9000/base/path/", true).unwrap();
         let target = with_port.target("b", "k", "list-type=2");
-        assert_eq!(target.url, "http://127.0.0.1:9000/base/path/b/k?list-type=2");
+        assert_eq!(
+            target.url,
+            "http://127.0.0.1:9000/base/path/b/k?list-type=2"
+        );
         assert_eq!(target.canonical_uri, "/base/path/b/k");
         assert_eq!(target.host, "127.0.0.1:9000");
 
@@ -2003,7 +2000,9 @@ mod tests {
                 "{url}: {from_url}"
             );
             assert!(
-                from_config.to_string().contains("the bucket name must be 3"),
+                from_config
+                    .to_string()
+                    .contains("the bucket name must be 3"),
                 "{url}: {from_config}"
             );
         }
@@ -2075,10 +2074,22 @@ mod tests {
             code: code.to_string(),
             message: String::new(),
         };
-        assert!(is_unsupported_conditional(501, &status(501, "NotImplemented")));
-        assert!(is_unsupported_conditional(400, &status(400, "InvalidRequest")));
-        assert!(!is_unsupported_conditional(400, &status(400, "InvalidArgument")));
-        assert!(!is_unsupported_conditional(500, &status(500, "InternalError")));
+        assert!(is_unsupported_conditional(
+            501,
+            &status(501, "NotImplemented")
+        ));
+        assert!(is_unsupported_conditional(
+            400,
+            &status(400, "InvalidRequest")
+        ));
+        assert!(!is_unsupported_conditional(
+            400,
+            &status(400, "InvalidArgument")
+        ));
+        assert!(!is_unsupported_conditional(
+            500,
+            &status(500, "InternalError")
+        ));
         // 403 is auth, never "unsupported".
         assert!(!is_unsupported_conditional(
             403,
@@ -2091,7 +2102,11 @@ mod tests {
     }
 
     /// An `S3Storage` with the degraded fallback explicitly accepted.
-    fn storage_allow_degraded(mock: &crate::mock_s3::MockS3, bucket: &str, prefix: &str) -> S3Storage {
+    fn storage_allow_degraded(
+        mock: &crate::mock_s3::MockS3,
+        bucket: &str,
+        prefix: &str,
+    ) -> S3Storage {
         S3Storage::new(
             S3Config::new(bucket)
                 .with_prefix(prefix)
@@ -2110,7 +2125,9 @@ mod tests {
     fn fabricated_signature_is_rejected() {
         let mock = crate::mock_s3::MockS3::start();
         let storage = storage_with_secret(&mock, "ops-bucket", "ops", "not-the-secret");
-        let err = storage.read("catalog.json", "reading catalog.json").unwrap_err();
+        let err = storage
+            .read("catalog.json", "reading catalog.json")
+            .unwrap_err();
         assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
         assert!(err.to_string().contains("SignatureDoesNotMatch"), "{err}");
         assert!(mock.keys().is_empty(), "nothing was written");
@@ -2136,12 +2153,16 @@ mod tests {
         let storage = storage(&mock, "ops-bucket", "ops");
 
         mock.tamper_next_body_hash();
-        let err = storage.read("catalog.json", "reading catalog.json").unwrap_err();
+        let err = storage
+            .read("catalog.json", "reading catalog.json")
+            .unwrap_err();
         assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
         assert!(err.to_string().contains("x-amz-content-sha256"), "{err}");
 
         mock.set_clock_offset_secs(3600);
-        let err = storage.read("catalog.json", "reading catalog.json").unwrap_err();
+        let err = storage
+            .read("catalog.json", "reading catalog.json")
+            .unwrap_err();
         assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
         assert!(err.to_string().contains("RequestTimeTooSkewed"), "{err}");
         mock.set_clock_offset_secs(0);
@@ -2178,7 +2199,9 @@ mod tests {
         let mut storage = storage(&mock, "ops-bucket", "ops");
         storage.client.max_object_bytes = 16;
 
-        let err = storage.read("big", "reading data file \"big\"").unwrap_err();
+        let err = storage
+            .read("big", "reading data file \"big\"")
+            .unwrap_err();
         assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
         assert!(err.to_string().contains("16-byte object cap"), "{err}");
 
@@ -2198,7 +2221,10 @@ mod tests {
         storage.list_page_cap = 3;
         let err = storage.list("snapshots").unwrap_err();
         assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
-        assert!(err.to_string().contains("did not finish after 3 pages"), "{err}");
+        assert!(
+            err.to_string().contains("did not finish after 3 pages"),
+            "{err}"
+        );
         let pages = mock
             .requests()
             .iter()
@@ -2215,7 +2241,9 @@ mod tests {
         mock.restrict_buckets(&["real-bucket"]);
         let ghost = storage(&mock, "ghost-bucket", "lake");
 
-        let err = ghost.read("catalog.json", "reading catalog.json").unwrap_err();
+        let err = ghost
+            .read("catalog.json", "reading catalog.json")
+            .unwrap_err();
         assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
         assert!(err.to_string().contains("bucket does not exist"), "{err}");
 
@@ -2292,13 +2320,20 @@ mod tests {
         assert!(storage.put_new("k1", b"v").unwrap());
         assert_eq!(mock.conditional_rejections(), 1, "one probe, then sticky");
         assert_eq!(storage.read("k1", "reading").unwrap(), b"v");
-        assert!(!storage.put_new("k1", b"v2").unwrap(), "create-only still holds");
+        assert!(
+            !storage.put_new("k1", b"v2").unwrap(),
+            "create-only still holds"
+        );
         assert_eq!(mock.conditional_rejections(), 1, "no second probe");
 
         storage.put("catalog.json", b"cat-1").unwrap();
         let (_, tag) = storage.read_tagged("catalog.json", "reading").unwrap();
-        assert!(storage.put_if_match("catalog.json", b"cat-2", &tag).unwrap());
-        assert!(!storage.put_if_match("catalog.json", b"cat-3", &tag).unwrap());
+        assert!(storage
+            .put_if_match("catalog.json", b"cat-2", &tag)
+            .unwrap());
+        assert!(!storage
+            .put_if_match("catalog.json", b"cat-3", &tag)
+            .unwrap());
         assert_eq!(storage.read("catalog.json", "reading").unwrap(), b"cat-2");
     }
 

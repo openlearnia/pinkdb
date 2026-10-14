@@ -65,10 +65,7 @@ fn mock_env(mock: &mock_s3::MockS3) -> Vec<(&'static str, String)> {
 /// Borrow the owned env strings for `run_with_env`.
 fn run_mock(mock: &mock_s3::MockS3, cmds: &str) -> String {
     let owned = mock_env(mock);
-    let borrowed: Vec<(&str, &str)> = owned
-        .iter()
-        .map(|(k, v)| (*k, v.as_str()))
-        .collect();
+    let borrowed: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     run_with_env(cmds, &borrowed)
 }
 
@@ -96,8 +93,14 @@ fn lake_s3_save_open_versions_tables_info() {
         "the lake URL is echoed: {out}"
     );
     let keys = mock.keys();
-    assert!(keys.contains(&"lakes/cli/catalog.json".to_string()), "{keys:?}");
-    assert!(keys.contains(&"lakes/cli/snapshots/2.json".to_string()), "{keys:?}");
+    assert!(
+        keys.contains(&"lakes/cli/catalog.json".to_string()),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&"lakes/cli/snapshots/2.json".to_string()),
+        "{keys:?}"
+    );
     assert_eq!(
         keys.iter().filter(|k| k.contains("/data/")).count(),
         2,
@@ -108,9 +111,7 @@ fn lake_s3_save_open_versions_tables_info() {
     // never touch the store.
     let out = run_mock(
         &mock,
-        &format!(
-            ".lake info {url}\n.lake versions {url}\n.lake tables {url}\n.quit\n"
-        ),
+        &format!(".lake info {url}\n.lake versions {url}\n.lake tables {url}\n.quit\n"),
     );
     assert!(out.contains("format version:  2"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
@@ -221,7 +222,11 @@ fn plain_http_and_degraded_endpoints_need_explicit_cli_opt_ins() {
     assert!(out.contains("Error: "), "{out}");
     assert!(out.contains("unencrypted"), "{out}");
     assert!(out.contains("PINKDB_S3_ALLOW_HTTP"), "{out}");
-    assert!(mock.requests().is_empty(), "no request may go out: {:?}", mock.requests());
+    assert!(
+        mock.requests().is_empty(),
+        "no request may go out: {:?}",
+        mock.requests()
+    );
 
     // An endpoint that rejects conditional writes refuses writes by default,
     // with the single-writer opt-in named; PINKDB_S3_ALLOW_DEGRADED=1 accepts
@@ -235,20 +240,25 @@ fn plain_http_and_degraded_endpoints_need_explicit_cli_opt_ins() {
     assert!(out.contains("Error: "), "{out}");
     assert!(out.contains("does not support conditional writes"), "{out}");
     assert!(out.contains("PINKDB_S3_ALLOW_DEGRADED"), "{out}");
-    assert!(mock.keys().is_empty(), "nothing was written: {:?}", mock.keys());
+    assert!(
+        mock.keys().is_empty(),
+        "nothing was written: {:?}",
+        mock.keys()
+    );
 
     let owned = mock_env(&mock);
-    let mut borrowed: Vec<(&str, &str)> = owned
-        .iter()
-        .map(|(k, v)| (*k, v.as_str()))
-        .collect();
+    let mut borrowed: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
     borrowed.push(("PINKDB_S3_ALLOW_DEGRADED", "1"));
     let out = run_with_env(
         &format!("CREATE TABLE t (a INTEGER);\n.lake save {url}\n.quit\n"),
         &borrowed,
     );
     assert!(out.contains("Saved lake version 2"), "{out}");
-    assert!(mock.keys().iter().any(|k| k == "lakes/deg/catalog.json"), "{:?}", mock.keys());
+    assert!(
+        mock.keys().iter().any(|k| k == "lakes/deg/catalog.json"),
+        "{:?}",
+        mock.keys()
+    );
 }
 
 #[test]
@@ -268,9 +278,7 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
         // chain.
         let out = run_mock(
             &mock,
-            &format!(
-                "CREATE TABLE warm (x INTEGER);\n.lake save {url}\n.quit\n"
-            ),
+            &format!("CREATE TABLE warm (x INTEGER);\n.lake save {url}\n.quit\n"),
         );
         assert!(
             out.contains(&format!("Saved lake version {next_version}")),
@@ -316,7 +324,10 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
         }
         let mut unique = winners.clone();
         unique.dedup();
-        assert_eq!(winners, unique, "round {round}: duplicate published versions");
+        assert_eq!(
+            winners, unique,
+            "round {round}: duplicate published versions"
+        );
 
         // The catalog parses and is byte-identical to the snapshot of its
         // version; the chain has no gaps.
@@ -362,7 +373,10 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
         // The lake loads through the CLI (metadata + the store).
         let out = run_mock(&mock, &format!(".lake info {url}\n.quit\n"));
         assert!(!out.contains("Error:"), "{out}");
-        assert!(out.contains(&format!("current version: {version}")), "{out}");
+        assert!(
+            out.contains(&format!("current version: {version}")),
+            "{out}"
+        );
     }
     std::fs::remove_dir_all(&scratch).ok();
 }

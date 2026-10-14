@@ -183,7 +183,10 @@ pub enum Expr {
     Literal(Value),
     /// Bare `*` (only valid as a function arg for `COUNT(*)`).
     Star,
-    Column { table: Option<String>, name: String },
+    Column {
+        table: Option<String>,
+        name: String,
+    },
     QualifiedStar(Option<String>),
     Binary {
         op: BinaryOp,

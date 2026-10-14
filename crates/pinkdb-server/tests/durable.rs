@@ -43,20 +43,31 @@ fn start_server(file: Option<&Path>) -> (Child, String) {
     let stdout = child.stdout.take().expect("child stdout");
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
-    let n = reader.read_line(&mut line).expect("read pinkdb-server stdout");
-    assert!(n > 0, "pinkdb-server exited before printing its listening line");
+    let n = reader
+        .read_line(&mut line)
+        .expect("read pinkdb-server stdout");
+    assert!(
+        n > 0,
+        "pinkdb-server exited before printing its listening line"
+    );
     let rest = line
         .split_once("listening on ")
         .unwrap_or_else(|| panic!("readiness line missing 'listening on': {line:?}"))
         .1;
-    let addr = rest.split_whitespace().next().expect("address on readiness line");
+    let addr = rest
+        .split_whitespace()
+        .next()
+        .expect("address on readiness line");
     (child, addr.to_string())
 }
 
 fn kill(child: &mut Child) {
     child.kill().expect("SIGKILL pinkdb-server");
     let status = child.wait().expect("reap pinkdb-server");
-    assert!(!status.success(), "a SIGKILLed server must not exit cleanly");
+    assert!(
+        !status.success(),
+        "a SIGKILLed server must not exit cleanly"
+    );
 }
 
 fn rows(results: Vec<QueryResult>) -> Vec<Vec<Value>> {
@@ -79,7 +90,9 @@ fn durable_rows_survive_kill_and_restart() {
     // First run: create + insert (acked), then SIGKILL.
     let (mut child, addr) = start_server(Some(&file));
     let mut client = Client::connect(&addr).expect("connect");
-    client.execute("CREATE TABLE t (a INTEGER, v VARCHAR);").unwrap();
+    client
+        .execute("CREATE TABLE t (a INTEGER, v VARCHAR);")
+        .unwrap();
     client
         .execute("INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');")
         .unwrap();
@@ -122,7 +135,10 @@ fn in_memory_server_serves_sql() {
     let mut client = Client::connect(&addr).expect("connect");
     client.execute("CREATE TABLE t (a INTEGER);").unwrap();
     client.execute("INSERT INTO t VALUES (7);").unwrap();
-    assert_eq!(rows(client.execute("SELECT a FROM t;").unwrap()), vec![vec![Value::Integer(7)]]);
+    assert_eq!(
+        rows(client.execute("SELECT a FROM t;").unwrap()),
+        vec![vec![Value::Integer(7)]]
+    );
     drop(client);
     kill(&mut child);
 }
@@ -134,7 +150,9 @@ fn concurrent_clients_survive_kill_with_exactly_once_replay() {
 
     let (mut child, addr) = start_server(Some(&file));
     let mut setup = Client::connect(&addr).expect("connect");
-    setup.execute("CREATE TABLE t (id INTEGER, tag VARCHAR);").unwrap();
+    setup
+        .execute("CREATE TABLE t (id INTEGER, tag VARCHAR);")
+        .unwrap();
     drop(setup);
 
     const CLIENTS: i64 = 4;
@@ -168,11 +186,18 @@ fn concurrent_clients_survive_kill_with_exactly_once_replay() {
         vec![vec![Value::Bigint(total)]]
     );
     // The full contents, in order: no duplicate and no lost row.
-    let got = rows(client.execute("SELECT id, tag FROM t ORDER BY id;").unwrap());
+    let got = rows(
+        client
+            .execute("SELECT id, tag FROM t ORDER BY id;")
+            .unwrap(),
+    );
     let expected: Vec<Vec<Value>> = (0..CLIENTS)
         .flat_map(|c| {
             (0..ROWS_PER_CLIENT).map(move |i| {
-                vec![Value::Integer((c * ROWS_PER_CLIENT + i) as i32), varchar(&format!("c{c}"))]
+                vec![
+                    Value::Integer((c * ROWS_PER_CLIENT + i) as i32),
+                    varchar(&format!("c{c}")),
+                ]
             })
         })
         .collect();

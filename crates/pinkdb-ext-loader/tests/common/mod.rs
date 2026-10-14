@@ -53,7 +53,11 @@ fn compile(name: &str, library: &Path) {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = manifest.join("tests/c").join(format!("{name}.c"));
     let include = manifest.join("include");
-    assert!(source.is_file(), "missing test extension source: {}", source.display());
+    assert!(
+        source.is_file(),
+        "missing test extension source: {}",
+        source.display()
+    );
     if let Some(parent) = library.parent() {
         std::fs::create_dir_all(parent).expect("create test extension directory");
     }
@@ -80,7 +84,10 @@ fn compile(name: &str, library: &Path) {
 
 /// [`extension`] as a `&str`-friendly owned path string.
 pub fn extension_path(name: &str) -> String {
-    extension(name).to_str().expect("UTF-8 test path").to_string()
+    extension(name)
+        .to_str()
+        .expect("UTF-8 test path")
+        .to_string()
 }
 
 /// Read one `pinkdb_test_*` introspection symbol returning `int64_t`.
@@ -110,7 +117,7 @@ fn open(library: &Path) -> libloading::Library {
 fn resolve<'a, T>(lib: &'a libloading::Library, name: &str) -> libloading::Symbol<'a, T> {
     let mut symbol = name.as_bytes().to_vec();
     symbol.push(0); // dlsym needs a NUL-terminated name
-    // SAFETY: the tests know each introspection symbol's C signature.
+                    // SAFETY: the tests know each introspection symbol's C signature.
     unsafe { lib.get::<T>(&symbol) }
         .unwrap_or_else(|e| panic!("test extension does not export {name}: {e}"))
 }

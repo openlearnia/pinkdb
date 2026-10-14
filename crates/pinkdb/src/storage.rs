@@ -129,9 +129,7 @@ impl DataTable {
             (Value::Varchar(s), DataType::Varchar) => Ok(Value::Varchar(s)),
             (Value::Date(d), DataType::Date) => Ok(Value::Date(d)),
             (Value::Timestamp(us), DataType::Timestamp) => Ok(Value::Timestamp(us)),
-            (v, t) => Err(PinkDbError::Type(format!(
-                "cannot coerce {v} to {t}"
-            ))),
+            (v, t) => Err(PinkDbError::Type(format!("cannot coerce {v} to {t}"))),
         }
     }
 
@@ -161,8 +159,7 @@ impl DataTable {
         }
         for (col, val) in self.columns.iter_mut().zip(values) {
             let coerced = Self::coerce(val, col.dtype)?;
-            Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
-                .push_value(coerced)?;
+            Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists")).push_value(coerced)?;
         }
         self.num_rows += 1;
         self.version = next_table_version();
@@ -208,11 +205,7 @@ impl DataTable {
         }
         // Fast path: the batch fits in an empty tail chunk (rows ≤ CHUNK_SIZE
         // by the check above) — move the built vectors in without copying.
-        let tail_len = self.columns[0]
-            .chunks
-            .last()
-            .map(|c| c.len())
-            .unwrap_or(0);
+        let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
         if tail_len == 0 {
             if self.columns[0].chunks.is_empty() {
                 for col in &mut self.columns {
@@ -241,11 +234,7 @@ impl DataTable {
                 }
             }
             let take = {
-                let tail_len = self.columns[0]
-                    .chunks
-                    .last()
-                    .map(|c| c.len())
-                    .unwrap_or(0);
+                let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
                 (CHUNK_SIZE - tail_len).min(rows - offset)
             };
             for (col, src) in self.columns.iter_mut().zip(&chunk) {
@@ -277,14 +266,18 @@ impl DataTable {
     /// (validate everything, then write).
     pub fn update_rows(&mut self, chunk: usize, updates: &[(usize, usize, Value)]) -> Result<()> {
         if chunk >= self.num_chunks() {
-            return Err(PinkDbError::Execution(format!("chunk {chunk} out of range")));
+            return Err(PinkDbError::Execution(format!(
+                "chunk {chunk} out of range"
+            )));
         }
         // Validate + coerce up front for atomicity.
         let mut staged: Vec<(usize, usize, Value)> = Vec::with_capacity(updates.len());
         for (col, row, v) in updates {
-            let dtype = self.columns.get(*col).ok_or_else(|| {
-                PinkDbError::Execution(format!("column {col} out of range"))
-            })?.dtype;
+            let dtype = self
+                .columns
+                .get(*col)
+                .ok_or_else(|| PinkDbError::Execution(format!("column {col} out of range")))?
+                .dtype;
             if *row >= self.columns[*col].chunks[chunk].len() {
                 return Err(PinkDbError::Execution(format!(
                     "row {row} out of bounds in chunk {chunk}"
@@ -305,7 +298,9 @@ impl DataTable {
     /// Returns the removed count. Emptied chunks are dropped.
     pub fn delete_from_chunk(&mut self, chunk: usize, drop: &[usize]) -> Result<usize> {
         if chunk >= self.num_chunks() {
-            return Err(PinkDbError::Execution(format!("chunk {chunk} out of range")));
+            return Err(PinkDbError::Execution(format!(
+                "chunk {chunk} out of range"
+            )));
         }
         if drop.is_empty() {
             return Ok(0);
@@ -484,7 +479,10 @@ impl PinkDb {
         for name in names {
             databases.insert(
                 Self::db_key(name.as_ref()),
-                DbCatalog { name: name.as_ref().to_string(), ..DbCatalog::default() },
+                DbCatalog {
+                    name: name.as_ref().to_string(),
+                    ..DbCatalog::default()
+                },
             );
         }
         Self {
@@ -567,7 +565,10 @@ impl PinkDb {
         }
         self.databases.insert(
             key,
-            DbCatalog { name: name.to_string(), ..DbCatalog::default() },
+            DbCatalog {
+                name: name.to_string(),
+                ..DbCatalog::default()
+            },
         );
         Ok(())
     }
@@ -610,7 +611,10 @@ impl PinkDb {
         }
         let mut names: Vec<&String> = self.databases.keys().collect();
         names.sort();
-        names.first().map(|s| (*s).clone()).unwrap_or_else(|| "main".to_string())
+        names
+            .first()
+            .map(|s| (*s).clone())
+            .unwrap_or_else(|| "main".to_string())
     }
 
     fn db_key(name: &str) -> String {
@@ -618,15 +622,15 @@ impl PinkDb {
     }
 
     fn catalog(&self, db: &str) -> Result<&DbCatalog> {
-        self.databases.get(&Self::db_key(db)).ok_or_else(|| {
-            PinkDbError::Catalog(format!("database \"{db}\" not found"))
-        })
+        self.databases
+            .get(&Self::db_key(db))
+            .ok_or_else(|| PinkDbError::Catalog(format!("database \"{db}\" not found")))
     }
 
     fn catalog_mut(&mut self, db: &str) -> Result<&mut DbCatalog> {
-        self.databases.get_mut(&Self::db_key(db)).ok_or_else(|| {
-            PinkDbError::Catalog(format!("database \"{db}\" not found"))
-        })
+        self.databases
+            .get_mut(&Self::db_key(db))
+            .ok_or_else(|| PinkDbError::Catalog(format!("database \"{db}\" not found")))
     }
 
     /// Current version of one table (for conflict detection).
@@ -640,10 +644,18 @@ impl PinkDb {
     }
 
     pub(crate) fn tables_remove_in(&mut self, db: &str, key: &str) -> Option<DataTable> {
-        self.databases.get_mut(&Self::db_key(db))?.tables.remove(key)
+        self.databases
+            .get_mut(&Self::db_key(db))?
+            .tables
+            .remove(key)
     }
 
-    pub(crate) fn tables_insert_in(&mut self, db: &str, key: String, table: DataTable) -> Result<()> {
+    pub(crate) fn tables_insert_in(
+        &mut self,
+        db: &str,
+        key: String,
+        table: DataTable,
+    ) -> Result<()> {
         self.catalog_mut(db)?.tables.insert(key, table);
         Ok(())
     }
@@ -816,11 +828,12 @@ impl PinkDb {
             let stmts = std::mem::take(&mut self.wal_txn);
             let touched = std::mem::take(&mut self.wal_txn_ext_paths);
             let loaded = std::mem::take(&mut self.wal_txn_ext_loaded);
-            let before = self.wal_txn_db.take().unwrap_or_else(|| self.current_db.clone());
+            let before = self
+                .wal_txn_db
+                .take()
+                .unwrap_or_else(|| self.current_db.clone());
             let after = self.current_db.clone();
-            if let Err(e) =
-                self.wal_append_session(&before, &after, &stmts, &touched, &loaded)
-            {
+            if let Err(e) = self.wal_append_session(&before, &after, &stmts, &touched, &loaded) {
                 // Keep the statements: a retried COMMIT must never publish
                 // changes that made it to memory but not to the WAL.
                 self.wal_txn = stmts;
@@ -863,11 +876,7 @@ impl PinkDb {
         name.to_ascii_lowercase()
     }
 
-    pub fn create_table(
-        &mut self,
-        name: &str,
-        schema: Vec<(String, DataType)>,
-    ) -> Result<()> {
+    pub fn create_table(&mut self, name: &str, schema: Vec<(String, DataType)>) -> Result<()> {
         let db = self.current_db.clone();
         self.create_table_in(&db, name, schema)
     }
@@ -913,9 +922,10 @@ impl PinkDb {
     }
 
     pub fn table_in(&self, db: &str, name: &str) -> Result<&DataTable> {
-        self.catalog(db)?.tables.get(&Self::key(name)).ok_or_else(|| {
-            PinkDbError::Catalog(format!("table \"{name}\" not found"))
-        })
+        self.catalog(db)?
+            .tables
+            .get(&Self::key(name))
+            .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
     }
 
     pub fn table_mut(&mut self, name: &str) -> Result<&mut DataTable> {
@@ -924,9 +934,10 @@ impl PinkDb {
     }
 
     pub fn table_mut_in(&mut self, db: &str, name: &str) -> Result<&mut DataTable> {
-        self.catalog_mut(db)?.tables.get_mut(&Self::key(name)).ok_or_else(|| {
-            PinkDbError::Catalog(format!("table \"{name}\" not found"))
-        })
+        self.catalog_mut(db)?
+            .tables
+            .get_mut(&Self::key(name))
+            .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
     }
 
     /// Sorted table names (stable output for `.tables`).
@@ -975,7 +986,14 @@ impl PinkDb {
                 "view \"{name}\" already exists"
             )));
         }
-        cat.views.insert(key, ViewDef { name: name.to_string(), query, cols });
+        cat.views.insert(
+            key,
+            ViewDef {
+                name: name.to_string(),
+                query,
+                cols,
+            },
+        );
         Ok(())
     }
 
@@ -997,9 +1015,10 @@ impl PinkDb {
     }
 
     pub fn view_in(&self, db: &str, name: &str) -> Result<&ViewDef> {
-        self.catalog(db)?.views.get(&Self::key(name)).ok_or_else(|| {
-            PinkDbError::Catalog(format!("view \"{name}\" not found"))
-        })
+        self.catalog(db)?
+            .views
+            .get(&Self::key(name))
+            .ok_or_else(|| PinkDbError::Catalog(format!("view \"{name}\" not found")))
     }
 
     /// Sorted view display names.
@@ -1053,11 +1072,8 @@ mod tests {
             ],
         )
         .unwrap();
-        t.append_row(vec![
-            Value::Bigint(1),
-            Value::Varchar("ann".to_string()),
-        ])
-        .unwrap();
+        t.append_row(vec![Value::Bigint(1), Value::Varchar("ann".to_string())])
+            .unwrap();
         // Integer widens to Bigint.
         t.append_row(vec![Value::Integer(2), Value::Null]).unwrap();
         t
@@ -1066,11 +1082,8 @@ mod tests {
     #[test]
     fn create_and_lookup_case_insensitive() {
         let mut db = PinkDb::new();
-        db.create_table(
-            "Sales",
-            vec![("id".to_string(), DataType::Integer)],
-        )
-        .unwrap();
+        db.create_table("Sales", vec![("id".to_string(), DataType::Integer)])
+            .unwrap();
         assert!(db.table("sales").is_ok());
         assert!(db.table("SALES").is_ok());
         assert_eq!(db.list_tables(), vec!["Sales".to_string()]);
@@ -1116,7 +1129,10 @@ mod tests {
         assert_eq!(t.scan_chunk(0).unwrap().num_rows(), CHUNK_SIZE);
         assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 5);
         assert!(t.scan_chunk(2).is_none());
-        assert_eq!(t.get(CHUNK_SIZE, 0), Some(Value::Integer(CHUNK_SIZE as i32)));
+        assert_eq!(
+            t.get(CHUNK_SIZE, 0),
+            Some(Value::Integer(CHUNK_SIZE as i32))
+        );
     }
 
     #[test]
@@ -1155,7 +1171,10 @@ mod tests {
         assert_eq!(t.num_chunks(), 2);
         assert_eq!(t.scan_chunk(0).unwrap().num_rows(), CHUNK_SIZE);
         assert_eq!(t.scan_chunk(1).unwrap().num_rows(), 2);
-        assert_eq!(t.get(CHUNK_SIZE - 1, 0), Some(Value::Bigint(CHUNK_SIZE as i64 - 1)));
+        assert_eq!(
+            t.get(CHUNK_SIZE - 1, 0),
+            Some(Value::Bigint(CHUNK_SIZE as i64 - 1))
+        );
         assert_eq!(t.get(CHUNK_SIZE, 0), Some(Value::Bigint(CHUNK_SIZE as i64)));
         assert_eq!(
             t.get(CHUNK_SIZE + 1, 1),
@@ -1163,11 +1182,8 @@ mod tests {
         );
 
         // Shape/type validation.
-        let mut t2 = DataTable::new(
-            "u".to_string(),
-            vec![("a".to_string(), DataType::Integer)],
-        )
-        .unwrap();
+        let mut t2 =
+            DataTable::new("u".to_string(), vec![("a".to_string(), DataType::Integer)]).unwrap();
         assert!(matches!(
             t2.append_chunk(vec![Vector::new_empty(DataType::Double)]),
             Err(PinkDbError::Type(_))
@@ -1203,18 +1219,23 @@ mod tests {
         // Case-insensitive create/use; display name kept as written.
         db.create_database("Analytics").unwrap();
         assert!(db.create_database("ANALYTICS").is_err(), "duplicate");
-        assert_eq!(db.list_databases(), vec!["Analytics".to_string(), "main".to_string()]);
+        assert_eq!(
+            db.list_databases(),
+            vec!["Analytics".to_string(), "main".to_string()]
+        );
         db.use_database("analytics").unwrap();
         assert_eq!(db.current_db(), "analytics");
         assert!(db.use_database("missing").is_err());
 
         // Tables resolve against the session's current database.
-        db.create_table("t", vec![("a".to_string(), DataType::Integer)]).unwrap();
+        db.create_table("t", vec![("a".to_string(), DataType::Integer)])
+            .unwrap();
         assert!(db.table_in("analytics", "t").is_ok());
         assert!(db.table("t").is_ok());
         assert!(db.table_in("main", "t").is_err());
         // Explicit targets work regardless of the session.
-        db.create_table_in("main", "m", vec![("a".to_string(), DataType::Integer)]).unwrap();
+        db.create_table_in("main", "m", vec![("a".to_string(), DataType::Integer)])
+            .unwrap();
         assert_eq!(db.list_tables_in("main"), vec!["m".to_string()]);
         assert_eq!(db.list_tables(), vec!["t".to_string()]);
 

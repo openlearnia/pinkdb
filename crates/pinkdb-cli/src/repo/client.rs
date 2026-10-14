@@ -204,9 +204,12 @@ fn ensure_artifact(
         .map_err(|e| read_error("artifact", base, &url, e, ARTIFACT_MAX_BYTES))?;
     let sha = sha256_hex(&bytes);
 
-    let parent = dest
-        .parent()
-        .ok_or_else(|| format!("cannot determine the parent directory of {}", dest.display()))?;
+    let parent = dest.parent().ok_or_else(|| {
+        format!(
+            "cannot determine the parent directory of {}",
+            dest.display()
+        )
+    })?;
     fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     let tmp = temp_path(dest);
     // `create_new` (O_EXCL) never follows a planted symlink or reuses an
@@ -262,7 +265,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Hex SHA-256 of a file, streamed in chunks.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {

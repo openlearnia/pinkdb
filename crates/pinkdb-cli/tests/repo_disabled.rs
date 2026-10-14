@@ -12,7 +12,9 @@ use std::process::Command;
 
 #[test]
 fn repo_dot_commands_report_the_missing_feature() {
-    let input = String::from_utf8_lossy(b".install math_ext\n.repositories list\n.installed\n.quit\n").into_owned();
+    let input =
+        String::from_utf8_lossy(b".install math_ext\n.repositories list\n.installed\n.quit\n")
+            .into_owned();
     let (text, status) = common::run_merged(Command::new(env!("CARGO_BIN_EXE_pinkdb")), &input);
     common::assert_script_exit(status);
     for cmd in [".install", ".repositories", ".installed"] {

@@ -35,10 +35,8 @@ struct TempHome(PathBuf);
 
 impl TempHome {
     fn new(tag: &str) -> TempHome {
-        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-            "pinkdb_cli_repo_{tag}_{}",
-            std::process::id()
-        ));
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("pinkdb_cli_repo_{tag}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         TempHome(path)
     }
@@ -78,7 +76,9 @@ struct Fixture {
 impl Fixture {
     fn start(catalog: String, artifacts: Vec<(String, Vec<u8>)>) -> Fixture {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
-        listener.set_nonblocking(true).expect("nonblocking fixture server");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking fixture server");
         let addr = listener.local_addr().expect("fixture address");
         // Keys are requested with a leading slash; accept either form.
         let artifacts: HashMap<String, Vec<u8>> = artifacts
@@ -321,7 +321,10 @@ fn assert_no_temp_files(root: &Path) {
         .iter()
         .filter(|p| p.to_string_lossy().contains(".tmp"))
         .collect();
-    assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "temp files left behind: {leftovers:?}"
+    );
 }
 
 // ---------- tests ----------
@@ -355,9 +358,15 @@ fn repository_config_management() {
         out.contains(&format!("1. {OFFICIAL}\n  2. http://127.0.0.1:9")),
         "{out}"
     );
-    assert!(out.contains("Removed repository http://127.0.0.1:9"), "{out}");
+    assert!(
+        out.contains("Removed repository http://127.0.0.1:9"),
+        "{out}"
+    );
     // An empty list is allowed, with a note.
-    assert!(out.contains("Note: no repositories are configured"), "{out}");
+    assert!(
+        out.contains("Note: no repositories are configured"),
+        "{out}"
+    );
     assert!(out.contains("(none configured"), "{out}");
     assert!(out.contains("is not configured"), "{out}");
     // The final state is just the re-added local repository — and the config
@@ -413,7 +422,11 @@ fn install_end_to_end_from_fixture_server() {
     assert!(out.contains(&format!("repo_ext 0.1.0 {platform}")), "{out}");
     // ...and the bytes on disk are exactly the fixture's.
     assert_eq!(fs::read(&path).unwrap(), bytes);
-    assert_eq!(server.artifact_requests(), 1, "exactly one artifact download");
+    assert_eq!(
+        server.artifact_requests(),
+        1,
+        "exactly one artifact download"
+    );
     assert_no_temp_files(home.path());
 }
 
@@ -461,7 +474,11 @@ fn resolution_follows_config_order_and_picks_the_highest_version() {
         ),
     );
     assert!(out.contains("Installed repo_ext 0.2.0"), "{out}");
-    assert!(b.requests().is_empty(), "second repository was consulted: {:?}", b.requests());
+    assert!(
+        b.requests().is_empty(),
+        "second repository was consulted: {:?}",
+        b.requests()
+    );
 
     // A repository without the extension falls through to the next one.
     let empty = Fixture::start(catalog_document(&[]), vec![]);
@@ -487,7 +504,10 @@ fn resolution_follows_config_order_and_picks_the_highest_version() {
     let home = TempHome::new("order-highest");
     let out = run_cli(
         home.path(),
-        &format!(".repositories add {}\n.install repo_ext\n.quit\n", c.base_url()),
+        &format!(
+            ".repositories add {}\n.install repo_ext\n.quit\n",
+            c.base_url()
+        ),
     );
     assert!(out.contains("Installed repo_ext 0.10.0"), "{out}");
 
@@ -528,7 +548,10 @@ fn platform_abi_and_format_errors_are_clear() {
             wrong_platform.base_url()
         ),
     );
-    assert!(out.contains("was not found in any configured repository"), "{out}");
+    assert!(
+        out.contains("was not found in any configured repository"),
+        "{out}"
+    );
     assert!(
         out.contains(&format!(
             "no artifact for \"repo_ext\" on platform {platform} with ABI 1"
@@ -554,7 +577,10 @@ fn platform_abi_and_format_errors_are_clear() {
     assert!(out.contains("(ABI 2)"), "{out}");
 
     // Unsupported repository format version.
-    let bad_format = Fixture::start(r#"{"format_version": 2, "extensions": []}"#.to_string(), vec![]);
+    let bad_format = Fixture::start(
+        r#"{"format_version": 2, "extensions": []}"#.to_string(),
+        vec![],
+    );
     let home = TempHome::new("err-format");
     let out = run_cli(
         home.path(),

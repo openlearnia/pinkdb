@@ -61,7 +61,6 @@ use std::path::Path;
 
 use pinkdb::{DataChunk, DataTable, DataType, PinkDb, Vector, VectorData};
 use serde::{Deserialize, Serialize};
-use vortex::VortexSessionDefault;
 use vortex::array::arrays::bool::BoolArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{
@@ -72,10 +71,11 @@ use vortex::array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex::buffer::{BitBuffer, Buffer, ByteBuffer};
 use vortex::dtype::{DType, FieldNames, Nullability, PType, StructFields};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
-use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
+use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
+use vortex::VortexSessionDefault;
 
 use crate::{empty_single_table_store, LakeError, Result};
 
@@ -240,12 +240,7 @@ fn encode_table_with_metadata(
             message: format!("chunk {i} of \"{dbname}.{table}\" disappeared while encoding"),
         })?;
         chunks.push(encode_chunk(
-            &chunk,
-            &schema,
-            &nulls,
-            any_null,
-            dbname,
-            table,
+            &chunk, &schema, &nulls, any_null, dbname, table,
         )?);
     }
     if chunks.is_empty() {
@@ -643,10 +638,10 @@ fn encode_column(
             // NULL slots must not leak the placeholder/stale bytes they hold
             // in the engine vector into the file: collect `""` for them.
             match nullability {
-                Nullability::NonNullable => VarBinViewArray::from_iter_str(
-                    (0..column.len()).map(|i| values[i].as_ref()),
-                )
-                .into_array(),
+                Nullability::NonNullable => {
+                    VarBinViewArray::from_iter_str((0..column.len()).map(|i| values[i].as_ref()))
+                        .into_array()
+                }
                 Nullability::Nullable => VarBinViewArray::from_iter_nullable_str(
                     (0..column.len()).map(|i| column.is_valid(i).then(|| values[i].as_ref())),
                 )
@@ -983,10 +978,8 @@ mod tests {
     #[test]
     fn parallel_writing_emits_identical_bytes() {
         let mut db = PinkDb::new();
-        db.execute(
-            "CREATE TABLE t (i INTEGER, g BIGINT, d DOUBLE, s VARCHAR, b BOOLEAN);",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE t (i INTEGER, g BIGINT, d DOUBLE, s VARCHAR, b BOOLEAN);")
+            .unwrap();
         let t = db.table_mut("t").unwrap();
         for i in 0..5_000i64 {
             // A mix of shapes (runs, repeats, nulls, long strings) so the
@@ -1021,18 +1014,22 @@ mod tests {
             r#"{"name":"i","type":"integer"},{"name":"g","type":"bigint"},{"name":"d","type":"double"},{"name":"s","type":"varchar"},{"name":"b","type":"boolean"}"#,
         );
         // The metadata segment content is irrelevant to layout; reuse one.
-        let serial = write_chunked("main", "t", chunked.clone(), Some(meta.clone()), false)
-            .unwrap();
-        let parallel = write_chunked("main", "t", chunked.clone(), Some(meta.clone()), true)
-            .unwrap();
+        let serial =
+            write_chunked("main", "t", chunked.clone(), Some(meta.clone()), false).unwrap();
+        let parallel =
+            write_chunked("main", "t", chunked.clone(), Some(meta.clone()), true).unwrap();
         let parallel_again = write_chunked("main", "t", chunked, Some(meta), true).unwrap();
         assert_eq!(
-            serial, parallel,
+            serial,
+            parallel,
             "a worker-pool write changed the file bytes ({} bytes vs {})",
             serial.len(),
             parallel.len()
         );
-        assert_eq!(parallel_again, parallel, "parallel writes must be deterministic");
+        assert_eq!(
+            parallel_again, parallel,
+            "parallel writes must be deterministic"
+        );
         // And the bytes still decode to the same table (all rows/chunks).
         let out = decode(&serial).unwrap();
         assert_eq!(out.table("t").unwrap().num_rows(), 5000);
@@ -1053,7 +1050,12 @@ mod tests {
         // profiles.
         for (name, db, pinned, required) in [
             ("seven_type_40", seven_type_victim(), 74usize, true),
-            ("string_heavy_40", string_victim(), 128usize, cfg!(debug_assertions)),
+            (
+                "string_heavy_40",
+                string_victim(),
+                128usize,
+                cfg!(debug_assertions),
+            ),
         ] {
             let bytes = victim_bytes(&db);
             let mut found = None;

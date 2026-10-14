@@ -92,8 +92,14 @@ fn full_cycle_create_save_open_versions_tables() {
     assert_eq!(lake.versions().unwrap(), vec![1]);
     assert_eq!(lake.path().to_str().unwrap(), "s3://test-bucket/lakes/mine");
     let keys = mock.keys();
-    assert!(keys.contains(&"lakes/mine/catalog.json".to_string()), "{keys:?}");
-    assert!(keys.contains(&"lakes/mine/snapshots/1.json".to_string()), "{keys:?}");
+    assert!(
+        keys.contains(&"lakes/mine/catalog.json".to_string()),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&"lakes/mine/snapshots/1.json".to_string()),
+        "{keys:?}"
+    );
 
     // A second create refuses: the same conditional create-only PUT that a
     // concurrent create would race on.
@@ -115,7 +121,11 @@ fn full_cycle_create_save_open_versions_tables() {
         mock.object("lakes/mine/snapshots/2.json").unwrap(),
         "catalog.json must be byte-identical to its snapshot"
     );
-    assert!(catalog.starts_with(b"{\n  \"format_version\": 2"), "{}", String::from_utf8_lossy(&catalog));
+    assert!(
+        catalog.starts_with(b"{\n  \"format_version\": 2"),
+        "{}",
+        String::from_utf8_lossy(&catalog)
+    );
 
     // The table list of the latest version.
     assert_eq!(
@@ -175,7 +185,10 @@ fn full_cycle_create_save_open_versions_tables() {
         store_bytes(&lake.load(None).unwrap(), &scratch, "v3"),
         store_bytes(&db, &scratch, "v3-original")
     );
-    assert_eq!(lake.load(Some(2)).unwrap().table("t").unwrap().num_rows(), 2);
+    assert_eq!(
+        lake.load(Some(2)).unwrap().table("t").unwrap().num_rows(),
+        2
+    );
 
     // Not a lake: a different prefix under the same bucket.
     let err = Lake::open_s3(mock_config(&mock, "test-bucket", "lakes/other")).unwrap_err();
@@ -248,9 +261,7 @@ fn stale_handles_conflict_and_conditional_catalog_replace_is_enforced() {
     // The failed save's snapshot 5 was written before the catalog replace:
     // an unpublished stray (the catalog still says 3), like a local crash
     // between the two publications. The documented recovery is to remove it.
-    assert!(mock
-        .keys()
-        .contains(&"lake/snapshots/5.json".to_string()));
+    assert!(mock.keys().contains(&"lake/snapshots/5.json".to_string()));
     assert_eq!(
         Lake::open_s3(mock_config(&mock, bucket, "lake"))
             .unwrap()
@@ -264,10 +275,7 @@ fn stale_handles_conflict_and_conditional_catalog_replace_is_enforced() {
     assert_eq!(b.write_from_store(&db).unwrap(), 5);
     assert_eq!(b.load(Some(3)).unwrap().table("t").unwrap().num_rows(), 2);
     // (v3's snapshot is untouched by all of this.)
-    assert_eq!(
-        mock.object("lake/snapshots/3.json").unwrap(),
-        v3_snapshot
-    );
+    assert_eq!(mock.object("lake/snapshots/3.json").unwrap(), v3_snapshot);
 }
 
 #[test]
@@ -290,7 +298,10 @@ fn resaving_a_published_snapshot_is_refused() {
     assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
     let msg = err.to_string();
     assert!(msg.contains("snapshot 3 already exists"), "{msg}");
-    assert!(msg.contains("refusing to replace a published version"), "{msg}");
+    assert!(
+        msg.contains("refusing to replace a published version"),
+        "{msg}"
+    );
     assert_eq!(
         mock.object("lake/catalog.json").unwrap(),
         v2_catalog,
@@ -314,12 +325,16 @@ fn prefixes_and_percent_encoded_table_names_round_trip() {
     assert_eq!(lake.path().to_str().unwrap(), "s3://root-bucket");
     lake.write_from_store(&db).unwrap();
     let root_keys = mock.keys();
-    assert!(root_keys.contains(&"catalog.json".to_string()), "{root_keys:?}");
-    assert!(root_keys.contains(&"snapshots/2.json".to_string()), "{root_keys:?}");
     assert!(
-        root_keys
-            .iter()
-            .any(|k| k.starts_with("data/main.root_t/")),
+        root_keys.contains(&"catalog.json".to_string()),
+        "{root_keys:?}"
+    );
+    assert!(
+        root_keys.contains(&"snapshots/2.json".to_string()),
+        "{root_keys:?}"
+    );
+    assert!(
+        root_keys.iter().any(|k| k.starts_with("data/main.root_t/")),
         "{root_keys:?}"
     );
     let listed = Lake::open_s3(mock_config(&mock, "root-bucket", "")).unwrap();
@@ -348,8 +363,12 @@ fn prefixes_and_percent_encoded_table_names_round_trip() {
         .unwrap()
         .append_row(vec![Value::Integer(9)])
         .unwrap();
-    odd.create_table_in("main", "odd name", vec![("y".to_string(), DataType::Varchar)])
-        .unwrap();
+    odd.create_table_in(
+        "main",
+        "odd name",
+        vec![("y".to_string(), DataType::Varchar)],
+    )
+    .unwrap();
     odd.table_mut_in("main", "odd name")
         .unwrap()
         .append_row(vec![Value::Varchar("héllo".to_string())])
@@ -400,7 +419,10 @@ fn error_mapping_not_found_auth_and_missing_data() {
     let lake = Lake::open_s3(mock_config(&mock, bucket, "lake")).unwrap();
     let err = lake.load(Some(99)).unwrap_err();
     assert!(matches!(err, LakeError::VersionNotFound { .. }), "{err:?}");
-    assert!(err.to_string().contains("has no snapshot version 99"), "{err}");
+    assert!(
+        err.to_string().contains("has no snapshot version 99"),
+        "{err}"
+    );
 
     // A deleted data object is reported by the cheap check and fails the load
     // with the data-file context (a 404 → I/O not-found).
@@ -414,7 +436,10 @@ fn error_mapping_not_found_auth_and_missing_data() {
     mock.remove_object(&victim);
     let missing = lake.missing_data_files().unwrap();
     assert_eq!(missing.len(), 1, "{missing:?}");
-    assert!(missing[0].1.to_str().unwrap().starts_with("s3://"), "{missing:?}");
+    assert!(
+        missing[0].1.to_str().unwrap().starts_with("s3://"),
+        "{missing:?}"
+    );
     let err = lake.load(None).unwrap_err();
     assert!(err.to_string().contains("loading data file"), "{err}");
 
@@ -494,10 +519,7 @@ fn open_url_reads_the_environment_and_saves_the_full_cycle() {
         "every request passed strict SigV4 verification"
     );
     // A session token is sent on the wire, not only signed.
-    assert!(mock
-        .requests()
-        .iter()
-        .any(|_| true));
+    assert!(mock.requests().iter().any(|_| true));
     // The URL path-style addressing: /url-bucket/from/env/... request paths.
     assert!(
         mock.requests()
@@ -554,14 +576,24 @@ fn endpoints_without_conditional_writes_refuse_writes_by_default() {
         "{err:?}"
     );
     let message = err.to_string();
-    assert!(message.contains("does not support conditional writes"), "{message}");
+    assert!(
+        message.contains("does not support conditional writes"),
+        "{message}"
+    );
     assert!(message.contains("PINKDB_S3_ALLOW_DEGRADED"), "{message}");
-    assert!(message.contains("S3Config::allow_degraded(true)"), "{message}");
+    assert!(
+        message.contains("S3Config::allow_degraded(true)"),
+        "{message}"
+    );
     assert!(
         message.contains("SINGLE-WRITER"),
         "the opt-in trade is spelled out: {message}"
     );
-    assert!(mock.keys().is_empty(), "no objects at all: {:?}", mock.keys());
+    assert!(
+        mock.keys().is_empty(),
+        "no objects at all: {:?}",
+        mock.keys()
+    );
     assert_eq!(mock.conditional_rejections(), 1);
     assert!(
         Lake::open_s3(mock_config(&mock, bucket, "lake"))
@@ -610,7 +642,10 @@ fn endpoints_without_conditional_writes_refuse_writes_by_default() {
         .into_iter()
         .filter(|k| k.contains("/snapshots/"))
         .collect();
-    assert_eq!(snapshots_after, snapshots_before, "no snapshot was published");
+    assert_eq!(
+        snapshots_after, snapshots_before,
+        "no snapshot was published"
+    );
     // Data files may have been uploaded before the first conditional write
     // was attempted (unreferenced leftovers, harmless like a crash); the
     // next attempt does not even get that far: the refusal is sticky.
@@ -652,7 +687,11 @@ fn endpoints_without_conditional_writes_allow_an_explicit_single_writer_opt_in()
     // exactly one conditional probe per handle, then sticky.
     let mut a = Lake::create_s3(config()).unwrap();
     assert_eq!(a.current_version(), 1);
-    assert_eq!(mock.conditional_rejections(), 1, "the snapshot create-only PUT");
+    assert_eq!(
+        mock.conditional_rejections(),
+        1,
+        "the snapshot create-only PUT"
+    );
     assert_eq!(a.write_from_store(&db).unwrap(), 2);
     assert_eq!(
         mock.conditional_rejections(),
@@ -666,7 +705,10 @@ fn endpoints_without_conditional_writes_allow_an_explicit_single_writer_opt_in()
         mock.object("lake/snapshots/3.json").unwrap(),
         "with a single writer the pair stays byte-identical"
     );
-    assert!(a.load(None).is_ok(), "the fallback publishes loadable versions");
+    assert!(
+        a.load(None).is_ok(),
+        "the fallback publishes loadable versions"
+    );
 
     // Conflict detection still works: it comes from the version re-check,
     // which needs no conditional writes.
@@ -748,7 +790,8 @@ fn degraded_opt_in_interleaving_repro_stays_consistent() {
         .expect_err("A must conflict");
     assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
     assert!(
-        err.to_string().contains("another writer published version 3"),
+        err.to_string()
+            .contains("another writer published version 3"),
         "{err}"
     );
 
@@ -824,7 +867,10 @@ fn degraded_opt_in_post_replace_verification_reconciles_the_pair() {
     // `snapshots/3.json` from A's authoritative catalog.
     mock.release_hold();
     let a_result = a_handle.join().expect("writer A thread");
-    assert!(a_result.is_ok(), "A is the last catalog writer: {a_result:?}");
+    assert!(
+        a_result.is_ok(),
+        "A is the last catalog writer: {a_result:?}"
+    );
 
     assert_eq!(
         mock.object("lake/catalog.json").unwrap(),
@@ -877,10 +923,12 @@ fn save_store_helpers_work_for_local_and_s3() {
     // A rejected store leaves nothing behind (same pre-validation as local).
     let mut dotted = PinkDb::new();
     dotted.execute("CREATE DATABASE \"a.b\";").unwrap();
-    dotted.execute("CREATE TABLE \"a.b\".t (x INTEGER);").unwrap();
+    dotted
+        .execute("CREATE TABLE \"a.b\".t (x INTEGER);")
+        .unwrap();
     let before = mock.keys().len();
-    let err = pink_lake::save_store_s3(&dotted, mock_config(&mock, "helpers-bucket", "h2"))
-        .unwrap_err();
+    let err =
+        pink_lake::save_store_s3(&dotted, mock_config(&mock, "helpers-bucket", "h2")).unwrap_err();
     assert!(err.to_string().contains("contains \".\""), "{err}");
     assert_eq!(mock.keys().len(), before, "a rejected save writes nothing");
     std::fs::remove_dir_all(&dir).ok();
@@ -897,7 +945,10 @@ fn conditional_409_conflicts_are_retried_within_bounds() {
     // Two 409s on the snapshot create-only PUT: attempt 3 lands.
     mock.conflict_on_next_conditional_puts(2);
     assert_eq!(lake.write_from_store(&db).unwrap(), 2);
-    assert_eq!(mock.object("lake/catalog.json").unwrap(), mock.object("lake/snapshots/2.json").unwrap());
+    assert_eq!(
+        mock.object("lake/catalog.json").unwrap(),
+        mock.object("lake/snapshots/2.json").unwrap()
+    );
     // More 409s than the retry budget: a clean I/O error naming the status.
     mock.conflict_on_next_conditional_puts(9);
     let err = lake.write_from_store(&db).unwrap_err();
@@ -940,7 +991,11 @@ fn lost_put_responses_leave_a_safe_recoverable_state() {
     let mut reopened = reopened;
     let err = reopened.write_from_store(&db).unwrap_err();
     assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
-    assert!(err.to_string().contains("refusing to replace a published version"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("refusing to replace a published version"),
+        "{err}"
+    );
     mock.remove_object("lake/snapshots/3.json");
     assert_eq!(reopened.write_from_store(&db).unwrap(), 3);
 
@@ -976,7 +1031,8 @@ fn v1_pink_data_files_load_over_s3() {
     let mock = MockS3::start();
     let scratch = scratch("v1");
     let mut one = PinkDb::new();
-    one.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
+    one.execute("CREATE TABLE t (a INTEGER, b VARCHAR);")
+        .unwrap();
     one.execute("INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'z');")
         .unwrap();
     let pink_bytes = store_bytes(&one, &scratch, "v1-data");
@@ -990,7 +1046,10 @@ fn v1_pink_data_files_load_over_s3() {
     );
     mock.put_object("v1/catalog.json", catalog.as_bytes());
     mock.put_object("v1/snapshots/1.json", catalog.as_bytes());
-    mock.put_object("v1/data/main.t/00000000-0000-4000-8000-000000000000.pink", &pink_bytes);
+    mock.put_object(
+        "v1/data/main.t/00000000-0000-4000-8000-000000000000.pink",
+        &pink_bytes,
+    );
 
     let lake = Lake::open_s3(mock_config(&mock, "v1-bucket", "v1")).unwrap();
     assert_eq!(lake.format_version(), 1);
@@ -1117,7 +1176,11 @@ fn virtual_hosted_addressing_round_trips_end_to_end() {
     let mut lake = Lake::create_s3(config()).unwrap();
     assert_eq!(lake.write_from_store(&db).unwrap(), 2);
     // The bucket traveled in the Host header; the key in the path.
-    assert!(mock.keys().contains(&"vh/catalog.json".to_string()), "{:?}", mock.keys());
+    assert!(
+        mock.keys().contains(&"vh/catalog.json".to_string()),
+        "{:?}",
+        mock.keys()
+    );
     let requests = mock.requests();
     assert!(
         requests.iter().any(|r| r.starts_with("PUT /vh/")),
@@ -1201,7 +1264,14 @@ fn ambiguous_failures_retry_only_idempotent_requests() {
     assert_eq!(lake.current_version(), 3);
 
     // The catalog replace is an If-Match PUT: not retried on a 500.
-    mock.inject_error("PUT", "lake/catalog.json", 500, "InternalError", "try again", 1);
+    mock.inject_error(
+        "PUT",
+        "lake/catalog.json",
+        500,
+        "InternalError",
+        "try again",
+        1,
+    );
     let err = lake.write_from_store(&db).unwrap_err();
     assert!(err.to_string().contains("InternalError"), "{err}");
 }
@@ -1215,7 +1285,14 @@ fn versions_reports_unreadable_snapshots() {
     let mut lake = Lake::create_s3(mock_config(&mock, "versions-bucket", "lake")).unwrap();
     lake.write_from_store(&db).unwrap();
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);
-    mock.inject_error("GET", "lake/snapshots/1.json", 403, "AccessDenied", "nope", 1);
+    mock.inject_error(
+        "GET",
+        "lake/snapshots/1.json",
+        403,
+        "AccessDenied",
+        "nope",
+        1,
+    );
     let err = lake.versions().unwrap_err();
     assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);

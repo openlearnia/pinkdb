@@ -47,7 +47,9 @@ fn run_until_marker_then_kill(cmds: &str, marker: &str) {
         .expect("spawn pinkdb CLI");
     let mut stdin = child.stdin.take().expect("child stdin");
     let stdout = child.stdout.take().expect("child stdout");
-    stdin.write_all(cmds.as_bytes()).expect("write commands to CLI stdin");
+    stdin
+        .write_all(cmds.as_bytes())
+        .expect("write commands to CLI stdin");
 
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
@@ -55,7 +57,10 @@ fn run_until_marker_then_kill(cmds: &str, marker: &str) {
     loop {
         line.clear();
         let n = reader.read_line(&mut line).expect("read CLI stdout");
-        assert!(n > 0, "CLI exited before marker {marker:?}; output was:\n{all}");
+        assert!(
+            n > 0,
+            "CLI exited before marker {marker:?}; output was:\n{all}"
+        );
         all.push_str(&line);
         if line.contains(marker) {
             break;
@@ -63,7 +68,10 @@ fn run_until_marker_then_kill(cmds: &str, marker: &str) {
     }
     child.kill().expect("SIGKILL the CLI"); // SIGKILL on Unix
     let status = child.wait().expect("reap the CLI");
-    assert!(!status.success(), "a SIGKILLed process must not exit cleanly");
+    assert!(
+        !status.success(),
+        "a SIGKILLed process must not exit cleanly"
+    );
     drop(stdin);
 }
 
@@ -130,7 +138,10 @@ fn sigkill_keeps_checkpointed_and_wal_committed_rows() {
     let dir = scratch("committed");
     let ckpt = dir.join("crash.pink");
     let path = ckpt.to_str().unwrap();
-    assert!(!path.contains(char::is_whitespace), "dot-commands split on whitespace");
+    assert!(
+        !path.contains(char::is_whitespace),
+        "dot-commands split on whitespace"
+    );
 
     // Rows 1-2 (one autocommit, one BEGIN..COMMIT) are folded into a `.save`
     // checkpoint; row 3 lands in the fresh WAL generation after it.
@@ -149,9 +160,17 @@ fn sigkill_keeps_checkpointed_and_wal_committed_rows() {
 
     // A second CLI run must replay the sidecar WAL on `.open`: the message
     // reports the record, and the query sees checkpointed + replayed rows.
-    let out = run_to_exit(&format!(".open {path}\nSELECT a FROM t ORDER BY a;\n.quit\n"));
-    assert!(out.contains("Replayed 1 WAL record(s)"), "CLI must replay the WAL:\n{out}");
-    assert!(out.contains("3 rows"), "checkpointed + WAL rows must be visible:\n{out}");
+    let out = run_to_exit(&format!(
+        ".open {path}\nSELECT a FROM t ORDER BY a;\n.quit\n"
+    ));
+    assert!(
+        out.contains("Replayed 1 WAL record(s)"),
+        "CLI must replay the WAL:\n{out}"
+    );
+    assert!(
+        out.contains("3 rows"),
+        "checkpointed + WAL rows must be visible:\n{out}"
+    );
 
     // Reopen in-process: checkpoint rows plus the one post-checkpoint WAL
     // record. Exactly one replay also proves `.save` checkpointed (rather
@@ -181,7 +200,10 @@ fn sigkill_mid_transaction_drops_uncommitted_rows() {
     run_until_marker_then_kill(&cmds, "txn-marker-ok");
 
     let (mut db, info) = PinkDb::open_durable_with(path, SyncPolicy::Sync).unwrap();
-    assert_eq!(info.replayed_records, 2, "CREATE + the committed insert only");
+    assert_eq!(
+        info.replayed_records, 2,
+        "CREATE + the committed insert only"
+    );
     assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1]);
     cleanup(&ckpt);
 }
@@ -217,7 +239,12 @@ fn sigkill_in_checkpoint_publish_window_survives_repeated_opens() {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn pinkdb CLI");
-        child.stdin.take().unwrap().write_all(cmds.as_bytes()).unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(cmds.as_bytes())
+            .unwrap();
         // The dangerous image: `.tmp` written, the WAL already rolled, the
         // publish not yet done.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -254,7 +281,9 @@ fn sigkill_in_checkpoint_publish_window_survives_repeated_opens() {
     drop(again);
 
     // Open #3 via the REPL, from a different working directory: same rows.
-    let out = run_to_exit(&format!(".open {path}\nSELECT a FROM t ORDER BY a;\n.quit\n"));
+    let out = run_to_exit(&format!(
+        ".open {path}\nSELECT a FROM t ORDER BY a;\n.quit\n"
+    ));
     assert!(out.contains("2 rows"), "checkpoint must be durable:\n{out}");
     cleanup(&ckpt);
 }
@@ -279,7 +308,10 @@ fn dot_slash_save_path_checkpoints_the_bound_database() {
     assert!(!out.contains("Error"), "{out}");
     let (mut db, info) =
         PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
-    assert_eq!(info.replayed_records, 1, "only the INSERT after the last save");
+    assert_eq!(
+        info.replayed_records, 1,
+        "only the INSERT after the last save"
+    );
     assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
     cleanup(&ckpt);
 }
@@ -302,8 +334,7 @@ fn absolute_save_path_checkpoints_the_bound_database() {
     );
     let out = run_to_exit_in(Some(&dir), &cmds);
     assert!(!out.contains("Error"), "{out}");
-    let (mut db, info) =
-        PinkDb::open_durable_with(&abs, SyncPolicy::Sync).unwrap();
+    let (mut db, info) = PinkDb::open_durable_with(&abs, SyncPolicy::Sync).unwrap();
     assert_eq!(info.replayed_records, 1);
     assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
     cleanup(&ckpt);
@@ -419,7 +450,10 @@ fn import_then_logged_dml_survives_sigkill_without_bricking() {
 
     let (mut db, info) = PinkDb::open_durable_with(&path, SyncPolicy::Sync).unwrap();
     assert_eq!(info.replayed_records, 1, "only the post-import INSERT");
-    assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 3, 100]);
+    assert_eq!(
+        ints(&mut db, "SELECT a FROM t ORDER BY a;"),
+        vec![1, 2, 3, 100]
+    );
     drop(db);
     cleanup(&ckpt);
 }

@@ -23,7 +23,10 @@ fn start() -> (ServerHandle, String) {
 /// (possibly malformed) connections did.
 fn assert_server_healthy(addr: &str) {
     let mut c = Client::connect(addr).expect("healthy client connects");
-    assert_eq!(rows(c.execute("SELECT 1;").unwrap()), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        rows(c.execute("SELECT 1;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
 }
 
 /// Raw protocol client used to inspect exact frames.
@@ -35,11 +38,15 @@ struct Raw {
 impl Raw {
     fn connect(addr: &str) -> Raw {
         let stream = TcpStream::connect(addr).expect("connect raw");
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut writer = stream.try_clone().unwrap();
         protocol::write_request(
             &mut writer,
-            &Request::Hello { protocol_version: PROTOCOL_VERSION },
+            &Request::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
         )
         .unwrap();
         let mut reader = BufReader::new(stream);
@@ -53,7 +60,9 @@ impl Raw {
     fn execute(&mut self, sql: &str) {
         protocol::write_request(
             &mut self.writer,
-            &Request::Execute { sql: sql.to_string() },
+            &Request::Execute {
+                sql: sql.to_string(),
+            },
         )
         .unwrap();
     }
@@ -110,7 +119,10 @@ fn create_insert_select_round_trips_every_value_type_and_nulls() {
     )
     .unwrap();
 
-    let result = single(c.execute("SELECT b, i, bi, d, v, dt, ts FROM t ORDER BY i;").unwrap());
+    let result = single(
+        c.execute("SELECT b, i, bi, d, v, dt, ts FROM t ORDER BY i;")
+            .unwrap(),
+    );
     let QueryResult::Selected { names, types, rows } = result else {
         panic!("expected Selected");
     };
@@ -138,9 +150,7 @@ fn create_insert_select_round_trips_every_value_type_and_nulls() {
             Value::Double(-0.5),
             varchar(""),
             Value::Date(pinkdb::types::days_from_civil(1969, 12, 31)),
-            Value::Timestamp(
-                pinkdb::types::parse_timestamp("1969-12-31 23:59:59").unwrap()
-            ),
+            Value::Timestamp(pinkdb::types::parse_timestamp("1969-12-31 23:59:59").unwrap()),
         ]
     );
     assert_eq!(
@@ -152,9 +162,7 @@ fn create_insert_select_round_trips_every_value_type_and_nulls() {
             Value::Double(3.5),
             varchar("x"),
             Value::Date(pinkdb::types::days_from_civil(2024, 1, 1)),
-            Value::Timestamp(
-                pinkdb::types::parse_timestamp("2024-01-01 00:00:01.5").unwrap()
-            ),
+            Value::Timestamp(pinkdb::types::parse_timestamp("2024-01-01 00:00:01.5").unwrap()),
         ]
     );
     assert_eq!(rows[2], vec![Value::Null; 7]);
@@ -188,7 +196,10 @@ fn sql_errors_are_reported_without_dropping_the_connection() {
     assert!(err.to_string().contains("missing"), "{err}");
 
     // The same connection is still usable.
-    assert_eq!(rows(c.execute("SELECT 1;").unwrap()), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        rows(c.execute("SELECT 1;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
 
     // A failing statement aborts the whole batch (all-or-nothing, like the
     // embedded `Connection::execute`), and the connection survives that too.
@@ -196,13 +207,19 @@ fn sql_errors_are_reported_without_dropping_the_connection() {
         .execute("INSERT INTO t VALUES (1); SELECT * FROM missing;")
         .unwrap_err();
     assert!(err.to_string().contains("missing"), "{err}");
-    assert_eq!(rows(c.execute("SELECT COUNT(*) FROM t;").unwrap()), vec![vec![Value::Bigint(1)]]);
+    assert_eq!(
+        rows(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
+        vec![vec![Value::Bigint(1)]]
+    );
 
     // Parse errors are reported identically (parsed locally by the same
     // engine parser, before any round trip).
     let err = c.execute("SELEKT 1;").unwrap_err();
     assert!(!err.to_string().is_empty());
-    assert_eq!(rows(c.execute("SELECT 2;").unwrap()), vec![vec![Value::Integer(2)]]);
+    assert_eq!(
+        rows(c.execute("SELECT 2;").unwrap()),
+        vec![vec![Value::Integer(2)]]
+    );
     handle.join();
 }
 
@@ -232,7 +249,10 @@ fn multi_statement_execute_returns_each_result_in_order() {
     assert_eq!(results[3], QueryResult::Began);
     assert_eq!(results[4], QueryResult::Inserted { count: 1 });
     assert_eq!(results[5], QueryResult::Committed);
-    assert_eq!(rows(c.execute("SELECT COUNT(*) FROM t;").unwrap()), vec![vec![Value::Bigint(3)]]);
+    assert_eq!(
+        rows(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
+        vec![vec![Value::Bigint(3)]]
+    );
     handle.join();
 }
 
@@ -256,16 +276,31 @@ fn use_sessions_are_isolated_per_client() {
         assert_eq!(b.execute("USE db1;").unwrap().len(), 1);
         b.execute("USE main;").unwrap();
         b.execute("INSERT INTO t VALUES ('b');").unwrap();
-        assert_eq!(rows(b.execute("SELECT v FROM t;").unwrap()), vec![vec![varchar("b")]]);
+        assert_eq!(
+            rows(b.execute("SELECT v FROM t;").unwrap()),
+            vec![vec![varchar("b")]]
+        );
         b
     });
     let mut b = b_thread.join().unwrap();
 
     // A's session is still db1; B's is still main; qualified names cross.
-    assert_eq!(rows(a.execute("SELECT v FROM t;").unwrap()), vec![vec![varchar("a")]]);
-    assert_eq!(rows(b.execute("SELECT v FROM t;").unwrap()), vec![vec![varchar("b")]]);
-    assert_eq!(rows(a.execute("SELECT v FROM main.t;").unwrap()), vec![vec![varchar("b")]]);
-    assert_eq!(rows(b.execute("SELECT v FROM db1.t;").unwrap()), vec![vec![varchar("a")]]);
+    assert_eq!(
+        rows(a.execute("SELECT v FROM t;").unwrap()),
+        vec![vec![varchar("a")]]
+    );
+    assert_eq!(
+        rows(b.execute("SELECT v FROM t;").unwrap()),
+        vec![vec![varchar("b")]]
+    );
+    assert_eq!(
+        rows(a.execute("SELECT v FROM main.t;").unwrap()),
+        vec![vec![varchar("b")]]
+    );
+    assert_eq!(
+        rows(b.execute("SELECT v FROM db1.t;").unwrap()),
+        vec![vec![varchar("a")]]
+    );
     handle.join();
 }
 
@@ -273,7 +308,8 @@ fn use_sessions_are_isolated_per_client() {
 fn large_result_streams_all_rows() {
     let (handle, addr) = start();
     let mut c = Client::connect(&addr).expect("connect");
-    c.execute("CREATE TABLE big (a BIGINT, v VARCHAR);").unwrap();
+    c.execute("CREATE TABLE big (a BIGINT, v VARCHAR);")
+        .unwrap();
 
     let mut sql = String::from("INSERT INTO big VALUES ");
     for i in 0..20_000i64 {
@@ -283,12 +319,19 @@ fn large_result_streams_all_rows() {
         sql.push_str(&format!("({i}, 'r{i}')"));
     }
     sql.push(';');
-    assert_eq!(single(c.execute(&sql).unwrap()), QueryResult::Inserted { count: 20_000 });
+    assert_eq!(
+        single(c.execute(&sql).unwrap()),
+        QueryResult::Inserted { count: 20_000 }
+    );
 
     let out = rows(c.execute("SELECT a, v FROM big ORDER BY a;").unwrap());
     assert_eq!(out.len(), 20_000);
     for (i, row) in out.iter().enumerate() {
-        assert_eq!(row, &vec![Value::Bigint(i as i64), varchar(&format!("r{i}"))], "row {i}");
+        assert_eq!(
+            row,
+            &vec![Value::Bigint(i as i64), varchar(&format!("r{i}"))],
+            "row {i}"
+        );
     }
     handle.join();
 }
@@ -300,7 +343,8 @@ fn huge_rows_stream_in_multiple_bounded_frames() {
     c.execute("CREATE TABLE big (v VARCHAR);").unwrap();
     let cell = "x".repeat(2 * 1024 * 1024);
     for _ in 0..5 {
-        c.execute(&format!("INSERT INTO big VALUES ('{cell}');")).unwrap();
+        c.execute(&format!("INSERT INTO big VALUES ('{cell}');"))
+            .unwrap();
     }
     drop(c);
 
@@ -311,7 +355,9 @@ fn huge_rows_stream_in_multiple_bounded_frames() {
     let mut writer = stream.try_clone().unwrap();
     protocol::write_request(
         &mut writer,
-        &Request::Hello { protocol_version: PROTOCOL_VERSION },
+        &Request::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        },
     )
     .unwrap();
     let mut reader = BufReader::new(stream);
@@ -321,7 +367,9 @@ fn huge_rows_stream_in_multiple_bounded_frames() {
     }
     protocol::write_request(
         &mut writer,
-        &Request::Execute { sql: "SELECT v FROM big;".to_string() },
+        &Request::Execute {
+            sql: "SELECT v FROM big;".to_string(),
+        },
     )
     .unwrap();
     let mut rows_frames = 0usize;
@@ -344,7 +392,10 @@ fn huge_rows_stream_in_multiple_bounded_frames() {
         }
     }
     assert_eq!(total_rows, 5);
-    assert!(rows_frames >= 2, "10 MiB must split into several frames, got {rows_frames}");
+    assert!(
+        rows_frames >= 2,
+        "10 MiB must split into several frames, got {rows_frames}"
+    );
     handle.join();
 }
 
@@ -380,14 +431,19 @@ fn mismatched_hello_is_rejected() {
     let mut writer = stream.try_clone().unwrap();
     protocol::write_request(
         &mut writer,
-        &Request::Hello { protocol_version: PROTOCOL_VERSION + 1 },
+        &Request::Hello {
+            protocol_version: PROTOCOL_VERSION + 1,
+        },
     )
     .unwrap();
     let mut reader = BufReader::new(stream);
     match protocol::read_response(&mut reader).unwrap() {
         Response::Error { message } => {
             assert!(message.contains("protocol version mismatch"), "{message}");
-            assert!(message.contains(&format!("v{}", PROTOCOL_VERSION)), "{message}");
+            assert!(
+                message.contains(&format!("v{}", PROTOCOL_VERSION)),
+                "{message}"
+            );
         }
         other => panic!("expected Error, got {other:?}"),
     }
@@ -403,7 +459,12 @@ fn client_rejects_a_wrong_server_protocol_version() {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let request = protocol::read_request(&mut reader).unwrap();
-        assert_eq!(request, Request::Hello { protocol_version: PROTOCOL_VERSION });
+        assert_eq!(
+            request,
+            Request::Hello {
+                protocol_version: PROTOCOL_VERSION
+            }
+        );
         protocol::write_response(
             &mut writer,
             &Response::HelloOk {
@@ -414,7 +475,10 @@ fn client_rejects_a_wrong_server_protocol_version() {
         .unwrap();
     });
     let err = Client::connect(addr.to_string()).unwrap_err();
-    assert!(err.to_string().contains("protocol version mismatch"), "{err}");
+    assert!(
+        err.to_string().contains("protocol version mismatch"),
+        "{err}"
+    );
     fake.join().unwrap();
 }
 
@@ -441,7 +505,10 @@ fn client_reports_a_malformed_server_frame() {
     });
     let mut c = Client::connect(addr.to_string()).unwrap();
     let err = c.execute("SELECT 1;").unwrap_err();
-    assert!(err.to_string().contains("unknown response message type"), "{err}");
+    assert!(
+        err.to_string().contains("unknown response message type"),
+        "{err}"
+    );
     fake.join().unwrap();
 }
 
@@ -465,7 +532,10 @@ fn zero_statement_execute_returns_batch_done_zero() {
     let mut c = Client::connect(&addr).unwrap();
     assert!(c.execute("").unwrap().is_empty());
     assert!(c.execute(" ;; ").unwrap().is_empty());
-    assert_eq!(rows(c.execute("SELECT 1;").unwrap()), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        rows(c.execute("SELECT 1;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
     handle.join();
 }
 
@@ -511,33 +581,30 @@ fn malformed_raw_connections_leave_the_server_healthy() {
     let cases: Vec<(&str, Vec<u8>)> = vec![
         ("single garbage byte", vec![0x00]),
         ("zero-length frame", vec![0, 0, 0, 0]),
-        ("oversized length prefix", (MAX_FRAME_SIZE as u32 + 1).to_le_bytes().to_vec()),
+        (
+            "oversized length prefix",
+            (MAX_FRAME_SIZE as u32 + 1).to_le_bytes().to_vec(),
+        ),
         ("unknown request type", frame(200, &[])),
-        ("Ping before Hello", protocol::encode_request(&Request::Ping).unwrap()),
         (
-            "Hello with trailing byte",
-            {
-                let mut body = PROTOCOL_VERSION.to_le_bytes().to_vec();
-                body.push(0);
-                frame(msg_type::HELLO, &body)
-            },
+            "Ping before Hello",
+            protocol::encode_request(&Request::Ping).unwrap(),
         ),
-        (
-            "truncated Execute body",
-            {
-                let mut body = 100u32.to_le_bytes().to_vec();
-                body.extend_from_slice(b"abc");
-                frame(msg_type::EXECUTE, &body)
-            },
-        ),
-        (
-            "invalid UTF-8 SQL",
-            {
-                let mut body = 2u32.to_le_bytes().to_vec();
-                body.extend_from_slice(&[0xff, 0xfe]);
-                frame(msg_type::EXECUTE, &body)
-            },
-        ),
+        ("Hello with trailing byte", {
+            let mut body = PROTOCOL_VERSION.to_le_bytes().to_vec();
+            body.push(0);
+            frame(msg_type::HELLO, &body)
+        }),
+        ("truncated Execute body", {
+            let mut body = 100u32.to_le_bytes().to_vec();
+            body.extend_from_slice(b"abc");
+            frame(msg_type::EXECUTE, &body)
+        }),
+        ("invalid UTF-8 SQL", {
+            let mut body = 2u32.to_le_bytes().to_vec();
+            body.extend_from_slice(&[0xff, 0xfe]);
+            frame(msg_type::EXECUTE, &body)
+        }),
         ("Ping with trailing bytes", frame(msg_type::PING, &[1])),
         (
             "mismatched protocol version",
@@ -549,9 +616,13 @@ fn malformed_raw_connections_leave_the_server_healthy() {
     ];
     for (label, bytes) in cases {
         let mut stream = TcpStream::connect(&addr).unwrap_or_else(|e| panic!("{label}: {e}"));
-        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
         let mut writer = stream.try_clone().unwrap();
-        writer.write_all(&bytes).unwrap_or_else(|e| panic!("{label}: {e}"));
+        writer
+            .write_all(&bytes)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
         // Half-close so the server's blocking reads see EOF.
         writer.shutdown(Shutdown::Write).unwrap();
         // Drain whatever the server answers (an Error frame, then EOF).
@@ -571,7 +642,9 @@ fn oversized_single_value_errors_cleanly_and_only_closes_that_connection() {
     // server must report a clean error and close that one connection.
     let big = "x".repeat(MAX_FRAME_SIZE + 1);
     let mut store = PinkDb::new();
-    store.create_table("t", vec![("v".to_string(), DataType::Varchar)]).unwrap();
+    store
+        .create_table("t", vec![("v".to_string(), DataType::Varchar)])
+        .unwrap();
     store
         .table_mut("t")
         .unwrap()
@@ -609,22 +682,28 @@ fn oversized_single_value_errors_cleanly_and_only_closes_that_connection() {
 
 #[test]
 fn connection_cap_rejects_excess_and_admits_after_a_slot_frees() {
-    let server =
-        Server::bind_with_max_connections("127.0.0.1:0", Database::new(), 2).unwrap();
+    let server = Server::bind_with_max_connections("127.0.0.1:0", Database::new(), 2).unwrap();
     let addr = server.local_addr().to_string();
     let handle = server.spawn().unwrap();
 
     let mut a = Client::connect(&addr).unwrap();
     let mut b = Client::connect(&addr).unwrap();
-    a.execute("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);").unwrap();
+    a.execute("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
+        .unwrap();
 
     // Over the cap: connect fails with the server's limit error.
     let err = Client::connect(&addr).unwrap_err();
     assert!(err.to_string().contains("connection limit"), "{err}");
 
     // Existing clients are unaffected.
-    assert_eq!(rows(a.execute("SELECT v FROM t;").unwrap()), vec![vec![Value::Integer(1)]]);
-    assert_eq!(rows(b.execute("SELECT 1;").unwrap()), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        rows(a.execute("SELECT v FROM t;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        rows(b.execute("SELECT 1;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
 
     // Freeing a slot admits a new connection (the thread decrements on EOF).
     drop(b);
@@ -639,7 +718,10 @@ fn connection_cap_rejects_excess_and_admits_after_a_slot_frees() {
         }
     }
     let mut c = admitted.expect("a slot must free after a client disconnects");
-    assert_eq!(rows(c.execute("SELECT 1;").unwrap()), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        rows(c.execute("SELECT 1;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
     handle.join();
 }
 
@@ -656,19 +738,33 @@ fn statement_panics_are_caught_and_connections_stay_usable() {
     let (handle, addr) = start();
     let mut a = Client::connect(&addr).unwrap();
     let mut b = Client::connect(&addr).unwrap();
-    a.execute("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);").unwrap();
+    a.execute("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1);")
+        .unwrap();
 
     let err = a.execute("SELECT '__PANIC__';").unwrap_err();
-    assert!(err.to_string().contains("internal error: statement panicked"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("internal error: statement panicked"),
+        "{err}"
+    );
     assert!(err.to_string().contains("injected test panic"), "{err}");
 
     // The same connection, and other connections, keep working.
-    assert_eq!(rows(a.execute("SELECT v FROM t;").unwrap()), vec![vec![Value::Integer(1)]]);
-    assert_eq!(rows(b.execute("SELECT 2;").unwrap()), vec![vec![Value::Integer(2)]]);
+    assert_eq!(
+        rows(a.execute("SELECT v FROM t;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        rows(b.execute("SELECT 2;").unwrap()),
+        vec![vec![Value::Integer(2)]]
+    );
 
     // The hook only fires on the marker.
     *STATEMENT_HOOK.lock().unwrap() = None;
-    assert_eq!(rows(a.execute("SELECT 3;").unwrap()), vec![vec![Value::Integer(3)]]);
+    assert_eq!(
+        rows(a.execute("SELECT 3;").unwrap()),
+        vec![vec![Value::Integer(3)]]
+    );
     handle.join();
 }
 
@@ -690,7 +786,10 @@ fn over_deep_statement_is_a_clean_error_and_the_server_stays_healthy() {
     assert!(err.to_string().contains("expression too deep"), "{err}");
 
     // The same connection and brand-new connections keep working.
-    assert_eq!(rows(c.execute("SELECT 1;").unwrap()), vec![vec![Value::Integer(1)]]);
+    assert_eq!(
+        rows(c.execute("SELECT 1;").unwrap()),
+        vec![vec![Value::Integer(1)]]
+    );
     assert_server_healthy(&addr);
     let mut fresh = Client::connect(&addr).unwrap();
     assert_eq!(
@@ -740,20 +839,32 @@ fn accept_errors_from_fd_exhaustion_do_not_kill_the_server() {
     let mut sockets = Vec::new();
     let mut served = 0usize;
     for _ in 0..60 {
-        let Ok(stream) = TcpStream::connect(&addr) else { continue };
-        stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let Ok(stream) = TcpStream::connect(&addr) else {
+            continue;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let mut writer = stream.try_clone().unwrap();
         let _ = protocol::write_request(
             &mut writer,
-            &Request::Hello { protocol_version: PROTOCOL_VERSION },
+            &Request::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
         );
         let mut reader = BufReader::new(stream);
-        if matches!(protocol::read_response(&mut reader), Ok(Response::HelloOk { .. })) {
+        if matches!(
+            protocol::read_response(&mut reader),
+            Ok(Response::HelloOk { .. })
+        ) {
             served += 1;
         }
         sockets.push((reader, writer));
     }
-    assert!(served >= 20, "expected fd pressure to serve some connections, got {served}");
+    assert!(
+        served >= 20,
+        "expected fd pressure to serve some connections, got {served}"
+    );
     assert!(
         child.try_wait().unwrap().is_none(),
         "the server must still be running after EMFILE"
@@ -765,12 +876,18 @@ fn accept_errors_from_fd_exhaustion_do_not_kill_the_server() {
     std::thread::sleep(Duration::from_millis(500));
     let mut admitted = None;
     for _ in 0..40 {
-        let Ok(stream) = TcpStream::connect(&addr) else { continue };
-        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let Ok(stream) = TcpStream::connect(&addr) else {
+            continue;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let mut writer = stream.try_clone().unwrap();
         protocol::write_request(
             &mut writer,
-            &Request::Hello { protocol_version: PROTOCOL_VERSION },
+            &Request::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
         )
         .unwrap();
         let mut reader = BufReader::new(stream);
@@ -786,7 +903,9 @@ fn accept_errors_from_fd_exhaustion_do_not_kill_the_server() {
         admitted.expect("the server must admit a connection after fd pressure clears");
     protocol::write_request(
         &mut writer,
-        &Request::Execute { sql: "SELECT 1;".to_string() },
+        &Request::Execute {
+            sql: "SELECT 1;".to_string(),
+        },
     )
     .unwrap();
     let mut got_done = false;
@@ -820,7 +939,8 @@ fn client_rejects_malformed_responses_and_marks_itself_broken() {
             w.write_all(&[0, 0, 0, 0]).unwrap();
         }),
         ("oversized frame", |w| {
-            w.write_all(&(MAX_FRAME_SIZE as u32 + 1).to_le_bytes()).unwrap();
+            w.write_all(&(MAX_FRAME_SIZE as u32 + 1).to_le_bytes())
+                .unwrap();
         }),
         ("truncated body", |w| {
             let mut bytes = 100u32.to_le_bytes().to_vec();
@@ -1008,5 +1128,8 @@ fn checkpoint_round_trips_as_its_own_done_kind() {
     let (_handle, addr) = start();
     let mut c = Client::connect(&addr).unwrap();
     // In-memory: a no-op that still reports its own statement kind (v4).
-    assert_eq!(c.execute("CHECKPOINT;").unwrap(), vec![QueryResult::Checkpointed]);
+    assert_eq!(
+        c.execute("CHECKPOINT;").unwrap(),
+        vec![QueryResult::Checkpointed]
+    );
 }

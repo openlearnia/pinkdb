@@ -91,10 +91,15 @@ impl Client {
         };
         protocol::write_request(
             &mut client.writer,
-            &Request::Hello { protocol_version: PROTOCOL_VERSION },
+            &Request::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            },
         )?;
         match protocol::read_response(&mut client.reader)? {
-            Response::HelloOk { server_version, protocol_version } => {
+            Response::HelloOk {
+                server_version,
+                protocol_version,
+            } => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(ProtocolError::VersionMismatch {
                         server: protocol_version,
@@ -159,7 +164,12 @@ impl Client {
     }
 
     fn execute_inner(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
-        protocol::write_request(&mut self.writer, &Request::Execute { sql: sql.to_string() })?;
+        protocol::write_request(
+            &mut self.writer,
+            &Request::Execute {
+                sql: sql.to_string(),
+            },
+        )?;
         let mut results = Vec::new();
         let mut current: PendingResult = None;
         loop {
@@ -275,15 +285,20 @@ fn build_result(
     }
     // A non-row result must not carry a half-built result set.
     if current.is_some() {
-        return Err(ProtocolError::Malformed(format!(
-            "Done({kind:?}) after a ResultSet frame"
-        ))
-        .into());
+        return Err(
+            ProtocolError::Malformed(format!("Done({kind:?}) after a ResultSet frame")).into(),
+        );
     }
     Ok(match kind {
-        DoneKind::Inserted => QueryResult::Inserted { count: to_count(count)? },
-        DoneKind::Updated => QueryResult::Updated { count: to_count(count)? },
-        DoneKind::Deleted => QueryResult::Deleted { count: to_count(count)? },
+        DoneKind::Inserted => QueryResult::Inserted {
+            count: to_count(count)?,
+        },
+        DoneKind::Updated => QueryResult::Updated {
+            count: to_count(count)?,
+        },
+        DoneKind::Deleted => QueryResult::Deleted {
+            count: to_count(count)?,
+        },
         DoneKind::Created => QueryResult::Created,
         DoneKind::Began => QueryResult::Began,
         DoneKind::Committed => QueryResult::Committed,

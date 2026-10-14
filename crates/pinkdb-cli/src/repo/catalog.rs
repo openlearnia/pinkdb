@@ -80,13 +80,21 @@ fn parse_entry(value: &serde_json::Value) -> Result<Entry, String> {
     // Catalog fields become filesystem path components in the cache, so a
     // malformed (or malicious) repository must not be able to escape
     // `$PINKDB_HOME/extensions`.
-    for (field, v) in [("name", &name), ("version", &version), ("platform", &platform)] {
+    for (field, v) in [
+        ("name", &name),
+        ("version", &version),
+        ("platform", &platform),
+    ] {
         if !is_safe_component(v) {
-            return Err(format!("field \"{field}\" is not a safe path component: {v:?}"));
+            return Err(format!(
+                "field \"{field}\" is not a safe path component: {v:?}"
+            ));
         }
     }
     if !is_safe_relative_path(&file) {
-        return Err(format!("field \"file\" is not a safe repository-relative path: {file:?}"));
+        return Err(format!(
+            "field \"file\" is not a safe repository-relative path: {file:?}"
+        ));
     }
     if sha256.len() != 64 || !sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!("field \"sha256\" is not 64 hex digits: {sha256:?}"));
@@ -111,17 +119,15 @@ fn string_field(value: &serde_json::Value, key: &str) -> Result<String, String> 
 }
 
 fn is_safe_component(v: &str) -> bool {
-    !v.is_empty()
-        && v != "."
-        && v != ".."
-        && !v.contains(['/', '\\', '\0'])
+    !v.is_empty() && v != "." && v != ".." && !v.contains(['/', '\\', '\0'])
 }
 
 fn is_safe_relative_path(v: &str) -> bool {
     !v.is_empty()
         && !v.starts_with('/')
         && !v.contains(['\\', '\0'])
-        && v.split('/').all(|part| !part.is_empty() && part != "." && part != "..")
+        && v.split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// The result of resolving `name[@version]` in one catalog.
@@ -267,7 +273,10 @@ mod tests {
         assert_eq!(e.version, "0.1.0");
         assert_eq!(e.abi, 1);
         assert_eq!(e.platform, "darwin-arm64");
-        assert_eq!(e.file, "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib");
+        assert_eq!(
+            e.file,
+            "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib"
+        );
         assert_eq!(e.sha256, SHA);
         assert_eq!(e.description.as_deref(), Some("test"));
     }
@@ -276,10 +285,7 @@ mod tests {
     fn refuses_other_format_versions() {
         let json = r#"{"format_version": 2, "extensions": []}"#;
         let err = Catalog::parse(json.as_bytes()).unwrap_err();
-        assert_eq!(
-            err,
-            "unsupported repository format version 2 (expected 1)"
-        );
+        assert_eq!(err, "unsupported repository format version 2 (expected 1)");
     }
 
     #[test]
@@ -368,7 +374,9 @@ mod tests {
         match lookup(&cat, "math_ext", None, "darwin-arm64", 1) {
             Lookup::NoMatch(reason) => {
                 assert!(
-                    reason.contains("no artifact for \"math_ext\" on platform darwin-arm64 with ABI 1"),
+                    reason.contains(
+                        "no artifact for \"math_ext\" on platform darwin-arm64 with ABI 1"
+                    ),
                     "{reason}"
                 );
                 assert!(reason.contains("linux-x64 (ABI 1)"), "{reason}");
@@ -377,7 +385,9 @@ mod tests {
             other => panic!("expected no match, got {other:?}"),
         }
         match lookup(&cat, "nope", None, "darwin-arm64", 1) {
-            Lookup::NoMatch(reason) => assert!(reason.contains("no extension named \"nope\""), "{reason}"),
+            Lookup::NoMatch(reason) => {
+                assert!(reason.contains("no extension named \"nope\""), "{reason}")
+            }
             other => panic!("expected no match, got {other:?}"),
         }
     }

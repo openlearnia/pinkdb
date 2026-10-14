@@ -9,10 +9,10 @@ use crate::types::FastMap;
 use super::expr::eval_expr;
 use super::Cx;
 use crate::plan::{compare_values, num_cmp};
-use rayon::prelude::*;
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
+use rayon::prelude::*;
 
 fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
@@ -121,10 +121,23 @@ pub(crate) enum Acc {
     /// wraparounds), so intermediate excursions past BIGINT are harmless and
     /// only a final value outside BIGINT is an overflow error. Two i64s keep
     /// the accumulator 8-byte aligned (an i128 would widen every `Acc`).
-    SumInt { sum: i64, wraps: i64, non_null: bool },
-    SumFloat { sum: f64, non_null: bool },
-    Avg { sum: f64, count: i64 },
-    MinMax { cur: Option<Value>, is_min: bool },
+    SumInt {
+        sum: i64,
+        wraps: i64,
+        non_null: bool,
+    },
+    SumFloat {
+        sum: f64,
+        non_null: bool,
+    },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
+    MinMax {
+        cur: Option<Value>,
+        is_min: bool,
+    },
 }
 
 /// Add `x` to a wrapping i64 sum, counting signed wraparounds so the exact
@@ -148,10 +161,20 @@ impl Acc {
     pub(crate) fn new(func: AggFunc) -> Acc {
         match func {
             AggFunc::Count => Acc::Count(0),
-            AggFunc::Sum => Acc::SumInt { sum: 0, wraps: 0, non_null: false },
+            AggFunc::Sum => Acc::SumInt {
+                sum: 0,
+                wraps: 0,
+                non_null: false,
+            },
             AggFunc::Avg => Acc::Avg { sum: 0.0, count: 0 },
-            AggFunc::Min => Acc::MinMax { cur: None, is_min: true },
-            AggFunc::Max => Acc::MinMax { cur: None, is_min: false },
+            AggFunc::Min => Acc::MinMax {
+                cur: None,
+                is_min: true,
+            },
+            AggFunc::Max => Acc::MinMax {
+                cur: None,
+                is_min: false,
+            },
         }
     }
 
@@ -177,7 +200,11 @@ impl Acc {
         match self {
             // `update(Some(_))` increments for every non-NULL payload.
             Acc::Count(n) => *n += 1,
-            Acc::SumInt { sum, wraps, non_null } => match v.data() {
+            Acc::SumInt {
+                sum,
+                wraps,
+                non_null,
+            } => match v.data() {
                 VectorData::Int32(d) => {
                     sum_add(sum, wraps, d[i] as i64);
                     *non_null = true;
@@ -254,7 +281,11 @@ impl Acc {
                     *n += 1;
                 }
             }
-            Acc::SumInt { sum, wraps, non_null } => match arg {
+            Acc::SumInt {
+                sum,
+                wraps,
+                non_null,
+            } => match arg {
                 Some(Value::Integer(i)) => {
                     sum_add(sum, wraps, *i as i64);
                     *non_null = true;
@@ -327,35 +358,70 @@ impl Acc {
         *self = match (mine, other) {
             (Acc::Count(a), Acc::Count(b)) => Acc::Count(a + b),
             (
-                Acc::SumInt { sum: a, wraps: aw, non_null: an },
-                Acc::SumInt { sum: b, wraps: bw, non_null: bn },
+                Acc::SumInt {
+                    sum: a,
+                    wraps: aw,
+                    non_null: an,
+                },
+                Acc::SumInt {
+                    sum: b,
+                    wraps: bw,
+                    non_null: bn,
+                },
             ) => {
                 let (mut sum, mut wraps) = (a, aw.wrapping_add(bw));
                 sum_add(&mut sum, &mut wraps, b);
-                Acc::SumInt { sum, wraps, non_null: an || bn }
+                Acc::SumInt {
+                    sum,
+                    wraps,
+                    non_null: an || bn,
+                }
             }
             (
-                Acc::SumFloat { sum: a, non_null: an },
-                Acc::SumFloat { sum: b, non_null: bn },
-            ) => Acc::SumFloat { sum: a + b, non_null: an || bn },
+                Acc::SumFloat {
+                    sum: a,
+                    non_null: an,
+                },
+                Acc::SumFloat {
+                    sum: b,
+                    non_null: bn,
+                },
+            ) => Acc::SumFloat {
+                sum: a + b,
+                non_null: an || bn,
+            },
             // Mixed int/float partials (one side saw a DOUBLE first): fold
             // the int side in as float. Either direction lands in SumFloat.
             (
-                Acc::SumInt { sum: a, wraps: aw, non_null: an },
-                Acc::SumFloat { sum: b, non_null: bn },
+                Acc::SumInt {
+                    sum: a,
+                    wraps: aw,
+                    non_null: an,
+                },
+                Acc::SumFloat {
+                    sum: b,
+                    non_null: bn,
+                },
             )
             | (
-                Acc::SumFloat { sum: b, non_null: bn },
-                Acc::SumInt { sum: a, wraps: aw, non_null: an },
-            ) => Acc::SumFloat { sum: exact_sum(a, aw) as f64 + b, non_null: an || bn },
-            (
-                Acc::Avg { sum: a, count: ac },
-                Acc::Avg { sum: b, count: bc },
-            ) => Acc::Avg { sum: a + b, count: ac + bc },
-            (
-                Acc::MinMax { cur: a, is_min },
-                Acc::MinMax { cur: b, .. },
-            ) => {
+                Acc::SumFloat {
+                    sum: b,
+                    non_null: bn,
+                },
+                Acc::SumInt {
+                    sum: a,
+                    wraps: aw,
+                    non_null: an,
+                },
+            ) => Acc::SumFloat {
+                sum: exact_sum(a, aw) as f64 + b,
+                non_null: an || bn,
+            },
+            (Acc::Avg { sum: a, count: ac }, Acc::Avg { sum: b, count: bc }) => Acc::Avg {
+                sum: a + b,
+                count: ac + bc,
+            },
+            (Acc::MinMax { cur: a, is_min }, Acc::MinMax { cur: b, .. }) => {
                 let better = match (&a, &b) {
                     (_, None) => false,
                     (None, Some(_)) => true,
@@ -365,7 +431,10 @@ impl Acc {
                             && ord != std::cmp::Ordering::Equal
                     }
                 };
-                Acc::MinMax { cur: if better { b } else { a }, is_min }
+                Acc::MinMax {
+                    cur: if better { b } else { a },
+                    is_min,
+                }
             }
             // Different aggregates never meet (one Acc per agg slot).
             (mine, _) => mine,
@@ -377,7 +446,11 @@ impl Acc {
         Ok(match self {
             Acc::Count(n) => Value::Bigint(*n),
             // SUM of zero/all-NULL inputs is NULL (like AVG/MIN/MAX).
-            Acc::SumInt { sum, wraps, non_null } => {
+            Acc::SumInt {
+                sum,
+                wraps,
+                non_null,
+            } => {
                 if !*non_null {
                     Value::Null
                 } else {
@@ -584,7 +657,10 @@ pub(crate) fn merge_partials(
                 }
             }
         }
-        groups.push(Group { keys: Vec::new(), accs });
+        groups.push(Group {
+            keys: Vec::new(),
+            accs,
+        });
     } else {
         for partial in partials {
             for (enc, g) in partial.groups {
@@ -689,7 +765,10 @@ mod tests {
         other.update(Some(&Value::Integer(7)));
         // 5*MAX + 5*MIN + 7 = 7 - 5: exact despite multiple wraps both ways.
         acc.merge(other);
-        assert_eq!(acc.finalize_ref(DataType::Bigint).unwrap(), Value::Bigint(2));
+        assert_eq!(
+            acc.finalize_ref(DataType::Bigint).unwrap(),
+            Value::Bigint(2)
+        );
         // Out of range at the end is an error, never a wrapped value.
         let mut big = Acc::new(AggFunc::Sum);
         big.update(Some(&Value::Bigint(i64::MAX)));

@@ -43,10 +43,10 @@ use std::sync::Arc;
 
 pub use abi::{
     ExtArg, ExtType, ExtValue, PinkdbExtAbiVersionFn, PinkdbExtInitFn, PinkdbExtNameFn,
-    PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi, PINKDB_EXT_ABI_VERSION,
-    PINKDB_EXT_MAX_ARGS, PINKDB_EXT_TYPE_BIGINT, PINKDB_EXT_TYPE_BOOLEAN,
-    PINKDB_EXT_TYPE_DATE, PINKDB_EXT_TYPE_DOUBLE, PINKDB_EXT_TYPE_INTEGER,
-    PINKDB_EXT_TYPE_NULL, PINKDB_EXT_TYPE_TIMESTAMP, PINKDB_EXT_TYPE_VARCHAR,
+    PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS,
+    PINKDB_EXT_TYPE_BIGINT, PINKDB_EXT_TYPE_BOOLEAN, PINKDB_EXT_TYPE_DATE, PINKDB_EXT_TYPE_DOUBLE,
+    PINKDB_EXT_TYPE_INTEGER, PINKDB_EXT_TYPE_NULL, PINKDB_EXT_TYPE_TIMESTAMP,
+    PINKDB_EXT_TYPE_VARCHAR,
 };
 pub use function::DynamicFunction;
 pub use host::{text_allocation_stats, TextAllocStats};
@@ -59,7 +59,11 @@ pub enum ExtError {
     /// The library opened but does not export a required ABI symbol.
     MissingSymbol { path: String, symbol: String },
     /// The extension was built against a different ABI version.
-    AbiVersion { path: String, extension: u32, host: u32 },
+    AbiVersion {
+        path: String,
+        extension: u32,
+        host: u32,
+    },
     /// `pinkdb_extension_name` was NULL, empty, or not UTF-8.
     InvalidName { path: String, message: String },
     /// `pinkdb_extension_init` returned a non-zero code.
@@ -76,7 +80,9 @@ pub enum ExtError {
 impl ExtError {
     /// Build a [`ExtError::Registration`] (used by [`ExtHost`] implementations).
     pub fn registration(message: impl Into<String>) -> Self {
-        ExtError::Registration { message: message.into() }
+        ExtError::Registration {
+            message: message.into(),
+        }
     }
 }
 
@@ -173,10 +179,7 @@ pub trait ExtHost {
 /// Fails — without registering anything — when the library does not open, is
 /// missing an ABI symbol, reports a different ABI version, has an invalid
 /// name, fails `pinkdb_extension_init`, or when `db` rejects a registration.
-pub fn load_extension<H: ExtHost + ?Sized>(
-    db: &mut H,
-    path: &str,
-) -> Result<String, ExtError> {
+pub fn load_extension<H: ExtHost + ?Sized>(db: &mut H, path: &str) -> Result<String, ExtError> {
     let ext = load(path)?;
     let name = ext.name().to_string();
     db.register_extension(ext)?;
@@ -190,13 +193,18 @@ pub fn load_extension<H: ExtHost + ?Sized>(
 /// version error rather than a confusing symbol error.
 pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
     if path.is_empty() {
-        return Err(ExtError::Load { path: path.to_string(), message: "empty path".to_string() });
+        return Err(ExtError::Load {
+            path: path.to_string(),
+            message: "empty path".to_string(),
+        });
     }
     // SAFETY: dlopen runs the library's initializers and maps its code; that
     // is exactly what loading an extension means, and the caller asked for
     // this path. The handle is kept alive by the returned functions.
-    let library = unsafe { libloading::Library::new(path) }
-        .map_err(|e| ExtError::Load { path: path.to_string(), message: e.to_string() })?;
+    let library = unsafe { libloading::Library::new(path) }.map_err(|e| ExtError::Load {
+        path: path.to_string(),
+        message: e.to_string(),
+    })?;
     let library = Arc::new(library);
 
     // SAFETY (all symbol lookups below): `get` is unsafe because a symbol of
@@ -219,10 +227,12 @@ pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
         });
     }
 
-    let name_fn = unsafe { library.get::<PinkdbExtNameFn>(b"pinkdb_extension_name\0") }
-        .map_err(|_| ExtError::MissingSymbol {
-            path: path.to_string(),
-            symbol: "pinkdb_extension_name".to_string(),
+    let name_fn =
+        unsafe { library.get::<PinkdbExtNameFn>(b"pinkdb_extension_name\0") }.map_err(|_| {
+            ExtError::MissingSymbol {
+                path: path.to_string(),
+                symbol: "pinkdb_extension_name".to_string(),
+            }
         })?;
     // SAFETY: called per the ABI; returns a NUL-terminated UTF-8 string with
     // static lifetime. Copied immediately below.
@@ -248,10 +258,12 @@ pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
         });
     }
 
-    let init_fn = unsafe { library.get::<PinkdbExtInitFn>(b"pinkdb_extension_init\0") }
-        .map_err(|_| ExtError::MissingSymbol {
-            path: path.to_string(),
-            symbol: "pinkdb_extension_init".to_string(),
+    let init_fn =
+        unsafe { library.get::<PinkdbExtInitFn>(b"pinkdb_extension_init\0") }.map_err(|_| {
+            ExtError::MissingSymbol {
+                path: path.to_string(),
+                symbol: "pinkdb_extension_init".to_string(),
+            }
         })?;
 
     let mut collector = host::Collector {
@@ -268,10 +280,15 @@ pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
     let code = unsafe { init_fn(&api, std::ptr::from_mut(&mut collector).cast::<c_void>()) };
     if let Some(first_error) = collector.error.take() {
         // A rejected registration fails the load even if init returned 0.
-        return Err(ExtError::Registration { message: first_error });
+        return Err(ExtError::Registration {
+            message: first_error,
+        });
     }
     if code != 0 {
-        return Err(ExtError::InitFailed { path: path.to_string(), code });
+        return Err(ExtError::InitFailed {
+            path: path.to_string(),
+            code,
+        });
     }
 
     Ok(LoadedExtension {
@@ -322,7 +339,10 @@ mod tests {
 
     #[test]
     fn host_rejection_propagates_and_registers_nothing() {
-        let mut host = Sink { fail: Some("nope".to_string()), ..Sink::default() };
+        let mut host = Sink {
+            fail: Some("nope".to_string()),
+            ..Sink::default()
+        };
         let err = load_extension(&mut host, "/nonexistent").unwrap_err();
         // The load fails first (no such library) — the host is only reached on
         // a successful load, which the integration tests cover end to end.

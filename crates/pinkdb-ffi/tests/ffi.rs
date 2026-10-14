@@ -55,11 +55,18 @@ fn durable_roundtrip_through_the_c_abi() {
     assert_eq!(pinkdb_result_statement_count(r), 1);
     assert_eq!(pinkdb_result_row_count(r, 0), 2);
     let v = pinkdb_result_value(r, 0, 0, 0);
-    assert_eq!((v.type_tag, v.is_null, v.int64), (PINKDB_TYPE_INTEGER, 0, i64::from(i32::MIN)));
+    assert_eq!(
+        (v.type_tag, v.is_null, v.int64),
+        (PINKDB_TYPE_INTEGER, 0, i64::from(i32::MIN))
+    );
     let v = pinkdb_result_value(r, 0, 0, 1);
     assert_eq!(v.int64, i64::MAX);
     let v = pinkdb_result_value(r, 0, 0, 2);
-    assert_eq!(v.double.to_bits(), (-0.0f64).to_bits(), "-0.0 must round-trip");
+    assert_eq!(
+        v.double.to_bits(),
+        (-0.0f64).to_bits(),
+        "-0.0 must round-trip"
+    );
     let v = pinkdb_result_value(r, 0, 0, 3);
     assert_eq!((v.type_tag, text(&v).len()), (PINKDB_TYPE_VARCHAR, 0));
     let v = pinkdb_result_value(r, 0, 0, 4);

@@ -168,9 +168,9 @@ mod catalog;
 mod local;
 #[cfg(test)]
 mod mock_s3;
-mod storage;
 #[cfg(feature = "s3")]
 mod s3;
+mod storage;
 mod time;
 mod vortex_file;
 
@@ -244,9 +244,15 @@ pub enum LakeError {
     /// single-writer guarantee with a small race window.
     UnsupportedEndpoint { path: PathBuf, message: String },
     /// Filesystem failure, with the operation that failed.
-    Io { context: String, source: std::io::Error },
+    Io {
+        context: String,
+        source: std::io::Error,
+    },
     /// The engine rejected the data or the store shape.
-    Engine { context: String, source: pinkdb::PinkDbError },
+    Engine {
+        context: String,
+        source: pinkdb::PinkDbError,
+    },
     /// The Vortex layer rejected data while encoding or decoding a data file
     /// (the error is a string because Vortex errors are not `std` error
     /// sources).
@@ -301,10 +307,18 @@ impl fmt::Display for LakeError {
                 "this pink-lake build does not include the `{feature}` feature: {message}"
             ),
             LakeError::Auth { path, message } => {
-                write!(f, "object storage access error at {}: {message}", path.display())
+                write!(
+                    f,
+                    "object storage access error at {}: {message}",
+                    path.display()
+                )
             }
             LakeError::UnsupportedEndpoint { path, message } => {
-                write!(f, "unsupported object-storage endpoint at {}: {message}", path.display())
+                write!(
+                    f,
+                    "unsupported object-storage endpoint at {}: {message}",
+                    path.display()
+                )
             }
             LakeError::Io { context, source } => write!(f, "lake I/O error ({context}): {source}"),
             LakeError::Engine { context, source } => {
@@ -410,7 +424,9 @@ impl Lake {
             let existing = storage.read(rel, &format!("reading {}", path.display()))?;
             let parsed = read_manifest(&path, &existing).map_err(|e| LakeError::Conflict {
                 path: path.clone(),
-                message: format!("snapshots/1.json exists but does not parse ({e}); refusing to adopt it"),
+                message: format!(
+                    "snapshots/1.json exists but does not parse ({e}); refusing to adopt it"
+                ),
             })?;
             if parsed.version != 1 || !parsed.tables.is_empty() {
                 return Err(LakeError::Conflict {
@@ -556,7 +572,10 @@ impl Lake {
             }
             let rel = format!("snapshots/{name}");
             let path = self.storage.abs(&rel);
-            let bytes = match self.storage.read(&rel, &format!("reading {}", path.display())) {
+            let bytes = match self
+                .storage
+                .read(&rel, &format!("reading {}", path.display()))
+            {
                 Ok(bytes) => bytes,
                 Err(LakeError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
@@ -602,8 +621,7 @@ impl Lake {
         let mut out = Vec::new();
         for (key, entry) in &manifest.tables {
             for rel in &entry.files {
-                if validate_rel_path(rel).is_err()
-                    || !matches!(self.storage.head(rel)?, Head::File)
+                if validate_rel_path(rel).is_err() || !matches!(self.storage.head(rel)?, Head::File)
                 {
                     out.push((key.clone(), self.storage.abs(rel)));
                 }
@@ -897,7 +915,8 @@ impl Lake {
                     }
                 };
                 let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
-                if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(table)
+                if !file_db.eq_ignore_ascii_case(dbname)
+                    || !file_table.name.eq_ignore_ascii_case(table)
                 {
                     return Err(LakeError::Corrupt {
                         path,
@@ -1051,7 +1070,11 @@ pub fn validate_store(db: &PinkDb) -> Result<()> {
 fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
     let path = storage.abs(CATALOG_FILE);
     match storage.head(CATALOG_FILE)? {
-        Head::Missing => return Err(LakeError::NotALake { path: root.to_path_buf() }),
+        Head::Missing => {
+            return Err(LakeError::NotALake {
+                path: root.to_path_buf(),
+            })
+        }
         Head::NotAFile => {
             return Err(LakeError::Corrupt {
                 path,
@@ -1168,9 +1191,7 @@ fn split_key<'a>(key: &'a str, path: &Path) -> Result<(&'a str, &'a str)> {
 /// A catalog `files` entry must be a plain relative path under `data/`.
 fn validate_rel_path(rel: &str) -> Result<()> {
     let path = Path::new(rel);
-    let plain = path
-        .components()
-        .all(|c| matches!(c, Component::Normal(_)));
+    let plain = path.components().all(|c| matches!(c, Component::Normal(_)));
     if path.is_absolute() || !plain || !rel.starts_with("data/") {
         return Err(LakeError::Corrupt {
             path: PathBuf::from(rel),
@@ -1187,10 +1208,7 @@ fn validate_rel_path(rel: &str) -> Result<()> {
 fn encode_key(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for (i, b) in key.bytes().enumerate() {
-        let safe = b.is_ascii_alphanumeric()
-            || b == b'_'
-            || b == b'-'
-            || (b == b'.' && i > 0);
+        let safe = b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || (b == b'.' && i > 0);
         if safe {
             out.push(b as char);
         } else {
@@ -1245,7 +1263,10 @@ fn only_table<'a>(mini: &'a PinkDb, rel: &str, root: &Path) -> Result<(String, &
     if dbs.len() != 1 {
         return Err(LakeError::Corrupt {
             path: root.join(rel),
-            message: format!("data file must hold exactly one database, has {}", dbs.len()),
+            message: format!(
+                "data file must hold exactly one database, has {}",
+                dbs.len()
+            ),
         });
     }
     let dbname = dbs.into_iter().next().expect("one database");
@@ -1253,7 +1274,10 @@ fn only_table<'a>(mini: &'a PinkDb, rel: &str, root: &Path) -> Result<(String, &
     if tables.len() != 1 {
         return Err(LakeError::Corrupt {
             path: root.join(rel),
-            message: format!("data file must hold exactly one table, has {}", tables.len()),
+            message: format!(
+                "data file must hold exactly one table, has {}",
+                tables.len()
+            ),
         });
     }
     let table = mini
@@ -1293,10 +1317,11 @@ fn empty_single_table_store(
 ) -> Result<PinkDb> {
     let mut mini = PinkDb::new();
     if !mini.database_exists(dbname) {
-        mini.create_database(dbname).map_err(|e| LakeError::Engine {
-            context: format!("creating database \"{dbname}\" while loading"),
-            source: e,
-        })?;
+        mini.create_database(dbname)
+            .map_err(|e| LakeError::Engine {
+                context: format!("creating database \"{dbname}\" while loading"),
+                source: e,
+            })?;
         mini.drop_database("main").map_err(|e| LakeError::Engine {
             context: format!("dropping the default main database while loading \"{dbname}\""),
             source: e,
@@ -1333,7 +1358,10 @@ mod tests {
     fn split_key_splits_on_the_first_dot() {
         let catalog = PathBuf::from("catalog.json");
         assert_eq!(split_key("main.t", &catalog).unwrap(), ("main", "t"));
-        assert_eq!(split_key("analytics.a.b", &catalog).unwrap(), ("analytics", "a.b"));
+        assert_eq!(
+            split_key("analytics.a.b", &catalog).unwrap(),
+            ("analytics", "a.b")
+        );
         assert_eq!(split_key("main.", &catalog).unwrap(), ("main", ""));
         let err = split_key("nodot", &catalog).unwrap_err().to_string();
         assert!(err.contains("catalog.json"), "{err}");
@@ -1346,7 +1374,10 @@ mod tests {
     fn canonical_version_numbers_reject_lookalikes() {
         assert_eq!(canonical_version_number("1"), Some(1));
         assert_eq!(canonical_version_number("42"), Some(42));
-        assert_eq!(canonical_version_number("18446744073709551615"), Some(u64::MAX));
+        assert_eq!(
+            canonical_version_number("18446744073709551615"),
+            Some(u64::MAX)
+        );
         for bad in ["", "0x1", "01", "007", "+1", "-1", " 1", "1 ", "1e3", "١"] {
             assert_eq!(canonical_version_number(bad), None, "{bad:?}");
         }
@@ -1383,7 +1414,10 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 36);
         let parts: Vec<&str> = a.split('-').collect();
-        assert_eq!(parts.iter().map(|p| p.len()).collect::<Vec<_>>(), vec![8, 4, 4, 4, 12]);
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            vec![8, 4, 4, 4, 12]
+        );
         assert!(a.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         assert!(parts[2].starts_with('4'));
         assert!(matches!(parts[3].as_bytes()[0], b'8'..=b'b'));

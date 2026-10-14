@@ -198,8 +198,12 @@ impl Request {
     pub fn decode_body(tag: u8, body: &[u8]) -> Result<Request, ProtocolError> {
         let mut r = Reader::new(body);
         let request = match tag {
-            msg_type::HELLO => Request::Hello { protocol_version: r.u32("Hello.protocol_version")? },
-            msg_type::EXECUTE => Request::Execute { sql: r.string("Execute.sql")? },
+            msg_type::HELLO => Request::Hello {
+                protocol_version: r.u32("Hello.protocol_version")?,
+            },
+            msg_type::EXECUTE => Request::Execute {
+                sql: r.string("Execute.sql")?,
+            },
             msg_type::PING => Request::Ping,
             other => {
                 return Err(ProtocolError::Malformed(format!(
@@ -216,19 +220,29 @@ impl Request {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Response {
     /// Handshake reply; the server's version and the agreed protocol version.
-    HelloOk { server_version: String, protocol_version: u32 },
+    HelloOk {
+        server_version: String,
+        protocol_version: u32,
+    },
     /// Reply to [`Request::Ping`].
     Pong,
     /// A row-producing statement's column names and types; followed by
     /// `Rows` frames and one `Done`.
-    ResultSet { names: Vec<String>, types: Vec<DataType> },
+    ResultSet {
+        names: Vec<String>,
+        types: Vec<DataType>,
+    },
     /// A batch of rows of the current result set. The frame carries the
     /// result set's column count (each row must have exactly that many
     /// values; a missing value is a truncation and trailing bytes are
     /// rejected, so the wire form stays self-validating).
     Rows { rows: Vec<Vec<Value>> },
     /// The end of one statement's result.
-    Done { kind: DoneKind, count: u64, name: String },
+    Done {
+        kind: DoneKind,
+        count: u64,
+        name: String,
+    },
     /// v2: the end of one `Execute` batch; `statements` is the number of
     /// result groups that preceded it. The client reads until this frame, so
     /// the statement count never needs local parsing.
@@ -328,7 +342,10 @@ impl Response {
     pub fn encode_body(&self) -> Result<Vec<u8>, ProtocolError> {
         let mut buf = Vec::new();
         match self {
-            Response::HelloOk { server_version, protocol_version } => {
+            Response::HelloOk {
+                server_version,
+                protocol_version,
+            } => {
                 put_str(&mut buf, server_version)?;
                 put_u32(&mut buf, *protocol_version);
             }
@@ -428,7 +445,9 @@ impl Response {
             msg_type::BATCH_DONE => Response::BatchDone {
                 statements: r.u32("BatchDone.statements")?,
             },
-            msg_type::ERROR => Response::Error { message: r.string("Error.message")? },
+            msg_type::ERROR => Response::Error {
+                message: r.string("Error.message")?,
+            },
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown response message type {other}"
@@ -446,7 +465,10 @@ impl Response {
 pub fn write_frame<W: Write>(w: &mut W, msg_type: u8, body: &[u8]) -> Result<(), ProtocolError> {
     let len = body.len() + 1;
     if len > MAX_FRAME_SIZE {
-        return Err(ProtocolError::FrameTooLarge { size: len, max: MAX_FRAME_SIZE });
+        return Err(ProtocolError::FrameTooLarge {
+            size: len,
+            max: MAX_FRAME_SIZE,
+        });
     }
     let mut frame = Vec::with_capacity(4 + len);
     frame.extend_from_slice(&(len as u32).to_le_bytes());
@@ -474,7 +496,10 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<(u8, Vec<u8>), ProtocolError> {
         ));
     }
     if len > MAX_FRAME_SIZE {
-        return Err(ProtocolError::FrameTooLarge { size: len, max: MAX_FRAME_SIZE });
+        return Err(ProtocolError::FrameTooLarge {
+            size: len,
+            max: MAX_FRAME_SIZE,
+        });
     }
     let mut tag = [0u8; 1];
     read_exact(r, &mut tag, "frame type byte")?;
@@ -558,8 +583,9 @@ fn put_u64(buf: &mut Vec<u8>, v: u64) {
 }
 
 fn put_str(buf: &mut Vec<u8>, s: &str) -> Result<(), ProtocolError> {
-    let len = u32::try_from(s.len())
-        .map_err(|_| ProtocolError::Malformed(format!("string of {} bytes exceeds u32", s.len())))?;
+    let len = u32::try_from(s.len()).map_err(|_| {
+        ProtocolError::Malformed(format!("string of {} bytes exceeds u32", s.len()))
+    })?;
     put_u32(buf, len);
     buf.extend_from_slice(s.as_bytes());
     Ok(())

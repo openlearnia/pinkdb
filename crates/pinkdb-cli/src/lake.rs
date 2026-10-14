@@ -142,9 +142,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
                 println!("Note: views are session-local and were not saved.");
             }
             if db.encryption_key().is_some() {
-                println!(
-                    "Note: lake data files are plaintext; PINKDB_KEY does not encrypt them."
-                );
+                println!("Note: lake data files are plaintext; PINKDB_KEY does not encrypt them.");
             }
             println!(
                 "Saved lake version {} in {:.3}s ({} table{}, {} row{}, {} bytes written)",

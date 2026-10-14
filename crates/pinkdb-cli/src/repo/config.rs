@@ -69,7 +69,8 @@ pub fn load_repositories_from(path: &Path) -> Result<Vec<String>, String> {
 }
 
 fn parse_repositories(path: &Path, bytes: &[u8]) -> Result<Vec<String>, String> {
-    let invalid = |detail: String| format!("invalid repositories config {}: {detail}", path.display());
+    let invalid =
+        |detail: String| format!("invalid repositories config {}: {detail}", path.display());
     let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| invalid(e.to_string()))?;
     let list = value
@@ -81,8 +82,8 @@ fn parse_repositories(path: &Path, bytes: &[u8]) -> Result<Vec<String>, String> 
         let url = item
             .as_str()
             .ok_or_else(|| invalid(format!("repositories[{i}] is not a string")))?;
-        let canonical = validate_repository_url(url)
-            .map_err(|e| invalid(format!("repositories[{i}]: {e}")))?;
+        let canonical =
+            validate_repository_url(url).map_err(|e| invalid(format!("repositories[{i}]: {e}")))?;
         urls.push(canonical);
     }
     Ok(urls)
@@ -98,9 +99,12 @@ pub fn save_repositories(urls: &[String]) -> Result<(), String> {
 /// written to a sibling temp file and renamed over the target, so readers
 /// never observe a partial file.
 pub fn save_repositories_to(path: &Path, urls: &[String]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("cannot determine the parent directory of {}", path.display()))?;
+    let parent = path.parent().ok_or_else(|| {
+        format!(
+            "cannot determine the parent directory of {}",
+            path.display()
+        )
+    })?;
     fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     let value = serde_json::json!({ "repositories": urls });
     let mut body = serde_json::to_string_pretty(&value)
@@ -362,7 +366,10 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -420,10 +427,21 @@ mod tests {
             );
         }
         // Plain http:// only for loopback (the env opt-in is not set in tests).
-        for ok in ["http://localhost:8080", "http://127.0.0.2/x", "http://[::1]:9"] {
-            assert!(validate_repository_url(ok).is_ok(), "{ok:?} should be accepted");
+        for ok in [
+            "http://localhost:8080",
+            "http://127.0.0.2/x",
+            "http://[::1]:9",
+        ] {
+            assert!(
+                validate_repository_url(ok).is_ok(),
+                "{ok:?} should be accepted"
+            );
         }
-        for bad in ["http://example.com", "http://10.0.0.1:80", "http://localhost.evil.com"] {
+        for bad in [
+            "http://example.com",
+            "http://10.0.0.1:80",
+            "http://localhost.evil.com",
+        ] {
             let err = validate_repository_url(bad).unwrap_err();
             assert!(err.contains("plain http://"), "{bad:?}: {err}");
         }
@@ -432,14 +450,20 @@ mod tests {
     #[test]
     fn add_dedupes_and_remove_keeps_order() {
         let mut urls = vec!["https://a".to_string(), "https://b".to_string()];
-        assert_eq!(add_repository(&mut urls, "https://c/").unwrap(), "https://c");
+        assert_eq!(
+            add_repository(&mut urls, "https://c/").unwrap(),
+            "https://c"
+        );
         assert_eq!(urls, ["https://a", "https://b", "https://c"]);
         // Duplicates (canonical form) are refused.
         let err = add_repository(&mut urls, "https://c").unwrap_err();
         assert!(err.contains("already configured"), "{err}");
         assert_eq!(urls.len(), 3);
         // Removal is by canonical URL and keeps the remaining order.
-        assert_eq!(remove_repository(&mut urls, "https://b/").unwrap(), "https://b");
+        assert_eq!(
+            remove_repository(&mut urls, "https://b/").unwrap(),
+            "https://b"
+        );
         assert_eq!(urls, ["https://a", "https://c"]);
         let err = remove_repository(&mut urls, "https://b").unwrap_err();
         assert!(err.contains("not configured"), "{err}");

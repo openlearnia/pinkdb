@@ -232,7 +232,10 @@ pub(crate) fn collect_tables_read(
         )
     };
     match plan {
-        LogicalPlan::Scan { db: Some(db), table } => {
+        LogicalPlan::Scan {
+            db: Some(db),
+            table,
+        } => {
             out.insert((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
         }
         LogicalPlan::Scan { db: None, .. }
@@ -254,7 +257,12 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(e, default_db, out);
             }
         }
-        LogicalPlan::Update { db, table, sets, predicate } => {
+        LogicalPlan::Update {
+            db,
+            table,
+            sets,
+            predicate,
+        } => {
             out.insert(key(db, table));
             for (_, e) in sets {
                 expr_tables_read(e, default_db, out);
@@ -263,7 +271,11 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(p, default_db, out);
             }
         }
-        LogicalPlan::Delete { db, table, predicate } => {
+        LogicalPlan::Delete {
+            db,
+            table,
+            predicate,
+        } => {
             out.insert(key(db, table));
             if let Some(p) = predicate {
                 expr_tables_read(p, default_db, out);
@@ -294,7 +306,13 @@ pub(crate) fn collect_tables_read(
                 }
             }
         }
-        LogicalPlan::Join { left, right, left_key, right_key, .. } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            left_key,
+            right_key,
+            ..
+        } => {
             collect_tables_read(left, default_db, out);
             collect_tables_read(right, default_db, out);
             expr_tables_read(left_key, default_db, out);
@@ -302,7 +320,10 @@ pub(crate) fn collect_tables_read(
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
             collect_tables_read(input, default_db, out);
-            for e in keys.iter().chain(aggs.iter().filter_map(|a| a.arg.as_ref())) {
+            for e in keys
+                .iter()
+                .chain(aggs.iter().filter_map(|a| a.arg.as_ref()))
+            {
                 expr_tables_read(e, default_db, out);
             }
         }
@@ -352,7 +373,9 @@ fn expr_tables_read(
                 expr_tables_read(a, default_db, out);
             }
         }
-        BoundExpr::Case { branches, else_, .. } => {
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
             for (c, v) in branches {
                 expr_tables_read(c, default_db, out);
                 expr_tables_read(v, default_db, out);

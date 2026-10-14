@@ -77,7 +77,8 @@ pub fn fidelity_store() -> PinkDb {
     }
 
     // Multi-chunk table (CHUNK_SIZE + 100 rows).
-    db.execute("CREATE TABLE big (a INTEGER, s VARCHAR);").unwrap();
+    db.execute("CREATE TABLE big (a INTEGER, s VARCHAR);")
+        .unwrap();
     {
         let t = db.table_mut("big").unwrap();
         for i in 0..(CHUNK_SIZE + 100) {
@@ -97,7 +98,8 @@ pub fn fidelity_store() -> PinkDb {
     db.execute("CREATE DATABASE analytics;").unwrap();
     db.execute("CREATE TABLE analytics.u (k BIGINT);").unwrap();
     db.execute("INSERT INTO analytics.u VALUES (7);").unwrap();
-    db.execute("CREATE TABLE analytics.\"a.b\" (z DOUBLE);").unwrap();
+    db.execute("CREATE TABLE analytics.\"a.b\" (z DOUBLE);")
+        .unwrap();
     db.execute("INSERT INTO analytics.\"a.b\" VALUES (1.5), (-0.0);")
         .unwrap();
 

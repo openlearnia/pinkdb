@@ -56,7 +56,13 @@ fn remote_repl_round_trip() {
 
     // File/catalog dot-commands are rejected in remote mode.
     for cmd in [
-        ".tables", ".schema", ".databases", ".import", ".save", ".open", ".lake",
+        ".tables",
+        ".schema",
+        ".databases",
+        ".import",
+        ".save",
+        ".open",
+        ".lake",
     ] {
         assert!(
             text.contains(&format!("Error: {cmd} is not available in remote mode")),

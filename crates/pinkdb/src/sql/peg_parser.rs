@@ -56,12 +56,30 @@ fn reject_nul_in_quoted_identifier(sql: &str) -> Result<()> {
 /// What may follow the left operand of a comparison-level expression.
 /// `apply_cmp` turns `(left, tail)` into the AST node the tail describes.
 enum CmpTail {
-    IsNull { negated: bool },
-    Between { negated: bool, low: Expr, high: Expr },
-    InList { negated: bool, items: Vec<Expr> },
-    InSubquery { negated: bool, query: Box<Select> },
-    Like { negated: bool, right: Expr },
-    Binary { op: BinaryOp, right: Expr },
+    IsNull {
+        negated: bool,
+    },
+    Between {
+        negated: bool,
+        low: Expr,
+        high: Expr,
+    },
+    InList {
+        negated: bool,
+        items: Vec<Expr>,
+    },
+    InSubquery {
+        negated: bool,
+        query: Box<Select>,
+    },
+    Like {
+        negated: bool,
+        right: Expr,
+    },
+    Binary {
+        op: BinaryOp,
+        right: Expr,
+    },
 }
 
 fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
@@ -83,7 +101,11 @@ fn apply_cmp(left: Expr, tail: CmpTail) -> Expr {
             negated,
         },
         CmpTail::Like { negated, right } => Expr::Binary {
-            op: if negated { BinaryOp::NotLike } else { BinaryOp::Like },
+            op: if negated {
+                BinaryOp::NotLike
+            } else {
+                BinaryOp::Like
+            },
             left: Box::new(left),
             right: Box::new(right),
         },
@@ -111,7 +133,10 @@ fn desugar_in_list(left: Expr, items: Vec<Expr>, negated: bool) -> Expr {
         };
     }
     if negated {
-        Expr::Unary { op: UnaryOp::Not, expr: Box::new(acc) }
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(acc),
+        }
     } else {
         acc
     }
@@ -1813,7 +1838,9 @@ mod tests {
             );
             for text in &texts {
                 assert_eq!(
-                    parse(text).unwrap_or_else(|e| panic!("rejected split {text:?}: {e}")).len(),
+                    parse(text)
+                        .unwrap_or_else(|e| panic!("rejected split {text:?}: {e}"))
+                        .len(),
                     1,
                     "split text {text:?} of {sql:?}"
                 );
@@ -1854,7 +1881,10 @@ mod tests {
             .projections
             .iter()
             .map(|p| match p {
-                Projection::Expr { expr: Expr::Column { name, .. }, .. } => name.as_str(),
+                Projection::Expr {
+                    expr: Expr::Column { name, .. },
+                    ..
+                } => name.as_str(),
                 other => panic!("{other:?}"),
             })
             .collect();
@@ -1969,11 +1999,17 @@ mod tests {
             .collect();
         assert!(matches!(
             exprs[0],
-            Expr::Binary { op: BinaryOp::NotEq, .. }
+            Expr::Binary {
+                op: BinaryOp::NotEq,
+                ..
+            }
         ));
         assert!(matches!(
             exprs[1],
-            Expr::Binary { op: BinaryOp::NotEq, .. }
+            Expr::Binary {
+                op: BinaryOp::NotEq,
+                ..
+            }
         ));
         assert!(matches!(exprs[2], Expr::Literal(Value::Double(v)) if *v == 2.5));
         assert!(matches!(exprs[3], Expr::Literal(Value::Varchar(v)) if v == "x"));
@@ -1991,8 +2027,18 @@ mod tests {
         // 1 + (2 * 3)
         match &sel.projections[0] {
             Projection::Expr { expr, .. } => match expr {
-                Expr::Binary { op: BinaryOp::Add, right, .. } => {
-                    assert!(matches!(**right, Expr::Binary { op: BinaryOp::Multiply, .. }));
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    right,
+                    ..
+                } => {
+                    assert!(matches!(
+                        **right,
+                        Expr::Binary {
+                            op: BinaryOp::Multiply,
+                            ..
+                        }
+                    ));
                 }
                 _ => panic!("wrong shape: {expr:?}"),
             },
@@ -2003,35 +2049,73 @@ mod tests {
     #[test]
     fn precedence_comparison_below_additive() {
         // `1 + 2 = 3` parses as `(1 + 2) = 3`.
-        let Expr::Binary { op: BinaryOp::Eq, left, .. } =
-            projection_expr(parse_one("SELECT 1 + 2 = 3;"))
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            ..
+        } = projection_expr(parse_one("SELECT 1 + 2 = 3;"))
         else {
             panic!()
         };
-        assert!(matches!(*left, Expr::Binary { op: BinaryOp::Add, .. }));
+        assert!(matches!(
+            *left,
+            Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
         // `NOT a = b` parses as `NOT (a = b)` (NOT sits above comparison).
-        let Expr::Unary { op: UnaryOp::Not, expr } =
-            projection_expr(parse_one("SELECT NOT a = b;"))
+        let Expr::Unary {
+            op: UnaryOp::Not,
+            expr,
+        } = projection_expr(parse_one("SELECT NOT a = b;"))
         else {
             panic!()
         };
-        assert!(matches!(*expr, Expr::Binary { op: BinaryOp::Eq, .. }));
+        assert!(matches!(
+            *expr,
+            Expr::Binary {
+                op: BinaryOp::Eq,
+                ..
+            }
+        ));
         // Subtraction is left-associative: `(10 - 3) - 2`.
         let Expr::Binary { left, .. } = projection_expr(parse_one("SELECT 10 - 3 - 2;")) else {
             panic!()
         };
-        assert!(matches!(*left, Expr::Binary { op: BinaryOp::Subtract, .. }));
+        assert!(matches!(
+            *left,
+            Expr::Binary {
+                op: BinaryOp::Subtract,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn and_binds_tighter_than_or() {
-        let Expr::Binary { op: BinaryOp::Or, left, right } =
-            projection_expr(parse_one("SELECT a AND b OR c AND d;"))
+        let Expr::Binary {
+            op: BinaryOp::Or,
+            left,
+            right,
+        } = projection_expr(parse_one("SELECT a AND b OR c AND d;"))
         else {
             panic!()
         };
-        assert!(matches!(*left, Expr::Binary { op: BinaryOp::And, .. }));
-        assert!(matches!(*right, Expr::Binary { op: BinaryOp::And, .. }));
+        assert!(matches!(
+            *left,
+            Expr::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
+        assert!(matches!(
+            *right,
+            Expr::Binary {
+                op: BinaryOp::And,
+                ..
+            }
+        ));
     }
 
     // ---------- statement shapes ----------
@@ -2071,12 +2155,26 @@ mod tests {
     fn outer_join_kinds_parse_and_full_cross_error() {
         // LEFT / LEFT OUTER / RIGHT / RIGHT OUTER, case-insensitive.
         for (sql, want) in [
-            ("SELECT * FROM a LEFT JOIN b ON a.id = b.id;", JoinKind::Left),
-            ("SELECT * FROM a left outer join b ON a.id = b.id;", JoinKind::Left),
-            ("SELECT * FROM a RIGHT JOIN b ON a.id = b.id;", JoinKind::Right),
-            ("SELECT * FROM a right OUTER join b ON a.id = b.id;", JoinKind::Right),
+            (
+                "SELECT * FROM a LEFT JOIN b ON a.id = b.id;",
+                JoinKind::Left,
+            ),
+            (
+                "SELECT * FROM a left outer join b ON a.id = b.id;",
+                JoinKind::Left,
+            ),
+            (
+                "SELECT * FROM a RIGHT JOIN b ON a.id = b.id;",
+                JoinKind::Right,
+            ),
+            (
+                "SELECT * FROM a right OUTER join b ON a.id = b.id;",
+                JoinKind::Right,
+            ),
         ] {
-            let Statement::Select(sel) = parse_one(sql) else { panic!() };
+            let Statement::Select(sel) = parse_one(sql) else {
+                panic!()
+            };
             assert_eq!(sel.from.unwrap().join.unwrap().kind, want, "{sql}");
         }
         // LEFT/RIGHT without JOIN, FULL/CROSS always.
@@ -2099,8 +2197,14 @@ mod tests {
         let s = parse_one("SELECT DATE '2024-02-29', TIMESTAMP '2024-03-15 12:00:00.5';");
         let Statement::Select(sel) = s else { panic!() };
         assert_eq!(sel.projections.len(), 2);
-        assert!(matches!(parse("SELECT DATE '2023-02-29';"), Err(PinkDbError::Parse(_))));
-        assert!(matches!(parse("SELECT DATE 123;"), Err(PinkDbError::Parse(_))));
+        assert!(matches!(
+            parse("SELECT DATE '2023-02-29';"),
+            Err(PinkDbError::Parse(_))
+        ));
+        assert!(matches!(
+            parse("SELECT DATE 123;"),
+            Err(PinkDbError::Parse(_))
+        ));
         assert!(matches!(
             parse_one("CREATE TABLE t (d DATE, ts TIMESTAMP);"),
             Statement::CreateTable { .. }
@@ -2112,7 +2216,10 @@ mod tests {
         let s = parse_one("SELECT rank() OVER (PARTITION BY a ORDER BY b DESC) FROM t;");
         let Statement::Select(sel) = s else { panic!() };
         match &sel.projections[0] {
-            Projection::Expr { expr: Expr::Window { name, over, .. }, .. } => {
+            Projection::Expr {
+                expr: Expr::Window { name, over, .. },
+                ..
+            } => {
                 assert_eq!(name, "rank");
                 assert_eq!(over.partition.len(), 1);
                 assert_eq!(over.order.len(), 1);
@@ -2125,7 +2232,10 @@ mod tests {
         let Statement::Select(sel) = s else { panic!() };
         assert!(matches!(
             &sel.projections[0],
-            Projection::Expr { expr: Expr::Window { .. }, .. }
+            Projection::Expr {
+                expr: Expr::Window { .. },
+                ..
+            }
         ));
         assert!(matches!(
             parse("SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;"),
@@ -2153,14 +2263,25 @@ mod tests {
             Projection::Expr { expr: Expr::Case { branches, else_ }, .. }
             if branches.len() == 1 && else_.is_none()
         ));
-        assert!(matches!(parse("SELECT CASE WHEN 1 THEN 2;"), Err(PinkDbError::Parse(_))));
-        assert!(matches!(parse("SELECT CASE END FROM t;"), Err(PinkDbError::Parse(_))));
+        assert!(matches!(
+            parse("SELECT CASE WHEN 1 THEN 2;"),
+            Err(PinkDbError::Parse(_))
+        ));
+        assert!(matches!(
+            parse("SELECT CASE END FROM t;"),
+            Err(PinkDbError::Parse(_))
+        ));
     }
 
     #[test]
     fn update_delete_shapes() {
         match parse_one("UPDATE t SET a = 1, b = a + 2 WHERE a > 0;") {
-            Statement::Update { db, table, sets, where_clause } => {
+            Statement::Update {
+                db,
+                table,
+                sets,
+                where_clause,
+            } => {
                 assert_eq!(db, None);
                 assert_eq!(table, "t");
                 assert_eq!(sets.len(), 2);
@@ -2176,7 +2297,11 @@ mod tests {
             _ => panic!(),
         }
         match parse_one("DELETE FROM t;") {
-            Statement::Delete { db, table, where_clause } => {
+            Statement::Delete {
+                db,
+                table,
+                where_clause,
+            } => {
                 assert_eq!(db, None);
                 assert_eq!(table, "t");
                 assert!(where_clause.is_none());
@@ -2238,7 +2363,9 @@ mod tests {
             _ => panic!(),
         }
         // Qualified FROM source.
-        let Statement::Select(sel) = parse_one("SELECT a FROM db1.t;") else { panic!() };
+        let Statement::Select(sel) = parse_one("SELECT a FROM db1.t;") else {
+            panic!()
+        };
         match sel.from.unwrap().source {
             FromSource::Table { db, name } => {
                 assert_eq!(db, Some("db1".to_string()));
@@ -2258,24 +2385,22 @@ mod tests {
         assert!(matches!(parse_one("BEGIN;"), Statement::Begin));
         assert!(matches!(parse_one("BEGIN TRANSACTION;"), Statement::Begin));
         assert!(matches!(parse_one("COMMIT;"), Statement::Commit));
-        assert!(matches!(parse_one("ROLLBACK TRANSACTION;"), Statement::Rollback));
+        assert!(matches!(
+            parse_one("ROLLBACK TRANSACTION;"),
+            Statement::Rollback
+        ));
     }
 
     #[test]
     fn with_in_exists_shapes() {
-        let s = parse_one(
-            "WITH a AS (SELECT 1 AS x), b(y) AS (SELECT x FROM a) SELECT * FROM b;",
-        );
+        let s = parse_one("WITH a AS (SELECT 1 AS x), b(y) AS (SELECT x FROM a) SELECT * FROM b;");
         let Statement::Select(sel) = s else { panic!() };
         assert_eq!(sel.with.len(), 2);
         assert_eq!(sel.with[1].cols, Some(vec!["y".to_string()]));
 
         let s = parse_one("SELECT * FROM (SELECT 1 AS x) AS s;");
         let Statement::Select(sel) = s else { panic!() };
-        assert!(matches!(
-            sel.from.unwrap().source,
-            FromSource::Derived(_)
-        ));
+        assert!(matches!(sel.from.unwrap().source, FromSource::Derived(_)));
 
         let s = parse_one("SELECT a FROM t WHERE a IN (SELECT b FROM u) AND EXISTS (SELECT 1);");
         let Statement::Select(sel) = s else { panic!() };
@@ -2286,7 +2411,10 @@ mod tests {
         let Statement::Select(sel) = s else { panic!() };
         assert!(matches!(
             sel.where_clause,
-            Some(Expr::Binary { op: BinaryOp::Or, .. })
+            Some(Expr::Binary {
+                op: BinaryOp::Or,
+                ..
+            })
         ));
 
         // Scalar subquery in an expression.
@@ -2307,7 +2435,9 @@ mod tests {
         ] {
             assert_eq!(
                 parse(sql).unwrap(),
-                vec![Statement::LoadExtension { path: path.to_string() }],
+                vec![Statement::LoadExtension {
+                    path: path.to_string()
+                }],
                 "{sql:?}"
             );
         }
@@ -2356,7 +2486,10 @@ mod tests {
             .projections
             .iter()
             .map(|p| match p {
-                Projection::Expr { expr: Expr::Column { name, .. }, .. } => name.as_str(),
+                Projection::Expr {
+                    expr: Expr::Column { name, .. },
+                    ..
+                } => name.as_str(),
                 other => panic!("{other:?}"),
             })
             .collect();

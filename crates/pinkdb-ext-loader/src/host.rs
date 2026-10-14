@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::abi::{
-    ExtType, PinkdbExtScalarFn, PinkdbHostApi, PINKDB_EXT_ABI_VERSION,
-    PINKDB_EXT_MAX_ARGS,
+    ExtType, PinkdbExtScalarFn, PinkdbHostApi, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS,
 };
 use crate::function::{DynamicFunction, Registration};
 
@@ -124,7 +123,11 @@ fn collect(
         // and the ABI requires `arg_types` to point at `n_args` tags.
         |i| unsafe { *arg_types.add(i) },
         func,
-        &collector.functions.iter().map(|f| f.name().to_string()).collect::<Vec<_>>(),
+        &collector
+            .functions
+            .iter()
+            .map(|f| f.name().to_string())
+            .collect::<Vec<_>>(),
     )?;
     collector.functions.push(DynamicFunction::new(
         Registration {
@@ -160,7 +163,9 @@ fn validate_registration(
     }
     if name.len() > 256 {
         let display: String = name.chars().take(40).collect();
-        return Err(format!("function name \"{display}…\" is longer than 256 bytes"));
+        return Err(format!(
+            "function name \"{display}…\" is longer than 256 bytes"
+        ));
     }
     // The C signature takes a function pointer, which may be NULL; storing it
     // would turn the first call into a jump to address 0.
@@ -173,7 +178,9 @@ fn validate_registration(
         ));
     }
     if n_args > 0 && arg_types_is_null {
-        return Err(format!("function \"{name}\": NULL arg_types with {n_args} arguments"));
+        return Err(format!(
+            "function \"{name}\": NULL arg_types with {n_args} arguments"
+        ));
     }
     let Some(ret_type) = ExtType::from_tag(ret_type) else {
         return Err(format!(
@@ -324,8 +331,14 @@ mod tests {
             "function \"f\": invalid type tag 0 for argument 1 (NULL is not an argument type)"
         );
         assert_eq!(
-            validate("f", 2, false, PINKDB_EXT_TYPE_INTEGER, &[PINKDB_EXT_TYPE_INTEGER, 99])
-                .unwrap_err(),
+            validate(
+                "f",
+                2,
+                false,
+                PINKDB_EXT_TYPE_INTEGER,
+                &[PINKDB_EXT_TYPE_INTEGER, 99]
+            )
+            .unwrap_err(),
             "function \"f\": invalid type tag 99 for argument 2 (NULL is not an argument type)"
         );
         // A duplicate name within one extension (case-insensitive): the
@@ -345,9 +358,14 @@ mod tests {
             "function \"F\" is registered twice"
         );
         // A valid registration decodes the tags in order.
-        let (types, ret, _) =
-            validate("ok", 2, false, PINKDB_EXT_TYPE_INTEGER, &[PINKDB_EXT_TYPE_INTEGER, 3])
-                .unwrap();
+        let (types, ret, _) = validate(
+            "ok",
+            2,
+            false,
+            PINKDB_EXT_TYPE_INTEGER,
+            &[PINKDB_EXT_TYPE_INTEGER, 3],
+        )
+        .unwrap();
         assert_eq!(types, vec![ExtType::Integer, ExtType::Bigint]);
         assert_eq!(ret, ExtType::Integer);
     }

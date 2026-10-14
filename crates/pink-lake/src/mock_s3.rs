@@ -149,9 +149,7 @@ impl MockS3 {
     pub fn start() -> MockS3 {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock S3");
         let addr = listener.local_addr().expect("mock S3 address");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking mock S3");
+        listener.set_nonblocking(true).expect("nonblocking mock S3");
         let state = Arc::new(State {
             store: Mutex::new(Store::default()),
             requests: Mutex::new(Vec::new()),
@@ -237,9 +235,13 @@ impl MockS3 {
     pub fn put_object(&self, key: &str, bytes: &[u8]) {
         let mut store = self.state.store.lock().unwrap();
         let etag = next_etag(&mut store);
-        store
-            .objects
-            .insert(key.to_string(), Object { bytes: bytes.to_vec(), etag });
+        store.objects.insert(
+            key.to_string(),
+            Object {
+                bytes: bytes.to_vec(),
+                etag,
+            },
+        );
     }
 
     /// Read one stored object back (for assertions).
@@ -444,8 +446,7 @@ impl MockS3 {
     /// Only the listed buckets exist; any other bucket answers 404
     /// `NoSuchBucket` (including its HEAD responses, which carry no body).
     pub fn restrict_buckets(&self, buckets: &[&str]) {
-        *self.state.buckets.lock().unwrap() =
-            Some(buckets.iter().map(|b| b.to_string()).collect());
+        *self.state.buckets.lock().unwrap() = Some(buckets.iter().map(|b| b.to_string()).collect());
     }
 
     /// Take the bucket from the `Host` header (`bucket.host/key`): the
@@ -616,11 +617,7 @@ struct Response {
 
 impl Response {
     fn new(status: u16, etag: Option<String>, body: Vec<u8>) -> Self {
-        Self {
-            status,
-            etag,
-            body,
-        }
+        Self { status, etag, body }
     }
 
     fn text(status: u16, body: &str) -> Self {
@@ -643,7 +640,11 @@ fn respond(
     body: &[u8],
 ) -> Response {
     if let Some(status) = *state.deny.lock().unwrap() {
-        let code = if status == 403 { "AccessDenied" } else { "InjectedError" };
+        let code = if status == 403 {
+            "AccessDenied"
+        } else {
+            "InjectedError"
+        };
         return Response::error(status, code, "injected by the mock");
     }
 
@@ -684,11 +685,7 @@ fn respond(
     };
     if let Some(buckets) = state.buckets.lock().unwrap().as_ref() {
         if !buckets.contains(&bucket) {
-            return Response::error(
-                404,
-                "NoSuchBucket",
-                "The specified bucket does not exist.",
-            );
+            return Response::error(404, "NoSuchBucket", "The specified bucket does not exist.");
         }
     }
 
@@ -715,7 +712,11 @@ fn respond(
             state.store.lock().unwrap().objects.remove(&key);
             Response::new(204, None, Vec::new())
         }
-        other => Response::error(405, "MethodNotAllowed", &format!("unsupported method {other}")),
+        other => Response::error(
+            405,
+            "MethodNotAllowed",
+            &format!("unsupported method {other}"),
+        ),
     }
 }
 
@@ -730,12 +731,7 @@ fn take_injected(state: &State, method: &str, target: &str) -> Option<(u16, Stri
     Some((error.status, error.code.clone(), error.message.clone()))
 }
 
-fn put_object(
-    state: &State,
-    key: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> Response {
+fn put_object(state: &State, key: &str, headers: &[(String, String)], body: &[u8]) -> Response {
     let if_none_match = header(headers, "if-none-match");
     let if_match = header(headers, "if-match");
     let conditional = if_none_match.is_some() || if_match.is_some();
@@ -767,9 +763,7 @@ fn put_object(
     }
     if let Some(expected) = if_match {
         match store.objects.get(key) {
-            None => {
-                return Response::error(404, "NoSuchKey", "The specified key does not exist.")
-            }
+            None => return Response::error(404, "NoSuchKey", "The specified key does not exist."),
             Some(object) if object.etag != expected => {
                 return Response::error(412, "PreconditionFailed", "etag mismatch")
             }
@@ -1085,7 +1079,11 @@ fn epoch_from_amz_date(date: &str) -> Option<i64> {
     let hour = digits(9..11)?;
     let minute = digits(11..13)?;
     let second = digits(13..15)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
     {
         return None;
     }
@@ -1128,11 +1126,8 @@ fn uri_encode(input: &str, encode_slash: bool) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(input.len());
     for &b in input.as_bytes() {
-        let unreserved = b.is_ascii_alphanumeric()
-            || b == b'-'
-            || b == b'_'
-            || b == b'.'
-            || b == b'~';
+        let unreserved =
+            b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~';
         if unreserved || (b == b'/' && !encode_slash) {
             out.push(b as char);
         } else {
@@ -1368,7 +1363,9 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         assert_eq!(
-            hex(&sha256(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")),
+            hex(&sha256(
+                b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+            )),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         // A 56-byte input crosses the first length-padding boundary.
@@ -1394,7 +1391,10 @@ mod tests {
         // A key longer than the block is hashed first.
         let long_key = [0xaa; 131];
         assert_eq!(
-            hex(&hmac_sha256(&long_key, b"Test Using Larger Than Block-Size Key - Hash Key First")),
+            hex(&hmac_sha256(
+                &long_key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
         );
     }
@@ -1402,7 +1402,10 @@ mod tests {
     #[test]
     fn amz_dates_parse_and_scope_checks_work() {
         // 2015-08-30T12:36:00Z
-        assert_eq!(epoch_from_amz_date("20150830T123600Z").unwrap(), 1_440_938_160);
+        assert_eq!(
+            epoch_from_amz_date("20150830T123600Z").unwrap(),
+            1_440_938_160
+        );
         assert_eq!(epoch_from_amz_date("19700101T000000Z").unwrap(), 0);
         assert!(epoch_from_amz_date("20240101T000000").is_none());
         assert!(epoch_from_amz_date("2024-01-01T00:00:00Z").is_none());

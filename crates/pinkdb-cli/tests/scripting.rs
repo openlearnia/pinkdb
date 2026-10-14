@@ -20,7 +20,12 @@ fn run_split(args: &[&str], stdin: &str) -> (String, String, Option<i32>) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
     let out = child.wait_with_output().unwrap();
     (
         String::from_utf8(out.stdout).unwrap(),
@@ -79,8 +84,15 @@ fn an_unterminated_last_statement_still_runs() {
 
 #[test]
 fn dash_c_runs_commands_and_reports_failure() {
-    let (out, err, code) =
-        run_split(&["-c", "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (5);", "-c", "SELECT a FROM t"], "");
+    let (out, err, code) = run_split(
+        &[
+            "-c",
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (5);",
+            "-c",
+            "SELECT a FROM t",
+        ],
+        "",
+    );
     assert_eq!(code, Some(0), "{err}");
     assert!(out.contains("5"), "{out}");
     let (_, err, code) = run_split(&["-c", "SELECT nope FROM nowhere"], "");
@@ -97,10 +109,17 @@ fn dot_read_runs_a_script_file_and_timer_is_opt_in() {
     let dir = std::env::temp_dir().join(format!("pinkdb_cli_read_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("setup.sql");
-    std::fs::write(&script, "CREATE TABLE r (x INTEGER);\nINSERT INTO r VALUES (1), (2);\n").unwrap();
+    std::fs::write(
+        &script,
+        "CREATE TABLE r (x INTEGER);\nINSERT INTO r VALUES (1), (2);\n",
+    )
+    .unwrap();
     let (out, status) = common::run_merged(
         cli(),
-        &format!(".read {}\n.timer on\nSELECT COUNT(*) FROM r;\n", script.display()),
+        &format!(
+            ".read {}\n.timer on\nSELECT COUNT(*) FROM r;\n",
+            script.display()
+        ),
     );
     assert_eq!(status.code(), Some(0), "{out}");
     assert!(out.contains("Run Time (s): real"), "{out}");

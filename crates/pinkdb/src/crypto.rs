@@ -175,8 +175,7 @@ impl EncryptionKey {
             Some(v) => match v.into_string() {
                 Ok(k) => Ok(Some(Self::from_passphrase(&k))),
                 Err(_) => Err(PinkDbError::Execution(
-                    "PINKDB_KEY is not valid UTF-8; set a UTF-8 passphrase or unset it"
-                        .to_string(),
+                    "PINKDB_KEY is not valid UTF-8; set a UTF-8 passphrase or unset it".to_string(),
                 )),
             },
         }
@@ -276,7 +275,8 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
             if data.len() < pos + KDF_PARAMS_LEN {
                 return Err(corrupt("truncated Argon2id parameters"));
             }
-            let u32_at = |off: usize| u32::from_le_bytes(data[off..off + 4].try_into().expect("4 bytes"));
+            let u32_at =
+                |off: usize| u32::from_le_bytes(data[off..off + 4].try_into().expect("4 bytes"));
             let m_cost = u32_at(pos);
             let t_cost = u32_at(pos + 4);
             let p_cost = u32_at(pos + 8);
@@ -328,7 +328,8 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
 /// Encrypted artifact opened by a build/key path that cannot decrypt it.
 pub(crate) fn encrypted_error(what: &str) -> PinkDbError {
     #[cfg(feature = "encryption")]
-    let hint = "open it with a key (open_with_key / open_durable_with_key, or the CLI's PINKDB_KEY)";
+    let hint =
+        "open it with a key (open_with_key / open_durable_with_key, or the CLI's PINKDB_KEY)";
     #[cfg(not(feature = "encryption"))]
     let hint = "build with the encryption feature to read it";
     PinkDbError::Execution(format!("{what}: file is encrypted; {hint}"))
@@ -391,7 +392,8 @@ mod imp {
     impl HeaderSpec {
         /// The serialized public header up to (excluding) the key-check.
         fn aad_base(&self) -> Vec<u8> {
-            let mut v = Vec::with_capacity(HEADER_FIXED_LEN + KDF_PARAMS_LEN + MAX_SALT_LEN as usize);
+            let mut v =
+                Vec::with_capacity(HEADER_FIXED_LEN + KDF_PARAMS_LEN + MAX_SALT_LEN as usize);
             v.extend_from_slice(ENC_MAGIC);
             v.extend_from_slice(&ENC_VERSION.to_le_bytes());
             v.push(CIPHER_AES256_GCM);
@@ -490,11 +492,14 @@ mod imp {
         let params = argon2::Params::new(m_cost, t_cost, p_cost, Some(KEY_LEN)).map_err(|e| {
             PinkDbError::Execution(format!("encrypted file: invalid Argon2id parameters: {e}"))
         })?;
-        let argon = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+        let argon =
+            argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
         let mut bytes = [0u8; KEY_LEN];
-        argon.hash_password_into(passphrase, salt, &mut bytes).map_err(|e| {
-            PinkDbError::Execution(format!("encrypted file: Argon2id derivation failed: {e}"))
-        })?;
+        argon
+            .hash_password_into(passphrase, salt, &mut bytes)
+            .map_err(|e| {
+                PinkDbError::Execution(format!("encrypted file: Argon2id derivation failed: {e}"))
+            })?;
         Ok(DerivedKey { bytes })
     }
 
@@ -514,9 +519,8 @@ mod imp {
             },
             KDF_ARGON2ID => match &key.passphrase {
                 Some(pass) => {
-                    let (m, t, p, salt) = params.ok_or_else(|| {
-                        corrupt("Argon2id header without KDF parameters")
-                    })?;
+                    let (m, t, p, salt) =
+                        params.ok_or_else(|| corrupt("Argon2id header without KDF parameters"))?;
                     argon2_derive(pass, *m, *t, *p, salt)
                 }
                 None => Err(PinkDbError::Execution(
@@ -635,7 +639,11 @@ mod imp {
     /// Verify the key-check and decrypt a whole checkpoint container. The
     /// final frame must be the terminal zero-length segment: a container
     /// truncated at a segment boundary is a hard error, never a partial load.
-    pub(crate) fn open_container(data: &[u8], key: &EncryptionKey, context: u64) -> Result<Vec<u8>> {
+    pub(crate) fn open_container(
+        data: &[u8],
+        key: &EncryptionKey,
+        context: u64,
+    ) -> Result<Vec<u8>> {
         let header = parse_container_header(data)?;
         if header.context != context {
             return Err(corrupt(&format!(
@@ -875,10 +883,10 @@ mod imp {
     }
 }
 
-#[cfg(feature = "encryption")]
-pub(crate) use imp::{open_container, seal_container, RecordCipher};
 #[cfg(not(feature = "encryption"))]
 pub(crate) use imp::RecordCipher;
+#[cfg(feature = "encryption")]
+pub(crate) use imp::{open_container, seal_container, RecordCipher};
 
 #[cfg(test)]
 mod tests {
@@ -1102,7 +1110,7 @@ mod enc_tests {
             (ARGON2_M_COST_KIB, ARGON2_MAX_T_COST + 1, 1),
             (ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_MAX_P_COST + 1),
             (ARGON2_MAX_M_COST_KIB, ARGON2_MAX_T_COST, 1), // 16× the default work
-            (8, 1, 4),                                      // m < 8·p
+            (8, 1, 4),                                     // m < 8·p
         ] {
             let err = parse_container_header(&mk(m, t, p)).unwrap_err();
             assert!(

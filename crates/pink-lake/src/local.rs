@@ -122,8 +122,7 @@ impl LocalStorage {
             // `link` refuses to follow a symlink at `path`, so `AlreadyExists`
             // covers both a regular file and a planted symlink there.
             Err(e)
-                if e.kind() == ErrorKind::AlreadyExists
-                    || fs::symlink_metadata(&path).is_ok() =>
+                if e.kind() == ErrorKind::AlreadyExists || fs::symlink_metadata(&path).is_ok() =>
             {
                 Ok(false)
             }

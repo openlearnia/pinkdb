@@ -17,7 +17,10 @@ fn run(args: &[&str]) -> Output {
 #[test]
 fn host_flag_without_client_feature_is_rejected() {
     let out = run(&["--host", "127.0.0.1:1"]);
-    assert!(!out.status.success(), "--host must fail without the client feature");
+    assert!(
+        !out.status.success(),
+        "--host must fail without the client feature"
+    );
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

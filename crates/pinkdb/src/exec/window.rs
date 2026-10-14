@@ -5,11 +5,11 @@
 //! peers, matching GROUP BY semantics. Aggregate windows share [`Acc`] with
 //! hash aggregation; an empty frame yields COUNT → 0, others → NULL.
 
-use std::cmp::Ordering;
 use crate::types::FastMap;
+use std::cmp::Ordering;
 
-use super::aggregate::{eval_agg_vec, Acc};
 use super::aggregate::EvalVec as FusedVec;
+use super::aggregate::{eval_agg_vec, Acc};
 use super::Cx;
 use crate::plan::compare_values;
 use crate::sql::binder::{BoundWindow, FrameBound, WindowFunc};
@@ -91,11 +91,7 @@ pub(crate) fn eval_window(
     Ok(out)
 }
 
-fn eval_one_window(
-    cx: &Cx,
-    chunks: &[DataChunk],
-    w: &BoundWindow,
-) -> Result<Vec<DataChunk>> {
+fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec<DataChunk>> {
     // 1. Evaluate the partition/order/arg expressions per chunk in parallel
     // (assembly preserves chunk order); rows stay as (chunk, row) indices.
     let per_chunk: Vec<ChunkVecs> = chunks
@@ -171,7 +167,9 @@ fn eval_one_window(
                 let mut rank: i64 = 1;
                 let mut dense: i64 = 1;
                 for (pos, g) in seq.iter().enumerate() {
-                    if pos > 0 && !is_peer(rows[seq[pos - 1]].ord.as_slice(), rows[*g].ord.as_slice()) {
+                    if pos > 0
+                        && !is_peer(rows[seq[pos - 1]].ord.as_slice(), rows[*g].ord.as_slice())
+                    {
                         rank = pos as i64 + 1;
                         dense += 1;
                     }
@@ -225,24 +223,31 @@ fn eval_one_window(
     if n == 0 {
         return Ok(Vec::new());
     }
-    let mut dtypes: Vec<DataType> =
-        chunks[0].columns.iter().map(|c| c.dtype()).collect();
+    let mut dtypes: Vec<DataType> = chunks[0].columns.iter().map(|c| c.dtype()).collect();
     dtypes.push(w.dtype);
     let mut finished = Vec::new();
-    let mut cur: Vec<Vector> = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
+    let mut cur: Vec<Vector> = dtypes
+        .iter()
+        .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+        .collect();
     let mut cur_rows = 0usize;
     let mut g = 0usize;
     for chunk in chunks {
         for i in 0..chunk.num_rows() {
             if cur_rows >= CHUNK_SIZE {
                 finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-                cur = dtypes.iter().map(|t| Vector::with_capacity(*t, CHUNK_SIZE)).collect();
+                cur = dtypes
+                    .iter()
+                    .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                    .collect();
                 cur_rows = 0;
             }
             for (dst, col) in cur.iter_mut().zip(chunk.columns.iter()) {
                 dst.push_from(col, i)?;
             }
-            cur.last_mut().expect("new column").push_value(out_vals[g].clone())?;
+            cur.last_mut()
+                .expect("new column")
+                .push_value(out_vals[g].clone())?;
             cur_rows += 1;
             g += 1;
         }
@@ -262,7 +267,11 @@ fn order_rows(a: &[Value], b: &[Value], w: &BoundWindow) -> Ordering {
             (_, Value::Null) => Ordering::Less,
             _ => {
                 let c = compare_values(ka, kb);
-                if *desc { c.reverse() } else { c }
+                if *desc {
+                    c.reverse()
+                } else {
+                    c
+                }
             }
         };
         if ord != Ordering::Equal {

@@ -41,30 +41,29 @@ fn run(cmds: &str) -> String {
 
 #[test]
 fn databases_dot_command_marks_the_current_one() {
-    let out = run(
-        ".databases\n\
+    let out = run(".databases\n\
          CREATE DATABASE analytics;\n\
          .databases\n\
          USE analytics;\n\
          .databases\n\
          USE main;\n\
          .databases\n\
-         .quit\n",
-    );
+         .quit\n");
     assert!(out.contains("Database analytics created."), "{out}");
     assert!(out.contains("Using database analytics."), "{out}");
     assert!(out.contains("Using database main."), "{out}");
     // The first listing has main as current; the second marks analytics.
     let first = out.find("main (current)").expect("main marked current");
-    let second = out.find("analytics (current)").expect("analytics marked current");
+    let second = out
+        .find("analytics (current)")
+        .expect("analytics marked current");
     assert!(first < second, "{out}");
     assert!(out.contains("analytics (0 tables)"), "{out}");
 }
 
 #[test]
 fn use_and_qualified_names_scope_sql_and_dot_commands() {
-    let out = run(
-        "CREATE DATABASE db1;\n\
+    let out = run("CREATE DATABASE db1;\n\
          CREATE TABLE db1.t (a INTEGER);\n\
          INSERT INTO db1.t VALUES (7);\n\
          USE db1;\n\
@@ -73,8 +72,7 @@ fn use_and_qualified_names_scope_sql_and_dot_commands() {
          USE main;\n\
          .tables\n\
          SELECT a FROM db1.t;\n\
-         .quit\n",
-    );
+         .quit\n");
     assert!(!out.contains("Error"), "{out}");
     // In db1, `.tables` shows its table; on main it is empty.
     let tables_at = out.find("t (1 rows)").expect("db1.t listed");
@@ -86,13 +84,11 @@ fn use_and_qualified_names_scope_sql_and_dot_commands() {
 
 #[test]
 fn schema_accepts_qualified_names() {
-    let out = run(
-        "CREATE DATABASE db1;\n\
+    let out = run("CREATE DATABASE db1;\n\
          CREATE TABLE db1.t (a INTEGER, b VARCHAR);\n\
          .schema db1.t\n\
          .schema t\n\
-         .quit\n",
-    );
+         .quit\n");
     assert!(out.contains("CREATE TABLE t ("), "{out}");
     assert!(out.contains("a INTEGER"), "{out}");
     assert!(out.contains("b VARCHAR"), "{out}");
@@ -129,8 +125,7 @@ fn import_targets_the_current_database_or_a_qualified_table() {
 
 #[test]
 fn databases_counts_tables_and_views_separately_and_schema_shows_views() {
-    let out = run(
-        "CREATE TABLE t (a INTEGER);\n\
+    let out = run("CREATE TABLE t (a INTEGER);\n\
          CREATE VIEW v AS SELECT a FROM t;\n\
          CREATE DATABASE db1;\n\
          USE db1;\n\
@@ -140,8 +135,7 @@ fn databases_counts_tables_and_views_separately_and_schema_shows_views() {
          .schema v\n\
          .schema db1.dv\n\
          .schema db1.missing\n\
-         .quit\n",
-    );
+         .quit\n");
     // Views are counted and labeled as views, not folded into the table count.
     assert!(out.contains("main (current) (1 table, 1 view)"), "{out}");
     assert!(out.contains("db1 (0 tables, 1 view)"), "{out}");
@@ -236,7 +230,10 @@ fn databases_persist_across_save_and_reopen() {
 
     // Reopen in-process: both databases and their rows survived.
     let db = pinkdb::PinkDb::open(path).unwrap();
-    assert_eq!(db.list_databases(), vec!["db1".to_string(), "main".to_string()]);
+    assert_eq!(
+        db.list_databases(),
+        vec!["db1".to_string(), "main".to_string()]
+    );
     assert_eq!(db.table("t").unwrap().num_rows(), 1);
     assert_eq!(db.table_in("db1", "t").unwrap().num_rows(), 1);
     assert_eq!(db.current_db(), "main");

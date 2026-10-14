@@ -222,8 +222,22 @@ impl ExtArg<'_> {
         let (type_tag, is_null, int64, double, text_ptr, text_len) = match self {
             // A NULL argument keeps is_null set, carrying its declared type.
             ExtArg::Null(t) => (t.tag(), 1, 0, 0.0, std::ptr::null(), 0),
-            ExtArg::Boolean(b) => (PINKDB_EXT_TYPE_BOOLEAN, 0, b as i64, 0.0, std::ptr::null(), 0),
-            ExtArg::Integer(i) => (PINKDB_EXT_TYPE_INTEGER, 0, i as i64, 0.0, std::ptr::null(), 0),
+            ExtArg::Boolean(b) => (
+                PINKDB_EXT_TYPE_BOOLEAN,
+                0,
+                b as i64,
+                0.0,
+                std::ptr::null(),
+                0,
+            ),
+            ExtArg::Integer(i) => (
+                PINKDB_EXT_TYPE_INTEGER,
+                0,
+                i as i64,
+                0.0,
+                std::ptr::null(),
+                0,
+            ),
             ExtArg::Bigint(i) => (PINKDB_EXT_TYPE_BIGINT, 0, i, 0.0, std::ptr::null(), 0),
             ExtArg::Double(x) => (PINKDB_EXT_TYPE_DOUBLE, 0, 0, x, std::ptr::null(), 0),
             ExtArg::Varchar(bytes) => (
@@ -237,7 +251,14 @@ impl ExtArg<'_> {
             ExtArg::Date(d) => (PINKDB_EXT_TYPE_DATE, 0, d as i64, 0.0, std::ptr::null(), 0),
             ExtArg::Timestamp(us) => (PINKDB_EXT_TYPE_TIMESTAMP, 0, us, 0.0, std::ptr::null(), 0),
         };
-        PinkdbExtValue { type_tag, is_null, int64, double, text_ptr, text_len }
+        PinkdbExtValue {
+            type_tag,
+            is_null,
+            int64,
+            double,
+            text_ptr,
+            text_len,
+        }
     }
 }
 

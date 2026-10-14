@@ -175,7 +175,10 @@ fn snapshots_accumulate_and_explicit_versions_load() {
     assert!(out.contains("Saved lake version 2"), "{out}");
     assert!(out.contains("Saved lake version 3"), "{out}");
     assert!(out.contains("1\n2\n3 (current)"), "{out}");
-    assert!(out.contains("main.t (2 rows)"), "current tables take the latest snapshot: {out}");
+    assert!(
+        out.contains("main.t (2 rows)"),
+        "current tables take the latest snapshot: {out}"
+    );
 
     // Opening version 2 sees only the first row; the latest sees both.
     let out = run(&format!(
@@ -246,13 +249,17 @@ fn lake_errors_are_clear() {
     assert!(out.contains("is not a pink-lake directory"), "{out}");
 
     // Usage errors.
-    let out = run(".lake save\n.lake open\n.lake versions\n.lake tables\n.lake info\n.lake\n.quit\n");
+    let out =
+        run(".lake save\n.lake open\n.lake versions\n.lake tables\n.lake info\n.lake\n.quit\n");
     assert!(out.contains("Usage: .lake save <dir>"), "{out}");
     assert!(out.contains("Usage: .lake open <dir> [version]"), "{out}");
     assert!(out.contains("Usage: .lake versions <dir>"), "{out}");
     assert!(out.contains("Usage: .lake tables <dir>"), "{out}");
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
-    assert!(out.contains("Usage: .lake <save|open|versions|tables|info> ..."), "{out}");
+    assert!(
+        out.contains("Usage: .lake <save|open|versions|tables|info> ..."),
+        "{out}"
+    );
 
     // Unknown subcommand.
     let out = run(".lake dunno\n.quit\n");
@@ -386,12 +393,18 @@ fn tampered_version_catalogs_are_clean_cli_errors() {
             "version {bad}: {out}"
         );
         assert!(!out.contains("panicked"), "version {bad} panicked: {out}");
-        assert!(!out.contains("Saved lake version"), "version {bad} wrapped: {out}");
+        assert!(
+            !out.contains("Saved lake version"),
+            "version {bad} wrapped: {out}"
+        );
     }
 
     // Restoring the catalog heals the lake (nothing was written).
     std::fs::write(lake.join("catalog.json"), &catalog).unwrap();
-    let out = run(&format!(".lake info {lake}\n.quit\n", lake = lake.display()));
+    let out = run(&format!(
+        ".lake info {lake}\n.quit\n",
+        lake = lake.display()
+    ));
     assert!(out.contains("current version: 2"), "{out}");
     cleanup(&dir);
 }
@@ -427,7 +440,10 @@ fn missing_data_files_are_warned_about() {
     );
 
     // The metadata still reads; a load fails clearly.
-    let out = run(&format!(".lake open {lake}\n.quit\n", lake = lake.display()));
+    let out = run(&format!(
+        ".lake open {lake}\n.quit\n",
+        lake = lake.display()
+    ));
     assert!(out.contains("Error:"), "{out}");
     cleanup(&dir);
 }
@@ -477,7 +493,10 @@ fn concurrent_lake_saves_stay_consistent() {
         }
         let mut unique = winners.clone();
         unique.dedup();
-        assert_eq!(winners, unique, "round {round}: duplicate published versions");
+        assert_eq!(
+            winners, unique,
+            "round {round}: duplicate published versions"
+        );
 
         // The catalog parses (`.lake info` uses the library reader) and is
         // byte-identical to the snapshot of its version; the version chain
@@ -496,9 +515,15 @@ fn concurrent_lake_saves_stay_consistent() {
         );
         assert_eq!(winners, (3..=version).collect::<Vec<_>>(), "round {round}");
 
-        let out = run(&format!(".lake info {lake}\n.quit\n", lake = lake.display()));
+        let out = run(&format!(
+            ".lake info {lake}\n.quit\n",
+            lake = lake.display()
+        ));
         assert!(!out.contains("Error:"), "{out}");
-        assert!(out.contains(&format!("current version: {version}")), "{out}");
+        assert!(
+            out.contains(&format!("current version: {version}")),
+            "{out}"
+        );
 
         // Snapshot files are exactly the published chain, canonically named.
         let mut names: Vec<String> = std::fs::read_dir(lake.join("snapshots"))
@@ -619,18 +644,13 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
 #[cfg(not(feature = "s3"))]
 #[test]
 fn s3_urls_need_the_s3_feature() {
-    let out = run(
-        ".lake save s3://bucket/prefix\n\
+    let out = run(".lake save s3://bucket/prefix\n\
          .lake open s3://bucket/prefix\n\
          .lake versions s3://bucket/prefix\n\
          .lake tables s3://bucket/prefix\n\
          .lake info s3://bucket/prefix\n\
-         .quit\n",
-    );
-    assert!(
-        out.contains("does not include the `s3` feature"),
-        "{out}"
-    );
+         .quit\n");
+    assert!(out.contains("does not include the `s3` feature"), "{out}");
     assert!(
         out.contains("cargo build -p pinkdb-cli --features lake,s3"),
         "{out}"
@@ -678,7 +698,10 @@ fn second_session_save_conflicts_instead_of_losing_an_update() {
     let mut seen = String::new();
     loop {
         let mut line = String::new();
-        assert!(a_out.read_line(&mut line).unwrap() > 0, "session A exited early: {seen}");
+        assert!(
+            a_out.read_line(&mut line).unwrap() > 0,
+            "session A exited early: {seen}"
+        );
         seen.push_str(&line);
         if line.starts_with("Opened lake version") || line.starts_with("Error:") {
             break;
@@ -708,7 +731,10 @@ fn second_session_save_conflicts_instead_of_losing_an_update() {
     // save still ran.
     assert_eq!(status.code(), Some(1), "{rest}");
     assert!(rest.contains("Error: write conflict"), "{rest}");
-    assert!(rest.contains("Saved lake version"), "forced save publishes: {rest}");
+    assert!(
+        rest.contains("Saved lake version"),
+        "forced save publishes: {rest}"
+    );
 
     // After a successful save the session's base moved: a plain save works.
     let out = run(&format!(
@@ -730,7 +756,11 @@ fn lake_commands_respect_transactions_and_durable_sessions() {
          .lake save {lake}\n.lake open {lake}\nROLLBACK;\n.lake save {lake}\n.quit\n",
         lake = lake.display()
     ));
-    assert_eq!(out.matches("not allowed inside a transaction").count(), 2, "{out}");
+    assert_eq!(
+        out.matches("not allowed inside a transaction").count(),
+        2,
+        "{out}"
+    );
     assert!(out.contains("Saved lake version"), "{out}");
     let out = run(&format!(
         ".open {db}\n.lake open {lake}\n.quit\n",

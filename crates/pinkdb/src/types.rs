@@ -100,7 +100,10 @@ impl DataType {
     }
 
     pub fn is_numeric(self) -> bool {
-        matches!(self, DataType::Integer | DataType::Bigint | DataType::Double)
+        matches!(
+            self,
+            DataType::Integer | DataType::Bigint | DataType::Double
+        )
     }
 }
 
@@ -383,7 +386,10 @@ mod tests {
     fn timestamp_parse_format() {
         assert_eq!(parse_timestamp("1970-01-01 00:00:00"), Some(0));
         assert_eq!(parse_timestamp("1970-01-01T00:00:01.5"), Some(1_500_000));
-        assert_eq!(parse_timestamp("2024-03-15 12:30:45"), parse_timestamp("2024-03-15T12:30:45"));
+        assert_eq!(
+            parse_timestamp("2024-03-15 12:30:45"),
+            parse_timestamp("2024-03-15T12:30:45")
+        );
         assert_eq!(format_timestamp(0), "1970-01-01 00:00:00");
         assert_eq!(format_timestamp(1_500_000), "1970-01-01 00:00:01.500000");
         assert_eq!(parse_timestamp("2024-03-15"), None);

@@ -79,8 +79,9 @@ fn parse_args() -> Result<Args, String> {
             "--host" => args.host = value("--host")?,
             "--port" => {
                 let raw = value("--port")?;
-                args.port =
-                    raw.parse().map_err(|_| format!("invalid --port value {raw:?}"))?;
+                args.port = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --port value {raw:?}"))?;
             }
             "--file" => args.file = Some(value("--file")?),
             "--max-connections" => {
@@ -93,8 +94,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "--idle-timeout" => {
                 let raw = value("--idle-timeout")?;
-                args.idle_timeout_secs =
-                    raw.parse().map_err(|_| format!("invalid --idle-timeout value {raw:?}"))?;
+                args.idle_timeout_secs = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --idle-timeout value {raw:?}"))?;
             }
             "--allow-load-extension" if inline.is_none() => args.allow_load_extension = true,
             other => return Err(format!("unknown argument {other:?}")),

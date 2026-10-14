@@ -28,9 +28,7 @@ pub(crate) fn amz_date_utc(time: SystemTime) -> (String, String) {
     let sod = secs.rem_euclid(86_400);
     let (hour, minute, second) = (sod / 3600, (sod % 3600) / 60, sod % 60);
     (
-        format!(
-            "{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"
-        ),
+        format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z"),
         format!("{year:04}{month:02}{day:02}"),
     )
 }
@@ -60,12 +58,24 @@ mod tests {
     #[test]
     fn known_epochs_format_correctly() {
         assert_eq!(iso8601_utc(at(0, 0)), "1970-01-01T00:00:00.000Z");
-        assert_eq!(iso8601_utc(at(1_000_000_000, 0)), "2001-09-09T01:46:40.000Z");
-        assert_eq!(iso8601_utc(at(1_700_000_000, 123)), "2023-11-14T22:13:20.123Z");
+        assert_eq!(
+            iso8601_utc(at(1_000_000_000, 0)),
+            "2001-09-09T01:46:40.000Z"
+        );
+        assert_eq!(
+            iso8601_utc(at(1_700_000_000, 123)),
+            "2023-11-14T22:13:20.123Z"
+        );
         // A leap day.
-        assert_eq!(iso8601_utc(at(1_582_934_400, 0)), "2020-02-29T00:00:00.000Z");
+        assert_eq!(
+            iso8601_utc(at(1_582_934_400, 0)),
+            "2020-02-29T00:00:00.000Z"
+        );
         // A pre-epoch clock (test clocks can be wrong); clamps to the epoch.
-        assert_eq!(iso8601_utc(UNIX_EPOCH - Duration::from_secs(5)), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            iso8601_utc(UNIX_EPOCH - Duration::from_secs(5)),
+            "1970-01-01T00:00:00.000Z"
+        );
     }
 
     /// The SigV4 timestamp pair (used by the `s3` feature).

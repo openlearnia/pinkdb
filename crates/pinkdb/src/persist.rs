@@ -79,7 +79,9 @@ fn dtype_from_tag(b: u8) -> Result<DataType> {
         4 => Ok(DataType::Varchar),
         5 => Ok(DataType::Date),
         6 => Ok(DataType::Timestamp),
-        _ => Err(PinkDbError::Execution(format!("corrupt file: bad dtype tag {b}"))),
+        _ => Err(PinkDbError::Execution(format!(
+            "corrupt file: bad dtype tag {b}"
+        ))),
     }
 }
 
@@ -136,9 +138,10 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).ok_or_else(|| {
-            PinkDbError::Execution("corrupt file: offset overflow".to_string())
-        })?;
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| PinkDbError::Execution("corrupt file: offset overflow".to_string()))?;
         if end > self.data.len() {
             return self.err("unexpected end of file");
         }
@@ -241,7 +244,11 @@ fn unpack_bits(reader: &mut Reader, count: usize, width: u32) -> Result<Vec<u64>
     let mut out = Vec::with_capacity(count);
     let mut acc: u64 = 0;
     let mut acc_bits: u32 = 0;
-    let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let mask = if width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
     while out.len() < count {
         while acc_bits < width {
             acc |= (reader.u8()? as u64) << acc_bits;
@@ -289,11 +296,9 @@ fn decode_validity(reader: &mut Reader, len: usize) -> Result<Vec<bool>> {
 /// Encode one column chunk: returns (encoding tag, payload bytes).
 fn encode_chunk(dtype: DataType, values: &[Value]) -> (u8, Vec<u8>) {
     let mut best: Option<(u8, Vec<u8>)> = None;
-    let mut consider = |tag: u8, payload: Vec<u8>| {
-        match &best {
-            Some((_, b)) if b.len() <= payload.len() => {}
-            _ => best = Some((tag, payload)),
-        }
+    let mut consider = |tag: u8, payload: Vec<u8>| match &best {
+        Some((_, b)) if b.len() <= payload.len() => {}
+        _ => best = Some((tag, payload)),
     };
     match dtype {
         DataType::Integer | DataType::Bigint => {
@@ -695,7 +700,9 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             let n = reader.chunk_count("chunk length")?;
             let need = n.div_ceil(8);
             let bytes = reader.take(need)?;
-            let out = (0..n).map(|i| Value::Boolean((bytes[i / 8] >> (i % 8)) & 1 == 1)).collect();
+            let out = (0..n)
+                .map(|i| Value::Boolean((bytes[i / 8] >> (i % 8)) & 1 == 1))
+                .collect();
             (out, decode_validity(&mut vr, n)?)
         }
         (DataType::Boolean, ENC_RLE) => {
@@ -718,7 +725,10 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
         (DataType::Varchar, ENC_PLAIN) => {
             let n = reader.chunk_count("chunk length")?;
             let strs = decode_strs(reader, n)?;
-            (strs.into_iter().map(Value::Varchar).collect(), decode_validity(&mut vr, n)?)
+            (
+                strs.into_iter().map(Value::Varchar).collect(),
+                decode_validity(&mut vr, n)?,
+            )
         }
         (DataType::Varchar, ENC_DICT) => {
             let n = reader.chunk_count("chunk length")?;
@@ -727,9 +737,9 @@ fn decode_chunk(dtype: DataType, tag: u8, reader: &mut Reader) -> Result<Vec<Val
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 let code = reader.u32()? as usize;
-                out.push(Value::Varchar(dict.get(code).cloned().ok_or_else(|| {
-                    PinkDbError::Execution("corrupt file: bad dict code".to_string())
-                })?));
+                out.push(Value::Varchar(dict.get(code).cloned().ok_or_else(
+                    || PinkDbError::Execution("corrupt file: bad dict code".to_string()),
+                )?));
             }
             (out, decode_validity(&mut vr, n)?)
         }
@@ -1132,9 +1142,7 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
         (DataType::Integer, ENC_BITPACK)
         | (DataType::Bigint, ENC_BITPACK)
         | (DataType::Date, ENC_BITPACK)
-        | (DataType::Timestamp, ENC_BITPACK) => {
-            encode_ints_bitpack(&ints)
-        }
+        | (DataType::Timestamp, ENC_BITPACK) => encode_ints_bitpack(&ints),
         (DataType::Double, ENC_RLE) => encode_u64_rle(
             &plain
                 .iter()
@@ -1161,9 +1169,8 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
     w.bytes(&forced);
     let mut r = Reader::new(&w.buf);
     let t = r.u8().unwrap();
-    decode_chunk(dtype, t, &mut r).unwrap_or_else(|e| {
-        panic!("CTX dtype={dtype:?} tag={t} n={} err={e}", values.len())
-    })
+    decode_chunk(dtype, t, &mut r)
+        .unwrap_or_else(|e| panic!("CTX dtype={dtype:?} tag={t} n={} err={e}", values.len()))
 }
 
 #[cfg(test)]
@@ -1263,13 +1270,16 @@ mod tests {
     #[test]
     fn roundtrip_empty_and_multichunk() {
         let mut db = PinkDb::new();
-        db.create_table("e", vec![("x".to_string(), DataType::Integer)]).unwrap();
-        db.create_table("big", vec![("y".to_string(), DataType::Varchar)]).unwrap();
+        db.create_table("e", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.create_table("big", vec![("y".to_string(), DataType::Varchar)])
+            .unwrap();
         {
             let t = db.table_mut("big").unwrap();
             for i in 0..(CHUNK_SIZE + 100) {
                 // Low cardinality → dictionary + multi-chunk.
-                t.append_row(vec![Value::Varchar(format!("region{}", i % 3))]).unwrap();
+                t.append_row(vec![Value::Varchar(format!("region{}", i % 3))])
+                    .unwrap();
             }
         }
         let back = roundtrip(&db);
@@ -1281,23 +1291,47 @@ mod tests {
     #[test]
     fn forced_encodings_roundtrip() {
         let ints: Vec<Value> = (0..100).map(|i| Value::Integer(i / 10)).collect();
-        assert_eq!(roundtrip_chunk(DataType::Integer, ints.clone(), ENC_RLE), ints);
-        assert_eq!(roundtrip_chunk(DataType::Integer, ints.clone(), ENC_BITPACK), ints);
-        assert_eq!(roundtrip_chunk(DataType::Integer, ints.clone(), ENC_PLAIN), ints);
+        assert_eq!(
+            roundtrip_chunk(DataType::Integer, ints.clone(), ENC_RLE),
+            ints
+        );
+        assert_eq!(
+            roundtrip_chunk(DataType::Integer, ints.clone(), ENC_BITPACK),
+            ints
+        );
+        assert_eq!(
+            roundtrip_chunk(DataType::Integer, ints.clone(), ENC_PLAIN),
+            ints
+        );
         let neg: Vec<Value> = vec![Value::Integer(-3), Value::Null, Value::Integer(5)];
-        assert_eq!(roundtrip_chunk(DataType::Integer, neg.clone(), ENC_BITPACK), neg);
+        assert_eq!(
+            roundtrip_chunk(DataType::Integer, neg.clone(), ENC_BITPACK),
+            neg
+        );
         let strs: Vec<Value> = vec![
             Value::Varchar("a".to_string()),
             Value::Varchar("a".to_string()),
             Value::Null,
             Value::Varchar("b".to_string()),
         ];
-        assert_eq!(roundtrip_chunk(DataType::Varchar, strs.clone(), ENC_DICT), strs);
-        assert_eq!(roundtrip_chunk(DataType::Varchar, strs.clone(), ENC_RLE), strs);
+        assert_eq!(
+            roundtrip_chunk(DataType::Varchar, strs.clone(), ENC_DICT),
+            strs
+        );
+        assert_eq!(
+            roundtrip_chunk(DataType::Varchar, strs.clone(), ENC_RLE),
+            strs
+        );
         let bools: Vec<Value> = vec![Value::Boolean(true), Value::Null, Value::Boolean(true)];
-        assert_eq!(roundtrip_chunk(DataType::Boolean, bools.clone(), ENC_RLE), bools);
+        assert_eq!(
+            roundtrip_chunk(DataType::Boolean, bools.clone(), ENC_RLE),
+            bools
+        );
         let dbls: Vec<Value> = vec![Value::Double(1.5), Value::Double(1.5), Value::Null];
-        assert_eq!(roundtrip_chunk(DataType::Double, dbls.clone(), ENC_RLE), dbls);
+        assert_eq!(
+            roundtrip_chunk(DataType::Double, dbls.clone(), ENC_RLE),
+            dbls
+        );
     }
 
     #[test]
@@ -1311,32 +1345,49 @@ mod tests {
         let mut rnd: Vec<Value> = Vec::new();
         let mut x: u64 = 42;
         for _ in 0..100 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             rnd.push(Value::Integer((x >> 32) as i32));
         }
         let (tag, _) = encode_chunk(DataType::Integer, &rnd);
         assert_eq!(tag, ENC_PLAIN);
         // Low-cardinality strings → dictionary.
-        let strs: Vec<Value> = (0..100).map(|i| Value::Varchar(format!("k{}", i % 4))).collect();
-        let (tag, _) = encode_chunk(DataType::Varchar, &strs.iter().map(|v| match v {
-            Value::Varchar(s) => Value::Varchar(s.clone()),
-            _ => unreachable!(),
-        }).collect::<Vec<_>>());
+        let strs: Vec<Value> = (0..100)
+            .map(|i| Value::Varchar(format!("k{}", i % 4)))
+            .collect();
+        let (tag, _) = encode_chunk(
+            DataType::Varchar,
+            &strs
+                .iter()
+                .map(|v| match v {
+                    Value::Varchar(s) => Value::Varchar(s.clone()),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>(),
+        );
         assert_eq!(tag, ENC_DICT);
     }
 
     #[test]
     fn corrupt_files_error_without_panic() {
         let mut db = PinkDb::new();
-        db.create_table("t", vec![("x".to_string(), DataType::Integer)]).unwrap();
-        db.table_mut("t").unwrap().append_row(vec![Value::Integer(1)]).unwrap();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(1)])
+            .unwrap();
         let path = temp_file("corrupt");
         db.save(path.to_str().unwrap()).unwrap();
         let full = std::fs::read(&path).unwrap();
         // Every truncation errors (never panics).
         for cut in [0, 4, 8, 9, 12, 20, full.len() / 2, full.len() - 1] {
             std::fs::write(&path, &full[..cut]).unwrap();
-            assert!(PinkDb::open(path.to_str().unwrap()).is_err(), "cut at {cut}");
+            assert!(
+                PinkDb::open(path.to_str().unwrap()).is_err(),
+                "cut at {cut}"
+            );
         }
         // Garbage magic + flipped bytes error.
         std::fs::write(&path, b"GARBAGE!junkjunkjunk").unwrap();
@@ -1351,8 +1402,12 @@ mod tests {
     #[test]
     fn v3_checksum_catches_bit_rot_and_v2_still_loads() {
         let mut db = PinkDb::new();
-        db.create_table("t", vec![("x".to_string(), DataType::Integer)]).unwrap();
-        db.table_mut("t").unwrap().append_row(vec![Value::Integer(7)]).unwrap();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(7)])
+            .unwrap();
         let full = db.to_bytes().unwrap();
         assert!(full.starts_with(MAGIC_V3));
         // A flipped payload bit is a checksum error, not a silent wrong value.
@@ -1360,7 +1415,10 @@ mod tests {
             let mut bad = full.clone();
             bad[i] ^= 0x01;
             let err = PinkDb::load_bytes(&bad).expect_err("bit flip must be detected");
-            assert!(err.to_string().contains("checksum") || i >= full.len() - 4, "{i}: {err}");
+            assert!(
+                err.to_string().contains("checksum") || i >= full.len() - 4,
+                "{i}: {err}"
+            );
         }
         // The same image without the trailer and with the v2 magic still loads.
         let mut v2 = full[..full.len() - 4].to_vec();
@@ -1392,7 +1450,10 @@ mod tests {
                 }
             }
         }
-        assert!(capped >= 4, "every column's chunk length must hit the cap ({capped})");
+        assert!(
+            capped >= 4,
+            "every column's chunk length must hit the cap ({capped})"
+        );
     }
 
     #[test]
@@ -1423,8 +1484,10 @@ mod tests {
         let mut db = PinkDb::new();
         db.execute("CREATE DATABASE analytics;").unwrap();
         db.execute("CREATE DATABASE empty;").unwrap();
-        db.execute("CREATE TABLE main.t (a INTEGER, b VARCHAR);").unwrap();
-        db.execute("INSERT INTO main.t VALUES (1, 'x'), (2, NULL);").unwrap();
+        db.execute("CREATE TABLE main.t (a INTEGER, b VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO main.t VALUES (1, 'x'), (2, NULL);")
+            .unwrap();
         db.execute("CREATE TABLE analytics.u (k BIGINT);").unwrap();
         db.execute("INSERT INTO analytics.u VALUES (7);").unwrap();
         // Same table name in two databases, different shapes.
@@ -1483,7 +1546,11 @@ mod tests {
         assert_eq!(db.current_db(), "db1");
         let back = roundtrip(&db);
         assert_eq!(back.list_databases(), vec!["db1".to_string()]);
-        assert_eq!(back.current_db(), "db1", "session starts on the only database");
+        assert_eq!(
+            back.current_db(),
+            "db1",
+            "session starts on the only database"
+        );
         assert_eq!(all_values(&back, "t"), vec![vec![Value::Integer(5)]]);
     }
 
@@ -1547,8 +1614,12 @@ mod tests {
         let plain = temp_file("plain_paths");
         let key = EncryptionKey::from_raw([5u8; 32]);
         let mut db = PinkDb::new();
-        db.create_table("t", vec![("x".to_string(), DataType::Integer)]).unwrap();
-        db.table_mut("t").unwrap().append_row(vec![Value::Integer(1)]).unwrap();
+        db.create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        db.table_mut("t")
+            .unwrap()
+            .append_row(vec![Value::Integer(1)])
+            .unwrap();
         db.save_with_key(enc.to_str().unwrap(), &key).unwrap();
         db.save(plain.to_str().unwrap()).unwrap();
 

@@ -134,18 +134,66 @@ struct Cell {
 impl Cell {
     fn from_value(v: &Value) -> Cell {
         match v {
-            Value::Null => Cell { tag: PINKDB_TYPE_NULL, is_null: true, i: 0, d: 0.0, text: None },
-            Value::Boolean(b) => Cell { tag: PINKDB_TYPE_BOOLEAN, is_null: false, i: *b as i64, d: 0.0, text: None },
-            Value::Integer(i) => Cell { tag: PINKDB_TYPE_INTEGER, is_null: false, i: *i as i64, d: 0.0, text: None },
-            Value::Bigint(i) => Cell { tag: PINKDB_TYPE_BIGINT, is_null: false, i: *i, d: 0.0, text: None },
-            Value::Double(x) => Cell { tag: PINKDB_TYPE_DOUBLE, is_null: false, i: 0, d: *x, text: None },
+            Value::Null => Cell {
+                tag: PINKDB_TYPE_NULL,
+                is_null: true,
+                i: 0,
+                d: 0.0,
+                text: None,
+            },
+            Value::Boolean(b) => Cell {
+                tag: PINKDB_TYPE_BOOLEAN,
+                is_null: false,
+                i: *b as i64,
+                d: 0.0,
+                text: None,
+            },
+            Value::Integer(i) => Cell {
+                tag: PINKDB_TYPE_INTEGER,
+                is_null: false,
+                i: *i as i64,
+                d: 0.0,
+                text: None,
+            },
+            Value::Bigint(i) => Cell {
+                tag: PINKDB_TYPE_BIGINT,
+                is_null: false,
+                i: *i,
+                d: 0.0,
+                text: None,
+            },
+            Value::Double(x) => Cell {
+                tag: PINKDB_TYPE_DOUBLE,
+                is_null: false,
+                i: 0,
+                d: *x,
+                text: None,
+            },
             Value::Varchar(s) => {
                 let mut b = s.as_bytes().to_vec();
                 b.push(0);
-                Cell { tag: PINKDB_TYPE_VARCHAR, is_null: false, i: 0, d: 0.0, text: Some(b) }
+                Cell {
+                    tag: PINKDB_TYPE_VARCHAR,
+                    is_null: false,
+                    i: 0,
+                    d: 0.0,
+                    text: Some(b),
+                }
             }
-            Value::Date(d) => Cell { tag: PINKDB_TYPE_DATE, is_null: false, i: *d as i64, d: 0.0, text: None },
-            Value::Timestamp(us) => Cell { tag: PINKDB_TYPE_TIMESTAMP, is_null: false, i: *us, d: 0.0, text: None },
+            Value::Date(d) => Cell {
+                tag: PINKDB_TYPE_DATE,
+                is_null: false,
+                i: *d as i64,
+                d: 0.0,
+                text: None,
+            },
+            Value::Timestamp(us) => Cell {
+                tag: PINKDB_TYPE_TIMESTAMP,
+                is_null: false,
+                i: *us,
+                d: 0.0,
+                text: None,
+            },
         }
     }
 
@@ -191,7 +239,11 @@ struct SelStmt {
 
 enum StmtData {
     Sel(SelStmt),
-    Simple { kind: i32, count: usize, name: Option<Vec<u8>> },
+    Simple {
+        kind: i32,
+        count: usize,
+        name: Option<Vec<u8>>,
+    },
 }
 
 /// Owns one `pinkdb_execute` outcome. Every pointer handed out by the
@@ -405,10 +457,7 @@ pub extern "C" fn pinkdb_result_kind(result: *const PinkResult, statement: usize
 
 /// For SELECT results: number of columns (0 for other kinds / out of range).
 #[no_mangle]
-pub extern "C" fn pinkdb_result_column_count(
-    result: *const PinkResult,
-    statement: usize,
-) -> usize {
+pub extern "C" fn pinkdb_result_column_count(result: *const PinkResult, statement: usize) -> usize {
     match stmt_at(result, statement) {
         Some(StmtData::Sel(s)) => s.names.len(),
         _ => 0,
@@ -486,10 +535,7 @@ pub extern "C" fn pinkdb_result_affected(result: *const PinkResult, statement: u
 /// Object/session name for CREATE/DROP VIEW/TABLE/DATABASE and USE results
 /// (NUL-terminated, owned by the result); NULL otherwise.
 #[no_mangle]
-pub extern "C" fn pinkdb_result_name(
-    result: *const PinkResult,
-    statement: usize,
-) -> *const c_char {
+pub extern "C" fn pinkdb_result_name(result: *const PinkResult, statement: usize) -> *const c_char {
     match stmt_at(result, statement) {
         Some(StmtData::Simple { name: Some(n), .. }) => n.as_ptr() as *const c_char,
         _ => ptr::null(),
@@ -591,7 +637,10 @@ mod tests {
     #[test]
     fn multi_statement_kinds_and_use() {
         let h = pinkdb_open_memory();
-        let r = exec_ok(h, "CREATE DATABASE db1; USE db1; BEGIN; COMMIT; BEGIN; ROLLBACK;");
+        let r = exec_ok(
+            h,
+            "CREATE DATABASE db1; USE db1; BEGIN; COMMIT; BEGIN; ROLLBACK;",
+        );
         let kinds: Vec<i32> = (0..6).map(|i| pinkdb_result_kind(r, i)).collect();
         assert_eq!(
             kinds,

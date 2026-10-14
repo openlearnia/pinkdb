@@ -210,15 +210,17 @@ impl Location {
 /// rule; shared by [`Location::parse`] and the `s3` feature's `S3Config`, so
 /// a URL and an explicit config reject exactly the same names).
 pub(crate) fn validate_bucket_name(bucket: &str) -> std::result::Result<(), String> {
-    let characters_ok = bucket.bytes().all(|b| {
-        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.'
-    });
+    let characters_ok = bucket
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.');
     if (3..=63).contains(&bucket.len()) && characters_ok {
         Ok(())
     } else {
-        Err("the bucket name must be 3–63 characters of lowercase ASCII letters, digits, \
+        Err(
+            "the bucket name must be 3–63 characters of lowercase ASCII letters, digits, \
              `.` and `-` (expected s3://bucket/prefix)"
-            .to_string())
+                .to_string(),
+        )
     }
 }
 
@@ -293,7 +295,10 @@ mod tests {
             "s3://ab/x",
         ] {
             let err = Location::parse(bad).unwrap_err();
-            assert!(matches!(err, LakeError::BadLocation { .. }), "{bad}: {err:?}");
+            assert!(
+                matches!(err, LakeError::BadLocation { .. }),
+                "{bad}: {err:?}"
+            );
             assert!(err.to_string().contains("invalid lake location"), "{err}");
         }
         let err = Location::parse(&too_long).unwrap_err();

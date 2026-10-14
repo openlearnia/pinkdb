@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::crypto::EncryptionKey;
-use crate::plan::{LogicalPlan, is_read_only};
+use crate::plan::{is_read_only, LogicalPlan};
 use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
 use crate::QueryResult;
@@ -92,17 +92,25 @@ impl Database {
     /// feature; a plaintext artifact is refused so the key cannot be silently
     /// ignored.
     pub fn open_with_key(path: &str, key: &EncryptionKey) -> Result<Database> {
-        Ok(Database::from_store(PinkDb::open_durable_with_key(path, key)?))
+        Ok(Database::from_store(PinkDb::open_durable_with_key(
+            path, key,
+        )?))
     }
 
     pub fn from_store(store: PinkDb) -> Self {
-        Self { shared: Arc::new(RwLock::new(store)) }
+        Self {
+            shared: Arc::new(RwLock::new(store)),
+        }
     }
 
     pub fn connect(&self) -> Connection {
         // Start on the store's current database (fresh stores: `main`).
         let current_db = read_lock(&self.shared).current_db().to_string();
-        Connection { db: self.clone(), txn: None, current_db }
+        Connection {
+            db: self.clone(),
+            txn: None,
+            current_db,
+        }
     }
 
     /// True when this database logs commits to a WAL.
@@ -195,8 +203,7 @@ impl Connection {
             let texts = crate::sql::statement_texts(sql)?;
             if texts.len() != stmts.len() {
                 return Err(PinkDbError::Execution(
-                    "internal error: statement source split disagrees with the parser"
-                        .to_string(),
+                    "internal error: statement source split disagrees with the parser".to_string(),
                 ));
             }
             Some(texts)
@@ -266,8 +273,7 @@ impl Connection {
                         // Extensions the statement calls: the record is
                         // prefixed with `LOAD EXTENSION` for every path the
                         // WAL generation has not loaded yet.
-                        let touched =
-                            txn.work.dynamic_function_paths(&dynamic_functions_used);
+                        let touched = txn.work.dynamic_function_paths(&dynamic_functions_used);
                         for p in touched {
                             if !txn.wal_ext_paths.contains(&p) {
                                 txn.wal_ext_paths.push(p);
@@ -310,8 +316,7 @@ impl Connection {
                     if let Some(text) = sql_text {
                         if crate::plan::writes_tables(&plan) {
                             let after = session_after(&result, &pre, &shared);
-                            let touched =
-                                shared.dynamic_function_paths(&dynamic_functions_used);
+                            let touched = shared.dynamic_function_paths(&dynamic_functions_used);
                             let loaded = crate::storage::loaded_extension_path(&plan);
                             shared.wal_append_session(
                                 &pre,
@@ -354,9 +359,7 @@ impl Connection {
                 // Apply the session transition.
                 self.current_db = match &result {
                     QueryResult::Used { db } => db.clone(),
-                    QueryResult::DroppedDatabase { name }
-                        if name.eq_ignore_ascii_case(&pre) =>
-                    {
+                    QueryResult::DroppedDatabase { name } if name.eq_ignore_ascii_case(&pre) => {
                         read_lock(&self.db.shared).fallback_db()
                     }
                     _ => pre,
@@ -368,7 +371,9 @@ impl Connection {
 
     fn txn_begin(&mut self) -> Result<QueryResult> {
         if self.txn.is_some() {
-            return Err(PinkDbError::Execution("already in a transaction".to_string()));
+            return Err(PinkDbError::Execution(
+                "already in a transaction".to_string(),
+            ));
         }
         let shared = read_lock(&self.db.shared);
         let mut base_tables = HashMap::new();
@@ -409,9 +414,10 @@ impl Connection {
     }
 
     fn txn_commit(&mut self) -> Result<QueryResult> {
-        let mut txn = self.txn.take().ok_or_else(|| {
-            PinkDbError::Execution("no transaction in progress".to_string())
-        })?;
+        let mut txn = self
+            .txn
+            .take()
+            .ok_or_else(|| PinkDbError::Execution("no transaction in progress".to_string()))?;
         let mut shared = write_lock(&self.db.shared);
         // A database dropped since BEGIN makes the transaction's WAL record
         // unreplayable (its statements or `USE` targets name it): conflict
@@ -507,7 +513,9 @@ impl Connection {
     fn txn_rollback(&mut self) -> Result<QueryResult> {
         match self.txn.take() {
             Some(_) => Ok(QueryResult::RolledBack),
-            None => Err(PinkDbError::Execution("no transaction in progress".to_string())),
+            None => Err(PinkDbError::Execution(
+                "no transaction in progress".to_string(),
+            )),
         }
     }
 }
@@ -592,7 +600,8 @@ mod tests {
         let db = Database::new();
         let mut c = db.connect();
         c.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
-        c.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y');").unwrap();
+        c.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y');")
+            .unwrap();
         c.execute("CREATE TABLE u (a INTEGER);").unwrap();
         c.execute("INSERT INTO u VALUES (10);").unwrap();
         db
@@ -638,8 +647,14 @@ mod tests {
         c.execute("COMMIT;").unwrap();
         // Both commits survived (disjoint tables merge cleanly).
         let mut c = db.connect();
-        assert_eq!(rows_of(c.execute("SELECT COUNT(*) FROM t;").unwrap()), vec![vec![Value::Bigint(3)]]);
-        assert_eq!(rows_of(c.execute("SELECT COUNT(*) FROM u;").unwrap()), vec![vec![Value::Bigint(2)]]);
+        assert_eq!(
+            rows_of(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
+            vec![vec![Value::Bigint(3)]]
+        );
+        assert_eq!(
+            rows_of(c.execute("SELECT COUNT(*) FROM u;").unwrap()),
+            vec![vec![Value::Bigint(2)]]
+        );
     }
 
     #[test]
@@ -661,7 +676,11 @@ mod tests {
         let mut c = db.connect();
         assert_eq!(
             rows_of(c.execute("SELECT a FROM t ORDER BY a;").unwrap()),
-            vec![vec![Value::Integer(1)], vec![Value::Integer(2)], vec![Value::Integer(4)]]
+            vec![
+                vec![Value::Integer(1)],
+                vec![Value::Integer(2)],
+                vec![Value::Integer(4)]
+            ]
         );
     }
 
@@ -702,7 +721,9 @@ mod tests {
         b.execute("DROP TABLE t;").unwrap();
         b.execute("CREATE TABLE t (a INTEGER, b VARCHAR);").unwrap();
         b.execute("INSERT INTO t VALUES (9, 'n');").unwrap();
-        let err = a.execute("COMMIT;").expect_err("recreated table must conflict");
+        let err = a
+            .execute("COMMIT;")
+            .expect_err("recreated table must conflict");
         assert!(err.to_string().contains("write conflict"), "{err}");
         assert_eq!(
             rows_of(b.execute("SELECT a FROM t;").unwrap()),
@@ -716,7 +737,8 @@ mod tests {
         let mut a = db.connect();
         a.execute("BEGIN;").unwrap();
         // A's write depends on t, which A does not write.
-        a.execute("UPDATE u SET a = (SELECT MAX(a) FROM t);").unwrap();
+        a.execute("UPDATE u SET a = (SELECT MAX(a) FROM t);")
+            .unwrap();
         let mut b = db.connect();
         b.execute("INSERT INTO t VALUES (50, 'late');").unwrap();
         // Committing would log SQL that replays against the new t (u = 50)
@@ -734,7 +756,8 @@ mod tests {
         a.execute("COMMIT;").unwrap();
         // An unrelated table changing does not abort a writer.
         a.execute("BEGIN;").unwrap();
-        a.execute("UPDATE u SET a = (SELECT MAX(a) FROM t);").unwrap();
+        a.execute("UPDATE u SET a = (SELECT MAX(a) FROM t);")
+            .unwrap();
         b.execute("CREATE TABLE other (x INTEGER);").unwrap();
         a.execute("COMMIT;").unwrap();
         assert_eq!(
@@ -748,13 +771,19 @@ mod tests {
     fn multi_db() -> Database {
         let db = Database::new();
         let mut c = db.connect();
-        c.execute("CREATE DATABASE db1; CREATE DATABASE db2;").unwrap();
-        c.execute("CREATE TABLE main.t (a INTEGER, tag VARCHAR);").unwrap();
+        c.execute("CREATE DATABASE db1; CREATE DATABASE db2;")
+            .unwrap();
+        c.execute("CREATE TABLE main.t (a INTEGER, tag VARCHAR);")
+            .unwrap();
         c.execute("INSERT INTO main.t VALUES (1, 'main');").unwrap();
-        c.execute("CREATE TABLE db1.t (a INTEGER, tag VARCHAR);").unwrap();
-        c.execute("INSERT INTO db1.t VALUES (1, 'db1'), (2, 'db1');").unwrap();
-        c.execute("CREATE TABLE db2.u (a INTEGER, u VARCHAR);").unwrap();
-        c.execute("INSERT INTO db2.u VALUES (1, 'u1'), (1, 'u2');").unwrap();
+        c.execute("CREATE TABLE db1.t (a INTEGER, tag VARCHAR);")
+            .unwrap();
+        c.execute("INSERT INTO db1.t VALUES (1, 'db1'), (2, 'db1');")
+            .unwrap();
+        c.execute("CREATE TABLE db2.u (a INTEGER, u VARCHAR);")
+            .unwrap();
+        c.execute("INSERT INTO db2.u VALUES (1, 'u1'), (1, 'u2');")
+            .unwrap();
         db
     }
 
@@ -768,12 +797,20 @@ mod tests {
 
         // A switches; B is untouched.
         let results = a.execute("USE db1;").unwrap();
-        assert_eq!(results, vec![QueryResult::Used { db: "db1".to_string() }]);
+        assert_eq!(
+            results,
+            vec![QueryResult::Used {
+                db: "db1".to_string()
+            }]
+        );
         assert_eq!(a.current_db(), "db1");
         assert_eq!(b.current_db(), "main");
         assert_eq!(
             rows_of(a.execute("SELECT tag FROM t;").unwrap()),
-            vec![vec![Value::Varchar("db1".to_string())], vec![Value::Varchar("db1".to_string())]]
+            vec![
+                vec![Value::Varchar("db1".to_string())],
+                vec![Value::Varchar("db1".to_string())]
+            ]
         );
         assert_eq!(
             rows_of(b.execute("SELECT tag FROM t;").unwrap()),
@@ -784,7 +821,10 @@ mod tests {
 
         // USE to a missing database is a clear bind-time error.
         let err = b.execute("USE nope;").unwrap_err();
-        assert!(err.to_string().contains("database \"nope\" not found"), "{err}");
+        assert!(
+            err.to_string().contains("database \"nope\" not found"),
+            "{err}"
+        );
 
         // Qualified names resolve regardless of the session.
         assert_eq!(
@@ -806,7 +846,10 @@ mod tests {
             rows_of(c.execute("SELECT tag FROM t;").unwrap()),
             vec![vec![Value::Varchar("main".to_string())]]
         );
-        assert_eq!(rows_of(c.execute("SELECT tag FROM db1.t;").unwrap()).len(), 2);
+        assert_eq!(
+            rows_of(c.execute("SELECT tag FROM db1.t;").unwrap()).len(),
+            2
+        );
         // Cross-database join: each side resolves independently.
         let rows = rows_of(
             c.execute(
@@ -818,8 +861,14 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                vec![Value::Varchar("db1".to_string()), Value::Varchar("u1".to_string())],
-                vec![Value::Varchar("db1".to_string()), Value::Varchar("u2".to_string())],
+                vec![
+                    Value::Varchar("db1".to_string()),
+                    Value::Varchar("u1".to_string())
+                ],
+                vec![
+                    Value::Varchar("db1".to_string()),
+                    Value::Varchar("u2".to_string())
+                ],
             ]
         );
         // Three-part column references stay a parse error.
@@ -837,7 +886,9 @@ mod tests {
 
         assert_eq!(
             c.execute("CREATE DATABASE Analytics;").unwrap(),
-            vec![QueryResult::CreatedDatabase { name: "Analytics".to_string() }]
+            vec![QueryResult::CreatedDatabase {
+                name: "Analytics".to_string()
+            }]
         );
         let err = c.execute("CREATE DATABASE analytics;").unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");
@@ -849,19 +900,28 @@ mod tests {
         assert_eq!(c.current_db(), "analytics");
         assert_eq!(
             c.execute("DROP DATABASE analytics;").unwrap(),
-            vec![QueryResult::DroppedDatabase { name: "analytics".to_string() }]
+            vec![QueryResult::DroppedDatabase {
+                name: "analytics".to_string()
+            }]
         );
         assert_eq!(c.current_db(), "main");
         assert_eq!(c.execute("SELECT 1;").unwrap().len(), 1);
 
         // Dropping main while another database exists is allowed and the
         // session moves to the first remaining database.
-        c.execute("CREATE DATABASE db1; CREATE DATABASE db2;").unwrap();
+        c.execute("CREATE DATABASE db1; CREATE DATABASE db2;")
+            .unwrap();
         assert_eq!(
             c.execute("DROP DATABASE main;").unwrap(),
-            vec![QueryResult::DroppedDatabase { name: "main".to_string() }]
+            vec![QueryResult::DroppedDatabase {
+                name: "main".to_string()
+            }]
         );
-        assert_eq!(c.current_db(), "db1", "fallback is the first sorted database");
+        assert_eq!(
+            c.current_db(),
+            "db1",
+            "fallback is the first sorted database"
+        );
         // Now db1 is the current database and can only be dropped if another
         // remains; drop db2 first (not current), then db1 is the last.
         c.execute("DROP DATABASE db2;").unwrap();
@@ -874,7 +934,8 @@ mod tests {
         let db = multi_db();
         let mut c = db.connect();
         c.execute("INSERT INTO db1.t VALUES (3, 'new');").unwrap();
-        c.execute("UPDATE db1.t SET tag = 'up' WHERE a = 3;").unwrap();
+        c.execute("UPDATE db1.t SET tag = 'up' WHERE a = 3;")
+            .unwrap();
         assert_eq!(
             rows_of(c.execute("SELECT tag FROM db1.t WHERE a = 3;").unwrap()),
             vec![vec![Value::Varchar("up".to_string())]]
@@ -887,12 +948,19 @@ mod tests {
 
         // Views are created in the session's database and resolved there.
         c.execute("USE db1;").unwrap();
-        c.execute("CREATE VIEW tview AS SELECT tag FROM t;").unwrap();
+        c.execute("CREATE VIEW tview AS SELECT tag FROM t;")
+            .unwrap();
         assert_eq!(rows_of(c.execute("SELECT * FROM tview;").unwrap()).len(), 2);
         c.execute("USE main;").unwrap();
-        assert!(c.execute("SELECT * FROM tview;").is_err(), "not visible from main");
+        assert!(
+            c.execute("SELECT * FROM tview;").is_err(),
+            "not visible from main"
+        );
         // ... but reachable qualified from another session database.
-        assert_eq!(rows_of(c.execute("SELECT * FROM db1.tview;").unwrap()).len(), 2);
+        assert_eq!(
+            rows_of(c.execute("SELECT * FROM db1.tview;").unwrap()).len(),
+            2
+        );
         // The view's body resolves `t` in db1 even though the session is main.
         c.execute("DROP VIEW db1.tview;").unwrap();
         assert!(c.execute("SELECT * FROM db1.tview;").is_err());
@@ -904,13 +972,24 @@ mod tests {
         let mut c = db.connect();
         c.execute("BEGIN;").unwrap();
         let err = c.execute("CREATE DATABASE db1;").unwrap_err();
-        assert!(err.to_string().contains("not allowed inside a transaction"), "{err}");
+        assert!(
+            err.to_string().contains("not allowed inside a transaction"),
+            "{err}"
+        );
         let err = c.execute("DROP DATABASE main;").unwrap_err();
-        assert!(err.to_string().contains("not allowed inside a transaction"), "{err}");
+        assert!(
+            err.to_string().contains("not allowed inside a transaction"),
+            "{err}"
+        );
         // LOAD EXTENSION would only register in the private snapshot and then
         // be discarded at COMMIT: refused like the database DDL above.
-        let err = c.execute("LOAD EXTENSION '/does/not/exist.dylib';").unwrap_err();
-        assert_eq!(err.to_string(), "LOAD EXTENSION is not allowed inside a transaction");
+        let err = c
+            .execute("LOAD EXTENSION '/does/not/exist.dylib';")
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "LOAD EXTENSION is not allowed inside a transaction"
+        );
         c.execute("ROLLBACK;").unwrap();
         c.execute("CREATE DATABASE db1;").unwrap();
     }
@@ -928,13 +1007,19 @@ mod tests {
         c.execute("CREATE VIEW db1.v AS SELECT * FROM x;").unwrap();
         // The caller's CTE is named like the view body's table.
         assert_eq!(
-            rows_of(c.execute("WITH x AS (SELECT 99 AS v) SELECT * FROM db1.v;").unwrap()),
+            rows_of(
+                c.execute("WITH x AS (SELECT 99 AS v) SELECT * FROM db1.v;")
+                    .unwrap()
+            ),
             vec![vec![Value::Integer(1)]],
             "the view body must resolve the table, not the caller's CTE"
         );
         // A CTE the view does not reference is unaffected.
         assert_eq!(
-            rows_of(c.execute("WITH y AS (SELECT 7 AS v) SELECT * FROM db1.v;").unwrap()),
+            rows_of(
+                c.execute("WITH y AS (SELECT 7 AS v) SELECT * FROM db1.v;")
+                    .unwrap()
+            ),
             vec![vec![Value::Integer(1)]]
         );
         // The view's own CTEs still bind and resolve.
@@ -957,11 +1042,23 @@ mod tests {
         a.execute("INSERT INTO t VALUES (20, 'txn');").unwrap();
         // Not visible outside the transaction yet.
         let mut b = db.connect();
-        assert_eq!(rows_of(b.execute("SELECT COUNT(*) FROM db1.t;").unwrap()), vec![vec![Value::Bigint(2)]]);
-        assert_eq!(rows_of(b.execute("SELECT COUNT(*) FROM main.t;").unwrap()), vec![vec![Value::Bigint(1)]]);
+        assert_eq!(
+            rows_of(b.execute("SELECT COUNT(*) FROM db1.t;").unwrap()),
+            vec![vec![Value::Bigint(2)]]
+        );
+        assert_eq!(
+            rows_of(b.execute("SELECT COUNT(*) FROM main.t;").unwrap()),
+            vec![vec![Value::Bigint(1)]]
+        );
         a.execute("COMMIT;").unwrap();
-        assert_eq!(rows_of(b.execute("SELECT COUNT(*) FROM db1.t;").unwrap()), vec![vec![Value::Bigint(3)]]);
-        assert_eq!(rows_of(b.execute("SELECT COUNT(*) FROM main.t;").unwrap()), vec![vec![Value::Bigint(2)]]);
+        assert_eq!(
+            rows_of(b.execute("SELECT COUNT(*) FROM db1.t;").unwrap()),
+            vec![vec![Value::Bigint(3)]]
+        );
+        assert_eq!(
+            rows_of(b.execute("SELECT COUNT(*) FROM main.t;").unwrap()),
+            vec![vec![Value::Bigint(2)]]
+        );
         // The transaction switched only its own session.
         assert_eq!(a.current_db(), "main");
         assert_eq!(b.current_db(), "main");
@@ -998,7 +1095,10 @@ mod tests {
             err.to_string().contains("expression too deep"),
             "unexpected error: {err}"
         );
-        assert_eq!(rows_of(c.execute("SELECT 2;").unwrap()), vec![vec![Value::Integer(2)]]);
+        assert_eq!(
+            rows_of(c.execute("SELECT 2;").unwrap()),
+            vec![vec![Value::Integer(2)]]
+        );
     }
 
     /// A ~10k-term chain (far past the recursive-drop crash point on this
@@ -1047,7 +1147,8 @@ mod tests {
             vec![vec![Value::Bigint(3)]]
         );
         // Transactions take the same path.
-        c.execute("BEGIN; INSERT INTO t VALUES (4, 'w'); COMMIT;").unwrap();
+        c.execute("BEGIN; INSERT INTO t VALUES (4, 'w'); COMMIT;")
+            .unwrap();
         assert_eq!(
             rows_of(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
             vec![vec![Value::Bigint(4)]]

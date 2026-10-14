@@ -250,7 +250,11 @@ impl Server {
                     eprintln!("pinkdb-server: accept loop stopped: {e}");
                 }
             })?;
-        Ok(ServerHandle { addr, shutdown, thread: Some(thread) })
+        Ok(ServerHandle {
+            addr,
+            shutdown,
+            thread: Some(thread),
+        })
     }
 }
 
@@ -480,8 +484,10 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), ProtocolError> {
     match result {
         QueryResult::Selected { names, types, rows } => {
-            let result_set =
-                Response::ResultSet { names: names.clone(), types: types.clone() };
+            let result_set = Response::ResultSet {
+                names: names.clone(),
+                types: types.clone(),
+            };
             protocol::write_response(w, &result_set)?;
             let mut batch: Vec<Vec<Value>> = Vec::new();
             let mut batch_bytes = 0usize;
@@ -491,7 +497,9 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
                     && (batch.len() >= protocol::ROWS_PER_FRAME
                         || batch_bytes + row_bytes > ROWS_FRAME_BUDGET)
                 {
-                    let frame = Response::Rows { rows: std::mem::take(&mut batch) };
+                    let frame = Response::Rows {
+                        rows: std::mem::take(&mut batch),
+                    };
                     protocol::write_response(w, &frame)?;
                     batch_bytes = 0;
                 }
@@ -516,25 +524,27 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
         QueryResult::CreatedDatabase { name } => done(w, DoneKind::CreatedDatabase, 0, name),
         QueryResult::DroppedDatabase { name } => done(w, DoneKind::DroppedDatabase, 0, name),
         QueryResult::Used { db } => done(w, DoneKind::Used, 0, db),
-        QueryResult::LoadedExtension { name } => {
-            done(w, DoneKind::LoadedExtension, 0, name)
-        }
+        QueryResult::LoadedExtension { name } => done(w, DoneKind::LoadedExtension, 0, name),
         QueryResult::Checkpointed => done(w, DoneKind::Checkpointed, 0, ""),
     }
 }
 
-fn done<W: Write>(
-    w: &mut W,
-    kind: DoneKind,
-    count: u64,
-    name: &str,
-) -> Result<(), ProtocolError> {
+fn done<W: Write>(w: &mut W, kind: DoneKind, count: u64, name: &str) -> Result<(), ProtocolError> {
     protocol::write_response(
         w,
-        &Response::Done { kind, count, name: name.to_string() },
+        &Response::Done {
+            kind,
+            count,
+            name: name.to_string(),
+        },
     )
 }
 
 fn send_error<W: Write>(w: &mut W, message: &str) -> Result<(), ProtocolError> {
-    protocol::write_response(w, &Response::Error { message: message.to_string() })
+    protocol::write_response(
+        w,
+        &Response::Error {
+            message: message.to_string(),
+        },
+    )
 }

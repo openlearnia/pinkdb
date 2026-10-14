@@ -61,7 +61,8 @@ fn fixture_store() -> PinkDb {
         ])
         .unwrap();
     }
-    db.execute("CREATE TABLE big (a INTEGER, s VARCHAR);").unwrap();
+    db.execute("CREATE TABLE big (a INTEGER, s VARCHAR);")
+        .unwrap();
     {
         let t = db.table_mut("big").unwrap();
         for i in 0..(CHUNK_SIZE + 100) {
@@ -72,12 +73,15 @@ fn fixture_store() -> PinkDb {
             .unwrap();
         }
     }
-    db.execute("CREATE TABLE empty (x INTEGER, y VARCHAR);").unwrap();
+    db.execute("CREATE TABLE empty (x INTEGER, y VARCHAR);")
+        .unwrap();
     db.execute("CREATE DATABASE analytics;").unwrap();
     db.execute("CREATE TABLE analytics.u (k BIGINT);").unwrap();
     db.execute("INSERT INTO analytics.u VALUES (7);").unwrap();
-    db.execute("CREATE TABLE analytics.\"a.b\" (z DOUBLE);").unwrap();
-    db.execute("INSERT INTO analytics.\"a.b\" VALUES (1.5), (-0.0);").unwrap();
+    db.execute("CREATE TABLE analytics.\"a.b\" (z DOUBLE);")
+        .unwrap();
+    db.execute("INSERT INTO analytics.\"a.b\" VALUES (1.5), (-0.0);")
+        .unwrap();
     db
 }
 
@@ -198,7 +202,11 @@ fn snapshot_roundtrip_is_bit_exact() {
     for (key, entry) in tables {
         assert_eq!(entry["format"], "vortex", "{key}");
         let files = entry["files"].as_array().unwrap();
-        assert_eq!(files.len(), 1, "the writer emits one file per table ({key})");
+        assert_eq!(
+            files.len(),
+            1,
+            "the writer emits one file per table ({key})"
+        );
         let rel = files[0].as_str().unwrap();
         assert!(rel.starts_with("data/"), "{rel}");
         assert!(rel.ends_with(".vortex"), "{rel}");
@@ -236,10 +244,7 @@ fn snapshot_roundtrip_is_bit_exact() {
             ("y".to_string(), DataType::Varchar)
         ]
     );
-    assert_eq!(
-        empty.num_chunks(),
-        db.table("empty").unwrap().num_chunks()
-    );
+    assert_eq!(empty.num_chunks(), db.table("empty").unwrap().num_chunks());
     // Multi-chunk table intact.
     assert_eq!(loaded.table("big").unwrap().num_rows(), CHUNK_SIZE + 100);
     assert_eq!(loaded.table("big").unwrap().num_chunks(), 2);
@@ -286,11 +291,18 @@ fn versions_accumulate_and_old_versions_stay_loadable() {
     assert_eq!(lake.versions().unwrap(), vec![1, 2, 3]);
     // v2 wrote 5 files, v3 wrote 5 more (main.t changed, main.big dropped,
     // extra.e added): old data files are never touched.
-    assert_eq!(data_files(&dir.join("data")).len(), 10, "old data files stay");
+    assert_eq!(
+        data_files(&dir.join("data")).len(),
+        10,
+        "old data files stay"
+    );
 
     let latest = lake.load(None).unwrap();
     assert_same_store(&db, &latest);
-    assert_eq!(store_bytes(&latest, &dir, "latest"), store_bytes(&db, &dir, "current"));
+    assert_eq!(
+        store_bytes(&latest, &dir, "latest"),
+        store_bytes(&db, &dir, "current")
+    );
 
     let old = lake.load(Some(2)).unwrap();
     assert_eq!(store_bytes(&old, &dir, "old"), v2_bytes);
@@ -373,7 +385,10 @@ fn manifest_without_catalog_keeps_the_previous_version() {
     let lake = Lake::open(&dir).unwrap();
     assert_eq!(lake.current_version(), 2, "the catalog is authoritative");
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);
-    assert_eq!(store_bytes(&lake.load(None).unwrap(), &dir, "prev"), v2_bytes);
+    assert_eq!(
+        store_bytes(&lake.load(None).unwrap(), &dir, "prev"),
+        v2_bytes
+    );
 
     // The leftover manifest is self-contained (its data files were written
     // first), so an explicit load works — it is ignored, not corrupt.
@@ -435,7 +450,11 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     let mut abs = read_json(&dir.join("catalog.json"));
     abs["tables"]["main.t"]["files"] = serde_json::json!(["/etc/passwd"]);
     write_json(&dir.join("catalog.json"), &abs);
-    assert!(lake.load(None).unwrap_err().to_string().contains("under data/"));
+    assert!(lake
+        .load(None)
+        .unwrap_err()
+        .to_string()
+        .contains("under data/"));
 
     // An unsupported format_version is named, not misparsed.
     let mut future = read_json(&dir.join("catalog.json"));
@@ -465,7 +484,10 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     write_json(&dir.join("catalog.json"), &v1_vortex);
     let err = Lake::open(&dir).unwrap_err().to_string();
     assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("vortex data file in a format_version 1 manifest"), "{err}");
+    assert!(
+        err.contains("vortex data file in a format_version 1 manifest"),
+        "{err}"
+    );
 
     // A missing field is corrupt, not defaulted.
     write_json(
@@ -486,7 +508,11 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
         }),
     );
     let lake = Lake::open(&dir).unwrap();
-    assert!(lake.load(None).unwrap_err().to_string().contains("no data files"));
+    assert!(lake
+        .load(None)
+        .unwrap_err()
+        .to_string()
+        .contains("no data files"));
 
     // A snapshot whose declared version disagrees with its file name.
     let mut wrong = read_json(&dir.join("catalog.json"));
@@ -538,7 +564,8 @@ fn a_table_entry_can_list_several_data_files() {
     let dir = scratch("multifile");
     let other = scratch("multifile-src");
     let mut db = PinkDb::new();
-    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);").unwrap();
+    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+        .unwrap();
     for i in 0..3 {
         db.table_mut("t")
             .unwrap()
@@ -551,7 +578,8 @@ fn a_table_entry_can_list_several_data_files() {
     // A second lake with the same schema; graft its data file into the first.
     let mut lake2 = Lake::create(&other).unwrap();
     let mut db2 = PinkDb::new();
-    db2.execute("CREATE TABLE t (x INTEGER, s VARCHAR);").unwrap();
+    db2.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+        .unwrap();
     for i in 3..6 {
         db2.table_mut("t")
             .unwrap()
@@ -579,14 +607,20 @@ fn a_table_entry_can_list_several_data_files() {
     let lake = Lake::open(&dir).unwrap();
     let loaded = lake.load(None).unwrap();
     assert_eq!(loaded.table("t").unwrap().num_rows(), 6);
-    assert_eq!(loaded.table("t").unwrap().get(4, 1), Some(Value::Varchar("v4".into())));
+    assert_eq!(
+        loaded.table("t").unwrap().get(4, 1),
+        Some(Value::Varchar("v4".into()))
+    );
 
     // A row count that disagrees with the files is corrupt.
     catalog["tables"]["main.t"]["rows"] = serde_json::json!(999);
     write_json(&dir.join("catalog.json"), &catalog);
     let lake = Lake::open(&dir).unwrap();
     let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("has 6 rows, but the catalog says 999"), "{err}");
+    assert!(
+        err.contains("has 6 rows, but the catalog says 999"),
+        "{err}"
+    );
 
     cleanup(&dir);
     cleanup(&other);
@@ -664,7 +698,8 @@ fn database_names_with_a_dot_are_refused_cleanly() {
 fn table_names_stay_inside_the_data_directory() {
     let dir = scratch("names");
     let mut db = PinkDb::new();
-    db.execute("CREATE TABLE \"odd name\" (x INTEGER);").unwrap();
+    db.execute("CREATE TABLE \"odd name\" (x INTEGER);")
+        .unwrap();
     db.execute("CREATE TABLE \"a/b\" (x INTEGER);").unwrap();
     db.execute("CREATE TABLE \"..\" (x INTEGER);").unwrap();
     db.execute("INSERT INTO \"odd name\" VALUES (1);").unwrap();
@@ -824,7 +859,10 @@ fn rollback_resave_refuses_to_replace_a_published_snapshot() {
     assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
     let msg = err.to_string();
     assert!(msg.contains("snapshot 3 already exists"), "{msg}");
-    assert!(msg.contains("refusing to replace a published version"), "{msg}");
+    assert!(
+        msg.contains("refusing to replace a published version"),
+        "{msg}"
+    );
     assert_eq!(
         std::fs::read(dir.join("snapshots/3.json")).unwrap(),
         v3_snapshot,
@@ -908,7 +946,9 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
     // A dotted database name cannot be a flat `db.table` key.
     let mut dotted = PinkDb::new();
     dotted.execute("CREATE DATABASE \"a.b\";").unwrap();
-    dotted.execute("CREATE TABLE \"a.b\".t (x INTEGER);").unwrap();
+    dotted
+        .execute("CREATE TABLE \"a.b\".t (x INTEGER);")
+        .unwrap();
     let err = validate_store(&dotted).unwrap_err().to_string();
     assert!(err.contains("contains \".\""), "{err}");
     let err = save_store(&dotted, &lake_dir).unwrap_err().to_string();
@@ -923,7 +963,8 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
     // ENAMETOOLONG after creating an empty v1 lake).
     let mut long = PinkDb::new();
     let name = "é".repeat(100); // 200 UTF-8 bytes -> 600 encoded bytes
-    long.execute(&format!("CREATE TABLE \"{name}\" (x INTEGER);")).unwrap();
+    long.execute(&format!("CREATE TABLE \"{name}\" (x INTEGER);"))
+        .unwrap();
     let err = validate_store(&long).unwrap_err().to_string();
     assert!(err.contains("over the 200-byte limit"), "{err}");
     let err = save_store(&long, &lake_dir).unwrap_err().to_string();
@@ -934,7 +975,8 @@ fn save_rejects_unrepresentable_stores_before_creating_a_lake() {
     // A long-but-encodable name still saves: the check is not over-strict.
     let mut ok = PinkDb::new();
     let name = "a".repeat(180);
-    ok.execute(&format!("CREATE TABLE \"{name}\" (x INTEGER);")).unwrap();
+    ok.execute(&format!("CREATE TABLE \"{name}\" (x INTEGER);"))
+        .unwrap();
     assert!(validate_store(&ok).is_ok());
     assert_eq!(save_store(&ok, &lake_dir).unwrap(), 2);
     let lake = Lake::open(&lake_dir).unwrap();
@@ -1012,9 +1054,19 @@ fn a_catalog_rename_failure_keeps_the_previous_catalog_authoritative() {
         catalog_before,
         "the previous catalog stayed authoritative"
     );
-    assert!(dir.join("snapshots/3.json").is_file(), "the stray manifest is there");
-    assert_eq!(lake.versions().unwrap(), vec![1, 2], "an unpublished stray is not listed");
-    assert!(lake.load(Some(3)).is_ok(), "the stray manifest is self-contained");
+    assert!(
+        dir.join("snapshots/3.json").is_file(),
+        "the stray manifest is there"
+    );
+    assert_eq!(
+        lake.versions().unwrap(),
+        vec![1, 2],
+        "an unpublished stray is not listed"
+    );
+    assert!(
+        lake.load(Some(3)).is_ok(),
+        "the stray manifest is self-contained"
+    );
 
     // The documented recovery: delete the unpublished stray, retry.
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1048,7 +1100,9 @@ fn missing_data_files_are_reported_but_metadata_still_reads() {
     let missing = lake.missing_data_files().unwrap();
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].0, "main.t");
-    assert!(missing[0].1.ends_with(victim.file_name().unwrap().to_str().unwrap()));
+    assert!(missing[0]
+        .1
+        .ends_with(victim.file_name().unwrap().to_str().unwrap()));
     // Metadata still reads; only a load fails, and it says why.
     assert!(lake.tables().unwrap().iter().any(|(k, _)| k == "main.t"));
     let err = lake.load(None).unwrap_err().to_string();
@@ -1219,7 +1273,10 @@ fn v1_fixture_lake_still_loads_bit_exactly() {
         fid.get(0, 3),
         Some(Value::Double(x)) if x.to_bits() == (-0.0f64).to_bits()
     ));
-    assert_eq!(fid.get(1, 4), Some(Value::Varchar("héllo wörld 🌍\0embedded".into())));
+    assert_eq!(
+        fid.get(1, 4),
+        Some(Value::Varchar("héllo wörld 🌍\0embedded".into()))
+    );
     assert_eq!(fid.get(0, 4), Some(Value::Varchar(String::new())));
     assert_eq!(fid.get(2, 0), Some(Value::Null));
     assert!(matches!(fid.get(0, 5), Some(Value::Date(i32::MIN))));
@@ -1261,9 +1318,16 @@ fn v1_lake_migrates_to_vortex_on_save() {
         );
     }
     let data = data_files(&dir.join("data"));
-    assert_eq!(data.iter().filter(|p| p.extension().unwrap() == "vortex").count(), 6);
     assert_eq!(
-        data.iter().filter(|p| p.extension().unwrap() == "pink").count(),
+        data.iter()
+            .filter(|p| p.extension().unwrap() == "vortex")
+            .count(),
+        6
+    );
+    assert_eq!(
+        data.iter()
+            .filter(|p| p.extension().unwrap() == "pink")
+            .count(),
         6,
         "the v1 files stay untouched"
     );
@@ -1336,8 +1400,14 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
         .collect();
     assert!(codes.contains(&(-0.0f64).to_bits()));
     assert!(codes.contains(&0.0f64.to_bits()));
-    assert!(codes.contains(&0x7ff8_0000_dead_beef), "positive NaN payload");
-    assert!(codes.contains(&0xfff8_0000_0000_0001), "negative NaN payload");
+    assert!(
+        codes.contains(&0x7ff8_0000_dead_beef),
+        "positive NaN payload"
+    );
+    assert!(
+        codes.contains(&0xfff8_0000_0000_0001),
+        "negative NaN payload"
+    );
     assert!(codes.contains(&f64::INFINITY.to_bits()));
 
     // DATE/TIMESTAMP extremes, i32/i64 extremes, NULLs, strings.
