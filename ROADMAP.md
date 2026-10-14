@@ -283,6 +283,14 @@ Java bindings.
   a single-writer fallback with read-back verification + catalog/snapshot reconciliation, race
   window documented); minors: client-side >5 GiB PUT refusal, timeout/no-retry docs, NoSuchBucket
   mapping, session-token scoping, sticky-flag scoping, symlink-safe temp copies, http:// opt-in
-  (PINKDB_S3_ALLOW_HTTP), paging cap, bucket-rule alignment; 493 default / 104 pink-lake s3 tests
+  (PINKDB_S3_ALLOW_HTTP), paging cap, bucket-rule alignment; 493 default / 104 pink-lake s3 tests ;
+  Docker-based real-S3 test harness (`crates/pink-lake/tests/s3_docker.sh`, s3mock): full
+  `s3://` roundtrip through the CLI (typed CSV, fresh-process open, byte-exact values),
+  concurrency races with catalog==snapshot byte checks, refusals, container lifecycle/KEEP;
+  discovered+documented that s3mock's conditional PUTs are NOT atomic under concurrency
+  (check-then-act; 60/60 duplicate 200s) — the harness reports that as a server limitation
+  and enforces one-winner only where the server can (plus a deterministic same-version
+  conflict test); AWS/R2 remain the atomic check via `PINKDB_S3_LIVE=1`; MinIO images now
+  unpullable without auth (documented)
 - 2026-10-14 — Binary size: `pinkdb` 2.22 MB default; 44.6 MB with `--features lake`; 46.5 MB
   with `lake,s3` (release, after wave 36; pre-wave-17 was 2.26 MB).
