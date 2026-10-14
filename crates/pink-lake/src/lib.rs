@@ -1,9 +1,12 @@
 //! pink-lake — the minimal lake layer for pinkdb: decoupled metadata and
-//! data storage on local disk.
+//! data storage on local disk, or in an S3 bucket/prefix with the
+//! non-default `s3` feature (AWS S3, Cloudflare R2, any S3-compatible
+//! endpoint).
 //!
 //! # What a lake is
 //!
-//! A lake is a directory:
+//! A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
+//! key prefix with exactly the same layout):
 //!
 //! ```text
 //! <lake>/
@@ -133,9 +136,18 @@
 //! - **Single writer**: one live handle per lake directory; a stale handle's
 //!   save fails with [`LakeError::Conflict`], it never silently forks the
 //!   version chain.
-//! - I/O goes through a private `LocalStorage` handle. There is deliberately
-//!   no storage trait yet — with a single implementation it would be unused
-//!   abstraction; wave 36 (S3) can lift the surface into a trait then.
+//! - I/O goes through a private `Storage` trait: a local directory
+//!   (`LocalStorage`, the wave-34/35 behavior unchanged) or, with the
+//!   non-default `s3` feature, an S3 bucket and key prefix.
+//!   `Lake::open_url("s3://bucket/prefix")` (and
+//!   [`save_store_url`]) accept either; without the feature an `s3://`
+//!   location is a clear [`LakeError::FeatureMissing`]. Over S3 the
+//!   snapshot `put_new` is `If-None-Match: *` and the catalog replace is
+//!   `If-Match: <etag>`, so AWS S3 / Cloudflare R2 evaluate conflict
+//!   detection atomically with the write; an endpoint that rejects
+//!   conditional writes degrades (once, noted) to a check-then-put with the
+//!   documented window. Single-PUT objects only: no multipart, so one table
+//!   file must be ≤ 5 GiB (see the README).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -146,11 +158,20 @@ use pinkdb::{DataTable, DataType, PinkDb, Vector};
 
 mod catalog;
 mod local;
+#[cfg(test)]
+mod mock_s3;
+mod storage;
+#[cfg(feature = "s3")]
+mod s3;
 mod time;
 mod vortex_file;
 
 use catalog::{Catalog, FileFormat, TableEntry};
 use local::{LocalStorage, CATALOG_FILE};
+use storage::{Head, Location, Storage, VersionTag};
+
+#[cfg(feature = "s3")]
+pub use s3::S3Config;
 
 /// The catalog format version this build reads and writes.
 ///
@@ -195,6 +216,18 @@ pub enum LakeError {
     /// The lake is at [`MAX_VERSION`] (or `u64::MAX - 1`) and cannot publish
     /// a further version without wrapping.
     Overflow { path: PathBuf, version: u64 },
+    /// The location string is not usable: a malformed `s3://` URL, a bad
+    /// bucket/prefix/endpoint.
+    BadLocation { location: String, message: String },
+    /// This pink-lake build cannot do that: a non-default cargo feature is
+    /// missing (an `s3://` location without the `s3` feature).
+    FeatureMissing {
+        feature: &'static str,
+        message: String,
+    },
+    /// Object storage denied the request (HTTP 403): credentials, bucket
+    /// permissions, or a wrong endpoint.
+    Auth { path: PathBuf, message: String },
     /// Filesystem failure, with the operation that failed.
     Io { context: String, source: std::io::Error },
     /// The engine rejected the data or the store shape.
@@ -245,6 +278,16 @@ impl fmt::Display for LakeError {
                  (this build publishes at most {MAX_VERSION})",
                 path.display()
             ),
+            LakeError::BadLocation { location, message } => {
+                write!(f, "invalid lake location {location:?}: {message}")
+            }
+            LakeError::FeatureMissing { feature, message } => write!(
+                f,
+                "this pink-lake build does not include the `{feature}` feature: {message}"
+            ),
+            LakeError::Auth { path, message } => {
+                write!(f, "object storage access error at {}: {message}", path.display())
+            }
             LakeError::Io { context, source } => write!(f, "lake I/O error ({context}): {source}"),
             LakeError::Engine { context, source } => {
                 write!(f, "lake data error ({context}): {source}")
@@ -280,17 +323,17 @@ pub struct SaveReport {
     pub bytes_written: u64,
 }
 
-/// A handle to a lake directory.
+/// A handle to a lake.
 ///
 /// The handle caches the catalog's current version (single-writer contract:
-/// one live handle per directory); [`Lake::current_version`] reflects the
+/// one live handle per lake location); [`Lake::current_version`] reflects the
 /// last open/create/save, not an out-of-band edit made by another process.
 /// If another writer publishes in the meantime, the next save fails with
 /// [`LakeError::Conflict`] — reopen the lake to continue.
 #[derive(Debug)]
 pub struct Lake {
     root: PathBuf,
-    storage: LocalStorage,
+    storage: Box<dyn Storage>,
     format_version: u32,
     version: u64,
 }
@@ -307,9 +350,24 @@ impl Lake {
     /// snapshot, and the loser retries [`Lake::open`] via
     /// [`Lake::open_or_create`].
     pub fn create(dir: impl AsRef<Path>) -> Result<Self> {
-        let root = dir.as_ref().to_path_buf();
-        let storage = LocalStorage::new(&root);
-        if storage.exists(CATALOG_FILE) {
+        Self::create_with(Box::new(LocalStorage::new(dir.as_ref())))
+    }
+
+    /// Create a lake at a location string: a local directory, or an
+    /// `s3://bucket/prefix` URL when the `s3` feature is built (a clear
+    /// [`LakeError::FeatureMissing`] otherwise). S3 credentials, endpoint and
+    /// region come from the usual environment variables (`AWS_ACCESS_KEY_ID`,
+    /// `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_ENDPOINT_URL`/
+    /// `AWS_ENDPOINT_URL_S3`, `AWS_REGION`/`AWS_DEFAULT_REGION`,
+    /// `AWS_S3_FORCE_PATH_STYLE`); use `Lake::create_s3` (with the `s3`
+    /// feature) for explicit configuration.
+    pub fn create_url(location: &str) -> Result<Self> {
+        Self::create_with(storage_for(Location::parse(location)?)?)
+    }
+
+    fn create_with(storage: Box<dyn Storage>) -> Result<Self> {
+        let root = storage.abs("");
+        if storage.exists(CATALOG_FILE)? {
             return Err(LakeError::AlreadyALake { path: root });
         }
         storage.create_dir("")?;
@@ -321,14 +379,14 @@ impl Lake {
         };
         let bytes = manifest_json(&manifest, &root)?;
         // Adopt (do not rewrite) an empty version-1 snapshot a concurrent or
-        // interrupted create already linked: the catalog must stay
+        // interrupted create already put there: the catalog must stay
         // byte-identical to the snapshot of its version.
-        let bytes = if storage.publish_new("snapshots/1.json", &bytes)? {
+        let bytes = if storage.put_new("snapshots/1.json", &bytes)? {
             bytes
         } else {
             let rel = "snapshots/1.json";
             let path = storage.abs(rel);
-            let existing = storage.read(rel)?;
+            let existing = storage.read(rel, &format!("reading {}", path.display()))?;
             let parsed = read_manifest(&path, &existing).map_err(|e| LakeError::Conflict {
                 path: path.clone(),
                 message: format!("snapshots/1.json exists but does not parse ({e}); refusing to adopt it"),
@@ -343,7 +401,7 @@ impl Lake {
             }
             existing
         };
-        if !storage.publish_new(CATALOG_FILE, &bytes)? {
+        if !storage.put_new(CATALOG_FILE, &bytes)? {
             return Err(LakeError::AlreadyALake { path: root });
         }
         Ok(Self {
@@ -356,9 +414,21 @@ impl Lake {
 
     /// Open an existing lake: `dir/catalog.json` must exist and parse.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        let root = dir.as_ref().to_path_buf();
-        let storage = LocalStorage::new(&root);
-        let manifest = read_catalog(&storage, &root)?;
+        Self::open_with(Box::new(LocalStorage::new(dir.as_ref())))
+    }
+
+    /// Open a lake at a location string: a local directory, or an
+    /// `s3://bucket/prefix` URL when the `s3` feature is built (see
+    /// [`Lake::create_url`] for the environment variables). Use
+    /// `Lake::open_s3` (with the `s3` feature) for explicit S3
+    /// configuration.
+    pub fn open_url(location: &str) -> Result<Self> {
+        Self::open_with(storage_for(Location::parse(location)?)?)
+    }
+
+    fn open_with(storage: Box<dyn Storage>) -> Result<Self> {
+        let root = storage.abs("");
+        let manifest = read_catalog(&*storage, &root)?;
         Ok(Self {
             root,
             storage,
@@ -383,7 +453,49 @@ impl Lake {
         }
     }
 
-    /// The lake directory.
+    /// [`Lake::open_url`] when the location already holds a lake, else
+    /// [`Lake::create_url`].
+    pub fn open_or_create_url(location: &str) -> Result<Self> {
+        match Self::open_url(location) {
+            Ok(lake) => Ok(lake),
+            Err(LakeError::NotALake { .. }) => match Self::create_url(location) {
+                Ok(lake) => Ok(lake),
+                Err(LakeError::AlreadyALake { .. }) => Self::open_url(location),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Create a lake from explicit [`S3Config`] (endpoint, region,
+    /// credentials, bucket/prefix) instead of the environment.
+    #[cfg(feature = "s3")]
+    pub fn create_s3(config: S3Config) -> Result<Self> {
+        Self::create_with(Box::new(s3::S3Storage::new(config)?))
+    }
+
+    /// Open a lake from explicit [`S3Config`].
+    #[cfg(feature = "s3")]
+    pub fn open_s3(config: S3Config) -> Result<Self> {
+        Self::open_with(Box::new(s3::S3Storage::new(config)?))
+    }
+
+    /// [`Lake::open_s3`] when the bucket/prefix already holds a lake, else
+    /// [`Lake::create_s3`].
+    #[cfg(feature = "s3")]
+    pub fn open_or_create_s3(config: S3Config) -> Result<Self> {
+        match Self::open_s3(config.clone()) {
+            Ok(lake) => Ok(lake),
+            Err(LakeError::NotALake { .. }) => match Self::create_s3(config.clone()) {
+                Ok(lake) => Ok(lake),
+                Err(LakeError::AlreadyALake { .. }) => Self::open_s3(config),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The lake location: a directory path or the `s3://bucket/prefix` URL.
     pub fn path(&self) -> &Path {
         &self.root
     }
@@ -420,7 +532,7 @@ impl Lake {
             }
             let rel = format!("snapshots/{name}");
             let path = self.storage.abs(&rel);
-            let Ok(bytes) = self.storage.read(&rel) else {
+            let Ok(bytes) = self.storage.read(&rel, &format!("reading {}", path.display())) else {
                 continue;
             };
             match read_manifest(&path, &bytes) {
@@ -460,8 +572,10 @@ impl Lake {
         let mut out = Vec::new();
         for (key, entry) in &manifest.tables {
             for rel in &entry.files {
-                if validate_rel_path(rel).is_err() || !self.root.join(rel).is_file() {
-                    out.push((key.clone(), self.root.join(rel)));
+                if validate_rel_path(rel).is_err()
+                    || !matches!(self.storage.head(rel)?, Head::File)
+                {
+                    out.push((key.clone(), self.storage.abs(rel)));
                 }
             }
         }
@@ -495,7 +609,7 @@ impl Lake {
                 version: self.version,
             })?;
         let snapshot_rel = format!("snapshots/{version}.json");
-        if self.storage.exists(&snapshot_rel) {
+        if self.storage.exists(&snapshot_rel)? {
             return Err(self.snapshot_exists_error(version));
         }
         let mut tables: BTreeMap<String, TableEntry> = BTreeMap::new();
@@ -513,11 +627,12 @@ impl Lake {
                 // the extension).
                 let rel_file = format!("{dir}/{id}.vortex");
                 // v2 encodes the whole table into a Vortex file in memory,
-                // then publishes it atomically (unique `create_new` temp
-                // sibling, fsync, rename). Nothing is referenced by the
-                // catalog until the manifest below links into place.
+                // then publishes it (locally: a unique `create_new` temp
+                // sibling + fsync + rename; over S3: one atomic PUT). Nothing
+                // is referenced by the catalog until the manifest is
+                // published below.
                 let bytes = vortex_file::encode_table(&dbname, &name, src)?;
-                self.storage.write_atomic(&rel_file, &bytes)?;
+                self.storage.put(&rel_file, &bytes)?;
                 bytes_written += bytes.len() as u64;
                 rows += src.num_rows() as u64;
                 tables.insert(
@@ -537,17 +652,33 @@ impl Lake {
             tables,
         };
         let bytes = manifest_json(&manifest, &self.root)?;
-        // Link, never rename: an existing snapshot version is a published
-        // version (or an unpublished stray the caller must remove), and is
-        // never replaced.
-        if !self.storage.publish_new(&snapshot_rel, &bytes)? {
+        // Create-only, never replace: an existing snapshot version is a
+        // published version (or an unpublished stray the caller must remove).
+        // Locally a hard link; over S3 `If-None-Match: *`.
+        if !self.storage.put_new(&snapshot_rel, &bytes)? {
             return Err(self.snapshot_exists_error(version));
         }
         bytes_written += bytes.len() as u64;
         // Re-check that the catalog is still the version our snapshot was
-        // taken from, right before replacing it.
-        self.ensure_catalog_unchanged()?;
-        self.storage.write_atomic(CATALOG_FILE, &bytes)?;
+        // taken from, right before replacing it, and replace it
+        // conditionally: `If-Match: <etag>` over S3 (a 412 is the conflict
+        // below), a file-identity re-check locally. A concurrent writer can
+        // never end up with a catalog that disagrees with the snapshot of its
+        // version.
+        let catalog_tag = self.ensure_catalog_unchanged()?;
+        if !self
+            .storage
+            .put_if_match(CATALOG_FILE, &bytes, &catalog_tag)?
+        {
+            return Err(LakeError::Conflict {
+                path: self.storage.abs(CATALOG_FILE),
+                message: format!(
+                    "catalog.json changed while this save was in flight (this handle is based \
+                     on version {}); reopen the lake",
+                    self.version
+                ),
+            });
+        }
         bytes_written += bytes.len() as u64;
         self.version = version;
         // A save always publishes a v2 (Vortex) manifest, so a handle that
@@ -566,19 +697,21 @@ impl Lake {
     fn manifest(&self, version: Option<u64>) -> Result<(Catalog, PathBuf)> {
         match version {
             None => {
-                let manifest = read_catalog(&self.storage, &self.root)?;
+                let manifest = read_catalog(&*self.storage, &self.root)?;
                 Ok((manifest, self.root.join(CATALOG_FILE)))
             }
             Some(v) => {
                 let rel = format!("snapshots/{v}.json");
                 let path = self.storage.abs(&rel);
-                if !self.storage.exists(&rel) {
+                if !self.storage.exists(&rel)? {
                     return Err(LakeError::VersionNotFound {
                         path: self.root.clone(),
                         version: v,
                     });
                 }
-                let bytes = self.storage.read(&rel)?;
+                let bytes = self
+                    .storage
+                    .read(&rel, &format!("reading {}", path.display()))?;
                 let manifest = read_manifest(&path, &bytes)?;
                 if manifest.version != v {
                     return Err(LakeError::Corrupt {
@@ -608,10 +741,14 @@ impl Lake {
     }
 
     /// The catalog must still declare the version this handle was opened or
-    /// last saved from; anything else means another writer published.
-    fn ensure_catalog_unchanged(&self) -> Result<()> {
+    /// last saved from; anything else means another writer published. Returns
+    /// the catalog's version tag for the conditional replace that follows.
+    fn ensure_catalog_unchanged(&self) -> Result<VersionTag> {
         let path = self.storage.abs(CATALOG_FILE);
-        if !self.storage.exists(CATALOG_FILE) {
+        // A directory-shaped catalog (local) still proceeds to the read and
+        // its I/O error, exactly as before; only a missing file is the
+        // conflict below.
+        if matches!(self.storage.head(CATALOG_FILE)?, Head::Missing) {
             return Err(LakeError::Conflict {
                 path,
                 message: format!(
@@ -620,7 +757,9 @@ impl Lake {
                 ),
             });
         }
-        let bytes = self.storage.read(CATALOG_FILE)?;
+        let (bytes, tag) = self
+            .storage
+            .read_tagged(CATALOG_FILE, &format!("reading {}", path.display()))?;
         let current = read_manifest(&path, &bytes)?;
         if current.version != self.version {
             return Err(LakeError::Conflict {
@@ -632,7 +771,7 @@ impl Lake {
                 ),
             });
         }
-        Ok(())
+        Ok(tag)
     }
 
     /// Build a [`PinkDb`] from a manifest by loading every referenced data
@@ -660,20 +799,25 @@ impl Lake {
             let mut created = false;
             for (i, rel) in entry.files.iter().enumerate() {
                 validate_rel_path(rel)?;
-                let path = self.root.join(rel);
+                let path = self.storage.abs(rel);
                 let mini = match format {
-                    // v1: the engine's own single-table persistence bytes.
-                    FileFormat::Pink => PinkDb::open(path_str(&path)?).map_err(|e| {
-                        LakeError::Engine {
+                    // v1: the engine's own single-table persistence bytes,
+                    // opened by path (over object storage this downloads a
+                    // temp copy that is removed when dropped).
+                    FileFormat::Pink => {
+                        let copy = self
+                            .storage
+                            .local_copy(rel, &format!("loading data file \"{rel}\""))?;
+                        PinkDb::open(path_str(copy.path())?).map_err(|e| LakeError::Engine {
                             context: format!("loading data file \"{rel}\" for table \"{key}\""),
                             source: e,
-                        }
-                    })?,
+                        })?
+                    }
                     // v2: a Vortex file that decodes into the same shape.
                     FileFormat::Vortex => {
                         let bytes = self
                             .storage
-                            .read_context(rel, format!("loading data file \"{rel}\""))?;
+                            .read(rel, &format!("loading data file \"{rel}\""))?;
                         vortex_file::decode_table(&path, &bytes)?
                     }
                 };
@@ -681,7 +825,7 @@ impl Lake {
                 if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(table)
                 {
                     return Err(LakeError::Corrupt {
-                        path: self.root.join(rel),
+                        path,
                         message: format!(
                             "data file holds {file_db}.{}, but the catalog says \"{key}\"",
                             file_table.name
@@ -704,7 +848,7 @@ impl Lake {
                     })?;
                 if i > 0 && dst.schema() != file_table.schema() {
                     return Err(LakeError::Corrupt {
-                        path: self.root.join(rel),
+                        path,
                         message: format!("data files of table \"{key}\" disagree on the schema"),
                     });
                 }
@@ -733,6 +877,54 @@ impl Lake {
 pub fn save_store(db: &PinkDb, dir: impl AsRef<Path>) -> Result<u64> {
     validate_store(db)?;
     Lake::open_or_create(dir)?.write_from_store(db)
+}
+
+/// Snapshot the store into the lake at `location`: a local directory or an
+/// `s3://bucket/prefix` URL (with the `s3` feature; credentials/endpoint come
+/// from the environment exactly as [`Lake::open_url`] documents). The store
+/// is validated *before* any lake is created, so a rejected store leaves
+/// nothing behind.
+pub fn save_store_url(db: &PinkDb, location: &str) -> Result<u64> {
+    validate_store(db)?;
+    Lake::open_or_create_url(location)?.write_from_store(db)
+}
+
+/// [`save_store_url`] with explicit [`S3Config`] (bucket/prefix/endpoint/
+/// region/credentials) instead of the environment.
+#[cfg(feature = "s3")]
+pub fn save_store_s3(db: &PinkDb, config: S3Config) -> Result<u64> {
+    validate_store(db)?;
+    Lake::open_or_create_s3(config)?.write_from_store(db)
+}
+
+/// The storage backend for a parsed location: local always, S3 only with the
+/// `s3` feature (a clear error otherwise).
+fn storage_for(location: Location) -> Result<Box<dyn Storage>> {
+    match location {
+        Location::Local(path) => Ok(Box::new(LocalStorage::new(&path))),
+        Location::S3 { bucket, prefix } => s3_storage(&bucket, &prefix),
+    }
+}
+
+#[cfg(feature = "s3")]
+fn s3_storage(bucket: &str, prefix: &str) -> Result<Box<dyn Storage>> {
+    Ok(Box::new(s3::S3Storage::from_url(bucket, prefix)?))
+}
+
+#[cfg(not(feature = "s3"))]
+fn s3_storage(bucket: &str, prefix: &str) -> Result<Box<dyn Storage>> {
+    let location = if prefix.is_empty() {
+        format!("s3://{bucket}")
+    } else {
+        format!("s3://{bucket}/{prefix}")
+    };
+    Err(LakeError::FeatureMissing {
+        feature: "s3",
+        message: format!(
+            "the location {location} needs object-storage support; rebuild with the `s3` \
+             feature (for the CLI: `cargo build -p pinkdb-cli --features lake,s3`)"
+        ),
+    })
 }
 
 /// The largest encoded `data/<table>` directory segment a writer accepts,
@@ -781,18 +973,19 @@ pub fn validate_store(db: &PinkDb) -> Result<()> {
 }
 
 /// Read and validate `catalog.json`.
-fn read_catalog(storage: &LocalStorage, root: &Path) -> Result<Catalog> {
-    let path = root.join(CATALOG_FILE);
-    if !storage.exists(CATALOG_FILE) {
-        return Err(LakeError::NotALake { path: root.to_path_buf() });
+fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
+    let path = storage.abs(CATALOG_FILE);
+    match storage.head(CATALOG_FILE)? {
+        Head::Missing => return Err(LakeError::NotALake { path: root.to_path_buf() }),
+        Head::NotAFile => {
+            return Err(LakeError::Corrupt {
+                path,
+                message: "catalog.json is not a regular file".to_string(),
+            })
+        }
+        Head::File => {}
     }
-    if !path.is_file() {
-        return Err(LakeError::Corrupt {
-            path,
-            message: "catalog.json is not a regular file".to_string(),
-        });
-    }
-    let bytes = storage.read(CATALOG_FILE)?;
+    let bytes = storage.read(CATALOG_FILE, &format!("reading {}", path.display()))?;
     read_manifest(&path, &bytes)
 }
 

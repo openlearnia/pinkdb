@@ -5,11 +5,21 @@ edition = "2021"
 description = "pink-lake: the minimal pinkdb lake layer — a JSON catalog + immutable per-table data files on local disk (Vortex by default, v1 `.pink` still readable)"
 license = "MIT"
 
+[features]
+# Opt-in object storage: `s3://bucket/prefix` lake locations over the S3 REST
+# API (AWS S3, Cloudflare R2, MinIO, …) with a blocking SigV4 client.
+s3 = ["dep:ureq", "dep:hmac", "dep:sha2"]
+
 [dependencies]
 pinkdb = { path = "../pinkdb" }
 # Metadata only: the catalog/snapshot JSON.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# S3 storage (`s3` feature): blocking HTTP over rustls, HMAC-SHA256 for AWS
+# SigV4. No aws-sdk, no async runtime.
+ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }
 # The default data format (v2 lakes): one Vortex file per table, written
 # through the `vortex` facade (arrays + the file writer/reader with builtin
 # codecs). `default-features = false, features = ["files"]` drops the

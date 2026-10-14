@@ -1,20 +1,23 @@
 //! `.lake` dot-commands (the `lake` feature): snapshot the in-memory store
-//! into a pinkdb lake directory and load versions back.
+//! into a pinkdb lake and load versions back.
 //!
 //! The lake itself lives in the `pink-lake` crate; this module is only the
-//! REPL surface. All commands are local-only — they read and write the
-//! process's filesystem, and `.lake open` replaces the in-memory store:
+//! REPL surface. Locations are local directories, or `s3://bucket/prefix`
+//! URLs when the `s3` feature is built (AWS S3, Cloudflare R2; credentials
+//! and endpoint come from the usual `AWS_*` environment). `.lake open`
+//! replaces the in-memory store:
 //!
 //! - the session database is reset to `main` (the lake has no session state;
 //!   the output says so when it changes);
 //! - the session's `PINKDB_KEY` is carried over so a later `.save`/`.open`
 //!   stays encrypted, while the lake's own files stay plaintext (the output
 //!   says so when a key is set);
-//! - a lake directory has **one live writer**: a `.lake save` whose handle
-//!   another writer outran fails with a conflict error naming the published
-//!   version — reopen the lake to continue;
+//! - a lake has **one live writer**: a `.lake save` whose handle another
+//!   writer outran fails with a conflict error naming the published version
+//!   — reopen the lake to continue (over S3 the catalog replace is a
+//!   conditional `If-Match` write, so the check is atomic with the write);
 //! - `.lake save` validates the store *before* creating a lake, so a store
-//!   the v1 catalog cannot represent (dotted database name, over-long table
+//!   the catalog cannot represent (dotted database name, over-long table
 //!   name) leaves no stray empty lake behind.
 
 use std::time::Instant;
@@ -23,6 +26,10 @@ use pink_lake::Lake;
 use pinkdb::PinkDb;
 
 use crate::{plural, take_token, unquote};
+
+/// The one-line pointer to object-storage locations appended to usage text
+/// (the `lake` feature alone does not accept `s3://`; the `s3` feature does).
+const HINT: &str = "   (an s3://bucket/prefix location needs the `s3` feature)";
 
 /// Dispatch `.lake <subcommand> ...`.
 pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
@@ -41,14 +48,15 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
     }
 }
 
-/// `.lake save <dir>`: snapshot every database/table of the current store.
+/// `.lake save <location>`: snapshot every database/table of the current
+/// store (a directory or an `s3://bucket/prefix` URL with the `s3` feature).
 fn cmd_save(db: &PinkDb, arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake save <dir>");
+        println!("Usage: .lake save <dir>{HINT}");
         return;
     };
     if !rest.trim().is_empty() {
-        println!("Usage: .lake save <dir>");
+        println!("Usage: .lake save <dir>{HINT}");
         return;
     }
     let dir = unquote(&dir);
@@ -59,7 +67,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
         println!("Error: {e}");
         return;
     }
-    let mut lake = match Lake::open_or_create(&dir) {
+    let mut lake = match Lake::open_or_create_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             println!("Error: {e}");
@@ -97,11 +105,11 @@ fn cmd_save(db: &PinkDb, arg: &str) {
     }
 }
 
-/// `.lake open <dir> [version]`: replace the in-memory store with the lake's
+/// `.lake open <location> [version]`: replace the in-memory store with the lake's
 /// latest (or the given) version.
 fn cmd_open(db: &mut PinkDb, arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake open <dir> [version]");
+        println!("Usage: .lake open <dir> [version]{HINT}");
         return;
     };
     let dir = unquote(&dir);
@@ -111,12 +119,12 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
         match rest.trim().parse::<u64>() {
             Ok(v) => Some(v),
             Err(_) => {
-                println!("Usage: .lake open <dir> [version]");
+                println!("Usage: .lake open <dir> [version]{HINT}");
                 return;
             }
         }
     };
-    let lake = match Lake::open(&dir) {
+    let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             println!("Error: {e}");
@@ -163,18 +171,18 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
     }
 }
 
-/// `.lake versions <dir>`: the published snapshot versions, current marked.
+/// `.lake versions <location>`: the published snapshot versions, current marked.
 fn cmd_versions(arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake versions <dir>");
+        println!("Usage: .lake versions <dir>{HINT}");
         return;
     };
     if !rest.trim().is_empty() {
-        println!("Usage: .lake versions <dir>");
+        println!("Usage: .lake versions <dir>{HINT}");
         return;
     }
     let dir = unquote(&dir);
-    let lake = match Lake::open(&dir) {
+    let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             println!("Error: {e}");
@@ -196,18 +204,18 @@ fn cmd_versions(arg: &str) {
     }
 }
 
-/// `.lake tables <dir>`: the current version's `db.table` names + row counts.
+/// `.lake tables <location>`: the current version's `db.table` names + row counts.
 fn cmd_tables(arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake tables <dir>");
+        println!("Usage: .lake tables <dir>{HINT}");
         return;
     };
     if !rest.trim().is_empty() {
-        println!("Usage: .lake tables <dir>");
+        println!("Usage: .lake tables <dir>{HINT}");
         return;
     }
     let dir = unquote(&dir);
-    let lake = match Lake::open(&dir) {
+    let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             println!("Error: {e}");
@@ -226,18 +234,18 @@ fn cmd_tables(arg: &str) {
     }
 }
 
-/// `.lake info <dir>`: format version, current version, snapshots, tables.
+/// `.lake info <location>`: format version, current version, snapshots, tables.
 fn cmd_info(arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake info <dir>");
+        println!("Usage: .lake info <dir>{HINT}");
         return;
     };
     if !rest.trim().is_empty() {
-        println!("Usage: .lake info <dir>");
+        println!("Usage: .lake info <dir>{HINT}");
         return;
     }
     let dir = unquote(&dir);
-    let lake = match Lake::open(&dir) {
+    let lake = match Lake::open_url(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             println!("Error: {e}");

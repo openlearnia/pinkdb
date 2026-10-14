@@ -620,3 +620,37 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
     assert!(stdout.contains("Opened lake version 2"), "{stdout}");
     cleanup(&dir);
 }
+
+/// Without the `s3` feature, an `s3://` location is a clear error pointing at
+/// the rebuild command — never a silent local directory named `s3:`.
+#[cfg(not(feature = "s3"))]
+#[test]
+fn s3_urls_need_the_s3_feature() {
+    let out = run(
+        ".lake save s3://bucket/prefix\n\
+         .lake open s3://bucket/prefix\n\
+         .lake versions s3://bucket/prefix\n\
+         .lake tables s3://bucket/prefix\n\
+         .lake info s3://bucket/prefix\n\
+         .quit\n",
+    );
+    assert!(
+        out.contains("does not include the `s3` feature"),
+        "{out}"
+    );
+    assert!(
+        out.contains("cargo build -p pinkdb-cli --features lake,s3"),
+        "{out}"
+    );
+    assert_eq!(
+        out.matches("Error:").count(),
+        5,
+        "every .lake subcommand reports the feature error: {out}"
+    );
+    // The URL is named so the typo is obvious.
+    assert!(out.contains("s3://bucket/prefix"), "{out}");
+    // A malformed s3 URL is a location error, not a feature error.
+    let out = run(".lake info s3://\n.quit\n");
+    assert!(out.contains("Error:"), "{out}");
+    assert!(out.contains("invalid lake location"), "{out}");
+}

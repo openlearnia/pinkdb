@@ -35,11 +35,19 @@ fn print_help() {
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     if cfg!(feature = "lake") {
-        println!("  .lake save <dir>       snapshot the store into a lake directory");
-        println!("  .lake open <dir> [v]   load the lake's latest (or version v) into memory");
-        println!("  .lake versions <dir>   list the lake's published versions");
-        println!("  .lake tables <dir>     list the current version's tables and row counts");
-        println!("  .lake info <dir>       show the lake's format version, versions, and tables");
+        if cfg!(feature = "s3") {
+            println!("  .lake save <dir|s3://bucket/prefix>   snapshot the store into a lake");
+            println!("  .lake open <dir|s3://…> [v]  load the lake's latest (or version v) into memory");
+        } else {
+            println!("  .lake save <dir>       snapshot the store into a lake directory");
+            println!("  .lake open <dir> [v]   load the lake's latest (or version v) into memory");
+        }
+        println!("  .lake versions <dir|s3://…>  list the lake's published versions");
+        println!("  .lake tables <dir|s3://…>    list the current version's tables and row counts");
+        println!("  .lake info <dir|s3://…>      show the lake's format version, versions, and tables");
+        if !cfg!(feature = "s3") {
+            println!("  .lake s3:// URLs need a build with the `s3` feature");
+        }
     } else {
         println!("  .lake <subcommand>     (not built; needs the `lake` feature)");
     }
@@ -74,7 +82,10 @@ fn lake_unavailable(cmd: &str) {
     println!(
         "Error: {cmd} is not available: this pinkdb binary was built without the lake feature;"
     );
-    println!("       rebuild with `cargo build -p pinkdb-cli --features lake`.");
+    println!(
+        "       rebuild with `cargo build -p pinkdb-cli --features lake` (add `,s3` for \
+         s3://bucket/prefix URLs)."
+    );
 }
 
 /// `.install <name[@version]>`: resolve, download, verify, cache, and load.

@@ -8,11 +8,17 @@
 //! into place, for files that must never be replaced. The parent directory is
 //! fsynced afterwards, best-effort; the crate docs are precise about what
 //! that does and does not guarantee on APFS.
+//!
+//! The implementation of the crate-internal [`Storage`] trait: this is the
+//! original wave-34/35 directory behavior, unchanged (same files, same
+//! atomicity, same errors) — the trait is what wave 36 adds for S3.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
+use super::storage::{Head, LocalCopy, Storage, VersionTag};
 use crate::{fresh_id, LakeError, Result};
 
 /// The catalog file name inside the lake root.
@@ -31,41 +37,26 @@ impl LocalStorage {
         }
     }
 
-    /// Absolute path of a lake-relative path.
-    pub(crate) fn abs(&self, rel: &str) -> PathBuf {
-        if rel.is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(rel)
+    fn ensure_parent(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| LakeError::Io {
+                context: format!("creating directory {}", parent.display()),
+                source: e,
+            })?;
         }
+        Ok(())
     }
 
-    pub(crate) fn exists(&self, rel: &str) -> bool {
-        self.abs(rel).exists()
-    }
-
-    pub(crate) fn read(&self, rel: &str) -> Result<Vec<u8>> {
-        let path = self.abs(rel);
-        fs::read(&path).map_err(|e| LakeError::Io {
-            context: format!("reading {}", path.display()),
-            source: e,
-        })
-    }
-
-    /// [`LocalStorage::read`] with a caller-supplied context, so a missing
-    /// data file is reported as "loading data file \"…\"" like the engine's
-    /// `.pink` path reports it.
-    pub(crate) fn read_context(&self, rel: &str, context: String) -> Result<Vec<u8>> {
-        let path = self.abs(rel);
-        fs::read(&path).map_err(|e| LakeError::Io { context, source: e })
-    }
-
-    pub(crate) fn create_dir(&self, rel: &str) -> Result<()> {
-        let path = self.abs(rel);
-        fs::create_dir_all(&path).map_err(|e| LakeError::Io {
-            context: format!("creating directory {}", path.display()),
-            source: e,
-        })
+    /// Best-effort `fsync` of the directory holding `path`, so a rename
+    /// survives a *process* crash. Errors are ignored: the rename has already
+    /// happened, and on APFS a directory fsync does not flush the drive's own
+    /// write cache anyway (see the crate docs on durability).
+    fn sync_parent(&self, path: &Path) {
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
     }
 
     /// Write `bytes` to `rel` atomically, replacing any previous file:
@@ -74,7 +65,7 @@ impl LocalStorage {
     /// leaves only an unreferenced `.tmp` file. Used by the catalog and by
     /// v2 Vortex data files; the snapshot path refuses to replace an
     /// existing version.
-    pub(crate) fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+    fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
         let path = self.abs(rel);
         self.ensure_parent(&path)?;
         let (tmp, mut file) = create_unique_tmp(&path).map_err(|e| LakeError::Io {
@@ -105,7 +96,7 @@ impl LocalStorage {
     /// gone. This is how snapshots (and the create-time v1 pair) are
     /// published: a published version file is never replaced, and two
     /// concurrent writers cannot both claim the same version.
-    pub(crate) fn publish_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
+    fn publish_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
         let path = self.abs(rel);
         self.ensure_parent(&path)?;
         let (tmp, mut file) = create_unique_tmp(&path).map_err(|e| LakeError::Io {
@@ -142,10 +133,94 @@ impl LocalStorage {
             }),
         }
     }
+}
+
+/// The local file's identity: byte length + modification time (nanoseconds
+/// since the Unix epoch; a clock before the epoch or an unsupported
+/// `modified()` reads as 0). This is the local stand-in for an S3 `ETag`:
+/// `put_if_match` re-stats the file and refuses when it changed while a save
+/// was in flight. A concurrent writer that moves `catalog.json` forward is
+/// already rejected by the version re-check before this point; the tag closes
+/// the tiny check-then-replace window (S3 closes it exactly with `If-Match`).
+fn local_tag(path: &Path) -> Result<VersionTag> {
+    let meta = fs::metadata(path).map_err(|e| LakeError::Io {
+        context: format!("reading metadata of {}", path.display()),
+        source: e,
+    })?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(VersionTag(format!("file:{}:{}", meta.len(), mtime)))
+}
+
+impl Storage for LocalStorage {
+    fn abs(&self, rel: &str) -> PathBuf {
+        if rel.is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(rel)
+        }
+    }
+
+    fn head(&self, rel: &str) -> Result<Head> {
+        let path = self.abs(rel);
+        // `fs::metadata` follows symlinks, exactly as `Path::is_file` did.
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => Ok(Head::File),
+            Ok(_) => Ok(Head::NotAFile),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Head::Missing),
+            Err(e) => Err(LakeError::Io {
+                context: format!("reading metadata of {}", path.display()),
+                source: e,
+            }),
+        }
+    }
+
+    fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
+        let path = self.abs(rel);
+        fs::read(&path).map_err(|e| LakeError::Io {
+            context: context.to_string(),
+            source: e,
+        })
+    }
+
+    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
+        let bytes = self.read(rel, context)?;
+        let tag = local_tag(&self.abs(rel))?;
+        Ok((bytes, tag))
+    }
+
+    fn create_dir(&self, rel: &str) -> Result<()> {
+        let path = self.abs(rel);
+        fs::create_dir_all(&path).map_err(|e| LakeError::Io {
+            context: format!("creating directory {}", path.display()),
+            source: e,
+        })
+    }
+
+    fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        self.write_atomic(rel, bytes)
+    }
+
+    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
+        self.publish_new(rel, bytes)
+    }
+
+    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
+        let current = local_tag(&self.abs(rel))?;
+        if &current != expected {
+            return Ok(false);
+        }
+        self.write_atomic(rel, bytes)?;
+        Ok(true)
+    }
 
     /// File names directly inside `rel` (sorted; a missing directory reads as
     /// empty). Subdirectories and non-UTF-8 names are skipped.
-    pub(crate) fn list(&self, rel: &str) -> Result<Vec<String>> {
+    fn list(&self, rel: &str) -> Result<Vec<String>> {
         let path = self.abs(rel);
         let entries = match fs::read_dir(&path) {
             Ok(entries) => entries,
@@ -173,26 +248,16 @@ impl LocalStorage {
         Ok(out)
     }
 
-    fn ensure_parent(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| LakeError::Io {
-                context: format!("creating directory {}", parent.display()),
-                source: e,
-            })?;
-        }
-        Ok(())
+    fn delete(&self, rel: &str) -> Result<()> {
+        let path = self.abs(rel);
+        fs::remove_file(&path).map_err(|e| LakeError::Io {
+            context: format!("deleting {}", path.display()),
+            source: e,
+        })
     }
 
-    /// Best-effort `fsync` of the directory holding `path`, so a rename
-    /// survives a *process* crash. Errors are ignored: the rename has already
-    /// happened, and on APFS a directory fsync does not flush the drive's own
-    /// write cache anyway (see the crate docs on durability).
-    fn sync_parent(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
+    fn local_copy(&self, rel: &str, _context: &str) -> Result<LocalCopy> {
+        Ok(LocalCopy::Path(self.abs(rel)))
     }
 }
 

@@ -68,7 +68,7 @@ SQL text
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
-| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table Vortex data files, v1 `.pink` files still readable (opt-in CLI `lake` feature) |
+| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table Vortex data files, v1 `.pink` files still readable (opt-in CLI `lake` feature), local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature) |
 
 Design rules: Rust edition 2021, zero async; the core is zero-unsafe, with
 `unsafe` contained to exactly two crates (the C ABI `pinkdb-ffi` and the
@@ -352,10 +352,12 @@ isolation without predicate tracking (write-skew is possible). The plain
 ## Lake layer (feature `lake`)
 
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
-JSON catalog plus immutable per-table data files, local disk first. Wave 35
-makes **Vortex the default data format**; wave 36 adds S3 storage.
+JSON catalog plus immutable per-table data files, on local disk or (with the
+`s3` feature) in an S3 bucket/prefix. Wave 35 makes **Vortex the default data
+format**; wave 36 adds S3/R2 object storage.
 
-A lake is a directory:
+A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
+key prefix with exactly this layout):
 
 ```text
 mylake/
@@ -420,12 +422,16 @@ errors, never a guess.
   (multi-file entries load fine; they are reserved for future writers). There
   is no appending, compaction or GC — each save costs one full rewrite, and
   old versions' files stay.
-- **Atomicity order: data files → snapshot → catalog.** Every write goes to a
-  *unique* temp sibling (`<name>.<uuid>.tmp`, created with `create_new(true)`
-  so a planted symlink or an older writer's temp file is never followed or
-  truncated), is fsynced, then renamed into place (catalog, data files) or
-  **hard-linked** into place (snapshots: an existing version can never be
-  replaced). The parent directory is fsynced afterwards, best-effort. This is
+- **Atomicity order: data files → snapshot → catalog.** Locally every write
+  goes to a *unique* temp sibling (`<name>.<uuid>.tmp`, created with
+  `create_new(true)` so a planted symlink or an older writer's temp file is
+  never followed or truncated), is fsynced, then renamed into place (catalog,
+  data files) or **hard-linked** into place (snapshots: an existing version
+  can never be replaced). Over S3 each write is a single atomic `PutObject`
+  (a reader sees the old or the new bytes, never a mix — no temp objects are
+  needed), the snapshot is `If-None-Match: *` and the catalog `If-Match`;
+  see "Object storage (S3/R2)". The parent directory is fsynced afterwards,
+  best-effort. Locally this is
   **process-crash safety**: after a `kill -9` the previous version always
   loads, and stray data files, `.tmp` files and snapshots above the catalog's
   version are ignored (`versions` lists only manifests that parse and declare
@@ -464,15 +470,19 @@ errors, never a guess.
   `save_store`/`.lake save` pre-validate the store (dotted database names,
   over-long encoded table names) *before* creating a lake, so a rejected save
   leaves nothing behind.
-- **One live writer handle per lake directory** (no file locking; concurrent
-  readers of published versions are fine). A handle that saves after another
+- **One live writer handle per lake** (no file locking; concurrent readers
+  of published versions are fine). A handle that saves after another
   handle/process moved the catalog fails with `LakeError::Conflict`
   ("another writer published version N; reopen the lake") *before* replacing
   the catalog, and two writers racing for one version cannot both win: the
-  snapshot link is atomic, so exactly one publishes it, and `catalog.json` is
-  byte-identical to the snapshot of its version. All I/O goes through a
-  private `LocalStorage` handle; a `Storage` trait is deliberately deferred
-  until wave 36 needs a second (S3) implementation.
+  snapshot publish is create-only (`If-None-Match: *` over S3, a hard link
+  locally), so exactly one publishes it, and `catalog.json` is byte-identical
+  to the snapshot of its version. Over S3 the catalog replace itself is a
+  conditional `If-Match: <etag>` write, so the check is atomic with the write
+  — see "Object storage (S3/R2)" below. All I/O goes through a private
+  `Storage` trait: `LocalStorage` (the original directory implementation,
+  same files/atomicity/errors) or, with the non-default `s3` feature,
+  `S3Storage` (a blocking SigV4 REST client over `ureq`/rustls).
 - **Measured on this machine (2026-10, release, Apple Silicon, 1M-row
   `bench/sales_1m.csv`: id/region/total/active):** one Vortex data file is
   3,117,738 B vs 14,042,574 B for the equivalent `.pink` bytes (0.22×, ≈4.5×
@@ -507,12 +517,18 @@ let tables = lake.tables()?;               // [("main.t", 2)]
 let versions = lake.versions()?;           // [1, 2, 3]
 let latest = lake.load(None)?;             // rebuild the latest
 let old = lake.load(Some(2))?;             // rebuild a specific snapshot
+
+// With the `s3` feature, every location may be an object-storage URL:
+// let mut lake = Lake::open_url("s3://bucket/prefix")?;  // env credentials
+// let version = save_store_url(&db, "s3://bucket/prefix")?;
 ```
 
-REPL (opt-in `lake` feature — the default binary stays lean):
+REPL (opt-in `lake` feature — the default binary stays lean; add `,s3` for
+`s3://bucket/prefix` locations):
 
 ```sh
-cargo build -p pinkdb-cli --features lake
+cargo build -p pinkdb-cli --features lake        # local directories
+cargo build -p pinkdb-cli --features lake,s3     # + S3/R2 object storage
 ```
 
 ```text
@@ -524,12 +540,110 @@ cargo build -p pinkdb-cli --features lake
 .lake info <dir>          format version, current version, snapshots, tables
 ```
 
+With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see
+the next subsection.
+
 `.lake tables`/`.lake info` also warn about tables whose referenced data file
 is missing, instead of advertising data a load cannot read. Without the
 feature, `.lake` reports `this pinkdb binary was built without the lake
-feature`. Release `pinkdb`: 2,289,616 B default (**unchanged**) vs 44,639,248 B
-with `--features lake` (38,171,440 B stripped) — the Vortex array encodings
-dominate; see the dependency/build note above.
+feature`; without `s3`, an `s3://` location is `this pink-lake build does not
+include the `s3` feature` with the rebuild command. Release `pinkdb` on
+Apple Silicon (2026-10): 2,217,792 B default (unchanged, byte-identical to
+the pre-S3 build) vs 44,586,864 B with `--features lake` (38,121,864 B
+stripped) and 46,548,016 B with `--features lake,s3` (39,775,672 B stripped)
+— the Vortex array encodings dominate; S3 adds ≈1.96 MB raw (ureq/rustls +
+hmac/sha2). See the dependency/build note above.
+
+### Object storage (S3/R2)
+
+The non-default `s3` feature makes any lake location an
+`s3://bucket/prefix` URL — AWS S3, Cloudflare R2, MinIO, any S3-compatible
+endpoint. It is a minimal **blocking** S3 REST client (`ureq` over rustls +
+`hmac` + `sha2` for AWS SigV4; no aws-sdk, no async runtime) with path-style
+and virtual-hosted addressing; the whole S3 code is compiled only with the
+feature.
+
+```sh
+cargo build -p pinkdb-cli --features lake,s3
+```
+
+Library: `Lake::open_url("s3://bucket/prefix")`,
+`Lake::open_or_create_url`, `Lake::create_url`, `save_store_url` — local
+paths keep working exactly as before. For explicit configuration (no
+environment), `S3Config::new(bucket).with_prefix(..).with_region(..)
+.with_endpoint(..).with_credentials(..)` feeds `Lake::{open_s3,
+open_or_create_s3, create_s3}` and `save_store_s3`.
+
+Environment (the `s3://` URL form):
+
+| variable | meaning | R2 example |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | credentials (required) | R2 API token key id/secret |
+| `AWS_SESSION_TOKEN` | optional temporary-credential token (signed) | — |
+| `AWS_ENDPOINT_URL` (or `AWS_ENDPOINT_URL_S3`) | non-AWS endpoint | `https://<account>.r2.cloudflarestorage.com` |
+| `AWS_REGION` (or `AWS_DEFAULT_REGION`) | SigV4 region | `auto` |
+| `AWS_S3_FORCE_PATH_STYLE` | force path-style (`1`/`true`/`yes`/`on`) | optional; path-style is already the default with a custom endpoint |
+
+R2 cookbook:
+
+```sh
+export AWS_ACCESS_KEY_ID=<r2-token-key-id>
+export AWS_SECRET_ACCESS_KEY=<r2-token-secret>
+export AWS_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
+export AWS_REGION=auto
+cargo build -p pinkdb-cli --features lake,s3
+# in the REPL:
+#   .lake save s3://my-bucket/lakes/demo
+#   .lake open s3://my-bucket/lakes/demo
+#   .lake versions s3://my-bucket/lakes/demo
+#   .lake tables   s3://my-bucket/lakes/demo
+#   .lake info     s3://my-bucket/lakes/demo
+```
+
+- **Conditional writes are the conflict machinery.** A snapshot is published
+  with `If-None-Match: *` (a published version is never replaced; a 412 is
+  the familiar `snapshot N already exists … refusing to replace` conflict),
+  and `catalog.json` is replaced with `If-Match: <etag>` from the read made
+  moments earlier (a 412 is `catalog.json changed while this save was in
+  flight … reopen the lake`). AWS S3 and Cloudflare R2 evaluate those
+  headers **atomically with the write commit** (R2 documents `If-Match` /
+  `If-None-Match` on `PutObject` and the atomicity of the conditional
+  evaluation), so concurrent single-writer saves cannot fork the version
+  chain: `create`/`save` are class-CRUD-safe for one live writer, with the
+  same conflict error text as the local hard-link/rename path. The lake
+  additionally re-reads and re-validates the catalog right before the
+  replace, so even a backend that cannot enforce conditionals still fails
+  stale saves cleanly.
+- **Endpoints without conditional writes degrade, once, with a documented
+  window.** If a conditional request is rejected with HTTP 501 or
+  `NotImplemented` (an old S3-compatible server), the client records that
+  and switches to check-then-put for `If-None-Match`/`If-Match`: it HEADs or
+  GETs the ETag, compares, and only then writes. That has a small
+  read-to-write window (a racing writer could slip in); conflict detection
+  still comes from the catalog version re-check, and the degradation is
+  sticky so later saves do not re-probe. Everything else — `create`,
+  `save`, `versions`, `tables`, `info`, `load` — behaves identically.
+- **Errors are clear:** HTTP 403 → `object storage access error at <lake>`
+  (credentials/permissions, including the missing-credentials case before any
+  request); 404 on the catalog → `not a pink-lake directory`; a missing
+  snapshot → `has no snapshot version N`; a deleted data object is reported
+  by `.lake tables`/`.lake info` and by `load` with the local
+  `loading data file "…"` context; 412 → `write conflict`. The host clock
+  must be within S3's allowed skew (~15 min) for SigV4.
+- **What is not implemented:** multipart uploads — one `PutObject` per
+  object, so a single table's data file must be ≤ 5 GiB (the S3 single-PUT
+  limit; the client refuses larger bodies and reads at the same cap); no
+  bucket creation, no lifecycle rules, no object versioning, no server-side
+  copy, no lake-side GC (old versions/data objects stay, exactly like
+  local), and lake data is plaintext (same as local). v1 `.pink` data files
+  stored in an S3 lake still load: the engine's loader needs a path, so the
+  object is downloaded to a unique temp file and removed when done.
+- **Live test (opt-in):** `PINKDB_S3_LIVE=1 PINKDB_S3_BUCKET=<bucket>
+  PINKDB_S3_PREFIX=<prefix> AWS_ACCESS_KEY_ID=… AWS_SECRET_ACCESS_KEY=…
+  AWS_ENDPOINT_URL=… AWS_REGION=auto cargo test -p pink-lake --features s3
+  --test s3 live_s3_roundtrip -- --nocapture` runs create/save/open/conflict
+  against the real service (it is skipped by default and leaves objects under
+  the prefix — there is no GC).
 
 ## Network server
 
@@ -1070,9 +1184,10 @@ ties in ORDER BY have no stable order on either engine).
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
 feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
-layer (`pink-lake`, CLI `lake` feature) shipped in wave 34 and became
-Vortex-first in wave 35 (v1 `.pink` lakes still load; open + save migrates);
-authentication and TLS are deferred.
+layer (`pink-lake`, CLI `lake` feature) shipped in wave 34, became
+Vortex-first in wave 35 (v1 `.pink` lakes still load; open + save migrates)
+and gained S3/R2 object storage in wave 36 (`s3` feature; `s3://` locations,
+conditional-write conflict detection); authentication and TLS are deferred.
 
 ## Development
 
@@ -1082,7 +1197,9 @@ cargo test             # 100+ unit + end-to-end tests
 cargo test -p pinkdb-server                          # protocol + server + durable tests
 cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
 cargo test -p pinkdb-cli --features lake             # lake round-trip + CLI tests
+cargo test -p pinkdb-cli --features lake,s3          # + S3/R2 over a hermetic mock S3
 cargo build -p pinkdb-cli --features lake            # REPL with .lake commands
+cargo build -p pinkdb-cli --features lake,s3         # REPL with .lake s3:// URLs
 PINKDB_CLI_BIN=./target/release/pinkdb cargo test -p pinkdb-cli --features lake  # release CLI (overflow checks off)
 cargo test -p pinkdb-ext-loader                      # loadable extensions (compiles C test extensions with cc)
 cargo test --features encryption                     # encrypted round-trips + WAL recovery
