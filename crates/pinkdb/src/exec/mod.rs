@@ -2322,6 +2322,82 @@ mod tests {
     }
 
     #[test]
+    fn typed_group_keys_match_a_reference_computation() {
+        // 3 chunks of rows; VARCHAR keys go past the small linear set (40
+        // distinct) mid-chunk, both key kinds have NULLs, and aggregates see
+        // NULL arguments.
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE g (s VARCHAR, k BIGINT, x DOUBLE, n INTEGER);")
+            .unwrap();
+        let rows = 3 * crate::vector::CHUNK_SIZE + 77;
+        // (key, (count, SUM(x), SUM(n))) per group, in first-seen order.
+        type ByStr = (Option<String>, (i64, Option<f64>, Option<i64>));
+        type ByInt = (Option<i64>, (i64, Option<i64>));
+        let mut expect_s: Vec<ByStr> = Vec::new();
+        let mut expect_k: Vec<ByInt> = Vec::new();
+        {
+            let t = db.table_mut("g").unwrap();
+            for i in 0..rows {
+                let s = (i % 53 != 0).then(|| format!("key{}", (i * 7) % 40));
+                let k = (i % 31 != 0).then_some(((i * 13) % 500) as i64 - 250);
+                let x = (i % 5 != 0).then_some(i as f64 * 0.5);
+                let n = (i % 3 != 0).then_some((i % 11) as i32);
+                t.append_row(vec![
+                    s.clone().map(V::Varchar).unwrap_or(V::Null),
+                    k.map(V::Bigint).unwrap_or(V::Null),
+                    x.map(V::Double).unwrap_or(V::Null),
+                    n.map(V::Integer).unwrap_or(V::Null),
+                ])
+                .unwrap();
+                let slot = match expect_s.iter().position(|(key, _)| *key == s) {
+                    Some(p) => p,
+                    None => {
+                        expect_s.push((s.clone(), (0, None, None)));
+                        expect_s.len() - 1
+                    }
+                };
+                let e = &mut expect_s[slot].1;
+                e.0 += 1;
+                if let Some(x) = x {
+                    e.1 = Some(e.1.unwrap_or(0.0) + x);
+                }
+                if let Some(n) = n {
+                    e.2 = Some(e.2.unwrap_or(0) + n as i64);
+                }
+                let slot = match expect_k.iter().position(|(key, _)| *key == k) {
+                    Some(p) => p,
+                    None => {
+                        expect_k.push((k, (0, None)));
+                        expect_k.len() - 1
+                    }
+                };
+                expect_k[slot].1 .0 += 1;
+                if let Some(n) = n {
+                    expect_k[slot].1 .1 = Some(expect_k[slot].1 .1.unwrap_or(0) + n as i64);
+                }
+            }
+        }
+        let got = select(
+            &mut db,
+            "SELECT s, COUNT(*), SUM(x), SUM(n) FROM g GROUP BY s;",
+        );
+        assert_eq!(got.len(), expect_s.len());
+        for (row, (key, (c, sx, sn))) in got.iter().zip(&expect_s) {
+            let key = key.clone().map(V::Varchar).unwrap_or(V::Null);
+            let sx = sx.map(V::Double).unwrap_or(V::Null);
+            let sn = sn.map(V::Bigint).unwrap_or(V::Null);
+            assert_eq!(row, &vec![key, V::Bigint(*c), sx, sn]);
+        }
+        let got = select(&mut db, "SELECT k, COUNT(*), SUM(n) FROM g GROUP BY k;");
+        assert_eq!(got.len(), expect_k.len());
+        for (row, (key, (c, sn))) in got.iter().zip(&expect_k) {
+            let key = key.map(V::Bigint).unwrap_or(V::Null);
+            let sn = sn.map(V::Bigint).unwrap_or(V::Null);
+            assert_eq!(row, &vec![key, V::Bigint(*c), sn]);
+        }
+    }
+
+    #[test]
     fn integer_overflow_errors_like_duckdb() {
         let mut db = PinkDb::new();
         let err =

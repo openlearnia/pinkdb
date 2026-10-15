@@ -189,6 +189,57 @@ impl Acc {
         }
     }
 
+    /// Exactly `update(Some(&Value::Bigint(x)))` for a non-NULL INTEGER or
+    /// BIGINT cell (an INTEGER widens to `i64` and then to `f64` exactly as
+    /// it would from `i32`). MIN/MAX never come here: they keep the
+    /// `Value`-typed comparison path.
+    #[inline]
+    fn add_int(&mut self, x: i64) {
+        match self {
+            Acc::Count(n) => *n += 1,
+            Acc::SumInt {
+                sum,
+                wraps,
+                non_null,
+            } => {
+                sum_add(sum, wraps, x);
+                *non_null = true;
+            }
+            Acc::SumFloat { sum, non_null } => {
+                *sum += x as f64;
+                *non_null = true;
+            }
+            Acc::Avg { sum, count } => {
+                *sum += x as f64;
+                *count += 1;
+            }
+            Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
+        }
+    }
+
+    /// Exactly `update(Some(&Value::Double(x)))` for a non-NULL DOUBLE cell.
+    #[inline]
+    fn add_f64(&mut self, x: f64) {
+        match self {
+            Acc::Count(n) => *n += 1,
+            Acc::SumInt { sum, wraps, .. } => {
+                *self = Acc::SumFloat {
+                    sum: exact_sum(*sum, *wraps) as f64 + x,
+                    non_null: true,
+                };
+            }
+            Acc::SumFloat { sum, non_null } => {
+                *sum += x;
+                *non_null = true;
+            }
+            Acc::Avg { sum, count } => {
+                *sum += x;
+                *count += 1;
+            }
+            Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
+        }
+    }
+
     /// Typed per-row update: exactly `update(Some(&v.get(i)))` (or
     /// `update(None)` when the cell is NULL) with the cell read straight out
     /// of the vector payload — no `Value` materialization per row.
@@ -571,52 +622,14 @@ pub(crate) fn aggregate(
                     Default::default(),
                 ),
             };
-            let mut buf = Vec::new();
-            let mut full_reserved = false;
-            for i in 0..chunk.num_rows() {
-                // Borrowed encoding + get-first lookup: hits (the common
-                // case) allocate nothing and probe the map exactly once;
-                // only misses materialize Values and insert.
-                buf.clear();
-                for kv in &key_vecs {
-                    kv.v().encode_into(&mut buf, i);
-                }
-                let idx = match partial.index.get(&buf) {
-                    Some(&idx) => idx,
-                    None => {
-                        let enc = buf.clone();
-                        let idx = partial.groups.len();
-                        // Adaptive growth: once a chunk proves it holds many
-                        // distinct keys (> HIGH_CARDINALITY_KEYS), reserve the
-                        // rest of the chunk's slots in one rehash instead of
-                        // growing doubling by doubling.
-                        if !full_reserved && partial.index.len() >= HIGH_CARDINALITY_KEYS {
-                            partial
-                                .index
-                                .reserve(chunk.num_rows().saturating_sub(partial.index.len()));
-                            full_reserved = true;
-                        }
-                        partial.index.insert(enc.clone(), idx);
-                        partial.groups.push((
-                            enc,
-                            Group {
-                                keys: key_vecs.iter().map(|kv| kv.v().get(i)).collect(),
-                                accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
-                            },
-                        ));
-                        idx
-                    }
-                };
-                let group = &mut partial.groups[idx].1;
-                for (acc, av) in group.accs.iter_mut().zip(arg_vecs.iter()) {
-                    match av {
-                        // COUNT(*): every row counts.
-                        None => acc.count_star(),
-                        // Typed read of the cell (NULL skips, exactly like
-                        // `update(None)`).
-                        Some(v) => acc.update_vec(v.v(), i),
-                    }
-                }
+            // Pass 1: one group id per row (first-seen order, as before).
+            let gids = group_ids(&mut partial, &key_vecs, aggs, chunk.num_rows());
+            // Pass 2: each aggregate runs as one typed loop over the chunk.
+            // Accumulators are independent, so feeding agg by agg instead of
+            // row by row gives every accumulator the same rows in the same
+            // order — results are bit-identical.
+            for (j, av) in arg_vecs.iter().enumerate() {
+                accumulate(&mut partial.groups, &gids, j, av.as_ref().map(|v| v.v()));
             }
             Ok(partial)
         })
@@ -627,6 +640,215 @@ pub(crate) fn aggregate(
     let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
     emit_groups(groups, &key_types, aggs)
+}
+
+/// Distinct keys a single-VARCHAR-key chunk resolves by linear scan before
+/// switching to the hash map (a short scan of short strings beats hashing
+/// plus an encoded-key compare for low-cardinality keys like `region`).
+const SMALL_KEY_SET: usize = 16;
+
+/// Register a new group for row `i` of `key_vecs` under encoded key `enc`.
+/// `indexed` also records it in the encoded-key index (the hashed path and
+/// the VARCHAR path, which may fall back to hashing mid-chunk); the typed
+/// integer path never consults that index and skips the second insert.
+fn new_group(
+    partial: &mut Partial,
+    key_vecs: &[EvalVec],
+    aggs: &[BoundAgg],
+    i: usize,
+    enc: Vec<u8>,
+    indexed: bool,
+) -> usize {
+    let idx = partial.groups.len();
+    if indexed {
+        partial.index.insert(enc.clone(), idx);
+    }
+    partial.groups.push((
+        enc,
+        Group {
+            keys: key_vecs.iter().map(|kv| kv.v().get(i)).collect(),
+            accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
+        },
+    ));
+    idx
+}
+
+/// The group slot of every row of one chunk, creating groups in first-seen
+/// row order. Single-column keys take typed paths (integers hash their
+/// value; VARCHAR keys scan a small first-seen set); everything else hashes
+/// the row's encoded key. Every group still records its encoded key, so the
+/// cross-chunk merge is unchanged.
+fn group_ids(
+    partial: &mut Partial,
+    key_vecs: &[EvalVec],
+    aggs: &[BoundAgg],
+    rows: usize,
+) -> Vec<usize> {
+    let mut gids = Vec::with_capacity(rows);
+    let mut buf = Vec::new();
+    let encode = |buf: &mut Vec<u8>, i: usize| {
+        buf.clear();
+        for kv in key_vecs {
+            kv.v().encode_into(buf, i);
+        }
+    };
+    let mut start = 0;
+    if let [single] = key_vecs {
+        let v = single.v();
+        match v.data() {
+            VectorData::Int32(_)
+            | VectorData::Int64(_)
+            | VectorData::Date32(_)
+            | VectorData::TimestampMicros(_) => {
+                let value = |i: usize| match v.data() {
+                    VectorData::Int32(d) | VectorData::Date32(d) => d[i] as i64,
+                    VectorData::Int64(d) | VectorData::TimestampMicros(d) => d[i],
+                    _ => unreachable!("matched above"),
+                };
+                let mut map: FastMap<i64, usize> = FastMap::with_capacity_and_hasher(
+                    local_index_capacity(rows),
+                    Default::default(),
+                );
+                let mut null_gid = None;
+                for i in 0..rows {
+                    let gid = if v.is_null(i) {
+                        match null_gid {
+                            Some(g) => g,
+                            None => {
+                                encode(&mut buf, i);
+                                let g = new_group(partial, key_vecs, aggs, i, buf.clone(), false);
+                                null_gid = Some(g);
+                                g
+                            }
+                        }
+                    } else {
+                        let x = value(i);
+                        match map.get(&x) {
+                            Some(&g) => g,
+                            None => {
+                                if map.len() >= HIGH_CARDINALITY_KEYS && map.capacity() < rows {
+                                    map.reserve(rows - map.len());
+                                }
+                                encode(&mut buf, i);
+                                let g = new_group(partial, key_vecs, aggs, i, buf.clone(), false);
+                                map.insert(x, g);
+                                g
+                            }
+                        }
+                    };
+                    gids.push(gid);
+                }
+                return gids;
+            }
+            VectorData::VarChar(d) => {
+                let mut small: Vec<(&str, usize)> = Vec::new();
+                let mut null_gid = None;
+                while start < rows {
+                    let i = start;
+                    let gid = if v.is_null(i) {
+                        match null_gid {
+                            Some(g) => g,
+                            None => {
+                                encode(&mut buf, i);
+                                let g = new_group(partial, key_vecs, aggs, i, buf.clone(), true);
+                                null_gid = Some(g);
+                                g
+                            }
+                        }
+                    } else {
+                        let key: &str = &d[i];
+                        match small.iter().find(|(k, _)| *k == key) {
+                            Some(&(_, g)) => g,
+                            None => {
+                                if small.len() >= SMALL_KEY_SET {
+                                    // High cardinality: the rest of the
+                                    // chunk takes the hashed path below
+                                    // (every group so far is in the index).
+                                    break;
+                                }
+                                encode(&mut buf, i);
+                                let g = new_group(partial, key_vecs, aggs, i, buf.clone(), true);
+                                small.push((key, g));
+                                g
+                            }
+                        }
+                    };
+                    gids.push(gid);
+                    start += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut full_reserved = false;
+    for i in start..rows {
+        // Borrowed encoding + get-first lookup: hits (the common case)
+        // allocate nothing and probe the map exactly once; only misses
+        // materialize Values and insert.
+        encode(&mut buf, i);
+        let gid = match partial.index.get(&buf) {
+            Some(&idx) => idx,
+            None => {
+                // Adaptive growth: once a chunk proves it holds many distinct
+                // keys (> HIGH_CARDINALITY_KEYS), reserve the rest of the
+                // chunk's slots in one rehash instead of growing doubling by
+                // doubling.
+                if !full_reserved && partial.index.len() >= HIGH_CARDINALITY_KEYS {
+                    partial
+                        .index
+                        .reserve(rows.saturating_sub(partial.index.len()));
+                    full_reserved = true;
+                }
+                new_group(partial, key_vecs, aggs, i, buf.clone(), true)
+            }
+        };
+        gids.push(gid);
+    }
+    gids
+}
+
+/// Feed one aggregate's argument column (or COUNT(*)) into the per-row
+/// group slots: the payload type is matched once per chunk, NULL cells are
+/// skipped (`update(None)` is a no-op for every accumulator), and MIN/MAX
+/// plus non-numeric cells keep the exact `update_vec` comparison path.
+fn accumulate(groups: &mut [(Vec<u8>, Group)], gids: &[usize], j: usize, arg: Option<&Vector>) {
+    let Some(v) = arg else {
+        for &g in gids {
+            groups[g].1.accs[j].count_star();
+        }
+        return;
+    };
+    let minmax = gids
+        .first()
+        .is_some_and(|&g| matches!(groups[g].1.accs[j], Acc::MinMax { .. }));
+    match v.data() {
+        VectorData::Int32(d) if !minmax => {
+            for (i, &g) in gids.iter().enumerate() {
+                if v.is_valid(i) {
+                    groups[g].1.accs[j].add_int(d[i] as i64);
+                }
+            }
+        }
+        VectorData::Int64(d) if !minmax => {
+            for (i, &g) in gids.iter().enumerate() {
+                if v.is_valid(i) {
+                    groups[g].1.accs[j].add_int(d[i]);
+                }
+            }
+        }
+        VectorData::Float64(d) if !minmax => {
+            for (i, &g) in gids.iter().enumerate() {
+                if v.is_valid(i) {
+                    groups[g].1.accs[j].add_f64(d[i]);
+                }
+            }
+        }
+        _ => {
+            for (i, &g) in gids.iter().enumerate() {
+                groups[g].1.accs[j].update_vec(v, i);
+            }
+        }
+    }
 }
 
 /// Merge per-chunk partials in chunk order (deterministic first-seen order).
