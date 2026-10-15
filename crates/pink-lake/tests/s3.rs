@@ -1297,3 +1297,68 @@ fn versions_reports_unreadable_snapshots() {
     assert!(matches!(err, LakeError::Auth { .. }), "{err:?}");
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);
 }
+
+/// Attach over object storage: footer-only descriptors (the objects are read
+/// whole — no ranged reads in this build — but never decoded), fast paths
+/// answered from the statistics, and lazy materialization matching the
+/// eager load bit-exactly.
+#[test]
+fn attach_over_s3_is_footer_only_and_matches_load() {
+    let mock = MockS3::start();
+    let dir = scratch("attach");
+    let db = small_store();
+    let mut lake = Lake::create_s3(mock_config(&mock, "test-bucket", "attach")).unwrap();
+    lake.write_from_store(&db).unwrap();
+
+    // Attach a fresh handle and check the descriptors against the eager load.
+    let lake = Lake::open_s3(mock_config(&mock, "test-bucket", "attach")).unwrap();
+    let report = lake.attach(None).unwrap();
+    assert!(report.remote, "object storage has no ranged reads here");
+    assert_eq!(report.tables, 3);
+    let loaded = lake.load(None).unwrap();
+
+    let mut attached = PinkDb::new();
+    let tables = attached.attach_lake(report.lake.clone()).unwrap();
+    assert_eq!(tables.len(), 3);
+    for t in &tables {
+        let expected = loaded.table_in(&t.db, &t.table).unwrap();
+        assert_eq!(t.rows, expected.num_rows() as u64);
+        assert_eq!(t.schema, expected.schema());
+        for (i, (name, _)) in t.schema.iter().enumerate() {
+            // null_count must agree whenever the lake proved it.
+            let mut nulls = 0u64;
+            for row in 0..expected.num_rows() {
+                if expected.get(row, i).unwrap().is_null() {
+                    nulls += 1;
+                }
+            }
+            assert_eq!(t.stats[i].null_count, Some(nulls), "{name}");
+        }
+    }
+
+    // Counts come from the footer; a scan materializes through the same
+    // decode `.lake load` uses and equals it bit-for-bit where it matters.
+    let counts = attached.execute("SELECT COUNT(*) FROM main.t;").unwrap();
+    match counts.first().unwrap() {
+        pinkdb::QueryResult::Selected { rows, .. } => {
+            assert_eq!(rows, &vec![vec![Value::Bigint(2)]])
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    let mut results = attached
+        .execute("SELECT MIN(i), MAX(i) FROM main.t;")
+        .unwrap();
+    match results.pop().unwrap() {
+        pinkdb::QueryResult::Selected { rows, .. } => {
+            assert_eq!(rows, vec![vec![Value::Integer(-5), Value::Integer(-5)]])
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // The objects were never rewritten: the catalog still equals its
+    // snapshot.
+    assert_eq!(
+        mock.object("attach/catalog.json").unwrap(),
+        mock.object("attach/snapshots/2.json").unwrap()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

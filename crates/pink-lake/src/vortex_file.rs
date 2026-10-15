@@ -66,19 +66,22 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use pinkdb::{DataChunk, DataTable, DataType, PinkDb, Vector, VectorData};
+use pinkdb::{ColumnStats, DataChunk, DataTable, DataType, PinkDb, Value, Vector, VectorData};
 use serde::{Deserialize, Serialize};
 use vortex::array::arrays::bool::BoolArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{BoolArray, PrimitiveArray, StructArray, VarBinViewArray};
+use vortex::array::stats::StatsSet;
 use vortex::array::validity::Validity;
 use vortex::array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex::buffer::{BitBuffer, Buffer, ByteBuffer};
 use vortex::dtype::{DType, FieldNames, Nullability, PType, StructFields};
+use vortex::expr::stats::{Precision, Stat};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::session::RuntimeSessionExt;
+use vortex::scalar::ScalarValue;
 use vortex::session::VortexSession;
 use vortex::VortexSessionDefault;
 
@@ -414,6 +417,190 @@ pub(crate) fn decode_table(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
 /// and the local entry (the file is read into exactly this buffer).
 pub(crate) fn decode_table_owned(path: &Path, bytes: Vec<u8>) -> Result<PinkDb> {
     decode_buffer(path, ByteBuffer::from(bytes))
+}
+
+/// What a footer-only read of one data file yields: identity, schema, exact
+/// row count, and the exact per-column statistics the executor can answer
+/// aggregates from. No column data is read or decoded.
+#[derive(Debug)]
+pub(crate) struct FileFooter {
+    pub(crate) db: String,
+    pub(crate) table: String,
+    pub(crate) rows: u64,
+    pub(crate) schema: Vec<(String, DataType)>,
+    pub(crate) stats: Vec<ColumnStats>,
+}
+
+/// Open one data file *footer-only*: the footer, the `pinkdb.table` metadata
+/// segment and the stored statistics — no data segments, no decode.
+///
+/// Locally this uses positioned reads (`open_path`); over object storage
+/// (no ranged reads in this build) the whole object is read into memory and
+/// opened in place, which still skips the decode. Runs inside the decoder
+/// guard, so a malformed file is a clean [`LakeError::Corrupt`] naming the
+/// data file, never an escaping panic.
+///
+/// Cross-file validation (the `pinkdb.table` identity matching the catalog
+/// key, the row count matching the manifest, one file per table) is the
+/// caller's job — this entry point only reports what the file itself says.
+pub(crate) fn read_footer(
+    path: &Path,
+    storage: &dyn crate::storage::Storage,
+    rel: &str,
+) -> Result<FileFooter> {
+    with_decoder_guard(path, "opening it footer-only", || {
+        let (runtime, session) = session();
+        let file = match storage.local_path(rel) {
+            // Local: positioned reads of the postscript + footer + metadata
+            // segments; the file's data segments are never touched.
+            Some(local) => runtime
+                .block_on(session.open_options().include_metadata().open_path(&local))
+                .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?,
+            // Object storage: whole-object read, still no decode.
+            None => {
+                let bytes = storage.read(rel, &format!("loading data file \"{rel}\""))?;
+                session
+                    .open_options()
+                    .include_metadata()
+                    .open_buffer(ByteBuffer::from(bytes))
+                    .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?
+            }
+        };
+        let metadata = parse_metadata(path, &file)?;
+        let schema = schema_of(path, &file, &metadata)?;
+        let stats = file_column_stats(path, &file, &schema)?;
+        Ok(FileFooter {
+            db: metadata.db,
+            table: metadata.table,
+            rows: file.row_count(),
+            schema,
+            stats,
+        })
+    })
+}
+
+/// The per-column statistics of a footer-opened file, gated for exactness.
+fn file_column_stats(
+    path: &Path,
+    file: &vortex::file::VortexFile,
+    schema: &[(String, DataType)],
+) -> Result<Vec<ColumnStats>> {
+    let Some(file_stats) = file.file_stats() else {
+        return Ok(schema.iter().map(|_| ColumnStats::unknown()).collect());
+    };
+    let sets = file_stats.stats_sets();
+    if sets.len() != schema.len() {
+        return Err(corrupt(
+            path,
+            format!(
+                "the file's statistics cover {} fields but the schema has {} columns",
+                sets.len(),
+                schema.len()
+            ),
+        ));
+    }
+    // `schema_of` has already checked the root is a non-nullable struct whose
+    // fields match the metadata; nullability per field decides `COUNT(col)`
+    // without a stored NULL count.
+    let DType::Struct(fields, _) = file.dtype() else {
+        return Err(corrupt(
+            path,
+            "Vortex data file root type is not a struct".to_string(),
+        ));
+    };
+    let mut out = Vec::with_capacity(schema.len());
+    for (i, (_name, dtype)) in schema.iter().enumerate() {
+        let non_nullable = fields
+            .fields()
+            .nth(i)
+            .is_some_and(|f| f.nullability() == Nullability::NonNullable);
+        out.push(column_stats(*dtype, non_nullable, &sets[i]));
+    }
+    Ok(out)
+}
+
+/// One column's exact statistics, or [`ColumnStats::unknown`] for anything
+/// that cannot be proved exactly.
+///
+/// Exactness rules (any doubt ⇒ the field stays `None` and the executor
+/// materializes the table instead of answering from statistics):
+///
+/// - a statistic must be `Precision::Exact`: the file-level min/max of a
+///   truncated VARCHAR statistic is written `Inexact`, so truncation needs no
+///   separate check here;
+/// - a DOUBLE column's min/max additionally needs an exact `NaNCount == 0`
+///   (the engine's comparator treats NaN as equal to everything and keeps the
+///   first-seen value, which a min/max statistic cannot reproduce) and a
+///   nonzero statistic (`-0.0 == 0.0` in the same comparator, so the sign of
+///   a first-seen zero is not recoverable);
+/// - a column that cannot contain NULLs has an exact `null_count` of 0 even
+///   when no NULL-count statistic was written.
+fn column_stats(dtype: DataType, non_nullable: bool, set: &StatsSet) -> ColumnStats {
+    let null_count = if non_nullable {
+        Some(0)
+    } else {
+        exact_u64(set.get(Stat::NullCount))
+    };
+    let (min, max) = match dtype {
+        DataType::Double => {
+            let no_nan = exact_u64(set.get(Stat::NaNCount)) == Some(0);
+            if no_nan {
+                (double_stat(set, Stat::Min), double_stat(set, Stat::Max))
+            } else {
+                (None, None)
+            }
+        }
+        _ => (
+            scalar_stat(set, Stat::Min, dtype),
+            scalar_stat(set, Stat::Max, dtype),
+        ),
+    };
+    ColumnStats {
+        null_count,
+        min,
+        max,
+    }
+}
+
+/// The exact `u64` value of a count-like statistic.
+fn exact_u64(precision: Precision<ScalarValue>) -> Option<u64> {
+    match precision {
+        Precision::Exact(ScalarValue::Primitive(p)) => p.as_u64(),
+        _ => None,
+    }
+}
+
+/// An exact non-DOUBLE min/max statistic as an engine value, in the column's
+/// own type. A statistic whose shape does not match the column type (which a
+/// file written by this writer cannot contain) is unusable, not an error.
+fn scalar_stat(set: &StatsSet, stat: Stat, dtype: DataType) -> Option<Value> {
+    let Precision::Exact(value) = set.get(stat) else {
+        return None;
+    };
+    Some(match (dtype, value) {
+        (DataType::Boolean, ScalarValue::Bool(b)) => Value::Boolean(b),
+        (DataType::Integer, ScalarValue::Primitive(p)) => Value::Integer(p.as_i32()?),
+        (DataType::Date, ScalarValue::Primitive(p)) => Value::Date(p.as_i32()?),
+        (DataType::Bigint, ScalarValue::Primitive(p)) => Value::Bigint(p.as_i64()?),
+        (DataType::Timestamp, ScalarValue::Primitive(p)) => Value::Timestamp(p.as_i64()?),
+        (DataType::Varchar, ScalarValue::Utf8(s)) => Value::Varchar(s.as_str().to_string()),
+        _ => return None,
+    })
+}
+
+/// An exact DOUBLE min/max statistic, refusing zeros (see [`column_stats`]).
+fn double_stat(set: &StatsSet, stat: Stat) -> Option<Value> {
+    let Precision::Exact(ScalarValue::Primitive(p)) = set.get(stat) else {
+        return None;
+    };
+    let x = p.as_f64()?;
+    // `-0.0` is caught by the same check (`-0.0 == 0.0`), and a NaN
+    // statistic must never be served (the NaN-count gate should have caught
+    // it already).
+    if x == 0.0 || x.is_nan() {
+        return None;
+    }
+    Some(Value::Double(x))
 }
 
 /// The in-memory entry: one `ByteBuffer` holding the whole file.
@@ -1045,6 +1232,10 @@ mod tests {
     use super::*;
     use pinkdb::{PinkDb, Value, CHUNK_SIZE};
 
+    /// Fresh-temp-dir counter for the footer tests.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
+
     /// A 40-row table with all seven engine types (the review's bit-flip
     /// victim shape, rebuilt deterministically).
     fn seven_type_victim() -> PinkDb {
@@ -1470,6 +1661,186 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("over the engine's CHUNK_SIZE"), "{err}");
+    }
+
+    /// Write `bytes` as `rel` under a fresh temp dir and read its footer
+    /// through the real local storage path (`open_path`, positioned reads).
+    fn try_footer_of(tag: &str, bytes: Vec<u8>) -> Result<FileFooter> {
+        let dir = std::env::temp_dir().join(format!(
+            "pink_lake_footer_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let rel = "data/t/x.vortex";
+        std::fs::create_dir_all(dir.join("data/t")).unwrap();
+        std::fs::write(dir.join(rel), bytes).unwrap();
+        let storage = crate::local::LocalStorage::new(&dir);
+        let out = read_footer(&dir.join(rel), &storage, rel);
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    fn footer_of(tag: &str, bytes: Vec<u8>) -> FileFooter {
+        try_footer_of(tag, bytes).unwrap_or_else(|e| panic!("read_footer failed: {e}"))
+    }
+
+    #[test]
+    fn footer_stats_refuse_nan_and_zero_doubles() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (d DOUBLE, z DOUBLE, ok DOUBLE);")
+            .unwrap();
+        let t = db.table_mut("t").unwrap();
+        // Row 0: -0.0 and NaN; row 1: 0.0 and 1.0; row 2: 2.5 and 1.0.
+        for (d, z, ok) in [(-0.0, f64::NAN, 5.5), (0.0, 1.0, -1.5), (2.5, 1.0, 0.0)] {
+            t.append_row(vec![Value::Double(d), Value::Double(z), Value::Double(ok)])
+                .unwrap();
+        }
+        let footer = footer_of("doubles", victim_bytes(&db));
+        // A zero *statistic* is ambiguous (`-0.0 == 0.0`, first-seen wins in
+        // the engine): the min statistic here is a zero (really `-0.0`), so
+        // it is not served — but the column's nonzero maximum is exact and
+        // is.
+        assert_eq!(footer.stats[0].min, None);
+        assert_eq!(footer.stats[0].max, Some(Value::Double(2.5)));
+        assert_eq!(footer.stats[0].null_count, Some(0));
+        // A column with any NaN proves nothing about MIN/MAX.
+        assert_eq!(footer.stats[1].min, None);
+        assert_eq!(footer.stats[1].max, None);
+        // Nonzero, NaN-free statistics are exact — even though the column
+        // contains a zero (which only matters when it *is* the extreme).
+        assert_eq!(footer.stats[2].min, Some(Value::Double(-1.5)));
+        assert_eq!(footer.stats[2].max, Some(Value::Double(5.5)));
+        assert_eq!(footer.stats[2].null_count, Some(0));
+    }
+
+    #[test]
+    fn footer_stats_of_empty_and_all_null_columns() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER, n INTEGER);")
+            .unwrap();
+        let footer = footer_of("empty", victim_bytes(&db));
+        assert_eq!(footer.rows, 0);
+        // No rows: every statistic is absent (the writer drops all-null stat
+        // columns); the executor derives NaN-free NULL/0 answers from `rows`.
+        assert_eq!(footer.stats[0].min, None);
+        assert_eq!(footer.stats[0].max, None);
+        assert_eq!(footer.stats[0].null_count, Some(0)); // non-nullable
+        assert_eq!(footer.stats[1].null_count, Some(0)); // non-nullable too
+
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER, n INTEGER);")
+            .unwrap();
+        let t = db.table_mut("t").unwrap();
+        for _ in 0..3 {
+            t.append_row(vec![Value::Integer(1), Value::Null]).unwrap();
+        }
+        let footer = footer_of("all_null", victim_bytes(&db));
+        // The nullable column is all NULL: an exact NULL count, no min/max.
+        assert_eq!(footer.stats[1].null_count, Some(3));
+        assert_eq!(footer.stats[1].min, None);
+        assert_eq!(footer.stats[1].max, None);
+        // The non-nullable column has exact statistics.
+        assert_eq!(footer.stats[0].null_count, Some(0));
+        assert_eq!(footer.stats[0].min, Some(Value::Integer(1)));
+        assert_eq!(footer.stats[0].max, Some(Value::Integer(1)));
+    }
+
+    #[test]
+    fn footer_stats_refuse_truncated_strings_but_serve_short_ones() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (s VARCHAR, l VARCHAR);")
+            .unwrap();
+        let t = db.table_mut("t").unwrap();
+        for i in 0..8i64 {
+            t.append_row(vec![
+                Value::Varchar(format!("key-{}", i % 3)),
+                // Long enough that the writer truncates the max statistic.
+                Value::Varchar(format!("long-{i}-{}", "x".repeat(120))),
+            ])
+            .unwrap();
+        }
+        let footer = footer_of("strings", victim_bytes(&db));
+        // Short strings are exact on both ends.
+        assert_eq!(footer.stats[0].min, Some(Value::Varchar("key-0".into())));
+        assert_eq!(footer.stats[0].max, Some(Value::Varchar("key-2".into())));
+        // Every long string exceeds the truncation length, so both bounds
+        // are inexact — never served as exact answers.
+        assert_eq!(footer.stats[1].min, None);
+        assert_eq!(footer.stats[1].max, None);
+        assert_eq!(footer.stats[1].null_count, Some(0));
+    }
+
+    /// Every served statistic equals the decoded min/max under the engine's
+    /// own comparator, for a fixture with all types.
+    #[test]
+    fn footer_stats_match_decoded_min_max() {
+        let db = seven_type_victim();
+        let footer = footer_of("seven", victim_bytes(&db));
+        let decoded = decode(&victim_bytes(&db)).unwrap();
+        let t = decoded.table("t").unwrap();
+        assert_eq!(footer.rows as usize, t.num_rows());
+        assert_eq!(footer.schema, t.schema());
+        for (i, (name, _)) in footer.schema.iter().enumerate() {
+            let mut nulls = 0u64;
+            let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
+            for row in 0..t.num_rows() {
+                let v = t.get(row, i).unwrap();
+                if v.is_null() {
+                    nulls += 1;
+                    continue;
+                }
+                if min
+                    .as_ref()
+                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_lt())
+                {
+                    min = Some(v.clone());
+                }
+                if max
+                    .as_ref()
+                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_gt())
+                {
+                    max = Some(v);
+                }
+            }
+            assert_eq!(footer.stats[i].null_count, Some(nulls), "{name}");
+            if let Some(stat) = &footer.stats[i].min {
+                assert_eq!(Some(stat), min.as_ref(), "{name} min");
+            }
+            if let Some(stat) = &footer.stats[i].max {
+                assert_eq!(Some(stat), max.as_ref(), "{name} max");
+            }
+        }
+    }
+
+    #[test]
+    fn footer_read_of_garbage_is_corrupt() {
+        let err = try_footer_of("garbage", b"not a vortex file at all".to_vec())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid Vortex file"), "{err}");
+    }
+
+    /// A byte flip anywhere in the footer region must yield `Ok` or a clean
+    /// error — never an escaping panic (the footer read runs inside the same
+    /// decoder guard as the full decode).
+    #[test]
+    fn footer_read_never_panics_on_flipped_bytes() {
+        let db = seven_type_victim();
+        let bytes = victim_bytes(&db);
+        let mut flips = 0;
+        for offset in bytes.len().saturating_sub(256)..bytes.len() {
+            let mut copy = bytes.clone();
+            copy[offset] ^= 0x01;
+            if let Ok(footer) = try_footer_of("flip", copy) {
+                // A flip that still parses must not claim an absurd row
+                // count or a schema that disagrees with the metadata.
+                assert_eq!(footer.schema.len(), 7);
+            }
+            flips += 1;
+        }
+        assert!(flips > 0);
     }
 
     #[test]

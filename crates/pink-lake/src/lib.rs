@@ -53,6 +53,14 @@
 //! still print one line to stderr first; the crate does not swap the global
 //! hook).
 //!
+//! `.lake open` and `.lake attach` remain the two ways in: `open` eagerly
+//! loads a version into the store, `attach` reads only the catalog, the
+//! manifest and every data file's footer (identity, schema, row count and
+//! exact per-column statistics) and lazily materializes the one table a
+//! query actually scans — with exact `COUNT`/`MIN`/`MAX` answered straight
+//! from those statistics. Attached lakes are read-only, session-local, and
+//! never part of a save, a checkpoint, or the WAL.
+//!
 //! # Snapshots and versioning
 //!
 //! [`Lake::write_from_store`] writes a full snapshot: every table of every
@@ -161,10 +169,12 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use pinkdb::{DataTable, DataType, PinkDb};
 
+mod attach;
 mod catalog;
 mod local;
 #[cfg(test)]
@@ -175,6 +185,7 @@ mod storage;
 mod time;
 mod vortex_file;
 
+pub use attach::AttachmentReport;
 use catalog::{Catalog, FileFormat, TableEntry};
 use local::{LocalStorage, CATALOG_FILE};
 use storage::{Head, Location, Storage, VersionTag};
@@ -372,7 +383,7 @@ pub struct SaveReport {
 #[derive(Debug)]
 pub struct Lake {
     root: PathBuf,
-    storage: Box<dyn Storage>,
+    storage: Arc<dyn Storage>,
     format_version: u32,
     version: u64,
 }
@@ -389,7 +400,7 @@ impl Lake {
     /// snapshot, and the loser retries [`Lake::open`] via
     /// [`Lake::open_or_create`].
     pub fn create(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with(Box::new(LocalStorage::new(dir.as_ref())))
+        Self::create_with(Arc::new(LocalStorage::new(dir.as_ref())))
     }
 
     /// Create a lake at a location string: a local directory, or an
@@ -407,7 +418,7 @@ impl Lake {
         Self::create_with(storage_for(Location::parse(location)?)?)
     }
 
-    fn create_with(storage: Box<dyn Storage>) -> Result<Self> {
+    fn create_with(storage: Arc<dyn Storage>) -> Result<Self> {
         let root = storage.abs("");
         if storage.exists(CATALOG_FILE)? {
             return Err(LakeError::AlreadyALake { path: root });
@@ -458,7 +469,7 @@ impl Lake {
 
     /// Open an existing lake: `dir/catalog.json` must exist and parse.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with(Box::new(LocalStorage::new(dir.as_ref())))
+        Self::open_with(Arc::new(LocalStorage::new(dir.as_ref())))
     }
 
     /// Open a lake at a location string: a local directory, or an
@@ -470,7 +481,7 @@ impl Lake {
         Self::open_with(storage_for(Location::parse(location)?)?)
     }
 
-    fn open_with(storage: Box<dyn Storage>) -> Result<Self> {
+    fn open_with(storage: Arc<dyn Storage>) -> Result<Self> {
         let root = storage.abs("");
         let manifest = read_catalog(&*storage, &root)?;
         Ok(Self {
@@ -515,13 +526,13 @@ impl Lake {
     /// credentials, bucket/prefix) instead of the environment.
     #[cfg(feature = "s3")]
     pub fn create_s3(config: S3Config) -> Result<Self> {
-        Self::create_with(Box::new(s3::S3Storage::new(config)?))
+        Self::create_with(Arc::new(s3::S3Storage::new(config)?))
     }
 
     /// Open a lake from explicit [`S3Config`].
     #[cfg(feature = "s3")]
     pub fn open_s3(config: S3Config) -> Result<Self> {
-        Self::open_with(Box::new(s3::S3Storage::new(config)?))
+        Self::open_with(Arc::new(s3::S3Storage::new(config)?))
     }
 
     /// [`Lake::open_s3`] when the bucket/prefix already holds a lake, else
@@ -616,6 +627,27 @@ impl Lake {
     pub fn load(&self, version: Option<u64>) -> Result<PinkDb> {
         let (manifest, manifest_path) = self.manifest(version)?;
         self.rebuild(&manifest, &manifest_path)
+    }
+
+    /// Footer-only *attach* of the latest version (`None`) or a specific
+    /// snapshot: read the manifest, then open every data file's footer,
+    /// metadata segment and statistics — no column data is read or decoded,
+    /// unless the files live on object storage (whole-object reads; still no
+    /// decode).
+    ///
+    /// The returned [`AttachmentReport`] carries the version-pinned
+    /// [`pinkdb::AttachedLake`] handle; register it with
+    /// [`pinkdb::PinkDb::attach_lake`] to make the tables queryable. Attach
+    /// validates what `.lake open` would validate when it loads: the
+    /// `pinkdb.table` identity, the declared schema, and the row count
+    /// against the manifest. It never mutates the lake.
+    ///
+    /// A `format_version` 1 lake (engine `.pink` data files, no statistics)
+    /// and a table with more than one data file are refused with a clear
+    /// error; `.lake open` remains the way to load those.
+    pub fn attach(&self, version: Option<u64>) -> Result<AttachmentReport> {
+        let (_, report) = attach::build(self, version)?;
+        Ok(report)
     }
 
     /// Referenced data files that are missing (or not a valid `data/…` path):
@@ -1001,20 +1033,20 @@ pub fn save_store_s3(db: &PinkDb, config: S3Config) -> Result<u64> {
 
 /// The storage backend for a parsed location: local always, S3 only with the
 /// `s3` feature (a clear error otherwise).
-fn storage_for(location: Location) -> Result<Box<dyn Storage>> {
+fn storage_for(location: Location) -> Result<Arc<dyn Storage>> {
     match location {
-        Location::Local(path) => Ok(Box::new(LocalStorage::new(&path))),
+        Location::Local(path) => Ok(Arc::new(LocalStorage::new(&path))),
         Location::S3 { bucket, prefix } => s3_storage(&bucket, &prefix),
     }
 }
 
 #[cfg(feature = "s3")]
-fn s3_storage(bucket: &str, prefix: &str) -> Result<Box<dyn Storage>> {
-    Ok(Box::new(s3::S3Storage::from_url(bucket, prefix)?))
+fn s3_storage(bucket: &str, prefix: &str) -> Result<Arc<dyn Storage>> {
+    Ok(Arc::new(s3::S3Storage::from_url(bucket, prefix)?))
 }
 
 #[cfg(not(feature = "s3"))]
-fn s3_storage(bucket: &str, prefix: &str) -> Result<Box<dyn Storage>> {
+fn s3_storage(bucket: &str, prefix: &str) -> Result<Arc<dyn Storage>> {
     let location = if prefix.is_empty() {
         format!("s3://{bucket}")
     } else {
@@ -1266,7 +1298,11 @@ fn splitmix64(mut z: u64) -> u64 {
 }
 
 /// The single database + single table a data file must hold.
-fn only_table<'a>(mini: &'a PinkDb, rel: &str, root: &Path) -> Result<(String, &'a DataTable)> {
+pub(crate) fn only_table<'a>(
+    mini: &'a PinkDb,
+    rel: &str,
+    root: &Path,
+) -> Result<(String, &'a DataTable)> {
     let dbs = mini.list_databases();
     if dbs.len() != 1 {
         return Err(LakeError::Corrupt {

@@ -380,3 +380,42 @@ fn concurrent_lake_saves_over_s3_stay_consistent() {
     }
     std::fs::remove_dir_all(&scratch).ok();
 }
+
+/// `.lake attach` over the mock S3: allowed, footer-only in the decode sense
+/// (whole objects, as the note says), with working statistics fast paths and
+/// lazy materialization.
+#[test]
+fn lake_s3_attach_reports_and_queries() {
+    let mock = mock_s3::MockS3::start();
+    let url = mock.url("cli-bucket", "lakes/attach");
+
+    let out = run_mock(
+        &mock,
+        &format!(
+            "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
+             INSERT INTO t VALUES (1, 'x'), (2, NULL);\n\
+             .lake save {url}\n\
+             .quit\n"
+        ),
+    );
+    assert!(out.contains("Saved lake version 2"), "{out}");
+
+    let out = run_mock(
+        &mock,
+        &format!(
+            ".lake attach {url}\n\
+             .lake attached\n\
+             SELECT COUNT(*), COUNT(b), MIN(a), MAX(b) FROM t;\n\
+             SELECT SUM(a) FROM t;\n\
+             .lake detach {url}\n\
+             .quit\n"
+        ),
+    );
+    assert!(
+        out.contains("footer-only") && out.contains("no ranged reads"),
+        "{out}"
+    );
+    assert!(out.contains("main.t (2 rows)"), "{out}");
+    assert!(out.contains("Detached"), "{out}");
+    assert!(!out.contains("Error:"), "{out}");
+}

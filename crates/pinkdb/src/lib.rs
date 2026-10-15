@@ -10,6 +10,7 @@
 //! zero-unsafe, and the built-in binder/executor path is unchanged when no
 //! extension is loaded.
 
+pub mod attached;
 pub mod crypto;
 pub mod csv;
 pub mod db;
@@ -24,6 +25,7 @@ pub mod types;
 pub mod vector;
 pub mod wal;
 
+pub use attached::{AttachedLake, AttachedTable, ColumnStats};
 pub use crypto::EncryptionKey;
 pub use db::{Connection, Database};
 pub use exec::QueryResult;
@@ -72,6 +74,12 @@ impl PinkDb {
                         "{stmt} is not allowed inside a transaction"
                     )));
                 }
+            }
+            // A durable store logs mutating statements: one that reads an
+            // attached lake table could never replay (the table is
+            // session-local), so refuse it before anything runs.
+            if self.is_durable() && plan::writes_tables(&plan) {
+                self.refuse_logged_attached_reads(&plan)?;
             }
             let result = exec::run(self, &plan)?;
             // Session transitions are applied before WAL logging so the log

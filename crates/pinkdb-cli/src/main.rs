@@ -72,6 +72,11 @@ fn print_help() {
                 "  .lake open <dir> [v]      load the lake's latest (or version v) into memory"
             );
         }
+        println!(
+            "  .lake attach <dir|s3://…> [v]  attach a lake read-only, from its metadata only"
+        );
+        println!("  .lake detach <dir|s3://…>    detach one attached lake");
+        println!("  .lake attached              list attached lakes and their tables");
         println!("  .lake versions <dir|s3://…>  list the lake's published versions");
         println!("  .lake tables <dir|s3://…>    list the current version's tables and row counts");
         println!(
@@ -300,13 +305,21 @@ fn plural(n: usize) -> &'static str {
 fn cmd_tables(db: &PinkDb) {
     let tables = db.list_tables();
     let views = db.list_views();
-    if tables.is_empty() && views.is_empty() {
+    let attached: Vec<pinkdb::AttachedTable> = db
+        .attached_tables()
+        .into_iter()
+        .filter(|t| t.db.eq_ignore_ascii_case(db.current_db()))
+        .collect();
+    if tables.is_empty() && views.is_empty() && attached.is_empty() {
         println!("(no tables)");
         return;
     }
     for t in tables {
         let n = db.table(&t).map(|x| x.num_rows()).unwrap_or(0);
         println!("{t} ({n} rows)");
+    }
+    for t in attached {
+        println!("{} ({} rows, attached)", t.table, t.rows);
     }
     for v in views {
         println!("{v} (view)");
@@ -348,6 +361,21 @@ fn cmd_schema(db: &mut PinkDb, arg: &str) {
             println!("); -- {} rows, {} chunks", t.num_rows(), t.num_chunks());
         }
         Err(table_err) => {
+            // An attached lake table is not in the store but is queryable;
+            // `.schema` shows its footer-read schema and row count.
+            let attached = match &lookup_db {
+                Some(q) => db.attached_table_in(q, &lookup_name),
+                None => db.attached_table_in(db.current_db(), &lookup_name),
+            };
+            if let Some(att) = attached {
+                println!("CREATE TABLE {} (", att.table);
+                for (i, (col, dtype)) in att.schema.iter().enumerate() {
+                    let comma = if i + 1 == att.schema.len() { "" } else { "," };
+                    println!("  {col} {dtype}{comma}");
+                }
+                println!("); -- {} rows, attached (read-only)", att.rows);
+                return;
+            }
             // Not a table: `.schema db.v` on a view shows the view's output
             // columns (bound through `LIMIT 0`, so a broken body is a clear
             // error, never stale columns).
@@ -543,6 +571,14 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                             .any(|d| !db.list_views_in(d).is_empty());
                         if any_views {
                             println!("Note: views are session-local and were not saved.");
+                        }
+                        let attached = db.attached_tables().len();
+                        if attached > 0 {
+                            println!(
+                                "Note: attached lake tables are session-local and were not \
+                                 saved ({attached} table{}).",
+                                plural(attached)
+                            );
                         }
                         println!("Saved in {:.3}s", t0.elapsed().as_secs_f64())
                     }

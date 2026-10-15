@@ -23,6 +23,7 @@ use expr::{coerce_to, count_true, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
 
+use crate::attached::AttachedTable;
 use crate::plan::{agg_output_schema, compare_values, win_output_schema, LogicalPlan};
 use crate::sql::ast::{BinaryOp, JoinKind};
 use crate::sql::binder::{common_numeric, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
@@ -367,6 +368,137 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     })
 }
 
+/// Every stored chunk of `t`, in order (columns shared by `Arc`, never
+/// copied).
+fn scan_chunks(t: &DataTable) -> Vec<DataChunk> {
+    let mut chunks = Vec::with_capacity(t.num_chunks());
+    for i in 0..t.num_chunks() {
+        if let Some(c) = t.scan_chunk(i) {
+            chunks.push(c);
+        }
+    }
+    chunks
+}
+
+/// Exact aggregate answers from an attached lake table's stored statistics
+/// (the stage-1 fast path): `COUNT(*)`, `COUNT(col)`, `MIN(col)` and
+/// `MAX(col)` over a plain scan of one attached table — no filter, grouping,
+/// or expression around the argument.
+///
+/// All-or-nothing: every aggregate in the query must be provable from exact
+/// statistics, otherwise the whole query returns `None` and takes the normal
+/// path, which materializes the attached table. The answers match the
+/// in-memory operators exactly:
+///
+/// - `COUNT(*)` is the data file's row count (cross-checked against the
+///   manifest's row count at attach time), so it is always exact;
+/// - `COUNT(col)` is `rows - NULLs`, taken only when the NULL count is exact
+///   (a non-nullable column always has an exact 0);
+/// - `MIN`/`MAX` use a column statistic only when the lake marked it exact:
+///   truncated VARCHAR statistics are inexact, a DOUBLE column with any NaN
+///   is refused (the engine's NaN ordering is first-seen), and a zero DOUBLE
+///   statistic is refused (`-0.0 == 0.0` in the engine's comparator, which
+///   keeps the first-seen zero, so the sign is not recoverable from a
+///   min/max alone);
+/// - an empty table, or a column whose every row is NULL, answers `NULL` for
+///   `MIN`/`MAX` and 0 for `COUNT(col)` without any statistic — exactly what
+///   the accumulators produce over an empty input.
+fn attached_stats_aggregate(
+    cx: &Cx,
+    input: &LogicalPlan,
+    keys: &[BoundExpr],
+    aggs: &[BoundAgg],
+) -> Result<Option<Output>> {
+    if !keys.is_empty() || aggs.is_empty() {
+        return Ok(None);
+    }
+    // A qualified scan is a catalog table (an unqualified `db: None` scan is
+    // a CTE); the attached lookup decides whether it is an attached lake
+    // table at all.
+    let LogicalPlan::Scan {
+        db: Some(db),
+        table,
+    } = input
+    else {
+        return Ok(None);
+    };
+    let Some((attached, _)) = cx.db.attached_lookup(db, table) else {
+        return Ok(None);
+    };
+    let mut values = Vec::with_capacity(aggs.len());
+    for agg in aggs {
+        let Some(value) = attached_aggregate_value(attached, agg) else {
+            return Ok(None);
+        };
+        values.push(value);
+    }
+    // Same output shape as the COUNT(*) fast path below: one row, one column
+    // per aggregate, `__agg{i}` names, the aggregate's own dtype.
+    let mut columns = Vec::with_capacity(aggs.len());
+    let mut names = Vec::with_capacity(aggs.len());
+    let mut types = Vec::with_capacity(aggs.len());
+    for (i, (agg, value)) in aggs.iter().zip(values).enumerate() {
+        let mut vec = Vector::new_empty(agg.dtype);
+        if value.is_null() {
+            vec.push_null()?;
+        } else {
+            vec.push_valid(value)?;
+        }
+        columns.push(vec);
+        names.push(format!("__agg{i}"));
+        types.push(agg.dtype);
+    }
+    Ok(Some(Output {
+        chunks: vec![DataChunk::new(columns)?],
+        names,
+        types,
+    }))
+}
+
+/// One aggregate's exact value from an attached table's descriptor, or
+/// `None` when stored statistics cannot prove it.
+fn attached_aggregate_value(attached: &AttachedTable, agg: &BoundAgg) -> Option<Value> {
+    // A row count the engine's `COUNT` (an `i64`) cannot represent is not
+    // answerable; it cannot be materialized either, but falling back keeps
+    // the fast path honest.
+    let rows = i64::try_from(attached.rows).ok()?;
+    match (agg.func, &agg.arg) {
+        (AggFunc::Count, None) => Some(Value::Bigint(rows)),
+        (AggFunc::Count, Some(BoundExpr::Column { index, .. })) => {
+            if attached.rows == 0 {
+                // No rows: no non-NULL values, whatever the NULL stat says.
+                return Some(Value::Bigint(0));
+            }
+            let nulls = i64::try_from(attached.stats.get(*index)?.null_count?).ok()?;
+            Some(Value::Bigint(rows.checked_sub(nulls)?))
+        }
+        (AggFunc::Min, Some(BoundExpr::Column { index, .. })) => {
+            min_max_value(attached, *index, true)
+        }
+        (AggFunc::Max, Some(BoundExpr::Column { index, .. })) => {
+            min_max_value(attached, *index, false)
+        }
+        // SUM/AVG (float order), COUNT(DISTINCT), expression arguments and
+        // everything else: the normal path.
+        _ => None,
+    }
+}
+
+/// `MIN(col)`/`MAX(col)` from an attached table's statistics: `NULL` for an
+/// empty table or an all-NULL column (exactly what the accumulator returns),
+/// else the exact statistic when the lake proved one.
+fn min_max_value(attached: &AttachedTable, index: usize, is_min: bool) -> Option<Value> {
+    let stats = attached.stats.get(index)?;
+    if attached.rows == 0 || stats.null_count == Some(attached.rows) {
+        return Some(Value::Null);
+    }
+    if is_min {
+        stats.min.clone()
+    } else {
+        stats.max.clone()
+    }
+}
+
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     match plan {
         LogicalPlan::CreateTable { .. }
@@ -395,16 +527,22 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 }
             }
             let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
-            let t = cx.db.table_in(lookup, table)?;
-            let mut chunks = Vec::with_capacity(t.num_chunks());
-            for i in 0..t.num_chunks() {
-                if let Some(c) = t.scan_chunk(i) {
-                    chunks.push(c);
-                }
+            // An attached lake table is not in the store: materialize it on
+            // first use (the exact decode `.lake open` performs) and scan the
+            // result like any other table for the rest of the session.
+            if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
+                let t = lake.load(lookup, table)?;
+                let (names, types) = t.schema().into_iter().unzip();
+                return Ok(Output {
+                    chunks: scan_chunks(&t),
+                    names,
+                    types,
+                });
             }
+            let t = cx.db.table_in(lookup, table)?;
             let (names, types) = t.schema().into_iter().unzip();
             Ok(Output {
-                chunks,
+                chunks: scan_chunks(t),
                 names,
                 types,
             })
@@ -483,6 +621,13 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // checks are static, so a blocked shape falls through without
             // having evaluated anything.
             if let Some(out) = fused_join_aggregate(cx, input, keys, aggs)? {
+                return Ok(out);
+            }
+            // Attached-lake statistics: an exact COUNT/COUNT(col)/MIN/MAX
+            // over a plain attached table is answered from the data file's
+            // footer without decoding it; every other shape falls through and
+            // materializes the table on first use.
+            if let Some(out) = attached_stats_aggregate(cx, input, keys, aggs)? {
                 return Ok(out);
             }
             // Fast path: pure COUNT(*) with no keys counts rows — no data

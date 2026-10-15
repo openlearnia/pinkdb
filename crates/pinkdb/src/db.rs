@@ -249,6 +249,12 @@ impl Connection {
                 let pre = self.current_db.clone();
                 let (plan, dynamic_functions_used) =
                     crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
+                // A durable transaction logs its mutating statements: one
+                // that reads an attached lake table could never replay (the
+                // guard is a no-op for in-memory stores).
+                if crate::plan::writes_tables(&plan) {
+                    txn.work.refuse_logged_attached_reads(&plan)?;
+                }
                 record_writes(&plan, &pre, &mut txn.table_writes, &mut txn.view_writes);
                 crate::plan::collect_tables_read(&plan, &pre, &mut txn.table_reads);
                 let result = crate::exec::run(&mut txn.work, &plan)?;
@@ -310,6 +316,12 @@ impl Connection {
                     let mut shared = write_lock(&self.db.shared);
                     let (plan, dynamic_functions_used) =
                         crate::sql::bind_tracked(&shared, stmt, &pre)?;
+                    // A durable store logs mutating statements: one that
+                    // reads an attached lake table could never replay (the
+                    // guard is a no-op for in-memory stores).
+                    if crate::plan::writes_tables(&plan) {
+                        shared.refuse_logged_attached_reads(&plan)?;
+                    }
                     let result = crate::exec::run(&mut shared, &plan)?;
                     // The write is published: log it while still holding the
                     // lock so WAL order matches commit order.

@@ -1744,3 +1744,262 @@ fn v3_round_trip_accepts_scan_chunks_above_the_old_cap() {
     assert_eq!(loaded.table("t").unwrap().num_rows(), 100_000);
     cleanup(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// `.lake attach`: footer-only descriptors + lazy materialization.
+
+/// Query `db` and return the rows bit-exactly (NaN payloads and `-0.0`
+/// compared by bits, like [`assert_same_store`]).
+fn select_rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
+    let mut results = db.execute(sql).unwrap();
+    match results.pop().unwrap() {
+        pinkdb::QueryResult::Selected { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+fn assert_rows_bit_same(a: &[Vec<Value>], b: &[Vec<Value>], what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}: row count");
+    for (ra, rb) in a.iter().zip(b) {
+        assert_eq!(ra.len(), rb.len(), "{what}: column count");
+        for (va, vb) in ra.iter().zip(rb) {
+            match (va, vb) {
+                (Value::Double(x), Value::Double(y)) => {
+                    assert_eq!(x.to_bits(), y.to_bits(), "{what}: {va:?} vs {vb:?}")
+                }
+                _ => assert_eq!(va, vb, "{what}"),
+            }
+        }
+    }
+}
+
+/// The whole fidelity fixture attaches: descriptors equal the decoded truth,
+/// and a battery of COUNT/COUNT(col)/MIN/MAX (plus shapes that must fall
+/// back) answers bit-identically to the `.lake open` store.
+#[test]
+fn attach_of_the_fidelity_store_matches_the_loaded_store() {
+    let dir = scratch("attach_fidelity");
+    let lake_dir = dir.join("lake");
+    let db = common::fidelity_store();
+    save_store(&db, &lake_dir).unwrap();
+    let lake = Lake::open(&lake_dir).unwrap();
+    let report = lake.attach(None).unwrap();
+    assert_eq!(report.version, 2);
+    assert_eq!(report.format_version, FORMAT_VERSION);
+    assert!(!report.remote);
+
+    // Descriptor-vs-decoded: every provable statistic must hold, for every
+    // table of the fixture.
+    let loaded = lake.load(None).unwrap();
+    let mut attached_db = PinkDb::new();
+    let tables = attached_db.attach_lake(report.lake.clone()).unwrap();
+    // The attached catalog is exactly the loaded store's table set.
+    let mut attached_keys: Vec<(String, String)> = tables
+        .iter()
+        .map(|t| (t.db.to_ascii_lowercase(), t.table.to_ascii_lowercase()))
+        .collect();
+    attached_keys.sort();
+    let mut loaded_keys: Vec<(String, String)> = Vec::new();
+    for dbname in loaded.list_databases() {
+        for name in loaded.list_tables_in(&dbname) {
+            loaded_keys.push((dbname.to_ascii_lowercase(), name.to_ascii_lowercase()));
+        }
+    }
+    loaded_keys.sort();
+    assert_eq!(attached_keys, loaded_keys);
+    for table in &tables {
+        let decoded = loaded.table_in(&table.db, &table.table).unwrap();
+        assert_eq!(table.rows, decoded.num_rows() as u64);
+        assert_eq!(table.schema, decoded.schema());
+        for (i, (name, _)) in table.schema.iter().enumerate() {
+            let mut nulls = 0u64;
+            let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
+            for row in 0..decoded.num_rows() {
+                let v = decoded.get(row, i).unwrap();
+                if v.is_null() {
+                    nulls += 1;
+                    continue;
+                }
+                if min
+                    .as_ref()
+                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_lt())
+                {
+                    min = Some(v.clone());
+                }
+                if max
+                    .as_ref()
+                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_gt())
+                {
+                    max = Some(v);
+                }
+            }
+            assert_eq!(table.stats[i].null_count, Some(nulls), "{name}");
+            if let Some(stat) = &table.stats[i].min {
+                assert_eq!(Some(stat), min.as_ref(), "{name} min");
+            }
+            if let Some(stat) = &table.stats[i].max {
+                assert_eq!(Some(stat), max.as_ref(), "{name} max");
+            }
+        }
+    }
+
+    // The query battery: attached store vs loaded store, bit-exact.
+    let fid_schema = attached_db
+        .attached_table_in("main", "fid")
+        .unwrap()
+        .schema
+        .clone();
+    let mut mut_attached = attached_db;
+    let mut mut_loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    let mut queries = vec![
+        "SELECT COUNT(*) FROM main.fid;".to_string(),
+        "SELECT COUNT(*) FROM big;".to_string(),
+        "SELECT COUNT(*) FROM empty;".to_string(),
+        "SELECT SUM(i), AVG(i) FROM fid;".to_string(),
+        "SELECT COUNT(*) FROM fid WHERE i > 0;".to_string(),
+        "SELECT b, COUNT(*) FROM fid GROUP BY b ORDER BY b;".to_string(),
+        "SELECT i, g FROM fid ORDER BY i LIMIT 4;".to_string(),
+        "SELECT MAX(i) FROM (SELECT i FROM fid) s;".to_string(),
+        "SELECT MIN(i) + 1, MAX(g) - 1 FROM fid;".to_string(),
+        "SELECT fid.i, big.a FROM fid JOIN big ON fid.i = big.a ORDER BY fid.i LIMIT 3;"
+            .to_string(),
+        "SELECT COUNT(*) FROM analytics.\"a.b\";".to_string(),
+        "SELECT z FROM analytics.\"a.b\";".to_string(),
+    ];
+    // Every column: COUNT(col) and MIN/MAX (bit-exact comparison decides
+    // whether the carrier is a fast path or a fallback).
+    for (col, _) in fid_schema {
+        queries.push(format!("SELECT COUNT({col}) FROM fid;"));
+        queries.push(format!("SELECT MIN({col}), MAX({col}) FROM fid;"));
+    }
+    for sql in queries {
+        let a = select_rows(&mut mut_attached, &sql);
+        let b = select_rows(&mut mut_loaded, &sql);
+        assert_rows_bit_same(&a, &b, &sql);
+    }
+    cleanup(&dir);
+}
+
+/// Attach reads the requested version only, and stays pinned to it however
+/// the catalog moves.
+#[test]
+fn attach_is_pinned_to_the_requested_version() {
+    let dir = scratch("attach_pinned");
+    let lake_dir = dir.join("lake");
+    let lake = Lake::open_or_create(&lake_dir).unwrap();
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+    let mut lake = {
+        drop(lake);
+        Lake::open(&lake_dir).unwrap()
+    };
+    lake.write_from_store(&db).unwrap(); // version 2: 2 rows
+    db.execute("INSERT INTO t VALUES (3);").unwrap();
+    lake.write_from_store(&db).unwrap(); // version 3: 3 rows
+
+    let older = Lake::open(&lake_dir).unwrap().attach(Some(2)).unwrap();
+    let mut attached = PinkDb::new();
+    attached.attach_lake(older.lake).unwrap();
+    assert_eq!(
+        select_rows(&mut attached, "SELECT COUNT(*) FROM t;"),
+        vec![vec![Value::Bigint(2)]],
+        "the attachment is pinned to version 2"
+    );
+    let latest = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let mut attached = PinkDb::new();
+    attached.attach_lake(latest.lake).unwrap();
+    assert_eq!(
+        select_rows(&mut attached, "SELECT COUNT(*) FROM t;"),
+        vec![vec![Value::Bigint(3)]]
+    );
+    cleanup(&dir);
+}
+
+/// Attach refusals: not a lake, a v1 lake, a missing data file, a row-count
+/// mismatch, and a two-file table.
+#[test]
+fn attach_refusals_are_clean_errors() {
+    // Not a lake.
+    let dir = scratch("attach_refuse");
+    let missing = dir.join("nope");
+    let err = Lake::open(&missing).unwrap_err().to_string();
+    assert!(err.contains("is not a pink-lake directory"), "{err}");
+
+    // A v1 lake: no statistics to read.
+    let fixture = v1_fixture_dir();
+    let lake = Lake::open(&fixture).unwrap();
+    let err = lake.attach(None).unwrap_err().to_string();
+    assert!(err.contains("format_version 1"), "{err}");
+    assert!(err.contains("use .lake open"), "{err}");
+
+    // A missing data file.
+    let lake_dir = dir.join("lake");
+    let db = common::fidelity_store();
+    save_store(&db, &lake_dir).unwrap();
+    for path in data_files(&lake_dir) {
+        std::fs::remove_file(&path).unwrap();
+    }
+    let lake = Lake::open(&lake_dir).unwrap();
+    let err = lake.attach(None).unwrap_err().to_string();
+    assert!(
+        err.contains("is missing") || err.contains("loading data file"),
+        "{err}"
+    );
+
+    // A row-count mismatch (the manifest lies about the file).
+    let lake_dir = dir.join("wrong_rows");
+    save_store(&db, &lake_dir).unwrap();
+    let mut catalog = read_json(&lake_dir.join("catalog.json"));
+    let key = catalog["tables"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let rows = catalog["tables"][&key]["rows"].as_u64().unwrap();
+    catalog["tables"][&key]["rows"] = serde_json::json!(rows + 1);
+    write_json(&lake_dir.join("catalog.json"), &catalog);
+    let err = Lake::open(&lake_dir)
+        .unwrap()
+        .attach(None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("but the catalog says"), "{err}");
+
+    // A table with two data files.
+    let lake_dir = dir.join("two_files");
+    save_store(&db, &lake_dir).unwrap();
+    let files = data_files(&lake_dir);
+    let data_dir = files[0].parent().unwrap().to_path_buf();
+    let second = data_dir.join("second.vortex");
+    std::fs::copy(&files[0], &second).unwrap();
+    let rel_first = files[0]
+        .strip_prefix(&lake_dir)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let rel_second = second
+        .strip_prefix(&lake_dir)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut catalog = read_json(&lake_dir.join("catalog.json"));
+    let key = catalog["tables"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    catalog["tables"][&key]["files"] = serde_json::json!([rel_first, rel_second]);
+    write_json(&lake_dir.join("catalog.json"), &catalog);
+    let err = Lake::open(&lake_dir)
+        .unwrap()
+        .attach(None)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("data files"), "{err}");
+    cleanup(&dir);
+}

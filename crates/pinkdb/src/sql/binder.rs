@@ -2042,6 +2042,9 @@ fn bind_update(
     where_clause: &Option<Expr>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    if let Some(err) = db.attached_read_only(&table_db, table) {
+        return Err(err);
+    }
     let t = db.table_in(&table_db, table)?;
     if sets.is_empty() {
         return Err(PinkDbError::Parse(
@@ -2121,6 +2124,9 @@ fn bind_delete(
     where_clause: &Option<Expr>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    if let Some(err) = db.attached_read_only(&table_db, table) {
+        return Err(err);
+    }
     let t = db.table_in(&table_db, table)?;
     let mut binder = Binder::new(db, &table_db);
     binder.allow_win = false;
@@ -2162,6 +2168,9 @@ fn bind_insert(
     rows: &[Vec<Expr>],
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    if let Some(err) = db.attached_read_only(&table_db, table) {
+        return Err(err);
+    }
     let t = db.table_in(&table_db, table)?;
     let schema = t.schema();
     let order: Vec<usize> = match columns {
@@ -2381,7 +2390,9 @@ fn plan_schema(
                 }
             }
             let lookup = qdb.as_deref().unwrap_or(default_db);
-            Ok(db.table_in(lookup, table)?.schema())
+            // Attached lake tables are visible to queries (they are not in
+            // the store themselves).
+            db.visible_table_schema(lookup, table)
         }
         LogicalPlan::SingleRow => Ok(Vec::new()),
         LogicalPlan::Filter { input, .. }
@@ -2511,7 +2522,7 @@ fn bind_source(
                     sub,
                 ));
             }
-            let columns = db.table_in(&lookup_db, name)?.schema();
+            let columns = db.visible_table_schema(&lookup_db, name)?;
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             Ok((
                 ScopeTable {

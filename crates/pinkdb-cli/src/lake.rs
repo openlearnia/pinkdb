@@ -74,10 +74,13 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
     match sub {
         "save" => cmd_save(db, rest),
         "open" => cmd_open(db, rest),
+        "attach" => cmd_attach(db, rest),
+        "detach" => cmd_detach(db, rest),
+        "attached" => cmd_attached(db, rest),
         "versions" => cmd_versions(rest),
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
-        "" => println!("Usage: .lake <save|open|versions|tables|info> ..."),
+        "" => println!("Usage: .lake <save|open|attach|detach|attached|versions|tables|info> ..."),
         other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
     }
 }
@@ -143,6 +146,14 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             }
             if db.encryption_key().is_some() {
                 println!("Note: lake data files are plaintext; PINKDB_KEY does not encrypt them.");
+            }
+            let attached = db.attached_tables().len();
+            if attached > 0 {
+                println!(
+                    "Note: attached lake tables are session-local and were not saved \
+                     ({attached} table{}).",
+                    plural(attached)
+                );
             }
             println!(
                 "Saved lake version {} in {:.3}s ({} table{}, {} row{}, {} bytes written)",
@@ -240,6 +251,111 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
             }
         }
         Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake attach <location> [version]`: attach the lake read-only, footer-only.
+///
+/// Reads the catalog + the chosen manifest and every data file's footer,
+/// metadata segment and statistics — no column data is decoded (over object
+/// storage the whole objects are read, still without decoding). The session
+/// gains the lake's tables for queries: exact `COUNT`/`MIN`/`MAX` answers
+/// come from the statistics, and any other query materializes the one table
+/// it touches through the same decode `.lake open` performs.
+fn cmd_attach(db: &mut PinkDb, arg: &str) {
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("Usage: .lake attach <dir> [version]{HINT}");
+        return;
+    };
+    let dir = unquote(&dir);
+    let version = if rest.trim().is_empty() {
+        None
+    } else {
+        match rest.trim().parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                println!("Usage: .lake attach <dir> [version]{HINT}");
+                return;
+            }
+        }
+    };
+    // Attaching changes session state that a ROLLBACK cannot undo (like
+    // `.lake save`, not like `.lake open`, which replaces the store).
+    if db.in_transaction() {
+        cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
+        return;
+    }
+    let lake = match Lake::open_url(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let t0 = Instant::now();
+    match lake.attach(version) {
+        Ok(report) => match db.attach_lake(report.lake) {
+            Ok(tables) => {
+                println!(
+                    "Attached {dir} version {} in {:.3}s ({} table{}, footer-only)",
+                    report.version,
+                    t0.elapsed().as_secs_f64(),
+                    tables.len(),
+                    plural(tables.len())
+                );
+                if report.remote {
+                    println!(
+                        "Note: object storage has no ranged reads in this build: attach read \
+                         the data files whole (queries still skip the decode)."
+                    );
+                }
+            }
+            Err(e) => cli_error!("{e}"),
+        },
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake detach <location>`: drop one attached lake from this session.
+fn cmd_detach(db: &mut PinkDb, arg: &str) {
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("Usage: .lake detach <dir>{HINT}");
+        return;
+    };
+    if !rest.trim().is_empty() {
+        println!("Usage: .lake detach <dir>{HINT}");
+        return;
+    }
+    let dir = unquote(&dir);
+    if db.detach_lake(&dir) {
+        println!("Detached {dir}");
+    } else {
+        cli_error!("no lake is attached at {dir} (see .lake attached)");
+    }
+}
+
+/// `.lake attached`: the lakes attached to this session and their tables.
+fn cmd_attached(db: &PinkDb, arg: &str) {
+    if !arg.trim().is_empty() {
+        println!("Usage: .lake attached");
+        return;
+    }
+    let lakes = db.attached_lakes();
+    if lakes.is_empty() {
+        println!("(no attached lakes)");
+        return;
+    }
+    for (location, tables) in lakes {
+        println!("{location}");
+        for t in tables {
+            println!(
+                "  {}.{} ({} row{})",
+                t.db,
+                t.table,
+                t.rows,
+                plural(t.rows as usize)
+            );
+        }
     }
 }
 

@@ -257,7 +257,7 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake tables <dir>"), "{out}");
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
-        out.contains("Usage: .lake <save|open|versions|tables|info> ..."),
+        out.contains("Usage: .lake <save|open|attach|detach|attached|versions|tables|info> ..."),
         "{out}"
     );
 
@@ -768,5 +768,554 @@ fn lake_commands_respect_transactions_and_durable_sessions() {
         lake = lake.display()
     ));
     assert!(out.contains("would detach this session"), "{out}");
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// `.lake attach`: footer-only, lazy, read-only.
+
+/// A deterministic corpus for the attach-equivalence tests, written into
+/// `dir` (SQL script returned; two CSVs written). Everything the design calls
+/// out: all-NULL column, empty table, NaN/±0 payloads, negative ints and
+/// extremes, long/outlined strings, and a >65,000-row imported table.
+fn write_corpus(dir: &Path) -> String {
+    // `big`: 70,000 rows, strings of mixed lengths (the long ones make the
+    // file's max statistic truncate).
+    let big_csv = dir.join("big.csv");
+    let mut csv = String::from("a,s\n");
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+    for i in 0..70_000i64 {
+        let r = next();
+        let word_len = (r % 200) as usize;
+        csv.push_str(&format!("{i},w{}-{}\n", r % 1000, "y".repeat(word_len)));
+    }
+    std::fs::write(&big_csv, csv).unwrap();
+
+    // `nan`: DOUBLE payloads that SQL literals cannot express.
+    let nan_csv = dir.join("nan.csv");
+    std::fs::write(&nan_csv, "d\n1.5\nNaN\n-0.0\n3.25\n\n0.0\n").unwrap();
+
+    let mut sql = String::new();
+    sql.push_str("CREATE DATABASE lake;\nUSE lake;\n");
+    sql.push_str(
+        "CREATE TABLE t (i INTEGER, g BIGINT, d DOUBLE, s VARCHAR, b BOOLEAN, \
+         dt DATE, ts TIMESTAMP, n INTEGER);\n",
+    );
+    // 300 rows: a NULL pattern, extremes, ±0, and long strings.
+    let mut state = 0x1234_5678_9ABC_DEF0u64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state
+    };
+    let mut rows = Vec::new();
+    for i in 0..300i64 {
+        let r = next();
+        let d = if i == 7 {
+            "-0.0".to_string()
+        } else {
+            format!("{:.3}", (r % 4000) as f64 / 8.0 - 250.0)
+        };
+        let s = if i % 5 == 0 {
+            format!("'{}'", "x".repeat((r % 300) as usize + 1))
+        } else if i % 11 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("'k{}-{}'", r % 100, i % 3)
+        };
+        let dt = (r % 20000) as i64 - 10000;
+        rows.push(format!(
+            "({}, {}, {}, {}, {}, {}, {}, NULL)",
+            (r % 500) as i64 - 250,
+            if i == 1 {
+                "-9223372036854775808".to_string()
+            } else if i == 2 {
+                "9223372036854775807".to_string()
+            } else {
+                format!("{}", r as i64)
+            },
+            d,
+            s,
+            r % 2 == 0,
+            dt,
+            r as i64 - 5000,
+        ));
+    }
+    sql.push_str(&format!("INSERT INTO t VALUES {};\n", rows.join(", ")));
+    sql.push_str("CREATE TABLE empty (x INTEGER, y VARCHAR);\n");
+    sql.push_str(&format!(".import {} nan\n", nan_csv.display()));
+    sql.push_str(&format!(".import {} big\n", big_csv.display()));
+    sql
+}
+
+/// The identical query batch every arm runs. Mixes stats-answerable shapes
+/// (COUNT/COUNT(col)/MIN/MAX) with shapes that must fall back (SUM/AVG,
+/// filter, group by, order by, joins, expressions) so the transcripts prove
+/// both paths agree.
+fn corpus_queries() -> &'static str {
+    "SELECT '===BEGIN===' AS marker;\n\
+     SELECT COUNT(*) FROM t;\n\
+     SELECT COUNT(n), COUNT(s), COUNT(d), COUNT(b) FROM t;\n\
+     SELECT MIN(i), MAX(i), MIN(g), MAX(g) FROM t;\n\
+     SELECT MIN(s), MAX(s) FROM t;\n\
+     SELECT MIN(b), MAX(b), MIN(dt), MAX(dt), MIN(ts), MAX(ts) FROM t;\n\
+     SELECT MIN(d), MAX(d), COUNT(d) FROM t;\n\
+     SELECT COUNT(*) FROM empty;\n\
+     SELECT COUNT(x), MIN(x), MAX(y) FROM empty;\n\
+     SELECT COUNT(*), COUNT(d), MIN(d), MAX(d) FROM nan;\n\
+     SELECT COUNT(*) FROM big;\n\
+     SELECT COUNT(s), MIN(a), MAX(a) FROM big;\n\
+     SELECT MIN(s), MAX(s) FROM big;\n\
+     SELECT SUM(i), AVG(i), SUM(d) FROM t;\n\
+     SELECT COUNT(*) FROM t WHERE i > 0;\n\
+     SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b;\n\
+     SELECT i, g FROM t ORDER BY i DESC LIMIT 5;\n\
+     SELECT MAX(i) FROM (SELECT i FROM t) s;\n\
+     SELECT MIN(ABS(i)) FROM t;\n\
+     SELECT t.i, big.a FROM t JOIN big ON t.i = big.a ORDER BY t.i LIMIT 5;\n\
+     SELECT * FROM t ORDER BY i LIMIT 3;\n"
+}
+
+/// The output from the shared `===BEGIN===` sentinel on (so the arm-specific
+/// setup lines are excluded).
+fn tail_after_marker(out: &str) -> &str {
+    let idx = out
+        .find("===BEGIN===")
+        .unwrap_or_else(|| panic!("sentinel missing from output:\n{out}"));
+    &out[idx..]
+}
+
+/// The core equivalence gate: the same data, the same queries, three arms —
+/// in-memory store, `.lake open`, `.lake attach` — must produce identical
+/// transcripts (values included).
+#[test]
+fn attach_answers_equal_open_and_in_memory() {
+    let dir = scratch("attach_equiv");
+    let lake = dir.join("lake");
+    let corpus = write_corpus(&dir);
+    let queries = corpus_queries();
+
+    // Create the lake from the corpus.
+    let out = run(&format!(
+        "{corpus}.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+
+    // Arm 1: the in-memory store.
+    let in_memory = run(&format!("{corpus}{queries}.quit\n"));
+    // Arm 2: `.lake open` (the eager loader).
+    let opened = run(&format!(
+        ".lake open {lake}\nUSE lake;\n{queries}.quit\n",
+        lake = lake.display()
+    ));
+    // Arm 3: `.lake attach` (footer-only + lazy materialization).
+    let attached = run(&format!(
+        ".lake attach {lake}\nUSE lake;\n{queries}.quit\n",
+        lake = lake.display()
+    ));
+
+    let base = tail_after_marker(&in_memory);
+    assert_eq!(
+        tail_after_marker(&opened),
+        base,
+        "`.lake open` diverged from the in-memory answers"
+    );
+    assert_eq!(
+        tail_after_marker(&attached),
+        base,
+        "`.lake attach` diverged from the in-memory answers"
+    );
+    // The fast paths really ran: the attach arm printed the footer-only line
+    // and the eager loader was not used.
+    assert!(attached.contains("footer-only"), "{attached}");
+    cleanup(&dir);
+}
+
+/// `.lake attach` lifecycle: output, listing, `.tables`/`.schema`, detach,
+/// and the read-only refusals.
+#[test]
+fn attach_lifecycle_and_read_only_rules() {
+    let dir = scratch("attach_life");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'zz');\n\
+         CREATE TABLE u (k BIGINT);\n\
+         INSERT INTO u VALUES (7);\n\
+         .lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         .lake attached\n.tables\n.schema t\n\
+         SELECT COUNT(*), COUNT(b), MIN(a), MAX(b) FROM t;\n\
+         .lake detach {lake}\n\
+         SELECT COUNT(*) FROM t;\n\
+         .lake attached\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains(&format!("Attached {} version 2 in", lake.display()))
+            && out.contains("(2 tables, footer-only)"),
+        "{out}"
+    );
+    assert!(out.contains("main.t (3 rows)"), "{out}");
+    assert!(out.contains("main.u (1 row)"), "{out}");
+    assert!(out.contains("t (3 rows, attached)"), "{out}");
+    assert!(out.contains("-- 3 rows, attached (read-only)"), "{out}");
+    assert!(out.contains("│ 3 "), "{out}");
+    assert!(out.contains("│ 2 "), "{out}");
+    assert!(out.contains("Detached"), "{out}");
+    assert!(out.contains("table \"t\" not found"), "{out}");
+    assert!(out.contains("(no attached lakes)"), "{out}");
+
+    // Mutations against an attached table are refused with the read-only
+    // message, and CREATE TABLE over the name is refused too.
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         INSERT INTO t VALUES (4, 'q');\n\
+         UPDATE t SET a = 9;\n\
+         DELETE FROM t;\n\
+         DROP TABLE t;\n\
+         CREATE TABLE t (a INTEGER, b VARCHAR);\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert_eq!(
+        out.matches("attached lake tables are read-only").count(),
+        5,
+        "{out}"
+    );
+    assert!(out.contains("use .lake open"), "{out}");
+
+    // Attaching inside a transaction is refused (a ROLLBACK cannot undo it),
+    // and so is a second attach of the same lake.
+    let out = run(&format!(
+        "BEGIN;\n.lake attach {lake}\nROLLBACK;\n\
+         .lake attach {lake}\n.lake attach {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("not allowed inside a transaction"), "{out}");
+    assert!(out.contains("already attached"), "{out}");
+
+    // A collision with an in-memory table is refused, atomically.
+    let out = run(&format!(
+        "CREATE TABLE t (x INTEGER);\n\
+         INSERT INTO t VALUES (42);\n\
+         .lake attach {lake}\n\
+         SELECT * FROM t;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("already exists in the session store"), "{out}");
+    assert!(
+        out.contains("42"),
+        "the store's table still resolves: {out}"
+    );
+
+    // `.lake save` while attached: attached tables are not saved (the note
+    // says so) and the new lake has no tables at all.
+    let other = dir.join("other");
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         .lake save {other}\n\
+         .lake tables {other}\n\
+         .quit\n",
+        lake = lake.display(),
+        other = other.display()
+    ));
+    assert!(
+        out.contains("attached lake tables are session-local and were not saved"),
+        "{out}"
+    );
+    assert!(out.contains("(no tables)"), "{out}");
+    cleanup(&dir);
+}
+
+/// Attach failures are clean errors: not a lake, a v1 lake, a missing data
+/// file, a truncated data file, a row-count mismatch, and a multi-file
+/// table.
+#[test]
+fn attach_errors_are_clear_and_never_panic() {
+    let dir = scratch("attach_err");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+
+    // Not a lake at all.
+    let out = run(&format!(
+        ".lake attach {missing}\n.quit\n",
+        missing = dir.join("no-such-lake").display()
+    ));
+    assert!(out.contains("is not a pink-lake directory"), "{out}");
+
+    // The v1 fixture: no statistics, refused with a clear message.
+    let v1 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v1");
+    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", v1.display()));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("format_version 1") && err.contains("use .lake open"),
+        "{out}\n{err}"
+    );
+
+    // A missing data file.
+    let missing_lake = dir.join("missing_lake");
+    copy_dir(&lake, &missing_lake);
+    let data = std::fs::read_dir(missing_lake.join("data/main.t"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_file(&data).unwrap();
+    let (out, err, code) =
+        run_captured(&format!(".lake attach {}\n.quit\n", missing_lake.display()));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("is missing") || err.contains("loading data file"),
+        "{out}\n{err}"
+    );
+
+    // A truncated data file: the footer cannot be read; a clean error, never
+    // a crash.
+    let truncated = dir.join("truncated_lake");
+    copy_dir(&lake, &truncated);
+    let data = std::fs::read_dir(truncated.join("data/main.t"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let bytes = std::fs::read(&data).unwrap();
+    std::fs::write(&data, &bytes[..bytes.len() / 4]).unwrap();
+    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", truncated.display()));
+    assert_eq!(code, 1);
+    assert!(err.contains("Error:"), "{out}\n{err}");
+
+    // A manifest whose row count disagrees with the file: corrupt.
+    let wrong_rows = dir.join("wrong_rows_lake");
+    copy_dir(&lake, &wrong_rows);
+    for name in ["catalog.json", "snapshots/2.json"] {
+        let path = wrong_rows.join(name);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let patched = text.replace("\"rows\": 1", "\"rows\": 2");
+        assert_ne!(text, patched, "rows field not found in {name}");
+        std::fs::write(&path, patched).unwrap();
+    }
+    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", wrong_rows.display()));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("has 1 rows, but the catalog says 2"),
+        "{out}\n{err}"
+    );
+
+    // A table with two data files is refused (this build attaches one file
+    // per table; use `.lake open`).
+    let two_files = dir.join("two_file_lake");
+    copy_dir(&lake, &two_files);
+    let data = std::fs::read_dir(two_files.join("data/main.t"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let second = data.with_file_name("second.vortex");
+    std::fs::copy(&data, &second).unwrap();
+    let first_rel = format!(
+        "data/main.t/{}",
+        data.file_name().unwrap().to_string_lossy()
+    );
+    let second_rel = format!(
+        "data/main.t/{}",
+        second.file_name().unwrap().to_string_lossy()
+    );
+    for name in ["catalog.json", "snapshots/2.json"] {
+        let path = two_files.join(name);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let needle = format!("\"{first_rel}\"");
+        let patched = text.replace(&needle, &format!("\"{first_rel}\", \"{second_rel}\""));
+        assert_ne!(text, patched, "file list not found in {name}");
+        std::fs::write(&path, patched).unwrap();
+    }
+    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", two_files.display()));
+    assert_eq!(code, 1);
+    assert!(err.contains("data files"), "{out}\n{err}");
+    cleanup(&dir);
+}
+
+/// Attach and its queries never write to the lake: `catalog.json` stays
+/// byte-identical to the snapshot of its version, and every data file is
+/// untouched.
+#[test]
+fn attach_never_touches_the_lake() {
+    let dir = scratch("attach_ro");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER, s VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'x'), (2, 'y');\n\
+         .lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+
+    let catalog = std::fs::read(lake.join("catalog.json")).unwrap();
+    let snapshot = std::fs::read(lake.join("snapshots/2.json")).unwrap();
+    assert_eq!(catalog, snapshot, "the invariant holds before attach");
+    let data_dir = lake.join("data/main.t");
+    let data_files: Vec<PathBuf> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    let before: Vec<Vec<u8>> = data_files
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+
+    // Attach, run both fast and fully materializing queries, then detach.
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         SELECT COUNT(*), MIN(a), MAX(s) FROM t;\n\
+         SELECT SUM(a) FROM t;\n\
+         SELECT * FROM t;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(!out.contains("Error:"), "{out}");
+
+    assert_eq!(
+        std::fs::read(lake.join("catalog.json")).unwrap(),
+        catalog,
+        "attach must not rewrite the catalog"
+    );
+    assert_eq!(
+        std::fs::read(lake.join("snapshots/2.json")).unwrap(),
+        snapshot
+    );
+    for (path, bytes) in data_files.iter().zip(&before) {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
+    }
+    // No stray files appeared in the lake.
+    let mut entries: Vec<String> = std::fs::read_dir(&lake)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, vec!["catalog.json", "data", "snapshots"], "{out}");
+    cleanup(&dir);
+}
+
+/// The checked-in version 2 fixture lake attaches (its files were written by
+/// the older writer), and the answers match `.lake open`.
+#[test]
+fn attach_of_the_v2_fixture_matches_open() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v2");
+    let queries = "SELECT '===BEGIN===' AS marker;\n\
+                   SELECT COUNT(*) FROM fid;\n\
+                   SELECT COUNT(v), MIN(i), MAX(i), MIN(g), MAX(g) FROM fid;\n\
+                   SELECT MIN(b), MAX(b), MIN(dt), MAX(dt), MIN(ts), MAX(ts) FROM fid;\n\
+                   SELECT MIN(d), MAX(d) FROM fid;\n\
+                   SELECT '===END===' AS marker;\n";
+    let opened = run(&format!(
+        ".lake open {}\nUSE main;\n{queries}.quit\n",
+        fixture.display()
+    ));
+    let attached = run(&format!(
+        ".lake attach {}\nUSE main;\n{queries}.quit\n",
+        fixture.display()
+    ));
+    assert!(
+        attached.contains("footer-only"),
+        "attach output: {attached}"
+    );
+    let base = tail_after_marker(&opened);
+    assert_eq!(tail_after_marker(&attached), base);
+    // The fixture's DOUBLE column holds NaN payloads, so its MIN/MAX take
+    // the materializing path on both arms.
+    assert!(base.contains("-0.0") && base.contains("inf"), "{base}");
+}
+
+/// `.lake open` after an attach still replaces the store and drops the
+/// attachment (same output as always).
+#[test]
+fn open_after_attach_resets_the_session() {
+    let dir = scratch("attach_then_open");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1);\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         SELECT COUNT(*) FROM t;\n\
+         .lake open {lake}\n\
+         SELECT COUNT(*) FROM t;\n\
+         .lake attached\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Opened lake version 2 in"), "{out}");
+    assert!(out.contains("(no attached lakes)"), "{out}");
+    assert!(!out.contains("Error:"), "{out}");
+    cleanup(&dir);
+}
+
+/// Copy one directory tree (a lake is a directory of JSON + data files).
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// `.lake attach <dir> [version]` pins the requested version, like
+/// `.lake open`.
+#[test]
+fn attach_pins_the_requested_version() {
+    let dir = scratch("attach_pin");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\n\
+         INSERT INTO t VALUES (1);\n\
+         .lake save {lake}\n\
+         INSERT INTO t VALUES (2);\n\
+         .lake save {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    let out = run(&format!(
+        ".lake attach {lake} 2\nSELECT COUNT(*) FROM t;\n\
+         .lake detach {lake}\n\
+         .lake attach {lake}\nSELECT COUNT(*) FROM t;\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains(&format!("Attached {} version 2 in", lake.display())),
+        "{out}"
+    );
+    assert!(
+        out.contains("│ 1 "),
+        "the version-2 attachment sees one row: {out}"
+    );
+    assert!(
+        out.contains("│ 2 "),
+        "the latest attachment sees two rows: {out}"
+    );
     cleanup(&dir);
 }

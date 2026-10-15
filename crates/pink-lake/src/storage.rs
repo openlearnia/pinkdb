@@ -92,7 +92,10 @@ impl Drop for LocalCopy {
 /// All paths are lake-relative (`catalog.json`, `snapshots/<v>.json`,
 /// `data/<table>/<uuid>.vortex`); [`Storage::abs`] turns one into the
 /// backend's absolute form for error messages.
-pub(crate) trait Storage: fmt::Debug {
+///
+/// `Send + Sync` because one handle is shared (`Arc`) with an attached-lake
+/// handle the engine may read through from more than one thread.
+pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// The absolute form of a lake-relative path: a filesystem path locally,
     /// an `s3://bucket/prefix/rel` URL for S3. `abs("")` is the lake root.
     fn abs(&self, rel: &str) -> PathBuf;
@@ -158,6 +161,14 @@ pub(crate) trait Storage: fmt::Debug {
     /// A local path for one object (see [`LocalCopy`]). Only the v1 `.pink`
     /// loader uses this: the engine opens files by path.
     fn local_copy(&self, rel: &str, context: &str) -> Result<LocalCopy>;
+
+    /// The object's real filesystem path, when the backend is local: the
+    /// footer-only attach opens a data file with positioned reads through
+    /// this. Object storage answers `None` (no ranged reads in this build),
+    /// and the caller falls back to reading the whole object.
+    fn local_path(&self, _rel: &str) -> Option<PathBuf> {
+        None
+    }
 
     /// Whether anything exists at `rel` (a directory counts, mirroring
     /// `Path::exists`).

@@ -301,6 +301,10 @@ impl Storage for LocalStorage {
     fn local_copy(&self, rel: &str, _context: &str) -> Result<LocalCopy> {
         Ok(LocalCopy::Path(self.abs(rel)))
     }
+
+    fn local_path(&self, rel: &str) -> Option<PathBuf> {
+        Some(self.abs(rel))
+    }
 }
 
 /// Write `bytes` and fsync the file (the durability half of a publication).

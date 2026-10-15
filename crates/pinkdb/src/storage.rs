@@ -490,6 +490,10 @@ pub struct PinkDb {
     /// replay is unaffected: it runs at open, before a front-end can flip
     /// this, and the Rust [`PinkDb::load_extension`] API is never gated.
     allow_sql_load_extension: bool,
+    /// Attached read-only lakes (`.lake attach`): session-local, additive to
+    /// the visible catalog for reads only — never part of the store's own
+    /// tables and never touched by `.save`, `.lake save`, or the WAL.
+    pub(crate) attached_lakes: Vec<Arc<dyn crate::attached::AttachedLake>>,
 }
 
 impl Default for PinkDb {
@@ -535,6 +539,7 @@ impl PinkDb {
             wal_txn_ext_loaded: Vec::new(),
             encryption_key: None,
             allow_sql_load_extension: true,
+            attached_lakes: Vec::new(),
         }
     }
 
@@ -621,6 +626,18 @@ impl PinkDb {
         if self.databases.len() == 1 {
             return Err(PinkDbError::Catalog(format!(
                 "cannot drop the last database \"{name}\""
+            )));
+        }
+        // Dropping a database whose tables are attached would silently
+        // orphan the attachment (its qualified names could no longer
+        // resolve); detach first.
+        if self
+            .attached_tables()
+            .iter()
+            .any(|t| t.db.eq_ignore_ascii_case(name))
+        {
+            return Err(PinkDbError::Catalog(format!(
+                "database \"{name}\" has attached lake tables; .lake detach the lake first"
             )));
         }
         self.databases.remove(&key);
@@ -922,6 +939,9 @@ impl PinkDb {
         name: &str,
         schema: Vec<(String, DataType)>,
     ) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, name) {
+            return Err(err);
+        }
         let key = Self::key(name);
         let cat = self.catalog_mut(db)?;
         if cat.tables.contains_key(&key) {
@@ -945,6 +965,9 @@ impl PinkDb {
     }
 
     pub fn drop_table_in(&mut self, db: &str, name: &str) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, name) {
+            return Err(err);
+        }
         self.catalog_mut(db)?
             .tables
             .remove(&Self::key(name))
@@ -969,6 +992,9 @@ impl PinkDb {
     }
 
     pub fn table_mut_in(&mut self, db: &str, name: &str) -> Result<&mut DataTable> {
+        if let Some(err) = self.attached_read_only(db, name) {
+            return Err(err);
+        }
         self.catalog_mut(db)?
             .tables
             .get_mut(&Self::key(name))
