@@ -181,7 +181,7 @@ Reproduce: `python3 bench/lake_bench.py --rows 1000000 --runs 5` (add
 Vortex scan/decode speed at 10M (the engine's in-memory scans lose to
 Parquet for filter/group-by/order-by there).
 
-## Lake workstream (sub-waves 45b–45d, Oct 2026)
+## Lake workstream (sub-waves 45b–45h, Oct 2026)
 
 Follow-on work on the lake path after wave 45, planned as the staged
 lake-scan design (design doc: wave C). Compact results:
@@ -191,13 +191,17 @@ lake-scan design (design doc: wave C). Compact results:
 | 45b (`89d0a2f`) | writer block-size A/B: coalesce stored blocks to 8/16 MiB (the DuckDB/Vortex prior art) | negative — bytes −0.15%, save not faster (10M median +9–11%), `.lake open` ~2× slower (ragged tails take `append_chunk`'s element-wise merge path: append 0.7 → 110 ms @10M). 1 MiB kept, format_version stays 3, documented in the code comment; the scheme-exclusion half (RunEnd/IntRLE/ALPRD/FloatRLE) is unreachable through the vortex facade without a new dep and byte-neutral on this corpus. 517 tests |
 | 45c (`ca5eb37`) | `.lake open` 3.7×: zero-copy file read (`ByteBuffer::from`), shared decoded chunks (`DataTable::append_shared_chunk` — no ~250 MB deep clone), per-chunk varchar interning keyed by the exact 16-byte Vortex view | @10M 110–126 → 30 ms printed, CPU 540 → 190 ms, peak RSS 996 → 352 MB; @1M 13 → 4 ms. Official cold-process @10M: count 38.8 vs DuckLake 35.2 ms, group-by 72.2 vs 64.3, filter 62.2 vs 52.2, order 77.2 vs 55.4 (was 2.8–4.2× behind, now 1.1–1.4×). Ingest wall 0.482 s / save 0.275 s; storage 25.1 MB vs 92.6 MB. 518 tests |
 | 45d (`5a024ea`) | `.lake attach <dir\|s3> [version]` + `.lake detach`/`.lake attached`; exact `COUNT(*)`/`COUNT(col)`/`MIN`/`MAX` from stored statistics; lazy per-table materialize + cache | cold @10M attach+`COUNT(*)` 4.94 ms vs DuckLake 34.92 vs `.lake open` 34.76; attach+`MIN`/`MAX` 4.90 ms; attach overhead ~1.2–1.7 ms, constant in file size; fallback queries within noise of open; @1M attach+`COUNT(*)` 4.62 ms. Stats gates: exact NullCount, `Precision::Exact` min/max, `NaNCount == 0`, no ±0.0 DOUBLE stat, multi-agg all-or-nothing. Mutations on attached tables refused; durable stores refuse mutating SQL that reads one. 542 workspace / CLI lake+s3 59 / pink-lake s3 123 / duckdiff 60/60 |
+| 45e (`64a29e1`) | `.lake attach` projection pushdown (lake-scan plan stage 2): address-keyed, exhaustive referenced-columns analysis (`plan.rs::ScanProjections`; Distinct/Union/Join/Cte conservative = all), attached scans decode only referenced columns into a per-column lazy cache, positioned local reads; unreferenced columns are zero-length placeholders and a missed reference is a hard internal error (never silent NULLs) | cold @10M: filter 60.6 → 41.9 ms (1.45×, 1 column; DuckLake 51.9), top-10 74.0 → 60.5 ms (1.22×, 2 columns; 55.4), group-by 72.8 → 68.9 ms (1.06×, 2 columns; 63.8), `COUNT(*)` unchanged (~5 ms, 0 decodes); @1M filter 10.7 → 8.9, top-10 12.5 → 11.1. Cold scorecard vs DuckLake: count 6.8× faster, filter 1.24× faster, order/group ~1.1–1.2× behind. 546 workspace / CLI lake+s3 60 / pink-lake 125 / duckdiff 60/60 |
+| 45h (`76a787e`) | `.pink` format v4: typed encode/decode paths (no per-row `Value`; chunk-parallel order-preserving save; serial bytes == parallel bytes), DELTA_BITPACK/DICT_BITPACK/ALP encodings + all-valid validity flag; `PINKDB04` magic, CRC kept, v1–v3 readable (v2/v3 fixtures), `PINKDB05`+ clean "newer format" error; `PINKENC1` encryption container untouched; `unpack_bits` width-64 fix | 1M sales `.pink` 14,042,575 → 2,679,387 B (1.015× Vortex bytes), save 0.165 → 0.029 s, open 0.188 → 0.026 s; 10M 140,424,925 → 26,792,121 B (26.8 MB, 1.067× Vortex), save 1.682 → 0.286 s, open 1.897 → 0.256 s; no adversarial-corpus regressions (worst +4 B of flags on a 755 B file); high-entropy strings/floats >1.3× Vortex (no FSST/LZ yet; stretch). 566 workspace / 392 encryption / CLI lake+s3 60 / duckdiff 60/60 |
 
 **Lake scan (staged).** Stage 1 shipped as 45d — footer-only attach + exact
-stats fast paths + lazy materialize. Stage 2 (projection pushdown) and stage 3
-(filter/zone-map pruning) are next. Until then a query the statistics cannot
-answer decodes the whole table exactly like `.lake open`: the cold-process
-numbers above close the open gap (1.1–1.4× vs DuckLake) but a projection or
-filter still pays the full decode.
+stats fast paths + lazy materialize; stage 2 shipped as 45e — projection
+pushdown (an attached scan decodes only the columns a query references, into a
+per-column lazy cache). Stage 3 (filter/zone-map pruning) is next: a query the
+statistics cannot answer still pays a full decode of the columns it reads. 45i
+(a lean `lake-lite` build — `vortex` optional in pink-lake via a `vortex-format`
+feature, `.pink` v4 data files, expected ~2.5–3 MB CLI binary, no attach fast
+paths — those stay Vortex-only) is in progress.
 
 ## Real-S3 integration harness (Oct 2026, wave 36 follow-up)
 

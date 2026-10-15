@@ -63,7 +63,7 @@ SQL text
 | `pinkdb::plan` | Logical plan tree |
 | `pinkdb::optimizer` | Constant folding, predicate pushdown (incl. across joins) |
 | `pinkdb::exec` | Vectorized expression eval, hash aggregate, hash join, operators (rayon-parallel) |
-| `pinkdb::persist` | `.pink` single-file columnar persistence, v2 (databases + RLE/dictionary/bitpack; v1 files load) |
+| `pinkdb::persist` | `.pink` single-file columnar persistence, v4 (typed paths + delta/dict-bitpack/ALP encodings; v1–v3 files load) |
 | `pinkdb::crypto` | optional at-rest encryption (`PINKENC1` container: AES-256-GCM + Argon2id) behind the `encryption` feature; a parse/identity stub otherwise |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
@@ -197,14 +197,21 @@ rayon pool; anything else goes through the `csv` crate sequentially.
 ## Persistence
 
 `db.save("x.pink")` writes every database and table in a single-file
-columnar format (v3: `PINKDB03`, ending in a CRC-32 of the whole image);
-`PinkDb::open("x.pink")` loads it back (`.save` / `.open` in the REPL). v2
-files (`PINKDB02`, the same layout without the checksum) and v1 files
-(`PINKDB01`, a flat table list) still load; v1 tables become the single
-`main` database. Views are session-local and never persisted. Round-trips are
-bit-exact (including `-0.0` and NaN payloads); truncated or corrupt files
-return errors, never panics — a damaged v3 file fails its checksum before
-any decoding, and no allocation is sized from an unvalidated length.
+columnar format (v4: `PINKDB04`, ending in a CRC-32 of the whole image);
+`PinkDb::open("x.pink")` loads it back (`.save` / `.open` in the REPL). The
+v4 encoder and decoder run on typed per-column paths (no per-row `Value`
+materialization; chunks save in parallel, and serial and parallel saves
+produce identical bytes) and add DELTA_BITPACK, DICT_BITPACK and ALP
+encodings (bit-exact exceptions) plus an "all valid" validity flag to the
+raw/RLE/bitpack/dictionary set. v1 files (`PINKDB01`, a flat table list), v2
+(`PINKDB02`, the databases layout) and v3 (`PINKDB03`, v2 + the checksum)
+still load; v1 tables become the single `main` database, and a format newer
+than this build (`PINKDB05`+) is refused with a clean "newer format" error,
+never guessed at. The encrypted `PINKENC1` container is unchanged. Views are
+session-local and never persisted. Round-trips are bit-exact (including `-0.0`
+and NaN payloads); truncated or corrupt files return errors, never panics — a
+damaged file fails its CRC-32 before any decoding, and no allocation is sized
+from an unvalidated length.
 
 Durable opens add a sidecar write-ahead log: `PinkDb::open_durable("x.pink")`
 (the REPL's `.open`) loads the checkpoint, recovers an interrupted checkpoint,
@@ -351,10 +358,13 @@ Release `pinkdb` binary: 2.21 MB default, 2.28 MB with `--features encryption`
 pre-encryption 2.19 MB — most of it segment page rounding, ~4.6 KB of code).
 
 Each ≤2048-row column chunk picks its smallest encoding: integers choose
-between raw, RLE, and bitpacking (min + width + packed bits); doubles raw or
-RLE; booleans bitpacked or RLE; strings raw, dictionary (u32 codes), or RLE.
-NULLs ride in a separate validity bitmap. 1M-row sales table: 24.5 MB CSV →
-14.0 MB `.pink`, saved in 0.16 s, reopened and queried in 0.25 s.
+between raw, RLE, bitpacking (min + width + packed bits) and DELTA_BITPACK;
+doubles raw, RLE or ALP (bit-exact exceptions); booleans bitpacked or RLE;
+strings raw, dictionary (u32 codes), RLE or DICT_BITPACK. NULLs ride in a
+separate validity bitmap, and an all-valid chunk sets a flag instead of
+writing one. 1M-row sales table: 24.5 MB CSV → **2.68 MB** `.pink` (1.015×
+the equivalent Vortex bytes), saved in 0.03 s, reopened in 0.03 s; the same
+table at 10M rows is 26.8 MB, saved in 0.29 s and reopened in 0.26 s.
 
 ## Concurrency
 
@@ -387,7 +397,8 @@ JSON catalog plus immutable per-table data files, on local disk or (with the
 `s3` feature) in an S3 bucket/prefix. Wave 35 makes **Vortex the default data
 format**; wave 36 adds S3/R2 object storage; wave 45d adds read-only
 **`.lake attach`** — a footer-only open with exact `COUNT`/`MIN`/`MAX` from
-stored statistics and lazy materialization.
+stored statistics and lazy materialization — and wave 45e adds **projection
+pushdown** (an attached scan decodes only the columns a query references).
 
 A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
 key prefix with exactly this layout):
@@ -538,7 +549,9 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
   `bench/sales_1m.csv`: id/region/total/active):** one Vortex data file is
   3,117,738 B vs 14,042,574 B for the equivalent `.pink` bytes (0.22×, ≈4.5×
   smaller); a lake save takes 0.20 s vs 0.09 s (Vortex compresses on write)
-  and a load 0.07 s vs 0.11 s. Reproduce with
+  and a load 0.07 s vs 0.11 s (wave 45h: `.pink` v4 shrank the same table's
+  `.pink` bytes to 2,679,387 B — 1.015× the Vortex bytes — save 0.029 s, open
+  0.026 s). Reproduce with
   `cargo test --release -p pink-lake --test bench_1m -- --ignored --nocapture`.
   **Dependency/build note:** `crates/pink-lake` now depends on the `vortex`
   crate directly (`default-features = false, features = ["files"]`); that
@@ -1421,9 +1434,26 @@ side-by-side run, the scan-query rows from 45c's official run):
 
 Attach overhead (catalog + manifest + footers) is ~1.2–1.7 ms, constant in
 file size. `.lake open` is now within 1.1–1.4× of DuckLake on the three scan
-queries (was 2.8–4.2× behind); the remaining gap is the scan path itself — no
-projection pushdown or filter/zone-map pruning yet (stages 2/3 of the
-lake-scan plan).
+queries (was 2.8–4.2× behind); the remaining gap is the scan path itself —
+stage 2 (projection pushdown) shipped as 45e right below, and stage 3
+(filter/zone-map pruning) is the follow-up.
+
+**Wave 45e refresh (Oct 2026):** projection pushdown for `.lake attach` — an
+attached scan decodes only the columns the query references, into a per-column
+lazy cache (a missed reference is a hard internal error, never a silent NULL).
+Cold-process @10M, fresh process → attach → one query → exit, best-of-5,
+2026-10-15, DuckLake measured alongside:
+
+| cold process, @10M (ms) | pink pre-45e | pink 45e | DuckLake |
+|---|---|---|---|
+| `COUNT(*)` — 0 columns decoded | ~5 | ~5 | 34.9 |
+| `WHERE total > 500` — 1 column | 60.6 | **41.9** (1.45×) | 51.9 |
+| `ORDER BY total DESC LIMIT 10` — 2 columns | 74.0 | **60.5** (1.22×) | 55.4 |
+| group-by — 2 columns | 72.8 | **68.9** (1.06×) | 63.8 |
+
+@1M: filter 10.7 → 8.9 ms, top-10 12.5 → 11.1 ms. The cold scorecard vs
+DuckLake is now: `COUNT(*)` 6.8× faster, filter 1.24× faster, order-by and
+group-by ~1.1–1.2× behind.
 
 **Fairness caveat — this is "same data, same queries, different
 architectures", not an apples-to-apples product comparison.** `.lake open`
@@ -1434,8 +1464,9 @@ catalog and every query scans Parquet at query time, so its printed query
 times include the scan and its fresh-process wall adds ~30 ms of process
 start + LOAD + ATTACH at 1M on top of the query. `.lake attach` is pink-lake's
 lazy mode (footer-only; statistics-only answers), but a query the statistics
-cannot answer still decodes the whole table — projection and filter/zone-map
-pushdown are not implemented yet. DuckLake is a full
+cannot answer still decodes the whole table (projection pushdown shipped in
+45e, so only the columns it references decode; filter/zone-map pruning is not
+implemented yet). DuckLake is a full
 lakehouse format (transactional SQL
 catalog, MVCC-ish snapshots, time travel) and its catalog DB grows with
 every write/snapshot (this run is a single ingest), while pink-lake
@@ -1489,8 +1520,9 @@ ties in ORDER BY have no stable order on either engine).
   collected; the lake is reached through `.lake open` (whole store into memory)
   or `.lake attach` (read-only, one version pinned, footer-only: exact
   COUNT/MIN/MAX from stored statistics, anything else lazily decodes the one
-  table it touches — no time travel within a session, no projection or
-  filter/zone-map pushdown yet); attached tables are session-local, not saved,
+  table it touches — no time travel within a session; projection pushdown
+  shipped in 45e, so only referenced columns decode, but there is no
+  filter/zone-map pruning yet); attached tables are session-local, not saved,
   and mutations over them are refused (mutating SQL over them on a durable
   store is refused too, since the log could not replay them); lake files are
   plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
@@ -1506,9 +1538,13 @@ feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
 layer (`pink-lake`, CLI `lake` feature) shipped in wave 34, became
 Vortex-first in wave 35 (v1 `.pink` lakes still load; open + save migrates)
 and gained S3/R2 object storage in wave 36 (`s3` feature; `s3://` locations,
-conditional-write conflict detection) and read-only `.lake attach` (footer-only;
-exact `COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d;
-authentication and TLS are deferred.
+conditional-write conflict detection), read-only `.lake attach` (footer-only;
+exact `COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d
+and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
+brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
+10M). A lean `lake-lite` build (`vortex` optional in pink-lake, `.pink` v4
+lake data files, expected ~2.5–3 MB CLI binary) is in progress; authentication
+and TLS are deferred.
 
 ## Development
 

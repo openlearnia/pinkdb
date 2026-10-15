@@ -93,9 +93,12 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Lake-scan plan (lake workstream, sub-waves 45b–45d): stage 1 shipped as 45d — footer-only
-`.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize;
-stages 2 (projection pushdown) and 3 (filter/zone-map pruning) are the follow-ups.
+Lake-scan plan (lake workstream, sub-waves 45b–45e): stage 1 shipped as 45d — footer-only
+`.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize; stage 2
+shipped as 45e — projection pushdown (an attached scan decodes only the columns a query
+references); stage 3 (filter/zone-map pruning) is the remaining follow-up. 45i — a lean
+`lake-lite` build (`vortex-format` optional in pink-lake, `.pink` v4 lake data files,
+expected ~2.5–3 MB CLI binary) — is in progress.
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -446,3 +449,25 @@ Java bindings.
   a real hazard: durable stores now refuse mutating SQL that reads an attached table (the
   logged text could not replay → unopenable WAL). Lake-scan plan stage 1. Gates: 542 workspace /
   CLI lake+s3 59 / pink-lake s3 123 / duckdiff 60/60.
+- 2026-10-15 — Wave 45e (64a29e1): `.lake attach` projection pushdown (lake-scan plan stage 2).
+  New address-keyed, exhaustive referenced-columns analysis (`plan.rs::ScanProjections`;
+  Distinct/Union/Join/Cte stay conservative = all columns) drives the attached-lake scan, which
+  decodes only referenced columns into a per-column lazy cache (positioned local reads). Safety
+  net: unreferenced columns become zero-length placeholders and a missed reference is a hard
+  internal error — never silent NULLs. Cold-process @10M: filter 60.6 → 41.9 ms (1.45×,
+  1 column; DuckLake 51.9), top-10 74.0 → 60.5 ms (1.22×, 2 columns; 55.4), group-by
+  72.8 → 68.9 ms (1.06×, 2 columns; 63.8), `COUNT(*)` unchanged (~5 ms, 0 decodes). @1M:
+  filter 10.7 → 8.9, top-10 12.5 → 11.1. Cold scorecard vs DuckLake: count 6.8× faster,
+  filter 1.24× faster, order/group ~1.1–1.2× behind. Gates: 546 workspace / CLI lake+s3 60 /
+  pink-lake 125, duckdiff 60/60.
+- 2026-10-15 — Wave 45h (76a787e): `.pink` format v4 — typed encode/decode paths (no per-row
+  `Value`; chunk-parallel order-preserving save; serial bytes == parallel bytes), new
+  DELTA_BITPACK / DICT_BITPACK / ALP encodings (bit-exact exceptions) and an all-valid validity
+  flag; magic `PINKDB04`, CRC kept, v1–v3 readable (new v2/v3 fixtures), `PINKDB05`+ clean
+  "newer format" error; the `PINKENC1` encryption container is untouched; also fixed a
+  pre-existing `unpack_bits` width-64 bug. 1M sales `.pink` 14,042,575 → 2,679,387 B (1.015×
+  the Vortex bytes), save 0.165 → 0.029 s, open 0.188 → 0.026 s; 10M sales 140,424,925 →
+  26,792,121 B (26.8 MB, 1.067× Vortex), save 1.682 → 0.286 s, open 1.897 → 0.256 s. No size
+  regressions on adversarial corpora (worst +4 B of flags on a 755 B file); high-entropy
+  strings/floats stay >1.3× Vortex (no FSST/LZ yet — recorded as stretch). Gates: 566
+  workspace / 392 encryption / CLI lake+s3 60, duckdiff 60/60.
