@@ -78,7 +78,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
 | 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + JavaScript procedures (optional embedded engine; WAL-replay determinism must be solved) | queued | — |
-| 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) | queued | — |
+| 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c; byte-neutral part done, layout-changing save work (bigger write units, stats trim) pending a format decision* | in progress | 4b53844, 70ab514, 0deea0e — @10M interleaved vs pre-wave: import 274–282 → 173–177 ms, `.lake open` 618–620 → 147–157 ms (≈4×), store teardown 93 → 16–24 ms, group_region 68–90 → 33–52 ms (≤60 target met; DuckLake 37–55), save flat cross-binary (−11% in-process A/B; the rest is Vortex's own writer pipeline); lake files byte-identical (10M sha256 unchanged); 1M battery 428 → 415–421 ms; 515 tests, duckdiff 60/60 + 64/64 big |
 | 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | queued | — |
 | 47 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | queued | — |
 | 48 | RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), `CREATE USER`/`CREATE ROLE`/`GRANT`/`REVOKE` on databases/tables, session login on the network server, per-connection enforcement (embedded API stays trusted), grants persisted in the catalog + WAL | queued | — |
@@ -388,3 +388,17 @@ Java bindings.
   id is gone from the README (it remains in git history — it is an identifier, not a
   credential); waves 29/39 rows now say what was actually built. 514 tests; actionlint
   clean; GitHub-only verification pending for the new runner jobs.
+- 2026-10-15 — Wave 45 (pulled forward), byte-neutral part: profile-driven (macOS `sample`).
+  Ingest: `append_chunk` moves a full batch in behind a full tail instead of copying it
+  row by row (the serial "store append" of import and lake load); lake save streams
+  parallel-converted windows into Vortex's push writer and straight into the temp file
+  (word-wise validity), byte-identical output; lake open drains the scan then decodes
+  chunks in parallel with bulk column builds (`Vector::from_raw`). The save profile shows
+  the remaining time is Vortex's sequential layout pipeline + a serial file-stats pass on
+  the writer thread — only layout-changing options (bigger row blocks + loader splitting,
+  stats trim) move it further. Query side: two-pass hash aggregation (group ids first,
+  then one typed loop per aggregate; typed single-column keys) — group_region @10M
+  68–70 → 33–35 ms isolated. Teardown: big columns drop on the rayon pool (93 → 16 ms
+  @10M). Measured and discarded: batch-level UTF-8/typed-push CSV parsing (no change —
+  parsing is already parallel). Also fixed a flaky test: a busy durable lock is retried
+  for 200 ms (a forking sibling thread briefly holds a duplicate descriptor).
