@@ -30,28 +30,39 @@
 //! }
 //! ```
 //!
-//! Schema and typing stay inside the data files. **With the `vortex-format`
-//! feature (not on by default; the full CLI builds enable it) Vortex is the
-//! format for new writes** ([`FORMAT_VERSION`] 3; version 2 lakes, with one
-//! row block per engine chunk, stay readable): every new data file is a
-//! plain Vortex file holding one struct array — one field per column, row
-//! order preserved, `-0.0` and NaN payloads bit-exact — plus a
+//! A `format_version` 1 entry additionally carries `"stats"`: the exact
+//! per-column schema and statistics the lean writer collected while encoding
+//! the `.pink` data file, CRC-sealed against the entry's key, file path and
+//! row count (see the `stats` module docs). `.lake attach` reads that block
+//! without opening the data file; a v1 entry saved before the block existed
+//! is refused with a clear message.
+//!
+//! Schema and typing stay inside the data files (the statistics block
+//! duplicates v1 entries' schema so attach can serve it without a data-file
+//! read; the data file stays authoritative for loading). **With the
+//! `vortex-format` feature (not on by default; the full CLI builds enable
+//! it) Vortex is the format for new writes** ([`FORMAT_VERSION`] 3; version 2
+//! lakes, with one row block per engine chunk, stay readable): every new data
+//! file is a plain Vortex file holding one struct array — one field per
+//! column, row order preserved, `-0.0` and NaN payloads bit-exact — plus a
 //! `pinkdb.table` metadata segment carrying the table's `db`/`table` identity
 //! and its pinkdb column schema (the `vortex_file` module docs have the
 //! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
 //! `vortex.timestamp` extension cannot represent the full engine range).
 //! **Without the feature** — the lean `lake-lite` builds — this crate writes
 //! **`format_version` 1** lakes: one engine `.pink` single-table persistence
-//! file per table ([`PinkDb::to_pink_bytes`], the wave-34 layout; today's
-//! engine writes v4 bytes), and reads exactly those. Reading a v2/v3 Vortex
-//! lake in such a build is a clear [`LakeError::FeatureMissing`] at the first
-//! manifest parse — never a corrupt-file error and never a wrong-format guess.
-//! A `format_version` 1 lake stays readable in every build: its entries have
-//! no `format` field and its data files open standalone with [`PinkDb::open`].
-//! Opening an old lake and saving again publishes this build's format: a v3
-//! snapshot in a `vortex-format` build (a full rewrite in Vortex — the
-//! migration path), still v1 without it. A manifest with any other
-//! `format_version` — or a v2/v3 entry that omits `format` or declares
+//! file per table ([`PinkDb::to_pink_bytes_with_stats`], the wave-34 layout;
+//! today's engine writes v4 bytes) **plus a CRC-protected statistics block on
+//! every entry** (the exact per-column facts the same encode pass collected;
+//! see the `stats` module docs), and reads exactly those. Reading a v2/v3
+//! Vortex lake in such a build is a clear [`LakeError::FeatureMissing`] at the
+//! first manifest parse — never a corrupt-file error and never a wrong-format
+//! guess. A `format_version` 1 lake stays readable in every build: its entries
+//! have no `format` field and its data files open standalone with
+//! [`PinkDb::open`]. Opening an old lake and saving again publishes this
+//! build's format: a v3 snapshot in a `vortex-format` build (a full rewrite in
+//! Vortex — the migration path), still v1 without it. A manifest with any
+//! other `format_version` — or a v2/v3 entry that omits `format` or declares
 //! anything but `"vortex"`, or a v1 entry that declares one — is a clear
 //! [`LakeError::Unsupported`]/[`LakeError::Corrupt`] error, never a guess.
 //! Decoding a corrupt Vortex data file is the same clear [`LakeError::Corrupt`]
@@ -60,15 +71,17 @@
 //! still print one line to stderr first; the crate does not swap the global
 //! hook).
 //!
-//! `.lake open` (every build) and `.lake attach` (only with
-//! `vortex-format`) are the two ways in: `open` eagerly loads a version into
-//! the store, `attach` reads only the catalog, the manifest and every data
-//! file's footer (identity, schema, row count and exact per-column
-//! statistics) and lazily materializes the one table a query actually scans —
-//! with exact `COUNT`/`MIN`/`MAX` answered straight from those statistics.
+//! `.lake open` (every build) and `.lake attach` (every build) are the two
+//! ways in: `open` eagerly loads a version into the store, `attach` reads
+//! only the catalog, the manifest, and the statistics layer — a Vortex data
+//! file's footer, metadata segment and stored statistics, or a v1 `.pink`
+//! entry's published statistics block (no data file is opened at attach for
+//! v1) — and lazily materializes the one table a query actually scans, with
+//! exact `COUNT`/`MIN`/`MAX` answered straight from those statistics.
 //! Attached lakes are read-only, session-local, and never part of a save, a
-//! checkpoint, or the WAL. A lean build has no attach fast paths: a v1 lake
-//! carries no statistics, and eager `.lake open` is the way in.
+//! checkpoint, or the WAL. A v1 lake saved before statistics blocks existed
+//! (or with its block corrupted) is refused with a clear error — `.lake open`
+//! remains the way in.
 //!
 //! # Snapshots and versioning
 //!
@@ -183,7 +196,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pinkdb::{DataTable, DataType, PinkDb};
 
-#[cfg(feature = "vortex-format")]
 mod attach;
 mod catalog;
 mod local;
@@ -191,12 +203,12 @@ mod local;
 mod mock_s3;
 #[cfg(feature = "s3")]
 mod s3;
+mod stats;
 mod storage;
 mod time;
 #[cfg(feature = "vortex-format")]
 mod vortex_file;
 
-#[cfg(feature = "vortex-format")]
 pub use attach::AttachmentReport;
 use catalog::{Catalog, FileFormat, TableEntry};
 use local::{LocalStorage, CATALOG_FILE};
@@ -217,14 +229,16 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 ///
 /// A build with the (default-off) `vortex-format` feature writes version 3;
 /// without it — the lean `lake-lite` builds — this build writes **version 1**
-/// only: entries carry no `format` and data files are engine `.pink` bytes.
+/// only: entries carry no `format`, data files are engine `.pink` bytes, and
+/// every entry carries a CRC-protected statistics block (wave 45k).
 /// Version 2 and 3 lakes are refused by such a build with a clear
 /// [`LakeError::FeatureMissing`], never a corrupt-file error.
 #[cfg(feature = "vortex-format")]
 pub const FORMAT_VERSION: u32 = 3;
 
 /// The catalog format version a build without `vortex-format` writes: the v1
-/// `.pink` data-file format (see [`FORMAT_VERSION`]).
+/// `.pink` data-file format with a statistics block on every entry (see
+/// [`FORMAT_VERSION`] and the `stats` module).
 #[cfg(not(feature = "vortex-format"))]
 pub const FORMAT_VERSION: u32 = 1;
 
@@ -672,25 +686,25 @@ impl Lake {
     }
 
     /// Footer-only *attach* of the latest version (`None`) or a specific
-    /// snapshot: read the manifest, then open every data file's footer,
-    /// metadata segment and statistics — no column data is read or decoded,
-    /// unless the files live on object storage (whole-object reads; still no
-    /// decode).
+    /// snapshot: read the manifest, then the statistics attach needs — a
+    /// Vortex data file's footer, metadata segment and stored statistics
+    /// (`vortex-format` builds; no column data is read or decoded, unless the
+    /// files live on object storage — whole-object reads, still no decode),
+    /// or the v1 `.pink` entry's published statistics block (every build:
+    /// the manifest is all attach reads; `data` files are never opened).
     ///
     /// The returned [`AttachmentReport`] carries the version-pinned
     /// [`pinkdb::AttachedLake`] handle; register it with
     /// [`pinkdb::PinkDb::attach_lake`] to make the tables queryable. Attach
-    /// validates what `.lake open` would validate when it loads: the
-    /// `pinkdb.table` identity, the declared schema, and the row count
-    /// against the manifest. It never mutates the lake.
+    /// validates what `.lake open` would validate when it loads: the file's
+    /// identity against its catalog key, the declared schema, and the row
+    /// count against the manifest. It never mutates the lake.
     ///
-    /// A `format_version` 1 lake (engine `.pink` data files, no statistics)
+    /// A `.pink` entry saved before statistics existed (no `stats` block)
     /// and a table with more than one data file are refused with a clear
-    /// error; `.lake open` remains the way to load those. This method exists
-    /// only with the `vortex-format` feature: attach is statistics over
-    /// Vortex footers, and a lean build has no Vortex reader (open a v1 lake
-    /// with [`Lake::load`] instead).
-    #[cfg(feature = "vortex-format")]
+    /// error; `.lake open` remains the way to load those. A `vortex-format`
+    /// build attaches v1 `.pink` lakes with statistics exactly like a lean
+    /// build, and refuses v1 lakes without them the same way.
     pub fn attach(&self, version: Option<u64>) -> Result<AttachmentReport> {
         let (_, report) = attach::build(self, version)?;
         Ok(report)
@@ -763,29 +777,44 @@ impl Lake {
                 // - `vortex-format`: a Vortex file (catalog format_version 3),
                 //   streamed into the store — locally straight into a unique
                 //   `create_new` temp sibling, then fsync + rename; over S3
-                //   buffered for one atomic PUT;
+                //   buffered for one atomic PUT. Statistics live in the
+                //   Vortex footer; the entry carries none.
                 // - without it (the lean builds): the wave-34 v1 layout — the
                 //   engine's own `.pink` single-table bytes (catalog
                 //   format_version 1) via `put`, same temp→fsync→rename /
-                //   single-PUT atomicity.
+                //   single-PUT atomicity. The same encode pass collects the
+                //   exact per-column statistics, published in the entry's
+                //   CRC-protected `stats` block (`.lake attach` answers
+                //   COUNT/MIN/MAX from it without opening the file).
                 #[cfg(feature = "vortex-format")]
-                let (rel_file, format, written) = {
+                let (rel_file, format, stats, written) = {
                     let rel_file = format!("{dir}/{id}.vortex");
                     let written = self.storage.put_streamed(&rel_file, &mut |sink| {
                         vortex_file::encode_table_into(&dbname, &name, src, sink)
                     })?;
-                    (rel_file, Some(FileFormat::Vortex), written)
+                    (rel_file, Some(FileFormat::Vortex), None, written)
                 };
                 #[cfg(not(feature = "vortex-format"))]
-                let (rel_file, format, written) = {
+                let (rel_file, format, stats, written) = {
                     let rel_file = format!("{dir}/{id}.pink");
                     let mini = single_table_store(&dbname, &name, src)?;
-                    let bytes = mini.to_pink_bytes().map_err(|e| LakeError::Engine {
-                        context: format!("saving table \"{key}\""),
-                        source: e,
-                    })?;
+                    let (bytes, saved) =
+                        mini.to_pink_bytes_with_stats()
+                            .map_err(|e| LakeError::Engine {
+                                context: format!("saving table \"{key}\""),
+                                source: e,
+                            })?;
+                    let saved = saved
+                        .iter()
+                        .find(|s| s.db == dbname && s.table == name)
+                        .ok_or_else(|| LakeError::Internal {
+                            message: format!(
+                                "the single-table encoder for \"{key}\" returned no statistics"
+                            ),
+                        })?;
+                    let block = stats::StatsBlock::from_saved(&key, &rel_file, saved)?;
                     self.storage.put(&rel_file, &bytes)?;
-                    (rel_file, None, bytes.len() as u64)
+                    (rel_file, None, Some(block), bytes.len() as u64)
                 };
                 bytes_written += written;
                 rows += src.num_rows() as u64;
@@ -795,6 +824,7 @@ impl Lake {
                         files: vec![rel_file],
                         rows: src.num_rows() as u64,
                         format,
+                        stats,
                     },
                 );
             }
@@ -1266,6 +1296,17 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
         });
     }
     for (key, entry) in &manifest.tables {
+        if manifest.format_version != 1 && entry.stats.is_some() {
+            return Err(LakeError::Corrupt {
+                path: path.to_path_buf(),
+                message: format!(
+                    "table \"{key}\" declares a statistics block in a format_version {} \
+                     manifest (statistics blocks belong to v1 `.pink` entries; Vortex \
+                     statistics live in the data file's footer)",
+                    manifest.format_version
+                ),
+            });
+        }
         match (manifest.format_version, entry.format) {
             (1, Some(FileFormat::Vortex)) => {
                 return Err(LakeError::Corrupt {

@@ -60,6 +60,15 @@ pub(crate) struct Catalog {
 /// A v2 writer always emits exactly one `.vortex` file per table; a v1
 /// manifest's entries have no `format` (they are engine `.pink` bytes), and
 /// the loader appends multiple files in order (forward-compatible).
+///
+/// A v1 entry may also carry a `StatsBlock` (see the `stats` module): the
+/// exact per-column statistics `.lake attach` answers
+/// `COUNT`/`COUNT(col)`/`MIN`/`MAX` from without opening the data file. The
+/// block is published atomically with the entry (catalog and snapshot are
+/// byte-identical) and CRC-protected; a v1 entry without one is a lake saved
+/// before statistics existed, and attach refuses it with a clear message. A
+/// v2/v3 (Vortex) entry must not carry one — Vortex statistics live in the
+/// file footer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableEntry {
     pub(crate) files: Vec<String>,
@@ -68,6 +77,9 @@ pub(crate) struct TableEntry {
     /// absent (⇒ [`FileFormat::Pink`]) in a `format_version` 1 manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) format: Option<FileFormat>,
+    /// The v1 `.pink` statistics block (see the struct docs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stats: Option<crate::stats::StatsBlock>,
 }
 
 impl TableEntry {

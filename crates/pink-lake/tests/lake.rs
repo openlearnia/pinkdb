@@ -2050,3 +2050,116 @@ fn attach_refusals_are_clean_errors() {
     assert!(err.contains("data files"), "{err}");
     cleanup(&dir);
 }
+
+/// Cross-build pin, full side: the lean-written `lake_v1_v4_stats` fixture —
+/// a `format_version` 1 lake whose entries carry CRC-protected statistics
+/// blocks over `.pink` v4 data files — attaches in this (full,
+/// `vortex-format`) build exactly like it does in a lean build: descriptors
+/// equal the decoded truth, fast paths answer from the manifest alone, and a
+/// battery of queries equals `.lake open` over the same fixture.
+#[test]
+fn v1_stats_fixture_attaches_in_the_full_build() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4_stats");
+    let lake = Lake::open(&fixture).unwrap();
+    assert_eq!(lake.format_version(), 1);
+    let report = lake.attach(None).unwrap();
+    assert_eq!(report.version, 2);
+    assert_eq!(report.format_version, 1);
+    assert!(!report.remote, "a v1 attach reads no data file");
+
+    // Descriptors vs the decoded store, column by column.
+    let loaded = lake.load(None).unwrap();
+    let mut attached = PinkDb::new();
+    let tables = attached.attach_lake(report.lake.clone()).unwrap();
+    assert_eq!(tables.len(), 6);
+    for table in &tables {
+        let decoded = loaded.table_in(&table.db, &table.table).unwrap();
+        assert_eq!(table.rows, decoded.num_rows() as u64);
+        assert_eq!(table.schema, decoded.schema());
+        for (i, (name, _)) in table.schema.iter().enumerate() {
+            let mut nulls = 0u64;
+            let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
+            for row in 0..decoded.num_rows() {
+                let v = decoded.get(row, i).unwrap();
+                if v.is_null() {
+                    nulls += 1;
+                    continue;
+                }
+                if min
+                    .as_ref()
+                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_lt())
+                {
+                    min = Some(v.clone());
+                }
+                if max
+                    .as_ref()
+                    .is_none_or(|m| pinkdb::plan::compare_values(&v, m).is_gt())
+                {
+                    max = Some(v);
+                }
+            }
+            assert_eq!(table.stats[i].null_count, Some(nulls), "{name} nulls");
+            if let Some(stat) = &table.stats[i].min {
+                assert_eq!(Some(stat), min.as_ref(), "{name} min");
+            }
+            if let Some(stat) = &table.stats[i].max {
+                assert_eq!(Some(stat), max.as_ref(), "{name} max");
+            }
+        }
+    }
+
+    // The query battery: attached vs `.lake open`, bit-exact.
+    let mut mut_loaded = lake.load(None).unwrap();
+    let queries = vec![
+        "SELECT COUNT(*) FROM main.big;".to_string(),
+        "SELECT COUNT(s), MIN(a), MAX(a) FROM main.big;".to_string(),
+        "SELECT MIN(s), MAX(s) FROM main.big;".to_string(),
+        "SELECT COUNT(*), MIN(i), MAX(i), MIN(g), MAX(g), MIN(v), MAX(v) FROM main.fid;"
+            .to_string(),
+        "SELECT MIN(b), MAX(b), MIN(dt), MAX(dt), MIN(ts), MAX(ts) FROM main.fid;".to_string(),
+        "SELECT MIN(d), MAX(d), COUNT(d) FROM main.fid;".to_string(),
+        "SELECT COUNT(*), COUNT(x), MIN(x), MAX(y) FROM main.empty;".to_string(),
+        "SELECT COUNT(*), MIN(k), MAX(k) FROM analytics.u;".to_string(),
+        "SELECT COUNT(*), MIN(z), MAX(z) FROM analytics.\"a.b\";".to_string(),
+        "SELECT SUM(i) FROM main.fid;".to_string(),
+    ];
+    for sql in queries {
+        let a = select_rows(&mut attached, &sql);
+        let b = select_rows(&mut mut_loaded, &sql);
+        assert_rows_bit_same(&a, &b, &sql);
+    }
+    // The stats-only shapes decoded nothing; the gated shapes (fid's NaN
+    // column `d`, `analytics.a.b`'s `-0.0` column `z`) materialized exactly
+    // their two tables, and every other query reused the caches.
+    let (loads, _) = report.lake.decode_stats();
+    assert_eq!(
+        loads, 2,
+        "only the two gated tables may materialize (got {loads})"
+    );
+
+    // And a v1 lake with statistics migrates on save like any v1 lake:
+    // opening it into a store and saving again publishes a v3 snapshot with
+    // the same values, leaving the v1 files (and their blocks) untouched.
+    let dir = scratch("v1_stats_migrate");
+    let copy = dir.join("lake");
+    copy_dir(&fixture, &copy);
+    let v1_files: Vec<PathBuf> = data_files(&copy.join("data"));
+    let mut migrated = Lake::open(&copy).unwrap();
+    let store = migrated.load(None).unwrap();
+    migrated.write_from_store(&store).unwrap();
+    let catalog = read_json(&copy.join("catalog.json"));
+    assert_eq!(catalog["format_version"], 3, "{catalog}");
+    assert_eq!(
+        catalog["tables"]["main.fid"]["format"], "vortex",
+        "{catalog}"
+    );
+    assert_same_store(&common::fidelity_store(), &migrated.load(None).unwrap());
+    for file in v1_files {
+        assert!(
+            file.is_file(),
+            "the v1 data file {} must stay",
+            file.display()
+        );
+    }
+    cleanup(&dir);
+}

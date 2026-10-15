@@ -63,9 +63,7 @@ use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
 use crate::storage::PinkDb;
-#[cfg(test)]
-use crate::types::Value;
-use crate::types::{DataType, PinkDbError, Result};
+use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{Vector, VectorData, CHUNK_SIZE};
 
 const MAGIC: &[u8; 8] = b"PINKDB01";
@@ -96,6 +94,272 @@ const ENC_FSST: u8 = 9;
 /// Tables with fewer chunks than this encode serially: the rayon fan-out
 /// costs more than it saves on small tables.
 const PARALLEL_SAVE_MIN_CHUNKS: usize = 32;
+
+// ---------- save-time statistics ----------
+//
+// [`PinkDb::to_pink_bytes_with_stats`] collects exact per-column statistics
+// during the same chunk pass that encodes a table (no second scan of the
+// store, no change to the `.pink` bytes). The lake layer publishes them in
+// its manifest; the engine itself never reads them back.
+
+/// Exact per-column statistics the `.pink` writer observed while saving one
+/// column: NULL count, the min/max of the non-NULL values (first-seen wins
+/// ties, exactly like the engine's MIN/MAX accumulators), and the exact NaN
+/// count (non-zero only for DOUBLE columns).
+///
+/// These are *facts*, not yet gated for use: a DOUBLE min/max with any NaN —
+/// or one that is zero (`-0.0 == 0.0` in the engine's comparator) — is still
+/// recorded here and refused later by the same exactness gate the Vortex
+/// footer path uses (`pink-lake`'s attach layer), so the two formats cannot
+/// drift apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedColumnStats {
+    /// Column name, as stored in the data file.
+    pub name: String,
+    /// Column type, as stored in the data file.
+    pub dtype: DataType,
+    /// Exact number of NULL rows.
+    pub null_count: u64,
+    /// Exact min of the non-NULL values, or `None` when the column has no
+    /// non-NULL value (empty table or all-NULL column).
+    pub min: Option<Value>,
+    /// Exact max of the non-NULL values, or `None` like `min`.
+    pub max: Option<Value>,
+    /// Exact number of NaN values (doubles; always 0 for other types).
+    pub nan_count: u64,
+}
+
+/// Exact statistics of one saved table, in data-file order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SavedTableStats {
+    /// Database name the table lives in.
+    pub db: String,
+    /// Table name.
+    pub table: String,
+    /// Exact row count.
+    pub rows: u64,
+    /// Per-column statistics in schema (scan) order.
+    pub columns: Vec<SavedColumnStats>,
+}
+
+/// One chunk's contribution to a column's exact statistics (merged across
+/// chunks into a [`SavedColumnStats`]).
+#[derive(Debug, Clone, PartialEq)]
+struct ChunkColumnStats {
+    null_count: u64,
+    min: Option<Value>,
+    max: Option<Value>,
+    nan_count: u64,
+}
+
+/// The running merge of a column's chunk statistics (few comparisons per
+/// chunk; uses the engine's own [`crate::plan::compare_values`] so ties and
+/// NaN behave exactly like the MIN/MAX accumulators).
+#[derive(Debug, Clone, PartialEq)]
+struct ColumnStatsAcc {
+    null_count: u64,
+    min: Option<Value>,
+    max: Option<Value>,
+    nan_count: u64,
+}
+
+impl ColumnStatsAcc {
+    fn new() -> Self {
+        Self {
+            null_count: 0,
+            min: None,
+            max: None,
+            nan_count: 0,
+        }
+    }
+
+    fn merge(&mut self, chunk: &ChunkColumnStats) {
+        self.null_count += chunk.null_count;
+        self.nan_count += chunk.nan_count;
+        if let Some(v) = &chunk.min {
+            if self
+                .min
+                .as_ref()
+                .is_none_or(|m| crate::plan::compare_values(v, m).is_lt())
+            {
+                self.min = Some(v.clone());
+            }
+        }
+        if let Some(v) = &chunk.max {
+            if self
+                .max
+                .as_ref()
+                .is_none_or(|m| crate::plan::compare_values(v, m).is_gt())
+            {
+                self.max = Some(v.clone());
+            }
+        }
+    }
+}
+
+/// Exact statistics of one chunk of one column: the same strict comparisons
+/// the MIN/MAX accumulators use (a tie never replaces the first-seen value).
+fn chunk_column_stats(v: &Vector) -> ChunkColumnStats {
+    let null_count = v.null_count() as u64;
+    match v.data() {
+        VectorData::Boolean(data) => {
+            let (mut min, mut max) = (false, false);
+            let mut see = |x: bool| {
+                if !x {
+                    min = true;
+                } else {
+                    max = true;
+                }
+            };
+            if v.has_nulls() {
+                for (i, &x) in data.iter().enumerate() {
+                    if v.is_valid(i) {
+                        see(x);
+                    }
+                }
+            } else {
+                for &x in data {
+                    see(x);
+                }
+            }
+            ChunkColumnStats {
+                null_count,
+                min: min.then_some(Value::Boolean(false)),
+                max: max.then_some(Value::Boolean(true)),
+                nan_count: 0,
+            }
+        }
+        VectorData::Int32(data) => {
+            let (min, max) = int_stats(v, data);
+            ChunkColumnStats {
+                null_count,
+                min: min.map(Value::Integer),
+                max: max.map(Value::Integer),
+                nan_count: 0,
+            }
+        }
+        VectorData::Int64(data) => {
+            let (min, max) = int_stats(v, data);
+            ChunkColumnStats {
+                null_count,
+                min: min.map(Value::Bigint),
+                max: max.map(Value::Bigint),
+                nan_count: 0,
+            }
+        }
+        VectorData::Date32(data) => {
+            let (min, max) = int_stats(v, data);
+            ChunkColumnStats {
+                null_count,
+                min: min.map(Value::Date),
+                max: max.map(Value::Date),
+                nan_count: 0,
+            }
+        }
+        VectorData::TimestampMicros(data) => {
+            let (min, max) = int_stats(v, data);
+            ChunkColumnStats {
+                null_count,
+                min: min.map(Value::Timestamp),
+                max: max.map(Value::Timestamp),
+                nan_count: 0,
+            }
+        }
+        VectorData::Float64(data) => {
+            let (mut min, mut max): (Option<f64>, Option<f64>) = (None, None);
+            let mut nan_count = 0u64;
+            let mut see = |x: f64| {
+                if x.is_nan() {
+                    nan_count += 1;
+                    return;
+                }
+                if min.is_none_or(|m| x < m) {
+                    min = Some(x);
+                }
+                if max.is_none_or(|m| x > m) {
+                    max = Some(x);
+                }
+            };
+            if v.has_nulls() {
+                for (i, &x) in data.iter().enumerate() {
+                    if v.is_valid(i) {
+                        see(x);
+                    }
+                }
+            } else {
+                for &x in data {
+                    see(x);
+                }
+            }
+            ChunkColumnStats {
+                null_count,
+                min: min.map(Value::Double),
+                max: max.map(Value::Double),
+                nan_count,
+            }
+        }
+        VectorData::VarChar(data) => {
+            let (min, max) = str_stats(v, data);
+            ChunkColumnStats {
+                null_count,
+                min: min.map(|s| Value::Varchar(s.to_string())),
+                max: max.map(|s| Value::Varchar(s.to_string())),
+                nan_count: 0,
+            }
+        }
+    }
+}
+
+/// min/max over the valid elements of an integer chunk, first-seen on ties.
+fn int_stats<T: Copy + Ord>(v: &Vector, data: &[T]) -> (Option<T>, Option<T>) {
+    let (mut min, mut max): (Option<T>, Option<T>) = (None, None);
+    let mut see = |x: T| {
+        if min.is_none_or(|m| x < m) {
+            min = Some(x);
+        }
+        if max.is_none_or(|m| x > m) {
+            max = Some(x);
+        }
+    };
+    if v.has_nulls() {
+        for (i, &x) in data.iter().enumerate() {
+            if v.is_valid(i) {
+                see(x);
+            }
+        }
+    } else {
+        for &x in data {
+            see(x);
+        }
+    }
+    (min, max)
+}
+
+/// min/max over the valid elements of a string chunk, first-seen on ties
+/// (byte order, exactly `Value::Varchar`'s `compare_values`).
+fn str_stats<'a>(v: &Vector, data: &'a [Arc<str>]) -> (Option<&'a str>, Option<&'a str>) {
+    let (mut min, mut max): (Option<&'a str>, Option<&'a str>) = (None, None);
+    let mut see = |x: &'a str| {
+        if min.is_none_or(|m| x < m) {
+            min = Some(x);
+        }
+        if max.is_none_or(|m| x > m) {
+            max = Some(x);
+        }
+    };
+    if v.has_nulls() {
+        for (i, s) in data.iter().enumerate() {
+            if v.is_valid(i) {
+                see(s);
+            }
+        }
+    } else {
+        for s in data {
+            see(s);
+        }
+    }
+    (min, max)
+}
 
 fn dtype_tag(t: DataType) -> u8 {
     match t {
@@ -288,11 +552,18 @@ fn bits_needed_exact(range: u64) -> u32 {
     64 - range.leading_zeros()
 }
 
+/// Pack `values` little-endian bitwise, `width` bits each (LSB first).
+///
+/// The accumulator is `u128`: after a flush the accumulator holds fewer than
+/// 8 bits, so a 64-bit value can temporarily push it to 71 bits. A `u64`
+/// accumulator would silently drop the top bits for widths above 57 — the
+/// pre-wave-45k bug this widening fixes (bytes are unchanged for every width
+/// that fit before).
 fn pack_bits(writer: &mut Writer, values: &[u64], width: u32) {
-    let mut acc: u64 = 0;
+    let mut acc: u128 = 0;
     let mut acc_bits: u32 = 0;
     for &v in values {
-        acc |= v << acc_bits;
+        acc |= (v as u128) << acc_bits;
         acc_bits += width;
         while acc_bits >= 8 {
             writer.u8((acc & 0xFF) as u8);
@@ -305,9 +576,15 @@ fn pack_bits(writer: &mut Writer, values: &[u64], width: u32) {
     }
 }
 
+/// Unpack `count` little-endian bitwise values of `width` bits (LSB first).
+///
+/// Like [`pack_bits`], the accumulator is `u128`: loading bytes can push it
+/// past 64 bits while the remainder for the next element is still valid, and
+/// widths above 56 need those high bits (the pre-wave-45k `u64` accumulator
+/// silently dropped them).
 fn unpack_bits(reader: &mut Reader, count: usize, width: u32) -> Result<Vec<u64>> {
     let mut out = Vec::with_capacity(count);
-    let mut acc: u64 = 0;
+    let mut acc: u128 = 0;
     let mut acc_bits: u32 = 0;
     let mask = if width == 64 {
         u64::MAX
@@ -316,19 +593,12 @@ fn unpack_bits(reader: &mut Reader, count: usize, width: u32) -> Result<Vec<u64>
     };
     while out.len() < count {
         while acc_bits < width {
-            acc |= (reader.u8()? as u64) << acc_bits;
+            acc |= (reader.u8()? as u128) << acc_bits;
             acc_bits += 8;
         }
-        out.push(acc & mask);
-        if width == 64 {
-            // `acc >>= 64` overflows; a full-width element is the whole
-            // accumulator, so clear it explicitly.
-            acc = 0;
-            acc_bits = 0;
-        } else {
-            acc >>= width;
-            acc_bits -= width;
-        }
+        out.push((acc as u64) & mask);
+        acc >>= width;
+        acc_bits -= width;
     }
     Ok(out)
 }
@@ -1611,20 +1881,51 @@ fn encode_columns(cols: &[Arc<Vector>], schema: &[(String, DataType)]) -> Vec<En
         .collect()
 }
 
+/// One chunk encoded, plus its per-column statistics when the caller asked
+/// for them (the `.lake` stats block). `collect_stats` is constant per save,
+/// so the branch is free in the common `.save` path.
+fn encode_chunk_with_stats(
+    cols: &[Arc<Vector>],
+    schema: &[(String, DataType)],
+    collect_stats: bool,
+) -> (Vec<EncodedCol>, Vec<ChunkColumnStats>) {
+    let encoded = encode_columns(cols, schema);
+    let stats = if collect_stats {
+        cols.iter().map(|v| chunk_column_stats(v)).collect()
+    } else {
+        Vec::new()
+    };
+    (encoded, stats)
+}
+
 impl PinkDb {
     /// Serialize every database (and every table in it) in the `.pink`
     /// columnar format. Databases and tables are stored in sorted name order
     /// (deterministic bytes). Views are session-local and never persisted.
     fn to_bytes(&self) -> Result<Vec<u8>> {
-        self.to_bytes_impl(true)
+        Ok(self.to_bytes_inner(true, false)?.0)
     }
 
     /// [`PinkDb::to_bytes`] with the chunk-parallel encode disabled (test
     /// switch: both paths must produce identical bytes).
+    #[cfg(test)]
     fn to_bytes_impl(&self, parallel: bool) -> Result<Vec<u8>> {
+        Ok(self.to_bytes_inner(parallel, false)?.0)
+    }
+
+    /// The one serialization path: `.pink` v4 bytes, optionally with the
+    /// exact per-table statistics collected in the same chunk pass. The
+    /// statistics never influence the bytes (`to_bytes_inner(_, false).0` is
+    /// bit-identical to `to_bytes_inner(_, true).0`).
+    fn to_bytes_inner(
+        &self,
+        parallel: bool,
+        collect_stats: bool,
+    ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         let mut w = Writer::new();
         w.bytes(MAGIC_V4);
         w.u32(0); // flags: no optional sections in v4.0
+        let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
         dbs.sort();
         w.u32(dbs.len() as u32);
@@ -1654,18 +1955,45 @@ impl PinkDb {
                     })?;
                     scans.push(chunk.columns);
                 }
-                let encoded: Vec<Vec<EncodedCol>> =
+                let per_chunk: Vec<(Vec<EncodedCol>, Vec<ChunkColumnStats>)> =
                     if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
                         scans
-                            .into_par_iter()
-                            .map(|cols| encode_columns(&cols, &schema))
+                            .par_iter()
+                            .map(|cols| encode_chunk_with_stats(cols, &schema, collect_stats))
                             .collect()
                     } else {
                         scans
                             .iter()
-                            .map(|cols| encode_columns(cols, &schema))
+                            .map(|cols| encode_chunk_with_stats(cols, &schema, collect_stats))
                             .collect()
                     };
+                let (encoded, chunk_stats): (Vec<_>, Vec<_>) = per_chunk.into_iter().unzip();
+                if collect_stats {
+                    let mut accs: Vec<ColumnStatsAcc> =
+                        schema.iter().map(|_| ColumnStatsAcc::new()).collect();
+                    for chunk in &chunk_stats {
+                        for (acc, stats) in accs.iter_mut().zip(chunk) {
+                            acc.merge(stats);
+                        }
+                    }
+                    saved.push(SavedTableStats {
+                        db: dbname.clone(),
+                        table: name.clone(),
+                        rows: t.num_rows() as u64,
+                        columns: schema
+                            .iter()
+                            .zip(accs)
+                            .map(|((col, dtype), acc)| SavedColumnStats {
+                                name: col.clone(),
+                                dtype: *dtype,
+                                null_count: acc.null_count,
+                                min: acc.min,
+                                max: acc.max,
+                                nan_count: acc.nan_count,
+                            })
+                            .collect(),
+                    });
+                }
                 for ci in 0..schema.len() {
                     w.u32(n_chunks as u32);
                     for chunk in &encoded {
@@ -1680,7 +2008,7 @@ impl PinkDb {
         }
         let crc = crate::wal::crc32(&w.buf);
         w.u32(crc);
-        Ok(w.buf)
+        Ok((w.buf, saved))
     }
 
     /// The bytes [`PinkDb::save`] would write: every database in the `.pink`
@@ -1696,6 +2024,25 @@ impl PinkDb {
         // (Checkpoints check the same flag under the WAL lock they hold.)
         self.ensure_wal_healthy()?;
         self.to_bytes()
+    }
+
+    /// [`PinkDb::to_pink_bytes`] plus the exact per-column statistics of
+    /// every table, collected in the same chunk pass as the encode — the
+    /// bytes are bit-identical to [`PinkDb::to_pink_bytes`] and the added
+    /// cost is one linear scan of the chunk payloads (no second walk of the
+    /// store, no per-row `Value` materialization except the per-chunk
+    /// min/max).
+    ///
+    /// For the `.lake` layer: a lean (`lake-lite`) save publishes these
+    /// facts in the v1 manifest's statistics block, and `.lake attach`
+    /// answers exact `COUNT`/`MIN`/`MAX` from them without decoding a data
+    /// file. The facts are ungated (`nan_count` and zero doubles are kept);
+    /// `pink-lake` applies the one exactness gate shared with the Vortex
+    /// footer path. [`PinkDb::save`]/[`PinkDb::to_pink_bytes`] never pay
+    /// this cost.
+    pub fn to_pink_bytes_with_stats(&self) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
+        self.ensure_wal_healthy()?;
+        self.to_bytes_inner(true, true)
     }
 
     /// Write every database to `path` in the `.pink` columnar format.
@@ -3617,6 +3964,44 @@ mod tests {
         assert!(!lz_probe(&[]));
     }
 
+    /// Regression (pre-wave-45k): bitpacked payloads whose width exceeds 56
+    /// bits lost the high bits of each element — the `u64` pack/unpack
+    /// accumulator overflowed while a wide element was being shifted in.
+    /// A full-width BITPACK chunk and a 63-bit DELTA_BITPACK chunk must
+    /// round-trip bit-exactly; the same bug silently corrupted `.pink` v4
+    /// data files for exactly these value patterns (it was found by the wave
+    /// 45k lake-attach equivalence corpus).
+    #[test]
+    fn wide_bitpack_roundtrips_exactly() {
+        // i64::MIN/MAX force a 64-bit bitpack, and deltas of -1, -i64::MAX,
+        // 0, -3, ... force a 63-bit delta codec.
+        let mut vals: Vec<Value> = vec![
+            Value::Bigint(i64::MIN),
+            Value::Bigint(i64::MAX),
+            Value::Bigint(0),
+        ];
+        for i in 0..2045i64 {
+            vals.push(Value::Bigint(-i * 3));
+        }
+        for tag in [ENC_BITPACK, ENC_DELTA_BITPACK] {
+            let out = roundtrip_chunk(DataType::Bigint, vals.clone(), tag);
+            assert_eq!(out, vals, "tag {tag} lost values");
+        }
+        // TIMESTAMP shares the 64-bit codecs.
+        let mut ts: Vec<Value> = vec![
+            Value::Timestamp(i64::MIN),
+            Value::Timestamp(i64::MAX),
+            Value::Timestamp(0),
+        ];
+        for i in 0..2045i64 {
+            ts.push(Value::Timestamp(i64::MAX - i * 7));
+        }
+        for tag in [ENC_BITPACK, ENC_DELTA_BITPACK] {
+            let out = roundtrip_chunk(DataType::Timestamp, ts.clone(), tag);
+            assert_eq!(out, ts, "timestamp tag {tag} lost values");
+        }
+    }
+
     #[test]
     fn golden_v4_bytes_are_pinned() {
         let db = golden_db();
@@ -3906,5 +4291,212 @@ mod tests {
         let back = PinkDb::load_bytes(&first).unwrap();
         let second = back.to_bytes().unwrap();
         assert_eq!(first, second, "open→save is not byte-identity");
+    }
+
+    /// Save-time statistics cost probe (run deliberately):
+    ///
+    /// ```text
+    /// cargo test --release -p pinkdb --lib stats_collection_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// Builds a 10M-row sales-shaped table, times the plain encode and the
+    /// encode-with-stats (best of three each), and prints the added cost. The
+    /// bytes must be identical either way.
+    #[test]
+    #[ignore = "timing probe: run with --release --ignored --nocapture"]
+    fn stats_collection_cost_at_10m_rows() {
+        let rows: usize = 10_000_000;
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE sales (id BIGINT, region VARCHAR, total DOUBLE, active BOOLEAN);")
+            .unwrap();
+        {
+            let t = db.table_mut("sales").unwrap();
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                state
+            };
+            let regions = ["west", "east", "north", "south"];
+            for i in 0..rows as i64 {
+                let r = next();
+                t.append_row(vec![
+                    Value::Bigint(i + 1),
+                    Value::Varchar(regions[(r % 4) as usize].to_string()),
+                    if r % 100 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Double((r % 999_000) as f64 / 1000.0 + 1.0)
+                    },
+                    Value::Boolean(r % 10 < 7),
+                ])
+                .unwrap();
+            }
+        }
+        let mut plain = f64::MAX;
+        let mut with_stats = f64::MAX;
+        let mut plain_bytes = Vec::new();
+        for i in 0..3 {
+            let t0 = std::time::Instant::now();
+            let bytes = db.to_pink_bytes().unwrap();
+            plain = plain.min(t0.elapsed().as_secs_f64());
+            if i == 0 {
+                plain_bytes = bytes;
+            } else {
+                assert_eq!(bytes, plain_bytes, "stats must not change the bytes");
+            }
+            let t0 = std::time::Instant::now();
+            let (bytes, stats) = db.to_pink_bytes_with_stats().unwrap();
+            with_stats = with_stats.min(t0.elapsed().as_secs_f64());
+            assert_eq!(bytes, plain_bytes, "stats must not change the bytes");
+            assert_eq!(stats[0].rows, rows as u64);
+        }
+        println!(
+            "10M rows: encode {plain:.3}s, encode+stats {with_stats:.3}s, stats cost {:+.1} ms",
+            (with_stats - plain) * 1000.0
+        );
+    }
+
+    /// `to_pink_bytes_with_stats` reports exact facts and leaves the bytes
+    /// untouched: NULL counts, first-seen min/max, NaN counts, all-NULL and
+    /// empty handling, multi-chunk merging — checked against the decoded
+    /// table with the engine's own comparator.
+    #[test]
+    fn saved_stats_are_exact_and_bytes_are_identical() {
+        let mut db = PinkDb::new();
+        db.create_table(
+            "t",
+            vec![
+                ("b".to_string(), DataType::Boolean),
+                ("i".to_string(), DataType::Integer),
+                ("g".to_string(), DataType::Bigint),
+                ("d".to_string(), DataType::Double),
+                ("v".to_string(), DataType::Varchar),
+                ("dt".to_string(), DataType::Date),
+                ("ts".to_string(), DataType::Timestamp),
+                ("n".to_string(), DataType::Integer),
+            ],
+        )
+        .unwrap();
+        {
+            let t = db.table_mut("t").unwrap();
+            t.append_row(vec![
+                Value::Boolean(true),
+                Value::Integer(-5),
+                Value::Bigint(9_999_999_999),
+                Value::Double(-0.0),
+                Value::Varchar("b".to_string()),
+                Value::Date(0),
+                Value::Timestamp(-1),
+                Value::Null,
+            ])
+            .unwrap();
+            t.append_row(vec![
+                Value::Boolean(false),
+                Value::Integer(9),
+                Value::Bigint(i64::MIN),
+                Value::Double(f64::INFINITY),
+                Value::Varchar("a".to_string()),
+                Value::Date(19_000),
+                Value::Timestamp(1_700_000_000_000_000),
+                Value::Null,
+            ])
+            .unwrap();
+            t.append_row(vec![
+                Value::Boolean(true),
+                Value::Integer(i32::MIN),
+                Value::Bigint(i64::MAX),
+                Value::Double(f64::from_bits(0x7ff8_0000_cafe_0001)),
+                Value::Varchar(String::new()),
+                Value::Date(i32::MIN),
+                Value::Timestamp(i64::MAX),
+                Value::Null,
+            ])
+            .unwrap();
+            // A second chunk (multi-chunk merge), still all-NULL for `n`.
+            for i in 0..CHUNK_SIZE {
+                t.append_row(vec![
+                    Value::Boolean(i % 2 == 0),
+                    Value::Integer(i as i32 - 100),
+                    Value::Bigint(-(i as i64) * 7),
+                    Value::Double((i as f64) / 16.0 - 3.0),
+                    Value::Varchar(format!("s{:04}", i)),
+                    Value::Date(i as i32),
+                    Value::Timestamp(i as i64 * 13),
+                    Value::Null,
+                ])
+                .unwrap();
+            }
+        }
+        db.create_table("empty", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+
+        let (bytes, stats) = db.to_pink_bytes_with_stats().unwrap();
+        assert_eq!(
+            bytes,
+            db.to_pink_bytes().unwrap(),
+            "stats collection must not change the bytes"
+        );
+        let back = PinkDb::load_bytes(&bytes).unwrap();
+        let mut seen = 0;
+        for table in &stats {
+            seen += 1;
+            let decoded = back.table_in(&table.db, &table.table).unwrap();
+            assert_eq!(table.rows, decoded.num_rows() as u64);
+            assert_eq!(table.columns.len(), decoded.num_cols());
+            for (i, col) in table.columns.iter().enumerate() {
+                let (name, dtype) = decoded.schema()[i].clone();
+                assert_eq!(col.name, name);
+                assert_eq!(col.dtype, dtype);
+                let mut nulls = 0u64;
+                let mut nan_count = 0u64;
+                let (mut min, mut max): (Option<Value>, Option<Value>) = (None, None);
+                for row in 0..decoded.num_rows() {
+                    let v = decoded.get(row, i).unwrap();
+                    if v.is_null() {
+                        nulls += 1;
+                        continue;
+                    }
+                    if matches!(v, Value::Double(x) if x.is_nan()) {
+                        nan_count += 1;
+                    }
+                    if min
+                        .as_ref()
+                        .is_none_or(|m| crate::plan::compare_values(&v, m).is_lt())
+                    {
+                        min = Some(v.clone());
+                    }
+                    if max
+                        .as_ref()
+                        .is_none_or(|m| crate::plan::compare_values(&v, m).is_gt())
+                    {
+                        max = Some(v);
+                    }
+                }
+                assert_eq!(col.null_count, nulls, "{name} nulls");
+                assert_eq!(col.nan_count, nan_count, "{name} NaN count");
+                assert_eq!(col.min, min, "{name} min");
+                assert_eq!(col.max, max, "{name} max");
+            }
+        }
+        assert_eq!(seen, 2, "one entry per table");
+        // The empty table: schema present, no min/max, zero counts.
+        let empty = stats.iter().find(|s| s.table == "empty").unwrap();
+        assert_eq!(empty.rows, 0);
+        assert_eq!(empty.columns.len(), 1);
+        assert_eq!(empty.columns[0].null_count, 0);
+        assert_eq!(empty.columns[0].min, None);
+        assert_eq!(empty.columns[0].max, None);
+        assert_eq!(empty.columns[0].nan_count, 0);
+        // The all-NULL column: exact count, no min/max.
+        let n = stats
+            .iter()
+            .flat_map(|s| &s.columns)
+            .find(|c| c.name == "n")
+            .unwrap();
+        assert_eq!(n.null_count, 3 + CHUNK_SIZE as u64);
+        assert_eq!(n.min, None);
+        assert_eq!(n.max, None);
     }
 }

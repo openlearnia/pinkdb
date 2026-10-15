@@ -72,13 +72,9 @@ fn print_help() {
                 "  .lake open <dir> [v]      load the lake's latest (or version v) into memory"
             );
         }
-        if cfg!(feature = "lake") {
-            println!(
-                "  .lake attach <dir|s3://…> [v]  attach a lake read-only, from its metadata only"
-            );
-        } else {
-            println!("  .lake attach                  (not built in the lean lake: needs `lake`)");
-        }
+        println!(
+            "  .lake attach <dir|s3://…> [v]  attach a lake read-only, from its statistics only"
+        );
         println!("  .lake detach <dir|s3://…>    detach one attached lake");
         println!("  .lake attached              list attached lakes and their tables");
         println!("  .lake versions <dir|s3://…>  list the lake's published versions");

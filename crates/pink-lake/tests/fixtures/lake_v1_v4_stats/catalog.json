@@ -1,0 +1,193 @@
+{
+  "format_version": 1,
+  "updated": "2026-10-15T17:27:09.638Z",
+  "version": 2,
+  "tables": {
+    "analytics.a.b": {
+      "files": [
+        "data/analytics.a.b/84f67220-abb8-4da0-b23f-8b2014def221.pink"
+      ],
+      "rows": 2,
+      "stats": {
+        "version": 1,
+        "table": "analytics.a.b",
+        "file": "data/analytics.a.b/84f67220-abb8-4da0-b23f-8b2014def221.pink",
+        "rows": 2,
+        "columns": [
+          {
+            "name": "z",
+            "dtype": "double",
+            "nulls": 0,
+            "min": "8000000000000000",
+            "max": "3ff8000000000000",
+            "nan": 0
+          }
+        ],
+        "crc32": 3711281680
+      }
+    },
+    "analytics.u": {
+      "files": [
+        "data/analytics.u/4104d7bc-389b-4508-9099-80b5d57eeb51.pink"
+      ],
+      "rows": 1,
+      "stats": {
+        "version": 1,
+        "table": "analytics.u",
+        "file": "data/analytics.u/4104d7bc-389b-4508-9099-80b5d57eeb51.pink",
+        "rows": 1,
+        "columns": [
+          {
+            "name": "k",
+            "dtype": "bigint",
+            "nulls": 0,
+            "min": "7",
+            "max": "7"
+          }
+        ],
+        "crc32": 3705149894
+      }
+    },
+    "main.big": {
+      "files": [
+        "data/main.big/108206d2-ba0f-4205-ab06-7ba5a7202f75.pink"
+      ],
+      "rows": 2148,
+      "stats": {
+        "version": 1,
+        "table": "main.big",
+        "file": "data/main.big/108206d2-ba0f-4205-ab06-7ba5a7202f75.pink",
+        "rows": 2148,
+        "columns": [
+          {
+            "name": "a",
+            "dtype": "integer",
+            "nulls": 0,
+            "min": "-3",
+            "max": "3"
+          },
+          {
+            "name": "s",
+            "dtype": "varchar",
+            "nulls": 0,
+            "min": "region0",
+            "max": "region2"
+          }
+        ],
+        "crc32": 2113855909
+      }
+    },
+    "main.empty": {
+      "files": [
+        "data/main.empty/ac1e2130-d127-4bbe-9eee-cc5020583d51.pink"
+      ],
+      "rows": 0,
+      "stats": {
+        "version": 1,
+        "table": "main.empty",
+        "file": "data/main.empty/ac1e2130-d127-4bbe-9eee-cc5020583d51.pink",
+        "rows": 0,
+        "columns": [
+          {
+            "name": "x",
+            "dtype": "integer",
+            "nulls": 0
+          },
+          {
+            "name": "y",
+            "dtype": "varchar",
+            "nulls": 0
+          }
+        ],
+        "crc32": 1236955833
+      }
+    },
+    "main.fid": {
+      "files": [
+        "data/main.fid/73ffefcf-b52a-4ced-9f5b-a716f2d528d3.pink"
+      ],
+      "rows": 6,
+      "stats": {
+        "version": 1,
+        "table": "main.fid",
+        "file": "data/main.fid/73ffefcf-b52a-4ced-9f5b-a716f2d528d3.pink",
+        "rows": 6,
+        "columns": [
+          {
+            "name": "b",
+            "dtype": "boolean",
+            "nulls": 1,
+            "min": "false",
+            "max": "true"
+          },
+          {
+            "name": "i",
+            "dtype": "integer",
+            "nulls": 1,
+            "min": "-2147483648",
+            "max": "2147483647"
+          },
+          {
+            "name": "g",
+            "dtype": "bigint",
+            "nulls": 1,
+            "min": "-9223372036854775808",
+            "max": "9223372036854775807"
+          },
+          {
+            "name": "d",
+            "dtype": "double",
+            "nulls": 1,
+            "min": "8000000000000000",
+            "max": "7ff0000000000000",
+            "nan": 2
+          },
+          {
+            "name": "v",
+            "dtype": "varchar",
+            "nulls": 1,
+            "min": "",
+            "max": "héllo wörld 🌍\u0000embedded"
+          },
+          {
+            "name": "dt",
+            "dtype": "date",
+            "nulls": 1,
+            "min": "-2147483648",
+            "max": "2147483647"
+          },
+          {
+            "name": "ts",
+            "dtype": "timestamp",
+            "nulls": 1,
+            "min": "-9223372036854775808",
+            "max": "9223372036854775807"
+          }
+        ],
+        "crc32": 2952499967
+      }
+    },
+    "main.héllo✓": {
+      "files": [
+        "data/main.h%C3%A9llo%E2%9C%93/2e9d37de-d7fc-475a-a0ef-bfbcd4642b08.pink"
+      ],
+      "rows": 1,
+      "stats": {
+        "version": 1,
+        "table": "main.héllo✓",
+        "file": "data/main.h%C3%A9llo%E2%9C%93/2e9d37de-d7fc-475a-a0ef-bfbcd4642b08.pink",
+        "rows": 1,
+        "columns": [
+          {
+            "name": "s",
+            "dtype": "varchar",
+            "nulls": 0,
+            "min": "π≈3.14",
+            "max": "π≈3.14"
+          }
+        ],
+        "crc32": 734636252
+      }
+    }
+  }
+}
