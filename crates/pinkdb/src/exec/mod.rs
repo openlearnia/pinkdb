@@ -2045,28 +2045,34 @@ fn rebuild_sorted(chunks: &[DataChunk], rows: &[u32]) -> Result<Vec<DataChunk>> 
         map
     });
     // Each output chunk gathers its CHUNK_SIZE slice of `rows` independently
-    // (in parallel); the chunking is exactly the sequential fill's.
-    rows.par_chunks(CHUNK_SIZE)
-        .map(|part| {
-            let mut cur: Vec<Vector> = dtypes
-                .iter()
-                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-                .collect();
-            for &g in part {
-                let g = g as usize;
-                let ci = match &row_chunk {
-                    Some(map) => map[g] as usize,
-                    None => starts.partition_point(|&s| s <= g) - 1,
-                };
-                let src = &chunks[ci];
-                let r = g - starts[ci];
-                for (dst, col) in cur.iter_mut().zip(src.columns.iter()) {
-                    dst.push_from(col, r)?;
-                }
+    // (in parallel); the chunking is exactly the sequential fill's. A single
+    // output chunk (top-N, small results) skips the pool.
+    let gather = |part: &[u32]| -> Result<DataChunk> {
+        let mut cur: Vec<Vector> = dtypes
+            .iter()
+            .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+            .collect();
+        for &g in part {
+            let g = g as usize;
+            let ci = match &row_chunk {
+                Some(map) => map[g] as usize,
+                None => starts.partition_point(|&s| s <= g) - 1,
+            };
+            let src = &chunks[ci];
+            let r = g - starts[ci];
+            for (dst, col) in cur.iter_mut().zip(src.columns.iter()) {
+                dst.push_from(col, r)?;
             }
-            DataChunk::new(cur)
-        })
-        .collect()
+        }
+        DataChunk::new(cur)
+    };
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    if rows.len() <= CHUNK_SIZE {
+        return Ok(vec![gather(rows)?]);
+    }
+    rows.par_chunks(CHUNK_SIZE).map(gather).collect()
 }
 
 fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec<DataChunk>> {

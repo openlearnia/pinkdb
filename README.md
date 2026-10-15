@@ -1301,6 +1301,31 @@ The wins are profile-driven: typed aggregate kernels + a count-filter fast path
 lake writes (see below). The typed kernels keep semantics pinned exactly
 (wrapping integer `SUM`, NULL skips, NaN rules), and no join row regressed.
 
+### Wave 45 refresh (Oct 2026)
+
+A second profile-driven round (pre-wave binary vs this one, interleaved
+best-of-5 on the same host; full numbers in ROADMAP.md):
+
+| Query (1M) | Pre-wave-45 (ms) | Wave 45 (ms) |
+|---|---|---|
+| GROUP BY region + 5 aggregates | 6.5–6.9 | 3.2 |
+| `SELECT DISTINCT region, active` | 19.4 | 3.8 |
+| ROW_NUMBER() / COUNT(*) OVER (PARTITION BY region …) | 63 / 63 | 13.7 / 13.4 |
+| ORDER BY region (full sort) | 36 | 29 |
+| GROUP BY id / DISTINCT id (1M groups) | 62 / 69 | 50 / 50 |
+| join with a DISTINCT subquery | 21 | 5.3 |
+| **battery total** | **416** | **245–250** |
+
+At 10M: GROUP BY region 68–70 → 33–35 ms (DuckLake 37–55), import 274 → 173
+ms, `.lake save` 632–758 → 296–340 ms (format_version 3: 8,192-row Vortex
+blocks), `.lake open` 618 → 100 ms, data 29.7 → 25 MB, store teardown 93 → 16
+ms. The techniques: two-pass hash aggregation (group ids, then one typed loop
+per aggregate) with typed single-column keys; DISTINCT through that
+aggregation; parallel window partitioning/sorting/assembly; prefix-keyed
+sorting; moving (not copying) bulk-loaded chunks; streamed + parallel Vortex
+encode and parallel bulk decode; parallel teardown. Every result is pinned
+to the old semantics (duckdiff 60/60 + the 1M battery 64/64).
+
 ### Lake format comparison (Vortex vs DuckLake)
 
 `bench/lake_bench.py` (stdlib-only Python, one file) runs the same 1M-row CSV

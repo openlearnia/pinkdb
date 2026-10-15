@@ -78,7 +78,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
 | 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + JavaScript procedures (optional embedded engine; WAL-replay determinism must be solved) | queued | — |
-| 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c; byte-neutral part done, layout-changing save work (bigger write units, stats trim) pending a format decision* | in progress | 4b53844, 70ab514, 0deea0e — @10M interleaved vs pre-wave: import 274–282 → 173–177 ms, `.lake open` 618–620 → 147–157 ms (≈4×), store teardown 93 → 16–24 ms, group_region 68–90 → 33–52 ms (≤60 target met; DuckLake 37–55), save flat cross-binary (−11% in-process A/B; the rest is Vortex's own writer pipeline); lake files byte-identical (10M sha256 unchanged); 1M battery 428 → 415–421 ms; 515 tests, duckdiff 60/60 + 64/64 big |
+| 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c* | done | 4b53844…(part 6) — 1M battery 416 → 245–250 ms (−41%): group_region 6.7 → 3.2, distinct_lowcard 19.4 → 3.8, windows 63 → 13.5, order_str 36 → 29, group_id/distinct_id 62/69 → 50/50, join_probe 21 → 5.3; @10M group_region 68–70 → 33–35 ms (≤60 target met; DuckLake 37–55), import 274 → 173 ms, `.lake save` 632–758 → 296–340 ms (lake format_version 3, 8,192-row blocks, agreed layout change), `.lake open` 618 → 100 ms, data 29.7 → 25 MB, teardown 93 → 16 ms; 516 tests, duckdiff 60/60 + 64/64 big, kill loops clean, clippy/fmt clean |
 | 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | queued | — |
 | 47 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | queued | — |
 | 48 | RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), `CREATE USER`/`CREATE ROLE`/`GRANT`/`REVOKE` on databases/tables, session login on the network server, per-connection enforcement (embedded API stays trusted), grants persisted in the catalog + WAL | queued | — |
@@ -402,3 +402,14 @@ Java bindings.
   @10M). Measured and discarded: batch-level UTF-8/typed-push CSV parsing (no change —
   parsing is already parallel). Also fixed a flaky test: a busy durable lock is retried
   for 200 ms (a forking sibling thread briefly holds a duplicate descriptor).
+- 2026-10-15 — Wave 45 completed: after the byte-neutral part, the agreed lake layout change
+  (format_version 3: 8,192-row / ~1 MiB Vortex blocks, loader slices back into engine
+  chunks; stats kept for future pruning; an immutable v2 fixture pins old-lake reads) took
+  save @10M to ~0.3 s and open to ~0.1 s. Query side: DISTINCT now runs through the
+  parallel aggregation; window functions parallelize partitioning, sorting and output
+  assembly (output chunks share input columns); sorts compare 8-byte key prefixes first and
+  rebuild output chunks in parallel. 1M battery 416 → 245–250 ms. Measured and dropped: a
+  radix-parallel merge for 1M-group aggregations (−2–3% only — the cost is per-group heap
+  churn). Next round's breadcrumb: struct-of-arrays group storage (typed key columns +
+  accumulator arrays, no per-group allocations) for high-cardinality GROUP BY / DISTINCT
+  (~50 ms @1M); `proj_func` (per-row string allocation in `upper`) is the other one.
