@@ -189,6 +189,18 @@ impl DataTable {
     /// (CSV import): one call per batch instead of one `append_row` per row.
     /// Splits across chunk boundaries as needed; one version bump per batch.
     pub fn append_chunk(&mut self, chunk: Vec<Vector>) -> Result<()> {
+        let chunk: Vec<Arc<Vector>> = chunk.into_iter().map(Arc::new).collect();
+        self.append_shared_chunk(&chunk)
+    }
+
+    /// [`DataTable::append_chunk`] for already-shared columns: appends the
+    /// caller's `Arc<Vector>`s (shared, never copied) where the chunking
+    /// rules allow. Validation, values, chunk boundaries and version bumps
+    /// are exactly those of `append_chunk`; the only difference is that the
+    /// caller's allocation is shared instead of moved into a fresh `Arc`.
+    /// The lake loader uses this to hand decoded chunks straight to the
+    /// destination table without deep-cloning megabytes of payload.
+    pub fn append_shared_chunk(&mut self, chunk: &[Arc<Vector>]) -> Result<()> {
         if chunk.len() != self.columns.len() {
             return Err(PinkDbError::Execution(format!(
                 "chunk has {} columns but table \"{}\" has {}",
@@ -197,13 +209,13 @@ impl DataTable {
                 self.columns.len()
             )));
         }
-        let rows = chunk.first().map(Vector::len).unwrap_or(0);
+        let rows = chunk.first().map(|c| c.len()).unwrap_or(0);
         if rows > CHUNK_SIZE {
             return Err(PinkDbError::Execution(format!(
                 "chunk has {rows} rows but CHUNK_SIZE is {CHUNK_SIZE}"
             )));
         }
-        for (dst, src) in self.columns.iter().zip(&chunk) {
+        for (dst, src) in self.columns.iter().zip(chunk) {
             if src.len() != rows {
                 return Err(PinkDbError::Execution(
                     "chunk columns must all have the same length".to_string(),
@@ -222,7 +234,7 @@ impl DataTable {
             return Ok(());
         }
         // Fast paths (rows ≤ CHUNK_SIZE by the check above): the batch fills
-        // an empty tail chunk, or starts a new chunk after a full one — move
+        // an empty tail chunk, or starts a new chunk after a full one — share
         // the built vectors in without copying. The copy path below would
         // produce exactly the same chunking; bulk loaders (CSV import, lake
         // load) append CHUNK_SIZE-row batches, so after the first batch every
@@ -231,11 +243,11 @@ impl DataTable {
         if tail_len == 0 || tail_len >= CHUNK_SIZE {
             if tail_len == 0 && !self.columns[0].chunks.is_empty() {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    *col.chunks.last_mut().expect("tail chunk exists") = Arc::new(src);
+                    *col.chunks.last_mut().expect("tail chunk exists") = Arc::clone(src);
                 }
             } else {
                 for (col, src) in self.columns.iter_mut().zip(chunk) {
-                    col.chunks.push(Arc::new(src));
+                    col.chunks.push(Arc::clone(src));
                 }
             }
             self.num_rows += rows;
@@ -260,7 +272,7 @@ impl DataTable {
                 let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
                 (CHUNK_SIZE - tail_len).min(rows - offset)
             };
-            for (col, src) in self.columns.iter_mut().zip(&chunk) {
+            for (col, src) in self.columns.iter_mut().zip(chunk) {
                 Arc::make_mut(col.chunks.last_mut().expect("tail chunk exists"))
                     .extend_from(src, offset, take);
             }
@@ -1216,6 +1228,65 @@ mod tests {
             Err(PinkDbError::Execution(_))
         ));
         assert_eq!(t2.num_rows(), 0);
+    }
+
+    #[test]
+    fn append_shared_chunk_shares_arcs_and_matches_append_chunk() {
+        let mk = || {
+            let t = DataTable::new(
+                "t".to_string(),
+                vec![
+                    ("a".to_string(), DataType::Bigint),
+                    ("s".to_string(), DataType::Varchar),
+                ],
+            )
+            .unwrap();
+            let mut a = Vector::with_capacity(DataType::Bigint, CHUNK_SIZE);
+            let mut s = Vector::with_capacity(DataType::Varchar, CHUNK_SIZE);
+            for i in 0..CHUNK_SIZE {
+                a.push_valid(Value::Bigint(i as i64)).unwrap();
+                s.push_str(&format!("v{}", i % 7)).unwrap();
+            }
+            let chunk = vec![Arc::new(a), Arc::new(s)];
+            // A partial tail first, so the next append must merge.
+            let mut a2 = Vector::with_capacity(DataType::Bigint, CHUNK_SIZE);
+            let mut s2 = Vector::with_capacity(DataType::Varchar, CHUNK_SIZE);
+            for i in 0..3i64 {
+                a2.push_valid(Value::Bigint(-i)).unwrap();
+                s2.push_str(&format!("t{i}")).unwrap();
+            }
+            (t, chunk, vec![Arc::new(a2), Arc::new(s2)])
+        };
+        let (mut shared, full, partial) = mk();
+        let (mut copied, _, _) = mk();
+
+        // The partial tail path (merge) plus a full-batch append on both,
+        // then the fast-path append, then compare chunk-for-chunk.
+        shared.append_shared_chunk(&partial).unwrap();
+        copied
+            .append_chunk(partial.iter().map(|c| (**c).clone()).collect())
+            .unwrap();
+        shared.append_shared_chunk(&full).unwrap();
+        copied
+            .append_chunk(full.iter().map(|c| (**c).clone()).collect())
+            .unwrap();
+
+        assert_eq!(shared.num_rows(), copied.num_rows());
+        assert_eq!(shared.num_chunks(), copied.num_chunks());
+        for i in 0..shared.num_chunks() {
+            let a = shared.scan_chunk(i).unwrap();
+            let b = copied.scan_chunk(i).unwrap();
+            assert_eq!(a.columns, b.columns, "chunk {i} differs");
+            assert_eq!(a.num_rows(), b.num_rows());
+        }
+        // The CHUNK_SIZE-row batch after a partial 3-row tail merges, so the
+        // source vectors are not shared anymore; a batch landing on the empty
+        // initial chunk is shared, not copied.
+        let (mut shared2, full2, _) = mk();
+        shared2.append_shared_chunk(&full2).unwrap();
+        assert_eq!(shared2.num_chunks(), 1); // empty tail is replaced
+        assert!(Arc::ptr_eq(&shared2.columns[0].chunks[0], &full2[0]));
+        assert!(Arc::ptr_eq(&shared2.columns[1].chunks[0], &full2[1]));
     }
 
     #[test]

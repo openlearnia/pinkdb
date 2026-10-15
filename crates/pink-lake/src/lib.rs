@@ -163,7 +163,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use pinkdb::{DataTable, DataType, PinkDb, Vector};
+use pinkdb::{DataTable, DataType, PinkDb};
 
 mod catalog;
 mod local;
@@ -913,12 +913,13 @@ impl Lake {
                             source: e,
                         })?
                     }
-                    // v2: a Vortex file that decodes into the same shape.
+                    // v2: a Vortex file that decodes into the same shape. The
+                    // bytes are moved into the decoder's buffer (zero copy).
                     FileFormat::Vortex => {
                         let bytes = self
                             .storage
                             .read(rel, &format!("loading data file \"{rel}\""))?;
-                        vortex_file::decode_table(&path, &bytes)?
+                        vortex_file::decode_table_owned(&path, bytes)?
                     }
                 };
                 let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
@@ -1296,18 +1297,21 @@ fn only_table<'a>(mini: &'a PinkDb, rel: &str, root: &Path) -> Result<(String, &
     Ok((dbname, table))
 }
 
-/// Copy every chunk of `src` into `dst` (deep column clone; bit-exact,
-/// including NaN payloads and `-0.0`). `context` names the source for errors.
+/// Append every chunk of `src` into `dst`, sharing each `Arc<Vector>` with
+/// the source (the decoded mini store is dropped right after) — bit-exact,
+/// including NaN payloads and `-0.0` — with `append_chunk`'s chunking rules
+/// (a ragged tail is merged, never left ragged). `context` names the source
+/// for errors.
 fn copy_chunks(src: &DataTable, dst: &mut DataTable, context: &str) -> Result<()> {
     for i in 0..src.num_chunks() {
         let chunk = src.scan_chunk(i).ok_or_else(|| LakeError::Internal {
             message: format!("chunk {i} of {context} disappeared while copying"),
         })?;
-        let cols: Vec<Vector> = chunk.columns.iter().map(|c| (**c).clone()).collect();
-        dst.append_chunk(cols).map_err(|e| LakeError::Engine {
-            context: format!("appending chunk {i} of {context}"),
-            source: e,
-        })?;
+        dst.append_shared_chunk(&chunk.columns)
+            .map_err(|e| LakeError::Engine {
+                context: format!("appending chunk {i} of {context}"),
+                source: e,
+            })?;
     }
     Ok(())
 }

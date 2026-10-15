@@ -252,6 +252,24 @@ const MAX_STORED_CHUNK_ROWS: usize = 1 << 20;
 /// writer's compression of window *k* overlaps the conversion of *k + 1*.
 const CONVERT_WINDOW: usize = 128;
 
+/// Slots of the per-decode VARCHAR interning cache (a power of two). Big
+/// enough that the handful of distinct strings a chunk repeats find their
+/// own slots, small enough to live in L1 (128 × 24 bytes).
+const INTERN_SLOTS: usize = 128;
+
+/// [`INTERN_SLOTS`] as a shift: `slot = hash >> INTERN_SHIFT`.
+const INTERN_SHIFT: u32 = 64 - INTERN_SLOTS.trailing_zeros();
+
+/// The direct-mapped cache slot for a raw Vortex view key: fold the 16-byte
+/// key to 64 bits and mix once (Fibonacci hashing). The *high* bits of the
+/// product depend on every input bit — unlike the low bits, which for short
+/// inlined views only see the string length — and index the table.
+#[inline]
+fn intern_slot(key: u128) -> usize {
+    let h = (key as u64 ^ (key >> 64) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (h >> INTERN_SHIFT) as usize
+}
+
 /// The `pinkdb.table` metadata segment for a table.
 fn table_metadata(dbname: &str, table: &str, src: &DataTable) -> Result<Vec<u8>> {
     let metadata = TableMetadata {
@@ -378,12 +396,36 @@ fn encode_table_with_metadata(
 /// Decode a Vortex data file into a one-table [`PinkDb`] (the same shape a
 /// v1 `.pink` data file opens as, so the loader's checks are identical).
 ///
-/// Every Vortex decoder entry point lives inside [`decode_table_inner`] and
-/// is reached only through [`with_decoder_guard`], so a malformed file can
+/// Every Vortex decoder entry point lives inside [`decode_buffer`] and is
+/// reached only through [`with_decoder_guard`], so a malformed file can
 /// produce a clean [`LakeError::Corrupt`] but never an escaping panic.
+///
+/// The in-memory entry point exists for tests and for callers holding a
+/// borrowed slice; the lake itself hands its buffer over to
+/// [`decode_table_owned`] so it is never copied.
+#[cfg(test)]
 pub(crate) fn decode_table(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
+    decode_buffer(path, ByteBuffer::copy_from(bytes))
+}
+
+/// [`decode_table`] for a buffer the caller already owns: the bytes are
+/// *moved* into the Vortex byte buffer (zero copy), not copied again. This
+/// is the object-storage entry (the whole object arrives as a `Vec<u8>`)
+/// and the local entry (the file is read into exactly this buffer).
+pub(crate) fn decode_table_owned(path: &Path, bytes: Vec<u8>) -> Result<PinkDb> {
+    decode_buffer(path, ByteBuffer::from(bytes))
+}
+
+/// The in-memory entry: one `ByteBuffer` holding the whole file.
+fn decode_buffer(path: &Path, buffer: ByteBuffer) -> Result<PinkDb> {
     with_decoder_guard(path, "opening and decoding it", || {
-        decode_table_inner(path, bytes)
+        let (runtime, session) = session();
+        let file = session
+            .open_options()
+            .include_metadata()
+            .open_buffer(buffer)
+            .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?;
+        decode_open_file(path, &runtime, &session, file)
     })
 }
 
@@ -417,14 +459,12 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
     "unknown panic payload".to_string()
 }
 
-fn decode_table_inner(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
-    let (runtime, session) = session();
-    let file = session
-        .open_options()
-        .include_metadata()
-        .open_buffer(ByteBuffer::copy_from(bytes))
-        .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?;
-
+fn decode_open_file(
+    path: &Path,
+    runtime: &CurrentThreadRuntime,
+    session: &VortexSession,
+    file: vortex::file::VortexFile,
+) -> Result<PinkDb> {
     let metadata = parse_metadata(path, &file)?;
     let schema = schema_of(path, &file, &metadata)?;
     let mut mini = empty_single_table_store(&metadata.db, &metadata.table, schema.clone())?;
@@ -856,20 +896,44 @@ fn decode_column(
         }
         DataType::Varchar => {
             let values = var_bin_values(path, name, array, ctx)?;
+            let views = values.views();
             let mut out: Vec<std::sync::Arc<str>> = Vec::with_capacity(len);
-            for i in 0..len {
-                if valid(i) {
-                    let bytes = values.bytes_at(i);
-                    let s = std::str::from_utf8(bytes.as_slice()).map_err(|e| {
-                        corrupt(
-                            path,
-                            format!("column \"{name}\" row {i} is not valid UTF-8: {e}"),
-                        )
-                    })?;
-                    out.push(std::sync::Arc::from(s));
-                } else {
-                    out.push(std::sync::Arc::from(""));
+            // Repeated strings — dictionary-encoded columns, low-cardinality
+            // fields — are allocated once per chunk instead of once per row:
+            // the 16-byte Vortex view is an exact key (two identical views
+            // always describe identical bytes), and a fixed direct-mapped
+            // cache of recently decoded values is enough for the repeats a
+            // chunk actually holds. The cache never grows and never
+            // allocates for itself; a high-cardinality column pays one
+            // multiply, one probe and one compare of cache overhead per row
+            // (plus the allocation it had to do anyway) and nothing more.
+            let mut cache: [Option<(u128, std::sync::Arc<str>)>; INTERN_SLOTS] =
+                std::array::from_fn(|_| None);
+            let empty: std::sync::Arc<str> = std::sync::Arc::from("");
+            for (i, view) in views.iter().enumerate() {
+                if !valid(i) {
+                    // One shared placeholder, exactly like `push_null`.
+                    out.push(std::sync::Arc::clone(&empty));
+                    continue;
                 }
+                let key = view.as_u128();
+                let slot = intern_slot(key);
+                if let Some((k, s)) = &cache[slot] {
+                    if *k == key {
+                        out.push(std::sync::Arc::clone(s));
+                        continue;
+                    }
+                }
+                let bytes = values.bytes_at(i);
+                let s = std::str::from_utf8(bytes.as_slice()).map_err(|e| {
+                    corrupt(
+                        path,
+                        format!("column \"{name}\" row {i} is not valid UTF-8: {e}"),
+                    )
+                })?;
+                let arc: std::sync::Arc<str> = std::sync::Arc::from(s);
+                cache[slot] = Some((key, std::sync::Arc::clone(&arc)));
+                out.push(arc);
             }
             VectorData::VarChar(out)
         }
