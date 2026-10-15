@@ -578,7 +578,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 chunks.push(DataChunk::new(cols)?);
             }
             let chunks = if *is_distinct {
-                distinct(&chunks)?
+                distinct(cx, &chunks)?
             } else {
                 chunks
             };
@@ -639,7 +639,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         }
         LogicalPlan::Distinct { input } => {
             let inner = eval(cx, input)?;
-            let chunks = distinct(&inner.chunks)?;
+            let chunks = distinct(cx, &inner.chunks)?;
             Ok(Output {
                 chunks,
                 names: inner.names,
@@ -1791,49 +1791,28 @@ fn fused_join_aggregate(
     }))
 }
 
-fn distinct(chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
-    let mut seen = FastSet::default();
-    let mut out: Vec<Vector> = Vec::new();
-    let mut out_rows = 0usize;
-    let mut finished: Vec<DataChunk> = Vec::new();
-    let mut buf = Vec::new();
-    for chunk in chunks.iter() {
-        for i in 0..chunk.num_rows() {
-            // Borrowed encoding, get-first: hits (dupes) allocate nothing.
-            buf.clear();
-            for col in chunk.columns.iter() {
-                col.encode_into(&mut buf, i);
-            }
-            if seen.contains(&buf) {
-                continue;
-            }
-            seen.insert(buf.clone());
-            if out.is_empty() {
-                out = chunk
-                    .columns
-                    .iter()
-                    .map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE))
-                    .collect();
-            }
-            if out_rows >= CHUNK_SIZE {
-                finished.push(DataChunk::new(std::mem::take(&mut out))?);
-                out = chunk
-                    .columns
-                    .iter()
-                    .map(|c| Vector::with_capacity(c.dtype(), CHUNK_SIZE))
-                    .collect();
-                out_rows = 0;
-            }
-            for (col, src) in out.iter_mut().zip(chunk.columns.iter()) {
-                col.push_value(src.get(i))?;
-            }
-            out_rows += 1;
-        }
-    }
-    if !out.is_empty() {
-        finished.push(DataChunk::new(out)?);
-    }
-    Ok(finished)
+/// `DISTINCT`: GROUP BY every column with no aggregates — the parallel
+/// hash aggregation (per-chunk partials merged in chunk order), so rows come
+/// out in first-seen order exactly as the former serial pass emitted them,
+/// with the same key encoding (NULLs equal each other).
+fn distinct(cx: &Cx, chunks: &[DataChunk]) -> Result<Vec<DataChunk>> {
+    let Some(first) = chunks.first() else {
+        return Ok(Vec::new());
+    };
+    let keys: Vec<BoundExpr> = first
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(index, c)| BoundExpr::Column {
+            index,
+            dtype: c.dtype(),
+        })
+        .collect();
+    let mut out = aggregate::aggregate(cx, chunks, &keys, &[])?;
+    // No input rows: no output chunks (the aggregation emits one empty
+    // chunk to carry its schema).
+    out.retain(|c| c.num_rows() > 0);
+    Ok(out)
 }
 
 // ---------- sort ----------
@@ -2065,37 +2044,29 @@ fn rebuild_sorted(chunks: &[DataChunk], rows: &[u32]) -> Result<Vec<DataChunk>> 
         }
         map
     });
-    let mut finished = Vec::new();
-    let mut cur: Vec<Vector> = dtypes
-        .iter()
-        .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
-        .collect();
-    let mut cur_rows = 0;
-    for &g in rows {
-        if cur_rows >= CHUNK_SIZE {
-            finished.push(DataChunk::new(std::mem::take(&mut cur))?);
-            cur = dtypes
+    // Each output chunk gathers its CHUNK_SIZE slice of `rows` independently
+    // (in parallel); the chunking is exactly the sequential fill's.
+    rows.par_chunks(CHUNK_SIZE)
+        .map(|part| {
+            let mut cur: Vec<Vector> = dtypes
                 .iter()
                 .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
                 .collect();
-            cur_rows = 0;
-        }
-        let g = g as usize;
-        let ci = match &row_chunk {
-            Some(map) => map[g] as usize,
-            None => starts.partition_point(|&s| s <= g) - 1,
-        };
-        let src = &chunks[ci];
-        let r = g - starts[ci];
-        for (dst, col) in cur.iter_mut().zip(src.columns.iter()) {
-            dst.push_from(col, r)?;
-        }
-        cur_rows += 1;
-    }
-    if cur_rows > 0 {
-        finished.push(DataChunk::new(cur)?);
-    }
-    Ok(finished)
+            for &g in part {
+                let g = g as usize;
+                let ci = match &row_chunk {
+                    Some(map) => map[g] as usize,
+                    None => starts.partition_point(|&s| s <= g) - 1,
+                };
+                let src = &chunks[ci];
+                let r = g - starts[ci];
+                for (dst, col) in cur.iter_mut().zip(src.columns.iter()) {
+                    dst.push_from(col, r)?;
+                }
+            }
+            DataChunk::new(cur)
+        })
+        .collect()
 }
 
 fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec<DataChunk>> {
@@ -2111,8 +2082,27 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec
         return sort_legacy(chunks, keys, &keyed);
     };
     let n = arena.offsets.len() - 1;
-    let mut rows: Vec<u32> = (0..n as u32).collect();
-    rows.par_sort_unstable_by(|&a, &b| arena.key(a).cmp(arena.key(b)).then(a.cmp(&b)));
+    // Sort (8-byte big-endian key prefix, row) pairs: the prefix decides
+    // most comparisons without touching the arena, and only prefix ties
+    // fall back to the full key. Zero padding keeps byte order (a shorter
+    // key that pads to an equal prefix is resolved by the full compare), so
+    // the order is exactly (key bytes, row).
+    let mut rows: Vec<(u64, u32)> = (0..n as u32)
+        .into_par_iter()
+        .map(|r| {
+            let key = arena.key(r);
+            let mut prefix = [0u8; 8];
+            let take = key.len().min(8);
+            prefix[..take].copy_from_slice(&key[..take]);
+            (u64::from_be_bytes(prefix), r)
+        })
+        .collect();
+    rows.par_sort_unstable_by(|&(pa, a), &(pb, b)| {
+        pa.cmp(&pb)
+            .then_with(|| arena.key(a).cmp(arena.key(b)))
+            .then(a.cmp(&b))
+    });
+    let rows: Vec<u32> = rows.into_iter().map(|(_, r)| r).collect();
     rebuild_sorted(chunks, &rows)
 }
 
