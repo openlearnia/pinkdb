@@ -200,10 +200,12 @@ const WRITE_BLOCK_ROWS: usize = 8192;
 /// Target bytes per data block (Vortex's default coalescing, pinned).
 const WRITE_BLOCK_BYTES: u64 = 1 << 20;
 
-/// The longest stored chunk the loader accepts: well above any block the
-/// writer emits, so only a tampered file trips it (and it bounds the slicing
-/// work a corrupt length could ask for).
-const MAX_STORED_CHUNK_ROWS: usize = 1 << 16;
+/// The longest scan chunk the loader accepts. The Vortex reader sub-splits
+/// stored layout chunks into scan ranges of at most its ideal split size
+/// (100,000 rows in Vortex 0.88), so every chunk a valid file yields is well
+/// below this; a tampered length is rejected here (bounding the slicing work
+/// it could ask for) rather than trusted.
+const MAX_STORED_CHUNK_ROWS: usize = 1 << 20;
 
 /// Engine chunks converted per parallel window while streaming into the
 /// writer: large enough to keep every core busy converting, small enough

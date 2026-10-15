@@ -1692,3 +1692,55 @@ fn csv_import_chunk_boundaries_roundtrip() {
     assert_eq!(sizes(loaded.table("t").unwrap()), vec![CHUNK_SIZE, 123]);
     cleanup(&dir);
 }
+
+#[test]
+fn v3_round_trip_accepts_scan_chunks_above_the_old_cap() {
+    // Regression (wave 45 v3 loader): the Vortex reader sub-splits stored
+    // layout chunks into scan ranges of at most its ideal split size (100,000
+    // rows in Vortex 0.88), so a ~100,000-row table is handed to the loader as
+    // one scan chunk of ~100,000 rows — larger than the loader's old 65,536
+    // cap, which rejected the lake it had just written as "corrupt". Any lake
+    // saved by the v3 writer with such a split was unreadable.
+    let dir = scratch("v3_split_cap");
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (id INTEGER, region VARCHAR, total DOUBLE, active BOOLEAN);")
+        .unwrap();
+    {
+        let t = db.table_mut("t").unwrap();
+        // 100,000 rows in engine chunks (each vector is at most CHUNK_SIZE).
+        const ROWS: usize = 100_000;
+        let mut offset = 0usize;
+        while offset < ROWS {
+            let rows = (ROWS - offset).min(CHUNK_SIZE);
+            let mut id = Vector::with_capacity(DataType::Integer, rows);
+            let mut region = Vector::with_capacity(DataType::Varchar, rows);
+            let mut total = Vector::with_capacity(DataType::Double, rows);
+            let mut active = Vector::with_capacity(DataType::Boolean, rows);
+            for i in 0..rows {
+                let n = offset + i;
+                id.push_value(Value::Integer(n as i32)).unwrap();
+                region
+                    .push_str(["west", "east", "north", "south"][n % 4])
+                    .unwrap();
+                if n.is_multiple_of(97) {
+                    total.push_null().unwrap();
+                } else {
+                    total.push_value(Value::Double(n as f64 / 8.0)).unwrap();
+                }
+                active
+                    .push_value(Value::Boolean(!n.is_multiple_of(3)))
+                    .unwrap();
+            }
+            t.append_chunk(vec![id, region, total, active]).unwrap();
+            offset += rows;
+        }
+    }
+    let mut lake = Lake::create(&dir).unwrap();
+    lake.write_from_store(&db).unwrap();
+    let loaded = lake.load(None).unwrap();
+    assert_same_store(&db, &loaded);
+    // The scan chunk was sliced back into engine chunks densely, and the
+    // 100,000 rows survived exactly.
+    assert_eq!(loaded.table("t").unwrap().num_rows(), 100_000);
+    cleanup(&dir);
+}
