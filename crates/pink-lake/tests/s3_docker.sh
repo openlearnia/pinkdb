@@ -3,8 +3,9 @@
 # pink-lake real-S3 integration test: a real S3 server in Docker, release CLI.
 # ============================================================================
 #
-# The in-repo `mock_s3.rs` (used by `cargo test -p pink-lake --features s3`
-# and the CLI's `lake_s3` tests) is the hermetic protocol suite — it even
+# The in-repo `mock_s3.rs` (used by
+# `cargo test -p pink-lake --features s3,vortex-format` and the CLI's
+# `lake_s3` tests) is the hermetic protocol suite — it even
 # verifies SigV4 on every request — but it is a home-grown server inside the
 # test process. This script is the independent check: a real, separate HTTP
 # server in a container, speaking real S3 semantics over a socket, driven

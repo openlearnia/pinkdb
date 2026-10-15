@@ -1420,6 +1420,21 @@ impl PinkDb {
         Ok(w.buf)
     }
 
+    /// The bytes [`PinkDb::save`] would write: every database in the `.pink`
+    /// columnar format, databases and tables in sorted name order
+    /// (deterministic bytes), views never persisted.
+    ///
+    /// For writers that need the serialized image in memory instead of a
+    /// file on disk (pink-lake's v1 `.pink` data files). The same fail-stop
+    /// check as [`PinkDb::save`] applies: a store holding a non-durable write
+    /// is refused.
+    pub fn to_pink_bytes(&self) -> Result<Vec<u8>> {
+        // Never serialize a store holding a non-durable write (fail-stop).
+        // (Checkpoints check the same flag under the WAL lock they hold.)
+        self.ensure_wal_healthy()?;
+        self.to_bytes()
+    }
+
     /// Write every database to `path` in the `.pink` columnar format.
     /// Databases and tables are stored in sorted name order (deterministic
     /// bytes). Views are session-local and never persisted.
@@ -1427,10 +1442,7 @@ impl PinkDb {
     /// Always writes plaintext; use [`PinkDb::save_with_key`] (feature
     /// `encryption`) for an encrypted container.
     pub fn save(&self, path: &str) -> Result<()> {
-        // Never serialize a store holding a non-durable write (fail-stop).
-        // (Checkpoints check the same flag under the WAL lock they hold.)
-        self.ensure_wal_healthy()?;
-        std::fs::write(path, self.to_bytes()?)?;
+        std::fs::write(path, self.to_pink_bytes()?)?;
         Ok(())
     }
 

@@ -1,5 +1,9 @@
-//! `.lake` dot-commands (the `lake` feature): snapshot the in-memory store
-//! into a pinkdb lake and load versions back.
+//! `.lake` dot-commands: snapshot the in-memory store into a pinkdb lake and
+//! load versions back.
+//!
+//! Built with the `lake` feature (full: Vortex data files, format_version 3,
+//! `.lake attach`) or `lake-lite` (lean: v1 `.pink` data files,
+//! format_version 1, no attach — see [`cmd_attach`]).
 //!
 //! The lake itself lives in the `pink-lake` crate; this module is only the
 //! REPL surface. Locations are local directories, or `s3://bucket/prefix`
@@ -254,15 +258,34 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
     }
 }
 
-/// `.lake attach <location> [version]`: attach the lake read-only, footer-only.
-///
-/// Reads the catalog + the chosen manifest and every data file's footer,
-/// metadata segment and statistics — no column data is decoded (over object
-/// storage the whole objects are read, still without decoding). The session
-/// gains the lake's tables for queries: exact `COUNT`/`MIN`/`MAX` answers
-/// come from the statistics, and any other query materializes the one table
-/// it touches through the same decode `.lake open` performs.
+/// `.lake attach <location> [version]`: attach the lake read-only,
+/// footer-only. Built with the full `lake` feature only — attach reads Vortex
+/// footers and statistics, which the lean `lake-lite` build has no reader for;
+/// there it reports the missing feature instead (a v1 lake has no statistics
+/// to attach either way: `.lake open` is the way in).
 fn cmd_attach(db: &mut PinkDb, arg: &str) {
+    #[cfg(feature = "lake")]
+    cmd_attach_vortex(db, arg);
+    #[cfg(not(feature = "lake"))]
+    {
+        let _ = (db, arg);
+        cli_error!(
+            ".lake attach is not available: this build was built without Vortex format support \
+             (the `lake` feature) and attach reads Vortex footers; use .lake open, or rebuild \
+             with `cargo build -p pinkdb-cli --features lake`"
+        );
+    }
+}
+
+/// The full-build `.lake attach`: reads the catalog + the chosen manifest and
+/// every data file's footer, metadata segment and statistics — no column data
+/// is decoded (over object storage the whole objects are read, still without
+/// decoding). The session gains the lake's tables for queries: exact
+/// `COUNT`/`MIN`/`MAX` answers come from the statistics, and any other query
+/// materializes the one table it touches through the same decode `.lake open`
+/// performs.
+#[cfg(feature = "lake")]
+fn cmd_attach_vortex(db: &mut PinkDb, arg: &str) {
     let Some((dir, rest)) = take_token(arg) else {
         println!("Usage: .lake attach <dir> [version]{HINT}");
         return;

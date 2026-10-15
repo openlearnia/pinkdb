@@ -18,6 +18,23 @@ file byte-for-byte (load → engine save → same bytes).
 The fixture is **immutable**: it pins reader backwards compatibility. Do not
 regenerate it with a writer newer than wave 34 — that is what this forbids.
 
+## `lake_v1_v4/` — a v1 lake (the lean writer, `.pink` v4 bytes)
+
+A complete `format_version: 1` lake written by the **lean `vortex-format`-less
+writer** (the `lake-lite` build) with the current engine — the same
+`pink_lake::save_store(&common::fidelity_store(), …)` call as `lake_v1/`, but
+the data files are the engine's **v4** `.pink` bytes (`PINKDB04…`). It pins the
+cross-build compatibility contract:
+
+- the lean build writes exactly this shape (`tests/lake_lite.rs` reloads it
+  bit-exactly), and a full (`vortex-format`) build opens and migrates it
+  (`tests/lake.rs::v1_v4_fixture_written_by_the_lean_writer_loads_and_migrates`);
+- a full build that can read this directory proves a lean-written lake is
+  portable, and vice versa.
+
+Immutable like the others: it is regenerated only deliberately, never with a
+different writer than the wave-45i lean one.
+
 ## `lake_v2/` — a v2 lake (waves 35–40 Vortex writer)
 
 A complete `format_version: 2` lake written by the **wave-35..40 Vortex

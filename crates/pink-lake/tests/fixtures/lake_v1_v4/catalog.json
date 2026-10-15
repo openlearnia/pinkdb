@@ -1,0 +1,43 @@
+{
+  "format_version": 1,
+  "updated": "2026-10-15T15:54:33.803Z",
+  "version": 2,
+  "tables": {
+    "analytics.a.b": {
+      "files": [
+        "data/analytics.a.b/e9cf8f8e-845a-4d53-a1fb-8dadc82c2aea.pink"
+      ],
+      "rows": 2
+    },
+    "analytics.u": {
+      "files": [
+        "data/analytics.u/1f1284f9-598b-4fbf-ba9e-b766ebb1eb23.pink"
+      ],
+      "rows": 1
+    },
+    "main.big": {
+      "files": [
+        "data/main.big/826527e5-99c6-414a-8fa2-25de46c7407c.pink"
+      ],
+      "rows": 2148
+    },
+    "main.empty": {
+      "files": [
+        "data/main.empty/58d956e3-e08c-4a2f-b8d8-af1fd71ee572.pink"
+      ],
+      "rows": 0
+    },
+    "main.fid": {
+      "files": [
+        "data/main.fid/6f6302b4-de37-4614-9164-d0cae7a8fe1d.pink"
+      ],
+      "rows": 6
+    },
+    "main.héllo✓": {
+      "files": [
+        "data/main.h%C3%A9llo%E2%9C%93/aa016d98-1b80-4a4b-b0f4-49b027bf8755.pink"
+      ],
+      "rows": 1
+    }
+  }
+}

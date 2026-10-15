@@ -1377,6 +1377,24 @@ fn open_after_attach_resets_the_session() {
     cleanup(&dir);
 }
 
+/// Every file under `dir`, recursively, sorted.
+fn data_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(data_files(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Copy one directory tree (a lake is a directory of JSON + data files).
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
@@ -1424,5 +1442,57 @@ fn attach_pins_the_requested_version() {
         out.contains("│ 2 "),
         "the latest attachment sees two rows: {out}"
     );
+    cleanup(&dir);
+}
+
+/// The lean writer's v1 lake (`crates/pink-lake/tests/fixtures/lake_v1_v4/`:
+/// engine v4 `.pink` data files under a v1 catalog) opens in the full build,
+/// answers the same as a fresh store, and migrates to v3 on the next save —
+/// the full-reads / lean-writes compatibility pin, end to end through the
+/// CLI. The lean side reads the same directory in
+/// `crates/pink-lake/tests/lake_lite.rs`.
+#[test]
+fn lean_written_v1_v4_fixture_opens_queries_and_migrates() {
+    let fixture =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v1_v4");
+    let dir = scratch("v1_v4_fixture");
+    let lake = dir.join("lake");
+    copy_dir(&fixture, &lake);
+
+    let out = run(&format!(
+        ".lake info {lake}\n\
+         .lake open {lake}\n\
+         SELECT COUNT(*) FROM main.fid;\n\
+         SELECT COUNT(*), MIN(i), MAX(g) FROM fid;\n\
+         SELECT COUNT(*) FROM big;\n\
+         SELECT COUNT(*) FROM big WHERE s = 'region1';\n\
+         SELECT z FROM analytics.\"a.b\" ORDER BY z;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("format version:  1"), "{out}");
+    assert!(out.contains("Opened lake version 2"), "{out}");
+    assert!(out.contains("│ 6 "), "fid has 6 rows: {out}");
+    assert!(out.contains("│ 2148 "), "big has 2148 rows: {out}");
+    assert!(out.contains("│ 716 "), "region1 has 716 rows: {out}");
+    assert!(out.contains("-0.0"), "{out}");
+
+    // Saving migrates to v3 (Vortex); the v1 files stay untouched and the
+    // migrated version loads the same values.
+    let before: Vec<PathBuf> = data_files(&lake.join("data"));
+    let out = run(&format!(
+        ".lake open {lake}\n\
+         .lake save {lake}\n\
+         SELECT COUNT(*) FROM main.fid;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 3"), "{out}");
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(catalog.contains("\"format_version\": 3"), "{catalog}");
+    assert!(catalog.contains(".vortex"), "{catalog}");
+    for path in before {
+        assert!(path.is_file(), "v1 file {} must stay", path.display());
+    }
     cleanup(&dir);
 }

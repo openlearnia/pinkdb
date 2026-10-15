@@ -37,7 +37,7 @@ use pinkdb_server::Client;
 #[cfg(feature = "repo")]
 mod repo;
 
-#[cfg(feature = "lake")]
+#[cfg(any(feature = "lake", feature = "lake-lite"))]
 mod lake;
 
 const PROMPT: &str = "pinkdb> ";
@@ -58,7 +58,7 @@ fn print_help() {
     println!("                         db.table targets another database)");
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
-    if cfg!(feature = "lake") {
+    if cfg!(any(feature = "lake", feature = "lake-lite")) {
         if cfg!(feature = "s3") {
             println!(
                 "  .lake save <dir|s3://bucket/prefix> [force]   snapshot the store into a lake"
@@ -72,9 +72,13 @@ fn print_help() {
                 "  .lake open <dir> [v]      load the lake's latest (or version v) into memory"
             );
         }
-        println!(
-            "  .lake attach <dir|s3://…> [v]  attach a lake read-only, from its metadata only"
-        );
+        if cfg!(feature = "lake") {
+            println!(
+                "  .lake attach <dir|s3://…> [v]  attach a lake read-only, from its metadata only"
+            );
+        } else {
+            println!("  .lake attach                  (not built in the lean lake: needs `lake`)");
+        }
         println!("  .lake detach <dir|s3://…>    detach one attached lake");
         println!("  .lake attached              list attached lakes and their tables");
         println!("  .lake versions <dir|s3://…>  list the lake's published versions");
@@ -85,8 +89,11 @@ fn print_help() {
         if !cfg!(feature = "s3") {
             println!("  .lake s3:// URLs need a build with the `s3` feature");
         }
+        if !cfg!(feature = "lake") {
+            println!("  (lean lake build: v1 `.pink` data files; v2/v3 Vortex lakes need `lake`)");
+        }
     } else {
-        println!("  .lake <subcommand>     (not built; needs the `lake` feature)");
+        println!("  .lake <subcommand>     (not built; needs the `lake` or `lake-lite` feature)");
     }
     if cfg!(feature = "repo") {
         println!("  .install <name[@version]>   install from a repository, then load it");
@@ -112,14 +119,13 @@ fn repo_unavailable(cmd: &str) {
     eprintln!("       rebuild with `cargo build -p pinkdb-cli --features repo`.");
 }
 
-/// The `.lake` message when the binary was built without the opt-in `lake`
-/// feature.
-#[cfg(not(feature = "lake"))]
+/// The `.lake` message when the binary was built without either lake feature.
+#[cfg(not(any(feature = "lake", feature = "lake-lite")))]
 fn lake_unavailable(cmd: &str) {
     cli_error!("{cmd} is not available: this pinkdb binary was built without the lake feature;");
     eprintln!(
-        "       rebuild with `cargo build -p pinkdb-cli --features lake` (add `,s3` for \
-         s3://bucket/prefix URLs)."
+        "       rebuild with `cargo build -p pinkdb-cli --features lake` (full: Vortex data \
+         files, attach, s3 with `,s3`) or `--features lake-lite` (lean: v1 `.pink` data files)."
     );
 }
 
@@ -630,9 +636,9 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             }
         }
         ".lake" => {
-            #[cfg(feature = "lake")]
+            #[cfg(any(feature = "lake", feature = "lake-lite"))]
             lake::cmd_lake(db, rest);
-            #[cfg(not(feature = "lake"))]
+            #[cfg(not(any(feature = "lake", feature = "lake-lite")))]
             lake_unavailable(".lake");
         }
         _ => cli_error!("unknown dot-command \"{cmd}\". Try .help"),

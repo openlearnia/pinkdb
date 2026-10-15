@@ -4,10 +4,18 @@ version = "0.1.0"
 edition = "2021"
 # vortex 0.88 requires Rust 1.95.
 rust-version = "1.95"
-description = "pink-lake: the minimal pinkdb lake layer — a JSON catalog + immutable per-table data files on local disk (Vortex by default, v1 `.pink` still readable)"
+description = "pink-lake: the minimal pinkdb lake layer — a JSON catalog + immutable per-table data files on local disk (Vortex with the `vortex-format` feature, v1 `.pink` data files without it)"
 license = "MIT"
 
 [features]
+default = []
+# Opt-in Vortex data files (catalog format_version 2/3, the format the full
+# CLI builds write): one Vortex file per table through the `vortex` facade
+# (arrays + the file writer/reader with builtin codecs), with the attach
+# fast paths. Without this feature a build reads and writes only the v1
+# `.pink` data-file format (catalog format_version 1) and pulls no Vortex
+# dependency — the `lake-lite` CLI builds.
+vortex-format = ["dep:vortex", "dep:rayon"]
 # Opt-in object storage: `s3://bucket/prefix` lake locations over the S3 REST
 # API (AWS S3, Cloudflare R2, MinIO, …) with a blocking SigV4 client.
 s3 = ["dep:ureq", "dep:hmac", "dep:sha2"]
@@ -22,11 +30,12 @@ serde_json = "1"
 ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
 hmac = { version = "0.12", optional = true }
 sha2 = { version = "0.10", optional = true }
-# The default data format (v2 lakes): one Vortex file per table, written
-# through the `vortex` facade (arrays + the file writer/reader with builtin
-# codecs). `default-features = false, features = ["files"]` drops the
-# wasm-bindgen/tensor/parquet-variant extras and the zstd codec — the builtin
-# Vortex encodings are still registered by `VortexSession::default()`.
-vortex = { version = "0.88.0", default-features = false, features = ["files"] }
-# Parallel engine→Vortex chunk conversion and data-file decode.
-rayon = "1.12.0"
+# The `vortex-format` data format (v2/v3 lakes): one Vortex file per table,
+# written through the `vortex` facade. `default-features = false,
+# features = ["files"]` drops the wasm-bindgen/tensor/parquet-variant extras
+# and the zstd codec — the builtin Vortex encodings are still registered by
+# `VortexSession::default()`.
+vortex = { version = "0.88.0", default-features = false, features = ["files"], optional = true }
+# Parallel engine→Vortex chunk conversion and data-file decode
+# (`vortex-format` only).
+rayon = { version = "1.12.0", optional = true }

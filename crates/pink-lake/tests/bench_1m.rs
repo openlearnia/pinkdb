@@ -1,13 +1,17 @@
 //! Opt-in 1M-row measurement (not part of the default test run):
-//! `bench/sales_1m.csv` imported into a store, saved as a v2 (Vortex) lake,
-//! and compared against the engine's own `.pink` bytes for the same table.
+//! `bench/sales_1m.csv` imported into a store, saved as a v2/v3 (Vortex)
+//! lake, and compared against the engine's own `.pink` bytes for the same
+//! table.
 //!
 //! ```sh
-//! cargo test --release -p pink-lake --test bench_1m -- --ignored --nocapture
+//! cargo test --release -p pink-lake --features vortex-format --test bench_1m \
+//!     -- --ignored --nocapture
 //! ```
 //!
 //! This is a report, not a gate: it prints data-file bytes and save/load wall
-//! time for both formats on the current machine.
+//! time for both formats on the current machine. `vortex-format` builds only.
+
+#![cfg(feature = "vortex-format")]
 
 use std::path::PathBuf;
 use std::time::Instant;

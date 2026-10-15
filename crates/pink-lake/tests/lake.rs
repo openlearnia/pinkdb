@@ -1,6 +1,11 @@
 //! End-to-end tests of the public `pink-lake` API: round-trips, versioning,
-//! crash-atomicity leftovers, corrupt-metadata handling, and the v1 → v2
+//! crash-atomicity leftovers, corrupt-metadata handling, and the v1 → v2/v3
 //! (`.pink` → Vortex) format history.
+//!
+//! `vortex-format` builds only; the lean (v1 `.pink`) behavior is covered by
+//! `tests/lake_lite.rs`.
+
+#![cfg(feature = "vortex-format")]
 
 mod common;
 
@@ -1374,6 +1379,53 @@ fn v1_lake_migrates_to_vortex_on_save() {
     assert_eq!(
         store_bytes(&migrated, &dir, "migrated"),
         store_bytes(&expected, &dir, "expected")
+    );
+    cleanup(&dir);
+}
+
+/// The compatibility pin in the other direction: `tests/fixtures/lake_v1_v4/`
+/// is a v1 lake written by the **lean** (`vortex-format`-less) writer —
+/// engine v4 `.pink` data files under a v1 catalog. The full build opens it
+/// bit-exactly and migrates it to v3 on the next save, while the lean build
+/// reads the same directory in `tests/lake_lite.rs`.
+#[test]
+fn v1_v4_fixture_written_by_the_lean_writer_loads_and_migrates() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4");
+    let catalog = read_json(&fixture.join("catalog.json"));
+    assert_eq!(catalog["format_version"], 1, "fixture must stay v1");
+    for entry in catalog["tables"].as_object().unwrap().values() {
+        assert!(entry.get("format").is_none(), "{entry}");
+    }
+    for file in data_files(&fixture.join("data")) {
+        assert!(
+            std::fs::read(&file).unwrap().starts_with(b"PINKDB04"),
+            "{} must be engine v4 bytes",
+            file.display()
+        );
+    }
+
+    // Work on a copy: the checked-in fixture stays untouched.
+    let dir = scratch("v1_v4_migrate");
+    copy_dir(&fixture, &dir);
+    let expected = common::fidelity_store();
+    let mut lake = Lake::open(&dir).unwrap();
+    assert_eq!(lake.format_version(), 1);
+    let loaded = lake.load(None).unwrap();
+    assert_same_store(&expected, &loaded);
+    assert_eq!(
+        store_bytes(&loaded, &dir, "loaded"),
+        store_bytes(&expected, &dir, "expected"),
+        "the lean writer's bytes load to the exact store the full build writes"
+    );
+
+    // Saving migrates to v3 (Vortex) without touching the v1 files.
+    assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
+    assert_eq!(lake.format_version(), 3);
+    let migrated = lake.load(None).unwrap();
+    assert_same_store(&expected, &migrated);
+    assert_eq!(
+        lake.load(Some(2)).unwrap().table("fid").unwrap().num_rows(),
+        6
     );
     cleanup(&dir);
 }

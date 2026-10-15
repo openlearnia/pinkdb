@@ -1,10 +1,11 @@
 //! The `.lake` dot-commands must fail with a clear message in a default
 //! (feature-less) build.
 //!
-//! This file only compiles when the `lake` feature is OFF; the feature-on
-//! behavior is covered by `tests/lake.rs`.
+//! This file only compiles when neither lake feature is on; the feature-on
+//! behavior is covered by `tests/lake.rs` (full) and `tests/lake_lite.rs`
+//! (lean).
 
-#![cfg(not(feature = "lake"))]
+#![cfg(not(any(feature = "lake", feature = "lake-lite")))]
 
 mod common;
 
@@ -26,7 +27,11 @@ fn lake_dot_commands_report_the_missing_feature() {
         "{text}"
     );
     assert!(
-        text.contains("(not built; needs the `lake` feature)"),
+        text.contains("`--features lake-lite` (lean: v1 `.pink` data files)"),
+        "the lean alternative must be named too:\n{text}"
+    );
+    assert!(
+        text.contains("(not built; needs the `lake` or `lake-lite` feature)"),
         "help must mention the missing feature:\n{text}"
     );
 }

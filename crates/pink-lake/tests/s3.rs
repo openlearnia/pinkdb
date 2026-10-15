@@ -8,8 +8,12 @@
 //! (canonical request + HMAC chain recomputed from the received bytes). The
 //! `PINKDB_S3_LIVE=1` test at the bottom talks to a real bucket (e.g.
 //! Cloudflare R2) and is skipped by default.
+//!
+//! `s3` + `vortex-format` builds: the suite pins v3 (Vortex) lake behavior.
+//! The lean `s3`-only (v1 `.pink`-over-S3) behavior is covered by
+//! `tests/lake_lite.rs`.
 
-#![cfg(feature = "s3")]
+#![cfg(all(feature = "s3", feature = "vortex-format"))]
 
 #[path = "../src/mock_s3.rs"]
 mod mock_s3;

@@ -12,7 +12,7 @@
 //! <lake>/
 //!   catalog.json                current catalog (authoritative for "latest")
 //!   snapshots/<version>.json    immutable manifests, one per published version
-//!   data/<table>/<uuid>.vortex  immutable per-table data files (v2, Vortex)
+//!   data/<table>/<uuid>.vortex  immutable per-table data files (v2/v3, Vortex)
 //!   data/<table>/<uuid>.pink    v1 data files (engine persistence bytes)
 //! ```
 //!
@@ -30,7 +30,8 @@
 //! }
 //! ```
 //!
-//! Schema and typing stay inside the data files. **Vortex is the default
+//! Schema and typing stay inside the data files. **With the `vortex-format`
+//! feature (not on by default; the full CLI builds enable it) Vortex is the
 //! format for new writes** ([`FORMAT_VERSION`] 3; version 2 lakes, with one
 //! row block per engine chunk, stay readable): every new data file is a
 //! plain Vortex file holding one struct array — one field per column, row
@@ -39,13 +40,19 @@
 //! and its pinkdb column schema (the `vortex_file` module docs have the
 //! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
 //! `vortex.timestamp` extension cannot represent the full engine range).
-//! A `format_version` 1 lake — the wave-34 writer — stays readable: its
-//! entries have no `format` field and its data files are the engine's own
-//! `.pink` single-table persistence bytes ([`PinkDb::save`] / [`PinkDb::open`]),
-//! which a data file still opens standalone. Opening an old lake and saving
-//! again publishes a v3 snapshot: a full rewrite in Vortex (the migration
-//! path). A manifest with any other `format_version` — or a v2 entry that
-//! omits `format` or declares anything but `"vortex"` — is a clear
+//! **Without the feature** — the lean `lake-lite` builds — this crate writes
+//! **`format_version` 1** lakes: one engine `.pink` single-table persistence
+//! file per table ([`PinkDb::to_pink_bytes`], the wave-34 layout; today's
+//! engine writes v4 bytes), and reads exactly those. Reading a v2/v3 Vortex
+//! lake in such a build is a clear [`LakeError::FeatureMissing`] at the first
+//! manifest parse — never a corrupt-file error and never a wrong-format guess.
+//! A `format_version` 1 lake stays readable in every build: its entries have
+//! no `format` field and its data files open standalone with [`PinkDb::open`].
+//! Opening an old lake and saving again publishes this build's format: a v3
+//! snapshot in a `vortex-format` build (a full rewrite in Vortex — the
+//! migration path), still v1 without it. A manifest with any other
+//! `format_version` — or a v2/v3 entry that omits `format` or declares
+//! anything but `"vortex"`, or a v1 entry that declares one — is a clear
 //! [`LakeError::Unsupported`]/[`LakeError::Corrupt`] error, never a guess.
 //! Decoding a corrupt Vortex data file is the same clear [`LakeError::Corrupt`]
 //! error: the whole decoder boundary is guarded, so a panic inside Vortex's
@@ -53,13 +60,15 @@
 //! still print one line to stderr first; the crate does not swap the global
 //! hook).
 //!
-//! `.lake open` and `.lake attach` remain the two ways in: `open` eagerly
-//! loads a version into the store, `attach` reads only the catalog, the
-//! manifest and every data file's footer (identity, schema, row count and
-//! exact per-column statistics) and lazily materializes the one table a
-//! query actually scans — with exact `COUNT`/`MIN`/`MAX` answered straight
-//! from those statistics. Attached lakes are read-only, session-local, and
-//! never part of a save, a checkpoint, or the WAL.
+//! `.lake open` (every build) and `.lake attach` (only with
+//! `vortex-format`) are the two ways in: `open` eagerly loads a version into
+//! the store, `attach` reads only the catalog, the manifest and every data
+//! file's footer (identity, schema, row count and exact per-column
+//! statistics) and lazily materializes the one table a query actually scans —
+//! with exact `COUNT`/`MIN`/`MAX` answered straight from those statistics.
+//! Attached lakes are read-only, session-local, and never part of a save, a
+//! checkpoint, or the WAL. A lean build has no attach fast paths: a v1 lake
+//! carries no statistics, and eager `.lake open` is the way in.
 //!
 //! # Snapshots and versioning
 //!
@@ -174,6 +183,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use pinkdb::{DataTable, DataType, PinkDb};
 
+#[cfg(feature = "vortex-format")]
 mod attach;
 mod catalog;
 mod local;
@@ -183,8 +193,10 @@ mod mock_s3;
 mod s3;
 mod storage;
 mod time;
+#[cfg(feature = "vortex-format")]
 mod vortex_file;
 
+#[cfg(feature = "vortex-format")]
 pub use attach::AttachmentReport;
 use catalog::{Catalog, FileFormat, TableEntry};
 use local::{LocalStorage, CATALOG_FILE};
@@ -193,7 +205,7 @@ use storage::{Head, Location, Storage, VersionTag};
 #[cfg(feature = "s3")]
 pub use s3::{S3Config, DEFAULT_RETRIES};
 
-/// The catalog format version this build reads and writes.
+/// The catalog format version this build writes (and its newest read).
 ///
 /// Version 3 (wave 45): Vortex data files with 8,192-row / ~1 MiB row blocks
 /// (the loader re-chunks them into engine chunks). Version 2: Vortex data
@@ -201,13 +213,29 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 /// `"format": "vortex"` on every entry; the bump exists so builds that only
 /// know version 2 (whose loader rejects blocks over 2,048 rows) refuse a
 /// version 3 lake with a clear "unsupported format_version" error instead of
-/// a misleading corrupt-file one. Version 1 (the wave-34 writer) is still
-/// read — its entries carry no `format` and its data files are engine `.pink`
-/// bytes.
+/// a misleading corrupt-file one.
+///
+/// A build with the (default-off) `vortex-format` feature writes version 3;
+/// without it — the lean `lake-lite` builds — this build writes **version 1**
+/// only: entries carry no `format` and data files are engine `.pink` bytes.
+/// Version 2 and 3 lakes are refused by such a build with a clear
+/// [`LakeError::FeatureMissing`], never a corrupt-file error.
+#[cfg(feature = "vortex-format")]
 pub const FORMAT_VERSION: u32 = 3;
+
+/// The catalog format version a build without `vortex-format` writes: the v1
+/// `.pink` data-file format (see [`FORMAT_VERSION`]).
+#[cfg(not(feature = "vortex-format"))]
+pub const FORMAT_VERSION: u32 = 1;
 
 /// The oldest catalog format version this build still reads.
 pub const MIN_FORMAT_VERSION: u32 = 1;
+
+/// The newest catalog format version this codebase knows: 3 (Vortex 0.88
+/// files with the wave-45 layout). A build without `vortex-format` refuses
+/// versions 2 and 3 with [`LakeError::FeatureMissing`]; a manifest above this
+/// (a future format) is [`LakeError::Unsupported`] in every build.
+pub const MAX_FORMAT_VERSION: u32 = 3;
 
 /// The largest manifest `version` this build reads or writes.
 ///
@@ -295,13 +323,25 @@ impl fmt::Display for LakeError {
             LakeError::Corrupt { path, message } => {
                 write!(f, "corrupt lake metadata at {}: {message}", path.display())
             }
-            LakeError::Unsupported { path, found } => write!(
-                f,
-                "unsupported lake format_version {found} at {} (this build reads format_version \
-                 {MIN_FORMAT_VERSION} in its v1 `.pink` form and reads/writes \
-                 format_version {FORMAT_VERSION} in its Vortex form)",
-                path.display()
-            ),
+            LakeError::Unsupported { path, found } => {
+                if cfg!(feature = "vortex-format") {
+                    write!(
+                        f,
+                        "unsupported lake format_version {found} at {} (this build reads \
+                         format_version {MIN_FORMAT_VERSION} in its v1 `.pink` form and \
+                         reads/writes format_version {FORMAT_VERSION} in its Vortex form)",
+                        path.display()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "unsupported lake format_version {found} at {} (this build reads/writes \
+                         format_version {FORMAT_VERSION} in its v1 `.pink` form; Vortex \
+                         format_version 2/3 needs the `vortex-format` feature)",
+                        path.display()
+                    )
+                }
+            }
             LakeError::VersionNotFound { path, version } => write!(
                 f,
                 "lake {} has no snapshot version {version}",
@@ -390,8 +430,9 @@ pub struct Lake {
 
 impl Lake {
     /// Create a new lake at `dir`: the directory (and parents) plus an empty
-    /// catalog at snapshot version 1 (a `format_version` 2 manifest) and its
-    /// snapshot. Fails if `dir` already holds a lake.
+    /// catalog at snapshot version 1 (a manifest of this build's
+    /// [`FORMAT_VERSION`]) and its snapshot. Fails if `dir` already holds a
+    /// lake.
     ///
     /// The empty version-1 snapshot is *linked* into place (never replaced).
     /// If a concurrent or crashed create already left a valid empty version-1
@@ -557,7 +598,8 @@ impl Lake {
 
     /// The catalog `format_version` this handle last saw: the version the lake
     /// was opened with, or [`FORMAT_VERSION`] after a successful save (a save
-    /// from a v1 lake migrates it to v2).
+    /// from a v1 lake migrates it to v3 in a `vortex-format` build; a build
+    /// without the feature always publishes v1 and keeps reporting 1).
     pub fn format_version(&self) -> u32 {
         self.format_version
     }
@@ -644,7 +686,11 @@ impl Lake {
     ///
     /// A `format_version` 1 lake (engine `.pink` data files, no statistics)
     /// and a table with more than one data file are refused with a clear
-    /// error; `.lake open` remains the way to load those.
+    /// error; `.lake open` remains the way to load those. This method exists
+    /// only with the `vortex-format` feature: attach is statistics over
+    /// Vortex footers, and a lean build has no Vortex reader (open a v1 lake
+    /// with [`Lake::load`] instead).
+    #[cfg(feature = "vortex-format")]
     pub fn attach(&self, version: Option<u64>) -> Result<AttachmentReport> {
         let (_, report) = attach::build(self, version)?;
         Ok(report)
@@ -707,27 +753,48 @@ impl Lake {
                 let src = table_in(db, &dbname, &name)?;
                 let key = format!("{dbname}.{name}");
                 let dir = format!("data/{}", encode_key(&key));
-                let format = FileFormat::Vortex;
                 let id = fresh_id();
-                // The v2 writer emits exactly one Vortex file per table (the
-                // loader is driven by the catalog's `format` field, never by
-                // the extension).
-                let rel_file = format!("{dir}/{id}.vortex");
-                // v2 streams the table's Vortex encoding into the store
-                // (locally straight into a unique `create_new` temp sibling,
-                // then fsync + rename; over S3 buffered for one atomic PUT).
-                // Nothing is referenced by the catalog until the manifest is
-                // published below.
-                bytes_written += self.storage.put_streamed(&rel_file, &mut |sink| {
-                    vortex_file::encode_table_into(&dbname, &name, src, sink)
-                })?;
+                // One data file per table either way (the loader is driven by
+                // the catalog's `format` field, never by the extension), and
+                // the publication order below is identical: the data file is
+                // finished (fsynced / one atomic PUT) before anything
+                // references it. Only the encoder differs:
+                //
+                // - `vortex-format`: a Vortex file (catalog format_version 3),
+                //   streamed into the store — locally straight into a unique
+                //   `create_new` temp sibling, then fsync + rename; over S3
+                //   buffered for one atomic PUT;
+                // - without it (the lean builds): the wave-34 v1 layout — the
+                //   engine's own `.pink` single-table bytes (catalog
+                //   format_version 1) via `put`, same temp→fsync→rename /
+                //   single-PUT atomicity.
+                #[cfg(feature = "vortex-format")]
+                let (rel_file, format, written) = {
+                    let rel_file = format!("{dir}/{id}.vortex");
+                    let written = self.storage.put_streamed(&rel_file, &mut |sink| {
+                        vortex_file::encode_table_into(&dbname, &name, src, sink)
+                    })?;
+                    (rel_file, Some(FileFormat::Vortex), written)
+                };
+                #[cfg(not(feature = "vortex-format"))]
+                let (rel_file, format, written) = {
+                    let rel_file = format!("{dir}/{id}.pink");
+                    let mini = single_table_store(&dbname, &name, src)?;
+                    let bytes = mini.to_pink_bytes().map_err(|e| LakeError::Engine {
+                        context: format!("saving table \"{key}\""),
+                        source: e,
+                    })?;
+                    self.storage.put(&rel_file, &bytes)?;
+                    (rel_file, None, bytes.len() as u64)
+                };
+                bytes_written += written;
                 rows += src.num_rows() as u64;
                 tables.insert(
                     key,
                     TableEntry {
                         files: vec![rel_file],
                         rows: src.num_rows() as u64,
-                        format: Some(format),
+                        format,
                     },
                 );
             }
@@ -795,8 +862,10 @@ impl Lake {
             self.storage.reconcile_snapshot(version, &bytes)?;
         }
         self.version = version;
-        // A save always publishes a v2 (Vortex) manifest, so a handle that
-        // opened a v1 lake reports v2 once it has migrated it.
+        // A save publishes this build's format (v3 Vortex with
+        // `vortex-format`, v1 `.pink` without it), so a handle that opened a
+        // v1 lake reports the new format once a Vortex build has migrated it
+        // (a lean build keeps publishing v1 and reports 1).
         self.format_version = FORMAT_VERSION;
         Ok(SaveReport {
             version,
@@ -945,13 +1014,33 @@ impl Lake {
                             source: e,
                         })?
                     }
-                    // v2: a Vortex file that decodes into the same shape. The
-                    // bytes are moved into the decoder's buffer (zero copy).
+                    // v2/v3: a Vortex file that decodes into the same shape.
+                    // The bytes are moved into the decoder's buffer (zero
+                    // copy).
                     FileFormat::Vortex => {
-                        let bytes = self
-                            .storage
-                            .read(rel, &format!("loading data file \"{rel}\""))?;
-                        vortex_file::decode_table_owned(&path, bytes)?
+                        #[cfg(feature = "vortex-format")]
+                        {
+                            let bytes = self
+                                .storage
+                                .read(rel, &format!("loading data file \"{rel}\""))?;
+                            vortex_file::decode_table_owned(&path, bytes)?
+                        }
+                        #[cfg(not(feature = "vortex-format"))]
+                        {
+                            // Unreachable: `read_manifest` refuses a v2/v3
+                            // manifest in a build without the feature long
+                            // before a Vortex entry could get here. Kept as a
+                            // clear error, not a panic.
+                            return Err(LakeError::FeatureMissing {
+                                feature: "vortex-format",
+                                message: format!(
+                                    "the data file \"{rel}\" is a Vortex file, and this build \
+                                     was built without Vortex format support — rebuild with \
+                                     the `vortex-format` feature (for the CLI: \
+                                     `cargo build -p pinkdb-cli --features lake`)"
+                                ),
+                            });
+                        }
                     }
                 };
                 let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
@@ -1062,8 +1151,8 @@ fn s3_storage(bucket: &str, prefix: &str) -> Result<Arc<dyn Storage>> {
 }
 
 /// The largest encoded `data/<table>` directory segment a writer accepts,
-/// so `<segment>/<uuid>.vortex.tmp` fits the common 255-byte name limit
-/// (36-char uuid + `.vortex.tmp` = 47 bytes). Also enforced by
+/// so `<segment>/<uuid>.vortex.<uuid>.tmp` (the data file plus a unique temp
+/// sibling) fits the common 255-byte name limit. Also enforced by
 /// [`Lake::write_from_store`].
 const MAX_ENCODED_SEGMENT: usize = 200;
 
@@ -1144,10 +1233,27 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
-    if manifest.format_version < MIN_FORMAT_VERSION || manifest.format_version > FORMAT_VERSION {
+    if manifest.format_version < MIN_FORMAT_VERSION || manifest.format_version > MAX_FORMAT_VERSION
+    {
         return Err(LakeError::Unsupported {
             path: path.to_path_buf(),
             found: manifest.format_version,
+        });
+    }
+    // A build without `vortex-format` reads v1 only. Refuse a v2/v3 lake here
+    // — at the very first manifest parse, before any data file is touched —
+    // with a feature error, never a corrupt-file one.
+    #[cfg(not(feature = "vortex-format"))]
+    if (2..=MAX_FORMAT_VERSION).contains(&manifest.format_version) {
+        return Err(LakeError::FeatureMissing {
+            feature: "vortex-format",
+            message: format!(
+                "{} is a format_version {} lake (Vortex data files); this build was built \
+                 without Vortex format support — rebuild with the `vortex-format` feature \
+                 (for the CLI: `cargo build -p pinkdb-cli --features lake`)",
+                path.display(),
+                manifest.format_version
+            ),
         });
     }
     if manifest.version < 1 || manifest.version > MAX_VERSION {
@@ -1352,34 +1458,67 @@ fn copy_chunks(src: &DataTable, dst: &mut DataTable, context: &str) -> Result<()
     Ok(())
 }
 
-/// An empty one-table [`PinkDb`]: `dbname.table` created with `schema`, the
-/// default `main` of a fresh store dropped when the table lives elsewhere.
-/// The v2 Vortex decoder builds one per data file, so a decoded file has
-/// exactly one database and table — the shape a v1 `.pink` data file opens
-/// as, which is what the loader's checks expect.
-fn empty_single_table_store(
+/// A one-table [`PinkDb`] holding `src` (the wave-34 v1 data-file encoder;
+/// `vortex-format`-less builds only). The mini store holds exactly the
+/// source's database and table (the default `main` of a fresh store is
+/// dropped when the table lives elsewhere); its chunks are shared with `src`
+/// (no deep copy) and appended with `append_chunk`'s chunking rules, exactly
+/// what the v1 loader's `copy_chunks` reverses. The engine's `.pink` encoder
+/// is then byte-deterministic for a given dense table.
+#[cfg(not(feature = "vortex-format"))]
+fn single_table_store(dbname: &str, table: &str, src: &DataTable) -> Result<PinkDb> {
+    let mut mini = empty_structure(dbname, table, src.schema(), "saving")?;
+    let dst = mini
+        .table_mut_in(dbname, table)
+        .map_err(|e| LakeError::Engine {
+            context: format!("preparing table \"{dbname}.{table}\" while saving"),
+            source: e,
+        })?;
+    copy_chunks(src, dst, &format!("{dbname}.{table}"))?;
+    Ok(mini)
+}
+
+/// The database/table skeleton the one-table encoders fill: `dbname.table`
+/// created with `schema`, the default `main` of a fresh store dropped when
+/// the table lives elsewhere. `what` reads "saving" or "loading" in errors.
+fn empty_structure(
     dbname: &str,
     table: &str,
     schema: Vec<(String, DataType)>,
+    what: &str,
 ) -> Result<PinkDb> {
     let mut mini = PinkDb::new();
     if !mini.database_exists(dbname) {
         mini.create_database(dbname)
             .map_err(|e| LakeError::Engine {
-                context: format!("creating database \"{dbname}\" while loading"),
+                context: format!("creating database \"{dbname}\" while {what}"),
                 source: e,
             })?;
         mini.drop_database("main").map_err(|e| LakeError::Engine {
-            context: format!("dropping the default main database while loading \"{dbname}\""),
+            context: format!("dropping the default main database while {what} \"{dbname}\""),
             source: e,
         })?;
     }
     mini.create_table_in(dbname, table, schema)
         .map_err(|e| LakeError::Engine {
-            context: format!("creating table \"{dbname}.{table}\" while loading"),
+            context: format!("creating table \"{dbname}.{table}\" while {what}"),
             source: e,
         })?;
     Ok(mini)
+}
+
+/// An empty one-table [`PinkDb`]: `dbname.table` created with `schema`, the
+/// default `main` of a fresh store dropped when the table lives elsewhere.
+/// The Vortex decoder builds one per data file, so a decoded file has
+/// exactly one database and table — the shape a v1 `.pink` data file opens
+/// as, which is what the loader's checks expect.
+#[cfg(feature = "vortex-format")]
+fn empty_single_table_store(
+    dbname: &str,
+    table: &str,
+    schema: Vec<(String, DataType)>,
+) -> Result<PinkDb> {
+    empty_structure(dbname, table, schema, "loading")
 }
 
 /// `&DataTable` with a lake error instead of an engine error.

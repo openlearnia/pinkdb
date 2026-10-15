@@ -18,15 +18,21 @@ encryption = ["pinkdb/encryption"]
 # Keeps the default binary lean: HTTP + TLS, JSON parsing, and SHA-256 live
 # only behind this feature.
 repo = ["dep:ureq", "dep:serde_json", "dep:sha2"]
-# Opt-in lake layer: `.lake save/open/versions/tables/info` snapshot the store
-# into a `pink-lake` directory (JSON metadata + immutable Vortex data files).
-# Keeps the default binary lean: lake + JSON metadata code lives only behind
-# this feature.
-lake = ["dep:pink-lake"]
+# Opt-in lake layer (full): `.lake save/open/versions/tables/info/attach`
+# snapshot the store into a `pink-lake` directory (JSON metadata + immutable
+# Vortex data files). Keeps the default binary lean: lake + JSON metadata +
+# Vortex code lives only behind this feature.
+lake = ["dep:pink-lake", "pink-lake/vortex-format"]
+# Opt-in *lean* lake layer: the same `.lake save/open/versions/tables/info`
+# commands over the v1 `.pink` data-file format, without the Vortex
+# dependency (~42 MB of binary size). No `.lake attach` (its statistics are
+# Vortex-only); reading a v2/v3 Vortex lake fails with a clear feature error.
+lake-lite = ["dep:pink-lake"]
 # Opt-in object storage for the lake: `.lake …` accepts `s3://bucket/prefix`
 # URLs (AWS S3, Cloudflare R2) via pink-lake's `s3` feature (ureq + SigV4).
-# Add it alongside `lake`: `cargo build -p pinkdb-cli --features lake,s3`.
-s3 = ["lake", "pink-lake/s3"]
+# Implies the lean lake (use `lake,s3` for the full one):
+# `cargo build -p pinkdb-cli --features lake,s3` or `--features lake-lite,s3`.
+s3 = ["lake-lite", "pink-lake/s3"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
