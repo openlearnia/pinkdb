@@ -20,7 +20,7 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 2,
+//!   "format_version": 3,
 //!   "updated": "2026-10-14T12:34:56.789Z",
 //!   "version": 2,
 //!   "tables": {
@@ -31,9 +31,10 @@
 //! ```
 //!
 //! Schema and typing stay inside the data files. **Vortex is the default
-//! format for new writes** ([`FORMAT_VERSION`] 2): every new data file is a
-//! plain Vortex file holding one struct array — one field per column, chunk
-//! boundaries preserved, `-0.0` and NaN payloads bit-exact — plus a
+//! format for new writes** ([`FORMAT_VERSION`] 3; version 2 lakes, with one
+//! row block per engine chunk, stay readable): every new data file is a
+//! plain Vortex file holding one struct array — one field per column, row
+//! order preserved, `-0.0` and NaN payloads bit-exact — plus a
 //! `pinkdb.table` metadata segment carrying the table's `db`/`table` identity
 //! and its pinkdb column schema (the `vortex_file` module docs have the
 //! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
@@ -42,7 +43,7 @@
 //! entries have no `format` field and its data files are the engine's own
 //! `.pink` single-table persistence bytes ([`PinkDb::save`] / [`PinkDb::open`]),
 //! which a data file still opens standalone. Opening an old lake and saving
-//! again publishes a v2 snapshot: a full rewrite in Vortex (the migration
+//! again publishes a v3 snapshot: a full rewrite in Vortex (the migration
 //! path). A manifest with any other `format_version` — or a v2 entry that
 //! omits `format` or declares anything but `"vortex"` — is a clear
 //! [`LakeError::Unsupported`]/[`LakeError::Corrupt`] error, never a guess.
@@ -183,10 +184,16 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 
 /// The catalog format version this build reads and writes.
 ///
-/// Version 2 is the Vortex default: every table entry declares its data file
-/// `format` (`"vortex"`). Version 1 (the wave-34 writer) is still read — its
-/// entries carry no `format` and its data files are engine `.pink` bytes.
-pub const FORMAT_VERSION: u32 = 2;
+/// Version 3 (wave 45): Vortex data files with 8,192-row / ~1 MiB row blocks
+/// (the loader re-chunks them into engine chunks). Version 2: Vortex data
+/// files with one block per engine chunk — still read. Both declare
+/// `"format": "vortex"` on every entry; the bump exists so builds that only
+/// know version 2 (whose loader rejects blocks over 2,048 rows) refuse a
+/// version 3 lake with a clear "unsupported format_version" error instead of
+/// a misleading corrupt-file one. Version 1 (the wave-34 writer) is still
+/// read — its entries carry no `format` and its data files are engine `.pink`
+/// bytes.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The oldest catalog format version this build still reads.
 pub const MIN_FORMAT_VERSION: u32 = 1;
@@ -1130,21 +1137,21 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                     ),
                 });
             }
-            (2, None) => {
+            (v @ (2 | 3), None) => {
                 return Err(LakeError::Corrupt {
                     path: path.to_path_buf(),
                     message: format!(
-                        "table \"{key}\" does not declare a data file format (a format_version 2 \
-                         entry requires `\"format\": \"vortex\"`)"
+                        "table \"{key}\" does not declare a data file format (a format_version \
+                         {v} entry requires `\"format\": \"vortex\"`)"
                     ),
                 });
             }
-            (2, Some(FileFormat::Pink)) => {
+            (v @ (2 | 3), Some(FileFormat::Pink)) => {
                 return Err(LakeError::Corrupt {
                     path: path.to_path_buf(),
                     message: format!(
-                        "table \"{key}\" declares a pink data file in a format_version 2 \
-                         manifest (the v2 writer emits Vortex only; `.pink` data files are \
+                        "table \"{key}\" declares a pink data file in a format_version {v} \
+                         manifest (Vortex-era writers emit Vortex only; `.pink` data files are \
                          format_version 1)"
                     ),
                 });

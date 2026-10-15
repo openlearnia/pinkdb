@@ -88,7 +88,7 @@ fn full_cycle_create_save_open_versions_tables() {
     // create → v1, snapshots/1.json + catalog.json at the lake prefix.
     let mut lake = Lake::create_s3(mock_config(&mock, "test-bucket", "lakes/mine")).unwrap();
     assert_eq!(lake.current_version(), 1);
-    assert_eq!(lake.format_version(), 2);
+    assert_eq!(lake.format_version(), 3);
     assert_eq!(lake.versions().unwrap(), vec![1]);
     assert_eq!(lake.path().to_str().unwrap(), "s3://test-bucket/lakes/mine");
     let keys = mock.keys();
@@ -122,7 +122,7 @@ fn full_cycle_create_save_open_versions_tables() {
         "catalog.json must be byte-identical to its snapshot"
     );
     assert!(
-        catalog.starts_with(b"{\n  \"format_version\": 2"),
+        catalog.starts_with(b"{\n  \"format_version\": 3"),
         "{}",
         String::from_utf8_lossy(&catalog)
     );
@@ -1068,10 +1068,10 @@ fn v1_pink_data_files_load_over_s3() {
     // (Scanning `std::env::temp_dir()` would race the other tests in this
     // binary, which use the same temp prefix.)
 
-    // A v1 lake still migrates to v2 on the next save (a full Vortex rewrite).
+    // A v1 lake still migrates on the next save (a full Vortex rewrite).
     let mut lake = lake;
     assert_eq!(lake.write_from_store(&loaded).unwrap(), 2);
-    assert_eq!(lake.format_version(), 2);
+    assert_eq!(lake.format_version(), 3);
     assert!(mock
         .keys()
         .iter()

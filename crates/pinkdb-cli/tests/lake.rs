@@ -115,7 +115,7 @@ fn save_open_query_and_metadata_commands() {
     assert!(lake.join("snapshots/1.json").is_file());
     assert!(lake.join("snapshots/2.json").is_file());
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 2"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 3"), "{catalog}");
     assert!(catalog.contains("\"version\": 2"), "{catalog}");
     assert!(catalog.contains("\"main.t\""), "{catalog}");
     assert!(catalog.contains("\"analytics.u\""), "{catalog}");
@@ -134,7 +134,7 @@ fn save_open_query_and_metadata_commands() {
         ".lake info {lake}\n.lake versions {lake}\n.lake tables {lake}\n.quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("format version:  2"), "{out}");
+    assert!(out.contains("format version:  3"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
     assert!(out.contains("snapshots:       2 (1, 2)"), "{out}");
     assert!(out.contains("tables (2):"), "{out}");

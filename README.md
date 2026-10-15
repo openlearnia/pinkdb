@@ -401,7 +401,7 @@ The manifests (`catalog.json` and every snapshot) share one shape:
 
 ```json
 {
-  "format_version": 2,
+  "format_version": 3,
   "updated": "2026-10-14T02:11:50.760Z",
   "version": 2,
   "tables": {
@@ -416,19 +416,22 @@ The manifests (`catalog.json` and every snapshot) share one shape:
 | catalog `format_version` | data file | written by | read by this build |
 |---|---|---|---|
 | 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`) |
-| 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry | this build (default) | yes |
+| 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry; one row block per 2,048-row engine chunk | waves 35–40 | yes |
+| 3 | as 2, but row blocks of 8,192 rows / ~1 MiB (fewer blocks → less per-block stats/compression work on save) | this build (default) | yes |
 
 **Migration:** open an old lake and `.lake save` again — the next snapshot is a
-full rewrite in Vortex (`format_version` 2); old snapshots and their `.pink`
-files stay untouched, so every published version still loads. Any unknown
-`format_version`, a v2 entry without a `format` field, and a v2 entry
-declaring anything but `"vortex"` (the v2 writer emits Vortex only) are clear
-errors, never a guess.
+full rewrite in Vortex (`format_version` 3); old snapshots and their data
+files stay untouched, so every published version still loads. Builds older
+than wave 45 read up to `format_version` 2 and refuse a v3 lake with a clear
+"unsupported lake format_version 3" error. Any unknown `format_version`, a
+v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
+`"vortex"` are clear errors, never a guess.
 
-- **Schema and typing live in the data files.** A v2 file is a plain Vortex
-  file: one struct array, one field per column, chunk boundaries preserved
-  (row blocks of exactly `CHUNK_SIZE` rows, one stream element per engine
-  chunk), so a loaded table re-saves to the same `.pink` bytes. DOUBLES keep
+- **Schema and typing live in the data files.** A data file is a plain
+  Vortex file: one struct array, one field per column, row order preserved;
+  the loader slices stored row blocks back into `CHUNK_SIZE`-row engine
+  chunks, so a table loads densely chunked (ragged chunks left by deletes come
+  back compacted — values and order unchanged). DOUBLES keep
   raw IEEE-754 bits (NaN payloads, `-0.0`), `i32`/`i64` cover their full
   ranges, VARCHAR is `utf8`. DATE/TIMESTAMP are stored as their raw `i32`/`i64`
   storage integers plus the exact pinkdb schema in a `pinkdb.table` metadata

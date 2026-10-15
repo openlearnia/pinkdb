@@ -4,7 +4,7 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 2,
+//!   "format_version": 3,
 //!   "updated": "<iso8601>",
 //!   "version": 3,
 //!   "tables": {
@@ -13,9 +13,9 @@
 //! }
 //! ```
 //!
-//! `format_version` 2 is the Vortex default: every table entry declares
-//! `"format": "vortex"` (the v2 writer emits Vortex only, so a `"pink"` entry
-//! in a v2 manifest is corrupt). A `format_version` 1 manifest — written by
+//! `format_version` 2 and 3 are Vortex lakes (3: larger row blocks, the
+//! default for new writes): every table entry declares `"format": "vortex"`
+//! (those writers emit Vortex only, so a `"pink"` entry there is corrupt). A `format_version` 1 manifest — written by
 //! the wave-34 writer — has no `format` field and implies the engine's
 //! `.pink` single-table bytes.
 //!
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum FileFormat {
     /// The engine's `.pink` single-table persistence bytes (format_version 1).
     Pink,
-    /// A Vortex file (format_version 2, the default for new writes).
+    /// A Vortex file (format_version 2 and 3; 3 is the default for new writes).
     Vortex,
 }
 

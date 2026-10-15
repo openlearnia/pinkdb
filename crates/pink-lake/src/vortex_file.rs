@@ -1,10 +1,14 @@
 //! Vortex data files: one Vortex file per table (the v2 lake default).
 //!
-//! A v2 data file is a plain Vortex file holding one struct array (one field
-//! per table column, in schema order) with the engine's chunk boundaries
-//! preserved: the writer feeds one Vortex stream element per engine chunk and
-//! fixes the row block size to [`pinkdb::CHUNK_SIZE`], so loading reproduces
-//! the same chunking and a loaded table re-saves to the same `.pink` bytes.
+//! A data file is a plain Vortex file holding one struct array (one field per
+//! table column, in schema order). The writer feeds the engine's chunks in
+//! order and lets Vortex group them into row blocks of [`WRITE_BLOCK_ROWS`]
+//! rows (~[`WRITE_BLOCK_BYTES`]; `format_version` 3). Format-version-2 files
+//! used one block per engine chunk ([`pinkdb::CHUNK_SIZE`] rows) and are
+//! still read. Either way the loader slices stored blocks back into
+//! `CHUNK_SIZE`-row engine chunks, so a loaded table is densely chunked (a
+//! saved table with ragged chunks — after deletes, say — loads compacted;
+//! every value and the row order are unchanged).
 //!
 //! Column values map to native Vortex types:
 //!
@@ -188,6 +192,19 @@ fn vortex_error(context: &str, e: impl std::fmt::Display) -> LakeError {
     }
 }
 
+/// Rows per Vortex row block (format_version 3; Vortex's own default, pinned
+/// so a dependency upgrade cannot silently change the layout). Fewer, larger
+/// blocks cut the writer's per-block statistics and compression-scheme work.
+const WRITE_BLOCK_ROWS: usize = 8192;
+
+/// Target bytes per data block (Vortex's default coalescing, pinned).
+const WRITE_BLOCK_BYTES: u64 = 1 << 20;
+
+/// The longest stored chunk the loader accepts: well above any block the
+/// writer emits, so only a tampered file trips it (and it bounds the slicing
+/// work a corrupt length could ask for).
+const MAX_STORED_CHUNK_ROWS: usize = 1 << 16;
+
 /// Engine chunks converted per parallel window while streaming into the
 /// writer: large enough to keep every core busy converting, small enough
 /// that only a window's worth of converted arrays is alive at once and the
@@ -271,11 +288,9 @@ fn encode_table_with_metadata(
     let dtype = struct_dtype(&schema, &nulls);
 
     let (runtime, _pool, session) = write_session(parallel);
-    // One stream element per engine chunk, and row blocks of exactly
-    // `CHUNK_SIZE` rows: chunk boundaries round-trip unchanged.
     let strategy = WriteStrategyBuilder::from_session(&session)
-        .with_row_block_size(pinkdb::CHUNK_SIZE)
-        .with_data_block_target_bytes(None)
+        .with_row_block_size(WRITE_BLOCK_ROWS)
+        .with_data_block_target_bytes(Some(WRITE_BLOCK_BYTES))
         .build();
     let mut options = session.write_options().with_strategy(strategy);
     if let Some(metadata) = metadata {
@@ -381,9 +396,33 @@ fn decode_table_inner(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
     // Read the (still encoded) chunks in file order, then decode them in
     // parallel — each worker with its own execution context — and append
     // them in file order. Decoding dominates a load; reading is cheap.
+    // Stored blocks may hold several engine chunks (format_version 3): slice
+    // them into `CHUNK_SIZE`-row pieces (a cheap view; decoding happens per
+    // piece below).
     let mut raw: Vec<ArrayRef> = Vec::new();
     for item in runtime.block_on_stream(&mut stream) {
-        raw.push(item.map_err(|e| corrupt(path, format!("reading a Vortex chunk: {e}")))?);
+        let block = item.map_err(|e| corrupt(path, format!("reading a Vortex chunk: {e}")))?;
+        let len = block.len();
+        if len > MAX_STORED_CHUNK_ROWS {
+            return Err(corrupt(
+                path,
+                format!(
+                    "a stored chunk has {len} rows, over the {MAX_STORED_CHUNK_ROWS}-row limit"
+                ),
+            ));
+        }
+        if len <= pinkdb::CHUNK_SIZE {
+            raw.push(block);
+            continue;
+        }
+        for start in (0..len).step_by(pinkdb::CHUNK_SIZE) {
+            let end = (start + pinkdb::CHUNK_SIZE).min(len);
+            raw.push(
+                block
+                    .slice(start..end)
+                    .map_err(|e| corrupt(path, format!("slicing a Vortex chunk: {e}")))?,
+            );
+        }
     }
     let decoded: Vec<Result<Option<Vec<Vector>>>> = raw
         .par_iter()

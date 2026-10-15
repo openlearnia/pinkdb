@@ -1,0 +1,49 @@
+{
+  "format_version": 2,
+  "updated": "2026-10-15T03:45:05.113Z",
+  "version": 2,
+  "tables": {
+    "analytics.a.b": {
+      "files": [
+        "data/analytics.a.b/7b5b2abb-07ed-4c70-9686-9f6d066301e7.vortex"
+      ],
+      "rows": 2,
+      "format": "vortex"
+    },
+    "analytics.u": {
+      "files": [
+        "data/analytics.u/6b547e8b-a588-41c6-878b-aadb3a7a0ec3.vortex"
+      ],
+      "rows": 1,
+      "format": "vortex"
+    },
+    "main.big": {
+      "files": [
+        "data/main.big/0d5ad71c-6430-4907-9c76-db840f83e9d8.vortex"
+      ],
+      "rows": 2148,
+      "format": "vortex"
+    },
+    "main.empty": {
+      "files": [
+        "data/main.empty/90fcda01-00c9-404a-a2d1-4cbd609c42b6.vortex"
+      ],
+      "rows": 0,
+      "format": "vortex"
+    },
+    "main.fid": {
+      "files": [
+        "data/main.fid/42eff9ba-fbaf-4a4e-a5e5-a0c84059cd13.vortex"
+      ],
+      "rows": 6,
+      "format": "vortex"
+    },
+    "main.héllo✓": {
+      "files": [
+        "data/main.h%C3%A9llo%E2%9C%93/eec7554e-06ac-4ba3-afeb-c6e225874733.vortex"
+      ],
+      "rows": 1,
+      "format": "vortex"
+    }
+  }
+}

@@ -163,6 +163,40 @@ fn v1_fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1")
 }
 
+fn v2_fixture_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v2")
+}
+
+/// A format_version 2 lake (one Vortex block per engine chunk) still loads
+/// value- and bit-exactly with the v3 reader, and saving migrates it to v3.
+#[test]
+fn v2_fixture_lake_still_loads() {
+    let fixture = v2_fixture_dir();
+    let catalog = read_json(&fixture.join("catalog.json"));
+    assert_eq!(catalog["format_version"], 2, "fixture must stay v2");
+    let expected = common::fidelity_store();
+
+    let lake = Lake::open(&fixture).unwrap();
+    assert_eq!(lake.format_version(), 2);
+    let loaded = lake.load(None).unwrap();
+    assert_same_store(&expected, &loaded);
+
+    // Re-save into a scratch copy: a v3 snapshot that loads identically.
+    let dir = scratch("v2_migrate");
+    let copy = dir.join("lake");
+    copy_dir(&fixture, &copy);
+    let mut lake = Lake::open(&copy).unwrap();
+    lake.write_from_store(&loaded).unwrap();
+    assert_eq!(lake.format_version(), 3);
+    assert_same_store(&expected, &Lake::open(&copy).unwrap().load(None).unwrap());
+    // The old v2 snapshot stays loadable from the upgraded lake.
+    assert_same_store(
+        &expected,
+        &Lake::open(&copy).unwrap().load(Some(2)).unwrap(),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn snapshot_roundtrip_is_bit_exact() {
     let dir = scratch("bit_exact");
@@ -178,10 +212,10 @@ fn snapshot_roundtrip_is_bit_exact() {
     assert_eq!(report.rows, 3 + (CHUNK_SIZE as u64 + 100) + 1 + 2);
     assert!(report.bytes_written > 0);
 
-    // Catalog shape: v2, one Vortex file per table, `format` declared.
+    // Catalog shape: v3, one Vortex file per table, `format` declared.
     let catalog = read_json(&dir.join("catalog.json"));
     assert_eq!(catalog["format_version"], FORMAT_VERSION);
-    assert_eq!(FORMAT_VERSION, 2, "v2 is the Vortex default");
+    assert_eq!(FORMAT_VERSION, 3, "v3 is the current Vortex layout");
     assert_eq!(catalog["version"], 2);
     let updated = catalog["updated"].as_str().unwrap();
     assert_eq!(updated.len(), 24, "ISO-8601 millis: {updated}");
@@ -458,10 +492,10 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
 
     // An unsupported format_version is named, not misparsed.
     let mut future = read_json(&dir.join("catalog.json"));
-    future["format_version"] = serde_json::json!(3);
+    future["format_version"] = serde_json::json!(4);
     write_json(&dir.join("catalog.json"), &future);
     let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("unsupported lake format_version 3"), "{err}");
+    assert!(err.contains("unsupported lake format_version 4"), "{err}");
     assert!(err.contains("Vortex form"), "{err}");
 
     // A version 2 manifest must declare a format on every entry; a missing
@@ -1305,11 +1339,11 @@ fn v1_lake_migrates_to_vortex_on_save() {
     let old = lake.load(None).unwrap();
     assert_same_store(&expected, &old);
 
-    // Saving again publishes a v2 snapshot: a full rewrite in Vortex.
+    // Saving again publishes a v3 snapshot: a full rewrite in Vortex.
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
-    assert_eq!(lake.format_version(), 2, "the handle now reports v2");
+    assert_eq!(lake.format_version(), 3, "the handle now reports v3");
     let catalog = read_json(&dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 2);
+    assert_eq!(catalog["format_version"], 3);
     for (key, entry) in catalog["tables"].as_object().unwrap() {
         assert_eq!(entry["format"], "vortex", "{key}");
         assert!(
@@ -1369,7 +1403,7 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
     let original_bytes = store_bytes(&db, &dir, "original");
 
     let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.format_version(), 2, "create publishes a v2 lake");
+    assert_eq!(lake.format_version(), 3, "create publishes a v3 lake");
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
 
@@ -1487,10 +1521,10 @@ fn catalog_format_fields_are_validated() {
     write_json(&dir.join("catalog.json"), &cat);
     let err = Lake::open(&dir).unwrap_err().to_string();
     assert!(
-        err.contains("declares a pink data file in a format_version 2 manifest"),
+        err.contains("declares a pink data file in a format_version 3 manifest"),
         "{err}"
     );
-    assert!(err.contains("v2 writer emits Vortex only"), "{err}");
+    assert!(err.contains("Vortex-era writers emit Vortex only"), "{err}");
 
     // A `format` of the wrong JSON type is corrupt too.
     let mut cat = read_json(&dir.join("catalog.json"));
