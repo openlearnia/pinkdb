@@ -63,6 +63,7 @@ use std::any::Any;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -77,6 +78,7 @@ use vortex::array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex::buffer::{BitBuffer, Buffer, ByteBuffer};
 use vortex::dtype::{DType, FieldNames, Nullability, PType, StructFields};
 use vortex::expr::stats::{Precision, Stat};
+use vortex::expr::{root, select};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex::io::runtime::BlockingRuntime;
@@ -417,6 +419,372 @@ pub(crate) fn decode_table(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
 /// and the local entry (the file is read into exactly this buffer).
 pub(crate) fn decode_table_owned(path: &Path, bytes: Vec<u8>) -> Result<PinkDb> {
     decode_buffer(path, ByteBuffer::from(bytes))
+}
+
+/// Decode only the `projection` columns (ascending schema indices) of one
+/// data file into a one-table [`PinkDb`] over the **full** schema: every
+/// unprojected column holds a NULL placeholder with the chunk lengths of the
+/// decoded ones, so row counts and chunk boundaries are exactly those of a
+/// full decode. Returns the store plus, per column, whether it was decoded.
+///
+/// Locally the file is opened with positioned reads (`open_path`): the
+/// unprojected columns' data segments are never read, let alone decoded.
+/// Over object storage (no ranged reads in this build) the object is read
+/// whole, still decoding only `projection`.
+///
+/// Chunks are streamed and decoded in bounded windows
+/// ([`CONVERT_WINDOW`]-many engine chunks at a time); nothing collects the
+/// whole file's encoded data, unlike the full decode path (which builds the
+/// table it returns anyway).
+pub(crate) fn decode_projected(
+    path: &Path,
+    storage: &dyn crate::storage::Storage,
+    rel: &str,
+    projection: &[usize],
+) -> Result<(PinkDb, Vec<bool>)> {
+    with_decoder_guard(path, "opening and decoding it", || {
+        let (runtime, session) = session();
+        let file = match storage.local_path(rel) {
+            // Local: positioned reads of the footer plus exactly the
+            // projected fields' segments.
+            Some(local) => runtime
+                .block_on(session.open_options().include_metadata().open_path(&local))
+                .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?,
+            // Object storage: whole-object read, still no unprojected decode.
+            None => {
+                let bytes = storage.read(rel, &format!("loading data file \"{rel}\""))?;
+                session
+                    .open_options()
+                    .include_metadata()
+                    .open_buffer(ByteBuffer::from(bytes))
+                    .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?
+            }
+        };
+        let metadata = parse_metadata(path, &file)?;
+        let schema = schema_of(path, &file, &metadata)?;
+        decode_projected_file(
+            path, &runtime, &session, file, &metadata, &schema, projection,
+        )
+    })
+}
+
+/// The decode core of [`decode_projected`] (already inside the guard).
+///
+/// The projection is a non-empty ascending subset of `schema`'s indices; the
+/// caller (the attach layer) validates its bound, this function checks the
+/// rest defensively.
+fn decode_projected_file(
+    path: &Path,
+    runtime: &CurrentThreadRuntime,
+    session: &VortexSession,
+    file: vortex::file::VortexFile,
+    metadata: &TableMetadata,
+    schema: &[(String, DataType)],
+    projection: &[usize],
+) -> Result<(PinkDb, Vec<bool>)> {
+    let n_cols = schema.len();
+    if projection.is_empty()
+        || projection.iter().any(|&i| i >= n_cols)
+        || projection.windows(2).any(|w| w[0] >= w[1])
+    {
+        return Err(corrupt(
+            path,
+            format!(
+                "internal error: invalid decode projection {projection:?} for a {n_cols}-column \
+                 file"
+            ),
+        ));
+    }
+    let mut present = vec![false; n_cols];
+    for &i in projection {
+        present[i] = true;
+    }
+    // The streamed struct carries exactly the projected fields, in the
+    // order they were requested; map each schema index to its field slot.
+    let mut field_of: Vec<Option<usize>> = vec![None; n_cols];
+    for (fi, &i) in projection.iter().enumerate() {
+        field_of[i] = Some(fi);
+    }
+    let names: Vec<&str> = projection.iter().map(|&i| schema[i].0.as_str()).collect();
+    let bound = select(names, root())
+        .bind(file.dtype())
+        .and_then(|expr| expr.optimize_recursive())
+        .map_err(|e| corrupt(path, format!("building the scan projection: {e}")))?;
+    let mut stream = file
+        .scan()
+        .map_err(|e| corrupt(path, format!("opening a Vortex scan: {e}")))?
+        .with_projection(bound)
+        .into_array_stream()
+        .map_err(|e| corrupt(path, format!("opening a Vortex scan: {e}")))?;
+
+    // One dense chunk builder per projected column, advanced in lockstep:
+    // the chunk lengths come out identical to a full decode's
+    // ([`pinkdb::CHUNK_SIZE`] each, one shorter tail) whatever the file's
+    // block boundaries are. That matters because the reader's block
+    // boundaries depend on *which* fields a scan references, so a later
+    // projected decode of other columns must still land on the same chunk
+    // boundaries to merge.
+    let mut builders: Vec<ColumnBuilder> = projection
+        .iter()
+        .map(|&i| ColumnBuilder::new(schema[i].1))
+        .collect();
+
+    let mut pending: Vec<ArrayRef> = Vec::new();
+    for item in runtime.block_on_stream(&mut stream) {
+        let block = item.map_err(|e| corrupt(path, format!("reading a Vortex chunk: {e}")))?;
+        let len = block.len();
+        if len > MAX_STORED_CHUNK_ROWS {
+            return Err(corrupt(
+                path,
+                format!(
+                    "a stored chunk has {len} rows, over the {MAX_STORED_CHUNK_ROWS}-row limit"
+                ),
+            ));
+        }
+        if len <= pinkdb::CHUNK_SIZE {
+            pending.push(block);
+        } else {
+            for start in (0..len).step_by(pinkdb::CHUNK_SIZE) {
+                let end = (start + pinkdb::CHUNK_SIZE).min(len);
+                pending.push(
+                    block
+                        .slice(start..end)
+                        .map_err(|e| corrupt(path, format!("slicing a Vortex chunk: {e}")))?,
+                );
+            }
+        }
+        if pending.len() >= CONVERT_WINDOW {
+            accumulate_projected(
+                path,
+                session,
+                schema,
+                projection,
+                &mut pending,
+                &mut builders,
+            )?;
+        }
+    }
+    accumulate_projected(
+        path,
+        session,
+        schema,
+        projection,
+        &mut pending,
+        &mut builders,
+    )?;
+
+    // Assemble the full-schema table: decoded columns from the builders,
+    // NULL placeholders (shared per distinct chunk length, so a multi-chunk
+    // read allocates a couple of vectors per absent column, not one per
+    // chunk) for the rest.
+    let decoded: Vec<(usize, Vec<Arc<Vector>>)> = projection
+        .iter()
+        .copied()
+        .zip(builders.into_iter().map(ColumnBuilder::finish))
+        .collect();
+    let rows: usize = decoded
+        .first()
+        .map(|(_, chunks)| chunks.iter().map(|c| c.len()).sum())
+        .unwrap_or(0);
+    let lens: Vec<usize> = decoded
+        .first()
+        .map(|(_, chunks)| chunks.iter().map(|c| c.len()).collect())
+        .unwrap_or_default();
+    let mut placeholders: std::collections::HashMap<(usize, usize), Arc<Vector>> =
+        std::collections::HashMap::new();
+    let mut columns: Vec<pinkdb::storage::Column> = Vec::with_capacity(n_cols);
+    let mut decoded = decoded.into_iter();
+    for (i, (name, dtype)) in schema.iter().enumerate() {
+        let chunks = if field_of[i].is_some() {
+            decoded
+                .next()
+                .map(|(_, chunks)| chunks)
+                .expect("one decoded column per projected field")
+        } else {
+            lens.iter()
+                .map(|&len| placeholder(&mut placeholders, i, *dtype, len))
+                .collect()
+        };
+        columns.push(pinkdb::storage::Column {
+            name: name.clone(),
+            dtype: *dtype,
+            chunks,
+        });
+    }
+    let mut mini = empty_single_table_store(&metadata.db, &metadata.table, schema.to_vec())?;
+    *mini
+        .table_mut_in(&metadata.db, &metadata.table)
+        .map_err(|e| LakeError::Engine {
+            context: format!("loading data file \"{}\"", path.display()),
+            source: e,
+        })? = DataTable::from_columns(metadata.table.clone(), columns, rows);
+    Ok((mini, present))
+}
+
+/// One projected column's dense chunk builder. Decoded pieces arrive at the
+/// file's block boundaries (not chunk-aligned); a piece that already covers
+/// a full engine chunk is adopted as-is, rows that straddle a boundary are
+/// copied into a carried chunk. Output chunk lengths are exactly a full
+/// decode's, independent of block boundaries (see [`decode_projected_file`]).
+struct ColumnBuilder {
+    dtype: DataType,
+    chunks: Vec<Arc<Vector>>,
+    /// The chunk under construction (< [`pinkdb::CHUNK_SIZE`] rows).
+    carry: Vector,
+}
+
+impl ColumnBuilder {
+    fn new(dtype: DataType) -> Self {
+        Self {
+            dtype,
+            chunks: Vec::new(),
+            carry: Vector::with_capacity(dtype, pinkdb::CHUNK_SIZE),
+        }
+    }
+
+    /// Append one decoded piece (≤ [`pinkdb::CHUNK_SIZE`] rows).
+    fn push(&mut self, v: Vector) {
+        debug_assert!(v.len() <= pinkdb::CHUNK_SIZE);
+        // Fast path: a full piece with nothing carried becomes its own chunk
+        // uncopied.
+        if self.carry.is_empty() && v.len() == pinkdb::CHUNK_SIZE {
+            self.chunks.push(Arc::new(v));
+            return;
+        }
+        let mut offset = 0;
+        while offset < v.len() {
+            if self.carry.len() == pinkdb::CHUNK_SIZE {
+                self.promote();
+            }
+            let take = (pinkdb::CHUNK_SIZE - self.carry.len()).min(v.len() - offset);
+            self.carry.extend_from(&v, offset, take);
+            offset += take;
+        }
+        if self.carry.len() == pinkdb::CHUNK_SIZE {
+            self.promote();
+        }
+    }
+
+    fn promote(&mut self) {
+        let full = std::mem::replace(
+            &mut self.carry,
+            Vector::with_capacity(self.dtype, pinkdb::CHUNK_SIZE),
+        );
+        self.chunks.push(Arc::new(full));
+    }
+
+    /// The column's chunks: a short tail stays short (a full decode's
+    /// chunking leaves one shorter final chunk); a zero-row column keeps one
+    /// empty chunk like [`DataTable::new`].
+    fn finish(mut self) -> Vec<Arc<Vector>> {
+        if !self.carry.is_empty() {
+            let tail = std::mem::replace(&mut self.carry, Vector::new_empty(self.dtype));
+            self.chunks.push(Arc::new(tail));
+        }
+        if self.chunks.is_empty() {
+            self.chunks.push(Arc::new(Vector::new_empty(self.dtype)));
+        }
+        self.chunks
+    }
+}
+
+/// Decode one window of still-encoded chunks in parallel and feed them into
+/// the dense builders (in file order) — the bounded-window half of
+/// [`decode_projected_file`].
+fn accumulate_projected(
+    path: &Path,
+    session: &VortexSession,
+    schema: &[(String, DataType)],
+    projection: &[usize],
+    pending: &mut Vec<ArrayRef>,
+    builders: &mut [ColumnBuilder],
+) -> Result<()> {
+    let decoded: Vec<Result<Option<Vec<Vector>>>> = pending
+        .par_iter()
+        .map_init(
+            || session.create_execution_ctx(),
+            |ctx, chunk| decode_projected_chunk(path, schema, projection, chunk, ctx),
+        )
+        .collect();
+    pending.clear();
+    for piece in decoded {
+        let Some(piece) = piece? else {
+            continue;
+        };
+        for (builder, column) in builders.iter_mut().zip(piece) {
+            builder.push(column);
+        }
+    }
+    Ok(())
+}
+
+/// Decode one projected stored chunk into the projected columns, in
+/// projection order (`None` for a 0-row chunk).
+fn decode_projected_chunk(
+    path: &Path,
+    schema: &[(String, DataType)],
+    projection: &[usize],
+    chunk: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> Result<Option<Vec<Vector>>> {
+    let len = chunk.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let fields = chunk
+        .clone()
+        .execute::<StructArray>(ctx)
+        .map_err(|e| corrupt(path, format!("decoding a Vortex chunk: {e}")))?;
+    if fields.struct_fields().nfields() != projection.len() {
+        return Err(corrupt(
+            path,
+            format!(
+                "a projected Vortex chunk has {} fields, expected {}",
+                fields.struct_fields().nfields(),
+                projection.len()
+            ),
+        ));
+    }
+    let mut columns: Vec<Vector> = Vec::with_capacity(projection.len());
+    for (fi, &i) in projection.iter().enumerate() {
+        let (name, dtype) = &schema[i];
+        let field = fields.unmasked_field(fi).clone();
+        columns.push(decode_column(path, name, &field, *dtype, ctx)?);
+    }
+    Ok(Some(columns))
+}
+
+/// The shared all-NULL placeholder for column `column` at chunk length
+/// `len`, allocated once per (column, length).
+fn placeholder(
+    placeholders: &mut std::collections::HashMap<(usize, usize), Arc<Vector>>,
+    column: usize,
+    dtype: DataType,
+    len: usize,
+) -> Arc<Vector> {
+    Arc::clone(
+        placeholders
+            .entry((column, len))
+            .or_insert_with(|| Arc::new(null_vector(dtype, len))),
+    )
+}
+
+/// An all-NULL vector of `dtype` with `rows` rows: every validity bit clear.
+/// The placeholder an unprojected column holds in a projected decode; no
+/// reader ever sees its values (it exists so the table's chunking is
+/// identical to a full decode's).
+fn null_vector(dtype: DataType, rows: usize) -> Vector {
+    let data = match dtype {
+        DataType::Boolean => VectorData::Boolean(vec![false; rows]),
+        DataType::Integer => VectorData::Int32(vec![0; rows]),
+        DataType::Bigint => VectorData::Int64(vec![0; rows]),
+        DataType::Double => VectorData::Float64(vec![0.0; rows]),
+        DataType::Varchar => VectorData::VarChar(vec![Arc::from(""); rows]),
+        DataType::Date => VectorData::Date32(vec![0; rows]),
+        DataType::Timestamp => VectorData::TimestampMicros(vec![0; rows]),
+    };
+    // No validity words: every row reads NULL.
+    Vector::from_raw(data, Vec::new())
 }
 
 /// What a footer-only read of one data file yields: identity, schema, exact

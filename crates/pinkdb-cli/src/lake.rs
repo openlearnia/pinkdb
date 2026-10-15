@@ -334,7 +334,9 @@ fn cmd_detach(db: &mut PinkDb, arg: &str) {
     }
 }
 
-/// `.lake attached`: the lakes attached to this session and their tables.
+/// `.lake attached`: the lakes attached to this session and their tables,
+/// plus each lake's data-file decode counters (statistics-only queries and a
+/// projected decode show up here).
 fn cmd_attached(db: &PinkDb, arg: &str) {
     if !arg.trim().is_empty() {
         println!("Usage: .lake attached");
@@ -345,7 +347,8 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
         println!("(no attached lakes)");
         return;
     }
-    for (location, tables) in lakes {
+    let stats = db.attached_decode_stats();
+    for ((location, tables), (_, loads, columns)) in lakes.into_iter().zip(stats) {
         println!("{location}");
         for t in tables {
             println!(
@@ -356,6 +359,11 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
                 plural(t.rows as usize)
             );
         }
+        println!(
+            "  decodes: {loads} load{}, {columns} column{}",
+            plural(loads as usize),
+            plural(columns as usize)
+        );
     }
 }
 

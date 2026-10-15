@@ -1,6 +1,8 @@
 //! Logical plan: Scan → Filter → Join → Aggregate → Window → Project →
 //! Distinct → Sort → Limit (plus DDL/DML and set unions).
 
+use std::collections::HashMap;
+
 use crate::sql::ast::{JoinKind, Select};
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::types::{DataType, Value};
@@ -390,6 +392,283 @@ fn expr_tables_read(
         BoundExpr::InSubquery { expr, query, .. } => {
             expr_tables_read(expr, default_db, out);
             collect_tables_read(query, default_db, out);
+        }
+    }
+}
+
+/// The catalog-table columns each `Scan` in a plan can be read through,
+/// keyed by the scan node's address.
+///
+/// The executor uses this to decode only the referenced columns of an
+/// attached lake's data files (see `pinkdb::attached`). Exactness matters in
+/// one direction only: the set must contain *every* column some operator
+/// evaluates, because a column left out is left undecoded — the executor
+/// reads such a column as an internal error, never as NULLs (see
+/// `DataChunk::expect_column`). A scan with no bound in this map is
+/// materialized in full, which is always correct.
+///
+/// The rules mirror what the executor actually evaluates, not what the query
+/// eventually displays: `Project` and `Window` evaluate every expression
+/// they hold (`fused_join_aggregate` is the one exception, and joins are
+/// unbounded here), `Filter`/`Sort` evaluate their predicates/keys, and the
+/// operators that read whole rows (`Distinct`, `Union`, `Join`) or
+/// materialize an output once and reuse it (`Cte`) are conservatively
+/// unbounded. The matches are exhaustive on purpose, like
+/// [`collect_tables_read`]: a new plan variant must decide here what its
+/// inputs reference.
+#[derive(Debug, Default)]
+pub(crate) struct ScanProjections {
+    /// Scan node address → referenced column indices, ascending. A `Scan`
+    /// with no entry reads every column.
+    map: HashMap<usize, Vec<usize>>,
+}
+
+impl ScanProjections {
+    /// Analyze `plan` (the whole statement plan, subqueries included).
+    pub(crate) fn of(plan: &LogicalPlan) -> Self {
+        let mut projections = Self::default();
+        walk_scan_projections(plan, &Needed::All, &mut projections.map);
+        projections
+    }
+
+    /// The columns of `scan` (a [`LogicalPlan::Scan`]) this plan reads, or
+    /// `None` when the analysis could not bound it (read every column).
+    pub(crate) fn for_scan(&self, scan: &LogicalPlan) -> Option<&[usize]> {
+        debug_assert!(matches!(scan, LogicalPlan::Scan { .. }));
+        self.map.get(&node_addr(scan)).map(Vec::as_slice)
+    }
+}
+
+/// A scan node's identity for [`ScanProjections`]: plans are immutable trees
+/// during one statement, so the address of the node is stable across the
+/// analysis walk and execution.
+fn node_addr(plan: &LogicalPlan) -> usize {
+    plan as *const LogicalPlan as usize
+}
+
+/// Which of a node's input columns a consumer reads: an explicit set, or
+/// `All` when the shape cannot be bounded (a correct fallback: every column
+/// is decoded).
+#[derive(Clone, Debug)]
+enum Needed {
+    All,
+    Cols(Vec<bool>),
+}
+
+impl Needed {
+    fn add_col(&mut self, index: usize) {
+        if let Needed::Cols(set) = self {
+            if index >= set.len() {
+                set.resize(index + 1, false);
+            }
+            set[index] = true;
+        }
+    }
+}
+
+/// Walk `plan`, telling every `Scan` which of its columns are referenced.
+/// `needed` is the set of *this node's output* columns its consumer reads.
+fn walk_scan_projections(
+    plan: &LogicalPlan,
+    needed: &Needed,
+    out: &mut HashMap<usize, Vec<usize>>,
+) {
+    match plan {
+        LogicalPlan::Scan { db: Some(_), .. } => {
+            if let Needed::Cols(set) = needed {
+                out.insert(
+                    node_addr(plan),
+                    set.iter()
+                        .enumerate()
+                        .filter(|(_, used)| **used)
+                        .map(|(i, _)| i)
+                        .collect(),
+                );
+            }
+        }
+        // Unqualified scans name CTE outputs (binder-resolved), not tables;
+        // the CTE's own query is walked through `LogicalPlan::Cte`.
+        LogicalPlan::Scan { db: None, .. } | LogicalPlan::SingleRow => {}
+        LogicalPlan::Filter { input, predicate } => {
+            let mut need = needed.clone();
+            collect_expr_projections(predicate, &mut need, out);
+            walk_scan_projections(input, &need, out);
+        }
+        // The executor evaluates every key and aggregate argument, whatever
+        // the consumer of the aggregate needs, so the input bound is the
+        // union of all of them.
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            let mut need = Needed::Cols(Vec::new());
+            for k in keys {
+                collect_expr_projections(k, &mut need, out);
+            }
+            for a in aggs {
+                if let Some(e) = &a.arg {
+                    collect_expr_projections(e, &mut need, out);
+                }
+            }
+            walk_scan_projections(input, &need, out);
+        }
+        // The executor evaluates every window's partition/order/argument
+        // expressions; the window's input columns themselves pass through,
+        // so only the ones the consumer (or a window expression) reads are
+        // needed.
+        LogicalPlan::Window {
+            input,
+            windows,
+            input_cols,
+        } => {
+            let mut need = match needed {
+                Needed::All => Needed::All,
+                Needed::Cols(set) => Needed::Cols(set[..set.len().min(*input_cols)].to_vec()),
+            };
+            for w in windows {
+                for e in w
+                    .arg
+                    .iter()
+                    .chain(w.partition.iter())
+                    .chain(w.order.iter().map(|(e, _)| e))
+                {
+                    collect_expr_projections(e, &mut need, out);
+                }
+            }
+            walk_scan_projections(input, &need, out);
+        }
+        // Every project expression is evaluated (only the fused
+        // join→aggregate path skips unused ones, and joins are unbounded
+        // here), so the bound is the union of all of them — plus each
+        // expression's subquery plans, which are analyzed in full.
+        LogicalPlan::Project { input, exprs, .. } => {
+            let mut need = Needed::Cols(Vec::new());
+            for e in exprs {
+                collect_expr_projections(e, &mut need, out);
+            }
+            walk_scan_projections(input, &need, out);
+        }
+        LogicalPlan::Sort { input, keys } => {
+            let mut need = needed.clone();
+            for (e, _) in keys {
+                collect_expr_projections(e, &mut need, out);
+            }
+            walk_scan_projections(input, &need, out);
+        }
+        LogicalPlan::Limit { input, .. } => walk_scan_projections(input, needed, out),
+        // Unbounded shapes: `Distinct` hashes whole rows; `Union` coerces
+        // every column of both sides; `Join` assembles all columns of both
+        // sides; a `Cte` query's output is materialized once and reused by
+        // the body. Nothing is lost by decoding in full.
+        LogicalPlan::Distinct { input } => walk_scan_projections(input, &Needed::All, out),
+        LogicalPlan::Union { left, right, .. } => {
+            walk_scan_projections(left, &Needed::All, out);
+            walk_scan_projections(right, &Needed::All, out);
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            left_key,
+            right_key,
+            ..
+        } => {
+            let mut l = Needed::All;
+            collect_expr_projections(left_key, &mut l, out);
+            let mut r = Needed::All;
+            collect_expr_projections(right_key, &mut r, out);
+            walk_scan_projections(left, &l, out);
+            walk_scan_projections(right, &r, out);
+        }
+        LogicalPlan::Cte { query, body, .. } => {
+            walk_scan_projections(query, &Needed::All, out);
+            walk_scan_projections(body, needed, out);
+        }
+        // DDL/DML never runs through the projection-aware read path; their
+        // expressions' subquery plans are still analyzed (in full).
+        LogicalPlan::Insert { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    let mut need = Needed::All;
+                    collect_expr_projections(e, &mut need, out);
+                }
+            }
+        }
+        LogicalPlan::Update {
+            sets, predicate, ..
+        } => {
+            for (_, e) in sets {
+                let mut need = Needed::All;
+                collect_expr_projections(e, &mut need, out);
+            }
+            if let Some(p) = predicate {
+                let mut need = Needed::All;
+                collect_expr_projections(p, &mut need, out);
+            }
+        }
+        LogicalPlan::Delete { predicate, .. } => {
+            if let Some(p) = predicate {
+                let mut need = Needed::All;
+                collect_expr_projections(p, &mut need, out);
+            }
+        }
+        LogicalPlan::CreateTable { .. }
+        | LogicalPlan::Begin
+        | LogicalPlan::Commit
+        | LogicalPlan::Rollback
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Use { .. }
+        | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::Checkpoint => {}
+    }
+}
+
+/// Union every table column `expr` reads into `need`, and analyze the plans
+/// of any subqueries it holds (in full: a subquery's output is materialized
+/// by the executor). Mirrors `expr_tables_read`'s walk.
+fn collect_expr_projections(
+    expr: &BoundExpr,
+    need: &mut Needed,
+    out: &mut HashMap<usize, Vec<usize>>,
+) {
+    match expr {
+        BoundExpr::Literal(_) | BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => {}
+        BoundExpr::Column { index, .. } => need.add_col(*index),
+        BoundExpr::Binary { left, right, .. } => {
+            collect_expr_projections(left, need, out);
+            collect_expr_projections(right, need, out);
+        }
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. }
+        | BoundExpr::Cast { expr: e, .. } => collect_expr_projections(e, need, out),
+        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            for a in args {
+                collect_expr_projections(a, need, out);
+            }
+        }
+        BoundExpr::DynamicScalar { args, .. } => {
+            for a in args.iter() {
+                collect_expr_projections(a, need, out);
+            }
+        }
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
+            for (c, v) in branches {
+                collect_expr_projections(c, need, out);
+                collect_expr_projections(v, need, out);
+            }
+            if let Some(e) = else_ {
+                collect_expr_projections(e, need, out);
+            }
+        }
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            walk_scan_projections(query, &Needed::All, out);
+        }
+        BoundExpr::InSubquery { expr, query, .. } => {
+            collect_expr_projections(expr, need, out);
+            walk_scan_projections(query, &Needed::All, out);
         }
     }
 }

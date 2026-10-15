@@ -625,6 +625,38 @@ fn tampered_data_files_are_clean_cli_errors_and_the_repl_stays_alive() {
         "at least one tamper must fail `.lake open` with a clean error"
     );
 
+    // The same tampers against `.lake attach` + a projected fallback query:
+    // attach may fail at the footer (clean) or succeed and fail at the
+    // decode (clean); a panic or a dead REPL is never acceptable.
+    for (what, bytes) in &tampers {
+        std::fs::write(&file, bytes).unwrap();
+        let (stdout, stderr, code) = run_captured(&format!(
+            ".lake attach {lake}\nSELECT SUM(i) FROM t;\nSELECT * FROM t;\n.databases\n.quit\n",
+            lake = lake.display()
+        ));
+        assert!(
+            code == 0 || code == 1,
+            "{what}: the attach CLI must exit cleanly, got {code} (stderr: {stderr})"
+        );
+        assert!(
+            !stdout.contains("panicked") && !stderr.contains("panicked"),
+            "{what}: a panic escaped under attach:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("main (current)"),
+            "{what}: the REPL died after an attach-path failure: {stdout}"
+        );
+        if code == 1 {
+            assert!(
+                stderr.contains("corrupt lake metadata")
+                    || stderr.contains("lake vortex error")
+                    || stderr.contains("not a valid Vortex file")
+                    || stderr.contains("decoding a Vortex chunk"),
+                "{what}: attach-path error is not a clean corrupt-file error: {stderr}"
+            );
+        }
+    }
+
     // Restoring the file heals the lake.
     std::fs::write(&file, &original).unwrap();
     let (stdout, stderr, code) = run_captured(&format!(
@@ -869,10 +901,20 @@ fn corpus_queries() -> &'static str {
      SELECT MIN(d), MAX(d), COUNT(d) FROM t;\n\
      SELECT COUNT(*) FROM empty;\n\
      SELECT COUNT(x), MIN(x), MAX(y) FROM empty;\n\
+     SELECT x, y FROM empty;\n\
+     SELECT y FROM empty ORDER BY x;\n\
+     SELECT * FROM empty;\n\
      SELECT COUNT(*), COUNT(d), MIN(d), MAX(d) FROM nan;\n\
      SELECT COUNT(*) FROM big;\n\
      SELECT COUNT(s), MIN(a), MAX(a) FROM big;\n\
      SELECT MIN(s), MAX(s) FROM big;\n\
+     SELECT COUNT(*) FROM big WHERE a > 0;\n\
+     SELECT s FROM big ORDER BY s LIMIT 2;\n\
+     SELECT a, s FROM big ORDER BY a DESC LIMIT 2;\n\
+     CREATE VIEW tv AS SELECT i, s FROM t;\n\
+     SELECT COUNT(*), MAX(i), MAX(s) FROM tv;\n\
+     SELECT s FROM tv ORDER BY i LIMIT 2;\n\
+     DROP VIEW tv;\n\
      SELECT SUM(i), AVG(i), SUM(d) FROM t;\n\
      SELECT COUNT(*) FROM t WHERE i > 0;\n\
      SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b;\n\
@@ -880,7 +922,18 @@ fn corpus_queries() -> &'static str {
      SELECT MAX(i) FROM (SELECT i FROM t) s;\n\
      SELECT MIN(ABS(i)) FROM t;\n\
      SELECT t.i, big.a FROM t JOIN big ON t.i = big.a ORDER BY t.i LIMIT 5;\n\
-     SELECT * FROM t ORDER BY i LIMIT 3;\n"
+     SELECT * FROM t ORDER BY i LIMIT 3;\n\
+     SELECT s FROM t ORDER BY i DESC LIMIT 3;\n\
+     SELECT d FROM t WHERE d < 0 ORDER BY d LIMIT 4;\n\
+     SELECT dt, COUNT(*) FROM t GROUP BY dt ORDER BY dt LIMIT 4;\n\
+     SELECT i, ROW_NUMBER() OVER (PARTITION BY b ORDER BY i) FROM t ORDER BY i LIMIT 5;\n\
+     SELECT ROW_NUMBER() OVER () FROM t LIMIT 2;\n\
+     WITH w AS (SELECT i, s FROM t) SELECT MAX(i), COUNT(s) FROM w;\n\
+     SELECT COUNT(*) FROM (SELECT d FROM t) x;\n\
+     SELECT 1 FROM t LIMIT 1;\n\
+     SELECT DISTINCT b FROM t ORDER BY b;\n\
+     SELECT i FROM t UNION ALL SELECT a FROM big LIMIT 3;\n\
+     SELECT (SELECT SUM(d) FROM t) AS m, (SELECT COUNT(s) FROM t) AS c FROM t LIMIT 2;\n"
 }
 
 /// The output from the shared `===BEGIN===` sentinel on (so the arm-specific
@@ -936,6 +989,56 @@ fn attach_answers_equal_open_and_in_memory() {
     // The fast paths really ran: the attach arm printed the footer-only line
     // and the eager loader was not used.
     assert!(attached.contains("footer-only"), "{attached}");
+    cleanup(&dir);
+}
+
+/// `.lake attached` reports data-file decodes end to end: statistics-only
+/// queries decode nothing, projection pushdown decodes exactly the
+/// referenced columns, and columns already decoded stay cached.
+#[test]
+fn attach_decode_stats_show_projection_pushdown() {
+    let dir = scratch("attach_stats");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER, b VARCHAR, c DOUBLE);\n\
+         INSERT INTO t VALUES (1, 'x', 1.5), (2, NULL, -2.5), (3, 'zz', 0.5);\n\
+         .lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         .lake attached\n\
+         SELECT COUNT(*), COUNT(b), MIN(a), MAX(a), MIN(c), MAX(c) FROM t;\n\
+         .lake attached\n\
+         SELECT b FROM t ORDER BY b;\n\
+         .lake attached\n\
+         SELECT c FROM t ORDER BY c;\n\
+         .lake attached\n\
+         SELECT a FROM t ORDER BY a;\n\
+         .lake attached\n\
+         SELECT * FROM t;\n\
+         .lake attached\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    let stats: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("decodes:"))
+        .collect();
+    assert_eq!(
+        stats,
+        vec![
+            "decodes: 0 loads, 0 columns", // attach reads footers only
+            "decodes: 0 loads, 0 columns", // every aggregate came from statistics
+            "decodes: 1 load, 1 column",   // ORDER BY b: b only
+            "decodes: 2 loads, 2 columns", // + c
+            "decodes: 3 loads, 3 columns", // + a
+            "decodes: 3 loads, 3 columns", // SELECT *: everything was cached
+        ],
+        "{out}"
+    );
     cleanup(&dir);
 }
 
@@ -1225,6 +1328,10 @@ fn attach_of_the_v2_fixture_matches_open() {
                    SELECT COUNT(v), MIN(i), MAX(i), MIN(g), MAX(g) FROM fid;\n\
                    SELECT MIN(b), MAX(b), MIN(dt), MAX(dt), MIN(ts), MAX(ts) FROM fid;\n\
                    SELECT MIN(d), MAX(d) FROM fid;\n\
+                   SELECT s FROM big ORDER BY a LIMIT 3;\n\
+                   SELECT a FROM big WHERE s = 'region1' ORDER BY a LIMIT 2;\n\
+                   SELECT a, s FROM empty;\n\
+                   SELECT y FROM empty ORDER BY x;\n\
                    SELECT '===END===' AS marker;\n";
     let opened = run(&format!(
         ".lake open {}\nUSE main;\n{queries}.quit\n",

@@ -108,6 +108,36 @@ impl DataTable {
         self.num_rows
     }
 
+    /// Build a table directly from pre-built columns: every column must have
+    /// the same per-chunk lengths, summing to `num_rows` (the projection-aware
+    /// lake reader assembles partially materialized tables without going
+    /// through `append`). Assigns a fresh version stamp like any constructor.
+    pub fn from_columns(name: String, columns: Vec<Column>, num_rows: usize) -> Self {
+        debug_assert!(
+            !columns.is_empty(),
+            "a table has at least one column (schemas are never empty)"
+        );
+        debug_assert!(
+            {
+                let chunks = columns[0].chunks.len();
+                columns.iter().all(|c| {
+                    c.chunks.len() == chunks
+                        && c.chunks
+                            .iter()
+                            .zip(&columns[0].chunks)
+                            .all(|(a, b)| a.len() == b.len())
+                })
+            },
+            "from_columns needs chunk-aligned columns"
+        );
+        Self {
+            name,
+            columns,
+            num_rows,
+            version: next_table_version(),
+        }
+    }
+
     pub fn num_cols(&self) -> usize {
         self.columns.len()
     }

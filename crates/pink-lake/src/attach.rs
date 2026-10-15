@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use pinkdb::attached::AttachedScan;
 use pinkdb::{AttachedLake, AttachedTable, DataTable, PinkDbError};
 
 use crate::storage::{Head, Storage};
@@ -56,16 +57,67 @@ pub(crate) struct LakeAttachment {
     /// lowercased `(db, table)` → `(display db, display table, data rel)`.
     files: HashMap<(String, String), (String, String, String)>,
     tables: Vec<AttachedTable>,
-    /// Materialized tables, decoded once on first use.
-    cache: Mutex<HashMap<(String, String), Arc<DataTable>>>,
+    /// Materialized columns per table, decoded lazily and cached.
+    cache: Mutex<HashMap<(String, String), CachedTable>>,
     /// Decodes performed (tests: a stats-only query must not decode).
     loads: AtomicU64,
+    /// Columns decoded in total (diagnostics and tests: projection pushdown
+    /// must decode only the referenced columns).
+    columns_decoded: AtomicU64,
+}
+
+/// One table's materialized state: the columns decoded so far, plus NULL
+/// placeholders (same chunking) for the ones not decoded yet. Every column of
+/// `table` is chunk-aligned with every other, so a column decoded later can
+/// be swapped in without touching the rest.
+#[derive(Debug)]
+struct CachedTable {
+    table: Arc<DataTable>,
+    /// One flag per column: true = decoded (its chunks hold values).
+    present: Vec<bool>,
 }
 
 impl LakeAttachment {
     #[cfg(test)]
     pub(crate) fn loads(&self) -> u64 {
         self.loads.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn columns_decoded(&self) -> u64 {
+        self.columns_decoded.load(Ordering::Relaxed)
+    }
+
+    /// The table descriptor for a lowercased `(db, table)` key.
+    fn descriptor(&self, key: &(String, String)) -> Option<&AttachedTable> {
+        let (db, table) = key;
+        self.tables
+            .iter()
+            .find(|t| t.db.eq_ignore_ascii_case(db) && t.table.eq_ignore_ascii_case(table))
+    }
+
+    /// The columns a call must decode: `requested` marked per index. A
+    /// `None`/out-of-range/unprovable projection marks every column (the
+    /// always-correct fallback), and an empty one marks column 0 (the table's
+    /// chunk shape has to come from somewhere).
+    fn requested_columns(&self, key: &(String, String), columns: Option<&[usize]>) -> Vec<bool> {
+        let n_cols = self.descriptor(key).map(|t| t.schema.len()).unwrap_or(0);
+        let mut requested = match columns {
+            Some(cols) if cols.iter().all(|&i| i < n_cols) => {
+                let mut wanted = vec![false; n_cols];
+                for &i in cols {
+                    wanted[i] = true;
+                }
+                wanted
+            }
+            _ => vec![true; n_cols],
+        };
+        if requested.iter().all(|&w| !w) {
+            if let Some(first) = requested.first_mut() {
+                *first = true;
+            }
+        }
+        requested
     }
 }
 
@@ -79,25 +131,109 @@ impl AttachedLake for LakeAttachment {
     }
 
     fn load(&self, db: &str, table: &str) -> std::result::Result<Arc<DataTable>, PinkDbError> {
+        Ok(self.load_projected(db, table, None)?.table)
+    }
+
+    fn load_projected(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+    ) -> std::result::Result<AttachedScan, PinkDbError> {
         let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
-        // One decode per table: the lock is held across the decode so
-        // concurrent readers of one store materialize a table once.
+        // One decode per table at a time: the lock is held across the decode
+        // so concurrent readers of one store materialize each column once.
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(t) = cache.get(&key) {
-            return Ok(Arc::clone(t));
-        }
-        let (dbname, tablename, rel) = self.files.get(&key).ok_or_else(|| {
-            PinkDbError::Catalog(format!(
+        let Some((dbname, tablename, rel)) = self.files.get(&key).cloned() else {
+            return Err(PinkDbError::Catalog(format!(
                 "lake {} has no table \"{db}.{table}\"",
                 self.location
-            ))
-        })?;
-        self.loads.fetch_add(1, Ordering::Relaxed);
-        let table = load_table(&*self.storage, &self.root, rel, dbname, tablename)
-            .map_err(|e| PinkDbError::Execution(e.to_string()))?;
-        let table = Arc::new(table);
-        cache.insert(key, Arc::clone(&table));
-        Ok(table)
+            )));
+        };
+        let requested = self.requested_columns(&key, columns);
+        if requested.is_empty() {
+            return Err(PinkDbError::Catalog(format!(
+                "lake {} table \"{db}.{table}\" has no columns",
+                self.location
+            )));
+        }
+        match cache.get_mut(&key) {
+            Some(entry) => {
+                let missing: Vec<usize> = (0..requested.len())
+                    .filter(|&i| requested[i] && !entry.present[i])
+                    .collect();
+                if missing.is_empty() {
+                    return Ok(AttachedScan {
+                        table: Arc::clone(&entry.table),
+                        present: entry.present.clone(),
+                    });
+                }
+                self.loads.fetch_add(1, Ordering::Relaxed);
+                self.columns_decoded
+                    .fetch_add(missing.len() as u64, Ordering::Relaxed);
+                let (fresh, _fresh_present) = load_projected_table(
+                    &*self.storage,
+                    &self.root,
+                    &rel,
+                    &dbname,
+                    &tablename,
+                    &missing,
+                )
+                .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+                let merged = merge_projected(&entry.table, &fresh, &missing, &tablename)
+                    .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+                for &i in &missing {
+                    entry.present[i] = true;
+                }
+                entry.table = Arc::new(merged);
+                Ok(AttachedScan {
+                    table: Arc::clone(&entry.table),
+                    present: entry.present.clone(),
+                })
+            }
+            None => {
+                // A full read takes the very decode `.lake open` performs
+                // (pinned value- and chunking-identical by the wave-D tests);
+                // a projection decodes only its columns.
+                self.loads.fetch_add(1, Ordering::Relaxed);
+                let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
+                self.columns_decoded
+                    .fetch_add(decoded.len() as u64, Ordering::Relaxed);
+                let (table, present) = if requested.iter().all(|&w| w) {
+                    let table = load_table(&*self.storage, &self.root, &rel, &dbname, &tablename)
+                        .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+                    let present = vec![true; table.num_cols()];
+                    (table, present)
+                } else {
+                    let (table, present) = load_projected_table(
+                        &*self.storage,
+                        &self.root,
+                        &rel,
+                        &dbname,
+                        &tablename,
+                        &decoded,
+                    )
+                    .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+                    (table, present)
+                };
+                let table = Arc::new(table);
+                cache.insert(
+                    key,
+                    CachedTable {
+                        table: Arc::clone(&table),
+                        present: present.clone(),
+                    },
+                );
+                Ok(AttachedScan { table, present })
+            }
+        }
+    }
+
+    fn decode_stats(&self) -> (u64, u64) {
+        (
+            self.loads.load(Ordering::Relaxed),
+            self.columns_decoded.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -125,6 +261,65 @@ fn load_table(
         });
     }
     Ok(file_table.clone())
+}
+
+/// [`vortex_file::decode_projected`]'s per-file read for one table: decode
+/// only `columns`, check the file's identity against its catalog key, and
+/// hand the full-schema table (decoded columns + NULL placeholders) back.
+fn load_projected_table(
+    storage: &dyn Storage,
+    root: &std::path::Path,
+    rel: &str,
+    dbname: &str,
+    tablename: &str,
+    columns: &[usize],
+) -> Result<(DataTable, Vec<bool>)> {
+    let path = storage.abs(rel);
+    let (mini, present) = vortex_file::decode_projected(&path, storage, rel, columns)?;
+    let (file_db, file_table) = only_table(&mini, rel, root)?;
+    if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(tablename) {
+        return Err(LakeError::Corrupt {
+            path,
+            message: format!(
+                "data file holds {file_db}.{}, but the catalog says \"{dbname}.{tablename}\"",
+                file_table.name
+            ),
+        });
+    }
+    Ok((file_table.clone(), present))
+}
+
+/// Swap freshly decoded columns into an already materialized table. The two
+/// tables' chunkings must agree exactly (both come from the same slicing of
+/// the same file, so they do); a mismatch is an internal error, never a
+/// silently misaligned column.
+fn merge_projected(
+    existing: &DataTable,
+    fresh: &DataTable,
+    columns: &[usize],
+    tablename: &str,
+) -> Result<DataTable> {
+    let rows: Vec<usize> = existing.columns[0].chunks.iter().map(|c| c.len()).collect();
+    let mut merged = existing.columns.clone();
+    for &i in columns {
+        let lens: Vec<usize> = fresh.columns[i].chunks.iter().map(|c| c.len()).collect();
+        if lens != rows {
+            return Err(LakeError::Internal {
+                message: format!(
+                    "projected decode of \"{tablename}\" column {i} produced a different \
+                     chunking ({} vs {} chunks)",
+                    lens.len(),
+                    rows.len()
+                ),
+            });
+        }
+        merged[i] = fresh.columns[i].clone();
+    }
+    Ok(DataTable::from_columns(
+        existing.name.clone(),
+        merged,
+        existing.num_rows,
+    ))
 }
 
 /// Footer-only open of one manifest's tables (see the module docs). `version`
@@ -231,6 +426,7 @@ pub(crate) fn build(
         tables,
         cache: Mutex::new(HashMap::new()),
         loads: AtomicU64::new(0),
+        columns_decoded: AtomicU64::new(0),
     });
     let report = AttachmentReport {
         version: manifest.version,
@@ -443,6 +639,273 @@ mod tests {
 
     fn compare(a: &Value, b: &Value) -> std::cmp::Ordering {
         pinkdb::plan::compare_values(a, b)
+    }
+
+    /// A multi-block, all-types table for the projection tests: 20,000 rows
+    /// (ten engine chunks over several stored blocks, so decodes exercise
+    /// ragged block tails and multi-block merges), NULLs, NaN payloads,
+    /// `-0.0`, extremes and long strings.
+    fn projection_store() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (i INTEGER, g BIGINT, d DOUBLE, v VARCHAR, b BOOLEAN);")
+            .unwrap();
+        {
+            let t = db.table_mut("t").unwrap();
+            let mut state = 0x9E37_79B9_7F4A_7C15u64;
+            let mut next = move || {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                state
+            };
+            for row in 0..20_000i64 {
+                let r = next();
+                let d = if row % 599 == 0 {
+                    Value::Double(f64::from_bits(0x7ff8_0000_cafe_0001))
+                } else if row == 3 {
+                    Value::Double(-0.0)
+                } else {
+                    Value::Double((r % 4000) as f64 / 8.0 - 250.0)
+                };
+                t.append_row(vec![
+                    if r % 23 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Integer((r % 500) as i32 - 250)
+                    },
+                    Value::Bigint((r as i64).wrapping_sub(i64::MAX / 2)),
+                    d,
+                    if r % 31 == 0 {
+                        Value::Varchar("z".repeat((r % 500) as usize))
+                    } else {
+                        Value::Varchar(format!("k{}-{}", r % 100, row % 7))
+                    },
+                    Value::Boolean(r % 2 == 0),
+                ])
+                .unwrap();
+            }
+        }
+        db
+    }
+
+    /// Row-for-row equality with doubles compared bit-exactly.
+    fn assert_same_rows(a: &[Vec<Value>], b: &[Vec<Value>], what: &str) {
+        assert_eq!(a.len(), b.len(), "{what}: row count");
+        for (ra, rb) in a.iter().zip(b) {
+            assert_eq!(ra.len(), rb.len(), "{what}: column count");
+            for (va, vb) in ra.iter().zip(rb) {
+                match (va, vb) {
+                    (Value::Double(x), Value::Double(y)) => {
+                        assert_eq!(x.to_bits(), y.to_bits(), "{what}: {va:?} vs {vb:?}")
+                    }
+                    _ => assert_eq!(va, vb, "{what}"),
+                }
+            }
+        }
+    }
+
+    /// A projected read decodes exactly the requested columns, is
+    /// value-identical (doubles by bit pattern) to the full decode for those
+    /// columns, keeps the full decode's chunking in every column, and shares
+    /// already-decoded columns across later projections.
+    #[test]
+    fn projected_reads_equal_full_reads_and_decode_only_requested_columns() {
+        let dir = scratch("projection_values");
+        let lake_dir = dir.join("lake");
+        crate::save_store(&projection_store(), &lake_dir).unwrap();
+        let lake = Lake::open(&lake_dir).unwrap();
+        let (attachment, _) = build(&lake, None).unwrap();
+
+        // Ground truth: the full decode (what `.lake open` materializes).
+        let full = attachment.load("main", "t").unwrap();
+        assert_eq!(full.num_rows(), 20_000);
+        assert!(full.num_chunks() > 1, "the fixture must be multi-chunk");
+
+        // A sparse projection after the full load: nothing new to decode.
+        let projected = attachment
+            .load_projected("main", "t", Some(&[0, 3]))
+            .unwrap();
+        assert_eq!(attachment.loads(), 1, "the full load already decoded");
+        assert_eq!(attachment.columns_decoded(), 5);
+        assert_eq!(projected.present, vec![true; 5]);
+        assert_eq!(projected.table.schema(), full.schema());
+        assert_eq!(projected.table.num_rows(), full.num_rows());
+
+        // A fresh attachment, so the first decode is the projection itself:
+        // exactly columns 1 and 4, with every other column a NULL
+        // placeholder of the same chunk lengths.
+        let (solo, _) = build(&lake, None).unwrap();
+        let sparse = solo.load_projected("main", "t", Some(&[1, 4])).unwrap();
+        assert_eq!(sparse.present, vec![false, true, false, false, true]);
+        assert_eq!(solo.loads(), 1);
+        assert_eq!(solo.columns_decoded(), 2, "only columns 1 and 4 decoded");
+        assert_eq!(sparse.table.num_rows(), full.num_rows());
+        assert_eq!(sparse.table.num_chunks(), full.num_chunks());
+        for j in 0..full.num_chunks() {
+            for i in 0..full.num_cols() {
+                assert_eq!(
+                    sparse.table.columns[i].chunks[j].len(),
+                    full.columns[i].chunks[j].len(),
+                    "chunk {j} column {i} length"
+                );
+            }
+        }
+        for (i, decoded) in [
+            (0usize, false),
+            (1, true),
+            (2, false),
+            (3, false),
+            (4, true),
+        ] {
+            for row in 0..full.num_rows() {
+                let (a, b) = (sparse.table.get(row, i).unwrap(), full.get(row, i).unwrap());
+                if decoded {
+                    match (&a, &b) {
+                        (Value::Double(x), Value::Double(y)) => assert_eq!(
+                            x.to_bits(),
+                            y.to_bits(),
+                            "column {i} row {row}: {a:?} vs {b:?}"
+                        ),
+                        _ => assert_eq!(a, b, "column {i} row {row}"),
+                    }
+                } else {
+                    assert!(a.is_null(), "an undecoded column is a NULL placeholder");
+                }
+            }
+        }
+
+        // Extending decodes only the missing columns and keeps the decoded
+        // ones shared (no re-decode, no copy).
+        let extended = solo
+            .load_projected("main", "t", Some(&[0, 1, 2, 3, 4]))
+            .unwrap();
+        assert_eq!(solo.loads(), 2);
+        assert_eq!(solo.columns_decoded(), 5);
+        assert_eq!(extended.present, vec![true; 5]);
+        for i in [1usize, 4] {
+            for j in 0..full.num_chunks() {
+                assert!(
+                    Arc::ptr_eq(
+                        &sparse.table.columns[i].chunks[j],
+                        &extended.table.columns[i].chunks[j]
+                    ),
+                    "column {i} chunk {j} must be shared across projections"
+                );
+            }
+        }
+        // Every value now equals the full decode bit for bit.
+        for i in 0..full.num_cols() {
+            for row in 0..full.num_rows() {
+                let (a, b) = (
+                    extended.table.get(row, i).unwrap(),
+                    full.get(row, i).unwrap(),
+                );
+                match (&a, &b) {
+                    (Value::Double(x), Value::Double(y)) => {
+                        assert_eq!(x.to_bits(), y.to_bits(), "column {i} row {row}")
+                    }
+                    _ => assert_eq!(a, b, "column {i} row {row}"),
+                }
+            }
+        }
+
+        // An empty projection decodes column 0 only (the chunk shape has to
+        // come from somewhere) and never panics.
+        let (empty, _) = build(&lake, None).unwrap();
+        let none = empty.load_projected("main", "t", Some(&[])).unwrap();
+        assert_eq!(none.present, vec![true, false, false, false, false]);
+        assert_eq!(empty.columns_decoded(), 1);
+        assert_eq!(none.table.num_rows(), 20_000);
+        assert_eq!(none.table.num_chunks(), full.num_chunks());
+
+        // An out-of-range projection is unprovable: every column decodes.
+        let (oob, _) = build(&lake, None).unwrap();
+        let all = oob.load_projected("main", "t", Some(&[9])).unwrap();
+        assert_eq!(all.present, vec![true; 5]);
+        assert_eq!(oob.columns_decoded(), 5);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The engine's attached scan path drives `load_projected`: each query
+    /// decodes its referenced columns only, extensions are incremental, the
+    /// fast paths decode nothing at all, and every answer equals the
+    /// in-memory execution over the same rows.
+    #[test]
+    fn queries_decode_only_their_referenced_columns() {
+        let dir = scratch("projection_queries");
+        let lake_dir = dir.join("lake");
+        crate::save_store(&projection_store(), &lake_dir).unwrap();
+        let lake = Lake::open(&lake_dir).unwrap();
+        let (attachment, _) = build(&lake, None).unwrap();
+        let mut store = PinkDb::new();
+        store
+            .attach_lake(Arc::clone(&attachment) as Arc<dyn AttachedLake>)
+            .unwrap();
+        // The same rows in an ordinary store: the ground-truth answers.
+        let mut plain = projection_store();
+
+        let mut check = |store: &mut PinkDb, sql: &str, decoded_after: u64| {
+            let (attached, plain) = (query(store, sql), query(&mut plain, sql));
+            assert_eq!(
+                attachment.columns_decoded(),
+                decoded_after,
+                "{sql}: columns decoded"
+            );
+            assert_same_rows(&attached, &plain, sql);
+        };
+
+        // Fast paths: statistics only, zero columns decoded.
+        check(&mut store, "SELECT COUNT(*) FROM t;", 0);
+        check(&mut store, "SELECT MIN(i), MAX(i), COUNT(v) FROM t;", 0);
+        check(
+            &mut store,
+            "SELECT MIN(b), MAX(b), MIN(g), MAX(g) FROM t;",
+            0,
+        );
+        // `d` holds NaN payloads: its MIN/MAX cannot come from statistics,
+        // so the whole query materializes — only `d`'s column.
+        check(&mut store, "SELECT MIN(d), MAX(d) FROM t;", 1);
+        // Each fallback decodes exactly the referenced column; repeats of an
+        // already-decoded column decode nothing.
+        check(&mut store, "SELECT SUM(i) FROM t;", 2);
+        check(&mut store, "SELECT AVG(i) FROM t;", 2);
+        // A filter decodes the predicate's column (already decoded here).
+        check(&mut store, "SELECT COUNT(*) FROM t WHERE i > 0;", 2);
+        // Order-by + limit: the sort key and the projected column.
+        check(&mut store, "SELECT g FROM t ORDER BY g DESC LIMIT 3;", 3);
+        check(&mut store, "SELECT v FROM t ORDER BY v LIMIT 5;", 4);
+        // GROUP BY aggregate: the key.
+        check(
+            &mut store,
+            "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b;",
+            5,
+        );
+        check(&mut store, "SELECT SUM(i), MIN(g), COUNT(v) FROM t;", 5);
+        // A window over projected columns.
+        check(
+            &mut store,
+            "SELECT i, ROW_NUMBER() OVER (PARTITION BY b ORDER BY i) FROM t LIMIT 5;",
+            5,
+        );
+        // `SELECT *` and expressions over several columns: every column is
+        // already in, so nothing decodes.
+        check(&mut store, "SELECT * FROM t ORDER BY i LIMIT 2;", 5);
+        check(&mut store, "SELECT i + g + d FROM t LIMIT 2;", 5);
+        // The counter only ever grows; the decode count stops growing once
+        // every column is materialized.
+        assert_eq!(
+            attachment.loads(),
+            5,
+            "one decode per newly referenced column set"
+        );
+        let loads = attachment.loads();
+        check(&mut store, "SELECT SUM(i), SUM(d) FROM t;", 5);
+        assert_eq!(
+            attachment.loads(),
+            loads,
+            "no decode once every column is in"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A missing data file fails attach with a clean error.

@@ -586,6 +586,12 @@ impl Vector {
 }
 
 /// A horizontal slice of columns, all of equal length.
+///
+/// [`DataChunk::projected`] builds a chunk whose columns may be *absent*: a
+/// zero-length placeholder stands in for a column a projection pushdown did
+/// not decode. Only projection-aware producers create such chunks; every
+/// reader goes through [`DataChunk::expect_column`], which rejects a
+/// placeholder instead of returning NULLs.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DataChunk {
     /// Reference-counted columns: scans and pass-throughs share storage
@@ -620,6 +626,52 @@ impl DataChunk {
         Some(Self { columns, num_rows })
     }
 
+    /// Build a chunk that may carry *absent* columns: a zero-length
+    /// placeholder (`len() == 0`) for a column a projection pushdown did not
+    /// decode; `num_rows` is authoritative here. The projection-aware shapes
+    /// only (`Filter`/`Sort`/`Limit` rebuilds and an attached-lake scan)
+    /// create these; operators that read columns use
+    /// [`DataChunk::expect_column`].
+    pub(crate) fn projected(columns: Vec<Arc<Vector>>, num_rows: usize) -> Self {
+        debug_assert!(
+            columns.iter().all(|c| c.len() == num_rows || c.is_empty()),
+            "projected chunks hold present columns (num_rows long) and \
+             zero-length absent placeholders"
+        );
+        Self { columns, num_rows }
+    }
+
+    /// True when column `index` is present (exactly `num_rows` values
+    /// long). An absent placeholder column is zero-length.
+    #[inline]
+    pub(crate) fn is_present(&self, index: usize) -> bool {
+        self.columns
+            .get(index)
+            .is_some_and(|c| c.len() == self.num_rows)
+    }
+
+    /// The column at `index`, for readers that must never silently see an
+    /// absent projection placeholder. Reading a placeholder is an internal
+    /// error (the referenced-columns analysis said nothing reads it), never
+    /// a NULL value.
+    #[inline]
+    pub(crate) fn expect_column(&self, index: usize) -> Result<&Arc<Vector>> {
+        let Some(col) = self.columns.get(index) else {
+            return Err(PinkDbError::Execution(format!(
+                "column {index} out of range (chunk has {} columns)",
+                self.columns.len()
+            )));
+        };
+        if col.len() == self.num_rows {
+            Ok(col)
+        } else {
+            Err(PinkDbError::Execution(format!(
+                "internal error: attached-lake projection missed a reference \
+                 to column {index}"
+            )))
+        }
+    }
+
     pub fn empty() -> Self {
         Self {
             columns: Vec::new(),
@@ -639,12 +691,22 @@ impl DataChunk {
         &self.columns[idx]
     }
 
-    /// Apply a selection vector to every column.
+    /// Apply a selection vector to every column. Absent placeholder columns
+    /// are carried through unchanged (shared, still zero-length): nothing
+    /// reads them, and gathering them would materialize NULLs for rows the
+    /// query never reads.
     pub fn gather(&self, selection: &[usize]) -> DataChunk {
         let columns = self
             .columns
             .iter()
-            .map(|c| Arc::new(c.gather(selection)))
+            .enumerate()
+            .map(|(i, c)| {
+                if self.is_present(i) {
+                    Arc::new(c.gather(selection))
+                } else {
+                    Arc::clone(c)
+                }
+            })
             .collect();
         DataChunk {
             columns,
@@ -757,6 +819,52 @@ mod tests {
         a.push_valid(Value::Integer(1)).unwrap();
         let b = Vector::new_empty(DataType::Integer);
         assert!(DataChunk::new(vec![a, b]).is_err());
+    }
+
+    /// A projected chunk's absent columns (zero-length placeholders) are
+    /// rejected by every column reader — never read as NULLs — and carried
+    /// through gathers without materializing.
+    #[test]
+    fn absent_columns_are_rejected_by_readers() {
+        let mut present = Vector::new_empty(DataType::Integer);
+        present.push_valid(Value::Integer(7)).unwrap();
+        let absent = Vector::new_empty(DataType::Varchar);
+        let chunk = DataChunk::projected(vec![Arc::new(present), Arc::new(absent)], 1);
+        assert_eq!(chunk.num_rows(), 1);
+        assert!(chunk.is_present(0));
+        assert!(!chunk.is_present(1));
+        assert_eq!(chunk.expect_column(0).unwrap().get(0), Value::Integer(7));
+        let err = chunk.expect_column(1).unwrap_err().to_string();
+        assert!(err.contains("projection missed a reference"), "{err}");
+        assert!(chunk.expect_column(2).is_err(), "out of range");
+
+        // Gather shares the absent column through unchanged and gathers the
+        // present one.
+        let out = chunk.gather(&[0]);
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(out.expect_column(0).unwrap().get(0), Value::Integer(7));
+        assert_eq!(out.column(1).len(), 0, "still a zero-length placeholder");
+        assert!(out.expect_column(1).is_err());
+
+        // A normal (non-projected) chunk is all-present.
+        let normal = DataChunk::new(vec![
+            {
+                let mut v = Vector::new_empty(DataType::Integer);
+                v.push_valid(Value::Integer(3)).unwrap();
+                v
+            },
+            {
+                let mut v = Vector::new_empty(DataType::Varchar);
+                v.push_valid(Value::Varchar("x".to_string())).unwrap();
+                v
+            },
+        ])
+        .unwrap();
+        assert!(normal.is_present(0) && normal.is_present(1));
+        assert_eq!(
+            normal.expect_column(1).unwrap().get(0),
+            Value::Varchar("x".to_string())
+        );
     }
 
     #[test]

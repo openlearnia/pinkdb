@@ -87,13 +87,16 @@ pub(crate) struct Output {
 }
 
 /// Per-statement execution context: the database, visible CTE outputs
-/// (CTEs shadow catalog tables), and memoised subquery results keyed by
+/// (CTEs shadow catalog tables), memoised subquery results keyed by
 /// plan-node address (the tree is immutable during execution, so each
-/// uncorrelated subquery evaluates once even when probed per chunk).
+/// uncorrelated subquery evaluates once even when probed per chunk), and the
+/// per-statement scan projections (which columns each scan's consumers
+/// read — the attached-lake read path decodes only those).
 pub(crate) struct Cx<'a> {
     pub(crate) db: &'a PinkDb,
     pub(crate) ctes: HashMap<String, Output>,
     pub(crate) memo: std::sync::Arc<std::sync::Mutex<HashMap<usize, Memo>>>,
+    pub(crate) projections: std::sync::Arc<crate::plan::ScanProjections>,
 }
 
 #[derive(Clone)]
@@ -109,7 +112,16 @@ impl<'a> Cx<'a> {
             db,
             ctes: HashMap::new(),
             memo: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            // No projection bound: every attached-lake scan materializes in
+            // full (the pre-projection behavior).
+            projections: std::sync::Arc::new(crate::plan::ScanProjections::default()),
         }
+    }
+
+    /// Bind the statement's scan projections (analyzed once, up front).
+    pub(crate) fn with_projections(mut self, plan: &LogicalPlan) -> Self {
+        self.projections = std::sync::Arc::new(crate::plan::ScanProjections::of(plan));
+        self
     }
 }
 
@@ -331,7 +343,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             Ok(QueryResult::LoadedExtension { name })
         }
         _ => {
-            let cx = Cx::new(db);
+            let cx = Cx::new(db).with_projections(plan);
             run_read_with(&cx, plan)
         }
     }
@@ -344,7 +356,7 @@ pub fn run_read(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         crate::plan::is_read_only(plan),
         "run_read needs a query plan"
     );
-    let cx = Cx::new(db);
+    let cx = Cx::new(db).with_projections(plan);
     run_read_with(&cx, plan)
 }
 
@@ -357,6 +369,17 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     let out = eval(cx, plan)?;
     let mut rows = Vec::new();
     for chunk in &out.chunks {
+        // The final result must be fully materialized: a zero-length column
+        // would be an undecoded projection placeholder (a missed reference
+        // in the projection analysis), never a result value.
+        for (i, col) in chunk.columns.iter().enumerate() {
+            if col.len() != chunk.num_rows() {
+                return Err(PinkDbError::Execution(format!(
+                    "internal error: result column {i} was never decoded \
+                     (attached-lake projection missed a reference)"
+                )));
+            }
+        }
         for i in 0..chunk.num_rows() {
             rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
         }
@@ -527,14 +550,16 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 }
             }
             let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
-            // An attached lake table is not in the store: materialize it on
-            // first use (the exact decode `.lake open` performs) and scan the
-            // result like any other table for the rest of the session.
+            // An attached lake table is not in the store: materialize the
+            // columns this plan references (the exact decode `.lake open`
+            // performs, projected) and scan the result like any other table
+            // for the rest of the session. A projection the analysis could
+            // not bound leaves every column decoded.
             if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
-                let t = lake.load(lookup, table)?;
-                let (names, types) = t.schema().into_iter().unzip();
+                let scan = lake.load_projected(lookup, table, cx.projections.for_scan(plan))?;
+                let (names, types) = scan.table.schema().into_iter().unzip();
                 return Ok(Output {
-                    chunks: scan_chunks(&t),
+                    chunks: scan.chunks(),
                     names,
                     types,
                 });
@@ -741,6 +766,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 db: cx.db,
                 ctes,
                 memo: cx.memo.clone(),
+                projections: cx.projections.clone(),
             };
             eval(&child, body)
         }
@@ -759,14 +785,16 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 .map(|chunk| -> Result<DataChunk> {
                     // Pass-through column references (and aggregate/window
                     // output columns) share the input chunk's `Arc<Vector>`
-                    // instead of deep-copying the payload.
+                    // instead of deep-copying the payload. A pass-through of
+                    // an undecoded projection placeholder fails loudly
+                    // (`expect_column`), never as NULLs.
                     let cols: Vec<std::sync::Arc<Vector>> = exprs
                         .iter()
                         .map(|e| match e {
                             BoundExpr::Column { index, .. }
                             | BoundExpr::AggRef { index, .. }
                             | BoundExpr::WindowRef { index, .. } => {
-                                Ok(chunk.columns[*index].clone())
+                                Ok(std::sync::Arc::clone(chunk.expect_column(*index)?))
                             }
                             e => Ok(std::sync::Arc::new(eval_expr(e, chunk, cx)?)),
                         })
@@ -2191,7 +2219,9 @@ fn rebuild_sorted(chunks: &[DataChunk], rows: &[u32]) -> Result<Vec<DataChunk>> 
     });
     // Each output chunk gathers its CHUNK_SIZE slice of `rows` independently
     // (in parallel); the chunking is exactly the sequential fill's. A single
-    // output chunk (top-N, small results) skips the pool.
+    // output chunk (top-N, small results) skips the pool. Absent placeholder
+    // columns (a projected attached-lake scan) are carried through, never
+    // read.
     let gather = |part: &[u32]| -> Result<DataChunk> {
         let mut cur: Vec<Vector> = dtypes
             .iter()
@@ -2206,10 +2236,15 @@ fn rebuild_sorted(chunks: &[DataChunk], rows: &[u32]) -> Result<Vec<DataChunk>> 
             let src = &chunks[ci];
             let r = g - starts[ci];
             for (dst, col) in cur.iter_mut().zip(src.columns.iter()) {
-                dst.push_from(col, r)?;
+                if col.len() == src.num_rows() {
+                    dst.push_from(col, r)?;
+                }
             }
         }
-        DataChunk::new(cur)
+        Ok(DataChunk::projected(
+            cur.into_iter().map(std::sync::Arc::new).collect(),
+            part.len(),
+        ))
     };
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -2370,7 +2405,8 @@ fn sort_legacy(
         // Stability tiebreak: input order (par_sort is not stable).
         a.seq.cmp(&b.seq)
     });
-    // Rebuild columns in sorted order.
+    // Rebuild columns in sorted order. Absent placeholder columns (a
+    // projected attached-lake scan) are carried through, never read.
     let dtypes: Vec<DataType> = chunks[0].columns.iter().map(|c| c.dtype()).collect();
     let mut finished = Vec::new();
     let mut cur: Vec<Vector> = dtypes
@@ -2380,7 +2416,13 @@ fn sort_legacy(
     let mut cur_rows = 0;
     for r in rows {
         if cur_rows >= CHUNK_SIZE {
-            finished.push(DataChunk::new(std::mem::take(&mut cur))?);
+            finished.push(DataChunk::projected(
+                std::mem::take(&mut cur)
+                    .into_iter()
+                    .map(std::sync::Arc::new)
+                    .collect(),
+                cur_rows,
+            ));
             cur = dtypes
                 .iter()
                 .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
@@ -2389,12 +2431,17 @@ fn sort_legacy(
         }
         let src = &chunks[r.chunk];
         for (dst, col) in cur.iter_mut().zip(src.columns.iter()) {
-            dst.push_value(col.get(r.row))?;
+            if col.len() == src.num_rows() {
+                dst.push_value(col.get(r.row))?;
+            }
         }
         cur_rows += 1;
     }
     if cur_rows > 0 {
-        finished.push(DataChunk::new(cur)?);
+        finished.push(DataChunk::projected(
+            cur.into_iter().map(std::sync::Arc::new).collect(),
+            cur_rows,
+        ));
     }
     Ok(finished)
 }

@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::vector::{DataChunk, Vector};
 
 /// The exact statistics of one attached-table column, as far as the lake
 /// layer could prove them.
@@ -76,6 +77,66 @@ pub struct AttachedTable {
     pub stats: Vec<ColumnStats>,
 }
 
+/// One projected read of an attached table: a full-schema, chunk-aligned
+/// table in which `present[i]` columns hold decoded values and the rest hold
+/// NULL placeholders with the same chunk lengths (so row counts and chunk
+/// boundaries are those of a full decode).
+///
+/// The engine converts this to scan chunks in which absent columns are
+/// zero-length placeholders; every column reader goes through
+/// `DataChunk::expect_column`, so a column the projection analysis missed
+/// fails loudly instead of reading NULLs. A later query that references an
+/// absent column materializes exactly that column (the lake caches decoded
+/// columns per table), so nothing here is ever a durable wrong value.
+#[derive(Debug, Clone)]
+pub struct AttachedScan {
+    /// The table, full schema, chunk-aligned: decoded columns and NULL
+    /// placeholders share the table's chunk lengths.
+    pub table: Arc<DataTable>,
+    /// One flag per table column: true = decoded.
+    pub present: Vec<bool>,
+}
+
+impl AttachedScan {
+    /// A scan where every column is decoded (the pre-projection behavior).
+    pub fn complete(table: Arc<DataTable>) -> Self {
+        let present = vec![true; table.num_cols()];
+        Self { table, present }
+    }
+
+    /// The scan as engine chunks, in table order: present columns as stored,
+    /// absent columns as a shared zero-length placeholder of their dtype.
+    pub fn chunks(&self) -> Vec<DataChunk> {
+        let num_cols = self.table.columns.len();
+        let rows: Vec<usize> = self
+            .table
+            .columns
+            .first()
+            .map(|c| c.chunks.iter().map(|c| c.len()).collect())
+            .unwrap_or_default();
+        // One shared placeholder per absent column; nothing reads it.
+        let absent: Vec<Option<Arc<Vector>>> = (0..num_cols)
+            .map(|i| {
+                let dtype = self.table.columns[i].dtype;
+                (!self.present.get(i).copied().unwrap_or(false))
+                    .then(|| Arc::new(Vector::new_empty(dtype)))
+            })
+            .collect();
+        rows.into_iter()
+            .enumerate()
+            .map(|(j, n)| {
+                let cols: Vec<Arc<Vector>> = (0..num_cols)
+                    .map(|i| match &absent[i] {
+                        Some(placeholder) => Arc::clone(placeholder),
+                        None => self.table.columns[i].chunks[j].clone(),
+                    })
+                    .collect();
+                DataChunk::projected(cols, n)
+            })
+            .collect()
+    }
+}
+
 /// One attached lake, as the engine sees it. Implemented by `pink-lake`
 /// (the dependency direction stays engine ← lake).
 pub trait AttachedLake: fmt::Debug + Send + Sync {
@@ -90,6 +151,31 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
     /// cached by the implementation (a second call is cheap and returns the
     /// same data). `db`/`table` are matched case-insensitively.
     fn load(&self, db: &str, table: &str) -> Result<Arc<DataTable>>;
+
+    /// Materialize only `columns` (table column indices; `None` = every
+    /// column) of one table, reusing everything already decoded and caching
+    /// the result per table — a later call naming other columns decodes just
+    /// those. `columns` need not be sorted or deduplicated; an out-of-range
+    /// index falls back to every column.
+    ///
+    /// The default implementation ignores the projection and materializes in
+    /// full (always correct; the engine reads every column).
+    fn load_projected(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+    ) -> Result<AttachedScan> {
+        let _ = columns;
+        Ok(AttachedScan::complete(self.load(db, table)?))
+    }
+
+    /// Data-file decode counters `(decodes, columns decoded)` for
+    /// diagnostics: `COUNT(*)`/`MIN`/`MAX` fast paths leave both at zero,
+    /// and a projected materialization counts only the columns it decoded.
+    fn decode_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 impl PinkDb {
@@ -165,6 +251,18 @@ impl PinkDb {
         self.attached_lakes
             .iter()
             .flat_map(|l| l.tables().iter().cloned())
+            .collect()
+    }
+
+    /// Per attached lake, the location and its data-file decode counters
+    /// `(decodes, columns decoded)` so far (see [`AttachedLake::decode_stats`]).
+    pub fn attached_decode_stats(&self) -> Vec<(String, u64, u64)> {
+        self.attached_lakes
+            .iter()
+            .map(|l| {
+                let (loads, columns) = l.decode_stats();
+                (l.location().to_string(), loads, columns)
+            })
             .collect()
     }
 
@@ -453,6 +551,241 @@ mod tests {
                 vec![Value::Integer(2), Value::Null, Value::Double(-2.0)],
             ],
         ))
+    }
+
+    /// A fake attached lake that *records* every projection it is asked for
+    /// and materializes exactly those columns (like `pink-lake`): requested
+    /// columns hold values, the rest are NULL placeholders of the same chunk
+    /// lengths. The engine converts placeholders to absent columns and fails
+    /// loudly on a read of one, so a query the analysis under-provisioned
+    /// cannot pass silently; the recorded requests prove what it asked for.
+    #[derive(Debug)]
+    struct RecordingLake {
+        location: String,
+        tables: Vec<AttachedTable>,
+        rows: Vec<Vec<Value>>,
+        /// One entry per `load_projected` call: the analysis's bound (`None`
+        /// = unbounded, every column).
+        requests: Mutex<Vec<Option<Vec<usize>>>>,
+    }
+
+    impl RecordingLake {
+        fn new(location: &str, schema: Vec<(String, DataType)>, rows: Vec<Vec<Value>>) -> Self {
+            let stats = stats_for(&schema, &rows);
+            Self {
+                location: location.to_string(),
+                tables: vec![AttachedTable {
+                    db: "main".to_string(),
+                    table: "t".to_string(),
+                    rows: rows.len() as u64,
+                    schema,
+                    stats,
+                }],
+                rows,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<Option<Vec<usize>>> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl AttachedLake for RecordingLake {
+        fn location(&self) -> &str {
+            &self.location
+        }
+        fn tables(&self) -> &[AttachedTable] {
+            &self.tables
+        }
+        fn load(&self, db: &str, table: &str) -> Result<Arc<DataTable>> {
+            self.load_projected(db, table, None).map(|scan| scan.table)
+        }
+        fn load_projected(
+            &self,
+            db: &str,
+            table: &str,
+            columns: Option<&[usize]>,
+        ) -> Result<AttachedScan> {
+            let t = self
+                .tables
+                .iter()
+                .find(|t| t.db.eq_ignore_ascii_case(db) && t.table.eq_ignore_ascii_case(table))
+                .ok_or_else(|| PinkDbError::Catalog(format!("no table {db}.{table}")))?;
+            self.requests
+                .lock()
+                .unwrap()
+                .push(columns.map(|c| c.to_vec()));
+            // The full table (this fake's "decode").
+            let mut full = DataTable::new(t.table.clone(), t.schema.clone())?;
+            for row in &self.rows {
+                full.append_row(row.clone())?;
+            }
+            let present = match columns {
+                Some(cols) if cols.iter().all(|&i| i < full.num_cols()) => {
+                    let mut p = vec![false; full.num_cols()];
+                    for &i in cols {
+                        p[i] = true;
+                    }
+                    // An empty projection still decodes column 0 (the shape).
+                    if p.iter().all(|&b| !b) {
+                        p[0] = true;
+                    }
+                    p
+                }
+                _ => vec![true; full.num_cols()],
+            };
+            // NULL placeholders for the columns not asked for, exactly like
+            // `pink-lake`'s projected decode.
+            let mut out = Vec::with_capacity(full.num_cols());
+            for (i, col) in full.columns.iter().enumerate() {
+                if present[i] {
+                    out.push(col.clone());
+                } else {
+                    let chunks = col
+                        .chunks
+                        .iter()
+                        .map(|c| {
+                            let mut v = Vector::new_empty(col.dtype);
+                            for _ in 0..c.len() {
+                                v.push_null().expect("push_null");
+                            }
+                            Arc::new(v)
+                        })
+                        .collect();
+                    out.push(crate::storage::Column {
+                        name: col.name.clone(),
+                        dtype: col.dtype,
+                        chunks,
+                    });
+                }
+            }
+            let table = DataTable::from_columns(full.name.clone(), out, full.num_rows);
+            Ok(AttachedScan {
+                table: Arc::new(table),
+                present,
+            })
+        }
+    }
+
+    /// A 5-column, 12-row corpus for the projection-analysis tests (every
+    /// column type, NULLs included).
+    fn analysis_corpus() -> (Vec<(String, DataType)>, Vec<Vec<Value>>) {
+        let schema = vec![
+            ("i".to_string(), DataType::Integer),
+            ("g".to_string(), DataType::Bigint),
+            ("d".to_string(), DataType::Double),
+            ("s".to_string(), DataType::Varchar),
+            ("b".to_string(), DataType::Boolean),
+        ];
+        let rows = (0..12i64)
+            .map(|r| {
+                vec![
+                    if r % 5 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Integer(r as i32 - 6)
+                    },
+                    Value::Bigint(r * 1000 - 500),
+                    Value::Double(r as f64 * 1.25 - 3.0),
+                    if r % 4 == 0 {
+                        Value::Null
+                    } else {
+                        Value::Varchar(format!("v{}", r % 3))
+                    },
+                    Value::Boolean(r % 2 == 0),
+                ]
+            })
+            .collect();
+        (schema, rows)
+    }
+
+    /// The referenced-columns analysis, query by query: exactly the columns
+    /// the executor reads, `[]` when the scan only provides row shape,
+    /// `None` for the unbounded shapes (joins), and no entry at all for the
+    /// statistics fast paths. Every query also runs against the same rows in
+    /// a plain store and must produce identical answers.
+    #[test]
+    fn scan_analysis_requests_exactly_the_referenced_columns() {
+        // (SQL, one request per attached-lake load; `None` = every column).
+        let cases: Vec<(&str, Vec<Option<Vec<usize>>>)> = vec![
+            // Statistics fast paths: no data-file access at all.
+            ("SELECT COUNT(*) FROM t;", vec![]),
+            ("SELECT MIN(i), MAX(i), MAX(g) FROM t;", vec![]),
+            ("SELECT COUNT(s), COUNT(*) FROM t;", vec![]),
+            // One referenced column.
+            ("SELECT SUM(d) FROM t;", vec![Some(vec![2])]),
+            ("SELECT COUNT(*) FROM t WHERE d > 0;", vec![Some(vec![2])]),
+            ("SELECT b, COUNT(*) FROM t GROUP BY b;", vec![Some(vec![4])]),
+            ("SELECT COUNT(*) FROM t GROUP BY i;", vec![Some(vec![0])]),
+            // Several: sort keys, projections, inner select lists.
+            ("SELECT i FROM t ORDER BY s;", vec![Some(vec![0, 3])]),
+            (
+                "SELECT COUNT(*) FROM (SELECT d FROM t) x;",
+                vec![Some(vec![2])],
+            ),
+            (
+                "SELECT MAX(i) FROM (SELECT i, s FROM t) x;",
+                vec![Some(vec![0, 3])],
+            ),
+            (
+                "SELECT i, ROW_NUMBER() OVER (PARTITION BY b ORDER BY g) FROM t;",
+                vec![Some(vec![0, 1, 4])],
+            ),
+            (
+                "WITH x AS (SELECT i, s FROM t) SELECT MAX(i) FROM x;",
+                vec![Some(vec![0, 3])],
+            ),
+            ("SELECT DISTINCT i, s FROM t;", vec![Some(vec![0, 3])]),
+            // Nothing referenced: the scan still provides the row shape.
+            ("SELECT 1 FROM t LIMIT 1;", vec![Some(vec![])]),
+            // Subqueries analyze their own plans; the outer scan is bounded
+            // separately.
+            (
+                "SELECT (SELECT SUM(d) FROM t) AS m FROM t;",
+                vec![Some(vec![2]), Some(vec![])],
+            ),
+            (
+                "SELECT (SELECT SUM(i) FROM t) AS a, (SELECT AVG(d) FROM t) AS b;",
+                vec![Some(vec![0]), Some(vec![2])],
+            ),
+            // Unbounded shapes: a join assembles every column of both sides.
+            (
+                "SELECT COUNT(*) FROM t AS a JOIN t AS b ON a.i = b.i;",
+                vec![None, None],
+            ),
+            ("SELECT * FROM t;", vec![Some(vec![0, 1, 2, 3, 4])]),
+        ];
+
+        for (sql, expected) in cases {
+            let (schema, rows) = analysis_corpus();
+            let fake = Arc::new(RecordingLake::new(
+                "/tmp/lake-analysis",
+                schema.clone(),
+                rows.clone(),
+            ));
+            let mut attached = PinkDb::new();
+            attached.attach_lake(fake.clone()).unwrap();
+            let mut plain = PinkDb::new();
+            let cols: Vec<String> = schema.iter().map(|(n, t)| format!("{n} {t}")).collect();
+            plain
+                .execute(&format!("CREATE TABLE t ({});", cols.join(", ")))
+                .unwrap();
+            for row in &rows {
+                plain
+                    .table_mut("t")
+                    .unwrap()
+                    .append_row(row.clone())
+                    .unwrap();
+            }
+
+            assert_rows_same(&query(&mut attached, sql), &query(&mut plain, sql), sql);
+            let mut got = fake.requests();
+            got.sort();
+            let mut want = expected;
+            want.sort();
+            assert_eq!(got, want, "{sql}");
+        }
     }
 
     #[test]

@@ -109,7 +109,7 @@ pub(crate) fn eval_agg_vec<'a>(
     cx: &Cx,
 ) -> Result<EvalVec<'a>> {
     match expr {
-        BoundExpr::Column { index, .. } => Ok(EvalVec::Col(chunk.column(*index))),
+        BoundExpr::Column { index, .. } => Ok(EvalVec::Col(&**chunk.expect_column(*index)?)),
         e => Ok(EvalVec::Owned(eval_expr(e, chunk, cx)?)),
     }
 }

@@ -26,9 +26,12 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
     let n = chunk.num_rows();
     match expr {
         BoundExpr::Literal(v) => const_vector(v.clone(), n),
-        BoundExpr::Column { index, .. } => Ok(chunk.column(*index).clone()),
-        BoundExpr::AggRef { index, .. } => Ok(chunk.column(*index).clone()),
-        BoundExpr::WindowRef { index, .. } => Ok(chunk.column(*index).clone()),
+        // Column reads go through the presence check: an attached-lake scan
+        // may not have decoded a column the projection analysis said nothing
+        // reads, and that must fail loudly, never read as NULLs.
+        BoundExpr::Column { index, .. } => Ok(chunk.expect_column(*index)?.as_ref().clone()),
+        BoundExpr::AggRef { index, .. } => Ok(chunk.expect_column(*index)?.as_ref().clone()),
+        BoundExpr::WindowRef { index, .. } => Ok(chunk.expect_column(*index)?.as_ref().clone()),
         BoundExpr::ScalarSubquery { query, .. } => eval_scalar_subquery(query, chunk, cx),
         BoundExpr::Cast { expr, dtype } => {
             let v = eval_expr(expr, chunk, cx)?;
