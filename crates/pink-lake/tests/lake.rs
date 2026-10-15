@@ -1269,24 +1269,19 @@ fn v1_fixture_lake_still_loads_bit_exactly() {
         "the loaded store re-saves byte-identically"
     );
 
-    // Every data file is byte-exact: load the mini store and re-save it.
+    // Every data file is value-exact: load the mini v2 store, re-save it as
+    // the current (v4) format, and compare the reloaded stores bit-exactly.
     for rel in catalog_data_files(&fixture) {
         let path = fixture.join(&rel);
         let mini = PinkDb::open(path.to_str().unwrap()).unwrap();
         let resaved = scratch.join("resaved.pink");
         mini.save(resaved.to_str().unwrap()).unwrap();
-        // The engine now writes `.pink` v3 = the v2 payload with the
-        // `PINKDB03` magic and a CRC-32 trailer; the payload must be
-        // byte-identical to the fixture's v2 bytes.
-        let resaved = std::fs::read(&resaved).unwrap();
         let original = std::fs::read(&path).unwrap();
         assert!(original.starts_with(b"PINKDB02"), "{rel}");
-        assert!(resaved.starts_with(b"PINKDB03"), "{rel}");
-        assert_eq!(
-            &resaved[8..resaved.len() - 4],
-            &original[8..],
-            "{rel} does not round-trip byte-exactly"
-        );
+        let resaved = std::fs::read(&resaved).unwrap();
+        assert!(resaved.starts_with(b"PINKDB04"), "{rel}");
+        let back = PinkDb::open(scratch.join("resaved.pink").to_str().unwrap()).unwrap();
+        assert_same_store(&mini, &back);
     }
     cleanup(&scratch);
 

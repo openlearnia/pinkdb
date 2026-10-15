@@ -1803,6 +1803,28 @@ mod tests {
         );
     }
 
+    /// T6: a checkpoint publishes the current format (v4) and a durable
+    /// reopen replays later WAL records on top of it.
+    #[test]
+    fn checkpoint_publishes_v4_and_replays_later_records() {
+        let ckpt = tmp_ckpt("v4_ckpt");
+        {
+            let db = crate::Database::open(ckpt.to_str().unwrap()).unwrap();
+            let mut c = db.connect();
+            c.execute("CREATE TABLE t (a INTEGER, v VARCHAR);").unwrap();
+            c.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two');")
+                .unwrap();
+            c.execute("checkpoint;").unwrap();
+            let bytes = std::fs::read(&ckpt).unwrap();
+            assert!(bytes.starts_with(b"PINKDB04"), "checkpoint publishes v4");
+            // A commit after the checkpoint: the WAL record must survive.
+            c.execute("INSERT INTO t VALUES (3, 'three');").unwrap();
+        }
+        let mut back = durable(&ckpt);
+        assert_eq!(ints(&mut back, "SELECT SUM(a) FROM t;"), vec![6]);
+        assert_eq!(ints(&mut back, "SELECT COUNT(*) FROM t;"), vec![3]);
+    }
+
     #[test]
     fn a_durable_database_has_one_live_handle() {
         let ckpt = tmp_ckpt("lock");
