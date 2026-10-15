@@ -93,14 +93,18 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Lake-scan plan (lake workstream, sub-waves 45b–45j): stage 1 shipped as 45d — footer-only
+Lake-scan plan (lake workstream, sub-waves 45b–45k): stage 1 shipped as 45d — footer-only
 `.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize; stage 2
 shipped as 45e — projection pushdown (an attached scan decodes only the columns a query
-references); stage 3 (filter/zone-map pruning) is the remaining follow-up. The lean
-`lake-lite` build shipped as 45i (2.69 MB vs 45.3 MB; `.pink` v4 data files, no attach fast
-paths) and `.pink` LZ frames (tag 8) shipped as 45j (text corpora 3–5× smaller). 45k —
-storage statistics inside `.pink` lakes, so the lean build gets attach fast paths under the
-same exactness gates — is in progress.
+references); stage 3 (per-chunk statistics + filter/zone-map pruning) is the remaining
+follow-up. The lean `lake-lite` build shipped as 45i (2.69 MB vs 45.3 MB; `.pink` v4 data
+files) and `.pink` LZ frames (tag 8) shipped as 45j (text corpora 3–5× smaller). 45k shipped
+exact attach fast paths for lean `.pink` lakes — a CRC-protected per-column statistics block
+published in the manifest on every lean save, so `COUNT`/`MIN`/`MAX` are answered with zero
+data-file reads under the same exactness gates as the Vortex attach. Known follow-ups (not
+committed): lean projection pushdown (`.pink` has no projected reader — a fallback decodes
+the whole table), per-chunk statistics + filter/zone pruning (stage 3), and the parked cold
+order-by/group-by items.
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -505,3 +509,28 @@ Java bindings.
   upgrade pinkdb`), malformed-frame tests. Gates: workspace 517/0, encryption 396/0, CLI
   61/35, pink-lake 126/0, duckdiff 60/60. Live: 5.88 MB JSON CSV → 699 KB `.pink` with an
   exact round trip.
+- 2026-10-15 — Wave 45k (bede9fc): exact attach fast paths for lean `.pink` lakes. Every lean
+  save now publishes a per-column **statistics block** in the manifest (`catalog.json` ==
+  `snapshots/<v>.json`, published atomically with the data-file reference): rows, exact NULL
+  counts, bit-exact min/max as canonical strings per type, and NaN counts, CRC-32-protected
+  over the block including its catalog key, data-file path and row count. `.lake attach`
+  verifies the CRC, cross-checks table/file/rows, the block version and every value's
+  decodability, and fails closed on corruption ("the statistics block failed its checksum
+  (corrupted or edited metadata) — use .lake open, or re-save the store to publish fresh
+  statistics"); attach reads NO data file. The engine collects the facts inside the existing
+  parallel chunk-encode pass (`PinkDb::to_pink_bytes_with_stats`; `.pink` bytes unchanged;
+  save cost +1 ms @1M / +17 ms @10M). One shared exactness gate for both formats
+  (`stats::serve_column_stats`; the Vortex footer path delegates) — the same gates as the
+  Vortex attach. `.lake attach` is now available in the lean `lake-lite` build
+  ("statistics-only"); a lake saved before 45k (no block) refuses with a clear re-save
+  message. Cold results: lean `.lake attach` + `COUNT`/`MIN`/`MAX` 2.64 ms @1M / 2.31 ms @10M
+  (overhead ~0.1–0.2 ms, constant in file size, 0 decodes) vs lean eager open 29.9 / 269.5 ms;
+  a full (Vortex) build attaches `.pink` lakes from the same block (3.44 / 3.45 ms), and full
+  Vortex attach is 4.07 / 4.13 ms. Also fixed a pre-existing `.pink` v4 correctness bug:
+  `pack_bits`/`unpack_bits` u64 accumulators silently dropped high bits for widths > 56
+  (64-bit BITPACK and wide DELTA_BITPACK decoded wrong, e.g. i64 extremes) — switched to u128
+  (bytes unchanged for previously-correct widths; regression test added). Known follow-ups
+  (not committed): lean projection pushdown (`.pink` has no projected reader — a fallback
+  decodes the whole table), per-chunk statistics + filter/zone pruning (stage 3), and the
+  parked cold order-by/group-by items. Gates: workspace 530/0, encryption 398/0, CLI
+  `lake,s3` 62/0 + `lake-lite` 38/0, pink-lake `s3,vortex-format` 132/0, duckdiff 60/60.

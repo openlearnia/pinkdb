@@ -181,7 +181,7 @@ Reproduce: `python3 bench/lake_bench.py --rows 1000000 --runs 5` (add
 Vortex scan/decode speed at 10M (the engine's in-memory scans lose to
 Parquet for filter/group-by/order-by there).
 
-## Lake workstream (sub-waves 45b–45j, Oct 2026)
+## Lake workstream (sub-waves 45b–45k, Oct 2026)
 
 Follow-on work on the lake path after wave 45, planned as the staged
 lake-scan design (design doc: wave C). Compact results:
@@ -195,17 +195,23 @@ lake-scan design (design doc: wave C). Compact results:
 | 45h (`76a787e`) | `.pink` format v4: typed encode/decode paths (no per-row `Value`; chunk-parallel order-preserving save; serial bytes == parallel bytes), DELTA_BITPACK/DICT_BITPACK/ALP encodings + all-valid validity flag; `PINKDB04` magic, CRC kept, v1–v3 readable (v2/v3 fixtures), `PINKDB05`+ clean "newer format" error; `PINKENC1` encryption container untouched; `unpack_bits` width-64 fix | 1M sales `.pink` 14,042,575 → 2,679,387 B (1.015× Vortex bytes), save 0.165 → 0.029 s, open 0.188 → 0.026 s; 10M 140,424,925 → 26,792,121 B (26.8 MB, 1.067× Vortex), save 1.682 → 0.286 s, open 1.897 → 0.256 s; no adversarial-corpus regressions (worst +4 B of flags on a 755 B file); high-entropy strings/floats >1.3× Vortex (no FSST/LZ yet; stretch). 566 workspace / 392 encryption / CLI lake+s3 60 / duckdiff 60/60 |
 | 45i (`0394795`) | lean lake build `lake-lite`: `vortex` + `rayon` optional in pink-lake behind `vortex-format`; CLI `lake` = full (enables it), new `lake-lite` = lean lake over `.pink` v4 data files (catalog `format_version` 1); `s3` now implies `lake-lite` (`lake,s3` for the full one); lean errors for v2/v3 lakes and `.lake attach` are explicit rebuild-with-`lake` messages; CI runs both feature sets | sizes (release): default 2,436,320 B; `lake-lite` 2,692,464 B (+250 KiB over default, −40.7 MiB vs full); `lake-lite,s3` 4,701,120 B; `lake` (full) 45,333,984 B (Vortex dep 42.6 MB). Lean vs full: no `.lake attach` fast paths yet (45k, in progress); eager open 0.023 s @1M / 0.238 s @10M printed vs 0.004 / 0.031 s; saves ≈ equal (0.054 / 0.321 s); data files 1.6–1.8% larger; in-session query results identical. Cross-build: lean-written fixture read bit-exactly by the full build (which migrates to v3 without touching the v1 files), v3 refused in a lean build with the feature error; live cross-build script 20/20. 513 workspace (default run = lean set) / CLI 61 `lake,s3` + 35 lean / pink-lake 18 lean / 72 `vortex-format` / 126 `s3,vortex-format` / duckdiff 60/60 |
 | 45j (`ff1ea61`) | `.pink` LZ frame (tag 8, reserved since v4): hand-rolled greedy LZ77 (64 KiB window, 4-byte hash, min match 4, max 130; no deps, no unsafe), frame `{ u32 raw_len \| u8 base_tag \| u32 token_len \| tokens }`, base tags 0..=6, emitted only when strictly smaller; decode caps raw_len ≤ 16 MiB and grows allocation with consumed tokens; candidate gating: only when the best existing candidate is ≥1024 B and a 4 KiB prefix probe saves ≥10% (sales VARCHAR chunks win with a ~300 B bitpacked dict and skip the scan) | measurement first — the v4 losses vs Vortex are compressible text, not random data (random f64 1.00×, random strings 1.07–1.10×; JSON-like 5.71×, logs 3.48×, URLs 3.15× behind). 1M rows, before → after (vs Vortex): JSON 70.4 → 15.7 MB (5.71× → 1.27×), logs 118.7 → 44.5 MB (3.48× → 1.30×), URLs 103.5 → 41.4 MB (3.15× → 1.26×); random corpora and both sales files byte-identical (sales save +0–1%); LZ also speeds save/open on text. FSST (tag 9) declined with the measured ceiling: post-LZ gaps 9.8% / 6.5%, FSST floor estimate 3.2% / 4.3% (the rest is offset encoding) — tag stays reserved with a design. Bit-exact round trips (forced tag-8 frames), determinism, old binaries reject tag-8 files cleanly, malformed-frame tests. 517 workspace / 396 encryption / CLI 61/35 / pink-lake 126 / duckdiff 60/60; live 5.88 MB JSON CSV → 699 KB `.pink` exact round trip |
+| 45k (`bede9fc`) | exact attach fast paths for lean `.pink` lakes: a per-column statistics block (rows, exact NULL counts, bit-exact min/max as canonical strings per type, NaN counts) published in the manifest on every lean save, CRC-32-protected over the block including catalog key/file/rows; attach verifies the CRC and cross-checks table/file/rows, block version and value decodability, fails closed on corruption ("the statistics block failed its checksum … use .lake open") and reads NO data file; the engine collects the facts inside the existing parallel chunk-encode pass (`PinkDb::to_pink_bytes_with_stats`; `.pink` bytes unchanged; save +1 ms @1M / +17 ms @10M); one shared exactness gate (`stats::serve_column_stats`; the Vortex footer path delegates); `.lake attach` now works in `lake-lite` ("statistics-only"), stats-less lakes refuse with a re-save message; also fixed the pre-existing `.pink` v4 `pack_bits`/`unpack_bits` bug (u64 accumulators silently dropped high bits for widths > 56 — 64-bit BITPACK / wide DELTA_BITPACK; u128 now, bytes unchanged for previously-correct widths, regression test) | lean cold attach+`COUNT`/`MIN`/`MAX` 2.64 ms @1M / 2.31 ms @10M (overhead ~0.1–0.2 ms, constant in file size, 0 decodes) vs lean eager open 29.9 / 269.5 ms; a full build attaches `.pink` lakes from the same block (3.44 / 3.45 ms); full Vortex attach 4.07 / 4.13 ms. Follow-ups (not committed): lean projection pushdown (`.pink` has no projected reader — a fallback decodes the whole table), per-chunk stats + filter/zone pruning (stage 3), parked cold order-by/group-by items. 530 workspace / 398 encryption / CLI `lake,s3` 62 + `lake-lite` 38 / pink-lake `s3,vortex-format` 132 / duckdiff 60/60 |
 
 **Lake scan (staged).** Stage 1 shipped as 45d — footer-only attach + exact
 stats fast paths + lazy materialize; stage 2 shipped as 45e — projection
 pushdown (an attached scan decodes only the columns a query references, into a
-per-column lazy cache). Stage 3 (filter/zone-map pruning) is next: a query the
-statistics cannot answer still pays a full decode of the columns it reads. The
-lean `lake-lite` build shipped as 45i (2.69 MB vs 45.3 MB; `.pink` v4 data
-files, no attach fast paths — those stay Vortex-only), and `.pink` LZ frames
-shipped as 45j (text corpora 3–5× smaller). 45k — storage statistics inside
-`.pink` lakes, so the lean build gets attach fast paths under the same
-exactness gates — is in progress.
+per-column lazy cache). Stage 3 (per-chunk statistics + filter/zone-map
+pruning) is next: a query the statistics cannot answer still pays a full
+decode of the columns it reads. The lean `lake-lite` build shipped as 45i
+(2.69 MB vs 45.3 MB; `.pink` v4 data files) and `.pink` LZ frames shipped as
+45j (text corpora 3–5× smaller). 45k shipped exact attach fast paths for lean
+`.pink` lakes — a CRC-protected per-column statistics block published in the
+manifest on every lean save, so `COUNT`/`MIN`/`MAX` are answered with zero
+data-file reads under the same exactness gate as the Vortex path — which is
+what makes `.lake attach` work in `lake-lite` too. Remaining follow-ups (not
+committed): lean projection pushdown (`.pink` has no projected reader — a
+fallback decodes the whole table), per-chunk statistics + filter/zone pruning
+(stage 3), and the parked cold order-by/group-by items.
 
 ## Real-S3 integration harness (Oct 2026, wave 36 follow-up)
 

@@ -385,7 +385,9 @@ the equivalent Vortex bytes), saved in 0.03 s, reopened in 0.03 s; the same
 table at 10M rows is 26.8 MB, saved in 0.29 s and reopened in 0.26 s. 1M-row
 text corpora (before → after the LZ frame): JSON-like 70.4 → 15.7 MB, logs
 118.7 → 44.5 MB, URLs 103.5 → 41.4 MB — now 1.26–1.30× Vortex (was
-3.15–5.71×).
+3.15–5.71×). The same parallel encode pass also collects the exact facts a
+lake save publishes (row count, per-column NULL/NaN counts, bit-exact
+min/max — wave 45k); the `.pink` bytes are unchanged by it.
 
 ## Concurrency
 
@@ -421,8 +423,10 @@ format**; wave 36 adds S3/R2 object storage; wave 45d adds read-only
 stored statistics and lazy materialization — and wave 45e adds **projection
 pushdown** (an attached scan decodes only the columns a query references).
 Wave 45i adds the lean **`lake-lite`** build: the same lake over `.pink` v4
-data files with no Vortex dependency (see "Lean lake (feature `lake-lite`)"
-below).
+data files with no Vortex dependency, and wave 45k brings attach to it — a
+lean save publishes a CRC-protected per-column statistics block in the
+manifest (`statistics-only` attach), so exact `COUNT`/`MIN`/`MAX` read no data
+file in either build (see "Lean lake (feature `lake-lite`)" below).
 
 A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
 key prefix with exactly this layout):
@@ -453,7 +457,7 @@ The manifests (`catalog.json` and every snapshot) share one shape:
 
 | catalog `format_version` | data file | written by | read by this build |
 |---|---|---|---|
-| 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`) |
+| 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes; a lean (`lake-lite`) save also publishes a CRC-protected per-column statistics block in the entry (wave 45k) | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`); `.lake attach` reads the statistics block, opening no data file |
 | 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry; one row block per 2,048-row engine chunk | waves 35–40 | yes |
 | 3 | as 2, but row blocks of 8,192 rows / ~1 MiB (fewer blocks → less per-block stats/compression work on save) | this build (default) | yes |
 
@@ -547,7 +551,13 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
 - **Read-only attach (wave 45d): `.lake attach <dir|s3> [version]`** reads the
   catalog, the chosen manifest and every data file's footer, metadata and
   statistics — no column data is decoded (over object storage the whole objects
-  are read, still without decoding). Attached tables are session-local and
+  are read, still without decoding). A v1 `.pink` lake attaches from the
+  manifest's **statistics block** instead (wave 45k; the lean save publishes
+  it): not even the data file is opened, and a block that fails its CRC-32
+  checksum, disagrees with the entry (table/file/rows), declares an unreadable
+  version or carries an undecodable value refuses with a clear "use .lake
+  open" / re-save message, never a guess; a lake saved before 45k (no block)
+  refuses the same way. Attached tables are session-local and
   read-only: they resolve under their `db.table` names, `.tables`/`.schema` mark
   them (`t (3 rows, attached)`), and every mutation over one is refused
   (`attached lake tables are read-only`). Exact `COUNT(*)`/`COUNT(col)`/`MIN`/
@@ -625,7 +635,7 @@ Vortex lake over S3/R2):
 | Build | CLI features | Lake | Data files | Release size |
 |---|---|---|---|---|
 | default | — | no `.lake` commands | — | 2,436,320 B |
-| lean lake | `lake-lite` | `.lake save/open/versions/tables/info`; no `.lake attach` (45k, in progress) | `.pink` v4 (catalog `format_version` 1) | 2,692,464 B (+250 KiB over default, −40.7 MiB vs full) |
+| lean lake | `lake-lite` | all `.lake` commands incl. read-only `.lake attach` (statistics-only: exact `COUNT`/`MIN`/`MAX` from the manifest's stats block, 0 data-file reads; anything else lazily decodes) | `.pink` v4 (catalog `format_version` 1) | 2,692,464 B (+250 KiB over default, −40.7 MiB vs full) |
 | lean lake + S3 | `lake-lite,s3` (plain `s3` implies it) | as above, `s3://bucket/prefix` locations | `.pink` v4 | 4,701,120 B |
 | full lake | `lake` | all `.lake` commands incl. read-only `.lake attach` (footer-only statistics fast paths) | Vortex (v2/v3 lakes) | 45,333,984 B |
 | full lake + S3 | `lake,s3` | as above, `s3://` locations | Vortex (v2/v3 lakes) | ≈47.3 MB (full + the same ≈2 MB S3 client) |
@@ -641,7 +651,8 @@ cargo build -p pinkdb-cli --features s3          # lean lake + S3/R2 (= lake-lit
 .lake save <dir>          snapshot the store (version, tables, rows, bytes)
 .lake open <dir> [ver]    replace the in-memory store with the lake
                           (session database resets to main; PINKDB_KEY is kept)
-.lake attach <dir> [ver]  attach the lake read-only, footer-only (session-local)
+.lake attach <dir> [ver]  attach the lake read-only, from its statistics only
+                          (session-local)
 .lake detach <dir>        detach one attached lake from this session
 .lake attached            list this session's attached lakes and their tables
 .lake versions <dir>      published versions (current marked)
@@ -650,10 +661,10 @@ cargo build -p pinkdb-cli --features s3          # lean lake + S3/R2 (= lake-lit
 ```
 
 With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see
-the next subsection. In a lean `lake-lite` build, `.lake attach` is not
-compiled in (its statistics are Vortex-only) and v2/v3 Vortex lakes are
-refused; both errors name the rebuild-with-`lake` command. See "Lean lake"
-below.
+the next subsection. In a lean `lake-lite` build, `.lake attach` works
+statistics-only, from the stats block a lean save publishes (a lake saved
+before 45k refuses with a re-save message); v2/v3 Vortex lakes are refused
+with the rebuild-with-`lake` error. See "Lean lake" below.
 
 `.lake tables`/`.lake info` also warn about tables whose referenced data file
 is missing, instead of advertising data a load cannot read. Without the
@@ -676,19 +687,28 @@ The same lake layer without the Vortex dependency: a `lake-lite` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
 single-table persistence bytes) and publishes `format_version` 1 catalogs —
 no `vortex` crate and none of its ~218 transitive crates, a 2.69 MB binary
-instead of 45.3 MB. It enables `.lake save/open/versions/tables/info` and
-S3/R2 (`s3` implies `lake-lite`), with the same layout, atomic publish order
-and conflict semantics. `.lake attach` is not compiled in (its statistics are
-Vortex-only), and a v2/v3 Vortex lake is refused with a clear
+instead of 45.3 MB. It enables every `.lake` command (save/open/attach/
+versions/tables/info) and S3/R2 (`s3` implies `lake-lite`), with the same
+layout, atomic publish order and conflict semantics. `.lake attach` is
+**statistics-only**: each lean save publishes a CRC-32-protected per-column
+statistics block in the manifest (rows, exact NULL counts, bit-exact min/max
+as canonical strings per type, NaN counts), collected inside the same parallel
+chunk-encode pass as the data file — save cost +1 ms @1M / +17 ms @10M, the
+`.pink` bytes unchanged — so attach answers exact `COUNT`/`COUNT(col)`/`MIN`/
+`MAX` with zero data-file reads, and a full Vortex build attaches `.pink` lakes
+from the same block. A lake saved without a block refuses attach with a
+re-save-the-store message; a v2/v3 Vortex lake is refused with the clear
 rebuild-with-`lake` error instead of being guessed at.
 
 Measured trade-offs (release, Apple Silicon, sales corpus): eager `.lake open`
-is slower without the fast paths — 0.023 s @1M / 0.238 s @10M printed vs
-0.004 / 0.031 s for the full build; saves are ≈ equal (0.054 s @1M / 0.321 s
-@10M); data files are 1.6–1.8% larger, because Vortex compresses the numeric
-columns better than `.pink` v4. In-session query results are identical.
-Storage statistics inside `.pink` lakes — attach fast paths for the lean build
-under the same exactness gates — is wave 45k, in progress.
+is slower than the full build — 0.023 s @1M / 0.238 s @10M printed vs
+0.004 / 0.031 s; attach is the fast start instead: cold `.lake attach` +
+`COUNT`/`MIN`/`MAX` takes **2.64 ms @1M / 2.31 ms @10M** (overhead ~0.1–0.2 ms,
+constant in file size, 0 data-file reads) while eager open costs 29.9 /
+269.5 ms. Saves are ≈ equal (0.054 s @1M / 0.321 s @10M); data files are
+1.6–1.8% larger, because Vortex compresses the numeric columns better than
+`.pink` v4. In-session query results are identical, and both builds answer the
+statistics fast paths identically.
 
 Cross-build compatibility is verified both ways: a lake written by the lean
 build opens **bit-exactly** in a full build (the next save migrates it to
@@ -1601,9 +1621,10 @@ ties in ORDER BY have no stable order on either engine).
   plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
   credentials come only from the environment or explicit config (no
   profiles/IMDS/SSO); the lean `lake-lite` build writes and reads only
-  `.pink` v4 data files (catalog `format_version` 1), has no `.lake attach`
-  (45k, in progress) and refuses a v2/v3 Vortex lake with the rebuild-with-
-  `lake` error
+  `.pink` v4 data files (catalog `format_version` 1), attaches them
+  statistics-only (exact `COUNT`/`MIN`/`MAX` from the manifest's stats block;
+  `.pink` has no projected reader, so a fallback decodes the whole table) and
+  refuses a v2/v3 Vortex lake with the rebuild-with-`lake` error
 - Extensions repository: artifacts are verified by SHA-256 from the catalog
   (no signatures yet), and only `darwin-arm64` builds are published
 - Known gaps and their scheduled waves are tracked in `docs/GAPS.md`
@@ -1620,8 +1641,13 @@ and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
 lean `lake-lite` build (`vortex` optional in pink-lake, `.pink` v4 lake data
-files, 2.69 MB vs 45.3 MB CLI) shipped in wave 45i; 45k (attach fast paths for
-the lean build) is in progress. Authentication and TLS are deferred.
+files, 2.69 MB vs 45.3 MB CLI) shipped in wave 45i, and wave 45k gave it exact
+attach fast paths (a CRC-32-protected per-column statistics block published in
+the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
+`.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for
+widths > 56). Remaining lake follow-ups (not committed): projection pushdown
+for `.pink`, per-chunk statistics + filter/zone pruning (stage 3), and the
+parked cold order-by/group-by items. Authentication and TLS are deferred.
 
 ## Development
 
