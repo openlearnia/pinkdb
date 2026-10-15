@@ -93,12 +93,14 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Lake-scan plan (lake workstream, sub-waves 45b–45e): stage 1 shipped as 45d — footer-only
+Lake-scan plan (lake workstream, sub-waves 45b–45j): stage 1 shipped as 45d — footer-only
 `.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize; stage 2
 shipped as 45e — projection pushdown (an attached scan decodes only the columns a query
-references); stage 3 (filter/zone-map pruning) is the remaining follow-up. 45i — a lean
-`lake-lite` build (`vortex-format` optional in pink-lake, `.pink` v4 lake data files,
-expected ~2.5–3 MB CLI binary) — is in progress.
+references); stage 3 (filter/zone-map pruning) is the remaining follow-up. The lean
+`lake-lite` build shipped as 45i (2.69 MB vs 45.3 MB; `.pink` v4 data files, no attach fast
+paths) and `.pink` LZ frames (tag 8) shipped as 45j (text corpora 3–5× smaller). 45k —
+storage statistics inside `.pink` lakes, so the lean build gets attach fast paths under the
+same exactness gates — is in progress.
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -471,3 +473,35 @@ Java bindings.
   regressions on adversarial corpora (worst +4 B of flags on a 755 B file); high-entropy
   strings/floats stay >1.3× Vortex (no FSST/LZ yet — recorded as stretch). Gates: 566
   workspace / 392 encryption / CLI lake+s3 60, duckdiff 60/60.
+- 2026-10-15 — Wave 45i (0394795): lean lake build `lake-lite` — `vortex` + `rayon` in
+  pink-lake became optional behind `vortex-format`; the CLI's full `lake` feature enables it,
+  and the new `lake-lite` feature is the lean lake over `.pink` v4 data files (catalog
+  `format_version` 1). `s3` now implies `lake-lite` (README says so explicitly), so the full
+  lake over S3/R2 is `lake,s3`. Sizes (release): default 2,436,320 B; `lake-lite` 2,692,464 B
+  (+250 KiB over default, −40.7 MiB vs full); `lake-lite,s3` 4,701,120 B; `lake` (full)
+  45,333,984 B (the Vortex dependency measures 42.6 MB of it). Lean trade-offs: no `.lake
+  attach` fast paths yet (45k, in progress), eager open 0.023 s @1M / 0.238 s @10M printed vs
+  full 0.004 / 0.031 s, saves ≈ equal (0.054 / 0.321 s), data files 1.6–1.8% larger; lean
+  errors for v2/v3 lakes and `.lake attach` are explicit rebuild-with-`lake` messages.
+  Cross-build verified: a lake written by the lean build opens bit-exactly in the full build
+  (which migrates to v3, leaving the v1 files untouched; checked-in fixture), and a v3 lake
+  in a lean build refuses cleanly. Gates: workspace 513 default (the lean set; full coverage
+  via feature runs — CLI 61 `lake,s3` / 35 lean; pink-lake 18 lean / 72 `vortex-format` /
+  126 `s3,vortex-format`), duckdiff 60/60; CI runs both feature sets.
+- 2026-10-15 — Wave 45j (ff1ea61): `.pink` LZ frame (encoding tag 8, reserved since v4) —
+  measurement first: the v4 losses vs Vortex are compressible TEXT, not random data (random
+  f64 1.00×, random strings 1.07–1.10×; JSON-like 5.71×, logs 3.48×, URLs 3.15× behind). A
+  hand-rolled greedy LZ77 (64 KiB window, 4-byte hash, min match 4, max 130; no deps, no
+  unsafe) frames a chunk as `u32 raw_len | u8 base_tag | u32 token_len | tokens` (base tags
+  0..=6), emitted only when strictly smaller; candidate gating needs the best existing
+  candidate ≥1024 B and a 4 KiB prefix probe ≥10% saved (sales VARCHAR chunks win with a
+  bitpacked dict and skip the scan). Results (1M rows, before → after, vs Vortex): JSON
+  70.4 → 15.7 MB (5.71× → 1.27×), logs 118.7 → 44.5 MB (3.48× → 1.30×), URLs 103.5 → 41.4 MB
+  (3.15× → 1.26×); random corpora and both sales files byte-identical (sales save +0–1%);
+  LZ also speeds save/open on text. FSST (tag 9) deliberately NOT implemented, with the
+  measured ceiling (post-LZ gaps 9.8% / 6.5%; FSST floor estimate 3.2% / 4.3%) — the tag
+  stays reserved with a design. Invariants: bit-exact round trips (forced tag-8 frames),
+  determinism, old binaries reject tag-8 files cleanly (`unsupported v4 encoding tag 8;
+  upgrade pinkdb`), malformed-frame tests. Gates: workspace 517/0, encryption 396/0, CLI
+  61/35, pink-lake 126/0, duckdiff 60/60. Live: 5.88 MB JSON CSV → 699 KB `.pink` with an
+  exact round trip.
