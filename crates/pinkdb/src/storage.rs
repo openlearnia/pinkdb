@@ -34,6 +34,24 @@ pub struct Column {
     pub chunks: Vec<Arc<Vector>>,
 }
 
+/// Chunks above which a dropped column releases them in parallel.
+const PARALLEL_DROP_CHUNKS: usize = 64;
+
+impl Drop for Column {
+    /// A large column frees one allocation per VARCHAR cell (plus every
+    /// chunk buffer); dropping a 10M-row table serially took about as long
+    /// as importing it. Release big columns' chunks on the rayon pool
+    /// instead (chunks still shared by a snapshot just lose a reference).
+    fn drop(&mut self) {
+        if self.chunks.len() >= PARALLEL_DROP_CHUNKS {
+            use rayon::prelude::*;
+            std::mem::take(&mut self.chunks)
+                .into_par_iter()
+                .for_each(drop);
+        }
+    }
+}
+
 impl Column {
     fn new(name: String, dtype: DataType) -> Self {
         Self {

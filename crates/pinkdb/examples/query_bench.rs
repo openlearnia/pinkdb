@@ -142,14 +142,20 @@ fn main() {
     }
 
     let mut best_import = f64::MAX;
+    let mut best_drop = f64::MAX;
     for _ in 0..args.runs {
         let mut db = PinkDb::new();
         let t0 = Instant::now();
         pinkdb::csv::import_csv(&mut db, &args.csv, Some("sales")).unwrap();
         best_import = best_import.min(ms(t0));
+        // Teardown of the imported store (what exiting or replacing it costs).
+        let t0 = Instant::now();
+        drop(db);
+        best_drop = best_drop.min(ms(t0));
     }
     println!("query_bench: {}, runs={}", args.csv, args.runs);
     println!("import  best of {}: {best_import:.3} ms", args.runs);
+    println!("drop    best of {}: {best_drop:.3} ms", args.runs);
 
     let mut db = PinkDb::new();
     pinkdb::csv::import_csv(&mut db, &args.csv, Some("sales")).unwrap();
