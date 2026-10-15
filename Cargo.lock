@@ -2025,6 +2025,7 @@ version = "0.1.0"
 dependencies = [
  "hmac",
  "pinkdb",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

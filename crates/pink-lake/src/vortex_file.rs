@@ -56,16 +56,17 @@
 //! after a caught panic.
 
 use std::any::Any;
+use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+
+use rayon::prelude::*;
 
 use pinkdb::{DataChunk, DataTable, DataType, PinkDb, Vector, VectorData};
 use serde::{Deserialize, Serialize};
 use vortex::array::arrays::bool::BoolArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
-use vortex::array::arrays::{
-    BoolArray, ChunkedArray, PrimitiveArray, StructArray, VarBinViewArray,
-};
+use vortex::array::arrays::{BoolArray, PrimitiveArray, StructArray, VarBinViewArray};
 use vortex::array::validity::Validity;
 use vortex::array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex::buffer::{BitBuffer, Buffer, ByteBuffer};
@@ -187,9 +188,14 @@ fn vortex_error(context: &str, e: impl std::fmt::Display) -> LakeError {
     }
 }
 
-/// Encode one table as a Vortex file (with its `pinkdb.table` segment) and
-/// return its bytes.
-pub(crate) fn encode_table(dbname: &str, table: &str, src: &DataTable) -> Result<Vec<u8>> {
+/// Engine chunks converted per parallel window while streaming into the
+/// writer: large enough to keep every core busy converting, small enough
+/// that only a window's worth of converted arrays is alive at once and the
+/// writer's compression of window *k* overlaps the conversion of *k + 1*.
+const CONVERT_WINDOW: usize = 128;
+
+/// The `pinkdb.table` metadata segment for a table.
+fn table_metadata(dbname: &str, table: &str, src: &DataTable) -> Result<Vec<u8>> {
     let metadata = TableMetadata {
         db: dbname.to_string(),
         table: table.to_string(),
@@ -202,21 +208,52 @@ pub(crate) fn encode_table(dbname: &str, table: &str, src: &DataTable) -> Result
             })
             .collect(),
     };
-    let metadata = serde_json::to_vec(&metadata).map_err(|e| LakeError::Internal {
+    serde_json::to_vec(&metadata).map_err(|e| LakeError::Internal {
         message: format!("serializing table metadata for \"{dbname}.{table}\": {e}"),
-    })?;
-    encode_table_with_metadata(dbname, table, src, Some(metadata))
+    })
 }
 
-/// The writer core: encode `src` as a Vortex file with an optional
-/// `pinkdb.table` segment. The loader requires the segment; `None` exists so
-/// tests can craft a file that lacks it (a tamper the loader must reject).
+/// Encode one table as a Vortex file (with its `pinkdb.table` segment) and
+/// return its bytes.
+#[cfg(test)]
+pub(crate) fn encode_table(dbname: &str, table: &str, src: &DataTable) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    encode_table_into(dbname, table, src, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Encode one table as a Vortex file (with its `pinkdb.table` segment)
+/// straight into `sink` (the lake streams it into the data file's temp
+/// file instead of materializing the whole file in memory).
+pub(crate) fn encode_table_into(
+    dbname: &str,
+    table: &str,
+    src: &DataTable,
+    sink: &mut (dyn Write + Send),
+) -> Result<()> {
+    let metadata = table_metadata(dbname, table, src)?;
+    encode_table_with_metadata(dbname, table, src, Some(metadata), sink, true)
+}
+
+/// The writer core: stream `src` into `sink` as a Vortex file with an
+/// optional `pinkdb.table` segment. The loader requires the segment; `None`
+/// exists so tests can craft a file that lacks it (a tamper the loader must
+/// reject). `parallel` selects the worker-pool runtime (production) or the
+/// bare current-thread runtime (test-only pin); both emit identical bytes.
+///
+/// Engine chunks are converted to Vortex arrays in parallel windows of
+/// [`CONVERT_WINDOW`] chunks and pushed in order, so conversion overlaps the
+/// writer's compression instead of running as a serial phase before it. The
+/// pushed sequence of arrays is exactly the one the former single
+/// `ChunkedArray` held, so the file bytes are unchanged.
 fn encode_table_with_metadata(
     dbname: &str,
     table: &str,
     src: &DataTable,
     metadata: Option<Vec<u8>>,
-) -> Result<Vec<u8>> {
+    sink: &mut (dyn Write + Send),
+    parallel: bool,
+) -> Result<()> {
     let schema = src.schema();
     if schema.is_empty() {
         return Err(LakeError::NotRepresentable {
@@ -232,50 +269,7 @@ fn encode_table_with_metadata(
     // column nullable everywhere).
     let (nulls, chunk_nulls) = column_nullability(src, &schema, dbname, table)?;
     let dtype = struct_dtype(&schema, &nulls);
-    let fields = field_names(&schema);
 
-    let mut chunks: Vec<ArrayRef> = Vec::with_capacity(src.num_chunks().max(1));
-    for (i, any_null) in chunk_nulls.iter().enumerate() {
-        let chunk = src.scan_chunk(i).ok_or_else(|| LakeError::Internal {
-            message: format!("chunk {i} of \"{dbname}.{table}\" disappeared while encoding"),
-        })?;
-        chunks.push(encode_chunk(
-            &chunk, &schema, &nulls, any_null, dbname, table,
-        )?);
-    }
-    if chunks.is_empty() {
-        // An empty table: one 0-row struct, so the file still carries the
-        // schema. The loader appends nothing back (0 chunks).
-        let children = schema
-            .iter()
-            .zip(&nulls)
-            .map(|((_, t), n)| encode_column(&Vector::new_empty(*t), *t, *n, false))
-            .collect::<Result<Vec<_>>>()?;
-        chunks.push(
-            StructArray::try_new(fields.clone(), children, 0, Validity::NonNullable)
-                .map_err(|e| {
-                    vortex_error(&format!("encoding empty table \"{dbname}.{table}\""), e)
-                })?
-                .into_array(),
-        );
-    }
-
-    let chunked = ChunkedArray::try_new(chunks, dtype)
-        .map_err(|e| vortex_error(&format!("assembling table \"{dbname}.{table}\""), e))?;
-
-    write_chunked(dbname, table, chunked.into_array(), metadata, true)
-}
-
-/// The writer tail: strategy + metadata segment + the blocking write.
-/// `parallel` selects the worker-pool runtime (production) or the bare
-/// current-thread runtime (test-only pin); both must emit identical bytes.
-fn write_chunked(
-    dbname: &str,
-    table: &str,
-    chunked: ArrayRef,
-    metadata: Option<Vec<u8>>,
-    parallel: bool,
-) -> Result<Vec<u8>> {
     let (runtime, _pool, session) = write_session(parallel);
     // One stream element per engine chunk, and row blocks of exactly
     // `CHUNK_SIZE` rows: chunk boundaries round-trip unchanged.
@@ -288,12 +282,41 @@ fn write_chunked(
         options =
             options.with_metadata_segment(TABLE_METADATA_KEY, ByteBuffer::copy_from(metadata));
     }
-    let mut bytes: Vec<u8> = Vec::new();
-    options
-        .blocking(&runtime)
-        .write(&mut bytes, chunked.to_array_iterator())
-        .map_err(|e| vortex_error(&format!("writing table \"{dbname}.{table}\""), e))?;
-    Ok(bytes)
+    let write_error = |e| vortex_error(&format!("writing table \"{dbname}.{table}\""), e);
+    let mut writer = options.blocking(&runtime).writer(sink, dtype);
+
+    if chunk_nulls.is_empty() {
+        // An empty table: one 0-row struct, so the file still carries the
+        // schema. The loader appends nothing back (0 chunks).
+        let children = schema
+            .iter()
+            .zip(&nulls)
+            .map(|((_, t), n)| encode_column(&Vector::new_empty(*t), *t, *n, false))
+            .collect::<Result<Vec<_>>>()?;
+        let empty = StructArray::try_new(field_names(&schema), children, 0, Validity::NonNullable)
+            .map_err(|e| vortex_error(&format!("encoding empty table \"{dbname}.{table}\""), e))?
+            .into_array();
+        writer.push(empty).map_err(write_error)?;
+    }
+    for window in (0..chunk_nulls.len()).step_by(CONVERT_WINDOW) {
+        let end = (window + CONVERT_WINDOW).min(chunk_nulls.len());
+        let arrays: Vec<Result<ArrayRef>> = (window..end)
+            .into_par_iter()
+            .map(|i| {
+                let chunk = src.scan_chunk(i).ok_or_else(|| LakeError::Internal {
+                    message: format!(
+                        "chunk {i} of \"{dbname}.{table}\" disappeared while encoding"
+                    ),
+                })?;
+                encode_chunk(&chunk, &schema, &nulls, &chunk_nulls[i], dbname, table)
+            })
+            .collect();
+        for array in arrays {
+            writer.push(array?).map_err(write_error)?;
+        }
+    }
+    writer.finish().map_err(write_error)?;
+    Ok(())
 }
 
 /// Decode a Vortex data file into a one-table [`PinkDb`] (the same shape a
@@ -355,22 +378,24 @@ fn decode_table_inner(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
         .map_err(|e| corrupt(path, format!("opening a Vortex scan: {e}")))?
         .into_array_stream()
         .map_err(|e| corrupt(path, format!("opening a Vortex scan: {e}")))?;
-    let mut ctx = session.create_execution_ctx();
+    // Read the (still encoded) chunks in file order, then decode them in
+    // parallel — each worker with its own execution context — and append
+    // them in file order. Decoding dominates a load; reading is cheap.
+    let mut raw: Vec<ArrayRef> = Vec::new();
     for item in runtime.block_on_stream(&mut stream) {
-        let chunk = item.map_err(|e| corrupt(path, format!("reading a Vortex chunk: {e}")))?;
-        let len = chunk.len();
-        let fields = chunk
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(|e| corrupt(path, format!("decoding a Vortex chunk: {e}")))?;
-        let mut columns = Vec::with_capacity(schema.len());
-        for (i, (name, dtype)) in schema.iter().enumerate() {
-            let field = fields.unmasked_field(i).clone();
-            columns.push(decode_column(path, name, &field, *dtype, &mut ctx)?);
-        }
-        if len == 0 {
+        raw.push(item.map_err(|e| corrupt(path, format!("reading a Vortex chunk: {e}")))?);
+    }
+    let decoded: Vec<Result<Option<Vec<Vector>>>> = raw
+        .par_iter()
+        .map_init(
+            || session.create_execution_ctx(),
+            |ctx, chunk| decode_chunk(path, &schema, chunk, ctx),
+        )
+        .collect();
+    for columns in decoded {
+        let Some(columns) = columns? else {
             continue;
-        }
+        };
         let dst = mini
             .table_mut_in(&metadata.db, &metadata.table)
             .map_err(|e| LakeError::Engine {
@@ -383,6 +408,26 @@ fn decode_table_inner(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
         })?;
     }
     Ok(mini)
+}
+
+/// Decode one stored chunk into engine columns (`None` for a 0-row chunk).
+fn decode_chunk(
+    path: &Path,
+    schema: &[(String, DataType)],
+    chunk: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> Result<Option<Vec<Vector>>> {
+    let len = chunk.len();
+    let fields = chunk
+        .clone()
+        .execute::<StructArray>(ctx)
+        .map_err(|e| corrupt(path, format!("decoding a Vortex chunk: {e}")))?;
+    let mut columns = Vec::with_capacity(schema.len());
+    for (i, (name, dtype)) in schema.iter().enumerate() {
+        let field = fields.unmasked_field(i).clone();
+        columns.push(decode_column(path, name, &field, *dtype, ctx)?);
+    }
+    Ok((len > 0).then_some(columns))
 }
 
 /// The identity + schema metadata of a data file, or a clear corrupt-file
@@ -560,7 +605,7 @@ fn column_nullability(
             let column = chunk.columns.get(c).ok_or_else(|| LakeError::Internal {
                 message: format!("column {c} of \"{dbname}.{table}\" disappeared while encoding"),
             })?;
-            let any_null = (0..column.len()).any(|row| column.is_null(row));
+            let any_null = column.has_nulls();
             if any_null {
                 *table_null = Nullability::Nullable;
             }
@@ -604,9 +649,28 @@ fn chunk_validity(column: &Vector, nullability: Nullability, any_null: bool) -> 
             if !any_null {
                 return Validity::AllValid;
             }
-            Validity::from_iter((0..column.len()).map(|i| column.is_valid(i)))
+            Validity::from(bits_from_words(column.validity_words(), column.len()))
         }
     }
+}
+
+/// A Vortex bit buffer over the first `len` bits of little-endian validity
+/// words (bit `i` of word `i / 64` ⇒ LSB-first bit `i` of the byte stream —
+/// exactly Arrow/Vortex bit order), built word-wise instead of per row.
+fn bits_from_words(words: &[u64], len: usize) -> BitBuffer {
+    let mut bytes = Vec::with_capacity(words.len() * 8);
+    for w in words {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    bytes.truncate(len.div_ceil(8));
+    // Bits past `len` in the last byte are outside the view; clear them so
+    // the buffer is canonical regardless of the engine's spare bits.
+    if !len.is_multiple_of(8) {
+        if let Some(last) = bytes.last_mut() {
+            *last &= (1u8 << (len % 8)) - 1;
+        }
+    }
+    BitBuffer::new(ByteBuffer::from(bytes), len)
 }
 
 /// Encode one engine column chunk as a canonical Vortex array.
@@ -657,7 +721,11 @@ fn encode_column(
     Ok(array)
 }
 
-/// Decode one canonical Vortex column into an engine vector of `len` rows.
+/// Decode one canonical Vortex column into an engine vector of `len` rows,
+/// in bulk: payloads are copied whole and validity is built word-wise, then
+/// NULL slots get the engine's placeholder (`0`, `false`, `""`) — exactly
+/// what a row-by-row `push_null` would have stored, so loaded vectors are
+/// bit-identical to the old per-row decode.
 fn decode_column(
     path: &Path,
     name: &str,
@@ -688,104 +756,107 @@ fn decode_column(
     } else {
         None
     };
-    let valid = |i: usize| mask.as_ref().is_none_or(|m| m.value(i));
+    // Validity words (bit set ⇒ valid) and whether any row is NULL.
+    let mut words = vec![u64::MAX; len.div_ceil(64)];
+    let mut any_null = false;
+    if let Some(m) = &mask {
+        for i in 0..len {
+            if !m.value(i) {
+                words[i / 64] &= !(1u64 << (i % 64));
+                any_null = true;
+            }
+        }
+    }
+    let valid = |i: usize| words[i / 64] >> (i % 64) & 1 == 1;
 
-    let mut out = Vector::with_capacity(dtype, len);
-    match dtype {
+    let data = match dtype {
         DataType::Boolean => {
             let values = bool_values(path, name, array, ctx)?;
-            for i in 0..len {
-                push_bool(name, &mut out, valid(i), values.value(i))?;
-            }
+            VectorData::Boolean((0..len).map(|i| valid(i) && values.value(i)).collect())
         }
         DataType::Varchar => {
             let values = var_bin_values(path, name, array, ctx)?;
+            let mut out: Vec<std::sync::Arc<str>> = Vec::with_capacity(len);
             for i in 0..len {
                 if valid(i) {
-                    push_str(path, name, &mut out, &values, i)?;
+                    let bytes = values.bytes_at(i);
+                    let s = std::str::from_utf8(bytes.as_slice()).map_err(|e| {
+                        corrupt(
+                            path,
+                            format!("column \"{name}\" row {i} is not valid UTF-8: {e}"),
+                        )
+                    })?;
+                    out.push(std::sync::Arc::from(s));
                 } else {
-                    out.push_null().map_err(|e| column_error(name, e))?;
+                    out.push(std::sync::Arc::from(""));
                 }
             }
+            VectorData::VarChar(out)
         }
-        DataType::Integer => {
+        DataType::Integer | DataType::Date => {
             let values = primitive(path, name, array, ctx)?;
-            let buffer = values.to_buffer::<i32>();
-            for i in 0..len {
-                if valid(i) {
-                    out.push_value(pinkdb::Value::Integer(buffer[i]))
-                        .map_err(|e| column_error(name, e))?;
-                } else {
-                    out.push_null().map_err(|e| column_error(name, e))?;
+            let mut v = values.to_buffer::<i32>().as_slice().to_vec();
+            if v.len() != len {
+                return Err(corrupt(
+                    path,
+                    format!("column \"{name}\" payload length mismatch"),
+                ));
+            }
+            if any_null {
+                for (i, x) in v.iter_mut().enumerate() {
+                    if !valid(i) {
+                        *x = 0;
+                    }
                 }
             }
-        }
-        DataType::Date => {
-            let values = primitive(path, name, array, ctx)?;
-            let buffer = values.to_buffer::<i32>();
-            for i in 0..len {
-                if valid(i) {
-                    out.push_value(pinkdb::Value::Date(buffer[i]))
-                        .map_err(|e| column_error(name, e))?;
-                } else {
-                    out.push_null().map_err(|e| column_error(name, e))?;
-                }
+            if dtype == DataType::Date {
+                VectorData::Date32(v)
+            } else {
+                VectorData::Int32(v)
             }
         }
-        DataType::Bigint => {
+        DataType::Bigint | DataType::Timestamp => {
             let values = primitive(path, name, array, ctx)?;
-            let buffer = values.to_buffer::<i64>();
-            for i in 0..len {
-                if valid(i) {
-                    out.push_value(pinkdb::Value::Bigint(buffer[i]))
-                        .map_err(|e| column_error(name, e))?;
-                } else {
-                    out.push_null().map_err(|e| column_error(name, e))?;
+            let mut v = values.to_buffer::<i64>().as_slice().to_vec();
+            if v.len() != len {
+                return Err(corrupt(
+                    path,
+                    format!("column \"{name}\" payload length mismatch"),
+                ));
+            }
+            if any_null {
+                for (i, x) in v.iter_mut().enumerate() {
+                    if !valid(i) {
+                        *x = 0;
+                    }
                 }
             }
-        }
-        DataType::Timestamp => {
-            let values = primitive(path, name, array, ctx)?;
-            let buffer = values.to_buffer::<i64>();
-            for i in 0..len {
-                if valid(i) {
-                    out.push_value(pinkdb::Value::Timestamp(buffer[i]))
-                        .map_err(|e| column_error(name, e))?;
-                } else {
-                    out.push_null().map_err(|e| column_error(name, e))?;
-                }
+            if dtype == DataType::Timestamp {
+                VectorData::TimestampMicros(v)
+            } else {
+                VectorData::Int64(v)
             }
         }
         DataType::Double => {
             let values = primitive(path, name, array, ctx)?;
-            let buffer = values.to_buffer::<f64>();
-            for i in 0..len {
-                if valid(i) {
-                    out.push_value(pinkdb::Value::Double(buffer[i]))
-                        .map_err(|e| column_error(name, e))?;
-                } else {
-                    out.push_null().map_err(|e| column_error(name, e))?;
+            let mut v = values.to_buffer::<f64>().as_slice().to_vec();
+            if v.len() != len {
+                return Err(corrupt(
+                    path,
+                    format!("column \"{name}\" payload length mismatch"),
+                ));
+            }
+            if any_null {
+                for (i, x) in v.iter_mut().enumerate() {
+                    if !valid(i) {
+                        *x = 0.0;
+                    }
                 }
             }
+            VectorData::Float64(v)
         }
-    }
-    Ok(out)
-}
-
-fn column_error(name: &str, e: pinkdb::PinkDbError) -> LakeError {
-    LakeError::Engine {
-        context: format!("building column \"{name}\""),
-        source: e,
-    }
-}
-
-fn push_bool(name: &str, out: &mut Vector, valid: bool, value: bool) -> Result<()> {
-    if valid {
-        out.push_value(pinkdb::Value::Boolean(value))
-            .map_err(|e| column_error(name, e))
-    } else {
-        out.push_null().map_err(|e| column_error(name, e))
-    }
+    };
+    Ok(Vector::from_raw(data, words))
 }
 
 fn primitive(
@@ -823,23 +894,6 @@ fn var_bin_values(
         .clone()
         .execute::<VarBinViewArray>(ctx)
         .map_err(|e| corrupt(path, format!("decoding column \"{name}\": {e}")))
-}
-
-fn push_str(
-    path: &Path,
-    name: &str,
-    out: &mut Vector,
-    values: &VarBinViewArray,
-    i: usize,
-) -> Result<()> {
-    let bytes = values.bytes_at(i);
-    let s = std::str::from_utf8(bytes.as_slice()).map_err(|e| {
-        corrupt(
-            path,
-            format!("column \"{name}\" row {i} is not valid UTF-8: {e}"),
-        )
-    })?;
-    out.push_str(s).map_err(|e| column_error(name, e))
 }
 
 #[cfg(test)]
@@ -923,12 +977,19 @@ mod tests {
         encode_table("main", "t", db.table("t").unwrap()).unwrap()
     }
 
+    /// Encode `src` into memory with an explicit metadata segment and runtime.
+    fn encode_with(src: &DataTable, metadata: Option<Vec<u8>>, parallel: bool) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        encode_table_with_metadata("main", "t", src, metadata, &mut bytes, parallel)?;
+        Ok(bytes)
+    }
+
     fn decode(bytes: &[u8]) -> Result<PinkDb> {
         decode_table(Path::new("crafted.vortex"), bytes)
     }
 
     fn decode_with_metadata(src: &DataTable, metadata: &[u8]) -> Result<PinkDb> {
-        let bytes = encode_table_with_metadata("main", "t", src, Some(metadata.to_vec())).unwrap();
+        let bytes = encode_with(src, Some(metadata.to_vec()), true).unwrap();
         decode(&bytes)
     }
 
@@ -998,27 +1059,11 @@ mod tests {
             .unwrap();
         }
         let src = db.table("t").unwrap();
-        let schema = src.schema();
         assert!(src.num_chunks() >= 3, "fixture should span several chunks");
-        let (nulls, chunk_nulls) = column_nullability(src, &schema, "main", "t").unwrap();
-        let dtype = struct_dtype(&schema, &nulls);
-        let mut chunks: Vec<ArrayRef> = Vec::new();
-        for (i, any_null) in chunk_nulls.iter().enumerate() {
-            let chunk = src.scan_chunk(i).unwrap();
-            chunks.push(encode_chunk(&chunk, &schema, &nulls, any_null, "main", "t").unwrap());
-        }
-        let chunked = ChunkedArray::try_new(chunks, dtype).unwrap().into_array();
-        let meta = metadata_json(
-            "main",
-            "t",
-            r#"{"name":"i","type":"integer"},{"name":"g","type":"bigint"},{"name":"d","type":"double"},{"name":"s","type":"varchar"},{"name":"b","type":"boolean"}"#,
-        );
-        // The metadata segment content is irrelevant to layout; reuse one.
-        let serial =
-            write_chunked("main", "t", chunked.clone(), Some(meta.clone()), false).unwrap();
-        let parallel =
-            write_chunked("main", "t", chunked.clone(), Some(meta.clone()), true).unwrap();
-        let parallel_again = write_chunked("main", "t", chunked, Some(meta), true).unwrap();
+        let meta = table_metadata("main", "t", src).unwrap();
+        let serial = encode_with(src, Some(meta.clone()), false).unwrap();
+        let parallel = encode_with(src, Some(meta.clone()), true).unwrap();
+        let parallel_again = encode_with(src, Some(meta), true).unwrap();
         assert_eq!(
             serial,
             parallel,
@@ -1156,7 +1201,7 @@ mod tests {
     #[test]
     fn missing_table_metadata_is_corrupt() {
         let db = tiny_table();
-        let bytes = encode_table_with_metadata("main", "t", db.table("t").unwrap(), None).unwrap();
+        let bytes = encode_with(db.table("t").unwrap(), None, true).unwrap();
         let err = decode(&bytes).unwrap_err().to_string();
         assert!(err.contains("carries no \"pinkdb.table\""), "{err}");
         assert!(err.contains("crafted.vortex"), "{err}");

@@ -904,7 +904,20 @@ fn acquire_db_lock(checkpoint: &Path) -> Result<Option<File>> {
         .truncate(false)
         .write(true)
         .open(&path)?;
-    match file.try_lock() {
+    // A lock that is busy only for an instant is not a live holder: while
+    // another thread of this process forks a child (e.g. `Command::spawn`),
+    // the child briefly holds a duplicate of every descriptor — and with it
+    // the `flock` — until its exec closes the close-on-exec ones. Retry for a
+    // short window before reporting a second handle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+    let mut attempt = file.try_lock();
+    while matches!(attempt, Err(std::fs::TryLockError::WouldBlock))
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        attempt = file.try_lock();
+    }
+    match attempt {
         Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Err(PinkDbError::Execution(format!(
             "database {} is already open by another handle or process \

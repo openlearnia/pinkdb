@@ -118,6 +118,21 @@ pub(crate) trait Storage: fmt::Debug {
     /// atomic — a reader sees the old or the new bytes, never a mix).
     fn put(&self, rel: &str, bytes: &[u8]) -> Result<()>;
 
+    /// [`Storage::put`] for content produced by `fill` into a sink, with the
+    /// same atomicity; returns the bytes written. The default buffers the
+    /// whole object (object storage needs it for one PUT); the local backend
+    /// streams it straight into its fsynced temp file.
+    fn put_streamed(
+        &self,
+        rel: &str,
+        fill: &mut dyn FnMut(&mut (dyn std::io::Write + Send)) -> Result<()>,
+    ) -> Result<u64> {
+        let mut bytes: Vec<u8> = Vec::new();
+        fill(&mut bytes)?;
+        self.put(rel, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
     /// Publish `bytes` **only if `rel` does not exist yet**: `Ok(false)` when
     /// it already existed (locally a hard link, so an existing file or
     /// planted symlink is never replaced; over S3 `If-None-Match: *` →

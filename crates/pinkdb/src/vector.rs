@@ -37,7 +37,13 @@ impl VectorData {
         }
     }
 
-    fn len(&self) -> usize {
+    /// True when the payload holds no elements.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Number of elements in the payload.
+    pub fn len(&self) -> usize {
         match self {
             VectorData::Boolean(v) => v.len(),
             VectorData::Int32(v) => v.len(),
@@ -202,6 +208,51 @@ impl Vector {
     /// checked per-row read).
     pub(crate) fn validity(&self) -> &[u64] {
         &self.validity
+    }
+
+    /// The validity bitmask as whole words (bit `i` of word `i / 64` set ⇒
+    /// row `i` valid), trimmed to exactly `ceil(len / 64)` words. Bits past
+    /// `len` in the last word are unspecified: mask them before use. For
+    /// bulk consumers (file encoders) that would otherwise test every row.
+    pub fn validity_words(&self) -> &[u64] {
+        &self.validity[..mask_len(self.len).min(self.validity.len())]
+    }
+
+    /// True when any of the `len` rows is NULL — a word-wise test, not a
+    /// per-row scan.
+    pub fn has_nulls(&self) -> bool {
+        let words = mask_len(self.len);
+        for w in 0..words {
+            let word = self.validity.get(w).copied().unwrap_or(0);
+            let bits = if w + 1 == words && !self.len.is_multiple_of(64) {
+                (1u64 << (self.len % 64)) - 1
+            } else {
+                u64::MAX
+            };
+            if word & bits != bits {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Build a vector from a payload and its validity words (bit `i` set ⇒
+    /// row `i` valid) in one step, for bulk producers such as file decoders.
+    /// The length is the payload's; missing words read as NULL and bits past
+    /// the length are cleared.
+    pub fn from_raw(data: VectorData, mut validity: Vec<u64>) -> Vector {
+        let len = data.len();
+        validity.resize(mask_len(len), 0);
+        if !len.is_multiple_of(64) {
+            if let Some(last) = validity.last_mut() {
+                *last &= (1u64 << (len % 64)) - 1;
+            }
+        }
+        Vector {
+            data,
+            validity,
+            len,
+        }
     }
 
     pub fn is_valid(&self, idx: usize) -> bool {

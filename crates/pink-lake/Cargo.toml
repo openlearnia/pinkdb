@@ -28,3 +28,5 @@ sha2 = { version = "0.10", optional = true }
 # wasm-bindgen/tensor/parquet-variant extras and the zstd codec — the builtin
 # Vortex encodings are still registered by `VortexSession::default()`.
 vortex = { version = "0.88.0", default-features = false, features = ["files"] }
+# Parallel engine→Vortex chunk conversion and data-file decode.
+rayon = "1.12.0"

@@ -674,14 +674,14 @@ impl Lake {
                 // loader is driven by the catalog's `format` field, never by
                 // the extension).
                 let rel_file = format!("{dir}/{id}.vortex");
-                // v2 encodes the whole table into a Vortex file in memory,
-                // then publishes it (locally: a unique `create_new` temp
-                // sibling + fsync + rename; over S3: one atomic PUT). Nothing
-                // is referenced by the catalog until the manifest is
+                // v2 streams the table's Vortex encoding into the store
+                // (locally straight into a unique `create_new` temp sibling,
+                // then fsync + rename; over S3 buffered for one atomic PUT).
+                // Nothing is referenced by the catalog until the manifest is
                 // published below.
-                let bytes = vortex_file::encode_table(&dbname, &name, src)?;
-                self.storage.put(&rel_file, &bytes)?;
-                bytes_written += bytes.len() as u64;
+                bytes_written += self.storage.put_streamed(&rel_file, &mut |sink| {
+                    vortex_file::encode_table_into(&dbname, &name, src, sink)
+                })?;
                 rows += src.num_rows() as u64;
                 tables.insert(
                     key,

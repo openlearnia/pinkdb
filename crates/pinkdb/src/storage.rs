@@ -203,17 +203,22 @@ impl DataTable {
         if rows == 0 {
             return Ok(());
         }
-        // Fast path: the batch fits in an empty tail chunk (rows ≤ CHUNK_SIZE
-        // by the check above) — move the built vectors in without copying.
+        // Fast paths (rows ≤ CHUNK_SIZE by the check above): the batch fills
+        // an empty tail chunk, or starts a new chunk after a full one — move
+        // the built vectors in without copying. The copy path below would
+        // produce exactly the same chunking; bulk loaders (CSV import, lake
+        // load) append CHUNK_SIZE-row batches, so after the first batch every
+        // append lands behind a full tail and takes the second fast path.
         let tail_len = self.columns[0].chunks.last().map(|c| c.len()).unwrap_or(0);
-        if tail_len == 0 {
-            if self.columns[0].chunks.is_empty() {
-                for col in &mut self.columns {
-                    col.chunks.push(Arc::new(Vector::new_empty(col.dtype)));
+        if tail_len == 0 || tail_len >= CHUNK_SIZE {
+            if tail_len == 0 && !self.columns[0].chunks.is_empty() {
+                for (col, src) in self.columns.iter_mut().zip(chunk) {
+                    *col.chunks.last_mut().expect("tail chunk exists") = Arc::new(src);
                 }
-            }
-            for (col, src) in self.columns.iter_mut().zip(chunk) {
-                *col.chunks.last_mut().expect("tail chunk exists") = Arc::new(src);
+            } else {
+                for (col, src) in self.columns.iter_mut().zip(chunk) {
+                    col.chunks.push(Arc::new(src));
+                }
             }
             self.num_rows += rows;
             self.version = next_table_version();

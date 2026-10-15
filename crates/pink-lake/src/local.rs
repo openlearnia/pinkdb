@@ -204,6 +204,49 @@ impl Storage for LocalStorage {
         self.write_atomic(rel, bytes)
     }
 
+    /// Stream into a unique temp sibling through a 1 MiB buffer, fsync,
+    /// rename into place, fsync the parent — [`LocalStorage::write_atomic`]
+    /// without ever holding the whole file in memory.
+    fn put_streamed(
+        &self,
+        rel: &str,
+        fill: &mut dyn FnMut(&mut (dyn Write + Send)) -> Result<()>,
+    ) -> Result<u64> {
+        let path = self.abs(rel);
+        self.ensure_parent(&path)?;
+        let (tmp, file) = create_unique_tmp(&path).map_err(|e| LakeError::Io {
+            context: format!("creating a temp file next to {}", path.display()),
+            source: e,
+        })?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+        let filled = fill(&mut out);
+        let synced = filled.and_then(|()| {
+            let file = out.into_inner().map_err(|e| LakeError::Io {
+                context: format!("writing {}", tmp.display()),
+                source: e.into_error(),
+            })?;
+            file.sync_all()
+                .and_then(|()| file.metadata().map(|m| m.len()))
+                .map_err(|e| LakeError::Io {
+                    context: format!("writing {}", tmp.display()),
+                    source: e,
+                })
+        });
+        let len = match synced {
+            Ok(len) => len,
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+        fs::rename(&tmp, &path).map_err(|e| LakeError::Io {
+            context: format!("publishing {}", path.display()),
+            source: e,
+        })?;
+        self.sync_parent(&path);
+        Ok(len)
+    }
+
     fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
         self.publish_new(rel, bytes)
     }
