@@ -198,6 +198,45 @@ fn vortex_error(context: &str, e: impl std::fmt::Display) -> LakeError {
 const WRITE_BLOCK_ROWS: usize = 8192;
 
 /// Target bytes per data block (Vortex's default coalescing, pinned).
+///
+/// The target was re-measured against 8 MiB and 16 MiB (wave-A A/B: interleaved
+/// best-of-N on this repo's CLI, `bench/gen_sales.py` corpus, 10-core M-series
+/// host; exact numbers in the wave-A report) and stays at 1 MiB:
+///
+/// | target | 1M rows: bytes / save / open | 10M rows: bytes / save / open |
+/// |--------|------------------------------|-------------------------------|
+/// | 1 MiB  | 2 638 079 B / 52 ms / 13 ms  | 26 310 679 B / 254 ms / 119 ms |
+/// | 8 MiB  | 2 634 223 B / 59 ms / 24 ms  | 26 272 343 B / 255 ms / 229 ms |
+/// | 16 MiB | 2 634 223 B / 60 ms / 23 ms  | 26 269 647 B / 267 ms / 241 ms |
+///
+/// A larger target saves only 0.15% of the bytes and makes `.lake open` about
+/// 2x slower: the reader sub-splits stored chunks at ~100k rows, and at these
+/// targets most stored chunks end on a row count that is not a multiple of the
+/// engine's `CHUNK_SIZE` (2048). Each such ragged tail makes the *next* engine
+/// chunk take the element-wise merge path in `append_chunk` instead of the
+/// move fast path, which accounted for essentially all of the regression
+/// (loader phase timing at 10M: append 0.7 ms at 1 MiB vs 110 ms at 8/16 MiB).
+///
+/// The scheme-exclusion half of that A/B (RunEnd / IntRLE / ALPRD / FloatRLE)
+/// could not be expressed through the `vortex` facade: `exclude_schemes` takes
+/// `SchemeId`s, whose only public constructor (`SchemeExt::id()`) and whose
+/// scheme types (`vortex_btrblocks::schemes::*`) are not re-exported by the
+/// `vortex` crate with our feature set, and the facade-only reconstruction
+/// (`BtrBlocksCompressorBuilder::empty()` + `with_new_scheme`) is not faithful
+/// — `build()` re-refines with `AllowedIds::all()`, selecting the FoR v2
+/// variant whose serialized ID the write context then rejects (the 10M save
+/// aborts with "Serialized array ID fastlanes.for.v2 not permitted by ctx").
+/// The exclusions would have been byte-neutral here anyway: the 1M exclusion
+/// arm is byte-identical to 8/16 MiB, and the 10M files contain no
+/// `vortex.runend`, `vortex.alprd`, `fastlanes.rle` or `fastlanes.delta`
+/// encoding at all (they are, recursively: sequence, dict, fsst, alp, bool,
+/// bitpacked, primitive, shared, slice, struct).
+///
+/// The target is a layout/performance knob, not part of the format contract:
+/// files written at any target read back identically (the loader slices stored
+/// chunks by row count, never by layout), `format_version` stays 3, and
+/// `parallel_writing_emits_identical_bytes` keeps pinning serial == parallel
+/// bytes for a fixed target.
 const WRITE_BLOCK_BYTES: u64 = 1 << 20;
 
 /// The longest scan chunk the loader accepts. The Vortex reader sub-splits
