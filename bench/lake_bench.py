@@ -311,6 +311,34 @@ def measure_pink_lake(
     if str(rows) not in out:
         die(f"pink-lake query session: result check failed ({rows} not in output)")
 
+    # Cold process, per query: fresh process -> .lake open -> one query ->
+    # exit, the same shape as the DuckLake arm's per-query runs, so both
+    # engines have directly comparable cold-process numbers.
+    log(f"[pink-lake] {len(QUERIES)} queries x {runs} cold-process runs (fresh process each)")
+    for name, template in QUERIES:
+        query = template.format(t=table)
+        query_in = f".lake open {dot_str(str(lake_dir))}\n" + query + "\n.quit\n"
+        per_run: list[float] = []
+        per_wall: list[float] = []
+        for _ in range(runs):
+            wall, out, err, rc = run_cmd([str(pinkdb)], ".timer on\n" + query_in, cwd=ROOT)
+            check_output(out, err, rc, f"pink-lake cold query {name}")
+            # `.timer on` prints one Run Time line per statement; the query is
+            # the only statement in this process, so it is the last line.
+            times = parse_real_times(out)
+            if not times:
+                die(f"pink-lake cold query {name}: no timer output\n--- output ---\n{out}")
+            per_run.append(times[-1])
+            per_wall.append(wall)
+        queries[name].update(
+            {
+                "cold_printed_best_s": best(per_run),
+                "cold_printed_all_s": per_run,
+                "cold_wall_best_s": best(per_wall),
+                "cold_wall_all_s": per_wall,
+            }
+        )
+
     # Cold end-to-end: fresh process -> .lake open -> first query -> exit.
     log("[pink-lake] cold end-to-end (start -> open -> first query -> exit)")
     cold_wall: list[float] = []
@@ -554,7 +582,7 @@ def side_by_side(pink: dict, duck: dict, rows: int) -> str:
         "0.00 means < 1 ms)"
     )
     lines.append("")
-    lines.append("-- per-query wall, fresh process (DuckLake) vs in-session (pink-lake) --")
+    lines.append("-- per-query wall, in-session (pink-lake, in-memory) vs fresh process (DuckLake) --")
     wrows = []
     for name, _ in QUERIES:
         p_q = pink["queries"].get(name, {})
@@ -567,6 +595,28 @@ def side_by_side(pink: dict, duck: dict, rows: int) -> str:
             ]
         )
     lines.append(render_table(["query", "pink-lake (ms)", "DuckLake (ms)"], wrows))
+    lines.append("")
+    lines.append(
+        "-- per-query cold process (fresh process -> open/attach -> one query -> exit) --"
+    )
+    crows = []
+    for name, _ in QUERIES:
+        p_q = pink["queries"].get(name, {})
+        d_q = duck["queries"].get(name, {})
+        p_cold = p_q.get("cold_wall_best_s", float("nan")) * 1000
+        d_cold = d_q.get("wall_best_s", float("nan")) * 1000
+        ratio = "n/a" if not d_cold else f"{p_cold / d_cold:.2f}x"
+        crows.append([name, f"{p_cold:.2f}", f"{d_cold:.2f}", ratio])
+    lines.append(
+        render_table(
+            ["query", "pink-lake cold (ms)", "DuckLake cold (ms)", "pink/duck"], crows
+        )
+    )
+    lines.append(
+        "(cold wall = process start + open/attach + query + exit on both sides; "
+        "pink-lake's open eagerly loads Vortex while DuckLake's attach is lazy "
+        "and each query scans Parquet)"
+    )
     return "\n".join(lines)
 
 
@@ -577,12 +627,13 @@ def fairness_notes(rows: int) -> list[str]:
         "  queries; the table is `lake.sales` on both sides (pink-lake is told to",
         "  import into a database named `lake`), so the SQL text is identical.",
         "- DIFFERENT ARCHITECTURES: pink-lake's `.lake open` eagerly loads the whole",
-        "  table from Vortex back into the in-memory engine, so its query timings",
-        "  are in-memory scans and the load cost is the separate `.lake open` row.",
-        "  DuckLake is lazy: ATTACH only opens the SQL catalog (SQLite metadata),",
-        "  and every query scans Parquet at query time. Its query timings are",
-        "  cold-process numbers that INCLUDE re-open (LOAD+ATTACH) and Parquet",
-        "  scanning; no in-memory warm query number exists for DuckLake.",
+        "  table from Vortex back into the in-memory engine, so its in-session query",
+        "  timings are in-memory scans and the load cost is the separate `.lake open`",
+        "  row. DuckLake is lazy: ATTACH only opens the SQL catalog (SQLite metadata),",
+        "  and every query scans Parquet at query time; no in-memory warm query",
+        "  number exists for DuckLake. The per-query cold-process table measures BOTH",
+        "  engines as fresh process -> open/attach -> one query -> exit, so those",
+        "  numbers include each engine's open/attach cost and are directly comparable.",
         "- DuckLake is a full lakehouse format: transactional SQL catalog, MVCC-ish",
         "  snapshots and time travel. This run is a single ingest; DuckLake's",
         "  catalog DB (meta.ducklake) grows with every write/snapshot, while",
