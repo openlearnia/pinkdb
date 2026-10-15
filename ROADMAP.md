@@ -59,7 +59,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 34 | Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer) | done | crates/pink-lake + CLI lake feature: catalog.json + immutable snapshots/<v>.json + per-table data/<table>/<uuid>.pink (single-table engine bytes); snapshot/version/restore API; crash-atomic publication; 465 tests both parser modes, 35 CLI lake tests, clippy clean incl. lake,encryption; process-race harness 8×4/6×4/6×6 consistent; sizes default 2.29 MB / +lake 2.47 MB |
 | 35 | Vortex file format as the default lake data format (format crate / extension) | done | vortex 0.88 direct dep in pink-lake (blocking, direct arrays, no arrow on our side); catalog v2 with per-table format; v1 `.pink` lakes readable (checked-in fixture) and migrate on save; bit-exact round-trips incl. NaN payloads/-0.0; temporals stored as raw ints + metadata (native vortex timestamp ext panics on i64 extremes); 1M-row data 3.1 MB vs 14.0 MB `.pink` (4.5× smaller), save 0.20 s vs 0.086 s, load 0.067 s vs 0.108 s; +218 crates, lake binary 44.6 MB (default unchanged 2.29 MB) ; post-review C1: tampered .vortex files could panic inside the vortex decoder (~0.5% of single-byte flips) — the full decode boundary is now catch_unwind-guarded and surfaces Corrupt errors naming the file, with a deterministic bit-flip sweep in debug and release plus a CLI tamper test; corrupt-input gate + crafted pinkdb.table cases added (472 → 487 tests); docs corrected (decoder panics caught; workspace builds compile vortex while the feature-less CLI binary stays vortex-free) |
 | 35b | Parser cleanup: delete the hand-written recursive-descent parser + lexer and the `PINKDB_PARSER` switch (PEG-only parsing); retain/re-home the shared pieces the PEG grammar and WAL statement-splitting still use; port lexer/parser unit tests to PEG tests; keep the differential corpus as a PEG-only corpus; update README/docs (including the docs website's CLI page) | done | hand-written parser + lexer deleted (2,001 lines; server cross-parser test replaced); Keyword/statement-splitting/nesting-guard re-homed; `PINKDB_PARSER` switch removed; lexer/parser tests + corpus + seeded fuzz ported to PEG-only; 472 tests, clippy clean, duckdiff 60/60, docs CLI page redeployed |
-| 36 | S3 bucket support for lake storage and file reading (optional `s3` feature, storage provider) | done | pink-lake `Storage` trait + `s3` feature (hand-rolled SigV4 over ureq/hmac/sha2, AWS + R2 path/virtual-hosted, conditional writes: create-only snapshots + `If-Match` catalog CAS with conflict errors, documented `501`→check-then-put degradation); mock-S3 test server + AWS SigV4 vectors + 3×3 race; CLI `s3://` URLs; default CLI byte-identical, +1.96 MB with `lake,s3`; 490 default tests, 79 pink-lake `s3` tests, clippy clean ; multi-server real-S3 harness (SERVER=s3mock|seaweedfs|rustfs): SeaweedFS and RustFS are strict witnesses (verify SigV4; conditional PUTs atomic under 2-writer races — 0/20 double-200s) so one-winner-per-version and catalog==snapshot bytes are HARD-enforced there; s3mock stays lenient (documented non-atomic conditionals); SeaweedFS's default config is anonymous (probed+reported; the harness starts an identity-configured container for the enforced run); RustFS needs a 4M-row slow-vs-quick window; MinIO images currently unpullable; recipes + capability matrix in README/s3_docker_notes.md |
+| 36 | S3 bucket support for lake storage and file reading (optional `s3` feature, storage provider) | done | pink-lake `Storage` trait + `s3` feature (hand-rolled SigV4 over ureq/hmac/sha2, AWS + R2 path/virtual-hosted, conditional writes: create-only snapshots + `If-Match` catalog CAS with conflict errors, documented `501`→check-then-put degradation); mock-S3 test server + AWS SigV4 vectors + 3×3 race; CLI `s3://` URLs; default CLI byte-identical, +1.96 MB with `lake,s3`; 490 default tests, 79 pink-lake `s3` tests, clippy clean ; multi-server real-S3 harness (SERVER=s3mock\|seaweedfs\|rustfs): SeaweedFS and RustFS are strict witnesses (verify SigV4; conditional PUTs atomic under 2-writer races — 0/20 double-200s) so one-winner-per-version and catalog==snapshot bytes are HARD-enforced there; s3mock stays lenient (documented non-atomic conditionals); SeaweedFS's default config is anonymous (probed+reported; the harness starts an identity-configured container for the enforced run); RustFS needs a 4M-row slow-vs-quick window; MinIO images currently unpullable; recipes + capability matrix in README/s3_docker_notes.md |
 | 37 | Documentation website (separate site/track) | done | website/ generator (stdlib Python, layout+fragments), 10 pages + CSS, 86 KiB self-contained, extensionless canonical links, wrangler dry-run validated |
 | 38 | Host the website and extension repository on Cloudflare Workers + R2 (infra; Workers half done, R2 deferred to the extensions-repository wave 32/39) | done | live at https://pinkdb-docs.defaultcms.workers.dev (Workers static assets; .html links 307→canonical extensionless; 404-page; assets 200) |
 | 39 | CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) — *as built: signing is a documented hook only (SHA-256 checksums); signatures moved to wave 40i* | done | three GitHub Actions workflows (.github/workflows/{ci,publish-extensions,deploy-docs}.yml): CI build/test/clippy + feature matrices + wasm + duckdiff + Python/Go bindings + C/Go SDK smokes + Docker S3 job; manual-dispatch extension publishing to the live R2 repo (dup refusal, checksums today, signing hook documented); docs auto-deploy; actionlint-clean, YAML-parsed, steps executed locally where possible; secrets documented (CLOUDFLARE_API_TOKEN scopes + account id) |
@@ -92,6 +92,10 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
+
+Lake-scan plan (lake workstream, sub-waves 45b–45d): stage 1 shipped as 45d — footer-only
+`.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize;
+stages 2 (projection pushdown) and 3 (filter/zone-map pruning) are the follow-ups.
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -413,3 +417,32 @@ Java bindings.
   churn). Next round's breadcrumb: struct-of-arrays group storage (typed key columns +
   accumulator arrays, no per-group allocations) for high-cardinality GROUP BY / DISTINCT
   (~50 ms @1M); `proj_func` (per-row string allocation in `upper`) is the other one.
+- 2026-10-15 — Wave 45b (89d0a2f): writer block-size A/B — negative result, kept the 1 MiB
+  write-block target. The 8/16 MiB coalescing from the DuckDB/Vortex prior art does not
+  transfer: bytes move by only −0.15%, save is not faster (10M median +9–11%), and
+  `.lake open` is ~2× slower (13→24 ms @1M, 119→241 ms @10M). Root cause measured: the
+  reader sub-splits stored chunks at ~100k rows, so larger targets leave ragged tails that
+  are not multiples of the engine's 2,048-row chunks and the append takes `append_chunk`'s
+  element-wise merge path (append phase 0.7 → 110 ms @10M). The scheme-exclusion half of
+  the A/B (RunEnd/IntRLE/ALPRD/FloatRLE) is not expressible through the vortex facade
+  without a new dependency and is byte-neutral on this corpus anyway (no such encodings
+  appear in the written files). Comment-only change; format_version stays 3. 517 tests.
+- 2026-10-15 — Wave 45c (ca5eb37): lake open 3.7× — the loader moves the `fs::read` buffer
+  into Vortex (`ByteBuffer::from`) instead of copying it again; `DataTable::append_shared_chunk`
+  shares `Arc<Vector>` columns, so the decoded store no longer deep-clones ~250 MB @10M; the
+  varchar decode interns per chunk keyed by the exact 16-byte Vortex view. `.lake open` @10M
+  110–126 → 30 ms printed (open CPU 540 → 190 ms, peak RSS 996 → 352 MB); @1M 13 → 4 ms.
+  Official cold-process @10M: count 38.8 vs DuckLake 35.2 ms, group-by 72.2 vs 64.3, filter
+  62.2 vs 52.2, order 77.2 vs 55.4 (was 2.8–4.2× behind; now 1.1–1.4×). Ingest wall 0.482 s /
+  save 0.275 s; storage 25.1 MB vs 92.6 MB. Measured and rejected: a file-backed reader and
+  rayon min-length batching (no gain). 518 tests.
+- 2026-10-15 — Wave 45d (5a024ea): `.lake attach` — footer-only `.lake attach <dir|s3>
+  [version]` (+`.lake detach`, `.lake attached`); exact `COUNT(*)`/`COUNT(col)`/`MIN`/`MAX`
+  answered from stored statistics under strict gates (exact NullCount; `Precision::Exact`
+  min/max; `NaNCount == 0`; no ±0.0 DOUBLE stat; multi-agg all-or-nothing; anything unproven
+  materializes lazily and caches). Cold @10M: attach+`COUNT(*)` **4.94 ms** vs DuckLake 34.92
+  vs `.lake open` 34.76; attach+`MIN`/`MAX` 4.90 ms; attach overhead ~1.2–1.7 ms, constant in
+  file size; fallback queries within noise of open. @1M attach+`COUNT(*)` 4.62 ms. Also closed
+  a real hazard: durable stores now refuse mutating SQL that reads an attached table (the
+  logged text could not replay → unopenable WAL). Lake-scan plan stage 1. Gates: 542 workspace /
+  CLI lake+s3 59 / pink-lake s3 123 / duckdiff 60/60.

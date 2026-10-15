@@ -181,6 +181,24 @@ Reproduce: `python3 bench/lake_bench.py --rows 1000000 --runs 5` (add
 Vortex scan/decode speed at 10M (the engine's in-memory scans lose to
 Parquet for filter/group-by/order-by there).
 
+## Lake workstream (sub-waves 45b–45d, Oct 2026)
+
+Follow-on work on the lake path after wave 45, planned as the staged
+lake-scan design (design doc: wave C). Compact results:
+
+| Sub-wave | Scope | Result |
+|---|---|---|
+| 45b (`89d0a2f`) | writer block-size A/B: coalesce stored blocks to 8/16 MiB (the DuckDB/Vortex prior art) | negative — bytes −0.15%, save not faster (10M median +9–11%), `.lake open` ~2× slower (ragged tails take `append_chunk`'s element-wise merge path: append 0.7 → 110 ms @10M). 1 MiB kept, format_version stays 3, documented in the code comment; the scheme-exclusion half (RunEnd/IntRLE/ALPRD/FloatRLE) is unreachable through the vortex facade without a new dep and byte-neutral on this corpus. 517 tests |
+| 45c (`ca5eb37`) | `.lake open` 3.7×: zero-copy file read (`ByteBuffer::from`), shared decoded chunks (`DataTable::append_shared_chunk` — no ~250 MB deep clone), per-chunk varchar interning keyed by the exact 16-byte Vortex view | @10M 110–126 → 30 ms printed, CPU 540 → 190 ms, peak RSS 996 → 352 MB; @1M 13 → 4 ms. Official cold-process @10M: count 38.8 vs DuckLake 35.2 ms, group-by 72.2 vs 64.3, filter 62.2 vs 52.2, order 77.2 vs 55.4 (was 2.8–4.2× behind, now 1.1–1.4×). Ingest wall 0.482 s / save 0.275 s; storage 25.1 MB vs 92.6 MB. 518 tests |
+| 45d (`5a024ea`) | `.lake attach <dir\|s3> [version]` + `.lake detach`/`.lake attached`; exact `COUNT(*)`/`COUNT(col)`/`MIN`/`MAX` from stored statistics; lazy per-table materialize + cache | cold @10M attach+`COUNT(*)` 4.94 ms vs DuckLake 34.92 vs `.lake open` 34.76; attach+`MIN`/`MAX` 4.90 ms; attach overhead ~1.2–1.7 ms, constant in file size; fallback queries within noise of open; @1M attach+`COUNT(*)` 4.62 ms. Stats gates: exact NullCount, `Precision::Exact` min/max, `NaNCount == 0`, no ±0.0 DOUBLE stat, multi-agg all-or-nothing. Mutations on attached tables refused; durable stores refuse mutating SQL that reads one. 542 workspace / CLI lake+s3 59 / pink-lake s3 123 / duckdiff 60/60 |
+
+**Lake scan (staged).** Stage 1 shipped as 45d — footer-only attach + exact
+stats fast paths + lazy materialize. Stage 2 (projection pushdown) and stage 3
+(filter/zone-map pruning) are next. Until then a query the statistics cannot
+answer decodes the whole table exactly like `.lake open`: the cold-process
+numbers above close the open gap (1.1–1.4× vs DuckLake) but a projection or
+filter still pays the full decode.
+
 ## Real-S3 integration harness (Oct 2026, wave 36 follow-up)
 
 `crates/pink-lake/tests/s3_docker.sh` (new; bash + python3 + Docker, not

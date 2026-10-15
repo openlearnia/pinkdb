@@ -256,8 +256,9 @@ compare equal. `.save <other>` is a plain snapshot and is refused when the
 target has a sidecar WAL with committed records. `.import` is made durable by
 a checkpoint before it returns (and is refused inside a transaction), so an
 import survives a crash immediately after it acks. A mutating statement that
-reads a session-local view is refused on durable databases: views are never
-persisted, so replaying its logged SQL could not rebuild it.
+reads a session-local view — or an attached lake table — is refused on durable
+databases: neither is persisted, so replaying its logged SQL could not
+rebuild it.
 
 A durable database has **one live handle**: opening takes an exclusive
 advisory lock on `<file>.pink.lock` (an OS `flock`, released automatically
@@ -384,7 +385,9 @@ embedding.
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
 JSON catalog plus immutable per-table data files, on local disk or (with the
 `s3` feature) in an S3 bucket/prefix. Wave 35 makes **Vortex the default data
-format**; wave 36 adds S3/R2 object storage.
+format**; wave 36 adds S3/R2 object storage; wave 45d adds read-only
+**`.lake attach`** — a footer-only open with exact `COUNT`/`MIN`/`MAX` from
+stored statistics and lazy materialization.
 
 A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
 key prefix with exactly this layout):
@@ -503,6 +506,21 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
   `save_store`/`.lake save` pre-validate the store (dotted database names,
   over-long encoded table names) *before* creating a lake, so a rejected save
   leaves nothing behind.
+- **Read-only attach (wave 45d): `.lake attach <dir|s3> [version]`** reads the
+  catalog, the chosen manifest and every data file's footer, metadata and
+  statistics — no column data is decoded (over object storage the whole objects
+  are read, still without decoding). Attached tables are session-local and
+  read-only: they resolve under their `db.table` names, `.tables`/`.schema` mark
+  them (`t (3 rows, attached)`), and every mutation over one is refused
+  (`attached lake tables are read-only`). Exact `COUNT(*)`/`COUNT(col)`/`MIN`/
+  `MAX` answers come from the stored statistics under strict gates (exact null
+  counts; `Precision::Exact` min/max; `NaNCount == 0`; no ambiguous `±0.0`
+  DOUBLE stat; a multi-aggregate query is all-or-nothing); anything unproven
+  materializes the one table the query touches through the same decode
+  `.lake open` performs, cached for the session. `.lake detach <dir>` drops one
+  attachment and `.lake attached` lists them; `.lake save` skips attached tables
+  with a note; `.lake open` drops them all; and a durable database refuses
+  mutating SQL that reads an attached table (its logged text could not replay).
 - **One live writer handle per lake** (no file locking; concurrent readers
   of published versions are fine). A handle that saves after another
   handle/process moved the catalog fails with `LakeError::Conflict`
@@ -568,6 +586,9 @@ cargo build -p pinkdb-cli --features lake,s3     # + S3/R2 object storage
 .lake save <dir>          snapshot the store (version, tables, rows, bytes)
 .lake open <dir> [ver]    replace the in-memory store with the lake
                           (session database resets to main; PINKDB_KEY is kept)
+.lake attach <dir> [ver]  attach the lake read-only, footer-only (session-local)
+.lake detach <dir>        detach one attached lake from this session
+.lake attached            list this session's attached lakes and their tables
 .lake versions <dir>      published versions (current marked)
 .lake tables <dir>        current version's db.table names + row counts
 .lake info <dir>          format version, current version, snapshots, tables
@@ -1380,6 +1401,30 @@ breadcrumb. At 10M, lake save is still behind DuckLake's ingest (0.76 s vs
 0.37 s), and the `.lake open` decode (~0.63 s) is the last obvious lake gap
 (bulk typed decode is the other breadcrumb).
 
+**Wave 45 refresh (Oct 2026, sub-waves 45c/45d):** `.lake open` at 10M went
+110–126 → **30 ms** printed (open CPU 540 → 190 ms, peak RSS 996 → 352 MB;
+13 → 4 ms at 1M) via a zero-copy file read, shared decoded chunks and
+per-chunk varchar interning; 10M ingest wall 0.482 s (save 0.275 s), storage
+25.1 MB vs DuckLake's 92.6 MB. `.lake attach` (wave 45d) is the lazy
+counterpart: footer-only (no column decode), exact `COUNT`/`MIN`/`MAX` from
+the stored statistics, and lazy per-table materialization for anything else.
+Cold-process runs (fresh process → open/attach → one query → exit; best-of-5,
+2026-10-15, same host — the `COUNT(*)`/attach rows are from 45d's
+side-by-side run, the scan-query rows from 45c's official run):
+
+| cold process (ms) | pink `.lake attach` | pink `.lake open` | DuckLake |
+|---|---|---|---|
+| @10M `COUNT(*)` | **4.94** | 34.76 | 34.92 |
+| @10M `MIN(total)` / `MAX(total)` | **4.90** | — | — |
+| @10M group-by / filter / order-by | fallback = decode, within noise of open | 72.2 / 62.2 / 77.2 | 64.3 / 52.2 / 55.4 |
+| @1M `COUNT(*)` | **4.62** | — | — |
+
+Attach overhead (catalog + manifest + footers) is ~1.2–1.7 ms, constant in
+file size. `.lake open` is now within 1.1–1.4× of DuckLake on the three scan
+queries (was 2.8–4.2× behind); the remaining gap is the scan path itself — no
+projection pushdown or filter/zone-map pruning yet (stages 2/3 of the
+lake-scan plan).
+
 **Fairness caveat — this is "same data, same queries, different
 architectures", not an apples-to-apples product comparison.** `.lake open`
 eagerly loads the whole table from Vortex back into pinkdb's in-memory
@@ -1387,7 +1432,10 @@ engine, so pink-lake's per-query lines are in-memory scans and the load cost
 is the separate open row; DuckLake is lazy — ATTACH only opens the SQL
 catalog and every query scans Parquet at query time, so its printed query
 times include the scan and its fresh-process wall adds ~30 ms of process
-start + LOAD + ATTACH at 1M on top of the query. DuckLake is a full
+start + LOAD + ATTACH at 1M on top of the query. `.lake attach` is pink-lake's
+lazy mode (footer-only; statistics-only answers), but a query the statistics
+cannot answer still decodes the whole table — projection and filter/zone-map
+pushdown are not implemented yet. DuckLake is a full
 lakehouse format (transactional SQL
 catalog, MVCC-ish snapshots, time travel) and its catalog DB grows with
 every write/snapshot (this run is a single ingest), while pink-lake
@@ -1400,8 +1448,8 @@ ties in ORDER BY have no stable order on either engine).
 
 - No nested transactions or savepoints; one live handle per durable `.pink`
   path (an exclusive `<file>.lock`; a second open fails); `.open` replaces the
-  whole store; `.lake save`/`.lake open` are refused inside a transaction and
-  `.lake open` refuses to detach a durable session
+  whole store; `.lake save`/`.lake open`/`.lake attach` are refused inside a
+  transaction and `.lake open` refuses to detach a durable session
 - `CREATE DATABASE` / `DROP DATABASE` / `LOAD EXTENSION` are refused inside a
   transaction; the last database cannot be dropped; `DROP DATABASE` does not
   remove views from other databases (views are per-database and session-local)
@@ -1438,9 +1486,14 @@ ties in ORDER BY have no stable order on either engine).
 
 - Lake (`lake`/`s3` features): every `.lake save` writes a full snapshot of
   every table; old versions and orphaned data files are never garbage
-  collected; the lake is reached only through `.lake open` (whole store into
-  memory — no SQL access, time travel or column projection yet); lake files
-  are plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
+  collected; the lake is reached through `.lake open` (whole store into memory)
+  or `.lake attach` (read-only, one version pinned, footer-only: exact
+  COUNT/MIN/MAX from stored statistics, anything else lazily decodes the one
+  table it touches — no time travel within a session, no projection or
+  filter/zone-map pushdown yet); attached tables are session-local, not saved,
+  and mutations over them are refused (mutating SQL over them on a durable
+  store is refused too, since the log could not replay them); lake files are
+  plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
   credentials come only from the environment or explicit config (no
   profiles/IMDS/SSO)
 - Extensions repository: artifacts are verified by SHA-256 from the catalog
@@ -1453,7 +1506,9 @@ feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
 layer (`pink-lake`, CLI `lake` feature) shipped in wave 34, became
 Vortex-first in wave 35 (v1 `.pink` lakes still load; open + save migrates)
 and gained S3/R2 object storage in wave 36 (`s3` feature; `s3://` locations,
-conditional-write conflict detection); authentication and TLS are deferred.
+conditional-write conflict detection) and read-only `.lake attach` (footer-only;
+exact `COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d;
+authentication and TLS are deferred.
 
 ## Development
 
