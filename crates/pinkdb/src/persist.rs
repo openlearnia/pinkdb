@@ -16,7 +16,7 @@
 //!     per column: chunk_count u32
 //!       per chunk:
 //!         encoding u8 (0=Plain, 1=RLE, 2=Dict, 3=Bitpack, 4=DeltaBitpack,
-//!                      5=DictBitpack, 6=ALP; 7..=9 reserved)
+//!                      5=DictBitpack, 6=ALP, 8=LZ frame; 7 and 9 reserved)
 //!         validity_len u32 + validity bytes (bit set = valid)
 //!         payload (encoding-specific)
 //! crc32 u32 (IEEE, over every preceding byte including the magic)
@@ -38,7 +38,9 @@
 //!   out-of-range values ride the exceptions).
 //! - Booleans: Plain (bitpacked) vs RLE.
 //! - Varchars: Plain (offsets + data) vs Dictionary (first-occurrence codes)
-//!   vs RLE vs dictionary-bitpack (the dictionary with minimal-width codes).
+//!   vs RLE vs dictionary-bitpack (the dictionary with minimal-width codes)
+//!   vs an LZ frame (tag 8) around the plain layout — attempted only when a
+//!   bounded prefix probe says the string bytes repeat.
 //!
 //! The reader never panics on corrupt input: every read is bounds-checked and
 //! surfaces `PinkDbError::Execution("...")`, and no allocation is sized from
@@ -84,8 +86,11 @@ const ENC_DICT_BITPACK: u8 = 5;
 const ENC_ALP: u8 = 6;
 /// Reserved (a corpus never showed a win); readers reject it cleanly.
 const ENC_DICT_RLE: u8 = 7;
-/// Reserved stretch tags (LZ frame, FSST); readers reject them cleanly.
+/// LZ77 frame (tag 8): a plain payload wrapped in a token stream, used only
+/// when it shrinks the chunk (see [`enc_lz_frame`]). Decode = decompress,
+/// then decode the inner payload.
 const ENC_LZ_FRAME: u8 = 8;
+/// Reserved stretch tag (FSST); readers reject it cleanly.
 const ENC_FSST: u8 = 9;
 
 /// Tables with fewer chunks than this encode serially: the rayon fan-out
@@ -891,6 +896,206 @@ fn consider_best(best: &mut Option<(u8, Vec<u8>)>, tag: u8, payload: Vec<u8>) {
     }
 }
 
+// ---------- LZ frame (tag 8) ----------
+//
+// A hand-rolled LZ77 in the spirit of LZ4: greedy longest-match over a
+// 64 KiB window with a 4-byte hash table; tokens are a control byte per
+// literal run / match, then the raw bytes / a u16 offset.
+//
+//   payload = u32 raw_len | u8 base_tag | u32 token_len | tokens
+//
+// `raw_len` is the untouched length of the inner payload; decompression must
+// land exactly on it, and the inner payload (decoded from the decompressed
+// bytes) must consume them exactly. The frame is only ever emitted when it
+// is strictly smaller than the base payload.
+
+/// Shortest match worth a token (3 bytes + control overhead).
+const LZ_MIN_MATCH: usize = 4;
+/// Longest match a single token can encode: `len - 3` in 7 bits.
+const LZ_MAX_MATCH: usize = 130;
+/// Longest literal run a single token can encode: `len - 1` in 7 bits.
+const LZ_MAX_LITERAL: usize = 128;
+/// Back-reference window = the u16 offset range.
+const LZ_WINDOW: usize = u16::MAX as usize;
+/// Hash table entries for the full encode pass (2^16).
+const LZ_HASH_BITS: u32 = 16;
+/// Hash table entries for the prefix probe (2^12, stack-allocated).
+const LZ_PROBE_HASH_BITS: u32 = 12;
+/// Bytes of the string data region the probe compresses.
+const LZ_PROBE_BYTES: usize = 4096;
+/// Hard cap on the inner payload size of a frame (decode safety: no
+/// allocation is sized from an unvalidated length).
+const LZ_MAX_RAW: usize = 1 << 24;
+/// LZ is only tried when the best existing candidate is at least this big:
+/// below it the frame header plus one token cannot win, so the scan would be
+/// pure cost (sales: the VARCHAR dictionary wins at ~300 B/chunk and never
+/// triggers a probe, keeping the 1M/10M save time at baseline).
+const LZ_MIN_ATTEMPT: usize = 1024;
+
+#[inline]
+fn lz_hash4(a: &[u8], bits: u32) -> usize {
+    let v = u32::from_le_bytes([a[0], a[1], a[2], a[3]]);
+    (v.wrapping_mul(0x9E37_79B1) >> (32 - bits)) as usize
+}
+
+/// Greedy LZ77 into a fresh token stream. `table` is scratch (any length);
+/// it is cleared first. Deterministic: fixed hash, last-occurrence matches,
+/// no randomness.
+fn lz_compress_into(data: &[u8], table: &mut [u32]) -> Vec<u8> {
+    debug_assert!(table.len().is_power_of_two(), "LZ scratch must be 2^n");
+    table.fill(u32::MAX);
+    let n = data.len();
+    let mut out = Vec::with_capacity(n / 2 + 16);
+    let bits = table.len().trailing_zeros();
+    let mut lit_start = 0usize;
+    let mut i = 0usize;
+    while i + LZ_MIN_MATCH <= n {
+        let h = lz_hash4(&data[i..i + 4], bits);
+        let cand = table[h];
+        table[h] = i as u32;
+        let mut matched = false;
+        if cand != u32::MAX {
+            let p = cand as usize;
+            if i - p <= LZ_WINDOW && data[p..p + LZ_MIN_MATCH] == data[i..i + LZ_MIN_MATCH] {
+                let mut len = LZ_MIN_MATCH;
+                while len < LZ_MAX_MATCH && i + len < n && data[p + len] == data[i + len] {
+                    len += 1;
+                }
+                // Flush the pending literals, then the match token.
+                let mut l = lit_start;
+                while l < i {
+                    let take = (i - l).min(LZ_MAX_LITERAL);
+                    out.push(((take - 1) as u8) << 1);
+                    out.extend_from_slice(&data[l..l + take]);
+                    l += take;
+                }
+                out.push((((len - 3) as u8) << 1) | 1);
+                out.extend_from_slice(&((i - p) as u16).to_le_bytes());
+                // Index every position the match skipped so later matches can
+                // still find it (each position is inserted at most once).
+                let end = i + len;
+                let mut k = i + 1;
+                while k < end && k + LZ_MIN_MATCH <= n {
+                    table[lz_hash4(&data[k..k + 4], bits)] = k as u32;
+                    k += 1;
+                }
+                i = end;
+                lit_start = i;
+                matched = true;
+            }
+        }
+        if !matched {
+            i += 1;
+        }
+    }
+    let mut l = lit_start;
+    while l < n {
+        let take = (n - l).min(LZ_MAX_LITERAL);
+        out.push(((take - 1) as u8) << 1);
+        out.extend_from_slice(&data[l..l + take]);
+        l += take;
+    }
+    out
+}
+
+fn lz_compress(data: &[u8]) -> Vec<u8> {
+    let mut table = vec![u32::MAX; 1 << LZ_HASH_BITS];
+    lz_compress_into(data, &mut table)
+}
+
+/// Compressibility probe for the LZ candidate: compresses the first
+/// [`LZ_PROBE_BYTES`] of the string data region with a small table and
+/// reports whether it saved at least 10%. Bounded cost (4 KiB scan + a 16 KiB
+/// stack table) regardless of payload size; a false negative only costs
+/// bytes (the frame is merely a candidate), never correctness.
+///
+/// The probe deliberately looks at the string bytes, not the offsets block:
+/// offsets measured as incompressible by this token format (4-byte matches
+/// cost more in control bytes than they save), so a payload whose repeats
+/// live only in its offsets — random strings — must not pay for a full LZ
+/// scan.
+fn lz_probe(data: &[u8]) -> bool {
+    let n = data.len().min(LZ_PROBE_BYTES);
+    if n < 512 {
+        return false;
+    }
+    let mut table = [u32::MAX; 1 << LZ_PROBE_HASH_BITS];
+    let compressed = lz_compress_into(&data[..n], &mut table);
+    compressed.len() * 10 < n * 9
+}
+
+/// LZ frame around `base` (the base payload), or `None` when it does not
+/// strictly shrink it. Caller-side gating (probe, size) is separate so the
+/// decode path can accept any valid base tag.
+fn enc_lz_frame(base_tag: u8, base: &[u8]) -> Option<Vec<u8>> {
+    if base.len() > LZ_MAX_RAW {
+        return None;
+    }
+    let tokens = lz_compress(base);
+    // 4 (raw_len) + 1 (base_tag) + 4 (token_len).
+    if tokens.len() + 9 >= base.len() {
+        return None;
+    }
+    let mut w = Writer::new();
+    w.u32(base.len() as u32);
+    w.u8(base_tag);
+    w.u32(tokens.len() as u32);
+    w.bytes(&tokens);
+    Some(w.buf)
+}
+
+/// Expand an LZ token stream into exactly `raw_len` bytes. Every read is
+/// bounds-checked; malformed streams (a claimed length larger than the
+/// tokens, a zero or out-of-range back-reference, output over-run, leftover
+/// tokens) are clear errors.
+fn lz_decompress(tokens: &[u8], raw_len: usize) -> Result<Vec<u8>> {
+    let corrupt = |what: &str| PinkDbError::Execution(format!("corrupt file: {what}"));
+    // Never size an allocation from the declared length alone; grow as the
+    // tokens are consumed. `raw_len` is capped by the caller.
+    let mut out: Vec<u8> = Vec::with_capacity(raw_len.min(1 << 16));
+    let mut pos = 0usize;
+    while out.len() < raw_len {
+        let ctrl = *tokens
+            .get(pos)
+            .ok_or_else(|| corrupt("truncated LZ token stream"))?;
+        pos += 1;
+        if ctrl & 1 == 0 {
+            let len = usize::from(ctrl >> 1) + 1;
+            if out.len() + len > raw_len {
+                return Err(corrupt("LZ literal run overruns the frame length"));
+            }
+            let end = pos + len;
+            let bytes = tokens
+                .get(pos..end)
+                .ok_or_else(|| corrupt("truncated LZ literal run"))?;
+            out.extend_from_slice(bytes);
+            pos = end;
+        } else {
+            let len = usize::from(ctrl >> 1) + 3;
+            let off_bytes = tokens
+                .get(pos..pos + 2)
+                .ok_or_else(|| corrupt("truncated LZ match"))?;
+            let off = usize::from(u16::from_le_bytes([off_bytes[0], off_bytes[1]]));
+            pos += 2;
+            if off == 0 || off > out.len() {
+                return Err(corrupt("LZ back-reference out of range"));
+            }
+            if out.len() + len > raw_len {
+                return Err(corrupt("LZ match overruns the frame length"));
+            }
+            // Overlapping copy (off < len) must read byte by byte.
+            let start = out.len() - off;
+            for k in 0..len {
+                out.push(out[start + k]);
+            }
+        }
+    }
+    if pos != tokens.len() {
+        return Err(corrupt("trailing bytes in LZ token stream"));
+    }
+    Ok(out)
+}
+
 /// Encode one column chunk straight from the [`Vector`]: returns
 /// (encoding tag, payload bytes). Candidate order is part of the format
 /// contract; ties keep the earlier candidate.
@@ -933,10 +1138,38 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
         }
         DataType::Varchar => {
             let strs = varchar_payload(v);
-            consider_best(&mut best, ENC_PLAIN, enc_strs_plain(&strs));
-            consider_best(&mut best, ENC_DICT, enc_strs_dict(&strs));
-            consider_best(&mut best, ENC_RLE, enc_strs_rle(&strs));
-            consider_best(&mut best, ENC_DICT_BITPACK, enc_strs_dict_bitpack(&strs));
+            let plain = enc_strs_plain(&strs);
+            let dict = enc_strs_dict(&strs);
+            let rle = enc_strs_rle(&strs);
+            let dict_bp = enc_strs_dict_bitpack(&strs);
+            // LZ (the last candidate) wraps the plain layout. It is only
+            // tried when the best structural candidate is still big enough
+            // to have room for a win (`LZ_MIN_ATTEMPT`) and a bounded prefix
+            // probe says the string bytes repeat: sales' low-cardinality
+            // VARCHAR chunks win with a ~300-byte bitpacked dictionary and
+            // never pay for a scan. The frame is only kept when strictly
+            // smaller, and ties keep the earlier candidate, so files that
+            // never win with LZ stay byte-identical to the pre-tag-8 writer.
+            let lz = {
+                let best_len = plain
+                    .len()
+                    .min(dict.len())
+                    .min(rle.len())
+                    .min(dict_bp.len());
+                let data_start = 4 + (strs.len() + 1) * 4;
+                if best_len >= LZ_MIN_ATTEMPT && lz_probe(&plain[data_start..]) {
+                    enc_lz_frame(ENC_PLAIN, &plain)
+                } else {
+                    None
+                }
+            };
+            consider_best(&mut best, ENC_PLAIN, plain);
+            consider_best(&mut best, ENC_DICT, dict);
+            consider_best(&mut best, ENC_RLE, rle);
+            consider_best(&mut best, ENC_DICT_BITPACK, dict_bp);
+            if let Some(frame) = lz {
+                consider_best(&mut best, ENC_LZ_FRAME, frame);
+            }
         }
     }
     best.expect("at least plain encoding")
@@ -1079,7 +1312,7 @@ fn decode_delta(r: &mut Reader, n: usize, base: i64) -> Result<Vec<i64>> {
 
 /// The error for a tag that has no meaning on this dtype (or is reserved).
 fn tag_error(dtype: DataType, tag: u8, v4: bool) -> PinkDbError {
-    let reserved = matches!(tag, ENC_DICT_RLE | ENC_LZ_FRAME | ENC_FSST) || tag > ENC_FSST;
+    let reserved = matches!(tag, ENC_DICT_RLE | ENC_FSST) || tag > ENC_FSST;
     if v4 && reserved {
         PinkDbError::Execution(format!("unsupported v4 encoding tag {tag}; upgrade pinkdb"))
     } else {
@@ -1306,8 +1539,38 @@ fn decode_payload(
             let runs = r.chunk_count("run count")?;
             Ok((VectorData::VarChar(decode_rle_strs(r, n, runs)?), n))
         }
+        (dtype, ENC_LZ_FRAME) => decode_lz_frame(dtype, r, v4),
         _ => Err(tag_error(dtype, tag, v4)),
     }
+}
+
+/// Decode an LZ frame (tag 8): `u32 raw_len | u8 base_tag | u32 token_len |
+/// tokens`. The decompressed bytes are the inner payload, which must be
+/// valid for the chunk's dtype and must consume the frame exactly.
+///
+/// `base_tag` is restricted to the payload tags (0..=6): the reserved and
+/// frame tags (7..=9 and above) are refused so a frame cannot nest or
+/// smuggle an unimplemented codec.
+fn decode_lz_frame(dtype: DataType, r: &mut Reader, v4: bool) -> Result<(VectorData, usize)> {
+    let raw_len = r.u32()? as usize;
+    let base_tag = r.u8()?;
+    let token_len = r.u32()? as usize;
+    if !(4..=LZ_MAX_RAW).contains(&raw_len) {
+        return r.err("bad LZ frame length");
+    }
+    if base_tag > ENC_ALP {
+        return r.err("unsupported LZ base encoding");
+    }
+    let tokens = r.take(token_len)?;
+    let raw = lz_decompress(tokens, raw_len)?;
+    let mut inner = Reader::new(&raw);
+    let (data, n) = decode_payload(dtype, base_tag, &mut inner, v4)?;
+    if !inner.end() {
+        return Err(PinkDbError::Execution(
+            "corrupt file: trailing bytes in LZ frame".to_string(),
+        ));
+    }
+    Ok((data, n))
 }
 
 /// Decode one framed chunk (validity + payload) into a [`Vector`].
@@ -1690,6 +1953,22 @@ fn encode_chunk(dtype: DataType, values: &[Value]) -> (u8, Vec<u8>) {
     encode_chunk_typed(&vector_from_values(dtype, values))
 }
 
+/// The PLAIN payload of a vector (test helper: forced-tag LZ round trips).
+#[cfg(test)]
+fn plain_payload(v: &Vector) -> Vec<u8> {
+    match v.dtype() {
+        DataType::Integer | DataType::Date => enc_ints_plain(&int32_payload(v)),
+        DataType::Bigint | DataType::Timestamp => enc_ints_plain(&int64_payload(v)),
+        DataType::Double => {
+            let values = float64_payload(v);
+            let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
+            enc_u64_plain(&bits)
+        }
+        DataType::Boolean => enc_bool_plain(&bool_payload(v)),
+        DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
+    }
+}
+
 /// Re-export for tests: chunk encode/decode round trip with a forced tag.
 #[cfg(test)]
 pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> Vec<Value> {
@@ -1795,6 +2074,18 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
         (DataType::Varchar, ENC_DICT) => enc_strs_dict(&varchar_payload(&v)),
         (DataType::Varchar, ENC_RLE) => enc_strs_rle(&varchar_payload(&v)),
         (DataType::Varchar, ENC_DICT_BITPACK) => enc_strs_dict_bitpack(&varchar_payload(&v)),
+        // Forced frame: bypass the size/probe gates (they only decide
+        // *selection*), always wrap the plain payload.
+        (_, ENC_LZ_FRAME) => {
+            let base = plain_payload(&v);
+            let tokens = lz_compress(&base);
+            let mut w = Writer::new();
+            w.u32(base.len() as u32);
+            w.u8(ENC_PLAIN);
+            w.u32(tokens.len() as u32);
+            w.bytes(&tokens);
+            w.buf
+        }
         _ => panic!("roundtrip_chunk: unsupported forced tag {tag} for {dtype:?}"),
     };
     let validity = encode_validity(&v);
@@ -2127,12 +2418,36 @@ mod tests {
             roundtrip_chunk(DataType::Varchar, with_nulls.clone(), ENC_DICT_BITPACK),
             with_nulls
         );
-        // High-cardinality strings stay out of the dictionary codecs.
+        // High-cardinality strings with repeated structure (shared prefixes)
+        // pick the LZ frame; a note on the candidate order: with all-distinct
+        // short strings the plain offsets+data layout is smaller than the
+        // 11-bit dictionary + dict bytes, and LZ wraps that plain layout.
         let distinct: Vec<Value> = (0..CHUNK_SIZE)
             .map(|i| Value::Varchar(format!("distinct-{i}-{:04}", i * 7919 % 10007)))
             .collect();
-        let (tag, _) = encode_chunk(DataType::Varchar, &distinct);
-        assert_eq!(tag, ENC_PLAIN, "random distinct strings must stay plain");
+        let v = vector_from_values(DataType::Varchar, &distinct);
+        let plain = enc_strs_plain(&varchar_payload(&v));
+        let (tag, payload) = encode_chunk(DataType::Varchar, &distinct);
+        assert_eq!(tag, ENC_LZ_FRAME, "repetitive distinct strings pick LZ");
+        assert!(
+            payload.len() < plain.len(),
+            "LZ frame {} must beat plain {}",
+            payload.len(),
+            plain.len()
+        );
+        // Strings whose bytes never repeat (seeded hex randoms: 4-byte
+        // collisions exist but pay for themselves) stay PLAIN.
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        let random: Vec<Value> = (0..CHUNK_SIZE)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                Value::Varchar(format!("{x:016x}"))
+            })
+            .collect();
+        let (tag, _) = encode_chunk(DataType::Varchar, &random);
+        assert_eq!(tag, ENC_PLAIN, "random strings must stay plain");
     }
 
     /// A forged dictionary bit width is rejected (strict equality with the
@@ -2342,27 +2657,30 @@ mod tests {
             .append_row(vec![Value::Integer(7)])
             .unwrap();
         let full = db.to_bytes().unwrap();
-        // Plant tag 7 (DICT_RLE) wherever a tag byte might be read, repairing
-        // the CRC so the reserved-tag error (not the checksum) fires.
+        // Plant tag 7 (DICT_RLE) and tag 9 (FSST) — the still-reserved tags —
+        // wherever a tag byte might be read, repairing the CRC so the
+        // reserved-tag error (not the checksum) fires.
         let mut seen = 0;
-        for i in 0..full.len() {
-            if matches!(full[i], ENC_PLAIN | ENC_BITPACK | ENC_DELTA_BITPACK) {
-                let mut bad = full.clone();
-                bad[i] = ENC_DICT_RLE;
-                fix_crc(&mut bad);
-                if let Err(e) = PinkDb::load_bytes(&bad) {
-                    let msg = e.to_string();
-                    if msg.contains("unsupported v4 encoding tag 7") {
-                        seen += 1;
+        for reserved in [ENC_DICT_RLE, ENC_FSST] {
+            for i in 0..full.len() {
+                if matches!(full[i], ENC_PLAIN | ENC_BITPACK | ENC_DELTA_BITPACK) {
+                    let mut bad = full.clone();
+                    bad[i] = reserved;
+                    fix_crc(&mut bad);
+                    if let Err(e) = PinkDb::load_bytes(&bad) {
+                        let msg = e.to_string();
+                        if msg.contains(&format!("unsupported v4 encoding tag {reserved}")) {
+                            seen += 1;
+                        }
+                        assert!(
+                            !msg.contains("invalid for"),
+                            "reserved tag must not report 'invalid for': {msg}"
+                        );
                     }
-                    assert!(
-                        !msg.contains("invalid for"),
-                        "reserved tag must not report 'invalid for': {msg}"
-                    );
                 }
             }
         }
-        assert!(seen >= 1, "reserved tag 7 must be reachable ({seen})");
+        assert!(seen >= 1, "reserved tags must be reachable ({seen})");
     }
 
     #[test]
@@ -3042,6 +3360,263 @@ mod tests {
     /// T2: the format is pinned — a fixed corpus has a fixed length and
     /// CRC-32, deterministic across parallel/serial encodes and across
     /// save→open→save.
+    /// Tag 8: the LZ frame round-trips every dtype bit-exactly (the frame is
+    /// dtype-agnostic: decode decompresses, then decodes the inner payload),
+    /// is chosen for repetitive strings, and is byte-deterministic.
+    #[test]
+    fn lz_frame_roundtrips_and_is_selected() {
+        let values: Vec<Value> = (0..CHUNK_SIZE)
+            .map(|i| {
+                Value::Varchar(format!(
+                    "{{\"event\":\"click\",\"user_id\":{},\"page\":\"/home\",\"ok\":true}}",
+                    i * 7919
+                ))
+            })
+            .collect();
+        let v = vector_from_values(DataType::Varchar, &values);
+        let plain = enc_strs_plain(&varchar_payload(&v));
+        let (tag, payload) = encode_chunk_typed(&v);
+        assert_eq!(tag, ENC_LZ_FRAME, "repetitive JSON strings must pick LZ");
+        assert!(payload.len() < plain.len());
+        // Layout: raw_len | base_tag (PLAIN) | token_len | tokens.
+        let raw_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let token_len = u32::from_le_bytes(payload[5..9].try_into().unwrap()) as usize;
+        assert_eq!(raw_len, plain.len());
+        assert_eq!(payload[4], ENC_PLAIN);
+        assert_eq!(payload.len(), 9 + token_len);
+        // Deterministic: the same chunk encodes to the same frame.
+        let (tag2, payload2) = encode_chunk_typed(&v);
+        assert_eq!(tag, tag2);
+        assert_eq!(payload, payload2);
+        // Forced round trips for every dtype, bit-exact (doubles by bits).
+        for dtype in [
+            DataType::Boolean,
+            DataType::Integer,
+            DataType::Bigint,
+            DataType::Double,
+            DataType::Varchar,
+            DataType::Date,
+            DataType::Timestamp,
+        ] {
+            let vals: Vec<Value> = (0..200).map(|i| corpus_value(dtype, i, 9)).collect();
+            let out = roundtrip_chunk(dtype, vals.clone(), ENC_LZ_FRAME);
+            assert_values_bit_equal(&out, &vals, &format!("LZ {dtype:?}"));
+        }
+        // A frame never wraps a base it cannot shrink: incompressible bytes
+        // produce no frame at all.
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        let random: Vec<u8> = (0..8192)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 56) as u8
+            })
+            .collect();
+        assert!(enc_lz_frame(ENC_PLAIN, &random).is_none());
+    }
+
+    /// Helper: a chunk frame around a raw payload (test).
+    fn framed_chunk(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u8(tag);
+        w.u32(0); // all-valid
+        w.bytes(payload);
+        w.buf
+    }
+
+    /// Helper: an LZ payload with explicit header fields (test).
+    fn lz_payload(raw_len: u32, base_tag: u8, tokens: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(raw_len);
+        w.u8(base_tag);
+        w.u32(tokens.len() as u32);
+        w.bytes(tokens);
+        w.buf
+    }
+
+    /// Helper: decode one VARCHAR chunk frame (test).
+    fn decode_framed(bytes: &[u8]) -> Result<Vector> {
+        let mut r = Reader::new(bytes);
+        let tag = r.u8().unwrap();
+        decode_chunk_typed(DataType::Varchar, tag, &mut r, true)
+    }
+
+    /// Tag 8 decode safety: every malformed shape is a clear error and never
+    /// a panic or a hung allocation (the declared lengths are capped).
+    #[test]
+    fn lz_frame_decode_rejects_malformed_bodies() {
+        let values: Vec<Value> = (0..100)
+            .map(|i| Value::Varchar(format!("row-{}", i % 7)))
+            .collect();
+        let v = vector_from_values(DataType::Varchar, &values);
+        let base = enc_strs_plain(&varchar_payload(&v));
+        let tokens = lz_compress(&base);
+        let good = lz_payload(base.len() as u32, ENC_PLAIN, &tokens);
+        assert_eq!(
+            decode_framed(&framed_chunk(ENC_LZ_FRAME, &good))
+                .unwrap()
+                .len(),
+            100
+        );
+        let err = |payload: &[u8]| {
+            decode_framed(&framed_chunk(ENC_LZ_FRAME, payload))
+                .unwrap_err()
+                .to_string()
+        };
+        // raw_len: 0, below the minimum, and above the cap.
+        for bad_len in [0u32, 3, (1 << 24) + 1, u32::MAX] {
+            let mut bad = good.clone();
+            bad[0..4].copy_from_slice(&bad_len.to_le_bytes());
+            assert!(
+                err(&bad).contains("LZ frame length"),
+                "{bad_len}: {}",
+                err(&bad)
+            );
+        }
+        // Reserved / frame base tags and a tag invalid for the dtype.
+        for base_tag in [ENC_DICT_RLE, ENC_LZ_FRAME, ENC_FSST, 10, 200, 255] {
+            let bad = lz_payload(base.len() as u32, base_tag, &tokens);
+            assert!(
+                err(&bad).contains("unsupported LZ base encoding"),
+                "base {base_tag}: {}",
+                err(&bad)
+            );
+        }
+        let bad = lz_payload(base.len() as u32, ENC_ALP, &tokens);
+        assert!(err(&bad).contains("invalid for VARCHAR"), "{}", err(&bad));
+        // token_len beyond the buffer.
+        let mut bad = good.clone();
+        bad[5..9].copy_from_slice(&(tokens.len() as u32 + 100).to_le_bytes());
+        assert!(
+            err(&bad).contains("unexpected end of file"),
+            "{}",
+            err(&bad)
+        );
+        // Truncated token stream.
+        let bad = lz_payload(base.len() as u32, ENC_PLAIN, &tokens[..tokens.len() - 2]);
+        assert!(err(&bad).contains("truncated"), "{}", err(&bad));
+        // Trailing token bytes after an otherwise complete output.
+        let mut extra = tokens.clone();
+        extra.push(0); // a one-byte literal token
+        extra.push(b'x');
+        let bad = lz_payload(base.len() as u32, ENC_PLAIN, &extra);
+        assert!(err(&bad).contains("trailing bytes"), "{}", err(&bad));
+        // A decompressed payload with bytes the inner codec does not consume.
+        let mut long_base = base.clone();
+        long_base.extend_from_slice(b"junk");
+        let mut long_tokens = Vec::new();
+        for chunk in long_base.chunks(LZ_MAX_LITERAL) {
+            long_tokens.push(((chunk.len() - 1) as u8) << 1);
+            long_tokens.extend_from_slice(chunk);
+        }
+        let bad = lz_payload(long_base.len() as u32, ENC_PLAIN, &long_tokens);
+        assert!(
+            err(&bad).contains("trailing bytes in LZ frame"),
+            "{}",
+            err(&bad)
+        );
+        // Literal run overruns the declared length (raw_len 4, literal 128).
+        let mut toks = vec![0xFEu8];
+        toks.extend(std::iter::repeat_n(b'x', 128));
+        let bad = lz_payload(4, ENC_PLAIN, &toks);
+        assert!(err(&bad).contains("literal run overruns"), "{}", err(&bad));
+        // Zero and out-of-range back-references.
+        let bad = lz_payload(4, ENC_PLAIN, &[0x03, 0x00, 0x00]);
+        assert!(
+            err(&bad).contains("back-reference out of range"),
+            "{}",
+            err(&bad)
+        );
+        let bad = lz_payload(4, ENC_PLAIN, &[0x03, 0x05, 0x00]);
+        assert!(
+            err(&bad).contains("back-reference out of range"),
+            "{}",
+            err(&bad)
+        );
+        // Match overruns the declared length (1 literal + a 129-byte match
+        // into raw_len 4).
+        let bad = lz_payload(4, ENC_PLAIN, &[0x00, b'A', 0xFD, 0x01, 0x00]);
+        assert!(err(&bad).contains("match overruns"), "{}", err(&bad));
+    }
+
+    /// A file whose VARCHAR chunks use the LZ frame errors on truncation at
+    /// (sampled) every offset: no cut may decode as a wrong value, and the
+    /// frame's exact-length checks are what enforce it.
+    #[test]
+    fn lz_file_truncation_errors_at_every_sampled_offset() {
+        let mut db = PinkDb::new();
+        db.create_table("t", vec![("v".to_string(), DataType::Varchar)])
+            .unwrap();
+        {
+            let t = db.table_mut("t").unwrap();
+            for i in 0..3000 {
+                t.append_row(vec![Value::Varchar(format!(
+                    "{{\"kind\":\"event\",\"row\":{},\"pad\":\"aaaaaaaaaaaaaaaa\"}}",
+                    i * 7919
+                ))])
+                .unwrap();
+            }
+        }
+        // The chunks really do use the frame.
+        let t = db.table("t").unwrap();
+        let chunk = t.scan_chunk(0).unwrap();
+        assert_eq!(
+            encode_chunk_typed(&chunk.columns[0]).0,
+            ENC_LZ_FRAME,
+            "the truncation corpus must exercise tag 8"
+        );
+        let bytes = db.to_bytes().unwrap();
+        let mut cuts: Vec<usize> = (0..bytes.len()).step_by(101).collect();
+        cuts.extend(bytes.len().saturating_sub(256)..bytes.len());
+        for cut in cuts {
+            assert!(
+                PinkDb::load_bytes(&bytes[..cut]).is_err(),
+                "truncation at {cut}/{} must error",
+                bytes.len()
+            );
+        }
+        assert!(PinkDb::load_bytes(&bytes).is_ok());
+        // A decoded LZ file re-encodes to the same bytes (deterministic
+        // probe + frame choice).
+        let back = PinkDb::load_bytes(&bytes).unwrap();
+        assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift with LZ");
+    }
+
+    /// The LZ probe is bounded and selective: repetitive text fires, random
+    /// or near-random bytes (4-byte matches that do not pay for their
+    /// control bytes) do not, and tiny payloads are never probed.
+    #[test]
+    fn lz_probe_is_selective() {
+        let json = "{\"event\":\"click\",\"user_id\":42}".repeat(200);
+        assert!(lz_probe(json.as_bytes()), "repetitive JSON must fire");
+        // 62-alphabet random strings: no 4-byte repeat at all.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let alpha = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let text: String = (0..8000)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                alpha[(x >> 33) as usize % alpha.len()] as char
+            })
+            .collect();
+        assert!(!lz_probe(text.as_bytes()), "random text must not fire");
+        // Hex randoms: 4-byte collisions exist but cost more than they save.
+        let mut x: u64 = 0x1234_5678_9abc_def0;
+        let mut hex = String::new();
+        for _ in 0..4000 {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            hex.push_str(&format!("{x:016x}"));
+        }
+        assert!(!lz_probe(hex.as_bytes()), "hex randoms must not fire");
+        // Small payloads are never probed.
+        assert!(!lz_probe(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"));
+        assert!(!lz_probe(&[]));
+    }
+
     #[test]
     fn golden_v4_bytes_are_pinned() {
         let db = golden_db();
@@ -3288,6 +3863,26 @@ mod tests {
                 .unwrap();
             }
         }
+        // A second table whose VARCHAR chunks pick the LZ frame: the
+        // order-preserving parallel collect must still match the serial
+        // bytes exactly.
+        db.execute("CREATE TABLE z (j VARCHAR);").unwrap();
+        {
+            let t = db.table_mut("z").unwrap();
+            for i in 0..(CHUNK_SIZE * 2 + 7) {
+                t.append_row(vec![Value::Varchar(format!(
+                    "{{\"kind\":\"row\",\"n\":{},\"pad\":\"aaaaaaaaaaaaaaaaaaaa\"}}",
+                    i * 7919
+                ))])
+                .unwrap();
+            }
+        }
+        let t = db.table("z").unwrap();
+        assert_eq!(
+            encode_chunk_typed(&t.scan_chunk(0).unwrap().columns[0]).0,
+            ENC_LZ_FRAME,
+            "the identity corpus must exercise tag 8"
+        );
         let a = db.to_bytes_impl(true).unwrap();
         let b = db.to_bytes_impl(false).unwrap();
         assert_eq!(a, b, "parallel and serial saves differ");

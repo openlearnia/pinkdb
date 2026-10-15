@@ -165,6 +165,22 @@ fn payload_start(data: &[u8]) -> usize {
     pos + 30 + 16
 }
 
+/// A 900-byte string with no useful repeats (16-char hex chunks of a seeded
+/// LCG): the container tests need their plaintext to stay above the AEAD
+/// segment size, and a repetitive filler would now be LZ-compressed below it.
+fn incompressible_filler(i: usize) -> String {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ (i as u64).wrapping_mul(0x9E37_79B9);
+    let mut s = String::with_capacity(912);
+    while s.len() < 900 {
+        x = x
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        s.push_str(&format!("{x:016x}"));
+    }
+    s.truncate(900);
+    s
+}
+
 #[test]
 fn bit_exact_roundtrip_multi_database() {
     let s = Scratch::new("roundtrip");
@@ -228,8 +244,8 @@ fn multi_segment_roundtrip_over_one_mib() {
     {
         let t = db.table_mut("big").unwrap();
         for i in 0..1500 {
-            let filler = format!("{}-{:0>900}", i % 7, i);
-            t.append_row(vec![Value::Varchar(filler)]).unwrap();
+            t.append_row(vec![Value::Varchar(incompressible_filler(i))])
+                .unwrap();
         }
     }
     db.save_with_key(s.path(), &raw_key()).unwrap();
@@ -810,7 +826,7 @@ fn duplicated_skipped_or_boundary_truncated_checkpoint_segments_are_rejected() {
     {
         let t = db.table_mut("big").unwrap();
         for i in 0..3000 {
-            t.append_row(vec![Value::Varchar(format!("{}-{:0>900}", i % 7, i))])
+            t.append_row(vec![Value::Varchar(incompressible_filler(i))])
                 .unwrap();
         }
     }
