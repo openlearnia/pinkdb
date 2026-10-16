@@ -88,7 +88,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 52 | Core extension: **json** — `json_extract`, `json_value`, `json_valid`, `json_array_length`, `json_object`, `json_array` (JSON as VARCHAR in v1) | queued | `extensions/json` |
 | 53 | Core extension: **string** — `split_part`, trim variants, `replace`, `reverse`, `left`/`right`, `strpos`, `starts_with`/`ends_with`, `regexp_match`/`regexp_extract` | queued | `extensions/string` |
 | 54 | Core extension: **math** — `sqrt`, `pow`, `log`/`ln`/`exp`, trig, `floor`/`ceil`, `sign`, `greatest`/`least`, `random` (volatile-flagged) | queued | `extensions/math` |
-| 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | core |
+| 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) — carry the post-merge audit items: profile the fused join→aggregate `MatchTable::build` path (`join_group` +14%, `join_probe` +7%) and the VARCHAR filter path (`filter_str` +19%) vs the 61-tree A/B | queued | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | done | landed; duckdiff 88 → 155 probes |
@@ -743,3 +743,18 @@ Java bindings.
   by bounded waits (`f92c2a6`; a recurrence now fails with the collected CLI
   output instead of hanging the suite). Fully green on 493ea50 (run
   38931704447, all nine jobs).
+- 2026-10-16 — Post-merge benchmark audit (HEAD 3e71930, idle machine). Standing
+  battery ~253 ms (61-tree 248.7; ≈ +1.8%). `mp_optimistic.py` txn-read reproduced
+  **2.34×** vs serialized (baseline binary 1.01× — the 45o contention result holds
+  on the merged tree). Durable: `Sync` inserts 42.2 s (fsync-bound ≈4.2 ms/insert),
+  `Batch` inserts **231.4 ms** (identical to 45o — the commit-check fast path
+  holds), selects 548/519 ms, checkpoints 59–60 ms. Back-to-back A/B against a
+  61-tree build (same machine, best-of-7): `join_group` 15.90 → 18.14 (**+14%**),
+  `filter_str` 4.50 → 5.37 (**+19%**), `join_probe` 5.83 → 6.22 (+7%); `join_self`,
+  `join_mat`, windows and `distinct_lowcard` within noise. Function-level diffs
+  (`fused_join_aggregate`, `MatchTable::build`, `walk_scan_projections`,
+  `ScanProjections`) show no algorithmic change — flagged for the wave-55 perf
+  round (profile the fused path's `MatchTable` build and the VARCHAR filter path;
+  the int filter and projection pushdown are unaffected). Note: same-binary
+  session-to-session variance on this machine reaches 9–15% on some queries, so
+  the back-to-back A/B pairs — not absolute totals — are the signal.
