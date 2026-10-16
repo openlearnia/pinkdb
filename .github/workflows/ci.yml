@@ -100,15 +100,15 @@ jobs:
       # SIGKILL crash-recovery loops against the dev CLI (plain, multi-db,
       # kill-during-checkpoint, encrypted).
       - name: kill loops (bench/kill_loop.py)
-        env:
-          PINKDB_KEY: ci-kill-loop-passphrase
         run: |
           cargo build -p pinkdb-cli
           python3 bench/kill_loop.py 20
           python3 bench/kill_loop.py 20 --multi-db
           python3 bench/kill_loop.py --targeted 10
           cargo build -p pinkdb-cli --features encryption
-          python3 bench/kill_loop.py 15 --encrypted
+          # Scope the passphrase to this one invocation: an ambient
+          # PINKDB_KEY would otherwise encrypt the plain runs' checkpoints.
+          PINKDB_KEY=ci-kill-loop-passphrase python3 bench/kill_loop.py 15 --encrypted
 
       - name: wasm check (the core must stay wasm32-compatible)
         run: |

@@ -52,10 +52,13 @@ WORK = tempfile.mkdtemp(prefix="pinkdb_killloop_")
 ACK_RE = re.compile(r"(ACK|TXN) (\d+)")
 ROW_RE = re.compile(r"^│\s*(-?\d+)\s*│", re.M)
 
-# Subprocess environment: None = inherit. `--encrypted` passes a copy with the
-# PINKDB_KEY taken from the environment (the passphrase never appears on a
-# command line).
-ENV = None
+# Subprocess environment for the plain passes: a copy of the parent
+# environment WITHOUT PINKDB_KEY, so an ambient key can never silently encrypt
+# a plain run's checkpoint (the CLI would create an encrypted image that a
+# binary built without the encryption feature cannot reopen). `--encrypted`
+# replaces this with a copy that adds the key (the passphrase never appears on
+# a command line).
+ENV = {k: v for k, v in os.environ.items() if k != "PINKDB_KEY"}
 
 
 def cli(binary, cmds, cwd):
@@ -465,7 +468,9 @@ def main():
                 file=sys.stderr,
             )
             return 2
-        ENV = dict(os.environ)
+        global ENV
+        ENV = dict(ENV)
+        ENV["PINKDB_KEY"] = passphrase
         print(
             f"encrypted mode: PINKDB_KEY from the environment "
             f"({len(passphrase)} chars)"
