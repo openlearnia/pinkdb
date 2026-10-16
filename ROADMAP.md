@@ -91,8 +91,21 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
+| 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | in progress | worktree; integrates as a patch with full gates after 45o |
+| 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | queued | — |
+| 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | in progress | worktree; patch integration after 45o |
+| 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | in progress | worktree; patch integration after 45o |
+| 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | queued | — |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
+
+Parallel feature work (Oct 2026): waves 58 (SQL completeness), 60 (functions) and
+61 (optimizer work) are being built in dedicated git worktrees
+(`wt-sql-completeness`, `wt-functions`, `wt-optimizer`) against the current base
+while 45o runs in the main tree; each produces a patch artifact that integrates
+with full gates plus CI before merge. 59 (prepared statements) and 62
+(DECIMAL/INTERVAL types) are queued; the schema-feature waves (declarative
+PK/FK constraints, indexes, materialized views) remain in the numbered queue.
 
 Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only

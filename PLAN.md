@@ -236,6 +236,14 @@ wrong key fails closed with an authenticated error, the `catalog == snapshot`
 byte invariant and the S3 conditional-PUT CAS (on ciphertext) are preserved, and
 the strict S3 and encrypted soak harnesses gain encrypted-lake coverage.
 
+**Parallel feature waves in git worktrees (Oct 2026).** Waves 58 (SQL
+completeness), 60 (functions) and 61 (optimizer work) are being built in
+dedicated worktrees off the current base while 45o runs in the main tree; each
+produces a patch artifact that integrates with full gates + CI before merge.
+59 (prepared statements) and 62 (DECIMAL/INTERVAL types) are queued; the
+schema-feature waves (declarative PK/FK, indexes, materialized views) remain in
+the numbered queue.
+
 **CI fully green (Oct 2026).** The first all-green CI run (38875669660; all
 nine jobs, incl. the kill loops, wasm check, release build and the DuckDB
 differential job) followed the `dd53f41…a837896` fix saga: 18 lake fixture
