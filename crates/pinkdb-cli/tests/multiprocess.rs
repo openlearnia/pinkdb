@@ -42,7 +42,7 @@ fn cleanup(ckpt: &Path) {
 struct Cli {
     child: Child,
     stdin: std::process::ChildStdin,
-    reader: BufReader<std::io::PipeReader>,
+    lines: std::sync::mpsc::Receiver<String>,
     out: String,
 }
 
@@ -72,10 +72,28 @@ impl Cli {
         }
         let mut child = cmd.spawn().expect("spawn pinkdb CLI");
         let stdin = child.stdin.take().expect("child stdin");
+        // A reader thread forwards merged stdout+stderr lines; `next_line`
+        // applies a bounded wait, so a rare stall fails with the collected
+        // output instead of hanging the suite forever.
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
         Cli {
             child,
             stdin,
-            reader: BufReader::new(reader),
+            lines,
             out: String::new(),
         }
     }
@@ -93,13 +111,21 @@ impl Cli {
     }
 
     fn next_line(&mut self) -> String {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).expect("read CLI output");
-        assert!(
-            n > 0,
-            "CLI exited before the expected output; collected output:\n{}",
-            self.out
-        );
+        use std::sync::mpsc::RecvTimeoutError;
+        let line = match self.lines.recv_timeout(std::time::Duration::from_secs(120)) {
+            Ok(line) => line,
+            Err(RecvTimeoutError::Timeout) => {
+                // Drain anything already buffered so the evidence is complete.
+                while let Ok(line) = self.lines.try_recv() {
+                    self.out.push_str(&line);
+                }
+                panic!("no CLI output for 120s; collected output:\n{}", self.out);
+            }
+            Err(RecvTimeoutError::Disconnected) => panic!(
+                "CLI exited before the expected output; collected output:\n{}",
+                self.out
+            ),
+        };
         self.out.push_str(&line);
         line
     }
