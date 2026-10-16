@@ -2,9 +2,15 @@
 //!
 //! Output preserves input row order (and input chunk boundaries) with one
 //! appended column per window.
-//! Ranking uses NULLS-LAST ordering (both directions); NULL order keys are
-//! peers, matching GROUP BY semantics. Aggregate windows share [`Acc`] with
-//! hash aggregation; an empty frame yields COUNT → 0, others → NULL.
+//! Ranking uses the ORDER BY's NULL placement (NULLS LAST by default, both
+//! directions); NULL order keys are peers, matching GROUP BY semantics.
+//! Aggregate windows share [`Acc`] with hash aggregation; an empty frame
+//! yields COUNT → 0, others → NULL.
+//!
+//! Frames: `ROWS` counts physical rows; `RANGE` counts ORDER BY *value*
+//! units (peers move together). The default frame with ORDER BY is DuckDB's
+//! `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` — peers share the
+//! frame and get the same value.
 
 use crate::types::FastMap;
 use std::cmp::Ordering;
@@ -13,6 +19,7 @@ use super::aggregate::EvalVec as FusedVec;
 use super::aggregate::{eval_agg_vec, Acc};
 use super::Cx;
 use crate::plan::compare_values;
+use crate::sql::ast::{FrameMode, SortSpec};
 use crate::sql::binder::{BoundWindow, FrameBound, WindowFunc};
 use crate::types::{Result, Value};
 use crate::vector::{DataChunk, Vector};
@@ -329,17 +336,18 @@ fn eval_partition(
             }
         }
         WindowFunc::Agg(f) => {
-            // `UnboundedPreceding` frames only ever grow: `hi(pos)` from
-            // `frame_range` is monotone non-decreasing (every end bound
-            // saturates; a `k PRECEDING` end is empty — `None` — before it
-            // reaches row 0), so one running accumulator extended row by row
-            // gives bit-identical results to recomputing each frame — but
-            // O(n) instead of O(n²) on whole-partition frames.
+            // `UnboundedPreceding` frames only ever grow: `hi(pos)` from the
+            // frame bounds is monotone non-decreasing (every end bound
+            // saturates; a `k PRECEDING` end is empty before it reaches row
+            // 0; RANGE end bounds are monotone in `pos` too), so one running
+            // accumulator extended row by row gives bit-identical results to
+            // recomputing each frame — but O(n) instead of O(n²) on
+            // whole-partition frames.
             if w.frame.start == FrameBound::UnboundedPreceding {
-                let mut acc = Acc::new(f);
+                let mut acc = Acc::new(f, false);
                 let mut next_to_add = 0usize;
                 for (pos, g) in seq.iter().enumerate() {
-                    if let Some((_, hi)) = frame_range(&w.frame, pos, seq.len()) {
+                    if let Some((_, hi)) = frame_range(&w.frame, pos, &seq, rows, w) {
                         // Additions happen in the same order as the per-row
                         // recompute used to (same frame rows, same order ⇒
                         // identical float results too).
@@ -354,8 +362,8 @@ fn eval_partition(
                 // Bounded start: frames are bounded by the spec, so a per-row
                 // recompute is fine (and keeps the code simple).
                 for (pos, g) in seq.iter().enumerate() {
-                    let mut acc = Acc::new(f);
-                    if let Some((lo, hi)) = frame_range(&w.frame, pos, seq.len()) {
+                    let mut acc = Acc::new(f, false);
+                    if let Some((lo, hi)) = frame_range(&w.frame, pos, &seq, rows, w) {
                         for k in lo..=hi {
                             acc.update(rows[seq[k]].arg.as_ref());
                         }
@@ -368,27 +376,47 @@ fn eval_partition(
     Ok(out)
 }
 
-/// Compare two order-key tuples with NULLS LAST in both directions.
+/// Compare two order-key tuples under the window's ORDER BY: direction and
+/// explicit/default NULL placement (NULLS LAST by default).
 fn order_rows(a: &[Value], b: &[Value], w: &BoundWindow) -> Ordering {
-    for ((ka, kb), (_, desc)) in a.iter().zip(b.iter()).zip(w.order.iter()) {
-        let ord = match (ka, kb) {
-            (Value::Null, Value::Null) => Ordering::Equal,
-            (Value::Null, _) => Ordering::Greater,
-            (_, Value::Null) => Ordering::Less,
-            _ => {
-                let c = compare_values(ka, kb);
-                if *desc {
-                    c.reverse()
-                } else {
-                    c
-                }
-            }
-        };
+    for ((ka, kb), (_, spec)) in a.iter().zip(b.iter()).zip(w.order.iter()) {
+        let ord = seq_cmp(ka, kb, spec);
         if ord != Ordering::Equal {
             return ord;
         }
     }
     Ordering::Equal
+}
+
+/// Compare two ORDER BY key values in *sequence order* (the order the sorted
+/// partition is in): direction flips non-NULL values; NULL placement is the
+/// spec's (first/last) independent of direction.
+fn seq_cmp(a: &Value, b: &Value, spec: &SortSpec) -> Ordering {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => {
+            if spec.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (false, true) => {
+            if spec.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (false, false) => {
+            let c = compare_values(a, b);
+            if spec.desc {
+                c.reverse()
+            } else {
+                c
+            }
+        }
+    }
 }
 
 /// Peer rows share a rank: equal order keys (NULLs are peers of NULLs).
@@ -404,8 +432,22 @@ fn is_peer(a: &[Value], b: &[Value]) -> bool {
     })
 }
 
-/// Frame bounds as inclusive [lo, hi] group positions; None = empty frame.
+/// One frame's inclusive `[lo, hi]` sequence positions; `None` = empty frame.
 fn frame_range(
+    frame: &crate::sql::binder::BoundFrame,
+    pos: usize,
+    seq: &[usize],
+    rows: &[Row],
+    w: &BoundWindow,
+) -> Option<(usize, usize)> {
+    match frame.mode {
+        FrameMode::Rows => rows_frame(frame, pos, seq.len()),
+        FrameMode::Range => range_frame(frame, pos, seq, rows, w),
+    }
+}
+
+/// ROWS frames: plain position arithmetic (the pre-RANGE behavior).
+fn rows_frame(
     frame: &crate::sql::binder::BoundFrame,
     pos: usize,
     len: usize,
@@ -432,4 +474,158 @@ fn frame_range(
     } else {
         Some((lo, hi))
     }
+}
+
+/// RANGE frames: bounds are positions of ORDER BY *values*. Peers (equal
+/// keys) always move together; `k PRECEDING`/`FOLLOWING` step `k` value
+/// units in the ordering direction (so for DESC, PRECEDING reaches larger
+/// values). Only the first ORDER BY key participates (the binder enforces at
+/// most one for RANGE).
+fn range_frame(
+    frame: &crate::sql::binder::BoundFrame,
+    pos: usize,
+    seq: &[usize],
+    rows: &[Row],
+    w: &BoundWindow,
+) -> Option<(usize, usize)> {
+    use FrameBound::*;
+    let len = seq.len();
+    let Some((_, spec)) = w.order.first() else {
+        // No ORDER BY: every row is a peer, so unbounded/current bounds
+        // cover the whole partition. (Offsets without ORDER BY are rejected
+        // at bind time.)
+        let lo = match frame.start {
+            UnboundedPreceding | CurrentRow => 0,
+            _ => return None,
+        };
+        let hi = match frame.end {
+            UnboundedFollowing | CurrentRow => len - 1,
+            _ => return None,
+        };
+        return if lo > hi { None } else { Some((lo, hi)) };
+    };
+    let spec = *spec;
+    let cur = key_of(&rows[seq[pos]]);
+    let has_offset = matches!(frame.start, Preceding(_) | Following(_))
+        || matches!(frame.end, Preceding(_) | Following(_));
+    // An offset on a NULL ordering key cannot be evaluated as value
+    // arithmetic: DuckDB restricts the frame to the NULL peer group.
+    if has_offset && cur.is_null() {
+        let mut lo = pos;
+        while lo > 0 && key_of(&rows[seq[lo - 1]]).is_null() {
+            lo -= 1;
+        }
+        let mut hi = pos;
+        while hi + 1 < len && key_of(&rows[seq[hi + 1]]).is_null() {
+            hi += 1;
+        }
+        return Some((lo, hi));
+    }
+    let lo = match frame.start {
+        UnboundedPreceding => 0,
+        CurrentRow => {
+            // Peers are equal full ORDER BY key tuples (multi-key safe).
+            let mut j = pos;
+            while j > 0
+                && is_peer(
+                    rows[seq[j - 1]].ord.as_slice(),
+                    rows[seq[pos]].ord.as_slice(),
+                )
+            {
+                j -= 1;
+            }
+            j
+        }
+        Preceding(k) => {
+            let t = shift_value(cur, k, !spec.desc)?;
+            first_seq_ge(seq, rows, &t, &spec)
+        }
+        Following(k) => {
+            let t = shift_value(cur, k, spec.desc)?;
+            first_seq_ge(seq, rows, &t, &spec)
+        }
+        UnboundedFollowing => return None,
+    };
+    let hi = match frame.end {
+        UnboundedPreceding => return None,
+        Preceding(k) => {
+            let t = shift_value(cur, k, !spec.desc)?;
+            last_seq_le(seq, rows, &t, &spec)?
+        }
+        CurrentRow => {
+            let mut j = pos;
+            while j + 1 < len
+                && is_peer(
+                    rows[seq[j + 1]].ord.as_slice(),
+                    rows[seq[pos]].ord.as_slice(),
+                )
+            {
+                j += 1;
+            }
+            j
+        }
+        Following(k) => {
+            let t = shift_value(cur, k, spec.desc)?;
+            last_seq_le(seq, rows, &t, &spec)?
+        }
+        UnboundedFollowing => len - 1,
+    };
+    if lo > hi {
+        None
+    } else {
+        Some((lo, hi))
+    }
+}
+
+/// The window's first ORDER BY value for one row.
+fn key_of(row: &Row) -> &Value {
+    row.ord.as_slice().first().unwrap_or(&Value::Null)
+}
+
+/// `k` value units before (sequence order) the current key. `back` is true
+/// when the target is sequence-earlier: ASC subtracts, DESC adds.
+fn shift_value(v: &Value, k: usize, back: bool) -> Option<Value> {
+    let k = k as i64;
+    let delta = if back { k.saturating_neg() } else { k };
+    Some(match v {
+        Value::Integer(i) => Value::Bigint((*i as i64).saturating_add(delta)),
+        Value::Bigint(i) => Value::Bigint(i.saturating_add(delta)),
+        Value::Double(x) => Value::Double(x + delta as f64),
+        Value::Date(d) => {
+            Value::Date(d.saturating_add(delta.clamp(i32::MIN as i64, i32::MAX as i64) as i32))
+        }
+        // The binder only admits numeric/DATE keys for RANGE offsets.
+        _ => return None,
+    })
+}
+
+/// First sequence index whose key is `>= threshold` in sequence order.
+fn first_seq_ge(seq: &[usize], rows: &[Row], threshold: &Value, spec: &SortSpec) -> usize {
+    let mut lo = 0usize;
+    let mut hi = seq.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if seq_cmp(key_of(&rows[seq[mid]]), threshold, spec) == Ordering::Less {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Last sequence index whose key is `<= threshold` in sequence order
+/// (`None` when no such index exists).
+fn last_seq_le(seq: &[usize], rows: &[Row], threshold: &Value, spec: &SortSpec) -> Option<usize> {
+    let mut lo = 0usize;
+    let mut hi = seq.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if seq_cmp(key_of(&rows[seq[mid]]), threshold, spec) == Ordering::Greater {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo.checked_sub(1)
 }

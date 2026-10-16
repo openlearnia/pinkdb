@@ -4843,6 +4843,61 @@ mod tests {
     }
 
     #[test]
+    fn wave58_ctas_and_insert_select_replay_and_reads_skip_the_wal() {
+        let p = tmp_ckpt("wave58dml");
+        {
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE src (a INTEGER, b VARCHAR);")
+                .unwrap();
+            db.execute("INSERT INTO src VALUES (1, 'x'), (2, 'y');")
+                .unwrap();
+            db.execute("CREATE TABLE copy AS SELECT a, b FROM src;")
+                .unwrap();
+            db.execute("CREATE TABLE ins (a INTEGER, b VARCHAR);")
+                .unwrap();
+            db.execute("INSERT INTO ins (a, b) SELECT a, b FROM src WHERE a = 2;")
+                .unwrap();
+            // Read-only completeness statements are never WAL-logged.
+            db.execute("EXPLAIN SELECT * FROM src;").unwrap();
+            db.execute("SHOW TABLES;").unwrap();
+            db.execute("DESCRIBE src;").unwrap();
+            db.execute("SELECT a FROM src INTERSECT SELECT a FROM copy;")
+                .unwrap();
+            // An IF NOT EXISTS no-op still logs its statement (it replays as
+            // a no-op) and must not corrupt anything.
+            db.execute("CREATE TABLE IF NOT EXISTS copy (a INTEGER);")
+                .unwrap();
+            db.execute("DROP TABLE IF EXISTS never_existed;").unwrap();
+        }
+        // No checkpoint: the whole state comes from replaying the WAL.
+        let (mut back, _) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM copy ORDER BY a;"),
+            vec![1, 2]
+        );
+        assert_eq!(ints(&mut back, "SELECT a FROM ins ORDER BY a;"), vec![2]);
+        // A transaction containing CTAS + INSERT SELECT replays as one record.
+        {
+            let mut db = durable(&p);
+            db.execute("BEGIN;").unwrap();
+            db.execute("CREATE TABLE tx AS SELECT a FROM src;").unwrap();
+            db.execute("INSERT INTO ins (a) SELECT a FROM src;")
+                .unwrap();
+            db.execute("COMMIT;").unwrap();
+        }
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert!(info.replayed_records >= 1);
+        assert_eq!(ints(&mut back, "SELECT a FROM tx ORDER BY a;"), vec![1, 2]);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM ins ORDER BY a;"),
+            vec![1, 2, 2]
+        );
+        cleanup(&p);
+    }
+
+    #[test]
     fn replay_reproduces_update_delete_and_drop_state() {
         let p = tmp_ckpt("dmlreplay");
         {

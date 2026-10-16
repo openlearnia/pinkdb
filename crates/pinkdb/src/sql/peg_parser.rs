@@ -311,12 +311,43 @@ peg::parser! {
             / load_extension()
             / drop()
             / checkpoint()
+            / show_stmt()
+            / describe_stmt()
+            / explain_stmt()
             / select_statement()
 
         rule select_statement() -> Statement = s:select() { Statement::Select(s) }
 
+        /// A non-reserved word matched case-insensitively (used for syntax
+        /// words that must stay usable as identifiers: SHOW, TABLES, IF,
+        /// NULLS, ...). Consumes trailing trivia like every token.
+        rule word(w: &'static str)
+            = s:ident_raw() ws() {? if s.eq_ignore_ascii_case(w) { Ok(()) } else { Err(w) } }
+
+        rule if_not_exists() -> bool
+            = word("if") kw(Keyword::Not) kw(Keyword::Exists) { true }
+            / { false }
+
+        rule if_exists() -> bool
+            = word("if") kw(Keyword::Exists) { true }
+            / { false }
+
         rule use_stmt() -> Statement
             = kw(Keyword::Use) name:ident() { Statement::Use { name } }
+
+        /// `SHOW TABLES` / `SHOW DATABASES` — matched as words, not reserved
+        /// keywords, so `show` and `tables` stay usable as names.
+        rule show_stmt() -> Statement
+            = word("show") word("tables") { Statement::ShowTables }
+            / word("show") word("databases") { Statement::ShowDatabases }
+
+        /// `DESCRIBE <table>`: DuckDB-shaped column metadata.
+        rule describe_stmt() -> Statement
+            = word("describe") t:table_ref() { Statement::Describe { db: t.0, name: t.1 } }
+
+        /// `EXPLAIN <select>` — the plain (optimized) plan text.
+        rule explain_stmt() -> Statement
+            = word("explain") q:select() { Statement::Explain(Box::new(q)) }
 
         /// `CHECKPOINT` — matched as a word, not a reserved keyword, so
         /// `checkpoint` stays usable as a table or column name.
@@ -347,17 +378,20 @@ peg::parser! {
             / name:ident() { (None, name) }
 
         rule create() -> Statement
-            = kw(Keyword::Create) kw(Keyword::Database) name:ident() {
-                  Statement::CreateDatabase { name }
+            = kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident() {
+                  Statement::CreateDatabase { name, if_not_exists: ifne }
               }
             / kw(Keyword::Create) kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
                   Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query) }
               }
-            / kw(Keyword::Create) kw(Keyword::Table) t:table_ref() lparen() first:table_column()
+            / kw(Keyword::Create) kw(Keyword::Table) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {
+                  Statement::CreateTableAs { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne }
+              }
+            / kw(Keyword::Create) kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_column()
               rest:(comma() c:table_column() { c })* rparen() {
                   let mut columns = vec![first];
                   columns.extend(rest);
-                  Statement::CreateTable { db: t.0, name: t.1, columns }
+                  Statement::CreateTable { db: t.0, name: t.1, columns, if_not_exists: ifne }
               }
 
         rule table_column() -> (String, DataType) = name:ident() ty:type_name() { (name, ty) }
@@ -376,9 +410,13 @@ peg::parser! {
               }
 
         rule insert() -> Statement
-            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? kw(Keyword::Values) rows:insert_rows() {
-                  Statement::Insert { db: t.0, table: t.1, columns, rows }
+            = kw(Keyword::Insert) kw(Keyword::Into) t:table_ref() columns:col_name_list()? source:insert_source() {
+                  Statement::Insert { db: t.0, table: t.1, columns, source }
               }
+
+        rule insert_source() -> InsertSource
+            = kw(Keyword::Values) rows:insert_rows() { InsertSource::Values(rows) }
+            / q:select() { InsertSource::Select(Box::new(q)) }
 
         rule insert_rows() -> Vec<Vec<Expr>>
             = first:insert_row() rest:(comma() r:insert_row() { r })* {
@@ -406,8 +444,12 @@ peg::parser! {
               }
 
         rule drop() -> Statement
-            = kw(Keyword::Drop) kw(Keyword::Database) name:ident() { Statement::DropDatabase { name } }
-            / kw(Keyword::Drop) kw(Keyword::Table) t:table_ref() { Statement::DropTable { db: t.0, name: t.1 } }
+            = kw(Keyword::Drop) kw(Keyword::Database) ife:if_exists() name:ident() {
+                  Statement::DropDatabase { name, if_exists: ife }
+              }
+            / kw(Keyword::Drop) kw(Keyword::Table) ife:if_exists() t:table_ref() {
+                  Statement::DropTable { db: t.0, name: t.1, if_exists: ife }
+              }
             / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
 
         rule txn() -> Statement
@@ -417,26 +459,36 @@ peg::parser! {
 
         // ---------- SELECT ----------
 
-        /// A full SELECT including trailing UNION branches (left-associative).
+        /// A full SELECT including trailing set-operation branches
+        /// (`UNION`/`INTERSECT`/`EXCEPT`), in written order.
         rule select() -> Select
-            = body:select_body() unions:(u:union_branch() { u })* {
+            = body:select_body() unions:(u:set_op_branch() { u })* {
                   let mut sel = body;
                   sel.unions = unions;
                   sel
               }
 
-        rule union_branch() -> (SetOp, Select)
-            = kw(Keyword::Union) op:union_op() branch:select_body() { (op, branch) }
+        rule set_op_branch() -> (SetOp, Select)
+            = kw(Keyword::Union) all:set_quantifier() branch:select_body() {
+                  (if all { SetOp::UnionAll } else { SetOp::Union }, branch)
+              }
+            / kw(Keyword::Intersect) all:set_quantifier() branch:select_body() {
+                  (if all { SetOp::IntersectAll } else { SetOp::Intersect }, branch)
+              }
+            / kw(Keyword::Except) all:set_quantifier() branch:select_body() {
+                  (if all { SetOp::ExceptAll } else { SetOp::Except }, branch)
+              }
 
-        rule union_op() -> SetOp
-            = kw(Keyword::Distinct) { SetOp::Union }
-            / kw_all() { SetOp::UnionAll }
-            / { SetOp::Union }
+        /// `[ALL | DISTINCT]` after a set operator (default DISTINCT).
+        rule set_quantifier() -> bool
+            = kw(Keyword::Distinct) { false }
+            / kw_all() { true }
+            / { false }
 
         rule select_body() -> Select
             = with:with_clause()? kw(Keyword::Select) distinct:opt_kw(Keyword::Distinct) projections:projection_list()
               from:from_clause()? where_:where_clause()? group:group_by_clause()? having:having_clause()?
-              order:order_by_clause()? limit:limit_clause()? {
+              order:order_by_clause()? limit:limit_clause()? offset:offset_clause()? {
                   Select {
                       with: with.unwrap_or_default(),
                       distinct,
@@ -447,6 +499,7 @@ peg::parser! {
                       having,
                       order_by: order.unwrap_or_default(),
                       limit,
+                      offset,
                       unions: Vec::new(),
                   }
               }
@@ -489,11 +542,11 @@ peg::parser! {
             / name:ident() { name }
 
         rule from_clause() -> FromClause
-            = kw(Keyword::From) source:from_source() alias:alias()? join:join_clause()? {?
+            = kw(Keyword::From) source:from_source() alias:alias()? joins:(j:join_clause() { j })* {?
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else {
-                      Ok(FromClause { source, alias, join })
+                      Ok(FromClause { source, alias, joins })
                   }
               }
 
@@ -501,14 +554,23 @@ peg::parser! {
             = lparen() q:select() rparen() { FromSource::Derived(Box::new(q)) }
             / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
 
-        /// FULL/CROSS/USING/NATURAL are not part of the grammar: they fail
-        /// to parse.
+        /// One join step: `CROSS JOIN src` (no condition) or
+        /// `[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN src ON cond`. Each `ON`
+        /// condition binds against every table to its left plus its own
+        /// right-hand source (multi-way joins are left-deep).
         rule join_clause() -> JoinClause
-            = kind:join_kind() source:from_source() alias:alias()? kw(Keyword::On) on:expr() {?
+            = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() alias:alias()? {?
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
                   } else {
-                      Ok(JoinClause { kind, source, alias, on })
+                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, on: None })
+                  }
+              }
+            / kind:join_kind() source:from_source() alias:alias()? kw(Keyword::On) on:expr() {?
+                  if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
+                      Err("derived table needs an alias")
+                  } else {
+                      Ok(JoinClause { kind, source, alias, on: Some(on) })
                   }
               }
 
@@ -517,12 +579,14 @@ peg::parser! {
             / kw(Keyword::Inner) kw(Keyword::Join) { JoinKind::Inner }
             / kw(Keyword::Left) kw(Keyword::Outer)? kw(Keyword::Join) { JoinKind::Left }
             / kw(Keyword::Right) kw(Keyword::Outer)? kw(Keyword::Join) { JoinKind::Right }
+            / kw(Keyword::Full) kw(Keyword::Outer)? kw(Keyword::Join) { JoinKind::Full }
 
         rule where_clause() -> Expr = kw(Keyword::Where) e:expr() { e }
         rule group_by_clause() -> Vec<Expr> = kw(Keyword::Group) kw(Keyword::By) l:expr_list() { l }
         rule having_clause() -> Expr = kw(Keyword::Having) e:expr() { e }
         rule order_by_clause() -> Vec<OrderItem> = kw(Keyword::Order) kw(Keyword::By) l:order_list() { l }
         rule limit_clause() -> usize = kw(Keyword::Limit) n:nonneg_integer() { n }
+        rule offset_clause() -> usize = kw(Keyword::Offset) n:nonneg_integer() { n }
 
         rule expr_list() -> Vec<Expr>
             = first:expr() rest:(comma() e:expr() { e })* {
@@ -539,9 +603,20 @@ peg::parser! {
               }
 
         rule order_item() -> OrderItem
-            = e:expr() kw(Keyword::Desc) { OrderItem { expr: e, desc: true } }
-            / e:expr() kw(Keyword::Asc) { OrderItem { expr: e, desc: false } }
-            / e:expr() { OrderItem { expr: e, desc: false } }
+            = e:expr() desc:order_direction() nulls:nulls_order() {
+                  OrderItem { expr: e, desc, nulls_first: nulls }
+              }
+
+        rule order_direction() -> bool
+            = kw(Keyword::Desc) { true }
+            / kw(Keyword::Asc) { false }
+            / { false }
+
+        /// `NULLS FIRST` / `NULLS LAST` (a non-reserved two-word suffix).
+        rule nulls_order() -> Option<bool>
+            = word("nulls") word("first") { Some(true) }
+            / word("nulls") word("last") { Some(false) }
+            / { None }
 
         // ---------- expressions ----------
 
@@ -761,12 +836,17 @@ peg::parser! {
             = s:ident() {? if s.eq_ignore_ascii_case("coalesce") { Err("non-COALESCE function name") } else { Ok(s) } }
 
         rule fn_call() -> Expr
-            = name:non_coalesce_name() lparen() args:fn_args() rparen() over:over_clause()? {
+            = name:non_coalesce_name() lparen() distinct:distinct_flag() args:fn_args() rparen() over:over_clause()? {
                   match over {
-                      Some(over) => Expr::Window { name, args, over },
-                      None => Expr::Function { name, args },
+                      Some(over) => Expr::Window { name, args, over, distinct },
+                      None => Expr::Function { name, args, distinct },
                   }
               }
+
+        /// `DISTINCT` before a function call's first argument.
+        rule distinct_flag() -> bool
+            = kw(Keyword::Distinct) { true }
+            / { false }
 
         /// COALESCE arguments: a plain expression list, so `*` may appear as
         /// an expression anywhere in it (unlike `fn_args`).
@@ -795,28 +875,30 @@ peg::parser! {
         rule partition_clause() -> Vec<Expr> = kw(Keyword::Partition) kw(Keyword::By) l:expr_list() { l }
 
         rule frame_clause() -> FrameSpec
-            = kw(Keyword::Rows) s:rows_frame() { s }
-            / kw(Keyword::Row) s:rows_frame() { s }
+            = kw(Keyword::Rows) s:frame_spec(FrameMode::Rows) { s }
+            / kw(Keyword::Row) s:frame_spec(FrameMode::Rows) { s }
+            / kw(Keyword::Range) s:frame_spec(FrameMode::Range) { s }
 
-        rule rows_frame() -> FrameSpec
-            = kw(Keyword::Between) start:frame_bound() kw(Keyword::And) end:frame_bound() { FrameSpec { start, end } }
+        rule frame_spec(mode: FrameMode) -> FrameSpec
+            = kw(Keyword::Between) start:frame_bound() kw(Keyword::And) end:frame_bound() { FrameSpec { mode, start, end } }
             / kw(Keyword::Current) kw(Keyword::Row) {
-                  FrameSpec { start: FrameBound::CurrentRow, end: FrameBound::CurrentRow }
+                  FrameSpec { mode, start: FrameBound::CurrentRow, end: FrameBound::CurrentRow }
               }
             / kw(Keyword::Unbounded) kw(Keyword::Preceding) {
-                  FrameSpec { start: FrameBound::UnboundedPreceding, end: FrameBound::CurrentRow }
+                  FrameSpec { mode, start: FrameBound::UnboundedPreceding, end: FrameBound::CurrentRow }
               }
             / kw(Keyword::Unbounded) kw(Keyword::Following) {
                   FrameSpec {
+                      mode,
                       start: FrameBound::UnboundedFollowing,
                       end: FrameBound::UnboundedFollowing,
                   }
               }
             / n:nonneg_integer() kw(Keyword::Preceding) {
-                  FrameSpec { start: FrameBound::Preceding(n), end: FrameBound::CurrentRow }
+                  FrameSpec { mode, start: FrameBound::Preceding(n), end: FrameBound::CurrentRow }
               }
             / n:nonneg_integer() kw(Keyword::Following) {
-                  FrameSpec { start: FrameBound::CurrentRow, end: FrameBound::Following(n) }
+                  FrameSpec { mode, start: FrameBound::CurrentRow, end: FrameBound::Following(n) }
               }
 
         rule frame_bound() -> FrameBound
@@ -1689,6 +1771,44 @@ mod tests {
         "load extension 'x';",
         "LOAD   EXTENSION   'x.dylib' ;",
         "SELECT 1; LOAD EXTENSION 'x'; SELECT 2;",
+        // SQL completeness (joins, set ops, DML/DDL, windows, EXPLAIN/SHOW).
+        "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id;",
+        "SELECT * FROM a LEFT JOIN b ON a.id = b.id FULL OUTER JOIN c ON c.id = b.id;",
+        "SELECT * FROM a CROSS JOIN b CROSS JOIN c;",
+        "SELECT * FROM a JOIN b ON a.x = b.x AND a.y = b.y AND a.z > b.z;",
+        "SELECT * FROM a JOIN b ON a.x < b.x;",
+        "SELECT x FROM a INTERSECT SELECT x FROM b;",
+        "SELECT x FROM a INTERSECT ALL SELECT x FROM b;",
+        "SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x;",
+        "SELECT x FROM a EXCEPT ALL SELECT x FROM b LIMIT 5;",
+        "SELECT x FROM a UNION SELECT x FROM b INTERSECT SELECT x FROM c;",
+        "INSERT INTO t (a, b) SELECT x, y FROM s;",
+        "INSERT INTO t SELECT * FROM s;",
+        "INSERT INTO t WITH c AS (SELECT 1 AS x) SELECT x FROM c;",
+        "CREATE TABLE t AS SELECT a, b FROM s;",
+        "CREATE TABLE IF NOT EXISTS t AS SELECT 1 AS x;",
+        "CREATE TABLE IF NOT EXISTS t (a INTEGER);",
+        "DROP TABLE IF EXISTS t;",
+        "CREATE DATABASE IF NOT EXISTS db1;",
+        "DROP DATABASE IF EXISTS db1;",
+        "SELECT a FROM t ORDER BY a NULLS FIRST;",
+        "SELECT a FROM t ORDER BY a DESC NULLS LAST, b ASC NULLS FIRST;",
+        "SELECT a FROM t ORDER BY a OFFSET 3;",
+        "SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 3;",
+        "SELECT COUNT(DISTINCT a) FROM t;",
+        "SELECT COUNT(DISTINCT a + 1), COUNT(DISTINCT b) FROM t;",
+        "SELECT SUM(x) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        "SELECT SUM(x) OVER (ORDER BY k RANGE UNBOUNDED PRECEDING) FROM t;",
+        "SELECT SUM(x) OVER (ORDER BY k RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t;",
+        "SELECT SUM(x) OVER (ORDER BY k DESC RANGE 2 PRECEDING) FROM t;",
+        "EXPLAIN SELECT a FROM t WHERE a > 1 ORDER BY a LIMIT 1;",
+        "EXPLAIN WITH c AS (SELECT 1 AS x) SELECT x FROM c UNION ALL SELECT 2;",
+        "SHOW TABLES;",
+        "SHOW DATABASES;",
+        "show tables;",
+        "DESCRIBE t;",
+        "DESCRIBE db1.t;",
+        "describe \"My Table\";",
     ];
 
     /// Must be rejected as [`PinkDbError::Parse`] (the invalid list below).
@@ -1719,10 +1839,6 @@ mod tests {
         "select 'abc",
         "INSERT needs at least one row",
         "SELECT * FROM a LEFT b ON a.id = b.id;",
-        "SELECT * FROM a FULL JOIN b ON a.id = b.id;",
-        "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id;",
-        "SELECT * FROM a CROSS JOIN b;",
-        "SELECT * FROM a CROSS JOIN b ON a.id = b.id;",
         "SELECT * FROM a JOIN b USING (id);",
         "SELECT * FROM a NATURAL JOIN b;",
         "SELECT FROM;",
@@ -1731,7 +1847,6 @@ mod tests {
         "SELECT 1 LIMIT -1;",
         "SELECT DATE '2023-02-29';",
         "SELECT DATE 123;",
-        "SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
         "SELECT CASE WHEN 1 THEN 2;",
         "SELECT CASE END FROM t;",
         "UPDATE t SET;",
@@ -1790,7 +1905,6 @@ mod tests {
         "SELECT a FROM t GROUP BY;",
         "SELECT a FROM t ORDER BY;",
         "SELECT a FROM t HAVING;",
-        "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.y = c.y;",
         "SELECT * FROM (SELECT 1);",
         "SELECT * FROM (1);",
         "WITH a AS SELECT 1 SELECT * FROM a;",
@@ -1855,6 +1969,20 @@ mod tests {
         "SELECT \"a\0b\";",
         "CREATE TABLE \"a\0b\" (x INTEGER);",
         "SELECT 1 AS \"a\0b\";",
+        // SQL completeness syntax errors: `EXPLAIN` takes a SELECT, SHOW only
+        // knows TABLES/DATABASES, and RANGE offsets are integer literals.
+        "EXPLAIN INSERT INTO t VALUES (1);",
+        "EXPLAIN;",
+        "SHOW;",
+        "SHOW TABLESS;",
+        "SHOW INDEXES;",
+        "DESCRIBE;",
+        "SELECT SUM(x) OVER (ORDER BY k RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW) FROM t;",
+        "SELECT SUM(x) OVER (ORDER BY k RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t;",
+        "INSERT INTO t SELECT;",
+        "CREATE TABLE t AS;",
+        "CREATE TABLE IF t (a INTEGER);",
+        "DROP TABLE IF t;",
     ];
 
     /// Every valid entry parses, and the raw statement split agrees with the
@@ -2256,16 +2384,20 @@ mod tests {
     fn join_parses_for_wave3() {
         let s = parse_one("SELECT * FROM a JOIN b ON a.id = b.id;");
         let Statement::Select(sel) = s else { panic!() };
-        let join = sel.from.unwrap().join.unwrap();
+        let join = sel.from.unwrap().joins.into_iter().next().unwrap();
         assert_eq!(join.kind, JoinKind::Inner);
         let s = parse_one("SELECT * FROM a INNER JOIN b ON a.id = b.id;");
         let Statement::Select(sel) = s else { panic!() };
-        assert_eq!(sel.from.unwrap().join.unwrap().kind, JoinKind::Inner);
+        assert_eq!(
+            sel.from.unwrap().joins.into_iter().next().unwrap().kind,
+            JoinKind::Inner
+        );
     }
 
     #[test]
-    fn outer_join_kinds_parse_and_full_cross_error() {
-        // LEFT / LEFT OUTER / RIGHT / RIGHT OUTER, case-insensitive.
+    fn join_kinds_parse_and_unsupported_joins_error() {
+        // LEFT / LEFT OUTER / RIGHT / RIGHT OUTER / FULL / FULL OUTER,
+        // case-insensitive.
         for (sql, want) in [
             (
                 "SELECT * FROM a LEFT JOIN b ON a.id = b.id;",
@@ -2283,20 +2415,42 @@ mod tests {
                 "SELECT * FROM a right OUTER join b ON a.id = b.id;",
                 JoinKind::Right,
             ),
+            (
+                "SELECT * FROM a FULL JOIN b ON a.id = b.id;",
+                JoinKind::Full,
+            ),
+            (
+                "SELECT * FROM a full outer join b ON a.id = b.id;",
+                JoinKind::Full,
+            ),
         ] {
             let Statement::Select(sel) = parse_one(sql) else {
                 panic!()
             };
-            assert_eq!(sel.from.unwrap().join.unwrap().kind, want, "{sql}");
+            assert_eq!(
+                sel.from.unwrap().joins.into_iter().next().unwrap().kind,
+                want,
+                "{sql}"
+            );
         }
-        // LEFT/RIGHT without JOIN, FULL/CROSS always.
+        // CROSS JOIN parses with no ON condition.
+        let Statement::Select(sel) = parse_one("SELECT * FROM a CROSS JOIN b;") else {
+            panic!()
+        };
+        let join = sel.from.unwrap().joins.into_iter().next().unwrap();
+        assert_eq!(join.kind, JoinKind::Cross);
+        assert!(join.on.is_none());
+        // Multiple joins in one FROM are a chain (left-deep).
+        let Statement::Select(sel) =
+            parse_one("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON c.id = b.id;")
+        else {
+            panic!()
+        };
+        assert_eq!(sel.from.unwrap().joins.len(), 2);
+        // LEFT/RIGHT without JOIN, CROSS ... ON, USING / NATURAL error.
         for sql in [
             "SELECT * FROM a LEFT b ON a.id = b.id;",
-            "SELECT * FROM a FULL JOIN b ON a.id = b.id;",
-            "SELECT * FROM a FULL OUTER JOIN b ON a.id = b.id;",
-            "SELECT * FROM a CROSS JOIN b;",
             "SELECT * FROM a CROSS JOIN b ON a.id = b.id;",
-            // USING / NATURAL stay errors.
             "SELECT * FROM a JOIN b USING (id);",
             "SELECT * FROM a NATURAL JOIN b;",
         ] {
@@ -2349,10 +2503,38 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            parse("SELECT sum(x) OVER (RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;"),
-            Err(PinkDbError::Parse(_))
-        ));
+        // RANGE frames parse now (offsets on the single ORDER BY key).
+        let s = parse_one(
+            "SELECT sum(x) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t;",
+        );
+        let Statement::Select(sel) = s else { panic!() };
+        match &sel.projections[0] {
+            Projection::Expr {
+                expr: Expr::Window { over, .. },
+                ..
+            } => {
+                let frame = over.frame.as_ref().expect("frame parsed");
+                assert_eq!(frame.mode, FrameMode::Range);
+                assert_eq!(frame.start, FrameBound::Preceding(1));
+                assert_eq!(frame.end, FrameBound::Following(1));
+            }
+            _ => panic!(),
+        }
+        // `ROWS` keeps the row-counting mode.
+        let s = parse_one("SELECT sum(x) OVER (ORDER BY k ROWS 2 PRECEDING) FROM t;");
+        let Statement::Select(sel) = s else { panic!() };
+        match &sel.projections[0] {
+            Projection::Expr {
+                expr: Expr::Window { over, .. },
+                ..
+            } => {
+                let frame = over.frame.as_ref().expect("frame parsed");
+                assert_eq!(frame.mode, FrameMode::Rows);
+                assert_eq!(frame.start, FrameBound::Preceding(2));
+                assert_eq!(frame.end, FrameBound::CurrentRow);
+            }
+            _ => panic!(),
+        }
     }
 
     #[test]
@@ -2428,11 +2610,11 @@ mod tests {
     fn multi_database_statements() {
         assert!(matches!(
             parse_one("CREATE DATABASE analytics;"),
-            Statement::CreateDatabase { name } if name == "analytics"
+            Statement::CreateDatabase { name, .. } if name == "analytics"
         ));
         assert!(matches!(
             parse_one("DROP DATABASE analytics;"),
-            Statement::DropDatabase { name } if name == "analytics"
+            Statement::DropDatabase { name, .. } if name == "analytics"
         ));
         assert!(matches!(
             parse_one("USE analytics;"),
@@ -2461,7 +2643,7 @@ mod tests {
             _ => panic!(),
         }
         match parse_one("DROP TABLE db1.t;") {
-            Statement::DropTable { db, name } => {
+            Statement::DropTable { db, name, .. } => {
                 assert_eq!(db, Some("db1".to_string()));
                 assert_eq!(name, "t");
             }

@@ -5,6 +5,7 @@
 //! output; SUM over integers accumulates in i64 (wraps on overflow, v1).
 
 use crate::types::FastMap;
+use crate::types::FastSet;
 
 use super::expr::eval_expr;
 use super::Cx;
@@ -138,6 +139,10 @@ pub(crate) enum Acc {
         cur: Option<Value>,
         is_min: bool,
     },
+    /// `COUNT(DISTINCT x)`: one encoded non-NULL value per distinct cell
+    /// (the byte encoding is the same one GROUP BY/DISTINCT use, so equality
+    /// semantics — NULL skipped, −0.0/NaN canonical — are shared).
+    CountDistinct(FastSet<Vec<u8>>),
 }
 
 /// Add `x` to a wrapping i64 sum, counting signed wraparounds so the exact
@@ -158,7 +163,11 @@ fn exact_sum(sum: i64, wraps: i64) -> i128 {
 }
 
 impl Acc {
-    pub(crate) fn new(func: AggFunc) -> Acc {
+    pub(crate) fn new(func: AggFunc, distinct: bool) -> Acc {
+        if distinct {
+            debug_assert_eq!(func, AggFunc::Count);
+            return Acc::CountDistinct(FastSet::default());
+        }
         match func {
             AggFunc::Count => Acc::Count(0),
             AggFunc::Sum => Acc::SumInt {
@@ -214,6 +223,8 @@ impl Acc {
                 *count += 1;
             }
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
+            // DISTINCT accumulators take the generic per-row path.
+            Acc::CountDistinct(_) => unreachable!("COUNT(DISTINCT) uses update_vec"),
         }
     }
 
@@ -237,6 +248,7 @@ impl Acc {
                 *count += 1;
             }
             Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
+            Acc::CountDistinct(_) => unreachable!("COUNT(DISTINCT) uses update_vec"),
         }
     }
 
@@ -321,6 +333,11 @@ impl Acc {
                     *cur = Some(v.get(i));
                 }
             }
+            Acc::CountDistinct(seen) => {
+                let mut buf = Vec::new();
+                v.encode_into(&mut buf, i);
+                seen.insert(buf);
+            }
         }
     }
 
@@ -396,6 +413,13 @@ impl Acc {
                     if better {
                         *cur = Some(v.clone());
                     }
+                }
+            }
+            Acc::CountDistinct(seen) => {
+                if let Some(v) = arg {
+                    let mut buf = Vec::new();
+                    encode_value(&mut buf, v);
+                    seen.insert(buf);
                 }
             }
         }
@@ -487,6 +511,11 @@ impl Acc {
                     is_min,
                 }
             }
+            (Acc::CountDistinct(a), Acc::CountDistinct(b)) => {
+                let mut seen = a;
+                seen.extend(b);
+                Acc::CountDistinct(seen)
+            }
             // Different aggregates never meet (one Acc per agg slot).
             (mine, _) => mine,
         };
@@ -531,6 +560,7 @@ impl Acc {
                 }
             }
             Acc::MinMax { cur, .. } => cur.clone().unwrap_or(Value::Null),
+            Acc::CountDistinct(seen) => Value::Bigint(seen.len() as i64),
         })
     }
 
@@ -667,7 +697,7 @@ fn new_group(
         enc,
         Group {
             keys: key_vecs.iter().map(|kv| kv.v().get(i)).collect(),
-            accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
+            accs: aggs.iter().map(|a| Acc::new(a.func, a.distinct)).collect(),
         },
     ));
     idx
@@ -818,25 +848,28 @@ fn accumulate(groups: &mut [(Vec<u8>, Group)], gids: &[usize], j: usize, arg: Op
         }
         return;
     };
-    let minmax = gids
-        .first()
-        .is_some_and(|&g| matches!(groups[g].1.accs[j], Acc::MinMax { .. }));
+    let generic = gids.first().is_some_and(|&g| {
+        matches!(
+            groups[g].1.accs[j],
+            Acc::MinMax { .. } | Acc::CountDistinct(_)
+        )
+    });
     match v.data() {
-        VectorData::Int32(d) if !minmax => {
+        VectorData::Int32(d) if !generic => {
             for (i, &g) in gids.iter().enumerate() {
                 if v.is_valid(i) {
                     groups[g].1.accs[j].add_int(d[i] as i64);
                 }
             }
         }
-        VectorData::Int64(d) if !minmax => {
+        VectorData::Int64(d) if !generic => {
             for (i, &g) in gids.iter().enumerate() {
                 if v.is_valid(i) {
                     groups[g].1.accs[j].add_int(d[i]);
                 }
             }
         }
-        VectorData::Float64(d) if !minmax => {
+        VectorData::Float64(d) if !generic => {
             for (i, &g) in gids.iter().enumerate() {
                 if v.is_valid(i) {
                     groups[g].1.accs[j].add_f64(d[i]);
@@ -868,7 +901,7 @@ pub(crate) fn merge_partials(
     // Fast path: no keys means a single global group — merge accumulators
     // directly instead of probing the table per row.
     if !has_keys {
-        let mut accs: Vec<Acc> = aggs.iter().map(|a| Acc::new(a.func)).collect();
+        let mut accs: Vec<Acc> = aggs.iter().map(|a| Acc::new(a.func, a.distinct)).collect();
         // Reuse the per-chunk partials computed above (each non-empty chunk
         // holds exactly one group; a fresh table scans as one 0-row chunk,
         // so an empty partial has no group to merge).
@@ -909,7 +942,7 @@ pub(crate) fn merge_partials(
     if groups.is_empty() && !has_keys {
         groups.push(Group {
             keys: Vec::new(),
-            accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
+            accs: aggs.iter().map(|a| Acc::new(a.func, a.distinct)).collect(),
         });
     }
     groups
@@ -976,11 +1009,11 @@ mod tests {
 
     #[test]
     fn integer_sum_is_exact_across_many_wraps_and_merges() {
-        let mut acc = Acc::new(AggFunc::Sum);
+        let mut acc = Acc::new(AggFunc::Sum, false);
         for _ in 0..5 {
             acc.update(Some(&Value::Bigint(i64::MAX)));
         }
-        let mut other = Acc::new(AggFunc::Sum);
+        let mut other = Acc::new(AggFunc::Sum, false);
         for _ in 0..5 {
             other.update(Some(&Value::Bigint(i64::MIN)));
         }
@@ -992,7 +1025,7 @@ mod tests {
             Value::Bigint(2)
         );
         // Out of range at the end is an error, never a wrapped value.
-        let mut big = Acc::new(AggFunc::Sum);
+        let mut big = Acc::new(AggFunc::Sum, false);
         big.update(Some(&Value::Bigint(i64::MAX)));
         big.update(Some(&Value::Bigint(1)));
         assert!(big.finalize_ref(DataType::Bigint).is_err());

@@ -25,7 +25,7 @@ use window::eval_window;
 
 use crate::attached::AttachedTable;
 use crate::plan::{agg_output_schema, compare_values, win_output_schema, LogicalPlan};
-use crate::sql::ast::{BinaryOp, JoinKind};
+use crate::sql::ast::{BinaryOp, JoinKind, SortSpec};
 use crate::sql::binder::{common_numeric, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -153,9 +153,56 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db: qdb,
             name,
             schema,
+            if_not_exists,
         } => {
             let target = resolve_db(db, qdb);
+            // `IF NOT EXISTS`: an existing table makes the statement a no-op
+            // (DuckDB semantics). A same-named view still conflicts, like
+            // the plain CREATE.
+            if *if_not_exists && db.table_in(&target, name).is_ok() {
+                return Ok(QueryResult::Created);
+            }
             db.create_table_in(&target, name, schema.clone())?;
+            Ok(QueryResult::Created)
+        }
+        LogicalPlan::CreateTableAs {
+            db: qdb,
+            name,
+            query,
+            if_not_exists,
+        } => {
+            let target = resolve_db(db, qdb);
+            if *if_not_exists && db.table_in(&target, name).is_ok() {
+                return Ok(QueryResult::Created);
+            }
+            // Evaluate the query first (it must not see the new table), then
+            // create and fill. Every cell is coerced before the first append,
+            // so a type error leaves no half-filled table.
+            let out = {
+                let cx = Cx::new(db).with_projections(plan);
+                eval(&cx, query)?
+            };
+            let schema: Vec<(String, DataType)> = out
+                .names
+                .iter()
+                .cloned()
+                .zip(out.types.iter().copied())
+                .collect();
+            let mut staged = Vec::new();
+            for chunk in &out.chunks {
+                for i in 0..chunk.num_rows() {
+                    let mut values = Vec::with_capacity(schema.len());
+                    for (col, (_, t)) in chunk.columns.iter().zip(schema.iter()) {
+                        values.push(DataTable::coerce(col.get(i), *t)?);
+                    }
+                    staged.push(values);
+                }
+            }
+            db.create_table_in(&target, name, schema)?;
+            let t = db.table_mut_in(&target, name)?;
+            for values in staged {
+                t.append_row(values)?;
+            }
             Ok(QueryResult::Created)
         }
         LogicalPlan::Insert {
@@ -204,6 +251,43 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                     DataTable::coerce(v.clone(), *t)?;
                 }
             }
+            let t = db.table_mut_in(&target, table)?;
+            for values in staged {
+                t.append_row(values)?;
+            }
+            Ok(QueryResult::Inserted { count })
+        }
+        LogicalPlan::InsertSelect {
+            db: qdb,
+            table,
+            columns,
+            query,
+        } => {
+            let target = resolve_db(db, qdb);
+            let out = {
+                let cx = Cx::new(db).with_projections(plan);
+                eval(&cx, query)?
+            };
+            // Target column indices in written order (the binder always
+            // resolves one entry per source column).
+            let schema = db.table_in(&target, table)?.schema();
+            let order: Vec<usize> = columns
+                .clone()
+                .unwrap_or_else(|| (0..schema.len()).collect());
+            // Stage every row (mapped into full table width, coerced), then
+            // append — a type error leaves the table untouched.
+            let mut staged = Vec::new();
+            for chunk in &out.chunks {
+                for i in 0..chunk.num_rows() {
+                    let mut values = vec![Value::Null; schema.len()];
+                    for (src, &target_idx) in order.iter().enumerate() {
+                        values[target_idx] =
+                            DataTable::coerce(chunk.columns[src].get(i), schema[target_idx].1)?;
+                    }
+                    staged.push(values);
+                }
+            }
+            let count = staged.len();
             let t = db.table_mut_in(&target, table)?;
             for values in staged {
                 t.append_row(values)?;
@@ -304,8 +388,23 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db.create_view_in(&target, name, (**query).clone(), cols.clone())?;
             Ok(QueryResult::CreatedView { name: name.clone() })
         }
-        LogicalPlan::DropTable { db: qdb, name } => {
+        LogicalPlan::DropTable {
+            db: qdb,
+            name,
+            if_exists,
+        } => {
             let target = resolve_db(db, qdb);
+            // An attached (read-only) name is refused before the existence
+            // probe: DROP TABLE must never look like a missing-table no-op.
+            if let Some(err) = db.attached_read_only(&target, name) {
+                return Err(err);
+            }
+            if db.table_in(&target, name).is_err() {
+                if !*if_exists {
+                    return Err(PinkDbError::Catalog(format!("table \"{name}\" not found")));
+                }
+                return Ok(QueryResult::DroppedTable { name: name.clone() });
+            }
             db.drop_table_in(&target, name)?;
             Ok(QueryResult::DroppedTable { name: name.clone() })
         }
@@ -314,11 +413,20 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db.drop_view_in(&target, name)?;
             Ok(QueryResult::DroppedView { name: name.clone() })
         }
-        LogicalPlan::CreateDatabase { name } => {
+        LogicalPlan::CreateDatabase {
+            name,
+            if_not_exists,
+        } => {
+            if *if_not_exists && db.database_exists(name) {
+                return Ok(QueryResult::CreatedDatabase { name: name.clone() });
+            }
             db.create_database(name)?;
             Ok(QueryResult::CreatedDatabase { name: name.clone() })
         }
-        LogicalPlan::DropDatabase { name } => {
+        LogicalPlan::DropDatabase { name, if_exists } => {
+            if *if_exists && !db.database_exists(name) {
+                return Ok(QueryResult::DroppedDatabase { name: name.clone() });
+            }
             db.drop_database(name)?;
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
@@ -583,6 +691,10 @@ fn attached_stats_aggregate(
 /// One aggregate's exact value from an attached table's descriptor, or
 /// `None` when stored statistics cannot prove it.
 fn attached_aggregate_value(attached: &AttachedTable, agg: &BoundAgg) -> Option<Value> {
+    // `COUNT(DISTINCT col)` is never answerable from statistics.
+    if agg.distinct {
+        return None;
+    }
     // A row count the engine's `COUNT` (an `i64`) cannot represent is not
     // answerable; it cannot be materialized either, but falling back keeps
     // the fast path honest.
@@ -661,7 +773,9 @@ fn project_chunk(cx: &Cx, exprs: &[BoundExpr], chunk: &DataChunk) -> Result<Data
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     match plan {
         LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateTableAs { .. }
         | LogicalPlan::Insert { .. }
+        | LogicalPlan::InsertSelect { .. }
         | LogicalPlan::Update { .. }
         | LogicalPlan::Delete { .. }
         | LogicalPlan::Begin
@@ -678,6 +792,88 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { .. } => scan_output(cx, plan),
+        LogicalPlan::ShowTables { db } => {
+            // DuckDB lists tables and views together, sorted by name.
+            let mut names = cx.db.list_tables_in(db);
+            for v in cx.db.list_views_in(db) {
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(&v)) {
+                    names.push(v);
+                }
+            }
+            names.sort();
+            Ok(Output {
+                chunks: vec![DataChunk::new(vec![string_vector(&names)?])?],
+                names: vec!["name".to_string()],
+                types: vec![DataType::Varchar],
+            })
+        }
+        LogicalPlan::ShowDatabases => {
+            let names = cx.db.list_databases();
+            Ok(Output {
+                chunks: vec![DataChunk::new(vec![string_vector(&names)?])?],
+                names: vec!["database_name".to_string()],
+                types: vec![DataType::Varchar],
+            })
+        }
+        LogicalPlan::Describe { schema } => {
+            // DuckDB's DESCRIBE shape: (column_name, column_type, null, key,
+            // default, extra); every v1 column is nullable and has no key,
+            // default, or extra.
+            let n = schema.len();
+            let mut column_name = Vector::with_capacity(DataType::Varchar, n);
+            let mut column_type = Vector::with_capacity(DataType::Varchar, n);
+            let mut null = Vector::with_capacity(DataType::Varchar, n);
+            let mut key = Vector::with_capacity(DataType::Varchar, n);
+            let mut default = Vector::with_capacity(DataType::Varchar, n);
+            let mut extra = Vector::with_capacity(DataType::Varchar, n);
+            for (name, dtype) in schema {
+                column_name.push_valid(Value::Varchar(name.clone()))?;
+                column_type.push_valid(Value::Varchar(dtype.to_string()))?;
+                null.push_valid(Value::Varchar("YES".to_string()))?;
+                key.push_null()?;
+                default.push_null()?;
+                extra.push_null()?;
+            }
+            Ok(Output {
+                chunks: if n == 0 {
+                    Vec::new()
+                } else {
+                    vec![DataChunk::new(vec![
+                        column_name,
+                        column_type,
+                        null,
+                        key,
+                        default,
+                        extra,
+                    ])?]
+                },
+                names: vec![
+                    "column_name".to_string(),
+                    "column_type".to_string(),
+                    "null".to_string(),
+                    "key".to_string(),
+                    "default".to_string(),
+                    "extra".to_string(),
+                ],
+                types: vec![DataType::Varchar; 6],
+            })
+        }
+        LogicalPlan::Explain { plan } => {
+            let mut chunk = Vector::with_capacity(DataType::Varchar, 0);
+            for line in explain_lines(plan) {
+                chunk.push_valid(Value::Varchar(line))?;
+            }
+            let chunks = if chunk.is_empty() {
+                Vec::new()
+            } else {
+                vec![DataChunk::new(vec![chunk])?]
+            };
+            Ok(Output {
+                chunks,
+                names: vec!["explain_value".to_string()],
+                types: vec![DataType::Varchar],
+            })
+        }
         LogicalPlan::SingleRow => Ok(Output {
             // One row, zero columns: literals evaluate to 1-row vectors.
             chunks: vec![DataChunk {
@@ -706,8 +902,8 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             kind,
             left,
             right,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             ..
         } => {
             let l = eval(cx, left)?;
@@ -728,10 +924,30 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 // The estimated-smaller left side feeds the match table and
                 // the right side probes it: output rows are right-row major,
                 // the probe side's deterministic order.
-                hash_join_probe(cx, rside, lside, right_key, left_key, true, false)?
+                hash_join_probe(cx, rside, lside, right_keys, left_keys, true, false, false)?
             } else {
-                hash_join(cx, lside, rside, *kind, left_key, right_key)?
+                hash_join(cx, lside, rside, *kind, left_keys, right_keys)?
             };
+            Ok(Output {
+                chunks,
+                names,
+                types,
+            })
+        }
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols: _,
+        } => {
+            let l = eval(cx, left)?;
+            let r = eval(cx, right)?;
+            let mut names = l.names.clone();
+            names.extend(r.names.iter().cloned());
+            let mut types = l.types.clone();
+            types.extend(r.types.iter().copied());
+            let chunks = nested_loop_join(cx, *kind, &l, &r, on.as_ref())?;
             Ok(Output {
                 chunks,
                 names,
@@ -827,28 +1043,41 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: all_types,
             })
         }
-        LogicalPlan::Union {
+        LogicalPlan::SetOp {
+            op,
             left,
             right,
-            distinct: is_distinct,
             types,
         } => {
             let l = eval(cx, left)?;
             let r = eval(cx, right)?;
-            // Coerce each side to the common column types, then concatenate.
+            // Coerce each side to the common column types, then combine.
             // Output names come from the left branch.
-            let mut chunks = Vec::with_capacity(l.chunks.len() + r.chunks.len());
-            for chunk in l.chunks.iter().chain(r.chunks.iter()) {
-                let mut cols = Vec::with_capacity(types.len());
-                for (col, t) in chunk.columns.iter().zip(types.iter()) {
-                    cols.push(coerce_to(col, *t)?);
+            let lchunks = coerce_chunks(&l.chunks, types)?;
+            let rchunks = coerce_chunks(&r.chunks, types)?;
+            let chunks = match op {
+                crate::sql::ast::SetOp::Union => {
+                    let mut both = lchunks;
+                    both.extend(rchunks);
+                    distinct(cx, &both)?
                 }
-                chunks.push(DataChunk::new(cols)?);
-            }
-            let chunks = if *is_distinct {
-                distinct(cx, &chunks)?
-            } else {
-                chunks
+                crate::sql::ast::SetOp::UnionAll => {
+                    let mut both = lchunks;
+                    both.extend(rchunks);
+                    both
+                }
+                crate::sql::ast::SetOp::Intersect => {
+                    set_op_chunks(&lchunks, &rchunks, SetOpKind::Intersect, false)
+                }
+                crate::sql::ast::SetOp::IntersectAll => {
+                    set_op_chunks(&lchunks, &rchunks, SetOpKind::Intersect, true)
+                }
+                crate::sql::ast::SetOp::Except => {
+                    set_op_chunks(&lchunks, &rchunks, SetOpKind::Except, false)
+                }
+                crate::sql::ast::SetOp::ExceptAll => {
+                    set_op_chunks(&lchunks, &rchunks, SetOpKind::Except, true)
+                }
             };
             Ok(Output {
                 chunks,
@@ -980,6 +1209,10 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let inner = eval(cx, input)?;
             Ok(truncate_output(inner, *limit))
         }
+        LogicalPlan::Offset { input, offset } => {
+            let inner = eval(cx, input)?;
+            Ok(skip_output(inner, *offset))
+        }
     }
 }
 
@@ -1067,12 +1300,13 @@ enum MatchTable {
 impl MatchTable {
     /// Build over the right input. `reserve` is the caller's capacity policy
     /// (distinct keys, not rows: a skewed join must not preallocate one slot
-    /// per right row; both containers grow on demand past the cap).
+    /// per right row; both containers grow on demand past the cap). A row
+    /// whose *any* key cell is NULL never matches and is not inserted.
     fn build(
         cx: &Cx,
         right_chunks: &[DataChunk],
-        right_key: &BoundExpr,
-        common: Option<DataType>,
+        right_keys: &[BoundExpr],
+        commons: &[Option<DataType>],
         ints: bool,
         reserve: usize,
     ) -> Result<MatchTable> {
@@ -1089,14 +1323,18 @@ impl MatchTable {
         };
         let mut buf = Vec::new();
         for (ci, chunk) in right_chunks.iter().enumerate() {
-            let kv = eval_join_key(cx, right_key, chunk, common, ints)?;
+            let kvs: Vec<Vector> = right_keys
+                .iter()
+                .zip(commons.iter())
+                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+                .collect::<Result<_>>()?;
             for i in 0..chunk.num_rows() {
-                if kv.is_null(i) {
+                if kvs.iter().any(|kv| kv.is_null(i)) {
                     continue;
                 }
                 match &mut table {
                     MatchTable::Ints { map, arena } => {
-                        let key = int_key_at(&kv, i);
+                        let key = int_key_at(&kvs[0], i);
                         let node = arena.len() as u32;
                         arena.push((ci as u32, i as u32, NIL));
                         match map.get_mut(&key) {
@@ -1112,7 +1350,9 @@ impl MatchTable {
                     MatchTable::Bytes { map, arena } => {
                         // Borrowed encoding, get-first: hits allocate nothing.
                         buf.clear();
-                        kv.encode_into(&mut buf, i);
+                        for kv in &kvs {
+                            kv.encode_into(&mut buf, i);
+                        }
                         let node = arena.len() as u32;
                         arena.push((ci as u32, i as u32, NIL));
                         match map.get_mut(&buf) {
@@ -1206,7 +1446,7 @@ fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
         | LogicalPlan::Project { input, .. }
         | LogicalPlan::Window { input, .. } => estimate_rows(cx, input),
         LogicalPlan::Limit { input, limit } => Some(estimate_rows(cx, input)?.min(*limit as u64)),
-        LogicalPlan::Union { left, right, .. } => {
+        LogicalPlan::SetOp { left, right, .. } => {
             Some(estimate_rows(cx, left)?.saturating_add(estimate_rows(cx, right)?))
         }
         LogicalPlan::Cte { body, .. } => estimate_rows(cx, body),
@@ -1237,6 +1477,7 @@ fn build_on_left(cx: &Cx, kind: JoinKind, left: &LogicalPlan, right: &LogicalPla
 ///   left row.
 /// - `Right`: mirrored — build on the left, probe with the right, plus NULLs
 ///   for the left columns + the right row for every unmatched right row.
+/// - `Full`: left-side behavior plus every unmatched right (build) row.
 ///
 /// NULL keys never match on either side, so they NULL-extend in outer joins.
 /// An INNER join whose left input estimates smaller than its right one is
@@ -1247,49 +1488,72 @@ fn hash_join(
     left: JoinSide<'_>,
     right: JoinSide<'_>,
     kind: JoinKind,
-    left_key: &BoundExpr,
-    right_key: &BoundExpr,
+    left_keys: &[BoundExpr],
+    right_keys: &[BoundExpr],
 ) -> Result<Vec<DataChunk>> {
-    // The preserved side is the probing side: left for Inner/Left, right for
-    // Right. `preserved_is_right` places it in the declared left ++ right
+    // The preserved side is the probing side: left for Inner/Left/Full, right
+    // for Right. `preserved_is_right` places it in the declared left ++ right
     // output order; `extend_unmatched` turns unmatched preserved rows into
     // NULL-extended rows (outer) instead of dropping them (inner).
     match kind {
-        JoinKind::Inner => hash_join_probe(cx, left, right, left_key, right_key, false, false),
-        JoinKind::Left => hash_join_probe(cx, left, right, left_key, right_key, false, true),
-        JoinKind::Right => hash_join_probe(cx, right, left, right_key, left_key, true, true),
+        JoinKind::Inner => {
+            hash_join_probe(cx, left, right, left_keys, right_keys, false, false, false)
+        }
+        JoinKind::Left => {
+            hash_join_probe(cx, left, right, left_keys, right_keys, false, true, false)
+        }
+        JoinKind::Right => {
+            hash_join_probe(cx, right, left, right_keys, left_keys, true, true, false)
+        }
+        JoinKind::Full => {
+            hash_join_probe(cx, left, right, left_keys, right_keys, false, true, true)
+        }
+        // Cross joins never reach the hash path (the binder emits a
+        // condition-less nested loop).
+        JoinKind::Cross => Err(PinkDbError::Execution(
+            "internal: CROSS JOIN cannot use the hash join".to_string(),
+        )),
     }
 }
 
 /// Shared hash-join probe/assembly loop. `preserved` is the side whose rows
-/// all appear in the output, in input order (left for Inner/Left, right for
-/// Right); `build` feeds the match table. `preserved_is_right` says which
+/// all appear in the output, in input order (left for Inner/Left/Full, right
+/// for Right); `build` feeds the match table. `preserved_is_right` says which
 /// side of the declared `left ++ right` output the preserved side is.
 /// `extend_unmatched` NULL-extends unmatched preserved rows (outer joins)
-/// instead of dropping them (inner). NULL keys never match, so they
+/// instead of dropping them (inner). `full` additionally emits every build
+/// row no preserved row matched (FULL JOIN). NULL keys never match, so they
 /// NULL-extend in outer joins and are skipped in an inner join.
 ///
 /// Matched pairs emit build/probe columns in declared order (left ++ right);
 /// an unmatched preserved row emits its own columns plus NULLs for the other
 /// side. Probe order and per-key build-row order are deterministic (left-row
-/// order for Inner/Left, right-row order for Right).
+/// order for Inner/Left/Full, right-row order for Right).
+#[allow(clippy::too_many_arguments)]
 fn hash_join_probe(
     cx: &Cx,
     preserved: JoinSide<'_>,
     build: JoinSide<'_>,
-    preserved_key: &BoundExpr,
-    build_key: &BoundExpr,
+    preserved_keys: &[BoundExpr],
+    build_keys: &[BoundExpr],
     preserved_is_right: bool,
     extend_unmatched: bool,
+    full: bool,
 ) -> Result<Vec<DataChunk>> {
     // Integer-payload keys take the i64-specialized match table: no byte
     // encoding and no `coerce_to` (INTEGER=BIGINT widens per cell). Every
-    // other dtype keeps the byte path, canonicalized to the common numeric
-    // type first (binder allows `1 = 1.0`); same-type keys skip the deep
-    // clone `coerce_to` would do. The int check and common-type resolution
-    // are symmetric in the two key dtypes.
-    let ints = is_int_key(preserved_key.dtype()) && is_int_key(build_key.dtype());
-    let common = common_numeric(preserved_key.dtype(), build_key.dtype()).ok();
+    // other shape (VARCHAR, DOUBLE, mixed numeric, composite keys) keeps the
+    // byte path, canonicalizing each key pair to its common numeric type
+    // first. The int check and common-type resolution are symmetric in the
+    // two key dtypes.
+    let ints = preserved_keys.len() == 1
+        && is_int_key(preserved_keys[0].dtype())
+        && is_int_key(build_keys[0].dtype());
+    let commons: Vec<Option<DataType>> = preserved_keys
+        .iter()
+        .zip(build_keys.iter())
+        .map(|(p, b)| common_numeric(p.dtype(), b.dtype()).ok())
+        .collect();
     let build_rows: usize = build.chunks.iter().map(|c| c.num_rows()).sum();
     if build_rows > u32::MAX as usize {
         return Err(PinkDbError::Execution(
@@ -1300,7 +1564,24 @@ fn hash_join_probe(
     // allocate `build_rows` map/arena slots for a handful of keys. Both grow
     // on demand past the cap.
     let reserve = build_rows.min(1 << 20);
-    let table = MatchTable::build(cx, build.chunks, build_key, common, ints, reserve)?;
+    let table = MatchTable::build(cx, build.chunks, build_keys, &commons, ints, reserve)?;
+    // FULL JOIN bookkeeping: global build-row index per chunk, and one flag
+    // per build row (shared across the parallel probe).
+    let build_chunk_starts: Vec<u32> = {
+        let mut starts = Vec::with_capacity(build.chunks.len() + 1);
+        let mut acc = 0u32;
+        for c in build.chunks {
+            starts.push(acc);
+            acc += c.num_rows() as u32;
+        }
+        starts.push(acc);
+        starts
+    };
+    let marked: Option<Vec<std::sync::atomic::AtomicBool>> = full.then(|| {
+        (0..build_rows)
+            .map(|_| std::sync::atomic::AtomicBool::new(false))
+            .collect()
+    });
 
     // Probe + assemble, parallel per preserved chunk: matches push straight
     // from the source chunks into per-partition output vectors (no
@@ -1319,7 +1600,11 @@ fn hash_join_probe(
         .chunks
         .par_iter()
         .map(|chunk| -> Result<Vec<DataChunk>> {
-            let kv = eval_join_key(cx, preserved_key, chunk, common, ints)?;
+            let kvs: Vec<Vector> = preserved_keys
+                .iter()
+                .zip(commons.iter())
+                .map(|(k, c)| eval_join_key(cx, k, chunk, *c, ints))
+                .collect::<Result<_>>()?;
             let mut finished = Vec::new();
             let mut cur: Vec<Vector> = dtypes
                 .iter()
@@ -1328,22 +1613,30 @@ fn hash_join_probe(
             let mut cur_rows = 0usize;
             let mut buf = Vec::new();
             for i in 0..chunk.num_rows() {
-                let head = if kv.is_null(i) {
+                let null_key = kvs.iter().any(|kv| kv.is_null(i));
+                let head = if null_key {
                     if !extend_unmatched {
                         continue;
                     }
                     None
                 } else if ints {
-                    table.head_int(int_key_at(&kv, i))
+                    table.head_int(int_key_at(&kvs[0], i))
                 } else {
                     buf.clear();
-                    kv.encode_into(&mut buf, i);
+                    for kv in &kvs {
+                        kv.encode_into(&mut buf, i);
+                    }
                     table.head_bytes(&buf)
                 };
                 match head {
                     Some(mut node) => {
                         while node != NIL {
                             let (bci, bi, next) = table.node(node);
+                            if let Some(marked) = &marked {
+                                let global =
+                                    build_chunk_starts[bci as usize] as usize + bi as usize;
+                                marked[global].store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
                             if cur_rows >= CHUNK_SIZE {
                                 finished.push(DataChunk::new(std::mem::take(&mut cur))?);
                                 cur = dtypes
@@ -1421,7 +1714,46 @@ fn hash_join_probe(
             Ok(finished)
         })
         .collect::<Result<_>>()?;
-    Ok(partitions.into_iter().flatten().collect())
+    let mut out: Vec<DataChunk> = partitions.into_iter().flatten().collect();
+    // FULL JOIN: emit every unmatched build row, NULL-extended on the other
+    // side. Build rows keep build input order (chunk order, row order).
+    if let Some(marked) = &marked {
+        for (bci, bchunk) in build.chunks.iter().enumerate() {
+            let base = build_chunk_starts[bci] as usize;
+            let unmatched: Vec<usize> = (0..bchunk.num_rows())
+                .filter(|i| !marked[base + i].load(std::sync::atomic::Ordering::Relaxed))
+                .collect();
+            if unmatched.is_empty() {
+                continue;
+            }
+            let gathered = bchunk.gather(&unmatched);
+            let mut cols: Vec<std::sync::Arc<Vector>> = Vec::with_capacity(dtypes.len());
+            if preserved_is_right {
+                // Output is build ++ preserved: NULLs come second.
+                cols.extend(gathered.columns.iter().cloned());
+                for t in preserved.types {
+                    let mut v = Vector::with_capacity(*t, unmatched.len());
+                    for _ in 0..unmatched.len() {
+                        v.push_null()?;
+                    }
+                    cols.push(std::sync::Arc::new(v));
+                }
+            } else {
+                for t in preserved.types {
+                    let mut v = Vector::with_capacity(*t, unmatched.len());
+                    for _ in 0..unmatched.len() {
+                        v.push_null()?;
+                    }
+                    cols.push(std::sync::Arc::new(v));
+                }
+                cols.extend(gathered.columns.iter().cloned());
+            }
+            out.push(DataChunk::from_arcs(cols).ok_or_else(|| {
+                PinkDbError::Execution("full-join assembly produced mismatched columns".to_string())
+            })?);
+        }
+    }
+    Ok(out)
 }
 
 // ---------- fused join → aggregate ----------
@@ -1841,16 +2173,16 @@ fn fused_join_aggregate(
     // Shape: Aggregate over Join, or over Project over Join. A Filter /
     // Distinct / Window / Limit / Cte between the aggregate and the join
     // (or any other input) keeps the materialized path.
-    let (kind, left, right, left_key, right_key, left_cols, project) = match input {
+    let (kind, left, right, left_keys, right_keys, left_cols, project) = match input {
         LogicalPlan::Join {
             kind,
             left,
             right,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             left_cols,
         } => (
-            *kind, &**left, &**right, left_key, right_key, *left_cols, None,
+            *kind, &**left, &**right, left_keys, right_keys, *left_cols, None,
         ),
         LogicalPlan::Project {
             input: inner,
@@ -1861,15 +2193,15 @@ fn fused_join_aggregate(
                 kind,
                 left,
                 right,
-                left_key,
-                right_key,
+                left_keys,
+                right_keys,
                 left_cols,
             } => (
                 *kind,
                 &**left,
                 &**right,
-                left_key,
-                right_key,
+                left_keys,
+                right_keys,
                 *left_cols,
                 Some(&exprs[..]),
             ),
@@ -1881,6 +2213,15 @@ fn fused_join_aggregate(
     // feeds matched pairs into the accumulators, so it would undercount.
     // Static kind check — nothing has been evaluated yet.
     if kind != JoinKind::Inner {
+        return Ok(None);
+    }
+    // Fusion probes one key column pair; composite and DISTINCT aggregates
+    // take the materialized path.
+    let (left_key, right_key) = match (left_keys.as_slice(), right_keys.as_slice()) {
+        ([l], [r]) => (l, r),
+        _ => return Ok(None),
+    };
+    if aggs.iter().any(|a| a.distinct) {
         return Ok(None);
     }
     // The same build-side choice the materialized `hash_join` makes: hash
@@ -2009,7 +2350,14 @@ fn fused_join_aggregate(
         ));
     }
     let reserve = build_rows.min(1 << 20);
-    let table = MatchTable::build(cx, &build.chunks, build_key, common, ints, reserve)?;
+    let table = MatchTable::build(
+        cx,
+        &build.chunks,
+        std::slice::from_ref(build_key),
+        std::slice::from_ref(&common),
+        ints,
+        reserve,
+    )?;
 
     // Fast path: keys-free pure COUNT(*) counts matched pairs by walking the
     // match chains — no per-pair `Value` work, no group state.
@@ -2150,7 +2498,10 @@ fn fused_join_aggregate(
                                             vecs[src.idx].v().get(row)
                                         })
                                         .collect(),
-                                    accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
+                                    accs: aggs
+                                        .iter()
+                                        .map(|a| Acc::new(a.func, a.distinct))
+                                        .collect(),
                                 },
                             ));
                             idx
@@ -2262,7 +2613,7 @@ impl PartialOrd for Candidate<'_> {
 fn eval_sort_keys<'a>(
     cx: &Cx,
     chunks: &'a [DataChunk],
-    keys: &[(BoundExpr, bool)],
+    keys: &[(BoundExpr, SortSpec)],
 ) -> Result<Vec<Vec<FusedVec<'a>>>> {
     chunks
         .par_iter()
@@ -2289,10 +2640,13 @@ fn push_be(out: &mut Vec<u8>, x: u64, width: usize, desc: bool) {
 
 /// Append one key cell to `out` so ascending byte comparison of two rows'
 /// concatenated encodings reproduces the `Value` comparator (reversed for
-/// DESC keys), with NULLS LAST in both directions:
+/// DESC keys):
 ///
-/// - NULL → single `0xFF` (after every non-null);
-/// - otherwise tag `0x00` + payload; DESC inverts payload bytes only.
+/// - NULL → a single tag byte: `0x00` under NULLS FIRST (before every
+///   non-null), `0xFF` under NULLS LAST (after every non-null) — the tag is
+///   independent of the sort direction;
+/// - otherwise tag `0x01` (NULLS FIRST) or `0x00` (NULLS LAST) + payload;
+///   DESC inverts payload bytes only.
 ///
 /// Payloads are order-preserving and, per key, prefix-free — a prefix
 /// relation inside one key must never let the *next* key decide a comparison
@@ -2311,12 +2665,13 @@ fn push_be(out: &mut Vec<u8>, x: u64, width: usize, desc: bool) {
 /// Returns `false` for a NaN DOUBLE cell: `compare_values` treats NaN as
 /// Equal to everything, which no byte order can express, so the caller
 /// aborts encoding and sorts with the `Value` comparator instead.
-fn encode_key_into(v: &Vector, idx: usize, desc: bool, out: &mut Vec<u8>) -> bool {
+fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) -> bool {
+    let desc = spec.desc;
     if v.is_null(idx) {
-        out.push(0xFF);
+        out.push(if spec.nulls_first { 0x00 } else { 0xFF });
         return true;
     }
-    out.push(0x00);
+    out.push(if spec.nulls_first { 0x01 } else { 0x00 });
     match v.data() {
         VectorData::Boolean(d) => {
             let b = d[idx] as u8;
@@ -2361,7 +2716,7 @@ fn encode_key_into(v: &Vector, idx: usize, desc: bool, out: &mut Vec<u8>) -> boo
 fn encode_sort_keys(
     chunks: &[DataChunk],
     keyed: &[Vec<FusedVec>],
-    keys: &[(BoundExpr, bool)],
+    keys: &[(BoundExpr, SortSpec)],
 ) -> Option<SortArena> {
     let n: usize = chunks.iter().map(|c| c.num_rows()).sum();
     if n > u32::MAX as usize {
@@ -2393,8 +2748,8 @@ fn encode_sort_keys(
                     return None;
                 }
                 offsets.push(bytes.len() as u32);
-                for (ki, (_, desc)) in keys.iter().enumerate() {
-                    if !encode_key_into(ks[ki].v(), i, *desc, &mut bytes) {
+                for (ki, (_, spec)) in keys.iter().enumerate() {
+                    if !encode_key_into(ks[ki].v(), i, *spec, &mut bytes) {
                         return None;
                     }
                 }
@@ -2484,7 +2839,7 @@ fn rebuild_sorted(chunks: &[DataChunk], rows: &[u32]) -> Result<Vec<DataChunk>> 
     rows.par_chunks(CHUNK_SIZE).map(gather).collect()
 }
 
-fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec<DataChunk>> {
+fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result<Vec<DataChunk>> {
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
@@ -2529,7 +2884,7 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, bool)]) -> Result<Vec
 fn top_n(
     cx: &Cx,
     chunks: &[DataChunk],
-    keys: &[(BoundExpr, bool)],
+    keys: &[(BoundExpr, SortSpec)],
     limit: usize,
 ) -> Result<Option<Vec<DataChunk>>> {
     let keyed = eval_sort_keys(cx, chunks, keys)?;
@@ -2590,7 +2945,7 @@ fn top_n(
 /// byte-arena path. Reached when a FLOAT key contains NaN.
 fn sort_legacy(
     chunks: &[DataChunk],
-    keys: &[(BoundExpr, bool)],
+    keys: &[(BoundExpr, SortSpec)],
     keyed: &[Vec<FusedVec>],
 ) -> Result<Vec<DataChunk>> {
     struct Row {
@@ -2612,15 +2967,28 @@ fn sort_legacy(
         }
     }
     rows.par_sort_by(|a, b| {
-        for ((ka, kb), (_, desc)) in a.key.iter().zip(b.key.iter()).zip(keys.iter()) {
-            // NULLS LAST regardless of direction: only non-null values flip.
+        for ((ka, kb), (_, spec)) in a.key.iter().zip(b.key.iter()).zip(keys.iter()) {
+            // Explicit NULL placement: NULLS LAST by default (both
+            // directions, DuckDB's `default_null_order`), or NULLS FIRST.
             let ord = match (ka, kb) {
                 (Value::Null, Value::Null) => Ordering::Equal,
-                (Value::Null, _) => Ordering::Greater,
-                (_, Value::Null) => Ordering::Less,
+                (Value::Null, _) => {
+                    if spec.nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (_, Value::Null) => {
+                    if spec.nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
                 _ => {
                     let c = compare_values(ka, kb);
-                    if *desc {
+                    if spec.desc {
                         c.reverse()
                     } else {
                         c
@@ -2697,6 +3065,628 @@ fn truncate_output(mut out: Output, limit: usize) -> Output {
         chunks,
         names: out.names,
         types: out.types,
+    }
+}
+
+/// Drop the first `offset` rows of `out` (the OFFSET shape).
+fn skip_output(mut out: Output, offset: usize) -> Output {
+    let mut chunks = Vec::new();
+    let mut left = offset;
+    for chunk in out.chunks.drain(..) {
+        if left == 0 {
+            chunks.push(chunk);
+            continue;
+        }
+        if chunk.num_rows() <= left {
+            left -= chunk.num_rows();
+        } else {
+            let sel: Vec<usize> = (left..chunk.num_rows()).collect();
+            chunks.push(chunk.gather(&sel));
+            left = 0;
+        }
+    }
+    Output {
+        chunks,
+        names: out.names,
+        types: out.types,
+    }
+}
+
+/// One VARCHAR column vector from `values` (SHOW/SHOW DATABASES shapes).
+fn string_vector(values: &[String]) -> Result<Vector> {
+    let mut v = Vector::with_capacity(DataType::Varchar, values.len());
+    for s in values {
+        v.push_valid(Value::Varchar(s.clone()))?;
+    }
+    Ok(v)
+}
+
+/// Coerce every chunk column to `types` (set-operation common types).
+fn coerce_chunks(chunks: &[DataChunk], types: &[DataType]) -> Result<Vec<DataChunk>> {
+    let mut out = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let mut cols = Vec::with_capacity(types.len());
+        for (col, t) in chunk.columns.iter().zip(types.iter()) {
+            cols.push(coerce_to(col, *t)?);
+        }
+        out.push(DataChunk::new(cols)?);
+    }
+    Ok(out)
+}
+
+/// Which set operation a [`set_op_chunks`] call computes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetOpKind {
+    Intersect,
+    Except,
+}
+
+/// Encode one row of `chunk` (all columns, in order) into `buf`.
+fn encode_row_from_chunk(buf: &mut Vec<u8>, chunk: &DataChunk, i: usize) {
+    for col in &chunk.columns {
+        col.encode_into(buf, i);
+    }
+}
+
+/// `INTERSECT [ALL]` / `EXCEPT [ALL]`: walk the left rows in input order and
+/// keep or drop each by the right side's per-key multiplicities. NULLs are
+/// peers (they encode identically), matching DuckDB's set-operation
+/// semantics. EVERY/ALL multiplicities are exact:
+/// - INTERSECT ALL keeps `min(count_left, count_right)` copies;
+/// - EXCEPT ALL keeps `count_left - count_right` copies (never negative).
+fn set_op_chunks(
+    left: &[DataChunk],
+    right: &[DataChunk],
+    kind: SetOpKind,
+    all: bool,
+) -> Vec<DataChunk> {
+    // Right-side multiplicities (also the membership set for the DISTINCT
+    // variants).
+    let mut counts: FastMap<Vec<u8>, i64> = FastMap::default();
+    let mut buf = Vec::new();
+    for chunk in right {
+        for i in 0..chunk.num_rows() {
+            buf.clear();
+            encode_row_from_chunk(&mut buf, chunk, i);
+            *counts.entry(buf.clone()).or_insert(0) += 1;
+        }
+    }
+    let mut seen: FastSet<Vec<u8>> = FastSet::default();
+    let mut out = Vec::new();
+    for chunk in left {
+        let mut sel = Vec::new();
+        for i in 0..chunk.num_rows() {
+            buf.clear();
+            encode_row_from_chunk(&mut buf, chunk, i);
+            let keep = match kind {
+                SetOpKind::Intersect => {
+                    if all {
+                        match counts.get_mut(&buf) {
+                            Some(n) if *n > 0 => {
+                                *n -= 1;
+                                true
+                            }
+                            _ => false,
+                        }
+                    } else {
+                        counts.contains_key(&buf) && seen.insert(buf.clone())
+                    }
+                }
+                SetOpKind::Except => {
+                    let in_right = counts.get(&buf).copied().unwrap_or(0);
+                    if all {
+                        if in_right > 0 {
+                            counts.insert(buf.clone(), in_right - 1);
+                            false
+                        } else {
+                            true
+                        }
+                    } else {
+                        !counts.contains_key(&buf) && seen.insert(buf.clone())
+                    }
+                }
+            };
+            if keep {
+                sel.push(i);
+            }
+        }
+        if !sel.is_empty() {
+            out.push(chunk.gather(&sel));
+        }
+    }
+    out
+}
+
+/// Nested-loop join over two materialized inputs: for every left row × right
+/// row, `on` (joined space) decides a match. `on: None` is a CROSS JOIN (all
+/// pairs). Emits matched pairs in left-major order, then (for LEFT/RIGHT/
+/// FULL) the unmatched preserved rows NULL-extended. Used for non-equi and
+/// residual-condition joins, where a hash key does not exist.
+fn nested_loop_join(
+    cx: &Cx,
+    kind: JoinKind,
+    left: &Output,
+    right: &Output,
+    on: Option<&BoundExpr>,
+) -> Result<Vec<DataChunk>> {
+    let mut dtypes: Vec<DataType> = left.types.clone();
+    dtypes.extend(right.types.iter().copied());
+    let n_left = left.types.len();
+    let left_rows: usize = left.chunks.iter().map(|c| c.num_rows()).sum();
+    let right_rows: usize = right.chunks.iter().map(|c| c.num_rows()).sum();
+    let mut left_matched = vec![false; left_rows];
+    let mut right_matched = vec![false; right_rows];
+    let right_starts: Vec<usize> = {
+        let mut starts = Vec::with_capacity(right.chunks.len() + 1);
+        let mut acc = 0usize;
+        for c in &right.chunks {
+            starts.push(acc);
+            acc += c.num_rows();
+        }
+        starts.push(acc);
+        starts
+    };
+
+    let mut builder = JoinedChunks::new(dtypes);
+    let mut li_global = 0usize;
+    for lchunk in &left.chunks {
+        for li in 0..lchunk.num_rows() {
+            for (rci, rchunk) in right.chunks.iter().enumerate() {
+                let n = rchunk.num_rows();
+                if n == 0 {
+                    continue;
+                }
+                let matched: Vec<usize> = match on {
+                    None => (0..n).collect(),
+                    Some(on) => {
+                        // Evaluate the condition on a synthetic chunk: the
+                        // left row's values repeated `n` times ++ the right
+                        // chunk's columns (shared, never copied).
+                        let mut cols: Vec<std::sync::Arc<Vector>> = Vec::with_capacity(n_left + n);
+                        for col in &lchunk.columns {
+                            let value = col.get(li);
+                            let mut v = Vector::with_capacity(col.dtype(), n);
+                            for _ in 0..n {
+                                v.push_value(value.clone())?;
+                            }
+                            cols.push(std::sync::Arc::new(v));
+                        }
+                        cols.extend(rchunk.columns.iter().cloned());
+                        let combined = DataChunk::from_arcs(cols).ok_or_else(|| {
+                            PinkDbError::Execution(
+                                "nested-loop join predicate chunk mismatch".to_string(),
+                            )
+                        })?;
+                        let pred = eval_expr(on, &combined, cx)?;
+                        select_true(&pred)?
+                    }
+                };
+                if matched.is_empty() {
+                    continue;
+                }
+                left_matched[li_global] = true;
+                for &rj in &matched {
+                    right_matched[right_starts[rci] + rj] = true;
+                    builder.ensure_room()?;
+                    for (dst, col) in builder
+                        .cur
+                        .iter_mut()
+                        .take(n_left)
+                        .zip(lchunk.columns.iter())
+                    {
+                        dst.push_from(col, li)?;
+                    }
+                    for (dst, col) in builder
+                        .cur
+                        .iter_mut()
+                        .skip(n_left)
+                        .zip(rchunk.columns.iter())
+                    {
+                        dst.push_from(col, rj)?;
+                    }
+                    builder.rows += 1;
+                }
+            }
+            li_global += 1;
+        }
+    }
+
+    // Unmatched preserved sides (LEFT/RIGHT/FULL only; INNER and CROSS emit
+    // matched pairs only).
+    if matches!(kind, JoinKind::Left | JoinKind::Full) {
+        let mut li_global = 0usize;
+        for lchunk in &left.chunks {
+            for li in 0..lchunk.num_rows() {
+                if !left_matched[li_global] {
+                    builder.ensure_room()?;
+                    for (dst, col) in builder
+                        .cur
+                        .iter_mut()
+                        .take(n_left)
+                        .zip(lchunk.columns.iter())
+                    {
+                        dst.push_from(col, li)?;
+                    }
+                    for dst in builder.cur.iter_mut().skip(n_left) {
+                        dst.push_null()?;
+                    }
+                    builder.rows += 1;
+                }
+                li_global += 1;
+            }
+        }
+    }
+    if matches!(kind, JoinKind::Right | JoinKind::Full) {
+        let mut ri_global = 0usize;
+        for rchunk in &right.chunks {
+            for ri in 0..rchunk.num_rows() {
+                if !right_matched[ri_global] {
+                    builder.ensure_room()?;
+                    for dst in builder.cur.iter_mut().take(n_left) {
+                        dst.push_null()?;
+                    }
+                    for (dst, col) in builder
+                        .cur
+                        .iter_mut()
+                        .skip(n_left)
+                        .zip(rchunk.columns.iter())
+                    {
+                        dst.push_from(col, ri)?;
+                    }
+                    builder.rows += 1;
+                }
+                ri_global += 1;
+            }
+        }
+    }
+    builder.finish()
+}
+
+/// Incremental chunk builder for joins (fixed output dtypes, CHUNK_SIZE cap).
+struct JoinedChunks {
+    dtypes: Vec<DataType>,
+    cur: Vec<Vector>,
+    rows: usize,
+    out: Vec<DataChunk>,
+}
+
+impl JoinedChunks {
+    fn new(dtypes: Vec<DataType>) -> Self {
+        let cur = dtypes
+            .iter()
+            .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+            .collect();
+        Self {
+            dtypes,
+            cur,
+            rows: 0,
+            out: Vec::new(),
+        }
+    }
+
+    /// Flush the current chunk when it is full (leaves room for one row).
+    fn ensure_room(&mut self) -> Result<()> {
+        if self.rows >= CHUNK_SIZE {
+            self.out
+                .push(DataChunk::new(std::mem::take(&mut self.cur))?);
+            self.cur = self
+                .dtypes
+                .iter()
+                .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
+                .collect();
+            self.rows = 0;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<Vec<DataChunk>> {
+        if self.rows > 0 {
+            self.out.push(DataChunk::new(self.cur)?);
+        }
+        Ok(self.out)
+    }
+}
+
+// ---------- EXPLAIN ----------
+
+/// One line per plan node, root first, indented by depth; the format is
+/// pinkdb's own (stable and printable, not DuckDB-compatible).
+fn explain_lines(plan: &LogicalPlan) -> Vec<String> {
+    let mut out = Vec::new();
+    explain_into(plan, 0, &mut out);
+    out
+}
+
+fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
+    let pad = "  ".repeat(depth);
+    let mut children: Vec<&LogicalPlan> = Vec::new();
+    let head = match plan {
+        LogicalPlan::CreateTable {
+            db,
+            name,
+            if_not_exists,
+            ..
+        } => {
+            let ine = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            format!("CreateTable{ine} {}", qualify(db, name))
+        }
+        LogicalPlan::CreateTableAs {
+            db,
+            name,
+            query,
+            if_not_exists,
+        } => {
+            children.push(query);
+            let ine = if *if_not_exists { " IF NOT EXISTS" } else { "" };
+            format!("CreateTableAs{ine} {}", qualify(db, name))
+        }
+        LogicalPlan::Insert { db, table, rows } => {
+            format!("Insert {} ({} rows)", qualify(db, table), rows.len())
+        }
+        LogicalPlan::InsertSelect {
+            db,
+            table,
+            query,
+            columns,
+        } => {
+            children.push(query);
+            format!(
+                "InsertSelect {} ({})",
+                qualify(db, table),
+                columns
+                    .as_ref()
+                    .map(|c| c.len().to_string())
+                    .unwrap_or_else(|| "*".to_string())
+            )
+        }
+        LogicalPlan::Update {
+            db,
+            table,
+            sets,
+            predicate,
+        } => {
+            let mut s = format!("Update {} ({} sets)", qualify(db, table), sets.len());
+            if let Some(p) = predicate {
+                s.push_str(&format!(" where {}", expr_text(p)));
+            }
+            s
+        }
+        LogicalPlan::Delete {
+            db,
+            table,
+            predicate,
+        } => {
+            let mut s = format!("Delete {}", qualify(db, table));
+            if let Some(p) = predicate {
+                s.push_str(&format!(" where {}", expr_text(p)));
+            }
+            s
+        }
+        LogicalPlan::Begin => "Begin".to_string(),
+        LogicalPlan::Commit => "Commit".to_string(),
+        LogicalPlan::Rollback => "Rollback".to_string(),
+        LogicalPlan::CreateView { db, name, .. } => format!("CreateView {}", qualify(db, name)),
+        LogicalPlan::DropTable { db, name, .. } => format!("DropTable {}", qualify(db, name)),
+        LogicalPlan::DropView { db, name } => format!("DropView {}", qualify(db, name)),
+        LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
+        LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
+        LogicalPlan::Use { name } => format!("Use {name}"),
+        LogicalPlan::LoadExtension { path } => format!("LoadExtension {path}"),
+        LogicalPlan::Checkpoint => "Checkpoint".to_string(),
+        LogicalPlan::ShowTables { db } => format!("ShowTables {db}"),
+        LogicalPlan::ShowDatabases => "ShowDatabases".to_string(),
+        LogicalPlan::Describe { schema } => format!("Describe ({} cols)", schema.len()),
+        LogicalPlan::Explain { plan } => {
+            children.push(plan);
+            "Explain".to_string()
+        }
+        LogicalPlan::SetOp {
+            op,
+            left,
+            right,
+            types,
+        } => {
+            children.push(left);
+            children.push(right);
+            let name = match op {
+                crate::sql::ast::SetOp::Union => "Union",
+                crate::sql::ast::SetOp::UnionAll => "Union All",
+                crate::sql::ast::SetOp::Intersect => "Intersect",
+                crate::sql::ast::SetOp::IntersectAll => "Intersect All",
+                crate::sql::ast::SetOp::Except => "Except",
+                crate::sql::ast::SetOp::ExceptAll => "Except All",
+            };
+            format!("{name} ({} cols)", types.len())
+        }
+        LogicalPlan::Scan { db, table } => {
+            if db.is_none() {
+                format!("Scan CTE {table}")
+            } else {
+                format!("Scan {}", qualify(db, table))
+            }
+        }
+        LogicalPlan::SingleRow => "SingleRow".to_string(),
+        LogicalPlan::Filter { input, predicate } => {
+            children.push(input);
+            format!("Filter {}", expr_text(predicate))
+        }
+        LogicalPlan::Cte { name, query, body } => {
+            out.push(format!("{pad}Cte {name}"));
+            explain_into(query, depth + 1, out);
+            explain_into(body, depth + 1, out);
+            return;
+        }
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            children.push(left);
+            children.push(right);
+            let mut key_text = String::new();
+            for (l, r) in left_keys.iter().zip(right_keys.iter()) {
+                if !key_text.is_empty() {
+                    key_text.push_str(", ");
+                }
+                key_text.push_str(&format!("{}={}", expr_text(l), expr_text(r)));
+            }
+            format!("Join {} on [{key_text}]", join_name(*kind))
+        }
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            ..
+        } => {
+            children.push(left);
+            children.push(right);
+            match on {
+                Some(e) => format!("NestedLoopJoin {} on {}", join_name(*kind), expr_text(e)),
+                None => format!("NestedLoopJoin {}", join_name(*kind)),
+            }
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            children.push(input);
+            let keys_text: Vec<String> = keys.iter().map(expr_text).collect();
+            let aggs_text: Vec<String> = aggs
+                .iter()
+                .map(|a| {
+                    let d = if a.distinct { "DISTINCT " } else { "" };
+                    let name = format!("{:?}", a.func).to_ascii_lowercase();
+                    match &a.arg {
+                        Some(e) => format!("{name}({d}{})", expr_text(e)),
+                        None => format!("{name}(*)"),
+                    }
+                })
+                .collect();
+            format!(
+                "Aggregate keys=[{}] aggs=[{}]",
+                keys_text.join(", "),
+                aggs_text.join(", ")
+            )
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            children.push(input);
+            format!("Window ({} functions)", windows.len())
+        }
+        LogicalPlan::Project { input, names, .. } => {
+            children.push(input);
+            format!("Project [{}]", names.join(", "))
+        }
+        LogicalPlan::Distinct { input } => {
+            children.push(input);
+            "Distinct".to_string()
+        }
+        LogicalPlan::Sort { input, keys } => {
+            children.push(input);
+            let keys_text: Vec<String> = keys
+                .iter()
+                .map(|(e, spec)| {
+                    let dir = if spec.desc { " DESC" } else { "" };
+                    let nulls = if spec.nulls_first { " NULLS FIRST" } else { "" };
+                    format!("{}{dir}{nulls}", expr_text(e))
+                })
+                .collect();
+            format!("Sort [{}]", keys_text.join(", "))
+        }
+        LogicalPlan::Limit { input, limit } => {
+            children.push(input);
+            format!("Limit {limit}")
+        }
+        LogicalPlan::Offset { input, offset } => {
+            children.push(input);
+            format!("Offset {offset}")
+        }
+    };
+    out.push(format!("{pad}{head}"));
+    for c in children {
+        explain_into(c, depth + 1, out);
+    }
+}
+
+fn join_name(kind: JoinKind) -> &'static str {
+    match kind {
+        JoinKind::Inner => "inner",
+        JoinKind::Left => "left",
+        JoinKind::Right => "right",
+        JoinKind::Full => "full",
+        JoinKind::Cross => "cross",
+    }
+}
+
+fn qualify(db: &Option<String>, table: &str) -> String {
+    match db {
+        Some(d) => format!("{d}.{table}"),
+        None => table.to_string(),
+    }
+}
+
+/// Compact textual form of a bound expression (EXPLAIN only).
+fn expr_text(e: &BoundExpr) -> String {
+    match e {
+        BoundExpr::Literal(v) => match v {
+            Value::Varchar(s) => format!("'{s}'"),
+            other => other.to_string(),
+        },
+        BoundExpr::Column { index, .. } => format!("#{index}"),
+        BoundExpr::AggRef { index, .. } => format!("agg#{index}"),
+        BoundExpr::WindowRef { index, .. } => format!("win#{index}"),
+        BoundExpr::Binary {
+            op, left, right, ..
+        } => {
+            let sym = match op {
+                BinaryOp::Add => "+",
+                BinaryOp::Subtract => "-",
+                BinaryOp::Multiply => "*",
+                BinaryOp::Divide => "/",
+                BinaryOp::Modulo => "%",
+                BinaryOp::Eq => "=",
+                BinaryOp::NotEq => "<>",
+                BinaryOp::Lt => "<",
+                BinaryOp::LtEq => "<=",
+                BinaryOp::Gt => ">",
+                BinaryOp::GtEq => ">=",
+                BinaryOp::And => "AND",
+                BinaryOp::Or => "OR",
+                BinaryOp::Like => "LIKE",
+                BinaryOp::NotLike => "NOT LIKE",
+                BinaryOp::Concat => "||",
+            };
+            format!("({} {sym} {})", expr_text(left), expr_text(right))
+        }
+        BoundExpr::Not(e) => format!("(NOT {})", expr_text(e)),
+        BoundExpr::Negate { expr, .. } => format!("(-{})", expr_text(expr)),
+        BoundExpr::IsNull { expr, negated } => {
+            let not = if *negated { " NOT" } else { "" };
+            format!("({}{not} IS NULL)", expr_text(expr))
+        }
+        BoundExpr::Scalar { func, args, .. } => format!(
+            "{:?}({})",
+            func,
+            args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
+        ),
+        BoundExpr::Cast { expr, dtype } => format!("CAST({} AS {dtype})", expr_text(expr)),
+        BoundExpr::Coalesce { args, .. } => format!(
+            "coalesce({})",
+            args.iter().map(expr_text).collect::<Vec<_>>().join(", ")
+        ),
+        BoundExpr::Case { branches, .. } => format!("CASE ({} branches)", branches.len()),
+        BoundExpr::ScalarSubquery { .. } => "(subquery)".to_string(),
+        BoundExpr::InSubquery { expr, negated, .. } => {
+            format!(
+                "({} {}IN (subquery))",
+                expr_text(expr),
+                if *negated { "NOT " } else { "" }
+            )
+        }
+        BoundExpr::Exists { negated, .. } => {
+            format!("({}EXISTS (subquery))", if *negated { "NOT " } else { "" })
+        }
+        BoundExpr::DynamicScalar { name, .. } => format!("{name}(...)"),
     }
 }
 
@@ -2799,10 +3789,10 @@ impl<'p> Stream<'p> {
                     exprs.iter().map(|e| e.dtype()).collect(),
                 )
             }
-            LogicalPlan::Union {
+            LogicalPlan::SetOp {
+                op: crate::sql::ast::SetOp::UnionAll,
                 left,
                 right,
-                distinct: false,
                 types,
             } => {
                 let Some(left) = Stream::build(cx, left)? else {
@@ -5095,7 +6085,9 @@ mod tests {
     #[test]
     fn window_agg_frames() {
         let mut db = win_db();
-        // Default cumulative frame with ORDER BY.
+        // Default cumulative frame with ORDER BY is DuckDB's RANGE BETWEEN
+        // UNBOUNDED PRECEDING AND CURRENT ROW: peers (equal amounts) share
+        // the frame, so both 5s see 5 + 5 = 10.
         let rows = select(
             &mut db,
             "SELECT amount, SUM(amount) OVER (ORDER BY amount) AS run FROM sales ORDER BY amount;",
@@ -5107,7 +6099,7 @@ mod tests {
                 _ => panic!(),
             })
             .collect();
-        assert_eq!(runs, vec![5, 10, 20, 40]);
+        assert_eq!(runs, vec![10, 10, 20, 40]);
         // Whole-partition default without ORDER BY.
         let rows = select(&mut db, "SELECT COUNT(*) OVER () AS c FROM sales;");
         assert!(rows.iter().all(|r| r[0] == V::Bigint(4)));
@@ -5125,6 +6117,478 @@ mod tests {
             })
             .collect();
         assert_eq!(got, vec![5, 10, 15, 30]);
+    }
+
+    /// Wave 58: joins (multi-way, composite, non-equi, CROSS, FULL), set
+    /// operations (INTERSECT/EXCEPT with ALL and precedence), DML/DDL
+    /// extensions, COUNT(DISTINCT), RANGE windows, and EXPLAIN/SHOW/DESCRIBE.
+    fn wave58_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE wj (x INTEGER, y INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO wj VALUES (1, 10), (2, 20), (5, 50);")
+            .unwrap();
+        db.execute("CREATE TABLE wk (x INTEGER, z VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO wk VALUES (2, 'two'), (3, 'three'), (6, 'six');")
+            .unwrap();
+        db.execute("CREATE TABLE wl (x INTEGER, w INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO wl VALUES (2, 200), (3, 300);")
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn wave58_multi_way_composite_and_full_joins() {
+        let mut db = wave58_db();
+        // Three tables, left-deep, non-equi middle step.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT a.x, b.x, c.x FROM wj a JOIN wk b ON a.x < b.x \
+                 JOIN wl c ON b.x < c.x ORDER BY 1, 2, 3;"
+            ),
+            vec![vec![V::Integer(1), V::Integer(2), V::Integer(3)]]
+        );
+        // Composite ON: two equality pairs must both hold.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT a.x, b.x FROM wj a JOIN wk b ON a.x = b.x AND a.y = b.x * 10;"
+            ),
+            vec![vec![V::Integer(2), V::Integer(2)]]
+        );
+        // CROSS JOIN is the full cartesian product.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM wj CROSS JOIN wk;"),
+            vec![vec![V::Bigint(9)]]
+        );
+        // FULL JOIN: unmatched rows from both sides, NULL-filled complements.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT wj.x AS ax, wk.x AS bx FROM wj FULL JOIN wk ON wj.x = wk.x \
+                 WHERE wj.x IS NULL OR wk.x IS NULL ORDER BY ax NULLS LAST, bx NULLS LAST;"
+            ),
+            vec![
+                vec![V::Integer(1), V::Null],
+                vec![V::Integer(5), V::Null],
+                vec![V::Null, V::Integer(3)],
+                vec![V::Null, V::Integer(6)],
+            ]
+        );
+        // A FULL JOIN with a residual (mixed) condition goes through the
+        // nested loop and still preserves both sides.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT COUNT(*) FROM wj FULL JOIN wk ON wj.x = wk.x AND wj.y > 100;"
+            ),
+            vec![vec![V::Bigint(6)]]
+        );
+        // Non-equi LEFT JOIN preserves unmatched left rows.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT a.x AS ax, b.x AS bx FROM wj a LEFT JOIN wk b ON a.x > b.x \
+                 ORDER BY ax NULLS LAST, bx NULLS LAST;"
+            ),
+            vec![
+                vec![V::Integer(1), V::Null],
+                vec![V::Integer(2), V::Null],
+                vec![V::Integer(5), V::Integer(2)],
+                vec![V::Integer(5), V::Integer(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn wave58_set_operations_and_precedence() {
+        let mut db = wave58_db();
+        // INTERSECT binds tighter than UNION (`wj UNION (wk INTERSECT wl)`).
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM wj UNION SELECT x FROM wk INTERSECT SELECT x FROM wl \
+                 ORDER BY 1;"
+            ),
+            [1, 2, 3, 5]
+                .map(|n| vec![V::Integer(n)])
+                .into_iter()
+                .collect::<Vec<_>>()
+        );
+        // EXCEPT shares UNION's precedence, left-associative.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM wj EXCEPT SELECT x FROM wk INTERSECT SELECT x FROM wl \
+                 ORDER BY 1;"
+            ),
+            vec![vec![V::Integer(1)], vec![V::Integer(5)]]
+        );
+        // ALL multiplicities: INTERSECT ALL keeps the min, EXCEPT ALL the
+        // positive difference.
+        db.execute("CREATE TABLE wm (x INTEGER);").unwrap();
+        db.execute("INSERT INTO wm VALUES (2), (2), (3), (9);")
+            .unwrap();
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM wm INTERSECT ALL SELECT x FROM wl ORDER BY 1;"
+            ),
+            vec![vec![V::Integer(2)], vec![V::Integer(3)]]
+        );
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM wm EXCEPT ALL SELECT x FROM wl ORDER BY 1;"
+            ),
+            vec![vec![V::Integer(2)], vec![V::Integer(9)]]
+        );
+        // NULLs are peers in set operations.
+        db.execute("CREATE TABLE wn (x INTEGER);").unwrap();
+        db.execute("INSERT INTO wn VALUES (NULL), (NULL), (7);")
+            .unwrap();
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT x FROM wn INTERSECT SELECT x FROM wn ORDER BY 1;"
+            ),
+            vec![vec![V::Integer(7)], vec![V::Null]]
+        );
+    }
+
+    #[test]
+    fn wave58_insert_select_and_ctas() {
+        let mut db = wave58_db();
+        // INSERT ... SELECT with a reordered column list; unspecified columns
+        // default to NULL.
+        db.execute("CREATE TABLE ins (p INTEGER, q VARCHAR, r DOUBLE);")
+            .unwrap();
+        db.execute("INSERT INTO ins (q, p) SELECT z, x FROM wk WHERE x = 2;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT p, q, r FROM ins;"),
+            vec![vec![V::Integer(2), V::Varchar("two".to_string()), V::Null]]
+        );
+        db.execute("INSERT INTO ins SELECT x, z, x * 1.0 FROM wk;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM ins;"),
+            vec![vec![V::Bigint(4)]]
+        );
+        // Arity and type mismatches are bind-time errors.
+        let err = db
+            .execute("INSERT INTO ins (p) SELECT x, z FROM wk;")
+            .unwrap_err();
+        assert!(err.to_string().contains("values for"), "{err}");
+        let err = db
+            .execute("INSERT INTO ins (p) SELECT z FROM wk;")
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot insert"), "{err}");
+        // A failed INSERT ... SELECT leaves the target untouched.
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM ins;"),
+            vec![vec![V::Bigint(4)]]
+        );
+        // CTAS infers names and types, including from an empty result.
+        db.execute("CREATE TABLE ct AS SELECT x, y * 2 AS d FROM wj WHERE x > 1;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT x, d FROM ct ORDER BY x;"),
+            vec![
+                vec![V::Integer(2), V::Integer(40)],
+                vec![V::Integer(5), V::Integer(100)],
+            ]
+        );
+        db.execute("CREATE TABLE ct_empty AS SELECT x AS q FROM wj WHERE false;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM ct_empty;"),
+            vec![vec![V::Bigint(0)]]
+        );
+    }
+
+    #[test]
+    fn wave58_if_exists_flags_and_databases() {
+        let mut db = wave58_db();
+        // CREATE TABLE IF NOT EXISTS: existing is a no-op, missing creates.
+        db.execute("CREATE TABLE flag (a INTEGER);").unwrap();
+        let before = select(&mut db, "SELECT COUNT(*) FROM flag;");
+        assert!(select(&mut db, "SELECT COUNT(*) FROM flag;") == before);
+        db.execute("CREATE TABLE IF NOT EXISTS flag (b VARCHAR);")
+            .unwrap();
+        let err = db.execute("CREATE TABLE flag (b VARCHAR);").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        // DROP TABLE IF EXISTS: missing is a no-op, existing drops.
+        db.execute("DROP TABLE IF EXISTS no_such_table;").unwrap();
+        db.execute("DROP TABLE IF EXISTS flag;").unwrap();
+        assert!(db.execute("SELECT * FROM flag;").is_err());
+        let err = db.execute("DROP TABLE flag;").unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+        // Database-level flags.
+        db.execute("CREATE DATABASE IF NOT EXISTS d2;").unwrap();
+        db.execute("CREATE DATABASE IF NOT EXISTS d2;").unwrap();
+        let err = db.execute("CREATE DATABASE d2;").unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+        db.execute("DROP DATABASE IF EXISTS d3;").unwrap();
+        db.execute("DROP DATABASE IF EXISTS d2;").unwrap();
+        let err = db.execute("DROP DATABASE d2;").unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
+    }
+
+    #[test]
+    fn wave58_count_distinct_and_ranges() {
+        let mut db = wave58_db();
+        db.execute("CREATE TABLE cd (k INTEGER, v INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO cd VALUES (1, 1), (1, 1), (1, 2), (2, NULL), (2, 2);")
+            .unwrap();
+        // NULLs never count; duplicates collapse per group.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT k, COUNT(DISTINCT v), COUNT(v) FROM cd GROUP BY k ORDER BY k;"
+            ),
+            vec![
+                vec![V::Integer(1), V::Bigint(2), V::Bigint(3)],
+                vec![V::Integer(2), V::Bigint(1), V::Bigint(1)],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(DISTINCT k * 10 + v) FROM cd;"),
+            vec![vec![V::Bigint(3)]]
+        );
+        // Only single-argument COUNT takes DISTINCT in v1.
+        assert!(db.execute("SELECT COUNT(DISTINCT x, y) FROM cd;").is_err());
+        assert!(db.execute("SELECT COUNT(DISTINCT *) FROM cd;").is_err());
+        assert!(db.execute("SELECT SUM(DISTINCT v) FROM cd;").is_err());
+        // DISTINCT inside a window function is rejected (DuckDB-only feature).
+        let err = db
+            .execute("SELECT COUNT(DISTINCT v) OVER (ORDER BY k) FROM cd;")
+            .unwrap_err();
+        assert!(err.to_string().contains("DISTINCT"), "{err}");
+        // RANGE with an integer offset over the sorted key; peers share.
+        db.execute("CREATE TABLE rp (k INTEGER, v INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO rp VALUES (2, 20), (2, 21), (3, 30), (1, 10), (3, 31);")
+            .unwrap();
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+                 AS s FROM rp ORDER BY k;"
+            ),
+            vec![
+                vec![V::Integer(1), V::Bigint(51)],
+                vec![V::Integer(2), V::Bigint(112)],
+                vec![V::Integer(2), V::Bigint(112)],
+                vec![V::Integer(3), V::Bigint(102)],
+                vec![V::Integer(3), V::Bigint(102)],
+            ]
+        );
+        // RANGE offsets need a numeric/DATE key and at most one ORDER BY key.
+        let err = db
+            .execute(
+                "SELECT SUM(v) OVER (ORDER BY CAST(k AS VARCHAR) RANGE BETWEEN 1 PRECEDING \
+                 AND CURRENT ROW) FROM rp;",
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("RANGE frames"), "{err}");
+        let err = db
+            .execute("SELECT SUM(v) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM rp;")
+            .unwrap_err();
+        assert!(err.to_string().contains("ORDER BY"), "{err}");
+    }
+
+    #[test]
+    fn wave58_offset_and_nulls_placement() {
+        let mut db = wave58_db();
+        db.execute("CREATE TABLE on2 (x INTEGER);").unwrap();
+        db.execute("INSERT INTO on2 VALUES (2), (NULL), (3), (NULL), (1);")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT x FROM on2 ORDER BY x;"),
+            vec![
+                vec![V::Integer(1)],
+                vec![V::Integer(2)],
+                vec![V::Integer(3)],
+                vec![V::Null],
+                vec![V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM on2 ORDER BY x NULLS FIRST;"),
+            vec![
+                vec![V::Null],
+                vec![V::Null],
+                vec![V::Integer(1)],
+                vec![V::Integer(2)],
+                vec![V::Integer(3)],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM on2 ORDER BY x DESC;"),
+            vec![
+                vec![V::Integer(3)],
+                vec![V::Integer(2)],
+                vec![V::Integer(1)],
+                vec![V::Null],
+                vec![V::Null],
+            ]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM on2 ORDER BY x OFFSET 3;"),
+            vec![vec![V::Null], vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM on2 ORDER BY x LIMIT 2 OFFSET 3;"),
+            vec![vec![V::Null], vec![V::Null]]
+        );
+        assert_eq!(
+            select(&mut db, "SELECT x FROM on2 ORDER BY x OFFSET 99;"),
+            Vec::<Vec<V>>::new()
+        );
+    }
+
+    #[test]
+    fn wave58_explain_show_describe() {
+        let mut db = wave58_db();
+        // EXPLAIN prints a stable plan tree (pinkdb's own format).
+        let lines: Vec<String> = select(
+            &mut db,
+            "EXPLAIN SELECT x FROM wj WHERE x > 1 ORDER BY x LIMIT 2;",
+        )
+        .into_iter()
+        .map(|r| match r[0].clone() {
+            V::Varchar(s) => s,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "Limit 2".to_string(),
+                "  Sort [#0]".to_string(),
+                "    Project [x]".to_string(),
+                "      Filter (#0 > 1)".to_string(),
+                "        Scan main.wj".to_string(),
+            ]
+        );
+        // EXPLAIN binds but never executes: an EXPLAIN of a query against a
+        // missing table still errors at bind; a plain EXPLAIN of writes is a
+        // parse error (SELECT only).
+        assert!(db.execute("EXPLAIN SELECT * FROM missing;").is_err());
+        assert!(db.execute("EXPLAIN INSERT INTO wj VALUES (1, 1);").is_err());
+        // SHOW TABLES: sorted names of the session database.
+        db.execute("CREATE TABLE zeta (a INTEGER);").unwrap();
+        db.execute("CREATE TABLE alpha (a INTEGER);").unwrap();
+        let names: Vec<String> = select(&mut db, "SHOW TABLES;")
+            .into_iter()
+            .map(|r| match r[0].clone() {
+                V::Varchar(s) => s,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, vec!["alpha", "wj", "wk", "wl", "zeta"]);
+        // SHOW DATABASES lists the store's databases, sorted.
+        db.execute("CREATE DATABASE zz;").unwrap();
+        db.execute("CREATE DATABASE aa;").unwrap();
+        assert_eq!(
+            select(&mut db, "SHOW DATABASES;"),
+            vec![
+                vec![V::Varchar("aa".to_string())],
+                vec![V::Varchar("main".to_string())],
+                vec![V::Varchar("zz".to_string())],
+            ]
+        );
+        // DESCRIBE: DuckDB's (column_name, column_type, null, key, default,
+        // extra) shape; every v1 column is nullable with no key/default/extra.
+        assert_eq!(
+            select(&mut db, "DESCRIBE wj;"),
+            vec![
+                vec![
+                    V::Varchar("x".to_string()),
+                    V::Varchar("INTEGER".to_string()),
+                    V::Varchar("YES".to_string()),
+                    V::Null,
+                    V::Null,
+                    V::Null
+                ],
+                vec![
+                    V::Varchar("y".to_string()),
+                    V::Varchar("INTEGER".to_string()),
+                    V::Varchar("YES".to_string()),
+                    V::Null,
+                    V::Null,
+                    V::Null
+                ],
+            ]
+        );
+        assert!(db.execute("DESCRIBE missing;").is_err());
+        // Views are described and listed like tables.
+        db.execute("CREATE VIEW wv AS SELECT x + 1 AS q FROM wj;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "DESCRIBE wv;"),
+            vec![vec![
+                V::Varchar("q".to_string()),
+                V::Varchar("INTEGER".to_string()),
+                V::Varchar("YES".to_string()),
+                V::Null,
+                V::Null,
+                V::Null
+            ]]
+        );
+        let names: Vec<String> = select(&mut db, "SHOW TABLES;")
+            .into_iter()
+            .map(|r| match r[0].clone() {
+                V::Varchar(s) => s,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert!(names.contains(&"wv".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn wave58_new_dml_in_transactions() {
+        let mut db = wave58_db();
+        db.execute("CREATE TABLE tx (a INTEGER);").unwrap();
+        // INSERT ... SELECT and CTAS are transactional.
+        db.execute("BEGIN;").unwrap();
+        db.execute("INSERT INTO tx SELECT x FROM wj WHERE x = 1;")
+            .unwrap();
+        db.execute("CREATE TABLE tx2 AS SELECT x FROM wj;").unwrap();
+        db.execute("EXPLAIN SELECT * FROM tx;").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM tx;"),
+            vec![vec![V::Bigint(1)]],
+            "own writes are visible inside the transaction"
+        );
+        db.execute("ROLLBACK;").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM tx;"),
+            vec![vec![V::Bigint(0)]]
+        );
+        assert!(db.execute("SELECT * FROM tx2;").is_err());
+        db.execute("BEGIN;").unwrap();
+        db.execute("CREATE TABLE tx2 AS SELECT x FROM wj;").unwrap();
+        db.execute("COMMIT;").unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM tx2;"),
+            vec![vec![V::Bigint(3)]]
+        );
+        // Store-level DDL is still refused inside a transaction.
+        db.execute("BEGIN;").unwrap();
+        let err = db
+            .execute("CREATE DATABASE IF NOT EXISTS nope;")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not allowed inside a transaction"),
+            "{err}"
+        );
+        db.execute("ROLLBACK;").unwrap();
     }
 
     /// Regression: a `k PRECEDING` end bound that lands before the partition
@@ -6649,7 +8113,10 @@ mod tests {
                 index: 0,
                 dtype: DataType::Double,
             },
-            false,
+            SortSpec {
+                desc: false,
+                nulls_first: false,
+            },
         )];
         let keyed = eval_sort_keys(&cx, &chunks, &keys).unwrap();
         assert!(encode_sort_keys(&chunks, &keyed, &keys).is_none());
@@ -6748,9 +8215,25 @@ mod tests {
         let chunks: Vec<DataChunk> = (0..t.num_chunks())
             .map(|i| t.scan_chunk(i).unwrap())
             .collect();
-        let asc = |index: usize, dtype: DataType| (BoundExpr::Column { index, dtype }, false);
-        let desc = |index: usize, dtype: DataType| (BoundExpr::Column { index, dtype }, true);
-        let cases: Vec<Vec<(BoundExpr, bool)>> = vec![
+        let asc = |index: usize, dtype: DataType| {
+            (
+                BoundExpr::Column { index, dtype },
+                SortSpec {
+                    desc: false,
+                    nulls_first: false,
+                },
+            )
+        };
+        let desc = |index: usize, dtype: DataType| {
+            (
+                BoundExpr::Column { index, dtype },
+                SortSpec {
+                    desc: true,
+                    nulls_first: false,
+                },
+            )
+        };
+        let cases: Vec<Vec<(BoundExpr, SortSpec)>> = vec![
             vec![asc(3, DataType::Varchar)],
             vec![desc(3, DataType::Varchar)],
             vec![asc(2, DataType::Double)],
@@ -6808,7 +8291,10 @@ mod tests {
                 index: 0,
                 dtype: DataType::Varchar,
             },
-            false,
+            SortSpec {
+                desc: false,
+                nulls_first: false,
+            },
         )];
         let keyed = eval_sort_keys(&cx, &chunks, &keys).unwrap();
         let arena = sort(&cx, &chunks, &keys).unwrap();
@@ -6902,7 +8388,13 @@ mod tests {
         }
         let db = PinkDb::new();
         let cx = Cx::new(&db);
-        let keys = vec![(BoundExpr::Column { index: 0, dtype }, false)];
+        let keys = vec![(
+            BoundExpr::Column { index: 0, dtype },
+            SortSpec {
+                desc: false,
+                nulls_first: false,
+            },
+        )];
         let full = sort(&cx, &chunks, &keys).unwrap();
         for limit in [1usize, 2, 4096, 5000] {
             assert!(
@@ -8428,10 +9920,10 @@ mod tests {
         assert_eq!(
             estimate_rows(
                 &cx,
-                &LogicalPlan::Union {
+                &LogicalPlan::SetOp {
+                    op: crate::sql::ast::SetOp::UnionAll,
                     left: Box::new(scan.clone()),
                     right: Box::new(scan.clone()),
-                    distinct: false,
                     types: Vec::new(),
                 }
             ),

@@ -239,11 +239,10 @@ the strict S3 and encrypted soak harnesses gain encrypted-lake coverage.
 
 **Parallel feature waves in git worktrees (Oct 2026).** Waves 58 (SQL
 completeness), 60 (functions) and 61 (optimizer work) were built in dedicated
-worktrees off the current base; 45o has landed and the patches integrate on
-main one at a time with full gates + CI before each commit (order 60, 61, 58 —
-sorted by merge overlap). 59 (prepared statements) and 62 (DECIMAL/INTERVAL
-types) are queued; the schema-feature waves (declarative PK/FK, indexes,
-materialized views) remain in the numbered queue.
+worktrees off the current base and all three are now integrated on main (order
+60 → 61 → 58, sorted by merge overlap; 45o landed first). 59 (prepared
+statements) and 62 (DECIMAL/INTERVAL types) are queued; the schema-feature waves
+(declarative PK/FK, indexes, materialized views) remain in the numbered queue.
 
 **CI fully green (Oct 2026).** The first all-green CI run (38875669660; all
 nine jobs, incl. the kill loops, wasm check, release build and the DuckDB

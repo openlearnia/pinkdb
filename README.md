@@ -100,16 +100,20 @@ DROP DATABASE db1;                   -- last database cannot be dropped; droppin
 USE db1;                             -- per-session current database (default: main)
 LOAD EXTENSION 'extensions/hello.dylib';   -- load a native extension (ABI v1)
 SELECT [DISTINCT] expr [AS alias], ...
-FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT [OUTER] / RIGHT [OUTER]
-                                  -- equi-join (single equality)
+FROM t [<join> u ON <cond>] ...    -- multi-way; INNER / LEFT [OUTER] / RIGHT [OUTER] /
+                                   -- FULL [OUTER] / CROSS JOIN; composite ON
+                                   -- (several equality pairs), non-equi predicates
+                                   -- (>, <, >=, <=, !=) run over a nested loop
   | FROM db1.t                    -- qualified tables resolve in that database
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
   | WITH w AS (SELECT ...) ...     -- CTEs, incl. WITH w(a, b) AS column aliases
 WHERE expr                        -- incl. IS [NOT] NULL, BETWEEN,
                                   -- IN (subquery|list), EXISTS (subquery)
 GROUP BY ... HAVING ...
-ORDER BY expr [ASC|DESC], ...     -- NULLS LAST both ways; ORDER BY 2 positional
-LIMIT n;
+ORDER BY expr [ASC|DESC] [NULLS FIRST|LAST], ...  -- default NULLS LAST both ways;
+                                                  -- ORDER BY 2 is positional
+LIMIT n [OFFSET m] | OFFSET m;
+<query> UNION|INTERSECT|EXCEPT [ALL] <query>      -- INTERSECT binds tighter
 -- Scalar subqueries `(SELECT ...)` anywhere an expression goes
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
 ```
@@ -133,21 +137,32 @@ leak in, so a CTE named like a table in the body does not shadow that table.
 session that was using the dropped database to `main` (or the first remaining
 database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
 
-- Aggregates: `COUNT(*)` / `COUNT(x)`, `SUM`, `AVG`, `MIN`, `MAX`
-- Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, aggregates `OVER`
-  (`PARTITION BY` / `ORDER BY` / `ROWS` frames; default frame is cumulative
-  with ORDER BY, whole partition without; no `RANGE` frames, no nesting)
-- Scalar functions: `abs`, `round` (1–2 args), `upper`, `lower`, `length`, `substr`
+- Aggregates: `COUNT(*)` / `COUNT(x)` / `COUNT(DISTINCT x)`, `SUM`, `AVG`, `MIN`, `MAX`
+- Window functions: `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `lag`/`lead` (offset,
+  default), `ntile`, `first_value`/`last_value`, and aggregates `OVER`
+  (`PARTITION BY` / `ORDER BY` / `ROWS` and `RANGE` frames — with ORDER BY the
+  default frame is `RANGE UNBOUNDED PRECEDING AND CURRENT ROW`, so peers share
+  the value; no nesting)
+- Scalar functions: `abs`, `round` (1–2 args), `upper`, `lower`, `length`,
+  `substr`, `concat` / `||`, `trim`/`ltrim`/`rtrim`, `replace`, `nullif`,
+  `greatest`/`least`, `extract`/`date_part`, `sqrt`, `floor`/`ceil`, `sign`,
+  `power`/`pow`, `mod`
 - `CAST(x AS type)` (numeric tower both ways, bool↔numeric, varchar parse/format,
   date↔timestamp; bad input and out-of-range narrowing error; DOUBLE → integer
   rounds half away from zero, like DuckDB), `COALESCE(a, b, ...)` (common type),
   `LIKE`/`NOT LIKE` (`%`/`_` patterns)
 - `CASE WHEN c THEN v ... [ELSE e] END` + simple `CASE x WHEN v` form
   (NULL conditions never match; result types unify like COALESCE)
-- Set ops: `UNION [ALL|DISTINCT]` (numeric types unify; ORDER BY/LIMIT after
-  the set operation apply to the whole result — branch-level clauses need
-  parentheses, unsupported in v1); `CREATE VIEW v [(cols)] AS ...` (session-local,
-  rebound per use), `DROP TABLE` / `DROP VIEW`
+- Set ops: `UNION [ALL|DISTINCT]`, `INTERSECT [ALL]`, `EXCEPT [ALL]`
+  (`INTERSECT` binds tighter than `UNION`/`EXCEPT`; numeric types unify;
+  ORDER BY/LIMIT/OFFSET after the set operation apply to the whole result —
+  branch-level clauses need parentheses, unsupported in v1); `CREATE VIEW v
+  [(cols)] AS ...` (session-local, rebound per use), `DROP TABLE` / `DROP VIEW`
+- DDL/DML: `CREATE TABLE ...` (with `IF NOT EXISTS`), `CREATE TABLE t AS
+  SELECT ...`, `DROP TABLE [IF EXISTS]`, `INSERT INTO t [(cols)] SELECT ...`,
+  `CREATE/DROP DATABASE [IF [NOT] EXISTS]`
+- Utilities: `EXPLAIN <select>` (stable plan tree), `SHOW TABLES`,
+  `SHOW DATABASES`, `DESCRIBE t` (DuckDB's column shape)
 - Types: `BOOLEAN`, `INTEGER` (i32), `BIGINT` (i64), `DOUBLE` (f64), `VARCHAR`,
   `DATE` (days since epoch), `TIMESTAMP` (microseconds, naive, no time zone)
 - Literals: `DATE '2024-02-29'`, `TIMESTAMP '2024-03-15 12:30:45.5'`
@@ -156,8 +171,9 @@ database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
 - CSV auto-detects `YYYY-MM-DD` → DATE and `YYYY-MM-DD HH:MM:SS[.f]` → TIMESTAMP
 - Coercion: INTEGER → BIGINT → DOUBLE; `int / int` → DOUBLE (DuckDB rule)
 - Three-valued logic: NULL fails `WHERE`; `COUNT(x)`/`SUM`/`AVG` skip NULLs;
-  NULL group keys group together; NULL join keys never match; LEFT/RIGHT
-  joins NULL-extend the unmatched side's columns
+  NULL group keys group together; NULL join keys never match; LEFT/RIGHT/FULL
+  joins NULL-extend the unmatched side's columns (FULL emits unmatched rows
+  from both sides)
 - Integer division/modulo by zero is an error; `0.0` float division is IEEE
 - Integer overflow is an error, like DuckDB: `+`/`-`/`*`, negation, `abs`,
   `date ± n` and narrowing casts report `Overflow in …` instead of wrapping;

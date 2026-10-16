@@ -13,13 +13,16 @@ Exit code: 0 iff every query matches.
 """
 
 import json
+import os
 import re
 import subprocess
 import sys
 import datetime
 
 VERBOSE = "--verbose" in sys.argv
-PINKDB = ["./target/release/pinkdb"]
+# The CLI under test: defaults to the worktree's release build; PINKDB_CLI
+# overrides it (e.g. a copy that cannot be clobbered by a concurrent build).
+PINKDB = [os.environ.get("PINKDB_CLI", "./target/release/pinkdb")]
 
 PASS = 0
 FAIL = 0
@@ -147,7 +150,8 @@ def pink_query(setup, sql):
             tables.append(("rows", types, rows))
             state = 0
     selects = sum(1 for part in sql.split(";")
-                  if part.strip().lower().startswith(("select", "with")))
+                  if part.strip().lower().startswith(
+                      ("select", "with", "show", "describe")))
     if len(tables) != selects:
         return ("error", f"harness: {len(tables)} results for {selects} selects in {sql[:60]!r}")
     # Multi-SELECT cases (unions parsed as one statement each produce one
@@ -186,6 +190,22 @@ INSERT INTO emp VALUES
  (5, 'eve', 20, 75.75, NULL, false);
 CREATE TABLE dept (did INTEGER, dname VARCHAR);
 INSERT INTO dept VALUES (10, 'eng'), (20, 'ops'), (30, 'hr');
+CREATE TABLE jx (x INTEGER, y INTEGER);
+INSERT INTO jx VALUES (1, 10), (2, 20), (5, 50);
+CREATE TABLE jy (x INTEGER, z VARCHAR);
+INSERT INTO jy VALUES (2, 'two'), (3, 'three'), (6, 'six');
+CREATE TABLE jz (x INTEGER, w INTEGER);
+INSERT INTO jz VALUES (2, 200), (3, 300);
+CREATE TABLE pn (k INTEGER, v INTEGER);
+INSERT INTO pn VALUES (2, 20), (2, 21), (3, 30), (1, 10), (3, 31);
+CREATE TABLE nn (x INTEGER);
+INSERT INTO nn VALUES (2), (NULL), (2), (3), (NULL);
+CREATE TABLE jn (x INTEGER, y INTEGER);
+INSERT INTO jn VALUES (1, NULL), (NULL, 1), (2, 2);
+CREATE TABLE dk (k DOUBLE, v INTEGER);
+INSERT INTO dk VALUES (1.0, 1), (1.5, 2), (2.0, 3);
+CREATE TABLE typed (a BIGINT, b TIMESTAMP);
+CREATE VIEW emp_view AS SELECT id, name FROM emp WHERE id > 1;
 """
 
 # (label, sql, ordered, expect_error)
@@ -283,6 +303,74 @@ QUERIES = [
     ("extract-bad-part", "SELECT extract(fortnight FROM hired) FROM emp;", False, True),
     ("sign-bool", "SELECT sign(active) FROM emp;", False, True),
     ("mod-zero", "SELECT mod(id, 0) FROM emp;", False, True),
+    # ---- wave 58: SQL completeness (joins / set ops / DML-DDL / windows) ----
+    ("multi-join", "SELECT a.x AS ax, b.x AS bx, c.x AS cx FROM jx a JOIN jy b ON a.x < b.x JOIN jz c ON b.x < c.x ORDER BY 1, 2, 3;", True, False),
+    ("multi-join-left-chain", "SELECT a.x, b.z, c.w FROM jx a LEFT JOIN jy b ON a.x = b.x LEFT JOIN jz c ON b.x = c.x ORDER BY 1, 2, 3;", True, False),
+    ("join-composite-on", "SELECT a.x AS ax, b.x AS bx FROM jx a JOIN jy b ON a.x = b.x AND a.y = b.x * 10;", True, False),
+    ("join-composite-null-keys", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.x = b.x AND a.y = b.y;", False, False),
+    ("join-single-null-keys", "SELECT COUNT(*) FROM jn a JOIN jn b ON a.x = b.x;", False, False),
+    ("full-join-null-keys", "SELECT COUNT(*) FROM jn a FULL JOIN jn b ON a.x = b.x;", False, False),
+    ("join-non-equi-lt", "SELECT a.x AS ax, b.x AS bx FROM jx a JOIN jy b ON a.x < b.x ORDER BY a.x, b.x;", True, False),
+    ("join-non-equi-ne", "SELECT a.x AS ax, b.x AS bx FROM jx a JOIN jy b ON a.x <> b.x ORDER BY a.x, b.x;", True, False),
+    ("join-cross", "SELECT COUNT(*) FROM jx CROSS JOIN jy;", False, False),
+    ("join-cross-proj", "SELECT a.x, b.z FROM jx a CROSS JOIN jy b WHERE a.x > 1 ORDER BY 1, 2;", True, False),
+    ("full-join", "SELECT jx.x AS ax, jy.x AS bx, y, z FROM jx FULL JOIN jy ON jx.x = jy.x ORDER BY ax NULLS LAST, bx NULLS LAST;", True, False),
+    ("full-join-unmatched", "SELECT jx.x AS ax, jy.x AS bx FROM jx FULL JOIN jy ON jx.x = jy.x WHERE jx.x IS NULL OR jy.x IS NULL ORDER BY ax NULLS LAST, bx NULLS LAST;", True, False),
+    ("full-join-count", "SELECT COUNT(*), COUNT(jx.x), COUNT(jy.x) FROM jx FULL JOIN jy ON jx.x = jy.x;", False, False),
+    ("full-join-chain", "SELECT a.x AS ax, b.x AS bx, c.x AS cx FROM jx a FULL JOIN jy b ON a.x = b.x FULL JOIN jz c ON b.x = c.x ORDER BY ax NULLS LAST, bx NULLS LAST, cx NULLS LAST;", True, False),
+    ("intersect", "SELECT x FROM nn INTERSECT SELECT x FROM jx ORDER BY 1;", True, False),
+    ("intersect-all", "SELECT x FROM nn INTERSECT ALL SELECT x FROM jx ORDER BY 1;", True, False),
+    ("except", "SELECT x FROM nn EXCEPT SELECT x FROM jx ORDER BY 1;", True, False),
+    ("except-all", "SELECT x FROM nn EXCEPT ALL SELECT x FROM jx ORDER BY 1;", True, False),
+    ("setop-precedence", "SELECT x FROM jx UNION SELECT x FROM jy INTERSECT SELECT x FROM jz ORDER BY 1;", True, False),
+    ("setop-precedence-except", "SELECT x FROM jx EXCEPT SELECT x FROM jy INTERSECT SELECT x FROM jz ORDER BY 1;", True, False),
+    ("setop-chain-limit", "SELECT x FROM jx UNION SELECT x FROM jy INTERSECT SELECT x FROM jz ORDER BY x DESC LIMIT 3;", True, False),
+    ("setop-in-derived", "SELECT x FROM (SELECT x FROM jx INTERSECT SELECT x FROM jy) t ORDER BY x;", True, False),
+    ("insert-select", "CREATE TABLE t_ins (p INTEGER, q DOUBLE); INSERT INTO t_ins (q, p) SELECT y * 1.0, x FROM jx WHERE x = 2; SELECT * FROM t_ins;", True, False),
+    ("insert-select-cols", "CREATE TABLE t_ins2 (p INTEGER, q INTEGER); INSERT INTO t_ins2 (q, p) SELECT y, x FROM jx WHERE x = 1; SELECT * FROM t_ins2;", True, False),
+    ("ctas", "CREATE TABLE t_ctas AS SELECT x, y * 2 AS d FROM jx WHERE x > 1; SELECT * FROM t_ctas ORDER BY x;", True, False),
+    ("ctas-union", "CREATE TABLE t_ctas_u AS SELECT x FROM jx UNION SELECT x FROM jy INTERSECT SELECT x FROM jz; SELECT x FROM t_ctas_u ORDER BY x;", True, False),
+    ("insert-select-union", "CREATE TABLE t_isu (x INTEGER); INSERT INTO t_isu SELECT x FROM jx WHERE x = 1 UNION ALL SELECT x FROM jy WHERE x = 3; SELECT x FROM t_isu ORDER BY x;", True, False),
+    ("ctas-if-not-exists", "CREATE TABLE IF NOT EXISTS t_ctas2 AS SELECT 1 AS one; CREATE TABLE IF NOT EXISTS t_ctas2 AS SELECT 2; SELECT * FROM t_ctas2;", True, False),
+    ("drop-if-exists", "DROP TABLE IF EXISTS no_such_table_here; SELECT 7;", True, False),
+    ("offset-alone", "SELECT x FROM nn ORDER BY x OFFSET 2;", True, False),
+    ("offset-limit", "SELECT x FROM nn ORDER BY x LIMIT 2 OFFSET 1;", True, False),
+    ("nulls-first-asc", "SELECT x FROM nn ORDER BY x NULLS FIRST;", True, False),
+    ("nulls-first-desc", "SELECT x FROM nn ORDER BY x DESC NULLS FIRST;", True, False),
+    ("nulls-last-desc", "SELECT x FROM nn ORDER BY x DESC NULLS LAST;", True, False),
+    ("nulls-default-desc", "SELECT x FROM nn ORDER BY x DESC;", True, False),
+    ("count-distinct", "SELECT COUNT(DISTINCT x), COUNT(x), COUNT(*) FROM nn;", False, False),
+    ("count-distinct-varchar", "SELECT COUNT(DISTINCT z) FROM jy;", False, False),
+    ("count-distinct-empty", "SELECT COUNT(DISTINCT did) FROM emp WHERE did IS NULL;", False, False),
+    ("count-distinct-group", "SELECT did, COUNT(DISTINCT salary) FROM emp GROUP BY did ORDER BY did;", True, False),
+    ("win-default-peers", "SELECT k, SUM(v) OVER (ORDER BY k) AS s FROM pn ORDER BY k;", True, False),
+    ("win-default-peers-desc", "SELECT k, SUM(v) OVER (ORDER BY k DESC) AS s FROM pn ORDER BY k DESC;", True, False),
+    ("win-default-peers-nulls", "SELECT x, SUM(x) OVER (ORDER BY x) AS s FROM nn ORDER BY x NULLS LAST;", True, False),
+    ("range-offsets", "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS s FROM pn ORDER BY k;", True, False),
+    ("range-current-following", "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS s FROM pn ORDER BY k;", True, False),
+    ("range-desc", "SELECT k, SUM(v) OVER (ORDER BY k DESC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM pn ORDER BY k DESC;", True, False),
+    ("range-unbounded", "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS s FROM pn ORDER BY k;", True, False),
+    ("range-double-keys", "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM dk ORDER BY k;", True, False),
+    ("range-date-keys", "SELECT hired, SUM(id) OVER (ORDER BY hired RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS s FROM emp ORDER BY hired NULLS LAST;", True, False),
+    ("range-unbounded-noorder", "SELECT id, SUM(id) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM emp ORDER BY id;", True, False),
+    ("show-tables", "SHOW TABLES;", True, False),
+    ("describe-table", "DESCRIBE emp;", True, False),
+    ("describe-view", "DESCRIBE emp_view;", True, False),
+    ("describe-all-types", "DESCRIBE typed;", True, False),
+    ("describe-empty-names", "DESCRIBE jz;", True, False),
+    ("left-join-non-equi", "SELECT a.x AS ax, b.x AS bx FROM jx a LEFT JOIN jy b ON a.x > b.x ORDER BY ax NULLS LAST, bx NULLS LAST;", True, False),
+    ("right-join-non-equi", "SELECT a.x AS ax, b.x AS bx FROM jx a RIGHT JOIN jy b ON a.x > b.x ORDER BY bx NULLS LAST, ax NULLS LAST;", True, False),
+    ("full-join-non-equi", "SELECT a.x AS ax, b.x AS bx FROM jx a FULL JOIN jy b ON a.x > b.x ORDER BY ax NULLS LAST, bx NULLS LAST;", True, False),
+    ("intersect-double", "SELECT 1 AS v INTERSECT SELECT 1.0 AS v;", True, False),
+    ("offset-past-end", "SELECT x FROM nn ORDER BY x OFFSET 100;", True, False),
+    ("win-nulls-first", "SELECT x, SUM(x) OVER (ORDER BY x NULLS FIRST) AS s FROM nn ORDER BY x NULLS FIRST;", True, False),
+    ("ctas-empty", "CREATE TABLE t_empty AS SELECT x FROM jx WHERE false; SELECT COUNT(*) FROM t_empty;", False, False),
+    ("range-zero-offset", "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN 0 PRECEDING AND CURRENT ROW) AS s FROM pn ORDER BY k;", True, False),
+    ("setop-cte-head", "WITH t AS (SELECT x FROM jx) SELECT x FROM t INTERSECT SELECT 2 AS x ORDER BY 1;", True, False),
+    ("bad-cross-on", "SELECT * FROM jx CROSS JOIN jy ON jx.x = jy.x;", False, True),
+    ("bad-range-no-order", "SELECT x, SUM(x) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM nn;", False, True),
+    ("bad-range-varchar", "SELECT x, SUM(x) OVER (ORDER BY CAST(x AS VARCHAR) RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM nn;", False, True),
+    ("bad-count-distinct-star", "SELECT COUNT(DISTINCT *) FROM nn;", False, True),
 ]
 
 

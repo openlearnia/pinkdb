@@ -9,7 +9,7 @@
 //!   never move below `Limit`.
 
 use crate::exec::expr::eval_expr;
-use crate::plan::LogicalPlan;
+use crate::plan::{shift_columns, LogicalPlan};
 use crate::sql::ast::{BinaryOp, JoinKind};
 use crate::sql::binder::BoundExpr;
 use crate::types::DataType;
@@ -140,15 +140,28 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             kind,
             left,
             right,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             left_cols,
         } => LogicalPlan::Join {
             kind,
             left: Box::new(fold_plan(db, *left)),
             right: Box::new(fold_plan(db, *right)),
-            left_key: fold_expr(&cx, left_key),
-            right_key: fold_expr(&cx, right_key),
+            left_keys: left_keys.into_iter().map(|k| fold_expr(&cx, k)).collect(),
+            right_keys: right_keys.into_iter().map(|k| fold_expr(&cx, k)).collect(),
+            left_cols,
+        },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(fold_plan(db, *left)),
+            right: Box::new(fold_plan(db, *right)),
+            on: on.map(|e| fold_expr(&cx, e)),
             left_cols,
         },
         LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
@@ -205,6 +218,10 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
             input: Box::new(fold_plan(db, *input)),
             limit,
         },
+        LogicalPlan::Offset { input, offset } => LogicalPlan::Offset {
+            input: Box::new(fold_plan(db, *input)),
+            offset,
+        },
         LogicalPlan::Insert { db, table, rows } => LogicalPlan::Insert {
             db,
             table,
@@ -213,16 +230,41 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
                 .map(|r| r.into_iter().map(|e| fold_expr(&cx, e)).collect())
                 .collect(),
         },
-        LogicalPlan::Union {
+        LogicalPlan::InsertSelect {
+            db: qdb,
+            table,
+            columns,
+            query,
+        } => LogicalPlan::InsertSelect {
+            db: qdb,
+            table,
+            columns,
+            query: Box::new(fold_plan(db, *query)),
+        },
+        LogicalPlan::SetOp {
+            op,
             left,
             right,
-            distinct,
             types,
-        } => LogicalPlan::Union {
+        } => LogicalPlan::SetOp {
+            op,
             left: Box::new(fold_plan(db, *left)),
             right: Box::new(fold_plan(db, *right)),
-            distinct,
             types,
+        },
+        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+            plan: Box::new(fold_plan(db, *plan)),
+        },
+        LogicalPlan::CreateTableAs {
+            db: qdb,
+            name,
+            query,
+            if_not_exists,
+        } => LogicalPlan::CreateTableAs {
+            db: qdb,
+            name,
+            query: Box::new(fold_plan(db, *query)),
+            if_not_exists,
         },
         leaf => leaf,
     }
@@ -230,10 +272,10 @@ fn fold_plan(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
 
 // ---------- predicate pushdown ----------
 
-/// Column indices referenced by `expr` (AggRefs count as unpushable).
-/// Subquery bodies live in their own scope; only an IN-subquery's outer
-/// expression can reference pushable columns.
-fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
+/// Column indices referenced by `expr` (AggRefs/WindowRefs count as
+/// unpushable, marked `usize::MAX`). Subquery bodies live in their own scope;
+/// only an IN-subquery's outer expression can reference pushable columns.
+pub(crate) fn columns_in(expr: &BoundExpr, out: &mut Vec<usize>) {
     match expr {
         BoundExpr::Column { index, .. } => out.push(*index),
         BoundExpr::Literal(_) | BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => {}
@@ -575,8 +617,8 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             kind,
             left,
             right,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             left_cols,
         } => {
             let mut conjuncts = Vec::new();
@@ -597,8 +639,8 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                 let left_only = cols.iter().all(|i| *i < left_cols);
                 let right_only = cols.iter().all(|i| *i >= left_cols);
                 match kind {
-                    // Inner: split freely (unchanged since wave 3).
-                    JoinKind::Inner => {
+                    // Inner/Cross: split freely (unchanged since wave 3).
+                    JoinKind::Inner | JoinKind::Cross => {
                         if left_only {
                             left_push.push(c);
                         } else if right_only {
@@ -625,6 +667,9 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                             keep.push(c);
                         }
                     }
+                    // FULL: both sides can be NULL-extended, so nothing moves
+                    // (conservative; see the join pushdown tests).
+                    JoinKind::Full => keep.push(c),
                 }
             }
             let pushed = !left_push.is_empty() || !right_push.is_empty();
@@ -646,8 +691,8 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                 kind,
                 left,
                 right,
-                left_key,
-                right_key,
+                left_keys,
+                right_keys,
                 left_cols,
             };
             match and_all(keep) {
@@ -718,24 +763,30 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             }
         }
         // Never below Limit (changes semantics).
-        // Below Union: selection distributes over both branches (same
-        // output width by construction; per-branch types were checked
+        // Below UNION/UNION ALL: selection distributes over both branches
+        // (same output width by construction; per-branch types were checked
         // compatible at bind time) — but cloning the predicate into both
         // branches would run a dynamic call once per branch instead of once
         // per output row, so a predicate containing one stays above.
-        LogicalPlan::Union {
+        // INTERSECT/EXCEPT never push: filtering one side changes the set
+        // semantics (`(A EXCEPT B) WHERE p` ≠ `(A WHERE p) EXCEPT (B WHERE p)`).
+        LogicalPlan::SetOp {
+            op,
             left,
             right,
-            distinct,
             types,
         } => {
-            if pred.contains_dynamic_scalar() {
+            let pushable = matches!(
+                op,
+                crate::sql::ast::SetOp::Union | crate::sql::ast::SetOp::UnionAll
+            ) && !pred.contains_dynamic_scalar();
+            if !pushable {
                 return (
                     LogicalPlan::Filter {
-                        input: Box::new(LogicalPlan::Union {
+                        input: Box::new(LogicalPlan::SetOp {
+                            op,
                             left,
                             right,
-                            distinct,
                             types,
                         }),
                         predicate: pred,
@@ -744,7 +795,8 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                 );
             }
             (
-                LogicalPlan::Union {
+                LogicalPlan::SetOp {
+                    op,
                     left: Box::new(LogicalPlan::Filter {
                         input: left,
                         predicate: pred.clone(),
@@ -753,12 +805,34 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                         input: right,
                         predicate: pred,
                     }),
-                    distinct,
                     types,
                 },
                 true,
             )
         }
+        // A nested-loop join's condition is not a hash key: pushing a WHERE
+        // conjunct into one side would change outer-join and non-equi
+        // semantics, so the filter always stays above (children still get
+        // their own pushdown).
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } => (
+            LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::NestedLoopJoin {
+                    kind,
+                    left: Box::new(pushdown(*left)),
+                    right: Box::new(pushdown(*right)),
+                    on,
+                    left_cols,
+                }),
+                predicate: pred,
+            },
+            false,
+        ),
         LogicalPlan::Window {
             input,
             windows,
@@ -813,81 +887,6 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
     }
 }
 
-/// Subtract `by` from every column index (right-side conjuncts of a join).
-fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
-    match expr {
-        BoundExpr::Column { index, dtype } => BoundExpr::Column {
-            index: index - by,
-            dtype,
-        },
-        BoundExpr::InSubquery {
-            expr,
-            query,
-            negated,
-        } => BoundExpr::InSubquery {
-            expr: Box::new(shift_columns(*expr, by)),
-            query,
-            negated,
-        },
-        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
-            expr: Box::new(shift_columns(*expr, by)),
-            dtype,
-        },
-        BoundExpr::Case {
-            branches,
-            else_,
-            dtype,
-        } => BoundExpr::Case {
-            branches: branches
-                .into_iter()
-                .map(|(c, v)| (shift_columns(c, by), shift_columns(v, by)))
-                .collect(),
-            else_: else_.map(|e| Box::new(shift_columns(*e, by))),
-            dtype,
-        },
-        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
-            args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
-            dtype,
-        },
-        BoundExpr::Binary {
-            op,
-            left,
-            right,
-            dtype,
-        } => BoundExpr::Binary {
-            op,
-            left: Box::new(shift_columns(*left, by)),
-            right: Box::new(shift_columns(*right, by)),
-            dtype,
-        },
-        BoundExpr::Not(e) => BoundExpr::Not(Box::new(shift_columns(*e, by))),
-        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
-            expr: Box::new(shift_columns(*expr, by)),
-            dtype,
-        },
-        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
-            expr: Box::new(shift_columns(*expr, by)),
-            negated,
-        },
-        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
-            func,
-            args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
-            dtype,
-        },
-        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
-            name,
-            args: args
-                .into_vec()
-                .into_iter()
-                .map(|a| shift_columns(a, by))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            dtype,
-        },
-        leaf => leaf,
-    }
-}
-
 fn pushdown(plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter { input, predicate } => {
@@ -914,15 +913,28 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             kind,
             left,
             right,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             left_cols,
         } => LogicalPlan::Join {
             kind,
             left: Box::new(pushdown(*left)),
             right: Box::new(pushdown(*right)),
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
+            left_cols,
+        },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(pushdown(*left)),
+            right: Box::new(pushdown(*right)),
+            on,
             left_cols,
         },
         LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
@@ -939,16 +951,41 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             windows,
             input_cols,
         },
-        LogicalPlan::Union {
+        LogicalPlan::SetOp {
+            op,
             left,
             right,
-            distinct,
             types,
-        } => LogicalPlan::Union {
+        } => LogicalPlan::SetOp {
+            op,
             left: Box::new(pushdown(*left)),
             right: Box::new(pushdown(*right)),
-            distinct,
             types,
+        },
+        LogicalPlan::InsertSelect {
+            db,
+            table,
+            columns,
+            query,
+        } => LogicalPlan::InsertSelect {
+            db,
+            table,
+            columns,
+            query: Box::new(pushdown(*query)),
+        },
+        LogicalPlan::CreateTableAs {
+            db,
+            name,
+            query,
+            if_not_exists,
+        } => LogicalPlan::CreateTableAs {
+            db,
+            name,
+            query: Box::new(pushdown(*query)),
+            if_not_exists,
+        },
+        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+            plan: Box::new(pushdown(*plan)),
         },
         // Filters push within the body and within the query independently —
         // never across the CTE boundary (different scopes).
@@ -967,6 +1004,10 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
         LogicalPlan::Limit { input, limit } => LogicalPlan::Limit {
             input: Box::new(pushdown(*input)),
             limit,
+        },
+        LogicalPlan::Offset { input, offset } => LogicalPlan::Offset {
+            input: Box::new(pushdown(*input)),
+            offset,
         },
         leaf => leaf,
     }
@@ -1026,8 +1067,8 @@ mod tests {
                 kind: JoinKind::Inner,
                 left: Box::new(LogicalPlan::SingleRow),
                 right: Box::new(LogicalPlan::SingleRow),
-                left_key: col(0),
-                right_key: col(0),
+                left_keys: vec![col(0)],
+                right_keys: vec![col(0)],
                 left_cols: 2,
             }),
             predicate: B::Binary {
@@ -1079,8 +1120,8 @@ mod tests {
                 kind: JoinKind::Inner,
                 left: Box::new(LogicalPlan::SingleRow),
                 right: Box::new(LogicalPlan::SingleRow),
-                left_key: col(0),
-                right_key: col(0),
+                left_keys: vec![col(0)],
+                right_keys: vec![col(0)],
                 left_cols: 2,
             }),
             predicate: B::Binary {
@@ -1127,8 +1168,8 @@ mod tests {
             kind,
             left: Box::new(LogicalPlan::SingleRow),
             right: Box::new(LogicalPlan::SingleRow),
-            left_key: col(0),
-            right_key: col(0),
+            left_keys: vec![col(0)],
+            right_keys: vec![col(0)],
             left_cols: 2,
         }
     }
@@ -1237,6 +1278,7 @@ mod tests {
             func: crate::sql::binder::AggFunc::Count,
             arg: None,
             dtype: T::Bigint,
+            distinct: false,
         }
     }
 

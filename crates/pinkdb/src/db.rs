@@ -908,11 +908,14 @@ pub(crate) fn record_writes(
     };
     match plan {
         LogicalPlan::Insert { db, table, .. }
+        | LogicalPlan::InsertSelect { db, table, .. }
         | LogicalPlan::Update { db, table, .. }
         | LogicalPlan::Delete { db, table, .. } => {
             tables.insert(key(db, table));
         }
-        LogicalPlan::CreateTable { db, name, .. } | LogicalPlan::DropTable { db, name } => {
+        LogicalPlan::CreateTable { db, name, .. }
+        | LogicalPlan::CreateTableAs { db, name, .. }
+        | LogicalPlan::DropTable { db, name, .. } => {
             tables.insert(key(db, name));
         }
         LogicalPlan::CreateView { db, name, .. } | LogicalPlan::DropView { db, name } => {
@@ -1123,6 +1126,37 @@ mod tests {
         c.execute("INSERT INTO db2.u VALUES (1, 'u1'), (1, 'u2');")
             .unwrap();
         db
+    }
+
+    #[test]
+    fn show_tables_and_databases_follow_the_connection_session() {
+        let db = multi_db();
+        let mut c = db.connect();
+        // SHOW TABLES names the session database's tables, sorted.
+        assert_eq!(
+            rows_of(c.execute("SHOW TABLES;").unwrap()),
+            vec![vec![Value::Varchar("t".to_string())]]
+        );
+        c.execute("USE db2;").unwrap();
+        assert_eq!(
+            rows_of(c.execute("SHOW TABLES;").unwrap()),
+            vec![vec![Value::Varchar("u".to_string())]]
+        );
+        // SHOW DATABASES lists the whole store, sorted by name.
+        assert_eq!(
+            rows_of(c.execute("SHOW DATABASES;").unwrap()),
+            vec![
+                vec![Value::Varchar("db1".to_string())],
+                vec![Value::Varchar("db2".to_string())],
+                vec![Value::Varchar("main".to_string())],
+            ]
+        );
+        // EXPLAIN is read-only: it prints a plan and never runs the query.
+        let rows = rows_of(c.execute("EXPLAIN SELECT * FROM u;").unwrap());
+        assert!(!rows.is_empty());
+        assert!(
+            matches!(rows.last().unwrap().last().unwrap(), Value::Varchar(s) if s.contains("Scan"))
+        );
     }
 
     #[test]

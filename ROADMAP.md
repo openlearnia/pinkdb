@@ -91,7 +91,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
-| 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | integrating | worktree patch on main (gates + CI before commit) |
+| 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | done | landed; duckdiff 88 → 155 probes |
 | 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | queued | — |
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
@@ -100,12 +100,11 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
 Parallel feature work (Oct 2026): waves 58 (SQL completeness), 60 (functions) and
-61 (optimizer work) were built in dedicated git worktrees
-(`wt-sql-completeness`, `wt-functions`, `wt-optimizer`) off the current base;
-45o has since landed and the three patches are integrating on main one at a
-time with full gates plus CI before each commit. 59 (prepared statements) and 62
-(DECIMAL/INTERVAL types) are queued; the schema-feature waves (declarative
-PK/FK constraints, indexes, materialized views) remain in the numbered queue.
+61 (optimizer work) were built in dedicated git worktrees and all three landed on
+main one at a time (60 → 61 → 58) with full gates plus CI; 45o landed first
+(optimistic commits). 59 (prepared statements) and 62 (DECIMAL/INTERVAL types) are
+queued; the schema-feature waves (declarative PK/FK constraints, indexes,
+materialized views) remain in the numbered queue.
 
 Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
@@ -693,3 +692,36 @@ Java bindings.
   Honest limits: outer joins cannot swap sides, INNER swaps change row order to
   probe-side order (one test expectation updated), projection stays conservative
   through Join/Distinct/Union/CTE, the estimator has no statistics.
+- 2026-10-16 — Wave 58 (SQL completeness; worktree fan-out, integrated after 60/61):
+  joins — multi-way `FROM` (left-deep), composite `ON` (multi-key hash), non-equi
+  `ON` (`> < >= <= !=`, vectorized nested loop), `CROSS JOIN` (`CROSS JOIN ... ON`
+  is a parse error like DuckDB), `FULL [OUTER] JOIN` (unmatched rows emitted from
+  both sides, NULL-extended; NULL keys never match but are preserved); set ops —
+  `INTERSECT [ALL]`, `EXCEPT [ALL]`, precedence pinned by probe (`INTERSECT` binds
+  tighter; `UNION`/`EXCEPT` left-assoc; trailing ORDER BY/LIMIT/OFFSET apply to the
+  whole set), pairwise common-type coercion; DML/DDL — `INSERT ... SELECT` (with
+  column lists), `CREATE TABLE AS SELECT`, `IF NOT EXISTS`/`IF EXISTS` on
+  CREATE/DROP TABLE and DATABASE, `OFFSET` (alone and with LIMIT), `ORDER BY ...
+  NULLS FIRST/LAST` — the DuckDB default was pinned by probe: NULLS LAST for both
+  ASC and DESC (the Postgres rule is different); aggregates — `COUNT(DISTINCT
+  expr)` (others reject clearly); windows — the default frame with ORDER BY is now
+  `RANGE UNBOUNDED PRECEDING AND CURRENT ROW` (peers share the value — the parity
+  fix), RANGE frames with UNBOUNDED/CURRENT ROW and integer value offsets
+  (direction-aware; DATE/DOUBLE/DESC covered); utilities — `EXPLAIN <select>`
+  (stable indented tree, never executes), `SHOW TABLES`, `SHOW DATABASES`,
+  `DESCRIBE` in DuckDB's exact shape. Durability: CTAS/INSERT…SELECT are logged as
+  statements and replay; the touched-set walkers were audited for all new plan
+  variants (`collect_tables_read`/`record_writes`/`writes_tables` cover them), so
+  wave-45o optimistic validation stays honest. Integration: hand-resolved merge
+  conflicts against 45o (WAL v4), 60 and 61 — join build-side choice generalized
+  to multi-key slices, fused-aggregate single-key/DISTINCT guards merged,
+  `scan_output` kept, `Union`→`SetOp` renames, window `frame_range` call site,
+  `Expr::Function { distinct }`, the `Concat` symbol. Test infra: the multiprocess
+  harness now bounds its waits (`f92c2a6`) after a rare 30+-minute silent stall
+  surfaced here (engine scenario passes 5/5 solo and 27/27; the stall was
+  `wait_for` with no deadline — a recurrence now fails with the collected CLI
+  output). Gates on main: fmt, clippy (pinkdb + CLI lake,s3 all-targets), pinkdb
+  424/424 (+ encryption 441/441 and 21/21 integration), CLI suites green
+  (multiprocess 26 + 27), `bench/duckdiff.py` **155/155**, workspace all green,
+  `mp_soak.py --ci` PASS (991 acked units, 18 kills, exactly-once across 24
+  writers).

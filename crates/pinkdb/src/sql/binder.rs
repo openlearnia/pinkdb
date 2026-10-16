@@ -132,6 +132,8 @@ pub struct BoundAgg {
     /// COUNT(*) has no arg.
     pub arg: Option<BoundExpr>,
     pub dtype: DataType,
+    /// `COUNT(DISTINCT x)` (the only DISTINCT aggregate supported).
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,22 +209,32 @@ fn map_frame_bound(b: crate::sql::ast::FrameBound) -> Result<FrameBound> {
     })
 }
 
+/// `ROWS`/`RANGE` — same shape in the AST and the bound frame.
+fn map_frame_mode(m: FrameMode) -> FrameMode {
+    m
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BoundFrame {
+    pub mode: FrameMode,
     pub start: FrameBound,
     pub end: FrameBound,
 }
 
 impl BoundFrame {
-    /// Default frame: whole partition, or cumulative when ordered.
+    /// Default frame. Without ORDER BY the whole partition; with ORDER BY
+    /// DuckDB's `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` — peers
+    /// (equal ORDER BY keys) share the frame, so they get the same value.
     fn default_for(ordered: bool) -> Self {
         if ordered {
             Self {
+                mode: FrameMode::Range,
                 start: FrameBound::UnboundedPreceding,
                 end: FrameBound::CurrentRow,
             }
         } else {
             Self {
+                mode: FrameMode::Rows,
                 start: FrameBound::UnboundedPreceding,
                 end: FrameBound::UnboundedFollowing,
             }
@@ -242,7 +254,7 @@ pub struct BoundWindow {
     /// edge (coerced to the result type at bind time).
     pub default: Option<BoundExpr>,
     pub partition: Vec<BoundExpr>,
-    pub order: Vec<(BoundExpr, bool)>,
+    pub order: Vec<(BoundExpr, SortSpec)>,
     pub frame: BoundFrame,
     pub dtype: DataType,
 }
@@ -923,10 +935,17 @@ impl<'a> Binder<'a> {
                     Ok(bound)
                 }
             }
-            Expr::Function { name, args } => self.bind_function(name, args, aggs, allow_agg),
-            Expr::Window { name, args, over } => {
-                self.bind_window(name, args, over, aggs, allow_agg)
-            }
+            Expr::Function {
+                name,
+                args,
+                distinct,
+            } => self.bind_function(name, args, *distinct, aggs, allow_agg),
+            Expr::Window {
+                name,
+                args,
+                over,
+                distinct,
+            } => self.bind_window(name, args, over, *distinct, aggs, allow_agg),
             Expr::Coalesce(args) => {
                 let mut bound = Vec::with_capacity(args.len());
                 for a in args {
@@ -1078,6 +1097,7 @@ impl<'a> Binder<'a> {
         name: &str,
         args: &[Expr],
         over: &OverClause,
+        distinct: bool,
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
@@ -1085,6 +1105,11 @@ impl<'a> Binder<'a> {
             return Err(PinkDbError::Execution(
                 "window functions are not allowed in WHERE, GROUP BY, or HAVING (use a subquery)"
                     .to_string(),
+            ));
+        }
+        if distinct {
+            return Err(PinkDbError::Execution(
+                "DISTINCT is not supported in window functions".to_string(),
             ));
         }
         if self.in_window {
@@ -1186,10 +1211,42 @@ impl<'a> Binder<'a> {
         }
         let mut order = Vec::with_capacity(over.order.len());
         for o in &over.order {
-            order.push((self.bind_expr(&o.expr, aggs, allow_agg)?, o.desc));
+            order.push((self.bind_expr(&o.expr, aggs, allow_agg)?, SortSpec::of(o)));
+        }
+        if let Some(f) = &over.frame {
+            if f.mode == FrameMode::Range {
+                use crate::sql::ast::FrameBound as AstBound;
+                let has_offset = matches!(f.start, AstBound::Preceding(_) | AstBound::Following(_))
+                    || matches!(f.end, AstBound::Preceding(_) | AstBound::Following(_));
+                if order.len() > 1 {
+                    return Err(PinkDbError::Execution(
+                        "RANGE window frames need at most one ORDER BY expression".to_string(),
+                    ));
+                }
+                if has_offset {
+                    let Some((key, _)) = order.first() else {
+                        return Err(PinkDbError::Execution(
+                            "RANGE frames with an offset need an ORDER BY expression".to_string(),
+                        ));
+                    };
+                    match key.dtype() {
+                        DataType::Integer
+                        | DataType::Bigint
+                        | DataType::Double
+                        | DataType::Date => {}
+                        t => {
+                            return Err(PinkDbError::Type(format!(
+                                "RANGE frames with an offset need a numeric or DATE ORDER BY \
+                                 expression, not {t}"
+                            )));
+                        }
+                    }
+                }
+            }
         }
         let frame = match &over.frame {
             Some(f) => BoundFrame {
+                mode: map_frame_mode(f.mode),
                 start: map_frame_bound(f.start)?,
                 end: map_frame_bound(f.end)?,
             },
@@ -1292,6 +1349,7 @@ impl<'a> Binder<'a> {
         &mut self,
         name: &str,
         args: &[Expr],
+        distinct: bool,
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
@@ -1299,6 +1357,11 @@ impl<'a> Binder<'a> {
             if !allow_agg {
                 return Err(PinkDbError::Execution(
                     "aggregate functions are not allowed in WHERE or GROUP BY".to_string(),
+                ));
+            }
+            if distinct && (func != AggFunc::Count || args.first() == Some(&Expr::Star)) {
+                return Err(PinkDbError::Execution(
+                    "DISTINCT is only supported in COUNT(DISTINCT x) in v1".to_string(),
                 ));
             }
             let is_star = args.len() == 1 && args[0] == Expr::Star;
@@ -1329,7 +1392,12 @@ impl<'a> Binder<'a> {
                 Some(a)
             };
             let dtype = agg_dtype(func, arg.as_ref().map(|a| a.dtype()))?;
-            let agg = BoundAgg { func, arg, dtype };
+            let agg = BoundAgg {
+                func,
+                arg,
+                dtype,
+                distinct,
+            };
             // Dedupe identical aggregates so `SUM(x), SUM(x)` computes once.
             let index = match aggs.iter().position(|a| a == &agg) {
                 Some(i) => i,
@@ -1339,6 +1407,11 @@ impl<'a> Binder<'a> {
                 }
             };
             return Ok(BoundExpr::AggRef { index, dtype });
+        }
+        if distinct {
+            return Err(PinkDbError::Execution(
+                "DISTINCT is only supported in COUNT(DISTINCT x) in v1".to_string(),
+            ));
         }
         if let Some(func) = ScalarFunc::from_name(name) {
             let mut bound = Vec::with_capacity(args.len());
@@ -1859,7 +1932,11 @@ fn default_name(expr: &Expr) -> String {
                 default_name(high)
             )
         }
-        Expr::Function { name, args } => {
+        Expr::Function {
+            name,
+            args,
+            distinct,
+        } => {
             let inner: Vec<String> = args
                 .iter()
                 .map(|a| {
@@ -1870,7 +1947,12 @@ fn default_name(expr: &Expr) -> String {
                     }
                 })
                 .collect();
-            format!("{}({})", name.to_ascii_lowercase(), inner.join(", "))
+            let distinct = if *distinct { "DISTINCT " } else { "" };
+            format!(
+                "{}({distinct}{})",
+                name.to_ascii_lowercase(),
+                inner.join(", ")
+            )
         }
         Expr::ScalarSubquery(_) => "(subquery)".to_string(),
         Expr::InSubquery { negated, .. } => {
@@ -2249,79 +2331,172 @@ fn resolve_agg_refs(expr: BoundExpr, num_keys: usize) -> BoundExpr {
 
 // ---------- statement binding ----------
 
-/// Bind a JOIN `ON` condition. v1 accepts a single `left_expr = right_expr`
-/// equality (either orientation); each side binds in its own table's scope,
-/// so keys are side-relative. Aggregates are forbidden in ON.
-fn bind_join_keys(
-    db: &PinkDb,
-    default_db: &str,
-    left: &ScopeTable,
-    right: &ScopeTable,
-    on: &Expr,
-) -> Result<(BoundExpr, BoundExpr)> {
-    let (l, r) = match on {
-        Expr::Binary {
-            op: BinaryOp::Eq,
+/// How one join step will execute.
+enum BoundJoin {
+    /// Hash join on extracted equi pairs (side-relative keys), plus an
+    /// optional residual predicate over the joined output (INNER only).
+    Hash {
+        left_keys: Vec<BoundExpr>,
+        right_keys: Vec<BoundExpr>,
+        residual: Option<BoundExpr>,
+    },
+    /// Nested-loop join with the full condition in joined space (`None` =
+    /// CROSS JOIN).
+    Nested { on: Option<BoundExpr> },
+}
+
+/// Split `a AND b AND ...` into conjuncts (mirrors the optimizer's splitter;
+/// kept local so the binder need not depend on the optimizer).
+fn split_conjuncts(expr: BoundExpr, out: &mut Vec<BoundExpr>) {
+    match expr {
+        BoundExpr::Binary {
+            op: BinaryOp::And,
             left,
             right,
-        } => (left.as_ref(), right.as_ref()),
-        _ => {
-            return Err(PinkDbError::Execution(
-                "JOIN ON must be a single equality `left_col = right_col` in v1".to_string(),
-            ));
+            ..
+        } => {
+            split_conjuncts(*left, out);
+            split_conjuncts(*right, out);
         }
+        e => out.push(e),
+    }
+}
+
+/// Rebuild `a AND b AND ...` from conjuncts (None when empty).
+fn and_all(mut exprs: Vec<BoundExpr>) -> Option<BoundExpr> {
+    if exprs.is_empty() {
+        return None;
+    }
+    let mut acc = exprs.remove(0);
+    for e in exprs {
+        acc = BoundExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(acc),
+            right: Box::new(e),
+            dtype: DataType::Boolean,
+        };
+    }
+    Some(acc)
+}
+
+/// Try to read a conjunct as a crossing equality: one side references only
+/// the accumulated left (indices < `left_cols`), the other only the just-added
+/// right (indices >= `left_cols`). Returns the pair as side-relative keys.
+fn equi_pair(conjunct: &BoundExpr, left_cols: usize) -> Option<(BoundExpr, BoundExpr)> {
+    let BoundExpr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+        ..
+    } = conjunct
+    else {
+        return None;
     };
-    fn bind_side(
-        db: &PinkDb,
-        default_db: &str,
-        scope: &ScopeTable,
-        expr: &Expr,
-    ) -> Result<BoundExpr> {
-        let mut b = Binder::new(db, default_db);
-        b.tables.push(scope.clone());
-        b.allow_alias = false;
-        b.allow_win = false;
-        let mut aggs = Vec::new();
-        let bound = b.bind_expr(expr, &mut aggs, false)?;
-        if !aggs.is_empty() {
-            return Err(PinkDbError::Execution(
-                "aggregates are not allowed in JOIN ON".to_string(),
-            ));
+    let side = |e: &BoundExpr| -> Option<bool> {
+        let mut cols = Vec::new();
+        crate::optimizer::columns_in(e, &mut cols);
+        // No columns, or an AggRef/WindowRef (usize::MAX), is not a side key.
+        if cols.is_empty() || cols.contains(&usize::MAX) {
+            return None;
         }
-        Ok(bound)
-    }
-    // Try `l=left, r=right`, then the swapped orientation.
-    if let (Ok(lk), Ok(rk)) = (
-        bind_side(db, default_db, left, l),
-        bind_side(db, default_db, right, r),
-    ) {
-        comparison_ok(BinaryOp::Eq, lk.dtype(), rk.dtype()).map_err(|_| {
-            PinkDbError::Type(format!(
-                "JOIN keys have incompatible types: {} and {}",
-                lk.dtype(),
-                rk.dtype()
-            ))
-        })?;
-        return Ok((lk, rk));
-    }
-    match (
-        bind_side(db, default_db, right, l),
-        bind_side(db, default_db, left, r),
-    ) {
-        (Ok(lk), Ok(rk)) => {
-            comparison_ok(BinaryOp::Eq, rk.dtype(), lk.dtype()).map_err(|_| {
-                PinkDbError::Type(format!(
-                    "JOIN keys have incompatible types: {} and {}",
-                    rk.dtype(),
-                    lk.dtype()
-                ))
-            })?;
-            Ok((rk, lk))
-        }
-        _ => Err(PinkDbError::Catalog(
-            "JOIN ON must reference one column from each side".to_string(),
+        Some(cols.iter().all(|i| *i < left_cols))
+    };
+    match (side(left), side(right)) {
+        (Some(true), Some(false)) => Some((
+            (**left).clone(),
+            crate::plan::shift_columns((**right).clone(), left_cols),
         )),
+        (Some(false), Some(true)) => Some((
+            (**right).clone(),
+            crate::plan::shift_columns((**left).clone(), left_cols),
+        )),
+        _ => None,
     }
+}
+
+/// Bind a `JOIN ... ON` step: the ON condition binds over the accumulated
+/// scope (already pushed into `binder.tables`, right table last) and the
+/// result decides hash vs. nested-loop execution. `kind: Cross` never has an
+/// `ON` (the parser rejects it) and becomes a condition-less nested loop.
+fn bind_join_shape(
+    binder: &mut Binder,
+    kind: JoinKind,
+    left_cols: usize,
+    on: Option<&Expr>,
+) -> Result<BoundJoin> {
+    let Some(on) = on else {
+        return Ok(BoundJoin::Nested { on: None });
+    };
+    // ON binds with table columns only (no aliases, no windows, no
+    // aggregates), exactly like WHERE.
+    let saved_alias = binder.allow_alias;
+    let saved_win = binder.allow_win;
+    binder.allow_alias = false;
+    binder.allow_win = false;
+    let mut aggs = Vec::new();
+    let bound = binder.bind_expr(on, &mut aggs, false);
+    binder.allow_alias = saved_alias;
+    binder.allow_win = saved_win;
+    let bound = bound?;
+    if !aggs.is_empty() {
+        return Err(PinkDbError::Execution(
+            "aggregates are not allowed in JOIN ON".to_string(),
+        ));
+    }
+    if bound.dtype() != DataType::Boolean {
+        return Err(PinkDbError::Type(
+            "JOIN ON needs a BOOLEAN expression".to_string(),
+        ));
+    }
+    if kind == JoinKind::Cross {
+        // `CROSS JOIN ... ON` is a syntax error in DuckDB; the grammar can
+        // never produce it, but keep the plan honest if it ever does.
+        return Err(PinkDbError::Parse(
+            "CROSS JOIN does not take an ON condition".to_string(),
+        ));
+    }
+
+    let mut conjuncts = Vec::new();
+    split_conjuncts(bound.clone(), &mut conjuncts);
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    let mut residuals = Vec::new();
+    for c in &conjuncts {
+        match equi_pair(c, left_cols) {
+            Some((l, r)) => {
+                comparison_ok(BinaryOp::Eq, l.dtype(), r.dtype()).map_err(|_| {
+                    PinkDbError::Type(format!(
+                        "JOIN keys have incompatible types: {} and {}",
+                        l.dtype(),
+                        r.dtype()
+                    ))
+                })?;
+                left_keys.push(l);
+                right_keys.push(r);
+            }
+            None => residuals.push(c.clone()),
+        }
+    }
+
+    // Pure equi condition (any kind): hash join.
+    if residuals.is_empty() && !left_keys.is_empty() {
+        return Ok(BoundJoin::Hash {
+            left_keys,
+            right_keys,
+            residual: None,
+        });
+    }
+    // INNER with some equi keys: hash + a residual filter above the join.
+    if kind == JoinKind::Inner && !left_keys.is_empty() {
+        return Ok(BoundJoin::Hash {
+            left_keys,
+            right_keys,
+            residual: and_all(residuals),
+        });
+    }
+    // Everything else (outer joins with residual conditions, non-equi
+    // conditions, constant conditions): one nested loop over the full ON.
+    Ok(BoundJoin::Nested { on: Some(bound) })
 }
 /// Total width of the scan scope (0 with no FROM).
 fn scan_width(binder: &Binder<'_>) -> usize {
@@ -2351,17 +2526,30 @@ pub(crate) fn bind_tracked(
             db: qdb,
             name,
             columns,
+            if_not_exists,
         } => empty(LogicalPlan::CreateTable {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
             schema: columns.clone(),
+            if_not_exists: *if_not_exists,
         }),
+        Statement::CreateTableAs {
+            db: qdb,
+            name,
+            query,
+            if_not_exists,
+        } => bind_create_table_as(db, default_db, qdb, name, query, *if_not_exists),
         Statement::Insert {
             db: qdb,
             table,
             columns,
-            rows,
-        } => bind_insert(db, default_db, qdb, table, columns, rows),
+            source,
+        } => match source {
+            InsertSource::Values(rows) => bind_insert(db, default_db, qdb, table, columns, rows),
+            InsertSource::Select(query) => {
+                bind_insert_select(db, default_db, qdb, table, columns, query)
+            }
+        },
         Statement::Update {
             db: qdb,
             table,
@@ -2382,18 +2570,50 @@ pub(crate) fn bind_tracked(
             cols,
             query,
         } => bind_create_view(db, default_db, qdb, name, cols, query),
-        Statement::DropTable { db: qdb, name } => empty(LogicalPlan::DropTable {
+        Statement::DropTable {
+            db: qdb,
+            name,
+            if_exists,
+        } => empty(LogicalPlan::DropTable {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
+            if_exists: *if_exists,
         }),
         Statement::DropView { db: qdb, name } => empty(LogicalPlan::DropView {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
         }),
-        Statement::CreateDatabase { name } => {
-            empty(LogicalPlan::CreateDatabase { name: name.clone() })
+        Statement::CreateDatabase {
+            name,
+            if_not_exists,
+        } => empty(LogicalPlan::CreateDatabase {
+            name: name.clone(),
+            if_not_exists: *if_not_exists,
+        }),
+        Statement::DropDatabase { name, if_exists } => empty(LogicalPlan::DropDatabase {
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        Statement::ShowTables => empty(LogicalPlan::ShowTables {
+            db: default_db.to_ascii_lowercase(),
+        }),
+        Statement::ShowDatabases => empty(LogicalPlan::ShowDatabases),
+        Statement::Describe { db: qdb, name } => {
+            bind_describe(db, default_db, qdb.as_deref(), name)
         }
-        Statement::DropDatabase { name } => empty(LogicalPlan::DropDatabase { name: name.clone() }),
+        Statement::Explain(query) => {
+            // Bind the inner query fully (errors surface here) and wrap it —
+            // EXPLAIN never executes it.
+            let mut binder = Binder::new(db, default_db);
+            let plan = bind_select_in(db, &mut binder, query)?;
+            let dynamic = binder.dynamic_functions_used();
+            Ok((
+                LogicalPlan::Explain {
+                    plan: Box::new(plan),
+                },
+                dynamic,
+            ))
+        }
         Statement::Use { name } => {
             // Validate at bind: USE must fail clearly before touching the
             // session (and before any later statement in the same string).
@@ -2657,6 +2877,143 @@ fn bind_insert(
     ))
 }
 
+/// Bind `INSERT INTO t [(cols)] SELECT ...`: resolve the target column
+/// indices, bind the query (its own scope), and check the arity and
+/// coercibility of every projected column against the target schema.
+fn bind_insert_select(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
+    table: &str,
+    columns: &Option<Vec<String>>,
+    query: &Select,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    if let Some(err) = db.attached_read_only(&table_db, table) {
+        return Err(err);
+    }
+    let t = db.table_in(&table_db, table)?;
+    let schema = t.schema();
+    let order: Vec<usize> = match columns {
+        Some(cols) => cols
+            .iter()
+            .map(|c| {
+                t.column_index(c)
+                    .map_err(|_| PinkDbError::Catalog(format!("no column \"{c}\"")))
+            })
+            .collect::<Result<_>>()?,
+        None => (0..schema.len()).collect(),
+    };
+    if let Some(cols) = columns {
+        let mut seen = std::collections::HashSet::new();
+        for c in cols {
+            if !seen.insert(c.to_ascii_lowercase()) {
+                return Err(PinkDbError::Catalog(format!(
+                    "duplicate INSERT column \"{c}\""
+                )));
+            }
+        }
+    }
+    let mut binder = Binder::new(db, default_db);
+    let query_plan = bind_select_in(db, &mut binder, query)?;
+    let source = plan_schema(db, &binder.default_db, &binder.ctes, &query_plan)?;
+    if source.len() != order.len() {
+        return Err(PinkDbError::Execution(format!(
+            "INSERT has {} values for {} columns",
+            source.len(),
+            order.len()
+        )));
+    }
+    for ((_, src), &target) in source.iter().zip(order.iter()) {
+        if !DataTable::can_coerce(*src, schema[target].1) {
+            return Err(PinkDbError::Type(format!(
+                "cannot insert {src} into {} column \"{}\"",
+                schema[target].1, schema[target].0
+            )));
+        }
+    }
+    reject_view_dependency(db, &binder.views_used())?;
+    let dynamic = binder.dynamic_functions_used();
+    Ok((
+        LogicalPlan::InsertSelect {
+            db: Some(table_db),
+            table: t.name.clone(),
+            columns: Some(order),
+            query: Box::new(query_plan),
+        },
+        dynamic,
+    ))
+}
+
+/// Bind `CREATE TABLE t AS SELECT ...`: infer the new table's schema from the
+/// query's output (names + types).
+fn bind_create_table_as(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
+    name: &str,
+    query: &Select,
+    if_not_exists: bool,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let mut binder = Binder::new(db, default_db);
+    let query_plan = bind_select_in(db, &mut binder, query)?;
+    // The schema is taken from the query's evaluated output at execution
+    // (names from the final Project, types from its expressions) — binding
+    // here already validated the query in full.
+    reject_view_dependency(db, &binder.views_used())?;
+    let dynamic = binder.dynamic_functions_used();
+    Ok((
+        LogicalPlan::CreateTableAs {
+            db: Some(table_db),
+            name: name.to_string(),
+            query: Box::new(query_plan),
+            if_not_exists,
+        },
+        dynamic,
+    ))
+}
+
+/// Bind `DESCRIBE <table>`: resolve the name like a FROM source (CTEs and
+/// views cannot be described — only catalog/attached tables) and carry its
+/// schema into the plan; the executor formats the DuckDB-shaped rows.
+fn bind_describe(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: Option<&str>,
+    name: &str,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let lookup = match qdb {
+        Some(q) => {
+            if !db.database_exists(q) {
+                return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
+            }
+            q.to_ascii_lowercase()
+        }
+        None => default_db.to_ascii_lowercase(),
+    };
+    if let Ok(t) = db.table_in(&lookup, name) {
+        return Ok((LogicalPlan::Describe { schema: t.schema() }, Vec::new()));
+    }
+    if let Ok(view) = db.view_in(&lookup, name) {
+        let view = view.clone();
+        let mut child = Binder::new(db, &lookup);
+        // The view body is self-contained (same rule as FROM resolution).
+        child.ctes.clear();
+        let sub = bind_select_in(db, &mut child, &view.query)?;
+        let mut schema = plan_schema(db, &child.default_db, &child.ctes, &sub)?;
+        if let Some(cols) = &view.cols {
+            for (s, c) in schema.iter_mut().zip(cols.iter()) {
+                s.0 = c.clone();
+            }
+        }
+        return Ok((LogicalPlan::Describe { schema }, Vec::new()));
+    }
+    // Attached lake tables are visible to queries (they are not in the store).
+    let schema = db.visible_table_schema(&lookup, name)?;
+    Ok((LogicalPlan::Describe { schema }, Vec::new()))
+}
+
 /// Durable databases replay committed SQL text, and views are never
 /// checkpointed — so a mutating statement that reads a session-local view
 /// could never be rebuilt during replay (recovery would hard-error
@@ -2684,13 +3041,21 @@ fn bind_select(db: &PinkDb, default_db: &str, sel: &Select) -> Result<(LogicalPl
 /// would silently change semantics. DuckDB rejects them too.
 fn union_clause_error() -> PinkDbError {
     PinkDbError::Parse(
-        "ORDER BY/LIMIT before UNION is not supported; place it after the last branch".to_string(),
+        "ORDER BY/LIMIT/OFFSET before UNION is not supported; place it after the last branch"
+            .to_string(),
     )
 }
 
+/// True when a set-op branch carries a trailing clause the parser attached
+/// to it (which means the clause was written *before* the next set operator).
+fn branch_has_trailing_clause(sel: &Select) -> bool {
+    !sel.order_by.is_empty() || sel.limit.is_some() || sel.offset.is_some()
+}
+
 /// Bind a complete SELECT in an existing scope: WITH/CTE definitions, the
-/// body, and — when present — the whole UNION chain. Chain-level ORDER
-/// BY/LIMIT (written after the last branch) apply to the whole set operation.
+/// body, and — when present — the whole set-operation chain. Chain-level
+/// ORDER BY/LIMIT/OFFSET (written after the last branch) apply to the whole
+/// set operation.
 ///
 /// Every query context (statement, derived table, CTE body, view, subquery)
 /// must enter here: `bind_select_with` binds a single branch and ignores
@@ -2700,12 +3065,12 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
         return bind_select_with(db, binder, sel);
     }
     // The parser attaches trailing clauses to the last branch; a clause on the
-    // head or on a middle branch was therefore written *before* a UNION.
-    if !sel.order_by.is_empty() || sel.limit.is_some() {
+    // head or on a middle branch was therefore written *before* a set operator.
+    if branch_has_trailing_clause(sel) {
         return Err(union_clause_error());
     }
     for (_, branch) in &sel.unions[..sel.unions.len() - 1] {
-        if !branch.order_by.is_empty() || branch.limit.is_some() {
+        if branch_has_trailing_clause(branch) {
             return Err(union_clause_error());
         }
     }
@@ -2714,6 +3079,7 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
     let (_, last) = head.unions.last_mut().expect("unions checked non-empty");
     let order_by = std::mem::take(&mut last.order_by);
     let limit = last.limit.take();
+    let offset = last.offset.take();
 
     // WITH belongs to the whole chain: bind it once, then wrap the final plan.
     // Every branch (and the ORDER BY/LIMIT wrapper below) sees the CTEs.
@@ -2721,7 +3087,7 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
     let cte_plans = bind_ctes(db, binder, sel)?;
     head.with.clear();
 
-    let plan = if order_by.is_empty() && limit.is_none() {
+    let plan = if order_by.is_empty() && limit.is_none() && offset.is_none() {
         bind_union_chain(db, binder, &head)?
     } else {
         // Apply the chain clauses over the whole set operation by wrapping it
@@ -2734,13 +3100,14 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
             from: Some(FromClause {
                 source: FromSource::Derived(Box::new(head)),
                 alias: Some("__setop".to_string()),
-                join: None,
+                joins: Vec::new(),
             }),
             where_clause: None,
             group_by: Vec::new(),
             having: None,
             order_by,
             limit,
+            offset,
             unions: Vec::new(),
         };
         bind_select_in(db, binder, &wrapper)?
@@ -2748,43 +3115,78 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
     Ok(wrap_ctes(binder, cte_base, cte_plans, plan))
 }
 
-/// Bind the head and every UNION branch into the left-associative set
-/// operation. Branch-level ORDER BY/LIMIT are hoisted (or rejected) by
+/// Bind the head and every set-operation branch into the left-associative set
+/// operation, honoring `INTERSECT`'s higher precedence over `UNION`/`EXCEPT`
+/// (DuckDB's rule): consecutive `INTERSECT` runs fold into their left
+/// neighbor first, then `UNION`/`EXCEPT` apply left-associatively over the
+/// resulting units. Branch-level ORDER BY/LIMIT are hoisted (or rejected) by
 /// [`bind_select_in`] before this point, so each branch binds bare; pairwise
-/// type unification (numeric tower) is recorded on every `Union` node.
+/// type unification (numeric tower) is recorded on every `SetOp` node.
 fn bind_union_chain(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
     debug_assert!(!sel.unions.is_empty());
-    debug_assert!(sel.order_by.is_empty() && sel.limit.is_none());
+    debug_assert!(sel.order_by.is_empty() && sel.limit.is_none() && sel.offset.is_none());
     let mut head = sel.clone();
     head.unions.clear();
-    let mut plan = bind_select_with(db, binder, &head)?;
-    // UNION branches (left-associative): each sees the outer CTEs (including
-    // the head's WITH CTEs, bound by the caller).
+    let head_plan = bind_select_with(db, binder, &head)?;
+    // Right branches: each sees the outer CTEs (including the head's WITH
+    // CTEs, bound by the caller).
+    let mut units: Vec<(Option<SetOp>, LogicalPlan)> = vec![(None, head_plan)];
     for (op, branch) in &sel.unions {
-        debug_assert!(branch.order_by.is_empty() && branch.limit.is_none());
+        debug_assert!(!branch_has_trailing_clause(branch));
         let mut child = binder.child();
         let right = bind_select_with(db, &mut child, branch)?;
-        let left_schema = plan_schema(db, &binder.default_db, &binder.ctes, &plan)?;
-        let right_schema = plan_schema(db, &child.default_db, &child.ctes, &right)?;
-        if left_schema.len() != right_schema.len() {
-            return Err(PinkDbError::Execution(format!(
-                "UNION branches have {} and {} columns",
-                left_schema.len(),
-                right_schema.len()
-            )));
+        if is_intersect(*op) {
+            // Fold into the previous unit (INTERSECT binds tighter).
+            let (prev_op, prev) = units.pop().expect("at least the head");
+            let combined = bind_pair_types(db, &binder.default_db, &binder.ctes, *op, prev, right)?;
+            units.push((prev_op, combined));
+        } else {
+            units.push((Some(*op), right));
         }
-        let mut types = Vec::with_capacity(left_schema.len());
-        for ((_, l), (_, r)) in left_schema.iter().zip(right_schema.iter()) {
-            types.push(coalesce_common(*l, *r)?);
-        }
-        plan = LogicalPlan::Union {
-            left: Box::new(plan),
-            right: Box::new(right),
-            distinct: *op == SetOp::Union,
-            types,
-        };
+    }
+    // Left-associative fold of the folded units.
+    let mut iter = units.into_iter();
+    let (_, mut plan) = iter.next().expect("head unit");
+    for (op, right) in iter {
+        let op = op.expect("non-head units carry their operator");
+        plan = bind_pair_types(db, &binder.default_db, &binder.ctes, op, plan, right)?;
     }
     Ok(plan)
+}
+
+fn is_intersect(op: SetOp) -> bool {
+    matches!(op, SetOp::Intersect | SetOp::IntersectAll)
+}
+
+/// Combine two already-bound set-operation operands with pairwise common
+/// types (numeric tower; else identical).
+fn bind_pair_types(
+    db: &PinkDb,
+    default_db: &str,
+    ctes: &[(String, Vec<(String, DataType)>)],
+    op: SetOp,
+    left: LogicalPlan,
+    right: LogicalPlan,
+) -> Result<LogicalPlan> {
+    let left_schema = plan_schema(db, default_db, ctes, &left)?;
+    let right_schema = plan_schema(db, default_db, ctes, &right)?;
+    if left_schema.len() != right_schema.len() {
+        return Err(PinkDbError::Execution(format!(
+            "set-operation branches have {} and {} columns",
+            left_schema.len(),
+            right_schema.len()
+        )));
+    }
+    let mut types = Vec::with_capacity(left_schema.len());
+    for ((_, l), (_, r)) in left_schema.iter().zip(right_schema.iter()) {
+        types.push(coalesce_common(*l, *r)?);
+    }
+    Ok(LogicalPlan::SetOp {
+        op,
+        left: Box::new(left),
+        right: Box::new(right),
+        types,
+    })
 }
 
 /// Output schema of a bound plan: (column name, type) per output column.
@@ -2819,9 +3221,12 @@ pub(crate) fn plan_schema(
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
-        | LogicalPlan::Limit { input, .. } => plan_schema(db, default_db, ctes, input),
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. } => plan_schema(db, default_db, ctes, input),
         LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateTableAs { .. }
         | LogicalPlan::Insert { .. }
+        | LogicalPlan::InsertSelect { .. }
         | LogicalPlan::Update { .. }
         | LogicalPlan::Delete { .. }
         | LogicalPlan::Begin
@@ -2833,8 +3238,13 @@ pub(crate) fn plan_schema(
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::ShowTables { .. }
+        | LogicalPlan::ShowDatabases
         | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. } => Ok(Vec::new()),
+        // DESCRIBE/EXPLAIN produce fixed shapes (their schema is built by the
+        // executor); they never appear as a query scope.
+        LogicalPlan::Describe { .. } | LogicalPlan::Explain { .. } => Ok(Vec::new()),
         LogicalPlan::Project { exprs, names, .. } => Ok(names
             .iter()
             .cloned()
@@ -2844,12 +3254,12 @@ pub(crate) fn plan_schema(
             let (names, types) = crate::plan::agg_output_schema(keys, aggs);
             Ok(names.into_iter().zip(types).collect())
         }
-        LogicalPlan::Join { left, right, .. } => {
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::NestedLoopJoin { left, right, .. } => {
             let mut out = plan_schema(db, default_db, ctes, left)?;
             out.extend(plan_schema(db, default_db, ctes, right)?);
             Ok(out)
         }
-        LogicalPlan::Union { left, types, .. } => {
+        LogicalPlan::SetOp { left, types, .. } => {
             // Output names come from the left branch.
             let left_schema = plan_schema(db, default_db, ctes, left)?;
             Ok(left_schema
@@ -3049,32 +3459,57 @@ fn wrap_ctes(
 }
 
 fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<LogicalPlan> {
-    // FROM (+ optional single JOIN). Returns the base plan and left width.
+    // FROM (+ left-deep join chain). Returns the base plan and left width.
     let mut base: LogicalPlan;
     if let Some(from) = &sel.from {
         let (left, left_plan) = bind_source(db, binder, &from.source, &from.alias)?;
-        let left_cols = left.columns.len();
+        let mut left_cols = left.columns.len();
         base = left_plan;
         binder.tables.push(left);
-        if let Some(join) = &from.join {
+        for join in &from.joins {
             let (right, right_plan) = bind_source(db, binder, &join.source, &join.alias)?;
-            if binder.tables[0].name == right.name {
+            if binder.tables.iter().any(|t| t.name == right.name) {
                 return Err(PinkDbError::Catalog(format!(
                     "table name \"{}\" specified more than once (use an alias)",
                     right.name
                 )));
             }
-            let (left_key, right_key) =
-                bind_join_keys(db, &binder.default_db, &binder.tables[0], &right, &join.on)?;
+            // The right scope joins the accumulated scope before the ON
+            // condition binds, so `ON` sees the left tables ++ right table
+            // (joined-space column indices).
             binder.tables.push(right);
-            base = LogicalPlan::Join {
-                kind: join.kind,
-                left: Box::new(base),
-                right: Box::new(right_plan),
-                left_key,
-                right_key,
-                left_cols,
+            let shape = bind_join_shape(binder, join.kind, left_cols, join.on.as_ref())?;
+            base = match shape {
+                BoundJoin::Hash {
+                    left_keys,
+                    right_keys,
+                    residual,
+                } => {
+                    let mut join = LogicalPlan::Join {
+                        kind: join.kind,
+                        left: Box::new(base),
+                        right: Box::new(right_plan),
+                        left_keys,
+                        right_keys,
+                        left_cols,
+                    };
+                    if let Some(predicate) = residual {
+                        join = LogicalPlan::Filter {
+                            input: Box::new(join),
+                            predicate,
+                        };
+                    }
+                    join
+                }
+                BoundJoin::Nested { on } => LogicalPlan::NestedLoopJoin {
+                    kind: join.kind,
+                    left: Box::new(base),
+                    right: Box::new(right_plan),
+                    on,
+                    left_cols,
+                },
             };
+            left_cols += binder.tables.last().expect("pushed above").columns.len();
         }
     } else {
         base = LogicalPlan::SingleRow;
@@ -3336,7 +3771,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         .collect();
     let mut proj_names = visible_names.clone();
     let mut hidden = 0usize;
-    let mut sort_keys: Vec<(BoundExpr, bool)> = Vec::new();
+    let mut sort_keys: Vec<(BoundExpr, SortSpec)> = Vec::new();
     for item in &sel.order_by {
         // Positional `ORDER BY 2` → Nth visible output.
         if let Expr::Literal(Value::Integer(n)) = &item.expr {
@@ -3353,7 +3788,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     index: idx,
                     dtype: visible_dtypes[idx],
                 },
-                item.desc,
+                SortSpec::of(item),
             ));
             continue;
         }
@@ -3368,7 +3803,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         index: pos,
                         dtype: visible_dtypes[pos],
                     },
-                    item.desc,
+                    SortSpec::of(item),
                 ));
                 continue;
             }
@@ -3399,7 +3834,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         match proj_exprs.iter().position(|p| p == &scoped) {
             Some(idx) => {
                 let dtype = proj_exprs[idx].dtype();
-                sort_keys.push((BoundExpr::Column { index: idx, dtype }, item.desc));
+                sort_keys.push((BoundExpr::Column { index: idx, dtype }, SortSpec::of(item)));
             }
             None => {
                 let dtype = scoped.dtype();
@@ -3411,7 +3846,7 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                         index: proj_exprs.len() - 1,
                         dtype,
                     },
-                    item.desc,
+                    SortSpec::of(item),
                 ));
             }
         }
@@ -3449,6 +3884,12 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                 names: visible_names,
             };
         }
+    }
+    if let Some(n) = sel.offset {
+        plan = LogicalPlan::Offset {
+            input: Box::new(plan),
+            offset: n,
+        };
     }
     if let Some(n) = sel.limit {
         plan = LogicalPlan::Limit {
@@ -3548,11 +3989,48 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PinkDbError::Catalog(_)));
-        // Non-equi ON is rejected.
-        assert!(bind_one(&db, "SELECT * FROM sales s JOIN sales o ON s.id > o.id;").is_err());
+        // Non-equi ON binds to a nested-loop join.
+        let plan = bind_one(&db, "SELECT * FROM sales s JOIN sales o ON s.id > o.id;").unwrap();
+        assert!(
+            has_nested_loop_join(&plan),
+            "expected a nested-loop join: {plan:?}"
+        );
+        // Composite equi ON binds to a multi-key hash join.
+        let plan = bind_one(
+            &db,
+            "SELECT * FROM sales s JOIN sales o ON s.id = o.id AND s.region = o.region;",
+        )
+        .unwrap();
+        assert!(has_multi_key_join(&plan), "expected a 2-key hash join");
         // Aliased equi-join binds.
         let plan = bind_one(&db, "SELECT * FROM sales s JOIN sales o ON s.id = o.id;").unwrap();
         assert!(matches!(plan, LogicalPlan::Project { .. }));
+    }
+
+    /// True when `plan` (recursively, through the projection) holds a
+    /// nested-loop join.
+    fn has_nested_loop_join(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::NestedLoopJoin { .. } => true,
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Limit { input, .. } => has_nested_loop_join(input),
+            _ => false,
+        }
+    }
+
+    fn has_multi_key_join(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join { left_keys, .. } => left_keys.len() == 2,
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Distinct { input }
+            | LogicalPlan::Limit { input, .. } => has_multi_key_join(input),
+            _ => false,
+        }
     }
 
     /// A misrouted call with UNION branches must fail loudly instead of
@@ -3666,11 +4144,11 @@ mod tests {
         );
         assert!(matches!(
             bind_one(&db, "CREATE DATABASE db2;").unwrap(),
-            LogicalPlan::CreateDatabase { name } if name == "db2"
+            LogicalPlan::CreateDatabase { name, .. } if name == "db2"
         ));
         assert!(matches!(
             bind_one(&db, "DROP DATABASE db1;").unwrap(),
-            LogicalPlan::DropDatabase { name } if name == "db1"
+            LogicalPlan::DropDatabase { name, .. } if name == "db1"
         ));
     }
 

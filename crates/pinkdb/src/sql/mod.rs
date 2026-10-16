@@ -201,13 +201,18 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
         let child = depth + 1;
         match node {
             NodeRef::Statement(stmt) => match stmt {
-                ast::Statement::Insert { rows, .. } => {
-                    for row in rows {
-                        for e in row {
-                            work.push((NodeRef::Expr(e), child));
+                ast::Statement::Insert { source, .. } => match source {
+                    ast::InsertSource::Values(rows) => {
+                        for row in rows {
+                            for e in row {
+                                work.push((NodeRef::Expr(e), child));
+                            }
                         }
                     }
-                }
+                    ast::InsertSource::Select(query) => {
+                        work.push((NodeRef::Select(query), child));
+                    }
+                },
                 ast::Statement::Update {
                     sets, where_clause, ..
                 } => {
@@ -224,7 +229,9 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                 } => {
                     work.push((NodeRef::Expr(e), child));
                 }
-                ast::Statement::CreateView { query, .. } => {
+                ast::Statement::CreateView { query, .. }
+                | ast::Statement::CreateTableAs { query, .. }
+                | ast::Statement::Explain(query) => {
                     work.push((NodeRef::Select(query), child));
                 }
                 ast::Statement::Select(select) => {
@@ -314,7 +321,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
             },
             NodeRef::FromClause(from) => {
                 work.push((NodeRef::FromSource(&from.source), child));
-                if let Some(join) = &from.join {
+                for join in &from.joins {
                     work.push((NodeRef::Join(join), child));
                 }
             }
@@ -333,7 +340,9 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
             }
             NodeRef::Join(join) => {
                 work.push((NodeRef::FromSource(&join.source), child));
-                work.push((NodeRef::Expr(&join.on), child));
+                if let Some(on) = &join.on {
+                    work.push((NodeRef::Expr(on), child));
+                }
             }
             NodeRef::Order(item) => {
                 work.push((NodeRef::Expr(&item.expr), child));
@@ -387,6 +396,7 @@ fn empty_select() -> ast::Select {
         having: None,
         order_by: Vec::new(),
         limit: None,
+        offset: None,
         unions: Vec::new(),
     }
 }
@@ -402,11 +412,16 @@ fn take_statement_children(
     selects: &mut Vec<ast::Select>,
 ) {
     match stmt {
-        ast::Statement::Insert { rows, .. } => {
-            for row in rows.drain(..) {
-                exprs.extend(row);
+        ast::Statement::Insert { source, .. } => match source {
+            ast::InsertSource::Values(rows) => {
+                for row in rows.drain(..) {
+                    exprs.extend(row);
+                }
             }
-        }
+            ast::InsertSource::Select(query) => {
+                selects.push(std::mem::replace(&mut **query, empty_select()));
+            }
+        },
         ast::Statement::Update {
             sets, where_clause, ..
         } => {
@@ -422,7 +437,9 @@ fn take_statement_children(
                 exprs.push(e);
             }
         }
-        ast::Statement::CreateView { query, .. } => {
+        ast::Statement::CreateView { query, .. }
+        | ast::Statement::CreateTableAs { query, .. }
+        | ast::Statement::Explain(query) => {
             selects.push(std::mem::replace(&mut **query, empty_select()));
         }
         ast::Statement::Select(select) => {
@@ -469,9 +486,11 @@ fn take_from_children(
     selects: &mut Vec<ast::Select>,
 ) {
     take_source_children(&mut from.source, selects);
-    if let Some(mut join) = from.join.take() {
+    for mut join in from.joins.drain(..) {
         take_source_children(&mut join.source, selects);
-        exprs.push(join.on);
+        if let Some(on) = join.on.take() {
+            exprs.push(on);
+        }
     }
 }
 

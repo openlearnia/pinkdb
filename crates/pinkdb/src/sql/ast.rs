@@ -14,12 +14,21 @@ pub enum Statement {
         db: Option<String>,
         name: String,
         columns: Vec<(String, crate::types::DataType)>,
+        /// `IF NOT EXISTS`: an existing table makes the statement a no-op.
+        if_not_exists: bool,
+    },
+    /// `CREATE TABLE t AS SELECT ...` (schema inferred from the query).
+    CreateTableAs {
+        db: Option<String>,
+        name: String,
+        query: Box<Select>,
+        if_not_exists: bool,
     },
     Insert {
         db: Option<String>,
         table: String,
         columns: Option<Vec<String>>,
-        rows: Vec<Vec<Expr>>,
+        source: InsertSource,
     },
     Update {
         db: Option<String>,
@@ -45,6 +54,8 @@ pub enum Statement {
     DropTable {
         db: Option<String>,
         name: String,
+        /// `IF EXISTS`: a missing table makes the statement a no-op.
+        if_exists: bool,
     },
     DropView {
         db: Option<String>,
@@ -53,10 +64,12 @@ pub enum Statement {
     /// `CREATE DATABASE <name>`.
     CreateDatabase {
         name: String,
+        if_not_exists: bool,
     },
     /// `DROP DATABASE <name>`.
     DropDatabase {
         name: String,
+        if_exists: bool,
     },
     /// `USE <name>`: switch the session's current database.
     Use {
@@ -72,7 +85,26 @@ pub enum Statement {
     /// for in-memory databases). Not a reserved word: only the bare
     /// statement form is recognized.
     Checkpoint,
+    /// `SHOW TABLES`: the current database's tables, sorted by name.
+    ShowTables,
+    /// `SHOW DATABASES`: every database in the store, sorted by name.
+    ShowDatabases,
+    /// `DESCRIBE <table>`: DuckDB-shaped column metadata.
+    Describe {
+        db: Option<String>,
+        name: String,
+    },
+    /// `EXPLAIN <select>`: print the bound (optimized) plan.
+    Explain(Box<Select>),
     Select(Select),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    /// `VALUES (...), (...)`.
+    Values(Vec<Vec<Expr>>),
+    /// `SELECT ...` (or WITH ... SELECT).
+    Select(Box<Select>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,7 +118,12 @@ pub struct Select {
     pub having: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub limit: Option<usize>,
-    /// `UNION [ALL|DISTINCT] branch...` (left-associative).
+    /// `OFFSET <n>`: skip the first `n` rows (valid alone or with LIMIT).
+    pub offset: Option<usize>,
+    /// Set-operation branches, left-associative in written order:
+    /// `UNION [ALL|DISTINCT]`, `INTERSECT [ALL|DISTINCT]`,
+    /// `EXCEPT [ALL|DISTINCT]`. `INTERSECT` binds tighter than
+    /// `UNION`/`EXCEPT` (DuckDB precedence).
     pub unions: Vec<(SetOp, Select)>,
 }
 
@@ -94,6 +131,10 @@ pub struct Select {
 pub enum SetOp {
     Union,
     UnionAll,
+    Intersect,
+    IntersectAll,
+    Except,
+    ExceptAll,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +169,9 @@ pub enum FromSource {
 pub struct FromClause {
     pub source: FromSource,
     pub alias: Option<String>,
-    pub join: Option<JoinClause>,
+    /// Chained joins, left-deep, in written order: each `ON` condition sees
+    /// every table to its left plus its own right-hand source.
+    pub joins: Vec<JoinClause>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +181,10 @@ pub enum JoinKind {
     Left,
     /// `RIGHT [OUTER] JOIN`: preserve every right row (NULL-extend unmatched).
     Right,
+    /// `FULL [OUTER] JOIN`: preserve rows from both sides.
+    Full,
+    /// `CROSS JOIN`: the cartesian product (never has an `ON`).
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -145,14 +192,36 @@ pub struct JoinClause {
     pub kind: JoinKind,
     pub source: FromSource,
     pub alias: Option<String>,
-    /// `ON` must be a single equi-condition `a = b` (checked in the binder).
-    pub on: Expr,
+    /// `ON` condition; `None` for CROSS JOIN, which has no condition.
+    pub on: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderItem {
     pub expr: Expr,
+    /// `DESC` (default ASC).
     pub desc: bool,
+    /// `NULLS FIRST` / `NULLS LAST`; `None` = the default (NULLS LAST, both
+    /// directions, matching DuckDB's `default_null_order`).
+    pub nulls_first: Option<bool>,
+}
+
+/// A bound order key: direction + NULL placement (the resolved `OrderItem`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortSpec {
+    pub desc: bool,
+    /// `false` = NULLS LAST (DuckDB's default for ASC and DESC).
+    pub nulls_first: bool,
+}
+
+impl SortSpec {
+    /// Resolve an AST order item's explicit/default NULL placement.
+    pub fn of(item: &OrderItem) -> SortSpec {
+        SortSpec {
+            desc: item.desc,
+            nulls_first: item.nulls_first.unwrap_or(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,15 +234,26 @@ pub struct OverClause {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameSpec {
+    pub mode: FrameMode,
     pub start: FrameBound,
     pub end: FrameBound,
+}
+
+/// How frame offsets count: `ROWS` counts rows; `RANGE` counts units of the
+/// single ORDER BY expression's value (peers stay together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+    Rows,
+    Range,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameBound {
     UnboundedPreceding,
+    /// `n PRECEDING` (ROWS: `n` rows; RANGE: value offset `n`).
     Preceding(usize),
     CurrentRow,
+    /// `n FOLLOWING` (ROWS: `n` rows; RANGE: value offset `n`).
     Following(usize),
     UnboundedFollowing,
 }
@@ -210,12 +290,18 @@ pub enum Expr {
     Function {
         name: String,
         args: Vec<Expr>,
+        /// `f(DISTINCT x)` — only `COUNT(DISTINCT x)` is supported (checked
+        /// in the binder).
+        distinct: bool,
     },
-    /// `f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS ...])`.
+    /// `f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS/RANGE ...])`.
     Window {
         name: String,
         args: Vec<Expr>,
         over: OverClause,
+        /// Parsed for a clear binder error (DISTINCT windows are not
+        /// supported, matching DuckDB).
+        distinct: bool,
     },
     /// `(SELECT ...)` — uncorrelated scalar subquery (exactly 1 row × 1 col;
     /// 0 rows → NULL).

@@ -1610,6 +1610,7 @@ mod tests {
             having: None,
             order_by: Vec::new(),
             limit: None,
+            offset: None,
             unions: Vec::new(),
         };
         db.create_view("v", query.clone(), None).unwrap();

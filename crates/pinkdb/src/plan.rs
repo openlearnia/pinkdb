@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::sql::ast::{JoinKind, Select};
+use crate::sql::ast::{JoinKind, Select, SetOp, SortSpec};
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::types::{DataType, Value};
 
@@ -14,6 +14,15 @@ pub enum LogicalPlan {
         db: Option<String>,
         name: String,
         schema: Vec<(String, DataType)>,
+        /// `IF NOT EXISTS`: an existing table makes this a no-op.
+        if_not_exists: bool,
+    },
+    /// `CREATE TABLE t AS SELECT ...`: schema from the query's output.
+    CreateTableAs {
+        db: Option<String>,
+        name: String,
+        query: Box<LogicalPlan>,
+        if_not_exists: bool,
     },
     Insert {
         db: Option<String>,
@@ -21,6 +30,14 @@ pub enum LogicalPlan {
         /// One bound expr per table column per row (constants; missing
         /// columns are NULL). Evaluated against an empty single-row chunk.
         rows: Vec<Vec<BoundExpr>>,
+    },
+    /// `INSERT INTO t [(cols)] SELECT ...`.
+    InsertSelect {
+        db: Option<String>,
+        table: String,
+        /// Target column indices in written order (`None` = every column).
+        columns: Option<Vec<usize>>,
+        query: Box<LogicalPlan>,
     },
     Update {
         db: Option<String>,
@@ -47,6 +64,8 @@ pub enum LogicalPlan {
     DropTable {
         db: Option<String>,
         name: String,
+        /// `IF EXISTS`: a missing table makes this a no-op.
+        if_exists: bool,
     },
     DropView {
         db: Option<String>,
@@ -55,10 +74,12 @@ pub enum LogicalPlan {
     /// `CREATE DATABASE <name>` (store-level; never inside a transaction).
     CreateDatabase {
         name: String,
+        if_not_exists: bool,
     },
     /// `DROP DATABASE <name>` (store-level; never inside a transaction).
     DropDatabase {
         name: String,
+        if_exists: bool,
     },
     /// `USE <name>`: the session layer applies the returned database.
     Use {
@@ -73,12 +94,27 @@ pub enum LogicalPlan {
     /// `CHECKPOINT`: persist + roll the WAL of a durable store (no-op
     /// otherwise). Never WAL-logged and refused inside a transaction.
     Checkpoint,
-    /// Set union: output names come from the left branch; every column is
-    /// coerced to the pairwise common type at execution.
-    Union {
+    /// `SHOW TABLES`: the given database's tables, sorted by name.
+    ShowTables {
+        db: String,
+    },
+    /// `SHOW DATABASES`: every database, sorted by name.
+    ShowDatabases,
+    /// `DESCRIBE <table>`: the resolved schema, printed DuckDB-shaped.
+    Describe {
+        schema: Vec<(String, DataType)>,
+    },
+    /// `EXPLAIN <select>`: a printable textual plan (never executed).
+    Explain {
+        plan: Box<LogicalPlan>,
+    },
+    /// Set operation (`UNION`/`INTERSECT`/`EXCEPT`, each `[ALL]`): output
+    /// names come from the left branch; every column is coerced to the
+    /// pairwise common type at execution.
+    SetOp {
+        op: SetOp,
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
-        distinct: bool,
         types: Vec<DataType>,
     },
     /// Full scan of a table. `db: None` names a CTE (binder-resolved);
@@ -109,18 +145,31 @@ pub enum LogicalPlan {
         /// Input column count (window results start here).
         input_cols: usize,
     },
-    /// Equi-join on a single `left_key = right_key` condition.
-    /// Output columns are left ++ right. Keys are side-relative (evaluated
-    /// against each input); every other expression above the join uses
-    /// joined-space indices. NULL keys never match. `Inner` emits matched
-    /// pairs only; `Left`/`Right` preserve every row of their side
-    /// (NULL-extending the other side's columns when unmatched).
+    /// Equi-join on one or more `left_key = right_key` pairs (all conjuncts
+    /// must hold for a pair to match). Output columns are left ++ right. Keys
+    /// are side-relative (evaluated against each input); every other
+    /// expression above the join uses joined-space indices. NULL keys never
+    /// match. `Inner` emits matched pairs only; `Left`/`Right`/`Full`
+    /// preserve every row of their side (NULL-extending the other side's
+    /// columns when unmatched).
     Join {
         kind: JoinKind,
         left: Box<LogicalPlan>,
         right: Box<LogicalPlan>,
-        left_key: BoundExpr,
-        right_key: BoundExpr,
+        left_keys: Vec<BoundExpr>,
+        right_keys: Vec<BoundExpr>,
+        left_cols: usize,
+    },
+    /// Nested-loop join: `on` evaluates in joined space (left ++ right
+    /// indices); `None` = CROSS JOIN (every pair). Used for non-equi and
+    /// composite-residual conditions and for any outer join whose condition
+    /// is not a pure conjunction of equi pairs. Output columns are
+    /// left ++ right.
+    NestedLoopJoin {
+        kind: JoinKind,
+        left: Box<LogicalPlan>,
+        right: Box<LogicalPlan>,
+        on: Option<BoundExpr>,
         left_cols: usize,
     },
     Aggregate {
@@ -139,12 +188,17 @@ pub enum LogicalPlan {
     },
     Sort {
         input: Box<LogicalPlan>,
-        /// (key expr, descending?) evaluated against the input.
-        keys: Vec<(BoundExpr, bool)>,
+        /// (key expr, direction + NULL placement) evaluated against the input.
+        keys: Vec<(BoundExpr, SortSpec)>,
     },
     Limit {
         input: Box<LogicalPlan>,
         limit: usize,
+    },
+    /// `OFFSET <n>`: drop the first `n` rows (may sit under `Limit`).
+    Offset {
+        input: Box<LogicalPlan>,
+        offset: usize,
     },
 }
 
@@ -159,15 +213,21 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
             | LogicalPlan::SingleRow
             | LogicalPlan::Filter { .. }
             | LogicalPlan::Join { .. }
+            | LogicalPlan::NestedLoopJoin { .. }
             | LogicalPlan::Aggregate { .. }
             | LogicalPlan::Project { .. }
             | LogicalPlan::Distinct { .. }
             | LogicalPlan::Sort { .. }
             | LogicalPlan::Limit { .. }
+            | LogicalPlan::Offset { .. }
             | LogicalPlan::Cte { .. }
             | LogicalPlan::Window { .. }
-            | LogicalPlan::Union { .. }
+            | LogicalPlan::SetOp { .. }
             | LogicalPlan::Use { .. }
+            | LogicalPlan::ShowTables { .. }
+            | LogicalPlan::ShowDatabases
+            | LogicalPlan::Describe { .. }
+            | LogicalPlan::Explain { .. }
     )
 }
 
@@ -192,7 +252,9 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
     matches!(
         plan,
         LogicalPlan::CreateTable { .. }
+            | LogicalPlan::CreateTableAs { .. }
             | LogicalPlan::Insert { .. }
+            | LogicalPlan::InsertSelect { .. }
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
             | LogicalPlan::DropTable { .. }
@@ -302,7 +364,15 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::ShowTables { .. }
+        | LogicalPlan::ShowDatabases
+        | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint => {}
+        LogicalPlan::Explain { plan } => collect_tables_read(plan, default_db, out),
+        LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_db, out),
+        LogicalPlan::InsertSelect { query, .. } => {
+            collect_tables_read(query, default_db, out);
+        }
         LogicalPlan::Insert { rows, .. } => {
             for e in rows.iter().flatten() {
                 expr_tables_read(e, default_db, out);
@@ -332,7 +402,7 @@ pub(crate) fn collect_tables_read(
                 expr_tables_read(p, default_db, out);
             }
         }
-        LogicalPlan::Union { left, right, .. } => {
+        LogicalPlan::SetOp { left, right, .. } => {
             collect_tables_read(left, default_db, out);
             collect_tables_read(right, default_db, out);
         }
@@ -360,14 +430,27 @@ pub(crate) fn collect_tables_read(
         LogicalPlan::Join {
             left,
             right,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             ..
         } => {
             collect_tables_read(left, default_db, out);
             collect_tables_read(right, default_db, out);
-            expr_tables_read(left_key, default_db, out);
-            expr_tables_read(right_key, default_db, out);
+            for k in left_keys {
+                expr_tables_read(k, default_db, out);
+            }
+            for k in right_keys {
+                expr_tables_read(k, default_db, out);
+            }
+        }
+        LogicalPlan::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            collect_tables_read(left, default_db, out);
+            collect_tables_read(right, default_db, out);
+            if let Some(on) = on {
+                expr_tables_read(on, default_db, out);
+            }
         }
         LogicalPlan::Aggregate { input, keys, aggs } => {
             collect_tables_read(input, default_db, out);
@@ -391,6 +474,9 @@ pub(crate) fn collect_tables_read(
             }
         }
         LogicalPlan::Distinct { input } | LogicalPlan::Limit { input, .. } => {
+            collect_tables_read(input, default_db, out);
+        }
+        LogicalPlan::Offset { input, .. } => {
             collect_tables_read(input, default_db, out);
         }
     }
@@ -604,35 +690,50 @@ fn walk_scan_projections(
             }
             walk_scan_projections(input, &need, out);
         }
-        LogicalPlan::Limit { input, .. } => walk_scan_projections(input, needed, out),
+        LogicalPlan::Limit { input, .. } | LogicalPlan::Offset { input, .. } => {
+            walk_scan_projections(input, needed, out)
+        }
         // Unbounded shapes: `Distinct` hashes whole rows; `Union` coerces
         // every column of both sides; `Join` assembles all columns of both
         // sides; a `Cte` query's output is materialized once and reused by
         // the body. Nothing is lost by decoding in full.
         LogicalPlan::Distinct { input } => walk_scan_projections(input, &Needed::All, out),
-        LogicalPlan::Union { left, right, .. } => {
+        LogicalPlan::SetOp { left, right, .. } => {
             walk_scan_projections(left, &Needed::All, out);
             walk_scan_projections(right, &Needed::All, out);
         }
         LogicalPlan::Join {
             left,
             right,
-            left_key,
-            right_key,
+            left_keys,
+            right_keys,
             ..
         } => {
             let mut l = Needed::All;
-            collect_expr_projections(left_key, &mut l, out);
+            for k in left_keys {
+                collect_expr_projections(k, &mut l, out);
+            }
             let mut r = Needed::All;
-            collect_expr_projections(right_key, &mut r, out);
+            for k in right_keys {
+                collect_expr_projections(k, &mut r, out);
+            }
             walk_scan_projections(left, &l, out);
             walk_scan_projections(right, &r, out);
+        }
+        LogicalPlan::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            if let Some(on) = on {
+                collect_expr_projections(on, &mut Needed::All, out);
+            }
+            walk_scan_projections(left, &Needed::All, out);
+            walk_scan_projections(right, &Needed::All, out);
         }
         LogicalPlan::Cte { query, body, .. } => {
             walk_scan_projections(query, &Needed::All, out);
             walk_scan_projections(body, needed, out);
         }
-        // DDL/DML never runs through the projection-aware read path; their
+        // DML/DDL never runs through the projection-aware read path; their
         // expressions' subquery plans are still analyzed (in full).
         LogicalPlan::Insert { rows, .. } => {
             for row in rows {
@@ -641,6 +742,15 @@ fn walk_scan_projections(
                     collect_expr_projections(e, &mut need, out);
                 }
             }
+        }
+        LogicalPlan::InsertSelect { query, .. } => {
+            walk_scan_projections(query, &Needed::All, out);
+        }
+        LogicalPlan::CreateTableAs { query, .. } => {
+            walk_scan_projections(query, &Needed::All, out);
+        }
+        LogicalPlan::Explain { plan } => {
+            walk_scan_projections(plan, &Needed::All, out);
         }
         LogicalPlan::Update {
             sets, predicate, ..
@@ -671,6 +781,9 @@ fn walk_scan_projections(
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::Use { .. }
         | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::ShowTables { .. }
+        | LogicalPlan::ShowDatabases
+        | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint => {}
     }
 }
@@ -765,6 +878,82 @@ pub(crate) fn win_output_schema(
 pub(crate) fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {
     // NaN sorts equal to itself here (grouping/display edge, not ORDER truth).
     x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// Subtract `by` from every column index in `expr` (used to rebase
+/// joined-space subexpressions onto a single join side).
+pub(crate) fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
+    match expr {
+        BoundExpr::Column { index, dtype } => BoundExpr::Column {
+            index: index - by,
+            dtype,
+        },
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => BoundExpr::InSubquery {
+            expr: Box::new(shift_columns(*expr, by)),
+            query,
+            negated,
+        },
+        BoundExpr::Cast { expr, dtype } => BoundExpr::Cast {
+            expr: Box::new(shift_columns(*expr, by)),
+            dtype,
+        },
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => BoundExpr::Case {
+            branches: branches
+                .into_iter()
+                .map(|(c, v)| (shift_columns(c, by), shift_columns(v, by)))
+                .collect(),
+            else_: else_.map(|e| Box::new(shift_columns(*e, by))),
+            dtype,
+        },
+        BoundExpr::Coalesce { args, dtype } => BoundExpr::Coalesce {
+            args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
+            dtype,
+        },
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => BoundExpr::Binary {
+            op,
+            left: Box::new(shift_columns(*left, by)),
+            right: Box::new(shift_columns(*right, by)),
+            dtype,
+        },
+        BoundExpr::Not(e) => BoundExpr::Not(Box::new(shift_columns(*e, by))),
+        BoundExpr::Negate { expr, dtype } => BoundExpr::Negate {
+            expr: Box::new(shift_columns(*expr, by)),
+            dtype,
+        },
+        BoundExpr::IsNull { expr, negated } => BoundExpr::IsNull {
+            expr: Box::new(shift_columns(*expr, by)),
+            negated,
+        },
+        BoundExpr::Scalar { func, args, dtype } => BoundExpr::Scalar {
+            func,
+            args: args.into_iter().map(|a| shift_columns(a, by)).collect(),
+            dtype,
+        },
+        BoundExpr::DynamicScalar { name, args, dtype } => BoundExpr::DynamicScalar {
+            name,
+            args: args
+                .into_vec()
+                .into_iter()
+                .map(|a| shift_columns(a, by))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            dtype,
+        },
+        leaf => leaf,
+    }
 }
 
 /// Output names/types of an Aggregate node (keys then aggs). Shared by the
