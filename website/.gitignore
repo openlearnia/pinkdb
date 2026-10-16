@@ -1,0 +1,2 @@
+# wrangler dev local state (miniflare cache, temp bundles)
+.wrangler/

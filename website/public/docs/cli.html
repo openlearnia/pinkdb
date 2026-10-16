@@ -7,7 +7,7 @@
 <meta name="description" content="The pinkdb REPL: dot-commands (.import, .save, .open, .lake, .install), scripting and exit codes, environment variables, and remote mode.">
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#0b0d17" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/cli.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -25,6 +25,67 @@
 <link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -32,6 +93,7 @@
   <div class="header-row">
     <a class="brand" href="../" aria-label="pinkdb home">
       <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <defs><linearGradient id="brand-grad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" class="brand-grad-a"/><stop offset="1" class="brand-grad-b"/></linearGradient></defs>
         <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
         <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
         <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
@@ -49,10 +111,16 @@
         <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
     <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
       <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
       <span class="header-gh-label">GitHub</span>
     </a>
+    </div>
   </div>
 </header>
 <main id="main">
@@ -436,6 +504,11 @@ warning instead of being silently ignored.</p>
   </div>
   <div class="footer-base">
     <p>Static, self-hosted type, no trackers, no cookies.</p>
+    <div class="theme-switch" role="group" aria-label="Colour theme" hidden>
+      <button type="button" data-theme-choice="system" aria-pressed="true">System</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
+    </div>
   </div>
 </footer>
 </body>

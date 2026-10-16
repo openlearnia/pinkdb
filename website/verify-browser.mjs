@@ -19,7 +19,8 @@
 //   - the design pass: the three self-hosted fonts load, headings use the
 //     display face, the top bar and sidebar mark the active page, margin
 //     notes render, all requests stay first-party, body text keeps a
-//     readable column;
+//     readable column; the theme toggle switches and persists, and the
+//     footer System choice resets it;
 //   - responsive: no horizontal overflow at 390px and 1280px on the landing
 //     page, a docs page, the extensions page and the Worker info page;
 //   - reduced motion: animations (the loading spinner) short-circuit;
@@ -427,6 +428,33 @@ try {
   check(docsPage.marginalia, "docs pages carry margin notes");
   check(docsPage.fontHosts.length === 1 && docsPage.fontHosts[0] === docsHost,
     "webfonts are served from the docs origin itself", docsPage.fontHosts.join(", "));
+
+  // Theme controls: the header toggle pins the opposite theme (and it
+  // survives a reload); the footer "System" choice clears it again.
+  await cdp.evaluate(`localStorage.removeItem("pinkdb-theme")`);
+  await cdp.navigate(`${DOCS}/docs/sql`);
+  const themeBefore = await cdp.evaluate(`(() => ({
+    bg: getComputedStyle(document.body).backgroundColor,
+    visible: !document.querySelector("[data-theme-toggle]").hidden,
+  }))()`);
+  await cdp.evaluate(`document.querySelector("[data-theme-toggle]").click()`);
+  await cdp.navigate(`${DOCS}/docs/sql`);
+  const themeAfter = await cdp.evaluate(`(() => ({
+    bg: getComputedStyle(document.body).backgroundColor,
+    pinned: document.documentElement.getAttribute("data-theme"),
+  }))()`);
+  await cdp.evaluate(`document.querySelector('[data-theme-choice="system"]').click()`);
+  const themeReset = await cdp.evaluate(`(() => ({
+    bg: getComputedStyle(document.body).backgroundColor,
+    pinned: document.documentElement.getAttribute("data-theme"),
+    stored: localStorage.getItem("pinkdb-theme"),
+  }))()`);
+  check(themeBefore.visible, "the theme toggle is shown when scripts run");
+  check(Boolean(themeAfter.pinned) && themeAfter.bg !== themeBefore.bg,
+    "the theme toggle switches the palette and persists across a reload",
+    JSON.stringify({ themeBefore, themeAfter }));
+  check(themeReset.pinned === null && themeReset.stored === null && themeReset.bg === themeBefore.bg,
+    "the footer System choice returns to the OS theme", JSON.stringify(themeReset));
 
   // ------------------------------------------------------ responsive pass
 

@@ -68,8 +68,10 @@ function check(ok, label, detail) {
 }
 
 function extractScript(page) {
+  // The catalog script is the page's first bare <script>; other inline
+  // scripts (the theme script in <head>) carry attributes.
   const open = page.indexOf("<script>");
-  const close = page.indexOf("</scr" + "ipt>");
+  const close = page.indexOf("</scr" + "ipt>", open);
   if (open === -1 || close === -1 || close < open) return null;
   return page.slice(open + "<script>".length, close);
 }
@@ -408,8 +410,9 @@ if (existsSync(cssPath)) {
   }
   check(css.includes("--bg:") && css.includes("--text:") && css.includes("--accent:"),
     "stylesheet defines the bg/text/accent colour tokens");
-  check(/@media \(prefers-color-scheme: dark\)\s*\{\s*:root/.test(css),
-    "stylesheet ships a dark colour scheme");
+  check(/--bg:\s*light-dark\(/.test(css) && css.includes(':root[data-theme="dark"]') &&
+      css.includes(':root[data-theme="light"]'),
+    "stylesheet ships light-dark() tokens with a data-theme override");
   check(/font-variant-numeric:\s*tabular-nums/.test(css),
     "data surfaces use tabular numerals");
   check(css.includes("prefers-reduced-motion"),
@@ -466,6 +469,14 @@ check(
     readFileSync(join(SITE, "docs", "sql.html"), "utf8").includes('class="toc"'),
   "docs pages carry previous/next links and the on-this-page TOC",
 );
+{
+  const page = readFileSync(join(SITE, "docs", "sql.html"), "utf8");
+  check(
+    page.includes("<script data-theme-script>") && page.includes("data-theme-toggle") &&
+      page.includes('data-theme-choice="system"'),
+    "pages carry the theme script, the header toggle and the footer System/Light/Dark switch",
+  );
+}
 check(
   readFileSync(join(SITE, "404.html"), "utf8").includes("404 — page not found"),
   "404 page is branded and self-describing",

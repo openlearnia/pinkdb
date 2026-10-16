@@ -10,14 +10,25 @@ catalog fetched at runtime from the repository Worker
 
 ## Design
 
-A clean product-docs look: neutral surfaces, one pink brand accent (`--accent`),
-and light **and** dark colour schemes driven purely by `prefers-color-scheme`
-(no theme script). All colours are tokens at the top of `src/assets/style.css`
-(`--bg`, `--surface`, `--border`, `--text`, `--accent`, the callout tones and the
-`--tok-*` syntax colours), redefined once in the dark-scheme block.
+A clean product-docs look on cool slate neutrals: **pink** is the brand
+(`--accent`: primary buttons, active states, the logo, highlights) and **indigo**
+is the second colour (`--link`: links, info callouts, code functions, focus
+rings). Every colour token at the top of `src/assets/style.css` is a
+`light-dark(<light>, <dark>)` pair, and every text pairing meets WCAG AA in both
+schemes.
+
+**Theme switching.** By default the page follows the OS (`color-scheme: light
+dark`). A small inline script in `layout.html` (`<script data-theme-script>`)
+lets visitors pin a theme: the sun/moon button in the header flips light/dark,
+and the System / Light / Dark switch in the footer can return to the OS
+setting. The choice is stored in `localStorage` (`pinkdb-theme`) and applied as
+`data-theme` on `<html>` before first paint, which sets `color-scheme` and so
+flips every token. Without JavaScript both controls stay hidden and the site
+simply follows the OS.
 
 - **Header** — sticky, translucent; brand, the `TOPNAV` sections (Docs, Guides,
-  API, Extensions, Roadmap) with the current section underlined, and GitHub.
+  API, Extensions, Roadmap) with the current section underlined, the theme
+  toggle, and GitHub.
 - **Docs pages** — three columns on wide screens: sticky sidebar, a ~46rem
   article column, and the "on this page" rail (≥80rem). Each article gets a
   section eyebrow, permalinked `<h2>`s, previous/next links in sidebar order and
@@ -190,11 +201,13 @@ wrangler deploy --dry-run --outdir <scratch-dir>
 - Content links to `github.com/openlearnia/pinkdb` are fine; do not add external
   stylesheets, scripts or image assets. Fonts live in `src/assets/fonts/`
   (self-hosted, OFL, licence texts committed) and are the only binary assets
-  besides the generated favicon/OG images. The one deliberate exception to
-  "no scripts" is `pages/extensions.html`, whose inline script fetches the
-  extension catalog from the repository Worker (which sends CORS `*`) and renders
-  it with the site's own CSS classes; keep that script inline too, and keep it the
-  page's first `<script>` (the verifier lifts its pure section).
+  besides the generated favicon/OG images. Scripts are inline only (never
+  `<script src>`), and there are just two: the theme script in `layout.html`
+  (on every page; it carries the `data-theme-script` attribute) and the
+  catalog script in `pages/extensions.html`, which fetches the extension catalog
+  from the repository Worker (which sends CORS `*`) and renders it with the
+  site's own CSS classes. Keep the catalog script the page's first *bare*
+  `<script>` (no attributes): the verifier lifts its pure section.
 - Diagrams are inline SVG (`<svg>` with `sk-*` classes defined in
   `style.css`, coloured from the theme tokens so they follow dark mode) — no
   image files, and they scale/scroll instead of breaking the layout.
