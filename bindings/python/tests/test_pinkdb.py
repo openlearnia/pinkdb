@@ -583,15 +583,25 @@ class SharedHandleTests(unittest.TestCase):
                 self.assertEqual(failures, [])
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM t;")[0].rows, [[400]])
 
-    def test_a_durable_file_has_one_live_handle(self):
+    def test_a_durable_file_allows_multiple_handles(self):
+        # Multi-process writers (wave 45m): any number of handles may open a
+        # durable file; writers serialize on the write lease and every handle
+        # refreshes at statement boundaries.
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "locked.pink"
-            with pinkdb.connect(path):
-                with self.assertRaises(pinkdb.Error) as ctx:
-                    pinkdb.connect(path)
-                self.assertIn("already open", str(ctx.exception))
-            # Closing releases the lock.
-            pinkdb.connect(path).close()
+            path = Path(tmp) / "shared.pink"
+            first = pinkdb.connect(path)
+            second = pinkdb.connect(path)
+            try:
+                first.execute("CREATE TABLE t (x INTEGER);")
+                first.execute("INSERT INTO t VALUES (1);")
+                second.execute("INSERT INTO t VALUES (2);")
+                # The second handle refreshes and sees the first handle's row.
+                self.assertEqual(
+                    second.execute("SELECT COUNT(*) FROM t;")[0].rows, [[2]]
+                )
+            finally:
+                first.close()
+                second.close()
 
 
 class EnvOverrideTests(unittest.TestCase):

@@ -887,9 +887,10 @@ for r in 1 2 3; do
     note "round $r launched (3 simultaneous writers)"
 done
 
-for f in "$TMP"/conc_r*_w*.exit; do
-    assert_status_zero "$f" "$(cat "$f")"
-done
+# The save outcome (a version claim, or the documented write conflict) is
+# classified below together with the exit code that belongs to it: since
+# wave 40b the CLI exits 1 after a failed statement in a piped script, so a
+# losing racer is expected to exit nonzero — and it must say why.
 for f in "$TMP"/conc_r*_w*.log; do
     assert_contains "$f" "Imported $WROWS rows"
 done
@@ -912,13 +913,23 @@ for log in logs:
     text = open(log, encoding="utf-8", errors="replace").read()
     saved = [int(v) for v in re.findall(r"^Saved lake version (\d+)\b", text, re.M)]
     errors = [l for l in text.splitlines() if l.startswith("Error:")]
+    try:
+        code = int(open(log[:-3] + "exit", encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        problems.append(f"{name}: missing or unreadable exit status")
+        continue
     if len(saved) == 1 and not errors:
+        if code != 0:
+            problems.append(f"{name}: published a version but exited {code}")
+            continue
         claims.setdefault(saved[0], []).append(name)
     elif not saved and len(errors) == 1:
         message = errors[0]
         if "write conflict at" not in message or not any(p in message for p in conflict_forms):
             problems.append(f"{name}: save failed without the documented conflict: {message}")
         else:
+            if code == 0:
+                problems.append(f"{name}: documented conflict but exited 0")
             conflicts.append((name, message))
     else:
         problems.append(f"{name}: expected exactly one save outcome, got saved={saved} errors={errors}")

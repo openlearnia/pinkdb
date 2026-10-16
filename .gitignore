@@ -1,6 +1,8 @@
 /target/
 *.pink
 !crates/pinkdb/tests/fixtures/*.pink
+# Lake fixture data files (their catalog/snapshot JSONs are tracked normally).
+!crates/pink-lake/tests/fixtures/**/*.pink
 *.csv
 .DS_Store
 __pycache__/
