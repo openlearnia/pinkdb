@@ -305,7 +305,7 @@ pub(crate) fn optimistic_eligible(plan: &LogicalPlan) -> bool {
 /// what it touches.
 pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::wal::FrameSets) {
     match plan {
-        LogicalPlan::CreateDatabase { name } | LogicalPlan::DropDatabase { name } => {
+        LogicalPlan::CreateDatabase { name, .. } | LogicalPlan::DropDatabase { name, .. } => {
             out.add_database(name);
             return;
         }

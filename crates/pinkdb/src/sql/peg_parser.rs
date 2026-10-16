@@ -731,6 +731,7 @@ peg::parser! {
                   Expr::Function {
                       name: "extract".to_string(),
                       args: vec![Expr::Literal(Value::Varchar(part)), e],
+                      distinct: false,
                   }
               }
 
@@ -2258,7 +2259,7 @@ mod tests {
 
     #[test]
     fn extract_call_desugars_to_function() {
-        let Expr::Function { name, args } =
+        let Expr::Function { name, args, .. } =
             projection_expr(parse_one("SELECT extract(year FROM d);"))
         else {
             panic!()

@@ -257,7 +257,7 @@ fn eval_partition(
     }
     let mut out = Vec::with_capacity(seq.len());
     let frame_value =
-        |pos: usize, seq: &[usize], first: bool| match frame_range(&w.frame, pos, seq.len()) {
+        |pos: usize, seq: &[usize], first: bool| match frame_range(&w.frame, pos, seq, rows, w) {
             Some((lo, hi)) => {
                 let k = if first { lo } else { hi };
                 rows[seq[k]].arg.clone().unwrap_or(Value::Null)
