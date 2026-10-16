@@ -1,0 +1,140 @@
+<h1>Go API</h1>
+
+<p class="doc-meta">The pinkdb Go binding is a thin <code>cgo</code> wrapper over the C
+ABI v1 (<code>bindings/go</code>, module
+<code>github.com/openlearnia/pinkdb/bindings/go</code>). No third-party
+dependencies — the Go standard library only.</p>
+
+<h2>Setup</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi</code></pre>
+
+<p>The <code>#cgo</code> directives resolve the ABI header and
+<code>target/release</code> relative to the package, so a repo checkout needs no
+environment variables at build or run time.</p>
+
+<pre class="code" data-lang="go"><code>import pinkdb "github.com/openlearnia/pinkdb/bindings/go"
+
+db, err := pinkdb.OpenMemory() // or pinkdb.Open("data.pink")
+if err != nil {
+    panic(err)
+}
+defer db.Close()
+
+results, err := db.Execute(
+    "CREATE TABLE t (x INTEGER, s VARCHAR);" +
+        "INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);" +
+        "SELECT x, s FROM t ORDER BY x;")
+if err != nil {
+    panic(err)
+}
+fmt.Println(results[2].Kind, results[2].Rows) // selected [[1 héllo] [&lt;nil&gt; &lt;nil&gt;]]</code></pre>
+
+<h2>Functions</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>Open(path string) (*DB, error)</code></td>
+      <td>Open a durable database (checkpoint + WAL) at <code>path</code>.</td>
+    </tr>
+    <tr>
+      <td><code>OpenMemory() (*DB, error)</code></td>
+      <td>Open a fresh, empty in-memory database.</td>
+    </tr>
+    <tr>
+      <td><code>(*DB).Execute(sql string) ([]Result, error)</code></td>
+      <td>Run one or more <code>;</code>-separated statements; one
+      <code>Result</code> per statement.</td>
+    </tr>
+    <tr>
+      <td><code>(*DB).Close()</code></td>
+      <td>Free the native handle. Idempotent; a second call is a no-op.</td>
+    </tr>
+    <tr>
+      <td><code>(*DB).ABI() uint32</code></td>
+      <td>ABI version reported by the linked library (1); stays callable after
+      <code>Close</code>.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>Both open functions check <code>pinkdb_abi_version()</code> first: a library that
+is not ABI 1 fails with an error naming both versions. <code>Open</code> rejects an
+empty path or one containing a NUL byte before any native call. SQL that is not valid
+UTF-8 fails with <code>SQL is not valid UTF-8</code> and leaves the handle
+usable.</p>
+
+<h2><code>Result</code></h2>
+
+<ul>
+  <li><code>Kind</code>: <code>selected</code>, <code>created</code>,
+  <code>inserted</code>, <code>updated</code>, <code>deleted</code>,
+  <code>began</code>, <code>committed</code>, <code>rolledback</code>,
+  <code>created_view</code>, <code>dropped_table</code>,
+  <code>dropped_view</code>, <code>created_database</code>,
+  <code>dropped_database</code>, <code>used</code>,
+  <code>loaded_extension</code>.</li>
+  <li><code>Columns</code> / <code>ColumnTypes</code> (SELECT only; types
+  <code>boolean</code>, <code>integer</code>, <code>bigint</code>,
+  <code>double</code>, <code>varchar</code>, <code>date</code>,
+  <code>timestamp</code>), <code>Rows</code>.</li>
+  <li><code>Affected</code> (INSERT/UPDATE/DELETE row count) and <code>Name</code>
+  (view/table/database/<code>USE</code> name, or the extension name for
+  <code>LOAD EXTENSION</code>; empty string when absent).</li>
+</ul>
+
+<h3>Value mapping</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>pinkdb type</th><th>Go value</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>NULL</code></td><td><code>nil</code></td><td>for any column type</td></tr>
+    <tr><td><code>BOOLEAN</code></td><td><code>bool</code></td><td></td></tr>
+    <tr><td><code>INTEGER</code></td><td><code>int64</code></td><td>32-bit range, widened</td></tr>
+    <tr><td><code>BIGINT</code></td><td><code>int64</code></td><td></td></tr>
+    <tr><td><code>DOUBLE</code></td><td><code>float64</code></td><td>bit-exact: <code>-0.0</code>, NaN and infinities survive</td></tr>
+    <tr><td><code>VARCHAR</code></td><td><code>string</code></td><td>decoded from <code>text_ptr</code> + <code>text_len</code>, so embedded NULs and empty strings are preserved</td></tr>
+    <tr><td><code>DATE</code></td><td><code>time.Time</code></td><td>UTC midnight; days since the Unix epoch</td></tr>
+    <tr><td><code>TIMESTAMP</code></td><td><code>time.Time</code></td><td>UTC; microseconds since the epoch; pre-epoch instants exact</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Errors and thread safety</h2>
+
+<ul>
+  <li>Native errors are returned verbatim (the message from
+  <code>pinkdb_last_error</code>) and leave the handle usable. After
+  <code>Close</code>, <code>Execute</code> fails fast with
+  <code>ErrClosed</code> instead of touching freed memory.</li>
+  <li><code>DB</code> serializes every native call behind a <code>sync.Mutex</code>,
+  so one <code>*DB</code> may be shared between goroutines and each
+  <code>Execute</code> is atomic with respect to the others. (The C handle itself is
+  single-threaded; the native call and the error read are pinned to one OS thread,
+  and result materialization happens after the thread is released.)</li>
+  <li><code>Close</code> is idempotent; <code>ABI()</code> is library-wide and stays
+  callable after close.</li>
+</ul>
+
+<h2>Testing</h2>
+
+<pre class="code" data-lang="sh"><code>cd bindings/go
+gofmt -l .        # must print nothing
+go vet ./...
+go test ./...</code></pre>
+
+<p class="doc-meta">Known limitation: ABI v1 reports column and object/session names
+as NUL-terminated C strings, so an identifier containing a NUL byte is truncated in
+<code>Columns</code>/<code>Name</code> (the engine keeps the full name internally).
+Avoid NUL bytes in identifiers until the engine-level fix lands.</p>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/api-c.html">C API →</a></li>
+  <li><a href="{{root}}docs/api-python.html">Python API →</a></li>
+  <li><a href="{{root}}docs/guide-embedding.html">Guide: embedding →</a></li>
+</ul>

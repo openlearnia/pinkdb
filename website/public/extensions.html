@@ -4,19 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Extensions — pinkdb</title>
-<meta name="description" content="The pinkdb extension repository: browse published extension artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
+<meta name="description" content="The pinkdb extension catalog: browse published artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#F7F1E8">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/extensions.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
 <meta property="og:title" content="Extensions — pinkdb">
-<meta property="og:description" content="The pinkdb extension repository: browse published extension artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
+<meta property="og:description" content="The pinkdb extension catalog: browse published artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
 <meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/extensions.html">
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, lake.">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="assets/favicon.png" sizes="64x64" type="image/png">
@@ -32,15 +32,6 @@
     <a class="brand" href="./"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
     <nav class="site-nav" aria-label="Site">
       <ul>
-        <li><a href="./">Home</a></li>
-        <li><a href="docs/getting-started">Getting started</a></li>
-        <li><a href="docs/sql">SQL</a></li>
-        <li><a href="docs/cli">CLI</a></li>
-        <li><a href="docs/server">Server</a></li>
-        <li><a href="docs/persistence">Persistence</a></li>
-        <li><a href="docs/bindings">Bindings</a></li>
-        <li><a href="docs/architecture">Architecture</a></li>
-        <li><a href="docs/roadmap">Roadmap</a></li>
         <li><a href="extensions" class="active" aria-current="page">Extensions</a></li>
         <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
       </ul>
@@ -48,7 +39,59 @@
   </div>
 </header>
 <main id="main">
-  <div class="container">
+<div class="container docs-shell">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="docs/getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="docs/guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="docs/guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="docs/guide-encryption">Encrypted databases</a></li>
+<li><a href="docs/guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="docs/guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="docs/cli">CLI &amp; REPL</a></li>
+<li><a href="docs/sql">SQL</a></li>
+<li><a href="docs/persistence">Persistence</a></li>
+<li><a href="docs/lake">Lake</a></li>
+<li><a href="docs/server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="docs/bindings">Bindings overview</a></li>
+<li><a href="docs/api-rust">Rust</a></li>
+<li><a href="docs/api-c">C</a></li>
+<li><a href="docs/api-python">Python</a></li>
+<li><a href="docs/api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="docs/extensions">Using extensions</a></li>
+<li><a href="extensions" class="active" aria-current="page">Extension catalog</a></li>
+<li><a href="docs/roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
 <!-- Catalog UI ported from the repository Worker's former `/` page
      (ext-repo/worker/src/index.js). The catalog is fetched client-side,
      cross-origin, from the repository Worker; the pure helper section
@@ -726,13 +769,15 @@
 })();
 </script>
 
-  </div>
+</article>
+
+</div>
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust. Docs track ROADMAP.md (Oct 2026).</p>
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
     <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="./">Home</a> · <a href="docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+    <p><a href="docs/getting-started">Docs</a> · <a href="extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

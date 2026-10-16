@@ -407,7 +407,7 @@ try {
 
   await cdp.navigate(`${DOCS}/docs/sql`);
   const docsPage = await cdp.evaluate(`(() => {
-    const active = document.querySelector(".site-nav a.active");
+    const active = document.querySelector(".sidebar a.active");
     const paragraph = document.querySelector("main p");
     return {
       active: active ? active.textContent : null,
@@ -437,7 +437,7 @@ try {
     });
     for (const [label, url] of [
       ["landing page", `${DOCS}/`],
-      ["docs page", `${DOCS}/docs/architecture`],
+      ["docs page", `${DOCS}/docs/sql`],
       ["extensions page", `${DOCS}/extensions`],
       ["repository info page", `${REPO}/`],
     ]) {

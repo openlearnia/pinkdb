@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>C API — pinkdb</title>
+<meta name="description" content="The pinkdb C ABI v1: pinkdb_open, pinkdb_execute, typed result accessors, statement-kind and type tags, and the ownership and threading contract.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/api-c.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="C API — pinkdb">
+<meta property="og:description" content="The pinkdb C ABI v1: pinkdb_open, pinkdb_execute, typed result accessors, statement-kind and type tags, and the ownership and threading contract.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/api-c.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c" class="active" aria-current="page">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>C API</h1>
+
+<p class="doc-meta">The pinkdb C ABI v1, exported by <code>pinkdb-ffi</code> as
+<code>libpinkdb_ffi.dylib</code> / <code>libpinkdb_ffi.a</code>. The header is
+<code>crates/pinkdb-ffi/include/pinkdb.h</code> and is the complete contract; this
+page mirrors it.</p>
+
+<h2 id="build-and-link">Build and link</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi     # cdylib + staticlib into target/release/
+make -C crates/pinkdb-ffi hello         # compiles and runs the C example</code></pre>
+
+<p>Link with <code>-lpinkdb_ffi</code> and include
+<code>crates/pinkdb-ffi/include/pinkdb.h</code>. The header is plain C99 and C++
+safe (<code>extern "C"</code> guards).</p>
+
+<h2 id="types">Types</h2>
+
+<pre class="code" data-lang="c"><code>typedef struct pinkdb_handle pinkdb_handle;   /* opaque */
+typedef struct pinkdb_result pinkdb_result;   /* opaque */
+
+/* One result value, passed by value. `int64` carries BOOLEAN (0/1), INTEGER,
+ * BIGINT, DATE (days since epoch) and TIMESTAMP (microseconds since epoch).
+ * `double_` carries DOUBLE. `text_ptr`/`text_len` carry VARCHAR (with a
+ * trailing NUL at text_ptr[text_len]). When `is_null` is non-zero only
+ * `type_tag` is meaningful. */
+typedef struct pink_value {
+    int32_t type_tag;
+    int32_t is_null;
+    int64_t int64;
+    double double_;
+    const char *text_ptr;
+    size_t text_len;
+} pink_value;</code></pre>
+
+<h2 id="functions">Functions</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>uint32_t pinkdb_abi_version(void)</code></td>
+      <td>ABI version of the linked library (currently <strong>1</strong>).</td>
+    </tr>
+    <tr>
+      <td><code>pinkdb_handle *pinkdb_open(const char *path)</code></td>
+      <td>Open a durable database (checkpoint + WAL) at a filesystem path. Returns
+      <code>NULL</code> on error.</td>
+    </tr>
+    <tr>
+      <td><code>pinkdb_handle *pinkdb_open_memory(void)</code></td>
+      <td>Open a fresh, empty in-memory database. Never returns
+      <code>NULL</code>.</td>
+    </tr>
+    <tr>
+      <td><code>void pinkdb_close(pinkdb_handle *handle)</code></td>
+      <td>Close a handle. <code>NULL</code>-safe.</td>
+    </tr>
+    <tr>
+      <td><code>pinkdb_result *pinkdb_execute(pinkdb_handle *handle, const char *sql, size_t sql_len)</code></td>
+      <td>Execute one or more <code>;</code>-separated SQL statements. Returns
+      <code>NULL</code> on error; free with <code>pinkdb_result_free</code>.</td>
+    </tr>
+    <tr>
+      <td><code>void pinkdb_result_free(pinkdb_result *result)</code></td>
+      <td>Free a result. <code>NULL</code>-safe.</td>
+    </tr>
+    <tr>
+      <td><code>size_t pinkdb_result_statement_count(const pinkdb_result *result)</code></td>
+      <td>Number of statements in the result.</td>
+    </tr>
+    <tr>
+      <td><code>int32_t pinkdb_result_kind(const pinkdb_result *result, size_t statement)</code></td>
+      <td>Statement kind (<code>PINKDB_STMT_*</code>), <code>-1</code> when out of
+      range.</td>
+    </tr>
+    <tr>
+      <td><code>size_t pinkdb_result_column_count(const pinkdb_result *result, size_t statement)</code></td>
+      <td>SELECT results: column count, else 0.</td>
+    </tr>
+    <tr>
+      <td><code>const char *pinkdb_result_column_name(const pinkdb_result *result, size_t statement, size_t column)</code></td>
+      <td>SELECT results: column name (NUL-terminated), <code>NULL</code> when out
+      of range.</td>
+    </tr>
+    <tr>
+      <td><code>int32_t pinkdb_result_column_type(const pinkdb_result *result, size_t statement, size_t column)</code></td>
+      <td>SELECT results: column type tag (<code>PINKDB_TYPE_*</code>),
+      <code>-1</code> when out of range.</td>
+    </tr>
+    <tr>
+      <td><code>size_t pinkdb_result_row_count(const pinkdb_result *result, size_t statement)</code></td>
+      <td>SELECT results: row count, else 0.</td>
+    </tr>
+    <tr>
+      <td><code>pink_value pinkdb_result_value(const pinkdb_result *result, size_t statement, size_t row, size_t column)</code></td>
+      <td>SELECT results: the value at (statement, row, column); a NULL value when
+      out of range or when the statement is not a SELECT.</td>
+    </tr>
+    <tr>
+      <td><code>size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement)</code></td>
+      <td>INSERT/UPDATE/DELETE results: affected row count, else 0.</td>
+    </tr>
+    <tr>
+      <td><code>const char *pinkdb_result_name(const pinkdb_result *result, size_t statement)</code></td>
+      <td>CREATE/DROP VIEW/TABLE/DATABASE, <code>USE</code> and
+      <code>LOAD EXTENSION</code> results: the object/session/extension name
+      (NUL-terminated), else <code>NULL</code>.</td>
+    </tr>
+    <tr>
+      <td><code>const char *pinkdb_last_error(void)</code></td>
+      <td>Last error on the calling thread (NUL-terminated), or <code>NULL</code>
+      when the last call on this thread succeeded. Valid until the next FFI call on
+      this thread.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="statement-kinds">Statement kinds</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th class="num">Tag</th><th>Constant</th><th class="num">Tag</th><th>Constant</th></tr></thead>
+  <tbody>
+    <tr><td class="num">0</td><td><code>PINKDB_STMT_SELECTED</code></td><td class="num">8</td><td><code>PINKDB_STMT_CREATED_VIEW</code></td></tr>
+    <tr><td class="num">1</td><td><code>PINKDB_STMT_CREATED</code></td><td class="num">9</td><td><code>PINKDB_STMT_DROPPED_TABLE</code></td></tr>
+    <tr><td class="num">2</td><td><code>PINKDB_STMT_INSERTED</code></td><td class="num">10</td><td><code>PINKDB_STMT_DROPPED_VIEW</code></td></tr>
+    <tr><td class="num">3</td><td><code>PINKDB_STMT_UPDATED</code></td><td class="num">11</td><td><code>PINKDB_STMT_CREATED_DATABASE</code></td></tr>
+    <tr><td class="num">4</td><td><code>PINKDB_STMT_DELETED</code></td><td class="num">12</td><td><code>PINKDB_STMT_DROPPED_DATABASE</code></td></tr>
+    <tr><td class="num">5</td><td><code>PINKDB_STMT_BEGAN</code></td><td class="num">13</td><td><code>PINKDB_STMT_USED</code></td></tr>
+    <tr><td class="num">6</td><td><code>PINKDB_STMT_COMMITTED</code></td><td class="num">14</td><td><code>PINKDB_STMT_LOADED_EXTENSION</code></td></tr>
+    <tr><td class="num">7</td><td><code>PINKDB_STMT_ROLLEDBACK</code></td><td class="num">15</td><td><code>PINKDB_STMT_CHECKPOINTED</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Type tags: <code>PINKDB_TYPE_NULL</code> 0, <code>BOOLEAN</code> 1,
+<code>INTEGER</code> 2, <code>BIGINT</code> 3, <code>DOUBLE</code> 4,
+<code>VARCHAR</code> 5, <code>DATE</code> 6, <code>TIMESTAMP</code> 7.</p>
+
+<h2 id="contract">Contract</h2>
+
+<ul>
+  <li><strong>Ownership.</strong> Every pointer returned by the library is freed
+  with the matching function (<code>pinkdb_result_free</code>,
+  <code>pinkdb_close</code>); never free the same pointer twice.</li>
+  <li><strong>Text lifetimes.</strong> Text pointers borrow from their owning
+  result/handle/thread and stay valid only until that owner is freed or the next FFI
+  call on the same thread — copy them if you need them longer.
+  <code>text_ptr</code> is followed by a NUL byte but may contain embedded NULs:
+  always trust <code>text_len</code>.</li>
+  <li><strong>Threading.</strong> Handles are <strong>not thread-safe</strong>;
+  never call into one handle from two threads at once (serialize calls, e.g. with a
+  mutex — the Python and Go bindings do). Errors are thread-local.</li>
+  <li><strong>SQL input.</strong> Passed as (pointer, length) and must be valid
+  UTF-8. A NULL pointer with a non-zero length, or invalid UTF-8, is an error.</li>
+  <li><strong>Error reporting.</strong> Functions returning a pointer return
+  <code>NULL</code> on failure; index/kind accessors return 0/-1 for out-of-range;
+  read <code>pinkdb_last_error()</code> for the message.</li>
+  <li><strong>Durability.</strong> <code>pinkdb_open</code> opens the embedded
+  durable path — the same WAL, checkpoint and multi-process write-lease machinery as
+  the CLI (see <a href="../docs/persistence">Persistence</a>).</li>
+</ul>
+
+<h2 id="example">Example</h2>
+
+<pre class="code" data-lang="c"><code>#include "pinkdb.h"
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+
+int main(void) {
+    pinkdb_handle *db = pinkdb_open_memory();
+    const char *sql =
+        "CREATE TABLE t (id BIGINT, name VARCHAR);"
+        "INSERT INTO t VALUES (1, 'one'), (2, NULL);"
+        "SELECT id, name FROM t ORDER BY id;";
+
+    pinkdb_result *result = pinkdb_execute(db, sql, strlen(sql));
+    if (!result) { fprintf(stderr, "%s\n", pinkdb_last_error()); return 1; }
+
+    const size_t stmt = 2;  /* the SELECT */
+    size_t rows = pinkdb_result_row_count(result, stmt);
+    printf("%zu rows\n", rows);
+    for (size_t r = 0; r &lt; rows; r++) {
+        pink_value id = pinkdb_result_value(result, stmt, r, 0);
+        pink_value name = pinkdb_result_value(result, stmt, r, 1);
+        printf("%lld %.*s\n", (long long)id.int64,
+               (int)name.text_len, name.text_ptr ? name.text_ptr : "");
+    }
+
+    pinkdb_result_free(result);
+    pinkdb_close(db);
+    return 0;
+}</code></pre>
+
+<p class="doc-meta">Not exposed through the C ABI today: at-rest encryption keys
+(<code>pinkdb_open</code> takes only a path) and extension installation. Use the
+Rust API or the CLI for encrypted databases; a column identifier containing a NUL
+byte is truncated in the names this ABI reports back (the engine keeps the full
+name).</p>
+
+<ul class="next-links">
+  <li><a href="../docs/bindings">Bindings overview →</a></li>
+  <li><a href="../docs/api-python">Python API →</a></li>
+  <li><a href="../docs/api-go">Go API →</a></li>
+</ul>
+
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#build-and-link">Build and link</a></li>
+  <li><a href="#types">Types</a></li>
+  <li><a href="#functions">Functions</a></li>
+  <li><a href="#statement-kinds">Statement kinds</a></li>
+  <li><a href="#contract">Contract</a></li>
+  <li><a href="#example">Example</a></li>
+</ul>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Python API — pinkdb</title>
+<meta name="description" content="The pinkdb Python binding: connect(), connect_memory(), Database.execute(), Result fields, value mapping, and error handling.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/api-python.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Python API — pinkdb">
+<meta property="og:description" content="The pinkdb Python binding: connect(), connect_memory(), Database.execute(), Result fields, value mapping, and error handling.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/api-python.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python" class="active" aria-current="page">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Python API</h1>
+
+<p class="doc-meta">The pinkdb Python binding is a thin wrapper over the C ABI,
+implemented with the standard library <code>ctypes</code> module — no
+<code>cffi</code>, no pip installs, no build step for the package itself.</p>
+
+<h2 id="setup">Setup</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi</code></pre>
+
+<p>Importing <code>pinkdb</code> finds the shared library in this order: the
+<code>PINKDB_FFI_LIB</code> environment variable (a full path to the
+<code>libpinkdb_ffi.dylib</code> / <code>.so</code> / <code>.dll</code>), then the
+repo-relative <code>target/release/</code>. A missing library, a library without the
+pinkdb symbols, or an ABI version other than 1 raises
+<code>pinkdb.Error</code>.</p>
+
+<pre class="code" data-lang="python"><code>import pinkdb
+
+with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
+    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+    db.execute("INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);")
+
+    result = db.execute("SELECT x, s FROM t ORDER BY x;")[0]
+    print(result.kind)          # 'selected'
+    print(result.columns)       # ['x', 's']
+    print(result.column_types)  # ['integer', 'varchar']
+    print(result.rows)          # [[1, 'héllo'], [None, None]]</code></pre>
+
+<h2 id="functions">Functions</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>connect(path)</code></td>
+      <td>Open a durable database (checkpoint + WAL) at <code>path</code>
+      (<code>str</code>, <code>bytes</code> or <code>os.PathLike</code>). Returns a
+      <code>Database</code>.</td>
+    </tr>
+    <tr>
+      <td><code>connect_memory()</code></td>
+      <td>Open a fresh, empty in-memory database.</td>
+    </tr>
+    <tr>
+      <td><code>abi_version()</code></td>
+      <td>ABI version reported by the loaded library (currently
+      <code>1</code>).</td>
+    </tr>
+    <tr>
+      <td><code>library_path</code></td>
+      <td>Path of the loaded <code>libpinkdb_ffi</code> shared library.</td>
+    </tr>
+    <tr>
+      <td><code>Error</code></td>
+      <td>The exception type for every native failure.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="database"><code>Database</code></h2>
+
+<ul>
+  <li><code>execute(sql)</code> — run one or more <code>;</code>-separated
+  statements; returns a list of <code>Result</code>, one per statement. Raises
+  <code>Error</code> (from <code>pinkdb_last_error</code>) if a statement fails; the
+  handle stays usable afterwards.</li>
+  <li><code>close()</code> — free the native handle; idempotent. The class is a
+  context manager (<code>with pinkdb.connect(…) as db:</code>) and
+  <code>__del__</code> is safe.</li>
+  <li>Handles cannot be copied: <code>copy.copy</code> / <code>copy.deepcopy</code>
+  raise <code>TypeError</code>; pickling fails safely.</li>
+  <li><strong>Threading:</strong> the C handle is not thread-safe, so
+  <code>Database</code> serializes every call behind an internal lock (ctypes
+  releases the GIL during native calls). Sharing one <code>Database</code> across
+  threads is safe; opening the same file from several threads is not needed.</li>
+</ul>
+
+<h2 id="result"><code>Result</code></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Attribute</th><th>Contents</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>kind</code></td>
+      <td>one of <code>selected</code>, <code>created</code>, <code>inserted</code>,
+      <code>updated</code>, <code>deleted</code>, <code>began</code>,
+      <code>committed</code>, <code>rolledback</code>, <code>created_view</code>,
+      <code>dropped_table</code>, <code>dropped_view</code>,
+      <code>created_database</code>, <code>dropped_database</code>,
+      <code>used</code>, <code>loaded_extension</code>,
+      <code>checkpointed</code></td>
+    </tr>
+    <tr>
+      <td><code>columns</code> / <code>column_types</code></td>
+      <td>SELECT column names and types (<code>boolean</code>,
+      <code>integer</code>, <code>bigint</code>, <code>double</code>,
+      <code>varchar</code>, <code>date</code>, <code>timestamp</code>)</td>
+    </tr>
+    <tr>
+      <td><code>rows</code></td>
+      <td>SELECT rows as Python values (mapping below)</td>
+    </tr>
+    <tr>
+      <td><code>affected</code></td>
+      <td>row count for INSERT/UPDATE/DELETE, else 0</td>
+    </tr>
+    <tr>
+      <td><code>name</code></td>
+      <td>object/session/extension name for view/table/database/ <code>USE</code> /
+      <code>LOAD EXTENSION</code> results, else <code>None</code></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Value mapping</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>pinkdb type</th><th>Python value</th></tr></thead>
+  <tbody>
+    <tr><td><code>NULL</code></td><td><code>None</code></td></tr>
+    <tr><td><code>BOOLEAN</code></td><td><code>bool</code></td></tr>
+    <tr><td><code>INTEGER</code> / <code>BIGINT</code></td><td><code>int</code></td></tr>
+    <tr><td><code>DOUBLE</code></td><td><code>float</code></td></tr>
+    <tr><td><code>VARCHAR</code></td><td><code>str</code> (embedded NULs preserved)</td></tr>
+    <tr><td><code>DATE</code></td><td><code>datetime.date</code></td></tr>
+    <tr><td><code>TIMESTAMP</code></td><td>naive UTC <code>datetime.datetime</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Errors</h3>
+
+<ul>
+  <li><code>pinkdb.Error</code> carries the message from the native library; a
+  failed statement leaves the handle usable.</li>
+  <li>DATE/TIMESTAMP values outside Python's <code>datetime</code> range raise
+  <code>Error</code> naming the raw value, instead of silently wrapping.</li>
+  <li>Strings that are not valid UTF-8 (SQL or paths) are rejected before the
+  native call; <code>connect()</code> rejects an empty path or one containing a NUL
+  byte with <code>ValueError</code>.</li>
+</ul>
+
+<h2 id="tests">Tests</h2>
+
+<pre class="code" data-lang="sh"><code>python3 -m unittest discover -s bindings/python/tests -v
+
+# prove the environment override:
+PINKDB_FFI_LIB="$PWD/target/release/libpinkdb_ffi.dylib" \
+    python3 -m unittest discover -s bindings/python/tests -v</code></pre>
+
+<p class="doc-meta">The package lives in <code>bindings/python</code>; a pip-installable
+wheel is planned (see the <a href="../docs/roadmap">roadmap</a>). At-rest
+encryption is not exposed through the C ABI yet, and the binding inherits that — use
+the Rust API or the CLI's <code>PINKDB_KEY</code> for encrypted databases.</p>
+
+<ul class="next-links">
+  <li><a href="../docs/api-c">C API →</a></li>
+  <li><a href="../docs/api-go">Go API →</a></li>
+  <li><a href="../docs/guide-embedding">Guide: embedding →</a></li>
+</ul>
+
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#setup">Setup</a></li>
+  <li><a href="#functions">Functions</a></li>
+  <li><a href="#database">Database</a></li>
+  <li><a href="#result">Result</a></li>
+  <li><a href="#tests">Tests</a></li>
+</ul>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

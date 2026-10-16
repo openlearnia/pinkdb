@@ -1,0 +1,166 @@
+<h1>Python API</h1>
+
+<p class="doc-meta">The pinkdb Python binding is a thin wrapper over the C ABI,
+implemented with the standard library <code>ctypes</code> module — no
+<code>cffi</code>, no pip installs, no build step for the package itself.</p>
+
+<h2>Setup</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi</code></pre>
+
+<p>Importing <code>pinkdb</code> finds the shared library in this order: the
+<code>PINKDB_FFI_LIB</code> environment variable (a full path to the
+<code>libpinkdb_ffi.dylib</code> / <code>.so</code> / <code>.dll</code>), then the
+repo-relative <code>target/release/</code>. A missing library, a library without the
+pinkdb symbols, or an ABI version other than 1 raises
+<code>pinkdb.Error</code>.</p>
+
+<pre class="code" data-lang="python"><code>import pinkdb
+
+with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
+    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+    db.execute("INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);")
+
+    result = db.execute("SELECT x, s FROM t ORDER BY x;")[0]
+    print(result.kind)          # 'selected'
+    print(result.columns)       # ['x', 's']
+    print(result.column_types)  # ['integer', 'varchar']
+    print(result.rows)          # [[1, 'héllo'], [None, None]]</code></pre>
+
+<h2>Functions</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Function</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>connect(path)</code></td>
+      <td>Open a durable database (checkpoint + WAL) at <code>path</code>
+      (<code>str</code>, <code>bytes</code> or <code>os.PathLike</code>). Returns a
+      <code>Database</code>.</td>
+    </tr>
+    <tr>
+      <td><code>connect_memory()</code></td>
+      <td>Open a fresh, empty in-memory database.</td>
+    </tr>
+    <tr>
+      <td><code>abi_version()</code></td>
+      <td>ABI version reported by the loaded library (currently
+      <code>1</code>).</td>
+    </tr>
+    <tr>
+      <td><code>library_path</code></td>
+      <td>Path of the loaded <code>libpinkdb_ffi</code> shared library.</td>
+    </tr>
+    <tr>
+      <td><code>Error</code></td>
+      <td>The exception type for every native failure.</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2><code>Database</code></h2>
+
+<ul>
+  <li><code>execute(sql)</code> — run one or more <code>;</code>-separated
+  statements; returns a list of <code>Result</code>, one per statement. Raises
+  <code>Error</code> (from <code>pinkdb_last_error</code>) if a statement fails; the
+  handle stays usable afterwards.</li>
+  <li><code>close()</code> — free the native handle; idempotent. The class is a
+  context manager (<code>with pinkdb.connect(…) as db:</code>) and
+  <code>__del__</code> is safe.</li>
+  <li>Handles cannot be copied: <code>copy.copy</code> / <code>copy.deepcopy</code>
+  raise <code>TypeError</code>; pickling fails safely.</li>
+  <li><strong>Threading:</strong> the C handle is not thread-safe, so
+  <code>Database</code> serializes every call behind an internal lock (ctypes
+  releases the GIL during native calls). Sharing one <code>Database</code> across
+  threads is safe; opening the same file from several threads is not needed.</li>
+</ul>
+
+<h2><code>Result</code></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Attribute</th><th>Contents</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>kind</code></td>
+      <td>one of <code>selected</code>, <code>created</code>, <code>inserted</code>,
+      <code>updated</code>, <code>deleted</code>, <code>began</code>,
+      <code>committed</code>, <code>rolledback</code>, <code>created_view</code>,
+      <code>dropped_table</code>, <code>dropped_view</code>,
+      <code>created_database</code>, <code>dropped_database</code>,
+      <code>used</code>, <code>loaded_extension</code>,
+      <code>checkpointed</code></td>
+    </tr>
+    <tr>
+      <td><code>columns</code> / <code>column_types</code></td>
+      <td>SELECT column names and types (<code>boolean</code>,
+      <code>integer</code>, <code>bigint</code>, <code>double</code>,
+      <code>varchar</code>, <code>date</code>, <code>timestamp</code>)</td>
+    </tr>
+    <tr>
+      <td><code>rows</code></td>
+      <td>SELECT rows as Python values (mapping below)</td>
+    </tr>
+    <tr>
+      <td><code>affected</code></td>
+      <td>row count for INSERT/UPDATE/DELETE, else 0</td>
+    </tr>
+    <tr>
+      <td><code>name</code></td>
+      <td>object/session/extension name for view/table/database/ <code>USE</code> /
+      <code>LOAD EXTENSION</code> results, else <code>None</code></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Value mapping</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>pinkdb type</th><th>Python value</th></tr></thead>
+  <tbody>
+    <tr><td><code>NULL</code></td><td><code>None</code></td></tr>
+    <tr><td><code>BOOLEAN</code></td><td><code>bool</code></td></tr>
+    <tr><td><code>INTEGER</code> / <code>BIGINT</code></td><td><code>int</code></td></tr>
+    <tr><td><code>DOUBLE</code></td><td><code>float</code></td></tr>
+    <tr><td><code>VARCHAR</code></td><td><code>str</code> (embedded NULs preserved)</td></tr>
+    <tr><td><code>DATE</code></td><td><code>datetime.date</code></td></tr>
+    <tr><td><code>TIMESTAMP</code></td><td>naive UTC <code>datetime.datetime</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<h3>Errors</h3>
+
+<ul>
+  <li><code>pinkdb.Error</code> carries the message from the native library; a
+  failed statement leaves the handle usable.</li>
+  <li>DATE/TIMESTAMP values outside Python's <code>datetime</code> range raise
+  <code>Error</code> naming the raw value, instead of silently wrapping.</li>
+  <li>Strings that are not valid UTF-8 (SQL or paths) are rejected before the
+  native call; <code>connect()</code> rejects an empty path or one containing a NUL
+  byte with <code>ValueError</code>.</li>
+</ul>
+
+<h2>Tests</h2>
+
+<pre class="code" data-lang="sh"><code>python3 -m unittest discover -s bindings/python/tests -v
+
+# prove the environment override:
+PINKDB_FFI_LIB="$PWD/target/release/libpinkdb_ffi.dylib" \
+    python3 -m unittest discover -s bindings/python/tests -v</code></pre>
+
+<p class="doc-meta">The package lives in <code>bindings/python</code>; a pip-installable
+wheel is planned (see the <a href="{{root}}docs/roadmap.html">roadmap</a>). At-rest
+encryption is not exposed through the C ABI yet, and the binding inherits that — use
+the Rust API or the CLI's <code>PINKDB_KEY</code> for encrypted databases.</p>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/api-c.html">C API →</a></li>
+  <li><a href="{{root}}docs/api-go.html">Go API →</a></li>
+  <li><a href="{{root}}docs/guide-embedding.html">Guide: embedding →</a></li>
+</ul>

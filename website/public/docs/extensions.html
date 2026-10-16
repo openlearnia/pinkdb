@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Using extensions — pinkdb</title>
+<meta name="description" content="Load native SQL functions into pinkdb with LOAD EXTENSION, install from the extension repository, and write your own extension with the C or Go SDK.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/extensions.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Using extensions — pinkdb">
+<meta property="og:description" content="Load native SQL functions into pinkdb with LOAD EXTENSION, install from the extension repository, and write your own extension with the C or Go SDK.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/extensions.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions" class="active" aria-current="page">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Using extensions</h1>
+
+<p class="doc-meta">pinkdb can load shared libraries that register scalar SQL functions
+at runtime — no recompilation of the engine. Extensions are a versioned C ABI (v1),
+separate from the <code>pinkdb-ffi</code> embedding ABI.</p>
+
+<h2>Loading an extension</h2>
+
+<pre class="code" data-lang="sql"><code>LOAD EXTENSION '/abs/path/to/math_ext.dylib';
+-- Extension math_ext loaded.
+SELECT ext_clamp(CAST(5 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT));  -- 5</code></pre>
+
+<ul>
+  <li>The path is a string literal and resolves against the process's working
+  directory at load time; <strong>absolute paths are recommended</strong>.</li>
+  <li>A successful load prints <code>Extension &lt;name&gt; loaded.</code>, and the
+  declared name is pinned: loading the same extension again is a clear
+  <code>extension "x" is already loaded</code> error.</li>
+  <li>Loaded functions resolve case-insensitively like built-ins and cannot shadow
+  one. Arguments must match the registered types exactly — write
+  <code>CAST(...)</code> for another numeric type; <code>NULL</code> literals pass
+  through as NULL.</li>
+  <li>Extensions are <strong>process-level</strong>: they are not stored in
+  <code>.pink</code> snapshots and not part of a transaction.
+  <code>LOAD EXTENSION</code> is refused inside <code>BEGIN..COMMIT</code>.</li>
+  <li>Native-only: on wasm targets the statement fails cleanly with
+  <code>extensions are not supported on wasm targets</code>.</li>
+</ul>
+
+<h2>Installing from the extension repository</h2>
+
+<p>The CLI can install published artifacts with one command (needs the
+<code>repo</code> feature, which keeps the default binary lean):</p>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features repo</code></pre>
+
+<pre class="code" data-lang="text"><code>pinkdb&gt; .install math_ext
+Installed math_ext 0.1.0 (darwin-arm64)
+  repository: https://pinkdb-ext-repo.defaultcms.workers.dev
+  path:       /Users/you/.pinkdb/extensions/math_ext/0.1.0/darwin-arm64/math_ext.dylib
+  sha256:     38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
+Extension math_ext loaded.</code></pre>
+
+<ul>
+  <li>Artifacts land under
+  <code>$PINKDB_HOME/extensions/&lt;name&gt;/&lt;version&gt;/&lt;platform&gt;/</code>
+  (<code>PINKDB_HOME</code> defaults to <code>~/.pinkdb</code>), are written
+  atomically, and are verified against the catalog's SHA-256 before the rename — a
+  mismatch is refused and leaves nothing behind. Installing the same coordinates
+  again reuses the verified copy.</li>
+  <li><code>.install &lt;name&gt;</code> picks the highest version for this platform
+  with ABI v1; <code>.install &lt;name&gt;@&lt;version&gt;</code> is exact.</li>
+  <li><code>.repositories list | add &lt;url&gt; | remove &lt;url&gt;</code> manage an
+  ordered repository list in <code>$PINKDB_HOME/repositories.json</code>; the first
+  repository with a match wins. When the file is absent, the official repository is
+  the default. <code>.installed</code> lists the cache.</li>
+  <li>Browse what is published in the
+  <a href="../extensions">extension catalog</a> (name, version, platform,
+  ABI, SHA-256, download).</li>
+</ul>
+
+<h2>Writing an extension</h2>
+
+<p>The in-repo SDKs provide a vendored ABI header, a commented template and worked
+examples:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>SDK</th><th>Directory</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>C / C++</td>
+      <td><code>ext-sdk/c/</code> (examples: numeric, string, C++)</td>
+      <td>shipped</td>
+    </tr>
+    <tr>
+      <td>Go (cgo, <code>-buildmode=c-shared</code>)</td>
+      <td><code>ext-sdk/go/</code></td>
+      <td>shipped</td>
+    </tr>
+    <tr>
+      <td>Rust</td>
+      <td><code>ext-sdk/rust/</code> (safe wrapper + macros)</td>
+      <td>planned — see the <a href="../docs/roadmap">roadmap</a></td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>An extension exports three symbols; <code>init</code> registers scalar functions
+through the host API:</p>
+
+<pre class="code" data-lang="c"><code>uint32_t    pinkdb_extension_abi_version(void);   /* PINKDB_EXT_ABI_VERSION */
+const char *pinkdb_extension_name(void);          /* UTF-8, non-empty, <=256 bytes */
+int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);</code></pre>
+
+<pre class="code" data-lang="c"><code>static int32_t hello_add(void *user_data, const pinkdb_ext_value *args,
+                         size_t n_args, pinkdb_ext_value *out) {
+    (void)user_data; (void)n_args;
+    if (args[0].is_null || args[1].is_null) { out-&gt;is_null = 1; return 0; }
+    out-&gt;type_tag = PINKDB_EXT_TYPE_BIGINT;
+    out-&gt;is_null = 0;
+    out-&gt;int64 = args[0].int64 + args[1].int64;
+    return 0;
+}
+
+int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
+    static const int32_t arg_types[2] = {
+        PINKDB_EXT_TYPE_BIGINT, PINKDB_EXT_TYPE_BIGINT
+    };
+    return api-&gt;register_scalar(host_ctx, "hello_add", 2, arg_types,
+                                PINKDB_EXT_TYPE_BIGINT, hello_add, NULL);
+}</code></pre>
+
+<pre class="code" data-lang="sh"><code>make -C ext-sdk/c                 # build the examples
+./ext-sdk/c/smoke.sh              # build + load + query, end to end
+make -C ext-sdk/go && ./ext-sdk/go/smoke.sh</code></pre>
+
+<p>Contract highlights (the header is complete):</p>
+
+<ul>
+  <li><strong>Thread safety:</strong> callbacks run concurrently on the executor's
+  rayon workers — a function may be invoked on several threads at once, so its state
+  must be guarded (atomics, locks, TLS). <code>register_scalar</code> is only valid
+  inside <code>pinkdb_extension_init</code>.</li>
+  <li><strong>Typing:</strong> ABI v1 is strictly typed; the result must carry the
+  registered type tag.</li>
+  <li><strong>VARCHAR results</strong> must be allocated with
+  <code>api-&gt;alloc(size)</code>; the host copies <code>text_len</code> bytes and
+  frees them with <code>api-&gt;free</code> immediately after the call — on every
+  path. A rejected registration fails the whole load atomically.</li>
+  <li><strong>Errors:</strong> a non-zero return aborts the enclosing statement with
+  a message naming the function and code; callbacks must not panic across the ABI
+  boundary (in C++: catch everything).</li>
+</ul>
+
+<h2>Extensions and durable databases</h2>
+
+<ul>
+  <li>A durable database WAL-logs <code>LOAD EXTENSION</code>, and every logged
+  record that calls an extension is prefixed with the
+  <code>LOAD EXTENSION '&lt;path&gt;'</code> it needs. Replay therefore re-loads
+  exactly what the replayed records use; a missing file at replay time is a hard
+  error naming the path, never a silent drop. Prefer absolute, stable paths.</li>
+  <li>A checkpoint rolls the WAL and never writes an extension into the
+  <code>.pink</code> file: after a reopen, the first record that touches one re-loads
+  it by path.</li>
+  <li>On <code>pinkdb-server</code>, <code>LOAD EXTENSION</code> loads native code
+  into the <em>server</em> process and is refused for remote clients unless the
+  server runs with <code>--allow-load-extension</code>.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../extensions">Extension catalog →</a></li>
+  <li><a href="../docs/api-c">C API →</a></li>
+  <li><a href="../docs/roadmap">Roadmap →</a></li>
+</ul>
+
+</article>
+
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

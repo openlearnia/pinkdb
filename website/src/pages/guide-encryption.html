@@ -1,0 +1,96 @@
+<h1>Guide: encrypted databases</h1>
+
+<p class="doc-meta">Encrypt an entire database at rest — checkpoint and WAL — with
+AES-256-GCM and an Argon2id-derived key, using the opt-in
+<code>encryption</code> feature.</p>
+
+<h2>1. Build with encryption</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features encryption</code></pre>
+
+<p>The default build links no crypto at all; this feature adds the audited RustCrypto
+crates <code>aes-gcm</code> and <code>argon2</code> (about 70&nbsp;KB over the default
+on a thin-LTO release build). Unencrypted files stay byte-identical either way.</p>
+
+<h2>2. Use <code>PINKDB_KEY</code> in the CLI</h2>
+
+<pre class="code" data-lang="sh"><code>export PINKDB_KEY='correct horse battery staple'
+./target/release/pinkdb</code></pre>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .import sales.csv sales
+pinkdb&gt; .save sales.pink          -- writes an encrypted checkpoint
+pinkdb&gt; .quit
+
+$ ./target/release/pinkdb           # fresh process
+pinkdb&gt; .open sales.pink           -- decrypts; the durable WAL uses the same key
+pinkdb&gt; SELECT COUNT(*) FROM sales;</code></pre>
+
+<ul>
+  <li>The passphrase is stretched with Argon2id (defaults m=19&nbsp;MiB, t=2, p=1);
+  the salt and parameters are stored in the file header, so raising the defaults
+  later keeps old files readable.</li>
+  <li><code>PINKDB_KEY</code> must be valid UTF-8. A set-but-invalid value is a hard
+  error (exit 2) instead of a silent fallback to plaintext.</li>
+  <li>Unset, behavior is byte-identical to an unkeyed build.</li>
+</ul>
+
+<h2>3. Use it from Rust</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{EncryptionKey, PinkDb};
+
+let key = EncryptionKey::from_passphrase("correct horse battery staple");
+
+db.save_with_key("x.pink", &amp;key)?;                        // encrypted snapshot
+let db = PinkDb::open_with_key("x.pink", &amp;key)?;          // decrypts
+let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?;  // encrypted WAL
+
+// multi-connection open:
+// let db = pinkdb::Database::open_with_key("x.pink", &amp;key)?;</code></pre>
+
+<p>A raw 32-byte key is also accepted — see <code>EncryptionKey</code>.</p>
+
+<h2>4. How the container works</h2>
+
+<ul>
+  <li>The file becomes a <code>PINKENC1</code> container (version 2): a plaintext
+  header (KDF parameters, salt, a random per-container nonce prefix, an AEAD
+  key-check block) followed by AEAD-sealed payloads. The WAL container carries a
+  small plaintext publish block so the multi-process refresh can work. Nothing but
+  those small blocks is readable in the clear — rows and SQL text are ciphertext.</li>
+  <li>Each open re-seals the WAL under a fresh random nonce prefix, so a record
+  discarded by a truncation can never reuse a <code>(key, nonce)</code> pair.</li>
+  <li>Header parameters are validated on read against a small multiple of the
+  defaults (m ≤ 76&nbsp;MiB, t ≤ 4, p ≤ 4), so a crafted header cannot make an open
+  burn minutes deriving.</li>
+  <li>Checkpoint containers end with a terminal zero-length segment, so a container
+  cut at a segment boundary is rejected instead of loading a silently shorter
+  database.</li>
+</ul>
+
+<h2>Gotchas</h2>
+
+<ul>
+  <li><strong>A wrong key says so</strong>: the key-check block fails with
+  <code>wrong key</code>, never “corrupt file”.</li>
+  <li><strong>Encrypted and plaintext never mix.</strong> A keyed open refuses a
+  plaintext checkpoint/WAL and a plaintext open refuses an encrypted one, so a key
+  can never be silently ignored. Without the feature, opening an encrypted file
+  reports <code>file is encrypted; build with the encryption feature</code>.</li>
+  <li><strong>The mode and key are fixed at open</strong> for a live store; changing
+  <code>set_encryption_key</code> afterwards is refused at the next checkpoint
+  (<code>cannot change encryption mode on a live store; reopen it instead</code>),
+  and a snapshot save refuses a target in the other mode or under a different
+  key.</li>
+  <li><strong>Not exposed everywhere yet:</strong> the C ABI takes only a path, so
+  the Python/Go bindings and C embedders open plaintext databases; use the Rust API
+  or the CLI for encrypted stores. <code>pinkdb-server</code> has no key option —
+  its <code>--file</code> must be plaintext.</li>
+  <li><strong>Lakes are not encrypted.</strong> <code>PINKDB_KEY</code> applies to
+  <code>.pink</code> databases and their WAL, not to lake data files or objects.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/persistence.html">Persistence &amp; encryption →</a></li>
+  <li><a href="{{root}}docs/api-rust.html">Rust API →</a></li>
+  <li><a href="{{root}}docs/cli.html">CLI &amp; REPL →</a></li>
+</ul>

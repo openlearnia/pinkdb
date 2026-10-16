@@ -1,0 +1,115 @@
+<h1>Guide: multi-process writers</h1>
+
+<p class="doc-meta">A durable <code>.pink</code> database can be opened read-write by
+several local processes at once. Writers serialize on a short-held write lease;
+readers never block and never see uncommitted rows.</p>
+
+<h2>1. Build the default CLI</h2>
+
+<p>Nothing extra is needed — durability is in the default build:</p>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli
+./target/release/pinkdb</code></pre>
+
+<h2>2. Two writers, one file</h2>
+
+<p>Open a terminal for each process — start the REPL, then <code>.open</code> the
+<em>same</em> durable database in each:</p>
+
+<pre class="code" data-lang="sql"><code># terminal A
+pinkdb&gt; .open db.pink
+pinkdb&gt; CREATE TABLE t (n INTEGER);
+pinkdb&gt; INSERT INTO t VALUES (1);
+
+# terminal B — same file, separate process
+pinkdb&gt; .open db.pink
+pinkdb&gt; INSERT INTO t VALUES (2);
+
+# terminal C — a reader
+pinkdb&gt; .open db.pink
+pinkdb&gt; SELECT COUNT(*) FROM t;
+┌──────────┐
+│ count(*) │
+│ BIGINT   │
+├──────────┤
+│ 2        │
+└──────────┘</code></pre>
+
+<p>Each process keeps its own in-memory store. A writer takes the file's
+<strong>write lease</strong> for the operation — refresh, execute, append, fsync,
+publish — and a reader checks a publication epoch with a single <code>pread</code>,
+replaying the WAL frames it has not seen only when the epoch changed. Refresh
+happens at statement boundaries and before <code>BEGIN</code>, never
+mid-statement.</p>
+
+<h2>3. Concurrency semantics</h2>
+
+<ul>
+  <li><strong>Writers serialize, per operation.</strong> Two processes never write
+  the WAL at the same instant; the lease is held for one statement, or from
+  <code>BEGIN</code> to <code>COMMIT</code>/<code>ROLLBACK</code> for a
+  transaction (so cross-process transactions serialize too).</li>
+  <li><strong>Readers never block</strong> and never observe uncommitted rows. A
+  replaced WAL or checkpoint triggers a full rebuild on the next refresh that
+  preserves views and attachments.</li>
+  <li><strong>A busy database waits</strong> up to the busy timeout — 5 s by default
+  — then fails with a clear <code>database is busy</code> error:</li>
+</ul>
+
+<pre class="code" data-lang="sh"><code>PINKDB_BUSY_TIMEOUT_MS=20000 ./target/release/pinkdb
+# or, in Rust:
+#   Database::set_busy_timeout(Duration::from_secs(20))
+#   DurableOpenOptions { busy_timeout: ..., .. }</code></pre>
+
+<ul>
+  <li><strong>Crash safety:</strong> the OS releases the lease on exit or crash, so
+  there is no stale-lock cleanup. A killed writer's committed records are recovered
+  from the WAL by the next open.</li>
+  <li><strong>Checkpoints refresh first</strong>, under the lease, so a checkpoint
+  can never publish a state that omits another process's committed records.</li>
+</ul>
+
+<h2>4. From Rust</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{Database, LockMode};
+
+// shared in-process store, one Connection per thread
+let db = Database::open("db.pink")?;
+let mut writer = db.connect();
+writer.execute("INSERT INTO t VALUES (42);")?;
+
+// tune the wait for another process's lease
+db.set_busy_timeout(std::time::Duration::from_secs(10));
+
+// explicit embedded options (CLI parity):
+// let db = Database::open_with_options("db.pink", DurableOpenOptions {
+//     policy: SyncPolicy::Sync,
+//     busy_timeout: Duration::from_secs(5),
+//     lock_mode: LockMode::Required,
+// })?;</code></pre>
+
+<h2>Gotchas</h2>
+
+<ul>
+  <li><strong><code>flock</code> is assumed to work.</strong> An open on a
+  filesystem that reports locking unsupported fails closed
+  (<code>LockMode::Required</code>, the default), with
+  <code>LockMode::UnsafeSingleProcess</code> as the explicit opt-out.</li>
+  <li><strong>No network-filesystem detection.</strong> A filesystem that accepts
+  <code>flock</code> but does not honor it across hosts (NFS/SMB) is not caught —
+  keep multi-process databases on local storage. Windows is untested.</li>
+  <li><strong>A failed WAL append is fail-stop:</strong> every later statement and
+  save is refused until the database is reopened, which recovers exactly the durable
+  prefix. Nobody can observe or persist the non-durable state.</li>
+  <li><strong>Encrypted stores are covered too:</strong> the same lease keeps two
+  writers off one encrypted WAL, where concurrency would risk nonce reuse.</li>
+  <li><strong>Cross-process conflicts are per statement.</strong>
+  <code>BEGIN..COMMIT</code> keeps its snapshot-isolation semantics; overlapping
+  commits abort with a write conflict you can retry.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/persistence.html">Persistence &amp; encryption →</a></li>
+  <li><a href="{{root}}docs/api-rust.html">Rust API →</a></li>
+  <li><a href="{{root}}docs/roadmap.html">Roadmap →</a></li>
+</ul>

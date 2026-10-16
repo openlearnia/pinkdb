@@ -1,0 +1,87 @@
+<h1>Guide: CSV to a lake</h1>
+
+<p class="doc-meta">Take a CSV file, shape it with SQL, publish it as an immutable lake
+snapshot, reopen it in a fresh process, and attach it read-only. Total time: a few
+minutes.</p>
+
+<h2>1. Build a lake-enabled CLI</h2>
+
+<pre class="code" data-lang="sh"><code># lean lake: .pink data files, 2.7 MB binary
+cargo build --release -p pinkdb-cli --features lake-lite
+
+# or the full lake: Vortex data files, 45.3 MB binary
+cargo build --release -p pinkdb-cli --features lake
+./target/release/pinkdb</code></pre>
+
+<h2>2. Import the CSV</h2>
+
+<p>Any CSV works; the repository's deterministic generator produces a 1M-row sales
+file if you want something bigger:</p>
+
+<pre class="code" data-lang="sh"><code>python3 bench/gen_sales.py            # -> sales_1m.csv (~24 MB)</code></pre>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .import sales_1m.csv sales
+Imported 1000000 rows in 0.025s</code></pre>
+
+<p>Check what was inferred and shape the table you want to publish:</p>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .schema sales
+pinkdb&gt; SELECT region, COUNT(*) AS n, AVG(total) AS avg_total
+   ...&gt;   FROM sales GROUP BY region ORDER BY n DESC;</code></pre>
+
+<h2>3. Save the lake</h2>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake save mylake
+pinkdb&gt; .lake info mylake
+pinkdb&gt; .lake versions mylake
+pinkdb&gt; .lake tables mylake</code></pre>
+
+<p>Each save is a <strong>full snapshot</strong>: fresh immutable data files, a new
+<code>snapshots/&lt;version&gt;.json</code>, then a replaced
+<code>catalog.json</code>. The first save of an empty store creates version 1 and
+publishes version 2 with your data.</p>
+
+<h2>4. Reopen in a fresh process</h2>
+
+<pre class="code" data-lang="sh"><code>./target/release/pinkdb     # new process, empty store</code></pre>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake open mylake
+pinkdb&gt; SELECT COUNT(*) FROM sales;
+pinkdb&gt; .lake open mylake 2      -- an earlier published version, if you have one</code></pre>
+
+<p><code>.lake open</code> replaces the in-memory store with a published version and
+resets the session database to <code>main</code>.</p>
+
+<h2>5. Attach read-only (the fast path)</h2>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake attach mylake
+pinkdb&gt; SELECT COUNT(*), MIN(total), MAX(total) FROM sales;  -- from stored statistics
+pinkdb&gt; .tables            -- lists sales (1000000 rows, attached)
+pinkdb&gt; .lake attached
+pinkdb&gt; .lake detach mylake</code></pre>
+
+<p>Attach decodes no column data for the statistics fast paths; anything else
+materializes the table lazily, decoding only the columns the query references.
+Attached tables are read-only and session-local.</p>
+
+<div class="callout warn">
+  <span class="callout-title">Gotchas</span>
+  <ul>
+    <li>Saving again rewrites every table — plan disk and time for full snapshots,
+    not appends. Old versions and their files are kept; there is no GC.</li>
+    <li><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code>
+    are refused inside a transaction.</li>
+    <li>A lean (<code>lake-lite</code>) build writes and reads only
+    <code>.pink</code> data files; a lake saved by a full build (Vortex) is refused
+    with a clear “rebuild with <code>lake</code>” error.</li>
+    <li>A second writer holding a stale handle gets
+    <code>another writer published version N; reopen the lake</code> on save — or use
+    <code>.lake save</code> in a fresh shell.</li>
+  </ul>
+</div>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/lake.html">Lake reference →</a></li>
+  <li><a href="{{root}}docs/guide-s3-lake.html">Guide: S3 / R2 lakes →</a></li>
+  <li><a href="{{root}}docs/cli.html">CLI &amp; REPL →</a></li>
+</ul>

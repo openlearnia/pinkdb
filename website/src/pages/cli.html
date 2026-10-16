@@ -1,26 +1,29 @@
 <h1>CLI &amp; REPL</h1>
 
-<p class="doc-meta"><code>pinkdb-cli</code> is a thin consumer of the library: a
-rustyline REPL with dot-commands and DuckDB-style box-drawn output. The release binary is
-named <code>pinkdb</code>.</p>
+<p class="doc-meta"><code>pinkdb-cli</code> is a thin consumer of the library: a rustyline
+REPL with dot-commands and DuckDB-style box-drawn output. The release binary is named
+<code>pinkdb</code>.</p>
 
 <h2>Build and run</h2>
 
-<pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli                       # debug REPL
+<pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli                        # debug REPL
 cargo build --release -p pinkdb-cli
-./target/release/pinkdb                       # local (embedded) mode
+./target/release/pinkdb                        # local (embedded) mode
+
 cargo build --release -p pinkdb-cli --features client
-./target/release/pinkdb --host 127.0.0.1:5433 # remote mode</code></pre>
+./target/release/pinkdb --host 127.0.0.1:5433  # remote mode (needs a server)</code></pre>
 
-<p>You land at the <code>pinkdb&gt;</code> prompt. SQL statements run until a semicolon
-(a <code>   ...&gt;</code> continuation prompt appears while one is open);
-dot-commands are single-line and take no semicolon.</p>
+<p>You land at the <code>pinkdb&gt;</code> prompt. SQL statements run until a
+semicolon (a <code>   ...&gt;</code> continuation prompt appears while one is open);
+dot-commands are single-line and take no semicolon. <code>Ctrl-C</code> clears a
+pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</p>
 
-<aside class="marginalia">
-  <span class="margin-tag">environment switches</span>
-  <p><code>PINKDB_KEY</code> opens encrypted files; it is documented under
-  <em>Environment variables</em>.</p>
-</aside>
+<p>Command-line flags:</p>
+
+<pre class="code" data-lang="text"><code>Usage: pinkdb [--host HOST:PORT] [-c COMMAND]...
+
+  -c COMMAND         run SQL or a dot-command, then exit (repeatable)
+  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)</code></pre>
 
 <h2>Dot-commands</h2>
 
@@ -33,16 +36,16 @@ dot-commands are single-line and take no semicolon.</p>
       <td>show the dot-command help (a shorter list in remote mode)</td>
     </tr>
     <tr>
+      <td><code>.quit</code> / <code>.exit</code></td>
+      <td>leave the shell</td>
+    </tr>
+    <tr>
       <td><code>.read &lt;file.sql&gt;</code></td>
-      <td>run SQL and dot-commands from a file</td>
+      <td>run SQL and dot-commands from a file in the current session</td>
     </tr>
     <tr>
       <td><code>.timer on|off</code></td>
       <td>print each statement's run time (default: on in a terminal)</td>
-    </tr>
-    <tr>
-      <td><code>.quit</code> / <code>.exit</code></td>
-      <td>leave the shell</td>
     </tr>
     <tr>
       <td><code>.databases</code></td>
@@ -51,37 +54,96 @@ dot-commands are single-line and take no semicolon.</p>
     </tr>
     <tr>
       <td><code>.tables</code></td>
-      <td>list tables (with row counts) and views of the current database</td>
+      <td>list tables (with row counts) and views of the current database; attached
+      lake tables are marked</td>
     </tr>
     <tr>
       <td><code>.schema &lt;table|view&gt;</code></td>
-      <td>show a schema; accepts <code>db.table</code>, views show their output columns,
-      double-quoted identifiers with spaces work (<code>"My Db".t</code>)</td>
+      <td>show a schema; accepts <code>db.table</code>, views show their output
+      columns, and double-quoted identifiers with spaces work
+      (<code>"My Db".t</code>)</td>
     </tr>
     <tr>
       <td><code>.import &lt;file.csv&gt; [table]</code></td>
       <td>import a CSV; the table defaults to the file stem, and a
-      <code>db.table</code> target names another database when <code>db</code> exists</td>
+      <code>db.table</code> target names another database when <code>db</code>
+      exists</td>
     </tr>
     <tr>
       <td><code>.save &lt;file.pink&gt;</code></td>
-      <td>write a checkpoint when the path is the bound database, otherwise a plain
-      snapshot (refused when the target has a sidecar WAL with committed records)</td>
+      <td>checkpoint when the path is the bound database, otherwise a plain
+      snapshot (refused when the target has a sidecar WAL with committed
+      records)</td>
     </tr>
     <tr>
       <td><code>.open &lt;file.pink&gt;</code></td>
-      <td>open durably: load the checkpoint, recover an interrupted checkpoint, replay the
-      sidecar WAL, and replace the whole store</td>
+      <td>open durably: load the checkpoint, recover an interrupted checkpoint,
+      replay the sidecar WAL, and replace the whole store</td>
+    </tr>
+    <tr>
+      <td><code>.lake save &lt;dir|s3://…&gt; [force]</code></td>
+      <td>publish a full lake snapshot; <code>force</code> overrides this session's
+      stale-baseline conflict check</td>
+    </tr>
+    <tr>
+      <td><code>.lake open &lt;dir|s3://…&gt; [version]</code></td>
+      <td>replace the in-memory store with a published lake version (latest by
+      default)</td>
+    </tr>
+    <tr>
+      <td><code>.lake attach &lt;dir|s3://…&gt; [version]</code></td>
+      <td>attach a lake read-only for this session, from its statistics only</td>
+    </tr>
+    <tr>
+      <td><code>.lake detach &lt;dir|s3://…&gt;</code></td>
+      <td>detach one attached lake from this session</td>
+    </tr>
+    <tr>
+      <td><code>.lake attached</code></td>
+      <td>list this session's attached lakes and their tables</td>
+    </tr>
+    <tr>
+      <td><code>.lake versions &lt;dir|s3://…&gt;</code></td>
+      <td>list the lake's published versions (the current one is marked)</td>
+    </tr>
+    <tr>
+      <td><code>.lake tables &lt;dir|s3://…&gt;</code></td>
+      <td>list the current version's <code>db.table</code> names and row counts</td>
+    </tr>
+    <tr>
+      <td><code>.lake info &lt;dir|s3://…&gt;</code></td>
+      <td>show format version, current version, snapshots and tables</td>
+    </tr>
+    <tr>
+      <td><code>.install &lt;name[@version]&gt;</code></td>
+      <td>install an extension from a repository, verify its SHA-256, and load it
+      (needs the <code>repo</code> feature)</td>
+    </tr>
+    <tr>
+      <td><code>.repositories [list | add &lt;url&gt; | remove &lt;url&gt;]</code></td>
+      <td>manage the ordered repository list in
+      <code>$PINKDB_HOME/repositories.json</code> (needs <code>repo</code>)</td>
+    </tr>
+    <tr>
+      <td><code>.installed</code></td>
+      <td>list cached extension artifacts under <code>$PINKDB_HOME</code>
+      (needs <code>repo</code>)</td>
     </tr>
   </tbody>
 </table>
 </div>
 
-<p>For <code>.import</code>, a dotted target is <code>db.table</code> only when the left
-side names an existing database — otherwise the whole string is the table name, so a file
-stem like <code>data.2024.csv</code> imports as <code>data.2024</code>. <code>.tables</code>
-and <code>.schema</code> scope to the current database; <code>USE &lt;db&gt;</code>
-switches it.</p>
+<p>The <code>.lake</code> commands need a build with <code>lake</code> or
+<code>lake-lite</code>; without one they report
+<code>this pinkdb binary was built without the lake feature</code>.
+<code>s3://</code> locations additionally need the <code>s3</code> feature. The
+<code>.install</code>/<code>.repositories</code>/<code>.installed</code> commands need
+the <code>repo</code> feature.</p>
+
+<p>For <code>.import</code>, a dotted target is <code>db.table</code> only when the
+left side names an existing database — otherwise the whole string is the table name,
+so a file stem like <code>data.2024.csv</code> imports as
+<code>data.2024</code>.</p>
 
 <h2>Output and timing</h2>
 
@@ -103,14 +165,39 @@ Run Time (s): real 0.000</code></pre>
 
 <h2>Scripting</h2>
 
-<p>Piped input and <code>-c COMMAND</code> (repeatable) follow sqlite3/duckdb conventions:
-errors go to stderr, there is no banner or timing, and the process exits
-<code>1</code> if any statement or dot-command failed. A statement still open at end of
-input runs as if terminated, and <code>;</code> is recognized outside strings and comments.
-<code>.read file.sql</code> runs a script in the current session.</p>
+<p>Piped input and <code>-c COMMAND</code> (repeatable) follow sqlite3/duckdb
+conventions: errors go to stderr, there is no banner or timing, and a statement
+still open at end of input runs as if terminated. <code>;</code> is recognized
+outside strings and comments (<code>SELECT 1; -- note</code> completes;
+<code>SELECT ';'</code> does not).</p>
 
 <pre class="code" data-lang="shell"><code>pinkdb -c ".open sales.pink" -c "SELECT COUNT(*) FROM sales;"
 pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
+
+<h3>Exit codes</h3>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th class="num">Code</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr>
+      <td class="num">0</td>
+      <td>success — and, in interactive mode, always when the shell exits normally</td>
+    </tr>
+    <tr>
+      <td class="num">1</td>
+      <td>any statement or dot-command failed in a script run (piped stdin or
+      <code>-c</code>), or a remote connection could not be established</td>
+    </tr>
+    <tr>
+      <td class="num">2</td>
+      <td>usage error (unknown flag, missing value), a set-but-non-UTF-8
+      <code>PINKDB_KEY</code>, or <code>--host</code> in a build without the
+      <code>client</code> feature</td>
+    </tr>
+  </tbody>
+</table>
+</div>
 
 <h2>Environment variables</h2>
 
@@ -121,9 +208,33 @@ pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
     <tr>
       <td><code>PINKDB_KEY</code></td>
       <td>passphrase for at-rest encryption: <code>.save</code> writes encrypted and
-      <code>.open</code> decrypts (the durable WAL uses the same key). Requires a build
-      with the <code>encryption</code> feature. A set-but-non-UTF-8 value is a hard error
-      (exit 2) instead of a silent fallback to plaintext.</td>
+      <code>.open</code> decrypts (the durable WAL uses the same key). Needs a build
+      with the <code>encryption</code> feature; unset, behavior is byte-identical to
+      an unkeyed build. Must be valid UTF-8 — a set-but-invalid value exits 2 rather
+      than silently writing plaintext.</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_BUSY_TIMEOUT_MS</code></td>
+      <td>how long <code>.open</code> and later statements wait for another
+      process's write lease before reporting the database busy. Default: 5&nbsp;s
+      (<code>5000</code>).</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_HOME</code></td>
+      <td>where the extension cache and repository config live. Default:
+      <code>~/.pinkdb</code>.</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_REPO_ALLOW_HTTP</code></td>
+      <td>allow a plain <code>http://</code> repository URL outside loopback
+      (local tests only; artifacts travel unencrypted).</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_S3_*</code></td>
+      <td>S3/R2 tuning knobs (<code>PINKDB_S3_ALLOW_HTTP</code>,
+      <code>PINKDB_S3_ALLOW_DEGRADED</code>, <code>PINKDB_S3_RETRIES</code>) and the
+      <code>AWS_*</code> credential variables — see
+      <a href="{{root}}docs/lake.html">Lake</a>.</td>
     </tr>
   </tbody>
 </table>
@@ -136,16 +247,18 @@ PINKDB_KEY='correct horse battery staple' ./target/release/pinkdb</code></pre>
 
 <p>With the optional <code>client</code> feature, <code>--host HOST:PORT</code> sends
 every SQL statement to a <code>pinkdb-server</code> and renders results with the same
-renderer and timing line. SQL (including <code>USE</code>, <code>CREATE DATABASE</code>,
+renderer and timing line. SQL (including <code>USE</code>, <code>CREATE DATABASE</code>
 and transactions) works unchanged; the file and catalog dot-commands
-(<code>.import</code>, <code>.save</code>, <code>.open</code>, <code>.databases</code>,
-<code>.tables</code>, <code>.schema</code>) are not available and report
+(<code>.import</code>, <code>.save</code>, <code>.open</code>,
+<code>.databases</code>, <code>.tables</code>, <code>.schema</code>) report
 <code>Error: &lt;cmd&gt; is not available in remote mode</code>. Without the feature,
-<code>--host</code> is rejected with “built without the client feature”.
-<code>PINKDB_KEY</code> is inert in remote mode and is reported as a warning.</p>
+<code>--host</code> is rejected with
+<code>built without the client feature</code>. <code>PINKDB_KEY</code> is inert in
+remote mode (the server's own at-rest configuration applies) and is reported as a
+warning instead of being silently ignored.</p>
 
 <ul class="next-links">
   <li><a href="{{root}}docs/server.html">Server &amp; protocol →</a></li>
   <li><a href="{{root}}docs/persistence.html">Persistence &amp; encryption →</a></li>
-  <li><a href="{{root}}docs/getting-started.html">Getting started →</a></li>
+  <li><a href="{{root}}docs/lake.html">Lake →</a></li>
 </ul>

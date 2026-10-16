@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide: encrypted databases — pinkdb</title>
+<meta name="description" content="Build with the encryption feature, use PINKDB_KEY, save and reopen an encrypted .pink database, and understand the plaintext/encrypted mixing rules.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-encryption.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Guide: encrypted databases — pinkdb">
+<meta property="og:description" content="Build with the encryption feature, use PINKDB_KEY, save and reopen an encrypted .pink database, and understand the plaintext/encrypted mixing rules.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-encryption.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption" class="active" aria-current="page">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Guide: encrypted databases</h1>
+
+<p class="doc-meta">Encrypt an entire database at rest — checkpoint and WAL — with
+AES-256-GCM and an Argon2id-derived key, using the opt-in
+<code>encryption</code> feature.</p>
+
+<h2>1. Build with encryption</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features encryption</code></pre>
+
+<p>The default build links no crypto at all; this feature adds the audited RustCrypto
+crates <code>aes-gcm</code> and <code>argon2</code> (about 70&nbsp;KB over the default
+on a thin-LTO release build). Unencrypted files stay byte-identical either way.</p>
+
+<h2>2. Use <code>PINKDB_KEY</code> in the CLI</h2>
+
+<pre class="code" data-lang="sh"><code>export PINKDB_KEY='correct horse battery staple'
+./target/release/pinkdb</code></pre>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .import sales.csv sales
+pinkdb&gt; .save sales.pink          -- writes an encrypted checkpoint
+pinkdb&gt; .quit
+
+$ ./target/release/pinkdb           # fresh process
+pinkdb&gt; .open sales.pink           -- decrypts; the durable WAL uses the same key
+pinkdb&gt; SELECT COUNT(*) FROM sales;</code></pre>
+
+<ul>
+  <li>The passphrase is stretched with Argon2id (defaults m=19&nbsp;MiB, t=2, p=1);
+  the salt and parameters are stored in the file header, so raising the defaults
+  later keeps old files readable.</li>
+  <li><code>PINKDB_KEY</code> must be valid UTF-8. A set-but-invalid value is a hard
+  error (exit 2) instead of a silent fallback to plaintext.</li>
+  <li>Unset, behavior is byte-identical to an unkeyed build.</li>
+</ul>
+
+<h2>3. Use it from Rust</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{EncryptionKey, PinkDb};
+
+let key = EncryptionKey::from_passphrase("correct horse battery staple");
+
+db.save_with_key("x.pink", &amp;key)?;                        // encrypted snapshot
+let db = PinkDb::open_with_key("x.pink", &amp;key)?;          // decrypts
+let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?;  // encrypted WAL
+
+// multi-connection open:
+// let db = pinkdb::Database::open_with_key("x.pink", &amp;key)?;</code></pre>
+
+<p>A raw 32-byte key is also accepted — see <code>EncryptionKey</code>.</p>
+
+<h2>4. How the container works</h2>
+
+<ul>
+  <li>The file becomes a <code>PINKENC1</code> container (version 2): a plaintext
+  header (KDF parameters, salt, a random per-container nonce prefix, an AEAD
+  key-check block) followed by AEAD-sealed payloads. The WAL container carries a
+  small plaintext publish block so the multi-process refresh can work. Nothing but
+  those small blocks is readable in the clear — rows and SQL text are ciphertext.</li>
+  <li>Each open re-seals the WAL under a fresh random nonce prefix, so a record
+  discarded by a truncation can never reuse a <code>(key, nonce)</code> pair.</li>
+  <li>Header parameters are validated on read against a small multiple of the
+  defaults (m ≤ 76&nbsp;MiB, t ≤ 4, p ≤ 4), so a crafted header cannot make an open
+  burn minutes deriving.</li>
+  <li>Checkpoint containers end with a terminal zero-length segment, so a container
+  cut at a segment boundary is rejected instead of loading a silently shorter
+  database.</li>
+</ul>
+
+<h2>Gotchas</h2>
+
+<ul>
+  <li><strong>A wrong key says so</strong>: the key-check block fails with
+  <code>wrong key</code>, never “corrupt file”.</li>
+  <li><strong>Encrypted and plaintext never mix.</strong> A keyed open refuses a
+  plaintext checkpoint/WAL and a plaintext open refuses an encrypted one, so a key
+  can never be silently ignored. Without the feature, opening an encrypted file
+  reports <code>file is encrypted; build with the encryption feature</code>.</li>
+  <li><strong>The mode and key are fixed at open</strong> for a live store; changing
+  <code>set_encryption_key</code> afterwards is refused at the next checkpoint
+  (<code>cannot change encryption mode on a live store; reopen it instead</code>),
+  and a snapshot save refuses a target in the other mode or under a different
+  key.</li>
+  <li><strong>Not exposed everywhere yet:</strong> the C ABI takes only a path, so
+  the Python/Go bindings and C embedders open plaintext databases; use the Rust API
+  or the CLI for encrypted stores. <code>pinkdb-server</code> has no key option —
+  its <code>--file</code> must be plaintext.</li>
+  <li><strong>Lakes are not encrypted.</strong> <code>PINKDB_KEY</code> applies to
+  <code>.pink</code> databases and their WAL, not to lake data files or objects.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/persistence">Persistence &amp; encryption →</a></li>
+  <li><a href="../docs/api-rust">Rust API →</a></li>
+  <li><a href="../docs/cli">CLI &amp; REPL →</a></li>
+</ul>
+
+</article>
+
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

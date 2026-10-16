@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide: CSV to a lake — pinkdb</title>
+<meta name="description" content="Walk through importing a CSV, shaping it with SQL, saving a lake snapshot, reopening it, and attaching it read-only.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-csv-to-lake.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Guide: CSV to a lake — pinkdb">
+<meta property="og:description" content="Walk through importing a CSV, shaping it with SQL, saving a lake snapshot, reopening it, and attaching it read-only.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-csv-to-lake.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake" class="active" aria-current="page">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Guide: CSV to a lake</h1>
+
+<p class="doc-meta">Take a CSV file, shape it with SQL, publish it as an immutable lake
+snapshot, reopen it in a fresh process, and attach it read-only. Total time: a few
+minutes.</p>
+
+<h2>1. Build a lake-enabled CLI</h2>
+
+<pre class="code" data-lang="sh"><code># lean lake: .pink data files, 2.7 MB binary
+cargo build --release -p pinkdb-cli --features lake-lite
+
+# or the full lake: Vortex data files, 45.3 MB binary
+cargo build --release -p pinkdb-cli --features lake
+./target/release/pinkdb</code></pre>
+
+<h2>2. Import the CSV</h2>
+
+<p>Any CSV works; the repository's deterministic generator produces a 1M-row sales
+file if you want something bigger:</p>
+
+<pre class="code" data-lang="sh"><code>python3 bench/gen_sales.py            # -> sales_1m.csv (~24 MB)</code></pre>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .import sales_1m.csv sales
+Imported 1000000 rows in 0.025s</code></pre>
+
+<p>Check what was inferred and shape the table you want to publish:</p>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .schema sales
+pinkdb&gt; SELECT region, COUNT(*) AS n, AVG(total) AS avg_total
+   ...&gt;   FROM sales GROUP BY region ORDER BY n DESC;</code></pre>
+
+<h2>3. Save the lake</h2>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake save mylake
+pinkdb&gt; .lake info mylake
+pinkdb&gt; .lake versions mylake
+pinkdb&gt; .lake tables mylake</code></pre>
+
+<p>Each save is a <strong>full snapshot</strong>: fresh immutable data files, a new
+<code>snapshots/&lt;version&gt;.json</code>, then a replaced
+<code>catalog.json</code>. The first save of an empty store creates version 1 and
+publishes version 2 with your data.</p>
+
+<h2>4. Reopen in a fresh process</h2>
+
+<pre class="code" data-lang="sh"><code>./target/release/pinkdb     # new process, empty store</code></pre>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake open mylake
+pinkdb&gt; SELECT COUNT(*) FROM sales;
+pinkdb&gt; .lake open mylake 2      -- an earlier published version, if you have one</code></pre>
+
+<p><code>.lake open</code> replaces the in-memory store with a published version and
+resets the session database to <code>main</code>.</p>
+
+<h2>5. Attach read-only (the fast path)</h2>
+
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .lake attach mylake
+pinkdb&gt; SELECT COUNT(*), MIN(total), MAX(total) FROM sales;  -- from stored statistics
+pinkdb&gt; .tables            -- lists sales (1000000 rows, attached)
+pinkdb&gt; .lake attached
+pinkdb&gt; .lake detach mylake</code></pre>
+
+<p>Attach decodes no column data for the statistics fast paths; anything else
+materializes the table lazily, decoding only the columns the query references.
+Attached tables are read-only and session-local.</p>
+
+<div class="callout warn">
+  <span class="callout-title">Gotchas</span>
+  <ul>
+    <li>Saving again rewrites every table — plan disk and time for full snapshots,
+    not appends. Old versions and their files are kept; there is no GC.</li>
+    <li><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code>
+    are refused inside a transaction.</li>
+    <li>A lean (<code>lake-lite</code>) build writes and reads only
+    <code>.pink</code> data files; a lake saved by a full build (Vortex) is refused
+    with a clear “rebuild with <code>lake</code>” error.</li>
+    <li>A second writer holding a stale handle gets
+    <code>another writer published version N; reopen the lake</code> on save — or use
+    <code>.lake save</code> in a fresh shell.</li>
+  </ul>
+</div>
+
+<ul class="next-links">
+  <li><a href="../docs/lake">Lake reference →</a></li>
+  <li><a href="../docs/guide-s3-lake">Guide: S3 / R2 lakes →</a></li>
+  <li><a href="../docs/cli">CLI &amp; REPL →</a></li>
+</ul>
+
+</article>
+
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

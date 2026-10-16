@@ -1,8 +1,8 @@
 <h1>SQL reference</h1>
 
-<p class="doc-meta">The v1 SQL surface, as implemented by <code>pinkdb::sql</code> and the
-vectorized executor. SQL is parsed by a <code>peg</code>-generated grammar — the
-PEG path is the only parser.</p>
+<p class="doc-meta">The SQL surface pinkdb implements today — DDL/DML, joins, CTEs,
+subqueries, window functions, aggregates and transactions — plus an honest list of
+what is not supported yet.</p>
 
 <h2>DDL and DML</h2>
 
@@ -16,18 +16,20 @@ CREATE DATABASE db1;                 -- new, empty database
 DROP DATABASE db1;                   -- the last database cannot be dropped
 USE db1;                             -- per-session current database (default: main)
 DROP TABLE t;  DROP VIEW v;
-CREATE VIEW v [(cols)] AS SELECT ...;  -- session-local, rebound per use</code></pre>
+CREATE VIEW v [(cols)] AS SELECT ...;  -- session-local, rebound per use
+CHECKPOINT;                          -- persist + roll the WAL (durable databases)</code></pre>
 
-<p><code>UPDATE</code> and <code>DELETE</code> are statement-atomic: the statement sees the
-pre-update values and either applies completely or not at all. <code>BEGIN</code> /
-<code>COMMIT</code> / <code>ROLLBACK</code> snapshot the whole store:
-commits to disjoint tables all succeed, and overlapping writes abort the second committer
-with a write-conflict error instead of a silent lost update.</p>
+<p><code>UPDATE</code> and <code>DELETE</code> are statement-atomic: the statement
+sees the pre-update values and either applies completely or not at all.
+<code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code> run on a whole-store
+snapshot: commits to disjoint tables all succeed, and overlapping writes abort the
+second committer with a write-conflict error instead of a silent lost update.</p>
 
 <aside class="marginalia">
-  <span class="margin-tag">dml shorthand</span>
-  <p><code>SET</code> expressions see the pre-update values, <code>DELETE</code>
-  never matches <code>NULL</code>, and a statement is atomic: all rows or none.</p>
+  <span class="margin-tag">duckdb conventions</span>
+  <p>Integer overflow is an error (not a wrap), <code>int / int</code> is a
+  <code>DOUBLE</code>, DOUBLE → integer casts round half away from zero, and
+  <code>SUM</code> over integers is computed exactly.</p>
 </aside>
 
 <h2>SELECT</h2>
@@ -43,40 +45,41 @@ ORDER BY expr [ASC|DESC], ...      -- NULLS LAST both ways; ORDER BY 2 positiona
 LIMIT n;
 
 -- Scalar subqueries (SELECT ...) anywhere an expression goes:
--- uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL.</code></pre>
+-- uncorrelated only: exactly 1 row x 1 col, 0 rows -> NULL.
+-- UNION [ALL|DISTINCT] combines query results (numeric types unify).</code></pre>
 
 <h3>Joins</h3>
 
 <ul>
-  <li>Equi-joins only, a single equality predicate:
-  <code>INNER</code>, <code>LEFT [OUTER]</code>, <code>RIGHT [OUTER]</code>.</li>
-  <li>Outer joins NULL-extend the unmatched side's columns; join-kind-aware predicate
-  pushdown.</li>
+  <li>Equi-joins with a single equality predicate: <code>INNER</code>,
+  <code>LEFT [OUTER]</code>, <code>RIGHT [OUTER]</code>.</li>
+  <li>Outer joins NULL-extend the unmatched side's columns.</li>
   <li>Cross-database joins work: <code>db1.t JOIN db2.u</code>.</li>
-  <li>No <code>FULL</code> joins; <code>CROSS</code> joins are rejected.</li>
-  <li>Integer-key joins use a specialized fast path, and join→aggregate queries are fused
-  so intermediate rows are never materialized (mixed-predicate joins materialize).</li>
+  <li>No <code>FULL</code> joins; <code>CROSS</code> joins are rejected with a clear
+  parse error.</li>
 </ul>
 
 <h3>Subqueries and CTEs</h3>
 
 <ul>
-  <li>Derived tables in <code>FROM</code> (alias required), including inside CTEs, views,
-  and other subqueries.</li>
-  <li>Scalar subqueries, <code>IN (subquery)</code>, and <code>EXISTS (subquery)</code> —
-  uncorrelated only; correlated subqueries are rejected.</li>
-  <li><code>WITH w AS (...)</code> plus <code>WITH w(a, b) AS (...)</code> column aliases.
-  CTEs shadow unqualified names only; a qualified name never resolves to a CTE.</li>
+  <li>Derived tables in <code>FROM</code> (alias required), including inside CTEs,
+  views and other subqueries.</li>
+  <li>Scalar subqueries, <code>IN (subquery)</code> and <code>EXISTS (subquery)</code>
+  — uncorrelated only; correlated subqueries are rejected.</li>
+  <li><code>WITH w AS (...)</code> plus <code>WITH w(a, b) AS (...)</code> column
+  aliases. CTEs shadow unqualified names only; a qualified name never resolves to a
+  CTE.</li>
 </ul>
 
 <h3>Set operations and views</h3>
 
 <ul>
   <li><code>UNION [ALL|DISTINCT]</code> with numeric type unification. An
-  <code>ORDER BY</code>/<code>LIMIT</code> after the set operation applies to the whole
-  result; branch-level clauses need parentheses and are unsupported in v1.</li>
-  <li><code>CREATE VIEW v [(cols)] AS ...</code> — session-local and per-database; bodies
-  are self-contained (the caller's CTEs never leak in) and rebound per use.</li>
+  <code>ORDER BY</code>/<code>LIMIT</code> after the set operation applies to the
+  whole result; branch-level clauses need parentheses and are unsupported today.</li>
+  <li><code>CREATE VIEW v [(cols)] AS ...</code> — session-local and per-database;
+  bodies are self-contained (the caller's CTEs never leak in) and rebound per
+  use.</li>
 </ul>
 
 <h2>Aggregates and window functions</h2>
@@ -87,12 +90,13 @@ LIMIT n;
   <li>Window functions: <code>ROW_NUMBER</code>, <code>RANK</code>,
   <code>DENSE_RANK</code>, and aggregates <code>OVER</code> with
   <code>PARTITION BY</code> / <code>ORDER BY</code> / <code>ROWS</code> frames. The
-  default frame is cumulative with <code>ORDER BY</code> and whole-partition without it.
-  No <code>RANGE</code> frames and no nesting.</li>
-  <li>Window functions are allowed in the SELECT list and <code>ORDER BY</code> only (not
-  in <code>WHERE</code>/<code>GROUP BY</code>/<code>HAVING</code>).</li>
+  default frame is cumulative with <code>ORDER BY</code> and whole-partition without
+  it. No <code>RANGE</code> frames and no nesting.</li>
+  <li>Window functions are allowed in the SELECT list and <code>ORDER BY</code> only
+  (not in <code>WHERE</code>/<code>GROUP BY</code>/<code>HAVING</code>).</li>
   <li>Aggregates in <code>ORDER BY</code> need a select alias or position; general
-  <code>ORDER BY</code> expressions must be aliases, positions, or GROUP BY keys.</li>
+  <code>ORDER BY</code> expressions must be aliases, positions, or GROUP BY
+  keys.</li>
 </ul>
 
 <h2>Scalar functions and expressions</h2>
@@ -100,13 +104,17 @@ LIMIT n;
 <ul>
   <li><code>abs</code>, <code>round</code> (1–2 args), <code>upper</code>,
   <code>lower</code>, <code>length</code>, <code>substr</code>.</li>
-  <li><code>CAST(x AS type)</code>: the numeric tower both ways, bool↔numeric,
-  varchar parse/format, date↔timestamp; bad input errors.</li>
+  <li><code>CAST(x AS type)</code>: the numeric tower both ways, bool ↔ numeric,
+  varchar parse/format, date ↔ timestamp; bad input and out-of-range narrowing
+  error.</li>
   <li><code>COALESCE(a, b, ...)</code> with a common result type;
-  <code>LIKE</code>/<code>NOT LIKE</code> with <code>%</code>/<code>_</code> patterns.</li>
+  <code>LIKE</code>/<code>NOT LIKE</code> with <code>%</code>/<code>_</code>
+  patterns.</li>
   <li><code>CASE WHEN c THEN v ... [ELSE e] END</code> and the simple
-  <code>CASE x WHEN v ...</code> form. NULL conditions never match; result types unify
-  like <code>COALESCE</code>.</li>
+  <code>CASE x WHEN v ...</code> form. NULL conditions never match; result types
+  unify like <code>COALESCE</code>.</li>
+  <li>Extensions can add scalar functions at runtime — see
+  <a href="{{root}}docs/extensions.html">Using extensions</a>.</li>
 </ul>
 
 <h2>Types and literals</h2>
@@ -130,36 +138,37 @@ LIMIT n;
 TIMESTAMP '2024-03-15 12:30:45.5'</code></pre>
 
 <p>Date operations: <code>date ± integer</code> adds/subtracts days,
-<code>date - date</code> yields <code>BIGINT</code> days, and
-<code>year(x)</code>, <code>month(x)</code>, <code>day(x)</code>,
-<code>hour(x)</code>, <code>minute(x)</code>, <code>second(x)</code>, and
-<code>date_trunc(part, x)</code> are available. CSV import auto-detects
-<code>YYYY-MM-DD</code> as <code>DATE</code> and
-<code>YYYY-MM-DD HH:MM:SS[.f]</code> as <code>TIMESTAMP</code>.</p>
+<code>date - date</code> yields <code>BIGINT</code> days, and <code>year(x)</code>,
+<code>month(x)</code>, <code>day(x)</code>, <code>hour(x)</code>,
+<code>minute(x)</code>, <code>second(x)</code> and <code>date_trunc(part, x)</code>
+are available. CSV import auto-detects <code>YYYY-MM-DD</code> as
+<code>DATE</code> and <code>YYYY-MM-DD HH:MM:SS[.f]</code> as
+<code>TIMESTAMP</code>.</p>
 
 <h3>Coercion rules</h3>
 
 <ul>
   <li><code>INTEGER → BIGINT → DOUBLE</code>.</li>
-  <li><code>int / int → DOUBLE</code> (the DuckDB rule).</li>
-  <li><code>%</code> is integer-only. Integer overflow is an error, like DuckDB
-  (<code>+</code>/<code>-</code>/<code>*</code>, negation, <code>abs</code>, date ± n,
-  narrowing casts); <code>SUM</code> over integers accumulates in 128 bits and errors
-  only when the final result does not fit BIGINT.</li>
+  <li><code>int / int → DOUBLE</code> (the DuckDB rule). <code>%</code> is
+  integer-only.</li>
+  <li>Integer overflow is an error, like DuckDB (<code>+</code>/<code>-</code>/<code>*</code>,
+  negation, <code>abs</code>, date ± n, narrowing casts); <code>SUM</code> over
+  integers is exact and errors only when the final value does not fit
+  <code>BIGINT</code>.</li>
   <li>Integer division/modulo by zero is an error; <code>0.0</code> float division is
   IEEE.</li>
-  <li>Mixed <code>DATE</code>/<code>TIMESTAMP</code> comparison is rejected; timestamps
-  never mix with integers (no <code>INTERVAL</code> type in v1).</li>
+  <li>Mixed <code>DATE</code>/<code>TIMESTAMP</code> comparison is rejected;
+  timestamps never mix with integers (no <code>INTERVAL</code> type today).</li>
 </ul>
 
 <h2>Three-valued logic</h2>
 
 <ul>
-  <li><code>NULL</code> fails <code>WHERE</code>: a comparison with NULL is never true.</li>
-  <li><code>COUNT(x)</code>, <code>SUM</code>, and <code>AVG</code> skip NULLs;
+  <li><code>NULL</code> fails <code>WHERE</code>: a comparison with NULL is never
+  true.</li>
+  <li><code>COUNT(x)</code>, <code>SUM</code> and <code>AVG</code> skip NULLs;
   <code>COUNT(*)</code> counts rows.</li>
-  <li>NULL group keys group together.</li>
-  <li>NULL join keys never match.</li>
+  <li>NULL group keys group together; NULL join keys never match.</li>
   <li>LEFT/RIGHT joins NULL-extend the unmatched side's columns.</li>
   <li><code>CASE</code> conditions that evaluate to NULL never match.</li>
 </ul>
@@ -168,40 +177,59 @@ TIMESTAMP '2024-03-15 12:30:45.5'</code></pre>
 
 <p>Databases are named, case-insensitive namespaces (<code>main</code> by default).
 A session — the embedded <code>PinkDb</code>, or each <code>Connection</code> — has a
-current database; unqualified table names resolve there. <code>USE db</code> switches it
-and never affects other sessions: the shared store is untouched.</p>
+current database; unqualified table names resolve there. <code>USE db</code> switches
+it and never affects other sessions: the shared store is untouched.</p>
 
 <ul>
   <li><code>db.table</code> qualifies any table reference in
   <code>FROM</code>/<code>JOIN</code>, <code>INSERT</code>, <code>UPDATE</code>,
   <code>DELETE</code>, <code>CREATE TABLE</code>, <code>DROP TABLE</code>,
-  <code>CREATE VIEW</code>, and <code>DROP VIEW</code>.</li>
-  <li>Three-part column references (<code>db.table.col</code>) are not supported — use an
-  alias (<code>SELECT x.col FROM db.table AS x</code>); a clear parse error is returned.</li>
+  <code>CREATE VIEW</code> and <code>DROP VIEW</code>.</li>
+  <li>Three-part column references (<code>db.table.col</code>) are not supported —
+  use an alias (<code>SELECT x.col FROM db.table AS x</code>).</li>
   <li>Views are per-database and session-local: created in the current database and
-  resolved there, with their bodies resolving unqualified names in that database.</li>
-  <li><code>DROP DATABASE</code> refuses the last database and switches a session that was
-  using the dropped database to <code>main</code> (or the first remaining database).
-  <code>CREATE</code>/<code>DROP DATABASE</code> are refused inside a transaction.</li>
-  <li><code>USE</code>, <code>DATABASE</code>, and
+  resolved there, with their bodies resolving unqualified names in that
+  database.</li>
+  <li><code>DROP DATABASE</code> refuses the last database and switches a session
+  that was using it to <code>main</code> (or the first remaining database).
+  <code>CREATE</code>/<code>DROP DATABASE</code> and <code>LOAD EXTENSION</code> are
+  refused inside a transaction.</li>
+  <li><code>USE</code>, <code>DATABASE</code>, <code>LOAD</code>,
+  <code>EXTENSION</code> and
   <code>LEFT</code>/<code>RIGHT</code>/<code>OUTER</code>/<code>FULL</code>/<code>CROSS</code>
-  are reserved words; quote identifiers to use them as names (<code>"use"</code> works).</li>
+  are reserved words; quote identifiers to use them as names
+  (<code>"use"</code> works).</li>
 </ul>
 
-<h2>Known v1 limits</h2>
+<h2>Not supported yet</h2>
+
+<p>These are real gaps, listed so you can plan around them. Most are scheduled on the
+<a href="{{root}}docs/roadmap.html">roadmap</a>.</p>
 
 <ul>
-  <li>No nested transactions or savepoints; one process per <code>.pink</code> path.</li>
-  <li>Durable commits refuse statements that read a session-local view (views are never
-  persisted), and <code>.import</code> checkpoints so it needs a settled transaction.</li>
-  <li>Correlated subqueries are rejected; no FULL joins; CROSS joins are rejected.</li>
-  <li>Expression nesting is capped at 24 levels and the parser-to-AST depth at 64 nodes;
-  deeper input returns a clean <code>Parse</code> error instead of overflowing the
-  stack.</li>
+  <li><strong>Joins:</strong> no <code>FULL</code> or <code>CROSS</code> joins, no
+  multi-way or composite/non-equi join conditions.</li>
+  <li><strong>SQL completeness (planned):</strong> <code>INSERT ... SELECT</code>,
+  CTAS, <code>IF [NOT] EXISTS</code>, <code>OFFSET</code>,
+  <code>NULLS FIRST/LAST</code>, <code>INTERSECT</code>/<code>EXCEPT</code>,
+  <code>COUNT(DISTINCT)</code>, <code>EXPLAIN</code>,
+  <code>SHOW</code>/<code>DESCRIBE</code>, <code>RANGE</code> window frames.</li>
+  <li><strong>Prepared statements (planned):</strong> placeholders and a bind API are
+  not available yet on any front-end.</li>
+  <li><strong>More functions and types (planned):</strong>
+  <code>lag</code>/<code>lead</code>/<code>ntile</code>, <code>DECIMAL</code>,
+  <code>INTERVAL</code>; core <code>json</code>, <code>string</code>,
+  <code>math</code> and <code>datetime</code> extensions.</li>
+  <li><strong>Schema features (planned):</strong> keys and constraints
+  (metadata), indexes, materialized views, stored procedures.</li>
+  <li><strong>Limits today:</strong> correlated subqueries are rejected; expression
+  nesting is capped at 24 levels and statement depth at 64 nodes (deeper input is a
+  clean parse error, never a stack overflow); aggregates in <code>ORDER BY</code>
+  need an alias or position.</li>
 </ul>
 
 <ul class="next-links">
   <li><a href="{{root}}docs/cli.html">CLI &amp; REPL →</a></li>
-  <li><a href="{{root}}docs/persistence.html">Persistence &amp; WAL →</a></li>
-  <li><a href="https://github.com/openlearnia/pinkdb#known-v1-limits" rel="noopener">Full limits list on GitHub →</a></li>
+  <li><a href="{{root}}docs/persistence.html">Persistence →</a></li>
+  <li><a href="{{root}}docs/roadmap.html">Roadmap →</a></li>
 </ul>

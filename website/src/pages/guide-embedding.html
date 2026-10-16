@@ -1,0 +1,139 @@
+<h1>Guide: embedding pinkdb</h1>
+
+<p class="doc-meta">Add a SQL engine to your application from Rust, C, Python or Go.
+This guide gets each target to "open a database, run SQL, read typed results".</p>
+
+<h2>Rust (native)</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{Database, PinkDb};
+
+// single connection, simplest possible:
+let mut db = PinkDb::new();
+let results = db.execute(
+    "CREATE TABLE events (name VARCHAR, n BIGINT);\
+     INSERT INTO events VALUES ('signup', 3), ('login', 9);\
+     SELECT name, SUM(n) AS total FROM events GROUP BY name ORDER BY total DESC;",
+)?;
+println!("{results:?}");
+
+// multi-threaded host: one shared store, one Connection per thread
+let db = Database::new();
+let mut c = db.connect();
+c.execute("SELECT 1;")?;</code></pre>
+
+<p>For durable files, use <code>Database::open</code>,
+<code>PinkDb::open_durable</code> or the encryption variants — the same machinery the
+CLI uses. See the <a href="{{root}}docs/api-rust.html">Rust API</a>.</p>
+
+<h2>C / C++</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
+# link: -L target/release -lpinkdb_ffi
+# include: crates/pinkdb-ffi/include/pinkdb.h</code></pre>
+
+<pre class="code" data-lang="c"><code>#include "pinkdb.h"
+
+pinkdb_handle *db = pinkdb_open_memory();
+const char *sql =
+    "CREATE TABLE t (x INTEGER);"
+    "INSERT INTO t VALUES (42);"
+    "SELECT x FROM t;";
+
+pinkdb_result *r = pinkdb_execute(db, sql, strlen(sql));
+if (!r) { fprintf(stderr, "%s\n", pinkdb_last_error()); return 1; }
+
+pink_value v = pinkdb_result_value(r, 2, 0, 0);   /* statement 2, row 0, col 0 */
+printf("%lld\n", (long long)v.int64);             /* 42 */
+
+pinkdb_result_free(r);
+pinkdb_close(db);</code></pre>
+
+<p class="doc-meta">Handles are not thread-safe — one per thread, or serialize calls.
+VARCHAR pointers borrow from the result; copy with <code>text_len</code> (embedded
+NULs are allowed). Full details: <a href="{{root}}docs/api-c.html">C API</a>.</p>
+
+<h2>Python</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
+python3 -c "import pinkdb"      # resolves the library from the repo checkout</code></pre>
+
+<pre class="code" data-lang="python"><code>import pinkdb
+
+with pinkdb.connect("app.pink") as db:         # durable; or connect_memory()
+    db.execute("CREATE TABLE t (x INTEGER);")
+    db.execute("INSERT INTO t VALUES (42);")
+    result = db.execute("SELECT x FROM t;")[0]
+    print(result.kind, result.rows)            # selected [[42]]</code></pre>
+
+<p>A <code>Database</code> is safe to share between threads (calls are serialized
+internally). A pip-installable wheel is planned. See the
+<a href="{{root}}docs/api-python.html">Python API</a>.</p>
+
+<h2>Go</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
+
+# from your app, point the module at your pinkdb checkout
+# (a standalone published module is planned):
+go mod edit -replace github.com/openlearnia/pinkdb/bindings/go=/path/to/pinkdb/bindings/go</code></pre>
+
+<pre class="code" data-lang="go"><code>import pinkdb "github.com/openlearnia/pinkdb/bindings/go"
+
+db, err := pinkdb.Open("app.pink") // or pinkdb.OpenMemory()
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+results, err := db.Execute("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42); SELECT x FROM t;")
+if err != nil {
+    log.Fatal(err)
+}
+rows := results[len(results)-1].Rows // [[42]]</code></pre>
+
+<p>One <code>*DB</code> is safe to share between goroutines. See the
+<a href="{{root}}docs/api-go.html">Go API</a>.</p>
+
+<h2>Choosing an embedding</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Situation</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Rust application</td>
+      <td>the <code>pinkdb</code> crate directly — no ABI, full API (durability
+      options, encryption keys, lake)</td>
+    </tr>
+    <tr>
+      <td>C/C++ or another FFI language</td>
+      <td><code>pinkdb-ffi</code> (ABI v1); the header is the contract</td>
+    </tr>
+    <tr>
+      <td>Python scripts and tools</td>
+      <td><code>bindings/python</code> (stdlib <code>ctypes</code>, no pip)</td>
+    </tr>
+    <tr>
+      <td>Go services</td>
+      <td><code>bindings/go</code> (<code>cgo</code>, goroutine-safe wrapper)</td>
+    </tr>
+    <tr>
+      <td>Several processes on one file</td>
+      <td>the durable path — all embeddings open the same WAL/lease machinery</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout">
+  <span class="callout-title">Feature note</span>
+  <p>The C ABI builds the engine without CLI features: encrypted databases and lake
+  commands are Rust/CLI paths today. The bindings inherit that and open plaintext
+  databases.</p>
+</div>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/bindings.html">Bindings overview →</a></li>
+  <li><a href="{{root}}docs/api-rust.html">Rust API →</a></li>
+  <li><a href="{{root}}docs/persistence.html">Persistence →</a></li>
+</ul>

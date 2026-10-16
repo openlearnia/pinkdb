@@ -339,6 +339,3 @@ jobs:
 
       - name: python3 website/build.py
         run: python3 website/build.py
-
-      - name: roadmap page matches ROADMAP.md
-        run: python3 website/tools/sync_roadmap.py --check

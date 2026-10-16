@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide: multi-process writers — pinkdb</title>
+<meta name="description" content="Open one durable .pink database from several processes: writers serialize on a write lease, readers refresh from the WAL, and a busy database waits up to the busy timeout.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-durable-multiprocess.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Guide: multi-process writers — pinkdb">
+<meta property="og:description" content="Open one durable .pink database from several processes: writers serialize on a write lease, readers refresh from the WAL, and a busy database waits up to the busy timeout.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-durable-multiprocess.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess" class="active" aria-current="page">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Guide: multi-process writers</h1>
+
+<p class="doc-meta">A durable <code>.pink</code> database can be opened read-write by
+several local processes at once. Writers serialize on a short-held write lease;
+readers never block and never see uncommitted rows.</p>
+
+<h2>1. Build the default CLI</h2>
+
+<p>Nothing extra is needed — durability is in the default build:</p>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli
+./target/release/pinkdb</code></pre>
+
+<h2>2. Two writers, one file</h2>
+
+<p>Open a terminal for each process — start the REPL, then <code>.open</code> the
+<em>same</em> durable database in each:</p>
+
+<pre class="code" data-lang="sql"><code># terminal A
+pinkdb&gt; .open db.pink
+pinkdb&gt; CREATE TABLE t (n INTEGER);
+pinkdb&gt; INSERT INTO t VALUES (1);
+
+# terminal B — same file, separate process
+pinkdb&gt; .open db.pink
+pinkdb&gt; INSERT INTO t VALUES (2);
+
+# terminal C — a reader
+pinkdb&gt; .open db.pink
+pinkdb&gt; SELECT COUNT(*) FROM t;
+┌──────────┐
+│ count(*) │
+│ BIGINT   │
+├──────────┤
+│ 2        │
+└──────────┘</code></pre>
+
+<p>Each process keeps its own in-memory store. A writer takes the file's
+<strong>write lease</strong> for the operation — refresh, execute, append, fsync,
+publish — and a reader checks a publication epoch with a single <code>pread</code>,
+replaying the WAL frames it has not seen only when the epoch changed. Refresh
+happens at statement boundaries and before <code>BEGIN</code>, never
+mid-statement.</p>
+
+<h2>3. Concurrency semantics</h2>
+
+<ul>
+  <li><strong>Writers serialize, per operation.</strong> Two processes never write
+  the WAL at the same instant; the lease is held for one statement, or from
+  <code>BEGIN</code> to <code>COMMIT</code>/<code>ROLLBACK</code> for a
+  transaction (so cross-process transactions serialize too).</li>
+  <li><strong>Readers never block</strong> and never observe uncommitted rows. A
+  replaced WAL or checkpoint triggers a full rebuild on the next refresh that
+  preserves views and attachments.</li>
+  <li><strong>A busy database waits</strong> up to the busy timeout — 5 s by default
+  — then fails with a clear <code>database is busy</code> error:</li>
+</ul>
+
+<pre class="code" data-lang="sh"><code>PINKDB_BUSY_TIMEOUT_MS=20000 ./target/release/pinkdb
+# or, in Rust:
+#   Database::set_busy_timeout(Duration::from_secs(20))
+#   DurableOpenOptions { busy_timeout: ..., .. }</code></pre>
+
+<ul>
+  <li><strong>Crash safety:</strong> the OS releases the lease on exit or crash, so
+  there is no stale-lock cleanup. A killed writer's committed records are recovered
+  from the WAL by the next open.</li>
+  <li><strong>Checkpoints refresh first</strong>, under the lease, so a checkpoint
+  can never publish a state that omits another process's committed records.</li>
+</ul>
+
+<h2>4. From Rust</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{Database, LockMode};
+
+// shared in-process store, one Connection per thread
+let db = Database::open("db.pink")?;
+let mut writer = db.connect();
+writer.execute("INSERT INTO t VALUES (42);")?;
+
+// tune the wait for another process's lease
+db.set_busy_timeout(std::time::Duration::from_secs(10));
+
+// explicit embedded options (CLI parity):
+// let db = Database::open_with_options("db.pink", DurableOpenOptions {
+//     policy: SyncPolicy::Sync,
+//     busy_timeout: Duration::from_secs(5),
+//     lock_mode: LockMode::Required,
+// })?;</code></pre>
+
+<h2>Gotchas</h2>
+
+<ul>
+  <li><strong><code>flock</code> is assumed to work.</strong> An open on a
+  filesystem that reports locking unsupported fails closed
+  (<code>LockMode::Required</code>, the default), with
+  <code>LockMode::UnsafeSingleProcess</code> as the explicit opt-out.</li>
+  <li><strong>No network-filesystem detection.</strong> A filesystem that accepts
+  <code>flock</code> but does not honor it across hosts (NFS/SMB) is not caught —
+  keep multi-process databases on local storage. Windows is untested.</li>
+  <li><strong>A failed WAL append is fail-stop:</strong> every later statement and
+  save is refused until the database is reopened, which recovers exactly the durable
+  prefix. Nobody can observe or persist the non-durable state.</li>
+  <li><strong>Encrypted stores are covered too:</strong> the same lease keeps two
+  writers off one encrypted WAL, where concurrency would risk nonce reuse.</li>
+  <li><strong>Cross-process conflicts are per statement.</strong>
+  <code>BEGIN..COMMIT</code> keeps its snapshot-isolation semantics; overlapping
+  commits abort with a write conflict you can retry.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/persistence">Persistence &amp; encryption →</a></li>
+  <li><a href="../docs/api-rust">Rust API →</a></li>
+  <li><a href="../docs/roadmap">Roadmap →</a></li>
+</ul>
+
+</article>
+
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

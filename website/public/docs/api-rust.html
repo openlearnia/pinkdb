@@ -1,0 +1,335 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rust API — pinkdb</title>
+<meta name="description" content="The pinkdb Rust API: PinkDb, Database/Connection, durability options, encryption keys, the CSV importer, and the pink-lake crate.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/api-rust.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Rust API — pinkdb">
+<meta property="og:description" content="The pinkdb Rust API: PinkDb, Database/Connection, durability options, encryption keys, the CSV importer, and the pink-lake crate.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/api-rust.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust" class="active" aria-current="page">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Rust API</h1>
+
+<p class="doc-meta">The native interface: the <code>pinkdb</code> crate for the engine
+and <code>pink-lake</code> for the lake layer. Everything else — the CLI, server,
+C ABI and bindings — is built on these types.</p>
+
+<h2 id="getting-the-crate">Getting the crate</h2>
+
+<pre class="code" data-lang="toml"><code>[dependencies]
+pinkdb = { path = "crates/pinkdb" }        # the engine
+pink-lake = { path = "crates/pink-lake" }  # optional: the lake layer</code></pre>
+
+<p>The crates live in this workspace; the examples here use path dependencies. The
+default build links no crypto, TLS or format code; features opt in:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Feature</th><th>Adds</th></tr></thead>
+  <tbody>
+    <tr><td><code>encryption</code></td><td><code>PINKENC1</code> at-rest encryption (AES-256-GCM + Argon2id)</td></tr>
+    <tr><td><code>vortex-format</code> (on <code>pink-lake</code>)</td><td>the Vortex lake data format (the CLI's <code>lake</code> feature enables it)</td></tr>
+    <tr><td><code>s3</code> (on <code>pink-lake</code>)</td><td>S3/R2 object storage (implies the lean lake)</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="quick-start">Quick start</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::PinkDb;
+
+let mut db = PinkDb::new();
+for result in db.execute(
+    "CREATE TABLE t (a INTEGER, s VARCHAR);\
+     INSERT INTO t VALUES (1, 'one'), (2, NULL);\
+     SELECT a, s FROM t ORDER BY a;",
+)? {
+    println!("{result:?}");
+}</code></pre>
+
+<h2 id="public-types">Public types</h2>
+
+<p>The crate root re-exports the main surface:</p>
+
+<pre class="code" data-lang="rust"><code>pub use pinkdb::{
+    // core session + store
+    PinkDb, DataTable, ViewDef,
+    // multi-writer handles
+    Database, Connection,
+    // results and values
+    QueryResult, Value, DataType, PinkDbError,
+    // vectors
+    Vector, VectorData, DataChunk, CHUNK_SIZE,   // CHUNK_SIZE = 2048
+    // durability
+    DurableOpenOptions, LockMode, RecoveryInfo, SyncPolicy,
+    DEFAULT_AUTO_CHECKPOINT_BYTES,               // 64 MiB
+    // encryption (feature `encryption`)
+    EncryptionKey,
+    // attached lakes (CLI/library attach support)
+    AttachedLake, AttachedTable, AttachedScan, ColumnStats,
+};</code></pre>
+
+<p>Modules: <code>pinkdb::csv</code> (CSV import), <code>pinkdb::sql</code> (parser,
+AST, binder), <code>pinkdb::plan</code>, <code>pinkdb::optimizer</code>,
+<code>pinkdb::exec</code>, <code>pinkdb::persist</code> (<code>.pink</code> save/open),
+<code>pinkdb::wal</code>, <code>pinkdb::db</code>, <code>pinkdb::storage</code>,
+<code>pinkdb::types</code>, <code>pinkdb::vector</code>,
+<code>pinkdb::attached</code>.</p>
+
+<h2 id="pinkdb-the-engine"><code>PinkDb</code> — the engine</h2>
+
+<p>One struct owns an in-memory store and a session (its current database). This is
+the single-connection embedding API:</p>
+
+<pre class="code" data-lang="rust"><code>impl PinkDb {
+    pub fn new() -> Self;
+    pub fn execute(&amp;mut self, sql: &amp;str) -> Result&lt;Vec&lt;QueryResult&gt;&gt;;
+
+    // databases and transactions
+    pub fn current_db(&amp;self) -&gt; &amp;str;
+    pub fn list_databases(&amp;self) -&gt; Vec&lt;String&gt;;
+    pub fn create_database(&amp;mut self, name: &amp;str) -&gt; Result&lt;()&gt;;
+    pub fn drop_database(&amp;mut self, name: &amp;str) -&gt; Result&lt;()&gt;;
+    pub fn use_database(&amp;mut self, name: &amp;str) -&gt; Result&lt;()&gt;;
+    pub fn begin(&amp;mut self) -&gt; Result&lt;()&gt;;
+    pub fn commit(&amp;mut self) -&gt; Result&lt;()&gt;;
+    pub fn rollback(&amp;mut self) -&gt; Result&lt;()&gt;;
+    pub fn in_transaction(&amp;self) -&gt; bool;
+
+    // persistence
+    pub fn save(&amp;self, path: &amp;str) -&gt; Result&lt;()&gt;;
+    pub fn save_snapshot(&amp;self, path: &amp;str) -&gt; Result&lt;()&gt;;
+    pub fn open(path: &amp;str) -&gt; Result&lt;PinkDb&gt;;
+    pub fn open_durable(path: &amp;str) -&gt; Result&lt;PinkDb&gt;;
+    pub fn open_durable_with(path: &amp;str, policy: SyncPolicy)
+        -&gt; Result&lt;(PinkDb, RecoveryInfo)&gt;;
+    pub fn open_durable_with_options(path: &amp;str, opts: DurableOpenOptions)
+        -&gt; Result&lt;(PinkDb, RecoveryInfo)&gt;;
+    pub fn checkpoint(&amp;mut self) -&gt; Result&lt;()&gt;;
+    pub fn flush_wal(&amp;mut self) -&gt; Result&lt;()&gt;;
+    pub fn durable_path(&amp;self) -&gt; Option&lt;PathBuf&gt;;
+    pub fn set_busy_timeout(&amp;self, timeout: Duration);
+    pub fn set_auto_checkpoint_bytes(&amp;self, bytes: Option&lt;u64&gt;);
+
+    // encryption (feature `encryption`)
+    pub fn save_with_key(&amp;self, path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;()&gt;;
+    pub fn open_with_key(path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;PinkDb&gt;;
+    pub fn open_durable_with_key(path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;PinkDb&gt;;
+    pub fn set_encryption_key(&amp;mut self, key: Option&lt;EncryptionKey&gt;);
+
+    // extensions
+    pub fn load_extension(&amp;mut self, path: &amp;str) -&gt; Result&lt;String&gt;;
+}</code></pre>
+
+<p>There are more helpers (<code>create_table</code>, <code>drop_table</code>,
+<code>list_tables</code>, <code>create_view</code>, <code>table_version</code>, and
+their <code>*_in(db)</code> variants) — see the crate docs. Tables/views are also
+reachable as <code>DataTable</code> / <code>ViewDef</code> if you build or inspect the
+store directly.</p>
+
+<h3>Importing CSV</h3>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::csv;
+
+csv::import_csv(&amp;mut db, "sales.csv", Some("sales"))?;        // file -> table
+csv::import_csv_string(&amp;mut db, "t", "a,b\n1,x\n")?;          // text -> table</code></pre>
+
+<h3>Durable options</h3>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{DurableOpenOptions, LockMode, SyncPolicy};
+use std::time::Duration;
+
+let opts = DurableOpenOptions {
+    policy: SyncPolicy::Sync,              // fsync every record (or SyncPolicy::Batch)
+    busy_timeout: Duration::from_secs(5),  // wait for another process's write lease
+    lock_mode: LockMode::Required,         // fail closed when locking is unsupported
+};
+let (db, recovery) = PinkDb::open_durable_with_options("x.pink", opts)?;
+println!("{} records replayed", recovery.replayed_records);</code></pre>
+
+<h2 id="database-connection-multi-writer"><code>Database</code> / <code>Connection</code> — multi-writer</h2>
+
+<p><code>Database</code> wraps the store in shared locks for multi-connection use
+(one <code>Connection</code> per thread); durable opens through it also carry the
+WAL and, for local files, the multi-process write lease.</p>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::Database;
+
+// in memory
+let db = Database::new();
+
+// durable
+let db = Database::open("x.pink")?;
+let db = Database::open_with_options("x.pink", opts)?;
+
+let mut c = db.connect();
+c.execute("CREATE TABLE t (a INTEGER);")?;
+
+db.checkpoint()?;                    // SQL `CHECKPOINT` also works from any front-end
+db.set_busy_timeout(Duration::from_secs(10));
+db.set_auto_checkpoint_bytes(Some(64 * 1024 * 1024));</code></pre>
+
+<h2 id="encryptionkey"><code>EncryptionKey</code></h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::EncryptionKey;
+
+let key = EncryptionKey::from_passphrase("correct horse battery staple");
+// or a raw 32-byte key — see the type's constructors.
+
+db.save_with_key("x.pink", &amp;key)?;
+let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?;</code></pre>
+
+<h2 id="pink-lake"><code>pink-lake</code></h2>
+
+<pre class="code" data-lang="rust"><code>use pink_lake::{Lake, save_store, save_store_url};
+
+let version = save_store(&amp;db, "mylake")?;        // create + save
+let mut lake = Lake::open("mylake")?;            // or Lake::open_url("s3://…") with `s3`
+let v = lake.write_from_store(&amp;db)?;             // publish a new full snapshot
+let versions = lake.versions()?;                 // [1, 2, 3]
+let tables = lake.tables()?;                     // [("main.t", 2)]
+let db = lake.load(None)?;                       // rebuild the latest version
+let db = lake.load(Some(2))?;                    // or a specific one
+let report = lake.attach(None)?;                 // read-only attachment (statistics)
+// save_store_s3 / save_store_url for object storage
+// S3Config::new(bucket).with_prefix(..).with_region(..)
+//     .with_endpoint(..).with_credentials(..) for explicit configuration</code></pre>
+
+<p class="doc-meta">One live writer handle per lake; loads and attachments can run
+concurrently from published versions. Details on the
+<a href="../docs/lake">Lake page</a>.</p>
+
+<h2 id="how-the-engine-works">How the engine works</h2>
+
+<ul>
+  <li><strong>Pipeline:</strong> SQL text → AST → binder (types, tables, columns) →
+  logical plan → optimizer (predicate pushdown, constant folding) → vectorized
+  executor → columnar storage.</li>
+  <li><strong>Vectors, not rows:</strong> a <code>Vector</code> is a typed column
+  chunk plus a validity bitmask; operators exchange <code>DataChunk</code>s of
+  ≤2,048 rows. <code>WHERE</code> produces a selection vector instead of copying
+  rows.</li>
+  <li><strong>Parallel by default:</strong> queries run under a shared read lock
+  with rayon-parallel chunks; writes take the write lock per statement; transactions
+  use snapshot isolation with write-conflict detection.</li>
+  <li><strong>Design rules:</strong> Rust edition 2021, zero async in the core, no
+  <code>unsafe</code> outside <code>pinkdb-ffi</code> and
+  <code>pinkdb-ext-loader</code>; new capabilities arrive as separate crates or
+  opt-in features.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/persistence">Persistence →</a></li>
+  <li><a href="../docs/lake">Lake →</a></li>
+  <li><a href="../docs/guide-embedding">Guide: embedding →</a></li>
+</ul>
+
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#getting-the-crate">Getting the crate</a></li>
+  <li><a href="#quick-start">Quick start</a></li>
+  <li><a href="#public-types">Public types</a></li>
+  <li><a href="#pinkdb-the-engine">PinkDb — the engine</a></li>
+  <li><a href="#database-connection-multi-writer">Database / Connection — multi-writer</a></li>
+  <li><a href="#encryptionkey">EncryptionKey</a></li>
+  <li><a href="#pink-lake">pink-lake</a></li>
+  <li><a href="#how-the-engine-works">How the engine works</a></li>
+</ul>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

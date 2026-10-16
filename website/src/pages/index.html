@@ -1,59 +1,213 @@
 <div class="ticker" aria-hidden="true">
   <div class="ticker-track">
-    <span>waves 0&#8211;40b shipped &#183; see the roadmap</span>
+    <span>~2.4 MB default binary</span>
+    <span>1M rows &#8594; 2.68 MB .pink</span>
+    <span>lean lake 2.69 MB &#183; full lake 45.3 MB</span>
+    <span>Vortex or .pink lake data files</span>
+    <span>S3 / R2 lakes with conflict detection</span>
+    <span>C &#183; Python &#183; Go bindings</span>
+    <span>loadable extensions &#183; catalog live</span>
     <span>zero async &#183; zero unsafe in the core</span>
-    <span>1M-row CSV import in 25 ms</span>
-    <span>durable .pink files with a WAL</span>
-    <span>C ABI v1 &#183; extensions catalog live</span>
-    <span>pinkdb 1.0.0-dev &#183; rust edition 2021</span>
-    <span>waves 0&#8211;40b shipped &#183; see the roadmap</span>
+    <span>~2.4 MB default binary</span>
+    <span>1M rows &#8594; 2.68 MB .pink</span>
+    <span>lean lake 2.69 MB &#183; full lake 45.3 MB</span>
+    <span>Vortex or .pink lake data files</span>
+    <span>S3 / R2 lakes with conflict detection</span>
+    <span>C &#183; Python &#183; Go bindings</span>
+    <span>loadable extensions &#183; catalog live</span>
     <span>zero async &#183; zero unsafe in the core</span>
-    <span>1M-row CSV import in 25 ms</span>
-    <span>durable .pink files with a WAL</span>
-    <span>C ABI v1 &#183; extensions catalog live</span>
-    <span>pinkdb 1.0.0-dev &#183; rust edition 2021</span>
   </div>
 </div>
 
 <section class="hero">
   <div class="hero-sun" aria-hidden="true"></div>
-  <p class="kicker">embedded analytical SQL database in rust</p>
+  <p class="kicker">embedded analytical SQL in rust</p>
   <h1>pinkdb — a mini <span class="hero-mark">DuckDB</span> in Rust</h1>
   <svg class="sketch-underline" viewBox="0 0 260 18" aria-hidden="true" focusable="false">
     <path class="sk-pink-stroke" d="M4 12 C 40 6, 70 14, 104 9 S 168 4, 204 10 S 246 12, 256 7"/>
     <path class="sk-stroke" d="M12 15 C 62 11, 122 16, 182 12" opacity="0.35"/>
   </svg>
-  <p class="lede">In-memory columnar storage, vectorized execution, SQL with joins,
-  aggregates, window functions and CTEs, CSV import, durable <code>.pink</code> files with
-  a write-ahead log, an optional network server, and a C ABI — zero async in the core,
-  zero <code>unsafe</code> outside the FFI crate.</p>
+  <p class="lede">Link it into your program or run the CLI: columnar vectors, vectorized
+  execution, SQL with joins, CTEs and window functions, CSV import, durable
+  <code>.pink</code> files with a write-ahead log, a lake layer over local disk or
+  S3/R2, and C, Python and Go bindings. The default build is <strong>~2.4 MB</strong> —
+  zero async in the core, zero <code>unsafe</code> outside the FFI and
+  extension-loader crates.</p>
   <div class="hero-actions">
     <a class="button primary" href="{{root}}docs/getting-started.html">Get started</a>
-    <a class="button" href="{{root}}docs/sql.html">SQL reference</a>
-    <a class="button ghost" href="{{root}}docs/extensions.html">Extension catalog</a>
-    <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub &#8599;</a>
+    <a class="button" href="{{root}}docs/roadmap.html">Roadmap</a>
+    <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub &#8599;</a>
   </div>
   <ul class="chips">
-    <li class="chip"><span class="chip-num">1M</span> rows &#8594; import <span class="chip-num">25 ms</span></li>
-    <li class="chip">binary <span class="chip-num">~2 MB</span></li>
+    <li class="chip">binary <span class="chip-num">~2.4 MB</span> default</li>
+    <li class="chip">lake sizes <span class="chip-num">2.7</span>–<span class="chip-num">45 MB</span></li>
+    <li class="chip">bindings <span class="chip-num">C &#183; Python &#183; Go</span></li>
     <li class="chip"><span class="chip-num">0</span> async</li>
     <li class="chip"><span class="chip-num">0</span> unsafe in core</li>
-    <li class="chip">C ABI <span class="chip-num">v1</span></li>
   </ul>
 </section>
 
-<p class="doc-meta">Filed under: engine · crates pinkdb, pinkdb-cli, pinkdb-server,
-pinkdb-ffi · docs track ROADMAP.md (Oct 2026)</p>
+<h2>What it is</h2>
 
-<p>pinkdb ships as a library crate (<code>pinkdb</code>), a CLI REPL
-(<code>pinkdb-cli</code>, a thin consumer of the library), a network server
-(<code>pinkdb-server</code>, a separate crate so the core stays lean), and a C ABI
+<p>pinkdb is an <strong>embeddable analytical SQL engine</strong> written in Rust, in
+the spirit of DuckDB: in-process, columnar, vectorized, with a small dependency
+footprint and no server required. It ships as a library crate
+(<code>pinkdb</code>), a CLI REPL (<code>pinkdb-cli</code>, a thin consumer of the
+library), a network server (<code>pinkdb-server</code>) and a C ABI
 (<code>pinkdb-ffi</code>).</p>
 
-<h2>Quick start</h2>
+<p>Capabilities are opt-in cargo features, so you only pay for what you use: the
+default build is <strong>2,436,320 B</strong>, the lean lake build adds the
+<code>.lake</code> commands for <strong>2,692,464 B</strong>, and the full lake build
+with the Vortex format is <strong>45,333,984 B</strong>. Nothing extra is compiled
+unless asked for — no crypto, TLS or format code in the default binary.</p>
 
-<pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli          # debug REPL
-cargo build --release -p pinkdb-cli</code></pre>
+<aside class="marginalia">
+  <span class="margin-tag">honest by design</span>
+  <p>The SQL surface is deliberately small and growing in the open. Everything listed
+  here is implemented and tested; what is queued lives on the
+  <a href="{{root}}docs/roadmap.html">roadmap</a>, and the
+  <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">engineering
+  log on GitHub</a> has the detail.</p>
+</aside>
+
+<h2>Features</h2>
+
+<ul class="cards">
+  <li class="card">
+    <h3><a href="{{root}}docs/api-rust.html">Embeddable engine</a></h3>
+    <p>Link the <code>pinkdb</code> crate and run SQL in-process. No daemon, no
+    runtime dependencies, ready for embedding.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/sql.html">Vectorized columnar core</a></h3>
+    <p>Typed column vectors and ≤2,048-row chunks; every operator runs over whole
+    chunks, in parallel via rayon.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/getting-started.html">CSV import</a></h3>
+    <p>One command infers the schema per column, parses files in parallel, and
+    auto-detects <code>DATE</code> and <code>TIMESTAMP</code>.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/persistence.html">Durable <code>.pink</code> files</a></h3>
+    <p>Single-file v4 columnar format with delta, dictionary, ALP and LZ encodings;
+    bit-exact round trips and a CRC-32 guard.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/persistence.html">WAL &amp; crash recovery</a></h3>
+    <p>A durable open replays the write-ahead log, checkpoints atomically, and
+    recovers an interrupted checkpoint on the next open.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/guide-durable-multiprocess.html">Multi-process writers</a></h3>
+    <p>Any local process may open a durable database read-write; writers serialize
+    on a short-held write lease, readers never block.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/lake.html">Lake layer</a></h3>
+    <p>Decoupled metadata: a JSON catalog plus immutable per-table snapshots.
+    Vortex data files, or lean <code>.pink</code> v4 files with no Vortex
+    dependency.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/lake.html">S3 / R2 object storage</a></h3>
+    <p>An <code>s3://</code> lake over AWS S3, Cloudflare R2 or any S3-compatible
+    endpoint, with conditional-write conflict detection.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/lake.html">Read-only attach</a></h3>
+    <p><code>.lake attach</code> opens a published snapshot without decoding column
+    data; exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> come from stored
+    statistics.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/server.html">Network server</a></h3>
+    <p><code>pinkdb-server</code> over TCP with a compact framed protocol and a
+    remote CLI mode — one thread per connection, no async runtime.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/bindings.html">C · Python · Go bindings</a></h3>
+    <p>A C ABI v1 (<code>pinkdb-ffi</code>) with a hand-written header, plus
+    dependency-free Python and Go wrappers, and Rust natively.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/extensions.html">Loadable extensions</a></h3>
+    <p>Register scalar SQL functions from a shared library at runtime — or
+    <code>.install</code> one from the extension catalog.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/guide-encryption.html">At-rest encryption</a></h3>
+    <p>Optional <code>PINKENC1</code> containers: AES-256-GCM with Argon2id
+    passphrase derivation, for checkpoints and the WAL.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/sql.html">SQL surface</a></h3>
+    <p>DDL/DML, inner and outer equi-joins, CTEs, subqueries, window functions,
+    aggregates, transactions and multiple databases per store.</p>
+  </li>
+</ul>
+
+<h2>Key facts</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Fact</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Binaries</td>
+      <td>default <strong>2.44 MB</strong> · lean lake <strong>2.69 MB</strong> ·
+      full lake <strong>45.3 MB</strong> (release, Apple Silicon)</td>
+    </tr>
+    <tr>
+      <td>Persistence</td>
+      <td><code>.pink</code> v4 single-file columnar format; 1M rows →
+      <strong>2.68 MB</strong>, 10M rows → <strong>26.8 MB</strong></td>
+    </tr>
+    <tr>
+      <td>SQL</td>
+      <td>CSV import, joins (INNER/LEFT/RIGHT equi), CTEs, subqueries, window
+      functions, aggregates, <code>CAST</code>, dates; transactions and
+      multi-database sessions</td>
+    </tr>
+    <tr>
+      <td>Durability</td>
+      <td>write-ahead log + atomic checkpoints; durable databases are
+      multi-process, with a 5&nbsp;s busy timeout for writers</td>
+    </tr>
+    <tr>
+      <td>Lake</td>
+      <td>catalog + immutable snapshots; Vortex or <code>.pink</code> v4 data
+      files; read-only attach answers exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code></td>
+    </tr>
+    <tr>
+      <td>Object storage</td>
+      <td><code>s3://</code> locations on AWS S3, Cloudflare R2 or any
+      S3-compatible endpoint (opt-in <code>s3</code> feature)</td>
+    </tr>
+    <tr>
+      <td>Bindings</td>
+      <td>Rust (native), C (ABI v1), Python (<code>ctypes</code>, no dependencies),
+      Go (<code>cgo</code>)</td>
+    </tr>
+    <tr>
+      <td>Extensions</td>
+      <td>loadable native scalar functions (ABI v1), C and Go SDKs, and a hosted
+      <a href="{{root}}extensions.html">extension catalog</a></td>
+    </tr>
+    <tr>
+      <td>DuckDB parity</td>
+      <td>differentially tested against DuckDB on a committed query corpus; the
+      current corpus matches on both engines</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<h2>Quickstart</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli
+./target/release/pinkdb</code></pre>
 
 <pre class="code" data-lang="sql"><code>.import sales.csv sales
 SELECT region, AVG(total) FROM sales GROUP BY region ORDER BY 2 DESC;</code></pre>
@@ -68,129 +222,12 @@ SELECT region, AVG(total) FROM sales GROUP BY region ORDER BY 2 DESC;</code></pr
 2 rows
 Run Time (s): real 0.000</code></pre>
 
-<h2>Benchmark highlight</h2>
+<p>That is the whole loop: import, query, save. The
+<a href="{{root}}docs/getting-started.html">getting-started guide</a> continues with
+<code>.save</code>/<code>.open</code>, the build matrix, and the library API.</p>
 
-<aside class="marginalia">
-  <span class="margin-tag">how to read this</span>
-  <p>Numbers are the best of five runs on Apple Silicon, release build, 1M
-  generated rows (seed 42). The dashed bars are the pre-wave numbers the
-  repository README records.</p>
-</aside>
-
-<p>1M rows, release build, Apple Silicon. Generated with <code>bench/gen_sales.py</code>
-(deterministic seed 42), measured with
-<code>cargo run --release -p pinkdb --example query_bench</code> (best of 5).</p>
-
-<figure class="plate">
-  <svg class="sketch" viewBox="0 0 660 372" role="img" aria-label="Speedups at 1M rows: WHERE region equals west 27 to 4.1 milliseconds, ORDER BY with LIMIT 100 to 3.0 milliseconds, self hash join 66 to 9.0 milliseconds, window function from quadratic minutes to 79 milliseconds">
-    <text class="sk-label-sm" x="0" y="14">before &#8212; dashed / now &#8212; pink (ms)</text>
-    <text class="sk-label-sm" x="196" y="14">bar = milliseconds, 1 px &#8776; 0.24 ms</text>
-    <line class="sk-dash" x1="200" y1="24" x2="200" y2="352"/>
-
-    <g transform="translate(0, 34)">
-      <text class="sk-label" x="0" y="12">WHERE region = 'west'</text>
-      <rect class="sk-before" x="200" y="22" width="113" height="12" rx="4"/>
-      <text class="sk-label-sm" x="321" y="32">27</text>
-      <rect class="sk-after" x="200" y="40" width="19" height="12" rx="4"/>
-      <text class="sk-label-sm" x="227" y="50">4.1</text>
-      <text class="sk-mult" x="650" y="44" text-anchor="end">6.6&#215;</text>
-    </g>
-    <g transform="translate(0, 116)">
-      <text class="sk-label" x="0" y="12">ORDER BY total DESC LIMIT 10</text>
-      <rect class="sk-before" x="200" y="22" width="420" height="12" rx="4"/>
-      <text class="sk-label-sm" x="212" y="32">100</text>
-      <rect class="sk-after" x="200" y="40" width="13" height="12" rx="4"/>
-      <text class="sk-label-sm" x="221" y="50">3.0</text>
-      <text class="sk-mult" x="650" y="44" text-anchor="end">33&#215;</text>
-    </g>
-    <g transform="translate(0, 198)">
-      <text class="sk-label" x="0" y="12">1M-row self hash join + COUNT</text>
-      <rect class="sk-before" x="200" y="22" width="277" height="12" rx="4"/>
-      <text class="sk-label-sm" x="212" y="32">66</text>
-      <rect class="sk-after" x="200" y="40" width="38" height="12" rx="4"/>
-      <text class="sk-label-sm" x="246" y="50">9.0</text>
-      <text class="sk-mult" x="650" y="44" text-anchor="end">7.3&#215;</text>
-    </g>
-    <g transform="translate(0, 280)">
-      <text class="sk-label" x="0" y="12">COUNT(*) OVER (PARTITION BY region)</text>
-      <rect class="sk-before" x="200" y="22" width="402" height="12" rx="4"/>
-      <text class="sk-label-sm" x="212" y="32">minutes &#8212; O(n&#178;) rescans</text>
-      <rect class="sk-after" x="200" y="40" width="332" height="12" rx="4"/>
-      <text class="sk-label-sm" x="212" y="50" fill="var(--paper-2)">79 ms, single pass</text>
-      <text class="sk-mult" x="650" y="44" text-anchor="end">&#8734;</text>
-    </g>
-    <text class="sk-label-sm" x="0" y="366">Fig. 1 — same machine, best of 5; the window step left minutes behind</text>
-  </svg>
-  <figcaption class="sk-figure-caption">Tail-latency wins came from fusion: filters stop copying rows,
-  sorts use a top-N arena, and the window step no longer rescans per partition.</figcaption>
-</figure>
-
-<div class="table-wrap">
-<table>
-  <thead>
-    <tr><th>Query</th><th class="num">Now (ms)</th><th class="num">Before (ms)</th></tr>
-  </thead>
-  <tbody>
-    <tr><td><code>.import</code> 1M rows (24 MB CSV)</td><td class="num">25</td><td class="num">28</td></tr>
-    <tr><td><code>SELECT COUNT(*) FROM sales</code></td><td class="num">0.01</td><td class="num">0.02</td></tr>
-    <tr><td><code>COUNT(*) ... WHERE total &gt; 500</code></td><td class="num">5.1</td><td class="num">5.8</td></tr>
-    <tr><td><code>COUNT(*) ... WHERE region = 'west'</code></td><td class="num">4.1</td><td class="num">27</td></tr>
-    <tr><td>GROUP BY region + 5 aggregates</td><td class="num">7.7</td><td class="num">9</td></tr>
-    <tr><td>ORDER BY total DESC LIMIT 10</td><td class="num">3.0</td><td class="num">100</td></tr>
-    <tr><td>1M-row self hash join + COUNT (fused)</td><td class="num">9.0</td><td class="num">66</td></tr>
-    <tr><td>COUNT(*) OVER (PARTITION BY region)</td><td class="num">79</td><td class="num">minutes (O(n&#178;))</td></tr>
-  </tbody>
-</table>
-</div>
-
-<p class="doc-meta">Full table in the repository README. For reference, DuckDB 1.5.6 imports
-the same file in 0.06 s on the same machine (<code>read_csv_auto</code> → table, single
-connection).</p>
-
-<h2>Explore the docs</h2>
-
-<ul class="cards zig">
-  <li class="card">
-    <h3><a href="{{root}}docs/getting-started.html">Getting started</a></h3>
-    <p>Build the CLI, import a CSV, run your first queries, and learn the REPL basics.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}docs/sql.html">SQL reference</a></h3>
-    <p>DDL/DML, joins, CTEs, subqueries, windows, types, dates, and three-valued logic.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}docs/cli.html">CLI &amp; REPL</a></h3>
-    <p>Dot-commands, box-drawn output, the timing line, and environment variables.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}docs/server.html">Server &amp; protocol</a></h3>
-    <p><code>pinkdb-server</code> over TCP, the framed binary protocol, and remote mode.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}docs/persistence.html">Persistence &amp; encryption</a></h3>
-    <p>The columnar <code>.pink</code> format, WAL crash recovery, and at-rest encryption.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}docs/bindings.html">Bindings</a></h3>
-    <p>The C ABI today; Python and Go bindings on the roadmap.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}docs/architecture.html">Architecture</a></h3>
-    <p>The parser → binder → plan → optimizer → vectorized executor pipeline.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}extensions.html">Extensions</a></h3>
-    <p>The extension repository: browse artifacts, verify hashes, install with one command.</p>
-  </li>
-  <li class="card">
-    <h3><a href="{{root}}docs/roadmap.html">Roadmap</a></h3>
-    <p>Waves 0–26 shipped; extensions, lake storage, TLS, and RBAC queued.</p>
-  </li>
-</ul>
-
-<div class="callout ok">
-  <span class="callout-title">Status</span>
-  <p>Waves 0–26 are done: the engine, persistence + WAL, multi-database, the network
-  server, at-rest encryption, and the C ABI. The default <code>cargo build</code> links no
-  crypto, TLS, or format code; optional capabilities ship as features or separate crates.</p>
+<div class="hero-actions">
+  <a class="button primary" href="{{root}}docs/getting-started.html">Get started</a>
+  <a class="button" href="{{root}}docs/roadmap.html">Roadmap</a>
+  <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub &#8599;</a>
 </div>

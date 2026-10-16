@@ -4,19 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Getting started — pinkdb</title>
-<meta name="description" content="Build the pinkdb CLI, import a CSV, run your first queries, and learn the REPL basics.">
+<meta name="description" content="Build the pinkdb CLI — with or without the lake, S3, encryption and repository features — import a CSV, run your first queries, and save the database to a .pink file.">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#F7F1E8">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/getting-started.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
 <meta property="og:title" content="Getting started — pinkdb">
-<meta property="og:description" content="Build the pinkdb CLI, import a CSV, run your first queries, and learn the REPL basics.">
+<meta property="og:description" content="Build the pinkdb CLI — with or without the lake, S3, encryption and repository features — import a CSV, run your first queries, and save the database to a .pink file.">
 <meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/getting-started.html">
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, lake.">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
@@ -32,15 +32,6 @@
     <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
     <nav class="site-nav" aria-label="Site">
       <ul>
-        <li><a href="../">Home</a></li>
-        <li><a href="../docs/getting-started" class="active" aria-current="page">Getting started</a></li>
-        <li><a href="../docs/sql">SQL</a></li>
-        <li><a href="../docs/cli">CLI</a></li>
-        <li><a href="../docs/server">Server</a></li>
-        <li><a href="../docs/persistence">Persistence</a></li>
-        <li><a href="../docs/bindings">Bindings</a></li>
-        <li><a href="../docs/architecture">Architecture</a></li>
-        <li><a href="../docs/roadmap">Roadmap</a></li>
         <li><a href="../extensions">Extensions</a></li>
         <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
       </ul>
@@ -48,35 +39,89 @@
   </div>
 </header>
 <main id="main">
-  <div class="container">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started" class="active" aria-current="page">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
 <h1>Getting started</h1>
 
-<p class="doc-meta">Get the REPL running, import a CSV, and run your first analytical
-queries in a few minutes.</p>
+<p class="doc-meta">Build pinkdb, import a CSV, run your first analytical queries, and
+save the result to a durable <code>.pink</code> file — about five minutes end to end.</p>
 
-<h2>Prerequisites</h2>
+<h2 id="prerequisites">Prerequisites</h2>
 
 <p>A recent stable <strong>Rust</strong> toolchain (the workspace uses edition 2021).
-Python 3 is only needed for the benchmark helpers and the docs site itself.</p>
-
-<aside class="marginalia">
-  <span class="margin-tag">debug vs release</span>
-  <p>The debug REPL is fine for the first steps; every benchmark quoted in these docs
-  comes from a release build (<code>cargo build --release</code>).</p>
-</aside>
+The core crates build on Rust 1.89; the lake crate (<code>pink-lake</code>) requires
+1.95. Python 3 is only needed for the benchmark helpers and this site's
+generator.</p>
 
 <pre class="code" data-lang="sh"><code>git clone https://github.com/openlearnia/pinkdb
 cd pinkdb</code></pre>
 
-<h2>Build and run the REPL</h2>
+<aside class="marginalia">
+  <span class="margin-tag">debug vs release</span>
+  <p>The debug REPL is fine for first steps. All sizes and timings in these docs come
+  from release builds (<code>cargo build --release</code>).</p>
+</aside>
+
+<h2 id="build-and-run-the-repl">Build and run the REPL</h2>
 
 <ol class="steps">
   <li>
     <p>Start the debug REPL straight from the workspace:</p>
     <pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli</code></pre>
     <p>You land at the <code>pinkdb&gt;</code> prompt. Statements run until a
-    semicolon; a continuation prompt (<code>   ...&gt;</code>) appears while a statement
-    is open.</p>
+    semicolon; a continuation prompt (<code>   ...&gt;</code>) appears while a
+    statement is open.</p>
   </li>
   <li>
     <p>For day-to-day use, build the release binary:</p>
@@ -85,15 +130,70 @@ cd pinkdb</code></pre>
   </li>
 </ol>
 
+<h2 id="choose-a-build-feature-matrix">Choose a build (feature matrix)</h2>
+
+<p>Capabilities are opt-in cargo features, so the default binary stays lean. Sizes are
+release builds on Apple Silicon (exact bytes from a recent measurement):</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Build</th><th>CLI features</th><th>What you get</th><th class="num">Release size</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>default</td>
+      <td>—</td>
+      <td>the engine, REPL, CSV import, <code>.pink</code> persistence + WAL</td>
+      <td class="num">2.44 MB<br><span class="doc-meta">2,436,320 B</span></td>
+    </tr>
+    <tr>
+      <td>lean lake</td>
+      <td><code>lake-lite</code></td>
+      <td>all <code>.lake</code> commands over <code>.pink</code> v4 data files
+      (no Vortex)</td>
+      <td class="num">2.69 MB<br><span class="doc-meta">2,692,464 B</span></td>
+    </tr>
+    <tr>
+      <td>lean lake + S3/R2</td>
+      <td><code>lake-lite,s3</code><br>(plain <code>s3</code> implies it)</td>
+      <td>lean lake on <code>s3://</code> locations</td>
+      <td class="num">4.70 MB<br><span class="doc-meta">4,701,120 B</span></td>
+    </tr>
+    <tr>
+      <td>full lake</td>
+      <td><code>lake</code></td>
+      <td>Vortex data files, footer-fast attach</td>
+      <td class="num">45.3 MB<br><span class="doc-meta">45,333,984 B</span></td>
+    </tr>
+    <tr>
+      <td>full lake + S3/R2</td>
+      <td><code>lake,s3</code></td>
+      <td>full lake on <code>s3://</code> locations</td>
+      <td class="num">≈47.3 MB</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<p>Other opt-in features: <code>encryption</code> adds AES-256-GCM + Argon2id at-rest
+support (about <strong>70 KB</strong> over the default on a thin-LTO release build);
+<code>repo</code> adds the extension-repository client used by <code>.install</code>
+(≈+2 MB); <code>client</code> adds the remote REPL mode. The features combine, for
+example:</p>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features lake,s3
+cargo build --release -p pinkdb-cli --features lake-lite   # lean lake, local disk
+cargo build --release -p pinkdb-cli --features encryption
+cargo build --release -p pinkdb-cli --features repo</code></pre>
+
 <div class="callout">
   <span class="callout-title">Optional: a 1M-row practice dataset</span>
   <p>The benchmark CSV generator is deterministic (seed 42) and writes
-  <code>sales_1m.csv</code> (columns <code>id, region, total, active</code>):</p>
+  <code>sales_1m.csv</code> with columns <code>id, region, total, active</code>:</p>
   <pre class="code" data-lang="sh"><code>python3 bench/gen_sales.py            # 1M rows, ~24 MB
 python3 bench/gen_sales.py 5000 small.csv</code></pre>
 </div>
 
-<h2>Import a CSV</h2>
+<h2 id="import-a-csv">Import a CSV</h2>
 
 <p>Create a tiny file and import it. Table names default to the file stem; a
 <code>db.table</code> argument targets another database when <code>db</code> already
@@ -118,12 +218,12 @@ CREATE TABLE sales (
 all <code>i32</code> values → <code>INTEGER</code>, all <code>i64</code> →
 <code>BIGINT</code>, all floats → <code>DOUBLE</code>, all
 <code>true</code>/<code>false</code> (case-insensitive) → <code>BOOLEAN</code>,
-anything else → <code>VARCHAR</code>. An empty cell becomes
-<code>NULL</code>. Types are sampled from the first 20&nbsp;480 rows and the import
-transparently reruns with whole-file inference if a later row disagrees. Files without
-<code>"</code> or <code>\r</code> bytes are parsed in parallel across the rayon pool.</p>
+anything else → <code>VARCHAR</code>. An empty cell becomes <code>NULL</code>. Types
+are sampled from the first 20&nbsp;480 rows and the import transparently reruns with
+whole-file inference if a later row disagrees. Files without <code>"</code> or
+<code>\r</code> bytes are parsed in parallel across the rayon pool.</p>
 
-<h2>First queries</h2>
+<h2 id="first-queries">First queries</h2>
 
 <pre class="code" data-lang="sql"><code>SELECT * FROM sales;
 SELECT region, AVG(total) AS avg_total, COUNT(*) AS n
@@ -137,8 +237,8 @@ SELECT region, total * 2 AS doubled
   ORDER BY doubled DESC
   LIMIT 2;</code></pre>
 
-<p>Result tables are box-drawn with a type row (DuckDB-style) and followed by the row
-count and a timing line:</p>
+<p>Results are box-drawn with a type row (DuckDB-style), followed by the row count and
+a timing line:</p>
 
 <pre class="code" data-lang="text"><code>┌─────────┬───────────┬────────┐
 │ region  │ avg_total │ n      │
@@ -154,20 +254,28 @@ Run Time (s): real 0.000</code></pre>
 <p>Long results are capped at 10&nbsp;000 displayed rows with a
 <code>(N more rows)</code> note; the query itself still runs over all of them.</p>
 
-<h2>REPL basics</h2>
+<h2 id="save-and-reopen">Save and reopen</h2>
 
-<ul>
-  <li>SQL statements end with <code>;</code> and may span lines.</li>
-  <li>Dot-commands (<code>.help</code>, <code>.tables</code>, <code>.import</code>, …)
-  are single-line and take no semicolon.</li>
-  <li><code>.help</code> lists every dot-command; <code>.quit</code> /
-  <code>.exit</code> leave the shell.</li>
-  <li>Timing: the SQL surface is local to the process; writes are statement-atomic,
-  and <code>BEGIN</code>/<code>COMMIT</code>/<code>ROLLBACK</code> work on a whole-store
-  snapshot.</li>
-</ul>
+<pre class="code" data-lang="sql"><code>pinkdb&gt; .save sales.pink
+pinkdb&gt; .quit
+$ ./target/release/pinkdb
+pinkdb&gt; .open sales.pink
+pinkdb&gt; SELECT COUNT(*) FROM sales;
+┌──────────┐
+│ count(*) │
+│ BIGINT   │
+├──────────┤
+│ 3        │
+└──────────┘</code></pre>
 
-<h2>Use it as a library</h2>
+<p><code>.save</code> to the open file checkpoints it; <code>.open</code> opens
+durably — it loads the checkpoint, replays the sidecar
+<code>sales.pink.wal</code>, and then logs every committed transaction. Durable
+databases can be opened from several processes at once, and a
+<code>CHECKPOINT</code> folds the WAL back into the <code>.pink</code> file. The
+whole story is on the <a href="../docs/persistence">persistence page</a>.</p>
+
+<h2 id="use-it-as-a-library">Use it as a library</h2>
 
 <pre class="code" data-lang="rust"><code>use pinkdb::PinkDb;
 
@@ -187,19 +295,35 @@ let db = Database::new();
 let mut c = db.connect();
 c.execute("CREATE TABLE t (a INTEGER);")?;</code></pre>
 
+<p>See the <a href="../docs/api-rust">Rust API</a> for the full surface, and
+<a href="../docs/guide-embedding">Embedding</a> for C, Python and Go.</p>
+
 <ul class="next-links">
-  <li><a href="../docs/sql">SQL reference →</a></li>
   <li><a href="../docs/cli">CLI &amp; REPL →</a></li>
-  <li><a href="../docs/persistence">Save and reopen data →</a></li>
+  <li><a href="../docs/sql">SQL reference →</a></li>
+  <li><a href="../docs/guide-csv-to-lake">Guide: CSV to a lake →</a></li>
 </ul>
 
-  </div>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#prerequisites">Prerequisites</a></li>
+  <li><a href="#build-and-run-the-repl">Build and run the REPL</a></li>
+  <li><a href="#choose-a-build-feature-matrix">Choose a build (feature matrix)</a></li>
+  <li><a href="#import-a-csv">Import a CSV</a></li>
+  <li><a href="#first-queries">First queries</a></li>
+  <li><a href="#save-and-reopen">Save and reopen</a></li>
+  <li><a href="#use-it-as-a-library">Use it as a library</a></li>
+</ul>
+</nav>
+</div>
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust. Docs track ROADMAP.md (Oct 2026).</p>
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
     <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

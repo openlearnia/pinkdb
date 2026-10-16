@@ -4,19 +4,19 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Roadmap — pinkdb</title>
-<meta name="description" content="Waves 0-26 shipped, 27-47 queued: bindings, extensions, lake storage, TLS, RBAC, and more.">
+<meta name="description" content="What pinkdb ships today, what is in progress, and what is planned: TLS, RBAC, async object storage, wasm extensions, the Rust extension SDK, and core json/string/math/datetime extensions.">
 <meta name="color-scheme" content="light">
 <meta name="theme-color" content="#F7F1E8">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/roadmap.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
 <meta property="og:title" content="Roadmap — pinkdb">
-<meta property="og:description" content="Waves 0-26 shipped, 27-47 queued: bindings, extensions, lake storage, TLS, RBAC, and more.">
+<meta property="og:description" content="What pinkdb ships today, what is in progress, and what is planned: TLS, RBAC, async object storage, wasm extensions, the Rust extension SDK, and core json/string/math/datetime extensions.">
 <meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/roadmap.html">
 <meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, C ABI, lake.">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
 <link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
@@ -32,15 +32,6 @@
     <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
     <nav class="site-nav" aria-label="Site">
       <ul>
-        <li><a href="../">Home</a></li>
-        <li><a href="../docs/getting-started">Getting started</a></li>
-        <li><a href="../docs/sql">SQL</a></li>
-        <li><a href="../docs/cli">CLI</a></li>
-        <li><a href="../docs/server">Server</a></li>
-        <li><a href="../docs/persistence">Persistence</a></li>
-        <li><a href="../docs/bindings">Bindings</a></li>
-        <li><a href="../docs/architecture">Architecture</a></li>
-        <li><a href="../docs/roadmap" class="active" aria-current="page">Roadmap</a></li>
         <li><a href="../extensions">Extensions</a></li>
         <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
       </ul>
@@ -48,144 +39,251 @@
   </div>
 </header>
 <main id="main">
-  <div class="container">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap" class="active" aria-current="page">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
 <h1>Roadmap</h1>
 
-<p class="doc-meta">A summary of the wave tracker. The single source of truth is
+<p class="doc-meta">What pinkdb ships today, what is being worked on, and what is
+planned. This page is the product view; the change-by-change engineering log — with
+measurements and benchmark notes — lives in
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">ROADMAP.md</a>
-in the repository — see it for full evidence per wave, and
-<a href="https://github.com/openlearnia/pinkdb/blob/main/docs/GAPS.md" rel="noopener">docs/GAPS.md</a>
-for the known gaps the hardening waves (40a–40j) close.</p>
+on GitHub.</p>
 
-<p>A wave is <span class="badge done">done</span> only when <code>cargo build</code> +
-<code>cargo test</code> + <code>cargo clippy</code> are green (plus the DuckDB
-differential suite, crash-recovery kill loops and benchmarks where applicable).</p>
+<h2 id="shipped">Shipped</h2>
 
-<!-- roadmap:begin (generated by website/tools/sync_roadmap.py) -->
-<p class="doc-meta">Generated from ROADMAP.md: 46 waves done, latest <strong>45</strong>; 22 queued or in progress. Per-wave evidence (test counts, benchmarks, sizes) lives in ROADMAP.md.</p>
+<ul class="cards">
+  <li class="card">
+    <h3>Analytical engine</h3>
+    <p>Columnar vectors, vectorized execution over ≤2,048-row chunks, and parallel
+    operators. CSV import with per-column type inference.</p>
+  </li>
+  <li class="card">
+    <h3>SQL surface</h3>
+    <p>DDL/DML, INNER/LEFT/RIGHT equi-joins, CTEs, derived tables and uncorrelated
+    subqueries, window functions, aggregates, CASE/CAST/COALESCE/LIKE, dates and
+    timestamps, UNION, views, snapshot transactions, multiple databases.
+    Differentially tested against DuckDB.</p>
+  </li>
+  <li class="card">
+    <h3>Persistence</h3>
+    <p>Single-file <code>.pink</code> v4 columnar format with delta, dictionary,
+    ALP and LZ encodings; bit-exact round trips; a write-ahead log with atomic
+    checkpoints and crash recovery.</p>
+  </li>
+  <li class="card">
+    <h3>Multi-process databases</h3>
+    <p>Any number of local processes can open a durable database read-write;
+    writers serialize on a per-operation write lease and readers refresh from the
+    WAL.</p>
+  </li>
+  <li class="card">
+    <h3>At-rest encryption</h3>
+    <p>Optional <code>PINKENC1</code> containers — AES-256-GCM with Argon2id key
+    derivation — covering the checkpoint and the WAL.</p>
+  </li>
+  <li class="card">
+    <h3>Lake layer</h3>
+    <p>JSON catalog plus immutable snapshots; full snapshots per save; Vortex or
+    lean <code>.pink</code> v4 data files; version restore. Read-only attach answers
+    exact COUNT/MIN/MAX from stored statistics.</p>
+  </li>
+  <li class="card">
+    <h3>Object storage</h3>
+    <p><code>s3://</code> lakes on AWS S3, Cloudflare R2 and other S3-compatible
+    endpoints, with atomic conditional writes for conflict detection.</p>
+  </li>
+  <li class="card">
+    <h3>Network server</h3>
+    <p><code>pinkdb-server</code> over a framed binary protocol (version 4) with a
+    remote CLI mode, durable <code>--file</code> mode, connection caps and idle
+    timeouts.</p>
+  </li>
+  <li class="card">
+    <h3>Bindings</h3>
+    <p>Rust natively; a C ABI (v1) with a hand-written header; dependency-free
+    Python (<code>ctypes</code>) and Go (<code>cgo</code>) wrappers.</p>
+  </li>
+  <li class="card">
+    <h3>Extensions</h3>
+    <p>Runtime-loadable native scalar functions (ABI v1), in-repo C/C++ and Go
+    SDKs, and the hosted <a href="../extensions">extension catalog</a>
+    with one-command <code>.install</code>.</p>
+  </li>
+</ul>
 
-<h2>Shipped</h2>
-
-<div class="table-wrap">
-<table>
-  <thead><tr><th>Wave</th><th>Scope</th><th>Status</th></tr></thead>
-  <tbody>
-    <tr><td>0</td><td>Repo baseline: initial commit (pre-wave-1)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>1</td><td>M0–M1: scaffold, types/vector/storage/CSV, skeleton CLI</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>2</td><td>M2–M3: SQL frontend + single-table executor + aggregates/sort/DISTINCT + CLI output</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>3</td><td>M4–M5: hash join, optimizer, README, benchmark, polish</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>4</td><td>Independent code review of full codebase; fix findings</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>5</td><td>Persistence: on-disk columnar format (RLE/dictionary/bitpack), <code>.save</code>/<code>.open</code></td><td><span class="badge done">done</span></td></tr>
-    <tr><td>6</td><td>Subqueries + CTEs: derived tables, scalar/IN/EXISTS (uncorrelated), WITH</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>7</td><td>DATE/TIMESTAMP types: storage, literals, arithmetic, date functions, CSV + persist</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>8</td><td>Window functions: ranking + aggregates OVER, PARTITION/ORDER/ROWS frames</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>9</td><td>UPDATE/DELETE: physical DML, simultaneous SET, statement-atomic</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>10</td><td>Transactions: BEGIN/COMMIT/ROLLBACK via whole-store snapshots</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>11</td><td>SQL completeness: UNION, views, CAST, COALESCE, LIKE, DROP</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>12</td><td>Parallel execution (rayon) + multi-writer Database/Connection</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>13</td><td>Differential testing vs DuckDB (bench/duckdiff.py)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>14</td><td>Speed round: Arc storage, borrowed codecs, FNV hashing, COUNT(*) path</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>15</td><td>Import speed round: streaming inference, buffer-reused records, zero-alloc bool checks</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>16</td><td>CASE expressions (searched + simple, NULL semantics, type unification)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>17</td><td>Performance tuning: O(n²) window-aggregate fix, typed expression kernels, sort key arena + top-N, join/group hash paths, REPL display cap, thin LTO</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>18</td><td>Binder fix: UNION inside derived tables/CTEs/views/subqueries; ORDER BY/LIMIT apply to the whole set operation</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>19</td><td>Join fast path: integer-key specialization + fused join→aggregate (no row materialization)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>20</td><td>Outer joins: LEFT/RIGHT equi-joins (NULL-extended unmatched rows), join-kind-aware pushdown</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>21</td><td>PEG parser (<code>peg</code> crate) in parallel with recursive descent; differential-tested; default flipped</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>22</td><td>WAL / crash recovery (core)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>23</td><td>Multi-database: <code>USE &lt;db&gt;</code>, qualified <code>db.table</code>, per-database persistence (core)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>24</td><td>Network server: <code>pinkdb-server</code> binary + CLI <code>--host</code> client mode (separate crate)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>25</td><td>At-rest encryption: encrypted <code>.pink</code> + WAL (AEAD + Argon2id, key via option/env) (core <code>encryption</code> feature)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>26</td><td>C ABI: <code>pinkdb-ffi</code> (staticlib + cdylib, C headers, example) (separate crate; contained <code>unsafe</code>)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>27</td><td>Python binding (cffi) (<code>bindings/python</code>)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>28</td><td>Go binding (cgo) (<code>bindings/go</code>)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>29</td><td>Extensions support: loadable extensions (<code>LOAD</code>/<code>INSTALL</code>), versioned C ABI v1, manifest/signature checks (separate <code>pinkdb-ext-loader</code> crate; contained <code>unsafe</code>) — *as built: <code>LOAD EXTENSION</code> + ABI-version/symbol …</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>30</td><td>C/C++ extension SDK: ABI headers, templates, examples (in-repo <code>ext-sdk/c</code>)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>31</td><td>Go extension SDK: build extensions as c-shared libraries (cgo) exporting the ABI (in-repo <code>ext-sdk/go</code>)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>32</td><td>Extensions repository: hosted catalog of built extension artifacts (metadata + binaries) (infra service)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>33</td><td>Custom repositories: user-configurable extension repository URLs and config (core config + repo client)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>34</td><td>Lake architecture: DuckLake-style decoupled metadata + data storage (catalog, snapshots, data files) (separate crates, storage layer)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>35</td><td>Vortex file format as the default lake data format (format crate / extension)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>35b</td><td>Parser cleanup: delete the hand-written recursive-descent parser + lexer and the <code>PINKDB_PARSER</code> switch (PEG-only parsing); retain/re-home the shared pieces the PEG grammar and WAL statement-splitting still use; port …</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>36</td><td>S3 bucket support for lake storage and file reading (optional <code>s3</code> feature, storage provider)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>37</td><td>Documentation website (separate site/track)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>38</td><td>Host the website and extension repository on Cloudflare Workers + R2 (infra; Workers half done, R2 deferred to the extensions-repository wave 32/39)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>39</td><td>CI/CD publishing of extensions to the repository (build, test, sign, publish) (infra/CI workflows) — *as built: signing is a documented hook only (SHA-256 checksums); signatures moved to wave 40i*</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>40</td><td>Performance tuning (recurring every 5th wave): bench-driven speed work, no new features (core)</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>40a</td><td>Hardening — safety (docs/GAPS.md P0 #1–#10): server-side <code>LOAD EXTENSION</code> opt-in, publish catalog-wipe guard, store-wide table versions, read-set COMMIT validation, bounded <code>.pink</code> decoder + v3 CRC trailer, DuckDB-style …</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>40b</td><td>Hardening — durability/operability: auto-checkpoint + <code>CHECKPOINT</code>, <code>.pink</code> file lock, fail-stop after a WAL write failure, single-lock bind+run, Python handle lock, CLI exit codes/stderr/<code>-c</code>/<code>.read</code>/EOF/<code>;</code> scanning …</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>40c</td><td>Hardening — CI + docs truthfulness: macOS CI + fmt/audit/feature-test gaps, website refresh, committed-binary/account-id cleanup, wave 29/39 claims corrected</td><td><span class="badge done">done</span></td></tr>
-    <tr><td>45</td><td>Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c*</td><td><span class="badge done">done</span></td></tr>
-  </tbody>
-</table>
-</div>
-
-<h2>Queued</h2>
-
-<div class="table-wrap">
-<table>
-  <thead><tr><th>Wave</th><th>Scope</th><th>Status</th></tr></thead>
-  <tbody>
-    <tr><td>40d</td><td>SQL completeness: multi-way/composite/non-equi/CROSS/FULL joins, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, INTERSECT/EXCEPT, COUNT(DISTINCT), EXPLAIN, SHOW/DESCRIBE, RANGE frames + frame validation</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>40e</td><td>Prepared statements + parameters: placeholders, bind API, protocol v4, FFI prepare/bind, Python DB-API, Go database/sql</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>40f</td><td>Functions + types: lag/lead/ntile/first/last_value, core scalar gaps, DECIMAL, INTERVAL</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>40g</td><td>Optimizer: projection pushdown, LIMIT short-circuit, join build-side choice, filter through aggregate</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>40h</td><td>Lake: incremental saves, <code>.lake gc</code>, <code>lake_scan</code> SQL access + time travel, bulk typed decode, encode panic guard</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>40i</td><td>Extension trust + distribution: Ed25519 artifact signatures, SQL <code>INSTALL</code>, Linux artifacts, Python wheel, standalone Go module</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>40j</td><td>Test depth: window/plan unit tests, WAL fuzz, persist property tests, duckdiff gated in CI</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>41</td><td>Primary/foreign keys, Snowflake-style: declarative <code>PRIMARY KEY</code> / <code>FOREIGN KEY</code> / <code>UNIQUE</code> / <code>NOT NULL</code> constraints (metadata, not enforced), <code>RELY</code> / <code>NOT ENFORCED</code> accepted, persisted in the catalog, used by the …</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>42</td><td>Index support: <code>CREATE INDEX</code> / <code>DROP INDEX</code>, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>43</td><td>Materialized views: <code>CREATE MATERIALIZED VIEW</code>, <code>REFRESH [MATERIALIZED VIEW]</code>, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred)</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>44</td><td>Stored procedures: SQL procedural language (parameters, variables, control flow) + JavaScript procedures (optional embedded engine; WAL-replay determinism must be solved)</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>46</td><td>Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature)</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>47</td><td>Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O …</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>48</td><td>RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), <code>CREATE USER</code>/<code>CREATE ROLE</code>/<code>GRANT</code>/<code>REVOKE</code> on databases/tables, session login on the network server, per-connection enforcement …</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>49</td><td>Extensions on wasm: support loadable/pluggable extensions for wasm targets — either wasm dynamic-linking (pre-built WASI side modules, per-runtime <code>dlopen</code> support) or a host-function registration path (JS/wasm-bindgen …</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>50</td><td>Performance tuning (recurring every 5th wave): bench-driven speed work (core)</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>51</td><td>Rust extension SDK: <code>ext-sdk/rust</code> safe wrapper + registration macros for first-party extensions; ABI v1 additive: a deterministic/volatile function flag (the engine refuses to WAL-log volatile calls, preventing replay …</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>52</td><td>Core extension: **json** — <code>json_extract</code>, <code>json_value</code>, <code>json_valid</code>, <code>json_array_length</code>, <code>json_object</code>, <code>json_array</code> (JSON as VARCHAR in v1)</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>53</td><td>Core extension: **string** — <code>split_part</code>, trim variants, <code>replace</code>, <code>reverse</code>, <code>left</code>/<code>right</code>, <code>strpos</code>, <code>starts_with</code>/<code>ends_with</code>, <code>regexp_match</code>/<code>regexp_extract</code></td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>54</td><td>Core extension: **math** — <code>sqrt</code>, <code>pow</code>, <code>log</code>/<code>ln</code>/<code>exp</code>, trig, <code>floor</code>/<code>ceil</code>, <code>sign</code>, <code>greatest</code>/<code>least</code>, <code>random</code> (volatile-flagged)</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>55</td><td>Performance tuning (recurring every 5th wave): bench-driven speed work (core)</td><td><span class="badge queued">queued</span></td></tr>
-    <tr><td>56</td><td>Core extension: **datetime** — <code>strftime</code>, <code>strptime</code>, <code>epoch</code>/<code>epoch_ms</code>, <code>dayofweek</code>/<code>dayofyear</code>/<code>week</code>, <code>last_day</code>, <code>age</code>, <code>make_date</code> (naive timestamps only)</td><td><span class="badge queued">queued</span></td></tr>
-  </tbody>
-</table>
-</div>
-<!-- roadmap:end -->
-
-<h2>Deferred</h2>
-
-<p>Not currently scheduled: Parquet read (<code>pinkdb-parquet</code>); JS/wasm,
-Node-native, and Java bindings.</p>
-
-<h2>Packaging principles</h2>
+<h2 id="in-progress">In progress</h2>
 
 <ul>
-  <li>New capabilities ship as separate workspace crates and/or opt-in cargo features;
-  the default <code>cargo build</code> stays lean (~2 MB) and links no crypto/TLS/format
-  code.</li>
-  <li>Every wave reports per-artifact release binary size; the build matrix covers the
-  default build, each feature, and each crate, plus a wasm check — <code>pinkdb</code>
-  (and <code>pinkdb-parquet</code>) must stay wasm32-compatible, and the server is
-  target-gated out of wasm builds.</li>
-  <li>No hand-rolled crypto; audited RustCrypto crates only.</li>
-  <li>Zero-<code>unsafe</code> holds for the core; contained <code>unsafe</code> is
-  confined to <code>pinkdb-ffi</code> and, later, the extension loader crate.</li>
+  <li><strong>Durable multi-process hardening.</strong> The first slice — any
+  process read-write, per-operation write lease, lock-free epoch refresh, WAL v3 —
+  is shipped. The follow-up round is a stability focus: chaos soaks, fuzzing, and
+  closing the known gaps around replay and recovery edge cases.</li>
 </ul>
+
+<h2 id="planned">Planned</h2>
+
+<h3>Server security and operations</h3>
+
+<ul>
+  <li><strong>TLS for the network server</strong> (rustls + certificate
+  configuration), so remote clients can connect over an encrypted transport.</li>
+  <li><strong>RBAC:</strong> users and roles with Argon2id password hashes,
+  <code>CREATE USER</code>/<code>CREATE ROLE</code>/<code>GRANT</code>/<code>REVOKE</code>
+  on databases and tables, session login and per-connection enforcement; grants
+  persisted and WAL-logged.</li>
+  <li><strong>Async I/O at the boundary:</strong> an optional async storage
+  layer (object stores / S3) and/or async server variant, feature-gated — a
+  documented carve-out where only the I/O boundary goes async; the executor stays
+  synchronous.</li>
+</ul>
+
+<h3>SQL and the engine</h3>
+
+<ul>
+  <li><strong>SQL completeness:</strong> multi-way, composite and non-equi joins,
+  <code>CROSS</code>/<code>FULL</code> joins, <code>INSERT ... SELECT</code>, CTAS,
+  <code>IF [NOT] EXISTS</code>, <code>OFFSET</code>, <code>NULLS FIRST/LAST</code>,
+  <code>INTERSECT</code>/<code>EXCEPT</code>, <code>COUNT(DISTINCT)</code>,
+  <code>EXPLAIN</code>, <code>SHOW</code>/<code>DESCRIBE</code>, RANGE window
+  frames.</li>
+  <li><strong>Prepared statements and parameters:</strong> placeholders, a bind API,
+  and the front-end support that follows (protocol, FFI, Python, Go).</li>
+  <li><strong>Functions and types:</strong> <code>lag</code>/<code>lead</code>/
+  <code>ntile</code>/<code>first_value</code>/<code>last_value</code>, remaining
+  scalar gaps, <code>DECIMAL</code> and <code>INTERVAL</code> types.</li>
+  <li><strong>Schema features:</strong> declarative primary/foreign keys and
+  constraints (metadata used by the optimizer), indexes with zone-map support, and
+  materialized views.</li>
+  <li><strong>Optimizer work:</strong> projection pushdown, LIMIT short-circuiting,
+  join build-side choice, filter-through-aggregate.</li>
+</ul>
+
+<h3>Lake</h3>
+
+<ul>
+  <li><strong>Incremental saves and <code>.lake gc</code>:</strong> appending
+  changes instead of full-snapshot rewrites, with garbage collection for retired
+  versions.</li>
+  <li><strong>Scan pruning:</strong> per-chunk statistics and filter/zone-map
+  pruning for attached lakes (the planned third stage of the lake-scan work) plus
+  lean projection pushdown.</li>
+  <li><strong>SQL access to lakes:</strong> a <code>lake_scan</code> table function
+  and time travel over published versions.</li>
+  <li><strong>Faster decode:</strong> bulk typed lake decode on the open path.</li>
+</ul>
+
+<h3>Extensions and distribution</h3>
+
+<ul>
+  <li><strong>Rust extension SDK:</strong> a safe wrapper and registration macros
+  for first-party extensions (including a deterministic/volatile flag so the engine
+  never WAL-logs volatile calls).</li>
+  <li><strong>Core extensions:</strong> <code>json</code>, <code>string</code>,
+  <code>math</code> and <code>datetime</code> function packs.</li>
+  <li><strong>Extension trust:</strong> Ed25519 artifact signatures, SQL
+  <code>INSTALL</code>, Linux artifacts.</li>
+  <li><strong>Extensions on wasm:</strong> a pluggable loading model for wasm
+  targets (native <code>dlopen</code> cannot work in the sandbox).</li>
+  <li><strong>Packaging:</strong> a Python wheel and a standalone Go module.</li>
+</ul>
+
+<h3>Performance</h3>
+
+<ul>
+  <li><strong>Recurring tuning rounds</strong> against the committed query
+  benchmark, following the existing profile-first approach.</li>
+</ul>
+
+<h2 id="deferred">Deferred</h2>
+
+<p>Not currently scheduled:</p>
+
+<ul>
+  <li>Parquet read support (<code>pinkdb-parquet</code>).</li>
+  <li>JS/wasm, Node-native and Java bindings.</li>
+</ul>
+
+<h2 id="engineering-log">Engineering log</h2>
+
+<p>Change-by-change detail — measurements, benchmarks, and design notes — lives in
+<a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">ROADMAP.md</a>
+on GitHub.</p>
 
 <ul class="next-links">
-  <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Full wave tracker on GitHub →</a></li>
-  <li><a href="../docs/architecture">Architecture →</a></li>
   <li><a href="../docs/getting-started">Getting started →</a></li>
+  <li><a href="../docs/sql">SQL reference →</a></li>
+  <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub →</a></li>
 </ul>
 
-  </div>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#shipped">Shipped</a></li>
+  <li><a href="#in-progress">In progress</a></li>
+  <li><a href="#planned">Planned</a></li>
+  <li><a href="#deferred">Deferred</a></li>
+  <li><a href="#engineering-log">Engineering log</a></li>
+</ul>
+</nav>
+</div>
 </main>
 <footer class="site-footer">
   <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust. Docs track ROADMAP.md (Oct 2026).</p>
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
     <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../">Home</a> · <a href="../docs/getting-started">Getting started</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

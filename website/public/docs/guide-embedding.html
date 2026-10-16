@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide: embedding pinkdb — pinkdb</title>
+<meta name="description" content="Embed pinkdb in an application from Rust, C, Python or Go: build the library, open a database, execute SQL, and read typed results.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-embedding.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Guide: embedding pinkdb — pinkdb">
+<meta property="og:description" content="Embed pinkdb in an application from Rust, C, Python or Go: build the library, open a database, execute SQL, and read typed results.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-embedding.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding" class="active" aria-current="page">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Guide: embedding pinkdb</h1>
+
+<p class="doc-meta">Add a SQL engine to your application from Rust, C, Python or Go.
+This guide gets each target to "open a database, run SQL, read typed results".</p>
+
+<h2>Rust (native)</h2>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{Database, PinkDb};
+
+// single connection, simplest possible:
+let mut db = PinkDb::new();
+let results = db.execute(
+    "CREATE TABLE events (name VARCHAR, n BIGINT);\
+     INSERT INTO events VALUES ('signup', 3), ('login', 9);\
+     SELECT name, SUM(n) AS total FROM events GROUP BY name ORDER BY total DESC;",
+)?;
+println!("{results:?}");
+
+// multi-threaded host: one shared store, one Connection per thread
+let db = Database::new();
+let mut c = db.connect();
+c.execute("SELECT 1;")?;</code></pre>
+
+<p>For durable files, use <code>Database::open</code>,
+<code>PinkDb::open_durable</code> or the encryption variants — the same machinery the
+CLI uses. See the <a href="../docs/api-rust">Rust API</a>.</p>
+
+<h2>C / C++</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
+# link: -L target/release -lpinkdb_ffi
+# include: crates/pinkdb-ffi/include/pinkdb.h</code></pre>
+
+<pre class="code" data-lang="c"><code>#include "pinkdb.h"
+
+pinkdb_handle *db = pinkdb_open_memory();
+const char *sql =
+    "CREATE TABLE t (x INTEGER);"
+    "INSERT INTO t VALUES (42);"
+    "SELECT x FROM t;";
+
+pinkdb_result *r = pinkdb_execute(db, sql, strlen(sql));
+if (!r) { fprintf(stderr, "%s\n", pinkdb_last_error()); return 1; }
+
+pink_value v = pinkdb_result_value(r, 2, 0, 0);   /* statement 2, row 0, col 0 */
+printf("%lld\n", (long long)v.int64);             /* 42 */
+
+pinkdb_result_free(r);
+pinkdb_close(db);</code></pre>
+
+<p class="doc-meta">Handles are not thread-safe — one per thread, or serialize calls.
+VARCHAR pointers borrow from the result; copy with <code>text_len</code> (embedded
+NULs are allowed). Full details: <a href="../docs/api-c">C API</a>.</p>
+
+<h2>Python</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
+python3 -c "import pinkdb"      # resolves the library from the repo checkout</code></pre>
+
+<pre class="code" data-lang="python"><code>import pinkdb
+
+with pinkdb.connect("app.pink") as db:         # durable; or connect_memory()
+    db.execute("CREATE TABLE t (x INTEGER);")
+    db.execute("INSERT INTO t VALUES (42);")
+    result = db.execute("SELECT x FROM t;")[0]
+    print(result.kind, result.rows)            # selected [[42]]</code></pre>
+
+<p>A <code>Database</code> is safe to share between threads (calls are serialized
+internally). A pip-installable wheel is planned. See the
+<a href="../docs/api-python">Python API</a>.</p>
+
+<h2>Go</h2>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
+
+# from your app, point the module at your pinkdb checkout
+# (a standalone published module is planned):
+go mod edit -replace github.com/openlearnia/pinkdb/bindings/go=/path/to/pinkdb/bindings/go</code></pre>
+
+<pre class="code" data-lang="go"><code>import pinkdb "github.com/openlearnia/pinkdb/bindings/go"
+
+db, err := pinkdb.Open("app.pink") // or pinkdb.OpenMemory()
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+results, err := db.Execute("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42); SELECT x FROM t;")
+if err != nil {
+    log.Fatal(err)
+}
+rows := results[len(results)-1].Rows // [[42]]</code></pre>
+
+<p>One <code>*DB</code> is safe to share between goroutines. See the
+<a href="../docs/api-go">Go API</a>.</p>
+
+<h2>Choosing an embedding</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Situation</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Rust application</td>
+      <td>the <code>pinkdb</code> crate directly — no ABI, full API (durability
+      options, encryption keys, lake)</td>
+    </tr>
+    <tr>
+      <td>C/C++ or another FFI language</td>
+      <td><code>pinkdb-ffi</code> (ABI v1); the header is the contract</td>
+    </tr>
+    <tr>
+      <td>Python scripts and tools</td>
+      <td><code>bindings/python</code> (stdlib <code>ctypes</code>, no pip)</td>
+    </tr>
+    <tr>
+      <td>Go services</td>
+      <td><code>bindings/go</code> (<code>cgo</code>, goroutine-safe wrapper)</td>
+    </tr>
+    <tr>
+      <td>Several processes on one file</td>
+      <td>the durable path — all embeddings open the same WAL/lease machinery</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="callout">
+  <span class="callout-title">Feature note</span>
+  <p>The C ABI builds the engine without CLI features: encrypted databases and lake
+  commands are Rust/CLI paths today. The bindings inherit that and open plaintext
+  databases.</p>
+</div>
+
+<ul class="next-links">
+  <li><a href="../docs/bindings">Bindings overview →</a></li>
+  <li><a href="../docs/api-rust">Rust API →</a></li>
+  <li><a href="../docs/persistence">Persistence →</a></li>
+</ul>
+
+</article>
+
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

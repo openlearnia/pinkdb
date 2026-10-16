@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lake — pinkdb</title>
+<meta name="description" content="The pinkdb lake layer: catalog + immutable snapshots, Vortex or lean .pink data files, S3/R2 object storage, read-only attach with COUNT/MIN/MAX fast paths, and writer conflict semantics.">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/lake.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Lake — pinkdb">
+<meta property="og:description" content="The pinkdb lake layer: catalog + immutable snapshots, Vortex or lean .pink data files, S3/R2 object storage, read-only attach with COUNT/MIN/MAX fast paths, and writer conflict semantics.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/lake.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+      </ul>
+    </nav>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
+<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake" class="active" aria-current="page">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions &amp; roadmap</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+<li><a href="roadmap">Roadmap</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<h1>Lake</h1>
+
+<p class="doc-meta">A lake keeps <strong>metadata and data storage decoupled</strong>: a
+small JSON catalog, an immutable manifest per published version, and one immutable data
+file per table — on local disk or in an S3/R2 bucket.</p>
+
+<h2 id="what-a-lake-is">What a lake is</h2>
+
+<p>A lake is a directory (or, with the <code>s3</code> feature, an
+<code>s3://bucket/prefix</code> key prefix) with exactly this layout:</p>
+
+<pre class="code" data-lang="text"><code>mylake/
+├── catalog.json               current state (the authoritative "latest")
+├── snapshots/&lt;version&gt;.json   immutable manifest per published version
+├── data/&lt;table&gt;/&lt;uuid&gt;.vortex immutable per-table data files (full lake)
+└── data/&lt;table&gt;/&lt;uuid&gt;.pink   lean data files (no Vortex; still readable)</code></pre>
+
+<p>Every save is a <strong>full snapshot</strong>: all tables are written to fresh
+data files, <code>snapshots/&lt;version&gt;.json</code> is published, then
+<code>catalog.json</code> is replaced with the same bytes. Published versions and
+their data files are never modified — so every version ever published still loads.
+There is no append, compaction or garbage collection; each save costs one full
+rewrite. Snapshot publication happens before the catalog update, so a crash leaves
+either the old version or the new one, never a mix.</p>
+
+<h2 id="two-data-formats-one-lake-api">Two data formats, one lake API</h2>
+
+<p>There are two builds of the lake layer with the same commands:</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Build (CLI feature)</th><th>Data files</th><th>Catalog</th><th class="num">Release size</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>lean lake (<code>lake-lite</code>)</td>
+      <td><code>.pink</code> v4 (the engine's single-table bytes)</td>
+      <td><code>format_version</code> 1</td>
+      <td class="num">2.69 MB</td>
+    </tr>
+    <tr>
+      <td>full lake (<code>lake</code>)</td>
+      <td>Vortex (the default lake format)</td>
+      <td><code>format_version</code> 2 or 3</td>
+      <td class="num">45.3 MB</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<ul>
+  <li>The full build is <strong>Vortex-first</strong>: current saves write
+  <code>format_version</code> 3 (8,192-row / ~1 MiB blocks); v2 lakes load and migrate
+  on the next save. Old <code>.pink</code> data files (v1 lakes) are still readable
+  and also migrate on save.</li>
+  <li>The lean build writes and reads only <code>format_version</code> 1
+  (<code>.pink</code> data files) and refuses a v2/v3 lake with a clear
+  “rebuild with <code>lake</code>” error. A lake written by the lean build opens
+  <strong>bit-exactly</strong> in a full build, which migrates it on the next save
+  and leaves the old files untouched.</li>
+  <li><code>s3</code> implies <code>lake-lite</code>; use <code>lake,s3</code> for the
+  full Vortex lake over S3/R2.</li>
+</ul>
+
+<h2 id="using-a-lake">Using a lake</h2>
+
+<pre class="code" data-lang="sql"><code>.lake save mylake              -- publish a full snapshot of the store
+.lake versions mylake          -- published versions (the current one is marked)
+.lake tables mylake            -- current version's db.table names + row counts
+.lake info mylake              -- format version, current version, snapshots, tables
+.lake open mylake              -- replace the in-memory store with the latest
+.lake open mylake 3            -- or with a specific published version
+.lake attach mylake            -- attach read-only (see below)
+.lake detach mylake
+.lake attached</code></pre>
+
+<p>From a program, the same operations live in the <code>pink-lake</code> crate:</p>
+
+<pre class="code" data-lang="rust"><code>use pink_lake::{Lake, save_store};
+use pinkdb::PinkDb;
+
+let mut db = PinkDb::new();
+db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
+
+let version = save_store(&amp;db, "mylake")?;  // creates the lake, publishes v2
+let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
+let v3 = lake.write_from_store(&amp;db)?;      // full snapshot, version 3
+let tables = lake.tables()?;               // [("main.t", 2)]
+let versions = lake.versions()?;           // [1, 2, 3]
+let latest = lake.load(None)?;             // rebuild the latest version
+let old = lake.load(Some(2))?;             // rebuild a specific snapshot</code></pre>
+
+<p><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code> are
+refused inside a transaction, and <code>.lake open</code> refuses to detach a durable
+session. Every <code>&lt;dir&gt;</code> argument also accepts an
+<code>s3://bucket/prefix</code> URL when the build has the <code>s3</code>
+feature.</p>
+
+<h2 id="read-only-attach">Read-only attach</h2>
+
+<p><code>.lake attach &lt;dir|s3://…&gt; [version]</code> attaches a lake for the
+session without loading any table into memory. No column data is decoded:</p>
+
+<ul>
+  <li>In a <strong>full (Vortex)</strong> build it reads the catalog, the manifest
+  and each data file's footer, metadata and statistics — no column decode.</li>
+  <li>In a <strong>lean</strong> build it reads a CRC-32-protected per-column
+  statistics block that every lean save publishes in the manifest, so
+  <strong>no data file is opened at all</strong>. A lake saved before that block
+  existed refuses attach with a re-save message, never a guess.</li>
+  <li>Exact <code>COUNT(*)</code>, <code>COUNT(col)</code>, <code>MIN</code> and
+  <code>MAX</code> answers come from the stored statistics under strict gates (exact
+  null counts, exact min/max, no ambiguous <code>±0.0</code> stat; a multi-aggregate
+  query is all-or-nothing). Anything unproven materializes the one table the query
+  touches, decoding only the columns it references.</li>
+  <li>Attached tables are session-local and <strong>read-only</strong>: they resolve
+  under their <code>db.table</code> names, <code>.tables</code>/<code>.schema</code>
+  mark them (<code>t (3 rows, attached)</code>), and every mutation over one is
+  refused. <code>.lake save</code> skips attached tables with a note.</li>
+  <li>Measured: a cold attach plus <code>COUNT</code>/<code>MIN</code>/<code>MAX</code>
+  takes ~2.6 ms at 1M rows and ~2.3 ms at 10M rows in the lean build; the attach
+  overhead (~0.1–0.2 ms) is constant in file size.</li>
+</ul>
+
+<h2 id="writer-semantics-and-conflicts">Writer semantics and conflicts</h2>
+
+<ul>
+  <li><strong>One live writer handle per lake</strong> (there is no file locking
+  between lake writers; concurrent readers of published versions are fine). A handle
+  that saves after another writer published a version fails with
+  <code>another writer published version N; reopen the lake</code> before replacing
+  the catalog.</li>
+  <li>Publishing the same version twice is impossible: the snapshot is create-only
+  (a hard link locally, <code>If-None-Match: *</code> over S3), so of two racing
+  writers exactly one wins. <code>catalog.json</code> is always byte-identical to the
+  snapshot of its version.</li>
+  <li>The CLI additionally tracks each lake's version baseline per session:
+  <code>.lake save [force]</code> — <code>force</code> overrides the stale-baseline
+  conflict check.</li>
+  <li>Every save is a full rewrite of every table, so plan for the disk/time cost of
+  the snapshot, not an append.</li>
+</ul>
+
+<h2 id="s3-r2-object-storage">S3 / R2 object storage</h2>
+
+<p>With the <code>s3</code> feature, any lake location can be an
+<code>s3://bucket/prefix</code> URL — AWS S3, Cloudflare R2, MinIO, or any
+S3-compatible endpoint. It is a small, blocking SigV4 client; there is no async
+runtime and no AWS SDK.</p>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features lake,s3
+
+export AWS_ACCESS_KEY_ID=&lt;r2-token-key-id&gt;
+export AWS_SECRET_ACCESS_KEY=&lt;r2-token-secret&gt;
+export AWS_ENDPOINT_URL=https://&lt;account&gt;.r2.cloudflarestorage.com
+export AWS_REGION=auto
+
+./target/release/pinkdb
+#   .lake save    s3://my-bucket/lakes/demo
+#   .lake open    s3://my-bucket/lakes/demo
+#   .lake versions s3://my-bucket/lakes/demo</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Variable</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>AWS_ACCESS_KEY_ID</code>, <code>AWS_SECRET_ACCESS_KEY</code></td>
+      <td>credentials (required for the environment-based URL form)</td>
+    </tr>
+    <tr>
+      <td><code>AWS_SESSION_TOKEN</code></td>
+      <td>optional temporary-credential token (used with the environment's
+      credential pair)</td>
+    </tr>
+    <tr>
+      <td><code>AWS_ENDPOINT_URL</code> (or <code>…_S3</code>)</td>
+      <td>non-AWS endpoint, e.g. the R2 S3 API URL</td>
+    </tr>
+    <tr>
+      <td><code>AWS_REGION</code> (or <code>AWS_DEFAULT_REGION</code>)</td>
+      <td>SigV4 region (<code>auto</code> requires a custom endpoint)</td>
+    </tr>
+    <tr>
+      <td><code>AWS_S3_FORCE_PATH_STYLE</code></td>
+      <td>force path-style addressing (the default with a custom endpoint; dotted
+      bucket names need it)</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_S3_ALLOW_HTTP</code></td>
+      <td>allow a plain <code>http://</code> endpoint (local tests only —
+      credentials travel unencrypted)</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_S3_ALLOW_DEGRADED</code></td>
+      <td>accept the single-writer check-then-put fallback on endpoints that reject
+      conditional writes (see below)</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_S3_RETRIES</code></td>
+      <td>retries after a retryable failure (default 3; <code>0</code>
+      disables)</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<ul>
+  <li><strong>Conflict detection is built on conditional writes.</strong> A snapshot
+  is published with <code>If-None-Match: *</code> (a published version is never
+  replaced) and <code>catalog.json</code> is replaced with
+  <code>If-Match: &lt;etag&gt;</code>, evaluated atomically with the write on AWS S3
+  and R2 — so concurrent saves cannot fork the version chain.</li>
+  <li><strong>Endpoints that reject conditional writes are refused by default.</strong>
+  Set <code>PINKDB_S3_ALLOW_DEGRADED=1</code> to accept a check-then-put fallback
+  with a documented race window — it is <em>single-writer only</em>. Errors are
+  specific: a missing catalog is <code>not a pink-lake directory</code>, a wrong
+  version is <code>has no snapshot version N</code>, a lost race is a write
+  conflict.</li>
+  <li><strong>One <code>PutObject</code> per object</strong>: no multipart uploads,
+  so a single table's data file must be ≤5&nbsp;GiB (checked client-side). No bucket
+  creation, no lifecycle rules, no lake-side GC — old versions stay, exactly like
+  local. Lake data is plaintext (<code>PINKDB_KEY</code> does not encrypt it).</li>
+  <li>Requests have a 120&nbsp;s whole-request timeout; retryable statuses
+  (<code>429</code>/<code>503</code>, and idempotent-request transport errors) back
+  off with jitter. A conditional PUT that failed ambiguously is never retried.</li>
+</ul>
+
+<aside class="marginalia">
+  <span class="margin-tag">after a failed save</span>
+  <p>Reopen the lake and inspect with <code>.lake versions</code> before retrying. A
+  failed save can leave unreferenced data files (harmless), a stray unpublished
+  snapshot (the next save refuses rather than clobber it), or a published version
+  whose response was lost. Never blindly re-run the save on the old handle.</p>
+</aside>
+
+<h2 id="which-build-should-i-use">Which build should I use?</h2>
+
+<ul>
+  <li><strong>Just a database file?</strong> Skip the lake — the default build's
+  <code>.pink</code> + WAL is the whole story.</li>
+  <li><strong>Versioned snapshots, local disk, lean binary?</strong> Use
+  <code>lake-lite</code>: all the commands, statistics-only attach, and a 2.69 MB
+  binary.</li>
+  <li><strong>Vortex data files and footer-based attach?</strong> Use the full
+  <code>lake</code> build, at the cost of a 45.3 MB binary. The data-size gap is
+  small: on the reference sales corpus the lean build's <code>.pink</code> files are
+  only about 1.6–1.8% larger; the binary size, not the data size, is the
+  trade-off.</li>
+  <li><strong>Object storage?</strong> Add <code>s3</code>: <code>lake-lite,s3</code>
+  (4.70 MB) or <code>lake,s3</code> (≈47.3 MB).</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/guide-csv-to-lake">Guide: CSV to a lake →</a></li>
+  <li><a href="../docs/guide-s3-lake">Guide: S3 / R2 lakes →</a></li>
+  <li><a href="../docs/persistence">Persistence →</a></li>
+</ul>
+
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#what-a-lake-is">What a lake is</a></li>
+  <li><a href="#two-data-formats-one-lake-api">Two data formats, one lake API</a></li>
+  <li><a href="#using-a-lake">Using a lake</a></li>
+  <li><a href="#read-only-attach">Read-only attach</a></li>
+  <li><a href="#writer-semantics-and-conflicts">Writer semantics and conflicts</a></li>
+  <li><a href="#s3-r2-object-storage">S3 / R2 object storage</a></li>
+  <li><a href="#which-build-should-i-use">Which build should I use?</a></li>
+</ul>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

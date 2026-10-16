@@ -1229,6 +1229,179 @@ figure.plate svg {
   .ticker-track { animation: none; flex-wrap: wrap; width: auto; }
 }
 
+/* ---------- Docs shell: sidebar + article + "on this page" ---------- */
+
+.container.narrow { max-width: 46rem; }
+
+.docs-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.9rem clamp(1.5rem, 3vw, 3rem);
+  align-items: start;
+}
+
+.doc-main { min-width: 0; max-width: 52rem; }
+
+/* Sidebar: paper card on narrow screens, sticky rail on wide ones. */
+.sidebar {
+  min-width: 0;
+  font-size: 0.92rem;
+}
+
+.sidebar-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--ink);
+  background: var(--paper-2);
+  border: 1.8px solid var(--ink);
+  border-radius: 8px 12px 9px 13px;
+  padding: 0.42rem 0.8rem 0.46rem;
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  rotate: -0.6deg;
+  transition: translate 0.18s var(--ease), box-shadow 0.18s var(--ease),
+              background-color 0.18s var(--ease);
+}
+.sidebar-toggle:hover { translate: -1px -1px; box-shadow: 4px 5px 0 rgba(36, 31, 28, 0.2); }
+.sidebar-toggle-arrow { color: var(--pink-deep); font-size: 0.9rem; }
+/* The checkbox itself stays focusable/clickable (via its label) but invisible. */
+.sidebar-toggle-cb {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.sidebar-toggle-cb:focus-visible ~ .sidebar-toggle {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+/* Hidden checkbox drives the mobile disclosure. */
+.sidebar-toggle-cb:not(:checked) ~ .sidebar-nav { display: none; }
+
+.sidebar-nav {
+  margin-top: 0.75rem;
+  border: 1.8px dashed var(--line-strong);
+  border-radius: 10px 14px 11px 15px;
+  background: var(--paper-2);
+  padding: 0.9rem 0.7rem 0.9rem 0.45rem;
+  box-shadow: var(--shadow-sm);
+}
+.side-group + .side-group { margin-top: 1rem; }
+.side-group-title {
+  margin: 0 0 0.3rem 0.55rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--pink-deep);
+  max-width: none;
+}
+.side-group ul { margin: 0; padding: 0; list-style: none; max-width: none; }
+.side-group li { margin: 0.05rem 0; }
+.sidebar-nav a {
+  display: block;
+  padding: 0.24rem 0.6rem 0.26rem;
+  color: var(--ink-2);
+  text-decoration: none;
+  border-left: 3px solid transparent;
+  border-radius: 0 8px 8px 0;
+  font-size: 0.9rem;
+  line-height: 1.45;
+  transition: color 0.16s var(--ease), background-color 0.16s var(--ease),
+              border-color 0.16s var(--ease), translate 0.16s var(--ease);
+}
+.sidebar-nav a:hover {
+  color: var(--ink);
+  background: var(--paper-3);
+  border-left-color: var(--line-strong);
+  translate: 2px 0;
+}
+.sidebar-nav a.active,
+.sidebar-nav a.active:hover {
+  color: var(--pink-deep);
+  background: var(--pink-soft);
+  border-left-color: var(--pink);
+  font-weight: 650;
+  translate: 0 0;
+}
+
+@media (min-width: 61rem) {
+  .docs-shell { grid-template-columns: minmax(12.5rem, 15.5rem) minmax(0, 1fr); }
+  .sidebar-toggle,
+  .sidebar-toggle-cb { display: none; }
+  .sidebar .sidebar-toggle-cb ~ .sidebar-nav { display: block; }
+  .sidebar { position: sticky; top: 4.35rem; max-height: calc(100dvh - 5.6rem); overflow-y: auto; }
+  .sidebar-nav { border-style: solid; border-color: var(--line); }
+}
+
+/* "On this page": right rail, only when there is room. */
+.toc { display: none; }
+.toc-title {
+  margin: 0 0 0.5rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  max-width: none;
+}
+.toc ul {
+  margin: 0;
+  padding: 0 0 0 0.75rem;
+  list-style: none;
+  border-left: 2px dashed var(--line-strong);
+  max-width: none;
+}
+.toc li { margin: 0.28rem 0; }
+.toc a {
+  display: block;
+  color: var(--ink-2);
+  text-decoration: none;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.toc a:hover { color: var(--pink-deep); text-decoration: underline; }
+@media (min-width: 74rem) {
+  .docs-shell.has-toc {
+    grid-template-columns: minmax(12.5rem, 15rem) minmax(0, 1fr) 12.5rem;
+  }
+  .docs-shell.has-toc .toc {
+    display: block;
+    position: sticky;
+    top: 4.35rem;
+    max-height: calc(100dvh - 5.6rem);
+    overflow-y: auto;
+  }
+}
+
+/* Anchored headings clear the sticky header. */
+h2[id], h3[id] { scroll-margin-top: 5.4rem; }
+
+/* Inside the docs column, margin notes read as inline note cards. */
+.doc-main .marginalia {
+  float: none;
+  clear: none;
+  width: auto;
+  max-width: 62ch;
+  margin: 1.4rem 0;
+  padding: 0.8rem 1rem 0.9rem;
+  border: 1.6px dashed var(--line-strong);
+  border-left: 4px solid var(--pink);
+  border-radius: 8px 12px 10px 14px;
+  background: var(--paper-2);
+  rotate: 0deg;
+}
+
 /* ---------- Small screens ---------- */
 
 @media (max-width: 68rem) {
