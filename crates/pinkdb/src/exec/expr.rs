@@ -438,6 +438,87 @@ fn eval_comparison(
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
+    // Column-vs-literal fast path: evaluate only the column and compare each
+    // row against the scalar. The general path builds the literal's constant
+    // Vector per chunk (an `Arc` clone per element on VARCHAR, a `Value`
+    // clone elsewhere), which for a 1M-row filter dwarfs the comparison
+    // itself. Same-dtype only: mixed numeric widths keep the generic
+    // value-by-value path below.
+    if left.dtype() == right.dtype() {
+        let fast = match (left, right) {
+            (BoundExpr::Literal(v), col)
+                if !v.is_null() && !matches!(col, BoundExpr::Literal(_)) =>
+            {
+                Some((v, col, true))
+            }
+            (col, BoundExpr::Literal(v))
+                if !v.is_null() && !matches!(col, BoundExpr::Literal(_)) =>
+            {
+                Some((v, col, false))
+            }
+            _ => None,
+        };
+        if let Some((scalar, col_expr, scalar_left)) = fast {
+            let col = eval_expr(col_expr, chunk, cx)?;
+            let mut out = Vector::with_capacity(DataType::Boolean, col.len());
+            let handled = match (col.data(), scalar) {
+                (VectorData::Boolean(a), Value::Boolean(s)) => {
+                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
+                    true
+                }
+                (VectorData::Int32(a), Value::Integer(s)) => {
+                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
+                    true
+                }
+                (VectorData::Int64(a), Value::Bigint(s)) => {
+                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
+                    true
+                }
+                (VectorData::Float64(a), Value::Double(s)) => {
+                    cmp_scalar(
+                        op,
+                        &col,
+                        a,
+                        s,
+                        scalar_left,
+                        |x, y| x.partial_cmp(y).unwrap_or(Ordering::Equal),
+                        &mut out,
+                    )?;
+                    true
+                }
+                (VectorData::VarChar(a), Value::Varchar(s)) => {
+                    // One `Arc<str>` for the scalar (one allocation per chunk)
+                    // instead of one clone per element.
+                    let s: std::sync::Arc<str> = std::sync::Arc::from(s.as_str());
+                    cmp_scalar(
+                        op,
+                        &col,
+                        a,
+                        &s,
+                        scalar_left,
+                        |x, y| (**x).cmp(&**y),
+                        &mut out,
+                    )?;
+                    true
+                }
+                (VectorData::Date32(a), Value::Date(s)) => {
+                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
+                    true
+                }
+                (VectorData::TimestampMicros(a), Value::Timestamp(s)) => {
+                    cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
+                    true
+                }
+                _ => false,
+            };
+            if handled {
+                return Ok(out);
+            }
+            // A shape the binder cannot produce for this dtype: fall through
+            // to the general path (re-evaluating the column has no side
+            // effects).
+        }
+    }
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
     let mut out = Vector::new_empty(DataType::Boolean);
@@ -495,6 +576,28 @@ fn eval_comparison(
 /// Typed comparison loop: NULL when either side is invalid, else `cmp` under
 /// the SQL operator. `bool::cmp` gives `false < true`; DATE/TIMESTAMP compare
 /// their raw payloads.
+/// Scalar companion of [`cmp_loop`] for the column-vs-literal fast path:
+/// `col op scalar` (or `scalar op col` when `scalar_left`), NULL-preserving.
+fn cmp_scalar<T>(
+    op: BinaryOp,
+    col: &Vector,
+    a: &[T],
+    s: &T,
+    scalar_left: bool,
+    cmp: impl Fn(&T, &T) -> Ordering,
+    out: &mut Vector,
+) -> Result<()> {
+    for (i, x) in a.iter().enumerate() {
+        if col.is_null(i) {
+            out.push_null()?;
+        } else {
+            let ord = if scalar_left { cmp(s, x) } else { cmp(x, s) };
+            out.push_bool(ord_matches(ord, op))?;
+        }
+    }
+    Ok(())
+}
+
 fn cmp_loop<T>(
     op: BinaryOp,
     l: &Vector,
@@ -1856,6 +1959,116 @@ mod tests {
         assert_eq!(lt.get(67), V::Boolean(true)); // "" < "apple"
         assert_eq!(lt.get(68), V::Boolean(true)); // "" < "banana"
         assert_eq!(lt.get(1), V::Null);
+    }
+
+    #[test]
+    fn scalar_fast_path_matches_the_vector_path() {
+        // The column-vs-literal fast path must agree with the general
+        // (column-vs-constant-column) path for every supported type, on both
+        // literal sides, NULLs included.
+        let mut ints = Vector::new_empty(DataType::Integer);
+        let mut bigs = Vector::new_empty(DataType::Bigint);
+        let mut doubles = Vector::new_empty(DataType::Double);
+        let mut strings = Vector::new_empty(DataType::Varchar);
+        let mut dates = Vector::new_empty(DataType::Date);
+        let mut stamps = Vector::new_empty(DataType::Timestamp);
+        for i in 0..70 {
+            if i % 11 == 0 {
+                ints.push_null().unwrap();
+                bigs.push_null().unwrap();
+                doubles.push_null().unwrap();
+                strings.push_null().unwrap();
+                dates.push_null().unwrap();
+                stamps.push_null().unwrap();
+                continue;
+            }
+            ints.push_valid(V::Integer(i - 35)).unwrap();
+            bigs.push_valid(V::Bigint(i as i64 * 1_000_000_007 - 3_000_000_000))
+                .unwrap();
+            doubles
+                .push_valid(V::Double(i as f64 * 1.5 - 20.0))
+                .unwrap();
+            strings
+                .push_str(match i % 4 {
+                    0 | 3 => "apple",
+                    1 => "",
+                    _ => "banana",
+                })
+                .unwrap();
+            dates.push_valid(V::Date(i - 35)).unwrap();
+            stamps
+                .push_valid(V::Timestamp(i as i64 * 86_400_000_000 - 1_000))
+                .unwrap();
+        }
+        let db = PinkDb::new();
+        let cx = test_cx(&db);
+
+        let cases: Vec<(DataType, Vector, V)> = vec![
+            (DataType::Integer, ints, V::Integer(4)),
+            (DataType::Bigint, bigs, V::Bigint(1_000_000_007)),
+            (DataType::Double, doubles, V::Double(10.5)),
+            (DataType::Varchar, strings, V::Varchar("apple".to_string())),
+            (DataType::Date, dates, V::Date(3)),
+            (DataType::Timestamp, stamps, V::Timestamp(86_400_000_000)),
+        ];
+        for (dtype, col, lit) in cases {
+            let mut lit_col = Vector::new_empty(dtype);
+            for _ in 0..col.len() {
+                lit_col.push_valid(lit.clone()).unwrap();
+            }
+            let chunk = DataChunk::new(vec![col.clone(), lit_col]).unwrap();
+            let lit_expr = B::Literal(lit);
+            let column = |index| Box::new(B::Column { index, dtype });
+            for op in [
+                BinaryOp::Eq,
+                BinaryOp::NotEq,
+                BinaryOp::Lt,
+                BinaryOp::LtEq,
+                BinaryOp::Gt,
+                BinaryOp::GtEq,
+            ] {
+                for scalar_left in [false, true] {
+                    // Reference: the same comparison as column-vs-column,
+                    // with the columns chosen to match the scalar's side.
+                    let (lidx, ridx) = if scalar_left { (1, 0) } else { (0, 1) };
+                    let general = eval_expr(
+                        &B::Binary {
+                            op,
+                            left: column(lidx),
+                            right: column(ridx),
+                            dtype: DataType::Boolean,
+                        },
+                        &chunk,
+                        &cx,
+                    )
+                    .unwrap();
+                    let (left, right) = if scalar_left {
+                        (Box::new(lit_expr.clone()), column(0))
+                    } else {
+                        (column(0), Box::new(lit_expr.clone()))
+                    };
+                    let fast = eval_expr(
+                        &B::Binary {
+                            op,
+                            left,
+                            right,
+                            dtype: DataType::Boolean,
+                        },
+                        &chunk,
+                        &cx,
+                    )
+                    .unwrap();
+                    assert_eq!(fast.len(), general.len());
+                    for i in 0..general.len() {
+                        assert_eq!(
+                            fast.get(i),
+                            general.get(i),
+                            "{dtype:?} {op:?} scalar_left={scalar_left} row {i}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

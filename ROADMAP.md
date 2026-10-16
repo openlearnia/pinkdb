@@ -88,7 +88,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 52 | Core extension: **json** — `json_extract`, `json_value`, `json_valid`, `json_array_length`, `json_object`, `json_array` (JSON as VARCHAR in v1) | queued | `extensions/json` |
 | 53 | Core extension: **string** — `split_part`, trim variants, `replace`, `reverse`, `left`/`right`, `strpos`, `starts_with`/`ends_with`, `regexp_match`/`regexp_extract` | queued | `extensions/string` |
 | 54 | Core extension: **math** — `sqrt`, `pow`, `log`/`ln`/`exp`, trig, `floor`/`ceil`, `sign`, `greatest`/`least`, `random` (volatile-flagged) | queued | `extensions/math` |
-| 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) — carry the post-merge audit items: profile the fused join→aggregate `MatchTable::build` path (`join_group` +14%, `join_probe` +7%) and the VARCHAR filter path (`filter_str` +19%) vs the 61-tree A/B | queued | core |
+| 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) — done: column-vs-literal comparison fast path (`filter_str` 5.39 → 1.60 ms, battery 235.5 ms best-ever); audit deltas attributed (per-chunk literal Vectors + codegen/thermal noise), fused-path choice validated | done | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | done | landed; duckdiff 88 → 155 probes |
@@ -758,3 +758,24 @@ Java bindings.
   the int filter and projection pushdown are unaffected). Note: same-binary
   session-to-session variance on this machine reaches 9–15% on some queries, so
   the back-to-back A/B pairs — not absolute totals — are the signal.
+- 2026-10-16 — Wave 55 (performance round; pulled forward after the post-merge
+  audit). Investigation: none of the audit deltas were algorithmic — `filter_chunk`
+  is byte-identical between trees, the projection walker and `ScanProjections` are
+  unchanged, and the fused join→aggregate hot loop only gained two once-per-query
+  guards; a materialized-path experiment proved fusion is the right choice
+  (materialized is 2–5× slower: join_self 25.6 vs 9.3, join_probe 32.6 vs 6.2).
+  Profiling (samply + manual RVA symbolization against `nm`) located the filter
+  cost: the literal's per-chunk constant Vector — on VARCHAR a full-width `Arc`
+  clone per element (~1M clones for a 1M-row filter) — plus `eval_comparison`,
+  ~25% of `filter_str`. Shipped: a same-dtype column-vs-literal fast path in
+  `eval_comparison` (BOOLEAN/INTEGER/BIGINT/DOUBLE/VARCHAR/DATE/TIMESTAMP, both
+  literal sides, NULL-preserving, one `Arc<str>` scalar per chunk; mixed numeric
+  widths keep the generic value-by-value path). A unit test proves
+  fast ≡ general across the type × op × side × NULL matrix. Result: `filter_str`
+  **5.39 → 1.60 ms** (3.4×) and the standing battery's best-ever total,
+  **235.5 ms** (best of 5; previous best 248.7 — joins and windows at their best
+  readings too). Gates: fmt, clippy `-D warnings`, pinkdb 425/425 (+1 ignored),
+  CLI lake+s3 green (multiprocess 27/27), `bench/duckdiff.py` 155/155, full
+  workspace green. Follow-up candidates (not scheduled): extend the fast path to
+  mixed numeric widths (`filter_num` unchanged at 2.31 ms), LIKE constant
+  folding, and a cool-machine re-audit of the join queries.
