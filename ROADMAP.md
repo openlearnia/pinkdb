@@ -93,7 +93,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | integrating | worktree patch on main (gates + CI before commit) |
 | 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | queued | — |
-| 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | integrating | worktree patch on main (gates + CI before commit) |
+| 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | integrating | worktree patch on main (gates + CI before commit) |
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | queued | — |
 
@@ -661,3 +661,17 @@ Java bindings.
   fmt, clippy (pinkdb, CLI lake+s3), pinkdb 396/396 + encryption 413/413, multiprocess
   26/26, duckdiff 60/60, workspace all green, `mp_soak.py --ci` PASS (1,135 acked
   units, 18 kills, exactly-once across 23 writers); Linux Docker 396/413/26 all green.
+- 2026-10-16 — Wave 60 (functions; worktree fan-out): window `lag`/`lead` (offset,
+  default; negative offset flips direction like DuckDB; frame-ignoring), `ntile`
+  (larger buckets first; `n ≤ 0` errors), `first_value`/`last_value` (frame-respecting;
+  empty frame → NULL); scalar `||` (new `BinaryOp::Concat`, strict NULL, precedence
+  pinned), `concat` (skips NULLs), `trim`/`ltrim`/`rtrim` (charset forms), `replace`,
+  `nullif`, `greatest`/`least` (NULL-skipping, NaN-greatest, common-type rules),
+  `extract`/`date_part` (ISO week and isoyear, millisecond/microsecond/epoch,
+  DATE-as-midnight), `sqrt`, `floor`/`ceil`/`ceiling`, `sign`, `power`/`pow`, `mod`
+  (int + double; zero-divisor errors). Semantics pinned with probes against DuckDB,
+  not assumptions; `bench/duckdiff.py` grew 60 → **88 probes, all passing**. Deferred
+  with reasons in the worktree report: `IGNORE NULLS`, non-constant offsets and
+  `ntile`, SQL-standard `trim(BOTH … FROM …)` syntax, `%` for doubles. Gates on main
+  after 45o: fmt, clippy `-D warnings`, pinkdb 403/403, CLI lake+s3 green
+  (multiprocess 27/27 including the lake-gated test), duckdiff 88/88.

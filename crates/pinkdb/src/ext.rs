@@ -201,7 +201,7 @@ impl ExtHost for PinkDb {
             let key = f.name().to_ascii_lowercase();
             if ScalarFunc::from_name(&key).is_some()
                 || AggFunc::from_name(&key).is_some()
-                || WindowFunc::ranking(&key).is_some()
+                || WindowFunc::from_name(&key).is_some()
             {
                 return Err(ExtError::registration(format!(
                     "function \"{}\" conflicts with a built-in function",

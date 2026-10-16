@@ -18,7 +18,7 @@ use std::rc::Rc;
 use super::ast::*;
 use crate::plan::LogicalPlan;
 use crate::storage::{DataTable, PinkDb};
-use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::types::{extract_field, DataType, ExtractField, PinkDbError, Result, Value};
 
 // ---------- bound expressions ----------
 
@@ -59,6 +59,26 @@ pub enum ScalarFunc {
     Minute,
     Second,
     DateTrunc,
+    /// `concat(a, b, ...)` — NULL arguments are skipped (DuckDB).
+    Concat,
+    Trim,
+    LTrim,
+    RTrim,
+    Replace,
+    /// `nullif(a, b)` — NULL when `a = b` (else `a`); only `a`'s NULL is
+    /// propagating, `b`'s NULL is not.
+    NullIf,
+    /// `greatest(...)` / `least(...)` — NULL arguments are skipped.
+    Greatest,
+    Least,
+    /// `extract(field FROM x)` / `date_part('field', x)`.
+    Extract,
+    Sqrt,
+    Floor,
+    Ceil,
+    Sign,
+    Power,
+    Mod,
 }
 
 impl ScalarFunc {
@@ -77,8 +97,32 @@ impl ScalarFunc {
             "minute" => ScalarFunc::Minute,
             "second" => ScalarFunc::Second,
             "date_trunc" => ScalarFunc::DateTrunc,
+            "concat" => ScalarFunc::Concat,
+            "trim" => ScalarFunc::Trim,
+            "ltrim" => ScalarFunc::LTrim,
+            "rtrim" => ScalarFunc::RTrim,
+            "replace" => ScalarFunc::Replace,
+            "nullif" => ScalarFunc::NullIf,
+            "greatest" => ScalarFunc::Greatest,
+            "least" => ScalarFunc::Least,
+            "extract" | "date_part" => ScalarFunc::Extract,
+            "sqrt" => ScalarFunc::Sqrt,
+            "floor" => ScalarFunc::Floor,
+            "ceil" | "ceiling" => ScalarFunc::Ceil,
+            "sign" => ScalarFunc::Sign,
+            "power" | "pow" => ScalarFunc::Power,
+            "mod" => ScalarFunc::Mod,
             _ => return None,
         })
+    }
+
+    /// False for the functions that handle NULLs themselves (they are not
+    /// `any-NULL-in → NULL-out`).
+    pub(crate) fn is_strict(self) -> bool {
+        !matches!(
+            self,
+            ScalarFunc::Concat | ScalarFunc::NullIf | ScalarFunc::Greatest | ScalarFunc::Least
+        )
     }
 }
 
@@ -95,6 +139,18 @@ pub enum WindowFunc {
     RowNumber,
     Rank,
     DenseRank,
+    /// `lag(x [, offset [, default]])` — reads the row `offset` before the
+    /// current one; the window frame is ignored.
+    Lag,
+    /// `lead(x [, offset [, default]])` — like `Lag`, in the other direction.
+    Lead,
+    /// `ntile(n)` — `n` (a positive constant) equally-sized buckets, the
+    /// larger ones first.
+    NTile,
+    /// `first_value(x)` — `x` of the frame's first row (frame-respecting).
+    FirstValue,
+    /// `last_value(x)` — `x` of the frame's last row (frame-respecting).
+    LastValue,
     Agg(AggFunc),
 }
 
@@ -104,6 +160,22 @@ impl WindowFunc {
             "row_number" => WindowFunc::RowNumber,
             "rank" => WindowFunc::Rank,
             "dense_rank" => WindowFunc::DenseRank,
+            _ => return None,
+        })
+    }
+
+    /// Every built-in window function name (used for registry-conflict
+    /// checks and window binding).
+    pub(crate) fn from_name(name: &str) -> Option<WindowFunc> {
+        if let Some(r) = Self::ranking(name) {
+            return Some(r);
+        }
+        Some(match name.to_ascii_lowercase().as_str() {
+            "lag" => WindowFunc::Lag,
+            "lead" => WindowFunc::Lead,
+            "ntile" => WindowFunc::NTile,
+            "first_value" => WindowFunc::FirstValue,
+            "last_value" => WindowFunc::LastValue,
             _ => return None,
         })
     }
@@ -120,7 +192,8 @@ pub enum FrameBound {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowKind {
-    Rank(WindowFunc),
+    /// Ranking functions plus lag/lead/ntile/first_value/last_value.
+    Simple(WindowFunc),
     Agg(AggFunc),
 }
 
@@ -160,8 +233,14 @@ impl BoundFrame {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BoundWindow {
     pub func: WindowFunc,
-    /// COUNT(*) has no arg.
+    /// COUNT(*) has no arg; lag/lead/ntile carry theirs here too.
     pub arg: Option<BoundExpr>,
+    /// `lag`/`lead`: rows to move back/forward (may be negative — DuckDB
+    /// treats a negative lag like a lead). Unused by other windows.
+    pub offset: i64,
+    /// `lag`/`lead`: value used when the target row is off the partition
+    /// edge (coerced to the result type at bind time).
+    pub default: Option<BoundExpr>,
     pub partition: Vec<BoundExpr>,
     pub order: Vec<(BoundExpr, bool)>,
     pub frame: BoundFrame,
@@ -763,6 +842,18 @@ impl<'a> Binder<'a> {
                         comparison_ok(*op, l.dtype(), r.dtype())?;
                         DataType::Boolean
                     }
+                    // `a || b`: both sides format to VARCHAR (DuckDB casts
+                    // implicitly); NULL on either side → NULL.
+                    BinaryOp::Concat => {
+                        let l2 = cast_to_varchar(l);
+                        let r2 = cast_to_varchar(r);
+                        return Ok(BoundExpr::Binary {
+                            op: BinaryOp::Concat,
+                            left: Box::new(l2),
+                            right: Box::new(r2),
+                            dtype: DataType::Varchar,
+                        });
+                    }
                     _ => arithmetic_dtype(*op, l.dtype(), r.dtype())?,
                 };
                 Ok(BoundExpr::Binary {
@@ -1002,11 +1093,42 @@ impl<'a> Binder<'a> {
             ));
         }
         // Resolve the function first (arity checks mirror the agg path).
-        let kind: WindowKind = if let Some(r) = WindowFunc::ranking(name) {
-            if !args.is_empty() {
-                return Err(PinkDbError::Type(format!("{name} takes no arguments")));
+        let kind: WindowKind = if let Some(wf) = WindowFunc::from_name(name) {
+            if args.iter().any(|a| a == &Expr::Star) {
+                return Err(PinkDbError::Parse(
+                    "`*` is only valid in COUNT(*)".to_string(),
+                ));
             }
-            WindowKind::Rank(r)
+            match wf {
+                WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                    if !args.is_empty() {
+                        return Err(PinkDbError::Type(format!("{name} takes no arguments")));
+                    }
+                }
+                WindowFunc::Lag | WindowFunc::Lead => {
+                    if args.is_empty() || args.len() > 3 {
+                        return Err(PinkDbError::Type(format!(
+                            "{name} takes 1 to 3 arguments (value, offset, default)"
+                        )));
+                    }
+                }
+                WindowFunc::NTile => {
+                    if args.len() != 1 {
+                        return Err(PinkDbError::Type(
+                            "ntile takes exactly 1 argument".to_string(),
+                        ));
+                    }
+                }
+                WindowFunc::FirstValue | WindowFunc::LastValue => {
+                    if args.len() != 1 {
+                        return Err(PinkDbError::Type(format!(
+                            "{name} takes exactly 1 argument"
+                        )));
+                    }
+                }
+                WindowFunc::Agg(_) => unreachable!("aggregate kinds resolve below"),
+            }
+            WindowKind::Simple(wf)
         } else if let Some(f) = AggFunc::from_name(name) {
             let is_star = args.len() == 1 && args[0] == Expr::Star;
             if args.iter().any(|a| a == &Expr::Star) && !is_star {
@@ -1045,11 +1167,18 @@ impl<'a> Binder<'a> {
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
-        let is_star = args.len() == 1 && args.first() == Some(&Expr::Star);
-        let arg = if is_star || args.is_empty() {
-            None
-        } else {
-            Some(self.bind_expr(&args[0], aggs, allow_agg)?)
+        let (func, dtype, arg, offset, default) = match kind {
+            WindowKind::Simple(wf) => self.bind_simple_window(wf, args, aggs, allow_agg)?,
+            WindowKind::Agg(f) => {
+                let is_star = args.len() == 1 && args.first() == Some(&Expr::Star);
+                let arg = if is_star || args.is_empty() {
+                    None
+                } else {
+                    Some(self.bind_expr(&args[0], aggs, allow_agg)?)
+                };
+                let dtype = agg_dtype(f, arg.as_ref().map(|a| a.dtype()))?;
+                (WindowFunc::Agg(f), dtype, arg, 1, None)
+            }
         };
         let mut partition = Vec::with_capacity(over.partition.len());
         for p in &over.partition {
@@ -1066,16 +1195,11 @@ impl<'a> Binder<'a> {
             },
             None => BoundFrame::default_for(!order.is_empty()),
         };
-        let (func, dtype) = match kind {
-            WindowKind::Rank(r) => (r, DataType::Bigint),
-            WindowKind::Agg(f) => {
-                let dtype = agg_dtype(f, arg.as_ref().map(|a| a.dtype()))?;
-                (WindowFunc::Agg(f), dtype)
-            }
-        };
         let win = BoundWindow {
             func,
             arg,
+            offset,
+            default,
             partition,
             order,
             frame,
@@ -1089,6 +1213,79 @@ impl<'a> Binder<'a> {
             }
         };
         Ok(BoundExpr::WindowRef { index, dtype })
+    }
+
+    /// Resolve a non-aggregate window function: its argument, result type,
+    /// and (for lag/lead) the constant offset and default expression.
+    #[allow(clippy::type_complexity)]
+    fn bind_simple_window(
+        &mut self,
+        wf: WindowFunc,
+        args: &[Expr],
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<(
+        WindowFunc,
+        DataType,
+        Option<BoundExpr>,
+        i64,
+        Option<BoundExpr>,
+    )> {
+        match wf {
+            WindowFunc::Lag | WindowFunc::Lead => {
+                let name = if wf == WindowFunc::Lag { "lag" } else { "lead" };
+                let arg = self.bind_expr(&args[0], aggs, allow_agg)?;
+                // DuckDB accepts any integer constant (negative flips the
+                // direction); a non-constant offset is not supported here.
+                let offset = match args.get(1) {
+                    None => 1,
+                    Some(e) => const_i64(e).ok_or_else(|| {
+                        PinkDbError::Type(format!("{name} offset must be an integer constant"))
+                    })?,
+                };
+                let default = match args.get(2) {
+                    Some(e) => Some(self.bind_expr(e, aggs, allow_agg)?),
+                    None => None,
+                };
+                // Result type: the value argument's type; a bare NULL value
+                // takes the default's type instead (DuckDB rule).
+                let dtype = if matches!(arg, BoundExpr::Literal(Value::Null)) {
+                    default
+                        .as_ref()
+                        .map(|d| d.dtype())
+                        .unwrap_or(DataType::Integer)
+                } else {
+                    arg.dtype()
+                };
+                let arg = cast_window_arg(arg, dtype)?;
+                let default = match default {
+                    Some(d) => Some(cast_window_arg(d, dtype)?),
+                    None => None,
+                };
+                Ok((wf, dtype, Some(arg), offset, default))
+            }
+            WindowFunc::NTile => {
+                let n = const_i64(&args[0]).ok_or_else(|| {
+                    PinkDbError::Type("ntile argument must be a constant integer".to_string())
+                })?;
+                if n <= 0 {
+                    return Err(PinkDbError::Type(
+                        "Argument for ntile must be greater than zero".to_string(),
+                    ));
+                }
+                Ok((wf, DataType::Bigint, None, n, None))
+            }
+            WindowFunc::FirstValue | WindowFunc::LastValue => {
+                let arg = self.bind_expr(&args[0], aggs, allow_agg)?;
+                let dtype = arg.dtype();
+                Ok((wf, dtype, Some(arg), 1, None))
+            }
+            WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank => {
+                // No argument; the rank itself is a BIGINT.
+                Ok((wf, DataType::Bigint, None, 1, None))
+            }
+            WindowFunc::Agg(_) => unreachable!("{wf:?} does not bind through bind_simple_window"),
+        }
     }
 
     fn bind_function(
@@ -1154,6 +1351,7 @@ impl<'a> Binder<'a> {
                 bound.push(self.bind_expr(a, aggs, allow_agg)?);
             }
             let dtype = scalar_dtype(func, &bound)?;
+            let bound = coerce_scalar_args(func, dtype, bound)?;
             return Ok(BoundExpr::Scalar {
                 func,
                 args: bound,
@@ -1243,6 +1441,85 @@ impl<'a> Binder<'a> {
             dtype,
         })
     }
+}
+
+/// A VARCHAR slot for the string functions: a VARCHAR argument or a bare
+/// NULL literal (which the executor turns into NULL).
+fn varchar_arg(e: &BoundExpr) -> bool {
+    e.dtype() == DataType::Varchar || matches!(e, BoundExpr::Literal(Value::Null))
+}
+
+/// Fold an integer constant expression (literals with unary `+`/`-`).
+/// Materializing the value underflows to None (an overflowing literal is a
+/// parse error long before this).
+fn const_i64(e: &Expr) -> Option<i64> {
+    match e {
+        Expr::Literal(Value::Integer(n)) => Some(*n as i64),
+        Expr::Literal(Value::Bigint(n)) => Some(*n),
+        Expr::Unary {
+            op: UnaryOp::Negate,
+            expr,
+        } => const_i64(expr).and_then(i64::checked_neg),
+        Expr::Unary {
+            op: UnaryOp::Plus,
+            expr,
+        } => const_i64(expr),
+        _ => None,
+    }
+}
+
+/// Implicitly cast one `||` operand to VARCHAR (everything formats to
+/// VARCHAR; a bare NULL stays typeless so its NULL propagates).
+fn cast_to_varchar(e: BoundExpr) -> BoundExpr {
+    if e.dtype() == DataType::Varchar || matches!(e, BoundExpr::Literal(Value::Null)) {
+        e
+    } else {
+        BoundExpr::Cast {
+            expr: Box::new(e),
+            dtype: DataType::Varchar,
+        }
+    }
+}
+
+/// Wrap scalar arguments in casts where a function's runtime kernel needs
+/// one layout: `concat` reads VARCHARs (DuckDB casts implicitly), and
+/// greatest/least compare in their common type.
+fn coerce_scalar_args(
+    func: ScalarFunc,
+    dtype: DataType,
+    args: Vec<BoundExpr>,
+) -> Result<Vec<BoundExpr>> {
+    let want = match func {
+        ScalarFunc::Concat => DataType::Varchar,
+        ScalarFunc::Greatest | ScalarFunc::Least | ScalarFunc::Mod => dtype,
+        _ => return Ok(args),
+    };
+    args.into_iter()
+        .map(|a| {
+            if a.dtype() == want || matches!(a, BoundExpr::Literal(Value::Null)) {
+                Ok(a)
+            } else {
+                check_cast(a.dtype(), want)?;
+                Ok(BoundExpr::Cast {
+                    expr: Box::new(a),
+                    dtype: want,
+                })
+            }
+        })
+        .collect()
+}
+
+/// Wraps `e` in `CAST(e AS dtype)` when its type differs (bare NULL literals
+/// are typeless already). Used for lag/lead value/default coercion.
+fn cast_window_arg(e: BoundExpr, dtype: DataType) -> Result<BoundExpr> {
+    if e.dtype() == dtype || matches!(e, BoundExpr::Literal(Value::Null)) {
+        return Ok(e);
+    }
+    check_cast(e.dtype(), dtype)?;
+    Ok(BoundExpr::Cast {
+        expr: Box::new(e),
+        dtype,
+    })
 }
 
 fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
@@ -1381,6 +1658,147 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
                 ))),
             }
         }
+        ScalarFunc::Concat => {
+            if args.is_empty() {
+                return Err(PinkDbError::Type(
+                    "concat needs at least 1 argument".to_string(),
+                ));
+            }
+            // Every argument coerces to VARCHAR (DuckDB); NULL args are
+            // skipped at evaluation, so a bare NULL literal stays bare.
+            Ok(DataType::Varchar)
+        }
+        ScalarFunc::Trim | ScalarFunc::LTrim | ScalarFunc::RTrim => {
+            arity(&[1, 2])?;
+            // A bare NULL literal fits the VARCHAR slots (DuckDB types it
+            // VARCHAR for these functions; the result is NULL anyway).
+            if !varchar_arg(&args[0]) {
+                return Err(PinkDbError::Type(format!("{func:?} needs VARCHAR")));
+            }
+            if args.len() == 2 && !varchar_arg(&args[1]) {
+                return Err(PinkDbError::Type(format!(
+                    "{func:?} characters must be VARCHAR"
+                )));
+            }
+            Ok(DataType::Varchar)
+        }
+        ScalarFunc::Replace => {
+            arity(&[3])?;
+            for a in args {
+                if !varchar_arg(a) {
+                    return Err(PinkDbError::Type(
+                        "replace needs VARCHAR arguments".to_string(),
+                    ));
+                }
+            }
+            Ok(DataType::Varchar)
+        }
+        ScalarFunc::NullIf => {
+            arity(&[2])?;
+            let (t0, t1) = (args[0].dtype(), args[1].dtype());
+            // Compare types only when both sides are actually typed (a bare
+            // NULL never needs a comparison, so `nullif(x, NULL)` is fine).
+            let null0 = matches!(args[0], BoundExpr::Literal(Value::Null));
+            let null1 = matches!(args[1], BoundExpr::Literal(Value::Null));
+            if !null0 && !null1 {
+                comparison_ok(BinaryOp::Eq, t0, t1)?;
+            }
+            // Result type: the first argument's (DuckDB); a bare NULL first
+            // argument falls back to the second's type.
+            Ok(if null0 {
+                if null1 {
+                    DataType::Integer
+                } else {
+                    t1
+                }
+            } else {
+                t0
+            })
+        }
+        ScalarFunc::Greatest | ScalarFunc::Least => {
+            if args.is_empty() {
+                return Err(PinkDbError::Type(format!(
+                    "{func:?} needs at least 1 argument"
+                )));
+            }
+            // Common type across the typed arguments (NULLs are skipped).
+            let mut common: Option<DataType> = None;
+            for a in args {
+                if matches!(a, BoundExpr::Literal(Value::Null)) {
+                    continue;
+                }
+                common = Some(match common {
+                    None => a.dtype(),
+                    Some(t) => coalesce_common(t, a.dtype()).map_err(|_| {
+                        PinkDbError::Type(format!(
+                            "cannot combine {} with {} in {func:?}",
+                            t,
+                            a.dtype()
+                        ))
+                    })?,
+                });
+            }
+            Ok(common.unwrap_or(DataType::Integer))
+        }
+        ScalarFunc::Extract => {
+            arity(&[2])?;
+            if args[0].dtype() != DataType::Varchar {
+                return Err(PinkDbError::Type(
+                    "extract needs a VARCHAR part as its first argument".to_string(),
+                ));
+            }
+            match args[1].dtype() {
+                DataType::Date | DataType::Timestamp => {}
+                t => {
+                    return Err(PinkDbError::Type(format!(
+                        "extract needs DATE or TIMESTAMP, got {t}"
+                    )));
+                }
+            }
+            // Literal parts are validated now and yield BIGINT (the epoch is
+            // DOUBLE). A non-constant VARCHAR part hits DuckDB's other
+            // overload, which returns DOUBLE.
+            if let BoundExpr::Literal(Value::Varchar(part)) = &args[0] {
+                let field = extract_field(part).map_err(PinkDbError::Type)?;
+                return Ok(match field {
+                    ExtractField::Epoch => DataType::Double,
+                    _ => DataType::Bigint,
+                });
+            }
+            Ok(DataType::Double)
+        }
+        ScalarFunc::Sqrt | ScalarFunc::Floor | ScalarFunc::Ceil => {
+            arity(&[1])?;
+            if !is_numeric(args[0].dtype()) {
+                return Err(PinkDbError::Type(format!(
+                    "{func:?} needs a numeric argument"
+                )));
+            }
+            Ok(DataType::Double)
+        }
+        ScalarFunc::Sign => {
+            arity(&[1])?;
+            if !is_numeric(args[0].dtype()) {
+                return Err(PinkDbError::Type(
+                    "sign needs a numeric argument".to_string(),
+                ));
+            }
+            Ok(DataType::Integer)
+        }
+        ScalarFunc::Power => {
+            arity(&[2])?;
+            if !is_numeric(args[0].dtype()) || !is_numeric(args[1].dtype()) {
+                return Err(PinkDbError::Type(
+                    "power needs numeric arguments".to_string(),
+                ));
+            }
+            Ok(DataType::Double)
+        }
+        ScalarFunc::Mod => {
+            arity(&[2])?;
+            common_numeric(args[0].dtype(), args[1].dtype())
+                .map_err(|_| PinkDbError::Type("mod needs numeric arguments".to_string()))
+        }
     }
 }
 
@@ -1414,6 +1832,7 @@ fn default_name(expr: &Expr) -> String {
                 BinaryOp::Or => "OR",
                 BinaryOp::Like => "LIKE",
                 BinaryOp::NotLike => "NOT LIKE",
+                BinaryOp::Concat => "||",
             };
             format!("({} {sym} {})", default_name(left), default_name(right))
         }

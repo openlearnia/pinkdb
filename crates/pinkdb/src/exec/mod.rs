@@ -1603,7 +1603,8 @@ fn expr_is_total(e: &BoundExpr) -> bool {
             | BinaryOp::And
             | BinaryOp::Or
             | BinaryOp::Like
-            | BinaryOp::NotLike => expr_is_total(left) && expr_is_total(right),
+            | BinaryOp::NotLike
+            | BinaryOp::Concat => expr_is_total(left) && expr_is_total(right),
             // int/int division errors on a zero divisor; only DOUBLE/DOUBLE
             // (both sides, so the int-div rule can never trigger) is safe.
             BinaryOp::Divide => {
@@ -4817,6 +4818,373 @@ mod tests {
             .is_err());
         assert!(db
             .execute("SELECT MEDIAN(amount) OVER () FROM sales;")
+            .is_err());
+    }
+
+    fn win_t() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (id INTEGER, g VARCHAR, v INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1,'a',10),(2,'a',20),(3,'a',NULL),(4,'b',40),(5,'b',50),(6,'b',60);")
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn window_lag_lead() {
+        let mut db = win_t();
+        // lag/lead reset per partition; NULL values stay NULL (no IGNORE
+        // NULLS); a negative offset flips the direction.
+        let rows = select(
+            &mut db,
+            "SELECT id, lag(v) OVER (PARTITION BY g ORDER BY id), lead(v) OVER (PARTITION BY g ORDER BY id)
+             FROM t ORDER BY id;",
+        );
+        let got: Vec<(i32, Option<i64>, Option<i64>)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    match r[0] {
+                        V::Integer(i) => i,
+                        _ => panic!(),
+                    },
+                    match r[1] {
+                        V::Integer(i) => Some(i as i64),
+                        V::Null => None,
+                        _ => panic!(),
+                    },
+                    match r[2] {
+                        V::Integer(i) => Some(i as i64),
+                        V::Null => None,
+                        _ => panic!(),
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, None, Some(20)),
+                (2, Some(10), None),
+                (3, Some(20), None),
+                (4, None, Some(50)),
+                (5, Some(40), Some(60)),
+                (6, Some(50), None),
+            ]
+        );
+        // Offset + DEFAULT at the edges; the frame is ignored.
+        let rows = select(
+            &mut db,
+            "SELECT id, lag(v, 2, -1) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW),
+                    lead(v, 1, -1) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING)
+             FROM t ORDER BY id;",
+        );
+        let got: Vec<(Option<i64>, Option<i64>)> = rows
+            .iter()
+            .map(|r| {
+                let get = |v: &V| match v {
+                    V::Integer(i) => Some(*i as i64),
+                    V::Null => None,
+                    _ => panic!(),
+                };
+                (get(&r[1]), get(&r[2]))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(-1), Some(20)),
+                (Some(-1), None),
+                (Some(10), Some(40)),
+                (Some(20), Some(50)),
+                (None, Some(60)),
+                (Some(40), Some(-1)),
+            ]
+        );
+        // Negative offset = opposite direction.
+        let rows = select(
+            &mut db,
+            "SELECT lag(v, -1) OVER (ORDER BY id) FROM t ORDER BY id;",
+        );
+        let vals: Vec<Option<i64>> = rows
+            .iter()
+            .map(|r| match r[0] {
+                V::Integer(i) => Some(i as i64),
+                V::Null => None,
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(
+            vals,
+            vec![Some(20), None, Some(40), Some(50), Some(60), None]
+        );
+        // Bad offsets.
+        assert!(db
+            .execute("SELECT lag(v, 1.5) OVER (ORDER BY id) FROM t;")
+            .is_err());
+        assert!(db
+            .execute("SELECT lead(v, id) OVER (ORDER BY id) FROM t;")
+            .is_err());
+    }
+
+    #[test]
+    fn window_ntile_first_last_value() {
+        let mut db = win_t();
+        // 6 rows into 4 buckets: 2,2,1,1 (larger buckets first).
+        let rows = select(
+            &mut db,
+            "SELECT ntile(4) OVER (ORDER BY id), ntile(2) OVER (ORDER BY id) FROM t ORDER BY id;",
+        );
+        let got: Vec<(i64, i64)> = rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (V::Bigint(a), V::Bigint(b)) => (*a, *b),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(got, vec![(1, 1), (1, 1), (2, 1), (2, 2), (3, 2), (4, 2)]);
+        // first/last_value respect the frame: default (ordered) frame = up to
+        // the current row; whole-partition frames see the partition's ends.
+        let rows = select(
+            &mut db,
+            "SELECT first_value(v) OVER (PARTITION BY g ORDER BY id),
+                    last_value(v) OVER (PARTITION BY g ORDER BY id),
+                    last_value(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+             FROM t ORDER BY id;",
+        );
+        let got: Vec<(Option<i64>, Option<i64>, Option<i64>)> = rows
+            .iter()
+            .map(|r| {
+                let get = |v: &V| match v {
+                    V::Integer(i) => Some(*i as i64),
+                    V::Null => None,
+                    _ => panic!(),
+                };
+                (get(&r[0]), get(&r[1]), get(&r[2]))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (Some(10), Some(10), None),
+                (Some(10), Some(20), None),
+                (Some(10), None, None),
+                (Some(40), Some(40), Some(60)),
+                (Some(40), Some(50), Some(60)),
+                (Some(40), Some(60), Some(60)),
+            ]
+        );
+        // Empty frame → NULL.
+        let rows = select(
+            &mut db,
+            "SELECT first_value(v) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) FROM t ORDER BY id;",
+        );
+        assert_eq!(rows[0][0], V::Null);
+        // ntile validation.
+        assert!(db
+            .execute("SELECT ntile(0) OVER (ORDER BY id) FROM t;")
+            .is_err());
+        assert!(db
+            .execute("SELECT ntile(-2) OVER (ORDER BY id) FROM t;")
+            .is_err());
+        assert!(db
+            .execute("SELECT ntile(id) OVER (ORDER BY id) FROM t;")
+            .is_err());
+    }
+
+    #[test]
+    fn scalar_concat_trim_replace_nullif() {
+        let mut db = PinkDb::new();
+        // `concat` skips NULLs, `||` propagates them; both cast to VARCHAR.
+        let rows = select(
+            &mut db,
+            "SELECT concat('a', NULL), concat(1, 2), NULL || 'a', 'a' || 1, 'x' || (1 + 2), 'a' || 'b' = 'ab';",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Varchar("a".to_string()),
+                V::Varchar("12".to_string()),
+                V::Null,
+                V::Varchar("a1".to_string()),
+                V::Varchar("x3".to_string()),
+                V::Boolean(true),
+            ]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT trim('  x  '), ltrim('  x'), rtrim('x  '), trim('xxabxx', 'x'), ltrim('ab', ''), rtrim(NULL);",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Varchar("x".to_string()),
+                V::Varchar("x".to_string()),
+                V::Varchar("x".to_string()),
+                V::Varchar("ab".to_string()),
+                V::Varchar("ab".to_string()),
+                V::Null,
+            ]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT replace('aaa', 'a', 'b'), replace('aaa', '', 'b'), replace(NULL, 'a', 'b');",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Varchar("bbb".to_string()),
+                V::Varchar("aaa".to_string()),
+                V::Null,
+            ]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT nullif(1, 1), nullif(1, 2), nullif('a', 'a'), nullif(1, NULL), nullif(NULL, 1);",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Null,
+                V::Integer(1),
+                V::Null,
+                V::Integer(1),
+                V::Null
+            ]]
+        );
+    }
+
+    #[test]
+    fn scalar_greatest_least_extract_numeric() {
+        let mut db = PinkDb::new();
+        // NULLs are skipped; all-NULL → NULL; NaN is greater than everything.
+        let rows = select(
+            &mut db,
+            "SELECT greatest(1, NULL, 3), least(1, NULL, 3), greatest(NULL, NULL), greatest(1, 2.5), least('a', 'b');",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Integer(3),
+                V::Integer(1),
+                V::Null,
+                V::Double(2.5),
+                V::Varchar("a".to_string()),
+            ]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT greatest(0.0 / 0.0, 5.0), least(0.0 / 0.0, 5.0);",
+        );
+        match (&rows[0][0], &rows[0][1]) {
+            (V::Double(a), V::Double(b)) => {
+                assert!(a.is_nan());
+                assert_eq!(*b, 5.0);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let rows = select(
+            &mut db,
+            "SELECT extract(year FROM DATE '2024-02-29'), extract(month FROM DATE '2024-02-29'),
+                    extract(day FROM DATE '2024-02-29'), extract(dow FROM DATE '2024-03-03'),
+                    extract(isodow FROM DATE '2024-03-03'), extract(doy FROM DATE '2024-03-03');",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Bigint(2024),
+                V::Bigint(2),
+                V::Bigint(29),
+                V::Bigint(0),
+                V::Bigint(7),
+                V::Bigint(63),
+            ]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT extract(week FROM DATE '2023-01-01'), extract(isoyear FROM DATE '2023-01-01'),
+                    extract(century FROM DATE '2024-01-01'), extract(decade FROM DATE '2024-01-01'),
+                    extract(millennium FROM DATE '2024-01-01'), extract(quarter FROM DATE '2024-05-01');",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Bigint(52),
+                V::Bigint(2022),
+                V::Bigint(21),
+                V::Bigint(202),
+                V::Bigint(3),
+                V::Bigint(2),
+            ]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT extract(hour FROM DATE '2024-01-01'),
+                    extract(second FROM TIMESTAMP '2024-02-29 13:45:56.789012'),
+                    extract(millisecond FROM TIMESTAMP '2024-02-29 13:45:56.789012'),
+                    extract(microsecond FROM TIMESTAMP '2024-02-29 13:45:56.789012'),
+                    extract(epoch FROM TIMESTAMP '1969-12-31 23:59:59.5'),
+                    date_part('dow', DATE '1969-07-20');",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Bigint(0),
+                V::Bigint(56),
+                V::Bigint(56789),
+                V::Bigint(56789012),
+                V::Double(-0.5),
+                V::Bigint(0),
+            ]]
+        );
+        let rows = select(
+            &mut db,
+            "SELECT sqrt(4), floor(1.7), floor(-1.5), floor(3), ceil(1.2), sign(-5), sign(3.5), power(2, 10), pow(2, -1), mod(7, 3), mod(-7, 3), mod(7.5, 2);",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Double(2.0),
+                V::Double(1.0),
+                V::Double(-2.0),
+                V::Double(3.0),
+                V::Double(2.0),
+                V::Integer(-1),
+                V::Integer(1),
+                V::Double(1024.0),
+                V::Double(0.5),
+                V::Integer(1),
+                V::Integer(-1),
+                V::Double(1.5),
+            ]]
+        );
+        match &select(&mut db, "SELECT sqrt(-1);")[0][0] {
+            V::Double(x) => assert!(x.is_nan()),
+            other => panic!("unexpected {other:?}"),
+        }
+        // A non-constant part hits DuckDB's VARCHAR overload → DOUBLE.
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT date_part(p, d) FROM (SELECT 'year' AS p, DATE '2024-01-01' AS d) AS s;"
+            ),
+            vec![vec![V::Double(2024.0)]]
+        );
+    }
+
+    #[test]
+    fn scalar_function_errors() {
+        let mut db = win_t();
+        assert!(db.execute("SELECT mod(1, 0);").is_err());
+        assert!(db.execute("SELECT mod(7.5, 0);").is_err());
+        assert!(db
+            .execute("SELECT extract(zip FROM DATE '2024-01-01');")
+            .is_err());
+        assert!(db.execute("SELECT sign(true);").is_err());
+        assert!(db.execute("SELECT concat();").is_err());
+        assert!(db.execute("SELECT sqrt('a');").is_err());
+        assert!(db
+            .execute("SELECT lag(v, 1, 'x') OVER (ORDER BY id) FROM t;")
             .is_err());
     }
 

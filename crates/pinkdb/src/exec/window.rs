@@ -73,6 +73,8 @@ struct ChunkVecs<'a> {
     part: Vec<FusedVec<'a>>,
     ord: Vec<FusedVec<'a>>,
     arg: Option<FusedVec<'a>>,
+    /// lag/lead DEFAULT expression, when present.
+    deflt: Option<FusedVec<'a>>,
 }
 
 /// Evaluate all windows, appending one column each (sequentially, so later
@@ -110,7 +112,16 @@ fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec
                 Some(e) => Some(eval_agg_vec(e, chunk, cx)?),
                 None => None,
             };
-            Ok(ChunkVecs { part, ord, arg })
+            let deflt = match &w.default {
+                Some(e) => Some(eval_agg_vec(e, chunk, cx)?),
+                None => None,
+            };
+            Ok(ChunkVecs {
+                part,
+                ord,
+                arg,
+                deflt,
+            })
         })
         .collect::<Result<_>>()?;
     // Row records, built per chunk in parallel and concatenated in chunk
@@ -140,6 +151,21 @@ fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec
     }
     chunk_starts.push(rows.len());
     let n = rows.len();
+    // lag/lead DEFAULT values, one per global row (chunks in order). Only
+    // built when the window carries a DEFAULT expression.
+    let defaults: Option<Vec<Value>> = match &w.default {
+        Some(_) if matches!(w.func, WindowFunc::Lag | WindowFunc::Lead) => {
+            let mut d = Vec::with_capacity(n);
+            for (ci, cv) in per_chunk.iter().enumerate() {
+                let v = cv.deflt.as_ref().expect("default evaluated with the arg");
+                for i in 0..chunks[ci].num_rows() {
+                    d.push(v.v().get(i));
+                }
+            }
+            Some(d)
+        }
+        _ => None,
+    };
 
     // 2. Group global indices by partition encoding (NULL keys group together).
     // The partition key encodes straight from the evaluated vectors — byte
@@ -180,7 +206,7 @@ fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec
     group_keys.sort();
     let computed: Vec<Vec<(usize, Value)>> = group_keys
         .par_iter()
-        .map(|k| eval_partition(&groups[*k], &rows, w))
+        .map(|k| eval_partition(&groups[*k], &rows, w, defaults.as_deref()))
         .collect::<Result<_>>()?;
     let mut out_vals: Vec<Value> = vec![Value::Null; n];
     for part in computed {
@@ -211,12 +237,26 @@ fn eval_one_window(cx: &Cx, chunks: &[DataChunk], w: &BoundWindow) -> Result<Vec
 }
 
 /// One partition's window values, as `(global row, value)` pairs.
-fn eval_partition(members: &[usize], rows: &[Row], w: &BoundWindow) -> Result<Vec<(usize, Value)>> {
+/// `defaults` (lag/lead only) holds one DEFAULT value per global row.
+fn eval_partition(
+    members: &[usize],
+    rows: &[Row],
+    w: &BoundWindow,
+    defaults: Option<&[Value]>,
+) -> Result<Vec<(usize, Value)>> {
     let mut seq: Vec<usize> = members.to_vec();
     if !w.order.is_empty() {
         seq.sort_by(|&a, &b| order_rows(rows[a].ord.as_slice(), rows[b].ord.as_slice(), w));
     }
     let mut out = Vec::with_capacity(seq.len());
+    let frame_value =
+        |pos: usize, seq: &[usize], first: bool| match frame_range(&w.frame, pos, seq.len()) {
+            Some((lo, hi)) => {
+                let k = if first { lo } else { hi };
+                rows[seq[k]].arg.clone().unwrap_or(Value::Null)
+            }
+            None => Value::Null,
+        };
     match w.func {
         WindowFunc::RowNumber => {
             for (pos, g) in seq.iter().enumerate() {
@@ -239,6 +279,53 @@ fn eval_partition(members: &[usize], rows: &[Row], w: &BoundWindow) -> Result<Ve
                         rank
                     }),
                 ));
+            }
+        }
+        WindowFunc::Lag | WindowFunc::Lead => {
+            // Frame-independent: lag/lead read the row `offset` before/after
+            // the current one; at the edges the DEFAULT (else NULL) is used.
+            // A negative offset flips the direction (DuckDB).
+            let delta = if w.func == WindowFunc::Lag {
+                w.offset
+            } else {
+                -w.offset
+            };
+            for (pos, g) in seq.iter().enumerate() {
+                let target = pos as i128 - delta as i128;
+                let v = if (0..seq.len() as i128).contains(&target) {
+                    rows[seq[target as usize]]
+                        .arg
+                        .clone()
+                        .unwrap_or(Value::Null)
+                } else {
+                    // The default expression is evaluated once per output
+                    // row (DuckDB evaluates it per row, not per partition).
+                    defaults
+                        .and_then(|d| d.get(*g))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                };
+                out.push((*g, v));
+            }
+        }
+        WindowFunc::NTile => {
+            // Buckets as equal as possible, larger ones first: the first
+            // `len % n` buckets take one extra row.
+            let n = w.offset as usize; // binder guarantees > 0
+            let (full, rem) = (seq.len() / n, seq.len() % n);
+            for (pos, g) in seq.iter().enumerate() {
+                let bucket = if pos < rem * (full + 1) {
+                    pos / (full + 1)
+                } else {
+                    rem + (pos - rem * (full + 1)) / full
+                };
+                out.push((*g, Value::Bigint(bucket as i64 + 1)));
+            }
+        }
+        WindowFunc::FirstValue | WindowFunc::LastValue => {
+            let first = w.func == WindowFunc::FirstValue;
+            for (pos, g) in seq.iter().enumerate() {
+                out.push((*g, frame_value(pos, &seq, first)));
             }
         }
         WindowFunc::Agg(f) => {

@@ -10,9 +10,9 @@
 //!
 //! Grammar shape (low → high precedence): OR → AND → NOT → comparison
 //! (`= <> != < <= > >=`, `IS [NOT] NULL`, `[NOT] BETWEEN`, `[NOT] IN
-//! (list|subquery)`, `[NOT] LIKE`) → additive → multiplicative → unary →
-//! primary. Every token rule consumes trailing whitespace/comments, so
-//! composite rules read as bare token sequences.
+//! (list|subquery)`, `[NOT] LIKE`) → `||` concatenation → additive →
+//! multiplicative → unary → primary. Every token rule consumes trailing
+//! whitespace/comments, so composite rules read as bare token sequences.
 
 use super::ast::*;
 use super::keyword::Keyword;
@@ -570,12 +570,25 @@ peg::parser! {
             / comparison()
 
         rule comparison() -> Expr
-            = l:additive() tail:comparison_tail()? {
+            = l:concat_expr() tail:comparison_tail()? {
                   match tail {
                       None => l,
                       Some(t) => apply_cmp(l, t),
                   }
               }
+
+        /// `a || b || c` — DuckDB/PG precedence: `||` binds tighter than
+        /// comparisons but looser than `+`/`-` (`1 + 2 || '3'` ⇒ `'33'`).
+        rule concat_expr() -> Expr
+            = first:additive() rest:(concat_op() r:additive() { r })* {
+                  rest.into_iter().fold(first, |l, r| Expr::Binary {
+                      op: BinaryOp::Concat,
+                      left: Box::new(l),
+                      right: Box::new(r),
+                  })
+              }
+
+        rule concat_op() = "||" ws()
 
         rule comparison_tail() -> CmpTail
             = kw(Keyword::Is) neg:opt_kw(Keyword::Not) kw(Keyword::Null) { CmpTail::IsNull { negated: neg } }
@@ -629,9 +642,30 @@ peg::parser! {
             / case_expr()
             / star() { Expr::Star }
             / exists_expr()
+            / extract_call()
             / lparen() q:select() rparen() { Expr::ScalarSubquery(Box::new(q)) }
             / lparen() e:expr() rparen() { e }
             / ident_expr()
+
+        /// `EXTRACT(field FROM date_or_timestamp)` — desugars to the
+        /// `extract('field', value)` scalar (field may also be a string
+        /// literal). Matched as a bare word so `extract` stays usable as a
+        /// column/table name everywhere else.
+        rule extract_call() -> Expr
+            = extract_name() lparen() part:extract_part() kw(Keyword::From) e:expr() rparen() {
+                  Expr::Function {
+                      name: "extract".to_string(),
+                      args: vec![Expr::Literal(Value::Varchar(part)), e],
+                  }
+              }
+
+        rule extract_name()
+            = s:ident_raw() ws() {? if s.eq_ignore_ascii_case("extract") { Ok(()) } else { Err("EXTRACT") } }
+
+        /// A field name (`year`, `dow`, ...) or a string literal.
+        rule extract_part() -> String
+            = s:string_lit() { s }
+            / i:ident() { i }
 
         rule date_literal() -> Expr
             = kw(Keyword::Date) s:string_lit() {?
@@ -2044,6 +2078,84 @@ mod tests {
             },
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn precedence_concat_between_comparison_and_additive() {
+        // `'a' || 'b' = 'ab'` parses as `('a' || 'b') = 'ab'`.
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            ..
+        } = projection_expr(parse_one("SELECT 'a' || 'b' = 'ab';"))
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            *left,
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                ..
+            }
+        ));
+        // `1 + 2 || '3'` parses as `(1 + 2) || '3'` (additive is tighter).
+        let Expr::Binary {
+            op: BinaryOp::Concat,
+            left,
+            ..
+        } = projection_expr(parse_one("SELECT 1 + 2 || '3';"))
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            *left,
+            Expr::Binary {
+                op: BinaryOp::Add,
+                ..
+            }
+        ));
+        // Left-associative: `('a' || 'b') || 'c'`.
+        let Expr::Binary { left, .. } = projection_expr(parse_one("SELECT 'a' || 'b' || 'c';"))
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            *left,
+            Expr::Binary {
+                op: BinaryOp::Concat,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn extract_call_desugars_to_function() {
+        let Expr::Function { name, args } =
+            projection_expr(parse_one("SELECT extract(year FROM d);"))
+        else {
+            panic!()
+        };
+        assert_eq!(name, "extract");
+        assert_eq!(args.len(), 2);
+        assert!(matches!(&args[0], Expr::Literal(Value::Varchar(p)) if p == "year"));
+        assert!(matches!(&args[1], Expr::Column { name, .. } if name == "d"));
+        // A string part is accepted; `extract` stays a usable identifier.
+        let Expr::Function { args, .. } =
+            projection_expr(parse_one("SELECT extract('dow' FROM d);"))
+        else {
+            panic!()
+        };
+        assert!(matches!(&args[0], Expr::Literal(Value::Varchar(p)) if p == "dow"));
+        let Expr::Column { name, .. } = projection_expr(parse_one("SELECT extract FROM t;")) else {
+            panic!()
+        };
+        assert_eq!(name, "extract");
+        // A plain two-argument call still parses (date_part alias).
+        let Expr::Function { name, .. } = projection_expr(parse_one("SELECT extract('year', d);"))
+        else {
+            panic!()
+        };
+        assert_eq!(name, "extract");
     }
 
     #[test]

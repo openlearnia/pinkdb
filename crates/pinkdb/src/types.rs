@@ -288,6 +288,62 @@ pub fn split_timestamp(us: i64) -> (i32, u32, u32, u32, u32) {
     (days, h as u32, mi as u32, sec as u32, micro as u32)
 }
 
+// ---------- extract/date_part fields ----------
+
+/// A recognized `extract(field FROM x)` / `date_part('field', x)` specifier.
+/// Only the fields this engine implements are listed (DuckDB has more:
+/// timezone/era/julian/...).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+    Millisecond,
+    Microsecond,
+    Epoch,
+    DayOfWeek,
+    IsoDayOfWeek,
+    DayOfYear,
+    Week,
+    Quarter,
+    IsoYear,
+    Century,
+    Decade,
+    Millennium,
+}
+
+/// Resolve a DuckDB field spelling (case-insensitive, singular or plural,
+/// `ms`/`us`/`sec` shorthands accepted) to an [`ExtractField`].
+pub fn extract_field(part: &str) -> std::result::Result<ExtractField, String> {
+    let p = part.trim().to_ascii_lowercase();
+    Ok(match p.as_str() {
+        "year" | "years" | "y" | "yr" | "yrs" => ExtractField::Year,
+        "month" | "months" | "mon" | "mons" => ExtractField::Month,
+        "day" | "days" | "d" => ExtractField::Day,
+        "hour" | "hours" | "h" | "hr" | "hrs" => ExtractField::Hour,
+        "minute" | "minutes" | "min" | "mins" => ExtractField::Minute,
+        "second" | "seconds" | "sec" | "secs" | "s" => ExtractField::Second,
+        "millisecond" | "milliseconds" | "ms" | "msec" | "msecs" => ExtractField::Millisecond,
+        "microsecond" | "microseconds" | "us" | "usec" | "usecs" => ExtractField::Microsecond,
+        "epoch" | "epochs" => ExtractField::Epoch,
+        "dow" | "dayofweek" => ExtractField::DayOfWeek,
+        "isodow" => ExtractField::IsoDayOfWeek,
+        "doy" | "dayofyear" => ExtractField::DayOfYear,
+        "week" | "weeks" | "isoweek" => ExtractField::Week,
+        "quarter" | "quarters" => ExtractField::Quarter,
+        "isoyear" => ExtractField::IsoYear,
+        "century" | "centuries" => ExtractField::Century,
+        "decade" | "decades" => ExtractField::Decade,
+        "millennium" | "millenniums" | "millennia" | "milleniums" | "millenia" => {
+            ExtractField::Millennium
+        }
+        _ => return Err(format!("extract specifier \"{part}\" not recognized")),
+    })
+}
+
 /// All engine errors. Lean: a few string-carrying variants + transparent
 /// IO/CSV wrappers. No extra deps (no thiserror).
 #[derive(Debug)]

@@ -216,13 +216,14 @@ committed): lean projection pushdown (`.pink` has no projected reader — a
 fallback decodes the whole table), per-chunk statistics + filter/zone pruning
 (stage 3), and the parked cold order-by/group-by items.
 
-**Multi-process durable writers (staged).** The first slice is 45m: the
+**Multi-process durable writers (shipped through stage 5).** 45m shipped the
 per-operation write lease, lock-free epoch refresh, WAL v3 and the
-refresh-first checkpoint; the stability-hardening wave (chaos soak, fuzzing,
-gap closures) shipped as 45n. Stage 5 — optimistic commits of disjoint tables
-across processes — is in progress as 45o (baseline to beat: commits plateau at
-~200–230/s and a transaction holds the lease `BEGIN`→`COMMIT`, blocking
-others).
+refresh-first checkpoint; 45n the stability-hardening wave (chaos soak,
+fuzzing, gap closures); 45o made explicit transactions **optimistic** (WAL v4
+touched sets, `BEGIN` takes no lease, `COMMIT` validates read/write sets at
+table granularity, typed conflicts with bounded CLI retry) — the contention
+bench measures 2.31–2.49× on overlapping transactions with disjoint writes,
+with an honest no-win on replay-bound write-heavy workloads.
 
 **Pink-lake encryption at rest (queued, wave 57).** Lake data is plaintext today:
 the engine's `.pink` checkpoints and WAL can be keyed, but the lake's data files
@@ -237,12 +238,12 @@ byte invariant and the S3 conditional-PUT CAS (on ciphertext) are preserved, and
 the strict S3 and encrypted soak harnesses gain encrypted-lake coverage.
 
 **Parallel feature waves in git worktrees (Oct 2026).** Waves 58 (SQL
-completeness), 60 (functions) and 61 (optimizer work) are being built in
-dedicated worktrees off the current base while 45o runs in the main tree; each
-produces a patch artifact that integrates with full gates + CI before merge.
-59 (prepared statements) and 62 (DECIMAL/INTERVAL types) are queued; the
-schema-feature waves (declarative PK/FK, indexes, materialized views) remain in
-the numbered queue.
+completeness), 60 (functions) and 61 (optimizer work) were built in dedicated
+worktrees off the current base; 45o has landed and the patches integrate on
+main one at a time with full gates + CI before each commit (order 60, 61, 58 —
+sorted by merge overlap). 59 (prepared statements) and 62 (DECIMAL/INTERVAL
+types) are queued; the schema-feature waves (declarative PK/FK, indexes,
+materialized views) remain in the numbered queue.
 
 **CI fully green (Oct 2026).** The first all-green CI run (38875669660; all
 nine jobs, incl. the kill loops, wasm check, release build and the DuckDB

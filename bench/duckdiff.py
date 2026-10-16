@@ -250,6 +250,39 @@ QUERIES = [
     ("case-nulls", "SELECT CASE WHEN did IS NULL THEN 'none' WHEN salary > 100 THEN 'big' ELSE 'small' END FROM emp ORDER BY id;", True, False),
     ("case-numeric", "SELECT CASE WHEN id = 1 THEN 1 WHEN id = 2 THEN 2.5 ELSE 0 END FROM emp ORDER BY id;", True, False),
     ("case-agg", "SELECT SUM(CASE WHEN did = 10 THEN salary ELSE 0 END) FROM emp;", False, False),
+    # --- wave: concat / trim / replace / nullif / greatest-least ---
+    ("concat-op", "SELECT id, name || '-' || did, did || '-x' FROM emp ORDER BY id;", True, False),
+    ("concat-fn", "SELECT concat(name, '-', did), concat('x'), concat(did, did) FROM emp ORDER BY id;", True, False),
+    ("concat-precedence", "SELECT 'a' || 'b' = 'ab', 1 + 2 || '3', 'x' || 1 + 2;", False, False),
+    ("trim-family", "SELECT '[' || trim('  ab  ') || ']', '[' || ltrim('  ab  ') || ']', '[' || rtrim('  ab  ') || ']', '[' || trim('xxabxx', 'x') || ']', '[' || ltrim('xxabxx', 'x') || ']', '[' || rtrim('xxabxx', 'x') || ']', '[' || trim('ab', '') || ']', '[' || trim(name || '!', 'x') || ']' FROM emp ORDER BY id;", True, False),
+    ("replace-fn", "SELECT replace(name, 'a', 'A'), replace('aaa', 'a', 'b'), replace(name, '', '!') FROM emp ORDER BY id;", True, False),
+    ("nullif-fn", "SELECT nullif(id, 1), nullif(did, 10), nullif(name, 'ann'), nullif(id, NULL), nullif(NULL, id) FROM emp ORDER BY id;", True, False),
+    ("greatest-least", "SELECT greatest(id, did, 3), least(id, did, 3), greatest(salary, 100.0), least(salary, 100.0), greatest(id, 99), greatest(NULL, NULL) FROM emp ORDER BY id;", True, False),
+    # --- wave: extract / date_part ---
+    ("extract-date", "SELECT extract(year FROM hired), extract(month FROM hired), extract(day FROM hired), extract(dow FROM hired), extract(isodow FROM hired), extract(doy FROM hired), extract(week FROM hired), extract(quarter FROM hired), extract(epoch FROM hired) FROM emp ORDER BY id;", True, False),
+    ("extract-ts", "SELECT extract(hour FROM TIMESTAMP '2024-02-29 13:45:56.789012'), extract(minute FROM TIMESTAMP '2024-02-29 13:45:56.789012'), extract(second FROM TIMESTAMP '2024-02-29 13:45:56.789012'), extract(millisecond FROM TIMESTAMP '2024-02-29 13:45:56.789012'), extract(microsecond FROM TIMESTAMP '2024-02-29 13:45:56.789012'), extract(epoch FROM TIMESTAMP '1969-12-31 23:59:59.5'), extract(isoyear FROM DATE '2023-01-01'), extract(week FROM DATE '2023-01-01'), extract(century FROM DATE '2024-01-01'), extract(decade FROM DATE '2024-01-01'), extract(millennium FROM DATE '2024-01-01');", False, False),
+    ("date-part-fn", "SELECT date_part('year', hired), date_part('dow', hired), date_part('ms', TIMESTAMP '2024-01-01 00:00:56.789012'), date_part('us', TIMESTAMP '2024-01-01 00:00:56.789012'), date_part('sec', TIMESTAMP '2024-01-01 00:00:56.789012') FROM emp ORDER BY id;", True, False),
+    ("extract-string-part", "SELECT extract('year' FROM hired), extract('week' FROM hired), extract('hour' FROM hired) FROM emp ORDER BY id;", True, False),
+    ("date-part-dynamic", "SELECT date_part(p, d), date_part(p2, d) FROM (SELECT 'year' AS p, 'dow' AS p2, DATE '2024-03-03' AS d) AS s;", False, False),
+    # --- wave: numeric scalars ---
+    ("numeric-fns", "SELECT sqrt(id), sqrt(salary), floor(salary), ceil(salary), floor(id), ceil(-1.5), sign(id - 3), sign(salary), power(id, 2), pow(2, 0.5), mod(id, 2), mod(id, 3), mod(salary, 2) FROM emp ORDER BY id;", True, False),
+    # --- wave: window functions lag/lead/ntile/first_value/last_value ---
+    ("win-lag-lead", "SELECT id, lag(name) OVER (ORDER BY id), lead(name) OVER (ORDER BY id), lag(salary, 2) OVER (ORDER BY id), lead(salary, 1, -1.0) OVER (ORDER BY id), lag(id, -1) OVER (ORDER BY id) FROM emp ORDER BY id;", True, False),
+    ("win-lag-default", "SELECT id, lag(id, 1, 99) OVER (ORDER BY id), lag(id, 2, 99) OVER (ORDER BY id), lag(id, 0) OVER (ORDER BY id) FROM emp ORDER BY id;", True, False),
+    ("win-lag-partition", "SELECT id, lag(salary) OVER (PARTITION BY did ORDER BY id), lead(name) OVER (PARTITION BY did ORDER BY id) FROM emp ORDER BY id;", True, False),
+    ("win-ntile", "SELECT id, ntile(3) OVER (ORDER BY id), ntile(2) OVER (PARTITION BY did ORDER BY id), ntile(8) OVER (ORDER BY id) FROM emp ORDER BY id;", True, False),
+    ("win-first-last", "SELECT id, first_value(salary) OVER (ORDER BY id), last_value(salary) OVER (ORDER BY id), first_value(name) OVER (PARTITION BY did ORDER BY id), last_value(name) OVER (PARTITION BY did ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM emp ORDER BY id;", True, False),
+    ("win-first-last-frame", "SELECT id, first_value(id) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), last_value(id) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING), first_value(id) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) FROM emp ORDER BY id;", True, False),
+    ("win-lag-ignore-frame", "SELECT id, lag(id) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND CURRENT ROW), lead(id) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 PRECEDING) FROM emp ORDER BY id;", True, False),
+    ("win-no-order", "SELECT id, first_value(salary) OVER (), last_value(salary) OVER (), lag(id) OVER (), lead(id) OVER () FROM emp ORDER BY id;", True, False),
+    # --- wave: error cases (both engines must reject) ---
+    ("concat-empty", "SELECT concat() FROM emp;", False, True),
+    ("ntile-zero", "SELECT ntile(0) OVER (ORDER BY id) FROM emp;", False, True),
+    ("lag-bad-offset", "SELECT lag(id, 1.5) OVER (ORDER BY id) FROM emp;", False, True),
+    ("lag-bad-default", "SELECT lag(id, 1, 'x') OVER (ORDER BY id) FROM emp;", False, True),
+    ("extract-bad-part", "SELECT extract(fortnight FROM hired) FROM emp;", False, True),
+    ("sign-bool", "SELECT sign(active) FROM emp;", False, True),
+    ("mod-zero", "SELECT mod(id, 0) FROM emp;", False, True),
 ]
 
 

@@ -263,6 +263,8 @@ pub enum BinaryOp {
     Or,
     Like,
     NotLike,
+    /// `a || b` — strict string concatenation (NULL if either side is NULL).
+    Concat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

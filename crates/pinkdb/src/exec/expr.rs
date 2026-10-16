@@ -138,6 +138,7 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
         } => match op {
             BinaryOp::And | BinaryOp::Or => eval_logic(*op, left, right, chunk, cx),
             BinaryOp::Like | BinaryOp::NotLike => eval_like(*op, left, right, chunk, cx),
+            BinaryOp::Concat => eval_concat(left, right, chunk, cx),
             BinaryOp::Eq
             | BinaryOp::NotEq
             | BinaryOp::Lt
@@ -858,7 +859,20 @@ fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vec
     if let Some(out) = eval_scalar_fast(func, dtype, args)? {
         return Ok(out);
     }
-    // Any-NULL-in → NULL-out (all v1 scalar functions are strict).
+    // concat/nullif/greatest/least handle NULLs themselves.
+    if !func.is_strict() {
+        let mut out = Vector::new_empty(dtype);
+        let mut row: Vec<Value> = Vec::with_capacity(args.len());
+        for i in 0..n {
+            row.clear();
+            for v in args {
+                row.push(v.get(i));
+            }
+            out.push_valid(apply_scalar_loose(func, &row)?)?;
+        }
+        return Ok(out);
+    }
+    // Any-NULL-in → NULL-out.
     let mut out = Vector::new_empty(dtype);
     for i in 0..n {
         let mut row: Vec<Value> = Vec::with_capacity(args.len());
@@ -874,7 +888,7 @@ fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vec
             out.push_null()?;
             continue;
         }
-        out.push_valid(apply_scalar(func, &row)?)?;
+        out.push_valid(apply_scalar(func, dtype, &row)?)?;
     }
     Ok(out)
 }
@@ -984,7 +998,84 @@ fn eval_scalar_fast(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Resul
     }
 }
 
-fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
+/// Non-strict scalar functions: NULL handling is part of the function
+/// (`concat`/`greatest`/`least` skip NULLs; `nullif` only propagates its
+/// first argument's NULL).
+fn apply_scalar_loose(func: ScalarFunc, row: &[Value]) -> Result<Value> {
+    match func {
+        ScalarFunc::Concat => {
+            let mut out = String::new();
+            for v in row {
+                match v {
+                    Value::Null => {}
+                    Value::Varchar(s) => out.push_str(s),
+                    // The binder casts every argument to VARCHAR; a bare NULL
+                    // literal stays NULL and is skipped above.
+                    other => {
+                        return Err(PinkDbError::Execution(format!(
+                            "concat of {other} (use CAST)"
+                        )));
+                    }
+                }
+            }
+            Ok(Value::Varchar(out))
+        }
+        ScalarFunc::NullIf => {
+            let a = &row[0];
+            if a.is_null() {
+                return Ok(Value::Null);
+            }
+            let b = &row[1];
+            if b.is_null() {
+                return Ok(a.clone());
+            }
+            Ok(if compare_values(a, b) == Ordering::Equal {
+                Value::Null
+            } else {
+                a.clone()
+            })
+        }
+        ScalarFunc::Greatest | ScalarFunc::Least => {
+            let want_greatest = func == ScalarFunc::Greatest;
+            let mut best: Option<&Value> = None;
+            for v in row {
+                if v.is_null() {
+                    continue;
+                }
+                best = Some(match best {
+                    None => v,
+                    Some(b) => {
+                        // DuckDB: NaN is greater than every other value
+                        // (including Inf), and equal to NaN.
+                        let v_nan = matches!(v, Value::Double(x) if x.is_nan());
+                        let b_nan = matches!(b, Value::Double(x) if x.is_nan());
+                        let take_v = if v_nan {
+                            want_greatest
+                        } else if b_nan {
+                            !want_greatest
+                        } else {
+                            let ord = compare_values(b, v);
+                            if want_greatest {
+                                ord == Ordering::Less
+                            } else {
+                                ord == Ordering::Greater
+                            }
+                        };
+                        if take_v {
+                            v
+                        } else {
+                            b
+                        }
+                    }
+                });
+            }
+            Ok(best.cloned().unwrap_or(Value::Null))
+        }
+        _ => unreachable!("strict scalar function reached the loose path"),
+    }
+}
+
+fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Value> {
     match func {
         ScalarFunc::Abs => match &row[0] {
             Value::Integer(i) => i
@@ -1108,7 +1199,184 @@ fn apply_scalar(func: ScalarFunc, row: &[Value]) -> Result<Value> {
             };
             Ok(Value::Varchar(chars[from..].iter().take(take).collect()))
         }
+        ScalarFunc::Trim | ScalarFunc::LTrim | ScalarFunc::RTrim => {
+            let s = match &row[0] {
+                Value::Varchar(s) => s.as_str(),
+                v => return Err(PinkDbError::Execution(format!("{func:?} of {v}"))),
+            };
+            let chars = match row.get(1) {
+                None => None,
+                Some(Value::Varchar(c)) => Some(c.as_str()),
+                Some(v) => return Err(PinkDbError::Execution(format!("{func:?} chars {v}"))),
+            };
+            // DuckDB: the default trims ASCII spaces only; a second argument
+            // is a set of characters (empty set ⇒ no-op).
+            let pred = |c: char| match chars {
+                None => c == ' ',
+                Some(set) => set.contains(c),
+            };
+            let out = match func {
+                ScalarFunc::LTrim => s.trim_start_matches(pred),
+                ScalarFunc::RTrim => s.trim_end_matches(pred),
+                _ => s.trim_matches(pred),
+            };
+            Ok(Value::Varchar(out.to_string()))
+        }
+        ScalarFunc::Replace => {
+            let (s, from, to) = match (&row[0], &row[1], &row[2]) {
+                (Value::Varchar(s), Value::Varchar(f), Value::Varchar(t)) => (s, f, t),
+                (a, b, c) => {
+                    return Err(PinkDbError::Execution(format!("replace of {a}, {b}, {c}")));
+                }
+            };
+            // DuckDB: an empty search string is a no-op (Rust's `replace`
+            // would insert the replacement between every character).
+            if from.is_empty() {
+                return Ok(Value::Varchar(s.clone()));
+            }
+            Ok(Value::Varchar(s.replace(from.as_str(), to)))
+        }
+        ScalarFunc::Extract => {
+            let part = match &row[0] {
+                Value::Varchar(s) => s.clone(),
+                v => return Err(PinkDbError::Execution(format!("extract part {v}"))),
+            };
+            let field = crate::types::extract_field(&part).map_err(PinkDbError::Execution)?;
+            let v = extract_value(field, &row[1])?;
+            // A non-constant part hits DuckDB's VARCHAR overload, which
+            // returns DOUBLE (the BIGINT kernel result widened).
+            Ok(match (dtype, v) {
+                (DataType::Double, Value::Bigint(x)) => Value::Double(x as f64),
+                (_, v) => v,
+            })
+        }
+        ScalarFunc::Sqrt => Ok(Value::Double(as_f64(&row[0])?.sqrt())),
+        ScalarFunc::Floor => Ok(Value::Double(as_f64(&row[0])?.floor())),
+        ScalarFunc::Ceil => Ok(Value::Double(as_f64(&row[0])?.ceil())),
+        ScalarFunc::Sign => match &row[0] {
+            Value::Integer(i) => Ok(Value::Integer(i.signum())),
+            Value::Bigint(i) => Ok(Value::Integer(i.signum() as i32)),
+            // DuckDB: sign(NaN) = 0, sign(±0.0) = 0.
+            Value::Double(x) => Ok(Value::Integer(if x.is_nan() {
+                0
+            } else if *x > 0.0 {
+                1
+            } else if *x < 0.0 {
+                -1
+            } else {
+                0
+            })),
+            v => Err(PinkDbError::Execution(format!("sign of {v}"))),
+        },
+        ScalarFunc::Power => Ok(Value::Double(as_f64(&row[0])?.powf(as_f64(&row[1])?))),
+        ScalarFunc::Mod => match (&row[0], &row[1]) {
+            (Value::Double(a), Value::Double(b)) => {
+                if *b == 0.0 {
+                    return Err(PinkDbError::Execution("mod by zero".to_string()));
+                }
+                Ok(Value::Double(a % b))
+            }
+            (Value::Bigint(a), Value::Bigint(b)) => {
+                if *b == 0 {
+                    return Err(PinkDbError::Execution("mod by zero".to_string()));
+                }
+                Ok(Value::Bigint(a.wrapping_rem(*b)))
+            }
+            (Value::Integer(a), Value::Integer(b)) => {
+                if *b == 0 {
+                    return Err(PinkDbError::Execution("mod by zero".to_string()));
+                }
+                Ok(Value::Integer(a.wrapping_rem(*b)))
+            }
+            (a, b) => Err(PinkDbError::Execution(format!("mod of {a} and {b}"))),
+        },
+        ScalarFunc::Concat | ScalarFunc::NullIf | ScalarFunc::Greatest | ScalarFunc::Least => {
+            unreachable!("non-strict scalar reached the strict path")
+        }
     }
+}
+
+/// One `extract`/`date_part` cell: the field of a DATE (time = midnight) or
+/// TIMESTAMP value. Only the fields in [`ExtractField`] are handled; DuckDB's
+/// larger specifier set (julian, era, timezone, ...) is out of v1 scope.
+fn extract_value(field: crate::types::ExtractField, v: &Value) -> Result<Value> {
+    use crate::types::{civil_from_days, days_from_civil, split_timestamp, ExtractField as F};
+    let (days, h, mi, s, micro) = match v {
+        Value::Date(d) => (*d, 0u32, 0u32, 0u32, 0u32),
+        Value::Timestamp(us) => split_timestamp(*us),
+        v => return Err(PinkDbError::Execution(format!("extract of {v}"))),
+    };
+    let (y, m, d) = civil_from_days(days);
+    let big = |x: i64| Ok(Value::Bigint(x));
+    match field {
+        F::Year => big(y as i64),
+        F::Month => big(m as i64),
+        F::Day => big(d as i64),
+        F::Hour => big(h as i64),
+        F::Minute => big(mi as i64),
+        F::Second => big(s as i64),
+        F::Millisecond => big(s as i64 * 1000 + micro as i64 / 1000),
+        F::Microsecond => big(s as i64 * 1_000_000 + micro as i64),
+        F::Epoch => match v {
+            Value::Date(d) => Ok(Value::Double(*d as f64 * 86_400.0)),
+            Value::Timestamp(us) => Ok(Value::Double(*us as f64 / 1_000_000.0)),
+            _ => unreachable!("dates/timestamps only"),
+        },
+        // 1970-01-01 was a Thursday: 0 = Sunday .. 6 = Saturday.
+        F::DayOfWeek => big((days as i64 + 4).rem_euclid(7)),
+        // ISO: 1 = Monday .. 7 = Sunday.
+        F::IsoDayOfWeek => big((days as i64 + 3).rem_euclid(7) + 1),
+        F::DayOfYear => big((days - days_from_civil(y, 1, 1)) as i64 + 1),
+        F::Week => big(iso_week(days).0),
+        F::Quarter => big(((m - 1) / 3 + 1) as i64),
+        F::IsoYear => big(iso_week(days).1),
+        F::Century => big((y as i64 + 99).div_euclid(100)),
+        F::Decade => big((y as i64).div_euclid(10)),
+        F::Millennium => big((y as i64 + 999).div_euclid(1000)),
+    }
+}
+
+/// ISO 8601 week and week-year for a civil date: week 1 is the week of
+/// Jan 4 (the Monday-based week containing the year's first Thursday).
+fn iso_week(days: i32) -> (i64, i64) {
+    let monday_of_week_1 = |year: i32| {
+        // Weekday with Monday = 0 .. Sunday = 6.
+        let jan4 = crate::types::days_from_civil(year, 1, 4);
+        jan4 - (jan4 + 3).rem_euclid(7)
+    };
+    let (mut year, _, _) = crate::types::civil_from_days(days);
+    let mut w1 = monday_of_week_1(year);
+    if days < w1 {
+        year -= 1;
+        w1 = monday_of_week_1(year);
+    } else if days >= monday_of_week_1(year + 1) {
+        year += 1;
+        w1 = monday_of_week_1(year);
+    }
+    (((days - w1) / 7 + 1) as i64, year as i64)
+}
+
+/// `a || b`: strict concatenation (NULL if either side is NULL). The binder
+/// casts both operands to VARCHAR, so payloads are VARCHAR (or a bare NULL).
+fn eval_concat(left: &BoundExpr, right: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<Vector> {
+    let l = eval_expr(left, chunk, cx)?;
+    let r = eval_expr(right, chunk, cx)?;
+    let mut out = Vector::new_empty(DataType::Varchar);
+    for i in 0..chunk.num_rows() {
+        if l.is_null(i) || r.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        match (l.get(i), r.get(i)) {
+            (Value::Varchar(a), Value::Varchar(b)) => out.push_str(&format!("{a}{b}"))?,
+            (a, b) => {
+                return Err(PinkDbError::Execution(format!(
+                    "cannot concatenate {a} and {b} (use CAST)"
+                )));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `LIKE` / `NOT LIKE` with three-valued logic (`%` = any run, `_` = one
