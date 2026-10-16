@@ -2790,8 +2790,10 @@ fn bind_union_chain(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
 /// Output schema of a bound plan: (column name, type) per output column.
 /// Used for CTE/derived-table scoping and subquery arity checks. `ctes`
 /// carries the CTEs visible at this point (CTEs shadow catalog tables);
-/// `default_db` resolves a `Scan` that names a CTE only indirectly.
-fn plan_schema(
+/// `default_db` resolves a `Scan` that names a CTE only indirectly. The
+/// executor uses it too (LIMIT 0 returns an empty result whose header must
+/// still match, and the LIMIT stream needs a scan's shape without decoding).
+pub(crate) fn plan_schema(
     db: &PinkDb,
     default_db: &str,
     ctes: &[(String, Vec<(String, DataType)>)],

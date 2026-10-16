@@ -629,7 +629,8 @@ impl DataChunk {
     /// Build a chunk that may carry *absent* columns: a zero-length
     /// placeholder (`len() == 0`) for a column a projection pushdown did not
     /// decode; `num_rows` is authoritative here. The projection-aware shapes
-    /// only (`Filter`/`Sort`/`Limit` rebuilds and an attached-lake scan)
+    /// only (`Filter`/`Sort`/`Limit` rebuilds and a projected scan — an
+    /// attached lake's decode or an in-memory table's `exec::project_scan_chunks`)
     /// create these; operators that read columns use
     /// [`DataChunk::expect_column`].
     pub(crate) fn projected(columns: Vec<Arc<Vector>>, num_rows: usize) -> Self {
@@ -666,8 +667,8 @@ impl DataChunk {
             Ok(col)
         } else {
             Err(PinkDbError::Execution(format!(
-                "internal error: attached-lake projection missed a reference \
-                 to column {index}"
+                "internal error: scan projection missed a reference to \
+                 column {index}"
             )))
         }
     }

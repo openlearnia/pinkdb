@@ -94,7 +94,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | integrating | worktree patch on main (gates + CI before commit) |
 | 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | queued | — |
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
-| 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | integrating | worktree patch on main (gates + CI before commit) |
+| 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | queued | — |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
@@ -675,3 +675,21 @@ Java bindings.
   `ntile`, SQL-standard `trim(BOTH … FROM …)` syntax, `%` for doubles. Gates on main
   after 45o: fmt, clippy `-D warnings`, pinkdb 403/403, CLI lake+s3 green
   (multiprocess 27/27 including the lake-gated test), duckdiff 88/88.
+- 2026-10-16 — Wave 61 (optimizer work; worktree fan-out): projection pushdown for
+  in-memory scans (reuses the `ScanProjections` bound; unreferenced columns are shared
+  zero-length placeholders — the attached-lake precedent), LIMIT short-circuiting
+  (`LIMIT 0` returns the schema without evaluating; a chunk-at-a-time `Stream` cursor
+  over Scan/SingleRow/Filter/Project/UNION ALL/Limit stops pulling once N rows exist;
+  blocking chains still materialize; LIMIT-over-Sort keeps top-N), join build-side
+  choice for INNER joins (shape-based row estimates with exact table counts; unknown
+  or tie keeps build-on-right; outer joins untouched so the preserved side's row
+  order is unchanged), filter-through-aggregate (key-only HAVING conjuncts rewritten
+  into the group keys; constants, `AggRef` and dynamic calls stay above). In-worktree
+  battery: TOTAL 267.4 → 250.2 ms, wins on `filter_str` 5.8 → 3.4, `distinct_lowcard`
+  6.0 → 3.9, `join_probe` 6.7 → 5.4, windows ~10%; micro-benchmarks: `WHERE total >
+  400 LIMIT 100` 6–7 ms → `<1` ms, `dim(4) JOIN sales(1M)` 26–28 → 6–7 ms. Gates on
+  main after 45o/60: fmt, clippy, pinkdb 414/415 (1 ignored timing probe), CLI lake+s3
+  and multiprocess green, duckdiff 88/88, standing battery TOTAL 248.7 ms (best of 5).
+  Honest limits: outer joins cannot swap sides, INNER swaps change row order to
+  probe-side order (one test expectation updated), projection stays conservative
+  through Join/Distinct/Union/CTE, the estimator has no statistics.

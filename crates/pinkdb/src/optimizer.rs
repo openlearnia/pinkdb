@@ -4,7 +4,9 @@
 //!   (`1 + 2` → `3`, `true AND x` stays — only fully constant trees fold).
 //! - Predicate pushdown moves `Filter` below `Project` (transparent columns),
 //!   `Sort`, and `Distinct`, and splits conjuncts across `Join` inputs.
-//!   Filters never move below `Limit` or `Aggregate` in v1.
+//!   Conjuncts over just the GROUP BY keys also move below `Aggregate`
+//!   (a HAVING on keys becomes a WHERE on the aggregate's input); filters
+//!   never move below `Limit`.
 
 use crate::exec::expr::eval_expr;
 use crate::plan::LogicalPlan;
@@ -408,6 +410,99 @@ fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<Boun
     }
 }
 
+/// Remap a predicate from aggregate-output space to input space: every
+/// `Column{i}` addresses the aggregate's i-th group key, so it becomes that
+/// key's own expression. `None` when an index escapes the key list (an
+/// aggregate-output reference). Subqueries are scope-independent and pass
+/// through; `AggRef`/`WindowRef` pass through too (the caller keeps any
+/// conjunct holding one above the aggregate).
+fn rewrite_through_keys(pred: &BoundExpr, keys: &[BoundExpr]) -> Option<BoundExpr> {
+    match pred {
+        BoundExpr::Column { index, .. } => keys.get(*index).cloned(),
+        BoundExpr::Literal(_) | BoundExpr::AggRef { .. } | BoundExpr::WindowRef { .. } => {
+            Some(pred.clone())
+        }
+        BoundExpr::ScalarSubquery { .. } | BoundExpr::Exists { .. } => Some(pred.clone()),
+        BoundExpr::InSubquery {
+            expr,
+            query,
+            negated,
+        } => Some(BoundExpr::InSubquery {
+            expr: Box::new(rewrite_through_keys(expr, keys)?),
+            query: query.clone(),
+            negated: *negated,
+        }),
+        BoundExpr::Binary {
+            op,
+            left,
+            right,
+            dtype,
+        } => Some(BoundExpr::Binary {
+            op: *op,
+            left: Box::new(rewrite_through_keys(left, keys)?),
+            right: Box::new(rewrite_through_keys(right, keys)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::Not(e) => Some(BoundExpr::Not(Box::new(rewrite_through_keys(e, keys)?))),
+        BoundExpr::Negate { expr, dtype } => Some(BoundExpr::Negate {
+            expr: Box::new(rewrite_through_keys(expr, keys)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::IsNull { expr, negated } => Some(BoundExpr::IsNull {
+            expr: Box::new(rewrite_through_keys(expr, keys)?),
+            negated: *negated,
+        }),
+        BoundExpr::Scalar { func, args, dtype } => Some(BoundExpr::Scalar {
+            func: *func,
+            args: args
+                .iter()
+                .map(|a| rewrite_through_keys(a, keys))
+                .collect::<Option<Vec<_>>>()?,
+            dtype: *dtype,
+        }),
+        BoundExpr::Cast { expr, dtype } => Some(BoundExpr::Cast {
+            expr: Box::new(rewrite_through_keys(expr, keys)?),
+            dtype: *dtype,
+        }),
+        BoundExpr::Coalesce { args, dtype } => Some(BoundExpr::Coalesce {
+            args: args
+                .iter()
+                .map(|a| rewrite_through_keys(a, keys))
+                .collect::<Option<Vec<_>>>()?,
+            dtype: *dtype,
+        }),
+        BoundExpr::Case {
+            branches,
+            else_,
+            dtype,
+        } => Some(BoundExpr::Case {
+            branches: branches
+                .iter()
+                .map(|(c, v)| {
+                    Some((
+                        rewrite_through_keys(c, keys)?,
+                        rewrite_through_keys(v, keys)?,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?,
+            else_: match else_ {
+                Some(e) => Some(Box::new(rewrite_through_keys(e, keys)?)),
+                None => None,
+            },
+            dtype: *dtype,
+        }),
+        BoundExpr::DynamicScalar { name, args, dtype } => Some(BoundExpr::DynamicScalar {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| rewrite_through_keys(a, keys))
+                .collect::<Option<Vec<_>>>()?
+                .into_boxed_slice(),
+            dtype: *dtype,
+        }),
+    }
+}
+
 /// Push a filter one level down. Returns `(plan, moved)`. When no push
 /// applies, the filter stays above the input — never dropped.
 fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
@@ -568,7 +663,61 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
                 None => (join, true),
             }
         }
-        // Never below Limit (changes semantics) or Aggregate (HAVING, v1).
+        // A conjunct over only GROUP BY keys moves below the aggregate: a
+        // group's key holds one value for every one of its rows, so filtering
+        // members by it drops exactly the groups the conjunct above would
+        // drop — for any key expression, NULL keys included (NULLs group
+        // together). The pushed predicate reads each row's key expression,
+        // the same values the aggregate groups by, so it is the
+        // SQL-standard equivalence of writing the predicate in WHERE.
+        // Conjuncts touching aggregate outputs (`AggRef`) or constants stay
+        // above: a keyless aggregate still emits its one row over an empty
+        // input, so filtering below would change COUNT(*) / SUM() over an
+        // empty relation.
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            let mut conjuncts = Vec::new();
+            split_conjuncts(pred, &mut conjuncts);
+            let mut keep = Vec::new();
+            let mut push = Vec::new();
+            for c in conjuncts {
+                let mut cols = Vec::new();
+                columns_in(&c, &mut cols);
+                if cols.is_empty() || cols.iter().any(|i| *i >= keys.len()) {
+                    keep.push(c);
+                    continue;
+                }
+                // Rewrite the key positions into their own expressions
+                // (input space). A pushed conjunct evaluates once per input
+                // row instead of once per group, so a predicate holding a
+                // dynamic call — reached through a key expression included —
+                // stays above.
+                match rewrite_through_keys(&c, &keys) {
+                    Some(rewritten) if !rewritten.contains_dynamic_scalar() => push.push(rewritten),
+                    _ => keep.push(c),
+                }
+            }
+            let pushed = !push.is_empty();
+            let input = match and_all(push) {
+                Some(p) => Box::new(LogicalPlan::Filter {
+                    input,
+                    predicate: p,
+                }),
+                None => input,
+            };
+            let aggregate = LogicalPlan::Aggregate { input, keys, aggs };
+            match and_all(keep) {
+                // Nothing moved below: report unmoved so pushdown terminates.
+                Some(p) => (
+                    LogicalPlan::Filter {
+                        input: Box::new(aggregate),
+                        predicate: p,
+                    },
+                    pushed,
+                ),
+                None => (aggregate, true),
+            }
+        }
+        // Never below Limit (changes semantics).
         // Below Union: selection distributes over both branches (same
         // output width by construction; per-branch types were checked
         // compatible at bind time) — but cloning the predicate into both
@@ -1081,5 +1230,144 @@ mod tests {
             }
             _ => panic!("nothing should push below a LEFT join here"),
         }
+    }
+
+    fn count_star() -> crate::sql::binder::BoundAgg {
+        crate::sql::binder::BoundAgg {
+            func: crate::sql::binder::AggFunc::Count,
+            arg: None,
+            dtype: T::Bigint,
+        }
+    }
+
+    fn aggref(i: usize) -> BoundExpr {
+        B::AggRef {
+            index: i,
+            dtype: T::Bigint,
+        }
+    }
+
+    fn aggregate(keys: Vec<BoundExpr>) -> LogicalPlan {
+        LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::SingleRow),
+            keys,
+            aggs: vec![count_star()],
+        }
+    }
+
+    /// A conjunct over only group keys pushes below the aggregate, rewritten
+    /// into the key expression itself (input space).
+    #[test]
+    fn having_on_group_keys_pushes_below_aggregate() {
+        let key = B::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(col(0)),
+            right: Box::new(B::Literal(Value::Integer(1))),
+            dtype: T::Integer,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(aggregate(vec![key.clone()])),
+            predicate: bool_gt(col(0), 5),
+        };
+        let out = pushdown(plan);
+        let LogicalPlan::Aggregate { input, keys, aggs } = out else {
+            panic!("the aggregate must remain the root: {out:?}");
+        };
+        assert_eq!(keys, vec![key.clone()]);
+        assert_eq!(aggs, vec![count_star()]);
+        assert_eq!(
+            *input,
+            LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::SingleRow),
+                predicate: bool_gt(key, 5),
+            }
+        );
+    }
+
+    /// HAVING on an aggregate output (AggRef) or on a constant stays above;
+    /// a mixed predicate splits — the key conjunct moves, the rest stays.
+    #[test]
+    fn having_on_aggregates_and_constants_stays_above() {
+        // Key conjunct + aggregate conjunct + constant conjunct.
+        let constant = B::Literal(Value::Boolean(false));
+        let plan = LogicalPlan::Filter {
+            input: Box::new(aggregate(vec![col(0)])),
+            predicate: and(
+                and(bool_gt(col(0), 5), bool_gt(aggref(0), 1)),
+                constant.clone(),
+            ),
+        };
+        let out = pushdown(plan);
+        let LogicalPlan::Filter { input, predicate } = out else {
+            panic!("filter must stay above the aggregate: {out:?}");
+        };
+        assert_eq!(predicate, and(bool_gt(aggref(0), 1), constant));
+        let LogicalPlan::Aggregate { input, .. } = *input else {
+            panic!()
+        };
+        assert_eq!(
+            *input,
+            LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::SingleRow),
+                predicate: bool_gt(col(0), 5),
+            }
+        );
+
+        // A keyless aggregate over an empty input still emits its row, so a
+        // constant filter must never move below it.
+        let plan = LogicalPlan::Filter {
+            input: Box::new(aggregate(vec![])),
+            predicate: B::Literal(Value::Boolean(false)),
+        };
+        assert!(matches!(pushdown(plan), LogicalPlan::Filter { .. }));
+    }
+
+    /// A key-only conjunct holding a dynamic (impure, possibly stateful)
+    /// call stays above: pushing it would change how often the call runs.
+    #[test]
+    fn having_with_dynamic_call_stays_above() {
+        let call = B::DynamicScalar {
+            name: "f".into(),
+            args: vec![col(0)].into_boxed_slice(),
+            dtype: T::Boolean,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(aggregate(vec![col(0)])),
+            predicate: call.clone(),
+        };
+        match pushdown(plan) {
+            LogicalPlan::Filter { input, predicate } => {
+                assert_eq!(predicate, call);
+                assert!(matches!(*input, LogicalPlan::Aggregate { .. }));
+            }
+            other => panic!("dynamic call must stay above: {other:?}"),
+        }
+    }
+
+    /// Optimization is deterministic: the same bound plan optimizes to the
+    /// same plan (no hash-order or address-order leaks into the shape).
+    #[test]
+    fn optimization_is_deterministic() {
+        let db = crate::storage::PinkDb::new();
+        let key = B::Binary {
+            op: BinaryOp::Add,
+            left: Box::new(col(0)),
+            right: Box::new(B::Literal(Value::Integer(1))),
+            dtype: T::Integer,
+        };
+        let plan = LogicalPlan::Filter {
+            input: Box::new(LogicalPlan::Aggregate {
+                input: Box::new(LogicalPlan::Filter {
+                    input: Box::new(LogicalPlan::SingleRow),
+                    predicate: B::Literal(Value::Boolean(true)),
+                }),
+                keys: vec![key],
+                aggs: vec![count_star()],
+            }),
+            predicate: bool_gt(col(0), 5),
+        };
+        let a = optimize(&db, plan.clone());
+        let b = optimize(&db, plan);
+        assert_eq!(a, b);
     }
 }

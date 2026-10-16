@@ -739,6 +739,10 @@ mod tests {
             ("SELECT DISTINCT i, s FROM t;", vec![Some(vec![0, 3])]),
             // Nothing referenced: the scan still provides the row shape.
             ("SELECT 1 FROM t LIMIT 1;", vec![Some(vec![])]),
+            // LIMIT 0 streams nothing: the table is never touched, so no
+            // decode is ever requested.
+            ("SELECT i FROM t LIMIT 0;", vec![]),
+            ("SELECT i FROM t LIMIT 2;", vec![Some(vec![0])]),
             // Subqueries analyze their own plans; the outer scan is bounded
             // separately.
             (

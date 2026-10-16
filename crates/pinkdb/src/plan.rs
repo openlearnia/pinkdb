@@ -448,13 +448,16 @@ fn expr_tables_read(
 /// The catalog-table columns each `Scan` in a plan can be read through,
 /// keyed by the scan node's address.
 ///
-/// The executor uses this to decode only the referenced columns of an
-/// attached lake's data files (see `pinkdb::attached`). Exactness matters in
-/// one direction only: the set must contain *every* column some operator
-/// evaluates, because a column left out is left undecoded — the executor
-/// reads such a column as an internal error, never as NULLs (see
-/// `DataChunk::expect_column`). A scan with no bound in this map is
-/// materialized in full, which is always correct.
+/// Two read paths use this to stop materializing unreferenced columns:
+/// an attached lake's data files decode only the referenced columns (see
+/// `pinkdb::attached`), and an in-memory table's chunks carry a shared
+/// zero-length placeholder in place of every unreferenced column (see
+/// `exec::project_scan_chunks`). Exactness matters in one direction only:
+/// the set must contain *every* column some operator evaluates, because a
+/// column left out is left undecoded — the executor reads such a column as
+/// an internal error, never as NULLs (see `DataChunk::expect_column`). A
+/// scan with no bound in this map is materialized in full, which is always
+/// correct.
 ///
 /// The rules mirror what the executor actually evaluates, not what the query
 /// eventually displays: `Project` and `Window` evaluate every expression

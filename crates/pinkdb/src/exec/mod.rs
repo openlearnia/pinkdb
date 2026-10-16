@@ -91,7 +91,8 @@ pub(crate) struct Output {
 /// plan-node address (the tree is immutable during execution, so each
 /// uncorrelated subquery evaluates once even when probed per chunk), and the
 /// per-statement scan projections (which columns each scan's consumers
-/// read — the attached-lake read path decodes only those).
+/// read — the attached-lake read path decodes only those, and a store scan
+/// materializes only those).
 pub(crate) struct Cx<'a> {
     pub(crate) db: &'a PinkDb,
     pub(crate) ctes: HashMap<String, Output>,
@@ -390,7 +391,7 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
             if col.len() != chunk.num_rows() {
                 return Err(PinkDbError::Execution(format!(
                     "internal error: result column {i} was never decoded \
-                     (attached-lake projection missed a reference)"
+                     (a scan projection missed a reference)"
                 )));
             }
         }
@@ -413,6 +414,93 @@ fn scan_chunks(t: &DataTable) -> Vec<DataChunk> {
         if let Some(c) = t.scan_chunk(i) {
             chunks.push(c);
         }
+    }
+    chunks
+}
+
+/// Evaluate one `Scan` plan node.
+///
+/// Unqualified scans name CTEs (binder-resolved); qualified scans are catalog
+/// tables in their database. An attached lake table is not in the store:
+/// materialize the columns this plan references (the exact decode `.lake
+/// open` performs, projected) and scan the result like any other table for
+/// the rest of the session. A projection the analysis could not bound leaves
+/// every column decoded.
+fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
+    let LogicalPlan::Scan { db: qdb, table } = plan else {
+        unreachable!("scan_output needs a Scan node");
+    };
+    if qdb.is_none() {
+        if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
+            return Ok(out.clone());
+        }
+    }
+    let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
+    let projected = cx.projections.for_scan(plan);
+    if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
+        let scan = lake.load_projected(lookup, table, projected)?;
+        let (names, types) = scan.table.schema().into_iter().unzip();
+        return Ok(Output {
+            chunks: scan.chunks(),
+            names,
+            types,
+        });
+    }
+    let t = cx.db.table_in(lookup, table)?;
+    let (names, types) = t.schema().into_iter().unzip();
+    let chunks = match projected {
+        Some(cols) => project_scan_chunks(t, cols),
+        None => scan_chunks(t),
+    };
+    Ok(Output {
+        chunks,
+        names,
+        types,
+    })
+}
+
+/// The chunks of a store table restricted to `cols` — the in-memory twin of
+/// the attached-lake projected decode. Present columns are shared (`Arc`)
+/// with the stored chunk; a column outside `cols` is a shared zero-length
+/// placeholder, never materialized, and every reader goes through
+/// `DataChunk::expect_column`, so a missed reference fails loudly instead of
+/// reading values. `cols` must be ascending and deduplicated (the analysis
+/// emits it that way); an out-of-range index falls back to a full scan,
+/// mirroring the lake reader's always-correct fallback. An empty `cols`
+/// still materializes column 0: a chunk carries its shape on its columns.
+fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Vec<DataChunk> {
+    let ncols = t.num_cols();
+    if cols.iter().any(|&i| i >= ncols) {
+        return scan_chunks(t);
+    }
+    let mut present = vec![false; ncols];
+    for &i in cols {
+        present[i] = true;
+    }
+    if !present.iter().any(|&p| p) {
+        present[0] = true;
+    }
+    if present.iter().all(|&p| p) {
+        return scan_chunks(t);
+    }
+    let absent: Vec<Option<std::sync::Arc<Vector>>> = t
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (!present[i]).then(|| std::sync::Arc::new(Vector::new_empty(c.dtype))))
+        .collect();
+    let mut chunks = Vec::with_capacity(t.num_chunks());
+    for i in 0..t.num_chunks() {
+        let Some(chunk) = t.scan_chunk(i) else {
+            continue;
+        };
+        let cols: Vec<std::sync::Arc<Vector>> = (0..ncols)
+            .map(|c| match &absent[c] {
+                Some(placeholder) => std::sync::Arc::clone(placeholder),
+                None => std::sync::Arc::clone(&chunk.columns[c]),
+            })
+            .collect();
+        chunks.push(DataChunk::projected(cols, chunk.num_rows()));
     }
     chunks
 }
@@ -536,6 +624,40 @@ fn min_max_value(attached: &AttachedTable, index: usize, is_min: bool) -> Option
     }
 }
 
+/// Apply one Filter chunk: `Ok(None)` when no row passes. Shared by the
+/// materializing path and the LIMIT stream, so both produce the same chunks.
+fn filter_chunk(cx: &Cx, predicate: &BoundExpr, chunk: &DataChunk) -> Result<Option<DataChunk>> {
+    let pred = eval_expr(predicate, chunk, cx)?;
+    let sel = select_true(&pred)?;
+    Ok(if sel.len() == chunk.num_rows() {
+        Some(chunk.clone())
+    } else if sel.is_empty() {
+        None
+    } else {
+        Some(chunk.gather(&sel))
+    })
+}
+
+/// Evaluate one Project chunk. Pass-through column references (and
+/// aggregate/window output columns) share the input chunk's `Arc<Vector>`
+/// instead of deep-copying the payload. A pass-through of an undecoded
+/// projection placeholder fails loudly (`expect_column`), never as NULLs.
+fn project_chunk(cx: &Cx, exprs: &[BoundExpr], chunk: &DataChunk) -> Result<DataChunk> {
+    let cols: Vec<std::sync::Arc<Vector>> = exprs
+        .iter()
+        .map(|e| match e {
+            BoundExpr::Column { index, .. }
+            | BoundExpr::AggRef { index, .. }
+            | BoundExpr::WindowRef { index, .. } => {
+                Ok(std::sync::Arc::clone(chunk.expect_column(*index)?))
+            }
+            e => Ok(std::sync::Arc::new(eval_expr(e, chunk, cx)?)),
+        })
+        .collect::<Result<_>>()?;
+    DataChunk::from_arcs(cols)
+        .ok_or_else(|| PinkDbError::Execution("project column length mismatch".to_string()))
+}
+
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     match plan {
         LogicalPlan::CreateTable { .. }
@@ -555,37 +677,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::Use { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
-        LogicalPlan::Scan { db: qdb, table } => {
-            // Unqualified scans name CTEs (binder-resolved); qualified scans
-            // are catalog tables in their database.
-            if qdb.is_none() {
-                if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
-                    return Ok(out.clone());
-                }
-            }
-            let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
-            // An attached lake table is not in the store: materialize the
-            // columns this plan references (the exact decode `.lake open`
-            // performs, projected) and scan the result like any other table
-            // for the rest of the session. A projection the analysis could
-            // not bound leaves every column decoded.
-            if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
-                let scan = lake.load_projected(lookup, table, cx.projections.for_scan(plan))?;
-                let (names, types) = scan.table.schema().into_iter().unzip();
-                return Ok(Output {
-                    chunks: scan.chunks(),
-                    names,
-                    types,
-                });
-            }
-            let t = cx.db.table_in(lookup, table)?;
-            let (names, types) = t.schema().into_iter().unzip();
-            Ok(Output {
-                chunks: scan_chunks(t),
-                names,
-                types,
-            })
-        }
+        LogicalPlan::Scan { .. } => scan_output(cx, plan),
         LogicalPlan::SingleRow => Ok(Output {
             // One row, zero columns: literals evaluate to 1-row vectors.
             chunks: vec![DataChunk {
@@ -601,17 +693,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let chunks: Vec<Option<DataChunk>> = inner
                 .chunks
                 .par_iter()
-                .map(|chunk| {
-                    let pred = eval_expr(predicate, chunk, cx)?;
-                    let sel = select_true(&pred)?;
-                    Ok(if sel.len() == chunk.num_rows() {
-                        Some(chunk.clone())
-                    } else if sel.is_empty() {
-                        None
-                    } else {
-                        Some(chunk.gather(&sel))
-                    })
-                })
+                .map(|chunk| filter_chunk(cx, predicate, chunk))
                 .collect::<Result<_>>()?;
             let chunks = chunks.into_iter().flatten().collect();
             Ok(Output {
@@ -634,20 +716,22 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             names.extend(r.names.iter().cloned());
             let mut types = l.types.clone();
             types.extend(r.types.iter().copied());
-            let chunks = hash_join(
-                cx,
-                JoinSide {
-                    chunks: &l.chunks,
-                    types: &l.types,
-                },
-                JoinSide {
-                    chunks: &r.chunks,
-                    types: &r.types,
-                },
-                *kind,
-                left_key,
-                right_key,
-            )?;
+            let lside = JoinSide {
+                chunks: &l.chunks,
+                types: &l.types,
+            };
+            let rside = JoinSide {
+                chunks: &r.chunks,
+                types: &r.types,
+            };
+            let chunks = if build_on_left(cx, *kind, left, right) {
+                // The estimated-smaller left side feeds the match table and
+                // the right side probes it: output rows are right-row major,
+                // the probe side's deterministic order.
+                hash_join_probe(cx, rside, lside, right_key, left_key, true, false)?
+            } else {
+                hash_join(cx, lside, rside, *kind, left_key, right_key)?
+            };
             Ok(Output {
                 chunks,
                 names,
@@ -796,27 +880,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             let chunks = inner
                 .chunks
                 .par_iter()
-                .map(|chunk| -> Result<DataChunk> {
-                    // Pass-through column references (and aggregate/window
-                    // output columns) share the input chunk's `Arc<Vector>`
-                    // instead of deep-copying the payload. A pass-through of
-                    // an undecoded projection placeholder fails loudly
-                    // (`expect_column`), never as NULLs.
-                    let cols: Vec<std::sync::Arc<Vector>> = exprs
-                        .iter()
-                        .map(|e| match e {
-                            BoundExpr::Column { index, .. }
-                            | BoundExpr::AggRef { index, .. }
-                            | BoundExpr::WindowRef { index, .. } => {
-                                Ok(std::sync::Arc::clone(chunk.expect_column(*index)?))
-                            }
-                            e => Ok(std::sync::Arc::new(eval_expr(e, chunk, cx)?)),
-                        })
-                        .collect::<Result<_>>()?;
-                    DataChunk::from_arcs(cols).ok_or_else(|| {
-                        PinkDbError::Execution("project column length mismatch".to_string())
-                    })
-                })
+                .map(|chunk| project_chunk(cx, exprs, chunk))
                 .collect::<Result<_>>()?;
             Ok(Output {
                 chunks,
@@ -843,6 +907,16 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             })
         }
         LogicalPlan::Limit { input, limit } => {
+            // LIMIT 0 produces the query's (empty) shape without evaluating
+            // the input at all — no scan, no predicate, no sort.
+            if *limit == 0 {
+                let (names, types) = plan_schema_of(cx, input)?;
+                return Ok(Output {
+                    chunks: Vec::new(),
+                    names,
+                    types,
+                });
+            }
             // Top-N fast path: LIMIT directly over SORT selects the first
             // `limit` rows with bounded per-partition heaps instead of a full
             // sort. Only worth it when the limit is much smaller than the row
@@ -853,30 +927,55 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 keys,
             } = &**input
             {
-                if *limit > 0 {
-                    // Evaluate the sort input once: the top-N path and the
-                    // fallback full sort below both consume these chunks
-                    // (re-evaluating `sort_in` here would run the whole
-                    // subtree twice).
-                    let inner = eval(cx, sort_in)?;
-                    let n: usize = inner.chunks.iter().map(|c| c.num_rows()).sum();
-                    let chunks = if limit.saturating_mul(16) <= n {
-                        match top_n(cx, &inner.chunks, keys, *limit)? {
-                            Some(chunks) => chunks,
-                            // NaN float key: full sort with the legacy comparator.
-                            None => sort(cx, &inner.chunks, keys)?,
-                        }
+                // Evaluate the sort input once: the top-N path and the
+                // fallback full sort below both consume these chunks
+                // (re-evaluating `sort_in` here would run the whole
+                // subtree twice).
+                let inner = eval(cx, sort_in)?;
+                let n: usize = inner.chunks.iter().map(|c| c.num_rows()).sum();
+                let chunks = if limit.saturating_mul(16) <= n {
+                    match top_n(cx, &inner.chunks, keys, *limit)? {
+                        Some(chunks) => chunks,
+                        // NaN float key: full sort with the legacy comparator.
+                        None => sort(cx, &inner.chunks, keys)?,
+                    }
+                } else {
+                    // Limit too large for top-N: full sort + truncate.
+                    sort(cx, &inner.chunks, keys)?
+                };
+                let out = Output {
+                    chunks,
+                    names: inner.names,
+                    types: inner.types,
+                };
+                return Ok(truncate_output(out, *limit));
+            }
+            // Streaming short-circuit: over a plan the executor can stream
+            // (scan/filter/project/UNION ALL), stop pulling the input as
+            // soon as `limit` rows are produced instead of materializing
+            // everything and truncating. Chunk for chunk identical to the
+            // fallback below.
+            if let Some(mut stream) = Stream::build(cx, input)? {
+                let mut chunks = Vec::new();
+                let mut remaining = *limit;
+                while remaining > 0 {
+                    let Some(chunk) = stream.next(cx)? else {
+                        break;
+                    };
+                    if chunk.num_rows() <= remaining {
+                        remaining -= chunk.num_rows();
+                        chunks.push(chunk);
                     } else {
-                        // Limit too large for top-N: full sort + truncate.
-                        sort(cx, &inner.chunks, keys)?
-                    };
-                    let out = Output {
-                        chunks,
-                        names: inner.names,
-                        types: inner.types,
-                    };
-                    return Ok(truncate_output(out, *limit));
+                        let sel: Vec<usize> = (0..remaining).collect();
+                        chunks.push(chunk.gather(&sel));
+                        remaining = 0;
+                    }
                 }
+                return Ok(Output {
+                    chunks,
+                    names: stream.names,
+                    types: stream.types,
+                });
             }
             let inner = eval(cx, input)?;
             Ok(truncate_output(inner, *limit))
@@ -1070,6 +1169,68 @@ struct JoinSide<'a> {
     types: &'a [DataType],
 }
 
+/// Estimated row count of a join input, for the build-side choice. Table
+/// row counts are exact and free; everything derived keeps the estimate
+/// shape-based (there are no statistics):
+/// - `Scan` → the store/attached table's row count (a CTE scan: the rows its
+///   query materialized);
+/// - `Limit(n)` → `min(input, n)`; `SingleRow` → 1;
+/// - `Filter`/`Sort`/`Distinct`/`Project`/`Window` → the input's estimate
+///   (a filter's selectivity is unknown, so it is estimated at 1.0);
+/// - `Union` → the sum of both branches.
+///
+/// Anything else (`Aggregate`, `Join`, subquery shapes) is `None`: an
+/// unknown size keeps the historical build-on-right side, the conservative
+/// default.
+fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
+    match plan {
+        LogicalPlan::Scan { db: qdb, table } => {
+            if qdb.is_none() {
+                if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
+                    return Some(out.chunks.iter().map(|c| c.num_rows() as u64).sum());
+                }
+            }
+            let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
+            if let Some((attached, _)) = cx.db.attached_lookup(lookup, table) {
+                return Some(attached.rows);
+            }
+            cx.db
+                .table_in(lookup, table)
+                .ok()
+                .map(|t| t.num_rows() as u64)
+        }
+        LogicalPlan::SingleRow => Some(1),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Window { input, .. } => estimate_rows(cx, input),
+        LogicalPlan::Limit { input, limit } => Some(estimate_rows(cx, input)?.min(*limit as u64)),
+        LogicalPlan::Union { left, right, .. } => {
+            Some(estimate_rows(cx, left)?.saturating_add(estimate_rows(cx, right)?))
+        }
+        LogicalPlan::Cte { body, .. } => estimate_rows(cx, body),
+        _ => None,
+    }
+}
+
+/// Whether an INNER join hashes its left input instead of its right one:
+/// true exactly when both sides have an estimate and the left is strictly
+/// smaller. Only INNER joins choose — `Left`/`Right` must probe their
+/// preserved side to emit its rows in order, which fixes their build side —
+/// and unknown estimates or a tie keep the historical build-on-the-right
+/// side. The plan is only a cost hint: a wrong estimate never changes the
+/// result, just which input feeds the match table.
+fn build_on_left(cx: &Cx, kind: JoinKind, left: &LogicalPlan, right: &LogicalPlan) -> bool {
+    if kind != JoinKind::Inner {
+        return false;
+    }
+    match (estimate_rows(cx, left), estimate_rows(cx, right)) {
+        (Some(l), Some(r)) => l < r,
+        _ => false,
+    }
+}
+
 /// Hash join dispatcher. Output columns are always left ++ right.
 /// - `Inner`: build on the right, probe with the left, emit matched pairs.
 /// - `Left`: same build/probe, plus left columns + NULLs for every unmatched
@@ -1078,6 +1239,9 @@ struct JoinSide<'a> {
 ///   for the left columns + the right row for every unmatched right row.
 ///
 /// NULL keys never match on either side, so they NULL-extend in outer joins.
+/// An INNER join whose left input estimates smaller than its right one is
+/// instead run through `hash_join_probe` directly (build left, probe right)
+/// — see `build_on_left`.
 fn hash_join(
     cx: &Cx,
     left: JoinSide<'_>,
@@ -1659,12 +1823,15 @@ fn expr_is_total(e: &BoundExpr) -> bool {
 /// accumulators directly. Returns `Ok(None)` — before evaluating anything —
 /// when the shape or any aggregate key/argument is not fusible.
 ///
-/// Row feed order is exactly the materialized pipeline's: left chunks in
-/// order and, within a left row, matches in right-row order, so first-seen
-/// group order and accumulation order match. Group-key encoding, key
-/// `Value`s, and accumulator updates read the same source vectors the
-/// materialized path sees, so integer/exact results are bit-identical
-/// (float partials may differ at the ulp level — accepted).
+/// Row feed order is exactly the materialized pipeline's, orientation
+/// included: the build-side choice is the same [`build_on_left`] the
+/// materialized `hash_join` makes, the probe side is iterated chunk by chunk
+/// in order, and within a probe row matches come in build-row order — so
+/// first-seen group order and accumulation order match whichever side is
+/// hashed. Group-key encoding, key `Value`s, and accumulator updates read
+/// the same source vectors the materialized path sees, so integer/exact
+/// results are bit-identical (float partials may differ at the ulp level —
+/// accepted).
 fn fused_join_aggregate(
     cx: &Cx,
     input: &LogicalPlan,
@@ -1716,6 +1883,10 @@ fn fused_join_aggregate(
     if kind != JoinKind::Inner {
         return Ok(None);
     }
+    // The same build-side choice the materialized `hash_join` makes: hash
+    // the estimated-smaller input and probe the other. `probe_left` decides
+    // the feed order below, so both paths agree chunk for chunk.
+    let probe_left = !build_on_left(cx, kind, left, right);
 
     // With a Project in the shape, fusion rewrites only the aggregate's
     // keys/args through it, so project exprs the aggregate does not reference
@@ -1791,19 +1962,54 @@ fn fused_join_aggregate(
     let l = eval(cx, left)?;
     let r = eval(cx, right)?;
 
+    // Orientation: `probe` is the side iterated chunk by chunk, `build`
+    // feeds the match table.
+    let (probe, build, probe_key, build_key) = if probe_left {
+        (&l, &r, left_key, right_key)
+    } else {
+        (&r, &l, right_key, left_key)
+    };
+    let (probe_exprs, build_exprs) = if probe_left {
+        (&left_exprs, &right_exprs)
+    } else {
+        (&right_exprs, &left_exprs)
+    };
+    let probe_side = if probe_left { Side::Left } else { Side::Right };
+
+    /// One key/arg source resolved for the active orientation: `probe`
+    /// selects the pulled probe chunk (row `pi`) or the arena's build row;
+    /// `idx` indexes the matching per-chunk expression vectors.
+    #[derive(Clone, Copy)]
+    struct OrientSource {
+        probe: bool,
+        idx: usize,
+    }
+    let orient = |src: ExprSource| match (src, probe_side) {
+        (ExprSource::Left(s), Side::Left) | (ExprSource::Right(s), Side::Right) => OrientSource {
+            probe: true,
+            idx: s,
+        },
+        (ExprSource::Left(s), _) | (ExprSource::Right(s), _) => OrientSource {
+            probe: false,
+            idx: s,
+        },
+    };
+    let key_srcs: Vec<OrientSource> = key_srcs.iter().map(|s| orient(*s)).collect();
+    let arg_srcs: Vec<Option<OrientSource>> = arg_srcs.iter().map(|s| s.map(orient)).collect();
+
     // Build the match table exactly like `hash_join`: same int
     // specialization, `common_numeric` canonicalization, u32 guard, and
     // capacity policy.
-    let ints = is_int_key(left_key.dtype()) && is_int_key(right_key.dtype());
-    let common = common_numeric(left_key.dtype(), right_key.dtype()).ok();
-    let right_rows: usize = r.chunks.iter().map(|c| c.num_rows()).sum();
-    if right_rows > u32::MAX as usize {
+    let ints = is_int_key(probe_key.dtype()) && is_int_key(build_key.dtype());
+    let common = common_numeric(probe_key.dtype(), build_key.dtype()).ok();
+    let build_rows: usize = build.chunks.iter().map(|c| c.num_rows()).sum();
+    if build_rows > u32::MAX as usize {
         return Err(PinkDbError::Execution(
             "hash join build side exceeds u32 rows".to_string(),
         ));
     }
-    let reserve = right_rows.min(1 << 20);
-    let table = MatchTable::build(cx, &r.chunks, right_key, common, ints, reserve)?;
+    let reserve = build_rows.min(1 << 20);
+    let table = MatchTable::build(cx, &build.chunks, build_key, common, ints, reserve)?;
 
     // Fast path: keys-free pure COUNT(*) counts matched pairs by walking the
     // match chains — no per-pair `Value` work, no group state.
@@ -1816,22 +2022,22 @@ fn fused_join_aggregate(
         // Binder dedup leaves exactly one COUNT(*); this path emits one
         // column (and `agg_output_schema` below still reflects `aggs`).
         debug_assert_eq!(aggs.len(), 1);
-        let total: i64 = l
+        let total: i64 = probe
             .chunks
             .par_iter()
             .map(|chunk| -> Result<i64> {
-                let kv = eval_join_key(cx, left_key, chunk, common, ints)?;
+                let kv = eval_join_key(cx, probe_key, chunk, common, ints)?;
                 let mut count = 0i64;
                 let mut buf = Vec::new();
-                for li in 0..chunk.num_rows() {
-                    if kv.is_null(li) {
+                for pi in 0..chunk.num_rows() {
+                    if kv.is_null(pi) {
                         continue;
                     }
                     let head = if ints {
-                        table.head_int(int_key_at(&kv, li))
+                        table.head_int(int_key_at(&kv, pi))
                     } else {
                         buf.clear();
-                        kv.encode_into(&mut buf, li);
+                        kv.encode_into(&mut buf, pi);
                         table.head_bytes(&buf)
                     };
                     let Some(mut node) = head else { continue };
@@ -1856,32 +2062,32 @@ fn fused_join_aggregate(
         }));
     }
 
-    // Pre-evaluate every right-side key/arg expression once per right chunk
-    // (shared by all left chunks).
-    let right_vecs: Vec<Vec<FusedVec>> = r
+    // Pre-evaluate every build-side key/arg expression once per build chunk
+    // (shared by all probe chunks).
+    let build_vecs: Vec<Vec<FusedVec>> = build
         .chunks
         .par_iter()
         .map(|chunk| {
-            right_exprs
+            build_exprs
                 .iter()
                 .map(|e| eval_fused_vec(e, chunk, cx))
                 .collect::<Result<Vec<_>>>()
         })
         .collect::<Result<_>>()?;
 
-    // Probe + accumulate, parallel per left chunk: each match feeds one row
+    // Probe + accumulate, parallel per probe chunk: each match feeds one row
     // into its group's partial. A partition can cover arbitrarily many
     // joined rows, so groups are created on first sight exactly like
     // `aggregate()` does per chunk.
-    let partials: Vec<Partial> = l
+    let partials: Vec<Partial> = probe
         .chunks
         .par_iter()
         .map(|chunk| -> Result<Partial> {
-            let left_vecs: Vec<FusedVec> = left_exprs
+            let probe_vecs: Vec<FusedVec> = probe_exprs
                 .iter()
                 .map(|e| eval_fused_vec(e, chunk, cx))
                 .collect::<Result<_>>()?;
-            let kv = eval_join_key(cx, left_key, chunk, common, ints)?;
+            let kv = eval_join_key(cx, probe_key, chunk, common, ints)?;
             let mut partial = Partial {
                 groups: Vec::new(),
                 index: FastMap::with_capacity_and_hasher(
@@ -1891,32 +2097,32 @@ fn fused_join_aggregate(
             };
             let mut buf = Vec::new();
             let mut full_reserved = false;
-            for li in 0..chunk.num_rows() {
-                if kv.is_null(li) {
+            for pi in 0..chunk.num_rows() {
+                if kv.is_null(pi) {
                     continue;
                 }
                 let head = if ints {
-                    table.head_int(int_key_at(&kv, li))
+                    table.head_int(int_key_at(&kv, pi))
                 } else {
                     buf.clear();
-                    kv.encode_into(&mut buf, li);
+                    kv.encode_into(&mut buf, pi);
                     table.head_bytes(&buf)
                 };
                 let Some(mut node) = head else { continue };
                 while node != NIL {
-                    let (rci, ri, next) = table.node(node);
-                    let (rci, ri) = (rci as usize, ri as usize);
+                    let (bci, bi, next) = table.node(node);
+                    let (bci, bi) = (bci as usize, bi as usize);
                     // Group key encoding byte-identical to `aggregate()`:
-                    // the same source vectors, indexed by the left row for
-                    // left/constant keys and the right row for right keys.
+                    // the same source vectors, indexed by the probe row for
+                    // probe-side keys and the build row for build-side ones.
                     buf.clear();
                     for src in &key_srcs {
-                        match src {
-                            ExprSource::Left(s) => left_vecs[*s].v().encode_into(&mut buf, li),
-                            ExprSource::Right(s) => {
-                                right_vecs[rci][*s].v().encode_into(&mut buf, ri)
-                            }
-                        }
+                        let (vecs, row) = if src.probe {
+                            (&probe_vecs, pi)
+                        } else {
+                            (&build_vecs[bci], bi)
+                        };
+                        vecs[src.idx].v().encode_into(&mut buf, row);
                     }
                     let idx = match partial.index.get(&buf) {
                         Some(&idx) => idx,
@@ -1935,9 +2141,13 @@ fn fused_join_aggregate(
                                 Group {
                                     keys: key_srcs
                                         .iter()
-                                        .map(|src| match src {
-                                            ExprSource::Left(s) => left_vecs[*s].v().get(li),
-                                            ExprSource::Right(s) => right_vecs[rci][*s].v().get(ri),
+                                        .map(|src| {
+                                            let (vecs, row) = if src.probe {
+                                                (&probe_vecs, pi)
+                                            } else {
+                                                (&build_vecs[bci], bi)
+                                            };
+                                            vecs[src.idx].v().get(row)
                                         })
                                         .collect(),
                                     accs: aggs.iter().map(|a| Acc::new(a.func)).collect(),
@@ -1953,9 +2163,13 @@ fn fused_join_aggregate(
                             None => acc.count_star(),
                             // Typed read of the cell (NULL skips), the same
                             // accumulator update the materialized path makes.
-                            Some(ExprSource::Left(s)) => acc.update_vec(left_vecs[*s].v(), li),
-                            Some(ExprSource::Right(s)) => {
-                                acc.update_vec(right_vecs[rci][*s].v(), ri)
+                            Some(src) => {
+                                let (vecs, row) = if src.probe {
+                                    (&probe_vecs, pi)
+                                } else {
+                                    (&build_vecs[bci], bi)
+                                };
+                                acc.update_vec(vecs[src.idx].v(), row)
                             }
                         }
                     }
@@ -1966,7 +2180,7 @@ fn fused_join_aggregate(
         })
         .collect::<Result<_>>()?;
 
-    // Merge in left-chunk order and emit through the shared post-partial
+    // Merge in probe-chunk order and emit through the shared post-partial
     // phase, exactly like `aggregate()`.
     let groups = merge_partials(partials, !keys.is_empty(), aggs);
     let key_types: Vec<DataType> = keys.iter().map(|k| k.dtype()).collect();
@@ -2484,6 +2698,291 @@ fn truncate_output(mut out: Output, limit: usize) -> Output {
         names: out.names,
         types: out.types,
     }
+}
+
+// ---------- LIMIT streaming ----------
+
+/// One chunk-at-a-time cursor over the plans whose evaluation streams:
+/// `Scan`, `SingleRow`, `Filter`, `Project`, `UNION ALL` and `Limit`.
+/// Blocking operators (`Sort`, `Aggregate`, `Distinct`, `Join`, `Window`, a
+/// distinct union) have no cursor, and the LIMIT arm evaluates them whole.
+///
+/// The LIMIT arm pulls from a cursor only until the requested rows exist, so
+/// `SELECT ... LIMIT 10` over a million rows evaluates just the chunks those
+/// ten rows need. Every variant applies exactly the same per-chunk operator
+/// the materializing path does (see `filter_chunk`/`project_chunk`), in the
+/// same order, so the two paths emit identical chunks — the early stop only
+/// skips work no output row can depend on.
+struct Stream<'p> {
+    kind: StreamKind<'p>,
+    names: Vec<String>,
+    types: Vec<DataType>,
+    /// Output chunks produced by the last batch pull (Filter/Project).
+    pending: std::collections::VecDeque<DataChunk>,
+}
+
+/// How many input chunks a Filter/Project cursor pulls per batch: the batch
+/// keeps the per-chunk operators parallel (they run through `par_iter`)
+/// while bounding the work wasted when the limit is reached mid-batch.
+const STREAM_BATCH: usize = 4;
+
+enum StreamKind<'p> {
+    /// A scan, materialized on first pull so a limit satisfied by an earlier
+    /// branch never touches the table (an attached lake would otherwise
+    /// decode its columns for nothing).
+    Scan {
+        plan: &'p LogicalPlan,
+        chunks: Option<std::vec::IntoIter<DataChunk>>,
+    },
+    /// `SELECT` without `FROM`: one empty row.
+    SingleRow(bool),
+    Filter {
+        input: Box<Stream<'p>>,
+        predicate: &'p BoundExpr,
+    },
+    Project {
+        input: Box<Stream<'p>>,
+        exprs: &'p [BoundExpr],
+    },
+    /// `UNION ALL` (a distinct union is blocking): left chunks, then right.
+    Union {
+        left: Box<Stream<'p>>,
+        right: Box<Stream<'p>>,
+        types: &'p [DataType],
+        on_left: bool,
+    },
+    Limit {
+        input: Box<Stream<'p>>,
+        remaining: usize,
+    },
+}
+
+impl<'p> Stream<'p> {
+    /// Build a cursor for `plan`, or `None` when its evaluation is blocking.
+    /// Building looks up schemas only: no chunk is materialized and no
+    /// predicate evaluated until the first pull.
+    fn build(cx: &Cx, plan: &'p LogicalPlan) -> Result<Option<Stream<'p>>> {
+        let (kind, names, types) = match plan {
+            LogicalPlan::Scan { .. } => {
+                let (names, types) = plan_schema_of(cx, plan)?;
+                (StreamKind::Scan { plan, chunks: None }, names, types)
+            }
+            LogicalPlan::SingleRow => (StreamKind::SingleRow(false), Vec::new(), Vec::new()),
+            LogicalPlan::Filter { input, predicate } => {
+                let Some(input) = Stream::build(cx, input)? else {
+                    return Ok(None);
+                };
+                let (names, types) = (input.names.clone(), input.types.clone());
+                (
+                    StreamKind::Filter {
+                        input: Box::new(input),
+                        predicate,
+                    },
+                    names,
+                    types,
+                )
+            }
+            LogicalPlan::Project {
+                input,
+                exprs,
+                names,
+            } => {
+                let Some(input) = Stream::build(cx, input)? else {
+                    return Ok(None);
+                };
+                (
+                    StreamKind::Project {
+                        input: Box::new(input),
+                        exprs,
+                    },
+                    names.clone(),
+                    exprs.iter().map(|e| e.dtype()).collect(),
+                )
+            }
+            LogicalPlan::Union {
+                left,
+                right,
+                distinct: false,
+                types,
+            } => {
+                let Some(left) = Stream::build(cx, left)? else {
+                    return Ok(None);
+                };
+                let Some(right) = Stream::build(cx, right)? else {
+                    return Ok(None);
+                };
+                let names = left.names.clone();
+                (
+                    StreamKind::Union {
+                        left: Box::new(left),
+                        right: Box::new(right),
+                        types,
+                        on_left: true,
+                    },
+                    names,
+                    types.to_vec(),
+                )
+            }
+            LogicalPlan::Limit { input, limit } => {
+                let Some(input) = Stream::build(cx, input)? else {
+                    return Ok(None);
+                };
+                let (names, types) = (input.names.clone(), input.types.clone());
+                (
+                    StreamKind::Limit {
+                        input: Box::new(input),
+                        remaining: *limit,
+                    },
+                    names,
+                    types,
+                )
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Stream {
+            kind,
+            names,
+            types,
+            pending: std::collections::VecDeque::new(),
+        }))
+    }
+
+    /// The next output chunk, or `None` when the input is exhausted.
+    fn next(&mut self, cx: &Cx) -> Result<Option<DataChunk>> {
+        let Stream { kind, pending, .. } = self;
+        if let Some(chunk) = pending.pop_front() {
+            return Ok(Some(chunk));
+        }
+        loop {
+            match kind {
+                StreamKind::Scan { plan, chunks } => {
+                    if chunks.is_none() {
+                        *chunks = Some(scan_output(cx, plan)?.chunks.into_iter());
+                    }
+                    return Ok(chunks.as_mut().and_then(|it| it.next()));
+                }
+                StreamKind::SingleRow(emitted) => {
+                    if *emitted {
+                        return Ok(None);
+                    }
+                    *emitted = true;
+                    return Ok(Some(DataChunk {
+                        columns: Vec::new(),
+                        num_rows: 1,
+                    }));
+                }
+                StreamKind::Filter { input, predicate } => {
+                    if pending.is_empty() {
+                        let batch = pull_batch(cx, input)?;
+                        if batch.is_empty() {
+                            return Ok(None);
+                        }
+                        let outs = batch
+                            .par_iter()
+                            .map(|chunk| filter_chunk(cx, predicate, chunk))
+                            .collect::<Result<Vec<_>>>()?;
+                        pending.extend(outs.into_iter().flatten());
+                        if pending.is_empty() {
+                            continue;
+                        }
+                    }
+                    return Ok(pending.pop_front());
+                }
+                StreamKind::Project { input, exprs } => {
+                    if pending.is_empty() {
+                        let batch = pull_batch(cx, input)?;
+                        if batch.is_empty() {
+                            return Ok(None);
+                        }
+                        let outs = batch
+                            .par_iter()
+                            .map(|chunk| project_chunk(cx, exprs, chunk))
+                            .collect::<Result<Vec<_>>>()?;
+                        pending.extend(outs);
+                    }
+                    return Ok(pending.pop_front());
+                }
+                StreamKind::Union {
+                    left,
+                    right,
+                    types,
+                    on_left,
+                } => {
+                    if *on_left {
+                        match left.next(cx)? {
+                            Some(chunk) => return Ok(Some(coerce_union_chunk(&chunk, types)?)),
+                            None => *on_left = false,
+                        }
+                    }
+                    match right.next(cx)? {
+                        Some(chunk) => return Ok(Some(coerce_union_chunk(&chunk, types)?)),
+                        None => return Ok(None),
+                    }
+                }
+                StreamKind::Limit { input, remaining } => {
+                    if *remaining == 0 {
+                        return Ok(None);
+                    }
+                    let Some(chunk) = input.next(cx)? else {
+                        return Ok(None);
+                    };
+                    let take = chunk.num_rows().min(*remaining);
+                    *remaining -= take;
+                    if take == chunk.num_rows() {
+                        return Ok(Some(chunk));
+                    }
+                    let sel: Vec<usize> = (0..take).collect();
+                    return Ok(Some(chunk.gather(&sel)));
+                }
+            }
+        }
+    }
+}
+
+/// Pull up to [`STREAM_BATCH`] chunks from `input`.
+fn pull_batch(cx: &Cx, input: &mut Stream<'_>) -> Result<Vec<DataChunk>> {
+    let mut batch = Vec::new();
+    while batch.len() < STREAM_BATCH {
+        match input.next(cx)? {
+            Some(chunk) => batch.push(chunk),
+            None => break,
+        }
+    }
+    Ok(batch)
+}
+
+/// Coerce one UNION input chunk to the union's common types, exactly like
+/// the materializing path (which coerces every chunk of both branches).
+fn coerce_union_chunk(chunk: &DataChunk, types: &[DataType]) -> Result<DataChunk> {
+    let mut cols = Vec::with_capacity(types.len());
+    for (col, t) in chunk.columns.iter().zip(types.iter()) {
+        cols.push(coerce_to(col, *t)?);
+    }
+    DataChunk::new(cols)
+}
+
+/// Output names/types of `plan` without evaluating it: the executor-side
+/// wrapper over the binder's schema inference (`binder::plan_schema`), which
+/// is the single source of truth for the shapes the executor produces.
+/// `LIMIT 0` returns an empty result whose header must still match, and a
+/// limit stream needs each scan's shape before it decodes anything.
+fn plan_schema_of(cx: &Cx, plan: &LogicalPlan) -> Result<(Vec<String>, Vec<DataType>)> {
+    let ctes: Vec<(String, Vec<(String, DataType)>)> = cx
+        .ctes
+        .iter()
+        .map(|(name, out)| {
+            (
+                name.clone(),
+                out.names
+                    .iter()
+                    .cloned()
+                    .zip(out.types.iter().copied())
+                    .collect(),
+            )
+        })
+        .collect();
+    let schema = crate::sql::binder::plan_schema(cx.db, cx.db.current_db(), &ctes, plan)?;
+    Ok(schema.into_iter().unzip())
 }
 
 #[cfg(test)]
@@ -6665,6 +7164,10 @@ mod tests {
             ]
         );
         // Right-side group keys: bare column and a shifted scalar function.
+        // fb (6 rows) estimates larger than fa (5 rows), so the join hashes
+        // fa and probes fb: groups appear in fb-row order (SQL does not fix
+        // GROUP BY order; this is the engine's first-seen order for the
+        // probe side).
         assert_eq!(
             select(
                 &mut db,
@@ -6673,8 +7176,8 @@ mod tests {
             ),
             vec![
                 vec![V::Varchar("W1".to_string()), V::Bigint(2), V::Bigint(10)],
-                vec![V::Varchar("W2".to_string()), V::Bigint(2), V::Bigint(10)],
                 vec![V::Varchar("E1".to_string()), V::Bigint(2), V::Bigint(5)],
+                vec![V::Varchar("W2".to_string()), V::Bigint(2), V::Bigint(10)],
                 vec![V::Varchar("E2".to_string()), V::Bigint(2), V::Bigint(5)],
             ]
         );
@@ -6686,8 +7189,8 @@ mod tests {
             ),
             vec![
                 vec![V::Varchar("W1".to_string()), V::Bigint(2)],
-                vec![V::Varchar("W2".to_string()), V::Bigint(2)],
                 vec![V::Varchar("E1".to_string()), V::Bigint(2)],
+                vec![V::Varchar("W2".to_string()), V::Bigint(2)],
                 vec![V::Varchar("E2".to_string()), V::Bigint(2)],
             ]
         );
@@ -7678,5 +8181,415 @@ mod tests {
         db.execute("DROP DATABASE db1;").unwrap();
         assert!(db.execute("SELECT * FROM db1.v;").is_err());
         assert!(db.execute("SELECT * FROM db1.t;").is_err());
+    }
+
+    // --- projection pushdown, LIMIT streaming, join build-side choice ---
+
+    /// A wide store table: five columns, several chunks, NULLs and both
+    /// repeating and unique values.
+    fn wide_table() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE w (a INTEGER, b BIGINT, c DOUBLE, s VARCHAR, f BOOLEAN);")
+            .unwrap();
+        {
+            let t = db.table_mut("w").unwrap();
+            for i in 0..(3 * crate::vector::CHUNK_SIZE + 9) {
+                let i = i as i64;
+                t.append_row(vec![
+                    if i % 17 == 0 {
+                        V::Null
+                    } else {
+                        V::Integer((i % 100) as i32)
+                    },
+                    V::Bigint(i * 7 - 30),
+                    if i % 23 == 0 {
+                        V::Null
+                    } else {
+                        V::Double(i as f64 * 0.25)
+                    },
+                    V::Varchar(format!("v{}", i % 11)),
+                    V::Boolean(i % 2 == 0),
+                ])
+                .unwrap();
+            }
+        }
+        db
+    }
+
+    /// Every row of an `Output` (present columns only; a projected scan's
+    /// placeholders are never part of a top-level result).
+    fn output_rows(out: &Output) -> Vec<Vec<V>> {
+        let mut rows = Vec::new();
+        for chunk in &out.chunks {
+            for i in 0..chunk.num_rows() {
+                rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+            }
+        }
+        rows
+    }
+
+    /// The join node of a bound plan (through the SELECT's wrappers).
+    fn join_node(plan: &LogicalPlan) -> &LogicalPlan {
+        match plan {
+            LogicalPlan::Join { .. } => plan,
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. } => join_node(input),
+            other => panic!("no join in plan: {other:?}"),
+        }
+    }
+
+    /// Projected store chunks: referenced columns share the stored vectors,
+    /// unreferenced ones become shared zero-length placeholders, an empty
+    /// projection still materializes column 0, and out-of-range indices fall
+    /// back to a full scan.
+    #[test]
+    fn store_scan_projection_shares_and_placeholders() {
+        let db = wide_table();
+        let t = db.table("w").unwrap();
+        assert!(t.num_chunks() > 2, "the corpus must span chunks");
+        let rows = t.num_rows();
+        let stored = t.scan_chunk(0).unwrap();
+
+        let chunks = project_scan_chunks(t, &[2]);
+        assert_eq!(chunks.len(), t.num_chunks());
+        assert_eq!(chunks.iter().map(|c| c.num_rows()).sum::<usize>(), rows);
+        let c = &chunks[0];
+        assert_eq!(c.num_rows(), stored.num_rows());
+        assert!(c.is_present(2));
+        for i in [0usize, 1, 3, 4] {
+            assert!(!c.is_present(i), "column {i} must be absent");
+            assert_eq!(c.columns[i].len(), 0, "column {i} is a placeholder");
+        }
+        assert!(std::sync::Arc::ptr_eq(&c.columns[2], &stored.columns[2]));
+        // One shared placeholder per absent column, across all chunks.
+        let c2 = &chunks[1];
+        assert!(std::sync::Arc::ptr_eq(&c.columns[0], &c2.columns[0]));
+
+        // An empty projection still materializes column 0 (chunk shape).
+        let empty = project_scan_chunks(t, &[]);
+        assert!(empty[0].is_present(0));
+        assert!(!empty[0].is_present(1));
+
+        // A full projection returns the stored chunks unchanged.
+        let full = project_scan_chunks(t, &[0, 1, 2, 3, 4]);
+        assert!(full[0].is_present(0));
+        assert!(std::sync::Arc::ptr_eq(
+            &full[0].columns[3],
+            &stored.columns[3]
+        ));
+
+        // Out-of-range indices fall back to a full scan.
+        let oob = project_scan_chunks(t, &[9]);
+        assert!(oob[0].is_present(4));
+    }
+
+    /// The in-memory projection changes nothing: evaluating a query with the
+    /// per-statement projection bound produces the same names, types, and
+    /// rows (order and values included) as evaluating it without one.
+    #[test]
+    fn in_memory_projection_matches_unbounded_evaluation() {
+        let db = wide_table();
+        let queries = [
+            "SELECT a FROM w;",
+            "SELECT c, s FROM w WHERE a > 0;",
+            "SELECT COUNT(*), SUM(c), MIN(s), MAX(b) FROM w;",
+            "SELECT a, COUNT(*) FROM w GROUP BY a;",
+            "SELECT DISTINCT s FROM w;",
+            "SELECT s FROM w ORDER BY c LIMIT 20;",
+            "SELECT a, ROW_NUMBER() OVER (PARTITION BY f ORDER BY c) AS rn FROM w;",
+            "SELECT 1 FROM w;",
+            "SELECT a FROM w LIMIT 5;",
+            "SELECT MAX(c) FROM (SELECT b, c FROM w) x;",
+            "WITH x AS (SELECT a, s FROM w) SELECT COUNT(*) FROM x;",
+            "SELECT a FROM w UNION ALL SELECT a FROM w;",
+            "SELECT x.a, y.s FROM w x JOIN w y ON x.a = y.a;",
+            "SELECT COUNT(*) FROM w WHERE f AND c > 10.0;",
+            "SELECT s FROM w WHERE b IN (SELECT b FROM w LIMIT 3);",
+        ];
+        for sql in queries {
+            let plan = bound_plan(&db, sql);
+            let full = eval(&Cx::new(&db), &plan).unwrap();
+            let projected = eval(&Cx::new(&db).with_projections(&plan), &plan).unwrap();
+            assert_eq!(full.names, projected.names, "{sql}");
+            assert_eq!(full.types, projected.types, "{sql}");
+            assert_eq!(output_rows(&full), output_rows(&projected), "{sql}");
+        }
+    }
+
+    /// The LIMIT stream is interchangeable with the materializing path:
+    /// streaming a plan and truncating its full evaluation agree on names,
+    /// types, and every row.
+    #[test]
+    fn limit_stream_equals_materialized_truncation() {
+        let db = wide_table();
+        let queries = [
+            "SELECT a FROM w LIMIT 0;",
+            "SELECT a FROM w LIMIT 1;",
+            "SELECT a, c FROM w WHERE a > 0 LIMIT 100;",
+            "SELECT a FROM w LIMIT 100000;",
+            "SELECT s FROM w WHERE f LIMIT 3;",
+            "SELECT a FROM w ORDER BY c DESC LIMIT 5;",
+            "SELECT a FROM w UNION ALL SELECT b FROM w LIMIT 7;",
+            "SELECT a FROM w WHERE f LIMIT 2;",
+            "SELECT CAST(c AS BIGINT) FROM w ORDER BY b LIMIT 9;",
+        ];
+        for sql in queries {
+            let plan = bound_plan(&db, sql);
+            let LogicalPlan::Limit { input, limit } = &plan else {
+                panic!("{sql}: expected a Limit root");
+            };
+            let cx = Cx::new(&db).with_projections(&plan);
+            let streamed = eval(&cx, &plan).unwrap();
+            let materialized = truncate_output(eval(&cx, input).unwrap(), *limit);
+            assert_eq!(streamed.names, materialized.names, "{sql}");
+            assert_eq!(streamed.types, materialized.types, "{sql}");
+            assert_eq!(output_rows(&streamed), output_rows(&materialized), "{sql}");
+        }
+    }
+
+    /// The LIMIT stream stops pulling once the requested rows exist: a value
+    /// that would error is never touched when it lies beyond the pulled
+    /// batches, and LIMIT 0 never evaluates its input at all.
+    #[test]
+    fn limit_stream_stops_before_later_chunks() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (s VARCHAR);").unwrap();
+        let chunks = 8;
+        {
+            let t = db.table_mut("t").unwrap();
+            for i in 0..(chunks * crate::vector::CHUNK_SIZE) {
+                let s = if i < (chunks - 1) * crate::vector::CHUNK_SIZE {
+                    "1"
+                } else {
+                    "x"
+                };
+                t.append_row(vec![V::Varchar(s.to_string())]).unwrap();
+            }
+        }
+        // LIMIT 0: nothing is cast at all (and the header still matches).
+        assert!(select(&mut db, "SELECT CAST(s AS INTEGER) FROM t LIMIT 0;").is_empty());
+        assert_eq!(
+            select_meta(&mut db, "SELECT CAST(s AS INTEGER) FROM t LIMIT 0;"),
+            select_meta(&mut db, "SELECT CAST(s AS INTEGER) FROM t LIMIT 1;")
+        );
+        // LIMIT 1 stops inside the first batch; the last chunk's "x" is
+        // never cast.
+        assert_eq!(
+            select(&mut db, "SELECT CAST(s AS INTEGER) FROM t LIMIT 1;"),
+            vec![vec![V::Integer(1)]]
+        );
+        // Without a limit, the bad value surfaces.
+        assert!(db.execute("SELECT CAST(s AS INTEGER) FROM t;").is_err());
+    }
+
+    /// The estimation rule, node by node (no statistics — shapes only).
+    #[test]
+    fn row_estimates_are_shape_based() {
+        let db = wide_table();
+        let cx = Cx::new(&db);
+        let rows = db.table("w").unwrap().num_rows() as u64;
+        let scan = LogicalPlan::Scan {
+            db: Some(db.current_db().to_string()),
+            table: "w".to_string(),
+        };
+        assert_eq!(estimate_rows(&cx, &scan), Some(rows));
+        assert_eq!(
+            estimate_rows(
+                &cx,
+                &LogicalPlan::Limit {
+                    input: Box::new(scan.clone()),
+                    limit: 3,
+                }
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            estimate_rows(
+                &cx,
+                &LogicalPlan::Limit {
+                    input: Box::new(scan.clone()),
+                    limit: usize::MAX,
+                }
+            ),
+            Some(rows)
+        );
+        assert_eq!(
+            estimate_rows(
+                &cx,
+                &LogicalPlan::Filter {
+                    input: Box::new(scan.clone()),
+                    predicate: BoundExpr::Literal(Value::Boolean(true)),
+                }
+            ),
+            Some(rows),
+            "a filter's selectivity is unknown: estimated at 1.0"
+        );
+        assert_eq!(
+            estimate_rows(
+                &cx,
+                &LogicalPlan::Union {
+                    left: Box::new(scan.clone()),
+                    right: Box::new(scan.clone()),
+                    distinct: false,
+                    types: Vec::new(),
+                }
+            ),
+            Some(2 * rows)
+        );
+        assert_eq!(estimate_rows(&cx, &LogicalPlan::SingleRow), Some(1));
+        assert_eq!(
+            estimate_rows(
+                &cx,
+                &LogicalPlan::Aggregate {
+                    input: Box::new(scan.clone()),
+                    keys: Vec::new(),
+                    aggs: Vec::new(),
+                }
+            ),
+            None
+        );
+        // Unknown tables are unknown, never an error.
+        assert_eq!(
+            estimate_rows(
+                &cx,
+                &LogicalPlan::Scan {
+                    db: Some("main".to_string()),
+                    table: "nope".to_string(),
+                }
+            ),
+            None
+        );
+    }
+
+    /// The inner-join build side follows the row-count estimate: the hash
+    /// table is built on the smaller side (left here) and the other side
+    /// probes, in its own row order. Ties, unknown estimates, and outer
+    /// joins keep the historical build-on-right/probe-preserved sides.
+    #[test]
+    fn inner_join_builds_the_estimated_smaller_side() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE small (k INTEGER, lv VARCHAR);")
+            .unwrap();
+        db.execute("CREATE TABLE big (k INTEGER, rv VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO small VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+        db.execute("INSERT INTO big VALUES (1, 'x'), (2, 'y'), (3, 'z'), (1, 'p'), (2, 'q');")
+            .unwrap();
+        let plan = bound_plan(&db, "SELECT lv, rv FROM small JOIN big ON small.k = big.k;");
+        let LogicalPlan::Join {
+            left, right, kind, ..
+        } = join_node(&plan)
+        else {
+            unreachable!()
+        };
+        assert_eq!(*kind, JoinKind::Inner);
+        assert!(
+            build_on_left(&Cx::new(&db), *kind, left, right),
+            "2 rows < 5 rows"
+        );
+        // Probe-side (big) row order: (1,x), (2,y), (1,p), (2,q).
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT lv, rv FROM small JOIN big ON small.k = big.k;"
+            ),
+            vec![
+                vec![V::Varchar("a".to_string()), V::Varchar("x".to_string())],
+                vec![V::Varchar("b".to_string()), V::Varchar("y".to_string())],
+                vec![V::Varchar("a".to_string()), V::Varchar("p".to_string())],
+                vec![V::Varchar("b".to_string()), V::Varchar("q".to_string())],
+            ]
+        );
+
+        db.execute("INSERT INTO small VALUES (3, 'c'), (4, 'd'), (5, 'e');")
+            .unwrap();
+        let plan = bound_plan(&db, "SELECT lv, rv FROM small JOIN big ON small.k = big.k;");
+        let LogicalPlan::Join {
+            left, right, kind, ..
+        } = join_node(&plan)
+        else {
+            unreachable!()
+        };
+        let cx = Cx::new(&db);
+        assert_eq!(estimate_rows(&cx, left), Some(5));
+        assert_eq!(estimate_rows(&cx, right), Some(5));
+        assert!(
+            !build_on_left(&cx, *kind, left, right),
+            "5 = 5 → build on the right"
+        );
+
+        let plan = bound_plan(
+            &db,
+            "SELECT lv, rv FROM small LEFT JOIN big ON small.k = big.k;",
+        );
+        let LogicalPlan::Join {
+            left, right, kind, ..
+        } = join_node(&plan)
+        else {
+            unreachable!()
+        };
+        assert_eq!(*kind, JoinKind::Left);
+        assert!(
+            !build_on_left(&cx, *kind, left, right),
+            "outer joins keep the preserved side probing"
+        );
+
+        // A subquery side (an aggregate's output is unknown) is
+        // conservative: build on the right.
+        let plan = bound_plan(
+            &db,
+            "SELECT lv, COUNT(*) FROM (SELECT k FROM big GROUP BY k) g \
+             JOIN small s ON g.k = s.k GROUP BY lv;",
+        );
+        let LogicalPlan::Join {
+            left, right, kind, ..
+        } = join_node(&plan)
+        else {
+            unreachable!()
+        };
+        assert_eq!(estimate_rows(&cx, left), None);
+        assert!(!build_on_left(&cx, *kind, left, right));
+    }
+
+    /// The fused join→aggregate path uses the same build side as the
+    /// materialized path (fa is smaller than fb), so group order and exact
+    /// values agree.
+    #[test]
+    fn fused_build_side_matches_materialized() {
+        let db = fused_db();
+        let sql = "SELECT fb.region, COUNT(*), SUM(fa.x) \
+                   FROM fa JOIN fb ON fa.id = fb.id GROUP BY fb.region;";
+        let plan = bound_plan(&db, sql);
+        let LogicalPlan::Aggregate { input, keys, aggs } = top_aggregate(&plan) else {
+            unreachable!()
+        };
+        let LogicalPlan::Join {
+            left, right, kind, ..
+        } = &**input
+        else {
+            unreachable!()
+        };
+        let cx = Cx::new(&db);
+        assert!(
+            build_on_left(&cx, *kind, left, right),
+            "fa (5 rows) is smaller than fb (6): probe fb"
+        );
+        let fused = fused_join_aggregate(&cx, input, keys, aggs)
+            .unwrap()
+            .expect("fa/fb fuse");
+        let inner = eval(&cx, input).unwrap();
+        let materialized = aggregate(&cx, &inner.chunks, keys, aggs).unwrap();
+        let rows = |chunks: &[DataChunk]| -> Vec<Vec<Value>> {
+            let mut rows = Vec::new();
+            for c in chunks {
+                for i in 0..c.num_rows() {
+                    rows.push(c.columns.iter().map(|col| col.get(i)).collect());
+                }
+            }
+            rows
+        };
+        assert_eq!(rows(&fused.chunks), rows(&materialized));
     }
 }
