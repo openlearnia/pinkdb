@@ -1226,7 +1226,8 @@ s3curl -fsS --max-time 30 -X PUT --data-binary 'not a manifest' \
 ok "planted stray refuse/snapshots/4.json"
 
 { echo ".lake save $REFUSE"; echo ".quit"; } | cli_run "$TMP/refuse_stray.log"
-assert_status_zero "$TMP/refuse_stray.log" "$?"
+# The refusal is the expected outcome: since wave 40b the CLI exits 1 after a
+# failed statement in a piped script; the message asserts below pin it.
 assert_contains "$TMP/refuse_stray.log" "Error: write conflict at"
 assert_contains "$TMP/refuse_stray.log" "snapshot 4 already exists"
 assert_contains "$TMP/refuse_stray.log" "refusing to replace a published version"

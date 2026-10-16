@@ -513,28 +513,30 @@ impl<'a> Reader<'a> {
     fn i32_vec(&mut self, n: usize) -> Result<Vec<i32>> {
         let bytes = self.take(n * 4)?;
         Ok(bytes
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| i32::from_le_bytes(*c))
             .collect())
     }
 
     fn i64_vec(&mut self, n: usize) -> Result<Vec<i64>> {
         let bytes = self.take(n * 8)?;
         Ok(bytes
-            .chunks_exact(8)
-            .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| i64::from_le_bytes(*c))
             .collect())
     }
 
     fn f64_vec(&mut self, n: usize) -> Result<Vec<f64>> {
         let bytes = self.take(n * 8)?;
         Ok(bytes
-            .chunks_exact(8)
-            .map(|c| {
-                f64::from_bits(u64::from_le_bytes([
-                    c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
-                ]))
-            })
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_bits(u64::from_le_bytes(*c)))
             .collect())
     }
 }
@@ -662,8 +664,10 @@ fn decode_validity(bytes: &[u8], n: usize) -> Result<Vec<u64>> {
         ));
     }
     Ok(bytes
-        .chunks_exact(8)
-        .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
         .collect())
 }
 
