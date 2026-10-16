@@ -93,7 +93,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Lake-scan plan (lake workstream, sub-waves 45b–45k) and the multi-process
+Lake-scan plan (lake workstream, sub-waves 45b–45p) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
 `.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize; stage 2
 shipped as 45e — projection pushdown (an attached scan decodes only the columns a query
@@ -110,7 +110,11 @@ order-by/group-by items. Durability: 45m made durable `.pink` databases multi-pr
 shipped the stability-hardening round — chaos-soak exactly-once evidence under SIGKILL,
 lock-file identity that fails closed on replacement, WAL fuzzing and gap closures (details
 in the progress log below). CI is fully green as of run 38875669660 (all nine jobs),
-unblocked by the dd53f41…a837896 saga.
+unblocked by the dd53f41…a837896 saga. Stage 5 — optimistic disjoint-table commits —
+is in progress as **45o**, and **45p (queued): pink-lake encryption/decryption at
+rest** — one Argon2id KDF per lake session (salt in the catalog), AEAD containers for
+the catalog/snapshots and the data files, `PINKDB_KEY` UX consistent with the engine,
+plaintext lakes unaffected.
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
