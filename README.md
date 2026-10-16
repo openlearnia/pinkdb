@@ -333,6 +333,12 @@ corrupt its framing and, encrypted, could reuse a `(key, nonce)`): per
 operation rather than per open, but still impossible rather than a
 convention.
 
+Wave 45n verified these guarantees under chaos: a SIGKILL soak (300 s runs,
+hundreds of worker processes) commits exactly-once — every acknowledged unit
+survives exactly once — and a deleted or replaced lock file now fails closed
+at every lease acquisition, wait and mutation boundary, with the residual
+check-then-write window documented in the code.
+
 The WAL is bounded: `CHECKPOINT` (SQL, any front-end — server, FFI,
 bindings; a no-op in memory, refused inside a transaction) persists the store
 and rolls the WAL, and a committed write checkpoints automatically once the
@@ -1702,7 +1708,8 @@ the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 widths > 56). Durable `.pink` databases became multi-process in wave 45m — a
 per-operation write lease, lock-free epoch refresh, WAL v3 and encrypted
 container v2 — with stage 5 (optimistic disjoint-table commits) deferred and
-a stability-hardening wave in progress. Remaining lake follow-ups (not
+the stability-hardening round shipped as wave 45n (chaos soak, lock-file
+identity, WAL fuzz). Remaining lake follow-ups (not
 committed): projection pushdown for `.pink`, per-chunk statistics +
 filter/zone pruning (stage 3), and the parked cold order-by/group-by items.
 Authentication and TLS are deferred.
@@ -1746,12 +1753,15 @@ only:
 
 ### Required repository secrets
 
-Set both under *Settings → Secrets and variables → Actions*:
+Set both under *Settings → Secrets and variables → Actions*. Two names are
+accepted for each — `CF_API_TOKEN` / `CF_ACCOUNT_ID` (tried first; used by this
+repository's organization) or `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`
+(the fallback):
 
 | Secret | Value | Used by |
 |---|---|---|
-| `CLOUDFLARE_API_TOKEN` | a Cloudflare API token scoped to **Workers Scripts: Edit** (docs Worker) and **R2: Edit** (extension artifact + catalog uploads) | `deploy-docs.yml`, `publish-extensions.yml` |
-| `CLOUDFLARE_ACCOUNT_ID` | the account that owns the `pinkdb-docs` / `pinkdb-ext-repo` Workers and the `pinkdb-extensions` R2 bucket (find it in the Cloudflare dashboard); store it as a secret, never in the repository | same |
+| `CF_API_TOKEN` (or `CLOUDFLARE_API_TOKEN`) | a Cloudflare API token scoped to **Workers Scripts: Edit** (docs Worker) and **R2: Edit** (extension artifact + catalog uploads) | `deploy-docs.yml`, `publish-extensions.yml` |
+| `CF_ACCOUNT_ID` (or `CLOUDFLARE_ACCOUNT_ID`) | the account that owns the `pinkdb-docs` / `pinkdb-ext-repo` Workers and the `pinkdb-extensions` R2 bucket (find it in the Cloudflare dashboard); store it as a secret, never in the repository | same |
 
 ### Publishing extensions by hand
 
@@ -1778,4 +1788,9 @@ here. Locally we lint every workflow with `actionlint`, parse them as YAML, and
 run the individual commands they execute (the docs build, the SDK smokes, the
 wasm build, `bench/duckdiff.py`, the binding suites, and the publish workflow's
 discovery/report steps against the live catalog) by hand; the first GitHub run
-of a workflow is the real gate.
+of a workflow is the real gate. That gate is now passed: run
+[38875669660](https://github.com/openlearnia/pinkdb/actions/runs/38875669660)
+(2026-10-16) is the first fully green CI run — all nine jobs, including the
+SIGKILL kill loops, the wasm check, the release build and the DuckDB
+differential job — and the separate Deploy docs workflow is green too (the
+site is deployed).

@@ -93,7 +93,8 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Lake-scan plan (lake workstream, sub-waves 45b–45k): stage 1 shipped as 45d — footer-only
+Lake-scan plan (lake workstream, sub-waves 45b–45k) and the multi-process
+durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
 `.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize; stage 2
 shipped as 45e — projection pushdown (an attached scan decodes only the columns a query
 references); stage 3 (per-chunk statistics + filter/zone-map pruning) is the remaining
@@ -104,7 +105,12 @@ published in the manifest on every lean save, so `COUNT`/`MIN`/`MAX` are answere
 data-file reads under the same exactness gates as the Vortex attach. Known follow-ups (not
 committed): lean projection pushdown (`.pink` has no projected reader — a fallback decodes
 the whole table), per-chunk statistics + filter/zone pruning (stage 3), and the parked cold
-order-by/group-by items.
+order-by/group-by items. Durability: 45m made durable `.pink` databases multi-process
+(per-operation write lease, lock-free epoch refresh, WAL v3, encrypted container v2); 45n
+shipped the stability-hardening round — chaos-soak exactly-once evidence under SIGKILL,
+lock-file identity that fails closed on replacement, WAL fuzzing and gap closures (details
+in the progress log below). CI is fully green as of run 38875669660 (all nine jobs),
+unblocked by the dd53f41…a837896 saga.
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -572,3 +578,37 @@ Java bindings.
   deferred; an old *binary* was not executed against a v3 WAL (refusal by construction, the
   version path is tested). A follow-up stability-hardening wave (chaos soak, fuzzing, gap
   closures) is in progress.
+- 2026-10-16 — CI unblocked (dd53f41…a837896): first fully green CI run (38875669660; all
+  nine jobs, incl. the kill loops, wasm check, release build and the DuckDB differential
+  job). The saga: lake fixture data files had been silently excluded by `.gitignore`
+  (`*.pink`) since the wave-45i fixtures — 18 fixture files committed and the ignore
+  negated; the Python bindings test still asserted the pre-45m single-live-handle lock —
+  rewritten for multi-process semantics; `cargo audit`: rustls 0.23.45 advisories →
+  0.23.46; deploy docs: the workflow read `CLOUDFLARE_*` secrets but the org provides
+  `CF_API_TOKEN` / `CF_ACCOUNT_ID` — both names accepted now (Deploy docs green, site
+  deployed); the S3 docker harness: four stale pre-wave-40b exit-code expectations
+  (race losers and an intentional refusal are supposed to exit 1) were replaced with
+  outcome-based checks (per-outcome exit codes + documented-conflict message matching);
+  Linux `pwrite` on `O_APPEND`: WAL commit-slot hint writes had been appending to EOF on
+  Linux (macOS honours the offset), failing five WAL tests only on CI — `publish()` now
+  uses a positioned handle (reproduced and verified in a Linux Docker container); the new
+  stable-clippy lint `chunks_exact_to_as_chunks` (×5 workspace-wide) → `as_chunks`; kill
+  loops: a step-level `PINKDB_KEY` made the plain runs write encrypted checkpoints the
+  non-crypto binary could not reopen — the key is scoped to the encrypted invocation and
+  `bench/kill_loop.py` now strips it from plain children (its `--encrypted` env assignment
+  had been a no-op local).
+- 2026-10-16 — Wave 45n (6d227ec): multi-process stability hardening. Chaos soak
+  `bench/mp_soak.py` (ack-authoritative writers — a unit is acknowledged only when its own
+  success output appears with no Error line; kill-stuck detection, fd/RSS sampling,
+  fresh-process exactly-once verification): 300 s default (272 workers, 180 kills, 31,836
+  acked units) and 300 s encrypted (194 workers, 184 kills, 3,739 units) both verified
+  exact; 15 s CI modes exact; no leaks. Lock-file identity robustness (dev/ino checks at
+  every acquisition/wait/mutation boundary; fails closed; residual TOCTOU documented). WAL
+  fuzz (every-offset truncation + byte flips) found and fixed a real bug: a single-bit
+  v3→v2 version-word flip took the legacy-upgrade path and silently dropped all records —
+  now refused via the corrected-header CRC (regression test). Gap closures: real-extension
+  replay, attached lakes across rebuild, save_snapshot vs a real process, epoch fast-path
+  counters. Contention: 20 processes, busy 0, perfect fairness, no livelock. Perf within
+  noise (≤3% budget). Gates: 574 workspace / 424 encryption / 82+57 CLI / 132 pink-lake /
+  duckdiff 60/60 / multiprocess 17/17 + Linux Docker (lib 386, encryption 403,
+  multiprocess 17/17).
