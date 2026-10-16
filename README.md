@@ -1078,8 +1078,9 @@ NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP; `DataType` tag byte), then
 `BatchDone { statements }` frame and the client reads result groups until it,
 so neither side parses SQL just to count statements. A failing statement ends
 the batch with a single `Error { message }` instead; SQL errors arrive as
-`Error` frames and the connection stays open. The protocol version is 3
-(v3 added the `Done` kind `LoadedExtension` for `LOAD EXTENSION`).
+`Error` frames and the connection stays open. The protocol version is 4
+(v4 added the `Done` kind `Checkpointed` for `CHECKPOINT`; v3 added
+`LoadedExtension` for `LOAD EXTENSION`).
 
 The client (`pinkdb_server::Client`) reconstructs pinkdb's public
 `QueryResult`/`Value`/`DataType`, so the CLI renders remote results with the
