@@ -165,14 +165,16 @@ fn payload_start(data: &[u8]) -> usize {
     pos + 30 + 16
 }
 
-/// Where a (container v2) encrypted WAL's records begin: the publish block
-/// (wal_id + CRC + two commit slots) sits between the header and the records.
+/// Where an encrypted WAL's records begin: the publish block (wal_id + CRC +
+/// two commit slots) sits between the header and the records.
 fn wal_records_start(data: &[u8]) -> usize {
-    // The container version is the u32 at 8..12; v2 WALs carry the block.
-    assert_eq!(
-        u32::from_le_bytes(data[8..12].try_into().unwrap()),
-        2,
-        "wave-45m WALs are container v2"
+    // The container version is the u32 at 8..12; WAL containers carry the
+    // block since v2 (wave 45m) and are written as v3 since wave 45o (the
+    // payload gained the per-frame touched sets). Checkpoints stay v2.
+    let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    assert!(
+        (2..=3).contains(&version),
+        "WAL containers are v2 or v3, got {version}"
     );
     payload_start(data) + 88
 }

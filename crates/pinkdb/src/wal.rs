@@ -3,30 +3,42 @@
 //! For `<path>.pink` the log is a sidecar `<path>.pink.wal`:
 //!
 //! ```text
-//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=3)
+//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=4)
 //!          + generation u64 + wal_id [16] + crc32(0..36) u32
 //!          + commit slot A (24 bytes) + commit slot B (24 bytes)
 //!          + reserved zero u32×2
 //! record:  payload_len u32 | lsn u64 | crc32(payload) u32 | payload
-//! payload: stmt_count u32 | per statement: len u32 + UTF-8 SQL text
+//! payload: stmt_count u32 | sets_len u32 | sets | per statement: len u32 + UTF-8 SQL text
+//! sets:    format u8 (=1) | table_count u32 | (db_len u16 + db, name_len u16 + name)*
+//!          | db_count u32 | (db_len u16 + db)*
 //! ```
 //!
 //! Version 3 (wave 45m) adds `wal_id` (a fresh 16-byte incarnation id per
 //! file creation, the ABA guard across checkpoints) and the dual 24-byte
-//! commit slots that publish the committed LSN. Version 2 WALs are accepted
-//! and upgraded in place under the write lease; older builds refuse version 3
-//! cleanly through the existing `BadVersion` path.
+//! commit slots that publish the committed LSN. Version 4 (wave 45o) adds
+//! the frame's **touched set** ([`FrameSets`]): every catalog table the
+//! frame's statements read or wrote (plus databases its `CREATE/DROP
+//! DATABASE` names), cleared to `sets_len = u32::MAX` for legacy records an
+//! upgrade adopted. Version 2/3 WALs are accepted and upgraded in place under
+//! the write lease (records are re-encoded with unknown sets); older builds
+//! refuse version 4 cleanly through the `BadVersion` path before reading any
+//! record. Encrypted **WAL** containers are version 3; encrypted checkpoints
+//! stay at container version 2, so `.pink` bytes are unchanged by this wave.
 //!
-//! # Multi-process access (wave 45m)
+//! # Multi-process access (wave 45m) and optimistic commits (wave 45o)
 //!
 //! Any number of local processes may open a durable database. Mutual
 //! exclusion is a per-operation **write lease**: an exclusive `flock` on
-//! `<path>.pink.lock` taken for `[refresh → execute → append → fsync →
-//! publish]` (writes, whole transactions, checkpoints, recovery) or just
-//! `[refresh]` (readers whose lock-free epoch precheck says the on-disk state
-//! advanced). Inside one process a refcounted gate shares the fd's lock,
-//! because `flock` locks are per open file description; in-process mutations
-//! stay serialized by the store lock and the Wal mutex exactly as before. The lock
+//! `<path>.pink.lock` taken for the mutation spans (append/fsync/publish,
+//! whole checkpoints, recovery, refresh) or just `[refresh]` (readers whose
+//! lock-free epoch precheck says the on-disk state advanced). Since wave 45o
+//! the lease is **not** held across statement or transaction *execution*:
+//! an autocommit write executes without it and takes the lease only for
+//! `[validate → apply others' frames → append → publish]`, and `BEGIN` takes
+//! it only for the initial refresh. Inside one process a refcounted gate
+//! shares the fd's lock, because `flock` locks are per open file
+//! description; in-process mutations stay serialized by the store lock and
+//! the Wal mutex exactly as before. The lock
 //! file's first 48 bytes carry two epoch slots (dual slots + CRC); every lease
 //! holder that changed something a reader must notice bumps one slot, and
 //! readers compare a cached value with one `pread` (a read error or an
@@ -46,6 +58,23 @@
 //! Checkpoints refresh first under the lease, so a checkpoint can never
 //! publish a state that omits another process's committed records.
 //!
+//! **Commit validation (wave 45o).** A unit committing at base
+//! `(wal_id, generation, applied LSN, checkpoint identity)` may commit iff
+//! the incarnation is unchanged and **no frame recorded after the base
+//! touches a table the unit read or wrote** (frames carry their touched set,
+//! so validation never has to re-bind another writer's SQL against a store
+//! that may hold uncommitted state). The applied journal
+//! (a pruned `Vec` of `(lsn, touched set)` entries, emptied when nothing is
+//! open) records the sets of frames this process applied or appended since
+//! the last full reload; the pairs written by others are scanned from the
+//! applied position. A conflict names
+//! the object and the frame's LSN — the WAL position is the cross-process
+//! "version": `DataTable::version` is process-local and never persisted, so
+//! it cannot be compared across writers. Clean commits apply the frames that
+//! arrived for other tables, then append; conflicts leave the store exactly
+//! as it was (the caller aborts the transaction, or rebuilds and
+//! re-executes an autocommit statement under the held lease).
+//!
 //! One record = one committed transaction unit: an autocommit statement logs
 //! individually; `BEGIN … COMMIT` logs all of the transaction's mutating
 //! statements as one record at `COMMIT` (a `ROLLBACK`, or a write-conflict
@@ -53,7 +82,8 @@
 //! re-executed, which is deterministic in v1 (no random()/now()). Because
 //! replay re-executes SQL text, a durable commit is refused when its bound
 //! plan depends on a session-local view (views are never persisted, so replay
-//! could not rebuild it).
+//! could not rebuild it) — and a writing transaction's reads participate in
+//! commit validation for the same reason.
 //!
 //! Durability policy ([`SyncPolicy`]): `Sync` fsyncs after every record,
 //! `Batch` leaves records in the page cache and fsyncs on
@@ -168,19 +198,24 @@ use crate::types::{PinkDbError, Result};
 
 pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
 /// On-disk format version. Version 2 added the generation to the header;
-/// version 3 (wave 45m) adds `wal_id` and the dual commit slots, and is
-/// written by every durable open (version 2 files are upgraded in place
-/// under the write lease).
-pub const WAL_VERSION: u32 = 3;
+/// version 3 (wave 45m) adds `wal_id` and the dual commit slots; version 4
+/// (wave 45o) extends the record payload with the frame's touched-object set
+/// (see [`FrameSets`]), which is what optimistic multi-writer commits
+/// validate against. Every durable open rewrites legacy files in place under
+/// the write lease; an older build refuses a v4 file with a clean
+/// version error before it reads any record.
+pub const WAL_VERSION: u32 = 4;
+/// The wave-45m plaintext version (no per-frame sets): upgraded at open.
+const WAL_VERSION_V3: u32 = 3;
 /// The pre-multi-process plaintext version, accepted and upgraded at open.
 const WAL_VERSION_V2: u32 = 2;
-/// v3 plaintext header: magic(8) + version(4) + gen(8) + wal_id(16) +
+/// v3/v4 plaintext header: magic(8) + version(4) + gen(8) + wal_id(16) +
 /// crc32(0..36)(4) + slot A(24) + slot B(24) + reserved(8).
 pub(crate) const HEADER_LEN: usize = 96;
-/// Where records begin in a v3 plaintext WAL (== `HEADER_LEN`).
+/// Where records begin in a v3/v4 plaintext WAL (== `HEADER_LEN`).
 pub(crate) const RECORDS_START: usize = HEADER_LEN;
-/// Where records begin in a v2 plaintext WAL (record bytes are preserved by
-/// the upgrade).
+/// Where records begin in a v2 plaintext WAL (records are re-encoded by the
+/// upgrade).
 const V2_RECORDS_START: usize = 20;
 const RECORD_HEADER_LEN: usize = 16;
 const ROLL_SUFFIX: &str = ".roll";
@@ -813,7 +848,7 @@ fn encode_publish_block(
 ) -> [u8; ENC_PUBLISH_BLOCK_LEN] {
     let mut b = [0u8; ENC_PUBLISH_BLOCK_LEN];
     b[..16].copy_from_slice(wal_id);
-    let crc = publish_block_crc(wal_id, gen, crypto::CONTAINER_VERSION);
+    let crc = publish_block_crc(wal_id, gen, crypto::WAL_CONTAINER_VERSION);
     b[16..20].copy_from_slice(&crc.to_le_bytes());
     if let Some((seq, value)) = initial {
         let at = if seq.is_multiple_of(2) {
@@ -881,6 +916,9 @@ pub struct RecoveryInfo {
 pub(crate) struct Record {
     lsn: u64,
     stmts: Vec<String>,
+    /// The frame's touched-object set (payload v4); `None` = unknown (a
+    /// record adopted from a legacy v2/v3 upgrade).
+    sets: Option<FrameSets>,
 }
 
 /// Default WAL size that triggers an automatic checkpoint after a commit
@@ -942,11 +980,164 @@ pub struct Wal {
     lease: Arc<Lease>,
     /// What the owning store's memory already includes of this file.
     applied: Applied,
+    /// Frames applied or appended since the last full reload, with their
+    /// touched sets: what an open optimistic base validates against. Pruned
+    /// to the oldest registered base (`open_bases`); empty when nothing is
+    /// open, which is the common case. Bounded by the current WAL
+    /// incarnation (the auto-checkpoint default caps it).
+    journal: Vec<JournalEntry>,
+    /// Registered open bases: seq → base lsn. The minimum lsn here is the
+    /// journal's prune threshold.
+    open_bases: std::collections::BTreeMap<u64, u64>,
+    next_base_seq: u64,
     /// Bytes discarded from a torn tail by the last scan (`0` = clean).
     truncated_last: u64,
     /// Whether the last scan rewrote the file (legacy upgrade or encrypted
     /// tail rebuild).
     upgraded_last: bool,
+    /// Test-only evidence counters for the optimistic commit path:
+    /// `(optimistic commits checked, conflicts detected, pessimistic
+    /// fallbacks taken)`.
+    #[cfg(test)]
+    optimistic_counts: (u64, u64, u64),
+}
+
+impl Wal {
+    /// Append one frame's sets to the journal (called after the frame is
+    /// applied or appended). Entries stay in lsn order by construction.
+    fn journal_push(&mut self, lsn: u64, sets: Option<FrameSets>) {
+        self.journal.push(JournalEntry { lsn, sets });
+    }
+
+    /// Replace the journal with a fresh (empty) one after a full rebuild: the
+    /// caller re-pushes the frames it replayed.
+    fn reset_journal(&mut self) {
+        self.journal.clear();
+    }
+
+    /// Drop journal entries no open base needs any more: everything at or
+    /// below the oldest registered base (or everything, when none is open).
+    fn prune_journal(&mut self) {
+        let threshold = self.open_bases.values().copied().min().unwrap_or(u64::MAX);
+        if let Some(pos) = self.journal.iter().position(|e| e.lsn > threshold) {
+            self.journal.drain(..pos);
+        } else {
+            self.journal.clear();
+        }
+    }
+
+    /// Register a new optimistic base at the current applied position.
+    /// `None` when the WAL is poisoned (no valid position exists).
+    fn register_base(&mut self) -> Option<(u64, BasePosition)> {
+        if self.poisoned.is_some() {
+            return None;
+        }
+        let position = BasePosition {
+            wal_id: self.wal_id,
+            gen: self.gen,
+            lsn: self.applied.applied_lsn,
+            // The cached meta is the last observed one; the commit check
+            // re-stats the checkpoint, so a replacement between this capture
+            // and the commit is still caught.
+            ckpt: self.applied.ckpt,
+        };
+        let seq = self.next_base_seq;
+        self.next_base_seq += 1;
+        self.open_bases.insert(seq, position.lsn);
+        self.prune_journal();
+        Some((seq, position))
+    }
+
+    /// Unregister a base (its token dropped) and prune.
+    fn close_base(&mut self, seq: u64) {
+        self.open_bases.remove(&seq);
+        self.prune_journal();
+    }
+
+    /// Validate `ours` against everything committed after `base`: the frame
+    /// journal (frames already applied) first. Returns the conflicting
+    /// object description. An unknown-set frame conflicts conservatively
+    /// (only reachable for a base older than a legacy upgrade, which the
+    /// incarnation check rejects first).
+    fn check_journal(
+        &self,
+        base: &BasePosition,
+        ours: &FrameSets,
+    ) -> Option<(String, Option<u64>)> {
+        for e in self.journal.iter().rev() {
+            if e.lsn <= base.lsn {
+                continue;
+            }
+            match &e.sets {
+                Some(sets) => {
+                    if let Some(object) = sets.conflict_with(ours) {
+                        return Some((object, Some(e.lsn)));
+                    }
+                }
+                None => {
+                    return Some((
+                        "an upgraded legacy frame (touched set unknown)".to_string(),
+                        Some(e.lsn),
+                    ))
+                }
+            }
+        }
+        None
+    }
+
+    /// Does the frame (by its sets) conflict with `ours`, given the base?
+    /// Frames at or below the base are already part of the transaction's
+    /// snapshot and cannot conflict.
+    fn frame_conflicts(
+        sets: Option<&FrameSets>,
+        lsn: u64,
+        base: &BasePosition,
+        ours: &FrameSets,
+    ) -> Option<(String, Option<u64>)> {
+        if lsn <= base.lsn {
+            return None;
+        }
+        match sets {
+            Some(sets) => sets.conflict_with(ours).map(|object| (object, Some(lsn))),
+            None => Some((
+                "an upgraded legacy frame (touched set unknown)".to_string(),
+                Some(lsn),
+            )),
+        }
+    }
+
+    /// Test-only evidence counters (see the field docs).
+    #[cfg(test)]
+    pub(crate) fn optimistic_counts(&self) -> (u64, u64, u64) {
+        self.optimistic_counts
+    }
+
+    /// Test-only: record one optimistic commit check outcome (`conflict` =
+    /// detected; `fallback` = the pessimistic path was taken).
+    #[cfg(test)]
+    pub(crate) fn note_optimistic_outcome(&mut self, conflict: bool, fallback: bool) {
+        self.optimistic_counts.0 += 1;
+        if conflict {
+            self.optimistic_counts.1 += 1;
+        }
+        if fallback {
+            self.optimistic_counts.2 += 1;
+        }
+    }
+
+    /// Test-only: the journal's `(lsn, sets-known)` list (oldest first).
+    #[cfg(test)]
+    pub(crate) fn journal_for_test(&self) -> Vec<(u64, bool)> {
+        self.journal
+            .iter()
+            .map(|e| (e.lsn, e.sets.is_some()))
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn open_bases_for_test(&self) -> usize {
+        self.open_bases.len()
+    }
 }
 
 /// What the owning store's memory already includes of the on-disk state:
@@ -965,7 +1156,127 @@ pub(crate) struct Applied {
     /// Number of applied records in this WAL incarnation (the encrypted
     /// nonce ordinal base for the next scan).
     applied_records: u64,
-    ckpt_dev_ino: Option<(u64, u64)>,
+    /// The checkpoint file this store was built from (see [`CkptMeta`]: the
+    /// meta catches an in-place `.save` rewrite that `(dev, ino)` cannot).
+    ckpt: Option<CkptMeta>,
+}
+
+/// Enough to witness a checkpoint-file replacement without reading it:
+/// identity, length, and mtime. A `.save` snapshot rewrites the target in
+/// place, so `(dev, ino)` alone cannot see it; the length + mtime pair does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CkptMeta {
+    dev_ino: Option<(u64, u64)>,
+    len: u64,
+    mtime_ns: Option<i128>,
+}
+
+/// A single-stat witness of a file's identity and length (the optimistic
+/// commit's fast path: nothing changed on disk since the last apply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileMeta {
+    dev_ino: Option<(u64, u64)>,
+    len: u64,
+}
+
+fn file_meta(path: &Path) -> Option<FileMeta> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(FileMeta {
+        dev_ino: Some(identity_of(&m)),
+        len: m.len(),
+    })
+}
+
+fn ckpt_meta(path: &Path) -> Option<CkptMeta> {
+    let m = std::fs::metadata(path).ok()?;
+    Some(CkptMeta {
+        dev_ino: Some(identity_of(&m)),
+        len: m.len(),
+        mtime_ns: m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i128),
+    })
+}
+
+/// The position one optimistic unit (transaction or autocommit statement)
+/// commits against: the WAL incarnation, the applied LSN at its start, and
+/// the checkpoint file identity the store was built from. A commit conflicts
+/// when the WAL incarnation changed (another process checkpointed or
+/// recovered), when the checkpoint file was replaced (a `.save` snapshot —
+/// which does not roll the WAL), or when any frame recorded after `lsn`
+/// touched an object of the unit (see [`FrameSets`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BasePosition {
+    wal_id: WalId,
+    gen: u64,
+    lsn: u64,
+    ckpt: Option<CkptMeta>,
+}
+
+/// One registered open base: a `BaseToken` holds this and unregisters it on
+/// drop, which is what keeps the journal bounded (entries a live base still
+/// needs are never pruned).
+#[derive(Debug)]
+pub(crate) struct BaseToken {
+    wal: Arc<Mutex<Wal>>,
+    seq: u64,
+    position: BasePosition,
+}
+
+impl BaseToken {
+    pub(crate) fn position(&self) -> BasePosition {
+        self.position
+    }
+}
+
+impl Drop for BaseToken {
+    fn drop(&mut self) {
+        let mut wal = self.wal.lock().unwrap_or_else(|p| p.into_inner());
+        wal.close_base(self.seq);
+    }
+}
+
+/// One frame's touched set, kept in the in-memory journal while any open base
+/// may still need it. `sets: None` = unknown (legacy frame).
+#[derive(Debug, Clone)]
+struct JournalEntry {
+    lsn: u64,
+    sets: Option<FrameSets>,
+}
+
+/// A cross-process commit conflict: the object whose frame(s) changed, why,
+/// and the frame's LSN when one is known (the WAL position is the
+/// cross-process "version" — `DataTable::version` is process-local and never
+/// persisted, so it cannot be compared across writers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitConflict {
+    /// e.g. `table "main.t"`, `database "db1"`, `the WAL generation`.
+    pub(crate) object: String,
+    /// e.g. `changed concurrently`.
+    pub(crate) detail: String,
+    pub(crate) lsn: Option<u64>,
+}
+
+impl CommitConflict {
+    /// The user-facing message (stable `write conflict on …` prefix, so hosts
+    /// can detect retryable conflicts without matching on a new error
+    /// variant; `PinkDbError` is a public enum without `#[non_exhaustive]`,
+    /// exactly like the wave-45n busy decision).
+    pub(crate) fn message(&self, unit: &str) -> String {
+        match self.lsn {
+            Some(lsn) => format!(
+                "write conflict on {} ({}, committed at lsn {lsn} by another writer since this \
+                 {unit} started); retry the {unit}",
+                self.object, self.detail
+            ),
+            None => format!(
+                "write conflict on {} ({}); retry the {unit}",
+                self.object, self.detail
+            ),
+        }
+    }
 }
 
 /// One rolled-away WAL generation found on disk.
@@ -1038,8 +1349,8 @@ struct OpenedWal {
 }
 
 impl Wal {
-    /// A v3 plaintext header with the given incarnation id.
-    fn header_for_v3(gen: u64, wal_id: &WalId) -> [u8; HEADER_LEN] {
+    /// A current-format (v4) plaintext header with the given incarnation id.
+    fn header_for(gen: u64, wal_id: &WalId) -> [u8; HEADER_LEN] {
         let mut h = [0u8; HEADER_LEN];
         h[..8].copy_from_slice(WAL_MAGIC);
         h[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
@@ -1050,10 +1361,10 @@ impl Wal {
         h
     }
 
-    /// A v3 header with a fresh incarnation id (test/raw fixtures).
+    /// A current header with a fresh incarnation id (test/raw fixtures).
     #[cfg(test)]
-    fn header_for(gen: u64) -> [u8; HEADER_LEN] {
-        Self::header_for_v3(gen, &fresh_wal_id())
+    fn header_fresh(gen: u64) -> [u8; HEADER_LEN] {
+        Self::header_for(gen, &fresh_wal_id())
     }
 
     /// Create (or recreate) the WAL file at `path` with just a header and
@@ -1082,7 +1393,7 @@ impl Wal {
                     f.write_all(c.header())?;
                     f.write_all(&encode_publish_block(&wal_id, gen, None))?;
                 }
-                None => f.write_all(&Self::header_for_v3(gen, &wal_id))?,
+                None => f.write_all(&Self::header_for(gen, &wal_id))?,
             }
             f.sync_all()?;
         }
@@ -1147,8 +1458,13 @@ impl Wal {
             bytes_appended_since_gen_start: 0,
             lease,
             applied: Applied::default(),
+            journal: Vec::new(),
+            open_bases: std::collections::BTreeMap::new(),
+            next_base_seq: 0,
             truncated_last: opened.truncated,
             upgraded_last: opened.upgraded,
+            #[cfg(test)]
+            optimistic_counts: (0, 0, 0),
         };
         Ok((wal, opened.records, truncated))
     }
@@ -1183,7 +1499,7 @@ impl Wal {
         if id != self.applied.wal_dev_ino || len != Some(self.applied.applied_end) {
             return Ok(true);
         }
-        Ok(file_identity(&self.checkpoint_path) != self.applied.ckpt_dev_ino)
+        Ok(ckpt_meta(&self.checkpoint_path) != self.applied.ckpt)
     }
 
     /// Poison the handle (H6): a refresh/replay failure fail-stops every
@@ -1282,7 +1598,7 @@ impl Wal {
             applied_end: opened.records_start,
             applied_lsn: 0,
             applied_records: 0,
-            ckpt_dev_ino: self.applied.ckpt_dev_ino,
+            ckpt: self.applied.ckpt,
         };
         if let Some(c) = self.cipher.as_mut() {
             let next = u32::try_from(opened.records.len())
@@ -1320,6 +1636,7 @@ impl Wal {
             self.cipher.as_ref(),
             self.applied.applied_lsn,
             u32::try_from(self.applied.applied_records).unwrap_or(u32::MAX),
+            true,
         )
         .map_err(PinkDbError::Execution)?;
         if let Some(first) = records.first() {
@@ -1350,8 +1667,11 @@ impl Wal {
         Ok(Some((records, end)))
     }
 
-    /// Append one committed unit of statements as a single record.
-    pub(crate) fn append(&mut self, stmts: &[String]) -> Result<()> {
+    /// Append one committed unit of statements as a single record. `sets` is
+    /// the frame's touched-object set (payload v4): `None` is reserved for
+    /// legacy re-encodes during an upgrade; every live append knows its set,
+    /// so optimistic commits can validate against this record later.
+    pub(crate) fn append(&mut self, stmts: &[String], sets: Option<&FrameSets>) -> Result<()> {
         if let Some(msg) = &self.poisoned {
             return Err(PinkDbError::Execution(format!(
                 "WAL is unusable after an earlier write failure ({msg})"
@@ -1366,9 +1686,21 @@ impl Wal {
             self.poisoned = Some(msg.clone());
             return Err(PinkDbError::Execution(msg));
         }
-        let payload = encode_payload(stmts)?;
+        let mut sets = sets.cloned();
+        if let Some(s) = &mut sets {
+            s.canonicalize();
+        }
+        let payload = encode_payload(stmts, sets.as_ref())?;
         let len = record_len_guard(payload.len())?;
         let lsn = self.last_lsn + 1;
+        // The applied position must be the pre-write EOF: every write path
+        // refreshes (applies) another process's frames under the lease before
+        // appending, so no committed frame is ever skipped.
+        debug_assert_eq!(
+            self.file.metadata().map(|m| m.len()).ok(),
+            Some(self.applied.applied_end),
+            "append without having applied the tail (lsn {lsn})"
+        );
         let (crc, body): (u32, Vec<u8>) = match &mut self.cipher {
             // The crc field stays in the framing for an encrypted record but
             // is zero: GCM authentication replaces it.
@@ -1395,6 +1727,9 @@ impl Wal {
                 self.applied.applied_end += rec.len() as u64;
                 self.applied.applied_lsn = lsn;
                 self.applied.applied_records += 1;
+                // Journal the frame so open optimistic bases validate against
+                // it even though it never goes through a replay pass.
+                self.journal_push(lsn, sets);
                 self.publish();
                 Ok(())
             }
@@ -1467,6 +1802,7 @@ impl Wal {
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
+        sets: Option<&FrameSets>,
     ) -> Result<()> {
         let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
         if let Some(before) = db_before {
@@ -1493,7 +1829,7 @@ impl Wal {
             rec.push(format!("LOAD EXTENSION '{}'", path.replace('\'', "''")));
         }
         rec.extend_from_slice(stmts);
-        self.append(&rec)?;
+        self.append(&rec, sets)?;
         // Covered only after a successful append.
         self.tracked_extensions
             .extend(touched_extensions.iter().cloned());
@@ -1578,6 +1914,10 @@ impl Wal {
                 };
                 self.published_seq = 0;
                 self.bytes_appended_since_gen_start = 0;
+                // The rolled generation's frames are folded into the
+                // checkpoint: no open base can validate against them any more
+                // (their incarnation is gone), so the journal restarts empty.
+                self.journal.clear();
                 // The rolled generation's `LOAD EXTENSION` records are folded
                 // into the checkpoint — but the checkpoint never stores an
                 // extension, so the fresh generation covers nothing: the next
@@ -1593,7 +1933,7 @@ impl Wal {
                     applied_end: self.records_start,
                     applied_lsn: 0,
                     applied_records: 0,
-                    ckpt_dev_ino: self.applied.ckpt_dev_ino,
+                    ckpt: self.applied.ckpt,
                 };
             }
             Err(e) => {
@@ -1613,7 +1953,7 @@ impl Wal {
         }
         sync_parent_dir(&self.checkpoint_path);
         guard.bump_epoch(0);
-        self.applied.ckpt_dev_ino = file_identity(&self.checkpoint_path);
+        self.applied.ckpt = ckpt_meta(&self.checkpoint_path);
         // 4. The old generation is now folded into the published `.pink`. A
         //    failed unlink (or a crash before it) is harmless: the next open
         //    proves foldedness from the roll name + live generation and
@@ -1635,11 +1975,190 @@ fn record_len_guard(len: usize) -> Result<u32> {
     })
 }
 
-fn encode_payload(stmts: &[String]) -> Result<Vec<u8>> {
+/// The catalog objects one committed unit touches: every table any of its
+/// statements reads or writes, plus the databases its `CREATE/DROP DATABASE`
+/// statements name. Wave 45o stores this in every WAL frame (payload v4), so
+/// commit validation can compare a transaction's read∪write set with the
+/// frames another writer published **without** re-binding their SQL against a
+/// store that may hold uncommitted state.
+///
+/// Granularity is table-level, exactly like the in-process commit check
+/// (`db.rs`), and the frame's *read* half is included: a transaction that
+/// reads a table another frame re-wrote must conflict (serializable-style;
+/// this is also what prevents write skew). Canonical form (sorted, deduped,
+/// lowercased) keeps the encoded bytes deterministic.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct FrameSets {
+    /// `(database, table)`, lowercased.
+    tables: Vec<(String, String)>,
+    /// Databases created or dropped by the frame, lowercased.
+    dbs: Vec<String>,
+}
+
+impl FrameSets {
+    /// Record a `(database, table)` dependency (called for both reads and
+    /// writes; duplicates are removed by [`FrameSets::canonicalize`]).
+    pub(crate) fn add_table(&mut self, db: &str, table: &str) {
+        self.tables
+            .push((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
+    }
+
+    /// Record a database-level mutation (`CREATE/DROP DATABASE`).
+    pub(crate) fn add_database(&mut self, db: &str) {
+        self.dbs.push(db.to_ascii_lowercase());
+    }
+
+    /// Record a whole other touched-set (transaction accumulation).
+    pub(crate) fn extend(&mut self, other: &FrameSets) {
+        self.tables.extend_from_slice(&other.tables);
+        self.dbs.extend_from_slice(&other.dbs);
+    }
+
+    /// Sort and dedupe (deterministic encoding and small linear comparison).
+    pub(crate) fn canonicalize(&mut self) {
+        self.tables.sort();
+        self.tables.dedup();
+        self.dbs.sort();
+        self.dbs.dedup();
+    }
+
+    /// Does this set overlap `ours`? Returns a human-readable description of
+    /// the first conflicting object, or `None` when the two are disjoint.
+    /// Both sides must be canonicalized.
+    pub(crate) fn conflict_with(&self, ours: &FrameSets) -> Option<String> {
+        for db in &self.dbs {
+            if ours.dbs.contains(db) {
+                return Some(format!("database \"{db}\""));
+            }
+        }
+        for (db, table) in &self.tables {
+            if ours.tables.contains(&(db.clone(), table.clone())) || ours.dbs.contains(db) {
+                return Some(format!("table \"{db}.{table}\""));
+            }
+        }
+        // Our database-level `DROP DATABASE` conflicts with a frame whose
+        // tables live in that database (conservative for `CREATE DATABASE`).
+        for db in &ours.dbs {
+            if self.tables.iter().any(|(tdb, _)| tdb == db) {
+                return Some(format!("database \"{db}\""));
+            }
+        }
+        None
+    }
+}
+
+/// `sets_len` value marking a frame whose touched set is unknown (a record
+/// adopted from a legacy v2/v3 upgrade). Unknown frames lie below every base
+/// captured after the upgrade, so they never spuriously conflict; if one did
+/// reach a validation window it is treated as conflicting (conservative).
+const SETS_UNKNOWN: u32 = u32::MAX;
+
+/// Encode the frame's touched set (payload v4, format 1):
+/// `u8 ver(=1) | u32 n_tables | n*(u16 db_len | db | u16 t_len | t) |
+///  u32 n_dbs | n*(u16 db_len | db)`.
+fn encode_sets(sets: &FrameSets) -> Result<Vec<u8>> {
+    let mut sets = sets.clone();
+    sets.canonicalize();
+    let mut out = Vec::with_capacity(1 + 4 + sets.dbs.len() * 10);
+    out.push(1u8);
+    let n = u32::try_from(sets.tables.len())
+        .map_err(|_| PinkDbError::Execution("too many tables in one WAL record".to_string()))?;
+    out.extend_from_slice(&n.to_le_bytes());
+    for (db, table) in &sets.tables {
+        for name in [db.as_str(), table.as_str()] {
+            let l = u16::try_from(name.len()).map_err(|_| {
+                PinkDbError::Execution("name too long for a WAL record".to_string())
+            })?;
+            out.extend_from_slice(&l.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+        }
+    }
+    let n = u32::try_from(sets.dbs.len())
+        .map_err(|_| PinkDbError::Execution("too many databases in one WAL record".to_string()))?;
+    out.extend_from_slice(&n.to_le_bytes());
+    for db in &sets.dbs {
+        let l = u16::try_from(db.len())
+            .map_err(|_| PinkDbError::Execution("database name too long".to_string()))?;
+        out.extend_from_slice(&l.to_le_bytes());
+        out.extend_from_slice(db.as_bytes());
+    }
+    Ok(out)
+}
+
+/// Decode the sets section written by [`encode_sets`] (payload format 1).
+fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
+    let mut pos = 0usize;
+    let need = |pos: usize, n: usize| -> std::result::Result<(), String> {
+        if pos + n > bytes.len() {
+            Err("truncated frame sets".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    need(pos, 1)?;
+    if bytes[pos] != 1 {
+        return Err(format!("unsupported frame-sets format {}", bytes[pos]));
+    }
+    pos += 1;
+    let u32_at = |pos: &mut usize| -> std::result::Result<u32, String> {
+        need(*pos, 4)?;
+        let v = u32::from_le_bytes(bytes[*pos..*pos + 4].try_into().expect("4 bytes"));
+        *pos += 4;
+        Ok(v)
+    };
+    let str_at = |pos: &mut usize| -> std::result::Result<String, String> {
+        need(*pos, 2)?;
+        let n = u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().expect("2 bytes")) as usize;
+        *pos += 2;
+        need(*pos, n)?;
+        let s = std::str::from_utf8(&bytes[*pos..*pos + n])
+            .map_err(|_| "frame-sets name is not UTF-8".to_string())?
+            .to_string();
+        *pos += n;
+        Ok(s)
+    };
+    let nt = u32_at(&mut pos)? as usize;
+    if nt > bytes.len() / 4 {
+        return Err(format!("implausible frame-sets table count {nt}"));
+    }
+    let mut sets = FrameSets::default();
+    for _ in 0..nt {
+        let db = str_at(&mut pos)?;
+        let table = str_at(&mut pos)?;
+        sets.tables.push((db, table));
+    }
+    let nd = u32_at(&mut pos)? as usize;
+    if nd > bytes.len() / 2 {
+        return Err(format!("implausible frame-sets database count {nd}"));
+    }
+    for _ in 0..nd {
+        sets.dbs.push(str_at(&mut pos)?);
+    }
+    if pos != bytes.len() {
+        return Err("trailing bytes in frame sets".to_string());
+    }
+    Ok(sets)
+}
+
+/// Encode a record payload (v4 layout):
+/// `u32 stmt_count | u32 sets_len | sets | stmt_count*(u32 len | UTF-8 SQL)`.
+/// `sets_len` is [`SETS_UNKNOWN`] when the frame's touched set is unknown (a
+/// legacy record adopted by an upgrade), else the [`encode_sets`] block's
+/// byte length.
+fn encode_payload(stmts: &[String], sets: Option<&FrameSets>) -> Result<Vec<u8>> {
     let count = u32::try_from(stmts.len()).map_err(|_| {
         PinkDbError::Execution("transaction has too many statements for one WAL record".to_string())
     })?;
-    let mut total = 4usize;
+    let sets_bytes = match sets {
+        Some(s) => encode_sets(s)?,
+        None => Vec::new(),
+    };
+    let sets_len: u32 = match sets {
+        Some(_) => u32::try_from(sets_bytes.len())
+            .map_err(|_| PinkDbError::Execution("frame sets too large".to_string()))?,
+        None => SETS_UNKNOWN,
+    };
+    let mut total = 8usize + sets_bytes.len();
     for s in stmts {
         let n = u32::try_from(s.len()).map_err(|_| {
             PinkDbError::Execution("statement is too large for a WAL record".to_string())
@@ -1652,6 +2171,8 @@ fn encode_payload(stmts: &[String]) -> Result<Vec<u8>> {
     let _ = record_len_guard(total)?;
     let mut out = Vec::with_capacity(total);
     out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&sets_len.to_le_bytes());
+    out.extend_from_slice(&sets_bytes);
     for s in stmts {
         out.extend_from_slice(&(s.len() as u32).to_le_bytes());
         out.extend_from_slice(s.as_bytes());
@@ -1660,25 +2181,23 @@ fn encode_payload(stmts: &[String]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Bounds-checked payload decode. `Err` means a CRC-valid record is malformed
-/// (hard error on replay, never a silent drop).
-fn decode_payload(payload: &[u8]) -> std::result::Result<Vec<String>, String> {
-    let mut pos = 0usize;
-    let u32_at = |pos: &mut usize| -> std::result::Result<u32, String> {
-        if *pos + 4 > payload.len() {
-            return Err("truncated payload".to_string());
-        }
-        let v = u32::from_le_bytes(payload[*pos..*pos + 4].try_into().expect("4 bytes"));
-        *pos += 4;
-        Ok(v)
-    };
-    let count = u32_at(&mut pos)? as usize;
+/// Decode `count` statements starting at `pos` (each `u32 len | UTF-8 SQL`);
+/// the payload must end exactly there.
+fn decode_statements(
+    payload: &[u8],
+    mut pos: usize,
+    count: usize,
+) -> std::result::Result<Vec<String>, String> {
     if count > payload.len() / 4 {
         return Err(format!("implausible statement count {count}"));
     }
     let mut stmts = Vec::with_capacity(count);
     for _ in 0..count {
-        let n = u32_at(&mut pos)? as usize;
+        if pos + 4 > payload.len() {
+            return Err("truncated payload".to_string());
+        }
+        let n = u32::from_le_bytes(payload[pos..pos + 4].try_into().expect("4 bytes")) as usize;
+        pos += 4;
         if pos + n > payload.len() {
             return Err("truncated statement text".to_string());
         }
@@ -1691,6 +2210,40 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<Vec<String>, String> {
         return Err("trailing bytes in payload".to_string());
     }
     Ok(stmts)
+}
+
+/// Decode a legacy (v2/v3) payload: `u32 count | count*(u32 len | SQL)`. The
+/// frame's touched set is unknown.
+fn decode_payload_legacy(payload: &[u8]) -> std::result::Result<Vec<String>, String> {
+    if payload.len() < 4 {
+        return Err("truncated payload".to_string());
+    }
+    let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+    decode_statements(payload, 4, count)
+}
+
+/// Bounds-checked v4 payload decode. `Err` means a CRC-valid record is
+/// malformed (hard error on replay, never a silent drop).
+fn decode_payload(payload: &[u8]) -> std::result::Result<(Vec<String>, Option<FrameSets>), String> {
+    if payload.len() < 8 {
+        return Err("truncated payload".to_string());
+    }
+    let count = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")) as usize;
+    let sets_len = u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes"));
+    let (sets, stmts_start) = if sets_len == SETS_UNKNOWN {
+        (None, 8usize)
+    } else {
+        let n = sets_len as usize;
+        if n == 0 {
+            return Err("frame sets section is empty but marked known".to_string());
+        }
+        if 8 + n > payload.len() {
+            return Err("truncated frame sets section".to_string());
+        }
+        (Some(decode_sets(&payload[8..8 + n])?), 8 + n)
+    };
+    let stmts = decode_statements(payload, stmts_start, count)?;
+    Ok((stmts, sets))
 }
 
 /// Parse records from `start` onward. A short read, a CRC mismatch (plaintext)
@@ -1710,6 +2263,7 @@ fn parse_records(
     cipher: Option<&RecordCipher>,
     prev_lsn: u64,
     ordinal_base: u32,
+    current_payloads: bool,
 ) -> std::result::Result<(Vec<Record>, usize), String> {
     let mut pos = start;
     let mut prev = prev_lsn;
@@ -1742,7 +2296,7 @@ fn parse_records(
         if end > data.len() {
             break;
         }
-        let stmts = match cipher {
+        let (stmts, sets) = match cipher {
             Some(c) => {
                 let next = ordinal_base
                     .checked_add(ordinal)
@@ -1763,9 +2317,18 @@ fn parse_records(
                                  nonzero CRC field {crc} on an encrypted record"
                             ));
                         }
-                        decode_payload(&plain).map_err(|e| {
-                            format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
-                        })?
+                        if current_payloads {
+                            decode_payload(&plain).map_err(|e| {
+                                format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
+                            })?
+                        } else {
+                            (
+                                decode_payload_legacy(&plain).map_err(|e| {
+                                    format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
+                                })?,
+                                None,
+                            )
+                        }
                     }
                     None => {
                         if end == data.len() {
@@ -1785,11 +2348,21 @@ fn parse_records(
                 if crc32(payload) != crc {
                     break;
                 }
-                decode_payload(payload)
-                    .map_err(|e| format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}"))?
+                if current_payloads {
+                    decode_payload(payload).map_err(|e| {
+                        format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
+                    })?
+                } else {
+                    (
+                        decode_payload_legacy(payload).map_err(|e| {
+                            format!("corrupt WAL record at offset {pos} (lsn {lsn}): {e}")
+                        })?,
+                        None,
+                    )
+                }
             }
         };
-        out.push(Record { lsn, stmts });
+        out.push(Record { lsn, stmts, sets });
         prev = lsn;
         ordinal += 1;
         pos = end;
@@ -1797,11 +2370,12 @@ fn parse_records(
     Ok((out, pos))
 }
 
-/// Rewrite an encrypted WAL whose tail was discarded or whose container was
-/// legacy v1: a fresh nonce prefix and a fresh `wal_id` (a new file
-/// incarnation; nonce reuse after a tail loss is forbidden), same key, KDF
-/// parameters and generation, the kept records re-sealed in order, publish
-/// slots seeded with the last intact LSN. Temp + rename, so a crash re-runs
+/// Rewrite an encrypted WAL whose tail was discarded or whose container is
+/// legacy: a fresh nonce prefix and a fresh `wal_id` (a new file incarnation;
+/// nonce reuse after a tail loss is forbidden), same key, KDF parameters and
+/// generation, the kept records re-sealed in order (their payloads re-encoded
+/// in the current format, preserving unknown touched sets), publish slots
+/// seeded with the last intact LSN. Temp + rename, so a crash re-runs
 /// recovery from the same on-disk state. Returns the cipher positioned after
 /// the re-sealed records.
 fn rewrite_encrypted(
@@ -1823,7 +2397,7 @@ fn rewrite_encrypted(
         f.write_all(fresh.header())?;
         f.write_all(&encode_publish_block(&wal_id, gen, Some((1, last_lsn))))?;
         for rec in records {
-            let payload = encode_payload(&rec.stmts)?;
+            let payload = encode_payload(&rec.stmts, rec.sets.as_ref())?;
             let len = record_len_guard(payload.len())?;
             let ct = fresh.seal(rec.lsn, &payload)?;
             f.write_all(&len.to_le_bytes())?;
@@ -1838,29 +2412,37 @@ fn rewrite_encrypted(
     Ok(fresh)
 }
 
-/// `<wal>.<gen>.upgrade`: temp name for the in-place v2→v3 plaintext rewrite.
-/// Deliberately not matched by `scan_rolls` (only `.roll` names are), so a
-/// crash mid-upgrade leaves an ignorable temp (design row R1).
+/// `<wal>.<gen>.upgrade`: temp name for the in-place legacy→v4 plaintext
+/// rewrite. Deliberately not matched by `scan_rolls` (only `.roll` names
+/// are), so a crash mid-upgrade leaves an ignorable temp (design row R1).
 fn upgrade_path(wal: &Path, gen: u64) -> PathBuf {
     let mut s = wal.as_os_str().to_os_string();
     s.push(format!(".{gen}.upgrade"));
     PathBuf::from(s)
 }
 
-/// Rewrite a legacy plaintext v2 WAL in place as v3 under the lease: fresh
-/// `wal_id`, publish slot A seeded with the last intact LSN, records (with
-/// their framing and CRCs) byte-preserved, same generation. A torn tail is
-/// simply not copied. Temp + rename; a crash re-runs the upgrade (R1).
-fn upgrade_plain_v2(path: &Path, data: &[u8], gen: u64) -> Result<()> {
+/// Rewrite a legacy plaintext WAL (v2 or v3) in place as v4 under the lease:
+/// fresh `wal_id`, publish slot A seeded with the last intact LSN, the intact
+/// records re-encoded in the v4 payload layout (their touched sets are
+/// unknown). A torn tail is simply not copied. Temp + rename; a crash re-runs
+/// the upgrade (R1).
+fn upgrade_plain(path: &Path, data: &[u8], gen: u64, records_start: usize) -> Result<()> {
     let (records, good_end) =
-        parse_records(data, V2_RECORDS_START, None, 0, 0).map_err(PinkDbError::Execution)?;
+        parse_records(data, records_start, None, 0, 0, false).map_err(PinkDbError::Execution)?;
     let last_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
     let wal_id = fresh_wal_id();
-    let mut out = Vec::with_capacity(HEADER_LEN + (good_end - V2_RECORDS_START));
-    out.extend_from_slice(&Wal::header_for_v3(gen, &wal_id));
+    let mut out = Vec::with_capacity(HEADER_LEN + (good_end - records_start));
+    out.extend_from_slice(&Wal::header_for(gen, &wal_id));
     let slot = slot_bytes(1, last_lsn, WAL_SLOT_DOMAIN);
     out[WAL_SLOT_A as usize..WAL_SLOT_A as usize + SLOT_LEN].copy_from_slice(&slot);
-    out.extend_from_slice(&data[V2_RECORDS_START..good_end]);
+    for rec in &records {
+        let payload = encode_payload(&rec.stmts, None)?;
+        let len = record_len_guard(payload.len())?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&rec.lsn.to_le_bytes());
+        out.extend_from_slice(&crc32(&payload).to_le_bytes());
+        out.extend_from_slice(&payload);
+    }
     let upgrade = upgrade_path(path, gen);
     {
         let mut f = OpenOptions::new()
@@ -1876,8 +2458,10 @@ fn upgrade_plain_v2(path: &Path, data: &[u8], gen: u64) -> Result<()> {
     Ok(())
 }
 
-/// True when the file is a pre-wave-45m format (plaintext v2 or container
-/// v1) that must be upgraded under the lease before it is replayed.
+/// True when the file is an older format that must be upgraded under the
+/// lease before it is replayed: plaintext v2/v3, or an encrypted WAL
+/// container older than the current version (which carries the per-frame
+/// touched sets).
 fn wal_legacy_format(path: &Path) -> Result<bool> {
     let mut f = File::open(path)?;
     let mut buf = [0u8; 512];
@@ -1885,17 +2469,21 @@ fn wal_legacy_format(path: &Path) -> Result<bool> {
     let buf = &buf[..n];
     if crypto::is_container(buf) {
         return Ok(match crypto::parse_container_header(buf) {
-            Ok(h) => h.version < 2,
+            Ok(h) => h.version < crypto::WAL_CONTAINER_VERSION,
             Err(_) => false, // torn: recovery recreates it
         });
     }
     Ok(buf.len() >= 12
         && &buf[..8] == WAL_MAGIC
-        && u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes")) == WAL_VERSION_V2)
+        && matches!(
+            u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes")),
+            WAL_VERSION_V2 | WAL_VERSION_V3
+        ))
 }
 
-/// Upgrade a legacy WAL in place (plaintext v2 → v3; container v1 → v2 with
-/// a fresh nonce prefix and publish block), under the lease.
+/// Upgrade a legacy WAL in place (plaintext v2/v3 → v4; an older container →
+/// the current WAL container version with a fresh nonce prefix and publish
+/// block), under the lease.
 fn upgrade_legacy_wal(
     path: &Path,
     data: &[u8],
@@ -1907,11 +2495,11 @@ fn upgrade_legacy_wal(
             return Err(crypto::encrypted_error(&path.display().to_string()));
         };
         let (old, _) = RecordCipher::from_header(data, k)?;
-        let (records, _) = parse_records(data, enc.payload_start, Some(&old), 0, 0)
+        let (records, _) = parse_records(data, enc.payload_start, Some(&old), 0, 0, false)
             .map_err(PinkDbError::Execution)?;
         rewrite_encrypted(path, header.gen, &records, &old)?;
     } else {
-        upgrade_plain_v2(path, data, header.gen)?;
+        upgrade_plain(path, data, header.gen, header.records_start)?;
     }
     Ok(())
 }
@@ -1941,19 +2529,40 @@ fn wal_header_invalid(path: &Path) -> Result<bool> {
     }
 }
 
-/// The parsed identity of the live WAL on disk `(gen, wal_id, records_start)`.
-/// Used for the refresh identity comparison; the file must already be in a
-/// current format (callers upgrade legacy files first). Reads only the header
-/// region, never the whole WAL.
-fn read_wal_identity(path: &Path) -> Result<(u64, WalId, u64)> {
+/// The live WAL's on-disk identity, read with one open + header read + fstat:
+/// incarnation `(gen, wal_id)`, where its records start, its file identity,
+/// and its length. Used for the refresh and the optimistic-commit identity
+/// comparisons; the file must already be in a current format (callers
+/// upgrade legacy files first). Reads only the header region, never the whole
+/// WAL.
+fn read_wal_identity(path: &Path) -> Result<WalIdentity> {
     let mut f = File::open(path)?;
+    let meta = f.metadata()?;
     // Enough for any container header (max salt + key-check) plus the
     // 88-byte publish block, or a plaintext v3 header.
     let mut buf = [0u8; 512];
     let n = f.read(&mut buf)?;
     let h =
         parse_wal_header(&buf[..n]).map_err(|e| PinkDbError::Execution(header_error(path, &e)))?;
-    Ok((h.gen, h.wal_id, h.records_start as u64))
+    Ok(WalIdentity {
+        gen: h.gen,
+        wal_id: h.wal_id,
+        records_start: h.records_start as u64,
+        dev_ino: Some(identity_of(&meta)),
+        len: meta.len(),
+    })
+}
+
+/// See [`read_wal_identity`].
+#[derive(Debug, Clone, Copy)]
+struct WalIdentity {
+    gen: u64,
+    wal_id: WalId,
+    #[allow(dead_code)] // kept for error context / future checks
+    records_start: u64,
+    dev_ino: Option<(u64, u64)>,
+    #[allow(dead_code)] // the fast path uses `file_meta`; kept for error context
+    len: u64,
 }
 
 /// Scan the live WAL (creating it when absent) and return every intact
@@ -2032,8 +2641,15 @@ fn scan_wal(
         out.upgraded = true;
         return Ok(out);
     }
-    let (records, good_end) = parse_records(&data, header.records_start, cipher.as_ref(), 0, 0)
-        .map_err(PinkDbError::Execution)?;
+    let (records, good_end) = parse_records(
+        &data,
+        header.records_start,
+        cipher.as_ref(),
+        0,
+        0,
+        !header.legacy,
+    )
+    .map_err(PinkDbError::Execution)?;
     let truncated = (data.len() - good_end) as u64;
     let record_count = u32::try_from(records.len())
         .map_err(|_| PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string()))?;
@@ -2152,8 +2768,10 @@ fn roll_path(wal: &Path, gen: u64) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Parse a live WAL header: plaintext v2/v3, container v1/v2. No key needed
-/// (the container key-check is verified separately when a cipher is built).
+/// Parse a live WAL header: plaintext v2/v3/v4, container v1/v2/v3. No key
+/// needed (the container key-check is verified separately when a cipher is
+/// built). `legacy` marks a file whose record payloads predate the current
+/// per-frame touched sets: those are upgraded under the lease before replay.
 fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> {
     if crypto::is_container(data) {
         #[cfg(not(feature = "encryption"))]
@@ -2206,8 +2824,8 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
                 records_start: payload_start + ENC_PUBLISH_BLOCK_LEN,
                 slots_at: payload_start as u64 + ENC_SLOT_A,
                 published_seq,
+                legacy: enc.version < crypto::WAL_CONTAINER_VERSION,
                 enc: Some(enc),
-                legacy: false,
             });
         }
     }
@@ -2219,15 +2837,18 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
     }
     let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
     match version {
-        WAL_VERSION_V2 => {
-            // A corrupted v3 header whose version word was flipped to 2
-            // (one bit!) would otherwise be mistaken for a genuine v2 file:
-            // its records would be misparsed from offset 20 and could be
-            // silently dropped by the upgrade. The v3 header's CRC over
-            // `magic..wal_id` proves it: correct the version word back to 3
-            // and check the CRC (plus the zero reserved tail). A genuine v2
-            // file cannot satisfy this except with cryptographic luck
-            // (2^-32), and its own header has no checksum to check.
+        WAL_VERSION_V2 | WAL_VERSION_V3 => {
+            // A corrupted current-format header whose version word was
+            // flipped to 2 or 3 (one bit!) would otherwise be mistaken for a
+            // genuine older file: its records would be misparsed from the
+            // wrong payload layout and could be silently dropped by the
+            // upgrade. The current header's CRC over `magic..wal_id` proves
+            // it: correct the version word back and check the CRC (plus the
+            // zero reserved tail). A genuine older file cannot satisfy this
+            // except with cryptographic luck (2^-32); its own header has no
+            // checksum to check (v3 headers do carry a CRC, but computed with
+            // version 3 — correcting to the *current* version is what
+            // distinguishes the two).
             if data.len() >= HEADER_LEN {
                 let mut corrected = [0u8; HEADER_LEN];
                 corrected.copy_from_slice(&data[..HEADER_LEN]);
@@ -2240,7 +2861,11 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
             Ok(WalHeader {
                 gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
                 wal_id: [0u8; 16],
-                records_start: V2_RECORDS_START,
+                records_start: if version == WAL_VERSION_V2 {
+                    V2_RECORDS_START
+                } else {
+                    HEADER_LEN
+                },
                 slots_at: 0,
                 published_seq: 0,
                 enc: None,
@@ -2383,8 +3008,9 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
                 }
                 (None, None) => None,
             };
-            let (records, _) = parse_records(&data, h.records_start, cipher.as_ref(), 0, 0)
-                .map_err(PinkDbError::Execution)?;
+            let (records, _) =
+                parse_records(&data, h.records_start, cipher.as_ref(), 0, 0, !h.legacy)
+                    .map_err(PinkDbError::Execution)?;
             Ok(Some(WalProbe {
                 gen: Some(h.gen),
                 has_records: !records.is_empty(),
@@ -2831,9 +3457,9 @@ impl PinkDb {
         // later record touching it must not emit a redundant prefix.
         handle.seed_tracked_extensions(db.loaded_extension_paths());
         // The applied position: this store's memory now matches the file.
-        let (wal_id_now, ckpt_id_now) = (
+        let (wal_id_now, ckpt_now) = (
             file_identity(&wal),
-            file_identity(&handle.checkpoint_path.clone()),
+            ckpt_meta(&handle.checkpoint_path.clone()),
         );
         handle.mark_applied(Applied {
             wal_id: handle.wal_id,
@@ -2845,7 +3471,7 @@ impl PinkDb {
                 .unwrap_or(handle.records_start),
             applied_lsn: handle.last_lsn,
             applied_records: records.len() as u64,
-            ckpt_dev_ino: ckpt_id_now,
+            ckpt: ckpt_now,
         });
         if mutated {
             // Publish recovery mutations (a completed checkpoint, a removed
@@ -2985,13 +3611,12 @@ impl PinkDb {
         // 3. Identity compare: a replaced WAL file, a new WAL incarnation
         //    (`wal_id`), or a new checkpoint means no incremental
         //    continuity — reload the checkpoint and replay from scratch.
-        let (disk_gen, disk_wal_id, _) = read_wal_identity(&wal_path)?;
-        let wal_id_now = file_identity(&wal_path);
-        let ckpt_id_now = file_identity(&ckpt);
-        let full = ckpt_id_now != wal.applied.ckpt_dev_ino
-            || wal_id_now != wal.applied.wal_dev_ino
-            || disk_gen != wal.applied.gen
-            || disk_wal_id != wal.applied.wal_id;
+        let disk = read_wal_identity(&wal_path)?;
+        let ckpt_now = ckpt_meta(&ckpt);
+        let full = ckpt_now != wal.applied.ckpt
+            || disk.dev_ino != wal.applied.wal_dev_ino
+            || disk.gen != wal.applied.gen
+            || disk.wal_id != wal.applied.wal_id;
 
         let (records, end) = if full {
             let other = self.load_checkpoint_for_refresh(&key, &ckpt)?;
@@ -3011,6 +3636,12 @@ impl PinkDb {
                 }
             }
         };
+        // A rebuild re-derives the whole journal from the replayed frames;
+        // an incremental scan appends to it (frames applied earlier keep
+        // their entries: an open optimistic base may still need them).
+        if full {
+            wal.reset_journal();
+        }
         if wal.truncated_last() > 0 || wal.upgraded_last() {
             mutated = true;
         }
@@ -3018,6 +3649,9 @@ impl PinkDb {
         // 4. Replay the new frames into the live store (hazards H1–H10).
         if !records.is_empty() {
             self.replay_frames(wal, &records, &local_session)?;
+            for rec in &records {
+                wal.journal_push(rec.lsn, rec.sets.clone());
+            }
         } else if self.database_exists(&local_session) {
             // No new frames: the local session is still valid (a full
             // rebuild adopted the checkpoint's default session).
@@ -3028,7 +3662,7 @@ impl PinkDb {
         }
 
         // 5. Bookkeeping: the applied position and the epoch cache.
-        let (wal_dev_ino, ckpt_dev_ino) = (file_identity(&wal_path), file_identity(&ckpt));
+        let (wal_dev_ino, ckpt_now) = (file_identity(&wal_path), ckpt_meta(&ckpt));
         let total = wal.applied.applied_records + records.len() as u64;
         let last = if records.is_empty() {
             wal.applied.applied_lsn
@@ -3043,7 +3677,7 @@ impl PinkDb {
             applied_end: end,
             applied_lsn: last,
             applied_records: total,
-            ckpt_dev_ino,
+            ckpt: ckpt_now,
         });
         if let Some(c) = wal.cipher.as_mut() {
             // A reopened encrypted WAL must not reuse the nonces of its
@@ -3062,6 +3696,266 @@ impl PinkDb {
             guard.bump_epoch(wal.last_lsn);
         }
         Ok(())
+    }
+
+    /// Discard every in-memory change not in the WAL and reload the committed
+    /// state (the undo step of a conflicted optimistic autocommit statement:
+    /// its effect never reached the WAL, so it must never be observable). The
+    /// caller holds the lease; for a shared store it also holds the write
+    /// guard, so no local reader can observe the intermediate state.
+    pub(crate) fn rebuild_under_lease(&mut self, guard: &LeaseGuard) -> Result<()> {
+        let Some(wal_arc) = self.wal.clone() else {
+            return Ok(());
+        };
+        {
+            let mut wal = wal_arc.lock().map_err(|_| {
+                PinkDbError::Execution("internal lock error (poisoned)".to_string())
+            })?;
+            // Invalidate the applied position: the identity compare in the
+            // refresh then forces a full rebuild (reload the checkpoint and
+            // replay the whole live WAL).
+            wal.mark_applied(Applied::default());
+        }
+        self.refresh_under_lease(guard)?;
+        Ok(())
+    }
+
+    /// A failure *after* an optimistic execution but before its frame was
+    /// appended: the statement's in-memory effect cannot be undone without
+    /// the lease, so the handle fail-stops (same policy as an append
+    /// failure) — the uncommitted state is never observable and a reopen
+    /// recovers exactly the durable prefix. Returns the error to report.
+    pub(crate) fn poison_uncommitted(&mut self, cause: &PinkDbError) -> PinkDbError {
+        let msg = format!(
+            "an optimistic statement's changes were not committed and cannot be undone in \
+             memory ({cause})"
+        );
+        if let Some(wal) = self.durable_handle() {
+            let mut w = wal.lock().unwrap_or_else(|p| p.into_inner());
+            w.poison(msg.clone());
+        }
+        PinkDbError::Execution(format!(
+            "the database stopped after a write failure ({msg}); reopen it to recover the \
+             durable state"
+        ))
+    }
+
+    /// Capture an optimistic base at the current applied position: the WAL
+    /// incarnation plus the applied LSN, registered so the frame journal is
+    /// not pruned below it while the unit is open. `None` for in-memory
+    /// stores (nothing to validate against) or a poisoned WAL (every
+    /// statement fail-stops anyway).
+    pub(crate) fn capture_base(&self) -> Result<Option<BaseToken>> {
+        let Some(wal_arc) = self.wal.clone() else {
+            return Ok(None);
+        };
+        let mut wal = wal_arc
+            .lock()
+            .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
+        Ok(wal.register_base().map(|(seq, position)| BaseToken {
+            wal: wal_arc.clone(),
+            seq,
+            position,
+        }))
+    }
+
+    /// Test-only evidence: count one clean optimistic autocommit commit.
+    /// Always defined (call sites stay unconditional) but a no-op outside
+    /// test builds.
+    #[inline]
+    pub(crate) fn note_optimistic_success_for_test(&mut self) {
+        #[cfg(test)]
+        if let Some(wal) = self.durable_handle() {
+            let mut w = wal.lock().unwrap_or_else(|p| p.into_inner());
+            w.note_optimistic_outcome(false, false);
+        }
+    }
+
+    /// Test-only evidence: count one optimistic conflict + pessimistic
+    /// fallback (no-op outside test builds).
+    #[inline]
+    pub(crate) fn note_optimistic_fallback_for_test(&mut self) {
+        #[cfg(test)]
+        if let Some(wal) = self.durable_handle() {
+            let mut w = wal.lock().unwrap_or_else(|p| p.into_inner());
+            w.note_optimistic_outcome(true, true);
+        }
+    }
+
+    /// Test-only: `(optimistic commits, conflicts, fallbacks)` on this
+    /// handle's WAL (`None` in memory).
+    #[cfg(test)]
+    pub(crate) fn optimistic_counts_for_test(&self) -> Option<(u64, u64, u64)> {
+        let wal = self.durable_handle()?;
+        let w = wal.lock().unwrap_or_else(|p| p.into_inner());
+        Some(w.optimistic_counts())
+    }
+
+    /// The optimistic commit check, run under the lease (and, for a shared
+    /// store, the write guard): validate `ours` against every frame committed
+    /// after `base` — the applied journal first, then the unapplied tail,
+    /// which is scanned (decoded) without executing. When clean, the tail is
+    /// replayed into this store and journaled so the view is current.
+    /// Returns `None` when the unit may commit; `Some(conflict)` when it must
+    /// abort, in which case nothing was applied and the store is left exactly
+    /// as it was.
+    ///
+    /// Frames are only ever executed after their touched set proved disjoint
+    /// from `ours`, so replaying them can never observe — or collide with —
+    /// the store's uncommitted local state (the H4 hazard the frame-carried
+    /// sets exist to avoid).
+    pub(crate) fn optimistic_commit_check(
+        &mut self,
+        _guard: &LeaseGuard,
+        base: &BasePosition,
+        ours: &FrameSets,
+    ) -> Result<Option<CommitConflict>> {
+        // The lock-identity re-check lives at the mutation boundary
+        // (`append`/`flush`/`refresh`/`checkpoint`); this pass only reads
+        // files and applies already-validated frames in memory.
+        #[cfg(debug_assertions)]
+        {
+            let mut sorted = ours.clone();
+            sorted.canonicalize();
+            debug_assert!(sorted == *ours, "ours must be canonicalized by the caller");
+        }
+        let Some(wal_arc) = self.wal.clone() else {
+            return Ok(None);
+        };
+        let mut wal = wal_arc
+            .lock()
+            .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
+        if let Some(msg) = &wal.poisoned {
+            return Err(PinkDbError::Execution(format!(
+                "WAL is unusable after an earlier write failure ({msg})"
+            )));
+        }
+        // 1. Incarnation. The cached handle is only refreshed at statement
+        //    boundaries, so trust nothing about it: re-read the live file
+        //    under the lease (one open + header read + fstat). A checkpoint,
+        //    recovery, upgrade, replacement, or a roll-away since the base
+        //    invalidates it — the base's snapshot is still internally
+        //    consistent, but it cannot be validated against frames that no
+        //    longer exist, so this is a retryable conflict (the next
+        //    statement's refresh reloads).
+        //    Fast path (one stat): the file is the one this handle last
+        //    applied and its length is the applied position — nothing on
+        //    disk changed at all, so the header cannot have. Anything else
+        //    (a foreign append, a replacement, a truncation) pays the header
+        //    read + the tail scan below.
+        let meta_now = file_meta(&wal.path);
+        let unchanged = meta_now.is_some_and(|m| {
+            m.dev_ino == wal.applied.wal_dev_ino && m.len == wal.applied.applied_end
+        });
+        if !unchanged {
+            let disk = match read_wal_identity(&wal.path) {
+                Ok(d) => d,
+                Err(_) => {
+                    return Ok(Some(CommitConflict {
+                        object: "the WAL generation".to_string(),
+                        detail: "the live WAL is unreadable (recovered by another process?)"
+                            .to_string(),
+                        lsn: None,
+                    }))
+                }
+            };
+            if disk.gen != base.gen
+                || disk.wal_id != base.wal_id
+                || disk.dev_ino != wal.applied.wal_dev_ino
+            {
+                return Ok(Some(CommitConflict {
+                    object: "the WAL generation".to_string(),
+                    detail: "another process checkpointed, recovered, or upgraded the database"
+                        .to_string(),
+                    lsn: None,
+                }));
+            }
+        }
+        // 1b. The checkpoint file itself: a `.save` snapshot of the target
+        //     replaces `.pink` without rolling the WAL, so the incarnation
+        //     check above cannot see it — but a frame appended after it
+        //     would replay on top of a different database.
+        if ckpt_meta(&wal.checkpoint_path) != base.ckpt {
+            return Ok(Some(CommitConflict {
+                object: "the checkpoint file".to_string(),
+                detail: "another process replaced the checkpoint while this unit was open"
+                    .to_string(),
+                lsn: None,
+            }));
+        }
+        // 2. Frames already applied since the base (refreshes and local
+        //    commits recorded their sets in the journal).
+        if let Some((object, lsn)) = wal.check_journal(base, ours) {
+            return Ok(Some(CommitConflict {
+                object,
+                detail: "changed concurrently".to_string(),
+                lsn,
+            }));
+        }
+        // 3. The unapplied tail (empty in the common single-writer case,
+        //    where the stat above proved the length unchanged): scan (decode
+        //    + framing only), check every frame's set, and only then apply.
+        let tail_is_empty = meta_now.is_some_and(|m| m.len == wal.applied.applied_end);
+        let (records, end) = if tail_is_empty {
+            (Vec::new(), wal.applied.applied_end)
+        } else {
+            match wal.scan_increment()? {
+                Some(x) => x,
+                None => {
+                    return Ok(Some(CommitConflict {
+                        object: "the WAL tail".to_string(),
+                        detail: "the WAL was rewritten under the transaction (retry)".to_string(),
+                        lsn: None,
+                    }))
+                }
+            }
+        };
+        for rec in &records {
+            if let Some((object, lsn)) =
+                Wal::frame_conflicts(rec.sets.as_ref(), rec.lsn, base, ours)
+            {
+                return Ok(Some(CommitConflict {
+                    object,
+                    detail: "changed concurrently".to_string(),
+                    lsn,
+                }));
+            }
+        }
+        if !records.is_empty() {
+            let local_session = self.current_db.clone();
+            self.replay_frames(&mut wal, &records, &local_session)?;
+            for rec in &records {
+                wal.journal_push(rec.lsn, rec.sets.clone());
+            }
+            let total = wal.applied.applied_records + records.len() as u64;
+            let (wal_dev_ino, ckpt_now) =
+                (file_identity(&wal.path), ckpt_meta(&wal.checkpoint_path));
+            let applied = Applied {
+                wal_id: wal.wal_id,
+                gen: wal.gen,
+                wal_dev_ino,
+                records_start: wal.records_start,
+                applied_end: end,
+                applied_lsn: wal.last_lsn,
+                applied_records: total,
+                ckpt: ckpt_now,
+            };
+            wal.mark_applied(applied);
+            if let Some(c) = wal.cipher.as_mut() {
+                // An encrypted refresh must not reuse nonces: position the
+                // counter after the on-disk record count.
+                let next = u32::try_from(total)
+                    .map_err(|_| {
+                        PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+                    })?
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+                    })?;
+                c.set_next_counter(next);
+            }
+        }
+        Ok(None)
     }
 
     /// Load the checkpoint `.pink` (plaintext or keyed) for a refresh's full
@@ -3098,10 +3992,10 @@ impl PinkDb {
         records: &[Record],
         local_session: &str,
     ) -> Result<()> {
-        debug_assert!(
-            self.txn_snapshot.is_none(),
-            "refresh never runs inside an embedded transaction"
-        );
+        // Two callers: the refresh (never inside an embedded transaction) and
+        // the optimistic commit check, where an open transaction's changes
+        // are already in the store — safe there because validation proved
+        // every replayed frame touches none of the transaction's objects.
         // H1: detach the handle for the whole replay.
         let stashed_wal = self.wal.take();
         // H2/H3: bare records replay in the lineage session; a vanished
@@ -3402,6 +4296,21 @@ impl PinkDb {
             Some(key) => self.save_with_key(path, key),
             None => self.save(path),
         };
+        // Publish the replacement: a checkpoint written in place (same
+        // inode) is invisible to other processes' identity checks, so bump
+        // the target's lock-file epoch to make them re-check (their refresh
+        // then compares the checkpoint meta and rebuilds). Best-effort — the
+        // epoch is a hint; a failure only delays other processes' refresh.
+        if result.is_ok() {
+            if let Some(f) = &target_lease {
+                let seq = read_slot_max(f, LOCK_SLOT_A, LOCK_SLOT_DOMAIN)
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                if write_slot(f, LOCK_SLOT_A, seq, 0, LOCK_SLOT_DOMAIN).is_err() {
+                    warn_slot_once("lock-file epoch slot");
+                }
+            }
+        }
         drop(target_lease);
         result
     }
@@ -3512,9 +4421,20 @@ mod tests {
         let _ = std::fs::remove_file(PathBuf::from(format!("{}.roll", wal.display())));
     }
 
+    /// The legacy (v2/v3) payload layout, for hand-built fixtures.
+    fn encode_payload_legacy_for_test(stmts: &[String]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(stmts.len() as u32).to_le_bytes());
+        for s in stmts {
+            out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        out
+    }
+
     fn records_of(path: &Path) -> Vec<Record> {
         let data = std::fs::read(path).unwrap();
-        let (recs, _) = parse_records(&data, RECORDS_START, None, 0, 0).unwrap();
+        let (recs, _) = parse_records(&data, RECORDS_START, None, 0, 0, true).unwrap();
         recs
     }
 
@@ -3752,9 +4672,9 @@ mod tests {
     /// records, CRCs computed for real.
     fn write_wal_lsns(path: &Path, gen: u64, records: &[(u64, Vec<String>)]) {
         let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&Wal::header_for(gen)).unwrap();
+        f.write_all(&Wal::header_fresh(gen)).unwrap();
         for (lsn, stmts) in records {
-            let payload = encode_payload(stmts).unwrap();
+            let payload = encode_payload(stmts, None).unwrap();
             f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
             f.write_all(&lsn.to_le_bytes()).unwrap();
             f.write_all(&crc32(&payload).to_le_bytes()).unwrap();
@@ -3777,7 +4697,7 @@ mod tests {
 
     fn write_raw_wal_payload(path: &Path, payload: &[u8]) {
         let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&Wal::header_for(1)).unwrap();
+        f.write_all(&Wal::header_fresh(1)).unwrap();
         f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
         f.write_all(&1u64.to_le_bytes()).unwrap();
         f.write_all(&crc32(payload).to_le_bytes()).unwrap();
@@ -3826,7 +4746,7 @@ mod tests {
         );
         let published = slot_max_in(&data, WAL_SLOT_A as usize, WAL_SLOT_DOMAIN);
         assert_eq!(published, 3, "one commit slot per appended record");
-        let (recs, good_end) = parse_records(&data, RECORDS_START, None, 0, 0).unwrap();
+        let (recs, good_end) = parse_records(&data, RECORDS_START, None, 0, 0, true).unwrap();
         assert_eq!(good_end, data.len());
         assert_eq!(recs.len(), 3);
         assert_eq!(
@@ -4127,22 +5047,22 @@ mod tests {
         );
 
         // A future version is refused cleanly through the same BadVersion
-        // path an old build would use to refuse our version 3 (that
+        // path an older build would use to refuse our version 4 (that
         // direction cannot be executed from this tree).
         let mut future = Vec::new();
         future.extend_from_slice(WAL_MAGIC);
-        future.extend_from_slice(&4u32.to_le_bytes());
+        future.extend_from_slice(&5u32.to_le_bytes());
         future.extend_from_slice(b"payload-bytes");
         std::fs::write(wal_path(&p), &future).unwrap();
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
         assert!(
-            err.to_string().contains("version 4 is not supported"),
+            err.to_string().contains("version 5 is not supported"),
             "{err}"
         );
 
         // A v3 header whose CRC does not verify, on a record-bearing file:
         // hard error (a corrupted header could name the wrong generation).
-        let mut bytes = Wal::header_for(7).to_vec();
+        let mut bytes = Wal::header_fresh(7).to_vec();
         bytes[20] ^= 0xFF; // inside wal_id (covered by the header CRC)
         bytes.extend_from_slice(b"garbage-bytes-here");
         std::fs::write(wal_path(&p), &bytes).unwrap();
@@ -4150,7 +5070,7 @@ mod tests {
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
 
         // Nonzero reserved header bytes are a format error, not a torn write.
-        let mut bytes = Wal::header_for(7).to_vec();
+        let mut bytes = Wal::header_fresh(7).to_vec();
         bytes[88] = 1;
         bytes.extend_from_slice(b"garbage-bytes-here");
         std::fs::write(wal_path(&p), &bytes).unwrap();
@@ -4172,7 +5092,7 @@ mod tests {
         drop(db);
 
         // Garbage after a valid header: intact prefix empty, tail truncated.
-        let mut bytes = Wal::header_for(7).to_vec();
+        let mut bytes = Wal::header_fresh(7).to_vec();
         bytes.extend_from_slice(b"garbage-bytes-here");
         std::fs::write(wal_path(&p), &bytes).unwrap();
         let (db, info) = PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
@@ -4202,7 +5122,7 @@ mod tests {
         ]);
         let record_bytes_start = bytes.len();
         for (lsn, stmts) in &recs {
-            let payload = encode_payload(stmts).unwrap();
+            let payload = encode_payload_legacy_for_test(stmts);
             bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             bytes.extend_from_slice(&lsn.to_le_bytes());
             bytes.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -4216,9 +5136,10 @@ mod tests {
         assert_eq!(info.replayed_records, 2);
         assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
 
-        // The file is now v3: 96-byte header, records byte-preserved.
+        // The file is now v4: 96-byte header, the records re-encoded in the
+        // v4 payload layout (same statements, same LSNs, same order).
         let data = std::fs::read(&wal).unwrap();
-        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 3);
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 4);
         assert_eq!(
             u32::from_le_bytes(data[36..40].try_into().unwrap()),
             crc32(&data[..36])
@@ -4229,11 +5150,13 @@ mod tests {
             1,
             "upgrade seeds slot A"
         );
-        assert_eq!(
-            &data[RECORDS_START..],
-            &record_bytes[..],
-            "records preserved"
-        );
+        let (recs, end) =
+            parse_records(&data, RECORDS_START, None, 0, 0, true).expect("v4 records decode");
+        let lsns: Vec<u64> = recs.iter().map(|r| r.lsn).collect();
+        assert_eq!(lsns, vec![1, 2]);
+        assert!(recs.iter().all(|r| r.sets.is_none()), "legacy sets unknown");
+        assert_eq!(end, data.len(), "no trailing bytes after the upgrade");
+        assert!(!record_bytes.is_empty());
 
         // A leftover `.upgrade` temp (a crash mid-upgrade) is ignored and
         // harmless (design row R1).
@@ -4328,11 +5251,13 @@ mod tests {
         cleanup(&p);
     }
 
-    /// Wave 45m M1: the busy timeout is what a second process sees while
-    /// another holds the lease (holding the flock from an independent fd in
-    /// the test process is exactly what `flock` sees from another process).
-    /// The report names both causes, and the handle keeps working after the
-    /// holder exits.
+    /// Wave 45m M1 (wave 45o semantics): the busy timeout is what a second
+    /// process sees while another holds the lease (holding the flock from an
+    /// independent fd in the test process is exactly what `flock` sees from
+    /// another process). The report names both causes. Because the statement
+    /// executed optimistically before the lease could be taken, the handle
+    /// fail-stops (the uncommitted effect must never be observable) and a
+    /// reopen recovers exactly the durable prefix.
     #[test]
     fn lease_reports_busy_after_the_timeout() {
         let p = tmp_ckpt("busy");
@@ -4352,12 +5277,23 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("is busy"), "{msg}");
         assert!(msg.contains("older pinkdb build"), "{msg}");
-        // A read that needs no refresh is still served from memory.
-        assert!(ints(&mut db, "SELECT a FROM t;").is_empty());
-        // After the foreign holder exits, the same handle succeeds.
+        assert!(msg.contains("stopped after a write failure"), "{msg}");
+        // The refused statement's effect is not durable and no longer
+        // observable: the handle fail-stops until reopened.
+        let read_err = db.execute("SELECT a FROM t;").unwrap_err().to_string();
+        assert!(
+            read_err.contains("stopped after a WAL write failure"),
+            "{read_err}"
+        );
+        drop(db);
+        // After the foreign holder exits, a fresh handle sees exactly the
+        // durable prefix (no row) and writes normally.
         drop(foreign);
-        db.execute("INSERT INTO t VALUES (1);").unwrap();
-        assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
+        let mut back = durable(&p);
+        assert!(ints(&mut back, "SELECT a FROM t;").is_empty());
+        back.execute("INSERT INTO t VALUES (1);").unwrap();
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+        drop(back);
         cleanup(&p);
     }
 
@@ -4402,7 +5338,7 @@ mod tests {
             assert!(err.to_string().contains("exceeds the u32"), "{err}");
         }
         // Real encodings stay far under the limit.
-        let payload = encode_payload(&["SELECT 1".to_string()]).unwrap();
+        let payload = encode_payload(&["SELECT 1".to_string()], None).unwrap();
         assert!(payload.len() < 100);
     }
 
@@ -4524,7 +5460,7 @@ mod tests {
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
         let sql = "LOAD EXTENSION '/nonexistent/pinkdb-h5-test.dylib';";
-        let payload = encode_payload(&[sql.to_string()]).unwrap();
+        let payload = encode_payload(&[sql.to_string()], None).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -4619,7 +5555,7 @@ mod tests {
         // A crashed publisher: append and fsync a record, never publish.
         let wal = wal_path(&p);
         let mut data = std::fs::read(&wal).unwrap();
-        let payload = encode_payload(&["INSERT INTO t VALUES (7);".to_string()]).unwrap();
+        let payload = encode_payload(&["INSERT INTO t VALUES (7);".to_string()], None).unwrap();
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&2u64.to_le_bytes());
         data.extend_from_slice(&crc32(&payload).to_le_bytes());
@@ -6382,13 +7318,13 @@ mod tests {
                 vec![1, 2, 3, 4]
             );
 
-            // A flip of the container version word (2 → 1) must not take the
+            // A flip of the container version word (3 → 1) must not take the
             // legacy-upgrade path and silently drop the records that follow
-            // the v2 publish block: the key-check AAD binds the version, so
-            // the keyed open is refused and the file is left untouched.
+            // the publish block: the key-check AAD binds the version, so the
+            // keyed open is refused and the file is left untouched.
             std::fs::write(&wal, &pristine).unwrap();
             let mut v1 = pristine.clone();
-            assert_eq!(u32::from_le_bytes(v1[8..12].try_into().unwrap()), 2);
+            assert_eq!(u32::from_le_bytes(v1[8..12].try_into().unwrap()), 3);
             v1[8] = 1; // version 1: legacy container, records at payload_start
             std::fs::write(&wal, &v1).unwrap();
             let err = PinkDb::open_durable_with_key(p.to_str().unwrap(), &key()).unwrap_err();
@@ -6450,9 +7386,16 @@ mod tests {
                 let err = db.execute(sql).unwrap_err().to_string();
                 assert!(err.contains("deleted or replaced"), "{sql}: {err}");
             }
-            // Reads still answer from the last consistent view (they never
-            // took a lease: the replaced fd's epoch cannot change).
-            assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1]);
+            // The first refused statement already fail-stopped the handle
+            // (its optimistic effect could not be committed or undone), so
+            // reads refuse too: the uncommitted state is never observable.
+            let read_err = db.execute("SELECT a FROM t ORDER BY a;").unwrap_err();
+            assert!(
+                read_err
+                    .to_string()
+                    .contains("stopped after a WAL write failure"),
+                "{read_err}"
+            );
             assert_eq!(
                 std::fs::read(&wal).unwrap(),
                 wal_before,
@@ -6464,8 +7407,9 @@ mod tests {
             assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1]);
         }
 
-        /// Wave 45n: replacement while a transaction holds the lease makes
-        /// the COMMIT fail closed; the uncommitted row must never become
+        /// Wave 45n/45o: replacement while a transaction is open (the
+        /// transaction itself holds no lease now, but its COMMIT does):
+        /// the COMMIT fails closed, the uncommitted row never becomes
         /// durable, and a fresh reopen is clean.
         #[test]
         fn lock_file_replacement_during_a_held_transaction_fails_closed() {
@@ -6477,7 +7421,7 @@ mod tests {
             replace_lock_file(&p);
             let err = db.execute("COMMIT;").unwrap_err().to_string();
             assert!(err.contains("deleted or replaced"), "{err}");
-            drop(db); // drops the open transaction and its lease
+            drop(db); // drops the still-open transaction (a lease failure keeps it)
             let mut back = durable(&p);
             assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1]);
         }
@@ -6485,7 +7429,9 @@ mod tests {
         /// Wave 45n: a waiter blocked on a lease whose lock file is replaced
         /// reports the replacement immediately (the path-identity check runs
         /// on every wait iteration) instead of burning the whole busy
-        /// timeout on a stray inode.
+        /// timeout on a stray inode. Wave 45o: the waiter executes
+        /// optimistically first, so on the refusal the handle fail-stops; the
+        /// optimistic effect is never durable nor observable.
         #[test]
         fn lock_file_replacement_while_waiting_fails_closed_not_busy() {
             let p = tmp_ckpt("lockrepwait");
@@ -6493,7 +7439,17 @@ mod tests {
             a.execute("CREATE TABLE t (a INTEGER);").unwrap();
             let b = durable(&p);
             b.set_busy_timeout(Duration::from_millis(2_000));
-            a.execute("BEGIN;").unwrap(); // a holds the lease
+            // A foreign fd (another "process") holds the flock: the waiter's
+            // 0→1 lease transition must wait.
+            let foreign = {
+                let f = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(format!("{}.lock", p.display()))
+                    .unwrap();
+                f.try_lock().unwrap();
+                f
+            };
             let p2 = p.ckpt.clone();
             let waiter = std::thread::spawn(move || {
                 let mut b = b;
@@ -6508,7 +7464,7 @@ mod tests {
                 .expect("waiter thread")
                 .expect_err("the replaced-lock write must fail");
             assert!(err.contains("deleted or replaced"), "{err}");
-            a.execute("ROLLBACK;").unwrap();
+            drop(foreign);
             drop(a);
             let mut back = durable(&p2);
             assert!(ints(&mut back, "SELECT a FROM t ORDER BY a;").is_empty());
@@ -6783,8 +7739,8 @@ mod tests {
             let upgraded = std::fs::read(&wal).unwrap();
             assert_eq!(
                 u32::from_le_bytes(upgraded[8..12].try_into().unwrap()),
-                3,
-                "the upgrade published a v3 header"
+                4,
+                "the upgrade published a v4 header"
             );
             assert!(!upgrade.exists(), "the temp was renamed over the WAL");
 
@@ -6975,5 +7931,352 @@ mod tests {
             drop(lease);
             cleanup(&p);
         }
+    }
+    // ---------- wave 45o: optimistic multi-writer commits ----------
+
+    /// Build a frame's touched set for a raw injected record.
+    fn sets_of(tables: &[(&str, &str)], dbs: &[&str]) -> FrameSets {
+        let mut s = FrameSets::default();
+        for (db, t) in tables {
+            s.add_table(db, t);
+        }
+        for d in dbs {
+            s.add_database(d);
+        }
+        s.canonicalize();
+        s
+    }
+
+    /// The headline scenario: two overlapping transactions on disjoint tables
+    /// both commit — neither holds the lease while it runs, so neither waits.
+    #[test]
+    fn optimistic_disjoint_transactions_both_commit() {
+        let p = tmp_ckpt("optdisjoint");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER); CREATE TABLE u (a INTEGER);")
+            .unwrap();
+        let mut b = durable(&p);
+        a.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        b.execute("BEGIN; INSERT INTO u VALUES (2);").unwrap();
+        // Both are open at the same time; committing either must not wait on
+        // the other.
+        a.execute("COMMIT;").unwrap();
+        b.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut a, "SELECT a FROM t ORDER BY a;"), vec![1]);
+        assert_eq!(ints(&mut a, "SELECT a FROM u ORDER BY a;"), vec![2]);
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+        assert_eq!(ints(&mut back, "SELECT a FROM u;"), vec![2]);
+        cleanup(&p);
+    }
+
+    /// A same-table conflict names the table and the frame's LSN, aborts the
+    /// transaction, and a retry (re-run on the refreshed state) commits.
+    #[test]
+    fn optimistic_same_table_conflict_then_retry_succeeds() {
+        let p = tmp_ckpt("optsame");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = durable(&p);
+        a.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        b.execute("BEGIN; INSERT INTO t VALUES (2);").unwrap();
+        a.execute("COMMIT;").unwrap();
+        let err = b.execute("COMMIT;").unwrap_err().to_string();
+        assert!(err.contains("write conflict"), "{err}");
+        assert!(err.contains("table \"main.t\""), "{err}");
+        assert!(err.contains("lsn"), "{err}");
+        // The aborted transaction logged nothing; a retry commits.
+        b.execute("BEGIN; INSERT INTO t VALUES (2);").unwrap();
+        b.execute("COMMIT;").unwrap();
+        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        cleanup(&p);
+    }
+
+    /// Read-set validation: a write computed from a read of `t` conflicts
+    /// when another writer commits `t` after the transaction's base — the
+    /// WAL record's replay would otherwise disagree with what the session
+    /// saw.
+    #[test]
+    fn optimistic_read_set_conflict_prevents_a_stale_write() {
+        let p = tmp_ckpt("optread");
+        let mut a = durable(&p);
+        a.execute(
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); CREATE TABLE u (a INTEGER);",
+        )
+        .unwrap();
+        let mut b = durable(&p);
+        a.execute("BEGIN; UPDATE u SET a = (SELECT MAX(a) FROM t);")
+            .unwrap();
+        b.execute("INSERT INTO t VALUES (50);").unwrap();
+        let err = a.execute("COMMIT;").unwrap_err().to_string();
+        assert!(err.contains("write conflict"), "{err}");
+        assert!(err.contains("main.t"), "{err}");
+        // The aborted write never applied.
+        assert_eq!(ints(&mut a, "SELECT a FROM u;"), Vec::<i64>::new());
+        // Read-only transactions never conflict on reads.
+        a.execute("BEGIN; SELECT COUNT(*) FROM t;").unwrap();
+        b.execute("INSERT INTO t VALUES (51);").unwrap();
+        a.execute("COMMIT;").unwrap();
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 50, 51]
+        );
+        cleanup(&p);
+    }
+
+    /// Write skew: T1 reads t and writes x, T2 reads x and writes t. Plain
+    /// snapshot isolation would let both commit and break `x.v = t.a`;
+    /// table-granular read-set validation aborts the second committer.
+    #[test]
+    fn optimistic_write_skew_is_prevented() {
+        let p = tmp_ckpt("optskew");
+        let mut a = durable(&p);
+        a.execute(
+            "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); \
+             CREATE TABLE x (v INTEGER); INSERT INTO x VALUES (1);",
+        )
+        .unwrap();
+        let mut b = durable(&p);
+        a.execute("BEGIN; UPDATE x SET v = 2 WHERE (SELECT MAX(a) FROM t) = 1;")
+            .unwrap();
+        b.execute("BEGIN; UPDATE t SET a = 2 WHERE (SELECT MAX(v) FROM x) = 1;")
+            .unwrap();
+        a.execute("COMMIT;").unwrap();
+        let err = b.execute("COMMIT;").unwrap_err().to_string();
+        assert!(err.contains("write conflict"), "{err}");
+        assert!(
+            err.contains("main.x") || err.contains("main.t"),
+            "the skew must be reported on one of the crossed tables: {err}"
+        );
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        // x.v = 2 and t.a = 1: the skew invariant (x.v = t.a) held.
+        assert_eq!(ints(&mut back, "SELECT v FROM x;"), vec![2]);
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+        cleanup(&p);
+    }
+
+    /// An optimistic autocommit statement that conflicts is undone and
+    /// re-executed under the lease (the pessimistic fallback): exactly one
+    /// effect lands, and the evidence counters show the fallback ran. The
+    /// conflicting frame is injected while the statement waits for the lease,
+    /// so the interleaving is deterministic.
+    #[test]
+    fn optimistic_autocommit_falls_back_and_applies_exactly_once() {
+        let p = tmp_ckpt("optfallback");
+        let mut b = durable(&p);
+        b.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        // A second open (its own lease) so b can be blocked on the flock.
+        let a = durable(&p);
+        b.set_busy_timeout(Duration::from_secs(5));
+        // A foreign fd holds the flock while b's statement runs.
+        let foreign = {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("{}.lock", p.display()))
+                .unwrap();
+            f.try_lock().unwrap();
+            f
+        };
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        // b's WAL handle, shared with the thread: the main thread injects a
+        // foreign frame through it while b waits for the flock.
+        let b_wal = b.durable_handle().expect("durable");
+        let handle = std::thread::spawn(move || {
+            // The statement executes optimistically (in memory) and then
+            // blocks on the foreign flock for up to the busy timeout.
+            let r = b
+                .execute("INSERT INTO t VALUES (2);")
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+            tx.send(format!("{r:?}")).ok();
+            b
+        });
+        // Give the statement time to execute and reach the lease wait, then
+        // inject a conflicting frame through *b's own* WAL handle (a second
+        // writer's frame arriving mid-statement).
+        std::thread::sleep(Duration::from_millis(250));
+        {
+            let mut guard = b_wal.lock().unwrap();
+            guard
+                .append(
+                    &["INSERT INTO t VALUES (9);".to_string()],
+                    Some(&sets_of(&[("main", "t")], &[])),
+                )
+                .unwrap();
+        }
+        drop(foreign);
+        let r = rx.recv().expect("the statement finished");
+        assert!(!r.contains("Err"), "the fallback must succeed: {r}");
+        let mut b = handle.join().expect("writer thread");
+        // Every row exactly once.
+        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 9]);
+        let (attempts, conflicts, fallbacks) =
+            b.optimistic_counts_for_test().expect("durable counts");
+        assert!(attempts >= 1, "{attempts}");
+        assert_eq!(conflicts, 1, "one injected conflict was detected");
+        assert_eq!(fallbacks, 1, "the fallback ran exactly once");
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 9]
+        );
+        cleanup(&p);
+    }
+
+    /// Frames carry their exact touched set: reads and writes of the
+    /// statement, database-level `CREATE/DROP DATABASE`, and an empty set for
+    /// `USE`.
+    #[test]
+    fn frames_carry_exact_touched_sets() {
+        let p = tmp_ckpt("optsets");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("CREATE TABLE v (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        // Reads count too: the insert's scalar subquery reads v.
+        db.execute("INSERT INTO t VALUES ((SELECT MAX(a) FROM v));")
+            .unwrap();
+        db.execute("CREATE DATABASE db1;").unwrap();
+        db.execute("DROP DATABASE db1;").unwrap();
+        db.execute("USE main;").unwrap();
+        let recs = records_of(&wal_path(&p));
+        let sets = |stmts: &str| -> FrameSets {
+            let rec = recs
+                .iter()
+                .find(|r| r.stmts.iter().any(|s| s.contains(stmts)))
+                .unwrap_or_else(|| panic!("no record with {stmts:?}: {recs:?}"));
+            rec.sets
+                .clone()
+                .expect("live frames always carry known sets")
+        };
+        assert_eq!(
+            sets("CREATE TABLE t"),
+            sets_of(&[("main", "t")], &[]),
+            "DDL write set"
+        );
+        assert_eq!(
+            sets("INSERT INTO t VALUES (1)"),
+            sets_of(&[("main", "t")], &[]),
+            "insert write set"
+        );
+        assert_eq!(
+            sets("SELECT MAX(a) FROM v"),
+            sets_of(&[("main", "t"), ("main", "v")], &[]),
+            "subquery reads are part of the frame's set"
+        );
+        assert_eq!(
+            sets("CREATE DATABASE db1"),
+            sets_of(&[], &["db1"]),
+            "database-level set"
+        );
+        assert_eq!(sets("DROP DATABASE db1"), sets_of(&[], &["db1"]));
+        assert_eq!(sets("USE main"), sets_of(&[], &[]), "USE touches nothing");
+        cleanup(&p);
+    }
+
+    /// A checkpoint by another process invalidates an open transaction's
+    /// base: a retryable conflict, never a silent append onto a new
+    /// generation.
+    #[test]
+    fn optimistic_commit_conflicts_on_incarnation_change() {
+        let p = tmp_ckpt("optckpt");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = durable(&p);
+        a.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        b.execute("CHECKPOINT;").unwrap();
+        let err = a.execute("COMMIT;").unwrap_err().to_string();
+        assert!(err.contains("write conflict"), "{err}");
+        assert!(err.contains("WAL generation"), "{err}");
+        // The retry runs against the new incarnation and commits.
+        a.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        a.execute("COMMIT;").unwrap();
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+        cleanup(&p);
+    }
+
+    /// `save_snapshot` (`SAVE ... AS`, `.save <other>`) replaces the
+    /// checkpoint without rolling the WAL: a base captured before it must
+    /// conflict, or a frame appended after it would replay onto a different
+    /// database.
+    #[test]
+    fn optimistic_commit_conflicts_on_checkpoint_replacement() {
+        let p = tmp_ckpt("optsnap");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER); CHECKPOINT;")
+            .unwrap();
+        a.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        // Replace the target's `.pink` with an empty store's snapshot (the
+        // WAL is empty, so the live-WAL guard lets it through).
+        let other = PinkDb::new();
+        other.save(p.to_str().unwrap()).unwrap();
+        let err = a.execute("COMMIT;").unwrap_err().to_string();
+        assert!(err.contains("write conflict"), "{err}");
+        assert!(err.contains("checkpoint file"), "{err}");
+        // The aborted transaction left the snapshot in place and the WAL
+        // empty: a fresh open sees the snapshot's empty store.
+        drop(a);
+        let back = PinkDb::open(p.to_str().unwrap()).unwrap();
+        assert!(back.list_tables().is_empty());
+        cleanup(&p);
+    }
+
+    /// A durable transaction whose whole effect is `CREATE TABLE` + rows is
+    /// exactly-once across the optimistic commit and a reopen (frames carry
+    /// the sets; replay is unchanged).
+    #[test]
+    fn optimistic_transaction_replays_exactly_once_after_reopen() {
+        let p = tmp_ckpt("optreplay");
+        let mut a = durable(&p);
+        a.execute("BEGIN; CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2), (3); COMMIT;")
+            .unwrap();
+        drop(a);
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(info.replayed_records, 1, "one transaction record");
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 3]
+        );
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// The journal is pruned to the oldest open base and emptied when nothing
+    /// is open: a long-running process does not accumulate sets forever.
+    #[test]
+    fn journal_is_pruned_when_no_base_is_open() {
+        let p = tmp_ckpt("optjournal");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        for i in 0..5 {
+            db.execute(&format!("INSERT INTO t VALUES ({i});")).unwrap();
+        }
+        let wal = db.durable_handle().unwrap();
+        let entries = wal.lock().unwrap().journal_for_test();
+        assert!(
+            entries.is_empty(),
+            "no open base: the journal is empty, got {entries:?}"
+        );
+        assert_eq!(wal.lock().unwrap().open_bases_for_test(), 0);
+        cleanup(&p);
     }
 }

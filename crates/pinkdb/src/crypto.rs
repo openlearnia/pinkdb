@@ -68,11 +68,18 @@ pub const ENC_MAGIC: &[u8; 8] = b"PINKENC1";
 
 const ENC_VERSION: u32 = 2;
 /// The pre-multi-process container version: no WAL publish block. Files are
-/// read as-is (checkpoints) or rebuilt as v2 (WALs) at open.
+/// read as-is (checkpoints) or rebuilt as current (WALs) at open.
 const ENC_VERSION_V1: u32 = 1;
-/// The container version this build writes (the WAL publish block's CRC
-/// domain binds it).
+/// The container version every fresh **checkpoint** this build writes uses.
+/// Deliberately unchanged by wave 45o: `.pink` bytes stay as wave 45m wrote
+/// them (the per-frame touched sets live only in the WAL payloads).
 pub(crate) const CONTAINER_VERSION: u32 = ENC_VERSION;
+/// The container version a **WAL** this build writes uses (wave 45o): the
+/// record payload gained the frame's touched-object set, so an older build
+/// must refuse the file; the version word makes that refusal clean (a WAL
+/// container older than this is rebuilt in place at open). The publish
+/// block's CRC domain binds this version.
+pub(crate) const WAL_CONTAINER_VERSION: u32 = 3;
 const CIPHER_AES256_GCM: u8 = 1;
 const KDF_RAW: u8 = 0;
 const KDF_ARGON2ID: u8 = 1;
@@ -230,7 +237,7 @@ impl Drop for EncryptionKey {
 /// the key, and locate the payload — no key required.
 #[derive(Debug, Clone)]
 pub(crate) struct ContainerHeader {
-    /// Container format version (1 or 2).
+    /// Container format version (1, 2, or 3 for WALs).
     pub version: u32,
     /// 0 for a checkpoint, the WAL generation for a WAL file.
     pub context: u64,
@@ -265,10 +272,10 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
         return Err(corrupt("truncated container header"));
     }
     let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-    if version != ENC_VERSION && version != ENC_VERSION_V1 {
+    if version != ENC_VERSION && version != ENC_VERSION_V1 && version != WAL_CONTAINER_VERSION {
         return Err(corrupt(&format!(
-            "unsupported container version {version} (want {ENC_VERSION}, or {ENC_VERSION_V1} \
-             for legacy files)"
+            "unsupported container version {version} (want {WAL_CONTAINER_VERSION} for WALs, \
+             {ENC_VERSION} for checkpoints, or an older version for legacy files)"
         )));
     }
     let cipher = data[12];
@@ -399,6 +406,9 @@ mod imp {
     /// Header fields needed to serialize a fresh container header.
     #[derive(Clone, Debug)]
     struct HeaderSpec {
+        /// Container version written into the header (and bound into the AAD:
+        /// a version flip fails authentication, not just a check).
+        version: u32,
         context: u64,
         kdf: u8,
         params: Option<(u32, u32, u32, Vec<u8>)>,
@@ -411,7 +421,7 @@ mod imp {
             let mut v =
                 Vec::with_capacity(HEADER_FIXED_LEN + KDF_PARAMS_LEN + MAX_SALT_LEN as usize);
             v.extend_from_slice(ENC_MAGIC);
-            v.extend_from_slice(&ENC_VERSION.to_le_bytes());
+            v.extend_from_slice(&self.version.to_le_bytes());
             v.push(CIPHER_AES256_GCM);
             v.push(self.kdf);
             v.extend_from_slice(&self.context.to_le_bytes());
@@ -556,11 +566,13 @@ mod imp {
         key: &EncryptionKey,
         context: u64,
         domain: Domain,
+        version: u32,
     ) -> Result<(HeaderSpec, Vec<u8>, Vec<u8>, DerivedKey)> {
         let prefix = random_prefix();
         let (spec, derived) = match (&key.raw, &key.passphrase) {
             (Some(raw), _) => (
                 HeaderSpec {
+                    version,
                     context,
                     kdf: KDF_RAW,
                     params: None,
@@ -575,6 +587,7 @@ mod imp {
                     argon2_derive(pass, ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, &salt)?;
                 (
                     HeaderSpec {
+                        version,
                         context,
                         kdf: KDF_ARGON2ID,
                         params: Some((ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, salt)),
@@ -612,7 +625,8 @@ mod imp {
         key: &EncryptionKey,
         context: u64,
     ) -> Result<Vec<u8>> {
-        let (spec, mut out, aad_base, derived) = build_header(key, context, Domain::Checkpoint)?;
+        let (spec, mut out, aad_base, derived) =
+            build_header(key, context, Domain::Checkpoint, CONTAINER_VERSION)?;
         let mut counter: u32 = 1;
         let mut pos = 0usize;
         while pos < plain.len() {
@@ -738,7 +752,8 @@ mod imp {
         /// A fresh container header (fresh salt/params when passphrase-based,
         /// fresh nonce prefix) for generation `context`.
         pub(crate) fn create(key: &EncryptionKey, context: u64) -> Result<Self> {
-            let (spec, header, aad_base, derived) = build_header(key, context, Domain::Wal)?;
+            let (spec, header, aad_base, derived) =
+                build_header(key, context, Domain::Wal, WAL_CONTAINER_VERSION)?;
             Ok(Self {
                 spec,
                 key: derived,
@@ -766,6 +781,7 @@ mod imp {
                 return Err(wrong_key());
             }
             let spec = HeaderSpec {
+                version: header.version,
                 context: header.context,
                 kdf: header.kdf,
                 params: header.params.clone(),
@@ -787,7 +803,11 @@ mod imp {
         /// A sibling container for a fresh WAL generation: same key and KDF
         /// parameters, a new generation context, and a fresh nonce prefix.
         pub(crate) fn fork(&self, context: u64) -> Result<Self> {
+            // A forked WAL container is always current-format: this is the
+            // path that upgrades a legacy container and that every checkpoint
+            // roll uses.
             let spec = HeaderSpec {
+                version: WAL_CONTAINER_VERSION,
                 context,
                 kdf: self.spec.kdf,
                 params: self.spec.params.clone(),

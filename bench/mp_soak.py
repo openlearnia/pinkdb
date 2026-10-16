@@ -49,8 +49,8 @@ Usage:
 Contention mode (`--contention N`) spawns N writers at once, each committing
 M units with a SHORT busy timeout and no kills; it measures wall time,
 per-writer skew, and requires: every acknowledged write present exactly once,
-no livelock/deadlock inside the deadline, and every error (if any) the
-documented busy kind.
+no livelock/deadlock inside the deadline, and every error (if any) of the
+documented retryable kinds (busy, or a write conflict the CLI retried).
 
 `--encrypted` reads the passphrase from `PINKDB_KEY` in the environment
 (never from the command line) and needs an encryption-feature binary
@@ -77,7 +77,17 @@ WORK = tempfile.mkdtemp(prefix="pinkdb_mpsoak_")
 DB = "x.pink"
 
 ERROR_MARK = "Error:"
-BUSY_RE = re.compile(r"busy|timeout", re.IGNORECASE)
+# Outcomes that are retryable/expected rather than run errors:
+#   * a busy lease wait (timeout);
+#   * (wave 45o) a cross-process `write conflict`, which the CLI already
+#     retried internally — when it surfaces, the unit-level retry below
+#     re-drives it after the verified cleanup, preserving exactly-once;
+#   * the `no transaction in progress` a cleanup's leading `ROLLBACK;`
+#     reports: the harness documents it as expected, and under load it can
+#     arrive after the mask window's drain, so the classifier accepts it too.
+RETRYABLE_RE = re.compile(
+    r"busy|timeout|write conflict|no transaction in progress", re.IGNORECASE
+)
 INSERT_OK = "Inserted 1 row(s)."
 TXN_BEGIN_OK = "Transaction started."
 TXN_COMMIT_OK = "Transaction committed."
@@ -152,8 +162,8 @@ def cli(binary, cmds, cwd, env=None, timeout=None):
         return text + f"\nError: CLI run exceeded its {timeout}s timeout\n"
 
 
-def is_busy(line):
-    return bool(BUSY_RE.search(line))
+def is_retryable(line):
+    return bool(RETRYABLE_RE.search(line))
 
 
 # ---------------------------------------------------------------- workers
@@ -332,9 +342,17 @@ def wait_opened(w, timeout=120.0, log=None):
 
 def settle(w, start, marker, timeout):
     """Wait for a unit statement's success marker. Returns True iff the
-    marker is present and no error line is in the window."""
+    marker is present and no non-retryable error line is in the window.
+
+    Wave 45o: a transaction whose COMMIT hit a cross-process conflict prints
+    the conflict error *and then* the CLI's automatic retry commits it
+    ("Transaction committed." in the same window). The marker proves the
+    whole transaction committed (the aborted attempt logged nothing), so a
+    retryable error next to the marker is not a unit failure; a real error
+    (or a marker-less window) is, and takes the verified-cleanup path."""
     text, errs = w.wait_for(start, marker, timeout)
-    return marker in text and not errs, text, errs
+    bad = [e for e in errs if not is_retryable(e)]
+    return marker in text and not bad, text, errs
 
 
 def cleanup_unit(w, wid, unit_where, deadline):
@@ -360,9 +378,9 @@ def cleanup_unit(w, wid, unit_where, deadline):
         if not w.alive():
             return False
         if not ok or not DELETE_OK_RE.search(text):
-            # A hard (non-busy) error cannot be retried away; stop the writer
-            # rather than risk duplicates. Busy errors retry.
-            if any(not is_busy(e) for e in errs):
+            # A hard (non-retryable) error cannot be retried away; stop the
+            # writer rather than risk duplicates. Busy/conflict errors retry.
+            if any(not is_retryable(e) for e in errs):
                 return False
             continue
         start = w.count()
@@ -376,7 +394,7 @@ def cleanup_unit(w, wid, unit_where, deadline):
             return False
         if f"CLEAN {wid}" in text and not errs:
             return True
-        if any(not is_busy(e) for e in errs):
+        if any(not is_retryable(e) for e in errs):
             return False
     return False
 
@@ -561,9 +579,9 @@ def cpu_seconds(pid):
 
 
 def scan_errors(w):
-    """(busy count, non-busy lines) over the worker's whole output, skipping
-    cleanup windows the driver masked (an expected `ROLLBACK` with no open
-    transaction is not a run error)."""
+    """(retryable count, other lines) over the worker's whole output,
+    skipping cleanup windows the driver masked (an expected `ROLLBACK` with no
+    open transaction is not a run error)."""
     busy = 0
     other = []
     masked = set()
@@ -572,7 +590,7 @@ def scan_errors(w):
     for i, line in enumerate(w.output().splitlines()):
         if i in masked or ERROR_MARK not in line:
             continue
-        if is_busy(line):
+        if is_retryable(line):
             busy += 1
         else:
             other.append(line.strip())
@@ -763,12 +781,12 @@ def run_soak(args, binary):
             timeout=max(60.0, args.busy_ms / 1000.0 + 30.0),
         )
         err_lines = [l for l in out.splitlines() if ERROR_MARK in l]
-        bad = [l for l in err_lines if not is_busy(l)]
+        bad = [l for l in err_lines if not is_retryable(l)]
         if "Opened" in out:
             if bad:
                 open_close_errors.append(f"open-close: {out.strip()[-260:]}")
             return
-        if err_lines and is_busy(err_lines[0]):
+        if err_lines and is_retryable(err_lines[0]):
             # The documented busy outcome: the one-shot CLI waited out its
             # timeout for the lease. Its follow-up SELECT cascades
             # `table not found` because no database is open — not a
@@ -884,7 +902,7 @@ def run_soak(args, binary):
         f"(busy opens={busy_open[0]}), kill-stuck={kill_stuck}"
     )
     print(
-        f"acked units={total_acked}, busy errors={busy_errors}, "
+        f"acked units={total_acked}, retryable errors (busy/conflict)={busy_errors}, "
         f"other errors={len(other_errors)}, failed opens={len(open_failures)}, "
         f"busy-abandoned writers={abandoned}"
     )
@@ -1082,7 +1100,13 @@ def drive_contention_writer(w, wid, stop, args):
             w.units[u] = 1
             sql = [f"INSERT INTO t VALUES ({i}, {u});"]
         deadline = time.time() + args.contention_deadline
+        # A transaction unit's two rows carry distinct `u` values: the
+        # cleanup predicate must cover both (exactly-once after a retry).
         unit_where = f"w = {i} AND u = {u}"
+        if txn:
+            unit_where = (
+                f"(w = {i} AND u = {1000000 + u}) OR (w = {i} AND u = {2000000 + u})"
+            )
         if not drive_unit(w, wid, sql, txn, unit_where, deadline):
             if w.alive() and not stop.is_set():
                 w.abandoned = True

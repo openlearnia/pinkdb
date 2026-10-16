@@ -44,12 +44,30 @@ impl PinkDb {
     /// statements as one record at `COMMIT`. In-memory databases skip that
     /// entirely — behavior is unchanged.
     ///
-    /// Multi-process (wave 45m): at every statement boundary outside a
+    /// Multi-process (waves 45m/45o): at every statement boundary outside a
     /// transaction, a durable store refreshes its view from the WAL when the
-    /// publication epoch says another process advanced it; mutating
-    /// statements take the write lease for `[refresh → execute → append →
-    /// publish → auto-checkpoint]`. Reads are served from memory and pay one
-    /// `pread` when nothing changed.
+    /// publication epoch says another process advanced it; reads are served
+    /// from memory and pay one `pread` when nothing changed. Autocommit
+    /// writes to plain tables run **optimistically**: the statement executes
+    /// with no lease held, then the commit takes the lease, validates the
+    /// statement's read/write set against the frames other writers committed
+    /// since (payload v4 carries each frame's touched set), appends, and
+    /// publishes. A conflict discards the never-logged effect (the store is
+    /// rebuilt from the committed state) and the statement is re-executed
+    /// under the held lease, so exactly one effect lands. Statements whose
+    /// effect cannot be discarded (`LOAD EXTENSION`, view DDL, database DDL,
+    /// `CHECKPOINT`) keep the serialized lease path.
+    ///
+    /// An explicit `BEGIN` takes no lease either: it refreshes (a short lease
+    /// only when stale), snapshots, and captures a base position. The
+    /// transaction's statements run on the private snapshot; `COMMIT` takes
+    /// the lease and validates the transaction's read/write set against the
+    /// frames committed after the base (table granularity, read sets
+    /// included, so write skew is prevented), applying the frames that
+    /// arrived for other tables. A conflict aborts the transaction with a
+    /// retryable `write conflict` error; re-running it on the refreshed state
+    /// is the intended retry (the CLI retries a buffered transaction up to
+    /// `PINKDB_TXN_RETRIES` times, default 3).
     ///
     /// The embedded session's current database (`USE`) applies to every later
     /// statement in the same string; unqualified names resolve against it.
@@ -96,6 +114,86 @@ impl PinkDb {
             if self.is_durable() && plan::writes_tables(&plan) {
                 self.refuse_logged_attached_reads(&plan)?;
             }
+            // Inside an open transaction, remember every object this
+            // statement read or wrote: COMMIT validates the set against the
+            // frames other writers committed (wave 45o). `USE` targets count
+            // too: the transaction's record replays them.
+            if self.is_durable() && self.in_transaction() {
+                plan::plan_sets(&plan, &session_db, &mut self.txn_touched);
+                if let plan::LogicalPlan::Use { name } = &plan {
+                    self.txn_touched.add_database(name);
+                }
+            }
+            // Autocommit writes to plain tables take the optimistic fast
+            // path: execute with no lease, then validate + append under it
+            // (with a pessimistic fallback when the commit conflicts). The
+            // serialized path below covers everything else.
+            let optimistic = self.is_durable()
+                && !self.in_transaction()
+                && !self.replaying
+                && plan::optimistic_eligible(&plan);
+            if optimistic {
+                let mut sets = crate::wal::FrameSets::default();
+                plan::plan_sets(&plan, &session_db, &mut sets);
+                sets.canonicalize();
+                let base = self.capture_base()?;
+                // The execution span no other writer waits for.
+                let first = exec::run(self, &plan)?;
+                // Past this point a failure must not leave the uncommitted
+                // effect observable: without the lease it cannot be undone,
+                // so the handle fail-stops (see `poison_uncommitted`).
+                let lease = match self.acquire_lease() {
+                    Ok(l) => l,
+                    Err(e) => return Err(self.poison_uncommitted(&e)),
+                };
+                let conflict = match (&base, &lease) {
+                    (Some(b), Some(g)) => {
+                        let position = b.position();
+                        match self.optimistic_commit_check(g, &position, &sets) {
+                            Ok(c) => c,
+                            Err(e) => return Err(self.poison_uncommitted(&e)),
+                        }
+                    }
+                    _ => None,
+                };
+                let (result, plan, dynamic_functions_used) = if conflict.is_none() {
+                    self.note_optimistic_success_for_test();
+                    (first, plan, dynamic_functions_used)
+                } else {
+                    // Conflict: discard the never-logged effect (reload the
+                    // committed state) and re-execute under the held lease —
+                    // exactly one attempt reaches the WAL.
+                    if let Some(g) = &lease {
+                        self.rebuild_under_lease(g)?;
+                    }
+                    self.note_optimistic_fallback_for_test();
+                    let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                    let p = optimizer::optimize(self, p);
+                    if plan::writes_tables(&p) {
+                        self.refuse_logged_attached_reads(&p)?;
+                    }
+                    (exec::run(self, &p)?, p, d)
+                };
+                // Session transitions are applied before WAL logging so the
+                // log record carries the post-statement session database.
+                match &result {
+                    QueryResult::Used { db } => self.set_current_db(db),
+                    QueryResult::DroppedDatabase { name }
+                        if name.eq_ignore_ascii_case(self.current_db()) =>
+                    {
+                        let fallback = self.fallback_db();
+                        self.set_current_db(&fallback);
+                    }
+                    _ => {}
+                }
+                if let Some(texts) = &texts {
+                    self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, Some(&sets))?;
+                    self.maybe_auto_checkpoint(lease.as_ref());
+                }
+                drop(lease);
+                out.push(result);
+                continue;
+            }
             // Transaction control manages its own lease (`begin` holds it
             // until `commit`/`rollback`). Other mutating statements (and
             // CHECKPOINT under these rules) take the lease around
@@ -137,7 +235,7 @@ impl PinkDb {
                 _ => {}
             }
             if let Some(texts) = &texts {
-                self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used)?;
+                self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, None)?;
                 self.maybe_auto_checkpoint(lease.as_ref());
             }
             drop(lease);

@@ -498,9 +498,17 @@ pub struct PinkDb {
     /// file fd, the in-process gate, the busy timeout, and the epoch cache.
     /// Shared by every clone; `None` in memory.
     pub(crate) lease: Option<Arc<crate::wal::Lease>>,
-    /// The lease held for the whole span of an embedded durable transaction
-    /// (`begin` .. `commit`/`rollback`). Never cloned into snapshots.
-    pub(crate) txn_lease: Option<crate::wal::LeaseGuard>,
+    /// The optimistic base of an embedded durable transaction
+    /// (`begin` .. `commit`/`rollback`), registered to keep the frame journal
+    /// from being pruned below it. No lease is held while the transaction
+    /// runs (wave 45o): `commit` takes it, validates against the frames
+    /// committed after this base, and only then appends. Never cloned into
+    /// snapshots.
+    pub(crate) txn_base: Option<crate::wal::BaseToken>,
+    /// Every catalog object the open transaction's statements read or wrote
+    /// (plus the databases its `USE` statements switched into): what `commit`
+    /// validates against the frames other writers committed.
+    pub(crate) txn_touched: crate::wal::FrameSets,
     /// SQL text of mutating statements executed since `BEGIN` of a durable
     /// transaction; flushed as one WAL record by [`PinkDb::commit`].
     wal_txn: Vec<String>,
@@ -517,6 +525,10 @@ pub struct PinkDb {
     /// inside a transaction; kept so a future relaxation still logs a
     /// self-contained record).
     wal_txn_ext_loaded: Vec<String>,
+    /// The buffered statements' touched-object set (wave 45o): stored in the
+    /// transaction's one WAL frame so optimistic commits elsewhere can
+    /// validate against it.
+    wal_txn_sets: crate::wal::FrameSets,
     /// At-rest key this store was opened/configured with. Checkpoints and
     /// snapshots of a keyed store are written encrypted (feature
     /// `encryption`); [`PinkDb::save`] stays a plaintext explicit API.
@@ -550,9 +562,9 @@ impl Default for PinkDb {
 impl Clone for PinkDb {
     /// Clone the store for a transaction snapshot / multi-writer copy. The
     /// copy shares the WAL handle and the lease *handle* (`Arc`s) but never
-    /// inherits `txn_lease`: a held lease belongs to exactly the store that
-    /// opened it, so dropping a snapshot can never release another store's
-    /// flock.
+    /// inherits `txn_base`: an open transaction's base belongs to exactly the
+    /// store that captured it, so dropping a snapshot can never unregister
+    /// another store's base.
     fn clone(&self) -> Self {
         Self {
             databases: self.databases.clone(),
@@ -564,11 +576,13 @@ impl Clone for PinkDb {
             txn_snapshot: self.txn_snapshot.clone(),
             wal: self.wal.clone(),
             lease: self.lease.clone(),
-            txn_lease: None,
+            txn_base: None,
+            txn_touched: crate::wal::FrameSets::default(),
             wal_txn: self.wal_txn.clone(),
             wal_txn_db: self.wal_txn_db.clone(),
             wal_txn_ext_paths: self.wal_txn_ext_paths.clone(),
             wal_txn_ext_loaded: self.wal_txn_ext_loaded.clone(),
+            wal_txn_sets: self.wal_txn_sets.clone(),
             encryption_key: self.encryption_key.clone(),
             allow_sql_load_extension: self.allow_sql_load_extension,
             replaying: false,
@@ -609,11 +623,13 @@ impl PinkDb {
             txn_snapshot: None,
             wal: None,
             lease: None,
-            txn_lease: None,
+            txn_base: None,
+            txn_touched: crate::wal::FrameSets::default(),
             wal_txn: Vec::new(),
             wal_txn_db: None,
             wal_txn_ext_paths: Vec::new(),
             wal_txn_ext_loaded: Vec::new(),
+            wal_txn_sets: crate::wal::FrameSets::default(),
             encryption_key: None,
             allow_sql_load_extension: true,
             replaying: false,
@@ -906,22 +922,37 @@ impl PinkDb {
     /// `dynamic_functions_used` lists the dynamic-function names (lowercased
     /// registry keys) the statement's expressions reference, collected at
     /// bind time.
+    /// `sets` is the statement's precomputed (canonical) touched set when the
+    /// caller already has it (the optimistic autocommit path computes it for
+    /// validation); `None` computes it here.
     pub(crate) fn wal_log_statement(
         &mut self,
         plan: &crate::plan::LogicalPlan,
         sql: &str,
         dynamic_functions_used: &[String],
+        sets: Option<&crate::wal::FrameSets>,
     ) -> Result<()> {
         if !crate::plan::writes_tables(plan) {
             return Ok(());
         }
         let touched = self.dynamic_function_paths(dynamic_functions_used);
         let loaded = loaded_extension_path(plan);
+        // The frame's touched set (wave 45o), recorded in the payload so
+        // other writers can validate optimistic commits against this frame.
+        let sets = match sets {
+            Some(s) => s.clone(),
+            None => {
+                let mut s = crate::wal::FrameSets::default();
+                crate::plan::plan_sets(plan, &self.current_db.clone(), &mut s);
+                s
+            }
+        };
         if self.in_transaction() {
             if self.wal_txn_db.is_none() {
                 self.wal_txn_db = Some(self.current_db.clone());
             }
             self.wal_txn.push(sql.to_string());
+            self.wal_txn_sets.extend(&sets);
             push_unique(&mut self.wal_txn_ext_paths, touched);
             push_unique(&mut self.wal_txn_ext_loaded, loaded);
             return Ok(());
@@ -933,13 +964,13 @@ impl PinkDb {
                 let mut guard = wal.lock().map_err(|_| {
                     PinkDbError::Execution("internal lock error (poisoned)".to_string())
                 })?;
-                guard.append(&[sql.to_string()])?;
+                guard.append(&[sql.to_string()], Some(&sets))?;
                 guard.set_session_db(&name.to_ascii_lowercase());
             }
             return Ok(());
         }
         let db = self.current_db.clone();
-        self.wal_append_session(&db, &db, &[sql.to_string()], &touched, &loaded)
+        self.wal_append_session(&db, &db, &[sql.to_string()], &touched, &loaded, Some(&sets))
     }
 
     /// Append one committed unit executed in session database `db_before`,
@@ -971,6 +1002,7 @@ impl PinkDb {
         stmts: &[String],
         touched_extensions: &[String],
         loaded_extensions: &[String],
+        sets: Option<&crate::wal::FrameSets>,
     ) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
             let mut guard = wal.lock().map_err(|_| {
@@ -983,63 +1015,100 @@ impl PinkDb {
                 stmts,
                 touched_extensions,
                 loaded_extensions,
+                sets,
             )?;
         }
         Ok(())
     }
 
-    /// Open a transaction: snapshot the whole store. Fails if one is open
-    /// (flat transactions only — no savepoints in v1). A durable store
-    /// acquires and holds the write lease from here to `commit`/`rollback`
-    /// (design 4.7): writes by other processes and their refreshes wait for
-    /// the transaction, and the transaction's view cannot go stale.
+    /// Open a transaction: refresh (a short lease only when something was
+    /// published), snapshot the whole store, and capture the optimistic base
+    /// the commit will validate against. No lease is held while the
+    /// transaction runs (wave 45o): another process's writes never wait for
+    /// it; `commit` detects conflicts from the frames those writers published
+    /// in the meantime. Fails if a transaction is already open (flat
+    /// transactions only — no savepoints in v1).
     pub fn begin(&mut self) -> Result<()> {
         if self.txn_snapshot.is_some() {
             return Err(PinkDbError::Execution(
                 "already in a transaction".to_string(),
             ));
         }
-        let guard = self.acquire_lease()?;
-        if let Some(g) = &guard {
-            // Refresh before snapshotting: the transaction runs against the
-            // complete, current state.
-            self.refresh_under_lease(g)?;
-        }
+        // Refresh before snapshotting: the transaction runs against the
+        // complete, current state (this takes the lease only if stale).
+        self.refresh_if_stale()?;
         self.wal_txn.clear();
         self.wal_txn_db = None;
         self.wal_txn_ext_paths.clear();
         self.wal_txn_ext_loaded.clear();
+        self.wal_txn_sets = crate::wal::FrameSets::default();
+        self.txn_touched = crate::wal::FrameSets::default();
+        // Capture the base *before* taking the snapshot: a frame committed
+        // between the two is past the base, so the commit validates it
+        // (conservative), while a base captured after the snapshot could miss
+        // a frame the snapshot already saw.
+        self.txn_base = self.capture_base()?;
         self.txn_snapshot = Some(Box::new(self.clone()));
-        self.txn_lease = guard;
         Ok(())
     }
 
-    /// Commit: make the transaction's statements durable (one WAL record),
-    /// then drop the snapshot, keeping all changes. A WAL failure returns the
-    /// error and leaves the transaction open (nothing was published) — and
-    /// with it the write lease, so a retried COMMIT still serializes.
+    /// Commit: take the write lease, validate the transaction against every
+    /// frame another writer committed after its base (write-write and
+    /// read-write, table granularity — a stale read or a lost update is a
+    /// conflict, and write skew is prevented), apply the frames that arrived
+    /// for other tables, then make the transaction's statements durable (one
+    /// WAL record) and drop the snapshot.
+    ///
+    /// A conflict aborts the transaction — the snapshot is discarded and a
+    /// retryable `write conflict` error is returned (re-running the
+    /// transaction on the refreshed state is the intended retry). A WAL
+    /// failure returns the error and leaves the transaction open (nothing was
+    /// published) and the handle fail-stopped, exactly as before this wave.
     pub fn commit(&mut self) -> Result<()> {
         if self.txn_snapshot.is_none() {
             return Err(PinkDbError::Execution(
                 "no transaction in progress".to_string(),
             ));
         }
-        if !self.wal_txn.is_empty() {
+        let lease = self.acquire_lease()?;
+        let writes = !self.wal_txn.is_empty();
+        // Cross-process validation first (durable stores with a captured
+        // base): it either applies the frames that arrived for other tables
+        // or reports the conflict. Nothing local is applied before the check
+        // passed, so a conflict leaves the (aborted) transaction's changes
+        // only in the snapshot being discarded. Read-only transactions (no
+        // buffered record) log nothing and never conflict.
+        if writes {
+            if let (Some(g), Some(base)) = (lease.as_ref(), self.txn_base.as_ref()) {
+                let position = base.position();
+                let mut touched = self.txn_touched.clone();
+                touched.canonicalize();
+                if let Some(conflict) = self.optimistic_commit_check(g, &position, &touched)? {
+                    self.rollback()?;
+                    return Err(PinkDbError::Execution(conflict.message("transaction")));
+                }
+            }
+        }
+        if writes {
             let stmts = std::mem::take(&mut self.wal_txn);
             let touched = std::mem::take(&mut self.wal_txn_ext_paths);
             let loaded = std::mem::take(&mut self.wal_txn_ext_loaded);
+            let sets = std::mem::take(&mut self.wal_txn_sets);
             let before = self
                 .wal_txn_db
                 .take()
                 .unwrap_or_else(|| self.current_db.clone());
             let after = self.current_db.clone();
-            if let Err(e) = self.wal_append_session(&before, &after, &stmts, &touched, &loaded) {
+            if let Err(e) =
+                self.wal_append_session(&before, &after, &stmts, &touched, &loaded, Some(&sets))
+            {
                 // Keep the statements: a retried COMMIT must never publish
                 // changes that made it to memory but not to the WAL.
                 self.wal_txn = stmts;
                 self.wal_txn_db = Some(before);
                 self.wal_txn_ext_paths = touched;
                 self.wal_txn_ext_loaded = loaded;
+                self.wal_txn_sets = sets;
                 return Err(e);
             }
         }
@@ -1047,9 +1116,11 @@ impl PinkDb {
         self.wal_txn_db = None;
         self.wal_txn_ext_paths.clear();
         self.wal_txn_ext_loaded.clear();
+        self.wal_txn_sets = crate::wal::FrameSets::default();
+        self.txn_touched = crate::wal::FrameSets::default();
         self.txn_snapshot = None;
-        // Release the transaction's lease only after the record is durable.
-        self.txn_lease = None;
+        // The base is released only after the record is durable.
+        self.txn_base = None;
         Ok(())
     }
 
@@ -1066,9 +1137,11 @@ impl PinkDb {
                 self.wal_txn_db = None;
                 self.wal_txn_ext_paths.clear();
                 self.wal_txn_ext_loaded.clear();
-                // The snapshot was cloned without the lease; dropping the old
-                // `self` above already released the transaction's guard.
-                self.txn_lease = None;
+                self.wal_txn_sets = crate::wal::FrameSets::default();
+                self.txn_touched = crate::wal::FrameSets::default();
+                // The snapshot was cloned without a base; dropping the old
+                // `self` above already unregistered it.
+                self.txn_base = None;
                 Ok(())
             }
             None => Err(PinkDbError::Execution(

@@ -91,19 +91,19 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
-| 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | in progress | worktree; integrates as a patch with full gates after 45o |
+| 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | integrating | worktree patch on main (gates + CI before commit) |
 | 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | queued | — |
-| 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | in progress | worktree; patch integration after 45o |
-| 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | in progress | worktree; patch integration after 45o |
+| 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | integrating | worktree patch on main (gates + CI before commit) |
+| 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | integrating | worktree patch on main (gates + CI before commit) |
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | queued | — |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
 Parallel feature work (Oct 2026): waves 58 (SQL completeness), 60 (functions) and
-61 (optimizer work) are being built in dedicated git worktrees
-(`wt-sql-completeness`, `wt-functions`, `wt-optimizer`) against the current base
-while 45o runs in the main tree; each produces a patch artifact that integrates
-with full gates plus CI before merge. 59 (prepared statements) and 62
+61 (optimizer work) were built in dedicated git worktrees
+(`wt-sql-completeness`, `wt-functions`, `wt-optimizer`) off the current base;
+45o has since landed and the three patches are integrating on main one at a
+time with full gates plus CI before each commit. 59 (prepared statements) and 62
 (DECIMAL/INTERVAL types) are queued; the schema-feature waves (declarative
 PK/FK constraints, indexes, materialized views) remain in the numbered queue.
 
@@ -125,7 +125,11 @@ shipped the stability-hardening round — chaos-soak exactly-once evidence under
 lock-file identity that fails closed on replacement, WAL fuzzing and gap closures (details
 in the progress log below). CI is fully green as of run 38875669660 (all nine jobs),
 unblocked by the dd53f41…a837896 saga. Stage 5 — optimistic disjoint-table commits —
-is in progress as **45o**, and **wave 57 (queued): pink-lake data encryption/decryption
+**shipped as 45o**: WAL v4 touched sets, lease-free transactions with commit-time
+read/write-set validation (write skew prevented), typed conflicts and bounded CLI
+retry; the contention bench measures 2.31–2.49× on overlapping transactions with
+disjoint writes, with an honest no-win on replay-bound write-heavy workloads.
+**Wave 57 (queued): pink-lake data encryption/decryption
 at rest** — one Argon2id KDF per lake session (salt in the catalog), AEAD containers for
 the catalog/snapshots and the data files, `PINKDB_KEY` UX consistent with the engine,
 plaintext lakes unaffected.
@@ -630,3 +634,30 @@ Java bindings.
   noise (≤3% budget). Gates: 574 workspace / 424 encryption / 82+57 CLI / 132 pink-lake /
   duckdiff 60/60 / multiprocess 17/17 + Linux Docker (lib 386, encryption 403,
   multiprocess 17/17).
+- 2026-10-16 — Wave 45o (optimistic multi-writer commits, stage 5): WAL **v4** — every
+  record carries its touched set (tables its statements read or wrote + `CREATE`/`DROP
+  DATABASE` names; `u32::MAX` = unknown for records adapted from v2/v3); v2/v3 upgrade
+  in place, encrypted WAL containers are v3, encrypted checkpoints stay container-v2,
+  plaintext `.pink` bytes untouched, older builds refuse v4 cleanly (`BadVersion`).
+  `BEGIN` snapshots `(wal_id, generation, applied LSN, checkpoint identity)` and holds
+  no lease; `COMMIT` leases only for refresh → validate → append → publish. Validation
+  is table-granularity against the frame journal: conflict iff a frame committed in
+  `(base, now]` touched a table the unit read or wrote — read-set validation also
+  prevents write skew across processes (both directions tested). Conflicts are typed
+  (`write conflict on table "db.name" (… lsn N …); retry`); the engine aborts, the CLI
+  retries (`PINKDB_TXN_RETRIES`, default 3) including a one-call `BEGIN; …; COMMIT;`
+  with the pre-BEGIN session restored. Autocommit runs optimistically too: on conflict
+  the never-logged effect is undone and the statement re-executes under the lease
+  (exactly-once, no user-visible error; a lease that cannot be acquired after an
+  optimistic execution fail-stops the handle — reopen recovers). Checkpoints and
+  `.save` snapshots invalidate open bases (retryable). Matrix: 26 multiprocess
+  scenarios (11 new, incl. kill -9 mid-optimistic-transaction, write skew, the
+  one-call CLI retry, autocommit hammering 4×100 and 3×60 exactly-once) + 10 new wal
+  unit tests. `bench/mp_optimistic.py`: 4 overlapping transactions with disjoint
+  writes **2.31–2.49×** vs the serialized binary (old binary 0.98–0.99×); honest
+  no-win on write-heavy replay-bound workloads (full-replica refresh materializes
+  peers' frames). Budget: `Sync` inserts within noise (≤3% holds); `Batch` ~9% faster
+  after the commit-check fast path. Verified on main with a clean workspace rebuild:
+  fmt, clippy (pinkdb, CLI lake+s3), pinkdb 396/396 + encryption 413/413, multiprocess
+  26/26, duckdiff 60/60, workspace all green, `mp_soak.py --ci` PASS (1,135 acked
+  units, 18 kills, exactly-once across 23 writers); Linux Docker 396/413/26 all green.

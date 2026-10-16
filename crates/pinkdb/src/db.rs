@@ -5,8 +5,8 @@
 //! [`Connection`]:
 //!
 //! - Outside a transaction (autocommit): queries run under a shared read
-//!   lock (readers never block each other); writes take the write lock for
-//!   one statement.
+//!   lock (readers never block each other); writes execute under the write
+//!   lock and commit one statement.
 //! - Inside `BEGIN..COMMIT`: the connection works on a private snapshot
 //!   (repeatable reads, own writes visible). `COMMIT` merges table-by-table
 //!   under the write lock after an optimistic version check — concurrent
@@ -20,8 +20,24 @@
 //! serializable at table granularity — and, crucially, keeps the WAL honest:
 //! replay re-runs the committed SQL text after every earlier commit, so a
 //! stale read would otherwise replay to different data than the session saw.
-//! Read-only transactions log nothing and never conflict. Transactions hold
-//! no locks while open (only validation+merge serializes at commit).
+//! Read-only transactions log nothing and never conflict.
+//!
+//! Across processes (waves 45m/45o), the lease is held only for short spans,
+//! never across statement/transaction execution. A durable autocommit write
+//! executes without the lease, then commits under it: the lease acquisition
+//! is followed by frame-based validation (each WAL frame records the set of
+//! tables its statements read or wrote, payload v4) and, on a conflict, an
+//! undo (reload the committed state) plus a pessimistic re-execution under
+//! the held lease — exactly one effect reaches the WAL. A durable `BEGIN`
+//! captures a base `(wal_id, generation, applied LSN, checkpoint identity)`
+//! and holds no lease; `COMMIT` takes the lease, validates the transaction's
+//! read∪write set against every frame committed after the base (a conflict
+//! names the object and the frame's LSN, the cross-process "version"), and
+//! applies the frames that arrived for other tables before appending. A
+//! checkpoint, a recovered WAL, or a replaced `.pink` invalidates the base —
+//! a retryable conflict, never a silent append onto another incarnation.
+//! The write guard may be held while acquiring the lease (the optimistic
+//! paths do); the in-process gate makes that safe (see the `Lease` docs).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +48,7 @@ use crate::crypto::EncryptionKey;
 use crate::plan::{is_read_only, LogicalPlan};
 use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
-use crate::wal::{DurableOpenOptions, Lease, LeaseGuard};
+use crate::wal::{BaseToken, DurableOpenOptions, Lease, LeaseGuard};
 use crate::QueryResult;
 
 /// One-time warning flag for poisoned-lock recovery (see [`read_lock`]).
@@ -222,6 +238,11 @@ struct Txn {
     base_views: HashMap<(String, String), ViewDef>,
     /// Tables / views created, dropped, or written, keyed `(database, name)`.
     table_writes: HashSet<(String, String)>,
+    /// The buffered (mutating) statements' touched-object set (wave 45o):
+    /// the transaction's one WAL frame records exactly which tables/databases
+    /// its replay depends on, so writers validate optimistic commits against
+    /// it.
+    wal_sets: crate::wal::FrameSets,
     /// Catalog tables read by any statement of the transaction (including
     /// subqueries and DML predicates). A transaction that writes must find
     /// them unchanged at COMMIT: its WAL record replays its SQL text *after*
@@ -249,10 +270,11 @@ struct Txn {
     /// target. A database dropped since BEGIN makes the record unreplayable,
     /// so COMMIT conflicts on it.
     wal_dbs: Vec<String>,
-    /// The write lease held from BEGIN to COMMIT/ROLLBACK (durable stores):
-    /// while a transaction is open, every other process's writes and
-    /// refreshes wait for it (design 4.7).
-    txn_lease: Option<LeaseGuard>,
+    /// The optimistic base captured at BEGIN (wave 45o): COMMIT validates
+    /// every frame committed after it. No lease is held while the transaction
+    /// is open — another process's writes run in parallel and are detected as
+    /// conflicts at COMMIT instead of being blocked.
+    base: Option<BaseToken>,
 }
 
 /// One connection: single-threaded statement stream, own transaction state,
@@ -329,6 +351,14 @@ impl Connection {
                 }
                 record_writes(&plan, &pre, &mut txn.table_writes, &mut txn.view_writes);
                 crate::plan::collect_tables_read(&plan, &pre, &mut txn.table_reads);
+                if crate::plan::writes_tables(&plan) {
+                    // The frame's set: only statements that get buffered into
+                    // the WAL record contribute (a read-only statement's text
+                    // never replays).
+                    let mut stmt_sets = crate::wal::FrameSets::default();
+                    crate::plan::plan_sets(&plan, &pre, &mut stmt_sets);
+                    txn.wal_sets.extend(&stmt_sets);
+                }
                 let result = crate::exec::run(&mut txn.work, &plan)?;
                 let after = session_after(&result, &pre, &txn.work);
                 // Buffer the committed statement for the transaction's single
@@ -390,43 +420,7 @@ impl Connection {
                     result?
                 } else {
                     drop(shared);
-                    // Invariant I6: lease first, then the store write guard.
-                    let lease = self.db.acquire_lease()?;
-                    let mut shared = write_lock(&self.db.shared);
-                    if let Some(g) = &lease {
-                        // Refresh under the lease; the rebind below covers a
-                        // changed catalog either way.
-                        shared.refresh_under_lease(g)?;
-                    }
-                    let (plan, dynamic_functions_used) =
-                        crate::sql::bind_tracked(&shared, stmt, &pre)?;
-                    // A durable store logs mutating statements: one that
-                    // reads an attached lake table could never replay (the
-                    // guard is a no-op for in-memory stores).
-                    if crate::plan::writes_tables(&plan) {
-                        shared.refuse_logged_attached_reads(&plan)?;
-                    }
-                    let result = crate::exec::run(&mut shared, &plan)?;
-                    // The write is published: log it while still holding the
-                    // lock so WAL order matches commit order.
-                    if let Some(text) = sql_text {
-                        if crate::plan::writes_tables(&plan) {
-                            let after = session_after(&result, &pre, &shared);
-                            let touched = shared.dynamic_function_paths(&dynamic_functions_used);
-                            let loaded = crate::storage::loaded_extension_path(&plan);
-                            shared.wal_append_session(
-                                &pre,
-                                &after,
-                                &[text.to_string()],
-                                &touched,
-                                &loaded,
-                            )?;
-                            shared.maybe_auto_checkpoint(lease.as_ref());
-                        }
-                    }
-                    drop(shared);
-                    drop(lease);
-                    result
+                    self.autocommit_write(stmt, sql_text, &pre)?
                 };
                 // `USE` is read-only for locking but still WAL-logged: replay
                 // must switch sessions exactly like this connection did.
@@ -451,12 +445,15 @@ impl Connection {
                             )));
                         }
                         if let Some(text) = sql_text {
+                            // `USE` touches no table: a known-empty set.
+                            let sets = crate::wal::FrameSets::default();
                             shared.wal_append_session(
                                 &pre,
                                 &after,
                                 &[text.to_string()],
                                 &[],
                                 &[],
+                                Some(&sets),
                             )?;
                         }
                         drop(shared);
@@ -476,22 +473,195 @@ impl Connection {
         }
     }
 
+    /// One autocommit write statement outside a transaction (wave 45o).
+    ///
+    /// Plain table DDL/DML takes the optimistic fast path: bind (and rebind
+    /// under the exclusive store lock), capture a base, execute **without**
+    /// the lease, then acquire the lease and validate the base from the
+    /// frames other writers committed in the meantime. A clean check applies
+    /// those frames and logs the statement; a conflict discards the in-memory
+    /// effect (a rebuild from the checkpoint + live WAL) and re-executes
+    /// under the held lease — the pessimistic fallback, so exactly one
+    /// attempt ever reaches the WAL.
+    ///
+    /// Everything else that mutates (view DDL, `LOAD EXTENSION`,
+    /// `CREATE/DROP DATABASE`, `CHECKPOINT`) stays on the serialized path:
+    /// its effect cannot be discarded and restored by a rebuild.
+    ///
+    /// Lock order note (invariant I6): this path holds the store write guard
+    /// while acquiring the lease. That is safe — the lease gate is an
+    /// in-process refcount, and a lease holder blocked on the store write
+    /// guard has not started its validation/append span; the flock itself is
+    /// held by the process the whole time or is acquired here.
+    fn autocommit_write(
+        &self,
+        stmt: &crate::sql::ast::Statement,
+        sql_text: Option<&str>,
+        pre: &str,
+    ) -> Result<QueryResult> {
+        let mut shared = write_lock(&self.db.shared);
+        // Rebind under the exclusive lock: a concurrent local commit could
+        // have changed the catalog between the caller's read-guard bind and
+        // this lock.
+        let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        if crate::plan::writes_tables(&plan) {
+            shared.refuse_logged_attached_reads(&plan)?;
+        }
+        if !self.db.lease.is_some() || !crate::plan::optimistic_eligible(&plan) {
+            // Serialized path: lease first, then refresh, run, log.
+            drop(shared);
+            let lease = self.db.acquire_lease()?;
+            let mut shared = write_lock(&self.db.shared);
+            if let Some(g) = &lease {
+                shared.refresh_under_lease(g)?;
+            }
+            let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+            if crate::plan::writes_tables(&plan) {
+                shared.refuse_logged_attached_reads(&plan)?;
+            }
+            let result = crate::exec::run(&mut shared, &plan)?;
+            self.log_autocommit(
+                &mut shared,
+                &plan,
+                &dynamic_functions_used,
+                sql_text,
+                pre,
+                &result,
+                lease.as_ref(),
+                None,
+            )?;
+            drop(shared);
+            drop(lease);
+            return Ok(result);
+        }
+        // Optimistic fast path.
+        let mut sets = crate::wal::FrameSets::default();
+        crate::plan::plan_sets(&plan, pre, &mut sets);
+        sets.canonicalize();
+        let base = shared.capture_base()?;
+        // Execute with no lease: this is the span other writers overlap.
+        let result = crate::exec::run(&mut shared, &plan)?;
+        // Past this point a failure must not leave the uncommitted effect
+        // observable: without the lease it cannot be undone, so the handle
+        // fail-stops (see `poison_uncommitted`).
+        let lease = match self.db.acquire_lease() {
+            Ok(l) => l,
+            Err(e) => return Err(shared.poison_uncommitted(&e)),
+        };
+        let conflict = match (&base, &lease) {
+            (Some(b), Some(g)) => {
+                let position = b.position();
+                match shared.optimistic_commit_check(g, &position, &sets) {
+                    Ok(c) => c,
+                    Err(e) => return Err(shared.poison_uncommitted(&e)),
+                }
+            }
+            _ => None,
+        };
+        if conflict.is_none() {
+            shared.note_optimistic_success_for_test();
+            self.log_autocommit(
+                &mut shared,
+                &plan,
+                &dynamic_functions_used,
+                sql_text,
+                pre,
+                &result,
+                lease.as_ref(),
+                Some(&sets),
+            )?;
+            drop(shared);
+            drop(lease);
+            return Ok(result);
+        }
+        // Conflict: undo the never-logged effect, then re-execute under the
+        // lease (which is held until this returns, so the retry cannot
+        // conflict again).
+        if let Some(g) = &lease {
+            shared.rebuild_under_lease(g)?;
+        }
+        shared.note_optimistic_fallback_for_test();
+        let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        if crate::plan::writes_tables(&plan) {
+            shared.refuse_logged_attached_reads(&plan)?;
+        }
+        let result = crate::exec::run(&mut shared, &plan)?;
+        self.log_autocommit(
+            &mut shared,
+            &plan,
+            &dynamic_functions_used,
+            sql_text,
+            pre,
+            &result,
+            lease.as_ref(),
+            None,
+        )?;
+        drop(shared);
+        drop(lease);
+        Ok(result)
+    }
+
+    /// Log one committed autocommit write: one WAL record (with a `USE`
+    /// prefix and extension prefixes when needed) while the store lock is
+    /// held, then the auto-checkpoint hook. `sets` is the statement's
+    /// precomputed (canonical) touched set when the caller already has it.
+    #[allow(clippy::too_many_arguments)]
+    fn log_autocommit(
+        &self,
+        shared: &mut PinkDb,
+        plan: &LogicalPlan,
+        dynamic_functions_used: &[String],
+        sql_text: Option<&str>,
+        pre: &str,
+        result: &QueryResult,
+        lease: Option<&LeaseGuard>,
+        sets: Option<&crate::wal::FrameSets>,
+    ) -> Result<()> {
+        if let Some(text) = sql_text {
+            if crate::plan::writes_tables(plan) {
+                let after = session_after(result, pre, shared);
+                let touched = shared.dynamic_function_paths(dynamic_functions_used);
+                let loaded = crate::storage::loaded_extension_path(plan);
+                // The optimistic path already computed (and canonicalized)
+                // the statement's set for validation; reuse it instead of
+                // walking the plan again.
+                let sets = match sets {
+                    Some(s) => s.clone(),
+                    None => {
+                        let mut s = crate::wal::FrameSets::default();
+                        crate::plan::plan_sets(plan, pre, &mut s);
+                        s
+                    }
+                };
+                shared.wal_append_session(
+                    pre,
+                    &after,
+                    &[text.to_string()],
+                    &touched,
+                    &loaded,
+                    Some(&sets),
+                )?;
+                shared.maybe_auto_checkpoint(lease);
+            }
+        }
+        Ok(())
+    }
+
     fn txn_begin(&mut self) -> Result<QueryResult> {
         if self.txn.is_some() {
             return Err(PinkDbError::Execution(
                 "already in a transaction".to_string(),
             ));
         }
-        // Durable stores hold the write lease from BEGIN to COMMIT/ROLLBACK
-        // and refresh before snapshotting (design 4.7): while the
-        // transaction is open, every other process's writes and refreshes
-        // wait for it, and the transaction's view cannot go stale.
-        let lease = self.db.acquire_lease()?;
-        if let Some(g) = &lease {
-            let mut shared = write_lock(&self.db.shared);
-            shared.refresh_under_lease(g)?;
-        }
+        // Refresh (a short lease only when something was published), then
+        // snapshot and capture the optimistic base. No lease is held while
+        // the transaction runs (wave 45o): another process's writes never
+        // wait for it; COMMIT validates against the frames they published.
+        self.db.refresh()?;
         let shared = read_lock(&self.db.shared);
+        // Base first (see `PinkDb::begin`): a frame committed between base and
+        // snapshot is past the base and therefore validated.
+        let base = shared.capture_base()?;
         let mut base_tables = HashMap::new();
         for dbname in shared.list_databases() {
             for name in shared.list_tables_in(&dbname) {
@@ -517,13 +687,14 @@ impl Connection {
             table_writes: HashSet::new(),
             table_reads: HashSet::new(),
             view_writes: HashSet::new(),
+            wal_sets: crate::wal::FrameSets::default(),
             wal_stmts: Vec::new(),
             wal_ext_paths: Vec::new(),
             wal_ext_loaded: Vec::new(),
             wal_db_before: None,
             wal_db_after: self.current_db.clone(),
             wal_dbs: Vec::new(),
-            txn_lease: lease,
+            base,
         };
         drop(shared);
         self.txn = Some(txn);
@@ -535,7 +706,45 @@ impl Connection {
             .txn
             .take()
             .ok_or_else(|| PinkDbError::Execution("no transaction in progress".to_string()))?;
+        // Take the lease for the commit span, then the store write guard.
+        // (Optimistic paths acquire the lease while already holding the write
+        // guard; the in-process gate makes that safe — see `Lease`.)
+        // A lease failure (busy timeout, replaced lock file) keeps the
+        // transaction open: nothing was validated or appended, and a retry or
+        // ROLLBACK stays possible.
+        let lease = match self.db.acquire_lease() {
+            Ok(l) => l,
+            Err(e) => {
+                self.txn = Some(txn);
+                return Err(e);
+            }
+        };
         let mut shared = write_lock(&self.db.shared);
+        // Cross-process validation (wave 45o): conflict iff any frame
+        // committed after the base touched a table this transaction read or
+        // wrote. Read-only transactions log nothing and never conflict (there
+        // is no record whose replay could disagree), so the check only runs
+        // for transactions that will produce a WAL record. On a clean result
+        // the frames that arrived for *other* tables are applied, so the
+        // store is current before the merge below.
+        if !txn.wal_stmts.is_empty() {
+            if let (Some(g), Some(base)) = (lease.as_ref(), txn.base.as_ref()) {
+                let mut ours = crate::wal::FrameSets::default();
+                for (db, name) in txn.table_reads.iter().chain(txn.table_writes.iter()) {
+                    ours.add_table(db, name);
+                }
+                for db in &txn.wal_dbs {
+                    ours.add_database(db);
+                }
+                // View DDL is session-local and never logged: no frame can
+                // carry it, so `view_writes` contributes nothing here.
+                ours.canonicalize();
+                let position = base.position();
+                if let Some(conflict) = shared.optimistic_commit_check(g, &position, &ours)? {
+                    return Err(conflict_error(&conflict, "transaction"));
+                }
+            }
+        }
         // A database dropped since BEGIN makes the transaction's WAL record
         // unreplayable (its statements or `USE` targets name it): conflict
         // instead of logging a dead record or silently no-op'ing the merge.
@@ -594,12 +803,15 @@ impl Connection {
                 .wal_db_before
                 .clone()
                 .unwrap_or_else(|| txn.wal_db_after.clone());
+            let mut sets = txn.wal_sets.clone();
+            sets.canonicalize();
             shared.wal_append_session(
                 &before,
                 &txn.wal_db_after,
                 &txn.wal_stmts,
                 &txn.wal_ext_paths,
                 &txn.wal_ext_loaded,
+                Some(&sets),
             )?;
         }
         // Merge: swap written tables (carrying bumped versions) and views.
@@ -622,7 +834,7 @@ impl Connection {
             }
         }
         if !txn.wal_stmts.is_empty() {
-            shared.maybe_auto_checkpoint(txn.txn_lease.as_ref());
+            shared.maybe_auto_checkpoint(lease.as_ref());
         }
         Ok(QueryResult::Committed)
     }
@@ -641,6 +853,15 @@ fn conflict(what: &str) -> PinkDbError {
     PinkDbError::Execution(format!(
         "write conflict on {what}: changed concurrently, retry the transaction"
     ))
+}
+
+/// The cross-process conflict error (wave 45o): names the object and the
+/// frame LSN the *other* writer committed (the WAL position is the
+/// cross-process version: `DataTable::version` is process-local and never
+/// persisted). The stable `write conflict on` prefix is what hosts match to
+/// retry.
+fn conflict_error(c: &crate::wal::CommitConflict, unit: &str) -> PinkDbError {
+    PinkDbError::Execution(c.message(unit))
 }
 
 /// Store/process-level statements refused inside a [`Connection`] transaction
@@ -671,7 +892,7 @@ fn session_after(result: &QueryResult, before: &str, store: &PinkDb) -> String {
 }
 
 /// Record which `(database, table|view)` pairs a bound plan will mutate.
-fn record_writes(
+pub(crate) fn record_writes(
     plan: &LogicalPlan,
     default_db: &str,
     tables: &mut HashSet<(String, String)>,

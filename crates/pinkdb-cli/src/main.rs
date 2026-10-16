@@ -477,9 +477,155 @@ fn cmd_import(db: &mut PinkDb, arg: &str) {
 /// irrelevant.
 #[allow(clippy::large_enum_variant)]
 enum Session {
-    Local(PinkDb),
+    Local(LocalSession),
     #[cfg(feature = "client")]
     Remote(Client),
+}
+
+/// Bounded retries for a transaction whose COMMIT hits a cross-process write
+/// conflict (wave 45o): the engine returns the conflict and aborts the
+/// transaction, so the CLI re-runs the buffered transaction on the refreshed
+/// state. `PINKDB_TXN_RETRIES` overrides the default (0 = report the first
+/// conflict, no retry).
+const DEFAULT_TXN_RETRIES: usize = 3;
+
+/// One local session: the store plus the retryable-transaction buffer.
+struct LocalSession {
+    db: PinkDb,
+    /// Raw SQL of every statement executed since BEGIN, in order (cleared
+    /// when the transaction ends). A conflicting COMMIT re-runs it after a
+    /// `USE <pre-BEGIN session>` prefix.
+    txn_sql: String,
+    /// Session database before BEGIN, restored on a retry.
+    txn_pre_db: Option<String>,
+    /// Bounded retry budget (see [`DEFAULT_TXN_RETRIES`]).
+    txn_retries: usize,
+}
+
+impl LocalSession {
+    fn new(db: PinkDb) -> Self {
+        let txn_retries = std::env::var("PINKDB_TXN_RETRIES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(DEFAULT_TXN_RETRIES);
+        LocalSession {
+            db,
+            txn_sql: String::new(),
+            txn_pre_db: None,
+            txn_retries,
+        }
+    }
+
+    /// Execute one SQL string, maintaining the transaction buffer and
+    /// retrying a conflicting COMMIT (bounded). When a retry succeeds only
+    /// the transaction's outcome is reported (the earlier attempt's
+    /// statement results were already rendered and its effects discarded by
+    /// the abort).
+    fn run_sql(&mut self, sql: &str) -> Result<Vec<QueryResult>, pinkdb::PinkDbError> {
+        let was = self.db.in_transaction();
+        let pre_db = self.db.current_db().to_string();
+        match self.db.execute(sql) {
+            Ok(results) => {
+                let now = self.db.in_transaction();
+                if !was && now {
+                    self.txn_pre_db = Some(pre_db);
+                    self.txn_sql.clear();
+                    self.txn_sql.push_str(sql);
+                    self.txn_sql.push('\n');
+                } else if was && now {
+                    self.txn_sql.push_str(sql);
+                    self.txn_sql.push('\n');
+                } else if was && !now {
+                    self.txn_sql.clear();
+                    self.txn_pre_db = None;
+                }
+                Ok(results)
+            }
+            Err(e) => {
+                let now = self.db.in_transaction();
+                // Retry only a conflict that ended the transaction on a
+                // COMMIT (the last statement of this call). Anything else
+                // (a failed statement inside the txn, a lease failure that
+                // left it open, a non-conflict error) is reported as-is. The
+                // transaction may have been opened by an earlier call or by
+                // this one (`BEGIN; …; COMMIT;` in a single string).
+                let started_here = !was && starts_transaction(sql);
+                if (was || started_here)
+                    && !now
+                    && self.txn_retries > 0
+                    && is_conflict_error(&e)
+                    && ends_with_commit(sql)
+                {
+                    let pre = self.txn_pre_db.take().unwrap_or_else(|| pre_db.clone());
+                    let mut retry_sql = format!("USE \"{}\";\n", pre.replace('"', "\"\""));
+                    retry_sql.push_str(&self.txn_sql);
+                    retry_sql.push_str(sql);
+                    retry_sql.push('\n');
+                    self.txn_sql.clear();
+                    let mut last = e;
+                    for attempt in 1..=self.txn_retries {
+                        // The conflict is reported (the engine aborted the
+                        // transaction with that error), then the retry runs;
+                        // only a retry that exhausts the budget fails the run.
+                        eprintln!("Error: {last}");
+                        eprintln!(
+                            "Retrying the transaction after a cross-process write conflict \
+                             (attempt {attempt}/{})",
+                            self.txn_retries
+                        );
+                        match self.db.execute(&retry_sql) {
+                            Ok(mut results) => {
+                                self.txn_pre_db = None;
+                                // Only the transaction's outcome: the
+                                // statement results of the first attempt
+                                // were already printed.
+                                return Ok(vec![results.pop().unwrap_or(QueryResult::Committed)]);
+                            }
+                            Err(e2) => {
+                                if self.db.in_transaction() {
+                                    // A retry that failed mid-transaction
+                                    // (not a conflict) left it open: drop it
+                                    // before deciding.
+                                    let _ = self.db.execute("ROLLBACK;");
+                                }
+                                if !is_conflict_error(&e2) {
+                                    return Err(e2);
+                                }
+                                last = e2;
+                            }
+                        }
+                    }
+                    Err(last)
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+}
+
+/// A retryable cross-process conflict (`PinkDbError` has no dedicated
+/// variant: the message prefix is the stable contract, like `busy`).
+fn is_conflict_error(e: &pinkdb::PinkDbError) -> bool {
+    e.to_string().contains("write conflict on")
+}
+
+/// Does this SQL string end with `COMMIT` (the only statement a conflicting
+/// transaction is retried on)?
+fn ends_with_commit(sql: &str) -> bool {
+    match pinkdb::sql::parse_statements(sql) {
+        Ok(stmts) => matches!(stmts.last(), Some(pinkdb::sql::ast::Statement::Commit)),
+        Err(_) => false,
+    }
+}
+
+/// Does this SQL string open a transaction (`BEGIN; …; COMMIT;` in a single
+/// call, where the session was not in one when the call started)?
+fn starts_transaction(sql: &str) -> bool {
+    match pinkdb::sql::parse_statements(sql) {
+        Ok(stmts) => matches!(stmts.first(), Some(pinkdb::sql::ast::Statement::Begin)),
+        Err(_) => false,
+    }
 }
 
 /// Returns false when the REPL should exit.
@@ -509,7 +655,7 @@ fn run_dot(session: &mut Session, line: &str) -> bool {
         _ => {}
     }
     match session {
-        Session::Local(db) => run_dot_local(db, line),
+        Session::Local(local) => run_dot_local(&mut local.db, line),
         #[cfg(feature = "client")]
         Session::Remote(_) => run_dot_remote(line),
     }
@@ -810,7 +956,7 @@ fn render_results(results: &[QueryResult]) {
 fn run_sql_session(session: &mut Session, sql: &str) {
     let t0 = Instant::now();
     match session {
-        Session::Local(db) => match db.execute(sql) {
+        Session::Local(local) => match local.run_sql(sql) {
             Ok(results) => render_results(&results),
             Err(e) => cli_error!("{e}"),
         },
@@ -887,7 +1033,7 @@ fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
         None => {
             let mut db = PinkDb::new();
             db.set_encryption_key(key);
-            Session::Local(db)
+            Session::Local(LocalSession::new(db))
         }
         #[cfg(feature = "client")]
         Some(host) => match Client::connect(&host) {

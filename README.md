@@ -251,20 +251,28 @@ fails `COMMIT` with a write conflict instead of logging an unreplayable
 record. `SyncPolicy::Sync` fsyncs every record; `Batch` fsyncs on
 `flush_wal`/checkpoint.
 
-The WAL format is `PINKWAL1` + version `3`: a generation number, a 16-byte
+The WAL format is `PINKWAL1` + version `4`: a generation number, a 16-byte
 `wal_id` (a fresh incarnation id per file creation, so a replaced file is
-never mistaken for the old one), a header CRC and two 24-byte commit slots;
-rolled generations are named `<wal>.<gen>.roll`. Every append publishes
+never mistaken for the old one), a header CRC, two 24-byte commit slots and,
+per record, the payload's **touched set** — the tables its statements read or
+wrote, plus `CREATE`/`DROP DATABASE` names — the substrate cross-process
+commit validation compares (`sets_len = u32::MAX` marks a record whose set is
+unknown, adopted from an older WAL). Rolled generations are named
+`<wal>.<gen>.roll`. Every append publishes
 `(seq + 1, last LSN)` into the alternate commit slot — the dual slots plus a
 CRC make a torn or lost update harmless — and bumps the epoch in
 `<file>.pink.lock`, so another process can detect that something was
 published with one `pread` of the lock file's first 48 bytes (two epoch
-slots + CRC; wave 45m). Version-2 WALs are accepted: a durable open upgrades
-them in place under the write lease, and older builds refuse a v3 WAL
-cleanly through the shared unsupported-version path. Encrypted WALs are
-`PINKENC1` container version 2 — a fixed 88-byte plaintext publish block
-(`wal_id`, CRC, the dual slots) before the AEAD-sealed records; version-1
-files stay readable, and a keyed open rebuilds a WAL as v2. A checkpoint
+slots + CRC; wave 45m). Version-2 and version-3 WALs are accepted: a durable open upgrades
+them in place under the write lease (records are re-encoded with an unknown
+touched set), and older builds refuse a v4 WAL cleanly through the shared
+unsupported-version path. Encrypted WALs are `PINKENC1` container version 3
+(the record payload gained the touched set, so older builds must refuse the
+file; the publish block's CRC domain binds the version) — a fixed 88-byte
+plaintext publish block (`wal_id`, CRC, the dual slots) before the
+AEAD-sealed records; encrypted checkpoints stay container version 2, so
+`.pink` bytes are unchanged; version-1 files stay readable, and a keyed open
+rebuilds a WAL at the current version. A checkpoint
 writes `.pink.tmp` (fsynced, directory fsynced), renames the live WAL to
 `.wal.<gen>.roll` and starts a fresh WAL of generation `gen + 1`, publishes
 `.pink.tmp` with an atomic rename, then removes the roll. Recovery never
@@ -298,11 +306,12 @@ reads a session-local view — or an attached lake table — is refused on durab
 databases: neither is persisted, so replaying its logged SQL could not
 rebuild it.
 
-Durable databases are **multi-process** (wave 45m): any number of local
-processes may open the same database read-write, and writers serialize on a
+Durable databases are **multi-process** (waves 45m/45o): any number of local
+processes may open the same database read-write, and writers coordinate on a
 short-held per-operation **write lease** — an exclusive `flock` on
-`<file>.pink.lock`, held for `[refresh → execute → append → fsync →
-publish]`, or from `BEGIN` to `COMMIT`/`ROLLBACK` — instead of a
+`<file>.pink.lock`, held for `[refresh → validate → append → fsync →
+publish]` only (explicit transactions no longer hold it for their lifetime;
+see the optimistic commits below) — instead of a
 lifetime-exclusive lock (the OS releases it on exit or crash, so there is no
 stale-lock cleanup). Readers never take the lease: each process keeps a full
 in-memory store, checks the lock file's epoch region with one `pread`, and
@@ -313,9 +322,10 @@ before `BEGIN` — never mid-statement; a replaced WAL or checkpoint (changed
 and attachments, and replay runs with the WAL detached so a refresh never
 re-logs. Inside one process, handles share the lease through a refcount gate
 (`flock` locks are per open file description), and the store lock and WAL
-mutex serialize threads exactly as before. `BEGIN` keeps the lease until
-`COMMIT`/`ROLLBACK`, so cross-process writers serialize, while readers never
-block and never see uncommitted rows.
+mutex serialize threads exactly as before. `BEGIN` snapshots the committed
+state and holds no lease; `COMMIT` takes it only for
+`[validate → append → publish]`, while readers never block and never see
+uncommitted rows.
 
 While another process holds the lease, an operation waits up to the **busy
 timeout** — 5 s by default; the CLI reads `PINKDB_BUSY_TIMEOUT_MS`, the
@@ -338,6 +348,30 @@ hundreds of worker processes) commits exactly-once — every acknowledged unit
 survives exactly once — and a deleted or replaced lock file now fails closed
 at every lease acquisition, wait and mutation boundary, with the residual
 check-then-write window documented in the code.
+
+Wave 45o made cross-process writers **optimistic** (stage 5 of the 45m
+design): `BEGIN` captures the current position (WAL `wal_id`, generation,
+applied LSN, checkpoint identity) and takes no lease; statements run on that
+private snapshot, and `COMMIT` takes the lease only for `[refresh → validate
+→ append → publish]`. Validation is table-granularity against the touched
+sets every WAL v4 record carries: a frame committed after the base that
+touched a table the unit **read or wrote** is a typed `write conflict on
+table "db.name" (… lsn N …)` naming the object and the frame's LSN —
+read-set validation is also what prevents write skew across processes. The
+CLI retries a conflicted transaction up to `PINKDB_TXN_RETRIES` (default 3;
+`0` surfaces the first conflict), including a whole one-call
+`BEGIN; …; COMMIT;` with the pre-`BEGIN` session restored; the embedded API
+returns the conflict. Autocommit writes run optimistically too and fall back
+to re-execution under the lease on conflict — exactly-once, with no
+user-visible error. A concurrent checkpoint or `.save` snapshot invalidates
+an open base, and the transaction fails retryably. If the lease cannot be
+acquired after an optimistic execution (busy timeout or a replaced lock
+file), the handle fail-stops — the uncommitted effect cannot be undone
+without the lease — and a reopen recovers the durable prefix; reads never do
+this. `bench/mp_optimistic.py` measures **2.31–2.49×** for overlapping
+transactions with disjoint writes (the serialized binary: 0.98–0.99×, no
+gain); write-heavy replay-bound workloads stay serial-equivalent because
+refresh replays every peer's frames.
 
 The WAL is bounded: `CHECKPOINT` (SQL, any front-end — server, FFI,
 bindings; a no-op in memory, refused inside a transaction) persists the store

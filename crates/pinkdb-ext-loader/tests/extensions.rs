@@ -1057,12 +1057,24 @@ fn transaction_spanning_a_checkpoint_survives_reopen() {
         .unwrap();
         // Open the transaction, write through the extension, and let the
         // store checkpoint while the transaction is still open (the txn
-        // works on a private snapshot; the checkpoint takes the write lock).
+        // works on a private snapshot; the checkpoint takes the lease for
+        // its own span — wave 45o: the open transaction holds none).
         c.execute("BEGIN; INSERT INTO t VALUES (ext_double_it(1));")
             .unwrap();
         db.checkpoint().unwrap();
-        c.execute("INSERT INTO t VALUES (ext_double_it(2)); COMMIT;")
-            .unwrap();
+        // Wave 45o: the checkpoint replaced the WAL generation while the
+        // transaction was open, so its COMMIT conflicts (retryable — the
+        // transaction would append onto a generation that no longer exists).
+        // The retry re-runs both statements on the checkpointed state.
+        let err = c
+            .execute("INSERT INTO t VALUES (ext_double_it(2)); COMMIT;")
+            .unwrap_err();
+        assert!(err.to_string().contains("write conflict"), "{err}");
+        c.execute(
+            "BEGIN; INSERT INTO t VALUES (ext_double_it(1)); \
+             INSERT INTO t VALUES (ext_double_it(2)); COMMIT;",
+        )
+        .unwrap();
     }
     let mut db = PinkDb::open_durable(ckpt).unwrap();
     assert_eq!(

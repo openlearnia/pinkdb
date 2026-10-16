@@ -48,6 +48,16 @@ struct Cli {
 
 impl Cli {
     fn spawn(cwd: &Path, busy_timeout_ms: Option<u64>) -> Cli {
+        Cli::spawn_full(cwd, busy_timeout_ms, None)
+    }
+
+    /// [`Cli::spawn`] plus `PINKDB_TXN_RETRIES` (0 = report the first
+    /// cross-process conflict instead of retrying the transaction).
+    fn spawn_with_retries(cwd: &Path, retries: usize) -> Cli {
+        Cli::spawn_full(cwd, None, Some(retries))
+    }
+
+    fn spawn_full(cwd: &Path, busy_timeout_ms: Option<u64>, retries: Option<usize>) -> Cli {
         let (reader, writer) = std::io::pipe().expect("create pipe");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
         cmd.current_dir(cwd)
@@ -56,6 +66,9 @@ impl Cli {
             .stderr(writer);
         if let Some(ms) = busy_timeout_ms {
             cmd.env("PINKDB_BUSY_TIMEOUT_MS", ms.to_string());
+        }
+        if let Some(n) = retries {
+            cmd.env("PINKDB_TXN_RETRIES", n.to_string());
         }
         let mut child = cmd.spawn().expect("spawn pinkdb CLI");
         let stdin = child.stdin.take().expect("child stdin");
@@ -181,6 +194,18 @@ impl Cli {
     }
 }
 
+/// Fresh-process verification of several `(table, expected column a)` pairs.
+fn verify_tables(ckpt: &Path, tables: &[(&str, &[i64])]) {
+    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    for (table, expected) in tables {
+        assert_eq!(
+            ints(&mut db, &format!("SELECT a FROM {table} ORDER BY a;")),
+            expected.to_vec(),
+            "table {table}"
+        );
+    }
+}
+
 /// Fresh-process verification: open in-process, see exactly the committed
 /// state.
 fn verify(ckpt: &Path, expected: &[i64]) -> pinkdb::RecoveryInfo {
@@ -286,8 +311,9 @@ fn reader_not_blocked_by_open_transaction() {
     );
     let mut p2 = Cli::spawn(&dir, None);
     p2.open("db.pink");
-    // P1 opens a transaction (holds the lease, buffered inserts only).
-    p1.wait_for_marker_after_begin();
+    // P1 opens a transaction (wave 45o: it holds no lease while open — the
+    // lease is taken only for the commit span).
+    p1.marker("BEGIN; INSERT INTO t VALUES (99);", "txn-open");
     // P2's reads are served from memory: they must NOT block on the lease,
     // and must not see P1's uncommitted row.
     p2.expect_absent(
@@ -301,13 +327,6 @@ fn reader_not_blocked_by_open_transaction() {
     p2.quit();
     verify(&ckpt, &[1, 99]);
     cleanup(&ckpt);
-}
-
-impl Cli {
-    /// `BEGIN; INSERT; marker` — leaves the process holding the lease.
-    fn wait_for_marker_after_begin(&mut self) {
-        self.marker("BEGIN; INSERT INTO t VALUES (99);", "txn-open");
-    }
 }
 
 #[test]
@@ -420,48 +439,389 @@ fn stale_writer_detects_checkpoint() {
 fn lock_timeout_reports_busy() {
     let dir = scratch("busy");
     let ckpt = dir.join("db.pink");
+    let lock = dir.join("db.pink.lock");
     let mut p2 = Cli::spawn(&dir, Some(100));
     p2.open("db.pink");
     p2.marker("CREATE TABLE t (a INTEGER);", "created");
-    let mut p1 = Cli::spawn(&dir, None);
-    p1.open("db.pink");
-    // P1 holds a transaction (and with it the write lease).
-    p1.wait_for_marker_after_begin();
-    // P2's write waits 100 ms, then reports the database busy.
+    // A foreign process holds the write lease (the flock is per open file
+    // description, exactly what a second process's lease looks like). Wave
+    // 45o: only the short commit/checkpoint spans take the lease, so the
+    // holder must be external — an open transaction no longer holds it.
+    let foreign = {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        f.try_lock().unwrap();
+        f
+    };
+    // P2's write executes optimistically, waits 100 ms for the lease, then
+    // reports the database busy; the uncommitted effect fail-stops the
+    // handle (it must never be observable).
     p2.send("INSERT INTO t VALUES (20);\n");
-    p2.expect_error("busy");
-    // P2's reads still work while the lease is held.
-    p2.expect_absent("SELECT 'ghost' AS m FROM t WHERE a = 20;", "ghost");
-    // P1 commits, releasing the lease; the retry succeeds.
-    p1.marker("COMMIT;", "p1-committed");
+    let line = p2.expect_error("busy");
+    assert!(line.contains("older pinkdb build"), "{line}");
+    p2.send("SELECT 'ghost' AS m FROM t WHERE a = 20;\n");
+    p2.expect_error("stopped after a WAL write failure");
+    // The holder exits; a reopened handle writes normally (no ghost row).
+    drop(foreign);
+    p2.open("db.pink");
     p2.marker("INSERT INTO t VALUES (20);", "p2-retry");
-    p1.quit();
     p2.quit();
-    verify(&ckpt, &[20, 99]);
+    verify(&ckpt, &[20]);
     cleanup(&ckpt);
 }
 
+/// Wave 45o headline: two transactions are open at the same time on
+/// disjoint tables; neither waits for the other, and both commit.
 #[test]
-fn long_transaction_serializes_fully() {
-    let dir = scratch("longtxn");
+fn overlapping_transactions_on_disjoint_tables_both_commit() {
+    let dir = scratch("optdisjoint");
+    let ckpt = dir.join("db.pink");
+    let mut p1 = Cli::spawn(&dir, None);
+    let mut p2 = Cli::spawn(&dir, Some(100)); // a short busy timeout proves no wait
+    p1.open("db.pink");
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); CREATE TABLE u (a INTEGER);",
+        "ready",
+    );
+    p2.open("db.pink");
+    // Both transactions are open at the same time.
+    p1.marker("BEGIN; INSERT INTO t VALUES (1);", "p1-txn");
+    p2.marker("BEGIN; INSERT INTO u VALUES (2);", "p2-txn");
+    // P1 commits while P2's transaction is still open: no busy, no wait.
+    p1.marker("COMMIT;", "p1-committed");
+    // P2 sees P1's committed row on its next statement, inside its own
+    // transaction (repeatable reads are per-transaction, not per-process).
+    // (Its own snapshot predates P1's commit, so it does not see row 1 yet;
+    // the commit below must still succeed: it never read t.)
+    p2.marker("COMMIT;", "p2-committed");
+    p2.expect_marker("SELECT 'see-t' AS m FROM t WHERE a = 1;", "see-t");
+    p1.quit();
+    p2.quit();
+    verify_tables(&ckpt, &[("t", &[1]), ("u", &[2])]);
+    cleanup(&ckpt);
+}
+
+/// Wave 45o: a same-table conflict surfaces with the documented error (the
+/// table and the conflicting frame's LSN), the aborted transaction logs
+/// nothing, and a retry on the refreshed state commits.
+#[test]
+fn same_table_transaction_conflict_then_retry_succeeds() {
+    let dir = scratch("optsame");
+    let ckpt = dir.join("db.pink");
+    let mut p1 = Cli::spawn(&dir, None);
+    let mut p2 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    p1.marker("CREATE TABLE t (a INTEGER);", "ready");
+    p2.open("db.pink");
+    p1.marker("BEGIN; INSERT INTO t VALUES (1);", "p1-txn");
+    p2.marker("BEGIN; INSERT INTO t VALUES (2);", "p2-txn");
+    p1.marker("COMMIT;", "p1-committed");
+    // P2's COMMIT conflicts and the engine aborts the transaction; the CLI
+    // re-runs the buffered transaction on the refreshed state (bounded) and
+    // reports the (first) conflict error.
+    p2.send("COMMIT;\n");
+    let line = p2.expect_error("write conflict");
+    assert!(line.contains("table \"main.t\""), "{line}");
+    assert!(line.contains("lsn"), "{line}");
+    assert!(line.contains("retry"), "{line}");
+    p2.wait_for("Retrying the transaction");
+    p2.wait_for("Transaction committed.");
+    p1.quit();
+    p2.quit();
+    verify(&ckpt, &[1, 2]);
+    cleanup(&ckpt);
+}
+
+/// Wave 45o: a whole transaction sent as ONE string (`BEGIN; …; COMMIT;`)
+/// that conflicts is retried by the CLI. A background committer keeps
+/// writing the table P2's transaction will write; when P2's first attempt
+/// reports the conflict, the test stops the committer, so the automatic
+/// retry of the whole call (with the pre-BEGIN session restored) commits.
+#[test]
+fn one_call_transaction_conflict_is_retried_by_the_cli() {
+    let dir = scratch("optonecall");
+    let ckpt = dir.join("db.pink");
+    // A read table heavy enough that P2's one-call transaction stays open
+    // long enough for the committer to land a conflicting frame.
+    let csv = dir.join("read.csv");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&csv).unwrap();
+        writeln!(f, "a").unwrap();
+        for i in 0..100_000 {
+            writeln!(f, "{i}").unwrap();
+        }
+    }
+    let mut setup = Cli::spawn(&dir, None);
+    setup.open("db.pink");
+    setup.marker("CREATE TABLE t (a BIGINT);", "setup");
+    setup.send(&format!(".import {} r\n", csv.display()));
+    setup.wait_for("Imported");
+    setup.quit();
+    // The background committer: autocommit inserts into t, one per line.
+    let mut p1 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    let mut script = String::new();
+    for _ in 0..500 {
+        script.push_str("INSERT INTO t VALUES (-1);\n");
+    }
+    p1.send(&script);
+    let mut p2 = Cli::spawn(&dir, None);
+    p2.open("db.pink");
+    // P2's whole transaction as one input line.
+    let reads = "SELECT COUNT(*) FROM r AS x JOIN r AS y ON x.a = y.a + 1; ".repeat(30);
+    p2.send(&format!(
+        "BEGIN; {reads} INSERT INTO t VALUES (77); COMMIT;\n"
+    ));
+    // P2's COMMIT conflicts (the committer's frames touch t, its write set):
+    // the CLI reports it and re-runs the whole buffered call.
+    let line = p2.expect_error("write conflict");
+    assert!(line.contains("main.t"), "{line}");
+    p2.wait_for("Retrying the transaction");
+    // Stop the committer so the retry (which re-runs the reads) commits.
+    p1.kill();
+    p2.wait_for("Transaction committed.");
+    p2.quit();
+    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    assert_eq!(
+        ints(&mut db, "SELECT COUNT(*) FROM t WHERE a = 77;"),
+        vec![1],
+        "the retried transaction's row exists exactly once"
+    );
+    assert_eq!(
+        ints(&mut db, "SELECT COUNT(*) FROM t;"),
+        vec![ints(&mut db, "SELECT COUNT(*) FROM t WHERE a = -1;")[0] + 1],
+        "only the committer's sentinel rows and the retried row exist"
+    );
+    assert_eq!(
+        ints(&mut db, "SELECT COUNT(*) FROM t WHERE a <> -1 AND a <> 77;"),
+        vec![0]
+    );
+    drop(db);
+    cleanup(&ckpt);
+}
+
+/// Wave 45o (c): read-set validation. P1's write is computed from a read of
+/// `t`; P2 commits `t` before P1's COMMIT, so P1 must conflict (its WAL
+/// record would replay against different data than the session saw).
+#[test]
+fn read_set_conflict_aborts_the_committer() {
+    let dir = scratch("optread");
+    let ckpt = dir.join("db.pink");
+    // No CLI retry: the aborted transaction must be observable as-is (the
+    // re-execution semantics get their own test below).
+    let mut p1 = Cli::spawn_with_retries(&dir, 0);
+    let mut p2 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); CREATE TABLE u (a INTEGER);",
+        "ready",
+    );
+    p2.open("db.pink");
+    p1.marker("BEGIN; UPDATE u SET a = (SELECT MAX(a) FROM t);", "p1-txn");
+    p2.marker("INSERT INTO t VALUES (50);", "p2-inserted");
+    p1.send("COMMIT;\n");
+    let line = p1.expect_error("write conflict");
+    assert!(line.contains("main.t"), "{line}");
+    p1.quit();
+    p2.quit();
+    verify_tables(&ckpt, &[("t", &[1, 50]), ("u", &[])]);
+    cleanup(&ckpt);
+}
+
+/// Wave 45o (e): write skew is prevented. T1 reads t and writes x; T2 reads
+/// x and writes t. Whole-snapshot isolation would let both commit and break
+/// `x.a = t.a`; the read half of the frame validation aborts the second one.
+#[test]
+fn write_skew_is_prevented_across_processes() {
+    let dir = scratch("optskew");
+    let ckpt = dir.join("db.pink");
+    let mut p1 = Cli::spawn(&dir, None);
+    let mut p2 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); \
+         CREATE TABLE x (a INTEGER); INSERT INTO x VALUES (1);",
+        "ready",
+    );
+    p2.open("db.pink");
+    p1.marker(
+        "BEGIN; UPDATE x SET a = 2 WHERE (SELECT MAX(a) FROM t) = 1;",
+        "p1-txn",
+    );
+    p2.marker(
+        "BEGIN; UPDATE t SET a = 2 WHERE (SELECT MAX(a) FROM x) = 1;",
+        "p2-txn",
+    );
+    p1.marker("COMMIT;", "p1-committed");
+    // The conflict aborts T2; the CLI's retry re-executes T2's UPDATE on the
+    // refreshed state, where its premise (`MAX(x.a) = 1`) no longer holds, so
+    // the rebased write affects zero rows and commits.
+    p2.send("COMMIT;\n");
+    let line = p2.expect_error("write conflict");
+    assert!(
+        line.contains("main.x") || line.contains("main.t"),
+        "the crossed tables must be named: {line}"
+    );
+    p2.wait_for("Retrying the transaction");
+    p2.wait_for("Transaction committed.");
+    p1.quit();
+    p2.quit();
+    // x.a = 2 and t.a = 1: the invariant x.a = t.a held (the skew's second
+    // write became a no-op instead of breaking it).
+    verify_tables(&ckpt, &[("t", &[1]), ("x", &[2])]);
+    cleanup(&ckpt);
+}
+
+/// Wave 45o (d): autocommit hammering on disjoint tables stays exactly-once
+/// (the optimistic fast path; the fallback covers any conflict).
+#[test]
+fn autocommit_hammering_on_disjoint_tables_is_exactly_once() {
+    let dir = scratch("ophammerdisjoint");
+    let ckpt = dir.join("db.pink");
+    let n_procs: i64 = 4;
+    let per_proc: i64 = 100;
+    let mut p0 = Cli::spawn(&dir, None);
+    p0.open("db.pink");
+    let mut setup = String::new();
+    for proc in 0..n_procs {
+        setup.push_str(&format!("CREATE TABLE t{proc} (a BIGINT);\n"));
+    }
+    p0.marker(&setup, "created");
+    p0.quit();
+    let mut procs = Vec::new();
+    for proc in 0..n_procs {
+        let mut p = Cli::spawn(&dir, None);
+        p.open("db.pink");
+        let mut script = String::new();
+        for i in 0..per_proc {
+            let v = proc * 1_000_000 + i;
+            script.push_str(&format!("INSERT INTO t{proc} VALUES ({v});\n"));
+        }
+        script.push_str(&format!("SELECT 'proc-{proc}-done' AS m;\n"));
+        p.send(&script);
+        procs.push((proc, p));
+    }
+    for (proc, p) in procs.iter_mut() {
+        p.wait_for(&format!("proc-{proc}-done"));
+    }
+    for (_, p) in procs {
+        p.quit();
+    }
+    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    let expected_sum: i64 = per_proc * (per_proc - 1) / 2;
+    for proc in 0..n_procs {
+        assert_eq!(
+            ints(&mut db, &format!("SELECT COUNT(*) FROM t{proc};")),
+            vec![per_proc],
+            "table t{proc} row count"
+        );
+        assert_eq!(
+            ints(&mut db, &format!("SELECT SUM(a) FROM t{proc};")),
+            vec![proc * 1_000_000 * per_proc + expected_sum],
+            "table t{proc} sum"
+        );
+    }
+    cleanup(&ckpt);
+}
+
+/// Wave 45o (d) cont.: autocommit hammering on the *same* table stays
+/// exactly-once too — conflicts take the pessimistic fallback and never
+/// duplicate or lose an effect.
+#[test]
+fn autocommit_hammering_on_one_table_is_exactly_once() {
+    let dir = scratch("ophammersame");
+    let ckpt = dir.join("db.pink");
+    let n_procs: i64 = 3;
+    let per_proc: i64 = 60;
+    let mut p0 = Cli::spawn(&dir, None);
+    p0.open("db.pink");
+    p0.marker("CREATE TABLE t (a BIGINT);", "created");
+    p0.quit();
+    let mut procs = Vec::new();
+    for proc in 0..n_procs {
+        let mut p = Cli::spawn(&dir, None);
+        p.open("db.pink");
+        let mut script = String::new();
+        for i in 0..per_proc {
+            let v = proc * 1_000_000 + i;
+            script.push_str(&format!("INSERT INTO t VALUES ({v});\n"));
+        }
+        script.push_str(&format!("SELECT 'proc-{proc}-done' AS m;\n"));
+        p.send(&script);
+        procs.push((proc, p));
+    }
+    for (proc, p) in procs.iter_mut() {
+        p.wait_for(&format!("proc-{proc}-done"));
+    }
+    for (_, p) in procs {
+        p.quit();
+    }
+    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    assert_eq!(
+        ints(&mut db, "SELECT COUNT(*) FROM t;"),
+        vec![n_procs * per_proc]
+    );
+    let expected_sum: i64 = (0..n_procs)
+        .map(|p| p * 1_000_000 * per_proc + per_proc * (per_proc - 1) / 2)
+        .sum();
+    assert_eq!(ints(&mut db, "SELECT SUM(a) FROM t;"), vec![expected_sum]);
+    cleanup(&ckpt);
+}
+
+/// Wave 45o (f): kill -9 during an open optimistic transaction leaves no
+/// partial effect (the frames were never appended — the effect exists only
+/// if COMMIT appended them).
+#[test]
+fn kill9_during_an_optimistic_transaction_leaves_no_effect() {
+    let dir = scratch("optkill");
+    let ckpt = dir.join("db.pink");
+    let mut p1 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);",
+        "ready",
+    );
+    // The transaction is open and its insert is acked *in memory* only.
+    p1.marker("BEGIN; INSERT INTO t VALUES (99);", "txn-open");
+    p1.kill();
+    // A second process writes and commits normally; the killed
+    // transaction's row never existed.
+    let mut p2 = Cli::spawn(&dir, None);
+    p2.open("db.pink");
+    p2.marker("INSERT INTO t VALUES (2);", "p2-acked");
+    // A committed-then-killed transaction's effect exists exactly once.
+    p2.marker("BEGIN; INSERT INTO t VALUES (3); COMMIT;", "p2-committed");
+    p2.kill();
+    let info = verify(&ckpt, &[1, 2, 3]);
+    assert_eq!(info.replayed_records, 4, "CREATE, row 1, row 2, txn row 3");
+    cleanup(&ckpt);
+}
+
+/// Wave 45o: a transaction and an autocommit statement from another process
+/// overlap on disjoint tables — neither blocks the other.
+#[test]
+fn optimistic_transaction_and_autocommit_overlap_disjointly() {
+    let dir = scratch("optoverlap");
     let ckpt = dir.join("db.pink");
     let mut p1 = Cli::spawn(&dir, None);
     let mut p2 = Cli::spawn(&dir, Some(100));
     p1.open("db.pink");
-    p1.marker("CREATE TABLE t (a INTEGER);", "ready");
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); CREATE TABLE u (a INTEGER);",
+        "ready",
+    );
     p2.open("db.pink");
-    // P1 holds a transaction; P2's BEGIN cannot proceed (busy with the short
-    // timeout) — proof the transaction serializes other writers.
     p1.marker("BEGIN; INSERT INTO t VALUES (1);", "p1-txn");
-    p2.send("BEGIN; INSERT INTO t VALUES (2); COMMIT;\n");
-    p2.expect_error("busy");
-    // Commit P1; the retried transaction then runs and both effects apply
-    // exactly once.
+    // P2's autocommit write runs while P1's transaction is open.
+    p2.marker("INSERT INTO u VALUES (2);", "p2-acked");
     p1.marker("COMMIT;", "p1-committed");
-    p2.marker("BEGIN; INSERT INTO t VALUES (2); COMMIT;", "p2-committed");
     p1.quit();
     p2.quit();
-    verify(&ckpt, &[1, 2]);
+    verify_tables(&ckpt, &[("t", &[1]), ("u", &[2])]);
     cleanup(&ckpt);
 }
 
@@ -551,10 +911,10 @@ fn old_v2_wal_upgrades_cleanly() {
     cli.marker("INSERT INTO t VALUES (3);", "post-upgrade");
     cli.quit();
 
-    // The WAL is v3 now: version 3, a nonzero wal_id, records preserved.
+    // The WAL is v4 now: version 4, a nonzero wal_id, records preserved.
     let data = std::fs::read(&wal).unwrap();
     assert_eq!(&data[..8], b"PINKWAL1");
-    assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 4);
     assert_ne!(&data[20..36], [0u8; 16], "fresh wal_id");
     verify(&ckpt, &[0, 1, 2, 3]);
     cleanup(&ckpt);
@@ -662,9 +1022,10 @@ fn lock_file_replacement_fails_closed_across_processes() {
     cleanup(&ckpt);
 }
 
-/// Wave 45n: replacement while p1 is mid-transaction (holding the lease):
-/// its COMMIT must fail closed, the uncommitted row must never be durable,
-/// and the process on the new lock file continues normally.
+/// Wave 45n/45o: replacement while p1 is mid-transaction. The transaction
+/// holds no lease while open (wave 45o), but its COMMIT takes the lease and
+/// must fail closed; the uncommitted row must never be durable, and the
+/// process on the new lock file continues normally.
 #[test]
 fn lock_file_replacement_mid_transaction_fails_closed_across_processes() {
     let dir = scratch("lockreptxn");
@@ -673,7 +1034,7 @@ fn lock_file_replacement_mid_transaction_fails_closed_across_processes() {
     let mut p1 = Cli::spawn(&dir, None);
     p1.open("db.pink");
     p1.marker("CREATE TABLE t (a INTEGER);", "ready");
-    // p1 holds the lease (BEGIN) with a buffered insert.
+    // p1's transaction is open with a buffered insert (no lease held).
     p1.marker("BEGIN; INSERT INTO t VALUES (99);", "p1-txn");
     std::fs::remove_file(&lock).unwrap();
     std::fs::write(&lock, b"").unwrap();
@@ -694,22 +1055,72 @@ fn lock_file_replacement_mid_transaction_fails_closed_across_processes() {
 
 /// Wave 45n gap (d): `save_snapshot` refuses a target whose lease a REAL
 /// second process holds — not a foreign flock from the test process.
+/// Wave 45o: `.save <target>` while another process has an open transaction
+/// proceeds (transactions hold no lease), and the *replaced checkpoint*
+/// aborts the open transaction's COMMIT instead — a frame appended after the
+/// snapshot would replay on top of a different database.
 #[test]
-fn save_snapshot_refuses_a_lease_held_by_a_real_process() {
-    let dir = scratch("snaplease");
+fn save_snapshot_replacing_the_checkpoint_conflicts_an_open_transaction() {
+    let dir = scratch("optsnap");
     let ckpt = dir.join("db.pink");
-    let mut p1 = Cli::spawn(&dir, None);
+    // No CLI retry: the replaced checkpoint must surface as the conflict,
+    // not be retried into a different database.
+    let mut p1 = Cli::spawn_with_retries(&dir, 0);
     p1.open("db.pink");
-    // Checkpoint first so the target WAL is empty and the WAL-records guard
-    // cannot mask the lease guard.
+    // Checkpoint first: the target WAL is empty, so the snapshot's live-WAL
+    // guard is not what decides the outcome.
     p1.marker(
         "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); checkpoint;",
         "p1-ready",
     );
-    // p1 holds the lease for a whole transaction.
     p1.marker("BEGIN; INSERT INTO t VALUES (2);", "p1-txn");
+    // P2 is bound to nothing: `.save db.pink` snapshots its (empty) store
+    // over the target. It succeeds — P1's open transaction holds no lease.
+    let mut p2 = Cli::spawn(&dir, None);
+    p2.send(".save db.pink\n");
+    p2.wait_for("Saved");
+    // P1's COMMIT now conflicts: the checkpoint file was replaced.
+    p1.send("COMMIT;\n");
+    let line = p1.expect_error("write conflict");
+    assert!(line.contains("checkpoint file"), "{line}");
+    p1.quit();
+    p2.quit();
+    // The aborted transaction never appended: the durable pair is exactly
+    // P2's snapshot (an empty `main`) — a fresh durable open replays cleanly
+    // instead of hitting an insert against a vanished table.
+    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    assert!(
+        db.execute("SELECT COUNT(*) FROM t;").is_err(),
+        "the snapshot replaced the target with p2's empty store"
+    );
+    drop(db);
+    cleanup(&ckpt);
+}
 
-    // p2 is bound to nothing: `.save db.pink` is a snapshot at the target.
+/// Wave 45o: a real external lease holder (a foreign flock — the same
+/// in-process simulation the wave-45n tests use for a second process) still
+/// makes `.save <target>` refuse; the refusal is about the lease, not the
+/// file state.
+#[test]
+fn save_snapshot_refuses_a_foreign_lease_holder() {
+    let dir = scratch("snaplease");
+    let ckpt = dir.join("db.pink");
+    let lock = dir.join("db.pink.lock");
+    let mut p1 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); checkpoint;",
+        "p1-ready",
+    );
+    let foreign = {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        f.try_lock().unwrap();
+        f
+    };
     let mut p2 = Cli::spawn(&dir, None);
     p2.send(".save db.pink\n");
     let line = p2.expect_error("in use by another handle or process");
@@ -717,28 +1128,14 @@ fn save_snapshot_refuses_a_lease_held_by_a_real_process() {
         line.contains("in use by another handle or process"),
         "{line}"
     );
-    let target_before = std::fs::read(&ckpt).unwrap();
-
-    // Once the real holder dies, the kernel releases the flock: the same
-    // snapshot now proceeds (the target WAL was checkpointed empty, so no
-    // other guard masks the lease check) — proof the first error came from
-    // the live lease, not from a static file state.
-    p1.kill();
+    // Once the holder exits, the same snapshot proceeds.
+    drop(foreign);
+    let before = std::fs::read(&ckpt).unwrap();
     p2.send(".save db.pink\n");
     p2.wait_for("Saved");
-    let target_after = std::fs::read(&ckpt).unwrap();
-    assert_ne!(
-        target_before, target_after,
-        "the released lease let the snapshot proceed"
-    );
-    // The snapshot is p2's in-memory store: an empty `main` database.
+    assert_ne!(before, std::fs::read(&ckpt).unwrap());
     p2.quit();
-    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
-    assert!(
-        db.execute("SELECT COUNT(*) FROM t;").is_err(),
-        "the snapshot replaced the target with p2's empty store"
-    );
-    drop(db);
+    p1.kill();
     cleanup(&ckpt);
 }
 

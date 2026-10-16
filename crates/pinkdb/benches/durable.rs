@@ -41,11 +41,18 @@ fn main() {
     let path = dir.join("bench.pink");
     let path = path.to_str().unwrap().to_string();
 
-    let (mut db, _) = PinkDb::open_durable_with(&path, SyncPolicy::Sync).expect("open durable");
+    let policy = if std::env::var("PINKDB_BENCH_BATCH").is_ok() {
+        SyncPolicy::Batch
+    } else {
+        SyncPolicy::Sync
+    };
+    let (mut db, _) = PinkDb::open_durable_with(&path, policy).expect("open durable");
     db.execute("CREATE TABLE t (a INTEGER, b VARCHAR);")
         .expect("create table");
 
-    // Phase 1: `n` autocommit inserts, each a fsynced WAL record.
+    // Phase 1: `n` autocommit inserts; each is a WAL record, fsynced under
+    // the default `Sync` policy (`PINKDB_BENCH_BATCH=1` isolates the
+    // non-fsync CPU path for a low-noise comparison).
     let t0 = Instant::now();
     for i in 0..n {
         db.execute(&format!("INSERT INTO t VALUES ({i}, 'value-{i}');"))
@@ -80,7 +87,14 @@ fn main() {
         println!("selects_100k_ms={:.1}", selects.as_secs_f64() * 1e3);
         println!("checkpoints_20_ms={:.1}", checkpoints.as_secs_f64() * 1e3);
     } else {
-        println!("n={n} checkpoints={n_ckpts}");
+        // `PINKDB_BENCH_BATCH=1` prints a `batch` tag so interleaved runs
+        // cannot be confused.
+        let tag = if std::env::var("PINKDB_BENCH_BATCH").is_ok() {
+            "batch"
+        } else {
+            "sync"
+        };
+        println!("n={n} checkpoints={n_ckpts} policy={tag}");
         println!("inserts_ms={:.1}", inserts.as_secs_f64() * 1e3);
         println!("selects_ms={:.1}", selects.as_secs_f64() * 1e3);
         println!("checkpoints_ms={:.1}", checkpoints.as_secs_f64() * 1e3);

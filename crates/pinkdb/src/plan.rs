@@ -216,6 +216,55 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
     })
 }
 
+/// True for the statements the optimistic autocommit fast path may execute
+/// before taking the lease (wave 45o): plain table DDL and DML, whose
+/// in-memory effect can be discarded by a rebuild when the commit turns out
+/// to conflict. Everything else that writes stays on the serialized path:
+/// view DDL (session-local; a rebuild preserves rather than undoes it),
+/// `LOAD EXTENSION` (process registry), `CREATE/DROP DATABASE` (catalog
+/// lifetime spans the rebuild), and `CHECKPOINT`.
+pub(crate) fn optimistic_eligible(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::Insert { .. }
+            | LogicalPlan::Update { .. }
+            | LogicalPlan::Delete { .. }
+            | LogicalPlan::CreateTable { .. }
+            | LogicalPlan::DropTable { .. }
+    )
+}
+
+/// Collect every catalog table `plan` reads **or writes**, plus the
+/// databases its `CREATE/DROP DATABASE` names, into `out` (wave 45o). This
+/// is the set stored in a WAL frame and validated at an optimistic commit:
+/// the union matters because a frame that merely *read* a table another
+/// transaction wrote could not be replayed honestly on top of it. The
+/// matches are exhaustive on purpose — a new plan variant must decide here
+/// what it touches.
+pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::wal::FrameSets) {
+    match plan {
+        LogicalPlan::CreateDatabase { name } | LogicalPlan::DropDatabase { name } => {
+            out.add_database(name);
+            return;
+        }
+        _ => {}
+    }
+    let mut reads = std::collections::HashSet::new();
+    collect_tables_read(plan, default_db, &mut reads);
+    for (db, table) in reads {
+        out.add_table(&db, &table);
+    }
+    // Writes: the same `(database, table)` pairs `record_writes` records
+    // (view DDL is session-local and never logged; a frame never contains
+    // it).
+    let mut writes = std::collections::HashSet::new();
+    let mut views = std::collections::HashSet::new();
+    crate::db::record_writes(plan, default_db, &mut writes, &mut views);
+    for (db, table) in writes {
+        out.add_table(&db, &table);
+    }
+}
+
 /// Collect every catalog table `plan` reads, as lowercased
 /// `(database, table)` keys, including tables scanned by subqueries in
 /// expressions and by DML predicates. CTE scans (`db: None`) are skipped:
