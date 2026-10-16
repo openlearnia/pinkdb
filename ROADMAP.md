@@ -122,8 +122,9 @@ order-by/group-by items. Durability: 45m made durable `.pink` databases multi-pr
 (per-operation write lease, lock-free epoch refresh, WAL v3, encrypted container v2); 45n
 shipped the stability-hardening round — chaos-soak exactly-once evidence under SIGKILL,
 lock-file identity that fails closed on replacement, WAL fuzzing and gap closures (details
-in the progress log below). CI is fully green as of run 38875669660 (all nine jobs),
-unblocked by the dd53f41…a837896 saga. Stage 5 — optimistic disjoint-table commits —
+in the progress log below). CI is fully green on **493ea50** (run 38931704447, all nine
+jobs; the duckdiff job pins the DuckDB 2.0 alpha as the parity reference).
+Stage 5 — optimistic disjoint-table commits —
 **shipped as 45o**: WAL v4 touched sets, lease-free transactions with commit-time
 read/write-set validation (write skew prevented), typed conflicts and bounded CLI
 retry; the contention bench measures 2.31–2.49× on overlapping transactions with
@@ -725,3 +726,20 @@ Java bindings.
   (multiprocess 26 + 27), `bench/duckdiff.py` **155/155**, workspace all green,
   `mp_soak.py --ci` PASS (991 acked units, 18 kills, exactly-once across 24
   writers).
+- 2026-10-16 — Integration close-out (45o → 60 → 61 → 58 → CI green). CI caught
+  two real issues that local gates could not: (1) `fc4b8eb` shipped the pre-fix
+  versions of `window.rs`/`plan.rs`/`peg_parser.rs` — the wave-58 merge fixes
+  were made in the working tree but never re-staged before the full-index
+  commit, so the pushed tree did not match the verified one; fixed in `0a8d111`
+  (the commit now exactly matches the locally verified tree: `git diff HEAD --
+  crates` is empty). (2) The duckdiff CI job downloaded DuckDB `latest` stable
+  while the 155 probes are pinned against the 2.0 alpha: stable accepts
+  `lag(x, 1.5)` (the alpha raises a Binder error on the non-BIGINT offset) and
+  returns rows for `mod(x, 0)` (the alpha raises "Division by zero in
+  expression mod(1, 0)") — CI now installs the alpha through the official
+  installer, pins it into PATH, and fails loudly if the version is not v2
+  (`493ea50`); `bench/duckdiff.py` prints its reference version in the header.
+  A rare multiprocess-harness stall surfaced during these gates and is closed
+  by bounded waits (`f92c2a6`; a recurrence now fails with the collected CLI
+  output instead of hanging the suite). Fully green on 493ea50 (run
+  38931704447, all nine jobs).
