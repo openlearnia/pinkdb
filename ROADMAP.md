@@ -90,10 +90,11 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 54 | Core extension: **math** — `sqrt`, `pow`, `log`/`ln`/`exp`, trig, `floor`/`ceil`, `sign`, `greatest`/`least`, `random` (volatile-flagged) | queued | `extensions/math` |
 | 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
+| 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Lake-scan plan (lake workstream, sub-waves 45b–45p) and the multi-process
+Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
 `.lake attach` + exact `COUNT`/`MIN`/`MAX` from stored statistics + lazy materialize; stage 2
 shipped as 45e — projection pushdown (an attached scan decodes only the columns a query
@@ -111,8 +112,8 @@ shipped the stability-hardening round — chaos-soak exactly-once evidence under
 lock-file identity that fails closed on replacement, WAL fuzzing and gap closures (details
 in the progress log below). CI is fully green as of run 38875669660 (all nine jobs),
 unblocked by the dd53f41…a837896 saga. Stage 5 — optimistic disjoint-table commits —
-is in progress as **45o**, and **45p (queued): pink-lake encryption/decryption at
-rest** — one Argon2id KDF per lake session (salt in the catalog), AEAD containers for
+is in progress as **45o**, and **wave 57 (queued): pink-lake data encryption/decryption
+at rest** — one Argon2id KDF per lake session (salt in the catalog), AEAD containers for
 the catalog/snapshots and the data files, `PINKDB_KEY` UX consistent with the engine,
 plaintext lakes unaffected.
 
