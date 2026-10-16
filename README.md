@@ -207,7 +207,8 @@ raw/RLE/bitpack/dictionary set. v1 files (`PINKDB01`, a flat table list), v2
 (`PINKDB02`, the databases layout) and v3 (`PINKDB03`, v2 + the checksum)
 still load; v1 tables become the single `main` database, and a format newer
 than this build (`PINKDB05`+) is refused with a clean "newer format" error,
-never guessed at. The encrypted `PINKENC1` container is unchanged. Views are
+never guessed at. The encrypted `PINKENC1` container wraps v4 transparently
+(the container itself is version 2 since wave 45m — see Encryption). Views are
 session-local and never persisted. Round-trips are bit-exact (including `-0.0`
 and NaN payloads); truncated or corrupt files return errors, never panics — a
 damaged file fails its CRC-32 before any decoding, and no allocation is sized
@@ -250,9 +251,21 @@ fails `COMMIT` with a write conflict instead of logging an unreplayable
 record. `SyncPolicy::Sync` fsyncs every record; `Batch` fsyncs on
 `flush_wal`/checkpoint.
 
-The WAL format is `PINKWAL1` + version `2` + a generation number, and rolled
-generations are named `<wal>.<gen>.roll`. A checkpoint writes `.pink.tmp`
-(fsynced, directory fsynced), renames the live WAL to
+The WAL format is `PINKWAL1` + version `3`: a generation number, a 16-byte
+`wal_id` (a fresh incarnation id per file creation, so a replaced file is
+never mistaken for the old one), a header CRC and two 24-byte commit slots;
+rolled generations are named `<wal>.<gen>.roll`. Every append publishes
+`(seq + 1, last LSN)` into the alternate commit slot — the dual slots plus a
+CRC make a torn or lost update harmless — and bumps the epoch in
+`<file>.pink.lock`, so another process can detect that something was
+published with one `pread` of the lock file's first 48 bytes (two epoch
+slots + CRC; wave 45m). Version-2 WALs are accepted: a durable open upgrades
+them in place under the write lease, and older builds refuse a v3 WAL
+cleanly through the shared unsupported-version path. Encrypted WALs are
+`PINKENC1` container version 2 — a fixed 88-byte plaintext publish block
+(`wal_id`, CRC, the dual slots) before the AEAD-sealed records; version-1
+files stay readable, and a keyed open rebuilds a WAL as v2. A checkpoint
+writes `.pink.tmp` (fsynced, directory fsynced), renames the live WAL to
 `.wal.<gen>.roll` and starts a fresh WAL of generation `gen + 1`, publishes
 `.pink.tmp` with an atomic rename, then removes the roll. Recovery never
 removes anything before the recovered state is durable:
@@ -285,13 +298,39 @@ reads a session-local view — or an attached lake table — is refused on durab
 databases: neither is persisted, so replaying its logged SQL could not
 rebuild it.
 
-A durable database has **one live handle**: opening takes an exclusive
-advisory lock on `<file>.pink.lock` (an OS `flock`, released automatically
-when the process exits or crashes, so there is no stale-lock cleanup), and a
-second open — from another process or the same one — fails with `already
-open`. Clones of the store (`Database` handles, transaction snapshots) share
-the lock. Two writers on one WAL would corrupt its framing and, encrypted,
-could reuse a `(key, nonce)`; the lock makes that impossible rather than a
+Durable databases are **multi-process** (wave 45m): any number of local
+processes may open the same database read-write, and writers serialize on a
+short-held per-operation **write lease** — an exclusive `flock` on
+`<file>.pink.lock`, held for `[refresh → execute → append → fsync →
+publish]`, or from `BEGIN` to `COMMIT`/`ROLLBACK` — instead of a
+lifetime-exclusive lock (the OS releases it on exit or crash, so there is no
+stale-lock cleanup). Readers never take the lease: each process keeps a full
+in-memory store, checks the lock file's epoch region with one `pread`, and
+only when the epoch changed replays the WAL frames it has not applied under
+the lease. Refresh runs at statement boundaries — autocommit statements and
+before `BEGIN` — never mid-statement; a replaced WAL or checkpoint (changed
+`wal_id`, generation or inode) triggers a full rebuild that preserves views
+and attachments, and replay runs with the WAL detached so a refresh never
+re-logs. Inside one process, handles share the lease through a refcount gate
+(`flock` locks are per open file description), and the store lock and WAL
+mutex serialize threads exactly as before. `BEGIN` keeps the lease until
+`COMMIT`/`ROLLBACK`, so cross-process writers serialize, while readers never
+block and never see uncommitted rows.
+
+While another process holds the lease, an operation waits up to the **busy
+timeout** — 5 s by default; the CLI reads `PINKDB_BUSY_TIMEOUT_MS`, the
+library exposes `DurableOpenOptions.busy_timeout` /
+`Database::set_busy_timeout` — then fails with a clear `database … is busy`
+error. An open on a filesystem that reports locking unsupported fails closed
+(`LockMode::Required`, the default), with `LockMode::UnsafeSingleProcess` as
+the explicit opt-out. This is not a network-filesystem guarantee: there is
+no NFS/SMB detection (no libc), so a filesystem that accepts `flock` but
+does not honor it across hosts is not caught, and Windows is untested. A
+checkpoint refreshes first under the lease — before writing its `.tmp` — so
+it can never publish a state that omits another process's committed records.
+The lease keeps two writers off one WAL at any instant (two writers would
+corrupt its framing and, encrypted, could reuse a `(key, nonce)`): per
+operation rather than per open, but still impossible rather than a
 convention.
 
 The WAL is bounded: `CHECKPOINT` (SQL, any front-end — server, FFI,
@@ -314,10 +353,15 @@ containers; `open_durable_with_key` (and the multi-writer
 `Database::open_with_key`) apply the same key to the sidecar WAL, and a keyed
 store's checkpoints and snapshots encrypt as well.
 
-The container is a plaintext header (magic `PINKENC1`, version, cipher id,
-KDF id + parameters + salt, a random per-container nonce prefix, and an AEAD
-key-check block) followed by AEAD-sealed payloads: 1 MiB segments for a
-checkpoint, one unit per WAL record (with the LSN bound into the AAD). The
+The container is a plaintext header (magic `PINKENC1`, container version 2,
+cipher id, KDF id + parameters + salt, a random per-container nonce prefix,
+and an AEAD key-check block) followed by AEAD-sealed payloads: 1 MiB
+segments for a checkpoint, one unit per WAL record (with the LSN bound into
+the AAD). The container is version 2 since wave 45m (version-1 files stay
+readable: checkpoints as-is, WALs rebuilt as v2 on the next keyed open);
+WAL containers additionally carry a fixed 88-byte plaintext publish block
+(`wal_id`, CRC and the dual commit slots the multi-process epoch refresh
+reads) before the records. The
 nonce is `prefix || counter`, counters are unique per container. A keyed open
 rebuilds the WAL with a fresh random prefix on **every** open (re-sealing the
 intact records atomically), not only after a torn-tail truncation: a file cut
@@ -401,7 +445,12 @@ c.execute("CREATE TABLE t (a INTEGER);")?;
 ```
 
 Queries run under a shared read lock (parallel readers, parallel chunks via
-rayon inside each query). Writes take the write lock per statement.
+rayon inside each query). Writes take the write lock per statement. On a
+durable `.pink` database the same statement stream extends across processes
+(wave 45m): writers additionally take the file's write lease for the
+statement (a transaction holds it from `BEGIN` to `COMMIT`/`ROLLBACK`, so
+cross-process transactions serialize on it) and statements refresh from the
+WAL at their boundaries — see Persistence.
 `BEGIN..COMMIT` works on a private snapshot: commits to disjoint tables all
 succeed; overlapping writes abort the second committer with a write-conflict
 error (retry the transaction) — never silent lost updates. A transaction that
@@ -1570,9 +1619,13 @@ ties in ORDER BY have no stable order on either engine).
 
 ## Known v1 limits
 
-- No nested transactions or savepoints; one live handle per durable `.pink`
-  path (an exclusive `<file>.lock`; a second open fails); `.open` replaces the
-  whole store; `.lake save`/`.lake open`/`.lake attach` are refused inside a
+- No nested transactions or savepoints; a durable `.pink` path is
+  multi-process (wave 45m) — writers serialize on a per-operation write
+  lease, a busy database waits up to the 5 s busy timeout (then errors), and
+  `flock` is assumed to be honored: unsupported locking fails closed unless
+  the `LockMode::UnsafeSingleProcess` opt-out is used, network filesystems
+  are not detected, and Windows is untested; `.open` replaces the whole
+  store; `.lake save`/`.lake open`/`.lake attach` are refused inside a
   transaction and `.lake open` refuses to detach a durable session
 - `CREATE DATABASE` / `DROP DATABASE` / `LOAD EXTENSION` are refused inside a
   transaction; the last database cannot be dropped; `DROP DATABASE` does not
@@ -1645,9 +1698,13 @@ files, 2.69 MB vs 45.3 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for
-widths > 56). Remaining lake follow-ups (not committed): projection pushdown
-for `.pink`, per-chunk statistics + filter/zone pruning (stage 3), and the
-parked cold order-by/group-by items. Authentication and TLS are deferred.
+widths > 56). Durable `.pink` databases became multi-process in wave 45m — a
+per-operation write lease, lock-free epoch refresh, WAL v3 and encrypted
+container v2 — with stage 5 (optimistic disjoint-table commits) deferred and
+a stability-hardening wave in progress. Remaining lake follow-ups (not
+committed): projection pushdown for `.pink`, per-chunk statistics +
+filter/zone pruning (stage 3), and the parked cold order-by/group-by items.
+Authentication and TLS are deferred.
 
 ## Development
 

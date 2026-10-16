@@ -534,3 +534,41 @@ Java bindings.
   decodes the whole table), per-chunk statistics + filter/zone pruning (stage 3), and the
   parked cold order-by/group-by items. Gates: workspace 530/0, encryption 398/0, CLI
   `lake,s3` 62/0 + `lake-lite` 38/0, pink-lake `s3,vortex-format` 132/0, duckdiff 60/60.
+- 2026-10-16 — Wave 45m (b026765): multi-process durable `.pink` writers (first slice).
+  Durable databases are no longer single-process: any local process may open one read-write,
+  and writers serialize on a short-held per-operation **write lease** (an exclusive `flock` on
+  `<db>.pink.lock` plus an in-process refcount gate) instead of the wave-40b lifetime-exclusive
+  lock. Readers never take the lease: the lock file's first 48 bytes carry a dual-slot/CRC
+  **epoch region**, and a reader that detects a change with one `pread` replays the WAL frames
+  past its applied position (`wal_id`, generation, file identity, byte/LSN offsets, checkpoint
+  identity) under the lease — refresh at autocommit boundaries and before `BEGIN`, never
+  mid-statement; replay runs with the WAL detached (never re-logging), restores the lineage
+  session around it and the local session after it, bypasses and restores the extension gate,
+  and poisons the store on a replay error; a replaced WAL or checkpoint triggers a full
+  rebuild that preserves views and attachments. Busy timeout default 5 s (CLI
+  `PINKDB_BUSY_TIMEOUT_MS`; library `DurableOpenOptions`/`set_busy_timeout`); an open on a
+  filesystem that reports locking unsupported fails closed (`LockMode::Required`, the default)
+  with `LockMode::UnsafeSingleProcess` as the explicit opt-out. WAL v3: a 96-byte header with a
+  16-byte `wal_id` (the ABA guard across checkpoints) and dual 24-byte commit slots; every
+  append publishes `(seq + 1, last_lsn)` into the alternate slot and bumps the lock epoch;
+  v2 files upgrade in place under the lease, and older builds refuse v3 cleanly through the
+  shared unsupported-version path. Encrypted WALs use `PINKENC1` container v2 (a fixed 88-byte
+  plaintext publish block — `wal_id`, CRC, the dual slots — before the AEAD records; container
+  v1 stays readable and is rebuilt as v2 on the next keyed open). Checkpoints refresh first
+  under the lease, before writing `.tmp` — without that a checkpoint could silently drop
+  another process's commits (the L0 hazard). Transactions: `BEGIN` holds the lease to
+  `COMMIT`/`ROLLBACK`; readers never block and never see uncommitted rows. Evidence: new
+  `crates/pinkdb-cli/tests/multiprocess.rs` (13 spawned-process scenarios incl. the L0 window,
+  kill9 mid-insert, kill9 in the checkpoint window, generation reload, stale writer, busy
+  timeout, long-transaction serialization, a 4×200 stress, the v2 upgrade and a mixed
+  old-build busy) + 2 new crash windows (the W1–W3 / C1–C6 / R1–R3 matrix is covered) +
+  `benches/durable.rs`; single-process perf shows no regression — inserts 465.7 → 413.5 s
+  across runs, selects −10%, checkpoints −8%, within the ≤3% gate. Gates: workspace 559/0,
+  encryption 413/0, CLI 77/53, pink-lake 132/0, duckdiff 60/60, kill sweeps clean; live demo:
+  two CLI processes inserted into one `db.pink`, a third read n=2 s=3. Honest gaps: the
+  keyed-WAL rebuild was kept for nonce safety instead of the design's narrowing; the
+  in-process gate is a lease refcount; no network-FS detection without libc; the busy report
+  is an `Execution` message (no new variant); stage 5 (optimistic disjoint-table commits) is
+  deferred; an old *binary* was not executed against a v3 WAL (refusal by construction, the
+  version path is tested). A follow-up stability-hardening wave (chaos soak, fuzzing, gap
+  closures) is in progress.
