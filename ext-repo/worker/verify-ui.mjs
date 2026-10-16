@@ -8,8 +8,8 @@
 // (https://pinkdb-docs.defaultcms.workers.dev). Checks, in order:
 //   1. local Worker: GET / is the short info page — self-contained, no
 //      catalog script, links to the docs Extensions page and /index.json,
-//      styled with the docs' "soft data-zine" palette using system fonts
-//      only; OPTIONS /index.json answers the CORS preflight; with a stubbed
+//      styled with the docs' neutral + pink tokens (light and dark) using
+//      system fonts only; OPTIONS /index.json answers the CORS preflight; with a stubbed
 //      R2 binding GET /index.json (200/304/404) carries
 //      Access-Control-Allow-Origin: *; /artifacts/… keeps the 405 for
 //      OPTIONS (only the catalog is CORS-enabled);
@@ -168,7 +168,20 @@ check(
   "info page loads no external assets",
   assetViolations(localPage).join(", "),
 );
-check(localPage.includes("--paper: #f7f1e8"), "info page uses the docs' paper palette");
+check(
+  localPage.includes("--bg: #ffffff") && localPage.includes("--accent: #c2255c") &&
+    localPage.includes("--accent: #f472a6"),
+  "info page uses the docs' light + dark tokens (neutral surfaces, pink accent)",
+);
+check(
+  /@media \(prefers-color-scheme: dark\)\s*\{\s*:root/.test(localPage) &&
+    localPage.includes('content="light dark"'),
+  "info page follows prefers-color-scheme (light + dark)",
+);
+check(
+  !localPage.includes("--paper") && !localPage.includes("--ink"),
+  "info page drops the old paper/ink palette",
+);
 check(
   localPage.includes("ui-sans-serif") && localPage.includes("ui-monospace"),
   "info page keeps to a system type stack",
@@ -186,8 +199,12 @@ check(
   "info page carries an inline (data URI) favicon",
 );
 check(
-  localPage.includes('class="tape"') && localPage.includes('class="sun"'),
-  "info page keeps the zine motifs (tape strip, pink sun)",
+  localPage.includes('class="brand-mark"') && (localPage.match(/class="brand-mark-bar"/g) || []).length === 3,
+  "info page carries the docs brand mark (rounded square, three bars)",
+);
+check(
+  !localPage.includes('class="tape"') && !localPage.includes('class="sun"'),
+  "info page drops the zine ornaments (tape strip, pink sun)",
 );
 
 const preflight = await localFetch("/index.json", { method: "OPTIONS" });

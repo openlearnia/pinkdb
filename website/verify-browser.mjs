@@ -23,7 +23,7 @@
 //   - responsive: no horizontal overflow at 390px and 1280px on the landing
 //     page, a docs page, the extensions page and the Worker info page;
 //   - reduced motion: animations (the loading spinner) short-circuit;
-//   - the Worker `/` info page: heading, docs link, paper/ink palette,
+//   - the Worker `/` info page: heading, docs link, docs tokens (bg/accent),
 //     favicon, script-free, and /index.json answering 200 with
 //     Access-Control-Allow-Origin: * (from the page context);
 //   - no console errors (CORS failures, exceptions, failed resources) during
@@ -485,14 +485,19 @@ try {
     "info page context: /index.json answers 200 with Access-Control-Allow-Origin: *",
     JSON.stringify(indexFetch));
   const workerDesign = await cdp.evaluate(`({
+    bg: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(),
+    accent: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(),
     paper: getComputedStyle(document.documentElement).getPropertyValue("--paper").trim(),
-    ink: getComputedStyle(document.documentElement).getPropertyValue("--ink").trim(),
+    dark: matchMedia("(prefers-color-scheme: dark)").matches,
+    mark: document.querySelectorAll(".brand-mark .brand-mark-bar").length,
     favicon: Boolean(document.querySelector('link[rel="icon"]')),
     script: document.querySelectorAll("script").length,
     bodyFont: getComputedStyle(document.body).fontFamily,
   })`);
-  check(workerDesign.paper === "#f7f1e8" && workerDesign.ink === "#241f1c",
-    "info page uses the paper/ink palette", JSON.stringify(workerDesign));
+  const workerTokens = workerDesign.dark ? ["#0e0d10", "#f472a6"] : ["#ffffff", "#c2255c"];
+  check(workerDesign.bg === workerTokens[0] && workerDesign.accent === workerTokens[1] && workerDesign.paper === "",
+    "info page uses the docs tokens (neutral bg, pink accent, no paper palette)", JSON.stringify(workerDesign));
+  check(workerDesign.mark === 3, "info page carries the docs brand mark", String(workerDesign.mark));
   check(workerDesign.favicon, "info page carries a favicon");
   check(workerDesign.script === 0, "info page stays script-free", String(workerDesign.script));
   check(/ui-sans-serif|system-ui/.test(workerDesign.bodyFont),
