@@ -376,6 +376,12 @@ QUERIES = [
 
 def run_small():
     print("== small battery ==")
+    try:
+        ref = subprocess.run(["duckdb", "--version"], capture_output=True, text=True)
+        version = (ref.stdout + ref.stderr).strip().splitlines()[0]
+        print(f"reference: {version}")
+    except (OSError, IndexError):
+        pass
     for label, sql, ordered, expect_error in QUERIES:
         got = pink_query(SETUP, sql)
         if expect_error:

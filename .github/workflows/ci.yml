@@ -146,13 +146,17 @@ jobs:
       - name: make the CLI executable
         run: chmod +x target/release/pinkdb
 
-      - name: install the DuckDB CLI
+      # The probes are pinned against the DuckDB 2.0 alpha (the project's
+      # parity target — the final 2.0 release is expected soon). `latest`
+      # stable disagrees on version-sensitive behavior (e.g. `lag(x, 1.5)`
+      # offset typing, `mod(x, 0)`), so install the alpha explicitly through
+      # the official installer and fail loudly if it is not a v2 build.
+      - name: install the DuckDB CLI (alpha — the parity reference)
         run: |
-          curl -fsSL -o /tmp/duckdb.zip \
-            https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip
-          unzip -q -o /tmp/duckdb.zip -d /tmp/duckdb
-          sudo install -m 0755 /tmp/duckdb/duckdb /usr/local/bin/duckdb
-          duckdb --version
+          curl -fsSL https://install.duckdb.org | DUCKDB_VERSION=alpha sh
+          sudo install -m 0755 "$HOME/.duckdb/cli/latest/duckdb" /usr/local/bin/duckdb
+          duckdb --version | tee /tmp/duckdb-version
+          grep -q '^v2\.' /tmp/duckdb-version
 
       - name: python3 bench/duckdiff.py
         run: python3 bench/duckdiff.py
