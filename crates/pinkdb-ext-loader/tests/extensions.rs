@@ -846,6 +846,62 @@ fn wal_replay_reloads_the_extension() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// H5 regression (wave 45n): refresh replay across another process's
+/// checkpoint. The post-checkpoint record re-prefixes `LOAD EXTENSION` (a
+/// checkpoint drops every extension from the generation); this process still
+/// has the extension mapped from its own earlier replay, so the replayed
+/// prefix must be satisfied by the existing registration instead of
+/// hard-failing the whole refresh with "already loaded".
+#[test]
+fn refresh_replay_accepts_reloading_an_already_loaded_extension() {
+    let path = common::extension_path("test_ext");
+    let dir = scratch("h5_refresh");
+    let ckpt = dir.join("db.pink");
+    let ckpt = ckpt.to_str().unwrap();
+    let mut a = PinkDb::open_durable(ckpt).unwrap();
+    a.execute(&format!(
+        "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER); \
+         INSERT INTO t VALUES (ext_double_it(1));"
+    ))
+    .unwrap();
+    // b replays the LOAD record: its (process-local) registry now has the
+    // extension too.
+    let mut b = PinkDb::open_durable(ckpt).unwrap();
+    assert_eq!(
+        rows(&mut b, "SELECT a FROM t ORDER BY a;"),
+        vec![vec![Value::Integer(2)]]
+    );
+    // a checkpoints (rolling the LOAD record away) and writes a record whose
+    // replay needs the extension: it must be prefixed again.
+    a.checkpoint().unwrap();
+    a.execute("INSERT INTO t VALUES (ext_double_it(2));")
+        .unwrap();
+    // b refreshes: a full rebuild (new generation) replays the prefixed
+    // record into a process that already has test_ext loaded.
+    assert_eq!(
+        rows(&mut b, "SELECT a FROM t ORDER BY a;"),
+        vec![vec![Value::Integer(2)], vec![Value::Integer(4)]]
+    );
+    // b's own next record touching the extension must not corrupt the WAL
+    // for later replays.
+    b.execute("INSERT INTO t VALUES (ext_double_it(3));")
+        .unwrap();
+    drop(a);
+    drop(b);
+    // A fresh process replays the whole generation: the prefixed record
+    // loads the extension exactly once and every row is present.
+    let mut back = PinkDb::open_durable(ckpt).unwrap();
+    assert_eq!(
+        rows(&mut back, "SELECT a FROM t ORDER BY a;"),
+        vec![
+            vec![Value::Integer(2)],
+            vec![Value::Integer(4)],
+            vec![Value::Integer(6)]
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---------- registration edges (review H2 + minors) ----------
 
 #[test]

@@ -138,6 +138,20 @@ impl PinkDb {
         }
         out
     }
+
+    /// The declared name of the extension loaded from exactly `path`, if
+    /// any. Used by WAL replay (hazard H5): a replayed `LOAD EXTENSION
+    /// '<path>'` whose library is already mapped in this process is
+    /// satisfied by the existing registration instead of re-running `init`
+    /// (which the duplicate-load guard would refuse). A different path that
+    /// claims the same extension *name* is still a hard replay error —
+    /// running with the wrong library would silently change query results.
+    pub(crate) fn loaded_extension_name_for_path(&self, path: &str) -> Option<String> {
+        self.loaded_extensions
+            .values()
+            .find(|ext| ext.path() == path)
+            .map(|ext| ext.name().to_string())
+    }
 }
 
 /// wasm32 stub: the loader is not linked there, so loading is a clear error.
@@ -159,6 +173,10 @@ impl PinkDb {
 
     pub(crate) fn loaded_extension_paths(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    pub(crate) fn loaded_extension_name_for_path(&self, _path: &str) -> Option<String> {
+        None
     }
 }
 

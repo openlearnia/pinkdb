@@ -336,6 +336,20 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                         .to_string(),
                 ));
             }
+            // WAL replay (hazard H5): a replayed `LOAD EXTENSION` prefix may
+            // name an extension this process already has loaded — its own
+            // earlier record, or a record a checkpoint rolled away while the
+            // in-process registry (which is never persisted) kept the
+            // library mapped. The record's intent is "the extension must be
+            // available here"; an exact path match already satisfies it, so
+            // it is a no-op instead of the user-facing duplicate error. A
+            // different path claiming the same name still fails in
+            // `load_extension` (running `init` twice would corrupt it).
+            if db.replaying {
+                if let Some(name) = db.loaded_extension_name_for_path(path) {
+                    return Ok(QueryResult::LoadedExtension { name });
+                }
+            }
             // Process-level side effect: load the cdylib and register its
             // functions (atomic; a failure registers nothing). The DB stays
             // usable afterwards either way.

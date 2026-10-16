@@ -30,7 +30,11 @@
 //! file's first 48 bytes carry two epoch slots (dual slots + CRC); every lease
 //! holder that changed something a reader must notice bumps one slot, and
 //! readers compare a cached value with one `pread` (a read error or an
-//! absent/torn pair counts as changed).
+//! absent/torn pair counts as changed). The lock file must never be deleted
+//! or replaced while processes have the database open: `flock` cannot protect
+//! a name that is unlinked and recreated, so every acquisition (and every WAL
+//! mutation boundary) re-checks that the locked fd is still the file named at
+//! the lock path and fails closed otherwise (see [`Lease`]).
 //!
 //! Every process keeps a full in-memory store with an applied position
 //! (`wal_id`, generation, WAL file identity, byte/record offsets, checkpoint
@@ -482,9 +486,30 @@ impl Gate {
 /// carry the epoch), the in-process gate, the busy timeout, the lock mode,
 /// and the epoch cache. One `Lease` per durable open; every clone of the
 /// store and its transactions share it.
+///
+/// # Lock-file identity (deletion/replacement detection)
+///
+/// `flock` is per open file description, so *deleting or replacing*
+/// `<path>.pink.lock` while processes hold leases makes two different inodes
+/// answer to the same name: a process holding the old inode and a process
+/// locking the new one can both believe they hold "the write lease" and
+/// mutate `.pink`/`.pink.wal` concurrently. The lock file is documented as
+/// never deleted, but external interference must fail closed instead of
+/// corrupting. After every acquisition (and on every wait iteration) the
+/// lease `stat`s the path and compares `(dev, ino)` with the locked fd:
+/// a mismatch refuses the operation with a clear "lock file was deleted or
+/// replaced" error, and the WAL re-checks at each mutation boundary
+/// (`append`, `flush`, `checkpoint`, refresh) before writing. A process on
+/// the *new* inode cannot see the old holders; the residual window is the
+/// time between one of these checks and the file write it guards (and the
+/// reads of a process that never takes the lease again). The check is
+/// Unix-only (`dev`/`ino`); elsewhere it is a no-op.
 #[derive(Debug)]
 pub(crate) struct Lease {
     file: File,
+    /// `<checkpoint>.pink.lock`: compared with the fd's identity by
+    /// [`Lease::verify_lock_identity`].
+    lock_path: PathBuf,
     checkpoint_path: PathBuf,
     gate: Gate,
     mode: LockMode,
@@ -495,6 +520,16 @@ pub(crate) struct Lease {
     /// The next epoch seq this process will write; synced from the slots on
     /// every outermost acquisition so concurrent writers never regress seq.
     next_epoch_seq: AtomicU64,
+    /// Test-only fast-path evidence (wave 45n gap d): statement-boundary
+    /// prechecks, how many of them skipped the refresh because the cached
+    /// epoch was unchanged, and how many entered a refresh pass. Per handle,
+    /// so parallel tests cannot interfere.
+    #[cfg(test)]
+    prechecks: AtomicU64,
+    #[cfg(test)]
+    fastpath_skips: AtomicU64,
+    #[cfg(test)]
+    refresh_passes: AtomicU64,
 }
 
 /// A held write lease. Drop releases the flock when the last in-process
@@ -527,12 +562,19 @@ impl Lease {
         let ms = busy_timeout.as_millis().min(u64::MAX as u128) as u64;
         Ok(Arc::new(Lease {
             file,
+            lock_path,
             checkpoint_path: checkpoint.to_path_buf(),
             gate: Gate::default(),
             mode,
             busy_timeout_ms: AtomicU64::new(ms),
             epoch_cache: AtomicU64::new(0),
             next_epoch_seq: AtomicU64::new(1),
+            #[cfg(test)]
+            prechecks: AtomicU64::new(0),
+            #[cfg(test)]
+            fastpath_skips: AtomicU64::new(0),
+            #[cfg(test)]
+            refresh_passes: AtomicU64::new(0),
         }))
     }
 
@@ -551,12 +593,17 @@ impl Lease {
     /// skipping the flock); overlapping acquisitions just share it. On
     /// timeout the report names both causes: a process busy
     /// writing/checkpointing, and an older pinkdb build (which holds the
-    /// same lock for its whole lifetime).
+    /// same lock for its whole lifetime). The locked fd must still be the
+    /// file named at the lock path, or the acquisition is refused (see
+    /// [`Lease::verify_lock_identity`]).
     pub(crate) fn acquire(self: &Arc<Self>) -> Result<LeaseGuard> {
         let mut count = self.gate.enter();
         if *count > 0 {
             // The process already holds the flock through this fd: sharing
-            // it needs no syscall.
+            // it needs no syscall. Still re-check the path identity so a
+            // replacement during a held lease (transaction, checkpoint)
+            // fails closed at the next acquisition too.
+            self.verify_lock_identity()?;
             *count += 1;
             return Ok(LeaseGuard {
                 lease: self.clone(),
@@ -573,8 +620,24 @@ impl Lease {
                 self.file.try_lock()
             };
             match attempt {
-                Ok(()) => break,
+                Ok(()) => {
+                    // The flock succeeded on *this fd*. If another process
+                    // deleted/replaced the lock file while we were opening
+                    // or waiting, this fd no longer answers to the path
+                    // name: fail closed instead of becoming a second
+                    // writer on a stray inode.
+                    if let Err(e) = self.verify_lock_identity() {
+                        let _ = self.file.unlock();
+                        return Err(e);
+                    }
+                    break;
+                }
                 Err(std::fs::TryLockError::WouldBlock) => {
+                    // Waiting on a lock that is no longer the named lock
+                    // file can never succeed usefully (the holder is a
+                    // stray): detect the replacement instead of burning the
+                    // full timeout.
+                    self.verify_lock_identity()?;
                     if Instant::now() >= deadline {
                         return Err(self.busy_error());
                     }
@@ -615,6 +678,49 @@ impl Lease {
         })
     }
 
+    /// Is the locked fd still the file currently named at the lock path?
+    /// `Ok(false)` on a platform without `(dev, ino)` identity (the check is
+    /// a no-op there), or when the path is missing; `Err` on an unexpected
+    /// stat failure.
+    fn identity_current(&self) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            let fd_meta = self.file.metadata().map_err(PinkDbError::Io)?;
+            match std::fs::metadata(&self.lock_path) {
+                Ok(path_meta) => Ok(identity_of(&fd_meta) == identity_of(&path_meta)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(PinkDbError::Io(e)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(true)
+        }
+    }
+
+    /// Refuse when the lock file was deleted or replaced under this lease
+    /// (see the type docs). Called after every acquisition, while waiting
+    /// for the flock, and at every WAL mutation boundary.
+    pub(crate) fn verify_lock_identity(&self) -> Result<()> {
+        if self.identity_current()? {
+            return Ok(());
+        }
+        Err(PinkDbError::Execution(format!(
+            "the lock file {} was deleted or replaced while this process had the database open; \
+             another process could hold the write lease on a different file, so this operation \
+             was refused. Close and reopen the database (never delete or replace a .pink.lock \
+             while a database is open)",
+            self.lock_path.display()
+        )))
+    }
+
+    /// The busy error is an `Execution` with a stable
+    /// `database <path> is busy:` prefix. Wave 45n reviewed adding a typed
+    /// `PinkDbError::Busy` variant and deliberately did not: `PinkDbError`
+    /// is a public enum without `#[non_exhaustive]`, so a new variant is a
+    /// breaking change for downstream exhaustive matches. Hosts that want
+    /// to retry can match the prefix; promoting this to a variant is an
+    /// explicit release-note decision.
     fn busy_error(&self) -> PinkDbError {
         PinkDbError::Execution(format!(
             "database {} is busy: another process has held the write lock for {} ms \
@@ -645,6 +751,18 @@ impl Lease {
         self.epoch_cache.load(Ordering::Relaxed)
     }
 
+    /// Test-only fast-path counters: `(prechecks, fastpath_skips,
+    /// refresh_passes)` (wave 45n gap d — white-box evidence that an idle
+    /// reader serves statements with one epoch pread and no lease).
+    #[cfg(test)]
+    pub(crate) fn fast_path_counts(&self) -> (u64, u64, u64) {
+        (
+            self.prechecks.load(Ordering::Relaxed),
+            self.fastpath_skips.load(Ordering::Relaxed),
+            self.refresh_passes.load(Ordering::Relaxed),
+        )
+    }
+
     /// Cache the current on-disk epoch (after a refresh).
     pub(crate) fn cache_epoch_now(&self) {
         if let Some(e) = self.epoch_now() {
@@ -669,6 +787,12 @@ impl LeaseGuard {
     /// Fast-path freshness precheck under a held lease.
     pub(crate) fn epoch_stale(&self) -> bool {
         self.lease.stale()
+    }
+
+    /// Refuse when the lock file was deleted or replaced under this held
+    /// lease (mutation-boundary re-check; see [`Lease`]).
+    pub(crate) fn verify_lock_identity(&self) -> Result<()> {
+        self.lease.verify_lock_identity()
     }
 
     pub(crate) fn cache_epoch_now(&self) {
@@ -1233,6 +1357,15 @@ impl Wal {
                 "WAL is unusable after an earlier write failure ({msg})"
             )));
         }
+        // Mutation-boundary identity re-check: a lease that no longer names
+        // the locked file must never write bytes. Fail-stop like any other
+        // append failure: the statement's in-memory effect is not durable
+        // and must never be observed through this handle.
+        if let Err(e) = self.lease.verify_lock_identity() {
+            let msg = e.to_string();
+            self.poisoned = Some(msg.clone());
+            return Err(PinkDbError::Execution(msg));
+        }
         let payload = encode_payload(stmts)?;
         let len = record_len_guard(payload.len())?;
         let lsn = self.last_lsn + 1;
@@ -1279,6 +1412,7 @@ impl Wal {
                 "WAL is unusable after an earlier write failure ({msg})"
             )));
         }
+        self.lease.verify_lock_identity()?;
         self.file.sync_all()?;
         Ok(())
     }
@@ -1389,6 +1523,9 @@ impl Wal {
                 "cannot checkpoint: the WAL failed earlier in this session".to_string(),
             ));
         }
+        // Mutation-boundary identity re-check (see [`Lease`]): a checkpoint
+        // against a replaced lock file must not roll the WAL or publish.
+        guard.verify_lock_identity()?;
         let tmp = tmp_path(&self.checkpoint_path);
         let roll = roll_path(&self.path, self.gen);
         // A roll of the live generation already existing proves a protocol
@@ -2082,15 +2219,34 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
     }
     let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
     match version {
-        WAL_VERSION_V2 => Ok(WalHeader {
-            gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
-            wal_id: [0u8; 16],
-            records_start: V2_RECORDS_START,
-            slots_at: 0,
-            published_seq: 0,
-            enc: None,
-            legacy: true,
-        }),
+        WAL_VERSION_V2 => {
+            // A corrupted v3 header whose version word was flipped to 2
+            // (one bit!) would otherwise be mistaken for a genuine v2 file:
+            // its records would be misparsed from offset 20 and could be
+            // silently dropped by the upgrade. The v3 header's CRC over
+            // `magic..wal_id` proves it: correct the version word back to 3
+            // and check the CRC (plus the zero reserved tail). A genuine v2
+            // file cannot satisfy this except with cryptographic luck
+            // (2^-32), and its own header has no checksum to check.
+            if data.len() >= HEADER_LEN {
+                let mut corrected = [0u8; HEADER_LEN];
+                corrected.copy_from_slice(&data[..HEADER_LEN]);
+                corrected[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
+                let crc = u32::from_le_bytes(corrected[36..40].try_into().expect("4 bytes"));
+                if data[88..96] == [0u8; 8] && crc == crc32(&corrected[..36]) {
+                    return Err(HeaderError::BadCrc);
+                }
+            }
+            Ok(WalHeader {
+                gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
+                wal_id: [0u8; 16],
+                records_start: V2_RECORDS_START,
+                slots_at: 0,
+                published_seq: 0,
+                enc: None,
+                legacy: true,
+            })
+        }
         WAL_VERSION => {
             if data.len() < HEADER_LEN {
                 return Err(HeaderError::TooShort);
@@ -2730,9 +2886,15 @@ impl PinkDb {
         let Some(lease) = self.lease.clone() else {
             return Ok(());
         };
+        #[cfg(test)]
+        lease.prechecks.fetch_add(1, Ordering::Relaxed);
         if !lease.stale() {
+            #[cfg(test)]
+            lease.fastpath_skips.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        #[cfg(test)]
+        lease.refresh_passes.fetch_add(1, Ordering::Relaxed);
         let guard = lease.acquire()?;
         self.refresh_under_lease(&guard).map(|_| ())
     }
@@ -2744,6 +2906,10 @@ impl PinkDb {
     /// committed data is never silently dropped and the partially advanced
     /// store is never observable.
     pub(crate) fn refresh_under_lease(&mut self, guard: &LeaseGuard) -> Result<bool> {
+        // Recovery/upgrade/replay below mutate files; a lease whose lock
+        // file was deleted or replaced must not run them (see [`Lease`]).
+        // Returned before any work: the store is left exactly as it was.
+        guard.verify_lock_identity()?;
         let Some(wal_arc) = self.wal.clone() else {
             return Ok(false);
         };
@@ -2947,9 +3113,16 @@ impl PinkDb {
         };
         self.set_current_db(&start);
         // H5: the SQL `LOAD EXTENSION` gate is a front-end policy; WAL replay
-        // must be able to re-load the extensions its records need.
+        // must be able to re-load the extensions its records need. A record
+        // may also re-load an extension this process already has mapped
+        // (the registry is process-local and never persisted, so a registry
+        // outlives the records that loaded it): replay mode turns an exact
+        // path match into a no-op instead of a duplicate-load error.
         let allow = self.allow_sql_load_extension;
         self.allow_sql_load_extension = true;
+        let previously_loaded: HashSet<String> =
+            self.loaded_extension_paths().into_iter().collect();
+        self.replaying = true;
         let mut result = Ok(());
         for rec in records {
             if let Err(e) = replay_record(self, rec) {
@@ -2957,8 +3130,22 @@ impl PinkDb {
                 break;
             }
         }
+        self.replaying = false;
         self.allow_sql_load_extension = allow;
         if result.is_ok() {
+            // Extensions these frames loaded are covered by the current WAL
+            // generation: a later record touching one of them must not emit
+            // a redundant `LOAD EXTENSION` prefix. Only the frames just
+            // replayed count — an extension loaded by an earlier generation
+            // (and kept mapped across a checkpoint) is deliberately not
+            // seeded, because a fresh replay of the current generation would
+            // not load it.
+            let newly_loaded: Vec<String> = self
+                .loaded_extension_paths()
+                .into_iter()
+                .filter(|p| !previously_loaded.contains(p))
+                .collect();
+            wal.seed_tracked_extensions(newly_loaded);
             // The replay session after the last record is the new lineage.
             wal.set_session_db(self.current_db());
         }
@@ -3179,7 +3366,26 @@ impl PinkDb {
         let lock_path = PathBuf::from(format!("{}.lock", target.display()));
         let target_lease = match File::open(&lock_path) {
             Ok(f) => match f.try_lock() {
-                Ok(()) => Some(f),
+                Ok(()) => {
+                    // The lock only guards the *current* file at this name:
+                    // a deletion/replacement between open and lock would
+                    // guard a stray inode while another process holds the
+                    // replacement (wave 45n lock-identity check).
+                    let same = f
+                        .metadata()
+                        .ok()
+                        .map(|m| Some(identity_of(&m)) == file_identity(&lock_path))
+                        .unwrap_or(false);
+                    if !same {
+                        return Err(PinkDbError::Execution(format!(
+                            "refusing to save over {path}: its lock file {} was deleted or \
+                             replaced while it was being checked; retry after the current \
+                             database closes",
+                            lock_path.display()
+                        )));
+                    }
+                    Some(f)
+                }
                 Err(std::fs::TryLockError::WouldBlock) => {
                     return Err(PinkDbError::Execution(format!(
                         "refusing to save over {path}: the database is currently in use by \
@@ -6078,6 +6284,696 @@ mod tests {
             drop(keyed);
             cleanup(&p);
             cleanup(&p2);
+        }
+
+        /// One wave-45n fuzz open with a key: must not panic; an open that
+        /// succeeds sees exactly `1..=m` rows (a committed prefix), a second
+        /// keyed open is idempotent, and a refused open is a clean error path.
+        fn fuzz_open_prefix_keyed(p: &Path, lo: i64, hi: i64) {
+            match PinkDb::open_durable_with_key(p.to_str().unwrap(), &key()) {
+                Ok(mut db) => {
+                    let rows = ints(&mut db, "SELECT a FROM t ORDER BY a;");
+                    assert_eq!(
+                        rows,
+                        (1..=rows.len() as i64).collect::<Vec<_>>(),
+                        "a fresh keyed open must recover a prefix of committed rows"
+                    );
+                    assert!(
+                        rows.len() as i64 >= lo && rows.len() as i64 <= hi,
+                        "recovered {} rows, expected [{lo}, {hi}]",
+                        rows.len()
+                    );
+                    let mut again = durable_keyed(p);
+                    assert_eq!(
+                        ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+                        rows,
+                        "a second keyed open must be idempotent"
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(!msg.is_empty(), "a refused keyed open needs a message");
+                    // The refused state must still be a clean error path.
+                    let _ = PinkDb::open_durable_with_key(p.to_str().unwrap(), &key());
+                }
+            }
+        }
+
+        /// Wave 45n fuzz: the encrypted WAL (container header, `wal_id`
+        /// publish block with its CRC and slots, AEAD records) truncated at
+        /// every offset and flipped at every byte, through a keyed open: no
+        /// panic, never a wrong value; a successful open recovers a committed
+        /// prefix, a refused one errors cleanly without touching the
+        /// checkpoint. The checkpoint (rows 1..=3) is intact throughout, so
+        /// a successful open always has the first three rows.
+        #[test]
+        fn fuzz_encrypted_wal_truncation_and_byte_flips() {
+            let p = tmp_ckpt("encfuzz");
+            {
+                let mut db = durable_keyed(&p);
+                db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+                for i in 1..=3 {
+                    db.execute(&format!("INSERT INTO t VALUES ({i});")).unwrap();
+                }
+                db.checkpoint().unwrap();
+                db.execute("INSERT INTO t VALUES (4);").unwrap();
+            }
+            let wal = wal_path(&p);
+            let pristine = std::fs::read(&wal).unwrap();
+            assert!(pristine.starts_with(crypto::ENC_MAGIC));
+            // Truncation at every offset (the file is bounded: one small
+            // record in the fresh generation).
+            for len in 0..=pristine.len() {
+                std::fs::write(&wal, &pristine[..len]).unwrap();
+                fuzz_open_prefix_keyed(&p, 3, 4);
+            }
+            // One-bit and byte flips at every offset: header, publish block
+            // (wal_id/CRC/slots), record framing, ciphertext, tag.
+            for off in 0..pristine.len() {
+                for mask in [0x01u8, 0xFFu8] {
+                    let mut corrupt = pristine.clone();
+                    corrupt[off] ^= mask;
+                    std::fs::write(&wal, &corrupt).unwrap();
+                    fuzz_open_prefix_keyed(&p, 3, 4);
+                }
+            }
+            // Restore and confirm every committed row is still there.
+            std::fs::write(&wal, &pristine).unwrap();
+            let mut back = durable_keyed(&p);
+            assert_eq!(
+                ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4]
+            );
+            // The publish block is a hint: corrupting only its slots must not
+            // block or misread anything (wal_id + CRC are untouched). The
+            // block starts at the container's `payload_start`; slots at
+            // +24..+72.
+            let payload_start = crypto::parse_container_header(&pristine)
+                .expect("container header")
+                .payload_start;
+            let mut slot_corrupt = pristine.clone();
+            for b in slot_corrupt.iter_mut().skip(payload_start + 24).take(48) {
+                *b ^= 0xA5;
+            }
+            std::fs::write(&wal, &slot_corrupt).unwrap();
+            let mut hinted = durable_keyed(&p);
+            assert_eq!(
+                ints(&mut hinted, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4]
+            );
+
+            // A flip of the container version word (2 → 1) must not take the
+            // legacy-upgrade path and silently drop the records that follow
+            // the v2 publish block: the key-check AAD binds the version, so
+            // the keyed open is refused and the file is left untouched.
+            std::fs::write(&wal, &pristine).unwrap();
+            let mut v1 = pristine.clone();
+            assert_eq!(u32::from_le_bytes(v1[8..12].try_into().unwrap()), 2);
+            v1[8] = 1; // version 1: legacy container, records at payload_start
+            std::fs::write(&wal, &v1).unwrap();
+            let err = PinkDb::open_durable_with_key(p.to_str().unwrap(), &key()).unwrap_err();
+            assert!(!err.to_string().is_empty(), "a version flip needs an error");
+            assert_eq!(
+                std::fs::read(&wal).unwrap(),
+                v1,
+                "the refused open must not rewrite the WAL (no silent drop)"
+            );
+            std::fs::write(&wal, &pristine).unwrap();
+            let mut back = durable_keyed(&p);
+            assert_eq!(
+                ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4]
+            );
+            cleanup(&p);
+        }
+    }
+
+    // ---------- wave 45n: lock identity, fuzz, H5 replay ----------
+
+    mod wave45n {
+        use super::*;
+
+        fn lock_path(p: &Path) -> PathBuf {
+            PathBuf::from(format!("{}.lock", p.display()))
+        }
+
+        /// Replace the lock file the way a foreign process would: unlink the
+        /// name and recreate it (a fresh inode). The running handle's fd keeps
+        /// the old inode.
+        fn replace_lock_file(p: &Path) {
+            let lp = lock_path(p);
+            std::fs::remove_file(&lp).unwrap();
+            std::fs::write(&lp, b"").unwrap();
+        }
+
+        /// Wave 45n: a lock file replaced while a handle is idle must fail
+        /// the next mutation closed — before any byte is written — and a
+        /// fresh reopen must recover the exact durable prefix. Pure reads
+        /// keep serving the last consistent view (statement snapshots; the
+        /// replacement is detected at the next lease-taking operation).
+        #[test]
+        fn lock_file_replacement_fails_closed_before_any_mutation() {
+            let p = tmp_ckpt("lockrep");
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+            let wal = wal_path(&p);
+            let wal_before = std::fs::read(&wal).unwrap();
+            replace_lock_file(&p);
+            // Every lease-taking operation (write, refresh, checkpoint)
+            // refuses with the same clear error.
+            for sql in [
+                "INSERT INTO t VALUES (2);",
+                "INSERT INTO t VALUES (3);",
+                "checkpoint;",
+            ] {
+                let err = db.execute(sql).unwrap_err().to_string();
+                assert!(err.contains("deleted or replaced"), "{sql}: {err}");
+            }
+            // Reads still answer from the last consistent view (they never
+            // took a lease: the replaced fd's epoch cannot change).
+            assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1]);
+            assert_eq!(
+                std::fs::read(&wal).unwrap(),
+                wal_before,
+                "the refused statements must not have written WAL bytes"
+            );
+            // The refused statements must not be observable after reopen.
+            drop(db);
+            let mut back = durable(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1]);
+        }
+
+        /// Wave 45n: replacement while a transaction holds the lease makes
+        /// the COMMIT fail closed; the uncommitted row must never become
+        /// durable, and a fresh reopen is clean.
+        #[test]
+        fn lock_file_replacement_during_a_held_transaction_fails_closed() {
+            let p = tmp_ckpt("lockreptxn");
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+                .unwrap();
+            db.execute("BEGIN; INSERT INTO t VALUES (2);").unwrap();
+            replace_lock_file(&p);
+            let err = db.execute("COMMIT;").unwrap_err().to_string();
+            assert!(err.contains("deleted or replaced"), "{err}");
+            drop(db); // drops the open transaction and its lease
+            let mut back = durable(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1]);
+        }
+
+        /// Wave 45n: a waiter blocked on a lease whose lock file is replaced
+        /// reports the replacement immediately (the path-identity check runs
+        /// on every wait iteration) instead of burning the whole busy
+        /// timeout on a stray inode.
+        #[test]
+        fn lock_file_replacement_while_waiting_fails_closed_not_busy() {
+            let p = tmp_ckpt("lockrepwait");
+            let mut a = durable(&p);
+            a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            let b = durable(&p);
+            b.set_busy_timeout(Duration::from_millis(2_000));
+            a.execute("BEGIN;").unwrap(); // a holds the lease
+            let p2 = p.ckpt.clone();
+            let waiter = std::thread::spawn(move || {
+                let mut b = b;
+                b.execute("INSERT INTO t VALUES (1);")
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
+            std::thread::sleep(Duration::from_millis(80));
+            replace_lock_file(&p);
+            let err = waiter
+                .join()
+                .expect("waiter thread")
+                .expect_err("the replaced-lock write must fail");
+            assert!(err.contains("deleted or replaced"), "{err}");
+            a.execute("ROLLBACK;").unwrap();
+            drop(a);
+            let mut back = durable(&p2);
+            assert!(ints(&mut back, "SELECT a FROM t ORDER BY a;").is_empty());
+        }
+
+        /// Wave 45n fuzz finding: flipping the v3 version word to 2 (one bit)
+        /// used to take the v2-upgrade path and could silently drop every
+        /// record. The corrected-header CRC now refuses it as header
+        /// corruption, and the refused open must not rewrite the file.
+        #[test]
+        fn version_flip_v3_to_v2_is_refused_without_touching_the_wal() {
+            let p = tmp_ckpt("verflip");
+            let mut db = durable(&p);
+            db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")
+                .unwrap();
+            drop(db);
+            let wal = wal_path(&p);
+            let good = std::fs::read(&wal).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(good[8..12].try_into().unwrap()),
+                WAL_VERSION
+            );
+            let mut corrupt = good.clone();
+            corrupt[8] = WAL_VERSION_V2 as u8; // 3 -> 2: a single-bit flip
+            std::fs::write(&wal, &corrupt).unwrap();
+            let err = PinkDb::open_durable(p.to_str().unwrap())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("checksum") || err.contains("corrupt"), "{err}");
+            assert_eq!(
+                std::fs::read(&wal).unwrap(),
+                corrupt,
+                "the refused open must not upgrade/rewrite the file"
+            );
+            // Repair the byte: every committed record is still there.
+            std::fs::write(&wal, &good).unwrap();
+            let mut back = durable(&p);
+            assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        }
+
+        /// Rows of `t ORDER BY a`, or an empty vec when `t` does not exist.
+        fn rows_or_missing(db: &mut PinkDb) -> Vec<i64> {
+            match db.execute("SELECT a FROM t ORDER BY a;") {
+                Ok(mut out) => match out.pop().unwrap() {
+                    QueryResult::Selected { rows, .. } => rows
+                        .into_iter()
+                        .map(|r| match &r[0] {
+                            Value::Integer(i) => *i as i64,
+                            Value::Bigint(i) => *i,
+                            other => panic!("expected integer, got {other:?}"),
+                        })
+                        .collect(),
+                    other => panic!("expected rows, got {other:?}"),
+                },
+                Err(e) if e.to_string().contains("not found") => Vec::new(),
+                Err(e) => panic!("unexpected query error: {e}"),
+            }
+        }
+
+        /// One fuzz open: must not panic; when it succeeds the rows are
+        /// exactly `1..=m` for an `m` in `[lo, hi]` (a committed prefix,
+        /// never a wrong or duplicated value), a second fresh open is
+        /// idempotent, and a failed open still leaves a clean error path.
+        fn fuzz_open_prefix(p: &Path, lo: i64, hi: i64) {
+            match PinkDb::open_durable(p.to_str().unwrap()) {
+                Ok(mut db) => {
+                    let rows = rows_or_missing(&mut db);
+                    assert_eq!(
+                        rows,
+                        (1..=rows.len() as i64).collect::<Vec<_>>(),
+                        "a fresh open must recover a prefix of committed rows"
+                    );
+                    assert!(
+                        rows.len() as i64 >= lo && rows.len() as i64 <= hi,
+                        "recovered {} rows, expected [{lo}, {hi}]",
+                        rows.len()
+                    );
+                    let mut again = durable(p);
+                    assert_eq!(
+                        rows_or_missing(&mut again),
+                        rows,
+                        "a second fresh open must be idempotent"
+                    );
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(!msg.is_empty(), "a refused open needs a message");
+                    // The refused state must still be a clean error path, not
+                    // a panic or a hang.
+                    let _ = PinkDb::open_durable(p.to_str().unwrap());
+                }
+            }
+        }
+
+        /// Build rows `1..=n`; when `ckpt_at` is set, checkpoint after that
+        /// row, so `.pink` holds `1..=ckpt_at` and the live WAL the rest.
+        fn build_db(p: &Path, n: i64, ckpt_at: Option<i64>) {
+            let mut db = durable(p);
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            for i in 1..=n {
+                db.execute(&format!("INSERT INTO t VALUES ({i});")).unwrap();
+                if Some(i) == ckpt_at {
+                    db.checkpoint().unwrap();
+                }
+            }
+        }
+
+        /// Truncate the live WAL at every length and reopen: no panic, and
+        /// every successful open sees exactly the committed prefix (the
+        /// checkpoint plus the records that survived).
+        #[test]
+        fn fuzz_wal_truncation_at_every_offset() {
+            let p = tmp_ckpt("fuzztrunc");
+            build_db(&p, 5, Some(2));
+            let wal = wal_path(&p);
+            let pristine = std::fs::read(&wal).unwrap();
+            for len in 0..=pristine.len() {
+                std::fs::write(&wal, &pristine[..len]).unwrap();
+                fuzz_open_prefix(&p, 2, 5);
+            }
+            // Restore and confirm the whole corpus is intact afterwards.
+            std::fs::write(&wal, &pristine).unwrap();
+            let mut db = durable(&p);
+            assert_eq!(
+                ints(&mut db, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4, 5]
+            );
+        }
+
+        /// Flip one byte at every WAL offset (bit 0 and all bits): header,
+        /// commit slots, records. No panic, no wrong values; header damage is
+        /// a clean refusal.
+        #[test]
+        fn fuzz_wal_byte_flips_never_yield_wrong_values() {
+            let p = tmp_ckpt("fuzzflip");
+            build_db(&p, 5, Some(2));
+            let wal = wal_path(&p);
+            let pristine = std::fs::read(&wal).unwrap();
+            for off in 0..pristine.len() {
+                for mask in [0x01u8, 0xFFu8] {
+                    let mut corrupt = pristine.clone();
+                    corrupt[off] ^= mask;
+                    std::fs::write(&wal, &corrupt).unwrap();
+                    fuzz_open_prefix(&p, 2, 5);
+                }
+            }
+            std::fs::write(&wal, &pristine).unwrap();
+            let mut db = durable(&p);
+            assert_eq!(
+                ints(&mut db, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4, 5]
+            );
+        }
+
+        /// The 48-byte lock-file epoch region and the WAL commit slots are
+        /// coordination hints: corrupting them must never change recovered
+        /// data or block appends/reads.
+        #[test]
+        fn fuzz_epoch_region_and_commit_slots_are_hints_only() {
+            let p = tmp_ckpt("fuzzhints");
+            build_db(&p, 4, Some(2));
+            let lock = lock_path(&p);
+            // Corrupt the epoch region while the database is open (same
+            // inode: no replacement), then read/write through the handle.
+            {
+                let mut f = OpenOptions::new().write(true).open(&lock).unwrap();
+                f.write_all(&[0xFFu8; 96]).unwrap();
+                f.sync_all().unwrap();
+            }
+            let mut db = durable(&p);
+            assert_eq!(
+                ints(&mut db, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4]
+            );
+            db.execute("INSERT INTO t VALUES (5);").unwrap();
+            // Every single-byte corruption of the 48-byte epoch region (both
+            // slots), while the database stays open: the slots are hints, so
+            // recovered data never changes.
+            let pristine_lock = std::fs::read(&lock).unwrap();
+            for off in 0..48 {
+                let mut corrupt = pristine_lock.clone();
+                corrupt[off] ^= 0xFF;
+                std::fs::write(&lock, &corrupt).unwrap();
+                let mut back = durable(&p);
+                assert_eq!(
+                    ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+                    vec![1, 2, 3, 4, 5],
+                    "epoch byte {off} corrupted: data must not change"
+                );
+            }
+            std::fs::write(&lock, &pristine_lock).unwrap();
+            // Truncating the lock file in place (same inode: not a
+            // replacement) loses both slots: the epoch reads as absent, which
+            // is "changed" — the next operation refreshes and the next bump
+            // recreates slot A. Data is unaffected.
+            {
+                let f = OpenOptions::new().write(true).open(&lock).unwrap();
+                f.set_len(0).unwrap();
+                f.sync_all().unwrap();
+            }
+            db.execute("INSERT INTO t VALUES (50);").unwrap();
+            assert_eq!(
+                ints(&mut db, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4, 5, 50]
+            );
+            drop(db);
+            // Corrupt the WAL commit slots (40..88) and reopen: the records
+            // are authoritative, the slots are ignored when invalid.
+            let wal = wal_path(&p);
+            let mut data = std::fs::read(&wal).unwrap();
+            for b in &mut data[WAL_SLOT_A as usize..ENC_SLOT_B as usize + SLOT_LEN] {
+                *b ^= 0xA5;
+            }
+            std::fs::write(&wal, &data).unwrap();
+            let mut back = durable(&p);
+            assert_eq!(
+                ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4, 5, 50]
+            );
+            back.execute("INSERT INTO t VALUES (6);").unwrap();
+            drop(back);
+            let mut again = durable(&p);
+            assert_eq!(
+                ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3, 4, 5, 6, 50]
+            );
+        }
+
+        /// A hand-built genuine v2 WAL (magic + version 2 + gen + records).
+        fn write_v2_wal(path: &Path, gen: u64, records: &[(u64, &str)]) {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"PINKWAL1");
+            bytes.extend_from_slice(&2u32.to_le_bytes());
+            bytes.extend_from_slice(&gen.to_le_bytes());
+            for (lsn, sql) in records {
+                let mut payload = Vec::new();
+                payload.extend_from_slice(&1u32.to_le_bytes());
+                payload.extend_from_slice(&(sql.len() as u32).to_le_bytes());
+                payload.extend_from_slice(sql.as_bytes());
+                bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                bytes.extend_from_slice(&lsn.to_le_bytes());
+                bytes.extend_from_slice(&crc32(&payload).to_le_bytes());
+                bytes.extend_from_slice(&payload);
+            }
+            std::fs::write(path, &bytes).unwrap();
+        }
+
+        /// The v2→v3 upgrade's temp file: a stale temp (garbage, or a
+        /// complete pre-rename copy) must never corrupt or block the upgrade,
+        /// and a crash before the rename simply re-runs it.
+        #[test]
+        fn fuzz_v2_upgrade_temp_is_ignored_and_crash_reruns() {
+            let p = tmp_ckpt("v2fuzz");
+            write_pink(&p, &[0]);
+            let wal = wal_path(&p);
+            let upgrade = upgrade_path(&wal, 1);
+
+            // Stale garbage temp next to an intact v2 WAL: upgraded anyway.
+            write_v2_wal(
+                &wal,
+                1,
+                &[
+                    (1, "INSERT INTO t VALUES (1);"),
+                    (2, "INSERT INTO t VALUES (2);"),
+                ],
+            );
+            std::fs::write(&upgrade, b"not a wal at all").unwrap();
+            {
+                let mut db = durable(&p);
+                assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
+            }
+            let upgraded = std::fs::read(&wal).unwrap();
+            assert_eq!(
+                u32::from_le_bytes(upgraded[8..12].try_into().unwrap()),
+                3,
+                "the upgrade published a v3 header"
+            );
+            assert!(!upgrade.exists(), "the temp was renamed over the WAL");
+
+            // The stale temp truncated at every offset (and re-copied each
+            // round, because the successful upgrade renames it away): the
+            // upgrade always re-runs from the intact v2 bytes.
+            for len in 0..=upgraded.len() {
+                write_v2_wal(
+                    &wal,
+                    1,
+                    &[
+                        (1, "INSERT INTO t VALUES (1);"),
+                        (2, "INSERT INTO t VALUES (2);"),
+                    ],
+                );
+                std::fs::write(&upgrade, &upgraded[..len]).unwrap();
+                let mut db = durable(&p);
+                assert_eq!(
+                    ints(&mut db, "SELECT a FROM t ORDER BY a;"),
+                    vec![0, 1, 2],
+                    "a stale temp truncated at {len} must not affect the upgrade"
+                );
+            }
+
+            // Crash right before the rename: the original v2 WAL is intact,
+            // the temp holds the complete v3 image. Reopening re-runs the
+            // upgrade from the v2 bytes (the temp is ignored, then replaced).
+            write_v2_wal(
+                &wal,
+                1,
+                &[
+                    (1, "INSERT INTO t VALUES (1);"),
+                    (2, "INSERT INTO t VALUES (2);"),
+                ],
+            );
+            std::fs::write(&upgrade, &upgraded).unwrap();
+            {
+                let mut db = durable(&p);
+                assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
+            }
+            // Crash after the rename but before anything else: the WAL is v3
+            // and a stale temp remains; opening normally ignores it.
+            std::fs::write(&upgrade, b"stale leftover").unwrap();
+            {
+                let mut db = durable(&p);
+                assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
+            }
+        }
+
+        /// Checkpoint `.tmp` windows: a `.tmp` next to an intact live WAL is
+        /// discarded; a `.tmp` with the roll already created is published;
+        /// truncated/flipped `.tmp` bytes either recover the full state or
+        /// fail cleanly — never panic, never report wrong values.
+        #[test]
+        fn fuzz_checkpoint_tmp_windows() {
+            let p = tmp_ckpt("tmpfuzz");
+            build_db(&p, 3, Some(3)); // checkpoint holds 1..3; live WAL gen 2, empty
+            let ckpt_bytes = std::fs::read(&p).unwrap();
+            let tmp = tmp_path(&p);
+            let wal = wal_path(&p);
+            let roll = roll_path(&wal, 2);
+            let roll_bytes = std::fs::read(&wal).unwrap();
+
+            // State A: live WAL exists, garbage `.tmp` -> discarded.
+            std::fs::write(&tmp, b"partial checkpoint").unwrap();
+            {
+                let mut db = durable(&p);
+                assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 3]);
+            }
+            assert!(!tmp.exists(), "state A discards the .tmp");
+
+            // State B: `.tmp` is the complete pre-rename checkpoint, the live
+            // WAL is absent, its rolled generation survives, no `.pink`.
+            // Recovery must publish `.tmp` (the roll proves it complete).
+            let reset_state_b = |tmp_bytes: &[u8]| {
+                let _ = std::fs::remove_file(&p);
+                let _ = std::fs::remove_file(&wal);
+                let _ = std::fs::remove_file(&roll);
+                let parent = p.parent().unwrap();
+                for e in std::fs::read_dir(parent).unwrap().flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".roll") {
+                        std::fs::remove_file(e.path()).unwrap();
+                    }
+                }
+                std::fs::write(&tmp, tmp_bytes).unwrap();
+                std::fs::write(&roll, &roll_bytes).unwrap();
+            };
+
+            // The uncorrupted state recovers the full state.
+            reset_state_b(&ckpt_bytes);
+            {
+                let mut db = durable(&p);
+                assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 3]);
+            }
+            assert!(!tmp.exists(), "state B publishes the .tmp");
+            assert!(!roll.exists(), "state B removes the roll");
+
+            // Fuzz every truncation of `.tmp` (it is a small file), then some
+            // byte flips: full recovery or a clean refusal, never a panic,
+            // never wrong values.
+            for len in 0..=ckpt_bytes.len() {
+                reset_state_b(&ckpt_bytes[..len]);
+                match PinkDb::open_durable(p.to_str().unwrap()) {
+                    Ok(mut db) => {
+                        assert_eq!(
+                            rows_or_missing(&mut db),
+                            vec![1, 2, 3],
+                            "a published .tmp must hold the full state"
+                        );
+                    }
+                    Err(e) => assert!(
+                        !e.to_string().is_empty(),
+                        "a refused corrupt .tmp needs a message"
+                    ),
+                }
+            }
+            for off in 0..ckpt_bytes.len() {
+                let mut corrupt = ckpt_bytes.clone();
+                corrupt[off] ^= 0x5A;
+                reset_state_b(&corrupt);
+                match PinkDb::open_durable(p.to_str().unwrap()) {
+                    Ok(mut db) => {
+                        assert_eq!(
+                            rows_or_missing(&mut db),
+                            vec![1, 2, 3],
+                            "a published .tmp must hold the full state"
+                        );
+                    }
+                    Err(e) => assert!(!e.to_string().is_empty()),
+                }
+            }
+
+            // State C: `.tmp` present but nothing proves it complete (no
+            // roll, no live WAL) -> discarded, an empty store opens cleanly.
+            let _ = std::fs::remove_file(&p);
+            let _ = std::fs::remove_file(&roll);
+            let _ = std::fs::remove_file(&wal);
+            std::fs::write(&tmp, &ckpt_bytes).unwrap();
+            {
+                let mut db = durable(&p);
+                assert!(
+                    rows_or_missing(&mut db).is_empty(),
+                    "an unprovable .tmp must not resurrect rows"
+                );
+            }
+        }
+
+        /// Wave 45n gap (d): epoch fast-path evidence. A reader whose cached
+        /// epoch is unchanged serves statements with one pread each and runs
+        /// no refresh pass (no lease, no WAL read); one publication by
+        /// another handle costs exactly one refresh pass, then the fast path
+        /// resumes. White-box counters live on the handle's lease
+        /// (`Lease::fast_path_counts`); limits: they count this handle's own
+        /// `refresh_if_stale` calls, the pread itself is instrumented next to
+        /// (not inside) `File::read_at`, and `needs_scan` may still run its
+        /// two `stat`s under an *already acquired* lease.
+        #[test]
+        fn epoch_fast_path_skips_refresh_for_an_idle_reader() {
+            let p = tmp_ckpt("epochfast");
+            let mut a = durable(&p);
+            a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            let mut b = durable(&p);
+            // Warm b's view and its cached epoch.
+            assert!(ints(&mut b, "SELECT a FROM t;").is_empty());
+            let lease = b.lease_handle().unwrap();
+            let (pre0, skip0, pass0) = lease.fast_path_counts();
+            for _ in 0..25 {
+                assert!(ints(&mut b, "SELECT a FROM t;").is_empty());
+            }
+            let (pre1, skip1, pass1) = lease.fast_path_counts();
+            assert_eq!(pre1 - pre0, 25, "one precheck per statement");
+            assert_eq!(skip1 - skip0, 25, "every statement took the fast path");
+            assert_eq!(pass1, pass0, "an unchanged epoch runs no refresh pass");
+
+            a.execute("INSERT INTO t VALUES (7);").unwrap();
+            assert_eq!(ints(&mut b, "SELECT a FROM t;"), vec![7]);
+            let (pre2, skip2, pass2) = lease.fast_path_counts();
+            assert_eq!(pass2, pass0 + 1, "a publication costs one refresh pass");
+            assert_eq!(skip2, skip1, "the changed epoch did not take the skip path");
+            assert_eq!(pre2 - pre1, 1);
+            for _ in 0..5 {
+                assert_eq!(ints(&mut b, "SELECT a FROM t;"), vec![7]);
+            }
+            let (_, skip3, pass3) = lease.fast_path_counts();
+            assert_eq!(pass3, pass2, "back to the fast path after the refresh");
+            assert_eq!(skip3 - skip2, 5);
+            drop(lease);
+            cleanup(&p);
         }
     }
 }

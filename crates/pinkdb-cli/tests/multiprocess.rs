@@ -610,6 +610,268 @@ fn snapshot_dir(dir: &Path) -> Vec<(String, u64)> {
     out
 }
 
+// ---------- wave 45n: lock-file identity (real second process) ----------
+
+/// Wave 45n: delete + recreate `<db>.pink.lock` while a real second process
+/// holds its lease. The holding process must fail its next lease-taking
+/// operation closed (clear error, zero WAL bytes); a fresh process that locks
+/// the new file may proceed; the final state is exactly the union of
+/// acknowledged commits of the process that held the valid lease.
+#[test]
+fn lock_file_replacement_fails_closed_across_processes() {
+    let dir = scratch("lockreplace");
+    let ckpt = dir.join("db.pink");
+    let lock = dir.join("db.pink.lock");
+    let wal = dir.join("db.pink.wal");
+    let mut p1 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);",
+        "p1-ready",
+    );
+
+    // A foreign process replaces the lock file (fresh inode); p1's fd still
+    // holds the old, unlinked one.
+    let wal_before = std::fs::read(&wal).unwrap();
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+
+    // Idle: the next write refuses before writing anything.
+    p1.send("INSERT INTO t VALUES (2);\n");
+    p1.expect_error("deleted or replaced");
+    assert_eq!(
+        std::fs::read(&wal).unwrap(),
+        wal_before,
+        "the refused write must not have touched the WAL"
+    );
+
+    // A fresh process locks the *new* lock file and continues cleanly.
+    let mut p2 = Cli::spawn(&dir, None);
+    p2.open("db.pink");
+    p2.marker("INSERT INTO t VALUES (3);", "p2-acked");
+
+    // p1 still fails closed on the stray inode (never a second writer).
+    p1.send("INSERT INTO t VALUES (4);\n");
+    p1.expect_error("deleted or replaced");
+    p1.quit();
+    p2.quit();
+
+    // Exactly p1's pre-replacement commit and p2's post-replacement commit.
+    let info = verify(&ckpt, &[1, 3]);
+    assert_eq!(info.replayed_records, 3, "CREATE, row 1, row 3");
+    cleanup(&ckpt);
+}
+
+/// Wave 45n: replacement while p1 is mid-transaction (holding the lease):
+/// its COMMIT must fail closed, the uncommitted row must never be durable,
+/// and the process on the new lock file continues normally.
+#[test]
+fn lock_file_replacement_mid_transaction_fails_closed_across_processes() {
+    let dir = scratch("lockreptxn");
+    let ckpt = dir.join("db.pink");
+    let lock = dir.join("db.pink.lock");
+    let mut p1 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    p1.marker("CREATE TABLE t (a INTEGER);", "ready");
+    // p1 holds the lease (BEGIN) with a buffered insert.
+    p1.marker("BEGIN; INSERT INTO t VALUES (99);", "p1-txn");
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    // p2 locks the fresh file and commits normally.
+    let mut p2 = Cli::spawn(&dir, None);
+    p2.open("db.pink");
+    p2.marker("INSERT INTO t VALUES (3);", "p2-acked");
+    // p1's COMMIT refuses at the WAL mutation boundary.
+    p1.send("COMMIT;\n");
+    p1.expect_error("deleted or replaced");
+    p1.quit();
+    p2.quit();
+    // The uncommitted 99 is gone; p2's commit is exactly once.
+    let info = verify(&ckpt, &[3]);
+    assert_eq!(info.replayed_records, 2, "CREATE + row 3");
+    cleanup(&ckpt);
+}
+
+/// Wave 45n gap (d): `save_snapshot` refuses a target whose lease a REAL
+/// second process holds — not a foreign flock from the test process.
+#[test]
+fn save_snapshot_refuses_a_lease_held_by_a_real_process() {
+    let dir = scratch("snaplease");
+    let ckpt = dir.join("db.pink");
+    let mut p1 = Cli::spawn(&dir, None);
+    p1.open("db.pink");
+    // Checkpoint first so the target WAL is empty and the WAL-records guard
+    // cannot mask the lease guard.
+    p1.marker(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); checkpoint;",
+        "p1-ready",
+    );
+    // p1 holds the lease for a whole transaction.
+    p1.marker("BEGIN; INSERT INTO t VALUES (2);", "p1-txn");
+
+    // p2 is bound to nothing: `.save db.pink` is a snapshot at the target.
+    let mut p2 = Cli::spawn(&dir, None);
+    p2.send(".save db.pink\n");
+    let line = p2.expect_error("in use by another handle or process");
+    assert!(
+        line.contains("in use by another handle or process"),
+        "{line}"
+    );
+    let target_before = std::fs::read(&ckpt).unwrap();
+
+    // Once the real holder dies, the kernel releases the flock: the same
+    // snapshot now proceeds (the target WAL was checkpointed empty, so no
+    // other guard masks the lease check) — proof the first error came from
+    // the live lease, not from a static file state.
+    p1.kill();
+    p2.send(".save db.pink\n");
+    p2.wait_for("Saved");
+    let target_after = std::fs::read(&ckpt).unwrap();
+    assert_ne!(
+        target_before, target_after,
+        "the released lease let the snapshot proceed"
+    );
+    // The snapshot is p2's in-memory store: an empty `main` database.
+    p2.quit();
+    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    assert!(
+        db.execute("SELECT COUNT(*) FROM t;").is_err(),
+        "the snapshot replaced the target with p2's empty store"
+    );
+    drop(db);
+    cleanup(&ckpt);
+}
+
+/// Compile `crates/pinkdb-ext-loader/tests/c/<name>.c` with the system `cc`
+/// against the ABI header — the same real extension fixture the ext-loader
+/// suite uses.
+fn compile_test_extension(dir: &Path, name: &str) -> String {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source = manifest
+        .join("../pinkdb-ext-loader/tests/c")
+        .join(format!("{name}.c"));
+    let include = manifest.join("../pinkdb-ext-loader/include");
+    let out = dir.join(format!("{name}{}", std::env::consts::DLL_SUFFIX));
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let status = Command::new(&cc)
+        .arg("-std=c99")
+        .arg("-O1")
+        .arg("-fPIC")
+        .arg("-shared")
+        .arg("-I")
+        .arg(&include)
+        .arg("-o")
+        .arg(&out)
+        .arg(&source)
+        .status()
+        .expect("run the C compiler (set CC?)");
+    assert!(status.success(), "compiling {name}.c failed");
+    out.to_str().expect("UTF-8 path").to_string()
+}
+
+/// Wave 45n gap (b), real processes + a REAL extension: refresh replay of a
+/// `LOAD EXTENSION`-prefixed record must succeed even though this process
+/// already has the extension mapped from its own earlier replay. This is the
+/// cross-process H5 bug: before the fix, b's refresh died with "extension
+/// \"test_ext\" is already loaded".
+#[test]
+fn refresh_replay_reloads_a_real_extension_across_processes() {
+    let dir = scratch("extrefresh");
+    let ext = compile_test_extension(&dir, "test_ext");
+    let ckpt = dir.join("db.pink");
+    // b opens first (empty database): its next statements must refresh.
+    let mut b = Cli::spawn(&dir, None);
+    b.open("db.pink");
+    let mut a = Cli::spawn(&dir, None);
+    a.open("db.pink");
+    a.marker(
+        &format!(
+            "LOAD EXTENSION '{ext}'; CREATE TABLE t (a INTEGER); \
+             INSERT INTO t VALUES (ext_double_it(1));"
+        ),
+        "a-loaded",
+    );
+    // b replays LOAD+CREATE+INSERT on its next statement: its process-local
+    // registry now has test_ext.
+    b.expect_marker("SELECT 'b-sees-2' AS m FROM t WHERE a = 2;", "b-sees-2");
+    // a checkpoints (rolling the LOAD record away) and writes a record that
+    // must be LOAD-prefixed again.
+    a.marker("checkpoint;", "a-ckpt");
+    a.marker("INSERT INTO t VALUES (ext_double_it(2));", "a-insert2");
+    // b's refresh (full rebuild: new generation) replays the prefixed record
+    // while test_ext is already loaded in b's process.
+    b.expect_marker("SELECT 'b-sees-4' AS m FROM t WHERE a = 4;", "b-sees-4");
+    b.marker("INSERT INTO t VALUES (ext_double_it(3));", "b-insert");
+    a.quit();
+    b.quit();
+    // A fresh process replays the whole generation: the prefixed record loads
+    // the extension exactly once; every row is present exactly once.
+    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![2, 4, 6]);
+    cleanup(&ckpt);
+}
+
+/// Wave 45n gap (c), with the real pink-lake fixture: an attached lake
+/// survives a full refresh rebuild triggered by another process's checkpoint
+/// (H10: attachments are process-local and the rebuild must preserve them).
+#[cfg(feature = "lake")]
+#[test]
+fn attached_lake_survives_a_full_rebuild() {
+    let dir = scratch("attachrebuild");
+    let lake = dir.join("lake");
+    let ckpt = dir.join("db.pink");
+
+    // Build a real lake fixture (catalog + data files) from an in-memory
+    // store, in its own database named `lake`.
+    let mut mk = Cli::spawn(&dir, None);
+    mk.send(&format!(
+        "CREATE DATABASE lake;\nUSE lake;\nCREATE TABLE lt (i INTEGER);\n\
+         INSERT INTO lt VALUES (1), (2), (3);\n.lake save {}\n",
+        lake.display()
+    ));
+    mk.wait_for("Saved lake");
+    mk.quit();
+
+    // The durable database those two processes share.
+    let mut a = Cli::spawn(&dir, None);
+    a.open("db.pink");
+    a.marker(
+        "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (10);",
+        "a-ready",
+    );
+
+    // b opens before a's checkpoint and attaches the lake read-only.
+    let mut b = Cli::spawn(&dir, None);
+    b.open("db.pink");
+    b.send(&format!(".lake attach {}\n", lake.display()));
+    b.wait_for("Attached");
+    b.expect_marker(
+        "SELECT 'attached-3' AS m FROM lake.lt WHERE i = 3;",
+        "attached-3",
+    );
+
+    // a commits and checkpoints: b's next statement refreshes with a full
+    // rebuild (new WAL incarnation + new checkpoint identity).
+    a.marker("INSERT INTO t VALUES (11); checkpoint;", "a-ckpt");
+    b.expect_marker(
+        "SELECT 'still-attached' AS m FROM lake.lt WHERE i = 3;",
+        "still-attached",
+    );
+    // The attachment still answers every query shape, and the durable side
+    // of the rebuild is right too.
+    b.expect_marker(
+        "SELECT 'attached-count' AS m FROM lake.lt HAVING COUNT(*) = 3;",
+        "attached-count",
+    );
+    b.expect_marker("SELECT 'sees-11' AS m FROM t WHERE a = 11;", "sees-11");
+    // `.lake attached` still lists it after the rebuild.
+    b.send(".lake attached\n");
+    b.wait_for("lake.lt");
+    a.quit();
+    b.quit();
+    cleanup(&ckpt);
+}
+
 // ---------- M4 scenario: kill in the checkpoint window with a live writer ----------
 
 #[test]

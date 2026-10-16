@@ -527,6 +527,14 @@ pub struct PinkDb {
     /// replay is unaffected: it runs at open, before a front-end can flip
     /// this, and the Rust [`PinkDb::load_extension`] API is never gated.
     pub(crate) allow_sql_load_extension: bool,
+    /// True only while [`PinkDb::replay_frames`] executes recovered WAL
+    /// records (hazard H5): a replayed `LOAD EXTENSION` prefix may name an
+    /// extension this process already has loaded (its own earlier record, or
+    /// a record the current generation loaded before a checkpoint rolled it
+    /// away), and the WAL intent is "the extension must be available", so an
+    /// exact path match is a no-op instead of the user-facing "already
+    /// loaded" error. Normal SQL keeps the strict duplicate-load refusal.
+    pub(crate) replaying: bool,
     /// Attached read-only lakes (`.lake attach`): session-local, additive to
     /// the visible catalog for reads only — never part of the store's own
     /// tables and never touched by `.save`, `.lake save`, or the WAL.
@@ -563,6 +571,7 @@ impl Clone for PinkDb {
             wal_txn_ext_loaded: self.wal_txn_ext_loaded.clone(),
             encryption_key: self.encryption_key.clone(),
             allow_sql_load_extension: self.allow_sql_load_extension,
+            replaying: false,
             attached_lakes: self.attached_lakes.clone(),
         }
     }
@@ -607,6 +616,7 @@ impl PinkDb {
             wal_txn_ext_loaded: Vec::new(),
             encryption_key: None,
             allow_sql_load_extension: true,
+            replaying: false,
             attached_lakes: Vec::new(),
         }
     }
@@ -856,6 +866,26 @@ impl PinkDb {
                     cat.views.entry(name).or_insert(view);
                 }
             }
+        }
+        // Attached lakes are session-local and survive the swap, but
+        // `attach_lake` also created the (empty) databases their tables live
+        // in so qualified names and `USE` keep resolving. Re-create those the
+        // reloaded catalog does not define; a real database with the same
+        // name wins (store tables shadow attached ones in resolution, exactly
+        // like `visible_table_schema`). Without this, a full rebuild silently
+        // orphaned every attached `db.table` name.
+        let attached_dbs: Vec<String> = self
+            .attached_lakes
+            .iter()
+            .flat_map(|l| l.tables().iter().map(|t| t.db.clone()))
+            .collect();
+        for name in attached_dbs {
+            self.databases
+                .entry(Self::db_key(&name))
+                .or_insert_with(|| DbCatalog {
+                    name,
+                    ..DbCatalog::default()
+                });
         }
         self.current_db = other.current_db;
     }
