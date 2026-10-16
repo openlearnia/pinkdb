@@ -1129,7 +1129,10 @@ sleep 0.3
     | cli_run "$TMP/conflict_quick.log"
 assert_status_zero "$TMP/conflict_quick.log" "$?"
 wait "$SLOW_PID"
-assert_status_zero "$TMP/conflict_slow.exit" "$(cat "$TMP/conflict_slow.exit")"
+# The slow writer is the expected loser. Since wave 40b the CLI exits 1 after
+# a failed statement in a piped script, so a nonzero exit is correct here; the
+# python block below classifies its log (exactly one error: the documented
+# write conflict). The exit file is kept for diagnostics only.
 
 python3 - "$TMP" <<'PY' || fail "the slow-save conflict did not behave as documented (see above)"
 import os, re, sys

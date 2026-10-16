@@ -1107,15 +1107,18 @@ impl Wal {
     /// commit.
     fn publish(&mut self) {
         let seq = self.published_seq + 1;
-        if write_slot(
-            &self.file,
-            self.slots_at,
-            seq,
-            self.last_lsn,
-            WAL_SLOT_DOMAIN,
-        )
-        .is_err()
-        {
+        // The data handle is opened with `append(true)` for atomic record
+        // appends; it must NOT be used for positioned writes: on Linux,
+        // `pwrite` on an O_APPEND descriptor ignores the offset and appends
+        // to EOF (macOS honours the offset), which silently strands the
+        // commit slot at the end of the file. Open a positioned handle for
+        // the header slot — a hint write on the commit path, one extra open,
+        // never an fsync.
+        let wrote = OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .and_then(|f| write_slot(&f, self.slots_at, seq, self.last_lsn, WAL_SLOT_DOMAIN));
+        if wrote.is_err() {
             warn_slot_once("WAL commit slot");
         }
         self.published_seq = seq;
