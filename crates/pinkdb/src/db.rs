@@ -26,11 +26,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use crate::crypto::EncryptionKey;
 use crate::plan::{is_read_only, LogicalPlan};
 use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
+use crate::wal::{DurableOpenOptions, Lease, LeaseGuard};
 use crate::QueryResult;
 
 /// One-time warning flag for poisoned-lock recovery (see [`read_lock`]).
@@ -72,6 +74,9 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 #[derive(Clone, Debug, Default)]
 pub struct Database {
     shared: Arc<RwLock<PinkDb>>,
+    /// The durable write lease, copied from the store at construction so the
+    /// per-statement freshness precheck needs no store lock.
+    lease: Option<Arc<Lease>>,
 }
 
 impl Database {
@@ -81,9 +86,18 @@ impl Database {
 
     /// Open a durable database at `path`: load the `.pink` checkpoint (if
     /// present), replay `<path>.pink.wal` (stopping at a torn tail), and log
-    /// every subsequent commit to that WAL.
+    /// every subsequent commit to that WAL. Any number of local processes may
+    /// open the same database; writers serialize per operation.
     pub fn open(path: &str) -> Result<Database> {
         Ok(Database::from_store(PinkDb::open_durable(path)?))
+    }
+
+    /// [`Database::open`] with the full durable-open options (sync policy,
+    /// busy timeout, lock mode).
+    pub fn open_with_options(path: &str, opts: DurableOpenOptions) -> Result<Database> {
+        Ok(Database::from_store(
+            PinkDb::open_durable_with_options(path, opts)?.0,
+        ))
     }
 
     /// Open a durable database at `path` with at-rest encryption: the
@@ -97,9 +111,22 @@ impl Database {
         )?))
     }
 
+    /// [`Database::open_with_key`] with the full durable-open options.
+    pub fn open_with_key_and_options(
+        path: &str,
+        key: &EncryptionKey,
+        opts: DurableOpenOptions,
+    ) -> Result<Database> {
+        Ok(Database::from_store(
+            PinkDb::open_durable_with_key_and_options(path, key, opts)?.0,
+        ))
+    }
+
     pub fn from_store(store: PinkDb) -> Self {
+        let lease = store.lease_handle();
         Self {
             shared: Arc::new(RwLock::new(store)),
+            lease,
         }
     }
 
@@ -118,11 +145,46 @@ impl Database {
         read_lock(&self.shared).is_durable()
     }
 
-    /// Checkpoint the durable store: atomically write the bound `.pink` and
-    /// roll the WAL generation. Errors for in-memory databases.
-    pub fn checkpoint(&self) -> Result<()> {
+    /// How long an operation waits for another process's write lease before
+    /// reporting the database busy (default 5 s; no-op in memory).
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        if let Some(lease) = &self.lease {
+            lease.set_busy_timeout(timeout);
+        }
+    }
+
+    /// Acquire the write lease (`None` in memory). Invariant I6: callers
+    /// take the lease *before* the store write lock.
+    fn acquire_lease(&self) -> Result<Option<LeaseGuard>> {
+        match &self.lease {
+            Some(lease) => Ok(Some(lease.acquire()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Refresh the shared store if another process published something (or
+    /// replaced a file). No-op when the epoch says nothing changed.
+    fn refresh(&self) -> Result<()> {
+        let Some(lease) = self.lease.clone() else {
+            return Ok(());
+        };
+        if !lease.stale() {
+            return Ok(());
+        }
+        let guard = lease.acquire()?;
         let mut shared = write_lock(&self.shared);
-        shared.checkpoint()
+        shared.refresh_under_lease(&guard)?;
+        Ok(())
+    }
+
+    /// Checkpoint the durable store: atomically write the bound `.pink` and
+    /// roll the WAL generation. Errors for in-memory databases. Takes the
+    /// lease before the store lock; the checkpoint refreshes first, so it can
+    /// never omit another process's committed records.
+    pub fn checkpoint(&self) -> Result<()> {
+        let guard = self.acquire_lease()?;
+        let mut shared = write_lock(&self.shared);
+        shared.checkpoint_with_guard(guard.as_ref())
     }
 
     /// WAL size that triggers an automatic checkpoint after a committed
@@ -139,10 +201,16 @@ impl Database {
         write_lock(&self.shared).set_allow_sql_load_extension(allow);
     }
 
-    /// fsync the WAL (meaningful with [`crate::SyncPolicy::Batch`]).
+    /// fsync the WAL (meaningful with [`crate::SyncPolicy::Batch`]). Takes
+    /// the lease first: a flush is the durability point other processes
+    /// wait for.
     pub fn flush_wal(&self) -> Result<()> {
+        let guard = self.acquire_lease()?;
         let mut shared = write_lock(&self.shared);
-        shared.flush_wal()
+        shared.flush_wal_holding_lease()?;
+        drop(shared);
+        drop(guard);
+        Ok(())
     }
 }
 
@@ -181,6 +249,10 @@ struct Txn {
     /// target. A database dropped since BEGIN makes the record unreplayable,
     /// so COMMIT conflicts on it.
     wal_dbs: Vec<String>,
+    /// The write lease held from BEGIN to COMMIT/ROLLBACK (durable stores):
+    /// while a transaction is open, every other process's writes and
+    /// refreshes wait for it (design 4.7).
+    txn_lease: Option<LeaseGuard>,
 }
 
 /// One connection: single-threaded statement stream, own transaction state,
@@ -300,10 +372,15 @@ impl Connection {
             }
             None => {
                 let pre = self.current_db.clone();
+                // Statement-boundary freshness: a stale view refreshes under
+                // the write lease before binding (statement-start snapshot;
+                // reads never hold a lease while executing).
+                self.db.refresh()?;
                 // Bind and run under one lock, so the plan always matches the
                 // catalog it executes against (a concurrent DROP + CREATE can
                 // never leave stale column indices). Reads bind and run under
-                // a shared lock; a write rebinds under the exclusive lock.
+                // a shared lock; a write takes the write lease, then rebinds
+                // under the exclusive lock.
                 let shared = read_lock(&self.db.shared);
                 let (plan, _) = crate::sql::bind_tracked(&shared, stmt, &pre)?;
                 let result = if is_read_only(&plan) {
@@ -313,7 +390,14 @@ impl Connection {
                     result?
                 } else {
                     drop(shared);
+                    // Invariant I6: lease first, then the store write guard.
+                    let lease = self.db.acquire_lease()?;
                     let mut shared = write_lock(&self.db.shared);
+                    if let Some(g) = &lease {
+                        // Refresh under the lease; the rebind below covers a
+                        // changed catalog either way.
+                        shared.refresh_under_lease(g)?;
+                    }
                     let (plan, dynamic_functions_used) =
                         crate::sql::bind_tracked(&shared, stmt, &pre)?;
                     // A durable store logs mutating statements: one that
@@ -337,19 +421,28 @@ impl Connection {
                                 &touched,
                                 &loaded,
                             )?;
-                            shared.maybe_auto_checkpoint();
+                            shared.maybe_auto_checkpoint(lease.as_ref());
                         }
                     }
+                    drop(shared);
+                    drop(lease);
                     result
                 };
                 // `USE` is read-only for locking but still WAL-logged: replay
                 // must switch sessions exactly like this connection did.
-                // Re-validate the target under this read lock, held across the
+                // Re-validate the target under the lease, held across the
                 // append: the bind-time check released its lock, so another
                 // connection could have dropped the database in between — a
                 // logged `USE` for a dead database could never replay.
                 if is_read_only(&plan) {
                     if let QueryResult::Used { .. } = &result {
+                        let lease = self.db.acquire_lease()?;
+                        if let Some(g) = &lease {
+                            // Refresh before logging: the `USE` record must
+                            // land after every earlier commit.
+                            let mut shared = write_lock(&self.db.shared);
+                            shared.refresh_under_lease(g)?;
+                        }
                         let shared = read_lock(&self.db.shared);
                         let after = session_after(&result, &pre, &shared);
                         if !shared.database_exists(&after) {
@@ -366,6 +459,8 @@ impl Connection {
                                 &[],
                             )?;
                         }
+                        drop(shared);
+                        drop(lease);
                     }
                 }
                 // Apply the session transition.
@@ -386,6 +481,15 @@ impl Connection {
             return Err(PinkDbError::Execution(
                 "already in a transaction".to_string(),
             ));
+        }
+        // Durable stores hold the write lease from BEGIN to COMMIT/ROLLBACK
+        // and refresh before snapshotting (design 4.7): while the
+        // transaction is open, every other process's writes and refreshes
+        // wait for it, and the transaction's view cannot go stale.
+        let lease = self.db.acquire_lease()?;
+        if let Some(g) = &lease {
+            let mut shared = write_lock(&self.db.shared);
+            shared.refresh_under_lease(g)?;
         }
         let shared = read_lock(&self.db.shared);
         let mut base_tables = HashMap::new();
@@ -419,6 +523,7 @@ impl Connection {
             wal_db_before: None,
             wal_db_after: self.current_db.clone(),
             wal_dbs: Vec::new(),
+            txn_lease: lease,
         };
         drop(shared);
         self.txn = Some(txn);
@@ -517,7 +622,7 @@ impl Connection {
             }
         }
         if !txn.wal_stmts.is_empty() {
-            shared.maybe_auto_checkpoint();
+            shared.maybe_auto_checkpoint(txn.txn_lease.as_ref());
         }
         Ok(QueryResult::Committed)
     }

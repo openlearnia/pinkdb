@@ -472,7 +472,7 @@ pub struct DbCatalog {
 /// the WAL handle (`Arc`), so transaction snapshots and multi-writer
 /// `txn.work` copies all log to the same file. In-memory databases have
 /// `wal == None` and are byte-for-byte unchanged.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PinkDb {
     /// Key = lowercased database name.
     databases: HashMap<String, DbCatalog>,
@@ -490,10 +490,17 @@ pub struct PinkDb {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) loaded_extensions: HashMap<String, LoadedExtension>,
     /// Lowercased name of the embedded session's current database.
-    current_db: String,
-    txn_snapshot: Option<Box<PinkDb>>,
+    pub(crate) current_db: String,
+    pub(crate) txn_snapshot: Option<Box<PinkDb>>,
     /// Durable WAL handle, shared by every clone of this store.
     pub(crate) wal: Option<Arc<Mutex<Wal>>>,
+    /// The per-operation write lease of a durable store (wave 45m): the lock
+    /// file fd, the in-process gate, the busy timeout, and the epoch cache.
+    /// Shared by every clone; `None` in memory.
+    pub(crate) lease: Option<Arc<crate::wal::Lease>>,
+    /// The lease held for the whole span of an embedded durable transaction
+    /// (`begin` .. `commit`/`rollback`). Never cloned into snapshots.
+    pub(crate) txn_lease: Option<crate::wal::LeaseGuard>,
     /// SQL text of mutating statements executed since `BEGIN` of a durable
     /// transaction; flushed as one WAL record by [`PinkDb::commit`].
     wal_txn: Vec<String>,
@@ -519,7 +526,7 @@ pub struct PinkDb {
     /// remote client cannot make the host process `dlopen` a library. WAL
     /// replay is unaffected: it runs at open, before a front-end can flip
     /// this, and the Rust [`PinkDb::load_extension`] API is never gated.
-    allow_sql_load_extension: bool,
+    pub(crate) allow_sql_load_extension: bool,
     /// Attached read-only lakes (`.lake attach`): session-local, additive to
     /// the visible catalog for reads only — never part of the store's own
     /// tables and never touched by `.save`, `.lake save`, or the WAL.
@@ -529,6 +536,35 @@ pub struct PinkDb {
 impl Default for PinkDb {
     fn default() -> Self {
         Self::with_databases(["main"])
+    }
+}
+
+impl Clone for PinkDb {
+    /// Clone the store for a transaction snapshot / multi-writer copy. The
+    /// copy shares the WAL handle and the lease *handle* (`Arc`s) but never
+    /// inherits `txn_lease`: a held lease belongs to exactly the store that
+    /// opened it, so dropping a snapshot can never release another store's
+    /// flock.
+    fn clone(&self) -> Self {
+        Self {
+            databases: self.databases.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            dynamic_functions: self.dynamic_functions.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
+            loaded_extensions: self.loaded_extensions.clone(),
+            current_db: self.current_db.clone(),
+            txn_snapshot: self.txn_snapshot.clone(),
+            wal: self.wal.clone(),
+            lease: self.lease.clone(),
+            txn_lease: None,
+            wal_txn: self.wal_txn.clone(),
+            wal_txn_db: self.wal_txn_db.clone(),
+            wal_txn_ext_paths: self.wal_txn_ext_paths.clone(),
+            wal_txn_ext_loaded: self.wal_txn_ext_loaded.clone(),
+            encryption_key: self.encryption_key.clone(),
+            allow_sql_load_extension: self.allow_sql_load_extension,
+            attached_lakes: self.attached_lakes.clone(),
+        }
     }
 }
 
@@ -563,6 +599,8 @@ impl PinkDb {
             current_db: "main".to_string(),
             txn_snapshot: None,
             wal: None,
+            lease: None,
+            txn_lease: None,
             wal_txn: Vec::new(),
             wal_txn_db: None,
             wal_txn_ext_paths: Vec::new(),
@@ -783,6 +821,45 @@ impl PinkDb {
         self.wal.clone()
     }
 
+    /// The durable write lease of this store, if durable.
+    pub(crate) fn lease_handle(&self) -> Option<Arc<crate::wal::Lease>> {
+        self.lease.clone()
+    }
+
+    /// Swap the catalog and data of `self` with `other` (a checkpoint loaded
+    /// from disk), preserving every process-local facet of `self`: the WAL
+    /// handle, the lease, loaded extensions, attached lakes, the encryption
+    /// key, the SQL `LOAD EXTENSION` gate, the caller-managed session (the
+    /// caller rewrites `current_db` right after, so this only adopts
+    /// `other`'s checkpoint-default session as the base), and this process's
+    /// session-local **views** (they live inside the catalogs but are never
+    /// persisted, so the reloaded catalog is authoritative only for tables;
+    /// design hazard H10). Used by the multi-process refresh's full rebuild.
+    pub(crate) fn adopt(&mut self, other: PinkDb) {
+        debug_assert!(
+            self.txn_snapshot.is_none(),
+            "a refreshed store is never inside an embedded transaction"
+        );
+        // Session-local views survive the swap; a replayed object colliding
+        // with one is then a hard replay error (hazard H4), exactly like a
+        // reopen.
+        let local_views: Vec<(String, HashMap<String, ViewDef>)> = self
+            .databases
+            .iter()
+            .filter(|(_, cat)| !cat.views.is_empty())
+            .map(|(key, cat)| (key.clone(), cat.views.clone()))
+            .collect();
+        self.databases = other.databases;
+        for (key, views) in local_views {
+            if let Some(cat) = self.databases.get_mut(&key) {
+                for (name, view) in views {
+                    cat.views.entry(name).or_insert(view);
+                }
+            }
+        }
+        self.current_db = other.current_db;
+    }
+
     /// WAL hook for one statement that has just committed successfully
     /// (autocommit) — or was executed inside an open transaction, in which
     /// case its text is buffered until `COMMIT`. Non-mutating statements
@@ -882,24 +959,35 @@ impl PinkDb {
     }
 
     /// Open a transaction: snapshot the whole store. Fails if one is open
-    /// (flat transactions only — no savepoints in v1).
+    /// (flat transactions only — no savepoints in v1). A durable store
+    /// acquires and holds the write lease from here to `commit`/`rollback`
+    /// (design 4.7): writes by other processes and their refreshes wait for
+    /// the transaction, and the transaction's view cannot go stale.
     pub fn begin(&mut self) -> Result<()> {
         if self.txn_snapshot.is_some() {
             return Err(PinkDbError::Execution(
                 "already in a transaction".to_string(),
             ));
         }
+        let guard = self.acquire_lease()?;
+        if let Some(g) = &guard {
+            // Refresh before snapshotting: the transaction runs against the
+            // complete, current state.
+            self.refresh_under_lease(g)?;
+        }
         self.wal_txn.clear();
         self.wal_txn_db = None;
         self.wal_txn_ext_paths.clear();
         self.wal_txn_ext_loaded.clear();
         self.txn_snapshot = Some(Box::new(self.clone()));
+        self.txn_lease = guard;
         Ok(())
     }
 
     /// Commit: make the transaction's statements durable (one WAL record),
     /// then drop the snapshot, keeping all changes. A WAL failure returns the
-    /// error and leaves the transaction open (nothing was published).
+    /// error and leaves the transaction open (nothing was published) — and
+    /// with it the write lease, so a retried COMMIT still serializes.
     pub fn commit(&mut self) -> Result<()> {
         if self.txn_snapshot.is_none() {
             return Err(PinkDbError::Execution(
@@ -930,6 +1018,8 @@ impl PinkDb {
         self.wal_txn_ext_paths.clear();
         self.wal_txn_ext_loaded.clear();
         self.txn_snapshot = None;
+        // Release the transaction's lease only after the record is durable.
+        self.txn_lease = None;
         Ok(())
     }
 
@@ -946,6 +1036,9 @@ impl PinkDb {
                 self.wal_txn_db = None;
                 self.wal_txn_ext_paths.clear();
                 self.wal_txn_ext_loaded.clear();
+                // The snapshot was cloned without the lease; dropping the old
+                // `self` above already released the transaction's guard.
+                self.txn_lease = None;
                 Ok(())
             }
             None => Err(PinkDbError::Execution(

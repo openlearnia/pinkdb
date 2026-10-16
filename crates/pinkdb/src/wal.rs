@@ -3,11 +3,44 @@
 //! For `<path>.pink` the log is a sidecar `<path>.pink.wal`:
 //!
 //! ```text
-//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=2)
-//!          + generation u64
+//! header:  magic "PINKWAL1" (8 bytes) + format version u32 (=3)
+//!          + generation u64 + wal_id [16] + crc32(0..36) u32
+//!          + commit slot A (24 bytes) + commit slot B (24 bytes)
+//!          + reserved zero u32×2
 //! record:  payload_len u32 | lsn u64 | crc32(payload) u32 | payload
 //! payload: stmt_count u32 | per statement: len u32 + UTF-8 SQL text
 //! ```
+//!
+//! Version 3 (wave 45m) adds `wal_id` (a fresh 16-byte incarnation id per
+//! file creation, the ABA guard across checkpoints) and the dual 24-byte
+//! commit slots that publish the committed LSN. Version 2 WALs are accepted
+//! and upgraded in place under the write lease; older builds refuse version 3
+//! cleanly through the existing `BadVersion` path.
+//!
+//! # Multi-process access (wave 45m)
+//!
+//! Any number of local processes may open a durable database. Mutual
+//! exclusion is a per-operation **write lease**: an exclusive `flock` on
+//! `<path>.pink.lock` taken for `[refresh → execute → append → fsync →
+//! publish]` (writes, whole transactions, checkpoints, recovery) or just
+//! `[refresh]` (readers whose lock-free epoch precheck says the on-disk state
+//! advanced). Inside one process a refcounted gate shares the fd's lock,
+//! because `flock` locks are per open file description; in-process mutations
+//! stay serialized by the store lock and the Wal mutex exactly as before. The lock
+//! file's first 48 bytes carry two epoch slots (dual slots + CRC); every lease
+//! holder that changed something a reader must notice bumps one slot, and
+//! readers compare a cached value with one `pread` (a read error or an
+//! absent/torn pair counts as changed).
+//!
+//! Every process keeps a full in-memory store with an applied position
+//! (`wal_id`, generation, WAL file identity, byte/record offsets, checkpoint
+//! identity). Refresh (design section 4) replays only the frames past the
+//! applied position, with the WAL handle detached (never re-logging), the
+//! WAL *lineage session* restored around the replay, and the local session
+//! restored afterwards; a changed WAL incarnation or checkpoint identity
+//! triggers a full reload of the checkpoint plus a replay of the live WAL.
+//! Checkpoints refresh first under the lease, so a checkpoint can never
+//! publish a state that omits another process's committed records.
 //!
 //! One record = one committed transaction unit: an autocommit statement logs
 //! individually; `BEGIN … COMMIT` logs all of the transaction's mutating
@@ -121,17 +154,561 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::crypto::{self, EncryptionKey, RecordCipher, TAG_LEN};
 use crate::storage::PinkDb;
 use crate::types::{PinkDbError, Result};
 
 pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
-/// On-disk format version. Version 2 adds the generation to the header.
-pub const WAL_VERSION: u32 = 2;
-const HEADER_LEN: usize = 20;
+/// On-disk format version. Version 2 added the generation to the header;
+/// version 3 (wave 45m) adds `wal_id` and the dual commit slots, and is
+/// written by every durable open (version 2 files are upgraded in place
+/// under the write lease).
+pub const WAL_VERSION: u32 = 3;
+/// The pre-multi-process plaintext version, accepted and upgraded at open.
+const WAL_VERSION_V2: u32 = 2;
+/// v3 plaintext header: magic(8) + version(4) + gen(8) + wal_id(16) +
+/// crc32(0..36)(4) + slot A(24) + slot B(24) + reserved(8).
+pub(crate) const HEADER_LEN: usize = 96;
+/// Where records begin in a v3 plaintext WAL (== `HEADER_LEN`).
+pub(crate) const RECORDS_START: usize = HEADER_LEN;
+/// Where records begin in a v2 plaintext WAL (record bytes are preserved by
+/// the upgrade).
+const V2_RECORDS_START: usize = 20;
 const RECORD_HEADER_LEN: usize = 16;
 const ROLL_SUFFIX: &str = ".roll";
+
+/// A publication slot (24 bytes; dual slots + CRC make a torn or lost update
+/// harmless): `seq u64 | value u64 | crc32(seq||value||domain) u32 | zero u32`.
+const SLOT_LEN: usize = 24;
+/// The lock file's epoch region: slot A at 0..24, slot B at 24..48.
+const LOCK_SLOT_A: u64 = 0;
+/// The plaintext v3 header's commit slots (A at 40..64, B at 64..88; the
+/// slot chosen for a write follows the seq parity in `write_slot`).
+#[cfg_attr(not(test), allow(dead_code))]
+const WAL_SLOT_B: u64 = 64;
+const WAL_SLOT_A: u64 = 40;
+/// The fixed plaintext publish block of an encrypted (container v2) WAL at
+/// `payload_start`: `wal_id [16] | crc32(wal_id||gen||version) u32 | zero u32 |
+/// slot A (24) | slot B (24) | zero [16]`; records follow. The block is
+/// deliberately outside the AEAD AAD: slots mutate, and a tampered slot can
+/// at most cause a spurious refresh.
+const ENC_PUBLISH_BLOCK_LEN: usize = 88;
+const ENC_SLOT_A: u64 = 24;
+const ENC_SLOT_B: u64 = 48;
+/// CRC domains keep a lock-file slot from verifying as a WAL slot.
+const LOCK_SLOT_DOMAIN: &[u8] = b"pinkdb-lock-epoch-v1";
+const WAL_SLOT_DOMAIN: &[u8] = b"pinkdb-wal-slot-v1";
+/// A fresh WAL incarnation id: fresh on every file creation, so no ABA is
+/// possible across checkpoints or recovery.
+pub(crate) type WalId = [u8; 16];
+
+// Test-only switch: force `try_lock` to report `Unsupported`, so the
+// fail-closed path is testable on filesystems that do support locking.
+// Thread-local: tests run in parallel threads of one process.
+#[cfg(test)]
+thread_local! {
+    static FORCE_UNSUPPORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_unsupported() -> bool {
+    FORCE_UNSUPPORTED.with(|f| f.get())
+}
+
+#[cfg(not(test))]
+fn force_unsupported() -> bool {
+    false
+}
+
+/// A fresh 16-byte WAL incarnation id. Not cryptographic: it only has to
+/// never repeat across file (re)creations. `RandomState` seeds from the OS;
+/// the time and a process-local counter make collisions impossible in
+/// practice even if two instances were seeded identically.
+fn fresh_wal_id() -> WalId {
+    use std::hash::{BuildHasher, Hasher};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let state = std::collections::hash_map::RandomState::new();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut a = state.build_hasher();
+    a.write_u64(0x9E37_79B9_7F4A_7C15);
+    a.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
+    a.write_u64(std::process::id() as u64);
+    a.write_u64(nanos);
+    let x = a.finish();
+    let mut b = state.build_hasher();
+    b.write_u64(x);
+    b.write_u64(!nanos);
+    let y = b.finish();
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&x.to_le_bytes());
+    id[8..].copy_from_slice(&y.to_le_bytes());
+    id
+}
+
+/// Encode one publication slot; `Ok(crc)` is implied by construction.
+fn slot_bytes(seq: u64, value: u64, domain: &[u8]) -> [u8; SLOT_LEN] {
+    let mut b = [0u8; SLOT_LEN];
+    b[..8].copy_from_slice(&seq.to_le_bytes());
+    b[8..16].copy_from_slice(&value.to_le_bytes());
+    let mut crc_input = Vec::with_capacity(16 + domain.len());
+    crc_input.extend_from_slice(&seq.to_le_bytes());
+    crc_input.extend_from_slice(&value.to_le_bytes());
+    crc_input.extend_from_slice(domain);
+    b[16..20].copy_from_slice(&crc32(&crc_input).to_le_bytes());
+    b
+}
+
+/// Parse one slot: `Some((seq, value))` only when the CRC verifies and the
+/// reserved word is zero.
+fn parse_slot(buf: &[u8], domain: &[u8]) -> Option<(u64, u64)> {
+    if buf.len() < SLOT_LEN || buf[20..24] != [0u8; 4] {
+        return None;
+    }
+    let seq = u64::from_le_bytes(buf[..8].try_into().expect("8 bytes"));
+    let value = u64::from_le_bytes(buf[8..16].try_into().expect("8 bytes"));
+    let crc = u32::from_le_bytes(buf[16..20].try_into().expect("4 bytes"));
+    let mut crc_input = Vec::with_capacity(16 + domain.len());
+    crc_input.extend_from_slice(&seq.to_le_bytes());
+    crc_input.extend_from_slice(&value.to_le_bytes());
+    crc_input.extend_from_slice(domain);
+    (crc32(&crc_input) == crc).then_some((seq, value))
+}
+
+/// The highest valid slot seq in `buf` at `base` (0 when neither verifies).
+fn slot_max_in(buf: &[u8], base: usize, domain: &[u8]) -> u64 {
+    let mut max = 0u64;
+    for off in [base, base + SLOT_LEN] {
+        if let Some(slot) = buf
+            .get(off..off + SLOT_LEN)
+            .and_then(|s| parse_slot(s, domain))
+        {
+            max = max.max(slot.0);
+        }
+    }
+    max
+}
+
+// ---------- positional file I/O (pread/pwrite; no shared offset) ----------
+
+#[cfg(unix)]
+fn file_read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn file_read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_read_at(_file: &File, _buf: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "positional file reads are not supported on this platform",
+    ))
+}
+
+#[cfg(unix)]
+fn file_write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::write_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn file_write_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_write(file, buf, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_write_at(_file: &File, _buf: &[u8], _offset: u64) -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "positional file writes are not supported on this platform",
+    ))
+}
+
+fn file_read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        match file_read_at(file, &mut buf[pos..], offset)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "short positional read",
+                ))
+            }
+            n => {
+                pos += n;
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn file_write_all_at(file: &File, buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        match file_write_at(file, &buf[pos..], offset)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "positional write wrote zero bytes",
+                ))
+            }
+            n => {
+                pos += n;
+                offset += n as u64;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Highest valid epoch seq in a region holding two slots at `base`; a short
+/// read (a fresh, still zero-length lock file) means "no valid slot" = 0.
+fn read_slot_max(file: &File, base: u64, domain: &[u8]) -> std::io::Result<u64> {
+    let mut buf = [0u8; 2 * SLOT_LEN];
+    let n = file_read_at(file, &mut buf, base)?;
+    Ok(slot_max_in(&buf[..n], 0, domain))
+}
+
+/// Write the next publication slot (alternating A/B by seq parity).
+fn write_slot(file: &File, base: u64, seq: u64, value: u64, domain: &[u8]) -> std::io::Result<()> {
+    let offset = base
+        + if seq.is_multiple_of(2) {
+            SLOT_LEN as u64
+        } else {
+            0
+        };
+    file_write_all_at(file, &slot_bytes(seq, value, domain), offset)
+}
+
+/// Warn once per process about a best-effort hint write failure (design 5.3:
+/// slots are hints; the frames stay authoritative and the next lease holder
+/// republishes).
+fn warn_slot_once(what: &str) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("pinkdb: warning: could not publish a {what} (hint only; readers may lag)");
+    }
+}
+
+/// The immutable identity of an on-disk file incarnation: `(dev, ino)` where
+/// available, else presence (non-Unix platforms). Used to detect a replaced
+/// WAL or checkpoint.
+#[cfg(unix)]
+fn identity_of(m: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.dev(), m.ino())
+}
+
+#[cfg(not(unix))]
+fn identity_of(_m: &std::fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    std::fs::metadata(path).ok().map(|m| identity_of(&m))
+}
+
+// ---------- the write lease ----------
+
+/// How durable opens coordinate with other processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockMode {
+    /// Take the exclusive `flock` lease for every operation; fail closed on
+    /// filesystems without locking (the default).
+    #[default]
+    Required,
+    /// Restore today's single-process assumption explicitly: in-process
+    /// serialization stays, but a filesystem without `flock` (or a network
+    /// filesystem with unreliable locking) is used without coordination.
+    /// Two processes opening such a database can corrupt it.
+    UnsafeSingleProcess,
+}
+
+/// Options for a durable open beyond the sync policy.
+#[derive(Debug, Clone)]
+pub struct DurableOpenOptions {
+    pub policy: SyncPolicy,
+    /// How long an operation waits for another process's lease before
+    /// reporting the database busy (default 5 s). A short timeout is useful
+    /// for hosts that want to retry themselves.
+    pub busy_timeout: Duration,
+    pub lock_mode: LockMode,
+}
+
+impl Default for DurableOpenOptions {
+    fn default() -> Self {
+        Self {
+            policy: SyncPolicy::Sync,
+            busy_timeout: Duration::from_secs(5),
+            lock_mode: LockMode::Required,
+        }
+    }
+}
+
+/// In-process lease gate: `flock` locks belong to the open file description,
+/// so every thread of one process shares the fd's lock (`try_lock` from a
+/// second thread succeeds silently). The gate is therefore a process-wide
+/// *refcount*: the flock is taken on the 0→1 transition and released at
+/// 1→0, and re-entrant/nested or overlapping acquisitions (a `CHECKPOINT`
+/// reached through `exec::run` while the autocommit path already holds the
+/// lease; two connections each holding a transaction lease on one thread)
+/// simply increment it. In-process mutual exclusion of store *mutations* is
+/// provided by the store write lock and the Wal mutex, exactly as before
+/// this wave; the lease adds the cross-process guarantee on top.
+#[derive(Debug, Default)]
+struct Gate {
+    /// Number of outstanding guards in this process.
+    count: Mutex<u32>,
+}
+
+impl Gate {
+    fn enter(&self) -> std::sync::MutexGuard<'_, u32> {
+        self.count.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// The per-operation write lease of one durable store: a dedicated fd on
+/// `<path>.pink.lock` (created if missing, never deleted — its first 48 bytes
+/// carry the epoch), the in-process gate, the busy timeout, the lock mode,
+/// and the epoch cache. One `Lease` per durable open; every clone of the
+/// store and its transactions share it.
+#[derive(Debug)]
+pub(crate) struct Lease {
+    file: File,
+    checkpoint_path: PathBuf,
+    gate: Gate,
+    mode: LockMode,
+    busy_timeout_ms: AtomicU64,
+    /// The seq this process last wrote or observed while refreshing; the
+    /// fast-path precheck compares it with one pread.
+    epoch_cache: AtomicU64,
+    /// The next epoch seq this process will write; synced from the slots on
+    /// every outermost acquisition so concurrent writers never regress seq.
+    next_epoch_seq: AtomicU64,
+}
+
+/// A held write lease. Drop releases the flock when the last in-process
+/// holder lets go (1→0).
+#[derive(Debug)]
+pub(crate) struct LeaseGuard {
+    lease: Arc<Lease>,
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        let mut count = self.lease.gate.enter();
+        debug_assert!(*count > 0, "unbalanced lease release");
+        *count -= 1;
+        if *count == 0 {
+            let _ = self.lease.file.unlock();
+        }
+    }
+}
+
+impl Lease {
+    fn open(checkpoint: &Path, mode: LockMode, busy_timeout: Duration) -> Result<Arc<Lease>> {
+        let lock_path = PathBuf::from(format!("{}.lock", checkpoint.display()));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+        let ms = busy_timeout.as_millis().min(u64::MAX as u128) as u64;
+        Ok(Arc::new(Lease {
+            file,
+            checkpoint_path: checkpoint.to_path_buf(),
+            gate: Gate::default(),
+            mode,
+            busy_timeout_ms: AtomicU64::new(ms),
+            epoch_cache: AtomicU64::new(0),
+            next_epoch_seq: AtomicU64::new(1),
+        }))
+    }
+
+    pub(crate) fn set_busy_timeout(&self, timeout: Duration) {
+        let ms = timeout.as_millis().min(u64::MAX as u128) as u64;
+        self.busy_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    fn busy_timeout(&self) -> Duration {
+        Duration::from_millis(self.busy_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// Acquire the lease. On the process's 0→1 transition, take the
+    /// exclusive flock with the busy timeout (the in-process state mutex is
+    /// held across that wait, so local threads queue instead of racing and
+    /// skipping the flock); overlapping acquisitions just share it. On
+    /// timeout the report names both causes: a process busy
+    /// writing/checkpointing, and an older pinkdb build (which holds the
+    /// same lock for its whole lifetime).
+    pub(crate) fn acquire(self: &Arc<Self>) -> Result<LeaseGuard> {
+        let mut count = self.gate.enter();
+        if *count > 0 {
+            // The process already holds the flock through this fd: sharing
+            // it needs no syscall.
+            *count += 1;
+            return Ok(LeaseGuard {
+                lease: self.clone(),
+            });
+        }
+        let deadline = Instant::now() + self.busy_timeout();
+        loop {
+            let attempt = if force_unsupported() {
+                Err(std::fs::TryLockError::Error(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "locking forced unsupported by a test switch",
+                )))
+            } else {
+                self.file.try_lock()
+            };
+            match attempt {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return Err(self.busy_error());
+                    }
+                    // 2 ms steps: the first window also absorbs
+                    // `Command::spawn`'s brief fd/OFD duplicate in a forked
+                    // child before exec closes it.
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::fs::TryLockError::Error(e))
+                    if e.kind() == std::io::ErrorKind::Unsupported =>
+                {
+                    if self.mode == LockMode::UnsafeSingleProcess {
+                        break;
+                    }
+                    return Err(PinkDbError::Execution(format!(
+                        "file locking is not supported on the filesystem holding {}; durable \
+                         multi-process access would be unsafe (open with \
+                         LockMode::UnsafeSingleProcess only if you know a single process will \
+                         use it)",
+                        self.checkpoint_path.display()
+                    )));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(PinkDbError::Io(e));
+                }
+            }
+        }
+        *count = 1;
+        // Sync the epoch counter while the lease is held: every writer's
+        // bumps are visible in the slots under the lease. (Overlapping
+        // holders skip this: the first holder synced, and every bump under
+        // the lease keeps the counter current.)
+        let current = read_slot_max(&self.file, LOCK_SLOT_A, LOCK_SLOT_DOMAIN).unwrap_or(0);
+        self.next_epoch_seq
+            .store(current.saturating_add(1).max(1), Ordering::Relaxed);
+        Ok(LeaseGuard {
+            lease: self.clone(),
+        })
+    }
+
+    fn busy_error(&self) -> PinkDbError {
+        PinkDbError::Execution(format!(
+            "database {} is busy: another process has held the write lock for {} ms \
+             (an older pinkdb build holds this lock for its whole lifetime); retry later or \
+             raise the busy timeout",
+            self.checkpoint_path.display(),
+            self.busy_timeout_ms.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Highest valid epoch seq on disk (`None` when the read failed).
+    pub(crate) fn epoch_now(&self) -> Option<u64> {
+        read_slot_max(&self.file, LOCK_SLOT_A, LOCK_SLOT_DOMAIN).ok()
+    }
+
+    /// True when the on-disk epoch differs from what this process last
+    /// refreshed/observed; a read error counts as changed.
+    pub(crate) fn stale(&self) -> bool {
+        match self.epoch_now() {
+            Some(e) => e != self.epoch_cache.load(Ordering::Relaxed),
+            None => true,
+        }
+    }
+
+    /// The cached epoch value (tests).
+    #[cfg(test)]
+    pub(crate) fn epoch_cache_value(&self) -> u64 {
+        self.epoch_cache.load(Ordering::Relaxed)
+    }
+
+    /// Cache the current on-disk epoch (after a refresh).
+    pub(crate) fn cache_epoch_now(&self) {
+        if let Some(e) = self.epoch_now() {
+            self.epoch_cache.store(e, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish a change to other processes: write the next seq into the
+    /// alternate slot and cache it. A write failure is a warning, never a
+    /// correctness failure (the slots are hints; recovery re-derives the
+    /// committed prefix from the frames).
+    pub(crate) fn bump_epoch(&self, value: u64) {
+        let seq = self.next_epoch_seq.fetch_add(1, Ordering::Relaxed);
+        if write_slot(&self.file, LOCK_SLOT_A, seq, value, LOCK_SLOT_DOMAIN).is_err() {
+            warn_slot_once("lock-file epoch slot");
+        }
+        self.epoch_cache.store(seq, Ordering::Relaxed);
+    }
+}
+
+impl LeaseGuard {
+    /// Fast-path freshness precheck under a held lease.
+    pub(crate) fn epoch_stale(&self) -> bool {
+        self.lease.stale()
+    }
+
+    pub(crate) fn cache_epoch_now(&self) {
+        self.lease.cache_epoch_now();
+    }
+
+    pub(crate) fn bump_epoch(&self, value: u64) {
+        self.lease.bump_epoch(value);
+    }
+}
+
+/// Encode the encrypted WAL's fixed 88-byte plaintext publish block; an
+/// `initial` slot edge seeds slot A for a rebuild/upgrade (design 9.2).
+fn encode_publish_block(
+    wal_id: &WalId,
+    gen: u64,
+    initial: Option<(u64, u64)>,
+) -> [u8; ENC_PUBLISH_BLOCK_LEN] {
+    let mut b = [0u8; ENC_PUBLISH_BLOCK_LEN];
+    b[..16].copy_from_slice(wal_id);
+    let crc = publish_block_crc(wal_id, gen, crypto::CONTAINER_VERSION);
+    b[16..20].copy_from_slice(&crc.to_le_bytes());
+    if let Some((seq, value)) = initial {
+        let at = if seq.is_multiple_of(2) {
+            ENC_SLOT_B
+        } else {
+            ENC_SLOT_A
+        } as usize;
+        b[at..at + SLOT_LEN].copy_from_slice(&slot_bytes(seq, value, WAL_SLOT_DOMAIN));
+    }
+    b
+}
+
+fn publish_block_crc(wal_id: &WalId, gen: u64, version: u32) -> u32 {
+    let mut v = Vec::with_capacity(16 + 12);
+    v.extend_from_slice(wal_id);
+    v.extend_from_slice(&gen.to_le_bytes());
+    v.extend_from_slice(&version.to_le_bytes());
+    crc32(&v)
+}
 
 /// Hand-rolled CRC-32 (IEEE, reflected polynomial 0xEDB88320) — no deps.
 pub fn crc32(bytes: &[u8]) -> u32 {
@@ -197,7 +774,16 @@ pub struct Wal {
     policy: SyncPolicy,
     /// Generation of the live WAL; rolls carry the drained generation.
     gen: u64,
+    /// This WAL file incarnation's fresh id (ABA guard across checkpoints).
+    wal_id: WalId,
     last_lsn: u64,
+    /// Byte offset where the first record begins (96 plaintext; the container
+    /// payload start + 88 encrypted).
+    records_start: u64,
+    /// Byte offset of the header's commit slot A.
+    slots_at: u64,
+    /// Highest commit-slot seq this process published (or read at open).
+    published_seq: u64,
     /// Set after a write/sync failure: appends are refused so a retry can
     /// never append a duplicate record after a partially durable write.
     poisoned: Option<String>,
@@ -221,9 +807,41 @@ pub struct Wal {
     /// WAL size (bytes) at which a committed write triggers an automatic
     /// checkpoint (`None` = never; see [`DEFAULT_AUTO_CHECKPOINT_BYTES`]).
     auto_checkpoint_bytes: Option<u64>,
-    /// The exclusive advisory lock on `<db>.pink.lock`, held for as long as
-    /// any clone of the store lives (released by the OS on exit or crash).
-    _lock: Option<File>,
+    /// Bytes appended by this process since the current generation began.
+    /// The auto-checkpoint additionally requires this process to own at
+    /// least half of the live WAL's bytes, so N writers do not each rewrite
+    /// the whole store round-robin (design 6.5). Single-process behavior is
+    /// unchanged after the first generation; a process that reopens an
+    /// existing WAL starts this at 0.
+    bytes_appended_since_gen_start: u64,
+    /// The write lease of the owning durable store (shared with the store).
+    lease: Arc<Lease>,
+    /// What the owning store's memory already includes of this file.
+    applied: Applied,
+    /// Bytes discarded from a torn tail by the last scan (`0` = clean).
+    truncated_last: u64,
+    /// Whether the last scan rewrote the file (legacy upgrade or encrypted
+    /// tail rebuild).
+    upgraded_last: bool,
+}
+
+/// What the owning store's memory already includes of the on-disk state:
+/// the WAL incarnation and position plus the checkpoint identity it was
+/// built from. Compared under the lease to decide incremental vs. full
+/// refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Applied {
+    wal_id: WalId,
+    gen: u64,
+    wal_dev_ino: Option<(u64, u64)>,
+    records_start: u64,
+    /// Byte offset just past the last applied frame.
+    applied_end: u64,
+    applied_lsn: u64,
+    /// Number of applied records in this WAL incarnation (the encrypted
+    /// nonce ordinal base for the next scan).
+    applied_records: u64,
+    ckpt_dev_ino: Option<(u64, u64)>,
 }
 
 /// One rolled-away WAL generation found on disk.
@@ -242,13 +860,21 @@ struct WalProbe {
     has_records: bool,
 }
 
+/// The parsed header of a live WAL (`gen`/identity/records start/slots).
 #[derive(Debug)]
-struct Header {
+struct WalHeader {
     gen: u64,
+    wal_id: WalId,
     /// Offset where the first record begins.
     records_start: usize,
+    /// Byte offset of commit slot A in the file.
+    slots_at: u64,
+    /// Highest valid publish-slot seq in the header (0 when none).
+    published_seq: u64,
     /// Container header for an encrypted WAL.
     enc: Option<crypto::ContainerHeader>,
+    /// A pre-wave-45m file (plaintext v2 or container v1) to be upgraded.
+    legacy: bool,
 }
 
 #[derive(Debug)]
@@ -256,43 +882,88 @@ enum HeaderError {
     TooShort,
     BadMagic,
     BadVersion(u32),
+    /// A v3 header whose CRC over `magic..wal_id` does not verify.
+    BadCrc,
+    /// Reserved header bytes are nonzero (a format error, never a torn write
+    /// of a valid header).
+    Reserved,
     /// A `PINKENC1` container whose public header did not parse.
     #[cfg(feature = "encryption")]
     Container(String),
+    /// An encrypted v2 container whose fixed publish block is missing or
+    /// malformed.
+    #[cfg(feature = "encryption")]
+    BadPublishBlock {
+        payload_start: usize,
+        what: String,
+    },
+}
+
+/// Every intact record of a freshly scanned WAL file plus its positioning.
+struct OpenedWal {
+    file: File,
+    gen: u64,
+    wal_id: WalId,
+    records_start: u64,
+    slots_at: u64,
+    published_seq: u64,
+    cipher: Option<RecordCipher>,
+    records: Vec<Record>,
+    truncated: u64,
+    upgraded: bool,
 }
 
 impl Wal {
-    fn header_for(gen: u64) -> [u8; HEADER_LEN] {
+    /// A v3 plaintext header with the given incarnation id.
+    fn header_for_v3(gen: u64, wal_id: &WalId) -> [u8; HEADER_LEN] {
         let mut h = [0u8; HEADER_LEN];
         h[..8].copy_from_slice(WAL_MAGIC);
         h[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
-        h[12..].copy_from_slice(&gen.to_le_bytes());
+        h[12..20].copy_from_slice(&gen.to_le_bytes());
+        h[20..36].copy_from_slice(wal_id);
+        let crc = crc32(&h[..36]);
+        h[36..40].copy_from_slice(&crc.to_le_bytes());
         h
     }
 
-    /// Create (or recreate) the WAL file at `path` with just a header: the
-    /// plaintext `PINKWAL1` header or, when `cipher` is given, its encrypted
-    /// container header (which carries the generation as its context). The
-    /// cipher is returned so the caller can keep appending through it.
+    /// A v3 header with a fresh incarnation id (test/raw fixtures).
+    #[cfg(test)]
+    fn header_for(gen: u64) -> [u8; HEADER_LEN] {
+        Self::header_for_v3(gen, &fresh_wal_id())
+    }
+
+    /// Create (or recreate) the WAL file at `path` with just a header and
+    /// position it for appends: the plaintext v3 header (fresh `wal_id`), or
+    /// — when `cipher` is given — an encrypted container v2 header plus the
+    /// fixed 88-byte publish block. The returned fd is opened `append`: a
+    /// second process may append between this process's writes, and a
+    /// non-append fd would overwrite from its cached offset.
     fn create_file(
         path: &Path,
         gen: u64,
         cipher: Option<RecordCipher>,
-    ) -> Result<(File, Option<RecordCipher>)> {
-        // No `append(true)` here: std rejects append+truncate on Unix, and a
-        // fresh file needs only sequential writes from offset 0.
-        let mut f = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        match &cipher {
-            Some(c) => f.write_all(c.header())?,
-            None => f.write_all(&Self::header_for(gen))?,
+    ) -> Result<(File, Option<RecordCipher>, WalId)> {
+        let wal_id = fresh_wal_id();
+        {
+            // No `append(true)` here: std rejects append+truncate on Unix,
+            // and a fresh file needs only sequential writes from offset 0.
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?;
+            match &cipher {
+                Some(c) => {
+                    f.write_all(c.header())?;
+                    f.write_all(&encode_publish_block(&wal_id, gen, None))?;
+                }
+                None => f.write_all(&Self::header_for_v3(gen, &wal_id))?,
+            }
+            f.sync_all()?;
         }
-        f.sync_all()?;
-        Ok((f, cipher))
+        let file = OpenOptions::new().read(true).append(true).open(path)?;
+        Ok((file, cipher, wal_id))
     }
 
     /// Path of the `.pink` checkpoint this WAL belongs to.
@@ -315,142 +986,88 @@ impl Wal {
         self.cipher.as_ref().is_some_and(|c| c.matches_key(key))
     }
 
-    /// Open the WAL at `path` (creating it when absent) and parse every intact
-    /// record. The file is truncated at the last intact record, so the handle
-    /// returned appends right after it. `recreate_gen` is the generation used
-    /// when the file is missing or its header is torn; recovery computes it
-    /// from the surviving roll files so the sequence never regresses. With
-    /// `key` the WAL is an encrypted container: an existing encrypted WAL is
-    /// decrypted (a wrong key is a hard error) and rebuilt with a fresh nonce
-    /// prefix before appends continue; a missing/torn one is recreated
-    /// encrypted. Returns the records, the bytes discarded from the tail, and
-    /// the positioned handle.
+    /// Open the WAL at `path` (creating it when absent) and parse every
+    /// intact record. `recreate_gen` is the generation used when the file is
+    /// missing or its header is torn; recovery computes it from the surviving
+    /// roll files so the sequence never regresses. The file is positioned for
+    /// appends right after the last intact record; a torn tail is truncated
+    /// in place (plaintext) or rebuilt under a fresh nonce prefix
+    /// (encrypted). Legacy formats are upgraded in place first: plaintext v2
+    /// → v3, container v1 → v2 + publish block.
     pub(crate) fn open(
         path: &Path,
         checkpoint_path: PathBuf,
         policy: SyncPolicy,
         recreate_gen: u64,
         key: Option<&EncryptionKey>,
+        lease: Arc<Lease>,
     ) -> Result<(Wal, Vec<Record>, u64)> {
-        let build = |file: File, gen: u64, last_lsn: u64, cipher: Option<RecordCipher>| Wal {
-            file,
+        let opened = scan_wal(path, key, recreate_gen, true)?;
+        let truncated = opened.truncated;
+        let wal = Wal {
+            file: opened.file,
             path: path.to_path_buf(),
-            checkpoint_path: checkpoint_path.clone(),
+            checkpoint_path,
             policy,
-            gen,
-            last_lsn,
+            gen: opened.gen,
+            wal_id: opened.wal_id,
+            records_start: opened.records_start,
+            slots_at: opened.slots_at,
+            published_seq: opened.published_seq,
+            last_lsn: opened.records.last().map(|r| r.lsn).unwrap_or(0),
             poisoned: None,
             session_db: None,
             tracked_extensions: HashSet::new(),
-            cipher,
+            cipher: opened.cipher,
             auto_checkpoint_bytes: Some(DEFAULT_AUTO_CHECKPOINT_BYTES),
-            _lock: None,
+            bytes_appended_since_gen_start: 0,
+            lease,
+            applied: Applied::default(),
+            truncated_last: opened.truncated,
+            upgraded_last: opened.upgraded,
         };
-        let fresh_cipher = |gen: u64| -> Result<Option<RecordCipher>> {
-            match key {
-                Some(k) => Ok(Some(RecordCipher::create(k, gen)?)),
-                None => Ok(None),
-            }
+        Ok((wal, opened.records, truncated))
+    }
+
+    /// Bytes discarded from a torn tail by the last scan.
+    pub(crate) fn truncated_last(&self) -> u64 {
+        self.truncated_last
+    }
+
+    /// Whether the last scan rewrote the file (legacy upgrade or rebuild).
+    pub(crate) fn upgraded_last(&self) -> bool {
+        self.upgraded_last
+    }
+
+    /// Mark the store's position in this WAL incarnation (after open or a
+    /// refresh).
+    pub(crate) fn mark_applied(&mut self, applied: Applied) {
+        self.applied = applied;
+    }
+
+    /// True when the WAL or checkpoint file was replaced or removed under us,
+    /// or the WAL grew past the applied position without a publication (a
+    /// crashed publisher's durable-but-unpublished frames — design row W2):
+    /// the caller must scan. Writer-side re-check (design 3.4): the epoch
+    /// alone cannot see a crash between a file mutation and its epoch bump.
+    fn needs_scan(&self) -> Result<bool> {
+        let (id, len) = match std::fs::metadata(&self.path) {
+            Ok(m) => (Some(identity_of(&m)), Some(m.len())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(e) => return Err(e.into()),
         };
-        if !path.exists() {
-            let (file, cipher) =
-                Self::create_file(path, recreate_gen, fresh_cipher(recreate_gen)?)?;
-            return Ok((build(file, recreate_gen, 0, cipher), Vec::new(), 0));
+        if id != self.applied.wal_dev_ino || len != Some(self.applied.applied_end) {
+            return Ok(true);
         }
-        let data = std::fs::read(path)?;
-        #[cfg(not(feature = "encryption"))]
-        refuse_container(path, &data)?;
-        let header = match parse_header(&data) {
-            Ok(h) => h,
-            #[cfg(feature = "encryption")]
-            Err(HeaderError::Container(msg)) if data.len() <= crypto::MAX_HEADER_LEN => {
-                // Torn container header (a crash while creating an encrypted
-                // WAL): no record can have been acknowledged yet, so the file
-                // is recreated. A container header that does not parse on a
-                // longer file is corruption and stays a hard error.
-                let _ = msg;
-                let (file, cipher) =
-                    Self::create_file(path, recreate_gen, fresh_cipher(recreate_gen)?)?;
-                return Ok((
-                    build(file, recreate_gen, 0, cipher),
-                    Vec::new(),
-                    data.len() as u64,
-                ));
-            }
-            Err(e) => {
-                if data.len() <= HEADER_LEN {
-                    // Torn header (crash while creating): start over.
-                    let (file, cipher) =
-                        Self::create_file(path, recreate_gen, fresh_cipher(recreate_gen)?)?;
-                    return Ok((
-                        build(file, recreate_gen, 0, cipher),
-                        Vec::new(),
-                        data.len() as u64,
-                    ));
-                }
-                return Err(PinkDbError::Execution(header_error(path, &e)));
-            }
-        };
-        let cipher = match (&header.enc, key) {
-            (None, Some(_)) => return Err(not_encrypted_with_key(path)),
-            (Some(_), None) => return Err(crypto::encrypted_error(&path.display().to_string())),
-            (Some(_), Some(k)) => {
-                // A wrong key fails the key-check here, before anything runs.
-                let (c, _) = RecordCipher::from_header(&data, k)?;
-                Some(c)
-            }
-            (None, None) => None,
-        };
-        let (records, good_end) = parse_records(&data, header.records_start, cipher.as_ref())
-            .map_err(PinkDbError::Execution)?;
-        let truncated = (data.len() - good_end) as u64;
-        let (file, cipher) = match cipher {
-            Some(old) => {
-                // Every keyed open rebuilds the WAL with a fresh random nonce
-                // prefix, not only when a torn tail was discarded: a file
-                // that ends exactly at a record boundary is byte-identical to
-                // a cleanly shorter one (a Batch-mode unsynced tail lost at a
-                // boundary, or a restored older backup), so reusing the old
-                // prefix would hand out the discarded record's
-                // `(key, nonce, AAD)` again. The rebuild re-seals the intact
-                // records under the new prefix and is temp + rename, so a
-                // crash re-runs recovery from the same on-disk state.
-                let fresh = rewrite_truncated(path, header.gen, &records, &old)?;
-                (
-                    OpenOptions::new().read(true).append(true).open(path)?,
-                    Some(fresh),
-                )
-            }
-            None => {
-                if truncated > 0 {
-                    let f = OpenOptions::new().read(true).append(true).open(path)?;
-                    f.set_len(good_end as u64)?;
-                    f.sync_all()?;
-                    (f, None)
-                } else {
-                    (OpenOptions::new().read(true).append(true).open(path)?, None)
-                }
-            }
-        };
-        // Records are validated strictly increasing, so max == last; `max`
-        // keeps the next append monotonic even if that ever changes.
-        let last_lsn = records.iter().map(|r| r.lsn).max().unwrap_or(0);
-        // A reopened encrypted WAL must not reuse the nonces of its existing
-        // records: position the counter after them.
-        let mut cipher = cipher;
-        if let Some(c) = cipher.as_mut() {
-            let next = u32::try_from(records.len()).map_err(|_| {
-                PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
-            })?;
-            c.set_next_counter(next.checked_add(1).ok_or_else(|| {
-                PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
-            })?);
+        Ok(file_identity(&self.checkpoint_path) != self.applied.ckpt_dev_ino)
+    }
+
+    /// Poison the handle (H6): a refresh/replay failure fail-stops every
+    /// later statement exactly like a failed append.
+    pub(crate) fn poison(&mut self, msg: String) {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(msg);
         }
-        Ok((
-            build(file, header.gen, last_lsn, cipher),
-            records,
-            truncated,
-        ))
     }
 
     /// Test hook: simulate an append that failed on disk.
@@ -464,12 +1081,16 @@ impl Wal {
         self.auto_checkpoint_bytes = bytes;
     }
 
-    /// True when the live WAL has grown past the auto-checkpoint threshold.
+    /// True when the live WAL has outgrown the auto-checkpoint threshold AND
+    /// this process appended at least half of its bytes since the generation
+    /// began (design 6.5: N writers must not round-robin the whole store).
     pub(crate) fn wants_checkpoint(&self) -> bool {
         match self.auto_checkpoint_bytes {
-            Some(limit) if self.poisoned.is_none() => {
-                self.file.metadata().is_ok_and(|m| m.len() >= limit)
-            }
+            Some(limit) if self.poisoned.is_none() => self.file.metadata().is_ok_and(|m| {
+                m.len() >= limit
+                    && self.bytes_appended_since_gen_start.saturating_mul(2)
+                        >= m.len().saturating_sub(self.records_start)
+            }),
             _ => false,
         }
     }
@@ -477,6 +1098,129 @@ impl Wal {
     /// Why the WAL stopped accepting writes, if it did (see `poisoned`).
     pub(crate) fn failure(&self) -> Option<&str> {
         self.poisoned.as_deref()
+    }
+
+    /// Publish the durable commit position to other processes: write the next
+    /// commit slot in the header (alternating slots, no fsync — a hint on top
+    /// of the authoritative frames) and bump the lock-file epoch. Called
+    /// after every successful append; failures warn once and never fail the
+    /// commit.
+    fn publish(&mut self) {
+        let seq = self.published_seq + 1;
+        if write_slot(
+            &self.file,
+            self.slots_at,
+            seq,
+            self.last_lsn,
+            WAL_SLOT_DOMAIN,
+        )
+        .is_err()
+        {
+            warn_slot_once("WAL commit slot");
+        }
+        self.published_seq = seq;
+        self.lease.bump_epoch(self.last_lsn);
+    }
+
+    /// Re-scan the live WAL under the lease after its identity changed:
+    /// fresh fd, fresh header identity, cipher counter from the on-disk
+    /// record count, `last_lsn` from the intact records, torn tail resolved.
+    /// Returns every intact record of the new incarnation (the caller replays
+    /// them all — there is no incremental continuity across incarnations).
+    fn reopen_under_lease(&mut self, key: &Option<EncryptionKey>) -> Result<(Vec<Record>, u64)> {
+        let opened = scan_wal(&self.path, key.as_ref(), self.gen.max(1), false)?;
+        // The good end is the file length after scanning (a torn tail was
+        // already truncated/rebuilt by the scan).
+        let end = std::fs::metadata(&self.path)
+            .map(|m| m.len())
+            .unwrap_or(opened.records_start);
+        self.file = opened.file;
+        self.gen = opened.gen;
+        self.wal_id = opened.wal_id;
+        self.records_start = opened.records_start;
+        self.slots_at = opened.slots_at;
+        self.published_seq = opened.published_seq;
+        self.cipher = opened.cipher;
+        self.last_lsn = opened.records.last().map(|r| r.lsn).unwrap_or(0);
+        self.truncated_last = opened.truncated;
+        self.upgraded_last = opened.upgraded;
+        // A new incarnation has no applied continuity: reset the position to
+        // the start of the file. The caller replays every returned record and
+        // then records the final position.
+        self.applied = Applied {
+            wal_id: opened.wal_id,
+            gen: opened.gen,
+            wal_dev_ino: file_identity(&self.path),
+            records_start: opened.records_start,
+            applied_end: opened.records_start,
+            applied_lsn: 0,
+            applied_records: 0,
+            ckpt_dev_ino: self.applied.ckpt_dev_ino,
+        };
+        if let Some(c) = self.cipher.as_mut() {
+            let next = u32::try_from(opened.records.len())
+                .map_err(|_| {
+                    PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+                })?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+                })?;
+            c.set_next_counter(next);
+        }
+        Ok((opened.records, end))
+    }
+
+    /// Incremental scan: parse the bytes past `applied_end` for the same file
+    /// incarnation. `None` when continuity is broken (a short read, framing
+    /// corruption at the boundary, or an LSN that does not continue) — the
+    /// caller then falls back to a full rebuild. A plaintext torn tail is
+    /// truncated in place; an encrypted one returns `None` so the full path
+    /// rebuilds it under a fresh nonce prefix.
+    fn scan_increment(&mut self) -> Result<Option<(Vec<Record>, u64)>> {
+        let len = self.file.metadata()?.len();
+        if self.applied.applied_end > len {
+            return Ok(None);
+        }
+        if self.applied.applied_end == len {
+            return Ok(Some((Vec::new(), len)));
+        }
+        let mut buf = vec![0u8; (len - self.applied.applied_end) as usize];
+        file_read_exact_at(&self.file, &mut buf, self.applied.applied_end)?;
+        let (records, good_end) = parse_records(
+            &buf,
+            0,
+            self.cipher.as_ref(),
+            self.applied.applied_lsn,
+            u32::try_from(self.applied.applied_records).unwrap_or(u32::MAX),
+        )
+        .map_err(PinkDbError::Execution)?;
+        if let Some(first) = records.first() {
+            if first.lsn != self.applied.applied_lsn + 1 {
+                return Ok(None);
+            }
+        }
+        let end = self.applied.applied_end + good_end as u64;
+        if end < len {
+            if self.cipher.is_some() {
+                // An encrypted tail loss must rebuild under a fresh prefix;
+                // the full path has every intact record and does exactly
+                // that.
+                return Ok(None);
+            }
+            // A crashed writer's torn tail: truncate at the last intact
+            // record so the next append cannot land after garbage.
+            self.file.set_len(end)?;
+            self.file.sync_all()?;
+            self.truncated_last = len - end;
+        } else {
+            self.truncated_last = 0;
+        }
+        self.upgraded_last = false;
+        if let Some(last) = records.last() {
+            self.last_lsn = last.lsn;
+        }
+        Ok(Some((records, end)))
     }
 
     /// Append one committed unit of statements as a single record.
@@ -507,6 +1251,15 @@ impl Wal {
         match result {
             Ok(()) => {
                 self.last_lsn = lsn;
+                self.bytes_appended_since_gen_start += rec.len() as u64;
+                // This process already applied the record: advance the
+                // applied position so a later refresh reads only frames from
+                // other processes. (The write paths refresh under the lease
+                // before appending, so `applied_end` is the pre-write EOF.)
+                self.applied.applied_end += rec.len() as u64;
+                self.applied.applied_lsn = lsn;
+                self.applied.applied_records += 1;
+                self.publish();
                 Ok(())
             }
             Err(e) => {
@@ -617,8 +1370,17 @@ impl Wal {
     }
 
     /// Crash-safe checkpoint: publish the state `save_tmp` writes to `tmp` as
-    /// the new checkpoint and roll the WAL generation (see module docs).
-    pub(crate) fn checkpoint(&mut self, save_tmp: impl FnOnce(&Path) -> Result<()>) -> Result<()> {
+    /// the new checkpoint and roll the WAL generation (see module docs). The
+    /// caller holds the write lease and has already refreshed (design 6.1:
+    /// the state must include every committed frame of every process, or
+    /// rolling the WAL would strand records in a roll that recovery then
+    /// deletes). Steps 2–4 bump the epoch so readers notice the new
+    /// incarnation.
+    pub(crate) fn checkpoint(
+        &mut self,
+        guard: &LeaseGuard,
+        save_tmp: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         if self.poisoned.is_some() {
             return Err(PinkDbError::Execution(
                 "cannot checkpoint: the WAL failed earlier in this session".to_string(),
@@ -643,8 +1405,9 @@ impl Wal {
         sync_parent_dir(&tmp);
         // 2. Roll the generation: the old records move to a name carrying
         //    their generation (never overwritten), a fresh WAL starts at
-        //    gen + 1. The fresh container cipher is prepared before the
-        //    rename so a crypto failure cannot leave the WAL rolled.
+        //    gen + 1 with a fresh `wal_id`. The fresh container cipher is
+        //    prepared before the rename so a crypto failure cannot leave the
+        //    WAL rolled.
         let fresh_gen = self
             .gen
             .checked_add(1)
@@ -655,16 +1418,43 @@ impl Wal {
         };
         std::fs::rename(&self.path, &roll)?;
         match Self::create_file(&self.path, fresh_gen, fresh_cipher) {
-            Ok((fresh, cipher)) => {
+            Ok((fresh, cipher, wal_id)) => {
+                // Readers will now see a new incarnation: bump before/at the
+                // rename visibility (a crash before this bump leaves the
+                // identity re-check in `refresh` to catch it).
+                guard.bump_epoch(self.last_lsn);
                 self.file = fresh;
                 self.cipher = cipher;
                 self.gen = fresh_gen;
+                self.wal_id = wal_id;
                 self.last_lsn = 0;
+                self.records_start = match &self.cipher {
+                    Some(c) => c.header().len() as u64 + ENC_PUBLISH_BLOCK_LEN as u64,
+                    None => RECORDS_START as u64,
+                };
+                self.slots_at = match &self.cipher {
+                    Some(c) => c.header().len() as u64 + ENC_SLOT_A,
+                    None => WAL_SLOT_A,
+                };
+                self.published_seq = 0;
+                self.bytes_appended_since_gen_start = 0;
                 // The rolled generation's `LOAD EXTENSION` records are folded
                 // into the checkpoint — but the checkpoint never stores an
                 // extension, so the fresh generation covers nothing: the next
                 // record touching an extension must be prefixed again.
                 self.tracked_extensions.clear();
+                // This process's memory is now exactly the checkpoint: the
+                // fresh WAL contributes nothing yet.
+                self.applied = Applied {
+                    wal_id,
+                    gen: fresh_gen,
+                    wal_dev_ino: file_identity(&self.path),
+                    records_start: self.records_start,
+                    applied_end: self.records_start,
+                    applied_lsn: 0,
+                    applied_records: 0,
+                    ckpt_dev_ino: self.applied.ckpt_dev_ino,
+                };
             }
             Err(e) => {
                 // The old WAL is intact in `.roll`; refuse further appends
@@ -682,11 +1472,14 @@ impl Wal {
             return Err(e.into());
         }
         sync_parent_dir(&self.checkpoint_path);
+        guard.bump_epoch(0);
+        self.applied.ckpt_dev_ino = file_identity(&self.checkpoint_path);
         // 4. The old generation is now folded into the published `.pink`. A
         //    failed unlink (or a crash before it) is harmless: the next open
         //    proves foldedness from the roll name + live generation and
         //    removes it again.
         let _ = std::fs::remove_file(&roll);
+        guard.bump_epoch(0);
         Ok(())
     }
 }
@@ -767,15 +1560,19 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<Vec<String>, String> {
 /// payload is a hard error. For an encrypted WAL an authentication failure on
 /// the last framed record is indistinguishable from a torn write, so the tail
 /// policy applies there; a complete mis-authenticating record with bytes after
-/// it is mid-file tampering and is a hard error. Returns the records and the
-/// offset just past the last intact record.
+/// it is mid-file tampering and is a hard error. `prev_lsn` is the LSN of the
+/// last record before `start` (0 for a full scan) and `ordinal_base` the
+/// number of records before it (the encrypted nonce ordinal base). Returns
+/// the records and the offset just past the last intact record.
 fn parse_records(
     data: &[u8],
     start: usize,
     cipher: Option<&RecordCipher>,
+    prev_lsn: u64,
+    ordinal_base: u32,
 ) -> std::result::Result<(Vec<Record>, usize), String> {
     let mut pos = start;
-    let mut prev_lsn = 0u64;
+    let mut prev = prev_lsn;
     // Encrypted records use their 1-based ordinal as the AEAD nonce counter.
     let mut ordinal: u32 = 0;
     let mut out = Vec::new();
@@ -790,7 +1587,7 @@ fn parse_records(
         // The LSN is not covered by the payload CRC; a record that regresses
         // it is corrupt framing and must not extend the intact prefix (the
         // next append would otherwise reuse an LSN).
-        if lsn <= prev_lsn {
+        if lsn <= prev {
             break;
         }
         // For an encrypted record `payload_len` is the plaintext length and
@@ -807,7 +1604,10 @@ fn parse_records(
         }
         let stmts = match cipher {
             Some(c) => {
-                let next = ordinal + 1;
+                let next = ordinal_base
+                    .checked_add(ordinal)
+                    .and_then(|o| o.checked_add(1))
+                    .ok_or_else(|| "encrypted WAL: record ordinal overflow".to_string())?;
                 match c.open(next, lsn, &data[payload_start..end]) {
                     Some(plain) => {
                         // Encrypted records always frame `crc = 0` (GCM
@@ -850,24 +1650,29 @@ fn parse_records(
             }
         };
         out.push(Record { lsn, stmts });
-        prev_lsn = lsn;
+        prev = lsn;
         ordinal += 1;
         pos = end;
     }
     Ok((out, pos))
 }
 
-/// Rewrite an encrypted WAL whose tail was discarded: a fresh nonce prefix
-/// (same key, KDF parameters and generation), the kept records re-sealed in
-/// order, written to a temp file and renamed over the original. Returns the
-/// cipher positioned after the rewritten records.
-fn rewrite_truncated(
+/// Rewrite an encrypted WAL whose tail was discarded or whose container was
+/// legacy v1: a fresh nonce prefix and a fresh `wal_id` (a new file
+/// incarnation; nonce reuse after a tail loss is forbidden), same key, KDF
+/// parameters and generation, the kept records re-sealed in order, publish
+/// slots seeded with the last intact LSN. Temp + rename, so a crash re-runs
+/// recovery from the same on-disk state. Returns the cipher positioned after
+/// the re-sealed records.
+fn rewrite_encrypted(
     path: &Path,
     gen: u64,
     records: &[Record],
     old: &RecordCipher,
 ) -> Result<RecordCipher> {
+    let wal_id = fresh_wal_id();
     let mut fresh = old.fork(gen)?;
+    let last_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
     let rewrite = rewrite_path(path);
     {
         let mut f = OpenOptions::new()
@@ -876,6 +1681,7 @@ fn rewrite_truncated(
             .truncate(true)
             .open(&rewrite)?;
         f.write_all(fresh.header())?;
+        f.write_all(&encode_publish_block(&wal_id, gen, Some((1, last_lsn))))?;
         for rec in records {
             let payload = encode_payload(&rec.stmts)?;
             let len = record_len_guard(payload.len())?;
@@ -892,45 +1698,291 @@ fn rewrite_truncated(
     Ok(fresh)
 }
 
-// ---------- file naming + header parsing ----------
+/// `<wal>.<gen>.upgrade`: temp name for the in-place v2→v3 plaintext rewrite.
+/// Deliberately not matched by `scan_rolls` (only `.roll` names are), so a
+/// crash mid-upgrade leaves an ignorable temp (design row R1).
+fn upgrade_path(wal: &Path, gen: u64) -> PathBuf {
+    let mut s = wal.as_os_str().to_os_string();
+    s.push(format!(".{gen}.upgrade"));
+    PathBuf::from(s)
+}
 
-/// Take the exclusive advisory lock on `<checkpoint>.lock` (created if
-/// missing, never deleted: removing it could let two openers lock different
-/// inodes). `Ok(None)` where the platform or filesystem cannot lock.
-fn acquire_db_lock(checkpoint: &Path) -> Result<Option<File>> {
-    let path = PathBuf::from(format!("{}.lock", checkpoint.display()));
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)?;
-    // A lock that is busy only for an instant is not a live holder: while
-    // another thread of this process forks a child (e.g. `Command::spawn`),
-    // the child briefly holds a duplicate of every descriptor — and with it
-    // the `flock` — until its exec closes the close-on-exec ones. Retry for a
-    // short window before reporting a second handle.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
-    let mut attempt = file.try_lock();
-    while matches!(attempt, Err(std::fs::TryLockError::WouldBlock))
-        && std::time::Instant::now() < deadline
+/// Rewrite a legacy plaintext v2 WAL in place as v3 under the lease: fresh
+/// `wal_id`, publish slot A seeded with the last intact LSN, records (with
+/// their framing and CRCs) byte-preserved, same generation. A torn tail is
+/// simply not copied. Temp + rename; a crash re-runs the upgrade (R1).
+fn upgrade_plain_v2(path: &Path, data: &[u8], gen: u64) -> Result<()> {
+    let (records, good_end) =
+        parse_records(data, V2_RECORDS_START, None, 0, 0).map_err(PinkDbError::Execution)?;
+    let last_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
+    let wal_id = fresh_wal_id();
+    let mut out = Vec::with_capacity(HEADER_LEN + (good_end - V2_RECORDS_START));
+    out.extend_from_slice(&Wal::header_for_v3(gen, &wal_id));
+    let slot = slot_bytes(1, last_lsn, WAL_SLOT_DOMAIN);
+    out[WAL_SLOT_A as usize..WAL_SLOT_A as usize + SLOT_LEN].copy_from_slice(&slot);
+    out.extend_from_slice(&data[V2_RECORDS_START..good_end]);
+    let upgrade = upgrade_path(path, gen);
     {
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        attempt = file.try_lock();
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&upgrade)?;
+        f.write_all(&out)?;
+        f.sync_all()?;
     }
-    match attempt {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Err(PinkDbError::Execution(format!(
-            "database {} is already open by another handle or process \
-             (lock {} is held); close it first",
-            checkpoint.display(),
-            path.display()
-        ))),
-        Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
-            Ok(None)
+    std::fs::rename(&upgrade, path)?;
+    sync_parent_dir(path);
+    Ok(())
+}
+
+/// True when the file is a pre-wave-45m format (plaintext v2 or container
+/// v1) that must be upgraded under the lease before it is replayed.
+fn wal_legacy_format(path: &Path) -> Result<bool> {
+    let mut f = File::open(path)?;
+    let mut buf = [0u8; 512];
+    let n = f.read(&mut buf)?;
+    let buf = &buf[..n];
+    if crypto::is_container(buf) {
+        return Ok(match crypto::parse_container_header(buf) {
+            Ok(h) => h.version < 2,
+            Err(_) => false, // torn: recovery recreates it
+        });
+    }
+    Ok(buf.len() >= 12
+        && &buf[..8] == WAL_MAGIC
+        && u32::from_le_bytes(buf[8..12].try_into().expect("4 bytes")) == WAL_VERSION_V2)
+}
+
+/// Upgrade a legacy WAL in place (plaintext v2 → v3; container v1 → v2 with
+/// a fresh nonce prefix and publish block), under the lease.
+fn upgrade_legacy_wal(
+    path: &Path,
+    data: &[u8],
+    header: &WalHeader,
+    key: Option<&EncryptionKey>,
+) -> Result<()> {
+    if let Some(enc) = &header.enc {
+        let Some(k) = key else {
+            return Err(crypto::encrypted_error(&path.display().to_string()));
+        };
+        let (old, _) = RecordCipher::from_header(data, k)?;
+        let (records, _) = parse_records(data, enc.payload_start, Some(&old), 0, 0)
+            .map_err(PinkDbError::Execution)?;
+        rewrite_encrypted(path, header.gen, &records, &old)?;
+    } else {
+        upgrade_plain_v2(path, data, header.gen)?;
+    }
+    Ok(())
+}
+
+/// Cheap refresh-path classification: is the live WAL missing or is its
+/// header unusable (so the recovery state machine must run)? A hard error (a
+/// record-bearing file with invalid magic, version, or CRC) is returned as
+/// `Err`; the caller then surfaces it without touching anything.
+fn wal_header_invalid(path: &Path) -> Result<bool> {
+    let mut buf = [0u8; 512];
+    let n = match File::open(path) {
+        Ok(mut f) => f.read(&mut buf)?,
+        Err(_) => return Ok(true),
+    };
+    let data = &buf[..n];
+    #[cfg(not(feature = "encryption"))]
+    refuse_container(path, data)?;
+    match parse_wal_header(data) {
+        Ok(_) => Ok(false),
+        Err(e) => {
+            if header_torn(data.len(), &e) {
+                Ok(true)
+            } else {
+                Err(PinkDbError::Execution(header_error(path, &e)))
+            }
         }
-        Err(std::fs::TryLockError::Error(e)) => Err(PinkDbError::Io(e)),
     }
 }
+
+/// The parsed identity of the live WAL on disk `(gen, wal_id, records_start)`.
+/// Used for the refresh identity comparison; the file must already be in a
+/// current format (callers upgrade legacy files first). Reads only the header
+/// region, never the whole WAL.
+fn read_wal_identity(path: &Path) -> Result<(u64, WalId, u64)> {
+    let mut f = File::open(path)?;
+    // Enough for any container header (max salt + key-check) plus the
+    // 88-byte publish block, or a plaintext v3 header.
+    let mut buf = [0u8; 512];
+    let n = f.read(&mut buf)?;
+    let h =
+        parse_wal_header(&buf[..n]).map_err(|e| PinkDbError::Execution(header_error(path, &e)))?;
+    Ok((h.gen, h.wal_id, h.records_start as u64))
+}
+
+/// Scan the live WAL (creating it when absent) and return every intact
+/// record plus its positioning. Torn tails are truncated in place
+/// (plaintext) or rebuilt under a fresh nonce prefix (encrypted); legacy
+/// formats are upgraded first (then the scan re-runs on the new file).
+fn scan_wal(
+    path: &Path,
+    key: Option<&EncryptionKey>,
+    recreate_gen: u64,
+    rebuild_encrypted: bool,
+) -> Result<OpenedWal> {
+    let fresh_cipher = |gen: u64| -> Result<Option<RecordCipher>> {
+        match key {
+            Some(k) => Ok(Some(RecordCipher::create(k, gen)?)),
+            None => Ok(None),
+        }
+    };
+    let created = |gen: u64, cipher: Option<RecordCipher>| -> Result<OpenedWal> {
+        let (file, cipher, wal_id) = Wal::create_file(path, gen, cipher)?;
+        let records_start = match &cipher {
+            Some(c) => c.header().len() as u64 + ENC_PUBLISH_BLOCK_LEN as u64,
+            None => RECORDS_START as u64,
+        };
+        let slots_at = match &cipher {
+            Some(c) => c.header().len() as u64 + ENC_SLOT_A,
+            None => WAL_SLOT_A,
+        };
+        Ok(OpenedWal {
+            file,
+            gen,
+            wal_id,
+            records_start,
+            slots_at,
+            published_seq: 0,
+            cipher,
+            records: Vec::new(),
+            truncated: 0,
+            upgraded: false,
+        })
+    };
+    if !path.exists() {
+        return created(recreate_gen, fresh_cipher(recreate_gen)?);
+    }
+    let data = std::fs::read(path)?;
+    #[cfg(not(feature = "encryption"))]
+    refuse_container(path, &data)?;
+    let header = match parse_wal_header(&data) {
+        Ok(h) => h,
+        Err(e) if header_torn(data.len(), &e) => {
+            // A torn creation (crash while creating/recreating the WAL): no
+            // record can have been acknowledged yet, so the file is
+            // recreated. A parse failure on a longer file is corruption and
+            // stays a hard error.
+            let mut out = created(recreate_gen, fresh_cipher(recreate_gen)?)?;
+            out.truncated = data.len() as u64;
+            return Ok(out);
+        }
+        Err(e) => return Err(PinkDbError::Execution(header_error(path, &e))),
+    };
+    // At-rest mode must match the key exactly (both directions).
+    let cipher = match (&header.enc, key) {
+        (None, Some(_)) => return Err(not_encrypted_with_key(path)),
+        (Some(_), None) => return Err(crypto::encrypted_error(&path.display().to_string())),
+        (Some(_), Some(k)) => {
+            // A wrong key fails the key-check here, before anything runs.
+            let (c, _) = RecordCipher::from_header(&data, k)?;
+            Some(c)
+        }
+        (None, None) => None,
+    };
+    if header.legacy {
+        // Upgrade under the lease, then re-scan the (now current) file.
+        upgrade_legacy_wal(path, &data, &header, key)?;
+        let mut out = scan_wal(path, key, header.gen, rebuild_encrypted)?;
+        out.upgraded = true;
+        return Ok(out);
+    }
+    let (records, good_end) = parse_records(&data, header.records_start, cipher.as_ref(), 0, 0)
+        .map_err(PinkDbError::Execution)?;
+    let truncated = (data.len() - good_end) as u64;
+    let record_count = u32::try_from(records.len())
+        .map_err(|_| PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string()))?;
+    let (file, cipher, wal_id, published_seq, records_start, slots_at, upgraded) = match cipher {
+        Some(old) if truncated > 0 || rebuild_encrypted => {
+            // Rebuild under a fresh nonce prefix and a fresh wal_id.
+            //
+            // `Wal::open` (once per process open) always rebuilds, keeping
+            // the wave-22 policy: a file cut exactly at a record boundary is
+            // byte-identical to a cleanly shorter one, so a counter resynced
+            // from the record count could hand out a discarded record's
+            // `(key, nonce, AAD)` again — real keystream reuse, not a
+            // theoretical one (the integration test detects it). This is a
+            // deliberate deviation from the wave-45m design's "narrow the
+            // rebuild to creation and upgrade only"; multi-process appends
+            // stay safe because every appender re-checks the WAL identity
+            // under the lease (`needs_scan`) and re-opens a replaced file
+            // before appending, and every refresh resyncs the cipher counter
+            // from the on-disk record count. Refreshes (`reopen_under_lease`)
+            // pass `rebuild_encrypted = false` and keep the prefix, except
+            // when they actually discard bytes (a crashed writer's torn
+            // tail), where the same reuse argument forces a rebuild.
+            let mut fresh = rewrite_encrypted(path, header.gen, &records, &old)?;
+            fresh.set_next_counter(record_count.checked_add(1).ok_or_else(|| {
+                PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+            })?);
+            let file = OpenOptions::new().read(true).append(true).open(path)?;
+            let rebuilt = std::fs::read(path)?;
+            let h2 = parse_wal_header(&rebuilt)
+                .map_err(|e| PinkDbError::Execution(header_error(path, &e)))?;
+            (
+                file,
+                Some(fresh),
+                h2.wal_id,
+                h2.published_seq,
+                h2.records_start as u64,
+                h2.slots_at,
+                true,
+            )
+        }
+        Some(mut old) => {
+            // Same prefix, positioned after the existing records.
+            old.set_next_counter(record_count.checked_add(1).ok_or_else(|| {
+                PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+            })?);
+            let file = OpenOptions::new().read(true).append(true).open(path)?;
+            (
+                file,
+                Some(old),
+                header.wal_id,
+                header.published_seq,
+                header.records_start as u64,
+                header.slots_at,
+                false,
+            )
+        }
+        None => {
+            let file = OpenOptions::new().read(true).append(true).open(path)?;
+            if truncated > 0 {
+                file.set_len(good_end as u64)?;
+                file.sync_all()?;
+            }
+            (
+                file,
+                None,
+                header.wal_id,
+                header.published_seq,
+                header.records_start as u64,
+                header.slots_at,
+                false,
+            )
+        }
+    };
+    let _ = data;
+    Ok(OpenedWal {
+        file,
+        gen: header.gen,
+        wal_id,
+        records_start,
+        slots_at,
+        published_seq,
+        cipher,
+        records,
+        truncated,
+        upgraded,
+    })
+}
+
+// ---------- file naming + header parsing ----------
 
 fn wal_path(checkpoint: &Path) -> PathBuf {
     let mut s = checkpoint.as_os_str().to_os_string();
@@ -960,45 +2012,108 @@ fn roll_path(wal: &Path, gen: u64) -> PathBuf {
     PathBuf::from(s)
 }
 
-#[cfg(feature = "encryption")]
-fn parse_header(data: &[u8]) -> std::result::Result<Header, HeaderError> {
-    // Encrypted container header (`PINKENC1`): the generation is the
-    // container's context, and records start after the key-check block.
+/// Parse a live WAL header: plaintext v2/v3, container v1/v2. No key needed
+/// (the container key-check is verified separately when a cipher is built).
+fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> {
     if crypto::is_container(data) {
-        let enc = crypto::parse_container_header(data)
-            .map_err(|e| HeaderError::Container(e.to_string()))?;
-        return Ok(Header {
-            gen: enc.context,
-            records_start: enc.payload_start,
-            enc: Some(enc),
-        });
+        #[cfg(not(feature = "encryption"))]
+        {
+            // Refused before this point by `refuse_container`; keep a clean
+            // error for any other caller.
+            return Err(HeaderError::BadMagic);
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let enc = crypto::parse_container_header(data)
+                .map_err(|e| HeaderError::Container(e.to_string()))?;
+            let payload_start = enc.payload_start;
+            if enc.version < 2 {
+                // Container v1: no publish block; records start right after
+                // the header. Upgraded under the lease by `scan_wal`.
+                return Ok(WalHeader {
+                    gen: enc.context,
+                    wal_id: [0u8; 16],
+                    records_start: payload_start,
+                    slots_at: 0,
+                    published_seq: 0,
+                    enc: Some(enc),
+                    legacy: true,
+                });
+            }
+            if data.len() < payload_start + ENC_PUBLISH_BLOCK_LEN {
+                return Err(HeaderError::BadPublishBlock {
+                    payload_start,
+                    what: "truncated publish block".to_string(),
+                });
+            }
+            let block = &data[payload_start..payload_start + ENC_PUBLISH_BLOCK_LEN];
+            let mut wal_id = [0u8; 16];
+            wal_id.copy_from_slice(&block[..16]);
+            let crc = u32::from_le_bytes(block[16..20].try_into().expect("4 bytes"));
+            if crc != publish_block_crc(&wal_id, enc.context, enc.version) {
+                return Err(HeaderError::BadPublishBlock {
+                    payload_start,
+                    what: "publish block CRC mismatch".to_string(),
+                });
+            }
+            if block[20..24] != [0u8; 4] || block[72..88] != [0u8; 16] {
+                return Err(HeaderError::Reserved);
+            }
+            let published_seq = slot_max_in(block, ENC_SLOT_A as usize, WAL_SLOT_DOMAIN);
+            return Ok(WalHeader {
+                gen: enc.context,
+                wal_id,
+                records_start: payload_start + ENC_PUBLISH_BLOCK_LEN,
+                slots_at: payload_start as u64 + ENC_SLOT_A,
+                published_seq,
+                enc: Some(enc),
+                legacy: false,
+            });
+        }
     }
-    parse_plain_header(data)
-}
-
-/// Without the `encryption` feature encrypted WALs are refused before this
-/// point (`encrypted_error`); the parser is exactly the pre-encryption one.
-#[cfg(not(feature = "encryption"))]
-fn parse_header(data: &[u8]) -> std::result::Result<Header, HeaderError> {
-    parse_plain_header(data)
-}
-
-fn parse_plain_header(data: &[u8]) -> std::result::Result<Header, HeaderError> {
-    if data.len() < HEADER_LEN {
+    if data.len() < V2_RECORDS_START {
         return Err(HeaderError::TooShort);
     }
     if &data[..8] != WAL_MAGIC {
         return Err(HeaderError::BadMagic);
     }
     let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-    if version != WAL_VERSION {
-        return Err(HeaderError::BadVersion(version));
+    match version {
+        WAL_VERSION_V2 => Ok(WalHeader {
+            gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
+            wal_id: [0u8; 16],
+            records_start: V2_RECORDS_START,
+            slots_at: 0,
+            published_seq: 0,
+            enc: None,
+            legacy: true,
+        }),
+        WAL_VERSION => {
+            if data.len() < HEADER_LEN {
+                return Err(HeaderError::TooShort);
+            }
+            let crc = u32::from_le_bytes(data[36..40].try_into().expect("4 bytes"));
+            if crc != crc32(&data[..36]) {
+                return Err(HeaderError::BadCrc);
+            }
+            if data[88..96] != [0u8; 8] {
+                return Err(HeaderError::Reserved);
+            }
+            let mut wal_id = [0u8; 16];
+            wal_id.copy_from_slice(&data[20..36]);
+            let published_seq = slot_max_in(data, WAL_SLOT_A as usize, WAL_SLOT_DOMAIN);
+            Ok(WalHeader {
+                gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
+                wal_id,
+                records_start: HEADER_LEN,
+                slots_at: WAL_SLOT_A,
+                published_seq,
+                enc: None,
+                legacy: false,
+            })
+        }
+        _ => Err(HeaderError::BadVersion(version)),
     }
-    Ok(Header {
-        gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
-        records_start: HEADER_LEN,
-        enc: None,
-    })
 }
 
 fn header_error(path: &Path, e: &HeaderError) -> String {
@@ -1010,8 +2125,41 @@ fn header_error(path: &Path, e: &HeaderError) -> String {
         HeaderError::BadVersion(v) => {
             format!("WAL format version {v} is not supported (want {WAL_VERSION})")
         }
+        HeaderError::BadCrc => format!(
+            "{}: WAL header checksum mismatch (corrupt header)",
+            path.display()
+        ),
+        HeaderError::Reserved => format!(
+            "{}: WAL header reserved bytes are nonzero (corrupt header)",
+            path.display()
+        ),
         #[cfg(feature = "encryption")]
         HeaderError::Container(msg) => format!("{}: {msg}", path.display()),
+        #[cfg(feature = "encryption")]
+        HeaderError::BadPublishBlock { what, .. } => {
+            format!("{}: {what}", path.display())
+        }
+    }
+}
+
+/// May a failed header parse on a file of this length be treated as a torn
+/// creation (recreated before anything is replayed), rather than
+/// record-bearing corruption (a hard error)? A version mismatch is never
+/// torn: a v1 or future-version file may carry records (the old rule only
+/// recreated invalid magic/version on a file at most one header long).
+fn header_torn(data_len: usize, e: &HeaderError) -> bool {
+    match e {
+        HeaderError::TooShort
+        | HeaderError::BadMagic
+        | HeaderError::BadCrc
+        | HeaderError::Reserved => data_len <= HEADER_LEN,
+        HeaderError::BadVersion(_) => false,
+        #[cfg(feature = "encryption")]
+        HeaderError::Container(_) => data_len <= crypto::MAX_HEADER_LEN + ENC_PUBLISH_BLOCK_LEN,
+        #[cfg(feature = "encryption")]
+        HeaderError::BadPublishBlock { payload_start, .. } => {
+            data_len <= payload_start + ENC_PUBLISH_BLOCK_LEN
+        }
     }
 }
 
@@ -1063,7 +2211,7 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
     let data = std::fs::read(path)?;
     #[cfg(not(feature = "encryption"))]
     refuse_container(path, &data)?;
-    match parse_header(&data) {
+    match parse_wal_header(&data) {
         Ok(h) => {
             let cipher = match (&h.enc, key) {
                 (None, Some(_)) => return Err(not_encrypted_with_key(path)),
@@ -1076,31 +2224,18 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
                 }
                 (None, None) => None,
             };
-            let (records, _) = parse_records(&data, h.records_start, cipher.as_ref())
+            let (records, _) = parse_records(&data, h.records_start, cipher.as_ref(), 0, 0)
                 .map_err(PinkDbError::Execution)?;
             Ok(Some(WalProbe {
                 gen: Some(h.gen),
                 has_records: !records.is_empty(),
             }))
         }
-        #[cfg(feature = "encryption")]
-        Err(HeaderError::Container(_)) if data.len() <= crypto::MAX_HEADER_LEN => {
-            Ok(Some(WalProbe {
-                gen: None,
-                has_records: false,
-            }))
-        }
-        Err(e) => {
-            if data.len() <= HEADER_LEN {
-                // A torn header (crash while creating the WAL): recreate it.
-                Ok(Some(WalProbe {
-                    gen: None,
-                    has_records: false,
-                }))
-            } else {
-                Err(PinkDbError::Execution(header_error(path, &e)))
-            }
-        }
+        Err(e) if header_torn(data.len(), &e) => Ok(Some(WalProbe {
+            gen: None,
+            has_records: false,
+        })),
+        Err(e) => Err(PinkDbError::Execution(header_error(path, &e))),
     }
 }
 
@@ -1167,7 +2302,7 @@ fn check_roll_header(roll: &Roll) -> Result<()> {
         Err(_) => return Ok(()),
     };
     buf.truncate(n);
-    match parse_header(&buf) {
+    match parse_wal_header(&buf) {
         Ok(h) if h.gen == roll.gen => Ok(()),
         Ok(h) => Err(PinkDbError::Execution(format!(
             "cannot recover: roll file {} is named generation {} but its header says {}; \
@@ -1236,7 +2371,6 @@ fn ensure_live_wal(
     };
     Wal::create_file(wal, gen, cipher).map(|_| ())
 }
-
 /// A keyed store must never publish over (or consume) an artifact of the
 /// other at-rest mode: `.pink`/`.tmp` are checked by their first 8 bytes,
 /// which needs no key. An encrypted artifact names the missing support (or
@@ -1377,13 +2511,20 @@ impl PinkDb {
     /// then log every commit to that WAL.
     /// A missing checkpoint *and* WAL starts a fresh durable database.
     pub fn open_durable(path: &str) -> Result<PinkDb> {
-        Ok(Self::open_durable_impl(path, SyncPolicy::Sync, None)?.0)
+        Ok(Self::open_durable_impl(path, None, &DurableOpenOptions::default())?.0)
     }
 
     /// [`PinkDb::open_durable`] with an explicit sync policy; also returns
     /// what recovery replayed (for callers like the REPL that report it).
     pub fn open_durable_with(path: &str, policy: SyncPolicy) -> Result<(PinkDb, RecoveryInfo)> {
-        Self::open_durable_impl(path, policy, None)
+        Self::open_durable_impl(
+            path,
+            None,
+            &DurableOpenOptions {
+                policy,
+                ..DurableOpenOptions::default()
+            },
+        )
     }
 
     /// [`PinkDb::open_durable`] with at-rest encryption: the checkpoint and
@@ -1401,7 +2542,7 @@ impl PinkDb {
         }
         #[cfg(feature = "encryption")]
         {
-            Ok(Self::open_durable_impl(path, SyncPolicy::Sync, Some(key))?.0)
+            Ok(Self::open_durable_impl(path, Some(key), &DurableOpenOptions::default())?.0)
         }
     }
 
@@ -1419,33 +2560,74 @@ impl PinkDb {
         }
         #[cfg(feature = "encryption")]
         {
-            Self::open_durable_impl(path, policy, Some(key))
+            Self::open_durable_impl(
+                path,
+                Some(key),
+                &DurableOpenOptions {
+                    policy,
+                    ..DurableOpenOptions::default()
+                },
+            )
+        }
+    }
+
+    /// [`PinkDb::open_durable_with`] with the full options set (sync policy,
+    /// busy timeout, lock mode). The recovery + initial replay happen under
+    /// the write lease, which is then released (the fd stays open for the
+    /// epoch precheck).
+    pub fn open_durable_with_options(
+        path: &str,
+        opts: DurableOpenOptions,
+    ) -> Result<(PinkDb, RecoveryInfo)> {
+        Self::open_durable_impl(path, None, &opts)
+    }
+
+    /// [`PinkDb::open_durable_with_options`] with at-rest encryption.
+    pub fn open_durable_with_key_and_options(
+        path: &str,
+        key: &EncryptionKey,
+        opts: DurableOpenOptions,
+    ) -> Result<(PinkDb, RecoveryInfo)> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = (path, key, opts);
+            Err(crate::crypto::unavailable())
+        }
+        #[cfg(feature = "encryption")]
+        {
+            Self::open_durable_impl(path, Some(key), &opts)
         }
     }
 
     /// Shared durable-open path for plaintext (`key == None`) and encrypted
     /// (`key == Some`) databases. Everything on disk must match the key mode;
     /// every artifact the open creates (fresh WAL, recreated WAL, completed
-    /// checkpoint) is written in the mode of the open.
+    /// checkpoint) is written in the mode of the open. Recovery, the format
+    /// upgrade and the initial replay run under the per-operation lease.
     fn open_durable_impl(
         path: &str,
-        policy: SyncPolicy,
         key: Option<&EncryptionKey>,
+        opts: &DurableOpenOptions,
     ) -> Result<(PinkDb, RecoveryInfo)> {
         let ckpt = PathBuf::from(path);
         let wal = wal_path(&ckpt);
         let tmp = tmp_path(&ckpt);
         let mut info = RecoveryInfo::default();
 
-        // 0. One live handle per durable database: recovery and appends from
-        //    two handles (two processes, or two opens in one process) would
-        //    corrupt the WAL. The lock is taken before recovery touches files.
-        let lock = acquire_db_lock(&ckpt)?;
+        // 0. Take the lease: recovery and appends from two processes would
+        //    corrupt the WAL. Unlike the old lifetime lock, it is released
+        //    when this open completes.
+        let lease = Lease::open(&ckpt, opts.lock_mode, opts.busy_timeout)?;
+        let guard = lease.acquire()?;
+        let mut mutated = false;
 
         // 1. Finish an interrupted checkpoint before loading anything.
         let rolls = scan_rolls(&wal)?;
         let probe = probe_wal(&wal, key)?;
         recover_checkpoint(&ckpt, &wal, &tmp, &rolls, probe.as_ref(), &mut info, key)?;
+        if info.checkpoints_completed > 0 || info.stale_rolls_removed > 0 {
+            mutated = true;
+        }
 
         // 2. Checkpoint, if one exists, then replay the live WAL on top.
         //    `open`/`open_with_key` enforce the key mode of the checkpoint.
@@ -1465,15 +2647,23 @@ impl PinkDb {
             Some(g) => g,
             None => next_gen_after_rolls(&rolls)?,
         };
-        let (handle, records, truncated) =
-            Wal::open(&wal, ckpt.clone(), policy, recreate_gen, key)?;
+        let (mut handle, records, truncated) = Wal::open(
+            &wal,
+            ckpt.clone(),
+            opts.policy,
+            recreate_gen,
+            key,
+            lease.clone(),
+        )?;
         for rec in &records {
             replay_record(&mut db, rec)?;
         }
         info.replayed_records += records.len() as u64;
         info.replayed_statements += records.iter().map(|r| r.stmts.len() as u64).sum::<u64>();
         info.truncated_bytes = truncated;
-        let mut handle = handle;
+        if truncated > 0 || handle.upgraded_last() {
+            mutated = true;
+        }
         // Replay leaves the session wherever the last record did (a logged
         // `USE` or the start at `main`): later appends must know that.
         handle.set_session_db(db.current_db());
@@ -1481,8 +2671,32 @@ impl PinkDb {
         // generation (the live WAL is exactly what was just replayed): a
         // later record touching it must not emit a redundant prefix.
         handle.seed_tracked_extensions(db.loaded_extension_paths());
-        handle._lock = lock;
-        db.wal = Some(std::sync::Arc::new(std::sync::Mutex::new(handle)));
+        // The applied position: this store's memory now matches the file.
+        let (wal_id_now, ckpt_id_now) = (
+            file_identity(&wal),
+            file_identity(&handle.checkpoint_path.clone()),
+        );
+        handle.mark_applied(Applied {
+            wal_id: handle.wal_id,
+            gen: handle.gen,
+            wal_dev_ino: wal_id_now,
+            records_start: handle.records_start,
+            applied_end: std::fs::metadata(&wal)
+                .map(|m| m.len())
+                .unwrap_or(handle.records_start),
+            applied_lsn: handle.last_lsn,
+            applied_records: records.len() as u64,
+            ckpt_dev_ino: ckpt_id_now,
+        });
+        if mutated {
+            // Publish recovery mutations (a completed checkpoint, a removed
+            // roll, a truncated tail, an upgrade) to already-open readers.
+            guard.bump_epoch(handle.last_lsn);
+        }
+        guard.cache_epoch_now();
+        drop(guard);
+        db.lease = Some(lease);
+        db.wal = Some(Arc::new(Mutex::new(handle)));
         Ok((db, info))
     }
 
@@ -1497,12 +2711,275 @@ impl PinkDb {
         }
     }
 
+    /// Acquire the write lease (`None` in memory). Callers must acquire it
+    /// *before* any store lock (invariant I6); the in-process gate makes
+    /// nested acquisitions by the same thread safe.
+    pub(crate) fn acquire_lease(&self) -> Result<Option<LeaseGuard>> {
+        match &self.lease {
+            Some(lease) => Ok(Some(lease.acquire()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Refresh the in-memory store from disk if anything was published (or
+    /// replaced), taking a short lease. No-op when fresh; used by read paths.
+    pub(crate) fn refresh_if_stale(&mut self) -> Result<()> {
+        let Some(lease) = self.lease.clone() else {
+            return Ok(());
+        };
+        if !lease.stale() {
+            return Ok(());
+        }
+        let guard = lease.acquire()?;
+        self.refresh_under_lease(&guard).map(|_| ())
+    }
+
+    /// Refresh under an already-held lease. Idempotent: a second caller
+    /// after the first refresh is a no-op. Returns whether a refresh pass
+    /// actually ran (callers that bound a plan before taking the lease must
+    /// rebind when it did). A failure poisons the handle (hazard H6/H9):
+    /// committed data is never silently dropped and the partially advanced
+    /// store is never observable.
+    pub(crate) fn refresh_under_lease(&mut self, guard: &LeaseGuard) -> Result<bool> {
+        let Some(wal_arc) = self.wal.clone() else {
+            return Ok(false);
+        };
+        let mut wal = wal_arc
+            .lock()
+            .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
+        if wal.poisoned.is_some() {
+            // Fail-stop is already in effect; the error surfaces through
+            // `ensure_wal_healthy`.
+            return Ok(false);
+        }
+        if !guard.epoch_stale() && !wal.needs_scan()? {
+            return Ok(false);
+        }
+        match self.refresh_inner(&mut wal, guard) {
+            Ok(()) => {
+                guard.cache_epoch_now();
+                Ok(true)
+            }
+            Err(e) => {
+                // H6/H9: the handle fail-stops with the full context.
+                let msg = format!("refresh failed: {e}");
+                wal.poison(msg.clone());
+                Err(PinkDbError::Execution(msg))
+            }
+        }
+    }
+
+    /// The heavy refresh: recovery, legacy upgrade, identity compare,
+    /// full-or-incremental reload, replay (design 4.4/4.5).
+    fn refresh_inner(&mut self, wal: &mut Wal, guard: &LeaseGuard) -> Result<()> {
+        let key = self.encryption_key.clone();
+        let wal_path = wal.path.clone();
+        let ckpt = wal.checkpoint_path.clone();
+        let tmp = tmp_path(&ckpt);
+        let local_session = self.current_db.clone();
+        let mut mutated = false;
+
+        // 1. Recovery state machine (idempotent under the lease): finish an
+        //    interrupted checkpoint, remove provably folded rolls, recreate a
+        //    missing live WAL. Only run it when a crash artifact exists or
+        //    the WAL header is missing/torn — the steady-state append path
+        //    must not read the whole WAL (probe authenticates records).
+        let rolls = scan_rolls(&wal_path)?;
+        let mut info = RecoveryInfo::default();
+        if tmp.exists() || !rolls.is_empty() || wal_header_invalid(&wal_path)? {
+            let probe = probe_wal(&wal_path, key.as_ref())?;
+            recover_checkpoint(
+                &ckpt,
+                &wal_path,
+                &tmp,
+                &rolls,
+                probe.as_ref(),
+                &mut info,
+                key.as_ref(),
+            )?;
+            if info.checkpoints_completed > 0 || info.stale_rolls_removed > 0 {
+                mutated = true;
+            }
+        }
+
+        // 2. Legacy formats are upgraded under the lease (plaintext v2 → v3;
+        //    container v1 → v2 + publish block). The upgrade replaces the
+        //    file incarnation, so a full rebuild follows.
+        if wal_legacy_format(&wal_path)? {
+            let data = std::fs::read(&wal_path)?;
+            let header = parse_wal_header(&data)
+                .map_err(|e| PinkDbError::Execution(header_error(&wal_path, &e)))?;
+            upgrade_legacy_wal(&wal_path, &data, &header, key.as_ref())?;
+            mutated = true;
+        }
+
+        // 3. Identity compare: a replaced WAL file, a new WAL incarnation
+        //    (`wal_id`), or a new checkpoint means no incremental
+        //    continuity — reload the checkpoint and replay from scratch.
+        let (disk_gen, disk_wal_id, _) = read_wal_identity(&wal_path)?;
+        let wal_id_now = file_identity(&wal_path);
+        let ckpt_id_now = file_identity(&ckpt);
+        let full = ckpt_id_now != wal.applied.ckpt_dev_ino
+            || wal_id_now != wal.applied.wal_dev_ino
+            || disk_gen != wal.applied.gen
+            || disk_wal_id != wal.applied.wal_id;
+
+        let (records, end) = if full {
+            let other = self.load_checkpoint_for_refresh(&key, &ckpt)?;
+            self.adopt(other);
+            wal.reopen_under_lease(&key)?
+        } else {
+            match wal.scan_increment()? {
+                Some(x) => x,
+                None => {
+                    // Defensive: bytes below `applied_end` were rewritten
+                    // (only possible outside the protocol) — rebuild.
+                    let other = self.load_checkpoint_for_refresh(&key, &ckpt)?;
+                    self.adopt(other);
+                    let x = wal.reopen_under_lease(&key)?;
+                    mutated = true;
+                    x
+                }
+            }
+        };
+        if wal.truncated_last() > 0 || wal.upgraded_last() {
+            mutated = true;
+        }
+
+        // 4. Replay the new frames into the live store (hazards H1–H10).
+        if !records.is_empty() {
+            self.replay_frames(wal, &records, &local_session)?;
+        } else if self.database_exists(&local_session) {
+            // No new frames: the local session is still valid (a full
+            // rebuild adopted the checkpoint's default session).
+            self.set_current_db(&local_session);
+        } else {
+            let fallback = self.fallback_db();
+            self.set_current_db(&fallback);
+        }
+
+        // 5. Bookkeeping: the applied position and the epoch cache.
+        let (wal_dev_ino, ckpt_dev_ino) = (file_identity(&wal_path), file_identity(&ckpt));
+        let total = wal.applied.applied_records + records.len() as u64;
+        let last = if records.is_empty() {
+            wal.applied.applied_lsn
+        } else {
+            wal.last_lsn
+        };
+        wal.mark_applied(Applied {
+            wal_id: wal.wal_id,
+            gen: wal.gen,
+            wal_dev_ino,
+            records_start: wal.records_start,
+            applied_end: end,
+            applied_lsn: last,
+            applied_records: total,
+            ckpt_dev_ino,
+        });
+        if let Some(c) = wal.cipher.as_mut() {
+            // A reopened encrypted WAL must not reuse the nonces of its
+            // records: position the counter after the on-disk record count.
+            let next = u32::try_from(total)
+                .map_err(|_| {
+                    PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+                })?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
+                })?;
+            c.set_next_counter(next);
+        }
+        if mutated {
+            guard.bump_epoch(wal.last_lsn);
+        }
+        Ok(())
+    }
+
+    /// Load the checkpoint `.pink` (plaintext or keyed) for a refresh's full
+    /// rebuild; `PinkDb::new()` when there is no checkpoint yet.
+    fn load_checkpoint_for_refresh(
+        &self,
+        key: &Option<EncryptionKey>,
+        ckpt: &Path,
+    ) -> Result<PinkDb> {
+        if !ckpt.exists() {
+            return Ok(PinkDb::new());
+        }
+        let path = ckpt.to_str().ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "cannot refresh {}: path is not valid UTF-8",
+                ckpt.display()
+            ))
+        })?;
+        match key {
+            Some(k) => PinkDb::open_with_key(path, k),
+            None => PinkDb::open(path),
+        }
+    }
+
+    /// Replay recovered frames into the LIVE store: WAL detached so nothing
+    /// re-enters logging/publishing/auto-checkpoint (H1), replay in the WAL
+    /// lineage session with the local session restored afterwards (H2/H3),
+    /// `LOAD EXTENSION` not gated by the SQL front-end switch (H5), and the
+    /// deterministic hard-error policy (H6). `local_session` is the session
+    /// the store had before the refresh (a full rebuild must preserve it).
+    fn replay_frames(
+        &mut self,
+        wal: &mut Wal,
+        records: &[Record],
+        local_session: &str,
+    ) -> Result<()> {
+        debug_assert!(
+            self.txn_snapshot.is_none(),
+            "refresh never runs inside an embedded transaction"
+        );
+        // H1: detach the handle for the whole replay.
+        let stashed_wal = self.wal.take();
+        // H2/H3: bare records replay in the lineage session; a vanished
+        // lineage database falls back (the record then cannot name it either
+        // — it was appended bare precisely because the database vanished).
+        let start = match wal.session_db.clone() {
+            Some(s) if self.database_exists(&s) => s,
+            _ => self.fallback_db(),
+        };
+        self.set_current_db(&start);
+        // H5: the SQL `LOAD EXTENSION` gate is a front-end policy; WAL replay
+        // must be able to re-load the extensions its records need.
+        let allow = self.allow_sql_load_extension;
+        self.allow_sql_load_extension = true;
+        let mut result = Ok(());
+        for rec in records {
+            if let Err(e) = replay_record(self, rec) {
+                result = Err(e);
+                break;
+            }
+        }
+        self.allow_sql_load_extension = allow;
+        if result.is_ok() {
+            // The replay session after the last record is the new lineage.
+            wal.set_session_db(self.current_db());
+        }
+        // H2c: never let another process's `USE` jump this process's local
+        // session; if it vanished under the refresh, fall back.
+        if self.database_exists(local_session) {
+            self.set_current_db(local_session);
+        } else {
+            let fallback = self.fallback_db();
+            self.set_current_db(&fallback);
+        }
+        self.wal = stashed_wal;
+        result
+    }
+
     /// Checkpoint when the WAL has outgrown the auto-checkpoint threshold
-    /// (outside transactions only). Called after a write is durable, so a
-    /// checkpoint failure must not fail that statement: it is reported on
-    /// stderr, and a failure that poisons the WAL stops the database
-    /// (fail-stop) exactly like a failed append.
-    pub(crate) fn maybe_auto_checkpoint(&mut self) {
+    /// (outside transactions only) and this process contributed at least
+    /// half of the live WAL (design 6.5). Called after a write is durable,
+    /// so a checkpoint failure must not fail that statement: it is reported
+    /// on stderr, and a failure that poisons the WAL stops the database
+    /// (fail-stop) exactly like a failed append. The caller passes the lease
+    /// it already holds (if any); acquiring it here would invert the lock
+    /// order.
+    pub(crate) fn maybe_auto_checkpoint(&mut self, guard: Option<&LeaseGuard>) {
         if self.in_transaction() {
             return;
         }
@@ -1514,7 +2991,7 @@ impl PinkDb {
             .unwrap_or_else(|p| p.into_inner())
             .wants_checkpoint();
         if due {
-            if let Err(e) = self.checkpoint() {
+            if let Err(e) = self.checkpoint_with_guard(guard) {
                 eprintln!("pinkdb: automatic checkpoint failed: {e}");
             }
         }
@@ -1522,8 +2999,25 @@ impl PinkDb {
 
     /// Checkpoint: atomically persist the current state to the bound `.pink`
     /// path and roll the WAL. Only durable databases have a bound path; a
-    /// transaction must not be open (its changes are not committed).
+    /// transaction must not be open (its changes are not committed). Takes
+    /// the lease itself; callers that already hold it use
+    /// [`PinkDb::checkpoint_with_guard`].
     pub fn checkpoint(&mut self) -> Result<()> {
+        if self.in_transaction() {
+            return Err(PinkDbError::Execution(
+                "cannot checkpoint inside a transaction".to_string(),
+            ));
+        }
+        let guard = self.acquire_lease()?;
+        self.checkpoint_with_guard(guard.as_ref())
+    }
+
+    /// Checkpoint under a lease the caller already holds (or, for the
+    /// embedded path, one acquired by [`PinkDb::checkpoint`]). Refreshes
+    /// first (design 6.1): without it a checkpoint would publish a state
+    /// lacking another process's committed frames and then roll those frames
+    /// into a roll that recovery deletes — destroying commits.
+    pub(crate) fn checkpoint_with_guard(&mut self, held: Option<&LeaseGuard>) -> Result<()> {
         if self.in_transaction() {
             return Err(PinkDbError::Execution(
                 "cannot checkpoint inside a transaction".to_string(),
@@ -1537,7 +3031,25 @@ impl PinkDb {
                 ))
             }
         };
-        let mut guard = wal
+        let own_guard;
+        let guard = match held {
+            Some(g) => g,
+            None => {
+                own_guard = self.acquire_lease()?;
+                match &own_guard {
+                    Some(g) => g,
+                    None => {
+                        return Err(PinkDbError::Execution(
+                            "database is not durable".to_string(),
+                        ))
+                    }
+                }
+            }
+        };
+        // Refresh-first: the persisted state must include every committed
+        // frame of every process.
+        self.refresh_under_lease(guard)?;
+        let mut guard_wal = wal
             .lock()
             .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
         // The live WAL's at-rest mode (and key) is fixed at open. A
@@ -1549,13 +3061,13 @@ impl PinkDb {
         #[cfg(feature = "encryption")]
         {
             let key = self.encryption_key.clone();
-            if key.is_some() != guard.is_encrypted() {
+            if key.is_some() != guard_wal.is_encrypted() {
                 return Err(PinkDbError::Execution(
                     "cannot change encryption mode on a live store; reopen it instead".to_string(),
                 ));
             }
             if let Some(k) = &key {
-                if !guard.key_matches(k) {
+                if !guard_wal.key_matches(k) {
                     return Err(PinkDbError::Execution(
                         "cannot change the encryption key on a live store; reopen it instead"
                             .to_string(),
@@ -1563,8 +3075,8 @@ impl PinkDb {
                 }
             }
             match key {
-                Some(k) => guard.checkpoint(|tmp| self.save_sync_with_key(tmp, &k))?,
-                None => guard.checkpoint(|tmp| self.save_sync(tmp))?,
+                Some(k) => guard_wal.checkpoint(guard, |tmp| self.save_sync_with_key(tmp, &k))?,
+                None => guard_wal.checkpoint(guard, |tmp| self.save_sync(tmp))?,
             }
         }
         #[cfg(not(feature = "encryption"))]
@@ -1572,13 +3084,13 @@ impl PinkDb {
             if self.encryption_key.is_some() {
                 return Err(crate::crypto::unavailable());
             }
-            guard.checkpoint(|tmp| self.save_sync(tmp))?;
+            guard_wal.checkpoint(guard, |tmp| self.save_sync(tmp))?;
         }
         // A fresh WAL generation replays from the checkpoint's session
         // default (the checkpoint does not store a session): reset the
         // tracked replay session so later appends `USE`-prefix correctly.
         let fallback = self.fallback_db();
-        guard.set_session_db(&fallback);
+        guard_wal.set_session_db(&fallback);
         Ok(())
     }
 
@@ -1590,14 +3102,34 @@ impl PinkDb {
     }
 
     /// fsync the WAL (relevant with [`SyncPolicy::Batch`]); no-op in memory.
+    /// Takes the lease: with `Batch` a flush is the durability point other
+    /// processes wait for.
     pub fn flush_wal(&mut self) -> Result<()> {
+        let guard = self.acquire_lease()?;
+        self.flush_wal_holding_lease()?;
+        drop(guard);
+        Ok(())
+    }
+
+    /// [`PinkDb::flush_wal`] with the lease already held by the caller.
+    pub(crate) fn flush_wal_holding_lease(&mut self) -> Result<()> {
         if let Some(wal) = self.durable_handle() {
-            let mut guard = wal.lock().map_err(|_| {
+            let mut guard_wal = wal.lock().map_err(|_| {
                 PinkDbError::Execution("internal lock error (poisoned)".to_string())
             })?;
-            guard.flush()?;
+            guard_wal.flush()?;
+            guard_wal.publish();
         }
         Ok(())
+    }
+
+    /// Change the busy timeout of the durable lease (no-op in memory). The
+    /// timeout bounds how long any operation waits for another process's
+    /// lease before reporting the database busy.
+    pub fn set_busy_timeout(&self, timeout: Duration) {
+        if let Some(lease) = &self.lease {
+            lease.set_busy_timeout(timeout);
+        }
     }
 
     /// True when `path` refers to the same `.pink` file this database is
@@ -1637,10 +3169,32 @@ impl PinkDb {
                 target_wal.display()
             )));
         }
-        match &self.encryption_key {
+        // A live lease on the target means a process is writing or
+        // checkpointing it: refuse instead of racing. The lock is held for
+        // the snapshot itself, so nothing can slip in between the check and
+        // the publish (dropping the fd releases the flock).
+        let lock_path = PathBuf::from(format!("{}.lock", target.display()));
+        let target_lease = match File::open(&lock_path) {
+            Ok(f) => match f.try_lock() {
+                Ok(()) => Some(f),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(PinkDbError::Execution(format!(
+                        "refusing to save over {path}: the database is currently in use by \
+                         another handle or process; retry after it finishes"
+                    )));
+                }
+                // Locking unsupported: nothing to coordinate with.
+                Err(std::fs::TryLockError::Error(_)) => None,
+            },
+            // No lock file: the target was never opened durably.
+            Err(_) => None,
+        };
+        let result = match &self.encryption_key {
             Some(key) => self.save_with_key(path, key),
             None => self.save(path),
-        }
+        };
+        drop(target_lease);
+        result
     }
 }
 
@@ -1751,8 +3305,43 @@ mod tests {
 
     fn records_of(path: &Path) -> Vec<Record> {
         let data = std::fs::read(path).unwrap();
-        let (recs, _) = parse_records(&data, HEADER_LEN, None).unwrap();
+        let (recs, _) = parse_records(&data, RECORDS_START, None, 0, 0).unwrap();
         recs
+    }
+
+    /// M3: two independent opens (two leases, two WAL handles) in one
+    /// process see each other's commits through the epoch-gated refresh.
+    #[test]
+    fn two_opens_refresh_each_other() {
+        let p = tmp_ckpt("twoopens");
+        let mut a = durable(&p);
+        let mut b = durable(&p); // before the table exists
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        assert!(ints(&mut b, "SELECT 1;").len() == 1); // refresh past the create
+        for n in 1..=5 {
+            a.execute(&format!("INSERT INTO t VALUES ({n});")).unwrap();
+            assert_eq!(
+                ints(&mut b, &format!("SELECT a FROM t WHERE a = {n};")),
+                vec![n],
+                "b must see row {n}"
+            );
+        }
+        for n in 6..=10 {
+            b.execute(&format!("INSERT INTO t VALUES ({n});")).unwrap();
+            assert_eq!(
+                ints(&mut a, &format!("SELECT a FROM t WHERE a = {n};")),
+                vec![n],
+                "a must see row {n}"
+            );
+        }
+        drop(a);
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            (1..=10).collect::<Vec<_>>()
+        );
+        cleanup(&p);
     }
 
     #[test]
@@ -1825,22 +3414,51 @@ mod tests {
         assert_eq!(ints(&mut back, "SELECT COUNT(*) FROM t;"), vec![3]);
     }
 
+    /// Wave 45m: a durable database is no longer a single-handle resource.
+    /// A second open succeeds, both handles see each other's commits on
+    /// their next statement (refresh under the lease), clones share the
+    /// lease, and the last clone releases the flock.
     #[test]
-    fn a_durable_database_has_one_live_handle() {
+    fn concurrent_opens_share_the_database() {
         let ckpt = tmp_ckpt("lock");
-        let first = durable(&ckpt);
-        let err = PinkDb::open_durable(ckpt.to_str().unwrap())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("already open"), "{err}");
-        // Clones (transaction snapshots, Database handles) share the lock.
+        let mut first = durable(&ckpt);
+        first
+            .execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        // The second open recovers/replays under the per-operation lease and
+        // releases it when open completes.
+        let mut second = durable(&ckpt);
+        assert_eq!(ints(&mut second, "SELECT a FROM t ORDER BY a;"), vec![1]);
+        // Commits by one handle become visible to the other on its next
+        // statement.
+        second.execute("INSERT INTO t VALUES (2);").unwrap();
+        assert_eq!(ints(&mut first, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        first.execute("INSERT INTO t VALUES (3);").unwrap();
+        assert_eq!(
+            ints(&mut second, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 3]
+        );
+        // Clones (transaction snapshots, Database handles) share the lease.
         let shared = crate::Database::from_store(first.clone());
         drop(first);
-        assert!(PinkDb::open_durable(ckpt.to_str().unwrap()).is_err());
+        drop(second);
+        // A third open may write while the clone still lives.
+        let mut third = durable(&ckpt);
+        third.execute("INSERT INTO t VALUES (4);").unwrap();
+        drop(third);
+        let mut c = shared.connect();
+        assert_eq!(
+            ints_conn(&mut c, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 3, 4]
+        );
+        // The last clone releases the lease.
+        drop(c);
         drop(shared);
-        // The last clone releases it.
         let mut again = durable(&ckpt);
-        again.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        assert_eq!(
+            ints(&mut again, "SELECT a FROM t ORDER BY a;"),
+            vec![1, 2, 3, 4]
+        );
     }
 
     #[test]
@@ -1979,8 +3597,27 @@ mod tests {
         db.execute("SELECT * FROM t;").unwrap();
 
         let data = std::fs::read(wal_path(&p)).unwrap();
-        assert_eq!(&data[..HEADER_LEN], &Wal::header_for(1));
-        let (recs, good_end) = parse_records(&data, HEADER_LEN, None).unwrap();
+        // The v3 header: magic, version 3, generation 1, a fresh wal_id, a
+        // valid header CRC, and a published commit slot carrying lsn 3.
+        assert_eq!(&data[..8], WAL_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(data[8..12].try_into().unwrap()),
+            WAL_VERSION
+        );
+        assert_eq!(
+            u64::from_le_bytes(data[12..20].try_into().unwrap()),
+            1,
+            "generation"
+        );
+        assert_ne!(&data[20..36], [0u8; 16], "wal_id is fresh, never zero");
+        assert_eq!(
+            u32::from_le_bytes(data[36..40].try_into().unwrap()),
+            crc32(&data[..36]),
+            "header CRC covers magic..wal_id"
+        );
+        let published = slot_max_in(&data, WAL_SLOT_A as usize, WAL_SLOT_DOMAIN);
+        assert_eq!(published, 3, "one commit slot per appended record");
+        let (recs, good_end) = parse_records(&data, RECORDS_START, None, 0, 0).unwrap();
         assert_eq!(good_end, data.len());
         assert_eq!(recs.len(), 3);
         assert_eq!(
@@ -1992,7 +3629,7 @@ mod tests {
             vec!["INSERT INTO t VALUES (1, 'x')".to_string()]
         );
         // CRC field verifies against the payload of every record.
-        let mut pos = HEADER_LEN;
+        let mut pos = RECORDS_START;
         for rec in &recs {
             let payload_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             let crc = u32::from_le_bytes(data[pos + 12..pos + 16].try_into().unwrap());
@@ -2255,10 +3892,18 @@ mod tests {
     #[test]
     fn wal_header_validation() {
         let p = tmp_ckpt("badmagic");
-        // Invalid magic on a file with payload bytes: hard error.
-        std::fs::write(wal_path(&p), b"NOTAWAL1\0\0\0\0extrabytes").unwrap();
+        // Invalid magic on a file longer than one header (it could hold
+        // records): hard error.
+        std::fs::write(wal_path(&p), vec![b'X'; HEADER_LEN + 40]).unwrap();
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("bad magic"), "{err}");
+
+        // Invalid magic but no longer than one header: a torn creation,
+        // recreated (this was the pre-v3 rule at 20 bytes; one header is 96).
+        std::fs::write(wal_path(&p), b"NOTAWAL1\0\0\0\0extrabytes").unwrap();
+        let db = PinkDb::open_durable(p.to_str().unwrap()).unwrap();
+        assert_eq!(wal_len(&p), HEADER_LEN as u64);
+        drop(db);
 
         // The pre-generation format (version 1) with records: hard error.
         let mut old = Vec::new();
@@ -2271,6 +3916,37 @@ mod tests {
             err.to_string().contains("version 1 is not supported"),
             "{err}"
         );
+
+        // A future version is refused cleanly through the same BadVersion
+        // path an old build would use to refuse our version 3 (that
+        // direction cannot be executed from this tree).
+        let mut future = Vec::new();
+        future.extend_from_slice(WAL_MAGIC);
+        future.extend_from_slice(&4u32.to_le_bytes());
+        future.extend_from_slice(b"payload-bytes");
+        std::fs::write(wal_path(&p), &future).unwrap();
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("version 4 is not supported"),
+            "{err}"
+        );
+
+        // A v3 header whose CRC does not verify, on a record-bearing file:
+        // hard error (a corrupted header could name the wrong generation).
+        let mut bytes = Wal::header_for(7).to_vec();
+        bytes[20] ^= 0xFF; // inside wal_id (covered by the header CRC)
+        bytes.extend_from_slice(b"garbage-bytes-here");
+        std::fs::write(wal_path(&p), &bytes).unwrap();
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
+
+        // Nonzero reserved header bytes are a format error, not a torn write.
+        let mut bytes = Wal::header_for(7).to_vec();
+        bytes[88] = 1;
+        bytes.extend_from_slice(b"garbage-bytes-here");
+        std::fs::write(wal_path(&p), &bytes).unwrap();
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("reserved bytes"), "{err}");
 
         // Exactly one header of garbage: a torn header, recreated.
         std::fs::write(wal_path(&p), vec![0xABu8; HEADER_LEN]).unwrap();
@@ -2294,6 +3970,217 @@ mod tests {
         assert_eq!(info.truncated_bytes, 18);
         assert_eq!(wal_len(&p), HEADER_LEN as u64);
         drop(db);
+        cleanup(&p);
+    }
+
+    /// Wave 45m: a v2 WAL (20-byte header, no `wal_id`) is accepted and
+    /// upgraded in place to v3 under the lease: records are byte-preserved,
+    /// the header becomes v3 with a fresh `wal_id` and slot A seeded with
+    /// the last intact LSN.
+    #[test]
+    fn legacy_v2_wal_upgrades_in_place() {
+        let p = tmp_ckpt("v2upgrade");
+        write_pink(&p, &[0]);
+        // A hand-built v2 WAL: magic + version 2 + gen 1, then two records.
+        let wal = wal_path(&p);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(WAL_MAGIC);
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        let recs = raw(&[
+            vec!["INSERT INTO t VALUES (1);".to_string()],
+            vec!["INSERT INTO t VALUES (2);".to_string()],
+        ]);
+        let record_bytes_start = bytes.len();
+        for (lsn, stmts) in &recs {
+            let payload = encode_payload(stmts).unwrap();
+            bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            bytes.extend_from_slice(&lsn.to_le_bytes());
+            bytes.extend_from_slice(&crc32(&payload).to_le_bytes());
+            bytes.extend_from_slice(&payload);
+        }
+        std::fs::write(&wal, &bytes).unwrap();
+        let record_bytes = bytes[record_bytes_start..].to_vec();
+
+        let (mut db, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(info.replayed_records, 2);
+        assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![0, 1, 2]);
+
+        // The file is now v3: 96-byte header, records byte-preserved.
+        let data = std::fs::read(&wal).unwrap();
+        assert_eq!(u32::from_le_bytes(data[8..12].try_into().unwrap()), 3);
+        assert_eq!(
+            u32::from_le_bytes(data[36..40].try_into().unwrap()),
+            crc32(&data[..36])
+        );
+        assert_ne!(&data[20..36], [0u8; 16], "fresh wal_id");
+        assert_eq!(
+            slot_max_in(&data, WAL_SLOT_A as usize, WAL_SLOT_DOMAIN),
+            1,
+            "upgrade seeds slot A"
+        );
+        assert_eq!(
+            &data[RECORDS_START..],
+            &record_bytes[..],
+            "records preserved"
+        );
+
+        // A leftover `.upgrade` temp (a crash mid-upgrade) is ignored and
+        // harmless (design row R1).
+        std::fs::write(upgrade_path(&wal, 1), b"stale").unwrap();
+        drop(db);
+        let (mut back, info) =
+            PinkDb::open_durable_with(p.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+        assert_eq!(info.replayed_records, 2, "idempotent: no re-append");
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+            vec![0, 1, 2]
+        );
+        drop(back);
+        cleanup(&p);
+    }
+
+    /// The publication slots: both a torn slot and a slot pair with a bad
+    /// CRC are ignored (max over valid slots); a corrupted slot never
+    /// validates.
+    #[test]
+    fn torn_commit_slots_are_ignored() {
+        let p = tmp_ckpt("tornslots");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        drop(db);
+        let wal = wal_path(&p);
+        let mut data = std::fs::read(&wal).unwrap();
+        // Three records: A holds seq 3 (value 3), B holds seq 2. Corrupting
+        // A's CRC leaves the reader with seq 2.
+        data[WAL_SLOT_A as usize + 16] ^= 0xFF;
+        let h = parse_wal_header(&data).unwrap();
+        assert_eq!(h.published_seq, 2);
+        // Corrupt both: no valid slot at all, and the file still opens (the
+        // slots are hints; the frames are authoritative).
+        data[WAL_SLOT_B as usize + 16] ^= 0xFF;
+        std::fs::write(&wal, &data).unwrap();
+        let h = parse_wal_header(&data).unwrap();
+        assert_eq!(h.published_seq, 0);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        // The next append publishes into a fresh sequence (A at seq 1).
+        back.execute("INSERT INTO t VALUES (3);").unwrap();
+        drop(back);
+        let data = std::fs::read(&wal).unwrap();
+        assert_eq!(slot_max_in(&data, WAL_SLOT_A as usize, WAL_SLOT_DOMAIN), 1);
+        cleanup(&p);
+    }
+
+    /// The epoch region in the lock file: bumps alternate slots, a torn slot
+    /// is ignored by the max, and the reader's stale() comparison works.
+    #[test]
+    fn lock_epoch_slots_tolerate_a_torn_write() {
+        let p = tmp_ckpt("epochslots");
+        let db = durable(&p);
+        let lease = db.lease_handle().unwrap();
+        assert_eq!(lease.epoch_now(), Some(0), "a fresh lock file has no slots");
+        {
+            let g = lease.acquire().unwrap();
+            g.bump_epoch(1);
+            g.bump_epoch(2);
+            g.bump_epoch(3);
+        }
+        assert_eq!(lease.epoch_now(), Some(3));
+        let lock_path = format!("{}.lock", p.display());
+        // Bumps alternate slots: A holds seq 3 (value 3), B holds seq 2.
+        // Corrupting B leaves the max at seq 3.
+        let mut raw = std::fs::read(&lock_path).unwrap();
+        raw[24 + 16] ^= 0xFF;
+        std::fs::write(&lock_path, &raw).unwrap();
+        assert_eq!(lease.epoch_now(), Some(3));
+        // Corrupt both slots: no valid epoch, and the bump sequence restarts
+        // (the pair is a hint; a lost update costs a redundant refresh).
+        raw[16] ^= 0xFF;
+        std::fs::write(&lock_path, &raw).unwrap();
+        assert_eq!(lease.epoch_now(), Some(0));
+        lease.cache_epoch_now();
+        assert!(!lease.stale(), "cache now holds 0");
+        {
+            let g = lease.acquire().unwrap();
+            g.bump_epoch(9);
+        }
+        assert_eq!(lease.epoch_now(), Some(1), "seq restarts after total loss");
+        // The publisher's own cache follows its bump (a self-bump is never
+        // "stale for us"), and a foreign bump still compares unequal.
+        assert!(!lease.stale());
+        assert_eq!(lease.epoch_cache_value(), 1);
+        lease.cache_epoch_now();
+        assert!(!lease.stale());
+        drop(db);
+        cleanup(&p);
+    }
+
+    /// Wave 45m M1: the busy timeout is what a second process sees while
+    /// another holds the lease (holding the flock from an independent fd in
+    /// the test process is exactly what `flock` sees from another process).
+    /// The report names both causes, and the handle keeps working after the
+    /// holder exits.
+    #[test]
+    fn lease_reports_busy_after_the_timeout() {
+        let p = tmp_ckpt("busy");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let foreign = {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("{}.lock", p.display()))
+                .unwrap();
+            f.try_lock().unwrap();
+            f
+        };
+        db.set_busy_timeout(Duration::from_millis(30));
+        let err = db.execute("INSERT INTO t VALUES (1);").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is busy"), "{msg}");
+        assert!(msg.contains("older pinkdb build"), "{msg}");
+        // A read that needs no refresh is still served from memory.
+        assert!(ints(&mut db, "SELECT a FROM t;").is_empty());
+        // After the foreign holder exits, the same handle succeeds.
+        drop(foreign);
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
+        cleanup(&p);
+    }
+
+    /// M1: `UnsafeSingleProcess` restores today's semantics when the
+    /// filesystem cannot lock; `Required` (the default) refuses to proceed.
+    /// The `Unsupported` arm is injected through a test-only switch because
+    /// no local filesystem here lacks `flock`.
+    #[test]
+    fn unsupported_locking_fails_closed_unless_opted_out() {
+        let p = tmp_ckpt("unsupported");
+        let opts = |mode| DurableOpenOptions {
+            lock_mode: mode,
+            ..DurableOpenOptions::default()
+        };
+        FORCE_UNSUPPORTED.with(|f| f.set(true));
+        let err = PinkDb::open_durable_with_options(p.to_str().unwrap(), opts(LockMode::Required))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("file locking is not supported"), "{err}");
+        // The escape hatch opens and writes without coordination.
+        let (mut db, _) = PinkDb::open_durable_with_options(
+            p.to_str().unwrap(),
+            opts(LockMode::UnsafeSingleProcess),
+        )
+        .unwrap();
+        db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        drop(db);
+        FORCE_UNSUPPORTED.with(|f| f.set(false));
+        // The default mode still opens the database normally afterwards.
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
         cleanup(&p);
     }
 
@@ -2379,6 +4266,267 @@ mod tests {
             ints(&mut again, "SELECT a FROM t ORDER BY a;"),
             vec![1, 2, 3]
         );
+        cleanup(&p);
+    }
+
+    /// H2: a refresh replays another process's `USE` in the WAL lineage
+    /// session but must never let it hijack this process's local session.
+    #[test]
+    fn refresh_does_not_hijack_the_local_session() {
+        let p = tmp_ckpt("sessionhijack");
+        let mut a = durable(&p);
+        a.execute(
+            "CREATE DATABASE db1; \
+             CREATE TABLE main.t (a INTEGER); \
+             CREATE TABLE db1.t (a INTEGER);",
+        )
+        .unwrap();
+        let mut b = durable(&p);
+        b.execute("INSERT INTO main.t VALUES (10);").unwrap();
+        // a logs a USE + an insert in db1; b refreshes past both.
+        a.execute("USE db1; INSERT INTO t VALUES (1);").unwrap();
+        assert_eq!(a.current_db(), "db1");
+        assert_eq!(ints(&mut b, "SELECT a FROM db1.t;"), vec![1]);
+        assert_eq!(
+            b.current_db(),
+            "main",
+            "another process's USE must not move the local session"
+        );
+        assert_eq!(ints(&mut b, "SELECT a FROM t;"), vec![10]);
+        // The writer's session is untouched either.
+        assert_eq!(a.current_db(), "db1");
+        assert_eq!(ints(&mut a, "SELECT a FROM t;"), vec![1]);
+        cleanup(&p);
+    }
+
+    /// H5: replay is not gated by the front-end `LOAD EXTENSION` switch. A
+    /// reader that disabled SQL `LOAD EXTENSION` still *attempts* the load a
+    /// replayed record needs — the failure is the loader's (a missing file),
+    /// never the front-end's "disabled" refusal — and its flag is restored
+    /// afterwards.
+    #[test]
+    fn refresh_replay_bypasses_the_sql_load_extension_gate() {
+        let p = tmp_ckpt("h5gate");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = durable(&p);
+        b.set_allow_sql_load_extension(false);
+        // A record that needs an extension the file does not provide.
+        let wal = wal_path(&p);
+        let mut data = std::fs::read(&wal).unwrap();
+        let sql = "LOAD EXTENSION '/nonexistent/pinkdb-h5-test.dylib';";
+        let payload = encode_payload(&[sql.to_string()]).unwrap();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&crc32(&payload).to_le_bytes());
+        data.extend_from_slice(&payload);
+        std::fs::write(&wal, &data).unwrap();
+        // Publish the change from the *other* handle's lease (a crashed
+        // publisher's epoch bump, simulated): b's cache stays behind, so its
+        // next statement scans and replays the manual frame.
+        a.lease_handle().unwrap().bump_epoch(2);
+        let err = b.execute("SELECT 1;").unwrap_err().to_string();
+        assert!(err.contains("refresh failed"), "{err}");
+        assert!(
+            !err.contains("disabled on this connection"),
+            "replay must bypass the front-end gate: {err}"
+        );
+        assert!(
+            err.to_lowercase().contains("dylib") || err.contains("load"),
+            "{err}"
+        );
+        drop(b);
+        drop(a);
+        cleanup(&p);
+    }
+
+    /// H4/H9/H6: a replayed `CREATE TABLE` colliding with this process's
+    /// session-local view is a hard error that poisons the handle — committed
+    /// data is never silently dropped and the partially advanced store is
+    /// never observable.
+    #[test]
+    fn refresh_replay_error_poisons_the_handle() {
+        let p = tmp_ckpt("replaypoison");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE base (x INTEGER);").unwrap();
+        let mut b = durable(&p);
+        // b's session-local view is named like the table `a` will create.
+        b.execute("CREATE VIEW t AS SELECT 1 AS x;").unwrap();
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        // b's next statement refreshes; the replayed CREATE TABLE collides.
+        let err = b.execute("SELECT 1;").unwrap_err().to_string();
+        assert!(err.contains("refresh failed"), "{err}");
+        // Every later statement fail-stops (the store may hold a partial
+        // replay; it must not be observed).
+        let err = b.execute("SELECT 1;").unwrap_err().to_string();
+        assert!(err.contains("stopped after a WAL write failure"), "{err}");
+        drop(b);
+        // A fresh open recovers the durable prefix.
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT COUNT(*) FROM t;"), vec![0]);
+        cleanup(&p);
+    }
+
+    /// H10: a full rebuild (another process's checkpoint) preserves this
+    /// process's session-local views and session; it is the reloaded catalog
+    /// plus the local, unpersisted facets.
+    #[test]
+    fn full_rebuild_preserves_local_views_and_session() {
+        let p = tmp_ckpt("rebuildlocals");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let mut b = durable(&p);
+        b.execute("CREATE VIEW v AS SELECT a FROM t;").unwrap();
+        b.execute("INSERT INTO t VALUES (5);").unwrap();
+        assert_eq!(ints(&mut b, "SELECT COUNT(*) FROM v;"), vec![2]);
+        // a checkpoints (its state has rows 1 and 5): b's next statement does
+        // a full rebuild and must keep its view.
+        a.execute("INSERT INTO t VALUES (2); checkpoint;").unwrap();
+        assert_eq!(
+            ints(&mut b, "SELECT COUNT(*) FROM v;"),
+            vec![3],
+            "the local view must survive the rebuild and see the reloaded rows"
+        );
+        assert_eq!(b.current_db(), "main");
+        // The replayed state is complete on both sides.
+        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 5]);
+        assert_eq!(ints(&mut a, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 5]);
+        cleanup(&p);
+    }
+
+    /// W2 self-healing: a crashed publisher left durable-but-unpublished
+    /// frames (an appended record with no epoch bump). Already-open readers
+    /// lag until later lease activity (the documented residual gap), but the
+    /// next writer re-checks the file under the lease (`needs_scan` compares
+    /// the length) and applies them before appending.
+    #[test]
+    fn unpublished_frames_are_recovered_by_the_next_lease_activity() {
+        let p = tmp_ckpt("w2heal");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = durable(&p);
+        assert!(ints(&mut b, "SELECT a FROM t;").is_empty());
+        // A crashed publisher: append and fsync a record, never publish.
+        let wal = wal_path(&p);
+        let mut data = std::fs::read(&wal).unwrap();
+        let payload = encode_payload(&["INSERT INTO t VALUES (7);".to_string()]).unwrap();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&2u64.to_le_bytes());
+        data.extend_from_slice(&crc32(&payload).to_le_bytes());
+        data.extend_from_slice(&payload);
+        std::fs::write(&wal, &data).unwrap();
+        // The reader trusting its epoch still serves the old view.
+        assert!(ints(&mut b, "SELECT a FROM t;").is_empty());
+        // The next write scans under the lease and applies the frame before
+        // appending its own.
+        b.execute("INSERT INTO t VALUES (8);").unwrap();
+        assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![7, 8]);
+        drop(a);
+        drop(b);
+        // A fresh open sees both, exactly once.
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![7, 8]);
+        cleanup(&p);
+    }
+
+    /// Design 6.5: the auto-checkpoint additionally requires this process to
+    /// own at least half of the live WAL, so N writers do not round-robin
+    /// the whole store. A process that reopens an existing WAL owns nothing
+    /// of it: it appends until its share is half, then the next commit folds.
+    #[test]
+    fn auto_checkpoint_requires_a_meaningful_share() {
+        let p = tmp_ckpt("ownshare");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        for i in 0..50 {
+            a.execute(&format!("INSERT INTO t VALUES ({i});")).unwrap();
+        }
+        let seeded = wal_len(&p);
+        drop(a);
+        let mut b = durable(&p);
+        b.set_auto_checkpoint_bytes(Some(1));
+        // b owns nothing of the seeded bytes: the first appends must not
+        // trigger a checkpoint.
+        b.execute("INSERT INTO t VALUES (1000);").unwrap();
+        assert!(wal_len(&p) > seeded, "no checkpoint triggered");
+        // Keep appending until b owns at least half of the live WAL; one of
+        // those commits then folds it (the WAL returns to a bare header).
+        let mut triggered = false;
+        let mut inserted = 1i64; // the probe insert above
+        for i in 0..200 {
+            b.execute(&format!("INSERT INTO t VALUES ({});", 1000 + i))
+                .unwrap();
+            inserted += 1;
+            if wal_len(&p) == HEADER_LEN as u64 {
+                triggered = true;
+                break;
+            }
+        }
+        assert!(triggered, "attribution never reached half the WAL");
+        drop(b);
+        let mut back = durable(&p);
+        assert_eq!(
+            ints(&mut back, "SELECT COUNT(*) FROM t;"),
+            vec![50 + inserted],
+            "all rows survived the attributed checkpoint"
+        );
+        cleanup(&p);
+    }
+
+    /// A snapshot over a target whose lease is currently held (another
+    /// process is writing or checkpointing it) is refused; once released it
+    /// succeeds.
+    #[test]
+    fn save_snapshot_refuses_a_lease_held_target() {
+        let a = tmp_ckpt("snaplease_a");
+        let b = tmp_ckpt("snaplease_b");
+        let _idle = durable(&b);
+        let foreign = {
+            let f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(format!("{}.lock", b.display()))
+                .unwrap();
+            f.try_lock().unwrap();
+            f
+        };
+        let mut aa = durable(&a);
+        aa.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        std::fs::write(b.to_str().unwrap(), b"stale").unwrap();
+        let err = aa.save_snapshot(b.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("in use"), "{err}");
+        drop(foreign);
+        aa.save_snapshot(b.to_str().unwrap()).unwrap();
+        let mut back = durable(&b);
+        assert_eq!(ints(&mut back, "SELECT COUNT(*) FROM t;"), vec![0]);
+        drop(back);
+        drop(aa);
+        cleanup(&a);
+        cleanup(&b);
+    }
+
+    /// The epoch fast path: an unchanged publication counter skips the
+    /// refresh entirely; a foreign bump makes the next statement refresh.
+    #[test]
+    fn epoch_fast_path_skips_unchanged_publications() {
+        let p = tmp_ckpt("fastpath");
+        let mut a = durable(&p);
+        a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut b = durable(&p);
+        assert_eq!(ints(&mut b, "SELECT COUNT(*) FROM t;"), vec![0]);
+        let lb = b.lease_handle().unwrap();
+        assert!(!lb.stale(), "a refreshed store is at the current epoch");
+        assert_eq!(lb.epoch_now(), Some(lb.epoch_cache_value()));
+        // The next read does not change anything.
+        assert!(!lb.stale());
+        // A commit elsewhere makes the epoch unequal.
+        a.execute("INSERT INTO t VALUES (1);").unwrap();
+        assert!(lb.stale());
+        assert_eq!(ints(&mut b, "SELECT a FROM t;"), vec![1]);
+        assert!(!lb.stale());
+        drop(a);
+        drop(b);
         cleanup(&p);
     }
 
@@ -3632,6 +5780,36 @@ mod tests {
             cleanup(&p);
         }
 
+        /// Wave 45m: two keyed opens refresh each other, including across a
+        /// checkpoint (the full-rebuild path with an encrypted WAL: the
+        /// counter must resync past the records of the new incarnation).
+        #[test]
+        fn keyed_two_opens_refresh_across_a_checkpoint() {
+            let p = tmp_ckpt("enctwoopens");
+            let mut a = durable_keyed(&p);
+            a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            let mut b = durable_keyed(&p);
+            a.execute("INSERT INTO t VALUES (1);").unwrap();
+            assert_eq!(ints(&mut b, "SELECT a FROM t;"), vec![1]);
+            // A checkpoint by `a` replaces both files; `b`'s next statement
+            // reloads checkpoint + fresh WAL.
+            a.execute("INSERT INTO t VALUES (2); checkpoint;").unwrap();
+            assert_eq!(ints(&mut b, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+            // `b` appends after the reload: the counter must continue past
+            // the records of the new generation (no nonce reuse), and `a`
+            // must see it after its own refresh.
+            b.execute("INSERT INTO t VALUES (3);").unwrap();
+            assert_eq!(ints(&mut a, "SELECT a FROM t ORDER BY a;"), vec![1, 2, 3]);
+            drop(a);
+            drop(b);
+            let mut back = durable_keyed(&p);
+            assert_eq!(
+                ints(&mut back, "SELECT a FROM t ORDER BY a;"),
+                vec![1, 2, 3]
+            );
+            cleanup(&p);
+        }
+
         #[test]
         fn wrong_key_fails_before_anything_replays() {
             let p = tmp_ckpt("encwrongkey");
@@ -3659,7 +5837,9 @@ mod tests {
             .unwrap();
             let wal = std::fs::read(wal_path(&p)).unwrap();
             assert!(wal.starts_with(crypto::ENC_MAGIC), "recreated encrypted");
-            assert_eq!(wal.len(), 80, "raw-key container header is 80 bytes");
+            // Raw-key container header (80 bytes) + the 88-byte publish
+            // block (container v2, wave 45m).
+            assert_eq!(wal.len(), 80 + 88, "recreated as container v2");
             assert_eq!(info.truncated_bytes, 0);
             drop(db);
             cleanup(&p);
@@ -3724,7 +5904,7 @@ mod tests {
             db.checkpoint().unwrap();
             let wal = std::fs::read(wal_path(&p)).unwrap();
             assert!(wal.starts_with(crypto::ENC_MAGIC));
-            assert_eq!(wal.len(), 80, "fresh generation is header-only");
+            assert_eq!(wal.len(), 80 + 88, "fresh generation is header + block");
             db.execute("INSERT INTO t VALUES (2);").unwrap();
             drop(db);
             let mut back = durable_keyed(&p);

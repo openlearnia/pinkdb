@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! magic "PINKENC1" (8 bytes)
-//! container version u32 (= 1)
+//! container version u32 (= 2; version 1 files are read and upgraded)
 //! cipher id u8 (1 = AES-256-GCM)
 //! kdf id u8 (0 = raw 32-byte key, 1 = Argon2id)
 //! context u64 (0 for a checkpoint; the WAL generation for a WAL file)
@@ -24,11 +24,17 @@
 //!
 //! Every AEAD unit uses nonce `nonce_prefix || counter u32 LE`: counter 0 is
 //! the key-check, then 1, 2, ... per checkpoint segment / WAL record. Within
-//! one container a (key, nonce) pair is therefore never reused; a WAL is
-//! rebuilt with a fresh random prefix on every keyed open (not only when a
-//! torn tail is discarded), so counters can never be reused after a shorter
-//! copy of the file — a Batch-mode tail lost at a record boundary, or a
-//! restored older backup — is reopened and appended to.
+//! one container a (key, nonce) pair is therefore never reused. Every keyed
+//! *open* of a WAL rebuilds it with a fresh random prefix (and a fresh
+//! `wal_id`), the wave-22 policy: a file cut exactly at a record boundary is
+//! byte-identical to a cleanly shorter one, so a counter resynced from the
+//! record count could otherwise hand out a discarded record's
+//! `(key, nonce, AAD)` again — real keystream reuse. With multi-process WAL
+//! access (wave 45m) that stays safe because every appender re-checks the
+//! WAL identity under the write lease and re-opens a replaced file before
+//! appending, and every refresh resyncs the cipher counter from the on-disk
+//! record count. Consequence (documented trade-off): a copied
+//! same-generation file must not be independently appended to.
 //!
 //! The AAD binds the whole public header (so any header/KDF/parameter change
 //! breaks every unit) plus the counter, plus the checkpoint segment index or
@@ -60,7 +66,13 @@ use crate::types::{PinkDbError, Result};
 /// produce the "file is encrypted; build with the encryption feature" error.
 pub const ENC_MAGIC: &[u8; 8] = b"PINKENC1";
 
-const ENC_VERSION: u32 = 1;
+const ENC_VERSION: u32 = 2;
+/// The pre-multi-process container version: no WAL publish block. Files are
+/// read as-is (checkpoints) or rebuilt as v2 (WALs) at open.
+const ENC_VERSION_V1: u32 = 1;
+/// The container version this build writes (the WAL publish block's CRC
+/// domain binds it).
+pub(crate) const CONTAINER_VERSION: u32 = ENC_VERSION;
 const CIPHER_AES256_GCM: u8 = 1;
 const KDF_RAW: u8 = 0;
 const KDF_ARGON2ID: u8 = 1;
@@ -218,6 +230,8 @@ impl Drop for EncryptionKey {
 /// the key, and locate the payload — no key required.
 #[derive(Debug, Clone)]
 pub(crate) struct ContainerHeader {
+    /// Container format version (1 or 2).
+    pub version: u32,
     /// 0 for a checkpoint, the WAL generation for a WAL file.
     pub context: u64,
     pub kdf: u8,
@@ -251,9 +265,10 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
         return Err(corrupt("truncated container header"));
     }
     let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-    if version != ENC_VERSION {
+    if version != ENC_VERSION && version != ENC_VERSION_V1 {
         return Err(corrupt(&format!(
-            "unsupported container version {version} (want {ENC_VERSION})"
+            "unsupported container version {version} (want {ENC_VERSION}, or {ENC_VERSION_V1} \
+             for legacy files)"
         )));
     }
     let cipher = data[12];
@@ -313,6 +328,7 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
     let key_check = data[pos..pos + key_check_len + TAG_LEN].to_vec();
     let payload_start = pos + key_check_len + TAG_LEN;
     Ok(ContainerHeader {
+        version,
         context,
         kdf,
         params,

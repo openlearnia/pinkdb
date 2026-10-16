@@ -32,7 +32,9 @@ pub use exec::QueryResult;
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};
 pub use vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
-pub use wal::{RecoveryInfo, SyncPolicy, DEFAULT_AUTO_CHECKPOINT_BYTES};
+pub use wal::{
+    DurableOpenOptions, LockMode, RecoveryInfo, SyncPolicy, DEFAULT_AUTO_CHECKPOINT_BYTES,
+};
 
 impl PinkDb {
     /// Parse and run every statement in `sql`, returning one result each.
@@ -41,6 +43,13 @@ impl PinkDb {
     /// statement to the WAL: autocommit statements individually, transaction
     /// statements as one record at `COMMIT`. In-memory databases skip that
     /// entirely — behavior is unchanged.
+    ///
+    /// Multi-process (wave 45m): at every statement boundary outside a
+    /// transaction, a durable store refreshes its view from the WAL when the
+    /// publication epoch says another process advanced it; mutating
+    /// statements take the write lease for `[refresh → execute → append →
+    /// publish → auto-checkpoint]`. Reads are served from memory and pay one
+    /// `pread` when nothing changed.
     ///
     /// The embedded session's current database (`USE`) applies to every later
     /// statement in the same string; unqualified names resolve against it.
@@ -61,6 +70,12 @@ impl PinkDb {
         };
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
+            // Refresh at the statement boundary (never mid-statement, never
+            // inside a transaction): reads served from memory only skip the
+            // protocol when the epoch says the on-disk state did not change.
+            if self.is_durable() && !self.in_transaction() {
+                self.refresh_if_stale()?;
+            }
             let session_db = self.current_db().to_string();
             let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
             let plan = optimizer::optimize(self, plan);
@@ -81,6 +96,33 @@ impl PinkDb {
             if self.is_durable() && plan::writes_tables(&plan) {
                 self.refuse_logged_attached_reads(&plan)?;
             }
+            // Transaction control manages its own lease (`begin` holds it
+            // until `commit`/`rollback`). Other mutating statements (and
+            // CHECKPOINT under these rules) take the lease around
+            // `[refresh → execute → append → publish → auto-checkpoint]`;
+            // reads never take it.
+            let needs_lease = self.is_durable()
+                && !self.in_transaction()
+                && (plan::writes_tables(&plan) || matches!(plan, plan::LogicalPlan::Checkpoint));
+            let lease = if needs_lease {
+                self.acquire_lease()?
+            } else {
+                None
+            };
+            let (plan, dynamic_functions_used) = match &lease {
+                Some(g) => {
+                    if self.refresh_under_lease(g)? {
+                        // The refresh may have changed the catalog (or the
+                        // replayed frames may name objects bound above):
+                        // rebind against the refreshed state.
+                        let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                        (optimizer::optimize(self, p), d)
+                    } else {
+                        (plan, dynamic_functions_used)
+                    }
+                }
+                None => (plan, dynamic_functions_used),
+            };
             let result = exec::run(self, &plan)?;
             // Session transitions are applied before WAL logging so the log
             // record carries the post-statement session database.
@@ -96,8 +138,9 @@ impl PinkDb {
             }
             if let Some(texts) = &texts {
                 self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used)?;
-                self.maybe_auto_checkpoint();
+                self.maybe_auto_checkpoint(lease.as_ref());
             }
+            drop(lease);
             out.push(result);
         }
         Ok(out)

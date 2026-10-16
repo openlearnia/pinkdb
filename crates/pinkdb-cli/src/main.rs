@@ -27,7 +27,7 @@ macro_rules! cli_error {
     }};
 }
 
-use pinkdb::{DataType, EncryptionKey, PinkDb, QueryResult, SyncPolicy, Value};
+use pinkdb::{DataType, DurableOpenOptions, EncryptionKey, PinkDb, QueryResult, Value};
 use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
 
@@ -593,9 +593,10 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             if path.is_empty() {
                 println!("Usage: .open <file.pink>");
             } else {
-                // Re-opening the database this session already holds: the
-                // durable lock is per handle, so release the current store
-                // first (its state is durable; the reopen replays it).
+                // Re-opening the database this session already holds: release
+                // the current store first so its WAL handle is closed (the
+                // per-operation lease means this is an optimization, not a
+                // lock requirement).
                 if db.is_bound_to(path) {
                     let key = db.encryption_key().cloned();
                     *db = PinkDb::new();
@@ -603,9 +604,10 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                 }
                 // `PINKDB_KEY` (if set) is already installed on the store, so
                 // both the checkpoint and the snapshot path encrypt.
+                let opts = durable_options();
                 let result = match db.encryption_key() {
-                    Some(k) => PinkDb::open_durable_with_key_and_policy(path, SyncPolicy::Sync, k),
-                    None => PinkDb::open_durable_with(path, SyncPolicy::Sync),
+                    Some(k) => PinkDb::open_durable_with_key_and_options(path, k, opts),
+                    None => PinkDb::open_durable_with_options(path, opts),
                 };
                 match result {
                     Ok((new_db, info)) => {
@@ -904,6 +906,19 @@ fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
             std::process::exit(2);
         }
     }
+}
+
+/// Durable-open options from the environment: `PINKDB_BUSY_TIMEOUT_MS`
+/// (optional) bounds how long `.open` and later statements wait for another
+/// process's write lease before reporting the database busy.
+fn durable_options() -> DurableOpenOptions {
+    let mut opts = DurableOpenOptions::default();
+    if let Ok(ms) = std::env::var("PINKDB_BUSY_TIMEOUT_MS") {
+        if let Ok(ms) = ms.trim().parse::<u64>() {
+            opts.busy_timeout = std::time::Duration::from_millis(ms);
+        }
+    }
+    opts
 }
 
 fn main() {

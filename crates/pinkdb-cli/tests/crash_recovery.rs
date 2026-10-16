@@ -457,3 +457,154 @@ fn import_then_logged_dml_survives_sigkill_without_bricking() {
     drop(db);
     cleanup(&ckpt);
 }
+
+/// Wave-45m M4 (state C1): SIGKILL while the checkpoint's `.tmp` is being
+/// written, before the WAL roll. The `.tmp` is not provably complete, so
+/// recovery must discard it and keep the live WAL authoritative: every acked
+/// row survives, and the database checkpoints cleanly afterwards.
+#[test]
+fn sigkill_during_tmp_write_keeps_the_live_wal_authoritative() {
+    let dir = scratch("tmpwrite");
+    let ckpt = dir.join("crash.pink");
+    let path = ckpt.to_str().unwrap().to_string();
+    let big = "w".repeat(4_000_000);
+    let cmds = format!(
+        ".open {path}\n\
+         CREATE TABLE t (a INTEGER, v VARCHAR);\n\
+         INSERT INTO t VALUES (1, '{big}');\n\
+         INSERT INTO t VALUES (2, '{big}');\n\
+         SELECT 'tmp-setup-ok' AS m;\n\
+         .save {path}\n\
+         .quit\n"
+    );
+    let tmp = dir.join("crash.pink.tmp");
+    let mut captured = false;
+    for _attempt in 0..10 {
+        for f in std::fs::read_dir(&dir).unwrap() {
+            let _ = std::fs::remove_file(f.unwrap().path());
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn pinkdb CLI");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(cmds.as_bytes())
+            .unwrap();
+        // The step-1 window: `.tmp` exists, no roll, no published `.pink`,
+        // while the live WAL still holds both committed rows.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut hit = false;
+        while std::time::Instant::now() < deadline {
+            if tmp.exists() && !has_gen_roll(&ckpt) && !ckpt.exists() {
+                hit = true;
+                break;
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+        }
+        let _ = child.kill();
+        child.wait().unwrap();
+        if hit && tmp.exists() && !has_gen_roll(&ckpt) && !ckpt.exists() {
+            captured = true;
+            break;
+        }
+    }
+    assert!(captured, "never caught the checkpoint tmp-write window");
+
+    let (mut db, info) = PinkDb::open_durable_with(&path, SyncPolicy::Sync).unwrap();
+    assert_eq!(
+        info.checkpoints_completed, 0,
+        ".tmp is not provably complete"
+    );
+    assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+    assert!(!tmp.exists(), "recovery discarded the partial .tmp");
+    // A clean checkpoint still works on the recovered database.
+    db.checkpoint().unwrap();
+    drop(db);
+    let (mut again, info) = PinkDb::open_durable_with(&path, SyncPolicy::Sync).unwrap();
+    assert_eq!(info.replayed_records, 0);
+    assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+    drop(again);
+    cleanup(&ckpt);
+}
+
+/// Wave-45m M4 (state W1): SIGKILL while a wide INSERT is being written.
+/// The check is prefix consistency, not one particular outcome: the acked row
+/// is durable and the unacked row is either fully committed (the fsync won
+/// the race) or absent — never half-applied and never duplicated.
+#[test]
+fn sigkill_mid_commit_leaves_no_partial_or_duplicated_row() {
+    let dir = scratch("midcommit");
+    let ckpt = dir.join("crash.pink");
+    let path = ckpt.to_str().unwrap().to_string();
+    let big = "m".repeat(8_000_000);
+    // Row 1 is acked; row 2's wide write is in flight when the process dies.
+    let cmds = |path: &str| {
+        format!(
+            ".open {path}\n\
+             CREATE TABLE t (a INTEGER, v VARCHAR);\n\
+             INSERT INTO t VALUES (1, 'small');\n\
+             SELECT 'mid-setup-ok' AS m;\n\
+             INSERT INTO t VALUES (2, '{big}');\n\
+             SELECT 'never-printed' AS m;\n"
+        )
+    };
+    let wal = dir.join("crash.pink.wal");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .expect("spawn pinkdb CLI");
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(cmds(&path).as_bytes()).unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).expect("read CLI stdout");
+            assert!(n > 0, "CLI exited before the acked marker");
+            if line.contains("mid-setup-ok") {
+                break;
+            }
+        }
+    }
+    // The second record is being written: wait until the WAL grows past the
+    // post-ack size, then SIGKILL (both a torn and a complete record are
+    // legal outcomes; only consistency is asserted below).
+    let after_ack = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > after_ack {
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+    }
+    let _ = child.kill();
+    child.wait().unwrap();
+
+    // A fresh open recovers exactly the durable prefix: row 1 always, row 2
+    // at most once, and the file survives repeated opens.
+    let (mut db, _) = PinkDb::open_durable_with(&path, SyncPolicy::Sync).unwrap();
+    let rows = ints(&mut db, "SELECT a FROM t ORDER BY a;");
+    assert!(
+        rows == vec![1] || rows == vec![1, 2],
+        "unexpected recovered rows: {rows:?}"
+    );
+    drop(db);
+    let (mut again, _) = PinkDb::open_durable_with(&path, SyncPolicy::Sync).unwrap();
+    assert_eq!(ints(&mut again, "SELECT a FROM t ORDER BY a;"), rows);
+    drop(again);
+    cleanup(&ckpt);
+}

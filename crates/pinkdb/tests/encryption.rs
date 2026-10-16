@@ -165,6 +165,18 @@ fn payload_start(data: &[u8]) -> usize {
     pos + 30 + 16
 }
 
+/// Where a (container v2) encrypted WAL's records begin: the publish block
+/// (wal_id + CRC + two commit slots) sits between the header and the records.
+fn wal_records_start(data: &[u8]) -> usize {
+    // The container version is the u32 at 8..12; v2 WALs carry the block.
+    assert_eq!(
+        u32::from_le_bytes(data[8..12].try_into().unwrap()),
+        2,
+        "wave-45m WALs are container v2"
+    );
+    payload_start(data) + 88
+}
+
 /// A 900-byte string with no useful repeats (16-char hex chunks of a seeded
 /// LCG): the container tests need their plaintext to stay above the AEAD
 /// segment size, and a repetitive filler would now be LZ-compressed below it.
@@ -424,7 +436,7 @@ fn empty_encrypted_wal_opens_and_replays() {
         wal.starts_with(ENC_MAGIC),
         "WAL must be an encrypted container"
     );
-    assert_eq!(wal.len(), payload_start(&wal), "header-only WAL");
+    assert_eq!(wal.len(), wal_records_start(&wal), "header + block only");
     db.execute("CREATE TABLE t (a INTEGER);").unwrap();
     db.execute("INSERT INTO t VALUES (1);").unwrap();
     drop(db);
@@ -498,7 +510,7 @@ fn encrypted_wal_mid_file_tamper_is_a_hard_error() {
         db.execute("INSERT INTO t VALUES (2);").unwrap();
     }
     let mut wal = std::fs::read(s.wal()).unwrap();
-    let start = payload_start(&wal);
+    let start = wal_records_start(&wal);
     // Flip a ciphertext byte of the *first* record while records follow:
     // indistinguishable from mid-file corruption, so replay hard-errors
     // instead of silently dropping committed records.
@@ -531,7 +543,7 @@ fn encrypted_checkpoint_roundtrips_and_leaks_no_plaintext() {
         let wal = std::fs::read(s.wal()).unwrap();
         assert!(!wal.windows(marker.len()).any(|w| w == marker.as_bytes()));
         // The rolled WAL is a fresh encrypted generation.
-        assert_eq!(wal.len(), payload_start(&wal));
+        assert_eq!(wal.len(), wal_records_start(&wal));
         db.execute(&format!("INSERT INTO t VALUES (2, '{marker}');"))
             .unwrap();
     }
@@ -661,7 +673,7 @@ fn rewrite_of(wal: &Path) -> PathBuf {
 fn wal_frames(data: &[u8]) -> Vec<(u64, u32, usize, usize)> {
     assert_eq!(&data[..8], ENC_MAGIC, "not an encrypted WAL");
     let mut out = Vec::new();
-    let mut pos = payload_start(data);
+    let mut pos = wal_records_start(data);
     while pos < data.len() {
         assert!(data.len() - pos >= 16, "short framing at {pos}");
         let n = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
@@ -804,8 +816,10 @@ fn normal_reopen_and_checkpoint_cycles_never_seal_two_records_under_one_nonce() 
         ints(&mut again, "SELECT a FROM t ORDER BY a;"),
         vec![1, 2, 3, 4]
     );
-    // CREATE + INSERT 1 were the two records visible in the pre-checkpoint
-    // snapshot; the checkpoint fork, both rebuilds, and the appends add more.
+    // CREATE + INSERT 1 were the two records visible in the first snapshot;
+    // every keyed reopen rebuilds the file under a fresh prefix, so each
+    // re-sealing adds new (prefix, counter) units — and the assertion inside
+    // `scan_wal_units` proves no unit ever maps to two different bodies.
     assert!(
         seen.len() >= 7,
         "snapshots covered several records: {}",
