@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Using extensions — pinkdb</title>
 <meta name="description" content="Load native SQL functions into pinkdb with LOAD EXTENSION, install from the extension repository, and write your own extension with the C or Go SDK.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/extensions.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Using extensions</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,27 +102,33 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions" class="active" aria-current="page">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Extensions</p>
 <h1>Using extensions</h1>
 
 <p class="doc-meta">pinkdb can load shared libraries that register scalar SQL functions
 at runtime — no recompilation of the engine. Extensions are a versioned C ABI (v1),
 separate from the <code>pinkdb-ffi</code> embedding ABI.</p>
 
-<h2>Loading an extension</h2>
+<h2 id="loading-an-extension">Loading an extension<a class="anchor" href="#loading-an-extension" aria-label="Permalink: Loading an extension">#</a></h2>
 
-<pre class="code" data-lang="sql"><code>LOAD EXTENSION '/abs/path/to/math_ext.dylib';
--- Extension math_ext loaded.
-SELECT ext_clamp(CAST(5 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT));  -- 5</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">LOAD</span> <span class="tok-k">EXTENSION</span> <span class="tok-s">'/abs/path/to/math_ext.dylib'</span>;
+<span class="tok-c">-- Extension math_ext loaded.</span>
+<span class="tok-k">SELECT</span> ext_clamp(<span class="tok-k">CAST</span>(<span class="tok-n">5</span> <span class="tok-k">AS</span> BIGINT), <span class="tok-k">CAST</span>(<span class="tok-n">0</span> <span class="tok-k">AS</span> BIGINT), <span class="tok-k">CAST</span>(<span class="tok-n">10</span> <span class="tok-k">AS</span> BIGINT));  <span class="tok-c">-- 5</span></code></pre></div>
 
 <ul>
   <li>The path is a string literal and resolves against the process's working
@@ -121,19 +147,19 @@ SELECT ext_clamp(CAST(5 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT));  -- 
   <code>extensions are not supported on wasm targets</code>.</li>
 </ul>
 
-<h2>Installing from the extension repository</h2>
+<h2 id="installing-from-the-extension-repository">Installing from the extension repository<a class="anchor" href="#installing-from-the-extension-repository" aria-label="Permalink: Installing from the extension repository">#</a></h2>
 
 <p>The CLI can install published artifacts with one command (needs the
 <code>repo</code> feature, which keeps the default binary lean):</p>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features repo</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> repo</code></pre></div>
 
-<pre class="code" data-lang="text"><code>pinkdb&gt; .install math_ext
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>pinkdb&gt; .install math_ext
 Installed math_ext 0.1.0 (darwin-arm64)
   repository: https://pinkdb-ext-repo.defaultcms.workers.dev
   path:       /Users/you/.pinkdb/extensions/math_ext/0.1.0/darwin-arm64/math_ext.dylib
   sha256:     38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
-Extension math_ext loaded.</code></pre>
+Extension math_ext loaded.</code></pre></div>
 
 <ul>
   <li>Artifacts land under
@@ -153,7 +179,7 @@ Extension math_ext loaded.</code></pre>
   ABI, SHA-256, download).</li>
 </ul>
 
-<h2>Writing an extension</h2>
+<h2 id="writing-an-extension">Writing an extension<a class="anchor" href="#writing-an-extension" aria-label="Permalink: Writing an extension">#</a></h2>
 
 <p>The in-repo SDKs provide a vendored ABI header, a commented template and worked
 examples:</p>
@@ -184,31 +210,31 @@ examples:</p>
 <p>An extension exports three symbols; <code>init</code> registers scalar functions
 through the host API:</p>
 
-<pre class="code" data-lang="c"><code>uint32_t    pinkdb_extension_abi_version(void);   /* PINKDB_EXT_ABI_VERSION */
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">C</span></div><pre class="code" data-lang="c"><code>uint32_t    pinkdb_extension_abi_version(void);   /* PINKDB_EXT_ABI_VERSION */
 const char *pinkdb_extension_name(void);          /* UTF-8, non-empty, <=256 bytes */
-int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);</code></pre>
+int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);</code></pre></div>
 
-<pre class="code" data-lang="c"><code>static int32_t hello_add(void *user_data, const pinkdb_ext_value *args,
-                         size_t n_args, pinkdb_ext_value *out) {
-    (void)user_data; (void)n_args;
-    if (args[0].is_null || args[1].is_null) { out-&gt;is_null = 1; return 0; }
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">C</span></div><pre class="code" data-lang="c"><code><span class="tok-k">static</span> <span class="tok-k">int32_t</span> hello_add(<span class="tok-k">void</span> *user_data, <span class="tok-k">const</span> pinkdb_ext_value *args,
+                         <span class="tok-k">size_t</span> n_args, pinkdb_ext_value *out) {
+    (<span class="tok-k">void</span>)user_data; (<span class="tok-k">void</span>)n_args;
+    <span class="tok-k">if</span> (args[<span class="tok-n">0</span>].is_null || args[<span class="tok-n">1</span>].is_null) { out-&gt;is_null = <span class="tok-n">1</span>; <span class="tok-k">return</span> <span class="tok-n">0</span>; }
     out-&gt;type_tag = PINKDB_EXT_TYPE_BIGINT;
-    out-&gt;is_null = 0;
-    out-&gt;int64 = args[0].int64 + args[1].int64;
-    return 0;
+    out-&gt;is_null = <span class="tok-n">0</span>;
+    out-&gt;int64 = args[<span class="tok-n">0</span>].int64 + args[<span class="tok-n">1</span>].int64;
+    <span class="tok-k">return</span> <span class="tok-n">0</span>;
 }
 
-int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
-    static const int32_t arg_types[2] = {
+<span class="tok-k">int32_t</span> pinkdb_extension_init(<span class="tok-k">const</span> PinkdbHostApi *api, <span class="tok-k">void</span> *host_ctx) {
+    <span class="tok-k">static</span> <span class="tok-k">const</span> <span class="tok-k">int32_t</span> arg_types[<span class="tok-n">2</span>] = {
         PINKDB_EXT_TYPE_BIGINT, PINKDB_EXT_TYPE_BIGINT
     };
-    return api-&gt;register_scalar(host_ctx, "hello_add", 2, arg_types,
-                                PINKDB_EXT_TYPE_BIGINT, hello_add, NULL);
-}</code></pre>
+    <span class="tok-k">return</span> api-&gt;register_scalar(host_ctx, <span class="tok-s">"hello_add"</span>, <span class="tok-n">2</span>, arg_types,
+                                PINKDB_EXT_TYPE_BIGINT, hello_add, <span class="tok-k">NULL</span>);
+}</code></pre></div>
 
-<pre class="code" data-lang="sh"><code>make -C ext-sdk/c                 # build the examples
-./ext-sdk/c/smoke.sh              # build + load + query, end to end
-make -C ext-sdk/go && ./ext-sdk/go/smoke.sh</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>make <span class="tok-f">-C</span> ext-sdk/c                 <span class="tok-c"># build the examples</span>
+./ext-sdk/c/smoke.sh              <span class="tok-c"># build + load + query, end to end</span>
+make <span class="tok-f">-C</span> ext-sdk/go &amp;&amp; ./ext-sdk/go/smoke.sh</code></pre></div>
 
 <p>Contract highlights (the header is complete):</p>
 
@@ -228,7 +254,7 @@ make -C ext-sdk/go && ./ext-sdk/go/smoke.sh</code></pre>
   boundary (in C++: catch everything).</li>
 </ul>
 
-<h2>Extensions and durable databases</h2>
+<h2 id="extensions-and-durable-databases">Extensions and durable databases<a class="anchor" href="#extensions-and-durable-databases" aria-label="Permalink: Extensions and durable databases">#</a></h2>
 
 <ul>
   <li>A durable database WAL-logs <code>LOAD EXTENSION</code>, and every logged
@@ -250,15 +276,57 @@ make -C ext-sdk/go && ./ext-sdk/go/smoke.sh</code></pre>
   <li><a href="../docs/roadmap">Roadmap →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="api-go"><span class="pager-dir">Previous</span><span class="pager-title">Go</span></a><a class="pager-link next" href="../extensions"><span class="pager-dir">Next</span><span class="pager-title">Extension catalog</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/extensions-guide.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
-
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#loading-an-extension">Loading an extension</a></li>
+  <li><a href="#installing-from-the-extension-repository">Installing from the extension repository</a></li>
+  <li><a href="#writing-an-extension">Writing an extension</a></li>
+  <li><a href="#extensions-and-durable-databases">Extensions and durable databases</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

@@ -20,20 +20,25 @@ fragment uses the ``docs/`` default.
 
 Layouts
 -------
-- ``home``  (index.html): hero page, full-width container, no sidebar.
-- ``docs``  (default): a left sidebar with the grouped documentation nav,
-  active-page highlighting, and (on wide screens) an optional "on this page"
-  table of contents generated from the fragment's ``<h2>`` headings.
+- ``home``  (index.html): full-width landing page, no sidebar.
+- ``docs``  (default): left sidebar with the grouped documentation nav and
+  active-page highlighting, a section eyebrow, permalinked ``<h2>``
+  headings, previous/next links and an edit-on-GitHub link, and (on wide
+  screens) an "on this page" table of contents generated from the ``<h2>``
+  headings (opt out per page with ``"toc": False``).
 - ``narrow`` (404.html): a centered single column, no sidebar.
+
+Every ``<pre class="code" data-lang="...">`` block gets a header bar with its
+language label and build-time syntax colouring (``tok-*`` spans).
 
 Template placeholders
 ---------------------
 - ``{{title}}`` / ``{{description}}`` — page metadata (HTML-escaped)
 - ``{{url}}`` — the page's canonical URL on the live docs origin
+- ``{{topnav}}`` — the top-bar links (``TOPNAV``), with the page's section
+  marked active
 - ``{{main}}`` — the assembled main column (sidebar + fragment + TOC)
 - ``{{root}}`` — relative path to the site root (``""`` or ``"../"``)
-- ``{{nav-<key>}}`` — expanded to the active-link attributes in the top bar
-  on the page whose ``nav`` key matches, empty otherwise
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ SITE_URL = "https://pinkdb-docs.defaultcms.workers.dev"
 NAV = [
     {
         "title": "Start here",
+        "section": "docs",
         "items": [
             {"key": "getting-started", "label": "Getting started",
              "out": "docs/getting-started.html"},
@@ -69,6 +75,7 @@ NAV = [
     },
     {
         "title": "Guides",
+        "section": "guides",
         "items": [
             {"key": "guide-csv-to-lake", "label": "CSV to a lake",
              "out": "docs/guide-csv-to-lake.html"},
@@ -84,6 +91,7 @@ NAV = [
     },
     {
         "title": "Reference",
+        "section": "docs",
         "items": [
             {"key": "cli", "label": "CLI & REPL", "out": "docs/cli.html"},
             {"key": "sql", "label": "SQL", "out": "docs/sql.html"},
@@ -94,6 +102,7 @@ NAV = [
     },
     {
         "title": "APIs",
+        "section": "api",
         "items": [
             {"key": "bindings", "label": "Bindings overview", "out": "docs/bindings.html"},
             {"key": "api-rust", "label": "Rust", "out": "docs/api-rust.html"},
@@ -103,16 +112,37 @@ NAV = [
         ],
     },
     {
-        "title": "Extensions & roadmap",
+        "title": "Extensions",
+        "section": "docs",
         "items": [
             {"key": "extensions-doc", "label": "Using extensions",
              "out": "docs/extensions.html"},
+            # The catalog has its own top-bar entry (see TOPNAV).
             {"key": "extensions", "label": "Extension catalog",
-             "out": "extensions.html"},
+             "out": "extensions.html", "section": "extensions"},
+        ],
+    },
+    {
+        "title": "Project",
+        "section": "roadmap",
+        "items": [
             {"key": "roadmap", "label": "Roadmap", "out": "docs/roadmap.html"},
         ],
     },
 ]
+
+# The top bar: (section key, label, output path). A docs page highlights the
+# entry whose key matches its NAV group's (or item's) ``section``. Keep
+# exactly one "Extensions" entry here — ext-repo/worker/verify-ui.mjs counts it.
+TOPNAV = [
+    ("docs", "Docs", "docs/getting-started.html"),
+    ("guides", "Guides", "docs/guide-csv-to-lake.html"),
+    ("api", "API", "docs/bindings.html"),
+    ("extensions", "Extensions", "extensions.html"),
+    ("roadmap", "Roadmap", "docs/roadmap.html"),
+]
+
+REPO_URL = "https://github.com/openlearnia/pinkdb"
 
 # Per-page metadata. Fragments without an entry still generate (under
 # docs/) with a title derived from the file name and no sidebar.
@@ -132,7 +162,6 @@ PAGES = {
     "getting-started.html": {
         "out": "docs/getting-started.html",
         "nav": "getting-started",
-        "toc": True,
         "title": "Getting started — pinkdb",
         "description": (
             "Build the pinkdb CLI — with or without the lake, S3, encryption "
@@ -143,7 +172,6 @@ PAGES = {
     "cli.html": {
         "out": "docs/cli.html",
         "nav": "cli",
-        "toc": True,
         "title": "CLI & REPL — pinkdb",
         "description": (
             "The pinkdb REPL: dot-commands (.import, .save, .open, .lake, "
@@ -154,7 +182,6 @@ PAGES = {
     "sql.html": {
         "out": "docs/sql.html",
         "nav": "sql",
-        "toc": True,
         "title": "SQL reference — pinkdb",
         "description": (
             "The pinkdb SQL surface: DDL/DML, joins, CTEs, subqueries, window "
@@ -165,7 +192,6 @@ PAGES = {
     "persistence.html": {
         "out": "docs/persistence.html",
         "nav": "persistence",
-        "toc": True,
         "title": "Persistence & encryption — pinkdb",
         "description": (
             "The .pink v4 columnar format, durable databases with a WAL, "
@@ -176,7 +202,6 @@ PAGES = {
     "lake.html": {
         "out": "docs/lake.html",
         "nav": "lake",
-        "toc": True,
         "title": "Lake — pinkdb",
         "description": (
             "The pinkdb lake layer: catalog + immutable snapshots, Vortex or "
@@ -187,7 +212,6 @@ PAGES = {
     "server.html": {
         "out": "docs/server.html",
         "nav": "server",
-        "toc": True,
         "title": "Server — pinkdb",
         "description": (
             "Run pinkdb-server over TCP: flags, durable mode, the framed "
@@ -206,7 +230,6 @@ PAGES = {
     "api-rust.html": {
         "out": "docs/api-rust.html",
         "nav": "api-rust",
-        "toc": True,
         "title": "Rust API — pinkdb",
         "description": (
             "The pinkdb Rust API: PinkDb, Database/Connection, durability "
@@ -217,7 +240,6 @@ PAGES = {
     "api-c.html": {
         "out": "docs/api-c.html",
         "nav": "api-c",
-        "toc": True,
         "title": "C API — pinkdb",
         "description": (
             "The pinkdb C ABI v1: pinkdb_open, pinkdb_execute, typed result "
@@ -228,7 +250,6 @@ PAGES = {
     "api-python.html": {
         "out": "docs/api-python.html",
         "nav": "api-python",
-        "toc": True,
         "title": "Python API — pinkdb",
         "description": (
             "The pinkdb Python binding: connect(), connect_memory(), "
@@ -239,7 +260,6 @@ PAGES = {
     "api-go.html": {
         "out": "docs/api-go.html",
         "nav": "api-go",
-        "toc": True,
         "title": "Go API — pinkdb",
         "description": (
             "The pinkdb Go binding: Open, OpenMemory, Execute, Result fields, "
@@ -308,7 +328,6 @@ PAGES = {
     "roadmap.html": {
         "out": "docs/roadmap.html",
         "nav": "roadmap",
-        "toc": True,
         "title": "Roadmap — pinkdb",
         "description": (
             "What pinkdb ships today, what is in progress, and what is "
@@ -320,6 +339,7 @@ PAGES = {
     "extensions.html": {
         "out": "extensions.html",
         "nav": "extensions",
+        "toc": False,
         "title": "Extensions — pinkdb",
         "description": (
             "The pinkdb extension catalog: browse published artifacts (name, "
@@ -341,17 +361,54 @@ def nav_items() -> list[dict[str, str]]:
     return [item for group in NAV for item in group["items"]]
 
 
+def nav_lookup(key: str) -> tuple[dict, dict] | None:
+    """The (group, item) pair for a NAV key, or None."""
+    for group in NAV:
+        for item in group["items"]:
+            if item["key"] == key:
+                return group, item
+    return None
+
+
+def page_section(meta: dict) -> str:
+    """The TOPNAV section a page belongs to (empty for home/404)."""
+    found = nav_lookup(meta.get("nav", ""))
+    if not found:
+        return ""
+    group, item = found
+    return item.get("section", group.get("section", ""))
+
+
 def rel_href(from_out: str, to_out: str) -> str:
     """A relative link from one output file to another (pre-extensionless)."""
     from_dir = posixpath.dirname(from_out) or "."
     return posixpath.relpath(to_out, from_dir)
 
 
+def render_topnav(from_out: str, section: str) -> str:
+    items = []
+    for key, label, out in TOPNAV:
+        href = html.escape(rel_href(from_out, out), quote=True)
+        if out == from_out:
+            active = ' class="active" aria-current="page"'
+        elif key == section:
+            active = ' class="active"'
+        else:
+            active = ""
+        items.append(f'<li><a href="{href}"{active}>{html.escape(label)}</a></li>')
+    return "\n        ".join(items)
+
+
 def render_sidebar(from_out: str, active_key: str) -> str:
+    found = nav_lookup(active_key)
+    current = html.escape(found[1]["label"]) if found else "Menu"
     parts = [
         '<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">',
-        '<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu',
-        '<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>',
+        '<label class="sidebar-toggle" for="sidebar-toggle">',
+        '<span class="sidebar-toggle-icon" aria-hidden="true"></span>',
+        '<span class="sidebar-toggle-label">Docs</span>',
+        f'<span class="sidebar-toggle-current">{current}</span>',
+        '<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>',
         '<nav class="sidebar-nav" aria-label="Documentation">',
     ]
     for group in NAV:
@@ -366,6 +423,33 @@ def render_sidebar(from_out: str, active_key: str) -> str:
         parts.append("</div>")
     parts.append("</nav>")
     return "\n".join(parts)
+
+
+def render_pager(from_out: str, active_key: str, fragment_name: str) -> str:
+    """Previous/next links in sidebar order, plus an edit-on-GitHub link."""
+    items = nav_items()
+    keys = [item["key"] for item in items]
+    links = []
+    if active_key in keys:
+        i = keys.index(active_key)
+        for kind, label, j in (("prev", "Previous", i - 1), ("next", "Next", i + 1)):
+            if 0 <= j < len(items):
+                item = items[j]
+                href = html.escape(rel_href(from_out, item["out"]), quote=True)
+                links.append(
+                    f'<a class="pager-link {kind}" href="{href}">'
+                    f'<span class="pager-dir">{label}</span>'
+                    f'<span class="pager-title">{html.escape(item["label"])}</span></a>'
+                )
+    edit = f"{REPO_URL}/blob/main/website/src/pages/{fragment_name}"
+    return (
+        '<footer class="doc-footer">\n'
+        + (f'<nav class="pager" aria-label="Previous and next">{"".join(links)}</nav>\n'
+           if links else "")
+        + f'<p class="edit-link"><a href="{html.escape(edit, quote=True)}" rel="noopener">'
+        "Edit this page on GitHub</a></p>\n"
+        "</footer>"
+    )
 
 
 H2_RE = re.compile(r"<h2(\s[^>]*)?>(.*?)</h2>", re.S)
@@ -384,7 +468,7 @@ def slugify(text: str) -> str:
 
 
 def with_toc(fragment: str) -> tuple[str, list[tuple[str, str]]]:
-    """Add ids to plain ``<h2>`` headings; return the fragment and its TOC."""
+    """Give plain ``<h2>`` headings ids + a permalink; return the fragment and its TOC."""
     used = set(ID_RE.findall(fragment))
     toc: list[tuple[str, str]] = []
 
@@ -399,7 +483,9 @@ def with_toc(fragment: str) -> tuple[str, list[tuple[str, str]]]:
             slug, n = f"{base}-{n}", n + 1
         used.add(slug)
         toc.append((slug, label))
-        return f'<h2 id="{slug}"{attrs}>{body}</h2>'
+        anchor = (f'<a class="anchor" href="#{slug}" '
+                  f'aria-label="Permalink: {html.escape(label, quote=True)}">#</a>')
+        return f'<h2 id="{slug}"{attrs}>{body}{anchor}</h2>'
 
     return H2_RE.sub(replace, fragment), toc
 
@@ -415,18 +501,140 @@ def render_toc(entries: list[tuple[str, str]]) -> str:
         '<nav class="toc" aria-label="On this page">\n'
         '<p class="toc-title">On this page</p>\n'
         f"<ul>\n{items}\n</ul>\n"
+        f'<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>\n'
         "</nav>"
     )
 
 
-def load_nav_keys(layout: str) -> list[str]:
-    keys = []
-    for match in re.finditer(r"\{\{nav-([a-z0-9-]+)\}\}", layout):
-        if match.group(1) not in keys:
-            keys.append(match.group(1))
-    if not keys:
-        sys.exit("error: layout.html contains no {{nav-*}} hooks")
-    return keys
+# ---------------------------------------------------------------- code blocks
+#
+# Build-time syntax colouring for ``<pre class="code" data-lang="...">``
+# blocks: a tiny per-language tokenizer (comments, strings, keywords,
+# numbers, commands) emitting ``<span class="tok-*">``. Blocks that already
+# contain markup are left alone. Each block also gets a header bar with its
+# language label.
+
+LANG_LABELS = {
+    "sh": "Shell", "shell": "Shell", "sql": "SQL", "rust": "Rust", "c": "C",
+    "go": "Go", "python": "Python", "json": "JSON", "toml": "TOML",
+    "text": "Output",
+}
+
+_KW = {
+    "sql": (
+        "SELECT FROM WHERE GROUP BY HAVING ORDER LIMIT OFFSET JOIN INNER LEFT "
+        "RIGHT FULL OUTER CROSS ON AS AND OR NOT NULL IS IN BETWEEN LIKE CASE "
+        "WHEN THEN ELSE END DISTINCT UNION ALL WITH INSERT INTO VALUES UPDATE "
+        "SET DELETE CREATE DROP TABLE VIEW DATABASE USE BEGIN COMMIT ROLLBACK "
+        "CHECKPOINT CAST OVER PARTITION ROWS RANGE ASC DESC NULLS FIRST LAST "
+        "LOAD EXTENSION ATTACH IF EXISTS PRIMARY KEY TRUE FALSE"
+    ),
+    "rust": (
+        "as async await break const continue crate dyn else enum extern false "
+        "fn for if impl in let loop match mod move mut pub ref return self Self "
+        "static struct super trait true type unsafe use where while Some None "
+        "Ok Err"
+    ),
+    "c": (
+        "auto break case char const continue default do double else enum "
+        "extern float for goto if int long register return short signed sizeof "
+        "static struct switch typedef union unsigned void volatile while "
+        "bool true false NULL size_t int64_t uint64_t int32_t uint8_t"
+    ),
+    "go": (
+        "break case chan const continue default defer else fallthrough for "
+        "func go goto if import interface map package range return select "
+        "struct switch type var nil true false err"
+    ),
+    "python": (
+        "and as assert break class continue def del elif else except finally "
+        "for from global if import in is lambda None nonlocal not or pass "
+        "raise return True False try while with yield print"
+    ),
+}
+
+_TOKEN_RES: dict[str, re.Pattern[str]] = {}
+
+
+def _alt(*parts: str) -> re.Pattern[str]:
+    return re.compile("|".join(parts), re.M)
+
+
+def _token_re(lang: str) -> re.Pattern[str] | None:
+    if lang in _TOKEN_RES:
+        return _TOKEN_RES[lang]
+    kw = _KW.get(lang)
+    kw_re = rf"(?P<k>\b(?:{'|'.join(kw.split())})\b)" if kw else None
+    num = r"(?P<n>\b\d[\d_]*(?:\.\d+)?\b)"
+    if lang == "sql":
+        pat = _alt(r"(?P<c>--[^\n]*)", r"(?P<s>'(?:[^'\n]|'')*')",
+                   r"(?P<f>^\.[a-z]+)", kw_re, num)
+    elif lang in ("sh", "shell"):
+        pat = _alt(r"(?P<c>(?:^|(?<=\s))#[^\n]*)",
+                   r"(?P<s>'[^'\n]*'|\"(?:[^\"\\\n]|\\.)*\")",
+                   r"(?P<f>(?<!\S)--?[A-Za-z][\w-]*)",
+                   r"(?P<v>\b[A-Z][A-Z0-9_]+(?==))")
+    elif lang in ("rust", "c", "go"):
+        pat = _alt(r"(?P<c>//[^\n]*|/\*[\s\S]*?\*/)",
+                   r"(?P<s>\"(?:[^\"\\\n]|\\.)*\"|`[^`]*`)",
+                   r"(?P<f>^\s*#\s*\w+)" if lang == "c" else r"(?P<f>\b[a-z_]\w*!)",
+                   kw_re, num)
+    elif lang == "python":
+        pat = _alt(r"(?P<c>#[^\n]*)",
+                   r"(?P<s>'(?:[^'\\\n]|\\.)*'|\"(?:[^\"\\\n]|\\.)*\")",
+                   kw_re, num)
+    elif lang == "toml":
+        pat = _alt(r"(?P<c>#[^\n]*)", r"(?P<f>^\[[^\]\n]+\])",
+                   r"(?P<s>\"(?:[^\"\\\n]|\\.)*\")",
+                   r"(?P<v>^[A-Za-z0-9_.-]+(?=\s*=))", num)
+    elif lang == "json":
+        pat = _alt(r"(?P<v>\"(?:[^\"\\\n]|\\.)*\"(?=\s*:))",
+                   r"(?P<s>\"(?:[^\"\\\n]|\\.)*\")",
+                   r"(?P<k>\b(?:true|false|null)\b)", num)
+    else:
+        pat = None
+    _TOKEN_RES[lang] = pat
+    return pat
+
+
+def highlight(code: str, lang: str) -> str:
+    """Colour already-escaped code text; returns escaped HTML."""
+    pat = _token_re(lang)
+    if pat is None or "<" in code:
+        return code
+    text = html.unescape(code)
+    out, pos = [], 0
+    for m in pat.finditer(text):
+        if m.start() == m.end():
+            continue
+        out.append(html.escape(text[pos:m.start()], quote=False))
+        out.append(f'<span class="tok-{m.lastgroup}">'
+                   f"{html.escape(m.group(0), quote=False)}</span>")
+        pos = m.end()
+    out.append(html.escape(text[pos:], quote=False))
+    return "".join(out)
+
+
+SCRIPT_RE = re.compile(r"(<script\b[\s\S]*?</script>)")
+CODE_RE = re.compile(
+    r'<pre class="code" data-lang="([a-z]+)"><code>(.*?)</code></pre>', re.S)
+
+
+def render_code_blocks(fragment: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        lang, code = match.group(1), match.group(2)
+        label = LANG_LABELS.get(lang, lang.upper())
+        return (
+            '<div class="codeblock">'
+            f'<div class="codeblock-head"><span class="codeblock-lang">{label}</span></div>'
+            f'<pre class="code" data-lang="{lang}"><code>{highlight(code, lang)}</code></pre>'
+            "</div>"
+        )
+
+    # Leave inline scripts alone: the catalog script builds <pre> strings.
+    parts = SCRIPT_RE.split(fragment)
+    return "".join(part if part.startswith("<script") else CODE_RE.sub(replace, part)
+                   for part in parts)
 
 
 def page_meta(fragment_name: str) -> dict:
@@ -478,31 +686,33 @@ def canonical_url(out_rel: str) -> str:
     return f"{SITE_URL}/{path}"
 
 
-def render(layout: str, nav_keys: list[str], fragment_name: str,
-           meta: dict) -> str:
+def render(layout: str, fragment_name: str, meta: dict) -> str:
     out_rel = meta["out"]
     root = "../" * out_rel.count("/")
 
     fragment = (PAGES_DIR / fragment_name).read_text(encoding="utf-8")
     fragment = expand(fragment, {"{{root}}": root})
+    fragment = render_code_blocks(fragment)
 
-    toc_html = ""
-    if meta.get("toc"):
-        fragment, toc = with_toc(fragment)
-        toc_html = render_toc(toc)
-
-    layout_kind = meta.get("layout")
+    layout_kind = meta.get("layout", "docs")
     if layout_kind == "home":
-        main = f'<div class="container home">\n{fragment}\n</div>'
+        main = f'<div class="home">\n{fragment}\n</div>'
     elif layout_kind == "narrow":
         main = f'<div class="container narrow">\n{fragment}\n</div>'
     else:
-        sidebar = render_sidebar(out_rel, meta.get("nav", ""))
-        shell_cls = "container docs-shell has-toc" if toc_html else "container docs-shell"
+        nav_key = meta.get("nav", "")
+        fragment, toc = with_toc(fragment)
+        toc_html = render_toc(toc) if meta.get("toc", True) else ""
+        found = nav_lookup(nav_key)
+        eyebrow = (f'<p class="eyebrow">{html.escape(found[0]["title"])}</p>\n'
+                   if found else "")
+        sidebar = render_sidebar(out_rel, nav_key)
+        shell_cls = "docs-shell has-toc" if toc_html else "docs-shell"
         main = (
             f'<div class="{shell_cls}">\n'
             f'<aside class="sidebar">\n{sidebar}\n</aside>\n'
-            f'<article class="doc-main">\n{fragment}\n</article>\n'
+            f'<article class="doc-main">\n{eyebrow}{fragment}\n'
+            f"{render_pager(out_rel, nav_key, fragment_name)}\n</article>\n"
             f"{toc_html}\n"
             "</div>"
         )
@@ -512,11 +722,9 @@ def render(layout: str, nav_keys: list[str], fragment_name: str,
         "{{description}}": html.escape(meta["description"]),
         "{{url}}": html.escape(canonical_url(out_rel)),
         "{{root}}": root,
+        "{{topnav}}": render_topnav(out_rel, page_section(meta)),
         "{{main}}": main,
     }
-    for key in nav_keys:
-        active = ' class="active" aria-current="page"' if key == meta.get("nav") else ""
-        replacements[f"{{{{nav-{key}}}}}"] = active
 
     page = expand(layout, replacements)
 
@@ -525,7 +733,7 @@ def render(layout: str, nav_keys: list[str], fragment_name: str,
         raise SystemExit(
             f"error: {fragment_name} left unexpanded placeholders: {leftover}"
         )
-    if meta.get("nav") and meta["nav"] not in {item["key"] for item in nav_items()}:
+    if meta.get("nav") and not nav_lookup(meta["nav"]):
         raise SystemExit(
             f"error: {fragment_name} sets nav={meta['nav']!r} but no NAV entry "
             "uses that key"
@@ -536,7 +744,7 @@ def render(layout: str, nav_keys: list[str], fragment_name: str,
 def validate_nav() -> None:
     fragment_outs = {page_meta(name)["out"] for name in
                      (p.name for p in PAGES_DIR.iterdir() if p.suffix == ".html")}
-    for item in nav_items():
+    for item in nav_items() + [{"key": k, "out": o} for k, _, o in TOPNAV]:
         if item["out"] not in fragment_outs:
             sys.exit(
                 f"error: NAV item {item['key']!r} points at {item['out']!r}, "
@@ -551,7 +759,8 @@ def main() -> int:
         sys.exit(f"error: missing fragments directory {PAGES_DIR}")
 
     layout = LAYOUT.read_text(encoding="utf-8")
-    nav_keys = load_nav_keys(layout)
+    if "{{topnav}}" not in layout or "{{main}}" not in layout:
+        sys.exit("error: layout.html must contain {{topnav}} and {{main}}")
     validate_nav()
 
     fragments = sorted(p.name for p in PAGES_DIR.iterdir() if p.suffix == ".html")
@@ -565,7 +774,7 @@ def main() -> int:
     written: list[Path] = []
     for fragment_name in fragments:
         meta = page_meta(fragment_name)
-        page = render(layout, nav_keys, fragment_name, meta)
+        page = render(layout, fragment_name, meta)
         target = OUT / meta["out"]
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(page, encoding="utf-8")

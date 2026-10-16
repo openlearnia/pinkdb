@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Guide: multi-process writers — pinkdb</title>
 <meta name="description" content="Open one durable .pink database from several processes: writers serialize on a write lease, readers refresh from the WAL, and a busy database waits up to the busy timeout.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-durable-multiprocess.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started">Docs</a></li>
+        <li><a href="guide-csv-to-lake" class="active">Guides</a></li>
+        <li><a href="bindings">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Multi-process writers</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,52 +102,58 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Guides</p>
 <h1>Guide: multi-process writers</h1>
 
 <p class="doc-meta">A durable <code>.pink</code> database can be opened read-write by
 several local processes at once. Writers serialize on a short-held write lease;
 readers never block and never see uncommitted rows.</p>
 
-<h2>1. Build the default CLI</h2>
+<h2 id="1-build-the-default-cli">1. Build the default CLI<a class="anchor" href="#1-build-the-default-cli" aria-label="Permalink: 1. Build the default CLI">#</a></h2>
 
 <p>Nothing extra is needed — durability is in the default build:</p>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli
-./target/release/pinkdb</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli
+./target/release/pinkdb</code></pre></div>
 
-<h2>2. Two writers, one file</h2>
+<h2 id="2-two-writers-one-file">2. Two writers, one file<a class="anchor" href="#2-two-writers-one-file" aria-label="Permalink: 2. Two writers, one file">#</a></h2>
 
 <p>Open a terminal for each process — start the REPL, then <code>.open</code> the
 <em>same</em> durable database in each:</p>
 
-<pre class="code" data-lang="sql"><code># terminal A
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code># terminal A
 pinkdb&gt; .open db.pink
-pinkdb&gt; CREATE TABLE t (n INTEGER);
-pinkdb&gt; INSERT INTO t VALUES (1);
+pinkdb&gt; <span class="tok-k">CREATE</span> <span class="tok-k">TABLE</span> t (n INTEGER);
+pinkdb&gt; <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (<span class="tok-n">1</span>);
 
 # terminal B — same file, separate process
 pinkdb&gt; .open db.pink
-pinkdb&gt; INSERT INTO t VALUES (2);
+pinkdb&gt; <span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (<span class="tok-n">2</span>);
 
 # terminal C — a reader
 pinkdb&gt; .open db.pink
-pinkdb&gt; SELECT COUNT(*) FROM t;
+pinkdb&gt; <span class="tok-k">SELECT</span> COUNT(*) <span class="tok-k">FROM</span> t;
 ┌──────────┐
 │ count(*) │
 │ BIGINT   │
 ├──────────┤
-│ 2        │
-└──────────┘</code></pre>
+│ <span class="tok-n">2</span>        │
+└──────────┘</code></pre></div>
 
 <p>Each process keeps its own in-memory store. A writer takes the file's
 <strong>write lease</strong> for the operation — refresh, execute, append, fsync,
@@ -136,7 +162,7 @@ replaying the WAL frames it has not seen only when the epoch changed. Refresh
 happens at statement boundaries and before <code>BEGIN</code>, never
 mid-statement.</p>
 
-<h2>3. Concurrency semantics</h2>
+<h2 id="3-concurrency-semantics">3. Concurrency semantics<a class="anchor" href="#3-concurrency-semantics" aria-label="Permalink: 3. Concurrency semantics">#</a></h2>
 
 <ul>
   <li><strong>Writers serialize, per operation.</strong> Two processes never write
@@ -150,10 +176,10 @@ mid-statement.</p>
   — then fails with a clear <code>database is busy</code> error:</li>
 </ul>
 
-<pre class="code" data-lang="sh"><code>PINKDB_BUSY_TIMEOUT_MS=20000 ./target/release/pinkdb
-# or, in Rust:
-#   Database::set_busy_timeout(Duration::from_secs(20))
-#   DurableOpenOptions { busy_timeout: ..., .. }</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-v">PINKDB_BUSY_TIMEOUT_MS</span>=20000 ./target/release/pinkdb
+<span class="tok-c"># or, in Rust:</span>
+<span class="tok-c">#   Database::set_busy_timeout(Duration::from_secs(20))</span>
+<span class="tok-c">#   DurableOpenOptions { busy_timeout: ..., .. }</span></code></pre></div>
 
 <ul>
   <li><strong>Crash safety:</strong> the OS releases the lease on exit or crash, so
@@ -163,26 +189,26 @@ mid-statement.</p>
   can never publish a state that omits another process's committed records.</li>
 </ul>
 
-<h2>4. From Rust</h2>
+<h2 id="4-from-rust">4. From Rust<a class="anchor" href="#4-from-rust" aria-label="Permalink: 4. From Rust">#</a></h2>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::{Database, LockMode};
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::{Database, LockMode};
 
-// shared in-process store, one Connection per thread
-let db = Database::open("db.pink")?;
-let mut writer = db.connect();
-writer.execute("INSERT INTO t VALUES (42);")?;
+<span class="tok-c">// shared in-process store, one Connection per thread</span>
+<span class="tok-k">let</span> db = Database::open(<span class="tok-s">"db.pink"</span>)?;
+<span class="tok-k">let</span> <span class="tok-k">mut</span> writer = db.connect();
+writer.execute(<span class="tok-s">"INSERT INTO t VALUES (42);"</span>)?;
 
-// tune the wait for another process's lease
-db.set_busy_timeout(std::time::Duration::from_secs(10));
+<span class="tok-c">// tune the wait for another process's lease</span>
+db.set_busy_timeout(std::time::Duration::from_secs(<span class="tok-n">10</span>));
 
-// explicit embedded options (CLI parity):
-// let db = Database::open_with_options("db.pink", DurableOpenOptions {
-//     policy: SyncPolicy::Sync,
-//     busy_timeout: Duration::from_secs(5),
-//     lock_mode: LockMode::Required,
-// })?;</code></pre>
+<span class="tok-c">// explicit embedded options (CLI parity):</span>
+<span class="tok-c">// let db = Database::open_with_options("db.pink", DurableOpenOptions {</span>
+<span class="tok-c">//     policy: SyncPolicy::Sync,</span>
+<span class="tok-c">//     busy_timeout: Duration::from_secs(5),</span>
+<span class="tok-c">//     lock_mode: LockMode::Required,</span>
+<span class="tok-c">// })?;</span></code></pre></div>
 
-<h2>Gotchas</h2>
+<h2 id="gotchas">Gotchas<a class="anchor" href="#gotchas" aria-label="Permalink: Gotchas">#</a></h2>
 
 <ul>
   <li><strong><code>flock</code> is assumed to work.</strong> An open on a
@@ -208,15 +234,58 @@ db.set_busy_timeout(std::time::Duration::from_secs(10));
   <li><a href="../docs/roadmap">Roadmap →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="guide-encryption"><span class="pager-dir">Previous</span><span class="pager-title">Encrypted databases</span></a><a class="pager-link next" href="guide-embedding"><span class="pager-dir">Next</span><span class="pager-title">Embedding</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/guide-durable-multiprocess.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
-
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#1-build-the-default-cli">1. Build the default CLI</a></li>
+  <li><a href="#2-two-writers-one-file">2. Two writers, one file</a></li>
+  <li><a href="#3-concurrency-semantics">3. Concurrency semantics</a></li>
+  <li><a href="#4-from-rust">4. From Rust</a></li>
+  <li><a href="#gotchas">Gotchas</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

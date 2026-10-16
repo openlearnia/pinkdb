@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Go API — pinkdb</title>
 <meta name="description" content="The pinkdb Go binding: Open, OpenMemory, Execute, Result fields, value mapping, error handling, and thread safety.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/api-go.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings" class="active">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell has-toc">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Go</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,16 +102,22 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">APIs</p>
 <h1>Go API</h1>
 
 <p class="doc-meta">The pinkdb Go binding is a thin <code>cgo</code> wrapper over the C
@@ -99,32 +125,32 @@ ABI v1 (<code>bindings/go</code>, module
 <code>github.com/openlearnia/pinkdb/bindings/go</code>). No third-party
 dependencies — the Go standard library only.</p>
 
-<h2 id="setup">Setup</h2>
+<h2 id="setup">Setup<a class="anchor" href="#setup" aria-label="Permalink: Setup">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-ffi</code></pre></div>
 
 <p>The <code>#cgo</code> directives resolve the ABI header and
 <code>target/release</code> relative to the package, so a repo checkout needs no
 environment variables at build or run time.</p>
 
-<pre class="code" data-lang="go"><code>import pinkdb "github.com/openlearnia/pinkdb/bindings/go"
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Go</span></div><pre class="code" data-lang="go"><code><span class="tok-k">import</span> pinkdb <span class="tok-s">"github.com/openlearnia/pinkdb/bindings/go"</span>
 
-db, err := pinkdb.OpenMemory() // or pinkdb.Open("data.pink")
-if err != nil {
-    panic(err)
+db, <span class="tok-k">err</span> := pinkdb.OpenMemory() <span class="tok-c">// or pinkdb.Open("data.pink")</span>
+<span class="tok-k">if</span> <span class="tok-k">err</span> != <span class="tok-k">nil</span> {
+    panic(<span class="tok-k">err</span>)
 }
-defer db.Close()
+<span class="tok-k">defer</span> db.Close()
 
-results, err := db.Execute(
-    "CREATE TABLE t (x INTEGER, s VARCHAR);" +
-        "INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);" +
-        "SELECT x, s FROM t ORDER BY x;")
-if err != nil {
-    panic(err)
+results, <span class="tok-k">err</span> := db.Execute(
+    <span class="tok-s">"CREATE TABLE t (x INTEGER, s VARCHAR);"</span> +
+        <span class="tok-s">"INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);"</span> +
+        <span class="tok-s">"SELECT x, s FROM t ORDER BY x;"</span>)
+<span class="tok-k">if</span> <span class="tok-k">err</span> != <span class="tok-k">nil</span> {
+    panic(<span class="tok-k">err</span>)
 }
-fmt.Println(results[2].Kind, results[2].Rows) // selected [[1 héllo] [&lt;nil&gt; &lt;nil&gt;]]</code></pre>
+fmt.Println(results[<span class="tok-n">2</span>].Kind, results[<span class="tok-n">2</span>].Rows) <span class="tok-c">// selected [[1 héllo] [&lt;nil&gt; &lt;nil&gt;]]</span></code></pre></div>
 
-<h2 id="functions">Functions</h2>
+<h2 id="functions">Functions<a class="anchor" href="#functions" aria-label="Permalink: Functions">#</a></h2>
 
 <div class="table-wrap">
 <table>
@@ -162,7 +188,7 @@ empty path or one containing a NUL byte before any native call. SQL that is not 
 UTF-8 fails with <code>SQL is not valid UTF-8</code> and leaves the handle
 usable.</p>
 
-<h2 id="result"><code>Result</code></h2>
+<h2 id="result"><code>Result</code><a class="anchor" href="#result" aria-label="Permalink: Result">#</a></h2>
 
 <ul>
   <li><code>Kind</code>: <code>selected</code>, <code>created</code>,
@@ -199,7 +225,7 @@ usable.</p>
 </table>
 </div>
 
-<h2 id="errors-and-thread-safety">Errors and thread safety</h2>
+<h2 id="errors-and-thread-safety">Errors and thread safety<a class="anchor" href="#errors-and-thread-safety" aria-label="Permalink: Errors and thread safety">#</a></h2>
 
 <ul>
   <li>Native errors are returned verbatim (the message from
@@ -215,12 +241,12 @@ usable.</p>
   callable after close.</li>
 </ul>
 
-<h2 id="testing">Testing</h2>
+<h2 id="testing">Testing<a class="anchor" href="#testing" aria-label="Permalink: Testing">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>cd bindings/go
-gofmt -l .        # must print nothing
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cd bindings/go
+gofmt <span class="tok-f">-l</span> .        <span class="tok-c"># must print nothing</span>
 go vet ./...
-go test ./...</code></pre>
+go test ./...</code></pre></div>
 
 <p class="doc-meta">Known limitation: ABI v1 reports column and object/session names
 as NUL-terminated C strings, so an identifier containing a NUL byte is truncated in
@@ -233,6 +259,10 @@ Avoid NUL bytes in identifiers until the engine-level fix lands.</p>
   <li><a href="../docs/guide-embedding">Guide: embedding →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="api-python"><span class="pager-dir">Previous</span><span class="pager-title">Python</span></a><a class="pager-link next" href="extensions"><span class="pager-dir">Next</span><span class="pager-title">Using extensions</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/api-go.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
@@ -243,14 +273,44 @@ Avoid NUL bytes in identifiers until the engine-level fix lands.</p>
   <li><a href="#errors-and-thread-safety">Errors and thread safety</a></li>
   <li><a href="#testing">Testing</a></li>
 </ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

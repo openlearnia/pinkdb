@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Persistence &amp; encryption — pinkdb</title>
 <meta name="description" content="The .pink v4 columnar format, durable databases with a WAL, crash recovery, checkpoints, multi-process writers, and optional at-rest encryption (AES-256-GCM + Argon2id).">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/persistence.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell has-toc">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Persistence</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,23 +102,29 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Reference</p>
 <h1>Persistence &amp; encryption</h1>
 
 <p class="doc-meta">Single-file columnar storage, a write-ahead log for durability,
 multi-process writers, and optional at-rest encryption — all in one database file you
 can copy anywhere.</p>
 
-<h2 id="the-pink-columnar-format">The <code>.pink</code> columnar format</h2>
+<h2 id="the-pink-columnar-format">The <code>.pink</code> columnar format<a class="anchor" href="#the-pink-columnar-format" aria-label="Permalink: The .pink columnar format">#</a></h2>
 
 <p><code>db.save("x.pink")</code> writes every database and table to one file;
 <code>PinkDb::open("x.pink")</code> loads it back (<code>.save</code> /
@@ -106,13 +132,13 @@ can copy anywhere.</p>
 (<code>PINKDB04</code>), ending in a CRC-32 of the whole image. Views are
 session-local and are never persisted.</p>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::PinkDb;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::PinkDb;
 
-db.save("x.pink")?;                 // write the store
-let db = PinkDb::open("x.pink")?;   // plain open (no WAL)
+db.save(<span class="tok-s">"x.pink"</span>)?;                 <span class="tok-c">// write the store</span>
+<span class="tok-k">let</span> db = PinkDb::open(<span class="tok-s">"x.pink"</span>)?;   <span class="tok-c">// plain open (no WAL)</span>
 
-// durable: checkpoint + sidecar WAL, replayed on open
-let (db, info) = PinkDb::open_durable_with("x.pink", SyncPolicy::Sync)?;</code></pre>
+<span class="tok-c">// durable: checkpoint + sidecar WAL, replayed on open</span>
+<span class="tok-k">let</span> (db, info) = PinkDb::open_durable_with(<span class="tok-s">"x.pink"</span>, SyncPolicy::Sync)?;</code></pre></div>
 
 <ul>
   <li>Data is stored per column in ≤2,048-row chunks. Each chunk picks its smallest
@@ -135,7 +161,7 @@ let (db, info) = PinkDb::open_durable_with("x.pink", SyncPolicy::Sync)?;</code><
   load; v1 tables become the single <code>main</code> database.</li>
 </ul>
 
-<h2 id="durable-databases-and-the-wal">Durable databases and the WAL</h2>
+<h2 id="durable-databases-and-the-wal">Durable databases and the WAL<a class="anchor" href="#durable-databases-and-the-wal" aria-label="Permalink: Durable databases and the WAL">#</a></h2>
 
 <p>A durable open — <code>PinkDb::open_durable("x.pink")</code>, or the REPL's
 <code>.open</code> — loads the checkpoint, recovers an interrupted checkpoint,
@@ -160,7 +186,7 @@ at <code>COMMIT</code> (a <code>ROLLBACK</code> or conflict abort logs nothing).
   <code>USE &lt;db&gt;</code> prefix) whenever the replay session could differ.</li>
 </ul>
 
-<h2 id="multi-process-writers">Multi-process writers</h2>
+<h2 id="multi-process-writers">Multi-process writers<a class="anchor" href="#multi-process-writers" aria-label="Permalink: Multi-process writers">#</a></h2>
 
 <p>Durable databases are <strong>multi-process</strong>: any number of local
 processes may open the same database read-write. Writers serialize on a short-held
@@ -193,7 +219,7 @@ cleanup.</p>
 <a href="../docs/guide-durable-multiprocess">Guide: multi-process
 writers</a>.</p>
 
-<h2 id="checkpoints">Checkpoints</h2>
+<h2 id="checkpoints">Checkpoints<a class="anchor" href="#checkpoints" aria-label="Permalink: Checkpoints">#</a></h2>
 
 <p>A checkpoint writes <code>x.pink.tmp</code> (fsynced, directory fsynced), rolls
 the live WAL to <code>.wal.&lt;gen&gt;.roll</code>, starts a fresh WAL of generation
@@ -227,19 +253,19 @@ the roll. Recovery never removes anything before the recovered state is durable:
   acknowledges.</li>
 </ul>
 
-<h2 id="encryption">Encryption</h2>
+<h2 id="encryption">Encryption<a class="anchor" href="#encryption" aria-label="Permalink: Encryption">#</a></h2>
 
 <p>At-rest encryption is opt-in: <code>cargo build --features encryption</code> links
 the audited RustCrypto crates <code>aes-gcm</code> (AES-256-GCM) and
 <code>argon2</code> (Argon2id). The default build stays crypto-free and unencrypted
 files are byte-identical.</p>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::{EncryptionKey, PinkDb};
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::{EncryptionKey, PinkDb};
 
-let key = EncryptionKey::from_passphrase("correct horse battery staple");
-db.save_with_key("x.pink", &amp;key)?;                       // encrypted snapshot
-let db = PinkDb::open_with_key("x.pink", &amp;key)?;         // decrypts
-let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?; // encrypted WAL</code></pre>
+<span class="tok-k">let</span> key = EncryptionKey::from_passphrase(<span class="tok-s">"correct horse battery staple"</span>);
+db.save_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;                       <span class="tok-c">// encrypted snapshot</span>
+<span class="tok-k">let</span> db = PinkDb::open_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;         <span class="tok-c">// decrypts</span>
+<span class="tok-k">let</span> db = PinkDb::open_durable_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?; <span class="tok-c">// encrypted WAL</span></code></pre></div>
 
 <ul>
   <li>The container is <code>PINKENC1</code> (version 2): a plaintext header with
@@ -263,7 +289,7 @@ let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?; // encrypted WAL</c
   <a href="../docs/guide-encryption">Guide: encrypted databases</a>.</li>
 </ul>
 
-<h2 id="known-limits">Known limits</h2>
+<h2 id="known-limits">Known limits<a class="anchor" href="#known-limits" aria-label="Permalink: Known limits">#</a></h2>
 
 <ul>
   <li>No nested transactions or savepoints; <code>BEGIN..COMMIT</code> uses whole-store
@@ -284,6 +310,10 @@ let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?; // encrypted WAL</c
   <li><a href="../docs/api-rust">Rust API →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="sql"><span class="pager-dir">Previous</span><span class="pager-title">SQL</span></a><a class="pager-link next" href="lake"><span class="pager-dir">Next</span><span class="pager-title">Lake</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/persistence.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
@@ -295,14 +325,44 @@ let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?; // encrypted WAL</c
   <li><a href="#encryption">Encryption</a></li>
   <li><a href="#known-limits">Known limits</a></li>
 </ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

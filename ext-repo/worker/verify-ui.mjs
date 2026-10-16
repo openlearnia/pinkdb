@@ -29,7 +29,7 @@
 //      (the extensions page marks it active); no generated page loads an
 //      external asset;
 //   4. design system: the generated stylesheet and font files are the
-//      "soft data-zine" set (paper/ink/pink tokens, three self-hosted OFL
+//      docs set (light + dark colour tokens, three self-hosted OFL
 //      families with licences, swap, tabular numerals, reduced-motion
 //      guards); every page carries favicon + canonical + OpenGraph metadata;
 //   5. live docs: GET <docs>/extensions answers 200 text/html with the
@@ -389,8 +389,10 @@ if (existsSync(cssPath)) {
     check(css.includes(`font-family: "${family}"`),
       `stylesheet declares the self-hosted ${family} face`);
   }
-  check(css.includes("--paper: #f7f1e8") && css.includes("--ink: #241f1c"),
-    "stylesheet keeps the paper/ink palette tokens");
+  check(css.includes("--bg:") && css.includes("--text:") && css.includes("--accent:"),
+    "stylesheet defines the bg/text/accent colour tokens");
+  check(/@media \(prefers-color-scheme: dark\)\s*\{\s*:root/.test(css),
+    "stylesheet ships a dark colour scheme");
   check(/font-variant-numeric:\s*tabular-nums/.test(css),
     "data surfaces use tabular numerals");
   check(css.includes("prefers-reduced-motion"),
@@ -399,8 +401,6 @@ if (existsSync(cssPath)) {
     "stylesheet loads no external fonts or imports");
   check(css.includes("dvh") || !css.includes("100vh"),
     "no 100vh sections (viewport-relative heights only)");
-  check(/\.ticker-track\s*\{[^}]*animation/.test(css),
-    "stylesheet animates the ticker strip");
 } else {
   check(false, "generated stylesheet is present", `missing ${cssPath}`);
 }
@@ -433,17 +433,21 @@ check(
 
 const landing = readFileSync(join(SITE, "index.html"), "utf8");
 check(
-  landing.includes('class="ticker"') && landing.includes("ticker-track"),
-  "landing page carries the ticker strip",
-);
-check(landing.includes("cards zig"), "landing page uses the broken-grid card arrangement");
-check(
-  landing.includes('role="img"') && landing.includes("sk-before") && landing.includes("sk-after"),
-  "landing page draws the benchmark as an inline sketch (before/after bars)",
+  landing.includes('class="terminal"') && landing.includes('role="img"'),
+  "landing page carries the labelled terminal sample",
 );
 check(
-  readFileSync(join(SITE, "docs", "architecture.html"), "utf8").includes("sk-arrowhead"),
-  "architecture page redraws the pipeline as an inline sketch",
+  landing.includes('class="stats"') && landing.includes('class="pillars"'),
+  "landing page carries the key-number strip and the feature pillars",
+);
+check(
+  readFileSync(join(SITE, "extensions.html"), "utf8").includes("sk-arrowhead"),
+  "extensions page draws the publish/install route as an inline diagram",
+);
+check(
+  readFileSync(join(SITE, "docs", "sql.html"), "utf8").includes('class="pager"') &&
+    readFileSync(join(SITE, "docs", "sql.html"), "utf8").includes('class="toc"'),
+  "docs pages carry previous/next links and the on-this-page TOC",
 );
 check(
   readFileSync(join(SITE, "404.html"), "utf8").includes("404 — page not found"),

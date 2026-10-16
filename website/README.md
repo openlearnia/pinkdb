@@ -8,14 +8,26 @@ catalog fetched at runtime from the repository Worker
 (`https://pinkdb-ext-repo.defaultcms.workers.dev/index.json`; the Worker sends CORS
 `*` for it).
 
-## Art direction — "soft data-zine"
+## Design
 
-The site reads like a warm-paper zine about data: paper `#F7F1E8`, warm ink
-`#241F1C`, one desaturated pink accent `#C9557A` (plus ink blue `#2C4A66` for
-links), warm-tinted greys only, a fixed paper-grain overlay, hard offset shadows
-from a single top-left light source, dashed "cut lines", sticker badges, tape
-strips, index-card code blocks, margin notes, sketchy inline SVG diagrams, and a
-ticker strip on the landing and Extensions pages.
+A clean product-docs look: neutral surfaces, one pink brand accent (`--accent`),
+and light **and** dark colour schemes driven purely by `prefers-color-scheme`
+(no theme script). All colours are tokens at the top of `src/assets/style.css`
+(`--bg`, `--surface`, `--border`, `--text`, `--accent`, the callout tones and the
+`--tok-*` syntax colours), redefined once in the dark-scheme block.
+
+- **Header** — sticky, translucent; brand, the `TOPNAV` sections (Docs, Guides,
+  API, Extensions, Roadmap) with the current section underlined, and GitHub.
+- **Docs pages** — three columns on wide screens: sticky sidebar, a ~46rem
+  article column, and the "on this page" rail (≥80rem). Each article gets a
+  section eyebrow, permalinked `<h2>`s, previous/next links in sidebar order and
+  an "Edit this page on GitHub" link. Below 60rem the sidebar collapses into a
+  "Docs / <page>" disclosure bar (a checkbox, no script).
+- **Code** — every `<pre class="code" data-lang>` block gets a header bar with its
+  language and build-time syntax colouring (SQL, shell, Rust, C, Go, Python,
+  TOML, JSON); `text` blocks are labelled "Output" and left plain.
+- **Landing** — hero with a terminal sample, a key-numbers strip, four feature
+  pillars, a three-step quickstart, the facts table and a closing call to action.
 
 Type is self-hosted (see `src/assets/fonts/README.md` for provenance and the
 subsetting commands):
@@ -35,27 +47,26 @@ animation is behind a `prefers-reduced-motion` guard.
 
 | URL | Fragment | Layout |
 |---|---|---|
-| `/` | `index.html` | hero, no sidebar |
+| `/` | `index.html` | landing, no sidebar |
 | `/docs/getting-started` | `getting-started.html` | sidebar + TOC |
 | `/docs/cli` | `cli.html` | sidebar + TOC |
 | `/docs/sql` | `sql.html` | sidebar + TOC |
 | `/docs/persistence` | `persistence.html` | sidebar + TOC |
 | `/docs/lake` | `lake.html` | sidebar + TOC |
 | `/docs/server` | `server.html` | sidebar + TOC |
-| `/docs/bindings` | `bindings.html` | sidebar |
+| `/docs/bindings` | `bindings.html` | sidebar + TOC |
 | `/docs/api-rust` `/api-c` `/api-python` `/api-go` | `api-*.html` | sidebar + TOC |
-| `/docs/extensions` (usage guide) | `extensions-guide.html` | sidebar |
-| `/docs/guide-csv-to-lake` `/guide-s3-lake` `/guide-encryption` `/guide-durable-multiprocess` `/guide-embedding` | `guide-*.html` | sidebar |
+| `/docs/extensions` (usage guide) | `extensions-guide.html` | sidebar + TOC |
+| `/docs/guide-csv-to-lake` `/guide-s3-lake` `/guide-encryption` `/guide-durable-multiprocess` `/guide-embedding` | `guide-*.html` | sidebar + TOC |
 | `/docs/roadmap` | `roadmap.html` | sidebar + TOC |
 | `/extensions` (catalog) | `extensions.html` | sidebar |
 | `/404` | `404.html` | narrow column, no sidebar |
 
-Docs pages render in a `.docs-shell` grid: a sticky sidebar with the grouped nav
-(collapsible on narrow screens via a checkbox disclosure), the article, and —
-when the page opts in and there is room (≥74rem) — a generated "on this page" TOC
-in a sticky right rail. The top bar keeps the brand, the Extensions catalog link
-and GitHub; the sidebar marks the active page with
-`class="active" aria-current="page"`.
+Docs pages render in a `.docs-shell` grid (see **Design** above). The sidebar
+marks the active page with `class="active" aria-current="page"`; the top bar
+marks the page's section (from the `section` of its `NAV` group or item) with
+`class="active"`, adding `aria-current="page"` only when the top-bar link is the
+page itself (the Extensions catalog).
 
 ## Layout
 
@@ -103,10 +114,10 @@ uses these placeholders, filled by `build.py`:
 | `{{url}}` | the page's canonical URL on the live origin |
 | `{{main}}` | the assembled main column (sidebar + fragment + optional TOC) |
 | `{{root}}` | relative path to the site root (`""` or `"../"`) |
-| `{{nav-<key>}}` | active-link attributes in the top bar, empty elsewhere |
+| `{{topnav}}` | the `TOPNAV` links, with the page's section marked active |
 
 The build fails if any `{{...}}` placeholder is left unexpanded, or if a page's
-`nav` key or a `NAV` entry's output path does not match a fragment.
+`nav` key or a `NAV`/`TOPNAV` entry's output path does not match a fragment.
 
 ## Adding a page
 
@@ -123,11 +134,13 @@ The build fails if any `{{...}}` placeholder is left unexpanded, or if a page's
    },
    ```
 3. Add the item to the `NAV` structure in `build.py` (grouped sidebar order).
-   That is all — the sidebar, active marking and relative links are generated.
+   That is all — the sidebar, top-bar section, previous/next links, active
+   marking and relative links are generated.
 
-`toc: True` rewrites the fragment's plain `<h2>` headings to add unique `id`s and
-builds the sticky right rail from them (three or more headings required; headings
-that already carry an `id` are left alone). Use `"layout": "home"` or
+Docs pages rewrite the fragment's plain `<h2>` headings to add unique `id`s and
+permalinks, and build the sticky right rail from them (three or more headings
+required; headings that already carry an `id` are left alone). Set
+`"toc": False` to drop the rail. Use `"layout": "home"` or
 `"layout": "narrow"` to opt out of the sidebar shell.
 
 ## Preview locally
@@ -182,13 +195,15 @@ wrangler deploy --dry-run --outdir <scratch-dir>
   extension catalog from the repository Worker (which sends CORS `*`) and renders
   it with the site's own CSS classes; keep that script inline too, and keep it the
   page's first `<script>` (the verifier lifts its pure section).
-- Sketch diagrams are inline SVG (`<svg>` with `sk-*` classes defined in
-  `style.css`) — no image files, and they scale/scroll instead of breaking
-  the layout.
+- Diagrams are inline SVG (`<svg>` with `sk-*` classes defined in
+  `style.css`, coloured from the theme tokens so they follow dark mode) — no
+  image files, and they scale/scroll instead of breaking the layout.
 - The Extensions catalog page is checked by `ext-repo/worker/verify-ui.mjs`: keep
   its `#ext-intro` / `#catalog` ids, the `for="filter"` label, the `data-copy`
   affordances and the inline `<script>` (with its `fetch(INDEX_URL` call) intact,
-  and keep exactly one `Extensions` link in the first `<nav>` of every page.
+  and keep exactly one `Extensions` link in the first `<nav>` of every page
+  (the `TOPNAV` header). The build's code-block pass skips `<script>` bodies, so
+  the script's own `<pre>` strings are emitted untouched.
 
 ## Regenerating the raster assets
 
@@ -210,9 +225,9 @@ node verify-browser.mjs        # headless Chrome over the live docs + Worker
 
 It renders `/extensions` in headless Chromium, exercises the filter, the
 details hash route and the not-found state, checks the design system (fonts
-load from the docs origin, the sidebar marks the active page on `/docs/sql`,
-margin notes and the ticker render, readable text column, no third-party
-requests, no horizontal overflow at 390px/1280px, reduced-motion handling),
+load from the docs origin, the top bar and sidebar mark the active page,
+margin notes render, readable text column, no third-party requests, no
+horizontal overflow at 390px/1280px, reduced-motion handling),
 loads the Worker `/` info page (palette, favicon, script-free, `/index.json`
 from the page context with CORS `*`), and fails on any console error.
 `ext-repo/worker/verify-ui.mjs` additionally checks the generated

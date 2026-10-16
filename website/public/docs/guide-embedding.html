@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Guide: embedding pinkdb — pinkdb</title>
 <meta name="description" content="Embed pinkdb in an application from Rust, C, Python or Go: build the library, open a database, execute SQL, and read typed results.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/guide-embedding.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started">Docs</a></li>
+        <li><a href="guide-csv-to-lake" class="active">Guides</a></li>
+        <li><a href="bindings">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Embedding</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,113 +102,119 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Guides</p>
 <h1>Guide: embedding pinkdb</h1>
 
 <p class="doc-meta">Add a SQL engine to your application from Rust, C, Python or Go.
 This guide gets each target to "open a database, run SQL, read typed results".</p>
 
-<h2>Rust (native)</h2>
+<h2 id="rust-native">Rust (native)<a class="anchor" href="#rust-native" aria-label="Permalink: Rust (native)">#</a></h2>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::{Database, PinkDb};
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::{Database, PinkDb};
 
-// single connection, simplest possible:
-let mut db = PinkDb::new();
-let results = db.execute(
+<span class="tok-c">// single connection, simplest possible:</span>
+<span class="tok-k">let</span> <span class="tok-k">mut</span> db = PinkDb::new();
+<span class="tok-k">let</span> results = db.execute(
     "CREATE TABLE events (name VARCHAR, n BIGINT);\
-     INSERT INTO events VALUES ('signup', 3), ('login', 9);\
+     INSERT INTO events VALUES ('signup', <span class="tok-n">3</span>), ('login', <span class="tok-n">9</span>);\
      SELECT name, SUM(n) AS total FROM events GROUP BY name ORDER BY total DESC;",
 )?;
-println!("{results:?}");
+<span class="tok-f">println!</span>(<span class="tok-s">"{results:?}"</span>);
 
-// multi-threaded host: one shared store, one Connection per thread
-let db = Database::new();
-let mut c = db.connect();
-c.execute("SELECT 1;")?;</code></pre>
+<span class="tok-c">// multi-threaded host: one shared store, one Connection per thread</span>
+<span class="tok-k">let</span> db = Database::new();
+<span class="tok-k">let</span> <span class="tok-k">mut</span> c = db.connect();
+c.execute(<span class="tok-s">"SELECT 1;"</span>)?;</code></pre></div>
 
 <p>For durable files, use <code>Database::open</code>,
 <code>PinkDb::open_durable</code> or the encryption variants — the same machinery the
 CLI uses. See the <a href="../docs/api-rust">Rust API</a>.</p>
 
-<h2>C / C++</h2>
+<h2 id="c-c">C / C++<a class="anchor" href="#c-c" aria-label="Permalink: C / C++">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
-# link: -L target/release -lpinkdb_ffi
-# include: crates/pinkdb-ffi/include/pinkdb.h</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-ffi
+<span class="tok-c"># link: -L target/release -lpinkdb_ffi</span>
+<span class="tok-c"># include: crates/pinkdb-ffi/include/pinkdb.h</span></code></pre></div>
 
-<pre class="code" data-lang="c"><code>#include "pinkdb.h"
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">C</span></div><pre class="code" data-lang="c"><code><span class="tok-f">#include</span> <span class="tok-s">"pinkdb.h"</span>
 
 pinkdb_handle *db = pinkdb_open_memory();
-const char *sql =
-    "CREATE TABLE t (x INTEGER);"
-    "INSERT INTO t VALUES (42);"
-    "SELECT x FROM t;";
+<span class="tok-k">const</span> <span class="tok-k">char</span> *sql =
+    <span class="tok-s">"CREATE TABLE t (x INTEGER);"</span>
+    <span class="tok-s">"INSERT INTO t VALUES (42);"</span>
+    <span class="tok-s">"SELECT x FROM t;"</span>;
 
 pinkdb_result *r = pinkdb_execute(db, sql, strlen(sql));
-if (!r) { fprintf(stderr, "%s\n", pinkdb_last_error()); return 1; }
+<span class="tok-k">if</span> (!r) { fprintf(stderr, <span class="tok-s">"%s\n"</span>, pinkdb_last_error()); <span class="tok-k">return</span> <span class="tok-n">1</span>; }
 
-pink_value v = pinkdb_result_value(r, 2, 0, 0);   /* statement 2, row 0, col 0 */
-printf("%lld\n", (long long)v.int64);             /* 42 */
+pink_value v = pinkdb_result_value(r, <span class="tok-n">2</span>, <span class="tok-n">0</span>, <span class="tok-n">0</span>);   <span class="tok-c">/* statement 2, row 0, col 0 */</span>
+printf(<span class="tok-s">"%lld\n"</span>, (<span class="tok-k">long</span> <span class="tok-k">long</span>)v.int64);             <span class="tok-c">/* 42 */</span>
 
 pinkdb_result_free(r);
-pinkdb_close(db);</code></pre>
+pinkdb_close(db);</code></pre></div>
 
 <p class="doc-meta">Handles are not thread-safe — one per thread, or serialize calls.
 VARCHAR pointers borrow from the result; copy with <code>text_len</code> (embedded
 NULs are allowed). Full details: <a href="../docs/api-c">C API</a>.</p>
 
-<h2>Python</h2>
+<h2 id="python">Python<a class="anchor" href="#python" aria-label="Permalink: Python">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
-python3 -c "import pinkdb"      # resolves the library from the repo checkout</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-ffi
+python3 <span class="tok-f">-c</span> <span class="tok-s">"import pinkdb"</span>      <span class="tok-c"># resolves the library from the repo checkout</span></code></pre></div>
 
-<pre class="code" data-lang="python"><code>import pinkdb
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Python</span></div><pre class="code" data-lang="python"><code><span class="tok-k">import</span> pinkdb
 
-with pinkdb.connect("app.pink") as db:         # durable; or connect_memory()
-    db.execute("CREATE TABLE t (x INTEGER);")
-    db.execute("INSERT INTO t VALUES (42);")
-    result = db.execute("SELECT x FROM t;")[0]
-    print(result.kind, result.rows)            # selected [[42]]</code></pre>
+<span class="tok-k">with</span> pinkdb.connect(<span class="tok-s">"app.pink"</span>) <span class="tok-k">as</span> db:         <span class="tok-c"># durable; or connect_memory()</span>
+    db.execute(<span class="tok-s">"CREATE TABLE t (x INTEGER);"</span>)
+    db.execute(<span class="tok-s">"INSERT INTO t VALUES (42);"</span>)
+    result = db.execute(<span class="tok-s">"SELECT x FROM t;"</span>)[<span class="tok-n">0</span>]
+    <span class="tok-k">print</span>(result.kind, result.rows)            <span class="tok-c"># selected [[42]]</span></code></pre></div>
 
 <p>A <code>Database</code> is safe to share between threads (calls are serialized
 internally). A pip-installable wheel is planned. See the
 <a href="../docs/api-python">Python API</a>.</p>
 
-<h2>Go</h2>
+<h2 id="go">Go<a class="anchor" href="#go" aria-label="Permalink: Go">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-ffi
 
-# from your app, point the module at your pinkdb checkout
-# (a standalone published module is planned):
-go mod edit -replace github.com/openlearnia/pinkdb/bindings/go=/path/to/pinkdb/bindings/go</code></pre>
+<span class="tok-c"># from your app, point the module at your pinkdb checkout</span>
+<span class="tok-c"># (a standalone published module is planned):</span>
+go mod edit <span class="tok-f">-replace</span> github.com/openlearnia/pinkdb/bindings/go=/path/to/pinkdb/bindings/go</code></pre></div>
 
-<pre class="code" data-lang="go"><code>import pinkdb "github.com/openlearnia/pinkdb/bindings/go"
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Go</span></div><pre class="code" data-lang="go"><code><span class="tok-k">import</span> pinkdb <span class="tok-s">"github.com/openlearnia/pinkdb/bindings/go"</span>
 
-db, err := pinkdb.Open("app.pink") // or pinkdb.OpenMemory()
-if err != nil {
-    log.Fatal(err)
+db, <span class="tok-k">err</span> := pinkdb.Open(<span class="tok-s">"app.pink"</span>) <span class="tok-c">// or pinkdb.OpenMemory()</span>
+<span class="tok-k">if</span> <span class="tok-k">err</span> != <span class="tok-k">nil</span> {
+    log.Fatal(<span class="tok-k">err</span>)
 }
-defer db.Close()
+<span class="tok-k">defer</span> db.Close()
 
-results, err := db.Execute("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42); SELECT x FROM t;")
-if err != nil {
-    log.Fatal(err)
+results, <span class="tok-k">err</span> := db.Execute(<span class="tok-s">"CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (42); SELECT x FROM t;"</span>)
+<span class="tok-k">if</span> <span class="tok-k">err</span> != <span class="tok-k">nil</span> {
+    log.Fatal(<span class="tok-k">err</span>)
 }
-rows := results[len(results)-1].Rows // [[42]]</code></pre>
+rows := results[len(results)-<span class="tok-n">1</span>].Rows <span class="tok-c">// [[42]]</span></code></pre></div>
 
 <p>One <code>*DB</code> is safe to share between goroutines. See the
 <a href="../docs/api-go">Go API</a>.</p>
 
-<h2>Choosing an embedding</h2>
+<h2 id="choosing-an-embedding">Choosing an embedding<a class="anchor" href="#choosing-an-embedding" aria-label="Permalink: Choosing an embedding">#</a></h2>
 
 <div class="table-wrap">
 <table>
@@ -232,15 +258,58 @@ rows := results[len(results)-1].Rows // [[42]]</code></pre>
   <li><a href="../docs/persistence">Persistence →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="guide-durable-multiprocess"><span class="pager-dir">Previous</span><span class="pager-title">Multi-process writers</span></a><a class="pager-link next" href="cli"><span class="pager-dir">Next</span><span class="pager-title">CLI &amp; REPL</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/guide-embedding.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
-
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#rust-native">Rust (native)</a></li>
+  <li><a href="#c-c">C / C++</a></li>
+  <li><a href="#python">Python</a></li>
+  <li><a href="#go">Go</a></li>
+  <li><a href="#choosing-an-embedding">Choosing an embedding</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

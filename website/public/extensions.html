@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Extensions — pinkdb</title>
 <meta name="description" content="The pinkdb extension catalog: browse published artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/extensions.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="./"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="./" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="docs/getting-started">Docs</a></li>
+        <li><a href="docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="docs/bindings">API</a></li>
         <li><a href="extensions" class="active" aria-current="page">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="docs/roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell">
+<div class="docs-shell">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Extension catalog</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,39 +102,29 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="docs/extensions">Using extensions</a></li>
 <li><a href="extensions" class="active" aria-current="page">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="docs/roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Extensions</p>
 <!-- Catalog UI ported from the repository Worker's former `/` page
      (ext-repo/worker/src/index.js). The catalog is fetched client-side,
      cross-origin, from the repository Worker; the pure helper section
      (marked __PURE_END__) is lifted and tested by
      ext-repo/worker/verify-ui.mjs. -->
 
-<div class="ticker" aria-hidden="true">
-  <div class="ticker-track">
-    <span>format v1 &#183; immutable artifacts</span>
-    <span>sha-256 verified before loading</span>
-    <span>install in one line: .install &lt;name&gt;</span>
-    <span>catalog is plain JSON behind CORS *</span>
-    <span>publish with ext-repo/publish.sh</span>
-    <span>format v1 &#183; immutable artifacts</span>
-    <span>sha-256 verified before loading</span>
-    <span>install in one line: .install &lt;name&gt;</span>
-    <span>catalog is plain JSON behind CORS *</span>
-    <span>publish with ext-repo/publish.sh</span>
-  </div>
-</div>
-
 <div id="ext-intro">
-  <p class="kicker">extension repository</p>
   <h1>Extensions</h1>
   <p class="lede">Built extension artifacts from the pinkdb extension repository —
   search the catalog, inspect metadata, and install one in a pinkdb shell with
@@ -129,7 +139,7 @@
     <svg viewBox="0 0 720 262" role="img" aria-label="Sketch of the route an extension takes: publish.sh uploads the dylib to the R2 bucket, the Worker serves index.json and the artifact bytes, this page renders the catalog, and a pinkdb shell installs the extension by name.">
       <defs>
         <marker id="sk-arrowhead" markerWidth="8" markerHeight="8" refX="5.5" refY="5" orient="auto">
-          <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--ink)" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--text-3)" stroke-width="1.8" stroke-linecap="round"/>
         </marker>
       </defs>
 
@@ -168,7 +178,7 @@
 
       <text class="sk-label-sm" x="4" y="252">write-once: publish, hash, never touch the bytes again</text>
     </svg>
-    <figcaption class="sk-figure-caption">Fig. 3 — the repository is a write-once store; the catalog is the
+    <figcaption class="sk-figure-caption">How an extension is published and installed: the repository is a write-once store; the catalog is the
     index of what exists, and every shell re-verifies the hash before calling into the dylib.</figcaption>
   </figure>
 </div>
@@ -461,7 +471,7 @@
     var primary = pickPrimary(entries);
     var parts = [
       '<a class="backlink" href="#/"><span aria-hidden="true">&#8592;</span> All extensions</a>',
-      '<p class="kicker">extension</p>',
+      '<p class="kicker">Extension</p>',
       "<h1>" + esc(primary.name) + "</h1>",
       '<p class="lede">' + esc(primary.description == null ? "" : primary.description) + "</p>",
       '<div class="badges">' +
@@ -512,7 +522,7 @@
 
   function errorView(message) {
     return [
-      '<p class="kicker">repository</p>',
+      '<p class="kicker">Repository</p>',
       "<h1>Catalog unavailable</h1>",
       '<div class="empty error">',
       "<p>" + esc(message) + "</p>",
@@ -530,7 +540,7 @@
       ? "Nothing in the catalog matches the extension name <code>" + esc(value) + "</code>."
       : "The page has no route for <code>" + esc(value) + "</code>.";
     return [
-      '<p class="kicker">not found</p>',
+      '<p class="kicker">Not found</p>',
       "<h1>" + heading + "</h1>",
       '<p class="lede">' + lead + "</p>",
       '<p><a class="button" href="#/">Back to the catalog</a> ' +
@@ -769,15 +779,48 @@
 })();
 </script>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="docs/extensions"><span class="pager-dir">Previous</span><span class="pager-title">Using extensions</span></a><a class="pager-link next" href="docs/roadmap"><span class="pager-dir">Next</span><span class="pager-title">Roadmap</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/extensions.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="docs/getting-started">Docs</a> · <a href="extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="docs/getting-started">Getting started</a></li>
+        <li><a href="docs/sql">SQL reference</a></li>
+        <li><a href="docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="extensions">Extension catalog</a></li>
+        <li><a href="docs/extensions">Writing extensions</a></li>
+        <li><a href="docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

@@ -16,13 +16,13 @@
 //   - the #/<name> details route: `.install <name>` / `.install
 //     <name>@<version>` commands, metadata table, download URL, raw entry;
 //   - the not-found hash route;
-//   - the "soft data-zine" design pass: the three self-hosted fonts load,
-//     headings use the display face, the active nav item is marked, margin
-//     notes and the ticker render, all requests stay first-party, body text
-//     keeps a readable column;
+//   - the design pass: the three self-hosted fonts load, headings use the
+//     display face, the top bar and sidebar mark the active page, margin
+//     notes render, all requests stay first-party, body text keeps a
+//     readable column;
 //   - responsive: no horizontal overflow at 390px and 1280px on the landing
 //     page, a docs page, the extensions page and the Worker info page;
-//   - reduced motion: the ticker stops and entry animations short-circuit;
+//   - reduced motion: animations (the loading spinner) short-circuit;
 //   - the Worker `/` info page: heading, docs link, paper/ink palette,
 //     favicon, script-free, and /index.json answering 200 with
 //     Access-Control-Allow-Origin: * (from the page context);
@@ -380,7 +380,6 @@ try {
       mono: document.fonts.check('400 13px "JetBrains Mono"'),
       skip: Boolean(document.querySelector(".skip-link")),
       activeNav: activeNav ? activeNav.getAttribute("aria-current") : null,
-      ticker: Boolean(document.querySelector(".ticker-track")),
       hosts,
       scrollWidth: document.documentElement.scrollWidth,
       viewport: document.documentElement.clientWidth,
@@ -397,7 +396,7 @@ try {
     design.headingFont,
   );
   check(design.skip, "the skip link is present");
-  check(design.ticker, "the ticker strip is present on the catalog page");
+  check(design.activeNav === "page", "the top bar marks Extensions as the current page", String(design.activeNav));
   const docsHost = new URL(DOCS).host;
   const repoHost = new URL(REPO).host;
   const thirdParty = design.hosts.filter(
@@ -456,15 +455,14 @@ try {
   });
   await cdp.navigate(`${DOCS}/`);
   const reduced = await cdp.evaluate(`(() => {
-    const ticker = document.querySelector(".ticker-track");
-    const card = document.querySelector(".card");
-    return {
-      ticker: ticker ? getComputedStyle(ticker).animationName : "missing",
-      card: card ? getComputedStyle(card).animationDuration : "missing",
-    };
+    const probe = document.createElement("span");
+    probe.className = "spinner";
+    document.body.appendChild(probe);
+    const duration = getComputedStyle(probe).animationDuration;
+    probe.remove();
+    return { spinner: duration };
   })()`);
-  check(reduced.ticker === "none", "reduced motion stops the ticker", reduced.ticker);
-  check(parseFloat(reduced.card) < 0.01, "reduced motion short-circuits card entry", reduced.card);
+  check(parseFloat(reduced.spinner) < 0.01, "reduced motion short-circuits animations", reduced.spinner);
   await cdp.send("Emulation.setEmulatedMedia", { features: [] });
 
   // ----------------------------------------------------------- worker page

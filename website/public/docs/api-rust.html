@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Rust API — pinkdb</title>
 <meta name="description" content="The pinkdb Rust API: PinkDb, Database/Connection, durability options, encryption keys, the CSV importer, and the pink-lake crate.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/api-rust.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings" class="active">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell has-toc">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Rust</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,27 +102,33 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">APIs</p>
 <h1>Rust API</h1>
 
 <p class="doc-meta">The native interface: the <code>pinkdb</code> crate for the engine
 and <code>pink-lake</code> for the lake layer. Everything else — the CLI, server,
 C ABI and bindings — is built on these types.</p>
 
-<h2 id="getting-the-crate">Getting the crate</h2>
+<h2 id="getting-the-crate">Getting the crate<a class="anchor" href="#getting-the-crate" aria-label="Permalink: Getting the crate">#</a></h2>
 
-<pre class="code" data-lang="toml"><code>[dependencies]
-pinkdb = { path = "crates/pinkdb" }        # the engine
-pink-lake = { path = "crates/pink-lake" }  # optional: the lake layer</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">TOML</span></div><pre class="code" data-lang="toml"><code><span class="tok-f">[dependencies]</span>
+<span class="tok-v">pinkdb</span> = { path = <span class="tok-s">"crates/pinkdb"</span> }        <span class="tok-c"># the engine</span>
+<span class="tok-v">pink-lake</span> = { path = <span class="tok-s">"crates/pink-lake"</span> }  <span class="tok-c"># optional: the lake layer</span></code></pre></div>
 
 <p>The crates live in this workspace; the examples here use path dependencies. The
 default build links no crypto, TLS or format code; features opt in:</p>
@@ -118,40 +144,40 @@ default build links no crypto, TLS or format code; features opt in:</p>
 </table>
 </div>
 
-<h2 id="quick-start">Quick start</h2>
+<h2 id="quick-start">Quick start<a class="anchor" href="#quick-start" aria-label="Permalink: Quick start">#</a></h2>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::PinkDb;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::PinkDb;
 
-let mut db = PinkDb::new();
-for result in db.execute(
+<span class="tok-k">let</span> <span class="tok-k">mut</span> db = PinkDb::new();
+<span class="tok-k">for</span> result <span class="tok-k">in</span> db.execute(
     "CREATE TABLE t (a INTEGER, s VARCHAR);\
-     INSERT INTO t VALUES (1, 'one'), (2, NULL);\
+     INSERT INTO t VALUES (<span class="tok-n">1</span>, 'one'), (<span class="tok-n">2</span>, NULL);\
      SELECT a, s FROM t ORDER BY a;",
 )? {
-    println!("{result:?}");
-}</code></pre>
+    <span class="tok-f">println!</span>(<span class="tok-s">"{result:?}"</span>);
+}</code></pre></div>
 
-<h2 id="public-types">Public types</h2>
+<h2 id="public-types">Public types<a class="anchor" href="#public-types" aria-label="Permalink: Public types">#</a></h2>
 
 <p>The crate root re-exports the main surface:</p>
 
-<pre class="code" data-lang="rust"><code>pub use pinkdb::{
-    // core session + store
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">pub</span> <span class="tok-k">use</span> pinkdb::{
+    <span class="tok-c">// core session + store</span>
     PinkDb, DataTable, ViewDef,
-    // multi-writer handles
+    <span class="tok-c">// multi-writer handles</span>
     Database, Connection,
-    // results and values
+    <span class="tok-c">// results and values</span>
     QueryResult, Value, DataType, PinkDbError,
-    // vectors
-    Vector, VectorData, DataChunk, CHUNK_SIZE,   // CHUNK_SIZE = 2048
-    // durability
+    <span class="tok-c">// vectors</span>
+    Vector, VectorData, DataChunk, CHUNK_SIZE,   <span class="tok-c">// CHUNK_SIZE = 2048</span>
+    <span class="tok-c">// durability</span>
     DurableOpenOptions, LockMode, RecoveryInfo, SyncPolicy,
-    DEFAULT_AUTO_CHECKPOINT_BYTES,               // 64 MiB
-    // encryption (feature `encryption`)
+    DEFAULT_AUTO_CHECKPOINT_BYTES,               <span class="tok-c">// 64 MiB</span>
+    <span class="tok-c">// encryption (feature `encryption`)</span>
     EncryptionKey,
-    // attached lakes (CLI/library attach support)
+    <span class="tok-c">// attached lakes (CLI/library attach support)</span>
     AttachedLake, AttachedTable, AttachedScan, ColumnStats,
-};</code></pre>
+};</code></pre></div>
 
 <p>Modules: <code>pinkdb::csv</code> (CSV import), <code>pinkdb::sql</code> (parser,
 AST, binder), <code>pinkdb::plan</code>, <code>pinkdb::optimizer</code>,
@@ -160,50 +186,50 @@ AST, binder), <code>pinkdb::plan</code>, <code>pinkdb::optimizer</code>,
 <code>pinkdb::types</code>, <code>pinkdb::vector</code>,
 <code>pinkdb::attached</code>.</p>
 
-<h2 id="pinkdb-the-engine"><code>PinkDb</code> — the engine</h2>
+<h2 id="pinkdb-the-engine"><code>PinkDb</code> — the engine<a class="anchor" href="#pinkdb-the-engine" aria-label="Permalink: PinkDb — the engine">#</a></h2>
 
 <p>One struct owns an in-memory store and a session (its current database). This is
 the single-connection embedding API:</p>
 
-<pre class="code" data-lang="rust"><code>impl PinkDb {
-    pub fn new() -> Self;
-    pub fn execute(&amp;mut self, sql: &amp;str) -> Result&lt;Vec&lt;QueryResult&gt;&gt;;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">impl</span> PinkDb {
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> new() -&gt; <span class="tok-k">Self</span>;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> execute(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>, sql: &amp;str) -&gt; Result&lt;Vec&lt;QueryResult&gt;&gt;;
 
-    // databases and transactions
-    pub fn current_db(&amp;self) -&gt; &amp;str;
-    pub fn list_databases(&amp;self) -&gt; Vec&lt;String&gt;;
-    pub fn create_database(&amp;mut self, name: &amp;str) -&gt; Result&lt;()&gt;;
-    pub fn drop_database(&amp;mut self, name: &amp;str) -&gt; Result&lt;()&gt;;
-    pub fn use_database(&amp;mut self, name: &amp;str) -&gt; Result&lt;()&gt;;
-    pub fn begin(&amp;mut self) -&gt; Result&lt;()&gt;;
-    pub fn commit(&amp;mut self) -&gt; Result&lt;()&gt;;
-    pub fn rollback(&amp;mut self) -&gt; Result&lt;()&gt;;
-    pub fn in_transaction(&amp;self) -&gt; bool;
+    <span class="tok-c">// databases and transactions</span>
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> current_db(&amp;<span class="tok-k">self</span>) -&gt; &amp;str;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> list_databases(&amp;<span class="tok-k">self</span>) -&gt; Vec&lt;String&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> create_database(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>, name: &amp;str) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> drop_database(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>, name: &amp;str) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> use_database(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>, name: &amp;str) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> begin(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> commit(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> rollback(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> in_transaction(&amp;<span class="tok-k">self</span>) -&gt; bool;
 
-    // persistence
-    pub fn save(&amp;self, path: &amp;str) -&gt; Result&lt;()&gt;;
-    pub fn save_snapshot(&amp;self, path: &amp;str) -&gt; Result&lt;()&gt;;
-    pub fn open(path: &amp;str) -&gt; Result&lt;PinkDb&gt;;
-    pub fn open_durable(path: &amp;str) -&gt; Result&lt;PinkDb&gt;;
-    pub fn open_durable_with(path: &amp;str, policy: SyncPolicy)
+    <span class="tok-c">// persistence</span>
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> save(&amp;<span class="tok-k">self</span>, path: &amp;str) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> save_snapshot(&amp;<span class="tok-k">self</span>, path: &amp;str) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> open(path: &amp;str) -&gt; Result&lt;PinkDb&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> open_durable(path: &amp;str) -&gt; Result&lt;PinkDb&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> open_durable_with(path: &amp;str, policy: SyncPolicy)
         -&gt; Result&lt;(PinkDb, RecoveryInfo)&gt;;
-    pub fn open_durable_with_options(path: &amp;str, opts: DurableOpenOptions)
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> open_durable_with_options(path: &amp;str, opts: DurableOpenOptions)
         -&gt; Result&lt;(PinkDb, RecoveryInfo)&gt;;
-    pub fn checkpoint(&amp;mut self) -&gt; Result&lt;()&gt;;
-    pub fn flush_wal(&amp;mut self) -&gt; Result&lt;()&gt;;
-    pub fn durable_path(&amp;self) -&gt; Option&lt;PathBuf&gt;;
-    pub fn set_busy_timeout(&amp;self, timeout: Duration);
-    pub fn set_auto_checkpoint_bytes(&amp;self, bytes: Option&lt;u64&gt;);
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> checkpoint(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> flush_wal(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> durable_path(&amp;<span class="tok-k">self</span>) -&gt; Option&lt;PathBuf&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> set_busy_timeout(&amp;<span class="tok-k">self</span>, timeout: Duration);
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> set_auto_checkpoint_bytes(&amp;<span class="tok-k">self</span>, bytes: Option&lt;u64&gt;);
 
-    // encryption (feature `encryption`)
-    pub fn save_with_key(&amp;self, path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;()&gt;;
-    pub fn open_with_key(path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;PinkDb&gt;;
-    pub fn open_durable_with_key(path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;PinkDb&gt;;
-    pub fn set_encryption_key(&amp;mut self, key: Option&lt;EncryptionKey&gt;);
+    <span class="tok-c">// encryption (feature `encryption`)</span>
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> save_with_key(&amp;<span class="tok-k">self</span>, path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;()&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> open_with_key(path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;PinkDb&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> open_durable_with_key(path: &amp;str, key: &amp;EncryptionKey) -&gt; Result&lt;PinkDb&gt;;
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> set_encryption_key(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>, key: Option&lt;EncryptionKey&gt;);
 
-    // extensions
-    pub fn load_extension(&amp;mut self, path: &amp;str) -&gt; Result&lt;String&gt;;
-}</code></pre>
+    <span class="tok-c">// extensions</span>
+    <span class="tok-k">pub</span> <span class="tok-k">fn</span> load_extension(&amp;<span class="tok-k">mut</span> <span class="tok-k">self</span>, path: &amp;str) -&gt; Result&lt;String&gt;;
+}</code></pre></div>
 
 <p>There are more helpers (<code>create_table</code>, <code>drop_table</code>,
 <code>list_tables</code>, <code>create_view</code>, <code>table_version</code>, and
@@ -213,77 +239,77 @@ store directly.</p>
 
 <h3>Importing CSV</h3>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::csv;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::csv;
 
-csv::import_csv(&amp;mut db, "sales.csv", Some("sales"))?;        // file -> table
-csv::import_csv_string(&amp;mut db, "t", "a,b\n1,x\n")?;          // text -> table</code></pre>
+csv::import_csv(&amp;<span class="tok-k">mut</span> db, <span class="tok-s">"sales.csv"</span>, <span class="tok-k">Some</span>(<span class="tok-s">"sales"</span>))?;        <span class="tok-c">// file -&gt; table</span>
+csv::import_csv_string(&amp;<span class="tok-k">mut</span> db, <span class="tok-s">"t"</span>, <span class="tok-s">"a,b\n1,x\n"</span>)?;          <span class="tok-c">// text -&gt; table</span></code></pre></div>
 
 <h3>Durable options</h3>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::{DurableOpenOptions, LockMode, SyncPolicy};
-use std::time::Duration;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::{DurableOpenOptions, LockMode, SyncPolicy};
+<span class="tok-k">use</span> std::time::Duration;
 
-let opts = DurableOpenOptions {
-    policy: SyncPolicy::Sync,              // fsync every record (or SyncPolicy::Batch)
-    busy_timeout: Duration::from_secs(5),  // wait for another process's write lease
-    lock_mode: LockMode::Required,         // fail closed when locking is unsupported
+<span class="tok-k">let</span> opts = DurableOpenOptions {
+    policy: SyncPolicy::Sync,              <span class="tok-c">// fsync every record (or SyncPolicy::Batch)</span>
+    busy_timeout: Duration::from_secs(<span class="tok-n">5</span>),  <span class="tok-c">// wait for another process's write lease</span>
+    lock_mode: LockMode::Required,         <span class="tok-c">// fail closed when locking is unsupported</span>
 };
-let (db, recovery) = PinkDb::open_durable_with_options("x.pink", opts)?;
-println!("{} records replayed", recovery.replayed_records);</code></pre>
+<span class="tok-k">let</span> (db, recovery) = PinkDb::open_durable_with_options(<span class="tok-s">"x.pink"</span>, opts)?;
+<span class="tok-f">println!</span>(<span class="tok-s">"{} records replayed"</span>, recovery.replayed_records);</code></pre></div>
 
-<h2 id="database-connection-multi-writer"><code>Database</code> / <code>Connection</code> — multi-writer</h2>
+<h2 id="database-connection-multi-writer"><code>Database</code> / <code>Connection</code> — multi-writer<a class="anchor" href="#database-connection-multi-writer" aria-label="Permalink: Database / Connection — multi-writer">#</a></h2>
 
 <p><code>Database</code> wraps the store in shared locks for multi-connection use
 (one <code>Connection</code> per thread); durable opens through it also carry the
 WAL and, for local files, the multi-process write lease.</p>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::Database;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::Database;
 
-// in memory
-let db = Database::new();
+<span class="tok-c">// in memory</span>
+<span class="tok-k">let</span> db = Database::new();
 
-// durable
-let db = Database::open("x.pink")?;
-let db = Database::open_with_options("x.pink", opts)?;
+<span class="tok-c">// durable</span>
+<span class="tok-k">let</span> db = Database::open(<span class="tok-s">"x.pink"</span>)?;
+<span class="tok-k">let</span> db = Database::open_with_options(<span class="tok-s">"x.pink"</span>, opts)?;
 
-let mut c = db.connect();
-c.execute("CREATE TABLE t (a INTEGER);")?;
+<span class="tok-k">let</span> <span class="tok-k">mut</span> c = db.connect();
+c.execute(<span class="tok-s">"CREATE TABLE t (a INTEGER);"</span>)?;
 
-db.checkpoint()?;                    // SQL `CHECKPOINT` also works from any front-end
-db.set_busy_timeout(Duration::from_secs(10));
-db.set_auto_checkpoint_bytes(Some(64 * 1024 * 1024));</code></pre>
+db.checkpoint()?;                    <span class="tok-c">// SQL `CHECKPOINT` also works from any front-end</span>
+db.set_busy_timeout(Duration::from_secs(<span class="tok-n">10</span>));
+db.set_auto_checkpoint_bytes(<span class="tok-k">Some</span>(<span class="tok-n">64</span> * <span class="tok-n">1024</span> * <span class="tok-n">1024</span>));</code></pre></div>
 
-<h2 id="encryptionkey"><code>EncryptionKey</code></h2>
+<h2 id="encryptionkey"><code>EncryptionKey</code><a class="anchor" href="#encryptionkey" aria-label="Permalink: EncryptionKey">#</a></h2>
 
-<pre class="code" data-lang="rust"><code>use pinkdb::EncryptionKey;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::EncryptionKey;
 
-let key = EncryptionKey::from_passphrase("correct horse battery staple");
-// or a raw 32-byte key — see the type's constructors.
+<span class="tok-k">let</span> key = EncryptionKey::from_passphrase(<span class="tok-s">"correct horse battery staple"</span>);
+<span class="tok-c">// or a raw 32-byte key — see the type's constructors.</span>
 
-db.save_with_key("x.pink", &amp;key)?;
-let db = PinkDb::open_durable_with_key("x.pink", &amp;key)?;</code></pre>
+db.save_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;
+<span class="tok-k">let</span> db = PinkDb::open_durable_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;</code></pre></div>
 
-<h2 id="pink-lake"><code>pink-lake</code></h2>
+<h2 id="pink-lake"><code>pink-lake</code><a class="anchor" href="#pink-lake" aria-label="Permalink: pink-lake">#</a></h2>
 
-<pre class="code" data-lang="rust"><code>use pink_lake::{Lake, save_store, save_store_url};
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pink_lake::{Lake, save_store, save_store_url};
 
-let version = save_store(&amp;db, "mylake")?;        // create + save
-let mut lake = Lake::open("mylake")?;            // or Lake::open_url("s3://…") with `s3`
-let v = lake.write_from_store(&amp;db)?;             // publish a new full snapshot
-let versions = lake.versions()?;                 // [1, 2, 3]
-let tables = lake.tables()?;                     // [("main.t", 2)]
-let db = lake.load(None)?;                       // rebuild the latest version
-let db = lake.load(Some(2))?;                    // or a specific one
-let report = lake.attach(None)?;                 // read-only attachment (statistics)
-// save_store_s3 / save_store_url for object storage
-// S3Config::new(bucket).with_prefix(..).with_region(..)
-//     .with_endpoint(..).with_credentials(..) for explicit configuration</code></pre>
+<span class="tok-k">let</span> version = save_store(&amp;db, <span class="tok-s">"mylake"</span>)?;        <span class="tok-c">// create + save</span>
+<span class="tok-k">let</span> <span class="tok-k">mut</span> lake = Lake::open(<span class="tok-s">"mylake"</span>)?;            <span class="tok-c">// or Lake::open_url("s3://…") with `s3`</span>
+<span class="tok-k">let</span> v = lake.write_from_store(&amp;db)?;             <span class="tok-c">// publish a new full snapshot</span>
+<span class="tok-k">let</span> versions = lake.versions()?;                 <span class="tok-c">// [1, 2, 3]</span>
+<span class="tok-k">let</span> tables = lake.tables()?;                     <span class="tok-c">// [("main.t", 2)]</span>
+<span class="tok-k">let</span> db = lake.load(<span class="tok-k">None</span>)?;                       <span class="tok-c">// rebuild the latest version</span>
+<span class="tok-k">let</span> db = lake.load(<span class="tok-k">Some</span>(<span class="tok-n">2</span>))?;                    <span class="tok-c">// or a specific one</span>
+<span class="tok-k">let</span> report = lake.attach(<span class="tok-k">None</span>)?;                 <span class="tok-c">// read-only attachment (statistics)</span>
+<span class="tok-c">// save_store_s3 / save_store_url for object storage</span>
+<span class="tok-c">// S3Config::new(bucket).with_prefix(..).with_region(..)</span>
+<span class="tok-c">//     .with_endpoint(..).with_credentials(..) for explicit configuration</span></code></pre></div>
 
 <p class="doc-meta">One live writer handle per lake; loads and attachments can run
 concurrently from published versions. Details on the
 <a href="../docs/lake">Lake page</a>.</p>
 
-<h2 id="how-the-engine-works">How the engine works</h2>
+<h2 id="how-the-engine-works">How the engine works<a class="anchor" href="#how-the-engine-works" aria-label="Permalink: How the engine works">#</a></h2>
 
 <ul>
   <li><strong>Pipeline:</strong> SQL text → AST → binder (types, tables, columns) →
@@ -308,6 +334,10 @@ concurrently from published versions. Details on the
   <li><a href="../docs/guide-embedding">Guide: embedding →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="bindings"><span class="pager-dir">Previous</span><span class="pager-title">Bindings overview</span></a><a class="pager-link next" href="api-c"><span class="pager-dir">Next</span><span class="pager-title">C</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/api-rust.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
@@ -321,14 +351,44 @@ concurrently from published versions. Details on the
   <li><a href="#pink-lake">pink-lake</a></li>
   <li><a href="#how-the-engine-works">How the engine works</a></li>
 </ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

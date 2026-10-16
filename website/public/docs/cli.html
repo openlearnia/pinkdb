@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CLI &amp; REPL — pinkdb</title>
 <meta name="description" content="The pinkdb REPL: dot-commands (.import, .save, .open, .lake, .install), scripting and exit codes, environment variables, and remote mode.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/cli.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell has-toc">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">CLI &amp; REPL</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,30 +102,36 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Reference</p>
 <h1>CLI &amp; REPL</h1>
 
 <p class="doc-meta"><code>pinkdb-cli</code> is a thin consumer of the library: a rustyline
 REPL with dot-commands and DuckDB-style box-drawn output. The release binary is named
 <code>pinkdb</code>.</p>
 
-<h2 id="build-and-run">Build and run</h2>
+<h2 id="build-and-run">Build and run<a class="anchor" href="#build-and-run" aria-label="Permalink: Build and run">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>cargo run -p pinkdb-cli                        # debug REPL
-cargo build --release -p pinkdb-cli
-./target/release/pinkdb                        # local (embedded) mode
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo run <span class="tok-f">-p</span> pinkdb-cli                        <span class="tok-c"># debug REPL</span>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli
+./target/release/pinkdb                        <span class="tok-c"># local (embedded) mode</span>
 
-cargo build --release -p pinkdb-cli --features client
-./target/release/pinkdb --host 127.0.0.1:5433  # remote mode (needs a server)</code></pre>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> client
+./target/release/pinkdb <span class="tok-f">--host</span> 127.0.0.1:5433  <span class="tok-c"># remote mode (needs a server)</span></code></pre></div>
 
 <p>You land at the <code>pinkdb&gt;</code> prompt. SQL statements run until a
 semicolon (a <code>   ...&gt;</code> continuation prompt appears while one is open);
@@ -114,12 +140,12 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
 
 <p>Command-line flags:</p>
 
-<pre class="code" data-lang="text"><code>Usage: pinkdb [--host HOST:PORT] [-c COMMAND]...
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>Usage: pinkdb [--host HOST:PORT] [-c COMMAND]...
 
   -c COMMAND         run SQL or a dot-command, then exit (repeatable)
-  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)</code></pre>
+  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)</code></pre></div>
 
-<h2 id="dot-commands">Dot-commands</h2>
+<h2 id="dot-commands">Dot-commands<a class="anchor" href="#dot-commands" aria-label="Permalink: Dot-commands">#</a></h2>
 
 <div class="table-wrap">
 <table>
@@ -239,12 +265,12 @@ left side names an existing database — otherwise the whole string is the table
 so a file stem like <code>data.2024.csv</code> imports as
 <code>data.2024</code>.</p>
 
-<h2 id="output-and-timing">Output and timing</h2>
+<h2 id="output-and-timing">Output and timing<a class="anchor" href="#output-and-timing" aria-label="Permalink: Output and timing">#</a></h2>
 
 <p>Results are box-drawn with a type row, then a row count and, in an interactive
 terminal, a timing line (<code>.timer on|off</code> toggles it):</p>
 
-<pre class="code" data-lang="text"><code>┌─────────┬────────────┐
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>┌─────────┬────────────┐
 │ region  │ avg(total) │
 │ VARCHAR │ DOUBLE     │
 ├─────────┼────────────┤
@@ -252,12 +278,12 @@ terminal, a timing line (<code>.timer on|off</code> toggles it):</p>
 │ east    │ 50.5       │
 └─────────┴────────────┘
 2 rows
-Run Time (s): real 0.000</code></pre>
+Run Time (s): real 0.000</code></pre></div>
 
 <p>At most 10&nbsp;000 rows are printed; longer results end with a
 <code>(N more rows)</code> note.</p>
 
-<h2 id="scripting">Scripting</h2>
+<h2 id="scripting">Scripting<a class="anchor" href="#scripting" aria-label="Permalink: Scripting">#</a></h2>
 
 <p>Piped input and <code>-c COMMAND</code> (repeatable) follow sqlite3/duckdb
 conventions: errors go to stderr, there is no banner or timing, and a statement
@@ -265,8 +291,8 @@ still open at end of input runs as if terminated. <code>;</code> is recognized
 outside strings and comments (<code>SELECT 1; -- note</code> completes;
 <code>SELECT ';'</code> does not).</p>
 
-<pre class="code" data-lang="shell"><code>pinkdb -c ".open sales.pink" -c "SELECT COUNT(*) FROM sales;"
-pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="shell"><code>pinkdb <span class="tok-f">-c</span> <span class="tok-s">".open sales.pink"</span> <span class="tok-f">-c</span> <span class="tok-s">"SELECT COUNT(*) FROM sales;"</span>
+pinkdb &lt; setup.sql || echo <span class="tok-s">"setup failed"</span></code></pre></div>
 
 <h3>Exit codes</h3>
 
@@ -293,7 +319,7 @@ pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
 </table>
 </div>
 
-<h2 id="environment-variables">Environment variables</h2>
+<h2 id="environment-variables">Environment variables<a class="anchor" href="#environment-variables" aria-label="Permalink: Environment variables">#</a></h2>
 
 <div class="table-wrap">
 <table>
@@ -334,10 +360,10 @@ pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
 </table>
 </div>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features encryption
-PINKDB_KEY='correct horse battery staple' ./target/release/pinkdb</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> encryption
+<span class="tok-v">PINKDB_KEY</span>=<span class="tok-s">'correct horse battery staple'</span> ./target/release/pinkdb</code></pre></div>
 
-<h2 id="remote-mode">Remote mode</h2>
+<h2 id="remote-mode">Remote mode<a class="anchor" href="#remote-mode" aria-label="Permalink: Remote mode">#</a></h2>
 
 <p>With the optional <code>client</code> feature, <code>--host HOST:PORT</code> sends
 every SQL statement to a <code>pinkdb-server</code> and renders results with the same
@@ -357,6 +383,10 @@ warning instead of being silently ignored.</p>
   <li><a href="../docs/lake">Lake →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="guide-embedding"><span class="pager-dir">Previous</span><span class="pager-title">Embedding</span></a><a class="pager-link next" href="sql"><span class="pager-dir">Next</span><span class="pager-title">SQL</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/cli.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
@@ -368,14 +398,44 @@ warning instead of being silently ignored.</p>
   <li><a href="#environment-variables">Environment variables</a></li>
   <li><a href="#remote-mode">Remote mode</a></li>
 </ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

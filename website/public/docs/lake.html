@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Lake — pinkdb</title>
 <meta name="description" content="The pinkdb lake layer: catalog + immutable snapshots, Vortex or lean .pink data files, S3/R2 object storage, read-only attach with COUNT/MIN/MAX fast paths, and writer conflict semantics.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/lake.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell has-toc">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Lake</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,32 +102,38 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Reference</p>
 <h1>Lake</h1>
 
 <p class="doc-meta">A lake keeps <strong>metadata and data storage decoupled</strong>: a
 small JSON catalog, an immutable manifest per published version, and one immutable data
 file per table — on local disk or in an S3/R2 bucket.</p>
 
-<h2 id="what-a-lake-is">What a lake is</h2>
+<h2 id="what-a-lake-is">What a lake is<a class="anchor" href="#what-a-lake-is" aria-label="Permalink: What a lake is">#</a></h2>
 
 <p>A lake is a directory (or, with the <code>s3</code> feature, an
 <code>s3://bucket/prefix</code> key prefix) with exactly this layout:</p>
 
-<pre class="code" data-lang="text"><code>mylake/
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Output</span></div><pre class="code" data-lang="text"><code>mylake/
 ├── catalog.json               current state (the authoritative "latest")
 ├── snapshots/&lt;version&gt;.json   immutable manifest per published version
 ├── data/&lt;table&gt;/&lt;uuid&gt;.vortex immutable per-table data files (full lake)
-└── data/&lt;table&gt;/&lt;uuid&gt;.pink   lean data files (no Vortex; still readable)</code></pre>
+└── data/&lt;table&gt;/&lt;uuid&gt;.pink   lean data files (no Vortex; still readable)</code></pre></div>
 
 <p>Every save is a <strong>full snapshot</strong>: all tables are written to fresh
 data files, <code>snapshots/&lt;version&gt;.json</code> is published, then
@@ -117,7 +143,7 @@ There is no append, compaction or garbage collection; each save costs one full
 rewrite. Snapshot publication happens before the catalog update, so a crash leaves
 either the old version or the new one, never a mix.</p>
 
-<h2 id="two-data-formats-one-lake-api">Two data formats, one lake API</h2>
+<h2 id="two-data-formats-one-lake-api">Two data formats, one lake API<a class="anchor" href="#two-data-formats-one-lake-api" aria-label="Permalink: Two data formats, one lake API">#</a></h2>
 
 <p>There are two builds of the lake layer with the same commands:</p>
 
@@ -155,33 +181,33 @@ either the old version or the new one, never a mix.</p>
   full Vortex lake over S3/R2.</li>
 </ul>
 
-<h2 id="using-a-lake">Using a lake</h2>
+<h2 id="using-a-lake">Using a lake<a class="anchor" href="#using-a-lake" aria-label="Permalink: Using a lake">#</a></h2>
 
-<pre class="code" data-lang="sql"><code>.lake save mylake              -- publish a full snapshot of the store
-.lake versions mylake          -- published versions (the current one is marked)
-.lake tables mylake            -- current version's db.table names + row counts
-.lake info mylake              -- format version, current version, snapshots, tables
-.lake open mylake              -- replace the in-memory store with the latest
-.lake open mylake 3            -- or with a specific published version
-.lake attach mylake            -- attach read-only (see below)
-.lake detach mylake
-.lake attached</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-f">.lake</span> save mylake              <span class="tok-c">-- publish a full snapshot of the store</span>
+<span class="tok-f">.lake</span> versions mylake          <span class="tok-c">-- published versions (the current one is marked)</span>
+<span class="tok-f">.lake</span> tables mylake            <span class="tok-c">-- current version's db.table names + row counts</span>
+<span class="tok-f">.lake</span> info mylake              <span class="tok-c">-- format version, current version, snapshots, tables</span>
+<span class="tok-f">.lake</span> open mylake              <span class="tok-c">-- replace the in-memory store with the latest</span>
+<span class="tok-f">.lake</span> open mylake <span class="tok-n">3</span>            <span class="tok-c">-- or with a specific published version</span>
+<span class="tok-f">.lake</span> attach mylake            <span class="tok-c">-- attach read-only (see below)</span>
+<span class="tok-f">.lake</span> detach mylake
+<span class="tok-f">.lake</span> attached</code></pre></div>
 
 <p>From a program, the same operations live in the <code>pink-lake</code> crate:</p>
 
-<pre class="code" data-lang="rust"><code>use pink_lake::{Lake, save_store};
-use pinkdb::PinkDb;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pink_lake::{Lake, save_store};
+<span class="tok-k">use</span> pinkdb::PinkDb;
 
-let mut db = PinkDb::new();
-db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
+<span class="tok-k">let</span> <span class="tok-k">mut</span> db = PinkDb::new();
+db.execute(<span class="tok-s">"CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);"</span>)?;
 
-let version = save_store(&amp;db, "mylake")?;  // creates the lake, publishes v2
-let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
-let v3 = lake.write_from_store(&amp;db)?;      // full snapshot, version 3
-let tables = lake.tables()?;               // [("main.t", 2)]
-let versions = lake.versions()?;           // [1, 2, 3]
-let latest = lake.load(None)?;             // rebuild the latest version
-let old = lake.load(Some(2))?;             // rebuild a specific snapshot</code></pre>
+<span class="tok-k">let</span> version = save_store(&amp;db, <span class="tok-s">"mylake"</span>)?;  <span class="tok-c">// creates the lake, publishes v2</span>
+<span class="tok-k">let</span> <span class="tok-k">mut</span> lake = Lake::open(<span class="tok-s">"mylake"</span>)?;      <span class="tok-c">// v1 is the create-time empty catalog</span>
+<span class="tok-k">let</span> v3 = lake.write_from_store(&amp;db)?;      <span class="tok-c">// full snapshot, version 3</span>
+<span class="tok-k">let</span> tables = lake.tables()?;               <span class="tok-c">// [("main.t", 2)]</span>
+<span class="tok-k">let</span> versions = lake.versions()?;           <span class="tok-c">// [1, 2, 3]</span>
+<span class="tok-k">let</span> latest = lake.load(<span class="tok-k">None</span>)?;             <span class="tok-c">// rebuild the latest version</span>
+<span class="tok-k">let</span> old = lake.load(<span class="tok-k">Some</span>(<span class="tok-n">2</span>))?;             <span class="tok-c">// rebuild a specific snapshot</span></code></pre></div>
 
 <p><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code> are
 refused inside a transaction, and <code>.lake open</code> refuses to detach a durable
@@ -189,7 +215,7 @@ session. Every <code>&lt;dir&gt;</code> argument also accepts an
 <code>s3://bucket/prefix</code> URL when the build has the <code>s3</code>
 feature.</p>
 
-<h2 id="read-only-attach">Read-only attach</h2>
+<h2 id="read-only-attach">Read-only attach<a class="anchor" href="#read-only-attach" aria-label="Permalink: Read-only attach">#</a></h2>
 
 <p><code>.lake attach &lt;dir|s3://…&gt; [version]</code> attaches a lake for the
 session without loading any table into memory. No column data is decoded:</p>
@@ -215,7 +241,7 @@ session without loading any table into memory. No column data is decoded:</p>
   overhead (~0.1–0.2 ms) is constant in file size.</li>
 </ul>
 
-<h2 id="writer-semantics-and-conflicts">Writer semantics and conflicts</h2>
+<h2 id="writer-semantics-and-conflicts">Writer semantics and conflicts<a class="anchor" href="#writer-semantics-and-conflicts" aria-label="Permalink: Writer semantics and conflicts">#</a></h2>
 
 <ul>
   <li><strong>One live writer handle per lake</strong> (there is no file locking
@@ -234,24 +260,24 @@ session without loading any table into memory. No column data is decoded:</p>
   the snapshot, not an append.</li>
 </ul>
 
-<h2 id="s3-r2-object-storage">S3 / R2 object storage</h2>
+<h2 id="s3-r2-object-storage">S3 / R2 object storage<a class="anchor" href="#s3-r2-object-storage" aria-label="Permalink: S3 / R2 object storage">#</a></h2>
 
 <p>With the <code>s3</code> feature, any lake location can be an
 <code>s3://bucket/prefix</code> URL — AWS S3, Cloudflare R2, MinIO, or any
 S3-compatible endpoint. It is a small, blocking SigV4 client; there is no async
 runtime and no AWS SDK.</p>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features lake,s3
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake,s3
 
-export AWS_ACCESS_KEY_ID=&lt;r2-token-key-id&gt;
-export AWS_SECRET_ACCESS_KEY=&lt;r2-token-secret&gt;
-export AWS_ENDPOINT_URL=https://&lt;account&gt;.r2.cloudflarestorage.com
-export AWS_REGION=auto
+export <span class="tok-v">AWS_ACCESS_KEY_ID</span>=&lt;r2-token-key-id&gt;
+export <span class="tok-v">AWS_SECRET_ACCESS_KEY</span>=&lt;r2-token-secret&gt;
+export <span class="tok-v">AWS_ENDPOINT_URL</span>=https://&lt;account&gt;.r2.cloudflarestorage.com
+export <span class="tok-v">AWS_REGION</span>=auto
 
 ./target/release/pinkdb
-#   .lake save    s3://my-bucket/lakes/demo
-#   .lake open    s3://my-bucket/lakes/demo
-#   .lake versions s3://my-bucket/lakes/demo</code></pre>
+<span class="tok-c">#   .lake save    s3://my-bucket/lakes/demo</span>
+<span class="tok-c">#   .lake open    s3://my-bucket/lakes/demo</span>
+<span class="tok-c">#   .lake versions s3://my-bucket/lakes/demo</span></code></pre></div>
 
 <div class="table-wrap">
 <table>
@@ -327,7 +353,7 @@ export AWS_REGION=auto
   whose response was lost. Never blindly re-run the save on the old handle.</p>
 </aside>
 
-<h2 id="which-build-should-i-use">Which build should I use?</h2>
+<h2 id="which-build-should-i-use">Which build should I use?<a class="anchor" href="#which-build-should-i-use" aria-label="Permalink: Which build should I use?">#</a></h2>
 
 <ul>
   <li><strong>Just a database file?</strong> Skip the lake — the default build's
@@ -350,6 +376,10 @@ export AWS_REGION=auto
   <li><a href="../docs/persistence">Persistence →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="persistence"><span class="pager-dir">Previous</span><span class="pager-title">Persistence</span></a><a class="pager-link next" href="server"><span class="pager-dir">Next</span><span class="pager-title">Server</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/lake.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
@@ -362,14 +392,44 @@ export AWS_REGION=auto
   <li><a href="#s3-r2-object-storage">S3 / R2 object storage</a></li>
   <li><a href="#which-build-should-i-use">Which build should I use?</a></li>
 </ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

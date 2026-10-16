@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Python API — pinkdb</title>
 <meta name="description" content="The pinkdb Python binding: connect(), connect_memory(), Database.execute(), Result fields, value mapping, and error handling.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/api-python.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings" class="active">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell has-toc">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Python</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,25 +102,31 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">APIs</p>
 <h1>Python API</h1>
 
 <p class="doc-meta">The pinkdb Python binding is a thin wrapper over the C ABI,
 implemented with the standard library <code>ctypes</code> module — no
 <code>cffi</code>, no pip installs, no build step for the package itself.</p>
 
-<h2 id="setup">Setup</h2>
+<h2 id="setup">Setup<a class="anchor" href="#setup" aria-label="Permalink: Setup">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-ffi</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-ffi</code></pre></div>
 
 <p>Importing <code>pinkdb</code> finds the shared library in this order: the
 <code>PINKDB_FFI_LIB</code> environment variable (a full path to the
@@ -109,19 +135,19 @@ repo-relative <code>target/release/</code>. A missing library, a library without
 pinkdb symbols, or an ABI version other than 1 raises
 <code>pinkdb.Error</code>.</p>
 
-<pre class="code" data-lang="python"><code>import pinkdb
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Python</span></div><pre class="code" data-lang="python"><code><span class="tok-k">import</span> pinkdb
 
-with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
-    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
-    db.execute("INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);")
+<span class="tok-k">with</span> pinkdb.connect_memory() <span class="tok-k">as</span> db:            <span class="tok-c"># or pinkdb.connect("data.pink")</span>
+    db.execute(<span class="tok-s">"CREATE TABLE t (x INTEGER, s VARCHAR);"</span>)
+    db.execute(<span class="tok-s">"INSERT INTO t VALUES (1, 'héllo'), (NULL, NULL);"</span>)
 
-    result = db.execute("SELECT x, s FROM t ORDER BY x;")[0]
-    print(result.kind)          # 'selected'
-    print(result.columns)       # ['x', 's']
-    print(result.column_types)  # ['integer', 'varchar']
-    print(result.rows)          # [[1, 'héllo'], [None, None]]</code></pre>
+    result = db.execute(<span class="tok-s">"SELECT x, s FROM t ORDER BY x;"</span>)[<span class="tok-n">0</span>]
+    <span class="tok-k">print</span>(result.kind)          <span class="tok-c"># 'selected'</span>
+    <span class="tok-k">print</span>(result.columns)       <span class="tok-c"># ['x', 's']</span>
+    <span class="tok-k">print</span>(result.column_types)  <span class="tok-c"># ['integer', 'varchar']</span>
+    <span class="tok-k">print</span>(result.rows)          <span class="tok-c"># [[1, 'héllo'], [None, None]]</span></code></pre></div>
 
-<h2 id="functions">Functions</h2>
+<h2 id="functions">Functions<a class="anchor" href="#functions" aria-label="Permalink: Functions">#</a></h2>
 
 <div class="table-wrap">
 <table>
@@ -154,7 +180,7 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
 </table>
 </div>
 
-<h2 id="database"><code>Database</code></h2>
+<h2 id="database"><code>Database</code><a class="anchor" href="#database" aria-label="Permalink: Database">#</a></h2>
 
 <ul>
   <li><code>execute(sql)</code> — run one or more <code>;</code>-separated
@@ -172,7 +198,7 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
   threads is safe; opening the same file from several threads is not needed.</li>
 </ul>
 
-<h2 id="result"><code>Result</code></h2>
+<h2 id="result"><code>Result</code><a class="anchor" href="#result" aria-label="Permalink: Result">#</a></h2>
 
 <div class="table-wrap">
 <table>
@@ -240,13 +266,13 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
   byte with <code>ValueError</code>.</li>
 </ul>
 
-<h2 id="tests">Tests</h2>
+<h2 id="tests">Tests<a class="anchor" href="#tests" aria-label="Permalink: Tests">#</a></h2>
 
-<pre class="code" data-lang="sh"><code>python3 -m unittest discover -s bindings/python/tests -v
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>python3 <span class="tok-f">-m</span> unittest discover <span class="tok-f">-s</span> bindings/python/tests <span class="tok-f">-v</span>
 
-# prove the environment override:
-PINKDB_FFI_LIB="$PWD/target/release/libpinkdb_ffi.dylib" \
-    python3 -m unittest discover -s bindings/python/tests -v</code></pre>
+<span class="tok-c"># prove the environment override:</span>
+<span class="tok-v">PINKDB_FFI_LIB</span>=<span class="tok-s">"$PWD/target/release/libpinkdb_ffi.dylib"</span> \
+    python3 <span class="tok-f">-m</span> unittest discover <span class="tok-f">-s</span> bindings/python/tests <span class="tok-f">-v</span></code></pre></div>
 
 <p class="doc-meta">The package lives in <code>bindings/python</code>; a pip-installable
 wheel is planned (see the <a href="../docs/roadmap">roadmap</a>). At-rest
@@ -259,6 +285,10 @@ the Rust API or the CLI's <code>PINKDB_KEY</code> for encrypted databases.</p>
   <li><a href="../docs/guide-embedding">Guide: embedding →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="api-c"><span class="pager-dir">Previous</span><span class="pager-title">C</span></a><a class="pager-link next" href="api-go"><span class="pager-dir">Next</span><span class="pager-title">Go</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/api-python.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
@@ -269,14 +299,44 @@ the Rust API or the CLI's <code>PINKDB_KEY</code> for encrypted databases.</p>
   <li><a href="#result">Result</a></li>
   <li><a href="#tests">Tests</a></li>
 </ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>

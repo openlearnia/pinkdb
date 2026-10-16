@@ -5,8 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>SQL reference — pinkdb</title>
 <meta name="description" content="The pinkdb SQL surface: DDL/DML, joins, CTEs, subqueries, window functions, aggregates, types, dates, transactions, and what is not supported yet.">
-<meta name="color-scheme" content="light">
-<meta name="theme-color" content="#F7F1E8">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/sql.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -28,22 +29,41 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="container header-row">
-    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+  <div class="header-row">
+    <a class="brand" href="../" aria-label="pinkdb home">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
+        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
+        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
+        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
+      </svg>
+      <span class="brand-name">pinkdb</span>
+      <span class="brand-tag">docs</span>
+    </a>
     <nav class="site-nav" aria-label="Site">
       <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
         <li><a href="../extensions">Extensions</a></li>
-        <li><a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
       </ul>
     </nav>
+    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
+      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      <span class="header-gh-label">GitHub</span>
+    </a>
   </div>
 </header>
 <main id="main">
-<div class="container docs-shell has-toc">
+<div class="docs-shell has-toc">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
-<label class="sidebar-toggle" for="sidebar-toggle">Documentation menu
-<span class="sidebar-toggle-arrow" aria-hidden="true">&#9662;</span></label>
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">SQL</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
 <nav class="sidebar-nav" aria-label="Documentation">
 <div class="side-group">
 <p class="side-group-title">Start here</p>
@@ -82,36 +102,42 @@
 </ul>
 </div>
 <div class="side-group">
-<p class="side-group-title">Extensions &amp; roadmap</p>
+<p class="side-group-title">Extensions</p>
 <ul>
 <li><a href="extensions">Using extensions</a></li>
 <li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
 <li><a href="roadmap">Roadmap</a></li>
 </ul>
 </div>
 </nav>
 </aside>
 <article class="doc-main">
+<p class="eyebrow">Reference</p>
 <h1>SQL reference</h1>
 
 <p class="doc-meta">The SQL surface pinkdb implements today — DDL/DML, joins, CTEs,
 subqueries, window functions, aggregates and transactions — plus an honest list of
 what is not supported yet.</p>
 
-<h2 id="ddl-and-dml">DDL and DML</h2>
+<h2 id="ddl-and-dml">DDL and DML<a class="anchor" href="#ddl-and-dml" aria-label="Permalink: DDL and DML">#</a></h2>
 
-<pre class="code" data-lang="sql"><code>CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE);
-CREATE TABLE db1.t (...);            -- qualified: any db.table target works
-INSERT INTO t VALUES (1, 'x', 9.5), (2, NULL, 3.0);
-UPDATE t SET price = price * 1.1 WHERE id &gt; 1;   -- SET exprs see pre-update values
-DELETE FROM t WHERE price IS NULL;               -- NULL never matches
-BEGIN; UPDATE t SET price = 0; ROLLBACK;         -- flat snapshot transactions
-CREATE DATABASE db1;                 -- new, empty database
-DROP DATABASE db1;                   -- the last database cannot be dropped
-USE db1;                             -- per-session current database (default: main)
-DROP TABLE t;  DROP VIEW v;
-CREATE VIEW v [(cols)] AS SELECT ...;  -- session-local, rebound per use
-CHECKPOINT;                          -- persist + roll the WAL (durable databases)</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CREATE</span> <span class="tok-k">TABLE</span> t (id BIGINT, name VARCHAR, price DOUBLE);
+<span class="tok-k">CREATE</span> <span class="tok-k">TABLE</span> db1.t (...);            <span class="tok-c">-- qualified: any db.table target works</span>
+<span class="tok-k">INSERT</span> <span class="tok-k">INTO</span> t <span class="tok-k">VALUES</span> (<span class="tok-n">1</span>, <span class="tok-s">'x'</span>, <span class="tok-n">9.5</span>), (<span class="tok-n">2</span>, <span class="tok-k">NULL</span>, <span class="tok-n">3.0</span>);
+<span class="tok-k">UPDATE</span> t <span class="tok-k">SET</span> price = price * <span class="tok-n">1.1</span> <span class="tok-k">WHERE</span> id &gt; <span class="tok-n">1</span>;   <span class="tok-c">-- SET exprs see pre-update values</span>
+<span class="tok-k">DELETE</span> <span class="tok-k">FROM</span> t <span class="tok-k">WHERE</span> price <span class="tok-k">IS</span> <span class="tok-k">NULL</span>;               <span class="tok-c">-- NULL never matches</span>
+<span class="tok-k">BEGIN</span>; <span class="tok-k">UPDATE</span> t <span class="tok-k">SET</span> price = <span class="tok-n">0</span>; <span class="tok-k">ROLLBACK</span>;         <span class="tok-c">-- flat snapshot transactions</span>
+<span class="tok-k">CREATE</span> <span class="tok-k">DATABASE</span> db1;                 <span class="tok-c">-- new, empty database</span>
+<span class="tok-k">DROP</span> <span class="tok-k">DATABASE</span> db1;                   <span class="tok-c">-- the last database cannot be dropped</span>
+<span class="tok-k">USE</span> db1;                             <span class="tok-c">-- per-session current database (default: main)</span>
+<span class="tok-k">DROP</span> <span class="tok-k">TABLE</span> t;  <span class="tok-k">DROP</span> <span class="tok-k">VIEW</span> v;
+<span class="tok-k">CREATE</span> <span class="tok-k">VIEW</span> v [(cols)] <span class="tok-k">AS</span> <span class="tok-k">SELECT</span> ...;  <span class="tok-c">-- session-local, rebound per use</span>
+<span class="tok-k">CHECKPOINT</span>;                          <span class="tok-c">-- persist + roll the WAL (durable databases)</span></code></pre></div>
 
 <p><code>UPDATE</code> and <code>DELETE</code> are statement-atomic: the statement
 sees the pre-update values and either applies completely or not at all.
@@ -126,21 +152,21 @@ second committer with a write-conflict error instead of a silent lost update.</p
   <code>SUM</code> over integers is computed exactly.</p>
 </aside>
 
-<h2 id="select">SELECT</h2>
+<h2 id="select">SELECT<a class="anchor" href="#select" aria-label="Permalink: SELECT">#</a></h2>
 
-<pre class="code" data-lang="sql"><code>SELECT [DISTINCT] expr [AS alias], ...
-FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT [OUTER] / RIGHT [OUTER], equi-join
-  | FROM db1.t                    -- qualified tables resolve in that database
-  | FROM (SELECT ...) AS s         -- derived tables (alias required)
-  | WITH w AS (SELECT ...) ...     -- CTEs, incl. WITH w(a, b) AS column aliases
-WHERE expr                        -- IS [NOT] NULL, BETWEEN, IN (subquery|list), EXISTS
-GROUP BY ... HAVING ...
-ORDER BY expr [ASC|DESC], ...      -- NULLS LAST both ways; ORDER BY 2 positional
-LIMIT n;
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">SELECT</span> [<span class="tok-k">DISTINCT</span>] expr [<span class="tok-k">AS</span> alias], ...
+<span class="tok-k">FROM</span> t [<span class="tok-k">JOIN</span> u <span class="tok-k">ON</span> t.x = u.y]      <span class="tok-c">-- INNER / LEFT [OUTER] / RIGHT [OUTER], equi-join</span>
+  | <span class="tok-k">FROM</span> db1.t                    <span class="tok-c">-- qualified tables resolve in that database</span>
+  | <span class="tok-k">FROM</span> (<span class="tok-k">SELECT</span> ...) <span class="tok-k">AS</span> s         <span class="tok-c">-- derived tables (alias required)</span>
+  | <span class="tok-k">WITH</span> w <span class="tok-k">AS</span> (<span class="tok-k">SELECT</span> ...) ...     <span class="tok-c">-- CTEs, incl. WITH w(a, b) AS column aliases</span>
+<span class="tok-k">WHERE</span> expr                        <span class="tok-c">-- IS [NOT] NULL, BETWEEN, IN (subquery|list), EXISTS</span>
+<span class="tok-k">GROUP</span> <span class="tok-k">BY</span> ... <span class="tok-k">HAVING</span> ...
+<span class="tok-k">ORDER</span> <span class="tok-k">BY</span> expr [<span class="tok-k">ASC</span>|<span class="tok-k">DESC</span>], ...      <span class="tok-c">-- NULLS LAST both ways; ORDER BY 2 positional</span>
+<span class="tok-k">LIMIT</span> n;
 
--- Scalar subqueries (SELECT ...) anywhere an expression goes:
--- uncorrelated only: exactly 1 row x 1 col, 0 rows -> NULL.
--- UNION [ALL|DISTINCT] combines query results (numeric types unify).</code></pre>
+<span class="tok-c">-- Scalar subqueries (SELECT ...) anywhere an expression goes:</span>
+<span class="tok-c">-- uncorrelated only: exactly 1 row x 1 col, 0 rows -&gt; NULL.</span>
+<span class="tok-c">-- UNION [ALL|DISTINCT] combines query results (numeric types unify).</span></code></pre></div>
 
 <h3>Joins</h3>
 
@@ -176,7 +202,7 @@ LIMIT n;
   use.</li>
 </ul>
 
-<h2 id="aggregates-and-window-functions">Aggregates and window functions</h2>
+<h2 id="aggregates-and-window-functions">Aggregates and window functions<a class="anchor" href="#aggregates-and-window-functions" aria-label="Permalink: Aggregates and window functions">#</a></h2>
 
 <ul>
   <li>Aggregates: <code>COUNT(*)</code> / <code>COUNT(x)</code>, <code>SUM</code>,
@@ -193,7 +219,7 @@ LIMIT n;
   keys.</li>
 </ul>
 
-<h2 id="scalar-functions-and-expressions">Scalar functions and expressions</h2>
+<h2 id="scalar-functions-and-expressions">Scalar functions and expressions<a class="anchor" href="#scalar-functions-and-expressions" aria-label="Permalink: Scalar functions and expressions">#</a></h2>
 
 <ul>
   <li><code>abs</code>, <code>round</code> (1–2 args), <code>upper</code>,
@@ -211,7 +237,7 @@ LIMIT n;
   <a href="../docs/extensions">Using extensions</a>.</li>
 </ul>
 
-<h2 id="types-and-literals">Types and literals</h2>
+<h2 id="types-and-literals">Types and literals<a class="anchor" href="#types-and-literals" aria-label="Permalink: Types and literals">#</a></h2>
 
 <div class="table-wrap">
 <table>
@@ -228,8 +254,8 @@ LIMIT n;
 </table>
 </div>
 
-<pre class="code" data-lang="sql"><code>DATE '2024-02-29'
-TIMESTAMP '2024-03-15 12:30:45.5'</code></pre>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code>DATE <span class="tok-s">'2024-02-29'</span>
+TIMESTAMP <span class="tok-s">'2024-03-15 12:30:45.5'</span></code></pre></div>
 
 <p>Date operations: <code>date ± integer</code> adds/subtracts days,
 <code>date - date</code> yields <code>BIGINT</code> days, and <code>year(x)</code>,
@@ -255,7 +281,7 @@ are available. CSV import auto-detects <code>YYYY-MM-DD</code> as
   timestamps never mix with integers (no <code>INTERVAL</code> type today).</li>
 </ul>
 
-<h2 id="three-valued-logic">Three-valued logic</h2>
+<h2 id="three-valued-logic">Three-valued logic<a class="anchor" href="#three-valued-logic" aria-label="Permalink: Three-valued logic">#</a></h2>
 
 <ul>
   <li><code>NULL</code> fails <code>WHERE</code>: a comparison with NULL is never
@@ -267,7 +293,7 @@ are available. CSV import auto-detects <code>YYYY-MM-DD</code> as
   <li><code>CASE</code> conditions that evaluate to NULL never match.</li>
 </ul>
 
-<h2 id="databases-and-sessions">Databases and sessions</h2>
+<h2 id="databases-and-sessions">Databases and sessions<a class="anchor" href="#databases-and-sessions" aria-label="Permalink: Databases and sessions">#</a></h2>
 
 <p>Databases are named, case-insensitive namespaces (<code>main</code> by default).
 A session — the embedded <code>PinkDb</code>, or each <code>Connection</code> — has a
@@ -295,7 +321,7 @@ it and never affects other sessions: the shared store is untouched.</p>
   (<code>"use"</code> works).</li>
 </ul>
 
-<h2 id="not-supported-yet">Not supported yet</h2>
+<h2 id="not-supported-yet">Not supported yet<a class="anchor" href="#not-supported-yet" aria-label="Permalink: Not supported yet">#</a></h2>
 
 <p>These are real gaps, listed so you can plan around them. Most are scheduled on the
 <a href="../docs/roadmap">roadmap</a>.</p>
@@ -328,6 +354,10 @@ it and never affects other sessions: the shared store is untouched.</p>
   <li><a href="../docs/roadmap">Roadmap →</a></li>
 </ul>
 
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="cli"><span class="pager-dir">Previous</span><span class="pager-title">CLI &amp; REPL</span></a><a class="pager-link next" href="persistence"><span class="pager-dir">Next</span><span class="pager-title">Persistence</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/sql.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
 </article>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
@@ -341,14 +371,44 @@ it and never affects other sessions: the shared store is untouched.</p>
   <li><a href="#databases-and-sessions">Databases and sessions</a></li>
   <li><a href="#not-supported-yet">Not supported yet</a></li>
 </ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>
 </div>
 </main>
 <footer class="site-footer">
-  <div class="container footer-row">
-    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
-    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  <div class="footer-grid">
+    <div class="footer-brand">
+      <p class="footer-name">pinkdb</p>
+      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+    </div>
+    <div>
+      <p class="footer-title">Learn</p>
+      <ul>
+        <li><a href="../docs/getting-started">Getting started</a></li>
+        <li><a href="../docs/sql">SQL reference</a></li>
+        <li><a href="../docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="../docs/bindings">APIs &amp; bindings</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Ecosystem</p>
+      <ul>
+        <li><a href="../extensions">Extension catalog</a></li>
+        <li><a href="../docs/extensions">Writing extensions</a></li>
+        <li><a href="../docs/server">Server</a></li>
+      </ul>
+    </div>
+    <div>
+      <p class="footer-title">Project</p>
+      <ul>
+        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
+        <li><a href="../docs/roadmap">Roadmap</a></li>
+        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-base">
+    <p>Static, self-hosted type, no trackers, no cookies.</p>
   </div>
 </footer>
 </body>
