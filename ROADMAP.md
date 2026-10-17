@@ -100,7 +100,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | done | landed; DuckLake-pinned AT semantics (literals only, capped at the attached version), per-version stats fast paths, manifest records + `.lake snapshots` + commit messages; `default_version` probed to be a catalog-format selector, not a read default — skipped |
 | 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | in progress | agent died in the Oct-17 disk-full cascade (`database or disk is full`); partial secured — `wt-lake-schema/partial-stuck.diff` (5,272 lines / 29 files); re-dispatch a continuation once sessions are cleared |
 | 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | in progress | agent stuck in the same cascade; partial secured — `wt-lake-partition/partial-stuck.diff` (4,796 lines / 16 files) |
-| 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | DuckLake-parity program |
+| 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | user-flagged: **start after 66** (closes the lake-parity block with 68) |
 | 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | queued | DuckLake-parity program |
 | 69 | Prepared statements in the Python and Go bindings: wrapper ergonomics + tests over the FFI entry points landed in 59 | queued | follows 59 |
 | 70 | Core extension: **parquet** — read: `read_parquet` / `parquet_scan` (globs, multi-file, `union_by_name`, hive-partition + `filename` columns, column subset), projection + filter pushdown via row-group statistics (min/max/null counts), introspection (`parquet_schema`, `parquet_metadata`, `parquet_file_metadata`, `parquet_kv_metadata`), direct `FROM 'file.parquet'` replacement scan; write: `COPY … (FORMAT parquet)` (snappy default; zstd/gzip/uncompressed; `row_group_size`; per-column stats) with the α-probed physical mapping (DECIMAL→INT32 or FIXED_LEN_BYTE_ARRAY, TIMESTAMP→INT64 micros, DATE→INT32 days, INTERVAL→FIXED_LEN_BYTE_ARRAY) | queued | crate `pinkdb-parquet` (wasm-compatible); nested types + parquet encryption deferred |
@@ -131,14 +131,16 @@ batch** (63 + 64, in `wt-lake-incr` / `wt-lake-versions` off 8b401cd): both
 conflicts). **In flight (fourth batch):** 57 (lake encryption, reusing the
 `wt-lake-encryption` worktree), 65 (schema evolution, `wt-lake-schema`) and 66
 (partitioning, `wt-lake-partition`). **Queue discipline (Oct 17):** the
-lake-parity block (63–68, the requested exception) wraps up first; after the
-in-flight cluster lands, dispatches return to the numeric list in order —
-**74 (naming sweep) + 44 (stored procedures with JavaScript, the user-flagged
-next item)**, then 42 (indexes), 43 (matviews), 46… — with new items always
-taking the next free number (77 macros, 78 server UI queued); the file-format
-block (70–72) plus 75 (httpfs) and 76 (import options) runs after the rename.
-Integrations are one patch at a time with full
-gates + CI (max two worktrees per the disk-space policy).
+lake-parity block (63–68) finishes first, in order — **65 → 66 → 67 → 68**
+(user-flagged: 67 starts after 66; 65/66/57 continue from their secured
+`partial-stuck.diff` partials after the second disk-full incident). Then
+dispatches return to the numeric list — **74 (naming sweep) + 44 (stored
+procedures with JavaScript, the user-flagged next item)**, then 42 (indexes),
+43 (matviews), 46… — with new items always taking the next free number (77
+macros, 78 server UI queued); the file-format block (70–72) plus 75 (httpfs)
+and 76 (import options) runs after the rename. Integrations are one patch at a
+time with full gates + CI (max two worktrees per the disk-space policy; every
+brief now carries the disk guard).
 
 Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
