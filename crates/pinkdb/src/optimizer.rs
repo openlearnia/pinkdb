@@ -409,7 +409,7 @@ fn and_all(mut exprs: Vec<BoundExpr>) -> Option<BoundExpr> {
 /// must address a bare `Column`/`AggRef` passthrough (same scope below).
 fn rewrite_through_project(pred: &BoundExpr, exprs: &[BoundExpr]) -> Option<BoundExpr> {
     match pred {
-        BoundExpr::Column { index, .. } => match &exprs[*index] {
+        BoundExpr::Column { index, .. } => match exprs.get(*index)? {
             BoundExpr::Column { .. } | BoundExpr::AggRef { .. } => Some(exprs[*index].clone()),
             _ => None,
         },

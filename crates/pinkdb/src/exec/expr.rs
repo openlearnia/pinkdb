@@ -1391,18 +1391,24 @@ fn temporal_arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
         (BinaryOp::Subtract, Value::Timestamp(x), Value::Timestamp(y)) => Ok(Value::Interval {
             months: 0,
             days: 0,
-            micros: x - y,
+            micros: x.checked_sub(*y).ok_or_else(timestamp_out_of_range)?,
         }),
-        (BinaryOp::Subtract, Value::Timestamp(x), Value::Date(d)) => Ok(Value::Interval {
-            months: 0,
-            days: 0,
-            micros: x - timestamp_us_for_date(*d)?,
-        }),
-        (BinaryOp::Subtract, Value::Date(d), Value::Timestamp(x)) => Ok(Value::Interval {
-            months: 0,
-            days: 0,
-            micros: timestamp_us_for_date(*d)? - x,
-        }),
+        (BinaryOp::Subtract, Value::Timestamp(x), Value::Date(d)) => {
+            let base = timestamp_us_for_date(*d)?;
+            Ok(Value::Interval {
+                months: 0,
+                days: 0,
+                micros: x.checked_sub(base).ok_or_else(timestamp_out_of_range)?,
+            })
+        }
+        (BinaryOp::Subtract, Value::Date(d), Value::Timestamp(x)) => {
+            let base = timestamp_us_for_date(*d)?;
+            Ok(Value::Interval {
+                months: 0,
+                days: 0,
+                micros: base.checked_sub(*x).ok_or_else(timestamp_out_of_range)?,
+            })
+        }
         (BinaryOp::Multiply, Value::Interval { .. }, _) => {
             let iv = as_interval(&a)?;
             let f = as_interval_number(&b)?;
@@ -1805,7 +1811,7 @@ fn decimal_round(x: i128, scale: u8, digits: i64, precision: u8) -> Result<Value
         let y = rescale_decimal(x, scale, want).ok_or_else(out_of_range)?;
         return Ok(Value::Decimal(y, want));
     }
-    let drop = (-digits) as u32;
+    let drop = digits.unsigned_abs();
     if drop > 38 {
         return Ok(Value::Decimal(0, 0));
     }
@@ -2476,6 +2482,13 @@ mod tests {
 
     fn test_cx<'a>(db: &'a PinkDb) -> Cx<'a> {
         Cx::new(db)
+    }
+
+    #[test]
+    fn decimal_round_handles_i64_min_digits() {
+        // `-digits` would overflow for i64::MIN; the helper must not panic
+        // (SQL caps the digit count at INTEGER, but the helper defends anyway).
+        assert_eq!(decimal_round(15, 1, i64::MIN, 2).unwrap(), V::Decimal(0, 0));
     }
 
     fn chunk2() -> DataChunk {

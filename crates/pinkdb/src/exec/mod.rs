@@ -6281,6 +6281,45 @@ mod tests {
         assert_eq!(rows, vec![vec![V::Bigint(4)]]);
     }
 
+    #[test]
+    fn concat_binds_on_both_sides_of_a_comparison() {
+        let mut db = sales_db();
+        // `||` on the right of `=`/`LIKE` used to fail to parse.
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM sales WHERE region = 'we' || 'st';",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(2)]]);
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM sales WHERE region || 'x' = 'westx';",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(2)]]);
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM sales WHERE region LIKE 'we' || '%';",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(2)]]);
+    }
+
+    #[test]
+    fn timestamp_subtraction_yields_an_interval() {
+        let mut db = PinkDb::new();
+        // The subtraction path is checked; a normal difference still works.
+        let rows = select(
+            &mut db,
+            "SELECT TIMESTAMP '2000-01-02 00:00:00' - TIMESTAMP '2000-01-01 00:00:00';",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![V::Interval {
+                months: 0,
+                days: 0,
+                micros: 86_400_000_000,
+            }]]
+        );
+    }
+
     // --- phase 8: window functions ---
 
     fn win_db() -> PinkDb {

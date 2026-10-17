@@ -1413,12 +1413,12 @@ peg::parser! {
 
         rule comparison_tail() -> CmpTail
             = kw(Keyword::Is) neg:opt_kw(Keyword::Not) kw(Keyword::Null) { CmpTail::IsNull { negated: neg } }
-            / neg:not_flag() kw(Keyword::Between) low:additive() kw(Keyword::And) high:additive() {
+            / neg:not_flag() kw(Keyword::Between) low:concat_expr() kw(Keyword::And) high:concat_expr() {
                   CmpTail::Between { negated: neg, low, high }
               }
             / neg:not_flag() kw(Keyword::In) lparen() t:in_tail(neg) { t }
-            / neg:not_flag() kw(Keyword::Like) right:additive() { CmpTail::Like { negated: neg, right } }
-            / op:cmp_op() right:additive() { CmpTail::Binary { op, right } }
+            / neg:not_flag() kw(Keyword::Like) right:concat_expr() { CmpTail::Like { negated: neg, right } }
+            / op:cmp_op() right:concat_expr() { CmpTail::Binary { op, right } }
 
         rule in_tail(negated: bool) -> CmpTail
             = q:select() rparen() { CmpTail::InSubquery { negated, query: Box::new(q) } }

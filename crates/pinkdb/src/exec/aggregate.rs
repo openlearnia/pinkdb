@@ -2,7 +2,8 @@
 //!
 //! Keys encode as `Vec<u8>` → `HashMap` (NULL keys group together — the NULL
 //! tag byte is the whole encoding). First-seen key `Value`s are kept for
-//! output; SUM over integers accumulates in i64 (wraps on overflow, v1).
+//! output; SUM over integers accumulates exactly (i128) and **errors** on a
+//! BIGINT overflow rather than wrapping (DuckDB's rule).
 
 use crate::types::FastMap;
 use crate::types::FastSet;
