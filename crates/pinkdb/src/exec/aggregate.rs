@@ -71,9 +71,9 @@ fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             micros,
         } => {
             buf.push(9);
-            buf.extend_from_slice(&months.to_le_bytes());
-            buf.extend_from_slice(&days.to_le_bytes());
-            buf.extend_from_slice(&micros.to_le_bytes());
+            // The comparison-normalized key (same as the vector path).
+            let key = crate::types::interval_key(*months, *days, *micros);
+            buf.extend_from_slice(&key.to_le_bytes());
         }
     }
 }

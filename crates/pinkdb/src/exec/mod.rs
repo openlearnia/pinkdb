@@ -6362,6 +6362,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn interval_grouping_matches_comparison_order() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (iv INTERVAL);").unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (INTERVAL '1 month'), (INTERVAL '30 days'), (INTERVAL '1 day');",
+        )
+        .unwrap();
+        // '1 month' == '30 days' under interval_cmp (months → 30 days), so
+        // DISTINCT and GROUP BY must treat them as one value.
+        let rows = select(&mut db, "SELECT COUNT(DISTINCT iv) FROM t;");
+        assert_eq!(rows, vec![vec![V::Bigint(2)]]);
+        let rows = select(&mut db, "SELECT COUNT(*) FROM t GROUP BY iv ORDER BY 1;");
+        assert_eq!(rows, vec![vec![V::Bigint(1)], vec![V::Bigint(2)]]);
+    }
+
     // --- phase 8: window functions ---
 
     fn win_db() -> PinkDb {

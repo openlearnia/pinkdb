@@ -730,7 +730,7 @@ pub struct Interval {
 
 const US_PER_DAY: i64 = 86_400_000_000;
 /// The interval comparison equivalence: `months * 30 days + days + micros`.
-fn interval_key(months: i32, days: i32, micros: i64) -> i128 {
+pub(crate) fn interval_key(months: i32, days: i32, micros: i64) -> i128 {
     months as i128 * 30 * US_PER_DAY as i128 + days as i128 * US_PER_DAY as i128 + micros as i128
 }
 

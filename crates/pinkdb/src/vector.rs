@@ -658,10 +658,12 @@ impl Vector {
             }
             VectorData::Interval(v) => {
                 buf.push(9);
+                // Encode the comparison-normalized key (months → 30 days, days
+                // → micros) so GROUP BY / DISTINCT / JOIN agree with `=` and
+                // the ordering, like the float -0.0/NaN path above.
                 let iv = &v[idx];
-                buf.extend_from_slice(&iv.months.to_le_bytes());
-                buf.extend_from_slice(&iv.days.to_le_bytes());
-                buf.extend_from_slice(&iv.micros.to_le_bytes());
+                let key = crate::types::interval_key(iv.months, iv.days, iv.micros);
+                buf.extend_from_slice(&key.to_le_bytes());
             }
         }
     }
