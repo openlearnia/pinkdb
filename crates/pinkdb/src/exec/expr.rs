@@ -1600,7 +1600,10 @@ fn cast_out_of_range(v: &Value, target: DataType) -> PinkDbError {
     PinkDbError::Execution(format!("cannot CAST {v} AS {target}: value out of range"))
 }
 
-fn cast_value(v: Value, target: DataType) -> Result<Value> {
+/// Convert one non-NULL value to `target` (CAST semantics; NULL is handled by
+/// callers). Shared with the prepared-statement bind step, which converts a
+/// bound parameter to its inferred slot type.
+pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
     match (v, target) {
         (v, t) if v.data_type() == Some(t) => Ok(v),
         // Numeric tower (DuckDB rules): narrowing out of range is an error,

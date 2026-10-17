@@ -117,3 +117,80 @@ fn ownership_loops_do_not_leak_or_corrupt() {
     }
     pinkdb_close(h);
 }
+
+/// A prepared INSERT on a durable database: the WAL carries the substituted
+/// SQL, and reopening replays it to the same rows.
+#[test]
+fn prepared_durable_round_trip_through_the_c_abi() {
+    let dir = std::env::temp_dir().join(format!("pinkdb_ffi_prep_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("p.pink");
+    let cpath = CString::new(path.to_str().unwrap()).unwrap();
+
+    let text_cell = |s: &str| -> (PinkValue, Vec<u8>) {
+        let mut owned = s.as_bytes().to_vec();
+        owned.push(0);
+        let ptr = owned.as_ptr() as *const c_char;
+        let len = owned.len() - 1;
+        (
+            PinkValue {
+                type_tag: PINKDB_TYPE_VARCHAR,
+                is_null: 0,
+                int64: 0,
+                double: 0.0,
+                text_ptr: ptr,
+                text_len: len,
+            },
+            owned,
+        )
+    };
+
+    let h = pinkdb_open(cpath.as_ptr());
+    assert!(!h.is_null(), "open failed: {}", last_error());
+    let r = exec(h, "CREATE TABLE t (i INTEGER, s VARCHAR);");
+    pinkdb_result_free(r);
+    let sql = CString::new("INSERT INTO t VALUES (?, ?);").unwrap();
+    let prep = pinkdb_prepare(h, sql.as_ptr(), sql.as_bytes().len());
+    assert!(!prep.is_null(), "{:?}", last_error());
+    assert_eq!(pinkdb_prepared_parameter_count(prep), 2);
+    for (i, s) in [(1, "it's"), (2, "two")] {
+        let (s_cell, _keep) = text_cell(s);
+        let i_cell = PinkValue {
+            type_tag: PINKDB_TYPE_INTEGER,
+            is_null: 0,
+            int64: i,
+            double: 0.0,
+            text_ptr: ptr::null(),
+            text_len: 0,
+        };
+        let values = [i_cell, s_cell];
+        let r = pinkdb_execute_prepared(h, prep, values.as_ptr(), 2);
+        assert!(!r.is_null(), "{:?}", last_error());
+        assert_eq!(pinkdb_result_affected(r, 0), 1);
+        pinkdb_result_free(r);
+    }
+    pinkdb_prepared_free(prep);
+    pinkdb_close(h);
+
+    // The WAL records the substituted SQL (quotes doubled), never `?`.
+    let wal = std::fs::read(format!("{}.wal", path.to_str().unwrap())).unwrap_or_default();
+    let wal_text = String::from_utf8_lossy(&wal);
+    assert!(
+        wal_text.contains("INSERT INTO t VALUES (1, 'it''s')"),
+        "unexpected WAL: {wal_text}"
+    );
+    assert!(!wal_text.contains("VALUES (?, ?)"), "{wal_text}");
+
+    // Reopen: recovery replays the WAL to the same state.
+    let h = pinkdb_open(cpath.as_ptr());
+    assert!(!h.is_null(), "reopen failed: {}", last_error());
+    let r = exec(h, "SELECT i, s FROM t ORDER BY i;");
+    assert_eq!(pinkdb_result_row_count(r, 0), 2);
+    let v = pinkdb_result_value(r, 0, 0, 1);
+    assert_eq!(text(&v), "it's");
+    assert_eq!(pinkdb_result_value(r, 0, 1, 0).int64, 2);
+    pinkdb_result_free(r);
+    pinkdb_close(h);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

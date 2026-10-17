@@ -92,7 +92,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | in progress | worktree `wt-lake-encryption` (patch integration) |
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | done | landed; duckdiff 88 → 155 probes |
-| 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | in progress | worktree `wt-prepared` (patch integration) |
+| 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | done | landed (engine + protocol v5 + FFI + client); Python/Go wrappers follow in wave 69 |
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | in progress | worktree `wt-types` (patch integration) |
@@ -102,6 +102,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | queued | DuckLake-parity program |
 | 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | DuckLake-parity program |
 | 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | queued | DuckLake-parity program |
+| 69 | Prepared statements in the Python and Go bindings: wrapper ergonomics + tests over the FFI entry points landed in 59 | queued | follows 59 |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
@@ -834,3 +835,37 @@ Java bindings.
   per-query time travel, evolution, partitioning and maintenance. All six stay
   queued for the next worktree batch after the in-flight four land
   (rate-limit cap: max four concurrent agents).
+- 2026-10-17 — Wave 59 (prepared statements): `?` placeholders in the parser;
+  inference + binding in the new `prepared` module (`PreparedStatement::parse`,
+  parameter types resolved against the catalog at bind time, `CAST(? AS t)` to
+  pin a type); an engine API on `Connection` (`prepare` → `bind` →
+  `execute_bound`/`execute_prepared`; binding uses the open transaction's
+  snapshot when one is open, execution goes through the normal statement path
+  so durable stores log the substituted SQL — replay-exact). Protocol **v5**:
+  `Prepare` / `ExecutePrepared` requests + the `Prepared` response
+  (connection-local handles, capped at 1024 per connection; bind/type errors
+  and unknown handles are normal errors, the connection stays usable; the
+  server's hook sees the substituted SQL). FFI: `pinkdb.h` + `pinkdb-ffi`
+  gained prepare/bind/execute entry points with tests. Client:
+  `Client::prepare` / `execute_prepared`, sharing the batch reader with
+  `execute`. Tests: the engine suite (`tests/prepared.rs`), a server round-trip
+  (binding, reuse, unknown handle, count/type errors, prepare-time parse
+  errors), and extended protocol round-trips. Gates on main: fmt, clippy
+  (pinkdb/server/ffi all-targets `-D warnings`), engine 431/431, server 25/25,
+  FFI, CLI lake+s3 (multiprocess 27/27), duckdiff **155/155**, workspace green.
+  The Python/Go binding wrappers are queued as **wave 69** (the FFI they wrap
+  is in place). Note: finished directly after the worktree agent died in the
+  Oct-17 disk-full incident (see next entry).
+- 2026-10-17 — Disk-full incident and recovery: the four-worktree batch's
+  private target dirs plus main's caches filled the volume (100%, 897 MiB
+  free); builds in every worktree began failing and the failure cascades
+  killed the agents with model-input-limit errors (57, 59 and 62 confirmed;
+  41 never reported and its target was freed — treated as failed). Recovery:
+  every worktree's source was secured as a patch artifact
+  (`wt-lake-encryption` 3,759 / `wt-pkfk` 2,843 / `wt-types` 2,993 /
+  `wt-prepared` 3,698 lines), then all four private targets, main's
+  incremental cache and the lake-bench temp dirs were removed — 29 GiB freed.
+  Wave 59 was finished by hand from its partial state and landed same-day;
+  57, 62 and 41 stay parked with their patches secured. Lesson: at most two
+  concurrent worktrees with private targets on this machine; write patch
+  artifacts at milestones; check free space before dispatching.

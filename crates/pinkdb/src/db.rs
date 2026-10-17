@@ -169,6 +169,12 @@ impl Database {
         }
     }
 
+    /// Run `f` against the shared store under a read lock (crate-internal:
+    /// prepared-statement bind needs the catalog a statement will see).
+    pub(crate) fn read_store<R>(&self, f: impl FnOnce(&PinkDb) -> R) -> R {
+        f(&read_lock(&self.shared))
+    }
+
     /// Acquire the write lease (`None` in memory). Invariant I6: callers
     /// take the lease *before* the store write lock.
     fn acquire_lease(&self) -> Result<Option<LeaseGuard>> {
@@ -315,6 +321,61 @@ impl Connection {
     /// The session's current database (lowercased).
     pub fn current_db(&self) -> &str {
         &self.current_db
+    }
+
+    /// Parse `sql` into a reusable prepared statement (exactly one statement,
+    /// `?` placeholders allowed). Pure parsing: no catalog access; types are
+    /// resolved by [`Connection::bind`] / [`Connection::execute_prepared`].
+    pub fn prepare(&self, sql: &str) -> Result<crate::prepared::PreparedStatement> {
+        crate::prepared::PreparedStatement::parse(sql)
+    }
+
+    /// Bind `params` to `stmt` against the catalog this connection binds
+    /// against — the open transaction's snapshot when one is open, else the
+    /// shared store. Returns the substituted SQL text; nothing executes.
+    pub fn bind(
+        &self,
+        stmt: &crate::prepared::PreparedStatement,
+        params: &[crate::types::Value],
+    ) -> Result<crate::prepared::BoundStatement> {
+        let default_db = self.current_db.clone();
+        self.with_bind_store(|db| stmt.bind(db, &default_db, params))
+    }
+
+    /// Execute a prepared statement like any other statement of this
+    /// connection: fresh binding/state per execute, inside the open
+    /// transaction when one is open, logged to the WAL (as the substituted
+    /// SQL) on a durable store.
+    pub fn execute_prepared(
+        &mut self,
+        stmt: &crate::prepared::PreparedStatement,
+        params: &[crate::types::Value],
+    ) -> Result<QueryResult> {
+        let bound = self.bind(stmt, params)?;
+        self.execute_bound(&bound)
+    }
+
+    /// Execute a statement already bound to values (see [`Connection::bind`]).
+    pub fn execute_bound(
+        &mut self,
+        bound: &crate::prepared::BoundStatement,
+    ) -> Result<QueryResult> {
+        let mut results = self.execute(bound.sql())?;
+        debug_assert_eq!(results.len(), 1, "a bound statement is one statement");
+        results.pop().ok_or_else(|| {
+            PinkDbError::Execution("internal error: bound statement produced no result".to_string())
+        })
+    }
+
+    /// Run `f` against the store a statement of this connection binds
+    /// against: the open transaction's private snapshot when one is open
+    /// (so a prepared statement sees uncommitted tables/rows), else the
+    /// shared store under a read lock.
+    fn with_bind_store<R>(&self, f: impl FnOnce(&PinkDb) -> R) -> R {
+        match &self.txn {
+            Some(txn) => f(&txn.work),
+            None => self.db.read_store(f),
+        }
     }
 
     fn execute_one(

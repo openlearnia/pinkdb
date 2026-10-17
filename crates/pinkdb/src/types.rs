@@ -351,6 +351,9 @@ pub enum PinkDbError {
     Catalog(String),
     Type(String),
     Parse(String),
+    /// A prepared-statement parameter failed to bind: missing/extra values,
+    /// an untypable `?`, or a value that cannot convert to the inferred type.
+    Parameter(String),
     Execution(String),
     Io(std::io::Error),
     Csv(csv::Error),
@@ -362,6 +365,7 @@ impl fmt::Display for PinkDbError {
             PinkDbError::Catalog(msg)
             | PinkDbError::Type(msg)
             | PinkDbError::Parse(msg)
+            | PinkDbError::Parameter(msg)
             | PinkDbError::Execution(msg) => write!(f, "{msg}"),
             PinkDbError::Io(e) => write!(f, "IO error: {e}"),
             PinkDbError::Csv(e) => write!(f, "CSV error: {e}"),

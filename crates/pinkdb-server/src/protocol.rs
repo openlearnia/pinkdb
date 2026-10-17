@@ -44,7 +44,10 @@ use pinkdb::{DataType, Value};
 /// terminator (the client no longer parses SQL locally to count statements).
 /// v3: [`DoneKind::LoadedExtension`] (tag 15) reports `LOAD EXTENSION`.
 /// v4: [`DoneKind::Checkpointed`] (tag 16) reports `CHECKPOINT`.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// v5: [`Request::Prepare`] / [`Request::ExecutePrepared`] and
+/// [`Response::Prepared`] carry server-side prepared statements with `?`
+/// parameters.
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -59,6 +62,11 @@ pub mod msg_type {
     pub const HELLO: u8 = 1;
     pub const EXECUTE: u8 = 2;
     pub const PING: u8 = 3;
+    /// v5: parse one statement with `?` placeholders into a connection-local
+    /// prepared statement.
+    pub const PREPARE: u8 = 4;
+    /// v5: execute a prepared statement with one value per placeholder.
+    pub const EXECUTE_PREPARED: u8 = 5;
 
     pub const HELLO_OK: u8 = 10;
     pub const PONG: u8 = 11;
@@ -68,6 +76,8 @@ pub mod msg_type {
     pub const ERROR: u8 = 15;
     /// v2: end of one `Execute` batch; body is the statement count.
     pub const BATCH_DONE: u8 = 16;
+    /// v5: reply to `Prepare`; body is the handle and the parameter count.
+    pub const PREPARED: u8 = 17;
 }
 
 /// Value tag bytes (one per [`Value`] variant).
@@ -162,6 +172,13 @@ pub enum Request {
     Execute { sql: String },
     /// Liveness probe.
     Ping,
+    /// v5: parse one statement with `?` placeholders (exactly one statement)
+    /// into a connection-local prepared statement.
+    Prepare { sql: String },
+    /// v5: execute a prepared statement with one value per `?` (textual
+    /// order). The reply is one result group plus a `BatchDone`, exactly like
+    /// a one-statement `Execute`.
+    ExecutePrepared { handle: u64, values: Vec<Value> },
 }
 
 impl Request {
@@ -171,6 +188,8 @@ impl Request {
             Request::Hello { .. } => msg_type::HELLO,
             Request::Execute { .. } => msg_type::EXECUTE,
             Request::Ping => msg_type::PING,
+            Request::Prepare { .. } => msg_type::PREPARE,
+            Request::ExecutePrepared { .. } => msg_type::EXECUTE_PREPARED,
         }
     }
 
@@ -180,6 +199,8 @@ impl Request {
             Request::Hello { .. } => "Hello",
             Request::Execute { .. } => "Execute",
             Request::Ping => "Ping",
+            Request::Prepare { .. } => "Prepare",
+            Request::ExecutePrepared { .. } => "ExecutePrepared",
         }
     }
 
@@ -190,6 +211,14 @@ impl Request {
             Request::Hello { protocol_version } => put_u32(&mut buf, *protocol_version),
             Request::Execute { sql } => put_str(&mut buf, sql)?,
             Request::Ping => {}
+            Request::Prepare { sql } => put_str(&mut buf, sql)?,
+            Request::ExecutePrepared { handle, values } => {
+                put_u64(&mut buf, *handle);
+                put_u32(&mut buf, count_u32(values.len(), "ExecutePrepared values")?);
+                for value in values {
+                    put_value(&mut buf, value)?;
+                }
+            }
         }
         Ok(buf)
     }
@@ -205,6 +234,22 @@ impl Request {
                 sql: r.string("Execute.sql")?,
             },
             msg_type::PING => Request::Ping,
+            msg_type::PREPARE => Request::Prepare {
+                sql: r.string("Prepare.sql")?,
+            },
+            msg_type::EXECUTE_PREPARED => {
+                let handle = r.u64("ExecutePrepared.handle")?;
+                let count = r.u32("ExecutePrepared value count")? as usize;
+                // Every value costs at least one tag byte.
+                if count as u64 > r.remaining() as u64 {
+                    return Err(ProtocolError::Truncated("ExecutePrepared values"));
+                }
+                let mut values = Vec::with_capacity(count.min(1024));
+                for _ in 0..count {
+                    values.push(r.value("ExecutePrepared value")?);
+                }
+                Request::ExecutePrepared { handle, values }
+            }
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown request message type {other}"
@@ -247,6 +292,10 @@ pub enum Response {
     /// result groups that preceded it. The client reads until this frame, so
     /// the statement count never needs local parsing.
     BatchDone { statements: u32 },
+    /// v5: reply to [`Request::Prepare`]; `handle` names the server-side
+    /// prepared statement (connection-local) and `parameter_count` is its
+    /// number of `?` placeholders.
+    Prepared { handle: u64, parameter_count: u32 },
     /// The statement (or handshake) failed; the connection stays usable.
     Error { message: String },
 }
@@ -321,6 +370,7 @@ impl Response {
             Response::Rows { .. } => msg_type::ROWS,
             Response::Done { .. } => msg_type::DONE,
             Response::BatchDone { .. } => msg_type::BATCH_DONE,
+            Response::Prepared { .. } => msg_type::PREPARED,
             Response::Error { .. } => msg_type::ERROR,
         }
     }
@@ -334,6 +384,7 @@ impl Response {
             Response::Rows { .. } => "Rows",
             Response::Done { .. } => "Done",
             Response::BatchDone { .. } => "BatchDone",
+            Response::Prepared { .. } => "Prepared",
             Response::Error { .. } => "Error",
         }
     }
@@ -388,6 +439,13 @@ impl Response {
                 put_str(&mut buf, name)?;
             }
             Response::BatchDone { statements } => put_u32(&mut buf, *statements),
+            Response::Prepared {
+                handle,
+                parameter_count,
+            } => {
+                put_u64(&mut buf, *handle);
+                put_u32(&mut buf, *parameter_count);
+            }
             Response::Error { message } => put_str(&mut buf, message)?,
         }
         Ok(buf)
@@ -444,6 +502,10 @@ impl Response {
             },
             msg_type::BATCH_DONE => Response::BatchDone {
                 statements: r.u32("BatchDone.statements")?,
+            },
+            msg_type::PREPARED => Response::Prepared {
+                handle: r.u64("Prepared.handle")?,
+                parameter_count: r.u32("Prepared.parameter_count")?,
             },
             msg_type::ERROR => Response::Error {
                 message: r.string("Error.message")?,

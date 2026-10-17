@@ -7,8 +7,8 @@
  * Contract
  * --------
  * - Every pointer returned by this library is freed with the matching
- *   `pinkdb_*_free` function (only `pinkdb_result_free` and `pinkdb_close`
- *   exist in v1). Never free the same pointer twice.
+ *   `pinkdb_*_free` function (`pinkdb_result_free`, `pinkdb_prepared_free`
+ *   and `pinkdb_close`). Never free the same pointer twice.
  * - Text pointers (`pinkdb_result_column_name`, `pinkdb_result_name`,
  *   `pink_value.text_ptr`, `pinkdb_last_error`) borrow from their owning
  *   result/handle/thread and stay valid only until that owner is freed or the
@@ -42,6 +42,7 @@ extern "C" {
 /* Opaque types. */
 typedef struct pinkdb_handle pinkdb_handle;
 typedef struct pinkdb_result pinkdb_result;
+typedef struct pinkdb_prepared pinkdb_prepared;
 
 /* Statement kind tags (pinkdb_result_kind). */
 enum {
@@ -114,6 +115,36 @@ pinkdb_result *pinkdb_execute(pinkdb_handle *handle, const char *sql,
 
 /* Free a result. NULL-safe. */
 void pinkdb_result_free(pinkdb_result *result);
+
+/* Prepared statements (`?` placeholders).
+ *
+ * `pinkdb_prepare` parses exactly one SQL statement; `?` in it is a
+ * positional placeholder, numbered by textual order. Types are resolved when
+ * the statement executes (the bind step): a comparison/arithmetic operator,
+ * an INSERT/UPDATE target column, or `CAST(? AS type)` fixes the
+ * placeholder's type, the bound value is converted to it, and an impossible
+ * conversion or an untypable NULL is a bind error (pinkdb_last_error). The
+ * prepared statement is reusable; every execution rebinds (fresh catalog
+ * state) and, on a durable database, the WAL logs the fully substituted SQL.
+ * Free with pinkdb_prepared_free. */
+pinkdb_prepared *pinkdb_prepare(pinkdb_handle *handle, const char *sql,
+                                size_t sql_len);
+
+/* Number of `?` placeholders: how many values pinkdb_execute_prepared takes
+ * (0 for NULL). */
+size_t pinkdb_prepared_parameter_count(const pinkdb_prepared *prepared);
+
+/* Free a prepared statement. NULL-safe. */
+void pinkdb_prepared_free(pinkdb_prepared *prepared);
+
+/* Execute a prepared statement with `value_count` values (in textual order).
+ * Returns NULL on error (see pinkdb_last_error); free with
+ * pinkdb_result_free. A wrong value count, a value of the wrong type, or a
+ * bind/execution failure is a normal error; the handle stays usable. */
+pinkdb_result *pinkdb_execute_prepared(pinkdb_handle *handle,
+                                       const pinkdb_prepared *prepared,
+                                       const pink_value *values,
+                                       size_t value_count);
 
 /* Number of statements in the result. */
 size_t pinkdb_result_statement_count(const pinkdb_result *result);

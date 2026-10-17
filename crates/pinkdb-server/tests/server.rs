@@ -1133,3 +1133,52 @@ fn checkpoint_round_trips_as_its_own_done_kind() {
         vec![QueryResult::Checkpointed]
     );
 }
+
+#[test]
+fn prepared_statements_round_trip_with_parameters() {
+    let (_handle, addr) = start();
+    let mut c = Client::connect(&addr).unwrap();
+    c.execute("CREATE TABLE p (id INTEGER, v VARCHAR);")
+        .unwrap();
+
+    // Insert through placeholders: the parameter count comes back from the
+    // server, and the statement is reusable with fresh bindings.
+    let (insert, params) = c.prepare("INSERT INTO p VALUES (?, ?)").unwrap();
+    assert_eq!(params, 2);
+    for (id, v) in [(1_i32, "one"), (2, "two")] {
+        c.execute_prepared(insert, &[Value::Integer(id), varchar(v)])
+            .unwrap();
+    }
+
+    // A prepared SELECT with a bound predicate, framed like a normal Execute.
+    let (select, params) = c.prepare("SELECT v FROM p WHERE id = ?").unwrap();
+    assert_eq!(params, 1);
+    assert_eq!(
+        rows(c.execute_prepared(select, &[Value::Integer(2)]).unwrap()),
+        vec![vec![varchar("two")]]
+    );
+
+    // A bind-type error is a normal server error: nothing executes and the
+    // connection stays usable.
+    assert!(c
+        .execute_prepared(insert, &[varchar("x"), Value::Integer(1)])
+        .is_err());
+    assert_eq!(
+        rows(c.execute("SELECT COUNT(*) FROM p;").unwrap()),
+        vec![vec![Value::Bigint(2)]]
+    );
+
+    // An unknown handle and an argument-count mismatch are clean errors.
+    let err = c.execute_prepared(987_654, &[]).unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("unknown prepared statement handle"));
+    assert!(c.execute_prepared(select, &[]).is_err());
+
+    // Parse errors surface at prepare time: bad SQL, several statements, and
+    // a non-code packet cannot be prepared.
+    assert!(c.prepare("SELECT ? FROM").is_err());
+    assert!(c.prepare("SELECT 1; SELECT 2;").is_err());
+
+    assert_server_healthy(&addr);
+}

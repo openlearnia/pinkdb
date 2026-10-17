@@ -14,7 +14,6 @@ mod split;
 use crate::types::{PinkDbError, Result, Value};
 pub(crate) use binder::bind_tracked;
 pub use binder::{bind, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
-
 /// Maximum AST depth the parser accepts (see [`check_ast_depth`]).
 ///
 /// Measured in nodes along the deepest root-to-leaf path: every statement,
@@ -153,6 +152,22 @@ fn nesting_estimate(sql: &str) -> usize {
 /// [`check_ast_depth`] (AST depth, protecting bind/execute/drop recursion).
 pub fn parse_statements(sql: &str) -> Result<Vec<ast::Statement>> {
     peg_parser::parse_statements(sql)
+}
+
+/// [`parse_statements`] plus the `?` placeholder positions, in textual order:
+/// the returned vector holds the byte offset of each `?` in `sql`, and every
+/// [`ast::Expr::Parameter`] carries its 0-based rank in that order. The vector
+/// length is the statement batch's parameter count.
+pub fn parse_prepared(sql: &str) -> Result<(Vec<ast::Statement>, Vec<usize>)> {
+    peg_parser::parse_prepared(sql)
+}
+
+/// Byte offsets of every `?` placeholder in `sql`, in textual order (strings,
+/// quoted identifiers and comments skipped). Used by
+/// [`crate::PreparedStatement::parse`] to cross-check the parser's captured
+/// positions; the parser is the authority for what counts as a placeholder.
+pub(crate) fn parameter_offsets(sql: &str) -> Vec<usize> {
+    split::parameter_offsets(sql)
 }
 
 /// Reject an AST whose depth exceeds [`MAX_AST_DEPTH`], iteratively.
@@ -315,6 +330,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                     }
                 }
                 ast::Expr::Literal(_)
+                | ast::Expr::Parameter(_)
                 | ast::Expr::Star
                 | ast::Expr::Column { .. }
                 | ast::Expr::QualifiedStar(_) => {}
@@ -548,6 +564,7 @@ fn take_expr_children(
             }
         }
         ast::Expr::Literal(_)
+        | ast::Expr::Parameter(_)
         | ast::Expr::Star
         | ast::Expr::Column { .. }
         | ast::Expr::QualifiedStar(_) => {}
@@ -587,6 +604,67 @@ mod tests {
             statement_texts("INSERT INTO t\n  VALUES (1);\n").unwrap(),
             vec!["INSERT INTO t\n  VALUES (1)"]
         );
+    }
+
+    // ---------- prepared placeholders ----------
+
+    /// `parse_prepared` returns the `?` offsets in textual order and renumbers
+    /// every `Expr::Parameter` to its rank; `?` inside strings, quoted
+    /// identifiers and comments is not a placeholder on either side.
+    #[test]
+    fn parse_prepared_offsets_and_ranks_follow_text_order() {
+        let sql = "SELECT '?', \"a?b\", ? /* ? */ FROM t WHERE a = ? AND b = ?";
+        let (stmts, offsets) = parse_prepared(sql).unwrap();
+        assert_eq!(offset_bytes(sql, &offsets), vec!['?', '?', '?']);
+        assert_eq!(offsets.len(), 3);
+        // 0-based ranks in textual order.
+        let sel = match &stmts[0] {
+            ast::Statement::Select(sel) => sel,
+            other => panic!("expected a SELECT, got {other:?}"),
+        };
+        let mut ranks = Vec::new();
+        collect_ranks(&mut ranks, sel);
+        assert_eq!(ranks, vec![0, 1, 2]);
+    }
+
+    fn offset_bytes(sql: &str, offsets: &[usize]) -> Vec<char> {
+        offsets
+            .iter()
+            .map(|&o| sql[o..].chars().next().unwrap())
+            .collect()
+    }
+
+    fn collect_ranks(out: &mut Vec<usize>, sel: &ast::Select) {
+        for p in &sel.projections {
+            if let ast::Projection::Expr { expr, .. } = p {
+                collect_expr_ranks(out, expr);
+            }
+        }
+        if let Some(w) = &sel.where_clause {
+            collect_expr_ranks(out, w);
+        }
+    }
+
+    fn collect_expr_ranks(out: &mut Vec<usize>, expr: &ast::Expr) {
+        match expr {
+            ast::Expr::Parameter(i) => out.push(*i),
+            ast::Expr::Binary { left, right, .. } => {
+                collect_expr_ranks(out, left);
+                collect_expr_ranks(out, right);
+            }
+            _ => {}
+        }
+    }
+
+    /// A placeholder's offset is a byte offset: a multi-byte literal before it
+    /// must not shift the substitution point.
+    #[test]
+    fn parse_prepared_offsets_are_byte_offsets() {
+        let sql = "SELECT 'héllo' || ?";
+        let (_, offsets) = parse_prepared(sql).unwrap();
+        assert_eq!(offsets.len(), 1);
+        assert_eq!(sql.as_bytes()[offsets[0]], b'?');
+        assert!(offsets[0] > 12, "the literal is multi-byte: {offsets:?}");
     }
 
     #[test]

@@ -261,6 +261,20 @@ pub enum FrameBound {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Value),
+    /// `?` — a positional parameter placeholder in a prepared statement.
+    ///
+    /// The payload is the placeholder's byte offset in the statement source
+    /// (the `?` character itself), as captured by the parser. Byte offsets
+    /// are unique per placeholder, which makes them a stable identity through
+    /// desugaring (a `BETWEEN`/`IN` desugar clones subtrees, so one
+    /// placeholder can appear several times in the tree).
+    ///
+    /// [`crate::sql::parse_prepared`] renumbers every node in textual order
+    /// (each payload becomes its 0-based rank), which is the index the bind
+    /// API uses. Plain [`crate::sql::parse_statements`] does the same, so a
+    /// `?` outside a prepared statement is a clear bind-time error, never a
+    /// parse error.
+    Parameter(usize),
     /// Bare `*` (only valid as a function arg for `COUNT(*)`).
     Star,
     Column {

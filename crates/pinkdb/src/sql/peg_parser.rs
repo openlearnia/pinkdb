@@ -24,13 +24,554 @@ use crate::types::{DataType, PinkDbError, Result, Value};
 /// Errors are [`PinkDbError::Parse`]; messages are positional and worded as
 /// PEG reports them (the furthest expected token).
 pub fn parse_statements(sql: &str) -> Result<Vec<Statement>> {
+    Ok(parse_prepared(sql)?.0)
+}
+
+/// [`parse_statements`] plus the `?` placeholder positions: every
+/// [`Expr::Parameter`] is renumbered to its 0-based textual rank (the order
+/// the placeholders appear in `sql`), and the returned vector holds the byte
+/// offset of each `?` in that same order. Its length is the statement's
+/// parameter count; the bind API takes one value per entry.
+///
+/// Placeholders in positions the engine cannot bind at execute time are
+/// rejected here (see [`reject_parameter_positions`]).
+pub(crate) fn parse_prepared(sql: &str) -> Result<(Vec<Statement>, Vec<usize>)> {
     super::check_nesting_depth(sql)?;
     reject_nul_in_quoted_identifier(sql)?;
     let mut out =
         peg_sql::statements(sql).map_err(|e| PinkDbError::Parse(format!("parse error: {e}")))?;
     // Post-parse depth guard (shared with the pre-parse nesting cap).
     super::check_ast_depth(&mut out)?;
-    Ok(out)
+    let offsets = renumber_parameters(&mut out)?;
+    Ok((out, offsets))
+}
+
+/// Renumber every [`Expr::Parameter`] payload from a source byte offset to
+/// its 0-based textual rank, and return the offsets in textual order.
+///
+/// Placeholders are rejected first ([`reject_parameter_positions`]) so the
+/// error names the clause, not the statement's position.
+fn renumber_parameters(stmts: &mut [Statement]) -> Result<Vec<usize>> {
+    reject_parameter_positions(stmts)?;
+    let mut offsets = Vec::new();
+    for stmt in stmts.iter_mut() {
+        collect_parameter_offsets(stmt, &mut offsets);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    for stmt in stmts.iter_mut() {
+        apply_parameter_ranks(stmt, &offsets);
+    }
+    Ok(offsets)
+}
+
+// ---------- placeholder position checks ----------
+
+/// Reject `?` placeholders in statement shapes whose substituted form would
+/// not mean the same thing:
+///
+/// - `ORDER BY ?` / `GROUP BY ?`: the substituted literal is re-read as a
+///   result-column ordinal (`ORDER BY 1`) or a constant key, neither of which
+///   is the parameter the caller wrote. DuckDB refuses parameters in these
+///   clauses; so does this engine.
+/// - `CREATE VIEW ... SELECT ?`: the view stores its AST for per-use
+///   rebinding, and a stored placeholder has no bind call to take a value
+///   from.
+///
+/// Every other position is legal (comparisons, arithmetic, function
+/// arguments, `CASE`, subqueries, `VALUES`, `SET`, `WHERE`, ...).
+fn reject_parameter_positions(stmts: &[Statement]) -> Result<()> {
+    for stmt in stmts {
+        match stmt {
+            Statement::CreateView { query, .. } => {
+                if select_contains_parameter(query) {
+                    return Err(PinkDbError::Parameter(
+                        "parameters are not supported in CREATE VIEW".to_string(),
+                    ));
+                }
+            }
+            Statement::CreateTableAs { query, .. } => check_select_positions(query)?,
+            Statement::Insert { source, .. } => match source {
+                InsertSource::Values(rows) => {
+                    for row in rows {
+                        for e in row {
+                            check_expr_positions(e)?;
+                        }
+                    }
+                }
+                InsertSource::Select(query) => check_select_positions(query)?,
+            },
+            Statement::Update {
+                sets, where_clause, ..
+            } => {
+                for (_, e) in sets {
+                    check_expr_positions(e)?;
+                }
+                if let Some(e) = where_clause {
+                    check_expr_positions(e)?;
+                }
+            }
+            Statement::Delete {
+                where_clause: Some(e),
+                ..
+            } => check_expr_positions(e)?,
+            Statement::Explain(query) => check_select_positions(query)?,
+            Statement::Select(query) => check_select_positions(query)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Per-select clause check (nested selects recurse; each has its own clauses).
+fn check_select_positions(sel: &Select) -> Result<()> {
+    for cte in &sel.with {
+        check_select_positions(&cte.query)?;
+    }
+    for p in &sel.projections {
+        if let Projection::Expr { expr, .. } = p {
+            check_expr_positions(expr)?;
+        }
+    }
+    if let Some(from) = &sel.from {
+        check_source_positions(&from.source)?;
+        for join in &from.joins {
+            check_source_positions(&join.source)?;
+            if let Some(on) = &join.on {
+                check_expr_positions(on)?;
+            }
+        }
+    }
+    if let Some(e) = &sel.where_clause {
+        check_expr_positions(e)?;
+    }
+    for key in &sel.group_by {
+        if expr_contains_parameter(key) {
+            return Err(PinkDbError::Parameter(
+                "parameters are not supported in GROUP BY".to_string(),
+            ));
+        }
+    }
+    if let Some(e) = &sel.having {
+        check_expr_positions(e)?;
+    }
+    for item in &sel.order_by {
+        if expr_contains_parameter(&item.expr) {
+            return Err(PinkDbError::Parameter(
+                "parameters are not supported in ORDER BY".to_string(),
+            ));
+        }
+    }
+    for (_, branch) in &sel.unions {
+        check_select_positions(branch)?;
+    }
+    Ok(())
+}
+
+fn check_source_positions(source: &FromSource) -> Result<()> {
+    match source {
+        FromSource::Derived(query) => check_select_positions(query),
+        FromSource::Table { .. } => Ok(()),
+    }
+}
+
+/// Walk one expression, rejecting placeholders only in the clauses
+/// [`check_select_positions`] owns; every nested subquery resets to its own
+/// per-select rules.
+fn check_expr_positions(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Parameter(_) | Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) => Ok(()),
+        Expr::Column { .. } => Ok(()),
+        Expr::Binary { left, right, .. } => {
+            check_expr_positions(left)?;
+            check_expr_positions(right)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            check_expr_positions(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            check_expr_positions(expr)?;
+            check_expr_positions(low)?;
+            check_expr_positions(high)
+        }
+        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+            for a in args {
+                check_expr_positions(a)?;
+            }
+            Ok(())
+        }
+        Expr::Window { args, over, .. } => {
+            for a in args {
+                check_expr_positions(a)?;
+            }
+            for e in &over.partition {
+                check_expr_positions(e)?;
+            }
+            for item in &over.order {
+                check_expr_positions(&item.expr)?;
+            }
+            Ok(())
+        }
+        Expr::ScalarSubquery(query) | Expr::Exists { query, .. } => check_select_positions(query),
+        Expr::InSubquery { expr, query, .. } => {
+            check_expr_positions(expr)?;
+            check_select_positions(query)
+        }
+        Expr::Case { branches, else_ } => {
+            for (cond, value) in branches {
+                check_expr_positions(cond)?;
+                check_expr_positions(value)?;
+            }
+            if let Some(e) = else_ {
+                check_expr_positions(e)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether `expr` (or any nested subquery) holds a `?`.
+fn expr_contains_parameter(expr: &Expr) -> bool {
+    match expr {
+        Expr::Parameter(_) => true,
+        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) | Expr::Column { .. } => false,
+        Expr::Binary { left, right, .. } => {
+            expr_contains_parameter(left) || expr_contains_parameter(right)
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            expr_contains_parameter(expr)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_contains_parameter(expr)
+                || expr_contains_parameter(low)
+                || expr_contains_parameter(high)
+        }
+        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+            args.iter().any(expr_contains_parameter)
+        }
+        Expr::Window { args, over, .. } => {
+            args.iter().any(expr_contains_parameter)
+                || over.partition.iter().any(expr_contains_parameter)
+                || over
+                    .order
+                    .iter()
+                    .any(|item| expr_contains_parameter(&item.expr))
+        }
+        Expr::ScalarSubquery(query) | Expr::Exists { query, .. } => {
+            select_contains_parameter(query)
+        }
+        Expr::InSubquery { expr, query, .. } => {
+            expr_contains_parameter(expr) || select_contains_parameter(query)
+        }
+        Expr::Case { branches, else_ } => {
+            branches
+                .iter()
+                .any(|(c, v)| expr_contains_parameter(c) || expr_contains_parameter(v))
+                || else_.as_ref().is_some_and(|e| expr_contains_parameter(e))
+        }
+    }
+}
+
+fn select_contains_parameter(sel: &Select) -> bool {
+    sel.with
+        .iter()
+        .any(|cte| select_contains_parameter(&cte.query))
+        || sel.projections.iter().any(|p| match p {
+            Projection::Expr { expr, .. } => expr_contains_parameter(expr),
+            _ => false,
+        })
+        || sel.from.as_ref().is_some_and(from_contains_parameter)
+        || sel
+            .where_clause
+            .as_ref()
+            .is_some_and(expr_contains_parameter)
+        || sel.group_by.iter().any(expr_contains_parameter)
+        || sel.having.as_ref().is_some_and(expr_contains_parameter)
+        || sel
+            .order_by
+            .iter()
+            .any(|item| expr_contains_parameter(&item.expr))
+        || sel.unions.iter().any(|(_, b)| select_contains_parameter(b))
+}
+
+fn from_contains_parameter(from: &FromClause) -> bool {
+    let source = match &from.source {
+        FromSource::Derived(query) => select_contains_parameter(query),
+        FromSource::Table { .. } => false,
+    };
+    source
+        || from.joins.iter().any(|join| {
+            let s = match &join.source {
+                FromSource::Derived(query) => select_contains_parameter(query),
+                FromSource::Table { .. } => false,
+            };
+            s || join.on.as_ref().is_some_and(expr_contains_parameter)
+        })
+}
+
+// ---------- placeholder collection / renumbering ----------
+
+fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
+    match stmt {
+        Statement::CreateTableAs { query, .. }
+        | Statement::CreateView { query, .. }
+        | Statement::Explain(query) => collect_select_offsets(query, out),
+        Statement::Insert { source, .. } => match source {
+            InsertSource::Values(rows) => {
+                for row in rows {
+                    for e in row {
+                        collect_expr_offsets(e, out);
+                    }
+                }
+            }
+            InsertSource::Select(query) => collect_select_offsets(query, out),
+        },
+        Statement::Update {
+            sets, where_clause, ..
+        } => {
+            for (_, e) in sets {
+                collect_expr_offsets(e, out);
+            }
+            if let Some(e) = where_clause {
+                collect_expr_offsets(e, out);
+            }
+        }
+        Statement::Delete {
+            where_clause: Some(e),
+            ..
+        } => collect_expr_offsets(e, out),
+        Statement::Select(sel) => collect_select_offsets(sel, out),
+        _ => {}
+    }
+}
+
+fn collect_select_offsets(sel: &Select, out: &mut Vec<usize>) {
+    for cte in &sel.with {
+        collect_select_offsets(&cte.query, out);
+    }
+    for p in &sel.projections {
+        if let Projection::Expr { expr, .. } = p {
+            collect_expr_offsets(expr, out);
+        }
+    }
+    if let Some(from) = &sel.from {
+        collect_source_offsets(&from.source, out);
+        for join in &from.joins {
+            collect_source_offsets(&join.source, out);
+            if let Some(on) = &join.on {
+                collect_expr_offsets(on, out);
+            }
+        }
+    }
+    if let Some(e) = &sel.where_clause {
+        collect_expr_offsets(e, out);
+    }
+    for e in &sel.group_by {
+        collect_expr_offsets(e, out);
+    }
+    if let Some(e) = &sel.having {
+        collect_expr_offsets(e, out);
+    }
+    for item in &sel.order_by {
+        collect_expr_offsets(&item.expr, out);
+    }
+    for (_, branch) in &sel.unions {
+        collect_select_offsets(branch, out);
+    }
+}
+
+fn collect_source_offsets(source: &FromSource, out: &mut Vec<usize>) {
+    if let FromSource::Derived(query) = source {
+        collect_select_offsets(query, out);
+    }
+}
+
+fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Parameter(off) => out.push(*off),
+        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) | Expr::Column { .. } => {}
+        Expr::Binary { left, right, .. } => {
+            collect_expr_offsets(left, out);
+            collect_expr_offsets(right, out);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            collect_expr_offsets(expr, out)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_offsets(expr, out);
+            collect_expr_offsets(low, out);
+            collect_expr_offsets(high, out);
+        }
+        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+            for a in args {
+                collect_expr_offsets(a, out);
+            }
+        }
+        Expr::Window { args, over, .. } => {
+            for a in args {
+                collect_expr_offsets(a, out);
+            }
+            for e in &over.partition {
+                collect_expr_offsets(e, out);
+            }
+            for item in &over.order {
+                collect_expr_offsets(&item.expr, out);
+            }
+        }
+        Expr::ScalarSubquery(query) | Expr::Exists { query, .. } => {
+            collect_select_offsets(query, out)
+        }
+        Expr::InSubquery { expr, query, .. } => {
+            collect_expr_offsets(expr, out);
+            collect_select_offsets(query, out);
+        }
+        Expr::Case { branches, else_ } => {
+            for (cond, value) in branches {
+                collect_expr_offsets(cond, out);
+                collect_expr_offsets(value, out);
+            }
+            if let Some(e) = else_ {
+                collect_expr_offsets(e, out);
+            }
+        }
+    }
+}
+
+fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
+    match stmt {
+        Statement::CreateTableAs { query, .. }
+        | Statement::CreateView { query, .. }
+        | Statement::Explain(query) => apply_select_ranks(query, offsets),
+        Statement::Insert { source, .. } => match source {
+            InsertSource::Values(rows) => {
+                for row in rows {
+                    for e in row {
+                        apply_expr_ranks(e, offsets);
+                    }
+                }
+            }
+            InsertSource::Select(query) => apply_select_ranks(query, offsets),
+        },
+        Statement::Update {
+            sets, where_clause, ..
+        } => {
+            for (_, e) in sets {
+                apply_expr_ranks(e, offsets);
+            }
+            if let Some(e) = where_clause {
+                apply_expr_ranks(e, offsets);
+            }
+        }
+        Statement::Delete {
+            where_clause: Some(e),
+            ..
+        } => apply_expr_ranks(e, offsets),
+        Statement::Select(sel) => apply_select_ranks(sel, offsets),
+        _ => {}
+    }
+}
+
+fn apply_select_ranks(sel: &mut Select, offsets: &[usize]) {
+    for cte in sel.with.iter_mut() {
+        apply_select_ranks(&mut cte.query, offsets);
+    }
+    for p in sel.projections.iter_mut() {
+        if let Projection::Expr { expr, .. } = p {
+            apply_expr_ranks(expr, offsets);
+        }
+    }
+    if let Some(from) = sel.from.as_mut() {
+        apply_source_ranks(&mut from.source, offsets);
+        for join in from.joins.iter_mut() {
+            apply_source_ranks(&mut join.source, offsets);
+            if let Some(on) = join.on.as_mut() {
+                apply_expr_ranks(on, offsets);
+            }
+        }
+    }
+    if let Some(e) = sel.where_clause.as_mut() {
+        apply_expr_ranks(e, offsets);
+    }
+    for e in sel.group_by.iter_mut() {
+        apply_expr_ranks(e, offsets);
+    }
+    if let Some(e) = sel.having.as_mut() {
+        apply_expr_ranks(e, offsets);
+    }
+    for item in sel.order_by.iter_mut() {
+        apply_expr_ranks(&mut item.expr, offsets);
+    }
+    for (_, branch) in sel.unions.iter_mut() {
+        apply_select_ranks(branch, offsets);
+    }
+}
+
+fn apply_source_ranks(source: &mut FromSource, offsets: &[usize]) {
+    if let FromSource::Derived(query) = source {
+        apply_select_ranks(query, offsets);
+    }
+}
+
+fn apply_expr_ranks(expr: &mut Expr, offsets: &[usize]) {
+    match expr {
+        Expr::Parameter(off) => {
+            debug_assert!(offsets.binary_search(off).is_ok());
+            *off = offsets.binary_search(off).unwrap_or(0);
+        }
+        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) | Expr::Column { .. } => {}
+        Expr::Binary { left, right, .. } => {
+            apply_expr_ranks(left, offsets);
+            apply_expr_ranks(right, offsets);
+        }
+        Expr::Unary { expr, .. } | Expr::IsNull { expr, .. } | Expr::Cast { expr, .. } => {
+            apply_expr_ranks(expr, offsets)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            apply_expr_ranks(expr, offsets);
+            apply_expr_ranks(low, offsets);
+            apply_expr_ranks(high, offsets);
+        }
+        Expr::Function { args, .. } | Expr::Coalesce(args) => {
+            for a in args {
+                apply_expr_ranks(a, offsets);
+            }
+        }
+        Expr::Window { args, over, .. } => {
+            for a in args {
+                apply_expr_ranks(a, offsets);
+            }
+            for e in over.partition.iter_mut() {
+                apply_expr_ranks(e, offsets);
+            }
+            for item in over.order.iter_mut() {
+                apply_expr_ranks(&mut item.expr, offsets);
+            }
+        }
+        Expr::ScalarSubquery(query) | Expr::Exists { query, .. } => {
+            apply_select_ranks(query, offsets)
+        }
+        Expr::InSubquery { expr, query, .. } => {
+            apply_expr_ranks(expr, offsets);
+            apply_select_ranks(query, offsets);
+        }
+        Expr::Case { branches, else_ } => {
+            for (cond, value) in branches.iter_mut() {
+                apply_expr_ranks(cond, offsets);
+                apply_expr_ranks(value, offsets);
+            }
+            if let Some(e) = else_.as_mut() {
+                apply_expr_ranks(e, offsets);
+            }
+        }
+    }
 }
 
 /// Reject a NUL byte inside a quoted identifier with its exact position.
@@ -713,6 +1254,7 @@ peg::parser! {
             / kw(Keyword::Null) { Expr::Literal(Value::Null) }
             / date_literal()
             / timestamp_literal()
+            / parameter()
             / cast_expr()
             / case_expr()
             / star() { Expr::Star }
@@ -721,6 +1263,15 @@ peg::parser! {
             / lparen() q:select() rparen() { Expr::ScalarSubquery(Box::new(q)) }
             / lparen() e:expr() rparen() { e }
             / ident_expr()
+
+        /// `?` — a positional prepared-statement parameter. The payload is the
+        /// placeholder's byte offset in the input (see [`Expr::Parameter`]);
+        /// [`super::parse_prepared`] renumbers the offsets into 0-based ranks.
+        ///
+        /// `?` is not a token anywhere else in the grammar, so this rule
+        /// cannot shadow existing syntax.
+        rule parameter() -> Expr
+            = p:position!() "?" ws() { Expr::Parameter(p) }
 
         /// `EXTRACT(field FROM date_or_timestamp)` — desugars to the
         /// `extract('field', value)` scalar (field may also be a string

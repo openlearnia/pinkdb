@@ -170,6 +170,63 @@ impl Client {
                 sql: sql.to_string(),
             },
         )?;
+        self.read_batch()
+    }
+
+    /// v5: parse one statement with `?` placeholders into a connection-local
+    /// prepared statement; returns `(handle, parameter_count)`.
+    pub fn prepare(&mut self, sql: &str) -> Result<(u64, usize)> {
+        self.check_usable()?;
+        let result = (|| {
+            protocol::write_request(
+                &mut self.writer,
+                &Request::Prepare {
+                    sql: sql.to_string(),
+                },
+            )?;
+            match protocol::read_response(&mut self.reader)? {
+                Response::Prepared {
+                    handle,
+                    parameter_count,
+                } => Ok((handle, parameter_count as usize)),
+                Response::Error { message } => Err(ProtocolError::Server(message).into()),
+                other => Err(ProtocolError::Unexpected(format!(
+                    "expected Prepared, got {}",
+                    other.kind()
+                ))
+                .into()),
+            }
+        })();
+        self.finish(result)
+    }
+
+    /// v5: execute a connection-local prepared statement with one value per
+    /// `?` (textual order). Framed exactly like a one-statement
+    /// [`Client::execute`]: one result group, then `BatchDone`.
+    pub fn execute_prepared(&mut self, handle: u64, values: &[Value]) -> Result<Vec<QueryResult>> {
+        self.check_usable()?;
+        let result = self.execute_prepared_inner(handle, values);
+        self.finish(result)
+    }
+
+    fn execute_prepared_inner(
+        &mut self,
+        handle: u64,
+        values: &[Value],
+    ) -> Result<Vec<QueryResult>> {
+        protocol::write_request(
+            &mut self.writer,
+            &Request::ExecutePrepared {
+                handle,
+                values: values.to_vec(),
+            },
+        )?;
+        self.read_batch()
+    }
+
+    /// Read result groups until the `BatchDone` terminator; shared by
+    /// `Execute` and `ExecutePrepared`.
+    fn read_batch(&mut self) -> Result<Vec<QueryResult>> {
         let mut results = Vec::new();
         let mut current: PendingResult = None;
         loop {

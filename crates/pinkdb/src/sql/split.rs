@@ -60,6 +60,48 @@ pub(crate) fn statement_texts(sql: &str) -> Vec<String> {
     out
 }
 
+/// Byte offsets of every `?` placeholder in `sql`, in textual order.
+///
+/// Mirrors the grammar's scan rules exactly: string literals (`''` escapes),
+/// quoted identifiers (`""` escapes), `--` line comments and `/* */` block
+/// comments are skipped, so a `?` inside any of them is not a placeholder.
+/// The parser is the authority for what a placeholder is (it alone knows a
+/// `?` was parsed as a parameter); [`crate::PreparedStatement::parse`]
+/// cross-checks the two, so a drift between this scan and the grammar is
+/// caught at prepare time instead of splicing substitution into wrong bytes.
+pub(crate) fn parameter_offsets(sql: &str) -> Vec<usize> {
+    let bytes = sql.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            _ if bytes[i].is_ascii_whitespace() => i += 1,
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'\'' | b'"' => i = skip_quoted(bytes, i, bytes[i]),
+            b'?' => {
+                out.push(i);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
 /// Offset of the opening quote of the first double-quoted identifier whose
 /// text contains a NUL byte, if any.
 ///

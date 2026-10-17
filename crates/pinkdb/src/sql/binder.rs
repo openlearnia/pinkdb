@@ -517,6 +517,22 @@ fn is_numeric(t: DataType) -> bool {
     matches!(t, DataType::Integer | DataType::Bigint | DataType::Double)
 }
 
+/// The type a bare `?` operand takes from the other side of a binary
+/// operator, when the operator itself fixes it. Most comparisons/arithmetic
+/// take the other operand's type (handled by the caller); the operators with
+/// a fixed parameter type decide it here.
+fn fixed_operand_dtype(op: BinaryOp, other: DataType) -> Option<DataType> {
+    Some(match op {
+        // LIKE compares strings only; `||` formats either side to VARCHAR.
+        BinaryOp::Like | BinaryOp::NotLike | BinaryOp::Concat => DataType::Varchar,
+        // AND/OR need BOOLEAN on both sides.
+        BinaryOp::And | BinaryOp::Or => DataType::Boolean,
+        // `date ± ?` is day arithmetic: the parameter is the INTEGER count.
+        BinaryOp::Add | BinaryOp::Subtract if other == DataType::Date => DataType::Integer,
+        _ => return None,
+    })
+}
+
 /// INTEGER → BIGINT → DOUBLE.
 pub(crate) fn common_numeric(a: DataType, b: DataType) -> Result<DataType> {
     if !is_numeric(a) || !is_numeric(b) {
@@ -658,6 +674,139 @@ fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
     Err(PinkDbError::Type(format!("cannot compare {l} with {r}")))
 }
 
+// ---------- parameter slots ----------
+
+/// Shared per-bind state for a `?`-parameterized statement: one slot per
+/// placeholder, in textual order.
+///
+/// Each slot starts with the value the caller bound and no type. A slot's
+/// type is *inferred* while binding — a comparison takes the other operand's
+/// type, an `INSERT`/`UPDATE` target takes the column's type, `CAST(? AS t)`
+/// pins `t`, and a slot that is never pinned falls back to its value's own
+/// type. The value is converted to the slot's type when the slot binds
+/// (DuckDB's rule: the context wins, and an impossible conversion is a clear
+/// bind-time error).
+///
+/// Cloning shares the state (subquery scopes bind through clones), and the
+/// engine reads [`ParamSlots::resolved_values`] back after a successful bind
+/// to substitute the converted values into the statement text.
+#[derive(Clone)]
+pub(crate) struct ParamSlots {
+    inner: Rc<RefCell<ParamState>>,
+}
+
+#[derive(Default)]
+struct ParamState {
+    /// The values passed to the bind call, one per slot.
+    values: Vec<Value>,
+    /// The slot's inferred type (pinned by the first context that needs one).
+    types: Vec<Option<DataType>>,
+    /// The value converted to the slot type, filled when the slot binds.
+    resolved: Vec<Option<Value>>,
+}
+
+impl ParamSlots {
+    /// One slot per bound value; every type starts uninferred.
+    pub(crate) fn new(values: Vec<Value>) -> Self {
+        let n = values.len();
+        ParamSlots {
+            inner: Rc::new(RefCell::new(ParamState {
+                values,
+                types: vec![None; n],
+                resolved: vec![None; n],
+            })),
+        }
+    }
+
+    /// The value bound to slot `i` (the raw API value), if any.
+    pub(crate) fn value_type(&self, i: usize) -> Option<DataType> {
+        self.inner
+            .borrow()
+            .values
+            .get(i)
+            .and_then(|v| v.data_type())
+    }
+
+    /// The type inferred for slot `i`, if any yet.
+    pub(crate) fn slot_type(&self, i: usize) -> Option<DataType> {
+        self.inner.borrow().types.get(i).copied().flatten()
+    }
+
+    /// The converted value for slot `i`, once the slot has bound.
+    pub(crate) fn resolved_value(&self, i: usize) -> Option<Value> {
+        self.inner.borrow().resolved.get(i).cloned().flatten()
+    }
+
+    /// Pin slot `i` to `dtype`. The first pin wins; a later use that needs a
+    /// different type is a clear error (DuckDB's "parameter cannot have two
+    /// types" case, e.g. `? BETWEEN 1 AND 2.5`).
+    fn pin(&self, i: usize, dtype: DataType) -> Result<()> {
+        let mut state = self.inner.borrow_mut();
+        match state.types.get(i).copied().flatten() {
+            Some(t) if t == dtype => Ok(()),
+            Some(t) => Err(PinkDbError::Parameter(format!(
+                "parameter {} has type {t} from an earlier use, but this use needs {dtype}",
+                i + 1
+            ))),
+            None => {
+                if let Some(slot) = state.types.get_mut(i) {
+                    *slot = Some(dtype);
+                    Ok(())
+                } else {
+                    Err(PinkDbError::Parameter(format!(
+                        "internal error: no parameter slot {i}"
+                    )))
+                }
+            }
+        }
+    }
+
+    /// Bind slot `i`: infer the type (pinned, else the value's own), convert
+    /// the value to it, and return the value as a bound literal.
+    fn bind(&self, i: usize) -> Result<BoundExpr> {
+        let mut state = self.inner.borrow_mut();
+        let value = match state.values.get(i) {
+            Some(v) => v.clone(),
+            None => {
+                return Err(PinkDbError::Parameter(format!(
+                    "internal error: no parameter slot {i}"
+                )))
+            }
+        };
+        let dtype = match state.types.get(i).copied().flatten() {
+            Some(t) => t,
+            None => match value.data_type() {
+                Some(t) => t,
+                // A NULL value with no context has no type: DuckDB defaults
+                // it to INTEGER; this engine asks for an explicit type
+                // instead, so a mistyped statement fails at bind, not later.
+                None => {
+                    return Err(PinkDbError::Parameter(format!(
+                        "could not determine data type of parameter {}: bind a non-NULL \
+                         value or add an explicit CAST(? AS <type>)",
+                        i + 1
+                    )))
+                }
+            },
+        };
+        // NULL keeps its typeless form (`cast_value` assumes non-NULL input).
+        let converted = if value.is_null() {
+            Value::Null
+        } else {
+            crate::exec::expr::cast_value(value.clone(), dtype).map_err(|e| {
+                PinkDbError::Parameter(format!("cannot bind parameter {} as {dtype}: {e}", i + 1))
+            })?
+        };
+        if let Some(slot) = state.types.get_mut(i) {
+            *slot = Some(dtype);
+        }
+        if let Some(slot) = state.resolved.get_mut(i) {
+            *slot = Some(converted.clone());
+        }
+        Ok(BoundExpr::Literal(converted))
+    }
+}
+
 // ---------- binder ----------
 
 /// One queryable relation in scope.
@@ -698,6 +847,9 @@ struct Binder<'a> {
     /// back to their extension paths so a logged record can be prefixed with
     /// the `LOAD EXTENSION` statements its replay needs.
     dynamic_functions_used: Rc<RefCell<Vec<String>>>,
+    /// `?` slots when binding a parameterized statement (shared with child
+    /// scopes); `None` binds a plain statement, where a `?` is an error.
+    params: Option<ParamSlots>,
 }
 
 impl<'a> Binder<'a> {
@@ -715,7 +867,15 @@ impl<'a> Binder<'a> {
             ctes: Vec::new(),
             views_used: Rc::new(RefCell::new(Vec::new())),
             dynamic_functions_used: Rc::new(RefCell::new(Vec::new())),
+            params: None,
         }
+    }
+
+    /// This binder binds a parameterized statement: `?` slots resolve
+    /// against `params` (see [`ParamSlots`]).
+    fn with_params(mut self, params: Option<ParamSlots>) -> Self {
+        self.params = params;
+        self
     }
 
     /// A child scope for a subquery: no tables/aliases leak in, CTEs do.
@@ -734,6 +894,98 @@ impl<'a> Binder<'a> {
             ctes: self.ctes.clone(),
             views_used: Rc::clone(&self.views_used),
             dynamic_functions_used: Rc::clone(&self.dynamic_functions_used),
+            params: self.params.clone(),
+        }
+    }
+
+    /// Bind one `?` as a literal of the slot's inferred type; a plain
+    /// (non-prepared) statement has no slots, so `?` is an error there.
+    fn bind_parameter(&self, index: usize) -> Result<BoundExpr> {
+        match &self.params {
+            Some(slots) => slots.bind(index),
+            None => Err(PinkDbError::Parameter(format!(
+                "parameter {} (`?`) is only allowed in a prepared statement",
+                index + 1
+            ))),
+        }
+    }
+
+    /// The slot of a top-level `?` operand whose type is not pinned yet, if
+    /// any: the operand a parent expression can infer a type for.
+    fn bare_unpinned_parameter(&self, expr: &Expr) -> Option<usize> {
+        let Expr::Parameter(index) = expr else {
+            return None;
+        };
+        let slots = self.params.as_ref()?;
+        if slots.slot_type(*index).is_none() {
+            Some(*index)
+        } else {
+            None
+        }
+    }
+
+    /// Pin a slot from context (no-op when `expr` is not a bare parameter).
+    fn pin_parameter(&self, expr: &Expr, dtype: DataType) -> Result<()> {
+        if let Some(index) = self.bare_unpinned_parameter(expr) {
+            if let Some(slots) = &self.params {
+                slots.pin(index, dtype)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind a binary operator's operands. When exactly one side is a bare,
+    /// unpinned `?`, the other side binds first and pins the parameter's type
+    /// (comparisons and arithmetic take the other operand's type; `LIKE`/
+    /// `||` are VARCHAR, `AND`/`OR` BOOLEAN, date ± integer is INTEGER days).
+    ///
+    /// Both operands are bound exactly once — aggregates and alias lookups
+    /// are not duplicated by the inference.
+    fn bind_binary_operands(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<(BoundExpr, BoundExpr)> {
+        if let Some(index) = self.bare_unpinned_parameter(left) {
+            if !matches!(right, Expr::Parameter(_)) {
+                let r = self.bind_expr(right, aggs, allow_agg)?;
+                let t = self.inferred_operand_type(op, r.dtype(), index);
+                if let Some(slots) = &self.params {
+                    slots.pin(index, t)?;
+                }
+                let l = self.bind_expr(left, aggs, allow_agg)?;
+                return Ok((l, r));
+            }
+        }
+        if let Some(index) = self.bare_unpinned_parameter(right) {
+            let l = self.bind_expr(left, aggs, allow_agg)?;
+            let t = self.inferred_operand_type(op, l.dtype(), index);
+            if let Some(slots) = &self.params {
+                slots.pin(index, t)?;
+            }
+            let r = self.bind_expr(right, aggs, allow_agg)?;
+            return Ok((l, r));
+        }
+        let l = self.bind_expr(left, aggs, allow_agg)?;
+        let r = self.bind_expr(right, aggs, allow_agg)?;
+        Ok((l, r))
+    }
+
+    /// The type a bare `?` operand takes from the other side's type `ctx`:
+    /// operator-fixed types first, else the wider of the numeric context and
+    /// the bound value's own type (a BIGINT value beside an INTEGER literal
+    /// stays BIGINT, like DuckDB), else the context type.
+    fn inferred_operand_type(&self, op: BinaryOp, ctx: DataType, index: usize) -> DataType {
+        if let Some(fixed) = fixed_operand_dtype(op, ctx) {
+            return fixed;
+        }
+        let value_type = self.params.as_ref().and_then(|p| p.value_type(index));
+        match value_type {
+            Some(v) if is_numeric(v) && is_numeric(ctx) => common_numeric(v, ctx).unwrap_or(ctx),
+            _ => ctx,
         }
     }
 
@@ -808,6 +1060,7 @@ impl<'a> Binder<'a> {
     ) -> Result<BoundExpr> {
         match expr {
             Expr::Literal(v) => Ok(BoundExpr::Literal(v.clone())),
+            Expr::Parameter(index) => self.bind_parameter(*index),
             Expr::Star => Err(PinkDbError::Parse(
                 "`*` is only valid in the projection list or COUNT(*)".to_string(),
             )),
@@ -832,8 +1085,7 @@ impl<'a> Binder<'a> {
                 Ok(BoundExpr::Column { index, dtype })
             }
             Expr::Binary { op, left, right } => {
-                let l = self.bind_expr(left, aggs, allow_agg)?;
-                let r = self.bind_expr(right, aggs, allow_agg)?;
+                let (l, r) = self.bind_binary_operands(*op, left, right, aggs, allow_agg)?;
                 let dtype = match op {
                     BinaryOp::And | BinaryOp::Or => {
                         if l.dtype() != DataType::Boolean || r.dtype() != DataType::Boolean {
@@ -977,6 +1229,10 @@ impl<'a> Binder<'a> {
                 })
             }
             Expr::Cast { expr, dtype } => {
+                // `CAST(? AS t)` pins the parameter to `t`: the bound value is
+                // converted to `t` at bind time (DuckDB reports the failed
+                // conversion at bind too), and the cast itself is a no-op.
+                self.pin_parameter(expr, *dtype)?;
                 let bound = self.bind_expr(expr, aggs, allow_agg)?;
                 check_cast(bound.dtype(), *dtype)?;
                 Ok(BoundExpr::Cast {
@@ -1879,6 +2135,9 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Literal(v) => v.to_string(),
+        // Only reachable when binding an unparameterized statement errors
+        // first; the display name keeps `SELECT ?`-style output sensible.
+        Expr::Parameter(i) => format!("?{}", i + 1),
         Expr::Star => "*".to_string(),
         Expr::Column { table, name } => match table {
             Some(t) => format!("{t}.{name}"),
@@ -2520,6 +2779,18 @@ pub(crate) fn bind_tracked(
     stmt: &Statement,
     default_db: &str,
 ) -> Result<(LogicalPlan, Vec<String>)> {
+    bind_tracked_with(db, stmt, default_db, None)
+}
+
+/// [`bind_tracked`] for a `?`-parameterized statement: `params` carries one
+/// bound value per placeholder, and each `?` binds (and type-infers) against
+/// its slot. A plain statement passes `None`, where any `?` is a clear error.
+pub(crate) fn bind_tracked_with(
+    db: &PinkDb,
+    stmt: &Statement,
+    default_db: &str,
+    params: Option<ParamSlots>,
+) -> Result<(LogicalPlan, Vec<String>)> {
     let empty = |plan| Ok((plan, Vec::new()));
     match stmt {
         Statement::CreateTable {
@@ -2538,16 +2809,26 @@ pub(crate) fn bind_tracked(
             name,
             query,
             if_not_exists,
-        } => bind_create_table_as(db, default_db, qdb, name, query, *if_not_exists),
+        } => bind_create_table_as(
+            db,
+            default_db,
+            qdb,
+            name,
+            query,
+            *if_not_exists,
+            params.clone(),
+        ),
         Statement::Insert {
             db: qdb,
             table,
             columns,
             source,
         } => match source {
-            InsertSource::Values(rows) => bind_insert(db, default_db, qdb, table, columns, rows),
+            InsertSource::Values(rows) => {
+                bind_insert(db, default_db, qdb, table, columns, rows, params.clone())
+            }
             InsertSource::Select(query) => {
-                bind_insert_select(db, default_db, qdb, table, columns, query)
+                bind_insert_select(db, default_db, qdb, table, columns, query, params.clone())
             }
         },
         Statement::Update {
@@ -2555,12 +2836,20 @@ pub(crate) fn bind_tracked(
             table,
             sets,
             where_clause,
-        } => bind_update(db, default_db, qdb, table, sets, where_clause),
+        } => bind_update(
+            db,
+            default_db,
+            qdb,
+            table,
+            sets,
+            where_clause,
+            params.clone(),
+        ),
         Statement::Delete {
             db: qdb,
             table,
             where_clause,
-        } => bind_delete(db, default_db, qdb, table, where_clause),
+        } => bind_delete(db, default_db, qdb, table, where_clause, params.clone()),
         Statement::Begin => empty(LogicalPlan::Begin),
         Statement::Commit => empty(LogicalPlan::Commit),
         Statement::Rollback => empty(LogicalPlan::Rollback),
@@ -2604,7 +2893,7 @@ pub(crate) fn bind_tracked(
         Statement::Explain(query) => {
             // Bind the inner query fully (errors surface here) and wrap it —
             // EXPLAIN never executes it.
-            let mut binder = Binder::new(db, default_db);
+            let mut binder = Binder::new(db, default_db).with_params(params.clone());
             let plan = bind_select_in(db, &mut binder, query)?;
             let dynamic = binder.dynamic_functions_used();
             Ok((
@@ -2630,7 +2919,7 @@ pub(crate) fn bind_tracked(
             empty(LogicalPlan::LoadExtension { path: path.clone() })
         }
         Statement::Checkpoint => empty(LogicalPlan::Checkpoint),
-        Statement::Select(sel) => bind_select(db, default_db, sel),
+        Statement::Select(sel) => bind_select(db, default_db, sel, params.clone()),
     }
 }
 
@@ -2671,7 +2960,8 @@ fn bind_create_view(
 }
 
 /// Bind UPDATE: resolve target columns, bind SET expressions in the table
-/// scope (no aggregates, windows, or aliases), check Boolean WHERE.
+/// scope (no aggregates, windows, or aliases), check Boolean WHERE. A bare
+/// `?` SET value takes the target column's type.
 fn bind_update(
     db: &PinkDb,
     default_db: &str,
@@ -2679,6 +2969,7 @@ fn bind_update(
     table: &str,
     sets: &[(String, Expr)],
     where_clause: &Option<Expr>,
+    params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
@@ -2698,7 +2989,7 @@ fn bind_update(
             )));
         }
     }
-    let mut binder = Binder::new(db, &table_db);
+    let mut binder = Binder::new(db, &table_db).with_params(params);
     binder.allow_win = false;
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
@@ -2710,6 +3001,8 @@ fn bind_update(
             .column_index(col)
             .map_err(|_| PinkDbError::Catalog(format!("no column \"{col}\"")))?;
         let (_, target) = t.schema()[idx].clone();
+        // `UPDATE t SET col = ?`: the parameter takes the column's type.
+        binder.pin_parameter(expr, target)?;
         let mut aggs = Vec::new();
         let bound = binder.bind_expr(expr, &mut aggs, false)?;
         if !aggs.is_empty() {
@@ -2761,13 +3054,14 @@ fn bind_delete(
     qdb: &Option<String>,
     table: &str,
     where_clause: &Option<Expr>,
+    params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
         return Err(err);
     }
     let t = db.table_in(&table_db, table)?;
-    let mut binder = Binder::new(db, &table_db);
+    let mut binder = Binder::new(db, &table_db).with_params(params);
     binder.allow_win = false;
     binder.allow_alias = false;
     binder.tables.push(ScopeTable {
@@ -2805,6 +3099,7 @@ fn bind_insert(
     table: &str,
     columns: &Option<Vec<String>>,
     rows: &[Vec<Expr>],
+    params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
@@ -2848,8 +3143,11 @@ fn bind_insert(
         let mut bound = vec![BoundExpr::Literal(Value::Null); schema.len()];
         // Fill unspecified columns with NULL (only when a column list is given).
         for (pos, cell) in row.iter().enumerate() {
-            let mut binder = Binder::new(db, &table_db);
+            let mut binder = Binder::new(db, &table_db).with_params(params.clone());
             binder.allow_win = false;
+            // `INSERT INTO t [(cols)] VALUES (?...)`: a bare `?` cell takes the
+            // target column's type; the value converts to it below.
+            binder.pin_parameter(cell, schema[order[pos]].1)?;
             let mut aggs = Vec::new();
             let e = binder.bind_expr(cell, &mut aggs, false)?;
             for v in binder.views_used() {
@@ -2887,6 +3185,7 @@ fn bind_insert_select(
     table: &str,
     columns: &Option<Vec<String>>,
     query: &Select,
+    params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
     if let Some(err) = db.attached_read_only(&table_db, table) {
@@ -2914,7 +3213,7 @@ fn bind_insert_select(
             }
         }
     }
-    let mut binder = Binder::new(db, default_db);
+    let mut binder = Binder::new(db, default_db).with_params(params);
     let query_plan = bind_select_in(db, &mut binder, query)?;
     let source = plan_schema(db, &binder.default_db, &binder.ctes, &query_plan)?;
     if source.len() != order.len() {
@@ -2954,9 +3253,10 @@ fn bind_create_table_as(
     name: &str,
     query: &Select,
     if_not_exists: bool,
+    params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
     let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
-    let mut binder = Binder::new(db, default_db);
+    let mut binder = Binder::new(db, default_db).with_params(params);
     let query_plan = bind_select_in(db, &mut binder, query)?;
     // The schema is taken from the query's evaluated output at execution
     // (names from the final Project, types from its expressions) — binding
@@ -3030,8 +3330,13 @@ fn reject_view_dependency(db: &PinkDb, views: &[String]) -> Result<()> {
 }
 
 /// Bind a top-level SELECT with a fresh binder.
-fn bind_select(db: &PinkDb, default_db: &str, sel: &Select) -> Result<(LogicalPlan, Vec<String>)> {
-    let mut binder = Binder::new(db, default_db);
+fn bind_select(
+    db: &PinkDb,
+    default_db: &str,
+    sel: &Select,
+    params: Option<ParamSlots>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let mut binder = Binder::new(db, default_db).with_params(params);
     let plan = bind_select_in(db, &mut binder, sel)?;
     Ok((plan, binder.dynamic_functions_used()))
 }

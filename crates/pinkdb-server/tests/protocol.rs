@@ -43,10 +43,25 @@ fn requests_round_trip() {
     request_round_trip(Request::Execute {
         sql: "SELECT 'héllo ✓';".to_string(),
     });
+    request_round_trip(Request::Prepare {
+        sql: "SELECT ? + ?".to_string(),
+    });
+    request_round_trip(Request::ExecutePrepared {
+        handle: 42,
+        values: vec![
+            Value::Integer(1),
+            Value::Null,
+            Value::Varchar("x".to_string()),
+        ],
+    });
 }
 
 #[test]
 fn responses_round_trip() {
+    response_round_trip(Response::Prepared {
+        handle: 42,
+        parameter_count: 3,
+    });
     response_round_trip(Response::HelloOk {
         server_version: "0.1.0".to_string(),
         protocol_version: PROTOCOL_VERSION,

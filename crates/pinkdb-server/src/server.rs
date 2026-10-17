@@ -373,6 +373,14 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
         return;
     }
 
+    // v5: connection-local prepared statements (`?` placeholders). Handles are
+    // handed out in order and die with this connection; the cap bounds the
+    // per-connection metadata a client can pin.
+    const MAX_PREPARED: usize = 1024;
+    let mut prepared: std::collections::HashMap<u64, pinkdb::PreparedStatement> =
+        std::collections::HashMap::new();
+    let mut next_handle: u64 = 1;
+
     loop {
         match protocol::read_request(&mut reader) {
             Ok(Request::Execute { sql }) => {
@@ -444,6 +452,123 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
             Ok(Request::Ping) => {
                 if protocol::write_response(&mut writer, &Response::Pong).is_err() {
                     return;
+                }
+            }
+            // v5: parse one statement with `?` placeholders into a
+            // connection-local prepared statement. Pure parsing: nothing
+            // executes and nothing is logged.
+            Ok(Request::Prepare { sql }) => {
+                if prepared.len() >= MAX_PREPARED {
+                    if send_error(
+                        &mut writer,
+                        "too many prepared statements (per-connection limit 1024)",
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                let outcome =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn.prepare(&sql)));
+                match outcome {
+                    Ok(Ok(stmt)) => {
+                        let handle = next_handle;
+                        next_handle += 1;
+                        let parameter_count = stmt.parameter_count() as u32;
+                        prepared.insert(handle, stmt);
+                        if protocol::write_response(
+                            &mut writer,
+                            &Response::Prepared {
+                                handle,
+                                parameter_count,
+                            },
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // A parse error (or an unsupported shape) is a normal
+                    // response: report it and keep the connection open.
+                    Ok(Err(e)) => {
+                        if send_error(&mut writer, &e.to_string()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(payload) => {
+                        let message = panic_message(payload.as_ref());
+                        eprintln!("pinkdb-server: prepare panicked: {message}");
+                        if send_error(
+                            &mut writer,
+                            &format!("internal error: prepare panicked ({message})"),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+            // v5: bind values and execute the prepared statement. Framing is
+            // identical to a one-statement Execute: one result group, then
+            // the BatchDone terminator. The hook sees the substituted SQL,
+            // so statement-count instrumentation matches the embedded path.
+            Ok(Request::ExecutePrepared { handle, values }) => {
+                let Some(stmt) = prepared.get(&handle) else {
+                    if send_error(
+                        &mut writer,
+                        &format!("unknown prepared statement handle {handle}"),
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                };
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let bound = conn.bind(stmt, &values)?;
+                    run_statement_hook(bound.sql());
+                    conn.execute_bound(&bound)
+                }));
+                match outcome {
+                    Ok(Ok(result)) => {
+                        // A bound statement is exactly one statement: one
+                        // result group, then the batch terminator.
+                        if let Err(e) = send_result(&mut writer, &result) {
+                            if !matches!(e, ProtocolError::Io(_)) {
+                                let _ = send_error(&mut writer, &e.to_string());
+                            }
+                            return;
+                        }
+                        if protocol::write_response(
+                            &mut writer,
+                            &Response::BatchDone { statements: 1 },
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // Bind/type/execution errors are normal responses; the
+                    // connection stays open (mirrors Execute).
+                    Ok(Err(e)) => {
+                        if send_error(&mut writer, &e.to_string()).is_err() {
+                            return;
+                        }
+                    }
+                    Err(payload) => {
+                        let message = panic_message(payload.as_ref());
+                        eprintln!("pinkdb-server: prepared execute panicked: {message}");
+                        if send_error(
+                            &mut writer,
+                            &format!("internal error: statement panicked ({message})"),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
                 }
             }
             Ok(Request::Hello { .. }) => {

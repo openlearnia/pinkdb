@@ -992,6 +992,7 @@ mod tests {
             PinkDbError::Catalog(_) => "catalog",
             PinkDbError::Type(_) => "type",
             PinkDbError::Parse(_) => "parse",
+            PinkDbError::Parameter(_) => "parameter",
             PinkDbError::Execution(_) => "execution",
             PinkDbError::Io(_) => "io",
             PinkDbError::Csv(_) => "csv",
