@@ -21,7 +21,10 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::crypto::{self, Crypto};
+use crate::local::CATALOG_FILE;
 use crate::{LakeError, Result};
 
 /// What [`Storage::head`] found at a lake-relative path.
@@ -198,6 +201,305 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     fn uses_degraded_fallback(&self) -> bool {
         false
     }
+
+    /// Whether this storage seals every object at rest (an encrypted lake
+    /// session). The default is `false`; the encryption decorator overrides
+    /// it. Used for reporting (`.lake attach`) and for the attach layer's
+    /// whole-object-read accounting — never to change what is read.
+    fn encrypted(&self) -> bool {
+        false
+    }
+
+    /// Seal one version's manifest **once**, so the exact ciphertext bytes
+    /// can be published as both `snapshots/<version>.json` and
+    /// `catalog.json` — the byte-identity invariant every published version
+    /// keeps. A plaintext backend (or a keyless session) returns the bytes
+    /// unchanged. The decorator's write methods recognize the container magic
+    /// and store already-sealed bytes as-is, so this is the one seam where
+    /// "seal once, publish twice" is expressed.
+    fn seal_manifest(&self, plain: &[u8]) -> Result<Vec<u8>> {
+        Ok(plain.to_vec())
+    }
+
+    /// [`Storage::read`] plus the object's **stored** bytes as the backend
+    /// holds them (raw ciphertext for an encrypted session). Only the create
+    /// adoption path uses it: when a concurrent create won the
+    /// `snapshots/1.json` link, the catalog must be published from the
+    /// snapshot's *exact stored bytes*, not from a fresh encryption (which
+    /// would mint a different container and break the byte-identity
+    /// invariant). The plaintext copy is what the caller validates.
+    fn read_with_stored(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+        let bytes = self.read(rel, context)?;
+        Ok((bytes.clone(), bytes))
+    }
+}
+
+/// The lake-relative-path → container domain/binding mapping every encrypted
+/// object is sealed and opened under (see the `crypto` module docs).
+fn crypto_domain(rel: &str) -> (crypto::Domain, &str) {
+    if rel == CATALOG_FILE || rel.starts_with("snapshots/") {
+        // Manifests are bound to nothing path-like: catalog.json and
+        // snapshots/<v>.json are the same bytes by construction.
+        (crypto::Domain::Manifest, "")
+    } else if rel.starts_with("commits/") {
+        (crypto::Domain::Commit, rel)
+    } else if rel.ends_with(".pinkdel") {
+        (crypto::Domain::DeleteFile, rel)
+    } else {
+        (crypto::Domain::DataFile, rel)
+    }
+}
+
+/// The at-rest encryption decorator: the single choke point every lake object
+/// passes through, so commits, deletes, time travel, attach and the retry
+/// paths all get encryption without knowing it.
+///
+/// - **Keyed session** (`crypto.is_some()`): every object the lake writes
+///   (that is not already a `PNKLAKE1` container — the once-per-version
+///   manifest `seal_manifest` mints) is sealed on the way to the backend, and
+///   every object it reads is authenticated and unsealed first. A keyed read
+///   of a plaintext object fails closed (`NotEncrypted`): a key is never
+///   silently ignored.
+/// - **Keyless session** (`crypto.is_none()`): reads and writes pass through
+///   unchanged — *except* that a read of a `PNKLAKE1` container fails closed
+///   with [`LakeError::Encrypted`] (or the "rebuild with the encryption
+///   feature" hint in a build without it), never a JSON parse error.
+///
+/// Branch/conditional semantics are untouched: `put_new` and `put_if_match`
+/// evaluate their conditions on the *sealed* bytes exactly as they would on
+/// plaintext (the ciphertext is the object). `read_tagged` returns the
+/// backend's version tag for the stored object — the caller's later
+/// conditional replace still reasons about the object it actually read.
+#[derive(Debug)]
+pub(crate) struct CryptoStorage {
+    inner: Arc<dyn Storage>,
+    crypto: Option<Arc<Crypto>>,
+}
+
+impl CryptoStorage {
+    /// Wrap `inner`. `key = None` is a plaintext session (the decorator still
+    /// recognizes containers to fail closed); `Some(key)` is a keyed session
+    /// — and in a build without the `encryption` feature this is the clear
+    /// "not compiled in" error, before any storage is touched.
+    pub(crate) fn new(inner: Arc<dyn Storage>, key: Option<crypto::EncryptionKey>) -> Result<Self> {
+        let crypto = match key {
+            Some(key) => Some(Arc::new(Crypto::new(key)?)),
+            None => None,
+        };
+        Ok(Self { inner, crypto })
+    }
+
+    /// The plaintext of one stored object: unsealed (and authenticated) for a
+    /// keyed session, as-is for a keyless one. Both directions fail closed —
+    /// see the type docs.
+    fn plain(&self, rel: &str, stored: Vec<u8>) -> Result<Vec<u8>> {
+        let path = self.inner.abs(rel);
+        match &self.crypto {
+            Some(crypto) => {
+                if !crypto::is_container(&stored) {
+                    return Err(crypto::not_encrypted_error(&path));
+                }
+                let (domain, binding) = crypto_domain(rel);
+                crypto.open(&path, domain, binding, &stored)
+            }
+            None => {
+                if crypto::is_container(&stored) {
+                    return Err(crypto::encrypted_error(&path));
+                }
+                Ok(stored)
+            }
+        }
+    }
+
+    /// The stored bytes of one object the lake is about to write: sealed for
+    /// a keyed session — unless the bytes already are a `PNKLAKE1` container
+    /// (the once-per-version manifest, or the snapshot bytes a create adopted
+    /// for the catalog), which are published as-is so the shared bytes stay
+    /// byte-identical.
+    fn sealed(&self, rel: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        match &self.crypto {
+            None => Ok(bytes.to_vec()),
+            Some(crypto) => {
+                if crypto::is_container(bytes) {
+                    return Ok(bytes.to_vec());
+                }
+                let path = self.inner.abs(rel);
+                let (domain, binding) = crypto_domain(rel);
+                crypto.seal(&path, domain, binding, bytes)
+            }
+        }
+    }
+}
+
+impl Storage for CryptoStorage {
+    fn abs(&self, rel: &str) -> PathBuf {
+        self.inner.abs(rel)
+    }
+
+    fn head(&self, rel: &str) -> Result<Head> {
+        self.inner.head(rel)
+    }
+
+    fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
+        let stored = self.inner.read(rel, context)?;
+        self.plain(rel, stored)
+    }
+
+    fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
+        let (stored, tag) = self.inner.read_tagged(rel, context)?;
+        Ok((self.plain(rel, stored)?, tag))
+    }
+
+    fn read_with_stored(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+        let stored = self.inner.read(rel, context)?;
+        let plain = self.plain(rel, stored.clone())?;
+        Ok((plain, stored))
+    }
+
+    fn create_dir(&self, rel: &str) -> Result<()> {
+        self.inner.create_dir(rel)
+    }
+
+    fn put(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        self.inner.put(rel, &self.sealed(rel, bytes)?)
+    }
+
+    fn put_streamed(
+        &self,
+        rel: &str,
+        fill: &mut dyn FnMut(&mut (dyn std::io::Write + Send)) -> Result<()>,
+    ) -> Result<u64> {
+        match &self.crypto {
+            None => self.inner.put_streamed(rel, fill),
+            Some(crypto) => {
+                let path = self.inner.abs(rel);
+                let (domain, binding) = crypto_domain(rel);
+                self.inner.put_streamed(rel, &mut |sink| {
+                    let mut sealed = crypto.sealing_writer(&path, domain, binding, sink)?;
+                    fill(&mut sealed)?;
+                    sealed.finish()
+                })
+            }
+        }
+    }
+
+    fn put_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
+        self.inner.put_new(rel, &self.sealed(rel, bytes)?)
+    }
+
+    fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
+        self.inner
+            .put_if_match(rel, &self.sealed(rel, bytes)?, expected)
+    }
+
+    fn list(&self, rel: &str) -> Result<Vec<String>> {
+        self.inner.list(rel)
+    }
+
+    fn delete(&self, rel: &str) -> Result<()> {
+        self.inner.delete(rel)
+    }
+
+    fn local_copy(&self, rel: &str, context: &str) -> Result<LocalCopy> {
+        match &self.crypto {
+            None => {
+                let copy = self.inner.local_copy(rel, context)?;
+                // Fail closed before the engine opens a ciphertext file as if
+                // it were a `.pink` one: the first 8 bytes are the magic.
+                if let Some(head) = read_magic(copy.path()) {
+                    if &head == crypto::ENC_MAGIC {
+                        return Err(crypto::encrypted_error(&self.inner.abs(rel)));
+                    }
+                }
+                Ok(copy)
+            }
+            Some(_) => {
+                // The engine opens `.pink` files by path, so unseal to a
+                // unique temp copy the caller drops when done; the plaintext
+                // exists on disk only for as long as the engine takes to load
+                // it. (Stage 1: whole-file. The engine's loader holds the
+                // whole store in memory anyway, so no streaming is lost.)
+                let bytes = self.read(rel, context)?;
+                let path =
+                    std::env::temp_dir().join(format!("pink-lake-dec-{}.pink", crate::fresh_id()));
+                let written = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes));
+                if let Err(e) = written {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(LakeError::Io {
+                        context: format!("writing the decrypted temp copy {}", path.display()),
+                        source: e,
+                    });
+                }
+                Ok(LocalCopy::Temp(path))
+            }
+        }
+    }
+
+    fn local_path(&self, rel: &str) -> Option<PathBuf> {
+        match &self.crypto {
+            // Encrypted objects are containers: a positioned footer read of
+            // the ciphertext is meaningless. `None` makes the Vortex attach
+            // paths read the whole object through `read` (unsealed first) —
+            // the documented stage-1 cost; footer-range reads over
+            // decrypted segments are the follow-up.
+            Some(_) => None,
+            None => self.inner.local_path(rel),
+        }
+    }
+
+    fn reconcile_snapshot(&self, version: u64, bytes: &[u8]) -> Result<()> {
+        if !self.inner.uses_degraded_fallback() {
+            return self.inner.reconcile_snapshot(version, bytes);
+        }
+        match &self.crypto {
+            None => self.inner.reconcile_snapshot(version, bytes),
+            Some(_) => {
+                // The repair must republish the catalog's *stored* bytes (the
+                // caller's `bytes` are the decrypted copy; sealing them again
+                // would mint a different container and break
+                // catalog == snapshot).
+                let context = format!("reading {}", self.inner.abs(CATALOG_FILE).display());
+                let stored = self.inner.read(CATALOG_FILE, &context)?;
+                let stored = if crypto::is_container(&stored) {
+                    stored
+                } else {
+                    bytes.to_vec()
+                };
+                self.inner.reconcile_snapshot(version, &stored)
+            }
+        }
+    }
+
+    fn uses_degraded_fallback(&self) -> bool {
+        self.inner.uses_degraded_fallback()
+    }
+
+    fn encrypted(&self) -> bool {
+        self.crypto.is_some()
+    }
+
+    fn seal_manifest(&self, plain: &[u8]) -> Result<Vec<u8>> {
+        match &self.crypto {
+            None => Ok(plain.to_vec()),
+            Some(crypto) => {
+                let path = self.inner.abs(CATALOG_FILE);
+                crypto.seal(&path, crypto::Domain::Manifest, "", plain)
+            }
+        }
+    }
+}
+
+/// The first 8 bytes of a file, when it has that many.
+fn read_magic(path: &Path) -> Option<[u8; 8]> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).ok()?;
+    Some(magic)
 }
 
 /// A parsed lake location: a local directory path or an `s3://` URL.
@@ -333,5 +635,101 @@ mod tests {
         }
         let err = Location::parse(&too_long).unwrap_err();
         assert!(matches!(err, LakeError::BadLocation { .. }), "{err:?}");
+    }
+
+    /// A keyless session never hands out ciphertext: a `PNKLAKE1` object is
+    /// the "open it with a key" error (or the rebuild hint in a build without
+    /// the `encryption` feature), never raw bytes.
+    #[test]
+    fn keyless_reads_of_containers_fail_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "pink_lake_crypto_storage_{}_{}",
+            std::process::id(),
+            crate::fresh_id()
+        ));
+        std::fs::create_dir_all(dir.join("data/t")).unwrap();
+        std::fs::write(dir.join("catalog.json"), b"PNKLAKE1 not for you").unwrap();
+        let inner: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
+        let storage = CryptoStorage::new(inner, None).unwrap();
+
+        let err = storage
+            .read(CATALOG_FILE, "reading catalog.json")
+            .unwrap_err();
+        assert!(matches!(err, LakeError::Encrypted { .. }), "{err:?}");
+        assert!(err.to_string().contains("the lake is encrypted"), "{err}");
+        #[cfg(not(feature = "encryption"))]
+        assert!(
+            err.to_string().contains("encryption"),
+            "a feature-off build must name the missing feature: {err}"
+        );
+
+        // A keyless `seal_manifest` is the identity (plaintext lakes keep
+        // byte-identical manifests) and `local_copy` refuses the container
+        // before the engine could open it as a `.pink` file.
+        assert_eq!(storage.seal_manifest(b"{\"v\":1}").unwrap(), b"{\"v\":1}");
+        let err = storage
+            .local_copy(CATALOG_FILE, "loading catalog.json")
+            .unwrap_err();
+        assert!(matches!(err, LakeError::Encrypted { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A keyed session seals and unseals every object, and the "seal once per
+    /// version" contract: `seal_manifest` output published to both objects is
+    /// byte-identical (the decorator stores already-sealed bytes as-is).
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn keyed_storage_seals_once_and_reads_back_through_every_path() {
+        use crate::crypto::EncryptionKey;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pink_lake_crypto_keyed_{}_{}",
+            std::process::id(),
+            crate::fresh_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
+        let storage = CryptoStorage::new(
+            inner,
+            Some(EncryptionKey::from_passphrase("storage-level test key")),
+        )
+        .unwrap();
+        assert!(storage.encrypted());
+
+        // The manifest pair: sealed once, published twice, byte-identical.
+        let plain = b"{\n  \"format_version\": 4\n}\n";
+        let sealed = storage.seal_manifest(plain).unwrap();
+        assert!(sealed.starts_with(b"PNKLAKE1"));
+        assert!(storage.put_new("snapshots/1.json", &sealed).unwrap());
+        assert!(storage.put_new(CATALOG_FILE, &sealed).unwrap());
+        assert_eq!(
+            std::fs::read(dir.join(CATALOG_FILE)).unwrap(),
+            std::fs::read(dir.join("snapshots/1.json")).unwrap()
+        );
+        assert_ne!(std::fs::read(dir.join(CATALOG_FILE)).unwrap(), plain);
+        assert_eq!(storage.read(CATALOG_FILE, "reading").unwrap(), plain);
+        let (plain_read, stored) = storage.read_with_stored(CATALOG_FILE, "reading").unwrap();
+        assert_eq!(plain_read, plain);
+        assert_eq!(stored, sealed);
+
+        // Plaintext writes are sealed on the way through (data files, delete
+        // files, commit deltas), and reads unseal them.
+        storage.put("data/t/x.pink", b"data bytes").unwrap();
+        let raw = std::fs::read(dir.join("data/t/x.pink")).unwrap();
+        assert!(raw.starts_with(b"PNKLAKE1"), "the data file must be sealed");
+        assert_eq!(
+            storage.read("data/t/x.pink", "reading").unwrap(),
+            b"data bytes"
+        );
+        // A container sealed for another path does not open here (binding).
+        std::fs::create_dir_all(dir.join("data/u")).unwrap();
+        std::fs::write(dir.join("data/u/y.pink"), &raw).unwrap();
+        let err = storage.read("data/u/y.pink", "reading").unwrap_err();
+        assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
+        // A keyed read of a plaintext object is refused, never guessed at.
+        std::fs::write(dir.join("data/plain.pink"), b"not sealed").unwrap();
+        let err = storage.read("data/plain.pink", "reading").unwrap_err();
+        assert!(matches!(err, LakeError::NotEncrypted { .. }), "{err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -186,6 +186,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-17">2026-10-17<a class="anchor" href="#2026-10-17" aria-label="Permalink: 2026-10-17">#</a></h2>
+<h3>Wave 57 — lake encryption at rest ✅</h3>
+<ul>
+<li>With the <code>encryption</code> feature, a keyed session (<code>PINKDB_KEY</code>, consistent with the engine) seals <strong>every lake object</strong> — catalogs, snapshots, commit deltas, data files, delete files — as <code>PNKLAKE1</code> <strong>AES-256-GCM</strong> containers under one Argon2id derivation per session. A <code>Storage</code>-level decorator means commits, deletes, time travel and retry paths are covered with no per-call-site code.</li>
+<li>The <code>catalog.json == snapshots/&lt;v&gt;.json</code> byte invariant survives (seal once, publish the same ciphertext); <strong>S3 conditional-write CAS is unchanged</strong>; statistics-fast attach on encrypted lean lakes still decodes zero data files.</li>
+<li>Wrong/missing keys and tampered containers fail closed with authenticated errors (never “corrupt file”); plaintext lakes stay byte-identical and are refused by keyed sessions. Encrypted Vortex attach reads whole objects in stage 1 (segment-level reads documented as the follow-up).</li>
+</ul>
 <h3>Wave 65 — lake schema evolution ✅</h3>
 <ul>
 <li><code>ALTER TABLE</code> on writable-attached lake tables — <code>ADD COLUMN … DEFAULT</code>, <code>RENAME COLUMN</code>, <code>DROP COLUMN</code> (plus the engine-wide <code>ALTER TABLE</code> support behind it: defaults, <code>NOT NULL</code> rules, <code>DESCRIBE</code> defaults, WAL replay) — published as <strong>metadata-only</strong> catalog schema versions (format now <strong>v5</strong>): old data files are never rewritten; they project through rename chains, missing columns materialize their defaults, and dropped columns keep their bytes (row positions unchanged — delete files stay valid).</li>

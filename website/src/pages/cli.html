@@ -230,10 +230,11 @@ pinkdb &lt; setup.sql || echo "setup failed"</code></pre>
     <tr>
       <td><code>PINKDB_KEY</code></td>
       <td>passphrase for at-rest encryption: <code>.save</code> writes encrypted and
-      <code>.open</code> decrypts (the durable WAL uses the same key). Needs a build
-      with the <code>encryption</code> feature; unset, behavior is byte-identical to
-      an unkeyed build. Must be valid UTF-8 — a set-but-invalid value exits 2 rather
-      than silently writing plaintext.</td>
+      <code>.open</code> decrypts, and with the <code>encryption</code> feature the
+      same key encrypts/decrypts <code>.lake</code> commands (save/open/attach/commit
+      and friends). Must be valid UTF-8 — a set-but-invalid value exits 2 rather
+      than silently writing plaintext; a keyless session refuses an encrypted lake
+      (and a keyed session refuses a plaintext one), never guessing.</td>
     </tr>
     <tr>
       <td><code>PINKDB_BUSY_TIMEOUT_MS</code></td>

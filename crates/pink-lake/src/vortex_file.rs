@@ -447,8 +447,9 @@ pub(crate) fn decode_table_owned(path: &Path, bytes: Vec<u8>) -> Result<PinkDb> 
 ///
 /// Locally the file is opened with positioned reads (`open_path`): the
 /// unprojected columns' data segments are never read, let alone decoded.
-/// Over object storage (no ranged reads in this build) the object is read
-/// whole, still decoding only `projection`.
+/// Over object storage (no ranged reads in this build) — and for an
+/// encrypted lake, where the whole container is unsealed first — the object
+/// is read whole, still decoding only `projection`.
 ///
 /// Chunks are streamed and decoded in bounded windows
 /// ([`CONVERT_WINDOW`]-many engine chunks at a time); nothing collects the
@@ -834,11 +835,14 @@ pub(crate) struct FileFooter {
 /// Open one data file *footer-only*: the footer, the `pinkdb.table` metadata
 /// segment and the stored statistics — no data segments, no decode.
 ///
-/// Locally this uses positioned reads (`open_path`); over object storage
-/// (no ranged reads in this build) the whole object is read into memory and
-/// opened in place, which still skips the decode. Runs inside the decoder
-/// guard, so a malformed file is a clean [`LakeError::Corrupt`] naming the
-/// data file, never an escaping panic.
+/// Locally this uses positioned reads (`open_path`); over object storage (no
+/// ranged reads in this build) — and for an **encrypted** lake, where the
+/// container must be unsealed before anything can be parsed — the whole
+/// object is read into memory through [`Storage::read`] and opened in place,
+/// which still skips the decode. (Footer-range reads over unsealed segments
+/// are the documented follow-up.) Runs inside the decoder guard, so a
+/// malformed file is a clean [`LakeError::Corrupt`] naming the data file,
+/// never an escaping panic.
 ///
 /// Cross-file validation (the `pinkdb.table` identity matching the catalog
 /// key, the row count matching the manifest, one file per table) is the

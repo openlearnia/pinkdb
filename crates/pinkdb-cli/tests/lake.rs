@@ -336,32 +336,41 @@ fn open_notes_the_session_reset_and_carries_the_key() {
     );
     assert!(out.contains("main (current)"), "{out}");
 
-    // With encryption, the session key survives the store replacement: the
-    // later `.save` must be an encrypted container, and the plaintext note
-    // must say the lake itself is not.
+    // With encryption, the session key governs the lake too: a keyed save
+    // writes PNKLAKE1 containers, a keyed open reads them, and the key
+    // survives the store replacement for a later `.save`.
     #[cfg(feature = "encryption")]
     {
+        let enc_lake = dir.join("enc_lake");
         let key = [("PINKDB_KEY", "lake-review-key")];
-        run_with_env(
+        let out = run_with_env(
             &format!(
                 "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (7);\n.lake save {lake}\n.quit\n",
-                lake = lake.display()
+                lake = enc_lake.display()
             ),
             &key,
+        );
+        assert!(out.contains("Saved lake version 2"), "{out}");
+        assert!(
+            out.contains("the lake is encrypted at rest with PINKDB_KEY"),
+            "{out}"
+        );
+        let catalog = std::fs::read(enc_lake.join("catalog.json")).unwrap();
+        assert_eq!(
+            &catalog[..8],
+            b"PNKLAKE1",
+            "a keyed .lake save must write encrypted containers"
         );
         let out = run_with_env(
             &format!(
                 ".lake open {lake}\nSELECT a FROM t;\n.save {out}\n.quit\n",
-                lake = lake.display(),
+                lake = enc_lake.display(),
                 out = dir.join("out.pink").display()
             ),
             &key,
         );
         assert!(
-            out.contains(
-                "Note: lake data files are plaintext; the session key applies to \
-                 .save/.open, not to the lake."
-            ),
+            out.contains("Note: the lake is encrypted at rest with PINKDB_KEY"),
             "{out}"
         );
         assert!(out.contains("7"), "{out}");
@@ -372,6 +381,123 @@ fn open_notes_the_session_reset_and_carries_the_key() {
             "the .save after .lake open must keep PINKDB_KEY (encrypted container)"
         );
     }
+    cleanup(&dir);
+}
+
+/// `PINKDB_KEY` in the `.lake` commands: a keyed save/open/versions/tables/
+/// info/attach round trip, and every fail-closed path (a missing key, a wrong
+/// key, and a plaintext lake a key must not rewrite).
+#[cfg(feature = "encryption")]
+#[test]
+fn keyed_lake_commands_roundtrip_and_fail_closed() {
+    /// Run the REPL with `PINKDB_KEY` definitely unset (the parent
+    /// environment is not trusted to be clean).
+    fn run_no_key(cmds: &str) -> String {
+        let mut command = Command::new(cli_binary());
+        command.env_remove("PINKDB_KEY");
+        let (out, status) = common::run_merged(command, cmds);
+        common::assert_script_exit(status);
+        out
+    }
+
+    let dir = scratch("keyed_lake");
+    let lake = dir.join("lake");
+    let key = [("PINKDB_KEY", "cli-lake-secret")];
+    let wrong = "cli-lake-wrong";
+
+    let out = run_with_env(
+        &format!(
+            "CREATE TABLE t (a INTEGER, b VARCHAR);\n\
+             INSERT INTO t VALUES (1, 'x'), (2, NULL);\n\
+             .lake save {lake}\n.quit\n",
+            lake = lake.display()
+        ),
+        &key,
+    );
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    assert!(out.contains("the lake is encrypted at rest"), "{out}");
+
+    // Metadata commands unseal the catalog (a missing key would fail here).
+    let out = run_with_env(
+        &format!(
+            ".lake versions {lake}\n.lake tables {lake}\n.lake info {lake}\n.quit\n",
+            lake = lake.display()
+        ),
+        &key,
+    );
+    assert!(out.contains("2 (current)"), "{out}");
+    assert!(out.contains("main.t (2 rows)"), "{out}");
+    assert!(out.contains("format version:  5"), "{out}");
+
+    // A fresh process loads the encrypted version and answers queries.
+    let out = run_with_env(
+        &format!(
+            ".lake open {lake}\nSELECT b, a FROM t ORDER BY a;\n.quit\n",
+            lake = lake.display()
+        ),
+        &key,
+    );
+    assert!(out.contains("Opened lake version 2"), "{out}");
+    assert!(out.contains("the lake is encrypted at rest"), "{out}");
+    assert!(out.contains("NULL"), "{out}");
+
+    // Attach unseals the footer/statistics and answers counts.
+    let out = run_with_env(
+        &format!(
+            ".lake attach {lake}\nSELECT COUNT(*) FROM t;\n.quit\n",
+            lake = lake.display()
+        ),
+        &key,
+    );
+    assert!(out.contains("Attached"), "{out}");
+    assert!(out.contains("the lake is encrypted"), "{out}");
+    assert!(out.contains("2"), "{out}");
+
+    // Failures: no key, wrong key, and a keyed save onto a plaintext lake.
+    let out = run_no_key(&format!(
+        ".lake open {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("the lake is encrypted"), "{out}");
+
+    for sub in [".lake open", ".lake tables"] {
+        let mut wrong_cmd = Command::new(cli_binary());
+        wrong_cmd.env("PINKDB_KEY", wrong);
+        let (out, status) = common::run_merged(
+            wrong_cmd,
+            &format!("{sub} {lake}\n.quit\n", lake = lake.display()),
+        );
+        assert_ne!(
+            status.code(),
+            Some(0),
+            "{sub} with a wrong key must fail: {out}"
+        );
+        assert!(out.contains("wrong key"), "{sub}: {out}");
+    }
+
+    let plain = dir.join("plain");
+    let out = run_no_key(&format!(
+        "CREATE TABLE u (x INTEGER);\n.lake save {plain}\n.quit\n",
+        plain = plain.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let mut keyed_save = Command::new(cli_binary());
+    keyed_save.env("PINKDB_KEY", key[0].1);
+    let (out, status) = common::run_merged(
+        keyed_save,
+        &format!(".lake save {plain}\n.quit\n", plain = plain.display()),
+    );
+    assert_ne!(status.code(), Some(0));
+    assert!(
+        out.contains("not an encrypted pink-lake container"),
+        "a keyed save must refuse a plaintext lake: {out}"
+    );
+    // ... and the plaintext lake is untouched.
+    let out = run_no_key(&format!(
+        ".lake info {plain}\n.quit\n",
+        plain = plain.display()
+    ));
+    assert!(out.contains("current version: 2"), "{out}");
     cleanup(&dir);
 }
 

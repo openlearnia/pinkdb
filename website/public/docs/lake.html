@@ -442,6 +442,38 @@ session without loading any table into memory. No column data is decoded:</p>
   overhead (~0.1–0.2 ms) is constant in file size.</li>
 </ul>
 
+<h2 id="encryption-at-rest">Encryption at rest<a class="anchor" href="#encryption-at-rest" aria-label="Permalink: Encryption at rest">#</a></h2>
+
+<p>With a build carrying the <code>encryption</code> feature (and the CLI's
+<code>lake,s3,encryption</code>), lakes can be encrypted end to end: every object —
+catalogs, snapshots, commit deltas, data files and delete files — is an
+<code>PNKLAKE1</code> <strong>AES-256-GCM</strong> container under one Argon2id
+derivation per session (each container's plaintext header records its salt and
+parameters; a wrong key fails an authenticated key-check, never “corrupt
+file”).</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake,s3,encryption
+<span class="tok-v">PINKDB_KEY</span>=<span class="tok-s">'correct horse battery staple'</span> ./target/release/pinkdb
+<span class="tok-c">#   .lake save   mylake        # publishes an encrypted version</span>
+<span class="tok-c">#   .lake attach mylake        # unseals manifests; statistics still answer COUNT/MIN/MAX</span>
+<span class="tok-c">#   .lake commit mylake        # new data/delete files land encrypted</span></code></pre></div>
+
+<ul>
+  <li><strong>The catalog == snapshot byte invariant survives</strong>: the
+  manifest is sealed once per version and the same ciphertext is published to both
+  <code>catalog.json</code> and <code>snapshots/&lt;v&gt;.json</code>.</li>
+  <li><strong>S3 conflict detection is unchanged</strong>: conditional writes
+  (<code>If-None-Match: *</code>, <code>If-Match</code>) evaluate on the
+  ciphertext.</li>
+  <li><strong>Statistics-fast attach keeps decoding zero data files</strong> for
+  lean lakes — the stats blocks ride inside the sealed manifest. Encrypted
+  <em>Vortex</em> attach reads a file whole to unseal its footer (stage 1;
+  segment-level reads are a documented follow-up).</li>
+  <li>Keyed sessions only ever read keyed lakes and vice versa: opening a keyed
+  lake without the key (or vice versa) fails closed with a clear message, and
+  plaintext lakes stay byte-identical.</li>
+</ul>
+
 <h2 id="writer-semantics-and-conflicts">Writer semantics and conflicts<a class="anchor" href="#writer-semantics-and-conflicts" aria-label="Permalink: Writer semantics and conflicts">#</a></h2>
 
 <ul>
@@ -594,6 +626,7 @@ export <span class="tok-v">AWS_REGION</span>=auto
   <li><a href="#two-data-formats-one-lake-api">Two data formats, one lake API</a></li>
   <li><a href="#using-a-lake">Using a lake</a></li>
   <li><a href="#read-only-attach">Read-only attach</a></li>
+  <li><a href="#encryption-at-rest">Encryption at rest</a></li>
   <li><a href="#writer-semantics-and-conflicts">Writer semantics and conflicts</a></li>
   <li><a href="#s3-r2-object-storage">S3 / R2 object storage</a></li>
   <li><a href="#which-build-should-i-use">Which build should I use?</a></li>

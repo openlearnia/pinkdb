@@ -257,6 +257,26 @@ cli_run() {
         "$BIN" >"$log" 2>&1
 }
 
+# cli_run with PINKDB_KEY set: the lake commands seal/unseal `PNKLAKE1`
+# containers; the rest of the environment is pinned exactly like cli_run.
+cli_run_keyed() { # <log> <passphrase>
+    local log="$1" key="$2"
+    CURRENT_LOG="$log"
+    env \
+        -u AWS_ENDPOINT_URL_S3 \
+        -u AWS_DEFAULT_REGION \
+        -u AWS_SESSION_TOKEN \
+        -u AWS_S3_FORCE_PATH_STYLE \
+        -u PINKDB_S3_ALLOW_DEGRADED \
+        AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
+        AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+        AWS_REGION="$REGION" \
+        AWS_ENDPOINT_URL="$ENDPOINT" \
+        PINKDB_S3_ALLOW_HTTP=1 \
+        PINKDB_KEY="$key" \
+        "$BIN" >"$log" 2>&1
+}
+
 assert_contains() { # <log> <literal>
     grep -qF -- "$2" "$1" || fail "expected the literal \"$2\" in $(basename "$1")"
     ok "$2"
@@ -739,11 +759,14 @@ fi
 
 # --- clean slate for the run's prefixes ------------------------------------
 step "clean slate (list + delete of the run's prefixes)"
-for p in "itest/" "conc/" "conflict/" "refuse/"; do
+for p in "itest/" "enc/" "enc-plain/" "conc/" "conflict/" "refuse/"; do
     wipe_prefix "$p"
 done
 
 ITEST="s3://$BUCKET/itest"
+ENC="s3://$BUCKET/enc"
+ENC_PLAIN="s3://$BUCKET/enc-plain"
+ENC_KEY="wave-57-s3-passphrase"
 CONC="s3://$BUCKET/conc"
 CONFLICT="s3://$BUCKET/conflict"
 REFUSE="s3://$BUCKET/refuse"
@@ -849,6 +872,161 @@ s3curl -fsS --max-time 30 -o "$TMP/rt_snapshot.json" "$ENDPOINT/$BUCKET/itest/sn
 cmp -s "$TMP/rt_catalog.json" "$TMP/rt_snapshot.json" \
     || fail "catalog.json is not byte-identical to snapshots/2.json"
 ok "catalog.json == snapshots/2.json (bytes; enforced)"
+
+# --- encrypted roundtrip (PINKDB_KEY) --------------------------------------
+step "encrypted roundtrip: .lake save/open/attach with PINKDB_KEY on $ENC"
+note "a keyed save writes PNKLAKE1 containers (catalog + snapshots + commit"
+note "deltas + data files + delete files); the harness fetches the objects over"
+note "REST and checks they are ciphertext-only, byte-identical as a pair, and"
+note "openable only with the right key. Requires a CLI built with the"
+note 'the `encryption` feature (the CI build is --features lake,s3,encryption);'
+note 'a build without it is reported and skipped.'
+
+ENC_SUPPORTED=0
+if printf '.lake save %s\n.quit\n' "$TMP/enc-probe" | cli_run_keyed "$TMP/enc_probe.log" "$ENC_KEY"; then
+    ENC_SUPPORTED=1
+    rm -rf "$TMP/enc-probe"
+else
+    if grep -qF 'does not include the `encryption` feature' "$TMP/enc_probe.log"; then
+        warn 'this CLI build has no `encryption` feature: skipping the encrypted roundtrip'
+        warn "  (build with: cargo build --release -p pinkdb-cli --features lake,s3,encryption)"
+    else
+        fail "the encryption feature probe failed unexpectedly (see $(basename "$TMP/enc_probe.log"))"
+    fi
+fi
+
+if [ "$ENC_SUPPORTED" = "1" ]; then
+
+{
+    echo ".import $CSV t"
+    echo ".lake save $ENC"
+    echo ".quit"
+} | cli_run_keyed "$TMP/enc_save.log" "$ENC_KEY"
+assert_status_zero "$TMP/enc_save.log" "$?"
+assert_re "$TMP/enc_save.log" '^Saved lake version 2 in .* \(1 table, 3 rows, [0-9]+ bytes written\)$'
+assert_contains "$TMP/enc_save.log" "the lake is encrypted at rest with PINKDB_KEY"
+ok "keyed save reported the encrypted lake"
+
+# The catalog object is a container, not JSON, and equals its snapshot.
+s3curl -fsS --max-time 30 -o "$TMP/enc_catalog.bin" "$ENDPOINT/$BUCKET/enc/catalog.json" \
+    || fail "fetching enc/catalog.json failed"
+s3curl -fsS --max-time 30 -o "$TMP/enc_snapshot.bin" "$ENDPOINT/$BUCKET/enc/snapshots/2.json" \
+    || fail "fetching enc/snapshots/2.json failed"
+[ "$(head -c 8 "$TMP/enc_catalog.bin")" = "PNKLAKE1" ] \
+    || fail "enc/catalog.json is not a PNKLAKE1 container"
+cmp -s "$TMP/enc_catalog.bin" "$TMP/enc_snapshot.bin" \
+    || fail "encrypted catalog.json is not byte-identical to snapshots/2.json"
+python3 - "$TMP/enc_catalog.bin" <<'PY' || fail "the encrypted catalog parses as JSON (it must not)"
+import json, sys
+try:
+    json.load(open(sys.argv[1]))
+except Exception:
+    print("  ok: the ciphertext does not parse as JSON")
+    sys.exit(0)
+sys.exit(1)
+PY
+ENC_KEYS="$(list_keys "enc/")" || fail "listing enc/ failed"
+printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.vortex$' \
+    || fail "the encrypted roundtrip's data object is missing"
+printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/commits/2.json" \
+    || fail "enc/commits/2.json (the v2 delta manifest) is missing"
+for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
+    s3curl -fsS --max-time 30 -o "$TMP/enc_data.bin" "$ENDPOINT/$BUCKET/$k" \
+        || fail "fetching $k failed"
+    [ "$(head -c 8 "$TMP/enc_data.bin")" = "PNKLAKE1" ] \
+        || fail "$k is not a PNKLAKE1 container"
+done
+assert_listing_count "$ENC_KEYS" "enc/" 5
+ok "every enc/ object is ciphertext (catalog, snapshots, commit delta, data)"
+
+# A fresh process with the key opens and queries the encrypted lake.
+{
+    echo ".lake open $ENC"
+    echo "SELECT i, v FROM t ORDER BY i;"
+    echo ".lake tables $ENC"
+    echo ".quit"
+} | cli_run_keyed "$TMP/enc_open.log" "$ENC_KEY"
+assert_status_zero "$TMP/enc_open.log" "$?"
+assert_contains "$TMP/enc_open.log" "Opened lake version 2"
+assert_contains "$TMP/enc_open.log" "the lake is encrypted at rest with PINKDB_KEY"
+assert_contains "$TMP/enc_open.log" "main.t (3 rows)"
+
+# Attach unseals the footer without a decode.
+{
+    echo ".lake attach $ENC"
+    echo "SELECT COUNT(*) FROM t;"
+    echo ".quit"
+} | cli_run_keyed "$TMP/enc_attach.log" "$ENC_KEY"
+assert_status_zero "$TMP/enc_attach.log" "$?"
+assert_contains "$TMP/enc_attach.log" "the lake is encrypted: attach read the whole ciphertext"
+
+# The conditional ciphertext CAS is unchanged: a keyed incremental commit on
+# the encrypted prefix publishes a delete file + new data file as containers.
+{
+    echo ".lake attach $ENC write"
+    echo "DELETE FROM t WHERE i = 1;"
+    echo "INSERT INTO t VALUES (true, 4, 40, 0.5, 'delta', NULL, NULL);"
+    echo ".lake commit $ENC"
+    echo ".quit"
+} | cli_run_keyed "$TMP/enc_commit.log" "$ENC_KEY"
+assert_status_zero "$TMP/enc_commit.log" "$?"
+assert_contains "$TMP/enc_commit.log" "Committed lake version 3"
+ENC_KEYS="$(list_keys "enc/")" || fail "listing enc/ failed"
+printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.pinkdel$' \
+    || fail "the encrypted commit's delete file is missing"
+for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
+    s3curl -fsS --max-time 30 -o "$TMP/enc_data.bin" "$ENDPOINT/$BUCKET/$k" \
+        || fail "fetching $k failed"
+    [ "$(head -c 8 "$TMP/enc_data.bin")" = "PNKLAKE1" ] \
+        || fail "$k is not a PNKLAKE1 container"
+done
+s3curl -fsS --max-time 30 -o "$TMP/enc_catalog3.bin" "$ENDPOINT/$BUCKET/enc/catalog.json" \
+    || fail "fetching enc/catalog.json failed"
+s3curl -fsS --max-time 30 -o "$TMP/enc_snapshot3.bin" "$ENDPOINT/$BUCKET/enc/snapshots/3.json" \
+    || fail "fetching enc/snapshots/3.json failed"
+cmp -s "$TMP/enc_catalog3.bin" "$TMP/enc_snapshot3.bin" \
+    || fail "encrypted catalog.json is not byte-identical to snapshots/3.json after the commit"
+ok "the encrypted commit's catalog == snapshot bytes and data files are ciphertext"
+
+# No key: refused (fail closed, never a plaintext guess).
+{
+    echo ".lake open $ENC"
+    echo ".quit"
+} | cli_run "$TMP/enc_nokey.log"
+[ "$?" != "0" ] || fail "opening an encrypted lake without a key must fail"
+assert_contains "$TMP/enc_nokey.log" "the lake is encrypted"
+
+# Wrong key: refused, distinguished from corruption.
+{
+    echo ".lake open $ENC"
+    echo ".quit"
+} | cli_run_keyed "$TMP/enc_wrongkey.log" "$ENC_KEY-wrong"
+[ "$?" != "0" ] || fail "opening an encrypted lake with a wrong key must fail"
+assert_contains "$TMP/enc_wrongkey.log" "wrong key at"
+
+# A keyed save onto a plaintext lake is refused, never silently rewritten.
+{
+    echo ".import $CSV t"
+    echo ".lake save $ENC_PLAIN"
+    echo ".quit"
+} | cli_run "$TMP/enc_plain_save.log"
+assert_status_zero "$TMP/enc_plain_save.log" "$?"
+{
+    echo ".lake save $ENC_PLAIN"
+    echo ".quit"
+} | cli_run_keyed "$TMP/enc_plain_keyed.log" "$ENC_KEY"
+[ "$?" != "0" ] || fail "a keyed save onto a plaintext lake must fail"
+assert_contains "$TMP/enc_plain_keyed.log" "not an encrypted pink-lake container"
+s3curl -fsS --max-time 30 -o "$TMP/enc_plain_catalog.json" "$ENDPOINT/$BUCKET/enc-plain/catalog.json" \
+    || fail "fetching enc-plain/catalog.json failed"
+python3 - "$TMP/enc_plain_catalog.json" <<'PY' || fail "the plaintext lake's catalog is not JSON (it was rewritten?)"
+import json, sys
+json.load(open(sys.argv[1]))
+print("  ok: the plaintext lake's catalog is still plain JSON")
+PY
+ok "keyed open of a plaintext lake refused, and the plaintext lake is untouched"
+
+fi # ENC_SUPPORTED
 
 # --- concurrency (a): 3 writers x 3 rounds ---------------------------------
 step "concurrency (a): 3 writers x 3 rounds on $CONC (one distinct table each)"
@@ -1275,6 +1453,13 @@ fi
 printf '                 slow-vs-quick: exactly one winner of v3 (the %s save), loser conflicted; catalog == snapshots/3.json\n' "$WINNER"
 printf '                 settle save after the race: version %s alone; catalog == snapshots/%s.json\n' "$FINAL" "$FINAL"
 printf '  refusal:       second save -> v3 (new version); stray snapshot -> write conflict; removed -> v4\n'
+if [ "$ENC_SUPPORTED" = "1" ]; then
+    printf '  encrypted:     PINKDB_KEY save/commit/open/attach round trip; ciphertext-only objects;\n'
+    printf '                 catalog == snapshot bytes under encryption; no/wrong key refused; a plaintext\n'
+    printf '                 lake is never rewritten\n'
+else
+    printf '  encrypted:     SKIPPED (this CLI build has no `encryption` feature)\n'
+fi
 printf '\nALL CHECKS PASSED'
 if [ "$DUPES" != "0" ]; then
     printf ' (the exactly-one-winner race assertion is not enforced on this non-atomic server)'

@@ -9,11 +9,14 @@
 //!   the `pinkdb.table` identity/schema segment and the stored statistics —
 //!   no data segment is read and no column is decoded. Locally that is a
 //!   positioned read of the postscript + footer per file; over object storage
-//!   (which has no ranged reads in this build) the whole object is read into
-//!   memory and opened in place, still skipping the decode.
+//!   (which has no ranged reads in this build) — and for an encrypted lake,
+//!   where the container must be unsealed before the footer can be parsed —
+//!   the whole object is read into memory and opened in place, still skipping
+//!   the decode.
 //! - a **`.pink`** entry (every build): the per-file statistics blocks
 //!   published in the manifest and nothing else — no data file is opened at
-//!   attach. Each block carries a file's schema and exact per-column
+//!   attach, encrypted or not (the blocks ride inside the sealed manifest).
+//!   Each block carries a file's schema and exact per-column
 //!   statistics and is CRC-protected against its key, path and row count (see
 //!   [`crate::stats`]); a `.pink` file published without one is refused with
 //!   a clear message.
@@ -120,8 +123,17 @@ pub struct AttachmentReport {
     /// True when Vortex data files live on object storage and attach read
     /// whole objects (no ranged reads in this build), still without
     /// decoding. Always false for `.pink` entries: attach reads no data file
-    /// at all.
+    /// at all. (An encrypted *local* lake also reads whole objects — see
+    /// [`AttachmentReport::encrypted`] — but that is not a `remote` fact.)
     pub remote: bool,
+    /// True when the lake is encrypted at rest: the manifests, statistics
+    /// and every data file were unsealed for this attachment. A Vortex
+    /// footer read then costs the whole ciphertext of each data file (the
+    /// encrypted lake's positioned/footer-range reads are a follow-up), and
+    /// a `.pink` entry still reads no data file at all — the published
+    /// statistics blocks ride inside the (now encrypted) manifest. Never a
+    /// decode either way.
+    pub encrypted: bool,
     /// True when every attached entry is a `.pink` entry, so attach read the
     /// manifests' CRC-protected statistics blocks and **no data file at
     /// all** (the "statistics-only" shape); false when any entry needed a
@@ -1219,6 +1231,7 @@ pub(crate) fn build_from(
     let mut tables: Vec<AttachedTable> = Vec::with_capacity(manifest.tables.len());
     let mut files: HashMap<(String, String), AttachedEntry> = HashMap::new();
     let mut statistics_only = true;
+    let encrypted = storage.encrypted();
     #[cfg(feature = "vortex-format")]
     let mut remote = false;
     #[cfg(not(feature = "vortex-format"))]
@@ -1287,8 +1300,13 @@ pub(crate) fn build_from(
                     #[cfg(feature = "vortex-format")]
                     {
                         let path = storage.abs(file.path());
+                        // A keyed (encrypted) session reports `local_path`
+                        // as `None` too: the whole object is read and
+                        // unsealed before the footer is parsed, which is the
+                        // documented stage-1 cost, not an object-storage
+                        // fact.
                         let local = storage.local_path(file.path()).is_some();
-                        remote |= !local;
+                        remote |= !local && !encrypted;
                         let footer = vortex_file::read_footer(&path, &**storage, file.path())?;
                         if !footer.db.eq_ignore_ascii_case(dbname)
                             || !footer.table.eq_ignore_ascii_case(table)
@@ -1588,6 +1606,7 @@ pub(crate) fn build_from(
         tables: attachment.tables.len(),
         format_version: manifest.format_version,
         remote,
+        encrypted,
         statistics_only,
         lake: Arc::clone(&attachment) as Arc<dyn AttachedLake>,
     };

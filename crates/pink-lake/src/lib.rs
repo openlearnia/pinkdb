@@ -22,7 +22,7 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 4,
+//!   "format_version": 5,
 //!   "updated": "2026-10-14T12:34:56.789Z",
 //!   "version": 2,
 //!   "tables": {
@@ -272,17 +272,26 @@
 //!   names that would not fit a filesystem name (and dotted database names)
 //!   *before* a lake is created, so a store that `save_store`/`.lake save`
 //!   rejects leaves nothing behind.
-//! - Data files are **plaintext** (both `.pink` and Vortex); the engine's
-//!   `encryption` feature is not wired into a lake (the CLI keeps
-//!   `PINKDB_KEY` for `.save`/`.open` across `.lake open`, but lake files
-//!   themselves stay plaintext). Data files carry **no checksums**: mutating
-//!   a data file in place is undetected by design. The checks that do run on
-//!   load are structural: a v2 file's `pinkdb.table` metadata must name the
-//!   catalog's table, agree with the Vortex field names/types, and the chunk
-//!   and row counts must match — so a file swapped in from a *differently
-//!   named* table is rejected. Swapping two files of the *same* table
-//!   (same name, same schema, same row count) is not detectable, and a
-//!   tampered file can still decode to different values or fail with a
+//! - Data files are **plaintext by default**. With the non-default
+//!   `encryption` feature, a lake opened or created with a key
+//!   ([`EncryptionKey`], or the CLI's `PINKDB_KEY`) seals every artifact —
+//!   catalog, snapshots, commit deltas, data files, and positional delete
+//!   files — into `PNKLAKE1` containers (AES-256-GCM, one Argon2id derivation
+//!   per session; see the `crypto` module for the format and the
+//!   `catalog.json == snapshots/<v>.json` byte-identity story). A keyed open
+//!   of a plaintext lake is refused and a keyless open of an encrypted lake
+//!   is refused, so a key is never silently ignored. The engine's own
+//!   `.pink` containers (`PINKENC1`) are never stored in a lake. Plaintext
+//!   data files carry **no checksums**: mutating a data file in place is
+//!   undetected by design (an encrypted lake authenticates the whole file,
+//!   and binds it to its catalog path). The checks that do run on load are
+//!   structural: a v2 file's `pinkdb.table` metadata must name the catalog's
+//!   table, agree with the Vortex field names/types, and the chunk and row
+//!   counts must match — so a file swapped in from a *differently named*
+//!   table is rejected. Swapping two *plaintext* files of the *same* table
+//!   (same name, same schema, same row count) is not detectable (an
+//!   encrypted file is bound to its catalog path), and a tampered plaintext
+//!   file can still decode to different values or fail with a
 //!   [`LakeError::Corrupt`] (a caught decoder panic included).
 //! - **Single writer**: one live handle per lake directory; a stale handle's
 //!   save fails with [`LakeError::Conflict`], it never silently forks the
@@ -312,6 +321,7 @@ use pinkdb::{DataTable, DataType, PinkDb};
 
 mod attach;
 mod catalog;
+mod crypto;
 mod delete_file;
 mod incremental;
 mod local;
@@ -330,10 +340,11 @@ mod zone;
 
 pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
+pub use crypto::EncryptionKey;
 pub use incremental::{Commit, CommitReport, CommitSettings, WritableAttachment};
 use local::{LocalStorage, CATALOG_FILE};
 pub use snapshot::{ChangeSummary, SnapshotInfo};
-use storage::{Head, Location, Storage, VersionTag};
+use storage::{CryptoStorage, Head, Location, Storage, VersionTag};
 
 #[cfg(feature = "s3")]
 pub use s3::{S3Config, DEFAULT_RETRIES};
@@ -448,6 +459,24 @@ pub enum LakeError {
     /// (the error is a string because Vortex errors are not `std` error
     /// sources).
     Vortex { context: String, message: String },
+    /// An encrypted lake artifact was read without a key: `catalog.json`, a
+    /// snapshot, a commit delta, or a data file is a `PNKLAKE1` container (or
+    /// this build cannot read it at all). A keyless open never guesses.
+    Encrypted { path: PathBuf, message: String },
+    /// A key was supplied but the artifact is plaintext. Refused so a key can
+    /// never be silently ignored (`pinkdb::crypto` has the same rule for
+    /// `.pink` files).
+    NotEncrypted { path: PathBuf, message: String },
+    /// The supplied key does not match: the container's key-check block did
+    /// not authenticate (wrong key, wrong key *type*, or a tampered header —
+    /// the three are indistinguishable in principle).
+    WrongKey { path: PathBuf, message: String },
+    /// An encrypted container failed authentication or does not belong here: a
+    /// modified/truncated ciphertext, a missing terminal frame, or a container
+    /// sealed for another domain/path. Never a partial read.
+    Tampered { path: PathBuf, message: String },
+    /// The key material itself is unusable (e.g. a non-UTF-8 `PINKDB_KEY`).
+    BadKey { message: String },
     /// A bug in this crate (e.g. serializing its own structs).
     Internal { message: String },
 }
@@ -538,6 +567,27 @@ impl fmt::Display for LakeError {
             LakeError::Vortex { context, message } => {
                 write!(f, "lake vortex error ({context}): {message}")
             }
+            LakeError::Encrypted { path, message } => {
+                write!(f, "{}: the lake is encrypted; {message}", path.display())
+            }
+            LakeError::NotEncrypted { path, message } => {
+                write!(
+                    f,
+                    "{}: not an encrypted pink-lake container; {message}",
+                    path.display()
+                )
+            }
+            LakeError::WrongKey { path, message } => {
+                write!(f, "wrong key at {}: {message}", path.display())
+            }
+            LakeError::Tampered { path, message } => {
+                write!(
+                    f,
+                    "corrupt or tampered encrypted lake file at {}: {message}",
+                    path.display()
+                )
+            }
+            LakeError::BadKey { message } => write!(f, "invalid encryption key: {message}"),
             LakeError::Internal { message } => write!(f, "internal lake error: {message}"),
         }
     }
@@ -599,7 +649,17 @@ impl Lake {
     /// snapshot, and the loser retries [`Lake::open`] via
     /// [`Lake::open_or_create`].
     pub fn create(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::create_with(Arc::new(LocalStorage::new(dir.as_ref())))
+        Self::create_with(Arc::new(LocalStorage::new(dir.as_ref())), None)
+    }
+
+    /// [`Lake::create`] with at-rest encryption: every artifact this lake
+    /// ever publishes — catalog, snapshots, commit deltas, data files, delete
+    /// files — is sealed into a `PNKLAKE1` container under `key` (see the
+    /// `crypto` module docs for the format and the KDF policy; one Argon2id
+    /// derivation per session). Reading the lake then requires the same key;
+    /// a wrong key fails closed and a keyless open refuses.
+    pub fn create_with_key(dir: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
+        Self::create_with(Arc::new(LocalStorage::new(dir.as_ref())), Some(key))
     }
 
     /// Create a lake at a location string: a local directory, or an
@@ -614,10 +674,18 @@ impl Lake {
     /// without conditional writes); use `Lake::create_s3` (with the `s3`
     /// feature) for explicit configuration.
     pub fn create_url(location: &str) -> Result<Self> {
-        Self::create_with(storage_for(Location::parse(location)?)?)
+        Self::create_with(storage_for(Location::parse(location)?)?, None)
     }
 
-    fn create_with(storage: Arc<dyn Storage>) -> Result<Self> {
+    /// [`Lake::create_url`] with at-rest encryption (local directory or
+    /// `s3://bucket/prefix`): a keyed create in a build without the
+    /// `encryption` feature fails before touching any storage.
+    pub fn create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
+        Self::create_with(storage_for(Location::parse(location)?)?, Some(key))
+    }
+
+    fn create_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
+        let storage: Arc<dyn Storage> = Arc::new(CryptoStorage::new(inner, key)?);
         let root = storage.abs("");
         if storage.exists(CATALOG_FILE)? {
             return Err(LakeError::AlreadyALake { path: root });
@@ -633,16 +701,23 @@ impl Lake {
             changes: None,
             schema_version: 0,
         };
-        let bytes = manifest_json(&manifest, &root)?;
+        let plain = manifest_json(&manifest, &root)?;
+        // Seal the manifest **once**: the same bytes are published as the
+        // snapshot and as the catalog (the byte-identity invariant of every
+        // published version). A keyless create seals nothing.
+        let bytes = storage.seal_manifest(&plain)?;
         // Adopt (do not rewrite) an empty version-1 snapshot a concurrent or
         // interrupted create already put there: the catalog must stay
-        // byte-identical to the snapshot of its version.
+        // byte-identical to the snapshot of its version, so the *stored*
+        // bytes are what gets republished (sealing the adopted plaintext
+        // again would mint a different container).
         let bytes = if storage.put_new("snapshots/1.json", &bytes)? {
             bytes
         } else {
             let rel = "snapshots/1.json";
             let path = storage.abs(rel);
-            let existing = storage.read(rel, &format!("reading {}", path.display()))?;
+            let (existing, stored) =
+                storage.read_with_stored(rel, &format!("reading {}", path.display()))?;
             let parsed = read_manifest(&path, &existing).map_err(|e| LakeError::Conflict {
                 path: path.clone(),
                 message: format!(
@@ -657,7 +732,7 @@ impl Lake {
                         .to_string(),
                 });
             }
-            existing
+            stored
         };
         if !storage.put_new(CATALOG_FILE, &bytes)? {
             return Err(LakeError::AlreadyALake { path: root });
@@ -673,7 +748,16 @@ impl Lake {
 
     /// Open an existing lake: `dir/catalog.json` must exist and parse.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with(Arc::new(LocalStorage::new(dir.as_ref())))
+        Self::open_with(Arc::new(LocalStorage::new(dir.as_ref())), None)
+    }
+
+    /// [`Lake::open`] with at-rest encryption: the catalog and every artifact
+    /// read must be `PNKLAKE1` containers under `key`. A plaintext lake is
+    /// refused ([`LakeError::NotEncrypted`], so a key can never be silently
+    /// ignored), and a wrong key fails with [`LakeError::WrongKey`] at the
+    /// catalog before anything else is read.
+    pub fn open_with_key(dir: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
+        Self::open_with(Arc::new(LocalStorage::new(dir.as_ref())), Some(key))
     }
 
     /// Open a lake at a location string: a local directory, or an
@@ -682,10 +766,16 @@ impl Lake {
     /// `Lake::open_s3` (with the `s3` feature) for explicit S3
     /// configuration.
     pub fn open_url(location: &str) -> Result<Self> {
-        Self::open_with(storage_for(Location::parse(location)?)?)
+        Self::open_with(storage_for(Location::parse(location)?)?, None)
     }
 
-    fn open_with(storage: Arc<dyn Storage>) -> Result<Self> {
+    /// [`Lake::open_url`] with at-rest encryption.
+    pub fn open_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
+        Self::open_with(storage_for(Location::parse(location)?)?, Some(key))
+    }
+
+    fn open_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
+        let storage: Arc<dyn Storage> = Arc::new(CryptoStorage::new(inner, key)?);
         let root = storage.abs("");
         let manifest = read_catalog(&*storage, &root)?;
         Ok(Self {
@@ -713,6 +803,24 @@ impl Lake {
         }
     }
 
+    /// [`Lake::open_or_create`] with at-rest encryption: creates an encrypted
+    /// lake at a fresh location, opens an existing encrypted one, and refuses
+    /// a *plaintext* lake ([`LakeError::NotEncrypted`]) — a plaintext lake is
+    /// never silently rewritten as encrypted (save the store to a new
+    /// location to migrate).
+    pub fn open_or_create_with_key(dir: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
+        let root = dir.as_ref().to_path_buf();
+        match Self::open_with_key(&root, key.clone()) {
+            Ok(lake) => Ok(lake),
+            Err(LakeError::NotALake { .. }) => match Self::create_with_key(&root, key.clone()) {
+                Ok(lake) => Ok(lake),
+                Err(LakeError::AlreadyALake { .. }) => Self::open_with_key(root, key),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
     /// [`Lake::open_url`] when the location already holds a lake, else
     /// [`Lake::create_url`].
     pub fn open_or_create_url(location: &str) -> Result<Self> {
@@ -727,17 +835,45 @@ impl Lake {
         }
     }
 
+    /// [`Lake::open_or_create_url`] with at-rest encryption (see
+    /// [`Lake::open_or_create_with_key`] for the plaintext-lake refusal).
+    pub fn open_or_create_url_with_key(location: &str, key: EncryptionKey) -> Result<Self> {
+        match Self::open_url_with_key(location, key.clone()) {
+            Ok(lake) => Ok(lake),
+            Err(LakeError::NotALake { .. }) => {
+                match Self::create_url_with_key(location, key.clone()) {
+                    Ok(lake) => Ok(lake),
+                    Err(LakeError::AlreadyALake { .. }) => Self::open_url_with_key(location, key),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Create a lake from explicit [`S3Config`] (endpoint, region,
     /// credentials, bucket/prefix) instead of the environment.
     #[cfg(feature = "s3")]
     pub fn create_s3(config: S3Config) -> Result<Self> {
-        Self::create_with(Arc::new(s3::S3Storage::new(config)?))
+        Self::create_with(Arc::new(s3::S3Storage::new(config)?), None)
+    }
+
+    /// [`Lake::create_s3`] with at-rest encryption.
+    #[cfg(feature = "s3")]
+    pub fn create_s3_with_key(config: S3Config, key: EncryptionKey) -> Result<Self> {
+        Self::create_with(Arc::new(s3::S3Storage::new(config)?), Some(key))
     }
 
     /// Open a lake from explicit [`S3Config`].
     #[cfg(feature = "s3")]
     pub fn open_s3(config: S3Config) -> Result<Self> {
-        Self::open_with(Arc::new(s3::S3Storage::new(config)?))
+        Self::open_with(Arc::new(s3::S3Storage::new(config)?), None)
+    }
+
+    /// [`Lake::open_s3`] with at-rest encryption.
+    #[cfg(feature = "s3")]
+    pub fn open_s3_with_key(config: S3Config, key: EncryptionKey) -> Result<Self> {
+        Self::open_with(Arc::new(s3::S3Storage::new(config)?), Some(key))
     }
 
     /// [`Lake::open_s3`] when the bucket/prefix already holds a lake, else
@@ -751,6 +887,22 @@ impl Lake {
                 Err(LakeError::AlreadyALake { .. }) => Self::open_s3(config),
                 Err(e) => Err(e),
             },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// [`Lake::open_or_create_s3`] with at-rest encryption.
+    #[cfg(feature = "s3")]
+    pub fn open_or_create_s3_with_key(config: S3Config, key: EncryptionKey) -> Result<Self> {
+        match Self::open_s3_with_key(config.clone(), key.clone()) {
+            Ok(lake) => Ok(lake),
+            Err(LakeError::NotALake { .. }) => {
+                match Self::create_s3_with_key(config.clone(), key.clone()) {
+                    Ok(lake) => Ok(lake),
+                    Err(LakeError::AlreadyALake { .. }) => Self::open_s3_with_key(config, key),
+                    Err(e) => Err(e),
+                }
+            }
             Err(e) => Err(e),
         }
     }
@@ -771,6 +923,13 @@ impl Lake {
     /// The current version (from `catalog.json`, cached after open/save).
     pub fn current_version(&self) -> u64 {
         self.version
+    }
+
+    /// Whether this handle is a keyed (encrypted) lake session. A handle that
+    /// opened or created a lake successfully with a key is always encrypted;
+    /// one created without a key always writes plaintext.
+    pub fn is_encrypted(&self) -> bool {
+        self.storage.encrypted()
     }
 
     /// Record the author and commit message for the **next** published save,
@@ -845,9 +1004,12 @@ impl Lake {
     /// snapshot: read the manifest, then the statistics attach needs — a
     /// Vortex data file's footer, metadata segment and stored statistics
     /// (`vortex-format` builds; no column data is read or decoded, unless the
-    /// files live on object storage — whole-object reads, still no decode),
-    /// or the `.pink` files' published statistics blocks (every build: the
-    /// manifest is all attach reads; `data` files are never opened).
+    /// files live on object storage — whole-object reads, still no decode —
+    /// or the lake is encrypted, where each container is unsealed whole
+    /// first: the documented stage-1 cost, with footer-range reads over
+    /// unsealed segments as the follow-up), or the `.pink` files' published
+    /// statistics blocks (every build: the manifest is all attach reads;
+    /// `data` files are never opened, encrypted or not).
     ///
     /// The returned [`AttachmentReport`] carries the version-pinned
     /// [`pinkdb::AttachedLake`] handle; register it with
@@ -1045,7 +1207,12 @@ impl Lake {
             changes,
             schema_version,
         };
-        let bytes = manifest_json(&manifest, &self.root)?;
+        let plain = manifest_json(&manifest, &self.root)?;
+        // Seal the manifest **once**: the exact same bytes are published as
+        // `snapshots/<version>.json` and as `catalog.json`, so the
+        // byte-identity invariant survives encryption. A keyless save seals
+        // nothing.
+        let bytes = self.storage.seal_manifest(&plain)?;
         let commit_manifest = catalog::CommitManifest {
             format_version: FORMAT_VERSION,
             version,
@@ -1069,12 +1236,13 @@ impl Lake {
         bytes_written += commit_bytes.len() as u64;
         // Create-only, never replace: an existing snapshot version is a
         // published version (or an unpublished stray the caller must remove).
-        // Locally a hard link; over S3 `If-None-Match: *`.
+        // Locally a hard link; over S3 `If-None-Match: *` — the condition
+        // evaluates on the *sealed* bytes exactly as it would on plaintext.
         if !self.storage.put_new(&snapshot_rel, &bytes)? {
             return Err(self.snapshot_exists_error(version));
         }
         bytes_written += bytes.len() as u64;
-        self.replace_catalog(version, &bytes, "save")?;
+        self.replace_catalog(version, &plain, &bytes, "save")?;
         bytes_written += bytes.len() as u64;
         Ok(SaveReport {
             version,
@@ -1309,7 +1477,19 @@ impl Lake {
     /// (so a concurrent publication can never produce a catalog that
     /// disagrees with the snapshot of its version), with the degraded
     /// (check-then-put) endpoint reconciliation. Updates this handle.
-    fn replace_catalog(&mut self, version: u64, bytes: &[u8], what: &str) -> Result<()> {
+    ///
+    /// `plain` is the manifest as written (`snapshots/<version>.json`'s
+    /// logical content) and `sealed` the exact bytes published there; for a
+    /// keyless lake they are the same bytes. The conditional replace sends
+    /// the *sealed* bytes, while the degraded-path verification compares the
+    /// decrypted catalog against `plain` (the bytes a reader sees).
+    fn replace_catalog(
+        &mut self,
+        version: u64,
+        plain: &[u8],
+        sealed: &[u8],
+        what: &str,
+    ) -> Result<()> {
         // Re-check that the catalog is still the version our snapshot was
         // taken from, right before replacing it, and replace it
         // conditionally: `If-Match: <etag>` over S3 (a 412 is the conflict
@@ -1317,7 +1497,7 @@ impl Lake {
         let catalog_tag = self.ensure_catalog_unchanged()?;
         if !self
             .storage
-            .put_if_match(CATALOG_FILE, bytes, &catalog_tag)?
+            .put_if_match(CATALOG_FILE, sealed, &catalog_tag)?
         {
             return Err(LakeError::Conflict {
                 path: self.storage.abs(CATALOG_FILE),
@@ -1341,7 +1521,7 @@ impl Lake {
             let (current, _) = self
                 .storage
                 .read_tagged(CATALOG_FILE, &format!("reading {}", path.display()))?;
-            if current != bytes {
+            if current != plain {
                 let winner = read_manifest(&path, &current)?;
                 self.storage.reconcile_snapshot(winner.version, &current)?;
                 return Err(LakeError::Conflict {
@@ -1353,7 +1533,7 @@ impl Lake {
                     ),
                 });
             }
-            self.storage.reconcile_snapshot(version, bytes)?;
+            self.storage.reconcile_snapshot(version, plain)?;
         }
         self.version = version;
         // The commit record is published; a later save without a new
@@ -1613,6 +1793,16 @@ pub fn save_store(db: &PinkDb, dir: impl AsRef<Path>) -> Result<u64> {
     Lake::open_or_create(dir)?.write_from_store(db)
 }
 
+/// [`save_store`] with at-rest encryption: creates an encrypted lake at a
+/// fresh location and appends an encrypted version to an existing keyed one;
+/// a *plaintext* lake at `dir` is refused ([`LakeError::NotEncrypted`]) — the
+/// plaintext→encrypted migration is a save to a new location, never a silent
+/// rewrite.
+pub fn save_store_with_key(db: &PinkDb, dir: impl AsRef<Path>, key: EncryptionKey) -> Result<u64> {
+    validate_store(db)?;
+    Lake::open_or_create_with_key(dir, key)?.write_from_store(db)
+}
+
 /// Snapshot the store into the lake at `location`: a local directory or an
 /// `s3://bucket/prefix` URL (with the `s3` feature; credentials/endpoint come
 /// from the environment exactly as [`Lake::open_url`] documents). The store
@@ -1623,12 +1813,26 @@ pub fn save_store_url(db: &PinkDb, location: &str) -> Result<u64> {
     Lake::open_or_create_url(location)?.write_from_store(db)
 }
 
+/// [`save_store_url`] with at-rest encryption (local directory or
+/// `s3://bucket/prefix`).
+pub fn save_store_url_with_key(db: &PinkDb, location: &str, key: EncryptionKey) -> Result<u64> {
+    validate_store(db)?;
+    Lake::open_or_create_url_with_key(location, key)?.write_from_store(db)
+}
+
 /// [`save_store_url`] with explicit [`S3Config`] (bucket/prefix/endpoint/
 /// region/credentials) instead of the environment.
 #[cfg(feature = "s3")]
 pub fn save_store_s3(db: &PinkDb, config: S3Config) -> Result<u64> {
     validate_store(db)?;
     Lake::open_or_create_s3(config)?.write_from_store(db)
+}
+
+/// [`save_store_s3`] with at-rest encryption.
+#[cfg(feature = "s3")]
+pub fn save_store_s3_with_key(db: &PinkDb, config: S3Config, key: EncryptionKey) -> Result<u64> {
+    validate_store(db)?;
+    Lake::open_or_create_s3_with_key(config, key)?.write_from_store(db)
 }
 
 /// The storage backend for a parsed location: local always, S3 only with the

@@ -12,8 +12,10 @@ path = "src/main.rs"
 # Opt-in remote mode: `pinkdb --host HOST:PORT` talks to a pinkdb-server.
 client = ["dep:pinkdb-server"]
 # Opt-in at-rest encryption: forwards to `pinkdb/encryption`; `PINKDB_KEY`
-# then encrypts `.save` and decrypts `.open`.
-encryption = ["pinkdb/encryption"]
+# then encrypts `.save` and decrypts `.open`. When a lake feature is built
+# too, the same key encrypts the lake at rest (pink-lake's `encryption`
+# feature): every `.lake` artifact becomes a `PNKLAKE1` container.
+encryption = ["pinkdb/encryption", "pink-lake?/encryption"]
 # Opt-in extension-repository client: `.install`, `.repositories`, `.installed`.
 # Keeps the default binary lean: HTTP + TLS, JSON parsing, and SHA-256 live
 # only behind this feature.

@@ -68,7 +68,7 @@ SQL text
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
-| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the full CLI `lake` feature, `.pink` v4 with the lean `lake-lite` feature (which `s3` implies); v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature) |
+| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the full CLI `lake` feature, `.pink` v4 with the lean `lake-lite` feature (which `s3` implies); v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
 
 Design rules: Rust edition 2021, zero async; the core is zero-unsafe, with
 `unsafe` contained to exactly two crates (the C ABI `pinkdb-ffi` and the
@@ -450,7 +450,10 @@ let db = PinkDb::open_durable_with_key("x.pink", &key)?; // encrypted WAL
 
 The REPL reads `PINKDB_KEY` from the environment: `.save` writes encrypted and
 `.open` decrypts (the durable WAL uses the same key); unset, behavior is
-byte-identical to an unkeyed build. The value must be valid UTF-8: a
+byte-identical to an unkeyed build. When a lake feature is built too (and the
+CLI's `encryption` feature is on), the same variable is the lake's at-rest
+key: `.lake save`/`open`/`attach`/`commit` seal and unseal `PNKLAKE1` lake
+containers (see "Lakes" below). The value must be valid UTF-8: a
 set-but-non-UTF-8 variable is a hard error (exit 2) instead of a silent
 fallback to plaintext, and remote mode (`--host`) warns that the variable is
 inert (the server's own configuration applies; `pinkdb-server` has no key
@@ -688,17 +691,26 @@ manifest whose rows do not add up) is a clear `Corrupt` error, never a guess.
   name may contain dots, a database name containing `.` is refused at save
   time. Views are session-local and are not saved. A lake records tables,
   so a database with no tables is not preserved and a dropped `main` comes
-  back empty (loading always recreates it). Data files are plaintext
-  (`PINKDB_KEY` does not encrypt a lake; the CLI keeps the session key
-  across `.lake open` for later `.save`/`.open`). Data files carry no
+  back empty (loading always recreates it). Data files are plaintext by
+  default. With the non-default `encryption` feature (the same CLI
+  `--features` flag that guards `PINKDB_KEY` for `.save`/`.open`) a lake
+  opened or created with a key seals **every** artifact — catalog, snapshots,
+  commit deltas, data files, and positional delete files — into a `PNKLAKE1`
+  container (AES-256-GCM; one Argon2id-derived key per session, whose salt is
+  recorded in every container header, catalog included); a keyed open of a
+  plaintext lake and a keyless open of an encrypted one are both refused
+  (`wrong key` is distinguished from tampering), and plaintext lakes stay
+  readable everywhere, byte-identically. Plaintext data files carry no
   checksums: mutating one in place is undetected by design. The checks that
   do run on load are structural — a v2 file's `pinkdb.table` metadata must
   name the catalog's table, agree with the Vortex field names/types, and the
   file's row count must match the catalog — so a file swapped in from a
-  *differently named* table is rejected. Swapping two files of the **same**
-  table (same name, same schema, same row count) cannot be detected, and a
-  tampered file may still decode to different values or fail with a clean
-  `Corrupt` error (caught decoder panics included).
+  *differently named* table is rejected. Swapping two *plaintext* files of the
+  **same** table (same name, same schema, same row count) cannot be detected
+  (an encrypted file is authenticated and bound to its catalog path, so the
+  swap fails closed), and a tampered plaintext file may still decode to
+  different values or fail with a clean `Corrupt` error (caught decoder
+  panics included).
   `save_store`/`.lake save` pre-validate the store (dotted database names,
   over-long encoded table names) *before* creating a lake, so a rejected save
   leaves nothing behind.
@@ -953,6 +965,22 @@ UPDATE t SET ...; DELETE FROM t WHERE ...;
 .lake partition mylake t clear           # new writes unpartitioned again
 ```
 
+With the `encryption` feature and a non-empty `PINKDB_KEY`, the same commands
+read and write an **encrypted lake**: every artifact — catalog, snapshots,
+commit deltas, data files, positional delete files — is a `PNKLAKE1` container
+(AES-256-GCM under a key derived once per session with Argon2id; the salt
+rides in every container header, the catalog included). The
+`catalog.json == snapshots/<version>.json` byte-identity invariant survives:
+the manifest is sealed once per version and the same ciphertext bytes are
+published to both. A keyed open of a plaintext lake, a keyless open of an
+encrypted lake, and a wrong key are each refused with a distinct,
+authenticated error; a plaintext lake is never silently rewritten as
+encrypted. Without the variable the lake stays plaintext, byte-identically.
+A keyed attach reads whole ciphertext objects for the Vortex footers (stage
+1: footer-range reads over unsealed segments are a follow-up) while still
+decoding nothing for `COUNT`/`MIN`/`MAX`; lean `.pink` lakes attach from the
+encrypted manifests' statistics blocks without opening any data file.
+
 With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see
 the next subsection. In a lean `lake-lite` build, `.lake attach` works
 statistics-only, from the stats blocks a lean save publishes (a lake saved
@@ -1141,8 +1169,12 @@ cargo build -p pinkdb-cli --features lake,s3
   them and caps reads at the same size); no bucket creation, no lifecycle
   rules, no object versioning, no server-side copy, no lake-side GC (old
   versions/data objects stay, exactly like local), and lake data is plaintext
-  (same as local). A dotted bucket name needs **path-style** addressing
-  (virtual-hosted TLS certificates do not cover `dots.in.bucket.<endpoint>`;
+  unless the `encryption` feature and `PINKDB_KEY` are used (then each object
+  is one encrypted container, written with the same single `PutObject`, and
+  the conditional `If-None-Match`/`If-Match` CAS evaluates on the ciphertext
+  bytes exactly as on plaintext). A dotted bucket name needs **path-style**
+  addressing (virtual-hosted TLS certificates do not cover
+  `dots.in.bucket.<endpoint>`;
   a custom endpoint already defaults to path-style and
   `AWS_S3_FORCE_PATH_STYLE=1` forces it for AWS). v1 `.pink` data files
   stored in an S3 lake still load: the engine's loader needs a path, so the

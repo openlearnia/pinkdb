@@ -10,6 +10,20 @@ one-liners below.
 
 ## 2026-10-17
 
+### Wave 57 — lake encryption at rest ✅
+- With the `encryption` feature, a keyed session (`PINKDB_KEY`, consistent with
+  the engine) seals **every lake object** — catalogs, snapshots, commit deltas,
+  data files, delete files — as `PNKLAKE1` **AES-256-GCM** containers under one
+  Argon2id derivation per session. A `Storage`-level decorator means commits,
+  deletes, time travel and retry paths are covered with no per-call-site code.
+- The `catalog.json == snapshots/<v>.json` byte invariant survives (seal once,
+  publish the same ciphertext); **S3 conditional-write CAS is unchanged**;
+  statistics-fast attach on encrypted lean lakes still decodes zero data files.
+- Wrong/missing keys and tampered containers fail closed with authenticated
+  errors (never “corrupt file”); plaintext lakes stay byte-identical and are
+  refused by keyed sessions. Encrypted Vortex attach reads whole objects in
+  stage 1 (segment-level reads documented as the follow-up).
+
 ### Wave 65 — lake schema evolution ✅
 - `ALTER TABLE` on writable-attached lake tables — `ADD COLUMN … DEFAULT`,
   `RENAME COLUMN`, `DROP COLUMN` (plus the engine-wide `ALTER TABLE` support

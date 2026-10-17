@@ -755,6 +755,17 @@ impl WritableAttachment {
         Self::attach(Lake::open_url(location)?, version)
     }
 
+    /// [`WritableAttachment::open`] with at-rest encryption: a keyed lake is
+    /// opened and committed under `key` (a plaintext lake is refused — a key
+    /// is never silently ignored).
+    pub fn open_with_key(
+        location: &str,
+        version: Option<u64>,
+        key: crate::EncryptionKey,
+    ) -> Result<Self> {
+        Self::attach(Lake::open_url_with_key(location, key)?, version)
+    }
+
     /// [`WritableAttachment::open`] on an already-open [`Lake`].
     pub fn attach(lake: Lake, version: Option<u64>) -> Result<Self> {
         let (base_version, base) = materialize_tables(&lake, version)?;
@@ -1727,14 +1738,20 @@ impl Lake {
     /// The publish step of one commit attempt: `commits/<v>.json` (self-healing
     /// a stray from a crashed attempt), then the snapshot link (create-only),
     /// then the conditional catalog replace.
+    ///
+    /// `snapshot_plain` is the new manifest; it is sealed **once** here and
+    /// the exact same bytes go to `snapshots/<v>.json` and to `catalog.json`,
+    /// so the byte-identity invariant survives encryption (see
+    /// `Storage::seal_manifest`).
     fn publish_commit_version(
         &mut self,
         version: u64,
         commit_bytes: &[u8],
-        snapshot_bytes: &[u8],
+        snapshot_plain: &[u8],
     ) -> Result<()> {
         let commit_rel = format!("commits/{version}.json");
         let snapshot_rel = format!("snapshots/{version}.json");
+        let snapshot_bytes = self.storage.seal_manifest(snapshot_plain)?;
         if !self.storage.put_new(&commit_rel, commit_bytes)? {
             // Version `version` already published (another writer won the
             // race), or a stray delta manifest from a crashed attempt that
@@ -1747,13 +1764,13 @@ impl Lake {
             }
             self.storage.put(&commit_rel, commit_bytes)?;
         }
-        if !self.storage.put_new(&snapshot_rel, snapshot_bytes)? {
+        if !self.storage.put_new(&snapshot_rel, &snapshot_bytes)? {
             return Err(LakeError::Conflict {
                 path: self.storage.abs(&snapshot_rel),
                 message: format!("another writer published version {version}; rebasing"),
             });
         }
-        self.replace_catalog(version, snapshot_bytes, "commit")
+        self.replace_catalog(version, snapshot_plain, &snapshot_bytes, "commit")
     }
 
     /// Read `catalog.json` for a commit attempt: whatever version it names

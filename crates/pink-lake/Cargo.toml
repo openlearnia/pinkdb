@@ -19,6 +19,13 @@ vortex-format = ["dep:vortex", "dep:rayon"]
 # Opt-in object storage: `s3://bucket/prefix` lake locations over the S3 REST
 # API (AWS S3, Cloudflare R2, MinIO, …) with a blocking SigV4 client.
 s3 = ["dep:ureq", "dep:hmac", "dep:sha2"]
+# Opt-in at-rest encryption (`PNKLAKE1` containers: catalog, snapshots, commit
+# deltas, data files, delete files). Audited RustCrypto crates only (the same
+# AES-256-GCM + Argon2id the engine's `pinkdb/encryption` uses). Without the
+# feature a keyed lake handle cannot be constructed — a key is never silently
+# ignored, and an encrypted lake reports a clear build hint instead of a
+# parse error.
+encryption = ["dep:aes-gcm", "dep:argon2"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
@@ -39,3 +46,7 @@ vortex = { version = "0.88.0", default-features = false, features = ["files"], o
 # Parallel engine→Vortex chunk conversion and data-file decode
 # (`vortex-format` only).
 rayon = { version = "1.12.0", optional = true }
+# At-rest encryption (`encryption` feature): the same audited RustCrypto
+# crates and versions as `pinkdb/encryption` (AES-256-GCM, Argon2id).
+aes-gcm = { version = "0.10", optional = true }
+argon2 = { version = "0.5", optional = true }

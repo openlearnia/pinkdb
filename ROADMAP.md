@@ -90,7 +90,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 54 | Core extension: **math** — `sqrt`, `pow`, `log`/`ln`/`exp`, trig, `floor`/`ceil`, `sign`, `greatest`/`least`, `random` (volatile-flagged) | queued | `extensions/math` |
 | 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) — done: column-vs-literal comparison fast path (`filter_str` 5.39 → 1.60 ms, battery 235.5 ms best-ever); audit deltas attributed (per-chunk literal Vectors + codegen/thermal noise), fused-path choice validated | done | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
-| 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | in progress | agent stuck in the Oct-17 disk-full cascade; partial secured — `wt-lake-encryption/partial-stuck.diff` (3,802 lines / 12 files) |
+| 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | done | landed; `PNKLAKE1` AES-256-GCM containers over every object via a `Storage` decorator (manifests sealed once → invariant holds; commits/deletes/time-travel inherited), stats-fast attach preserved, wrong/missing key fails closed with feature-off rebuild hints, encrypted CI matrix + Docker harness section; Vortex stage-1 whole-file reads documented |
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | done | landed; duckdiff 88 → 155 probes |
 | 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | done | landed (engine + protocol v5 + FFI + client); Python/Go wrappers follow in wave 69 |
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
@@ -1165,7 +1165,35 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   epoch-stamped via `with_schema_version` (partition values carried through),
   and every format-5 pin was swept (s3 tests, docker script, README/site).
   Worktree `wt-lake-schema` removed after landing.
-- 2026-10-17 — Wave-57 follow-up note: the encryption agent completed on the
-  same day (patch secured: `wt-lake-encryption/patch.diff`, 4,040 lines /
-  15 files, +3,321/−93; CI jobs for encrypted feature combos included);
-  integration follows the 65+66 merge.
+- 2026-10-17 — Wave 57 (lake encryption at rest): a `Storage`-level
+  **`CryptoStorage` decorator** wraps every session (keyed and keyless) with
+  `PNKLAKE1` **AES-256-GCM** containers — 1 MiB frames, four AAD-bound domains
+  (manifest / data file / commit / delete file, path-bound where applicable),
+  a fresh nonce prefix per container, and one Argon2id derivation per session
+  (each container's plaintext header carries the salt and parameters). Every
+  lake object is covered — `catalog.json`, `snapshots/<v>.json`,
+  `commits/<v>.json`, `.pink` and Vortex data files, `.pinkdel` delete files —
+  so commits, deletes, time travel and retry/rebase inherit encryption with no
+  per-call-site code. The **catalog == snapshot byte invariant survives**: the
+  manifest is sealed once per version (`seal_manifest`) and the same ciphertext
+  is published to both objects (including create-adoption and the degraded-S3
+  reconciliation path). `PINKDB_KEY` UX is engine-consistent: keyed
+  save/open/attach/commit; keyless reads of keyed lakes fail closed
+  ("the lake is encrypted" / rebuild hint without the feature), wrong keys fail
+  the authenticated key-check, and keyed sessions refuse plaintext lakes —
+  never a silent rewrite. S3 ciphertext CAS is unchanged (conditional writes
+  evaluate on sealed bytes; verified over the mock and the Docker harness).
+  Stats-fast attach on encrypted lean lakes still decodes **zero** data files
+  (stats ride inside the sealed manifest); encrypted Vortex attach reads whole
+  objects for footers (stage 1; segment-level reads are the documented
+  follow-up). CI gained the encrypted feature combos (pink-lake
+  `s3,encryption` / `s3,vortex-format,encryption`, CLI `lake,s3,encryption`,
+  and the s3-docker job now builds an encrypting binary). Gates on the merged
+  tree: every pink-lake feature combo compiles clean (12/12), suites green —
+  default 76, vortex 122 incl. encryption 96/…, s3,vortex 187, encryption 0
+  failures in all configs — CLI `lake,s3,encryption` green (one stale
+  `format version: 4` pin fixed to 5), fmt/clippy clean across the encrypted
+  combos, duckdiff **171/171**. Integration on top of 65+66 was **one
+  import-line conflict** — the decorator sits entirely at the `Storage` choke
+  point, which the schema/partition restructures never touched. Worktree
+  `wt-lake-encryption` removed after landing.

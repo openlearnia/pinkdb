@@ -265,6 +265,38 @@ session without loading any table into memory. No column data is decoded:</p>
   overhead (~0.1–0.2 ms) is constant in file size.</li>
 </ul>
 
+<h2>Encryption at rest</h2>
+
+<p>With a build carrying the <code>encryption</code> feature (and the CLI's
+<code>lake,s3,encryption</code>), lakes can be encrypted end to end: every object —
+catalogs, snapshots, commit deltas, data files and delete files — is an
+<code>PNKLAKE1</code> <strong>AES-256-GCM</strong> container under one Argon2id
+derivation per session (each container's plaintext header records its salt and
+parameters; a wrong key fails an authenticated key-check, never “corrupt
+file”).</p>
+
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features lake,s3,encryption
+PINKDB_KEY='correct horse battery staple' ./target/release/pinkdb
+#   .lake save   mylake        # publishes an encrypted version
+#   .lake attach mylake        # unseals manifests; statistics still answer COUNT/MIN/MAX
+#   .lake commit mylake        # new data/delete files land encrypted</code></pre>
+
+<ul>
+  <li><strong>The catalog == snapshot byte invariant survives</strong>: the
+  manifest is sealed once per version and the same ciphertext is published to both
+  <code>catalog.json</code> and <code>snapshots/&lt;v&gt;.json</code>.</li>
+  <li><strong>S3 conflict detection is unchanged</strong>: conditional writes
+  (<code>If-None-Match: *</code>, <code>If-Match</code>) evaluate on the
+  ciphertext.</li>
+  <li><strong>Statistics-fast attach keeps decoding zero data files</strong> for
+  lean lakes — the stats blocks ride inside the sealed manifest. Encrypted
+  <em>Vortex</em> attach reads a file whole to unseal its footer (stage 1;
+  segment-level reads are a documented follow-up).</li>
+  <li>Keyed sessions only ever read keyed lakes and vice versa: opening a keyed
+  lake without the key (or vice versa) fails closed with a clear message, and
+  plaintext lakes stay byte-identical.</li>
+</ul>
+
 <h2>Writer semantics and conflicts</h2>
 
 <ul>

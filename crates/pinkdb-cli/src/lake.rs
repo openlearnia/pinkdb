@@ -14,9 +14,15 @@
 //!
 //! - the session database is reset to `main` (the lake has no session state;
 //!   the output says so when it changes);
-//! - the session's `PINKDB_KEY` is carried over so a later `.save`/`.open`
-//!   stays encrypted, while the lake's own files stay plaintext (the output
-//!   says so when a key is set);
+//! - `PINKDB_KEY` — when set — is the lake's at-rest key too (with a build
+//!   that has both a lake feature and `encryption`): `.lake save` writes
+//!   `PNKLAKE1` containers (catalog, snapshots, commit deltas, data files,
+//!   delete files) and every `.lake` command unseals them, with the engine's
+//!   exact key convention (a keyed open of a plaintext lake is refused; a
+//!   wrong key fails closed with `wrong key`; a missing key refuses with
+//!   "the lake is encrypted"). Without the variable a lake stays plaintext
+//!   exactly as before. The session key is also carried over to the store
+//!   `.lake open` builds, so a later `.save`/`.open` stays encrypted;
 //! - a lake has **one live writer**: the session remembers the version it
 //!   last opened or saved per lake, and a later `.lake save` to that lake
 //!   fails with a conflict error when another writer published in between
@@ -79,6 +85,41 @@ use pink_lake::{CommitSettings, Lake, WritableAttachment};
 use pinkdb::PinkDb;
 
 use crate::{plural, take_token, unquote};
+
+/// The lake key from `PINKDB_KEY`, the engine's convention (a non-empty value
+/// is a passphrase; unset/empty means plaintext). A set-but-non-UTF-8 value
+/// is a hard error — never a silent plaintext lake. The CLI already exits on
+/// such a value at startup (`EncryptionKey::from_env` in `main`); this is the
+/// same check at the lake boundary.
+fn lake_key() -> Option<pink_lake::EncryptionKey> {
+    match pink_lake::EncryptionKey::from_env() {
+        Ok(key) => key,
+        Err(e) => {
+            cli_error!("{e}");
+            None
+        }
+    }
+}
+
+/// The keyed or plaintext [`Lake`] open the CLI needs for `dir`: the keyed
+/// constructor when `PINKDB_KEY` is set (so the key can never be silently
+/// ignored), the plaintext one otherwise.
+fn open_lake(dir: &str) -> pink_lake::Result<Lake> {
+    match lake_key() {
+        Some(key) => Lake::open_url_with_key(dir, key),
+        None => Lake::open_url(dir),
+    }
+}
+
+/// [`open_lake`] for `.lake save`: create a keyed lake at a fresh location,
+/// append to an existing keyed one, and refuse a *plaintext* lake when a key
+/// is set (never a silent rewrite — save to a new location to migrate).
+fn open_or_create_lake(dir: &str) -> pink_lake::Result<Lake> {
+    match lake_key() {
+        Some(key) => Lake::open_or_create_url_with_key(dir, key),
+        None => Lake::open_or_create_url(dir),
+    }
+}
 
 /// The one-line pointer to object-storage locations appended to usage text:
 /// with the `s3` feature `s3://` URLs are accepted, without it they are not.
@@ -267,7 +308,7 @@ fn cmd_save(db: &PinkDb, arg: &str) {
         cli_error!("{e}");
         return;
     }
-    let mut lake = match Lake::open_or_create_url(&dir) {
+    let mut lake = match open_or_create_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -315,8 +356,11 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             {
                 println!("Note: views are session-local and were not saved.");
             }
-            if db.encryption_key().is_some() {
-                println!("Note: lake data files are plaintext; PINKDB_KEY does not encrypt them.");
+            if lake.is_encrypted() {
+                println!(
+                    "Note: the lake is encrypted at rest with PINKDB_KEY (AES-256-GCM, \
+                     one Argon2id key per session)."
+                );
             }
             let attached = db.attached_tables().len();
             if attached > 0 {
@@ -397,20 +441,20 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
             }
         }
     }
-    let lake = match Lake::open_url(&dir) {
+    let lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
             return;
         }
     };
+    let encrypted = lake.is_encrypted();
     let t0 = Instant::now();
     match lake.load(version) {
         Ok(mut new_db) => {
             // Replacing the store must not silently drop the session's
             // `PINKDB_KEY`: a later `.save`/`.open` would write plaintext.
             let key = db.encryption_key().cloned();
-            let keyed = key.is_some();
             if key.is_some() {
                 new_db.set_encryption_key(key);
             }
@@ -444,10 +488,10 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
                     db.current_db()
                 );
             }
-            if keyed {
+            if encrypted {
                 println!(
-                    "Note: lake data files are plaintext; the session key applies to \
-                     .save/.open, not to the lake."
+                    "Note: the lake is encrypted at rest with PINKDB_KEY; the same key is \
+                     installed on the store for later .save/.open."
                 );
             }
         }
@@ -516,7 +560,7 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
         cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
         return;
     }
-    let lake = match Lake::open_url(&dir) {
+    let lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -539,7 +583,20 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
                     tables.len(),
                     plural(tables.len())
                 );
-                if report.remote {
+                if report.encrypted {
+                    if report.statistics_only {
+                        println!(
+                            "Note: the lake is encrypted; attach unsealed the manifests and \
+                             their statistics blocks and read no data file."
+                        );
+                    } else {
+                        println!(
+                            "Note: the lake is encrypted: attach read the whole ciphertext of \
+                             each Vortex data file and unsealed it (queries still skip the \
+                             decode; ranged footer reads for encrypted files are a follow-up)."
+                        );
+                    }
+                } else if report.remote {
                     println!(
                         "Note: object storage has no ranged reads in this build: attach read \
                          the Vortex data files whole (queries still skip the decode)."
@@ -561,7 +618,11 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
         return;
     }
     let t0 = Instant::now();
-    let wa = match WritableAttachment::open(dir, version) {
+    let wa = match lake_key() {
+        Some(key) => WritableAttachment::open_with_key(dir, version, key),
+        None => WritableAttachment::open(dir, version),
+    };
+    let wa = match wa {
         Ok(wa) => wa,
         Err(e) => {
             cli_error!("{e}");
@@ -1044,7 +1105,7 @@ fn cmd_versions(arg: &str) {
         return;
     }
     let dir = unquote(&dir);
-    let lake = match Lake::open_url(&dir) {
+    let lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -1079,7 +1140,7 @@ fn cmd_snapshots(arg: &str) {
         return;
     }
     let dir = unquote(&dir);
-    let lake = match Lake::open_url(&dir) {
+    let lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -1161,7 +1222,7 @@ fn cmd_tables(arg: &str) {
         return;
     }
     let dir = unquote(&dir);
-    let lake = match Lake::open_url(&dir) {
+    let lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -1191,7 +1252,7 @@ fn cmd_info(arg: &str) {
         return;
     }
     let dir = unquote(&dir);
-    let lake = match Lake::open_url(&dir) {
+    let lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");

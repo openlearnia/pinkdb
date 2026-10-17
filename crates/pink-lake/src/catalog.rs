@@ -4,7 +4,7 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 4,
+//!   "format_version": 5,
 //!   "updated": "<iso8601>",
 //!   "version": 3,
 //!   "tables": {

@@ -67,8 +67,17 @@ jobs:
       - name: cargo test -p pink-lake --features s3,vortex-format
         run: cargo test -p pink-lake --features s3,vortex-format
 
+      - name: cargo test -p pink-lake --features s3,encryption
+        run: cargo test -p pink-lake --features s3,encryption
+
+      - name: cargo test -p pink-lake --features s3,vortex-format,encryption
+        run: cargo test -p pink-lake --features s3,vortex-format,encryption
+
       - name: cargo test -p pinkdb-cli --features lake,s3
         run: cargo test -p pinkdb-cli --features lake,s3
+
+      - name: cargo test -p pinkdb-cli --features lake,s3,encryption
+        run: cargo test -p pinkdb-cli --features lake,s3,encryption
 
       - name: cargo test -p pinkdb-cli --features lake-lite
         run: cargo test -p pinkdb-cli --features lake-lite
@@ -94,6 +103,8 @@ jobs:
           cargo clippy --all-targets -p pink-lake --features vortex-format -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3 -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,vortex-format -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features s3,encryption -- -D warnings
+          cargo clippy --all-targets -p pink-lake --features s3,vortex-format,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features lake,s3,repo,client,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features lake-lite -- -D warnings
 
@@ -258,8 +269,8 @@ jobs:
         with:
           key: lake-s3
 
-      - name: cargo build --release -p pinkdb-cli --features lake,s3
-        run: cargo build --release -p pinkdb-cli --features lake,s3
+      - name: cargo build --release -p pinkdb-cli --features lake,s3,encryption
+        run: cargo build --release -p pinkdb-cli --features lake,s3,encryption
 
       - name: crates/pink-lake/tests/s3_docker.sh
         run: SKIP_BUILD=1 crates/pink-lake/tests/s3_docker.sh
