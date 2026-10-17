@@ -794,9 +794,13 @@ impl Connection {
                 for (db, name) in txn.table_reads.iter().chain(txn.table_writes.iter()) {
                     ours.add_table(db, name);
                 }
-                for db in &txn.wal_dbs {
-                    ours.add_database(db);
-                }
+                // Database-level conflicts come only from `CREATE`/`DROP
+                // DATABASE` (tracked in `txn.wal_sets`), never from a
+                // statement's *session* database: `conflict_with` treats our db
+                // set as a wildcard over that database's tables, and the
+                // documented contract is table-level granularity. (The session
+                // dbs stay in `txn.wal_dbs` for the existence check below.)
+                ours.extend_databases(&txn.wal_sets);
                 // View DDL is session-local and never logged: no frame can
                 // carry it, so `view_writes` contributes nothing here.
                 ours.canonicalize();
@@ -1092,6 +1096,30 @@ mod tests {
                 vec![Value::Integer(2)],
                 vec![Value::Integer(4)]
             ]
+        );
+    }
+
+    #[test]
+    fn a_session_database_is_not_a_database_level_conflict() {
+        let db = seeded();
+        // A transaction writes t.
+        let mut a = db.connect();
+        a.execute("BEGIN;").unwrap();
+        a.execute("INSERT INTO t VALUES (3, 'z');").unwrap();
+        // B autocommits a write to the *other* table in the same database.
+        let mut b = db.connect();
+        b.execute("INSERT INTO u VALUES (20);").unwrap();
+        // A must still commit: its session database is not a database-level
+        // (CREATE/DROP DATABASE) conflict, and t/u are disjoint.
+        a.execute("COMMIT;").unwrap();
+        let mut c = db.connect();
+        assert_eq!(
+            rows_of(c.execute("SELECT COUNT(*) FROM t;").unwrap()),
+            vec![vec![Value::Bigint(3)]]
+        );
+        assert_eq!(
+            rows_of(c.execute("SELECT COUNT(*) FROM u;").unwrap()),
+            vec![vec![Value::Bigint(2)]]
         );
     }
 

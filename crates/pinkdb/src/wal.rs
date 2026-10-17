@@ -1397,6 +1397,10 @@ impl Wal {
             }
             f.sync_all()?;
         }
+        // A fresh database's first WAL (or a recovery-recreated one) must have
+        // its directory entry durable, or a crash can lose the file even under
+        // `Sync`.
+        sync_parent_dir(path);
         let file = OpenOptions::new().read(true).append(true).open(path)?;
         Ok((file, cipher, wal_id))
     }
@@ -1640,7 +1644,7 @@ impl Wal {
         )
         .map_err(PinkDbError::Execution)?;
         if let Some(first) = records.first() {
-            if first.lsn != self.applied.applied_lsn + 1 {
+            if self.applied.applied_lsn.checked_add(1) != Some(first.lsn) {
                 return Ok(None);
             }
         }
@@ -1692,7 +1696,9 @@ impl Wal {
         }
         let payload = encode_payload(stmts, sets.as_ref())?;
         let len = record_len_guard(payload.len())?;
-        let lsn = self.last_lsn + 1;
+        let lsn = self.last_lsn.checked_add(1).ok_or_else(|| {
+            PinkDbError::Execution("WAL LSN space exhausted (u64::MAX)".to_string())
+        })?;
         // The applied position must be the pre-write EOF: every write path
         // refreshes (applies) another process's frames under the lease before
         // appending, so no committed frame is ever skipped.
@@ -2014,6 +2020,13 @@ impl FrameSets {
         self.dbs.extend_from_slice(&other.dbs);
     }
 
+    /// Record only `other`'s database-level mutations. Used by COMMIT's
+    /// conflict set, which takes its tables from the transaction's own
+    /// read/write sets rather than its buffered statements' touched set.
+    pub(crate) fn extend_databases(&mut self, other: &FrameSets) {
+        self.dbs.extend_from_slice(&other.dbs);
+    }
+
     /// Sort and dedupe (deterministic encoding and small linear comparison).
     pub(crate) fn canonicalize(&mut self) {
         self.tables.sort();
@@ -2089,7 +2102,7 @@ fn encode_sets(sets: &FrameSets) -> Result<Vec<u8>> {
 fn decode_sets(bytes: &[u8]) -> std::result::Result<FrameSets, String> {
     let mut pos = 0usize;
     let need = |pos: usize, n: usize| -> std::result::Result<(), String> {
-        if pos + n > bytes.len() {
+        if pos.checked_add(n).is_none_or(|end| end > bytes.len()) {
             Err("truncated frame sets".to_string())
         } else {
             Ok(())
@@ -2193,12 +2206,12 @@ fn decode_statements(
     }
     let mut stmts = Vec::with_capacity(count);
     for _ in 0..count {
-        if pos + 4 > payload.len() {
+        if pos.checked_add(4).is_none_or(|end| end > payload.len()) {
             return Err("truncated payload".to_string());
         }
         let n = u32::from_le_bytes(payload[pos..pos + 4].try_into().expect("4 bytes")) as usize;
         pos += 4;
-        if pos + n > payload.len() {
+        if pos.checked_add(n).is_none_or(|end| end > payload.len()) {
             return Err("truncated statement text".to_string());
         }
         let s = std::str::from_utf8(&payload[pos..pos + n])
