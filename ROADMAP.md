@@ -67,10 +67,10 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 40a | Hardening — safety (docs/GAPS.md P0 #1–#10): server-side `LOAD EXTENSION` opt-in, publish catalog-wipe guard, store-wide table versions, read-set COMMIT validation, bounded `.pink` decoder + v3 CRC trailer, DuckDB-style overflow errors, CLI lake handle baselines, https-only `.install`, redacted S3 secrets, bounded server frames + idle timeout | done | 502 workspace tests (+8 regression tests, each shown to fail without its fix where the platform allows); feature matrix green (pink-lake s3 106, cli lake,s3 44, cli encryption 27, core encryption 352, cli client 27, cli repo 54); clippy -D warnings clean all feature sets; duckdiff 60/60; kill loops 30/30 plain + 30/30 multi-db + 20/20 targeted + 30/30 encrypted; bench parity vs main interleaved (418–422 vs 419–425 ms); sizes `pinkdb` 2.14 MB (unchanged) / `pinkdb-server` 1.80 MB (+0.02) |
 | 40b | Hardening — durability/operability: auto-checkpoint + `CHECKPOINT`, `.pink` file lock, fail-stop after a WAL write failure, single-lock bind+run, Python handle lock, CLI exit codes/stderr/`-c`/`.read`/EOF/`;` scanning, S3 retries, honest `versions()`, `.lake` transaction/durable guards | done | 512 workspace tests; feature matrix green (pink-lake s3 108, cli lake,s3 51, cli encryption 33, core encryption 356, cli client 33, cli repo 60); Python 37 + Go (-race) green; clippy -D warnings clean all feature sets; duckdiff 60/60; kill loops 30/30 + 30/30 multi-db + 20/20 targeted + 30/30 encrypted; C/Go SDK smokes 14/14 + 15/15; bench parity (421–424 vs 418–424 ms); sizes `pinkdb` 2.15 / `pinkdb-server` 1.83 / dylib 1.68 MB |
 | 40c | Hardening — CI + docs truthfulness: macOS CI + fmt/audit/feature-test gaps, website refresh, committed-binary/account-id cleanup, wave 29/39 claims corrected | done | CI: fmt gate (after a one-time mechanical `cargo fmt`), feature tests for encryption/client/repo, clippy per feature set, kill loops, macOS job, MSRV job (rust-version 1.89 core / 1.95 pink-lake), `cargo audit`, docs build + roadmap-sync check, Go vet/-race, C example; all actions pinned to commit SHAs, wrangler pinned (4.151.0); `pinkdb.h` ↔ Rust header-sync test (shown to fail on a planted drift); website refreshed (parser, protocol v4, TLS/RBAC wave numbers, scripting, locking) with the roadmap page generated from ROADMAP.md; committed `hello` binary removed + ignored; account id removed from README; 514 tests; actionlint clean. Only GitHub can verify: the new jobs' runner execution (macOS, MSRV 1.89, cargo audit) |
-| 40d | SQL completeness: multi-way/composite/non-equi/CROSS/FULL joins, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, INTERSECT/EXCEPT, COUNT(DISTINCT), EXPLAIN, SHOW/DESCRIBE, RANGE frames + frame validation | queued | — |
-| 40e | Prepared statements + parameters: placeholders, bind API, protocol v4, FFI prepare/bind, Python DB-API, Go database/sql | queued | — |
-| 40f | Functions + types: lag/lead/ntile/first/last_value, core scalar gaps, DECIMAL, INTERVAL | queued | — |
-| 40g | Optimizer: projection pushdown, LIMIT short-circuit, join build-side choice, filter through aggregate | queued | — |
+| 40d | SQL completeness: multi-way/composite/non-equi/CROSS/FULL joins, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, INTERSECT/EXCEPT, COUNT(DISTINCT), EXPLAIN, SHOW/DESCRIBE, RANGE frames + frame validation | done | absorbed by wave 58 |
+| 40e | Prepared statements + parameters: placeholders, bind API, protocol v4, FFI prepare/bind, Python DB-API, Go database/sql | done | absorbed by wave 59 (binding wrappers = wave 69) |
+| 40f | Functions + types: lag/lead/ntile/first/last_value, core scalar gaps, DECIMAL, INTERVAL | done | absorbed by waves 60 + 62 |
+| 40g | Optimizer: projection pushdown, LIMIT short-circuit, join build-side choice, filter through aggregate | done | absorbed by wave 61 |
 | 40h | Lake: incremental saves, `.lake gc`, `lake_scan` SQL access + time travel, bulk typed decode, encode panic guard | queued | — |
 | 40i | Extension trust + distribution: Ed25519 artifact signatures, SQL `INSTALL`, Linux artifacts, Python wheel, standalone Go module | queued | — |
 | 40j | Test depth: window/plan unit tests, WAL fuzz, persist property tests, duckdiff gated in CI | queued | — |
@@ -103,18 +103,25 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | DuckLake-parity program |
 | 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | queued | DuckLake-parity program |
 | 69 | Prepared statements in the Python and Go bindings: wrapper ergonomics + tests over the FFI entry points landed in 59 | queued | follows 59 |
+| 70 | Core extension: **parquet** — read: `read_parquet` / `parquet_scan` (globs, multi-file, `union_by_name`, hive-partition + `filename` columns, column subset), projection + filter pushdown via row-group statistics (min/max/null counts), introspection (`parquet_schema`, `parquet_metadata`, `parquet_file_metadata`, `parquet_kv_metadata`), direct `FROM 'file.parquet'` replacement scan; write: `COPY … (FORMAT parquet)` (snappy default; zstd/gzip/uncompressed; `row_group_size`; per-column stats) with the α-probed physical mapping (DECIMAL→INT32 or FIXED_LEN_BYTE_ARRAY, TIMESTAMP→INT64 micros, DATE→INT32 days, INTERVAL→FIXED_LEN_BYTE_ARRAY) | queued | crate `pinkdb-parquet` (wasm-compatible); nested types + parquet encryption deferred |
+| 71 | Core extension: **arrow** — Arrow IPC (Feather v2) file read/write (`read_arrow` + `FROM 'file.arrow'`, `COPY … (FORMAT arrow)`) over the arrow-rs crates; Arrow **C Data Interface** in the FFI (query-result export + Arrow-array scan input, zero-copy where the layout allows) for pyarrow/Polars/DuckDB/ADBC hosts; DuckDB α ships no loadable `arrow` extension on this platform (probed: HTTP 404), so parity is pinned at the file level (arrow-rs/pyarrow round-trips; pyarrow pip-installable) and at the C ABI level, not via SQL | queued | crate `pinkdb-arrow` (wasm-compatible); Python/Go wrapper ergonomics follow-up |
+| 72 | Core extension: **iceberg** — Iceberg v2 reads from the local filesystem: `iceberg_scan` (newest snapshot) plus the α-probed introspection set (`iceberg_metadata`, `iceberg_snapshots`, `iceberg_scan_plan`, `iceberg_scan_tasks`, `iceberg_column_stats`, `iceberg_partition_stats`, schema/table properties), time travel, `ATTACH … (TYPE iceberg)` catalogs (local first; REST follow-up), over parquet data files (depends on wave 70) | queued | crate `pinkdb-iceberg`; writes/maintenance (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, truncate, property mutations, `iceberg_to_ducklake`) deferred until the α surface is probed |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
 Parallel feature work (Oct 2026): the first batch — waves 58 (SQL completeness),
 60 (functions) and 61 (optimizer work) — landed one at a time (60 → 61 → 58)
-with full gates plus CI. **Second batch in flight**: waves 57 (lake encryption),
-59 (prepared statements), 62 (DECIMAL/INTERVAL) and 41 (PK/FK constraints) run in
-four worktrees (`wt-lake-encryption`, `wt-prepared`, `wt-types`, `wt-pkfk`) off
-41fd01b; each integrates as a patch with full gates + CI, one at a time. Note:
-41 and 62 both bump the `.pink` on-disk format — reconcile versions/tags at
-integration. Indexes (42), materialized views (43), stored procedures (44) and
-the remaining queue (46–49, 51–56) stay numbered.
+with full gates plus CI. The second batch (57 lake encryption, 59 prepared
+statements, 62 DECIMAL/INTERVAL, 41 PK/FK constraints) finished as: **59, 62
+and 41 landed** (the two `.pink` v5 proposals were reconciled into one v5 —
+constraint section gated by flags bit 0 plus DECIMAL/INTERVAL dtype tags; wave
+41 also shipped conservative FK→PK join elimination), and **57 stays parked**
+with its patch secured (`wt-lake-encryption`). **Third batch in flight** (max
+two worktrees per the disk-space policy): wave 63 (incremental lake writes) in
+`wt-lake-incr` and wave 64 (lake time travel) in `wt-lake-versions`, both off
+8b401cd; each integrates as a patch with full gates + CI, one at a time.
+Indexes (42), materialized views (43), stored procedures (44), the extensions
+block (51–56) and the file-format extensions (70–72) stay numbered.
 
 Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
@@ -151,8 +158,7 @@ schema evolution (65), partitioning + zone-map pruning (66), maintenance/
 compaction (67), inlined small writes + CDC (68). The probed feature delta is
 recorded in the progress log below.
 
-Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
-Java bindings.
+Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
 
 ## Progress log
 
@@ -951,3 +957,14 @@ Java bindings.
   after the conflict line, so the retry sees a quiescent store and commits
   within the bounded budget. 6/6 local repeats in ~2.3 s each; suite **26/26**
   (default) and **27/27** (`lake,s3`), clippy clean.
+- 2026-10-17 — Queue: waves 70–72 added (parquet, arrow, iceberg as core
+  extensions at request; parquet leaves the Deferred list). Grounded on a live
+  probe of the α reference: parquet is built-in there (`read_parquet` /
+  `parquet_scan` + the metadata functions + `COPY … (FORMAT parquet)`; the
+  physical mapping probed for DECIMAL/DATE/TIMESTAMP/INTERVAL); iceberg
+  installs with a 19-function distinct surface (reads/introspection plus
+  rewrite/rollback/property mutations/`iceberg_to_ducklake`); `arrow` has **no
+  loadable extension** on this α (HTTP 404, candidates listed) — Arrow parity
+  is pinned at the file (IPC/Feather) + C-Data-Interface level instead. Also:
+  stale queue rows 40d–40g marked absorbed by waves 58–62; the wave-41 macOS
+  flake fix verified green in CI (`8b401cd`).
