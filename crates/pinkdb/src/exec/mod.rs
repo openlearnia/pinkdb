@@ -6320,6 +6320,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn select_alias_does_not_shadow_an_input_column_in_the_same_list() {
+        let mut db = sales_db();
+        // `id * 2 AS id` must not shadow the input `id` for the next item.
+        let rows = select(&mut db, "SELECT id * 2 AS id, id FROM sales ORDER BY 2;");
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Integer(2), V::Integer(1)],
+                vec![V::Integer(4), V::Integer(2)],
+                vec![V::Integer(6), V::Integer(3)],
+                vec![V::Integer(8), V::Integer(4)],
+            ]
+        );
+        // The alias is still visible in ORDER BY.
+        let rows = select(
+            &mut db,
+            "SELECT id * 2 AS d FROM sales ORDER BY d DESC LIMIT 1;",
+        );
+        assert_eq!(rows, vec![vec![V::Integer(8)]]);
+    }
+
     // --- phase 8: window functions ---
 
     fn win_db() -> PinkDb {

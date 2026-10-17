@@ -4622,9 +4622,16 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
 
     let mut aggs: Vec<BoundAgg> = Vec::new();
     let mut select: Vec<(BoundExpr, String)> = Vec::with_capacity(pending.len());
+    // Aliases from this SELECT list are not visible to the other items in the
+    // same list (standard SQL exposes them only to ORDER BY / GROUP BY /
+    // HAVING), so `SELECT id*2 AS id, id` resolves the second `id` to the
+    // input column, not the alias.
+    let saved_alias = binder.allow_alias;
+    binder.allow_alias = false;
     for (e, name) in &pending {
         select.push((binder.bind_expr(e, &mut aggs, true)?, name.clone()));
     }
+    binder.allow_alias = saved_alias;
 
     // GROUP BY keys (pre-agg scope, no aggregates, no windows).
     let mut keys: Vec<BoundExpr> = Vec::new();
