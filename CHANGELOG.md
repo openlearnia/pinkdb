@@ -10,6 +10,20 @@ one-liners below.
 
 ## 2026-10-17
 
+### Wave 65 — lake schema evolution ✅
+- `ALTER TABLE` on writable-attached lake tables — `ADD COLUMN … DEFAULT`,
+  `RENAME COLUMN`, `DROP COLUMN` (plus the engine-wide `ALTER TABLE` support
+  behind it: defaults, `NOT NULL` rules, `DESCRIBE` defaults, WAL replay) —
+  published as **metadata-only** catalog schema versions (format now **v5**):
+  old data files are never rewritten; they project through rename chains,
+  missing columns materialize their defaults, and dropped columns keep their
+  bytes (row positions unchanged — delete files stay valid).
+- **Time travel reads each version with that version's schema and names**;
+  writes across versions keep working through the projection.
+- Limits (documented): `RENAME TABLE` through a lake commit is refused with a
+  `.lake save` hint; no `ALTER COLUMN TYPE` / `SET|DROP DEFAULT` /
+  `ADD CONSTRAINT`; read-only attachments refuse `ALTER`.
+
 ### Wave 66 — lake partitioning & pruning ✅
 - Lake tables can be **partitioned**: identity values or `bucket(N)` labels are
   recorded per file, commits write **one data file per partition value set**,

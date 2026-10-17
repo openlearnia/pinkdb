@@ -27,6 +27,13 @@ fn next_table_version() -> u64 {
 pub struct Column {
     pub name: String,
     pub dtype: DataType,
+    /// The column's DEFAULT (wave 65): the value a later `INSERT` that omits
+    /// the column writes, and the value `ALTER TABLE … ADD COLUMN … DEFAULT`
+    /// materialized into the rows that existed before it. `None` = no default
+    /// (an omitted `INSERT` column writes NULL). Persisted in `.pink` v5 under
+    /// the defaults flag; lake v5 manifests carry it in the table entry's
+    /// `columns` record.
+    pub default: Option<Value>,
     /// Reference-counted chunks: scans share storage instead of cloning
     /// megabytes per query. Mutations use copy-on-write (`Arc::make_mut`),
     /// which never actually clones — the executor never holds chunks
@@ -57,6 +64,7 @@ impl Column {
         Self {
             name,
             dtype,
+            default: None,
             chunks: vec![Arc::new(Vector::new_empty(dtype))],
         }
     }
@@ -284,6 +292,103 @@ impl DataTable {
                     self.name, name
                 ))
             })
+    }
+
+    /// `ALTER TABLE … ADD COLUMN` (wave 65): append a column at the end,
+    /// filled with `default` for every existing row. The value is
+    /// materialized into the chunks (the engine's in-memory style; the lake's
+    /// schema record is what keeps the operation metadata-only for old *data
+    /// files*). `default` stays recorded on the [`Column`] so later `INSERT`s
+    /// that omit the column write it too.
+    pub(crate) fn add_column(
+        &mut self,
+        name: String,
+        dtype: DataType,
+        default: Option<Value>,
+    ) -> Result<()> {
+        if self
+            .columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&name))
+        {
+            return Err(PinkDbError::Catalog(format!(
+                "Column with name \"{name}\" already exists!"
+            )));
+        }
+        let mut col = Column {
+            name,
+            dtype,
+            default: default.clone(),
+            chunks: Vec::new(),
+        };
+        let lens: Vec<usize> = self
+            .columns
+            .first()
+            .map(|c| c.chunks.iter().map(|v| v.len()).collect())
+            .unwrap_or_default();
+        for len in lens {
+            let mut v = Vector::with_capacity(dtype, len);
+            for _ in 0..len {
+                match &default {
+                    Some(d) if !d.is_null() => v.push_valid(d.clone())?,
+                    _ => v.push_null()?,
+                }
+            }
+            col.chunks.push(Arc::new(v));
+        }
+        self.columns.push(col);
+        Ok(())
+    }
+
+    /// `ALTER TABLE … DROP COLUMN`: remove the column at `idx` and reindex the
+    /// declarative constraints that described the columns after it. The
+    /// caller (binder or executor) has already refused a column a key or
+    /// foreign-key constraint depends on; `NOT NULL` is reindexed (its flag
+    /// on the dropped column simply goes away).
+    pub(crate) fn drop_column_at(&mut self, idx: usize) -> Result<()> {
+        if idx >= self.columns.len() {
+            return Err(PinkDbError::Execution(format!(
+                "drop column index {idx} out of range for \"{}\" ({} columns)",
+                self.name,
+                self.columns.len()
+            )));
+        }
+        if self.columns.len() == 1 {
+            return Err(PinkDbError::Catalog(
+                "cannot drop the only column of a table".to_string(),
+            ));
+        }
+        self.columns.remove(idx);
+        let reindex = |c: &mut usize| {
+            if *c > idx {
+                *c -= 1;
+            }
+        };
+        for k in &mut self.constraints.keys {
+            k.columns.iter_mut().for_each(reindex);
+        }
+        for fk in &mut self.constraints.foreign_keys {
+            fk.columns.iter_mut().for_each(reindex);
+        }
+        self.constraints.not_null.retain(|&c| c != idx);
+        self.constraints.not_null.iter_mut().for_each(reindex);
+        self.version = next_table_version();
+        Ok(())
+    }
+
+    /// `ALTER TABLE … RENAME COLUMN`: set the column's display name (the
+    /// binder validated the new name is free; a case-only change is allowed).
+    pub(crate) fn rename_column_at(&mut self, idx: usize, to: String) -> Result<()> {
+        let Some(col) = self.columns.get_mut(idx) else {
+            return Err(PinkDbError::Execution(format!(
+                "rename column index {idx} out of range for \"{}\" ({} columns)",
+                self.name,
+                self.columns.len()
+            )));
+        };
+        col.name = to;
+        self.version = next_table_version();
+        Ok(())
     }
 
     /// Widening coercion for INSERT/CSV: INTEGER → BIGINT → DOUBLE.
@@ -1406,6 +1511,43 @@ impl PinkDb {
             .remove(&Self::key(name))
             .map(|_| ())
             .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
+    }
+
+    /// `ALTER TABLE … RENAME TO` (wave 65): move the table to a new
+    /// case-insensitive key, keeping its data (and its schema/constraints) —
+    /// metadata only, like DuckDB. The new name must be free among the
+    /// database's tables and views; a case-only rename updates the display
+    /// name in place.
+    pub fn rename_table_in(&mut self, db: &str, from: &str, to: &str) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, from) {
+            return Err(err);
+        }
+        let cat = self.catalog_mut(db)?;
+        let key_from = Self::key(from);
+        let key_to = Self::key(to);
+        if key_to == key_from {
+            let table = cat
+                .tables
+                .get_mut(&key_from)
+                .ok_or_else(|| PinkDbError::Catalog(format!("table \"{from}\" not found")))?;
+            table.name = to.to_string();
+            table.version = next_table_version();
+            return Ok(());
+        }
+        if cat.tables.contains_key(&key_to) || cat.views.contains_key(&key_to) {
+            return Err(PinkDbError::Catalog(format!(
+                "Could not rename \"{from}\" to \"{to}\": another entry with this name already \
+                 exists!"
+            )));
+        }
+        let mut table = cat
+            .tables
+            .remove(&key_from)
+            .ok_or_else(|| PinkDbError::Catalog(format!("table \"{from}\" not found")))?;
+        table.name = to.to_string();
+        table.version = next_table_version();
+        cat.tables.insert(key_to, table);
+        Ok(())
     }
 
     pub fn table(&self, name: &str) -> Result<&DataTable> {

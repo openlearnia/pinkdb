@@ -49,7 +49,8 @@ use pinkdb::{DataType, Value};
 /// parameters.
 /// v5: `DECIMAL`/`INTERVAL` value and dtype tags (DECIMAL's precision/scale
 /// ride after its dtype tag).
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7: [`DoneKind::AlteredTable`] (tag 17) reports `ALTER TABLE`.
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -339,6 +340,9 @@ pub enum DoneKind {
     LoadedExtension = 15,
     /// `CHECKPOINT` (v4).
     Checkpointed = 16,
+    /// `ALTER TABLE` (v7); `name` is the table's name after the statement (a
+    /// `RENAME TO` reports the new one).
+    AlteredTable = 17,
 }
 
 impl DoneKind {
@@ -361,6 +365,7 @@ impl DoneKind {
             14 => DoneKind::Other,
             15 => DoneKind::LoadedExtension,
             16 => DoneKind::Checkpointed,
+            17 => DoneKind::AlteredTable,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"

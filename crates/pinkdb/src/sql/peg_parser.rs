@@ -860,6 +860,7 @@ peg::parser! {
             / txn()
             / use_stmt()
             / load_extension()
+            / alter_stmt()
             / drop()
             / checkpoint()
             / show_stmt()
@@ -1098,6 +1099,41 @@ peg::parser! {
                   Statement::DropTable { db: t.0, name: t.1, if_exists: ife }
               }
             / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
+
+        /// `ALTER TABLE` (wave 65). `alter`, `add`, `column`, `rename` and
+        /// `default` are matched as words, not reserved keywords, so they stay
+        /// usable as table/column names (`to` too: `RENAME COLUMN a TO to`).
+        rule alter_stmt() -> Statement
+            = word("alter") kw(Keyword::Table) t:table_ref() op:alter_op() {
+                  Statement::AlterTable { db: t.0, name: t.1, op }
+              }
+
+        rule alter_op() -> AlterTableOp
+            = word("add") word("column")? ifne:if_not_exists() name:ident() ty:type_name()
+              before:alter_default()? cons:column_constraints() after:alter_default()? {?
+                  let default = match (before, after) {
+                      (Some(_), Some(_)) => return Err("only one DEFAULT clause"),
+                      (d, None) => d,
+                      (None, d) => d,
+                  };
+                  Ok(AlterTableOp::AddColumn {
+                      column: ColumnDef { name, dtype: ty, constraints: cons },
+                      default,
+                      if_not_exists: ifne,
+                  })
+              }
+            / kw(Keyword::Drop) word("column")? ife:if_exists() name:ident() {
+                  AlterTableOp::DropColumn { name, if_exists: ife }
+              }
+            / word("rename") word("column") from:ident() word("to") to:ident() {
+                  AlterTableOp::RenameColumn { from, to }
+              }
+            / word("rename") word("to") to:ident() {
+                  AlterTableOp::RenameTable { to }
+              }
+
+        rule alter_default() -> Expr
+            = word("default") e:expr() { e }
 
         rule txn() -> Statement
             = kw(Keyword::Begin) kw(Keyword::Transaction)? { Statement::Begin }

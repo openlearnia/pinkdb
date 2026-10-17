@@ -155,6 +155,8 @@ type SchemaAndStats = (Vec<(String, pinkdb::DataType)>, Vec<ColumnStats>);
 struct AttachedFile {
     rel: String,
     rows: u64,
+    /// The table schema epoch this file was written under (v5 entries).
+    schema_version: u64,
     deletes: Vec<u64>,
     /// The file's per-column exact facts, in schema order. `None` when no
     /// metadata carries them (e.g. a `.pink` file published without a block):
@@ -185,6 +187,9 @@ struct AttachedEntry {
     keys: Vec<PartitionKey>,
     files: Vec<AttachedFile>,
     format: AttachedFormat,
+    /// The v5 schema record of this version's entry (wave 65); `None` for a
+    /// legacy entry, whose files carry the schema themselves and must agree.
+    record: Option<crate::schema::TableSchema>,
 }
 
 impl AttachedEntry {
@@ -690,6 +695,14 @@ impl LakeAttachment {
 }
 
 /// Decode one data file of `entry` and apply its positional deletes.
+///
+/// With a v5 schema record the file is *projected* onto the entry's logical
+/// schema: a renamed column reads its physical predecessor, a column the file
+/// predates becomes a constant (its default), a dropped column is skipped (its
+/// bytes stay on disk — positions are unchanged, so delete files stay valid).
+/// `columns` are logical column indices (`None` = every logical column);
+/// Vortex files decode only the physical columns a mapped logical column
+/// needs, `.pink` files decode whole and project in memory.
 #[cfg_attr(not(feature = "vortex-format"), allow(unused_variables))]
 fn load_file(
     storage: &dyn Storage,
@@ -718,40 +731,129 @@ fn load_file(
                 });
             }
             let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
-            let present = vec![true; table.num_cols()];
-            Ok((table, present))
+            match &entry.record {
+                Some(schema) => {
+                    let mapping = schema.map_file(
+                        file.schema_version,
+                        &table.schema(),
+                        &storage.abs(&file.rel),
+                    )?;
+                    let all = vec![true; table.num_cols()];
+                    schema.project_table(&mapping, &table, &all, &entry.table)
+                }
+                None => {
+                    let present = vec![true; table.num_cols()];
+                    Ok((table, present))
+                }
+            }
         }
         AttachedFormat::Vortex => {
             #[cfg(feature = "vortex-format")]
             {
-                let (table, present) = match columns {
-                    Some(cols) => load_projected_table(
-                        storage,
-                        root,
-                        &file.rel,
-                        &entry.db,
-                        &entry.table,
-                        cols,
-                    )?,
+                // With a record: resolve which physical columns the request
+                // needs (mapped logical ones only — never a dropped column's
+                // bytes) from the file's own (footer) schema.
+                let (table, present) = match &entry.record {
+                    Some(schema) => {
+                        let path = storage.abs(&file.rel);
+                        let footer = vortex_file::read_footer(&path, storage, &file.rel)?;
+                        let mapping =
+                            schema.map_file(file.schema_version, &footer.schema, &path)?;
+                        let wanted: Vec<bool> = match columns {
+                            Some(cols) => {
+                                let mut w = vec![false; schema.columns.len()];
+                                for &i in cols {
+                                    if i < w.len() {
+                                        w[i] = true;
+                                    }
+                                }
+                                w
+                            }
+                            None => vec![true; schema.columns.len()],
+                        };
+                        let mut physical: Vec<usize> = Vec::new();
+                        for (li, on) in wanted.iter().enumerate() {
+                            if *on {
+                                if let Some(pi) = mapping.physical[li] {
+                                    if !physical.contains(&pi) {
+                                        physical.push(pi);
+                                    }
+                                }
+                            }
+                        }
+                        physical.sort_unstable();
+                        let (file_table, file_present) = if physical.len() == footer.schema.len() {
+                            let table =
+                                load_table(storage, root, &file.rel, &entry.db, &entry.table)?;
+                            let present = vec![true; table.num_cols()];
+                            (table, present)
+                        } else {
+                            // Decode at least one physical column: the row
+                            // count has to come from somewhere even when the
+                            // request only needs default-filled columns.
+                            let decode_cols: Vec<usize> = if physical.is_empty() {
+                                vec![0]
+                            } else {
+                                physical.clone()
+                            };
+                            load_projected_table(
+                                storage,
+                                root,
+                                &file.rel,
+                                &entry.db,
+                                &entry.table,
+                                &decode_cols,
+                            )?
+                        };
+                        if file_table.num_rows() as u64 != file.rows {
+                            return Err(LakeError::Corrupt {
+                                path: storage.abs(&file.rel),
+                                message: format!(
+                                    "table \"{key}\": data file \"{}\" has {} rows, but the \
+                                     manifest says {}",
+                                    file.rel,
+                                    file_table.num_rows(),
+                                    file.rows
+                                ),
+                            });
+                        }
+                        let file_table =
+                            apply_file_deletes(&file_table, &file.deletes, &key, &file.rel)?;
+                        schema.project_table(&mapping, &file_table, &file_present, &entry.table)?
+                    }
                     None => {
-                        let table = load_table(storage, root, &file.rel, &entry.db, &entry.table)?;
-                        let present = vec![true; table.num_cols()];
+                        let (table, present) = match columns {
+                            Some(cols) => load_projected_table(
+                                storage,
+                                root,
+                                &file.rel,
+                                &entry.db,
+                                &entry.table,
+                                cols,
+                            )?,
+                            None => {
+                                let table =
+                                    load_table(storage, root, &file.rel, &entry.db, &entry.table)?;
+                                let present = vec![true; table.num_cols()];
+                                (table, present)
+                            }
+                        };
+                        if table.num_rows() as u64 != file.rows {
+                            return Err(LakeError::Corrupt {
+                                path: storage.abs(&file.rel),
+                                message: format!(
+                                    "table \"{key}\": data file \"{}\" has {} rows, but the \
+                                     manifest says {}",
+                                    file.rel,
+                                    table.num_rows(),
+                                    file.rows
+                                ),
+                            });
+                        }
+                        let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
                         (table, present)
                     }
                 };
-                if table.num_rows() as u64 != file.rows {
-                    return Err(LakeError::Corrupt {
-                        path: storage.abs(&file.rel),
-                        message: format!(
-                            "table \"{key}\": data file \"{}\" has {} rows, but the manifest \
-                             says {}",
-                            file.rel,
-                            table.num_rows(),
-                            file.rows
-                        ),
-                    });
-                }
-                let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
                 Ok((table, present))
             }
             #[cfg(not(feature = "vortex-format"))]
@@ -1021,19 +1123,15 @@ fn zone_stats_compatible(block: &ColumnStats, footer: &ColumnStats) -> bool {
 
 /// Fold per-file statistics into one table's: NULL counts add up,
 /// `MIN`/`MAX` fold when **every** contributing file proves them, and any
-/// file that cannot (or any positional delete, which could have removed the
-/// extreme value) makes the fact unknown — never an approximation. `files`
-/// is `(rows, stats)` per data file in manifest order.
-fn merge_file_stats(files: &[(u64, Vec<ColumnStats>)], has_deletes: bool) -> Vec<ColumnStats> {
+/// file that cannot (or any positional delete over a physical column, which
+/// could have removed the extreme value) makes the fact unknown — never an
+/// approximation. `files` is `(surviving rows, stats)` per data file in
+/// manifest order, already mapped onto the logical schema and gated (a
+/// default-filled column's constant facts are exact even under deletes).
+fn merge_file_stats(files: &[(u64, Vec<ColumnStats>)]) -> Vec<ColumnStats> {
     let ncols = files.first().map(|(_, s)| s.len()).unwrap_or(0);
     let mut out = Vec::with_capacity(ncols);
     for col in 0..ncols {
-        if has_deletes {
-            // A deleted position may have held any value: no per-column fact
-            // is provable without reading data.
-            out.push(ColumnStats::unknown());
-            continue;
-        }
         let mut nulls = Some(0u64);
         let mut min: Option<Value> = None;
         let mut max: Option<Value> = None;
@@ -1160,16 +1258,29 @@ pub(crate) fn build_from(
         if format != FileFormat::Pink {
             statistics_only = false;
         }
-        // Per-file (schema, stats), in manifest order. The stats are the
-        // file's zone map (wave 66): the `.pink` block's gated column facts,
-        // or for Vortex the footer's, cross-checked against a
-        // catalog-published block when one rides on the file.
+        // The v5 schema record (wave 65), when this entry has one.
+        let record = crate::schema::TableSchema::from_entry(key, entry, &manifest_path)?;
+        // Per-file (surviving rows, stats in logical-schema order), in
+        // manifest order — the stats are the file's zone map (wave 66): the
+        // `.pink` block's gated column facts, or for Vortex the footer's,
+        // cross-checked against a catalog-published block when one rides on
+        // the file.
         let mut per_file: Vec<(u64, Vec<ColumnStats>)> = Vec::with_capacity(entry.files.len());
+        // Per-file zone maps (ungated by deletes: deleting rows only shrinks
+        // a file's value set, so a file that provably could not match a
+        // predicate before deletes still cannot after them — wave 66's
+        // pruning rule). The `per_file` stats fed to the table-level merge
+        // use wave 65's gating instead (a deleted position may have held any
+        // value, so physical facts fall back; default-materialized constants
+        // stay exact).
+        let mut zones: Vec<Vec<ColumnStats>> = Vec::with_capacity(entry.files.len());
         let mut schema: Option<Vec<(String, pinkdb::DataType)>> = None;
-        for file in &entry.files {
+        for (fi, file) in entry.files.iter().enumerate() {
             // A v1–v3 entry's single file carries no per-file count; the
             // entry's logical count is that file's count.
             let rows = file.rows().unwrap_or(entry.rows);
+            let deleted = layout.get(fi).map(|(_, _, d)| d.len() as u64).unwrap_or(0);
+            let surviving = rows.saturating_sub(deleted);
             let (file_schema, file_stats) = match format {
                 FileFormat::Pink => pink_file_stats(key, entry, file, &manifest_path)?,
                 FileFormat::Vortex => {
@@ -1257,17 +1368,80 @@ pub(crate) fn build_from(
                     }
                 }
             };
-            match &schema {
-                None => schema = Some(file_schema),
-                Some(first) if *first != file_schema => {
-                    return Err(LakeError::Corrupt {
-                        path: manifest_path.clone(),
-                        message: format!("data files of table \"{key}\" disagree on the schema"),
-                    });
+            let (zone_stats, stats) = match &record {
+                // Project the file's physical statistics onto the logical
+                // schema: renamed columns map, old-file columns materialize
+                // their default's constant facts, dropped ones vanish.
+                Some(record) => {
+                    let file_version = file.schema_version().unwrap_or(record.version);
+                    let mapping =
+                        record.map_file(file_version, &file_schema, &storage.abs(file.path()))?;
+                    let mut zone_stats = Vec::with_capacity(record.columns.len());
+                    let mut stats = Vec::with_capacity(record.columns.len());
+                    // Only the merged table-level facts lose a deleted file's
+                    // per-column values (a deleted position may have held any
+                    // value); the file's zone map keeps them.
+                    let file_has_deletes = layout.get(fi).is_some_and(|(_, _, d)| !d.is_empty());
+                    for (li, mapped) in mapping.physical.iter().enumerate() {
+                        match mapped {
+                            Some(pi) => {
+                                zone_stats.push(file_stats[*pi].clone());
+                                if file_has_deletes {
+                                    stats.push(ColumnStats::unknown());
+                                } else {
+                                    stats.push(file_stats[*pi].clone());
+                                }
+                            }
+                            None => {
+                                let constant = record.default_stats(li, surviving);
+                                zone_stats.push(constant.clone());
+                                stats.push(constant);
+                            }
+                        }
+                    }
+                    let logical = record.schema_pairs();
+                    match &schema {
+                        None => schema = Some(logical),
+                        Some(first) if *first != logical => {
+                            return Err(LakeError::Corrupt {
+                                path: manifest_path.clone(),
+                                message: format!(
+                                    "the schema records of table \"{key}\" disagree across \
+                                     versions"
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                    (zone_stats, stats)
                 }
-                Some(_) => {}
-            }
-            per_file.push((rows, file_stats));
+                None => {
+                    match &schema {
+                        None => schema = Some(file_schema),
+                        Some(first) if *first != file_schema => {
+                            return Err(LakeError::Corrupt {
+                                path: manifest_path.clone(),
+                                message: format!(
+                                    "data files of table \"{key}\" disagree on the schema"
+                                ),
+                            });
+                        }
+                        Some(_) => {}
+                    }
+                    // A legacy entry has no schema record and no defaults:
+                    // its merged facts simply fall back once deletes exist,
+                    // while the file's zone map stays exact.
+                    let file_has_deletes = layout.get(fi).is_some_and(|(_, _, d)| !d.is_empty());
+                    let merged = if file_has_deletes {
+                        file_stats.iter().map(|_| ColumnStats::unknown()).collect()
+                    } else {
+                        file_stats.clone()
+                    };
+                    (file_stats, merged)
+                }
+            };
+            per_file.push((surviving, stats));
+            zones.push(zone_stats);
         }
         let schema = schema.ok_or_else(|| LakeError::Corrupt {
             path: manifest_path.clone(),
@@ -1276,7 +1450,9 @@ pub(crate) fn build_from(
         // The partition spec: every key column must exist, and every file's
         // recorded partition value must decode under that column's type and
         // agree with the file's zone map (a misplaced or tampered value must
-        // never silently prune a matching file).
+        // never silently prune a matching file). A stats entry gated to
+        // unknown by positional deletes simply cannot cross-check a value —
+        // the check passes rather than guessing.
         let keys: Vec<PartitionKey> = entry.partition_keys().to_vec();
         for spec_key in &keys {
             if zone::schema_column_index(&schema, &spec_key.column).is_none() {
@@ -1342,7 +1518,7 @@ pub(crate) fn build_from(
                 }
             }
         }
-        let stats = merge_file_stats(&per_file, !entry.deletes.is_empty());
+        let stats = merge_file_stats(&per_file);
         let attached = AttachedTable {
             db: dbname.to_string(),
             table: table.to_string(),
@@ -1352,12 +1528,16 @@ pub(crate) fn build_from(
         };
         let file_list: Vec<AttachedFile> = layout
             .iter()
-            .zip(entry.files.iter().zip(per_file.iter()))
-            .map(|((rel, rows, deletes), (file, (_, stats)))| AttachedFile {
+            .zip(entry.files.iter().zip(zones.iter()))
+            .map(|((rel, rows, deletes), (file, zone))| AttachedFile {
                 rel: rel.clone(),
                 rows: *rows,
+                schema_version: file
+                    .schema_version()
+                    .or_else(|| record.as_ref().map(|r| r.version))
+                    .unwrap_or(0),
                 deletes: deletes.clone(),
-                zone: Some(stats.clone()),
+                zone: Some(zone.clone()),
                 partition: file.partition().cloned(),
             })
             .collect();
@@ -1384,6 +1564,7 @@ pub(crate) fn build_from(
                 } else {
                     AttachedFormat::Vortex
                 },
+                record,
             },
         );
         tables.push(attached);
@@ -1667,6 +1848,7 @@ mod tests {
             files: vec![FileRef::Entry {
                 path: "data/main.t/x.pink".to_string(),
                 rows: 3,
+                schema_version: None,
                 stats: block,
                 partition: None,
             }],
@@ -1675,6 +1857,9 @@ mod tests {
             stats: None,
             deletes: Vec::new(),
             partition_by: None,
+            schema_version: 0,
+            columns: None,
+            renames: Vec::new(),
         };
         let path = std::path::Path::new("snapshots/2.json");
         let key = "main.t";
@@ -1737,6 +1922,9 @@ mod tests {
             stats: Some(block),
             deletes: Vec::new(),
             partition_by: None,
+            schema_version: 0,
+            columns: None,
+            renames: Vec::new(),
         };
         let (schema, stats) = pink_file_stats(key, &v1, &v1.files[0], path).unwrap();
         assert_eq!(schema[0].0, "i");

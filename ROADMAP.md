@@ -98,7 +98,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | done | landed; `.pink` v5, protocol v6, FFI text cells; duckdiff 155 → 165 |
 | 63 | Lake writes, DuckLake parity: incremental lake commits — append new immutable data files with per-file row ranges instead of whole-table rewrites, positional delete files for DELETE/UPDATE (merge-on-read; deletion-vector option as a follow-up), writable attached lakes, per-commit manifests, concurrent-writer retry/backoff (`max_retry_count`/`retry_backoff`/`retry_wait_ms` parity), WAL-logged for durable sessions | done | landed; catalog v4 (per-file rows + `pinkdel` delete files + `commits/<v>.json` deltas), `Lake::commit`/`commit_from_tables`, writable attach + retry parity (10/1.5/100ms probed), 1M-row demo: 7.6 KB / 0.54 s per commit, 0 bytes rewritten |
 | 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | done | landed; DuckLake-pinned AT semantics (literals only, capped at the attached version), per-version stats fast paths, manifest records + `.lake snapshots` + commit messages; `default_version` probed to be a catalog-format selector, not a read default — skipped |
-| 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | in progress | agent died in the Oct-17 disk-full cascade (`database or disk is full`); partial secured — `wt-lake-schema/partial-stuck.diff` (5,272 lines / 29 files); re-dispatch a continuation once sessions are cleared |
+| 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | done | landed; catalog **format 5** schema records (per-column defaults/added-epochs/renames), metadata-only commits, per-version schemas under time travel, engine-wide ALTER + `.pink` FLAG_DEFAULTS; reconciled with 66 by hand (21 conflicts — `record` field split, zone-map vs merge gating, format-5 pins) |
 | 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | done | landed; identity + `bucket(N)` specs recorded in the catalog (additive to v4), one data file per partition value per commit, per-file zone maps (Vortex via `persist::table_stats`), planner-extracted conjunct pruning with decode counters; bucket labels are pinkdb's own FNV-1a (no bucket-value pruning; documented); duckdiff 171/171 |
 | 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | user-flagged: **start after 66** (closes the lake-parity block with 68) |
 | 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | queued | DuckLake-parity program |
@@ -1136,3 +1136,36 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   + the full CLI feature matrix, duckdiff **171/171**, workspace green.
   Recovered from the Oct-17 disk-full stall (partial secured, continued in
   place). Worktree `wt-lake-partition` removed after landing.
+- 2026-10-17 — Wave 65 (lake schema evolution): `ALTER TABLE` on
+  writable-attached lake tables — `ADD COLUMN … DEFAULT`, `RENAME COLUMN`,
+  `DROP COLUMN` (plus engine-wide ALTER: parser/binder/exec, constants
+  materialized for later inserts, `NOT NULL`-needs-a-default on non-empty
+  tables, `.pink` `FLAG_DEFAULTS` section, `DESCRIBE`'s `default` column, WAL
+  touched-sets, durable replay) — published as metadata-only catalog **format
+  5** schema records (`schema_version` epochs, per-column defaults and
+  `added` markers, ordered rename history, per-file epochs, lake-wide
+  counter); old files are never rewritten and project through renames /
+  defaults / drops with positions intact (delete files stay valid). Time
+  travel reads each version with that version's schema and names; legacy v4
+  entries upgrade on first schema change; unknown future formats refuse
+  cleanly. DuckLake-pinned (live): `snapshot.schema_version` bumps on
+  create/ALTER only, ADD COLUMN DEFAULT is metadata-only (`initial_default`),
+  DROP closes the column row, RENAME keeps identity, RENAME TABLE is
+  metadata-only (refused here at commit level — documented, `.lake save`
+  hint). Gates on the merged tree: pink-lake default 28 + 12 + 10 + 12
+  (vortex 48 + 12 + 46 + 13; s3,vortex 77 + …), pinkdb **461/461** + alter 12,
+  server/FFI green, CLI lake,s3 **31** (multiprocess 27/27) + the feature
+  matrix, duckdiff **171/171**, fmt/clippy/workspace clean. **Integration on
+  top of 66: 21 conflicts resolved by hand** — `AttachedEntry.schema`
+  collision split (66's Vec stays `schema`, 65's record renamed `record`),
+  the deletes-honesty regimes reconciled (per-file **zone maps stay ungated**
+  for pruning; table-level merges keep 65's per-physical-column gating with
+  default constants exact; legacy entries fall back on deletes), 66's
+  filter-walk gained the `AlterTable` arm, `write_data_files` files are
+  epoch-stamped via `with_schema_version` (partition values carried through),
+  and every format-5 pin was swept (s3 tests, docker script, README/site).
+  Worktree `wt-lake-schema` removed after landing.
+- 2026-10-17 — Wave-57 follow-up note: the encryption agent completed on the
+  same day (patch secured: `wt-lake-encryption/patch.diff`, 4,040 lines /
+  15 files, +3,321/−93; CI jobs for encrypted feature combos included);
+  integration follows the 65+66 merge.

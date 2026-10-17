@@ -186,6 +186,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-17">2026-10-17<a class="anchor" href="#2026-10-17" aria-label="Permalink: 2026-10-17">#</a></h2>
+<h3>Wave 65 — lake schema evolution ✅</h3>
+<ul>
+<li><code>ALTER TABLE</code> on writable-attached lake tables — <code>ADD COLUMN … DEFAULT</code>, <code>RENAME COLUMN</code>, <code>DROP COLUMN</code> (plus the engine-wide <code>ALTER TABLE</code> support behind it: defaults, <code>NOT NULL</code> rules, <code>DESCRIBE</code> defaults, WAL replay) — published as <strong>metadata-only</strong> catalog schema versions (format now <strong>v5</strong>): old data files are never rewritten; they project through rename chains, missing columns materialize their defaults, and dropped columns keep their bytes (row positions unchanged — delete files stay valid).</li>
+<li><strong>Time travel reads each version with that version's schema and names</strong>; writes across versions keep working through the projection.</li>
+<li>Limits (documented): <code>RENAME TABLE</code> through a lake commit is refused with a <code>.lake save</code> hint; no <code>ALTER COLUMN TYPE</code> / <code>SET|DROP DEFAULT</code> / <code>ADD CONSTRAINT</code>; read-only attachments refuse <code>ALTER</code>.</li>
+</ul>
 <h3>Wave 66 — lake partitioning &amp; pruning ✅</h3>
 <ul>
 <li>Lake tables can be <strong>partitioned</strong>: identity values or <code>bucket(N)</code> labels are recorded per file, commits write <strong>one data file per partition value set</strong>, and spec changes (<code>.lake partition … by (…) | clear</code>) never rewrite old files.</li>

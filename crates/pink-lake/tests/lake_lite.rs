@@ -135,18 +135,18 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
     }
 }
 
-/// The lean writer publishes a v4 lake: `format_version` 4 catalogs and
+/// The lean writer publishes a v5 lake: `format_version` 5 catalogs and
 /// snapshots, entries with `"format": "pink"` and object-shaped `files` with
 /// per-file row counts and CRC-protected statistics blocks, plus the
 /// per-commit delta manifest — then loads it back bit-exactly.
 #[test]
-fn lean_save_publishes_a_v4_lake_and_reloads_bit_exactly() {
-    assert_eq!(FORMAT_VERSION, 4, "a lean build writes v4");
+fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
+    assert_eq!(FORMAT_VERSION, 5, "a lean build writes v5");
     let dir = scratch("roundtrip");
     let lake_dir = dir.join("lake");
     let expected = common::fidelity_store();
     let mut lake = Lake::create(&lake_dir).unwrap();
-    assert_eq!(lake.format_version(), 4, "create publishes a v4 lake");
+    assert_eq!(lake.format_version(), 5, "create publishes a v5 lake");
     let report = lake.write_from_store_report(&expected).unwrap();
     assert_eq!(report.version, 2);
     assert_eq!(report.tables, all_tables(&expected).len());
@@ -155,7 +155,7 @@ fn lean_save_publishes_a_v4_lake_and_reloads_bit_exactly() {
     // The on-disk shape: a v4 entry per table, `.pink` files as objects with
     // their row counts and statistics blocks.
     let catalog = read_json(&lake_dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 4, "{catalog}");
+    assert_eq!(catalog["format_version"], 5, "{catalog}");
     assert_eq!(catalog["version"], 2, "{catalog}");
     for (key, entry) in catalog["tables"].as_object().unwrap() {
         assert_eq!(entry["format"], "pink", "{key}: {entry}");
@@ -340,7 +340,7 @@ fn lean_build_refuses_vortex_lakes_with_a_feature_error() {
     cleanup(&dir);
 }
 
-/// A `format_version` this codebase does not know at all (4+) is the same
+/// A `format_version` this codebase does not know at all (6+) is the same
 /// [`LakeError::Unsupported`] as in a full build, not a feature error.
 #[test]
 fn unsupported_future_format_versions_are_named() {
@@ -348,7 +348,7 @@ fn unsupported_future_format_versions_are_named() {
     let lake = dir.join("lake");
     std::fs::create_dir_all(&lake).unwrap();
     let manifest = serde_json::json!({
-        "format_version": 5,
+        "format_version": 6,
         "updated": "2026-10-15T00:00:00.000Z",
         "version": 1,
         "tables": {},
@@ -360,12 +360,12 @@ fn unsupported_future_format_versions_are_named() {
     .unwrap();
     let err = Lake::open(&lake).unwrap_err();
     assert!(
-        matches!(err, LakeError::Unsupported { found: 5, .. }),
+        matches!(err, LakeError::Unsupported { found: 6, .. }),
         "{err:?}"
     );
     assert!(
         err.to_string()
-            .contains("unsupported lake format_version 5"),
+            .contains("unsupported lake format_version 6"),
         "{err}"
     );
     assert!(err.to_string().contains("newer pinkdb"), "{err}");
@@ -443,7 +443,7 @@ fn lean_s3_v4_roundtrip() {
         .with_credentials(mock.access_key_id(), "mock-secret");
     let expected = common::fidelity_store();
     let mut lake = Lake::create_s3(config).unwrap();
-    assert_eq!(lake.format_version(), 4);
+    assert_eq!(lake.format_version(), 5);
     lake.write_from_store(&expected).unwrap();
 
     let keys = mock.keys();
@@ -718,7 +718,7 @@ fn lean_attach_fast_paths_decode_nothing_and_fallbacks_decode_once() {
     save_store(&db, &lake_dir).unwrap();
     let lake = Lake::open(&lake_dir).unwrap();
     let report = lake.attach(None).unwrap();
-    assert_eq!(report.format_version, 4);
+    assert_eq!(report.format_version, 5);
     assert!(!report.remote, "a `.pink` attach reads no data file");
     let mut attached = PinkDb::new();
     attached.attach_lake(report.lake.clone()).unwrap();

@@ -1,4 +1,5 @@
-//! Incremental lake commits (catalog `format_version` 4): append-only data
+//! Incremental lake commits (catalog `format_version` 5 with schema records;
+//! partitioning and zone maps are additive): append-only data
 //! files, positional delete files (merge-on-read), per-commit delta
 //! manifests, the row-level diff behind `.lake commit`, multi-file readers,
 //! and DuckLake's writer-retry settings.
@@ -134,6 +135,30 @@ fn data_files(lake_dir: &Path) -> Vec<PathBuf> {
         .map(|(p, _, _)| p)
         .filter(|p| p.extension().unwrap() != "pinkdel")
         .collect()
+}
+
+/// The data-file names of every table (sorted) — for "no published file was
+/// rewritten or replaced" assertions.
+fn file_list(lake_dir: &Path, _table: &str) -> Vec<String> {
+    data_files(lake_dir)
+        .into_iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        .collect()
+}
+
+/// One table's entry in `catalog.json`, raw (the crate's `TableEntry` is
+/// private; the published JSON is the contract).
+fn lake_entry(lake_dir: &Path, key: &str) -> serde_json::Value {
+    read_json(&lake_dir.join("catalog.json"))["tables"][key].clone()
+}
+
+/// Run one query and return its rows.
+fn query(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
+    let mut results = db.execute(sql).unwrap();
+    match results.pop().unwrap() {
+        pinkdb::QueryResult::Selected { rows, .. } => rows,
+        other => panic!("{other:?}"),
+    }
 }
 
 #[test]
@@ -871,7 +896,7 @@ fn multi_file_attach_merges_stats_and_gates_on_deletes() {
 }
 
 #[test]
-fn writable_attachment_drops_tables_and_refuses_schema_changes() {
+fn writable_attachment_drops_tables_and_publishes_schema_changes() {
     let dir = scratch("writable");
     let lake_dir = dir.join("lake");
     let mut db = store(4);
@@ -905,36 +930,74 @@ fn writable_attachment_drops_tables_and_refuses_schema_changes() {
     assert_eq!(tables.len(), 1, "{tables:?}");
     assert_eq!(tables[0].0, "main.t");
 
-    // A schema change is refused with a clear pointer (wave 65's job).
+    // Wave 65: a schema change publishes a new schema record instead of
+    // being refused. `ADD COLUMN … DEFAULT` is metadata-only for the old
+    // files: they stay untouched and their rows read the default.
     let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
     let mut db = lake.load(None).unwrap();
-    db.execute("ALTER TABLE t ADD COLUMN extra INTEGER;")
-        .unwrap_err();
-    // The engine has no ALTER yet; simulate the shape change by rebuilding
-    // the table with an extra column.
-    let mut widened = PinkDb::new();
-    widened
-        .execute("CREATE TABLE t (i INTEGER, s VARCHAR, extra INTEGER);")
+    let files_before = file_list(&lake_dir, "main.t");
+    db.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 7;")
         .unwrap();
-    for (i, s) in expected_rows(&db) {
-        widened
-            .table_mut("t")
-            .unwrap()
-            .append_row(vec![Value::Integer(i), Value::Varchar(s), Value::Null])
-            .unwrap();
-    }
-    let err = wa.commit(&widened, &CommitSettings::default()).unwrap_err();
-    assert!(err.to_string().contains("changed shape"), "{err}");
-    assert!(err.to_string().contains("schema evolution"), "{err}");
-
-    // changed_tables sees the pending change and clears after a commit.
+    db.execute("INSERT INTO t (i, s) VALUES (50, 'late');")
+        .unwrap();
+    let report = wa
+        .commit(
+            &db,
+            &CommitSettings {
+                retry_wait_ms: 1,
+                ..CommitSettings::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(report.schema_changes, 1, "{report:?}");
     assert_eq!(
         wa.changed_tables(&db).unwrap(),
+        Vec::<String>::new(),
+        "the schema change committed with the rows"
+    );
+    let lake = Lake::open(&lake_dir).unwrap();
+    let mut reloaded = lake.load(None).unwrap();
+    let rows = query(&mut reloaded, "SELECT i, extra FROM t ORDER BY i;");
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    assert!(
+        rows.iter().all(|r| r[1] == Value::Integer(7)),
+        "old rows read the default, the new row writes it: {rows:?}"
+    );
+    // The old data file was never rewritten by the schema change.
+    let files_after = file_list(&lake_dir, "main.t");
+    assert!(
+        files_before.iter().all(|f| files_after.contains(f)),
+        "no published file may disappear: {files_before:?} vs {files_after:?}"
+    );
+    // The published entry carries the record: epoch 2, the column `added` at
+    // epoch 2, and one file left at the base epoch.
+    let entry = lake_entry(&lake_dir, "main.t");
+    assert_eq!(entry["schema_version"], 2, "{entry}");
+    let columns = entry["columns"].as_array().unwrap();
+    assert_eq!(columns.len(), 3, "{entry}");
+    assert_eq!(columns[2]["name"], "extra");
+    assert_eq!(columns[2]["added"], 2);
+    let file_versions: Vec<u64> = entry["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["schema_version"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        file_versions,
+        vec![1, 2],
+        "the old file stays at epoch 1, the appended one is written at 2"
+    );
+
+    // changed_tables sees a later pending change and clears after a commit.
+    assert_eq!(
+        wa.changed_tables(&lake.load(None).unwrap()).unwrap(),
         Vec::<String>::new(),
         "no pending change"
     );
     let mut db2 = lake.load(None).unwrap();
-    db2.execute("INSERT INTO t VALUES (999, 'late');").unwrap();
+    db2.execute("INSERT INTO t VALUES (999, 'late', 1);")
+        .unwrap();
     assert_eq!(wa.changed_tables(&db2).unwrap(), vec!["main.t".to_string()]);
     wa.commit(
         &db2,

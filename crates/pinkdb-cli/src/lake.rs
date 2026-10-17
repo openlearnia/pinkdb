@@ -620,6 +620,12 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
                         return;
                     }
                 };
+                // The lake's schema record is authoritative for column
+                // defaults (wave 65): an INSERT that omits an added column
+                // writes them, exactly like the version it materializes.
+                for (col, src) in dst.columns.iter_mut().zip(&base_table.columns) {
+                    col.default = src.default.clone();
+                }
                 for c in 0..base_table.num_chunks() {
                     let Some(chunk) = base_table.scan_chunk(c) else {
                         continue;
@@ -738,13 +744,22 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
             set_baseline_version_only(&dir, report.version);
             println!(
                 "Committed lake version {} onto {dir} in {:.3}s ({} file{}: {} data, {} \
-                 delete; +{} row{}, -{} row{}; {} bytes; {} retr{})",
+                 delete;{} +{} row{}, -{} row{}; {} bytes; {} retr{})",
                 report.version,
                 t0.elapsed().as_secs_f64(),
                 report.data_files + report.delete_files,
                 plural(report.data_files + report.delete_files),
                 report.data_files,
                 report.delete_files,
+                if report.schema_changes > 0 {
+                    format!(
+                        " {} schema change{};",
+                        report.schema_changes,
+                        plural(report.schema_changes)
+                    )
+                } else {
+                    String::new()
+                },
                 report.rows_added,
                 plural(report.rows_added as usize),
                 report.rows_deleted,
@@ -1094,6 +1109,7 @@ fn cmd_snapshots(arg: &str) {
                     info.rows,
                     plural(info.rows as usize)
                 );
+                println!("  schema:  version {}", info.schema_version);
                 match &info.changes {
                     None => println!("  changes: (not recorded)"),
                     Some(changes) if changes.is_empty() => println!("  changes: (none)"),
@@ -1192,6 +1208,9 @@ fn cmd_info(arg: &str) {
     println!("Lake {}", lake.path().display());
     println!("  format version:  {}", lake.format_version());
     println!("  current version: {}", lake.current_version());
+    if let Some(latest) = lake.snapshots().ok().and_then(|s| s.last().cloned()) {
+        println!("  schema version:  {}", latest.schema_version);
+    }
     match lake.versions() {
         Ok(versions) => println!(
             "  snapshots:       {} ({})",

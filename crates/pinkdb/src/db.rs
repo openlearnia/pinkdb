@@ -979,6 +979,15 @@ pub(crate) fn record_writes(
         | LogicalPlan::DropTable { db, name, .. } => {
             tables.insert(key(db, name));
         }
+        LogicalPlan::AlterTable { db, name, op } => {
+            // A rename touches the old and the new key: the WAL frame's set
+            // must cover both, so a concurrent writer of either name
+            // conflicts instead of replaying onto the wrong table.
+            tables.insert(key(db, name));
+            if let crate::plan::AlterTablePlan::RenameTable { to } = op {
+                tables.insert(key(db, to));
+            }
+        }
         LogicalPlan::CreateView { db, name, .. } | LogicalPlan::DropView { db, name } => {
             views.insert(key(db, name));
         }

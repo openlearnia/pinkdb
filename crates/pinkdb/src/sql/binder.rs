@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use super::ast::*;
 use crate::attached::AtSpec;
-use crate::plan::LogicalPlan;
+use crate::plan::{AlterTablePlan, LogicalPlan};
 use crate::storage::{
     DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
@@ -3011,6 +3011,9 @@ pub(crate) fn bind_tracked_with(
             name: name.clone(),
             if_exists: *if_exists,
         }),
+        Statement::AlterTable { db: qdb, name, op } => {
+            bind_alter_table(db, default_db, qdb.as_deref(), name, op, params.clone())
+        }
         Statement::DropView { db: qdb, name } => empty(LogicalPlan::DropView {
             db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
             name: name.clone(),
@@ -3284,7 +3287,16 @@ fn bind_insert(
             )));
         }
         let mut bound = vec![BoundExpr::Literal(Value::Null); schema.len()];
-        // Fill unspecified columns with NULL (only when a column list is given).
+        // Fill unspecified columns with NULL — or the column's DEFAULT when it
+        // has one (`ALTER TABLE … ADD COLUMN … DEFAULT`, wave 65); only when a
+        // column list is given.
+        for (i, cell) in bound.iter_mut().enumerate() {
+            if !order.contains(&i) {
+                if let Some(d) = &t.columns[i].default {
+                    *cell = BoundExpr::Literal(d.clone());
+                }
+            }
+        }
         for (pos, cell) in row.iter().enumerate() {
             let mut binder = Binder::new(db, &table_db).with_params(params.clone());
             binder.allow_win = false;
@@ -3444,6 +3456,193 @@ fn bind_create_table(
             schema,
             constraints,
             if_not_exists,
+        },
+        Vec::new(),
+    ))
+}
+
+/// Bind `ALTER TABLE` (wave 65): validate the target table/columns against the
+/// catalog, convert the operation into an [`AlterTablePlan`], and bind the
+/// optional `ADD COLUMN` default as a constant expression (an empty scope,
+/// like an `INSERT` cell: literals and constant scalar functions only).
+///
+/// Error wording follows DuckDB where it is pinned by parity tests
+/// (`Column with name … already exists!`, `Table "t" does not have a column
+/// with name …`, `Could not rename …`).
+fn bind_alter_table(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: Option<&str>,
+    name: &str,
+    op: &AlterTableOp,
+    params: Option<ParamSlots>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    if let Some(err) = db.attached_read_only(&target, name) {
+        return Err(err);
+    }
+    let t = db.table_in(&target, name)?;
+    let schema: Vec<(String, DataType)> = t.schema();
+    let table_display = t.name.clone();
+    let plan_op = match op {
+        AlterTableOp::AddColumn {
+            column,
+            default,
+            if_not_exists,
+        } => {
+            let exists = schema
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case(&column.name));
+            if exists && !*if_not_exists {
+                return Err(PinkDbError::Catalog(format!(
+                    "Column with name \"{}\" already exists!",
+                    column.name
+                )));
+            }
+            let mut not_null = false;
+            for c in &column.constraints {
+                match c.kind {
+                    ColumnConstraintKind::NotNull => not_null = true,
+                    // The other constraint kinds exist on CREATE TABLE only in
+                    // this wave; a clean refusal instead of a half-recording.
+                    ColumnConstraintKind::PrimaryKey
+                    | ColumnConstraintKind::Unique
+                    | ColumnConstraintKind::References { .. } => {
+                        return Err(PinkDbError::Catalog(format!(
+                            "ALTER TABLE ADD COLUMN supports only the NOT NULL constraint \
+                             (a {} constraint on an added column is not supported by this \
+                             wave); add the column first and re-create the table with the \
+                             constraint",
+                            match c.kind {
+                                ColumnConstraintKind::PrimaryKey => "PRIMARY KEY",
+                                ColumnConstraintKind::Unique => "UNIQUE",
+                                _ => "REFERENCES",
+                            }
+                        )));
+                    }
+                }
+            }
+            // A default expression binds in an empty scope (constants only).
+            let bound_default = match default {
+                None => None,
+                Some(expr) => {
+                    let mut binder = Binder::new(db, &target).with_params(params.clone());
+                    binder.allow_win = false;
+                    binder.pin_parameter(expr, column.dtype)?;
+                    let mut aggs = Vec::new();
+                    Some(binder.bind_expr(expr, &mut aggs, false)?)
+                }
+            };
+            AlterTablePlan::AddColumn {
+                column: column.name.clone(),
+                dtype: column.dtype,
+                default: bound_default,
+                not_null,
+                if_not_exists: *if_not_exists,
+            }
+        }
+        AlterTableOp::DropColumn {
+            name: col,
+            if_exists,
+        } => {
+            let Some(idx) = schema.iter().position(|(n, _)| n.eq_ignore_ascii_case(col)) else {
+                if *if_exists {
+                    // A no-op plan the executor recognizes by index `None`.
+                    return Ok((
+                        LogicalPlan::AlterTable {
+                            db: Some(target),
+                            name: table_display,
+                            op: AlterTablePlan::DropColumn {
+                                column: col.clone(),
+                                if_exists: true,
+                            },
+                        },
+                        Vec::new(),
+                    ));
+                }
+                return Err(PinkDbError::Catalog(format!(
+                    "Table \"{name}\" does not have a column with name \"{col}\""
+                )));
+            };
+            // A column a declarative key depends on must not disappear: the
+            // stored constraint indices would silently address other columns.
+            // (NOT NULL is fine: the executor reindexes it.)
+            for k in &t.constraints.keys {
+                if k.columns.contains(&idx) {
+                    return Err(PinkDbError::Catalog(format!(
+                        "Cannot drop column \"{col}\" because there is a {} constraint that \
+                         depends on it",
+                        match k.kind {
+                            KeyKind::Primary => "PRIMARY KEY",
+                            KeyKind::Unique => "UNIQUE",
+                        }
+                    )));
+                }
+            }
+            for fk in &t.constraints.foreign_keys {
+                if fk.columns.contains(&idx) {
+                    return Err(PinkDbError::Catalog(format!(
+                        "Cannot drop column \"{col}\" because there is a FOREIGN KEY constraint \
+                         that depends on it"
+                    )));
+                }
+            }
+            AlterTablePlan::DropColumn {
+                column: col.clone(),
+                if_exists: *if_exists,
+            }
+        }
+        AlterTableOp::RenameColumn { from, to } => {
+            let Some(from_idx) = schema
+                .iter()
+                .position(|(n, _)| n.eq_ignore_ascii_case(from))
+            else {
+                return Err(PinkDbError::Catalog(format!(
+                    "Table \"{name}\" does not have a column with name \"{from}\""
+                )));
+            };
+            if let Some(to_idx) = schema.iter().position(|(n, _)| n.eq_ignore_ascii_case(to)) {
+                if to_idx != from_idx {
+                    return Err(PinkDbError::Catalog(format!(
+                        "Column with name \"{to}\" already exists!"
+                    )));
+                }
+            }
+            AlterTablePlan::RenameColumn {
+                from: schema[from_idx].0.clone(),
+                to: to.clone(),
+            }
+        }
+        AlterTableOp::RenameTable { to } => {
+            if to.eq_ignore_ascii_case(&table_display) {
+                return Ok((
+                    LogicalPlan::AlterTable {
+                        db: Some(target),
+                        name: table_display,
+                        op: AlterTablePlan::RenameTable { to: to.clone() },
+                    },
+                    Vec::new(),
+                ));
+            }
+            let taken = db.table_in(&target, to).is_ok() || db.view_in(&target, to).is_ok();
+            if taken {
+                return Err(PinkDbError::Catalog(format!(
+                    "Could not rename \"{}\" to \"{to}\": another entry with this name already \
+                     exists!",
+                    table_display
+                )));
+            }
+            if let Some(err) = db.attached_read_only(&target, to) {
+                return Err(err);
+            }
+            AlterTablePlan::RenameTable { to: to.clone() }
+        }
+    };
+    Ok((
+        LogicalPlan::AlterTable {
+            db: Some(target),
+            name: table_display,
+            op: plan_op,
         },
         Vec::new(),
     ))
@@ -3728,17 +3927,20 @@ fn bind_describe(
         None => default_db.to_ascii_lowercase(),
     };
     if let Ok(t) = db.table_in(&lookup, name) {
-        let columns = t
-            .columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| crate::plan::DescribeColumn {
+        let mut columns = Vec::with_capacity(t.columns.len());
+        for (i, c) in t.columns.iter().enumerate() {
+            columns.push(crate::plan::DescribeColumn {
                 name: c.name.clone(),
                 dtype: c.dtype,
                 not_null: t.constraints.is_not_null(i),
                 key: t.constraints.column_key_kind(i),
-            })
-            .collect();
+                default: c
+                    .default
+                    .as_ref()
+                    .map(crate::prepared::value_literal)
+                    .transpose()?,
+            });
+        }
         return Ok((LogicalPlan::Describe { columns }, Vec::new()));
     }
     if let Ok(view) = db.view_in(&lookup, name) {
@@ -3760,6 +3962,7 @@ fn bind_describe(
                 dtype,
                 not_null: false,
                 key: None,
+                default: None,
             })
             .collect();
         return Ok((LogicalPlan::Describe { columns }, Vec::new()));
@@ -3773,6 +3976,7 @@ fn bind_describe(
             dtype,
             not_null: false,
             key: None,
+            default: None,
         })
         .collect();
     Ok((LogicalPlan::Describe { columns }, Vec::new()))
@@ -4008,6 +4212,7 @@ pub(crate) fn plan_schema(
         | LogicalPlan::Rollback
         | LogicalPlan::CreateView { .. }
         | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }

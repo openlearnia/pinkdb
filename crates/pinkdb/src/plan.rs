@@ -29,6 +29,15 @@ pub enum LogicalPlan {
         query: Box<LogicalPlan>,
         if_not_exists: bool,
     },
+    /// `ALTER TABLE` (wave 65): a bound add/drop/rename operation on one store
+    /// table. The `ADD COLUMN` default is a bound constant expression the
+    /// executor evaluates once (and stores as the column's default).
+    AlterTable {
+        /// Target database (binder-resolved; `None` = session default).
+        db: Option<String>,
+        name: String,
+        op: AlterTablePlan,
+    },
     Insert {
         db: Option<String>,
         table: String,
@@ -210,6 +219,36 @@ pub enum LogicalPlan {
     },
 }
 
+/// One bound `ALTER TABLE` operation (wave 65). `ADD COLUMN`'s default is a
+/// bound constant expression (evaluated once at execution).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTablePlan {
+    AddColumn {
+        column: String,
+        dtype: DataType,
+        /// `DEFAULT <expr>`: a constant expression (empty scope). `None` =
+        /// the DEFAULT of a nullable column (NULL).
+        default: Option<BoundExpr>,
+        /// `NOT NULL` was declared. A non-empty table needs a non-NULL
+        /// default; the engine records the flag (constraints are declarative
+        /// metadata, never enforced on writes — wave 41).
+        not_null: bool,
+        /// `IF NOT EXISTS`: an existing column makes the statement a no-op.
+        if_not_exists: bool,
+    },
+    DropColumn {
+        column: String,
+        if_exists: bool,
+    },
+    RenameColumn {
+        from: String,
+        to: String,
+    },
+    RenameTable {
+        to: String,
+    },
+}
+
 /// One `DESCRIBE` output row: `(column_name, column_type, null, key)` plus the
 /// always-NULL `default`/`extra` columns the executor appends.
 #[derive(Debug, Clone, PartialEq)]
@@ -222,6 +261,10 @@ pub struct DescribeColumn {
     /// The `key` marker: `PRI` for primary-key columns, `UNI` for UNIQUE ones
     /// (PRI wins), `NULL` otherwise.
     pub key: Option<crate::storage::KeyKind>,
+    /// The column's DEFAULT, rendered as a SQL literal (DuckDB's `default`
+    /// column; wave 65). `None` = no default. The original expression text is
+    /// not retained — the evaluated value is rendered instead.
+    pub default: Option<String>,
 }
 
 /// True for row-producing queries (safe under a shared read lock).
@@ -280,6 +323,7 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Update { .. }
             | LogicalPlan::Delete { .. }
             | LogicalPlan::DropTable { .. }
+            | LogicalPlan::AlterTable { .. }
             | LogicalPlan::CreateDatabase { .. }
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Use { .. }
@@ -315,6 +359,7 @@ pub(crate) fn optimistic_eligible(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Delete { .. }
             | LogicalPlan::CreateTable { .. }
             | LogicalPlan::DropTable { .. }
+            | LogicalPlan::AlterTable { .. }
     )
 }
 
@@ -380,6 +425,7 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::Commit
         | LogicalPlan::Rollback
         | LogicalPlan::CreateView { .. }
+        | LogicalPlan::AlterTable { .. }
         | LogicalPlan::DropTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
@@ -703,6 +749,7 @@ fn walk_scan_filters(
         | LogicalPlan::ShowDatabases
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint
+        | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateTable { .. } => {}
         LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
         LogicalPlan::CreateTableAs { query, .. } | LogicalPlan::InsertSelect { query, .. } => {
@@ -1140,6 +1187,7 @@ fn walk_scan_projections(
             }
         }
         LogicalPlan::CreateTable { .. }
+        | LogicalPlan::AlterTable { .. }
         | LogicalPlan::Begin
         | LogicalPlan::Commit
         | LogicalPlan::Rollback

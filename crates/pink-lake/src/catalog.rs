@@ -85,6 +85,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::ChangeSummary;
+use crate::{LakeError, Result};
 
 /// One partition key of a table's partition specification (wave 66), the
 /// maker-side twin of DuckLake's `ducklake_partition_column` row: the key
@@ -239,11 +240,18 @@ pub(crate) enum FileFormat {
 pub(crate) enum FileRef {
     /// v1–v3: a plain lake-relative path (the entry's single data file).
     Path(String),
-    /// v4: the path, the file's exact row count, and (`.pink` files only) its
-    /// statistics block.
+    /// v4+: the path, the file's exact row count, and (`.pink` files only)
+    /// its statistics block.
     Entry {
         path: String,
         rows: u64,
+        /// v5: the table schema version this file was written under (see
+        /// [`TableEntry::columns`]). Absent in v4 manifests and on files of a
+        /// legacy entry; attach then reads them as written under the entry's
+        /// current schema (no rename/default mapping). Written on every file
+        /// of a v5-recorded entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        schema_version: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats: Option<crate::stats::StatsBlock>,
         /// The file's written partition values, keyed by the partition key's
@@ -271,6 +279,7 @@ impl<'de> Deserialize<'de> for FileRef {
             Entry {
                 path: String,
                 rows: Option<u64>,
+                schema_version: Option<u64>,
                 stats: Option<crate::stats::StatsBlock>,
                 partition: Option<BTreeMap<String, Option<String>>>,
             },
@@ -280,6 +289,7 @@ impl<'de> Deserialize<'de> for FileRef {
             Repr::Entry {
                 path,
                 rows,
+                schema_version,
                 stats,
                 partition,
             } => {
@@ -293,6 +303,7 @@ impl<'de> Deserialize<'de> for FileRef {
                 Ok(FileRef::Entry {
                     path,
                     rows,
+                    schema_version,
                     stats,
                     partition,
                 })
@@ -347,6 +358,113 @@ impl FileRef {
         }
         self
     }
+
+    /// The table schema version this file was written under (v5 files of a
+    /// recorded entry); `None` for v1–v4 files and legacy entries.
+    pub(crate) fn schema_version(&self) -> Option<u64> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry { schema_version, .. } => *schema_version,
+        }
+    }
+
+    /// [`FileRef::schema_version`] set to a new value (verbatim variant kept;
+    /// an entry's partition values are carried through unchanged).
+    pub(crate) fn with_schema_version(&self, version: Option<u64>) -> FileRef {
+        match self {
+            FileRef::Path(path) => FileRef::Path(path.clone()),
+            FileRef::Entry {
+                path,
+                rows,
+                stats,
+                partition,
+                ..
+            } => FileRef::Entry {
+                path: path.clone(),
+                rows: *rows,
+                schema_version: version,
+                stats: stats.clone(),
+                partition: partition.clone(),
+            },
+        }
+    }
+}
+
+/// One column of a v5 table entry's schema record (wave 65): the logical
+/// name, its canonical type name (`DataType::name()`), the optional DEFAULT
+/// as a canonical value string (the same encoding the statistics block uses;
+/// decoded with the column's type), and the table schema version at which the
+/// column appeared (`added`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ColumnEntry {
+    pub(crate) name: String,
+    /// `INTEGER`, `DECIMAL(10,2)`, … ([`pinkdb::DataType::name`]).
+    #[serde(rename = "type")]
+    pub(crate) dtype: String,
+    /// The column's DEFAULT, canonically encoded; absent = NULL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) default: Option<String>,
+    /// The table schema version at which this column appeared.
+    pub(crate) added: u64,
+}
+
+impl ColumnEntry {
+    /// Build the record for one live column.
+    pub(crate) fn new(
+        name: &str,
+        dtype: pinkdb::DataType,
+        default: Option<&pinkdb::Value>,
+        added: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            name: name.to_string(),
+            dtype: dtype.name(),
+            default: match default {
+                Some(v) if !v.is_null() => {
+                    Some(crate::stats::encode_value(dtype, v).ok_or_else(|| {
+                        LakeError::Internal {
+                            message: format!(
+                            "column \"{name}\": default {v:?} does not match its {dtype:?} type"
+                        ),
+                        }
+                    })?)
+                }
+                _ => None,
+            },
+            added,
+        })
+    }
+
+    /// The column's type, parsed back.
+    pub(crate) fn dtype(&self) -> Option<pinkdb::DataType> {
+        parse_dtype_name(&self.dtype)
+    }
+}
+
+/// Parse a canonical type name back to [`pinkdb::DataType`]
+/// (`DECIMAL(p,s)` included).
+pub(crate) fn parse_dtype_name(s: &str) -> Option<pinkdb::DataType> {
+    let upper = s.to_ascii_uppercase();
+    if let Some(rest) = upper.strip_prefix("DECIMAL(") {
+        let inner = rest.strip_suffix(')')?;
+        let (p, sc) = inner.split_once(',')?;
+        let precision = p.trim().parse::<u8>().ok()?;
+        let scale = sc.trim().parse::<u8>().ok()?;
+        return pinkdb::types::decimal_type(precision, scale);
+    }
+    pinkdb::DataType::from_sql(&upper)
+}
+
+/// One rename of a table's schema history (wave 65): at table schema version
+/// `version` the column last known as `from` became `to`. Files written
+/// before `version` hold the old name physically; the reader walks the log
+/// backwards to map a logical column to a physical one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RenameEntry {
+    /// The table schema version the rename produced.
+    pub(crate) version: u64,
+    pub(crate) from: String,
+    pub(crate) to: String,
 }
 
 /// One positional delete file of a v4 table entry: the rows it deletes from
@@ -390,6 +508,13 @@ pub(crate) struct Catalog {
     /// unavailable (e.g. expired snapshots).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) changes: Option<ChangeSummary>,
+    /// The lake-wide schema version at this version (wave 65; DuckLake's
+    /// `snapshot.schema_version`). Starts at 0 with the empty `create`
+    /// manifest and increments by one on every published version that
+    /// created, dropped or altered a table's schema — a pure-data version
+    /// leaves it unchanged. Absent (0) in v4 manifests.
+    #[serde(default)]
+    pub(crate) schema_version: u64,
 }
 
 /// One table of one version: the immutable data files it is made of, the
@@ -424,6 +549,19 @@ pub(crate) struct TableEntry {
     /// unpartitioned table — the pre-wave-66 shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) partition_by: Option<Vec<PartitionKey>>,
+    /// v5 (wave 65): the table's schema epoch at this version. `0` = a legacy
+    /// entry without a schema record (the files carry the schema).
+    #[serde(default)]
+    pub(crate) schema_version: u64,
+    /// v5: the logical schema record — every live column with its type, the
+    /// optional DEFAULT an old file's missing value materializes as, and the
+    /// epoch it appeared. Absent on legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) columns: Option<Vec<ColumnEntry>>,
+    /// v5: the rename history of the live columns (see [`RenameEntry`]),
+    /// ordered by version.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) renames: Vec<RenameEntry>,
 }
 
 impl TableEntry {

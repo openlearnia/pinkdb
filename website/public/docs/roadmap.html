@@ -230,7 +230,7 @@ on GitHub, and the wave-by-wave summary in the
   </li>
   <li class="card">
     <h3>Lake layer</h3>
-    <p>JSON catalog (<code>format_version</code> 4) plus immutable per-version
+    <p>JSON catalog (<code>format_version</code> 5) plus immutable per-version
     manifests; <strong>incremental commits</strong> (append-only data files and
     positional deletes, never rewriting published files), <strong>writable
     attachments</strong> (<code>.lake attach … write</code> + <code>.lake
@@ -268,11 +268,11 @@ on GitHub, and the wave-by-wave summary in the
 <h2 id="in-progress">In progress<a class="anchor" href="#in-progress" aria-label="Permalink: In progress">#</a></h2>
 
 <ul>
-  <li><strong>DuckLake parity, part two (waves 65–68).</strong> Incremental commits
-  (<code>format_version</code> 4) and time travel are shipped; next: schema evolution
-  on lake tables (<code>ALTER TABLE</code> with catalog schema versions), partition
-  splits with per-file zone-map pruning, maintenance/compaction, and inlined small
-  writes.</li>
+  <li><strong>DuckLake parity (waves 63–68).</strong> Incremental commits, time
+  travel, schema evolution on lake tables (<code>ALTER TABLE</code> with catalog
+  schema versions) and partition splits with per-file zone-map pruning are shipped;
+  next: maintenance/compaction (<code>merge_adjacent_files</code>,
+  <code>expire_snapshots</code>) and inlined small writes.</li>
 </ul>
 
 <h2 id="planned">Planned<a class="anchor" href="#planned" aria-label="Permalink: Planned">#</a></h2>

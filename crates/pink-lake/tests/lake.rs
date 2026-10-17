@@ -193,7 +193,7 @@ fn v2_fixture_lake_still_loads() {
     copy_dir(&fixture, &copy);
     let mut lake = Lake::open(&copy).unwrap();
     lake.write_from_store(&loaded).unwrap();
-    assert_eq!(lake.format_version(), 4);
+    assert_eq!(lake.format_version(), 5);
     assert_same_store(&expected, &Lake::open(&copy).unwrap().load(None).unwrap());
     // The old v2 snapshot stays loadable from the upgraded lake.
     assert_same_store(
@@ -221,7 +221,7 @@ fn snapshot_roundtrip_is_bit_exact() {
     // Catalog shape: v4, one Vortex file per table, `format` declared.
     let catalog = read_json(&dir.join("catalog.json"));
     assert_eq!(catalog["format_version"], FORMAT_VERSION);
-    assert_eq!(FORMAT_VERSION, 4, "v4 is the current incremental layout");
+    assert_eq!(FORMAT_VERSION, 5, "v5 adds the schema records");
     assert_eq!(catalog["version"], 2);
     let updated = catalog["updated"].as_str().unwrap();
     assert_eq!(updated.len(), 24, "ISO-8601 millis: {updated}");
@@ -502,10 +502,10 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
 
     // An unsupported format_version is named, not misparsed.
     let mut future = read_json(&dir.join("catalog.json"));
-    future["format_version"] = serde_json::json!(5);
+    future["format_version"] = serde_json::json!(6);
     write_json(&dir.join("catalog.json"), &future);
     let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("unsupported lake format_version 5"), "{err}");
+    assert!(err.contains("unsupported lake format_version 6"), "{err}");
     assert!(err.contains("newer pinkdb"), "{err}");
 
     // A version 2 manifest must declare a format on every entry; a missing
@@ -1347,9 +1347,9 @@ fn v1_lake_migrates_to_vortex_on_save() {
 
     // Saving again publishes a v4 snapshot: a full rewrite in Vortex.
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
-    assert_eq!(lake.format_version(), 4, "the handle now reports v4");
+    assert_eq!(lake.format_version(), 5, "the handle now reports v5");
     let catalog = read_json(&dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 4);
+    assert_eq!(catalog["format_version"], 5);
     for (key, entry) in catalog["tables"].as_object().unwrap() {
         assert_eq!(entry["format"], "vortex", "{key}");
         assert!(
@@ -1429,7 +1429,7 @@ fn v1_v4_fixture_written_by_the_lean_writer_loads_and_migrates() {
 
     // Saving migrates to v4 (Vortex) without touching the v1 files.
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
-    assert_eq!(lake.format_version(), 4);
+    assert_eq!(lake.format_version(), 5);
     let migrated = lake.load(None).unwrap();
     assert_same_store(&expected, &migrated);
     assert_eq!(
@@ -1459,7 +1459,7 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
     let original_bytes = store_bytes(&db, &dir, "original");
 
     let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.format_version(), 4, "create publishes a v4 lake");
+    assert_eq!(lake.format_version(), 5, "create publishes a v5 lake");
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
 
@@ -2168,7 +2168,7 @@ fn v1_stats_fixture_attaches_in_the_full_build() {
     let store = migrated.load(None).unwrap();
     migrated.write_from_store(&store).unwrap();
     let catalog = read_json(&copy.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 4, "{catalog}");
+    assert_eq!(catalog["format_version"], 5, "{catalog}");
     assert_eq!(
         catalog["tables"]["main.fid"]["format"], "vortex",
         "{catalog}"

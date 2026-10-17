@@ -24,7 +24,9 @@ use rayon::prelude::*;
 use window::eval_window;
 
 use crate::attached::AttachedTable;
-use crate::plan::{agg_output_schema, compare_values, win_output_schema, LogicalPlan};
+use crate::plan::{
+    agg_output_schema, compare_values, win_output_schema, AlterTablePlan, LogicalPlan,
+};
 use crate::sql::ast::{BinaryOp, JoinKind, SortSpec};
 use crate::sql::binder::{common_numeric, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
 use crate::storage::{DataTable, PinkDb};
@@ -68,6 +70,12 @@ pub enum QueryResult {
     },
     /// `LOAD EXTENSION '<path>'`: `name` is the extension's declared name.
     LoadedExtension {
+        name: String,
+    },
+    /// `ALTER TABLE` (wave 65): the table (its new name after a `RENAME TO`)
+    /// was altered. Wire-compatible with a statement outcome that carries no
+    /// payload beyond the name.
+    AlteredTable {
         name: String,
     },
     /// `CHECKPOINT` finished (a no-op for in-memory databases).
@@ -283,7 +291,13 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             };
             // Target column indices in written order (the binder always
             // resolves one entry per source column).
-            let schema = db.table_in(&target, table)?.schema();
+            let t0 = db.table_in(&target, table)?;
+            let schema = t0.schema();
+            let defaults: Vec<Value> = t0
+                .columns
+                .iter()
+                .map(|c| c.default.clone().unwrap_or(Value::Null))
+                .collect();
             let order: Vec<usize> = columns
                 .clone()
                 .unwrap_or_else(|| (0..schema.len()).collect());
@@ -292,7 +306,8 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let mut staged = Vec::new();
             for chunk in &out.chunks {
                 for i in 0..chunk.num_rows() {
-                    let mut values = vec![Value::Null; schema.len()];
+                    // Unlisted columns take their DEFAULT (wave 65).
+                    let mut values = defaults.clone();
                     for (src, &target_idx) in order.iter().enumerate() {
                         values[target_idx] =
                             DataTable::coerce(chunk.columns[src].get(i), schema[target_idx].1)?;
@@ -420,6 +435,139 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             db.drop_table_in(&target, name)?;
             Ok(QueryResult::DroppedTable { name: name.clone() })
+        }
+        LogicalPlan::AlterTable { db: qdb, name, op } => {
+            let target = resolve_db(db, qdb);
+            // An attached (read-only) name is refused before anything runs:
+            // ALTER must never look like a no-op on a lake table.
+            if let Some(err) = db.attached_read_only(&target, name) {
+                return Err(err);
+            }
+            match op {
+                AlterTablePlan::AddColumn {
+                    column,
+                    dtype,
+                    default,
+                    not_null,
+                    if_not_exists,
+                } => {
+                    {
+                        let t = db.table_in(&target, name)?;
+                        if t.columns
+                            .iter()
+                            .any(|c| c.name.eq_ignore_ascii_case(column))
+                        {
+                            if *if_not_exists {
+                                return Ok(QueryResult::AlteredTable { name: name.clone() });
+                            }
+                            return Err(PinkDbError::Catalog(format!(
+                                "Column with name \"{column}\" already exists!"
+                            )));
+                        }
+                    }
+                    // Evaluate the DEFAULT once, against an empty single-row
+                    // chunk (like an INSERT cell), then coerce to the column.
+                    let value = match default {
+                        None => None,
+                        Some(expr) => {
+                            let single = DataChunk {
+                                columns: Vec::new(),
+                                num_rows: 1,
+                            };
+                            let cx = Cx::new(db);
+                            let v = eval_expr(expr, &single, &cx)?;
+                            if v.len() != 1 {
+                                return Err(PinkDbError::Execution(
+                                    "the ADD COLUMN default did not evaluate to one value"
+                                        .to_string(),
+                                ));
+                            }
+                            Some(DataTable::coerce(v.get(0), *dtype)?)
+                        }
+                    };
+                    let table = db.table_mut_in(&target, name)?;
+                    // DuckDB's rule: `ADD COLUMN … NOT NULL` needs a non-NULL
+                    // default once the table has rows (an empty one is fine).
+                    if *not_null && table.num_rows > 0 && value.as_ref().is_none_or(|v| v.is_null())
+                    {
+                        return Err(PinkDbError::Execution(format!(
+                            "NOT NULL constraint failed: {name}.{column}"
+                        )));
+                    }
+                    table.add_column(column.clone(), *dtype, value)?;
+                    if *not_null {
+                        let idx = table.columns.len() - 1;
+                        table.constraints.not_null.push(idx);
+                    }
+                    Ok(QueryResult::AlteredTable { name: name.clone() })
+                }
+                AlterTablePlan::DropColumn { column, if_exists } => {
+                    let table = db.table_mut_in(&target, name)?;
+                    let Some(idx) = table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(column))
+                    else {
+                        if *if_exists {
+                            return Ok(QueryResult::AlteredTable { name: name.clone() });
+                        }
+                        return Err(PinkDbError::Catalog(format!(
+                            "Table \"{name}\" does not have a column with name \"{column}\""
+                        )));
+                    };
+                    for k in &table.constraints.keys {
+                        if k.columns.contains(&idx) {
+                            return Err(PinkDbError::Catalog(format!(
+                                "Cannot drop column \"{column}\" because there is a {} \
+                                 constraint that depends on it",
+                                match k.kind {
+                                    crate::storage::KeyKind::Primary => "PRIMARY KEY",
+                                    crate::storage::KeyKind::Unique => "UNIQUE",
+                                }
+                            )));
+                        }
+                    }
+                    for fk in &table.constraints.foreign_keys {
+                        if fk.columns.contains(&idx) {
+                            return Err(PinkDbError::Catalog(format!(
+                                "Cannot drop column \"{column}\" because there is a FOREIGN KEY \
+                                 constraint that depends on it"
+                            )));
+                        }
+                    }
+                    table.drop_column_at(idx)?;
+                    Ok(QueryResult::AlteredTable { name: name.clone() })
+                }
+                AlterTablePlan::RenameColumn { from, to } => {
+                    let table = db.table_mut_in(&target, name)?;
+                    let from_idx = table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(from));
+                    let Some(from_idx) = from_idx else {
+                        return Err(PinkDbError::Catalog(format!(
+                            "Table \"{name}\" does not have a column with name \"{from}\""
+                        )));
+                    };
+                    if let Some(to_idx) = table
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(to))
+                    {
+                        if to_idx != from_idx {
+                            return Err(PinkDbError::Catalog(format!(
+                                "Column with name \"{to}\" already exists!"
+                            )));
+                        }
+                    }
+                    table.rename_column_at(from_idx, to.clone())?;
+                    Ok(QueryResult::AlteredTable { name: name.clone() })
+                }
+                AlterTablePlan::RenameTable { to } => {
+                    db.rename_table_in(&target, name, to)?;
+                    Ok(QueryResult::AlteredTable { name: to.clone() })
+                }
+            }
         }
         LogicalPlan::DropView { db: qdb, name } => {
             let target = resolve_db(db, qdb);
@@ -812,6 +960,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::Rollback
         | LogicalPlan::CreateView { .. }
         | LogicalPlan::DropTable { .. }
+        | LogicalPlan::AlterTable { .. }
         | LogicalPlan::DropView { .. }
         | LogicalPlan::CreateDatabase { .. }
         | LogicalPlan::DropDatabase { .. }
@@ -871,7 +1020,11 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     }
                     None => key.push_null()?,
                 }
-                default.push_null()?;
+                match &c.default {
+                    // DuckDB-shaped: the DEFAULT rendered as a SQL literal.
+                    Some(d) => default.push_valid(Value::Varchar(d.clone()))?,
+                    None => default.push_null()?,
+                }
                 extra.push_null()?;
             }
             Ok(Output {
@@ -3492,6 +3645,17 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         }
         LogicalPlan::Insert { db, table, rows } => {
             format!("Insert {} ({} rows)", qualify(db, table), rows.len())
+        }
+        LogicalPlan::AlterTable { db, name, op } => {
+            let what = match op {
+                AlterTablePlan::AddColumn { column, .. } => format!("AddColumn {column}"),
+                AlterTablePlan::DropColumn { column, .. } => format!("DropColumn {column}"),
+                AlterTablePlan::RenameColumn { from, to } => {
+                    format!("RenameColumn {from}->{to}")
+                }
+                AlterTablePlan::RenameTable { to } => format!("RenameTable ->{to}"),
+            };
+            format!("AlterTable {} ({what})", qualify(db, name))
         }
         LogicalPlan::InsertSelect {
             db,

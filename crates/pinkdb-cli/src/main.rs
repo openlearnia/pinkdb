@@ -950,6 +950,7 @@ fn render_results(results: &[QueryResult]) {
                 println!("Extension {name} loaded.")
             }
             QueryResult::Checkpointed => println!("Checkpoint complete."),
+            QueryResult::AlteredTable { name } => println!("Table {name} altered."),
             QueryResult::Selected { names, types, rows } => {
                 if rows.is_empty() {
                     println!("(no rows)");

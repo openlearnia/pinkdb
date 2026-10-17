@@ -115,7 +115,7 @@ fn save_open_query_and_metadata_commands() {
     assert!(lake.join("snapshots/1.json").is_file());
     assert!(lake.join("snapshots/2.json").is_file());
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 4"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
     assert!(catalog.contains("\"version\": 2"), "{catalog}");
     assert!(catalog.contains("\"main.t\""), "{catalog}");
     assert!(catalog.contains("\"analytics.u\""), "{catalog}");
@@ -134,7 +134,7 @@ fn save_open_query_and_metadata_commands() {
         ".lake info {lake}\n.lake versions {lake}\n.lake tables {lake}\n.quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("format version:  4"), "{out}");
+    assert!(out.contains("format version:  5"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
     assert!(out.contains("snapshots:       2 (1, 2)"), "{out}");
     assert!(out.contains("tables (2):"), "{out}");
@@ -1099,8 +1099,8 @@ fn attach_errors_are_clear_and_never_panic() {
         let text = std::fs::read_to_string(&path).unwrap();
         // Remove the *file object's* `"rows"` (the first occurrence, inside
         // the files array); the entry-level one must stay.
-        let needle = ",\n          \"rows\": 1";
-        let patched = text.replacen(needle, "", 1);
+        let needle = "\"rows\": 1,\n          \"schema_version\": 1";
+        let patched = text.replacen(needle, "\"schema_version\": 1", 1);
         assert_ne!(text, patched, "file rows field not found in {name}");
         std::fs::write(&path, patched).unwrap();
     }
@@ -1374,7 +1374,7 @@ fn lean_written_v1_v4_fixture_opens_queries_and_migrates() {
     ));
     assert!(out.contains("Saved lake version 3"), "{out}");
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 4"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
     assert!(catalog.contains(".vortex"), "{catalog}");
     for path in before {
         assert!(path.is_file(), "v1 file {} must stay", path.display());
@@ -1676,7 +1676,7 @@ fn writable_attach_commit_appends_without_rewriting() {
     // The new version lists both data files plus the delete file, and the
     // v4 manifest adds up.
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 4"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
     assert!(catalog.contains("\"rows\": 200"), "{catalog}");
     assert!(
         catalog.contains("\"rows\": 2"),
@@ -1710,6 +1710,132 @@ fn writable_attach_commit_appends_without_rewriting() {
     assert!(out.contains("Opened lake version 3"), "{out}");
     assert!(out.contains("│ 200 "), "{out}");
     assert!(out.contains("up"), "the updated value survives: {out}");
+    cleanup(&dir);
+}
+
+/// Wave 65: schema evolution through the writable attach — `ALTER TABLE`
+/// (ADD COLUMN with DEFAULT, RENAME COLUMN, DROP COLUMN) runs against the
+/// materialized session copy, `.lake commit` publishes one schema record,
+/// old data files stay untouched and readable (the default materializes on
+/// read; dropped columns stay on disk), and time travel reads each version's
+/// own schema.
+#[test]
+fn writable_attach_schema_evolution_publishes_and_time_travels() {
+    let dir = scratch("schema");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (i INTEGER, s VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');\n\
+         .lake save {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let files_before = data_files(&lake.join("data")).len();
+    assert_eq!(files_before, 1);
+
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 42;\n\
+         ALTER TABLE t ADD COLUMN tmp INTEGER;\n\
+         UPDATE t SET n = 9 WHERE i = 2;\n\
+         ALTER TABLE t RENAME COLUMN s TO label;\n\
+         ALTER TABLE t DROP COLUMN tmp;\n\
+         INSERT INTO t (i, n) VALUES (4, 7);\n\
+         .lake commit {lake}\n\
+         SELECT i, n FROM t ORDER BY i;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Table t altered."), "{out}");
+    assert!(
+        out.contains("1 schema change"),
+        "the commit reports its schema record: {out}"
+    );
+    assert!(out.contains("Committed lake version 3"), "{out}");
+    assert!(out.contains("│ 9  "), "the updated row: {out}");
+
+    // Old data files were never rewritten; the catalog carries the record.
+    // The commit added one data file (the INSERT) and one delete file (the
+    // UPDATE's old row).
+    let data_only = |dir: &Path| {
+        data_files(dir)
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e != "pinkdel"))
+            .count()
+    };
+    assert_eq!(data_only(&lake.join("data")), files_before + 1);
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
+    assert!(catalog.contains("\"schema_version\": 2"), "{catalog}");
+    assert!(catalog.contains("\"name\": \"n\""), "{catalog}");
+    assert!(catalog.contains("\"default\": \"42\""), "{catalog}");
+    assert!(catalog.contains("\"renames\""), "{catalog}");
+    assert!(
+        catalog.contains("\"from\": \"s\"") && catalog.contains("\"to\": \"label\""),
+        "{catalog}"
+    );
+
+    // `.lake open` reads the evolved schema: old rows materialize 42.
+    let out = run(&format!(
+        ".lake open {lake}\n\
+         SELECT i, n FROM t ORDER BY i;\n\
+         .lake snapshots {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Opened lake version 3"), "{out}");
+    assert!(
+        out.contains("│ 42 "),
+        "old rows read the published default: {out}"
+    );
+    assert!(out.contains("schema:  version 2"), "{out}");
+    assert!(out.contains("schema:  version 1"), "{out}");
+
+    // Time travel: the version before the schema change has the old name and
+    // no `n`; the latest has `n` and no `s`.
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         SELECT i, s FROM t AT (VERSION => 2) ORDER BY i;\n\
+         SELECT i, n FROM t ORDER BY i;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("one"), "{out}");
+    assert!(out.contains("three"), "{out}");
+    assert!(out.contains("│ 42 "), "{out}");
+    cleanup(&dir);
+}
+
+/// A RENAME TABLE through a writable attach is refused with the way out
+/// (incremental commits publish data and schema, not names).
+#[test]
+fn writable_attach_refuses_rename_table_with_a_hint() {
+    let dir = scratch("rename-table");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (i INTEGER);\nINSERT INTO t VALUES (1);\n.lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         ALTER TABLE t RENAME TO t2;\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("RENAME TABLE is not published through .lake commit"),
+        "{out}"
+    );
+    assert!(out.contains(".lake save"), "{out}");
+    // Nothing was published.
+    let out = run(&format!(
+        ".lake versions {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("2 (current)"), "{out}");
     cleanup(&dir);
 }
 

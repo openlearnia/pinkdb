@@ -222,6 +222,13 @@ INSERT INTO t VALUES (...);
   count; scans union the file list in order. Previously published files are never
   rewritten — a 1M-row lake committed 4 rows in <strong>7.6 KB / 0.54 s with 0
   bytes rewritten</strong> (a full save of the same table writes 2.6 MB).</li>
+  <li><strong>Schema evolution.</strong> <code>ALTER TABLE</code> works on writable
+  attachments (<code>ADD COLUMN … DEFAULT</code>, <code>RENAME COLUMN</code>,
+  <code>DROP COLUMN</code>) and publishes a <strong>metadata-only</strong> schema
+  version: old files are never rewritten — they project through rename chains,
+  missing columns materialize their defaults, dropped columns keep their bytes (row
+  positions unchanged, so delete files stay valid). Time travel reads each version
+  with <em>that version's</em> schema and names.</li>
   <li><strong>Deletes are positional files.</strong> <code>DELETE</code> records the
   dropped positions in a <code>.pinkdel</code> file bound to the data file it
   targets; readers apply it at read time (merge-on-read), and
@@ -332,13 +339,13 @@ cross-checked against the file's own footer at attach).</p>
       <td>lean lake (<code>lake-lite</code>)</td>
       <td><code>.pink</code> v5 (the engine's single-table bytes, with a per-file
       statistics block in the manifest)</td>
-      <td><code>format_version</code> 4</td>
+      <td><code>format_version</code> 5</td>
       <td class="num">2.69 MB</td>
     </tr>
     <tr>
       <td>full lake (<code>lake</code>)</td>
       <td>Vortex (the default lake format)</td>
-      <td><code>format_version</code> 4</td>
+      <td><code>format_version</code> 5</td>
       <td class="num">45.3 MB</td>
     </tr>
   </tbody>
@@ -347,9 +354,11 @@ cross-checked against the file's own footer at attach).</p>
 
 <ul>
   <li>Both builds write and read the current format — <strong>catalog
-  <code>format_version</code> 4</strong> — and both support incremental commits and
-  time travel. Older lakes stay readable: v1–v3 catalogs (single-file Vortex v2/v3
-  and lean v1) load and migrate on the next save, leaving old files untouched.</li>
+  <code>format_version</code> 5</strong> (schema records included; partitioning and
+  zone maps are additive) — and both support incremental commits, time travel and
+  schema evolution. Older lakes stay readable: v1–v4 catalogs (single-file Vortex
+  v2/v3 and lean v1) load and migrate on the next save, leaving old files
+  untouched.</li>
   <li>The lean build decodes <code>.pink</code> data files only and refuses a Vortex
   lake with a clear “rebuild with <code>lake</code>” error. A lake written by the
   lean build opens <strong>bit-exactly</strong> in a full build.</li>

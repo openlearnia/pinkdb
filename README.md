@@ -568,7 +568,7 @@ The manifests (`catalog.json` and every snapshot) share one shape:
 
 ```json
 {
-  "format_version": 4,
+  "format_version": 5,
   "updated": "2026-10-14T02:11:50.760Z",
   "version": 2,
   "tables": {

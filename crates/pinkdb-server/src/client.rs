@@ -368,6 +368,7 @@ fn build_result(
         DoneKind::Used => QueryResult::Used { db: name },
         DoneKind::LoadedExtension => QueryResult::LoadedExtension { name },
         DoneKind::Checkpointed => QueryResult::Checkpointed,
+        DoneKind::AlteredTable => QueryResult::AlteredTable { name },
         DoneKind::Other => {
             return Err(ProtocolError::Malformed(
                 "server sent the reserved Done kind Other".to_string(),

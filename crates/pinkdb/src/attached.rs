@@ -872,6 +872,7 @@ mod tests {
                     out.push(crate::storage::Column {
                         name: col.name.clone(),
                         dtype: col.dtype,
+                        default: None,
                         chunks,
                     });
                 }

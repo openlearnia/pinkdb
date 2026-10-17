@@ -168,6 +168,39 @@
 //! (`FROM t AT (VERSION => n)` / `AT (TIMESTAMP => ts)`) over the versions up
 //! to the one it is pinned to (see the `attach` module).
 //!
+//! # Schema evolution (wave 65)
+//!
+//! A `format_version` 5 table entry carries a **schema record** (see the
+//! `schema` module): `schema_version` (the table's schema epoch), `columns`
+//! (every live column with its type, its `DEFAULT` and the epoch it appeared)
+//! and `renames` (the rename history). Every data file records the epoch it
+//! was written under, and every manifest carries the lake-wide
+//! `schema_version` counter (DuckLake's `snapshot.schema_version`), bumped
+//! once per published version that created, dropped, or altered a table.
+//! `ALTER TABLE` (ADD COLUMN with or without a DEFAULT, DROP COLUMN, RENAME
+//! COLUMN) through a writable attach publishes a new record with the version
+//! **without rewriting any data file**: a column the file predates reads its
+//! default on every row, a renamed column reads its physical predecessor, and
+//! a dropped column's bytes simply stay unlisted (positions are unchanged, so
+//! positional delete files stay valid). Each manifest embeds the record as of
+//! its own version, so time travel reads each version with that version's
+//! schema and names.
+//!
+//! Probed against DuckLake (duckdb `v2.0.0-alpha46057` + ducklake): creating a
+//! table bumps `snapshot.schema_version`, data changes do not, and each
+//! `ALTER TABLE` does; `ADD COLUMN … DEFAULT` sets both `initial_default` and
+//! `default_value` and leaves the data file's `end_snapshot` NULL (no
+//! rewrite); `DROP COLUMN` closes the `ducklake_column` row and leaves the
+//! data file and its bytes untouched; a drop + re-add is a **fresh column id**
+//! whose `initial_default` covers the old files; `RENAME COLUMN` keeps the
+//! column id and closes/reopens its name row. `ALTER TABLE … RENAME TO` *is*
+//! supported by DuckLake as metadata-only (`ducklake_table.table_name` gets an
+//! `end_snapshot` + a new row, same table id), but pinkdb's commit format has
+//! no per-version table-name mapping: a rename on a writable attach is
+//! refused by [`WritableAttachment::commit`] with [`LakeError::NotRepresentable`]
+//! pointing at `.lake save` (a full snapshot), never silently published as a
+//! drop.
+//!
 //! DuckLake's `ducklake_default_version` setting is deliberately **not**
 //! mirrored: it is not a per-query read default — it selects the storage
 //! format version for *new catalogs*, and the probed DuckDB build rejects
@@ -286,6 +319,7 @@ mod local;
 mod mock_s3;
 #[cfg(feature = "s3")]
 mod s3;
+mod schema;
 mod snapshot;
 mod stats;
 mod storage;
@@ -306,6 +340,16 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 
 /// The catalog format version this build writes (and its newest read).
 ///
+/// Version 5 (wave 65): version 4 plus the per-table **schema record** —
+/// `schema_version`, `columns` (every live column with its type, default and
+/// the epoch it appeared) and `renames` — so `ALTER TABLE` publishes
+/// metadata-only changes and old data files stay readable through the name
+/// mapping; every data file records the schema epoch it was written under.
+/// A v5 manifest may still carry *legacy entries* (no record): a table a
+/// commit did not touch, and tables of a v4 lake that was never re-saved.
+/// The lake also carries a lake-wide `schema_version` counter
+/// (DuckLake's `snapshot.schema_version`).
+///
 /// Version 4 (wave 63): the incremental format — every data file carries its
 /// own row count, a table lists a growing, never-rewritten file list, and
 /// positional delete files (merge-on-read) express `DELETE`/`UPDATE`. Written
@@ -324,19 +368,19 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 /// every entry. Version 1 (wave 34): one engine `.pink` file per entry (no
 /// `format` field) plus one entry-level statistics block.
 ///
-/// A build without `vortex-format` — the lean `lake-lite` builds — writes v4
-/// with `.pink` files and refuses a v4 (or v2/v3) Vortex lake with a clear
+/// A build without `vortex-format` — the lean `lake-lite` builds — writes v5
+/// with `.pink` files and refuses a v5 (or v2/v3/v4) Vortex lake with a clear
 /// [`LakeError::FeatureMissing`], never a corrupt-file error.
-pub const FORMAT_VERSION: u32 = 4;
+pub const FORMAT_VERSION: u32 = 5;
 
 /// The oldest catalog format version this build still reads.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 
-/// The newest catalog format version this codebase knows: 4 (the incremental
-/// format). A manifest above this (a future format) is
-/// [`LakeError::Unsupported`] in every build; a v4 Vortex lake in a build
+/// The newest catalog format version this codebase knows: 5 (the schema
+/// record). A manifest above this (a future format) is
+/// [`LakeError::Unsupported`] in every build; a v5 Vortex lake in a build
 /// without `vortex-format` is [`LakeError::FeatureMissing`].
-pub const MAX_FORMAT_VERSION: u32 = 4;
+pub const MAX_FORMAT_VERSION: u32 = 5;
 
 /// The largest manifest `version` this build reads or writes.
 ///
@@ -446,7 +490,7 @@ impl fmt::Display for LakeError {
                         f,
                         "unsupported lake format_version {found} at {} (this build reads/writes \
                          format_version {FORMAT_VERSION} with `.pink` data files; Vortex \
-                         format_version 2/3/4 needs the `vortex-format` feature)",
+                         format_version 2/3/4/5 needs the `vortex-format` feature)",
                         path.display()
                     )
                 }
@@ -587,6 +631,7 @@ impl Lake {
             author: None,
             commit_message: None,
             changes: None,
+            schema_version: 0,
         };
         let bytes = manifest_json(&manifest, &root)?;
         // Adopt (do not rewrite) an empty version-1 snapshot a concurrent or
@@ -929,10 +974,26 @@ impl Lake {
                 // One data file per partition value set (exactly one for an
                 // unpartitioned or empty table), written before anything
                 // references it (see [`Lake::write_data_files`] for the
-                // encoders).
+                // encoders). Every file of a recorded entry then carries the
+                // schema epoch it was written under (1: a full save writes the
+                // current schema).
                 let (files, written) = self.write_data_files(&key, Some(format), &keys, src)?;
                 bytes_written += written;
                 rows += src.num_rows() as u64;
+                // The v5 schema record: the store table's live columns, with
+                // their defaults, all at epoch 1 — a full save rewrites every
+                // data file under the current schema, so no history is needed.
+                let columns = src
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        crate::catalog::ColumnEntry::new(&c.name, c.dtype, c.default.as_ref(), 1)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let files: Vec<crate::catalog::FileRef> = files
+                    .into_iter()
+                    .map(|f| f.with_schema_version(Some(1)))
+                    .collect();
                 deltas.insert(
                     key.clone(),
                     catalog::TableDelta {
@@ -954,6 +1015,9 @@ impl Lake {
                         stats: None,
                         deletes: Vec::new(),
                         partition_by: (!keys.is_empty()).then_some(keys),
+                        schema_version: 1,
+                        columns: Some(columns),
+                        renames: Vec::new(),
                     },
                 );
             }
@@ -967,7 +1031,10 @@ impl Lake {
             Some((author, message)) => (author.clone(), message.clone()),
             None => (None, None),
         };
-        let changes = previous.map(|previous| ChangeSummary::diff(&previous.tables, &tables));
+        let schema_version = next_schema_version(previous.as_ref(), &tables);
+        let changes = previous
+            .as_ref()
+            .map(|previous| ChangeSummary::diff(&previous.tables, &tables));
         let manifest = Catalog {
             format_version: FORMAT_VERSION,
             updated: time::iso8601_utc(SystemTime::now()),
@@ -976,6 +1043,7 @@ impl Lake {
             author,
             commit_message,
             changes,
+            schema_version,
         };
         let bytes = manifest_json(&manifest, &self.root)?;
         let commit_manifest = catalog::CommitManifest {
@@ -1073,6 +1141,7 @@ impl Lake {
                         FileRef::Entry {
                             path: rel,
                             rows,
+                            schema_version: None,
                             stats: Some(block),
                             partition: None,
                         },
@@ -1112,6 +1181,7 @@ impl Lake {
                     FileRef::Entry {
                         path: rel,
                         rows,
+                        schema_version: None,
                         stats: Some(block),
                         partition: None,
                     },
@@ -1390,6 +1460,8 @@ impl Lake {
             }
             let format = entry.format();
             let layout = self.entry_layout(entry, key, manifest_path)?;
+            // The v5 schema record (wave 65), when this entry has one.
+            let schema = crate::schema::TableSchema::from_entry(key, entry, manifest_path)?;
             let mut created = false;
             for (i, (rel, file_rows, deleted)) in layout.iter().enumerate() {
                 validate_rel_path(rel)?;
@@ -1416,12 +1488,41 @@ impl Lake {
                     });
                 }
                 let file_table = apply_file_deletes(file_table, deleted, key, rel)?;
+                // Project the file onto the entry's logical schema: renamed
+                // columns map to their current name, columns the file
+                // predates materialize their default, dropped ones stay out.
+                let file_table = match &schema {
+                    Some(s) => {
+                        let physical = file_table.schema();
+                        let file_version = entry.files[i].schema_version().unwrap_or(s.version);
+                        let mapping =
+                            s.map_file(file_version, &physical, &self.storage.abs(rel))?;
+                        let all_present = vec![true; physical.len()];
+                        s.project_table(&mapping, &file_table, &all_present, table)?
+                            .0
+                    }
+                    None => file_table,
+                };
                 if !created {
                     db.create_table_in(dbname, table, file_table.schema())
                         .map_err(|e| LakeError::Engine {
                             context: format!("recreating table \"{key}\""),
                             source: e,
                         })?;
+                    if let Some(s) = &schema {
+                        // The record's defaults become the rebuilt table's:
+                        // a later INSERT that omits the column writes them,
+                        // and a `.lake save` publishes them again.
+                        let t = db
+                            .table_mut_in(dbname, table)
+                            .map_err(|e| LakeError::Engine {
+                                context: format!("recreating table \"{key}\""),
+                                source: e,
+                            })?;
+                        for (col, record) in t.columns.iter_mut().zip(&s.columns) {
+                            col.default = record.default.clone();
+                        }
+                    }
                     created = true;
                 }
                 let dst = db
@@ -1430,7 +1531,9 @@ impl Lake {
                         context: format!("loading table \"{key}\""),
                         source: e,
                     })?;
-                if i > 0 && dst.schema() != file_table.schema() {
+                // Recorded entries project every file onto the same logical
+                // schema; legacy entries keep the files-agree check.
+                if schema.is_none() && i > 0 && dst.schema() != file_table.schema() {
                     return Err(LakeError::Corrupt {
                         path: self.storage.abs(rel),
                         message: format!("data files of table \"{key}\" disagree on the schema"),
@@ -1775,13 +1878,13 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                  data file's footer)"
             )));
         }
-        if v != 4 && !entry.deletes.is_empty() {
+        if v < 4 && !entry.deletes.is_empty() {
             return Err(corrupt(format!(
                 "table \"{key}\" declares positional delete files in a format_version {v} \
                  manifest (deletes are part of the v4 incremental format)"
             )));
         }
-        if v != 4 && entry.partition_by.is_some() {
+        if v < 4 && entry.partition_by.is_some() {
             return Err(corrupt(format!(
                 "table \"{key}\" declares a partition specification in a format_version {v} \
                  manifest (partitioning is part of the v4 incremental format)"
@@ -1837,18 +1940,18 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                      format_version 1)"
                 )));
             }
-            (4, None) => {
+            (4 | 5, None) => {
                 return Err(corrupt(format!(
-                    "table \"{key}\" does not declare a data file format (a format_version 4 \
+                    "table \"{key}\" does not declare a data file format (a format_version {v} \
                      entry requires `\"format\"`: \"pink\" or \"vortex\")"
                 )));
             }
-            (4, Some(FileFormat::Vortex)) => {
+            (4 | 5, Some(FileFormat::Vortex)) => {
                 #[cfg(not(feature = "vortex-format"))]
                 return Err(LakeError::FeatureMissing {
                     feature: "vortex-format",
                     message: format!(
-                        "{}: table \"{key}\" uses Vortex data files (format_version 4); this \
+                        "{}: table \"{key}\" uses Vortex data files (format_version {v}); this \
                          build was built without Vortex format support — rebuild with the \
                          `vortex-format` feature (for the CLI: `cargo build -p pinkdb-cli \
                          --features lake`)",
@@ -1868,15 +1971,15 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                          {v} manifest (only v4 entries carry per-file row counts)"
                     )));
                 }
-                (4, FileRef::Path(_)) => {
+                (4 | 5, FileRef::Path(_)) => {
                     return Err(corrupt(format!(
                         "table \"{key}\" lists a data file without its row count (a \
-                         format_version 4 entry lists files as {{\"path\", \"rows\"}} \
+                         format_version {v} entry lists files as {{\"path\", \"rows\"}} \
                          objects)"
                     )));
                 }
                 (
-                    4,
+                    4 | 5,
                     FileRef::Entry {
                         path: rel,
                         stats: _stats,
@@ -1907,10 +2010,10 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                 _ => {}
             }
         }
-        if v == 4 {
+        if v >= 4 {
             if entry.files.is_empty() {
                 return Err(corrupt(format!(
-                    "table \"{key}\" has no data files (a format_version 4 table always lists \
+                    "table \"{key}\" has no data files (a format_version {v} table always lists \
                      at least one)"
                 )));
             }
@@ -2055,6 +2158,27 @@ fn splitmix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// The lake-wide schema version for a new manifest: the previous version's
+/// counter, plus one when any table was created, dropped, or had its schema
+/// record (columns / defaults / renames) changed. DuckLake bumps
+/// `snapshot.schema_version` once per schema-changing statement; pinkdb's
+/// version granularity is the published version, so it bumps once.
+pub(crate) fn next_schema_version(
+    previous: Option<&Catalog>,
+    tables: &BTreeMap<String, TableEntry>,
+) -> u64 {
+    let Some(previous) = previous else {
+        return u64::from(!tables.is_empty());
+    };
+    let schema_changed = tables.len() != previous.tables.len()
+        || tables.iter().any(|(key, entry)| {
+            previous.tables.get(key).is_none_or(|before| {
+                before.columns != entry.columns || before.renames != entry.renames
+            })
+        });
+    previous.schema_version + u64::from(schema_changed)
 }
 
 /// The single database + single table a data file must hold.

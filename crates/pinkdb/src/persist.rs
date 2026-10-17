@@ -86,7 +86,7 @@ use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
 use crate::storage::{
-    DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
+    Column, DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{Vector, VectorData, CHUNK_SIZE};
@@ -109,6 +109,23 @@ const MAGIC_V5: &[u8; 8] = b"PINKDB05";
 /// Flags bit 0 (v5+): every table carries the constraint section described in
 /// the module docs. Set iff at least one table has constraints.
 const FLAG_CONSTRAINTS: u32 = 0x1;
+
+/// Flags bit 1 (v5+): every table carries the column-default section (wave
+/// 65) described in the module docs. Set iff at least one column has a
+/// DEFAULT. An older v5 build refuses the file cleanly through the unknown-
+/// flags check.
+const FLAG_DEFAULTS: u32 = 0x2;
+
+/// Column-default value tags (one byte per non-NULL default).
+const VD_BOOL: u8 = 0;
+const VD_I32: u8 = 1;
+const VD_I64: u8 = 2;
+const VD_F64_BITS: u8 = 3;
+const VD_VARCHAR: u8 = 4;
+const VD_DATE: u8 = 5;
+const VD_TIMESTAMP: u8 = 6;
+const VD_DECIMAL: u8 = 7;
+const VD_INTERVAL: u8 = 8;
 
 /// Constraint-section kinds (one byte per constraint).
 const CK_PRIMARY_KEY: u8 = 0;
@@ -2135,19 +2152,28 @@ impl PinkDb {
     ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         let mut w = Writer::new();
         w.bytes(MAGIC_V5);
-        // The constraint section exists iff some table has constraints (the
-        // flags word is written before the tables, so decide it up front).
+        // The constraint and column-default sections exist iff some table
+        // needs them (the flags word is written before the tables, so decide
+        // it up front).
         let with_constraints = self.list_databases().iter().any(|db| {
             self.list_tables_in(db).iter().any(|t| {
                 self.table_in(db, t)
                     .is_ok_and(|t| !t.constraints.is_empty())
             })
         });
-        w.u32(if with_constraints {
-            FLAG_CONSTRAINTS
-        } else {
-            0
+        let with_defaults = self.list_databases().iter().any(|db| {
+            self.list_tables_in(db).iter().any(|t| {
+                self.table_in(db, t)
+                    .is_ok_and(|t| t.columns.iter().any(|c| c.default.is_some()))
+            })
         });
+        w.u32(
+            if with_constraints {
+                FLAG_CONSTRAINTS
+            } else {
+                0
+            } | if with_defaults { FLAG_DEFAULTS } else { 0 },
+        );
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
         dbs.sort();
@@ -2173,6 +2199,9 @@ impl PinkDb {
                 }
                 if with_constraints {
                     write_constraints(&mut w, &t.constraints);
+                }
+                if with_defaults {
+                    write_defaults(&mut w, &t.columns);
                 }
                 w.u64(t.num_rows() as u64);
                 let n_chunks = t.num_chunks();
@@ -2416,15 +2445,17 @@ impl PinkDb {
             ));
         };
         let mut constraints = false;
+        let mut defaults = false;
         if flags {
             let f = r.u32()?;
             if v5 {
-                if f & !FLAG_CONSTRAINTS != 0 {
+                if f & !(FLAG_CONSTRAINTS | FLAG_DEFAULTS) != 0 {
                     return Err(PinkDbError::Execution(format!(
                         "unsupported .pink v5 flags 0x{f:08x}; upgrade pinkdb"
                     )));
                 }
                 constraints = f & FLAG_CONSTRAINTS != 0;
+                defaults = f & FLAG_DEFAULTS != 0;
             } else if f != 0 {
                 return Err(PinkDbError::Execution(format!(
                     "unsupported .pink v4 flags 0x{f:08x}; upgrade pinkdb"
@@ -2441,7 +2472,7 @@ impl PinkDb {
                 db.create_database(&dbname)?;
                 let n_tables = r.u32()?;
                 for _ in 0..n_tables {
-                    load_table(&mut r, &mut db, &dbname, v5, constraints)?;
+                    load_table(&mut r, &mut db, &dbname, v5, constraints, defaults)?;
                 }
             }
             if db.list_databases().is_empty() {
@@ -2452,7 +2483,7 @@ impl PinkDb {
             db.create_database("main")?;
             let n_tables = r.u32()?;
             for _ in 0..n_tables {
-                load_table(&mut r, &mut db, "main", false, false)?;
+                load_table(&mut r, &mut db, "main", false, false, false)?;
             }
         }
         if !r.end() {
@@ -2504,6 +2535,139 @@ fn write_constraints(w: &mut Writer, c: &TableConstraints) {
         w.str("");
         w.u32(1);
         w.u32(*col as u32);
+    }
+}
+
+/// Encode every column's DEFAULT (wave 65): one presence byte per column,
+/// then the value bytes of the ones that have a default (a NULL default is
+/// simply absent — it means the same on read).
+fn write_defaults(w: &mut Writer, columns: &[Column]) {
+    for col in columns {
+        match &col.default {
+            Some(v) if !v.is_null() => {
+                w.u8(1);
+                write_default_value(w, v);
+            }
+            _ => w.u8(0),
+        }
+    }
+}
+
+/// One default value's bytes: a tag byte plus its payload.
+fn write_default_value(w: &mut Writer, v: &Value) {
+    match v {
+        // Unreachable: `write_defaults` treats a NULL default as absent. A
+        // total match keeps the encoder honest.
+        Value::Null => w.u8(VD_BOOL),
+        Value::Boolean(b) => {
+            w.u8(VD_BOOL);
+            w.u8(*b as u8);
+        }
+        Value::Integer(i) => {
+            w.u8(VD_I32);
+            w.u32(*i as u32);
+        }
+        Value::Bigint(i) => {
+            w.u8(VD_I64);
+            w.u64(*i as u64);
+        }
+        Value::Double(x) => {
+            w.u8(VD_F64_BITS);
+            w.u64(x.to_bits());
+        }
+        Value::Varchar(s) => {
+            w.u8(VD_VARCHAR);
+            w.str(s);
+        }
+        Value::Date(d) => {
+            w.u8(VD_DATE);
+            w.u32(*d as u32);
+        }
+        Value::Timestamp(t) => {
+            w.u8(VD_TIMESTAMP);
+            w.u64(*t as u64);
+        }
+        Value::Decimal(x, scale) => {
+            w.u8(VD_DECIMAL);
+            w.bytes(&x.to_le_bytes());
+            w.u8(*scale);
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            w.u8(VD_INTERVAL);
+            w.u32(*months as u32);
+            w.u32(*days as u32);
+            w.u64(*micros as u64);
+        }
+    }
+}
+
+/// Decode the per-column default section (`FLAG_DEFAULTS`). Every tag is
+/// validated; an unknown tag or a truncated payload is a corrupt-file error.
+fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
+    let mut out = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        if r.u8()? == 0 {
+            out.push(None);
+            continue;
+        }
+        let tag = r.u8()?;
+        let v = match tag {
+            VD_BOOL => Value::Boolean(match r.u8()? {
+                0 => false,
+                1 => true,
+                _ => return r.err("bad BOOLEAN default byte"),
+            }),
+            VD_I32 => Value::Integer(r.i32()?),
+            VD_I64 => Value::Bigint(r.i64()?),
+            VD_F64_BITS => Value::Double(f64::from_bits(r.u64()?)),
+            VD_VARCHAR => Value::Varchar(r.str()?),
+            VD_DATE => Value::Date(r.i32()?),
+            VD_TIMESTAMP => Value::Timestamp(r.i64()?),
+            VD_DECIMAL => {
+                let b = r.take(16)?;
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(b);
+                let x = i128::from_le_bytes(arr);
+                let scale = r.u8()?;
+                if scale > 38 {
+                    return r.err("bad DECIMAL default scale");
+                }
+                Value::Decimal(x, scale)
+            }
+            VD_INTERVAL => Value::Interval {
+                months: r.i32()?,
+                days: r.i32()?,
+                micros: r.i64()?,
+            },
+            other => {
+                return Err(PinkDbError::Execution(format!(
+                    "corrupt file: unknown default value tag {other}"
+                )))
+            }
+        };
+        out.push(Some(v));
+    }
+    Ok(out)
+}
+
+/// Whether a decoded default value has exactly its column's type (a tampered
+/// file cannot smuggle a mistyped default into later INSERTs).
+fn default_matches(v: &Value, dtype: DataType) -> bool {
+    match (v, dtype) {
+        (Value::Boolean(_), DataType::Boolean)
+        | (Value::Integer(_), DataType::Integer)
+        | (Value::Bigint(_), DataType::Bigint)
+        | (Value::Double(_), DataType::Double)
+        | (Value::Varchar(_), DataType::Varchar)
+        | (Value::Date(_), DataType::Date)
+        | (Value::Timestamp(_), DataType::Timestamp)
+        | (Value::Interval { .. }, DataType::Interval) => true,
+        (Value::Decimal(_, s), DataType::Decimal { scale, .. }) => *s == scale,
+        _ => false,
     }
 }
 
@@ -2599,6 +2763,7 @@ fn load_table(
     dbname: &str,
     v4: bool,
     constraints: bool,
+    defaults: bool,
 ) -> Result<()> {
     let name = r.str()?;
     let n_cols = r.u32()? as usize;
@@ -2627,6 +2792,21 @@ fn load_table(
         read_constraints(r, n_cols)?
     } else {
         TableConstraints::default()
+    };
+    let defaults = if defaults {
+        let decoded = read_defaults(r, n_cols)?;
+        for ((name, dtype), d) in schema.iter().zip(decoded.iter()) {
+            if let Some(v) = d {
+                if !default_matches(v, *dtype) {
+                    return r.err(&format!(
+                        "default value of column \"{name}\" does not match its type"
+                    ));
+                }
+            }
+        }
+        decoded
+    } else {
+        vec![None; n_cols]
     };
     let num_rows = r.u64()? as usize;
     // Decode each column's chunks into shared vectors (no per-row Value
@@ -2664,6 +2844,9 @@ fn load_table(
     }
     db.create_table_with_constraints_in(dbname, &name, schema, constraints)?;
     let t = db.table_mut_in(dbname, &name)?;
+    for (col, d) in t.columns.iter_mut().zip(defaults) {
+        col.default = d;
+    }
     for ci in 0..n_chunks {
         let chunk: Vec<Arc<Vector>> = columns.iter().map(|c| Arc::clone(&c[ci])).collect();
         t.append_shared_chunk(&chunk)?;
@@ -3407,11 +3590,11 @@ mod tests {
         let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
         assert!(err.contains("bad magic"), "{err}");
         // Unknown v5 flags bits are a hard error (re-checksummed so the flags
-        // check, not the CRC, is what fires). Bit 0 (the constraint section)
-        // is known; its absence/presence is exercised by the constraint
-        // round-trip tests.
+        // check, not the CRC, is what fires). Bits 0 (constraint section) and
+        // 1 (column defaults) are known; their absence/presence is exercised
+        // by the constraint/default round-trip tests.
         let mut data = full.clone();
-        data[8..12].copy_from_slice(&2u32.to_le_bytes());
+        data[8..12].copy_from_slice(&4u32.to_le_bytes());
         fix_crc(&mut data);
         let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
         assert!(err.contains("unsupported .pink v5 flags"), "{err}");
@@ -4832,7 +5015,7 @@ mod tests {
         )
         .unwrap();
         let t = db.table_in("main", "t").unwrap();
-        let stats = table_stats("main", "t", &t);
+        let stats = table_stats("main", "t", t);
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(true)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(true)), "{col:?}");
@@ -4840,7 +5023,7 @@ mod tests {
         db.execute("CREATE TABLE f (b BOOLEAN); INSERT INTO f VALUES (false), (false);")
             .unwrap();
         let f = db.table_in("main", "f").unwrap();
-        let stats = table_stats("main", "f", &f);
+        let stats = table_stats("main", "f", f);
         let col = &stats.columns[0];
         assert_eq!(col.min, Some(Value::Boolean(false)), "{col:?}");
         assert_eq!(col.max, Some(Value::Boolean(false)), "{col:?}");
@@ -4848,7 +5031,7 @@ mod tests {
         db.execute("CREATE TABLE n (b BOOLEAN); INSERT INTO n VALUES (NULL);")
             .unwrap();
         let n = db.table_in("main", "n").unwrap();
-        let stats = table_stats("main", "n", &n);
+        let stats = table_stats("main", "n", n);
         let col = &stats.columns[0];
         assert_eq!(col.min, None, "{col:?}");
         assert_eq!(col.max, None, "{col:?}");

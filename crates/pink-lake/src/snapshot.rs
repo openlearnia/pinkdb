@@ -122,6 +122,9 @@ pub struct SnapshotInfo {
     pub time_micros: Option<i64>,
     /// The catalog `format_version` of this version's manifest.
     pub format_version: u32,
+    /// The lake-wide schema version at this version (wave 65; DuckLake's
+    /// `snapshot.schema_version`). 0 for manifests written before this wave.
+    pub schema_version: u64,
     /// The author the save recorded, if any.
     pub author: Option<String>,
     /// The save's commit message, if any.
@@ -144,6 +147,7 @@ impl SnapshotInfo {
             time: manifest.updated.clone(),
             time_micros,
             format_version: manifest.format_version,
+            schema_version: manifest.schema_version,
             author: manifest.author.clone(),
             message: manifest.commit_message.clone(),
             tables: manifest.tables.len(),

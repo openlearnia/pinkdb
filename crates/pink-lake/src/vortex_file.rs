@@ -626,6 +626,7 @@ fn decode_projected_file(
         columns.push(pinkdb::storage::Column {
             name: name.clone(),
             dtype: *dtype,
+            default: None,
             chunks,
         });
     }

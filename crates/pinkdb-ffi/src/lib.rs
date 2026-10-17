@@ -53,6 +53,9 @@ pub const PINKDB_STMT_USED: i32 = 13;
 pub const PINKDB_STMT_LOADED_EXTENSION: i32 = 14;
 /// `CHECKPOINT` (a no-op for in-memory databases).
 pub const PINKDB_STMT_CHECKPOINTED: i32 = 15;
+/// `ALTER TABLE`; `pinkdb_result_name` carries the table's name after the
+/// statement (a `RENAME TO` reports the new name).
+pub const PINKDB_STMT_ALTERED_TABLE: i32 = 16;
 
 // ----- value / column type tags -----
 pub const PINKDB_TYPE_NULL: i32 = 0;
@@ -305,6 +308,7 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::Used { .. } => PINKDB_STMT_USED,
         QueryResult::LoadedExtension { .. } => PINKDB_STMT_LOADED_EXTENSION,
         QueryResult::Checkpointed => PINKDB_STMT_CHECKPOINTED,
+        QueryResult::AlteredTable { .. } => PINKDB_STMT_ALTERED_TABLE,
     }
 }
 
@@ -330,7 +334,8 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
                     | QueryResult::DroppedTable { name }
                     | QueryResult::DroppedView { name }
                     | QueryResult::CreatedDatabase { name }
-                    | QueryResult::DroppedDatabase { name } => (0, Some(nul_terminated(name))),
+                    | QueryResult::DroppedDatabase { name }
+                    | QueryResult::AlteredTable { name } => (0, Some(nul_terminated(name))),
                     QueryResult::Used { db } => (0, Some(nul_terminated(db))),
                     QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
                     _ => (0, None),

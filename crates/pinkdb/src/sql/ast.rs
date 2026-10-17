@@ -58,6 +58,14 @@ pub enum Statement {
         /// `IF EXISTS`: a missing table makes the statement a no-op.
         if_exists: bool,
     },
+    /// `ALTER TABLE` (wave 65): add a column (with an optional constant
+    /// `DEFAULT`), drop a column, rename a column, or rename the table.
+    AlterTable {
+        /// Explicit `db.` qualifier, if written (resolved at bind).
+        db: Option<String>,
+        name: String,
+        op: AlterTableOp,
+    },
     DropView {
         db: Option<String>,
         name: String,
@@ -98,6 +106,31 @@ pub enum Statement {
     /// `EXPLAIN <select>`: print the bound (optimized) plan.
     Explain(Box<Select>),
     Select(Select),
+}
+
+/// One `ALTER TABLE` operation (wave 65).
+///
+/// `ADD COLUMN` carries the column definition (type + inline constraints; the
+/// binder accepts only `NOT NULL`, which needs a non-NULL `DEFAULT` on a
+/// non-empty table — DuckDB's rule) plus the optional `DEFAULT` expression.
+/// The default is bound as a constant expression and evaluated once when the
+/// statement runs; every existing row (and every later `INSERT` that omits
+/// the column) reads that value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableOp {
+    AddColumn {
+        column: ColumnDef,
+        /// `DEFAULT <expr>`: bound in an empty scope (constants only).
+        default: Option<Expr>,
+        /// `IF NOT EXISTS`: an existing column makes the statement a no-op.
+        if_not_exists: bool,
+    },
+    /// `DROP [COLUMN] <name> [IF EXISTS]`.
+    DropColumn { name: String, if_exists: bool },
+    /// `RENAME COLUMN <from> TO <to>`.
+    RenameColumn { from: String, to: String },
+    /// `RENAME TO <to>`: rename the whole table.
+    RenameTable { to: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -64,7 +64,10 @@ enum {
      * declared name. */
     PINKDB_STMT_LOADED_EXTENSION = 14,
     /* CHECKPOINT (a no-op for in-memory databases). */
-    PINKDB_STMT_CHECKPOINTED = 15
+    PINKDB_STMT_CHECKPOINTED = 15,
+    /* ALTER TABLE: pinkdb_result_name returns the table's name after the
+     * statement (a RENAME TO reports the new name). */
+    PINKDB_STMT_ALTERED_TABLE = 16
 };
 
 /* Value / column type tags. */

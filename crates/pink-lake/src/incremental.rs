@@ -131,6 +131,11 @@ pub struct Commit {
     /// the spec, `None` clears it. Applied to the table's catalog entry when
     /// the commit publishes; the table must exist.
     partition_changes: BTreeMap<String, Option<Vec<PartitionKey>>>,
+    /// Schema records this commit publishes (wave 65), per `db.table`: an
+    /// added/dropped/renamed column's new [`TableSchema`](crate::schema::TableSchema).
+    /// Set by [`Lake::commit_from_tables`]; a hand-built commit leaves it
+    /// empty (no schema change).
+    schemas: BTreeMap<String, crate::schema::TableSchema>,
     /// Table entries a row-level diff was computed against (`None` = the
     /// table must not exist), set by [`Lake::commit_from_tables`]. When one
     /// of these tables changed in the lake before the publish lands, the
@@ -242,6 +247,7 @@ impl Commit {
             && self.deletes.is_empty()
             && self.drops.is_empty()
             && self.partition_changes.is_empty()
+            && self.schemas.is_empty()
     }
 
     /// Require `key`'s entry in the head to still equal `entry` (`None`: the
@@ -249,6 +255,13 @@ impl Commit {
     /// by [`Lake::commit_from_tables`]; see the `expect` field docs).
     pub(crate) fn expect_table(&mut self, key: &str, entry: Option<TableEntry>) {
         self.expect.insert(key.to_string(), entry);
+    }
+
+    /// Publish `key`'s new schema record with this commit (crate-internal:
+    /// set by [`Lake::commit_from_tables`]; the record's epoch must be the
+    /// base entry's + 1).
+    pub(crate) fn set_schema(&mut self, key: &str, schema: crate::schema::TableSchema) {
+        self.schemas.insert(key.to_string(), schema);
     }
 
     /// The appended sub-table for `table`, if any.
@@ -284,6 +297,9 @@ pub struct CommitReport {
     /// Tables whose partition specification this commit set, changed, or
     /// cleared.
     pub tables_repartitioned: usize,
+    /// Tables whose schema record this commit published (wave 65: an
+    /// `ADD`/`DROP`/`RENAME COLUMN` run against the writable session copy).
+    pub schema_changes: usize,
     /// Data files written.
     pub data_files: usize,
     /// Delete files written.
@@ -308,6 +324,7 @@ impl CommitReport {
             tables_changed: 0,
             tables_dropped: 0,
             tables_repartitioned: 0,
+            schema_changes: 0,
             data_files: 0,
             delete_files: 0,
             bytes_written: 0,
@@ -338,8 +355,22 @@ impl TableDiff {
 /// O(rows × chunks): the diff runs over whole tables.
 fn hash_row(table: &DataTable, chunk: usize, row: usize) -> u64 {
     // FNV-1a, 64-bit.
-    const PRIME: u64 = 0x100_0000_01b3;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for col in 0..table.num_cols() {
+        mix_value(&mut h, &table.columns[col].chunks[chunk].get(row));
+    }
+    h
+}
+
+/// One current-schema column as a base-version row reads it (the write-side
+/// projection of a schema delta, see [`crate::schema::DiffCol`]).
+use crate::schema::DiffCol;
+
+/// FNV-1a mixing of one value (shared by both sides of the diff so an equal
+/// logical row hashes equal, whatever side it is read from).
+fn mix_value(h: &mut u64, v: &Value) {
     fn mix(h: &mut u64, tag: u8, bytes: &[u8]) {
+        const PRIME: u64 = 0x100_0000_01b3;
         *h ^= tag as u64;
         *h = h.wrapping_mul(PRIME);
         for &b in bytes {
@@ -347,34 +378,42 @@ fn hash_row(table: &DataTable, chunk: usize, row: usize) -> u64 {
             *h = h.wrapping_mul(PRIME);
         }
     }
+    match v {
+        Value::Null => mix(h, 0, &[]),
+        Value::Boolean(b) => mix(h, 1, &[*b as u8]),
+        Value::Integer(i) => mix(h, 2, &i.to_le_bytes()),
+        Value::Bigint(i) => mix(h, 3, &i.to_le_bytes()),
+        Value::Double(d) => mix(h, 4, &d.to_bits().to_le_bytes()),
+        Value::Varchar(s) => mix(h, 5, s.as_bytes()),
+        Value::Date(d) => mix(h, 6, &d.to_le_bytes()),
+        Value::Timestamp(t) => mix(h, 7, &t.to_le_bytes()),
+        Value::Decimal(v, scale) => {
+            let mut b = [0u8; 17];
+            b[..16].copy_from_slice(&v.to_le_bytes());
+            b[16] = *scale;
+            mix(h, 8, &b);
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            let mut b = [0u8; 16];
+            b[..4].copy_from_slice(&months.to_le_bytes());
+            b[4..8].copy_from_slice(&days.to_le_bytes());
+            b[8..].copy_from_slice(&micros.to_le_bytes());
+            mix(h, 9, &b);
+        }
+    }
+}
+
+/// [`hash_row`] for a base row read through a schema-delta view.
+fn hash_row_view(base: &DataTable, chunk: usize, row: usize, view: &[DiffCol]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for col in 0..table.num_cols() {
-        match table.columns[col].chunks[chunk].get(row) {
-            Value::Null => mix(&mut h, 0, &[]),
-            Value::Boolean(b) => mix(&mut h, 1, &[b as u8]),
-            Value::Integer(i) => mix(&mut h, 2, &i.to_le_bytes()),
-            Value::Bigint(i) => mix(&mut h, 3, &i.to_le_bytes()),
-            Value::Double(d) => mix(&mut h, 4, &d.to_bits().to_le_bytes()),
-            Value::Varchar(s) => mix(&mut h, 5, s.as_bytes()),
-            Value::Date(d) => mix(&mut h, 6, &d.to_le_bytes()),
-            Value::Timestamp(t) => mix(&mut h, 7, &t.to_le_bytes()),
-            Value::Decimal(v, scale) => {
-                let mut b = [0u8; 17];
-                b[..16].copy_from_slice(&v.to_le_bytes());
-                b[16] = scale;
-                mix(&mut h, 8, &b);
-            }
-            Value::Interval {
-                months,
-                days,
-                micros,
-            } => {
-                let mut b = [0u8; 16];
-                b[..4].copy_from_slice(&months.to_le_bytes());
-                b[4..8].copy_from_slice(&days.to_le_bytes());
-                b[8..].copy_from_slice(&micros.to_le_bytes());
-                mix(&mut h, 9, &b);
-            }
+    for col in view {
+        match col {
+            DiffCol::Base(index) => mix_value(&mut h, &base.columns[*index].chunks[chunk].get(row)),
+            DiffCol::Added(v) => mix_value(&mut h, v.as_ref().unwrap_or(&Value::Null)),
         }
     }
     h
@@ -391,22 +430,25 @@ fn values_identical(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Exact row equality over two tables (same column count), addressed by
-/// `(chunk, row-in-chunk)`.
-fn rows_identical(
+/// [`rows_identical`] for a base row read through a schema-delta view: `a` is
+/// the base table, `b` the current one, and `view[i]` says where the current
+/// column `i` comes from in `a` (a column, or a constant default).
+fn rows_identical_view(
     a: &DataTable,
     ac: usize,
     ar: usize,
     b: &DataTable,
     bc: usize,
     br: usize,
+    view: &[DiffCol],
 ) -> bool {
-    a.num_cols() == b.num_cols()
-        && (0..a.num_cols()).all(|col| {
-            values_identical(
-                &a.columns[col].chunks[ac].get(ar),
-                &b.columns[col].chunks[bc].get(br),
-            )
+    view.len() == b.num_cols()
+        && view.iter().enumerate().all(|(i, col)| {
+            let bv = &b.columns[i].chunks[bc].get(br);
+            match col {
+                DiffCol::Base(bi) => values_identical(&a.columns[*bi].chunks[ac].get(ar), bv),
+                DiffCol::Added(v) => values_identical(v.as_ref().unwrap_or(&Value::Null), bv),
+            }
         })
 }
 
@@ -414,11 +456,16 @@ fn rows_identical(
 /// order minus their existing delete positions) and `current`.
 ///
 /// `base_files` is the base version's physical layout; the caller has already
-/// validated `base.num_rows()` against it.
+/// validated `base.num_rows()` against it. `view` projects a base row onto
+/// the current schema (`view.len() == current.num_cols()`): an exact match,
+/// a rename, or a constant for a column the base predates (wave 65). An
+/// identity view (`DiffCol::Base(i)` per column) is the no-schema-change
+/// case.
 pub(crate) fn diff_table(
     base_files: &[(String, u64, Vec<u64>)],
     base: &DataTable,
     current: &DataTable,
+    view: &[DiffCol],
 ) -> Result<TableDiff> {
     // Logical base row → (file index, physical position).
     let mut layout: Vec<(usize, u64)> = Vec::with_capacity(base.num_rows());
@@ -467,7 +514,7 @@ pub(crate) fn diff_table(
     for bc in 0..base.num_chunks() {
         let len = base.columns[0].chunks[bc].len();
         for br in 0..len {
-            let h = hash_row(base, bc, br);
+            let h = hash_row_view(base, bc, br, view);
             let mut found: Option<(usize, usize)> = None;
             if let Some(list) = buckets.get(&h) {
                 let cursor = cursors.entry(h).or_insert(0);
@@ -476,7 +523,7 @@ pub(crate) fn diff_table(
                 }
                 for &(cand_c, cand_r) in &list[*cursor..] {
                     if !taken[flat_of[cand_c] + cand_r]
-                        && rows_identical(base, bc, br, current, cand_c, cand_r)
+                        && rows_identical_view(base, bc, br, current, cand_c, cand_r, view)
                     {
                         found = Some((cand_c, cand_r));
                         break;
@@ -553,17 +600,53 @@ pub(crate) fn sub_table(src: &DataTable, indices: &[usize]) -> Result<DataTable>
     Ok(out)
 }
 
+/// Project a base-version table onto the current schema through a schema
+/// delta's view: `DiffCol::Base(i)` columns are shared (`Arc` clones, no
+/// copy), `DiffCol::Added` columns become constants chunk-aligned with the
+/// base. Output names/types come from `current` (the shape the result must
+/// have).
+fn project_base_table(
+    base: &DataTable,
+    current: &DataTable,
+    view: &[DiffCol],
+) -> Result<DataTable> {
+    let mut columns = Vec::with_capacity(view.len());
+    for (i, col) in view.iter().enumerate() {
+        match col {
+            DiffCol::Base(bi) => {
+                let mut c = base.columns[*bi].clone();
+                c.name = current.columns[i].name.clone();
+                columns.push(c);
+            }
+            DiffCol::Added(v) => columns.push(crate::schema::constant_column(
+                &current.columns[i].name,
+                current.columns[i].dtype,
+                v.as_ref(),
+                base,
+            )?),
+        }
+    }
+    Ok(DataTable::from_columns(
+        current.name.clone(),
+        columns,
+        base.num_rows(),
+    ))
+}
+
 /// The base table's logical content after a diff lands: base rows minus the
 /// deleted positions, plus the appended rows, in merge-on-read order (the
-/// exact order the lake's readers produce). Chunks are shared where possible:
-/// this is the reference a writable attachment diffs against next, not a
-/// persisted artifact.
+/// exact order the lake's readers produce), **in the current schema** (the
+/// view projects renamed columns and materializes added columns' defaults).
+/// Chunks are shared where possible: this is the reference a writable
+/// attachment diffs against next, not a persisted artifact.
 fn rebuild_logical(
     base: &DataTable,
+    current: &DataTable,
+    view: &[DiffCol],
     layout: &[(String, u64, Vec<u64>)],
     diff: &TableDiff,
-    current: &DataTable,
 ) -> Result<DataTable> {
+    let base = project_base_table(base, current, view)?;
     // Physical (file, position) → logical index, and the deleted logical
     // indices.
     let deleted: BTreeSet<(usize, u64)> = diff
@@ -720,7 +803,10 @@ impl WritableAttachment {
             let changed = match db.table_in(dbname, table) {
                 Ok(current) => {
                     let files = self.base_layout(key)?;
-                    !diff_table(&files, base_table, current)?.is_empty()
+                    let entry = self.base_entry(key)?;
+                    let delta = crate::schema::plan_schema_delta(key, &entry, base_table, current)?;
+                    !diff_table(&files, base_table, current, &delta.view)?.is_empty()
+                        || delta.record.is_some()
                 }
                 Err(_) => true,
             };
@@ -738,10 +824,50 @@ impl WritableAttachment {
     /// the attachment are ignored (use `Lake::write_from_store` — `.lake
     /// save` — to publish new tables).
     ///
+    /// A schema change (an `ADD COLUMN`/`DROP COLUMN`/`RENAME COLUMN` run
+    /// against the session table, wave 65) publishes a new schema record with
+    /// the version: old data files stay untouched and readable through the
+    /// name/default mapping, appended rows are written under the new schema,
+    /// and positional delete files keep their positions. A `RENAME TABLE` is
+    /// **not** published through a commit (a base table that disappeared is
+    /// treated as a drop); the CLI refuses the commit when it detects one.
+    ///
     /// On success the pinned base advances to the published version with the
     /// tables' logical content **in the lake's merge-on-read order**, so the
     /// next diff's positional mapping stays exact.
     pub fn commit(&mut self, db: &PinkDb, settings: &CommitSettings) -> Result<CommitReport> {
+        // A base table that vanished from the session while a same-shaped
+        // sibling appeared is almost certainly a RENAME TABLE (the engine
+        // supports it, but an incremental commit publishes data changes, not
+        // renames — publishing it as a drop would silently lose the new
+        // name's rows). Refuse with the way out instead.
+        for (key, base_table) in &self.base {
+            let (dbname, table) = split_key(key, self.location())?;
+            if db.table_in(dbname, table).is_ok() {
+                continue;
+            }
+            for other in db.list_tables_in(dbname) {
+                let other_key = format!("{dbname}.{other}");
+                if self.base.contains_key(&other_key) || other_key.eq_ignore_ascii_case(key) {
+                    continue;
+                }
+                if db
+                    .table_in(dbname, &other)
+                    .is_ok_and(|t| t.schema() == base_table.schema())
+                {
+                    return Err(LakeError::NotRepresentable {
+                        message: format!(
+                            "table \"{key}\" is gone from the session while \"{other_key}\" \
+                             (the same shape) appeared: a RENAME TABLE is not published \
+                             through .lake commit (incremental commits move rows and schema, \
+                             not names). Publish the store as a full snapshot with \
+                             `.lake save <dir>`, or keep the name and commit the schema/row \
+                             change instead"
+                        ),
+                    });
+                }
+            }
+        }
         let base: Vec<(String, Arc<DataTable>)> = self
             .base
             .iter()
@@ -799,6 +925,22 @@ impl WritableAttachment {
             ),
         })?;
         self.lake.entry_layout(entry, key, &manifest_path)
+    }
+
+    /// The base version's catalog entry of one table (for schema deltas).
+    fn base_entry(&self, key: &str) -> Result<TableEntry> {
+        let (manifest, manifest_path) = self.lake.manifest(Some(self.base_version))?;
+        manifest
+            .tables
+            .get(key)
+            .cloned()
+            .ok_or_else(|| LakeError::Corrupt {
+                path: manifest_path,
+                message: format!(
+                    "the writable attachment holds table \"{key}\", but version {} does not",
+                    self.base_version
+                ),
+            })
     }
 }
 
@@ -1119,28 +1261,17 @@ impl Lake {
                             ),
                         });
                     }
-                    if base_table.schema() != table.schema() {
-                        return Err(LakeError::NotRepresentable {
-                            message: format!(
-                                "table \"{key}\" changed shape: its schema is now {:?}, but \
-                                 version {base_version} holds {:?}; schema evolution is not \
-                                 part of this wave (re-save the lake with .lake save)",
-                                table
-                                    .schema()
-                                    .iter()
-                                    .map(|(n, t)| format!("{n} {t}"))
-                                    .collect::<Vec<_>>(),
-                                base_table
-                                    .schema()
-                                    .iter()
-                                    .map(|(n, t)| format!("{n} {t}"))
-                                    .collect::<Vec<_>>(),
-                            ),
-                        });
+                    // The schema delta (wave 65): a rename maps old files to
+                    // the new name, an added column materializes its default
+                    // on read, a dropped one hides. Published with the commit
+                    // when it changed anything.
+                    let delta = crate::schema::plan_schema_delta(key, &entry, base_table, table)?;
+                    if let Some(record) = &delta.record {
+                        commit.set_schema(key, record.clone());
                     }
                     let layout = self.entry_layout(&entry, key, &manifest_path)?;
-                    let diff = diff_table(&layout, base_table, table)?;
-                    if diff.is_empty() {
+                    let diff = diff_table(&layout, base_table, table, &delta.view)?;
+                    if diff.is_empty() && delta.record.is_none() {
                         after.insert((*key).to_string(), Arc::clone(table));
                         continue;
                     }
@@ -1155,16 +1286,38 @@ impl Lake {
                     }
                     after.insert(
                         (*key).to_string(),
-                        Arc::new(rebuild_logical(base_table, &layout, &diff, table)?),
+                        Arc::new(rebuild_logical(
+                            base_table,
+                            table,
+                            &delta.view,
+                            &layout,
+                            &diff,
+                        )?),
                     );
                 }
                 None => {
                     // A table the base version does not have: create it with
                     // its whole content as one data file — and refuse if
                     // another writer created it in between (the two contents
-                    // are not the same change).
+                    // are not the same change). It gets a schema record from
+                    // the start (epoch 1).
                     commit.expect_table(key, None);
                     commit.append(key, Arc::clone(table));
+                    let record = crate::schema::TableSchema {
+                        version: 1,
+                        columns: table
+                            .columns
+                            .iter()
+                            .map(|c| crate::schema::SchemaColumn {
+                                name: c.name.clone(),
+                                dtype: c.dtype,
+                                default: c.default.clone().filter(|v| !v.is_null()),
+                                added: 1,
+                            })
+                            .collect(),
+                        renames: Vec::new(),
+                    };
+                    commit.set_schema(key, record);
                     after.insert((*key).to_string(), Arc::clone(table));
                 }
             }
@@ -1303,6 +1456,18 @@ impl Lake {
             let appended = commit.appends.get(key).expect("uploaded append has rows");
             let added = appended.num_rows() as u64;
             rows_added += added;
+            // A new file's schema epoch: the record the commit publishes for
+            // this table, else the entry's current epoch (a recorded entry's
+            // files always carry one), else none (legacy entry).
+            let file_version = commit
+                .schemas
+                .get(key)
+                .map(|s| s.version)
+                .or_else(|| tables.get(key).map(|e| e.schema_version).filter(|v| *v > 0));
+            let files: Vec<crate::catalog::FileRef> = files
+                .iter()
+                .map(|f| f.with_schema_version(file_version))
+                .collect();
             match tables.get_mut(key) {
                 Some(entry) => {
                     entry.files.extend(files.iter().cloned());
@@ -1340,6 +1505,9 @@ impl Lake {
                             stats: None,
                             deletes: Vec::new(),
                             partition_by: spec.clone(),
+                            schema_version: 0,
+                            columns: None,
+                            renames: Vec::new(),
                         },
                     );
                     let delta = deltas.entry(key.clone()).or_default();
@@ -1351,6 +1519,31 @@ impl Lake {
                     }
                 }
             }
+        }
+        // The schema records this commit publishes (wave 65): the new epoch
+        // and columns; every file that predates the record (or predates this
+        // change) is stamped with the epoch it was written under.
+        for (key, record) in &commit.schemas {
+            let Some(entry) = tables.get_mut(key) else {
+                return Err(PublishFailure::Fatal(LakeError::Corrupt {
+                    path: self.storage.abs(CATALOG_FILE),
+                    message: format!(
+                        "the commit publishes a schema for table \"{key}\", but the head \
+                         version does not have it"
+                    ),
+                }));
+            };
+            let previous = record.version.saturating_sub(1).max(1);
+            for file in &mut entry.files {
+                if file.schema_version().is_none() {
+                    *file = file.with_schema_version(Some(previous));
+                }
+            }
+            let (version, columns, renames) =
+                record.to_entry_fields().map_err(PublishFailure::Fatal)?;
+            entry.schema_version = version;
+            entry.columns = Some(columns);
+            entry.renames = renames;
         }
         for (key, files) in &uploaded.deletes {
             let entry = tables.get_mut(key).ok_or_else(|| {
@@ -1466,6 +1659,7 @@ impl Lake {
         let changes = crate::manifest_for(&*self.storage, &self.root, Some(version - 1))
             .ok()
             .map(|(previous, _)| crate::snapshot::ChangeSummary::diff(&previous.tables, &tables));
+        let schema_version = crate::next_schema_version(Some(&head), &tables);
         let new_catalog = crate::catalog::Catalog {
             format_version: crate::FORMAT_VERSION,
             updated: crate::time::iso8601_utc(std::time::SystemTime::now()),
@@ -1474,6 +1668,7 @@ impl Lake {
             author,
             commit_message,
             changes,
+            schema_version,
         };
         let snapshot_bytes =
             crate::manifest_json(&new_catalog, &self.root).map_err(PublishFailure::Fatal)?;
@@ -1512,6 +1707,7 @@ impl Lake {
                         .is_none_or(|entry| entry.partition_by.as_ref() != spec.as_ref())
                 })
                 .count(),
+            schema_changes: commit.schemas.len(),
             data_files: uploaded.appends.values().map(Vec::len).sum(),
             delete_files: uploaded.deletes.values().map(BTreeMap::len).sum(),
             bytes_written: uploaded.bytes
