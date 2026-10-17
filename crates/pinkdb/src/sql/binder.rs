@@ -2799,6 +2799,10 @@ fn equi_pair(conjunct: &BoundExpr, left_cols: usize) -> Option<(BoundExpr, Bound
     else {
         return None;
     };
+    // Classify an operand as referencing only the accumulated left (indices
+    // < `left_cols`), only the just-added right (indices >= `left_cols`), or
+    // neither. A MIXED operand is not an equi key: treating it as a right-side
+    // key would shift its left-side column indices below zero.
     let side = |e: &BoundExpr| -> Option<bool> {
         let mut cols = Vec::new();
         crate::optimizer::columns_in(e, &mut cols);
@@ -2806,7 +2810,15 @@ fn equi_pair(conjunct: &BoundExpr, left_cols: usize) -> Option<(BoundExpr, Bound
         if cols.is_empty() || cols.contains(&usize::MAX) {
             return None;
         }
-        Some(cols.iter().all(|i| *i < left_cols))
+        let all_left = cols.iter().all(|i| *i < left_cols);
+        let all_right = cols.iter().all(|i| *i >= left_cols);
+        if all_left {
+            Some(true)
+        } else if all_right {
+            Some(false)
+        } else {
+            None
+        }
     };
     match (side(left), side(right)) {
         (Some(true), Some(false)) => Some((

@@ -6260,6 +6260,27 @@ mod tests {
         assert_eq!(rows[0][1], V::Bigint(1));
     }
 
+    #[test]
+    fn join_on_a_mixed_operand_does_not_underflow() {
+        let mut db = sales_db();
+        // `o.id + s.id` mixes both sides, so it is not an equi key: the join
+        // must fall back to a nested loop. Treating it as a right-side key
+        // would shift the left-side column index below zero (debug panic /
+        // release wrap). No row matches (s.id = o.id + s.id ⇒ o.id = 0).
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM sales s JOIN sales o ON s.id = o.id + s.id;",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(0)]]);
+
+        // A mixed operand that does match: s.id = o.id + 0*s.id ⇒ s.id = o.id.
+        let rows = select(
+            &mut db,
+            "SELECT COUNT(*) FROM sales s JOIN sales o ON s.id = o.id + 0 * s.id;",
+        );
+        assert_eq!(rows, vec![vec![V::Bigint(4)]]);
+    }
+
     // --- phase 8: window functions ---
 
     fn win_db() -> PinkDb {

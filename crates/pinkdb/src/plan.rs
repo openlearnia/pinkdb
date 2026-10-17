@@ -1356,10 +1356,16 @@ fn as_double(v: &Value) -> f64 {
 /// joined-space subexpressions onto a single join side).
 pub(crate) fn shift_columns(expr: BoundExpr, by: usize) -> BoundExpr {
     match expr {
-        BoundExpr::Column { index, dtype } => BoundExpr::Column {
-            index: index - by,
-            dtype,
-        },
+        BoundExpr::Column { index, dtype } => {
+            debug_assert!(
+                index >= by,
+                "shift_columns would underflow: column {index} < left_cols {by}"
+            );
+            BoundExpr::Column {
+                index: index - by,
+                dtype,
+            }
+        }
         BoundExpr::InSubquery {
             expr,
             query,
