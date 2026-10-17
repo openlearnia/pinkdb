@@ -6398,6 +6398,32 @@ mod tests {
     }
 
     #[test]
+    fn range_frame_with_offset_and_null_key_uses_the_lower_bound() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (k INTEGER, v INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (NULL, 10), (1, 20), (2, 30);")
+            .unwrap();
+        // Sorted NULLS LAST: k = 1, 2, NULL. `1 FOLLOWING` keeps keys <= 2, so
+        // both k=1 and k=2 sum 20 + 30; the NULL row is restricted to its own
+        // NULL peer group (DuckDB) and must sum only v=10. The running
+        // accumulator used to ignore the frame's lower bound and report 60.
+        let rows = select(
+            &mut db,
+            "SELECT k, SUM(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS s \
+             FROM t ORDER BY k;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Integer(1), V::Bigint(50)],
+                vec![V::Integer(2), V::Bigint(50)],
+                vec![V::Null, V::Bigint(10)],
+            ]
+        );
+    }
+
+    #[test]
     fn window_agg_frames() {
         let mut db = win_db();
         // Default cumulative frame with ORDER BY is DuckDB's RANGE BETWEEN

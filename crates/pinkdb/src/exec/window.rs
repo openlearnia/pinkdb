@@ -336,14 +336,23 @@ fn eval_partition(
             }
         }
         WindowFunc::Agg(f) => {
-            // `UnboundedPreceding` frames only ever grow: `hi(pos)` from the
-            // frame bounds is monotone non-decreasing (every end bound
-            // saturates; a `k PRECEDING` end is empty before it reaches row
-            // 0; RANGE end bounds are monotone in `pos` too), so one running
-            // accumulator extended row by row gives bit-identical results to
-            // recomputing each frame — but O(n) instead of O(n²) on
-            // whole-partition frames.
-            if w.frame.start == FrameBound::UnboundedPreceding {
+            // `UnboundedPreceding` frames grow monotonically in `hi(pos)`
+            // (every end bound saturates; RANGE end bounds are monotone in
+            // `pos` too), so one running accumulator over `[0, hi]` gives
+            // bit-identical results to recomputing each frame — O(n) instead of
+            // O(n²). It never reads `lo`, so it is valid only while `lo` is
+            // always 0: that fails for a RANGE frame with an offset, where a
+            // NULL ordering key restricts the frame to the NULL peer group
+            // (`lo > 0`). Those frames take the per-row recompute below.
+            let range_offset = matches!(w.frame.mode, FrameMode::Range)
+                && (matches!(
+                    w.frame.start,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                ) || matches!(
+                    w.frame.end,
+                    FrameBound::Preceding(_) | FrameBound::Following(_)
+                ));
+            if w.frame.start == FrameBound::UnboundedPreceding && !range_offset {
                 let mut acc = Acc::new(f, false);
                 let mut next_to_add = 0usize;
                 for (pos, g) in seq.iter().enumerate() {
