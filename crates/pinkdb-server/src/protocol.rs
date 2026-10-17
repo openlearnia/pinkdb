@@ -55,6 +55,18 @@ pub const PROTOCOL_VERSION: u32 = 7;
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
+/// The most rows one `Rows` frame may declare. This is a decoder-side sanity
+/// bound (the server frames at [`ROWS_PER_FRAME`]): the wire-size bound is
+/// vacuous for zero-column rows, so a hostile frame could otherwise force a
+/// huge allocation.
+pub const MAX_ROWS_PER_FRAME: usize = 1 << 16;
+
+/// The most values one `ExecutePrepared` request may carry. Each value costs a
+/// `Value` in memory, far more than its single wire tag, so the count is
+/// capped independently of the frame size (a ~60 MiB frame of NULL tags would
+/// otherwise materialize ~2 GiB).
+pub const MAX_PREPARED_VALUES: usize = 1 << 16;
+
 /// Rows per `Rows` frame when a result set is streamed (upper bound; the
 /// server may emit fewer rows per frame to keep frames well under
 /// [`MAX_FRAME_SIZE`]).
@@ -251,8 +263,9 @@ impl Request {
             msg_type::EXECUTE_PREPARED => {
                 let handle = r.u64("ExecutePrepared.handle")?;
                 let count = r.u32("ExecutePrepared value count")? as usize;
-                // Every value costs at least one tag byte.
-                if count as u64 > r.remaining() as u64 {
+                // Every value costs at least one tag byte on the wire and a
+                // `Value` in memory: bound both the wire claim and the count.
+                if count > MAX_PREPARED_VALUES || count as u64 > r.remaining() as u64 {
                     return Err(ProtocolError::Truncated("ExecutePrepared values"));
                 }
                 let mut values = Vec::with_capacity(count.min(1024));
@@ -500,9 +513,12 @@ impl Response {
                 let columns = r.u32("Rows columns")? as usize;
                 // Every cell costs at least one tag byte; a zero-column row
                 // (pinkdb's one-row `SingleRow` shape) is representable at
-                // most once, so `max(columns, 1)` bounds the claim.
+                // most once, so `max(columns, 1)` bounds the wire claim — and
+                // `MAX_ROWS_PER_FRAME` bounds the in-memory row vector, since a
+                // zero-column frame's wire cost is otherwise zero.
                 let row_cost = columns.max(1) as u64;
-                if count as u64 * row_cost > r.remaining() as u64 + 1 {
+                if count > MAX_ROWS_PER_FRAME || count as u64 * row_cost > r.remaining() as u64 + 1
+                {
                     return Err(ProtocolError::Truncated("Rows values"));
                 }
                 let mut rows = Vec::with_capacity(count.min(4096));

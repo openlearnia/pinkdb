@@ -6,7 +6,8 @@ use std::io::Cursor;
 use pinkdb::{DataType, Value};
 use pinkdb_server::protocol::{
     decode_request, decode_response, encode_request, encode_response, msg_type, read_response,
-    write_response, DoneKind, ProtocolError, Request, Response, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    write_response, DoneKind, ProtocolError, Request, Response, MAX_FRAME_SIZE,
+    MAX_PREPARED_VALUES, MAX_ROWS_PER_FRAME, PROTOCOL_VERSION,
 };
 
 fn request_round_trip(request: Request) {
@@ -352,6 +353,31 @@ fn oversized_frames_are_rejected() {
     )
     .unwrap_err();
     assert!(matches!(err, ProtocolError::FrameTooLarge { .. }), "{err}");
+}
+
+#[test]
+fn an_oversized_execute_prepared_value_count_is_rejected() {
+    // The frame carries one tag byte per claimed value, so the wire-size bound
+    // alone would pass; the count cap must reject it before it materializes one
+    // `Value` per tag.
+    let count = (MAX_PREPARED_VALUES + 1) as u32;
+    let mut body = 7u64.to_le_bytes().to_vec();
+    body.extend_from_slice(&count.to_le_bytes());
+    body.extend_from_slice(&vec![0u8; count as usize]);
+    let err = decode_request(&frame(msg_type::EXECUTE_PREPARED, &body)).unwrap_err();
+    assert!(err.to_string().contains("truncated"), "{err}");
+}
+
+#[test]
+fn an_oversized_rows_count_is_rejected() {
+    // One column, one tag byte per row: the wire-size bound alone would pass,
+    // but the claimed row count exceeds the cap.
+    let count = (MAX_ROWS_PER_FRAME + 1) as u32;
+    let mut body = count.to_le_bytes().to_vec();
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&vec![0u8; count as usize]);
+    let err = decode_response(&frame(msg_type::ROWS, &body)).unwrap_err();
+    assert!(err.to_string().contains("truncated"), "{err}");
 }
 
 #[test]
