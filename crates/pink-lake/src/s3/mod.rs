@@ -78,7 +78,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::storage::{Head, LocalCopy, ObjectInfo, Storage, VersionTag};
-use crate::{fresh_id, LakeError, Result};
+use crate::{LakeError, Result};
 
 use sigv4::{Credentials, SigningInput};
 
@@ -991,23 +991,24 @@ impl Storage for S3Storage {
 
     fn local_copy(&self, rel: &str, context: &str) -> Result<LocalCopy> {
         let bytes = self.read(rel, context)?;
-        let path = std::env::temp_dir().join(format!("pink-lake-s3-{}.pink", fresh_id()));
-        // `create_new` so a planted symlink or an old temp file at the same
-        // name is never followed or truncated; a failure removes the
-        // partial file instead of leaving it behind.
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .and_then(|mut file| io::Write::write_all(&mut file, &bytes));
-        if let Err(e) = written {
-            let _ = std::fs::remove_file(&path);
+        // Stage into a private, owner-only directory: the copy is removed when
+        // the `LocalCopy` drops, and other local users cannot read it while it
+        // exists.
+        let (dir, path) = crate::storage::private_temp_dir().map_err(|e| LakeError::Io {
+            context: format!(
+                "creating a private temp dir for {}",
+                self.abs(rel).display()
+            ),
+            source: e,
+        })?;
+        if let Err(e) = crate::storage::write_private(&path, &bytes) {
+            let _ = std::fs::remove_dir_all(&dir);
             return Err(LakeError::Io {
                 context: format!("writing the temp copy {}", path.display()),
                 source: e,
             });
         }
-        Ok(LocalCopy::Temp(path))
+        Ok(LocalCopy::Temp { file: path, dir })
     }
 }
 

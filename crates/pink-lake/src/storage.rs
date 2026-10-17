@@ -83,24 +83,108 @@ impl VersionTag {
 pub(crate) enum LocalCopy {
     /// The storage's own file; nothing to clean up.
     Path(PathBuf),
-    /// A downloaded temp copy, removed on drop (only constructed by object
+    /// A staging temp copy (decrypted plaintext or a downloaded object) inside
+    /// a private directory, removed on drop (only constructed by object
     /// storage, so it is dead code in a default build).
     #[cfg_attr(not(feature = "s3"), allow(dead_code))]
-    Temp(PathBuf),
+    Temp {
+        /// The staged file the caller reads.
+        file: PathBuf,
+        /// The private (0700) directory holding it, removed on drop.
+        dir: PathBuf,
+    },
 }
 
 impl LocalCopy {
     pub(crate) fn path(&self) -> &Path {
         match self {
-            LocalCopy::Path(path) | LocalCopy::Temp(path) => path,
+            LocalCopy::Path(path) => path,
+            LocalCopy::Temp { file, .. } => file,
         }
     }
 }
 
 impl Drop for LocalCopy {
     fn drop(&mut self) {
-        if let LocalCopy::Temp(path) = self {
-            let _ = std::fs::remove_file(path);
+        if let LocalCopy::Temp { dir, .. } = self {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// Create a private (0700, owner-only) staging directory and return it with a
+/// file path inside it. Decrypted/downloaded plaintext lives here only for as
+/// long as the engine loads it; other local users cannot read it and the
+/// directory is removed when the [`LocalCopy`] drops.
+pub(crate) fn private_temp_dir() -> std::io::Result<(PathBuf, PathBuf)> {
+    sweep_once();
+    let dir = std::env::temp_dir().join(format!(
+        "pinkdb-lake-dec-{}-{}",
+        std::process::id(),
+        crate::fresh_id()
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir)?;
+    let file = dir.join("copy.pink");
+    Ok((dir, file))
+}
+
+/// Write `bytes` to `file` with owner-only (0600) permissions, never following
+/// a pre-existing path (`create_new`).
+pub(crate) fn write_private(file: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(file)?;
+    std::io::Write::write_all(&mut f, bytes)
+}
+
+/// Sweep [`sweep_stale_temp_dirs`] once per process (the first staging call).
+fn sweep_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(sweep_stale_temp_dirs);
+}
+
+/// Best-effort: remove staging directories left behind by a crashed process.
+/// A live directory is removed on [`LocalCopy`] drop and is short-lived, so
+/// only directories older than an hour are swept.
+fn sweep_stale_temp_dirs() {
+    sweep_dir(&std::env::temp_dir(), std::time::Duration::from_secs(3600));
+}
+
+/// Remove `pinkdb-lake-dec-*` directories under `base` older than `min_age`.
+fn sweep_dir(base: &Path, min_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(min_age) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pinkdb-lake-dec-")
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t < cutoff)
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
         }
     }
 }
@@ -459,26 +543,24 @@ impl Storage for CryptoStorage {
             }
             Some(_) => {
                 // The engine opens `.pink` files by path, so unseal to a
-                // unique temp copy the caller drops when done; the plaintext
-                // exists on disk only for as long as the engine takes to load
-                // it. (Stage 1: whole-file. The engine's loader holds the
-                // whole store in memory anyway, so no streaming is lost.)
+                // private, owner-only temp copy the caller drops when done; the
+                // plaintext exists on disk only for as long as the engine takes
+                // to load it, and other local users cannot read it. (Stage 1:
+                // whole-file. The engine's loader holds the whole store in
+                // memory anyway, so no streaming is lost.)
                 let bytes = self.read(rel, context)?;
-                let path =
-                    std::env::temp_dir().join(format!("pink-lake-dec-{}.pink", crate::fresh_id()));
-                let written = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                    .and_then(|mut file| std::io::Write::write_all(&mut file, &bytes));
-                if let Err(e) = written {
-                    let _ = std::fs::remove_file(&path);
+                let (dir, path) = private_temp_dir().map_err(|e| LakeError::Io {
+                    context: format!("creating a private temp dir for the decrypted copy of {rel}"),
+                    source: e,
+                })?;
+                if let Err(e) = write_private(&path, &bytes) {
+                    let _ = std::fs::remove_dir_all(&dir);
                     return Err(LakeError::Io {
                         context: format!("writing the decrypted temp copy {}", path.display()),
                         source: e,
                     });
                 }
-                Ok(LocalCopy::Temp(path))
+                Ok(LocalCopy::Temp { file: path, dir })
             }
         }
     }
@@ -775,5 +857,59 @@ mod tests {
         let err = storage.read("data/plain.pink", "reading").unwrap_err();
         assert!(matches!(err, LakeError::NotEncrypted { .. }), "{err:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A staging copy of decrypted (or downloaded) plaintext lives in a private
+    /// 0700 directory as a 0600 file, and the whole directory is removed when
+    /// the `LocalCopy` drops.
+    #[cfg(unix)]
+    #[test]
+    fn staging_copies_are_owner_only_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, file) = private_temp_dir().unwrap();
+        write_private(&file, b"top-secret plaintext").unwrap();
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "temp dir mode {dir_mode:o}");
+        let file_mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600, "temp file mode {file_mode:o}");
+        {
+            let copy = LocalCopy::Temp {
+                file: file.clone(),
+                dir: dir.clone(),
+            };
+            assert_eq!(copy.path(), file.as_path());
+            assert!(file.exists());
+        }
+        assert!(!dir.exists(), "the private temp dir must go on drop");
+    }
+
+    /// A staging directory left by a crashed process (older than an hour) is
+    /// swept; a fresh one is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn stale_staging_dirs_are_swept_fresh_ones_kept() {
+        // A private base dir keeps this independent of the other tests in this
+        // binary (which stage under the shared system temp dir).
+        let base = std::env::temp_dir().join(format!(
+            "pinkdb-sweep-test-{}-{}",
+            std::process::id(),
+            crate::fresh_id()
+        ));
+        let stale = base.join("pinkdb-lake-dec-1-stale");
+        let fresh = base.join("pinkdb-lake-dec-2-fresh");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("copy.pink"), b"leftover plaintext").unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+
+        sweep_dir(&base, std::time::Duration::from_secs(3600));
+        assert!(!stale.exists(), "a stale staging dir must be swept");
+        assert!(fresh.exists(), "a fresh staging dir must be kept");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
