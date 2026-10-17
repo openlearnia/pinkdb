@@ -941,3 +941,13 @@ Java bindings.
   pinkdb **452/452** (+prepared 22; encryption 469 + 21), CLI lake+s3 **91**
   (multiprocess 27/27), pink-lake 29 + vortex 38, `bench/duckdiff.py`
   **171/171**, workspace green. Worktree `wt-pkfk` removed after landing.
+- 2026-10-17 — Multiprocess harness determinism fix (`one_call_transaction_conflict_is_retried_by_the_cli`):
+  the committer fed a fixed 500-insert burst before P2 spawned, so on the
+  macOS CI runner the burst could finish before P2's transaction window even
+  opened — the expected conflict never happened and the test hit the 120 s
+  bound (wave-41 CI red on `accf8cb`, macOS only; every other job green). The
+  committer is now fed continuously from a background thread
+  (`Cli::feed_until_stopped`, 5 ms cadence) and stopped + killed immediately
+  after the conflict line, so the retry sees a quiescent store and commits
+  within the bounded budget. 6/6 local repeats in ~2.3 s each; suite **26/26**
+  (default) and **27/27** (`lake,s3`), clippy clean.

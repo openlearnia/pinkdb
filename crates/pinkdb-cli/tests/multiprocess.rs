@@ -14,7 +14,7 @@ mod common;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use pinkdb::{PinkDb, QueryResult, SyncPolicy, Value};
 
@@ -41,7 +41,7 @@ fn cleanup(ckpt: &Path) {
 /// lines synchronized by polling the output stream.
 struct Cli {
     child: Child,
-    stdin: std::process::ChildStdin,
+    stdin: Option<std::process::ChildStdin>,
     lines: std::sync::mpsc::Receiver<String>,
     out: String,
 }
@@ -92,7 +92,7 @@ impl Cli {
         });
         Cli {
             child,
-            stdin,
+            stdin: Some(stdin),
             lines,
             out: String::new(),
         }
@@ -104,10 +104,12 @@ impl Cli {
     }
 
     fn send(&mut self, sql: &str) {
-        self.stdin
-            .write_all(sql.as_bytes())
-            .expect("write to CLI stdin");
-        self.stdin.flush().expect("flush CLI stdin");
+        let stdin = self
+            .stdin
+            .as_mut()
+            .expect("stdin available (not handed to a feeder thread)");
+        stdin.write_all(sql.as_bytes()).expect("write to CLI stdin");
+        stdin.flush().expect("flush CLI stdin");
     }
 
     fn next_line(&mut self) -> String {
@@ -217,6 +219,31 @@ impl Cli {
     fn kill(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// Feed one `sql` line at a fixed cadence from a background thread until
+    /// `stop` is set or the process dies, and hand back the stop flag and
+    /// the thread handle. Used to keep a committer's conflicting frames
+    /// landing inside another process's transaction window on any machine
+    /// speed (a fixed burst can finish before that window even opens).
+    fn feed_until_stopped(
+        &mut self,
+        sql: &'static str,
+    ) -> (std::sync::Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let mut stdin = self.stdin.take().expect("stdin not already handed out");
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread_stop = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Relaxed) {
+                // The child can die mid-feed (the test kills it once the
+                // conflict is observed): a failed write simply ends the loop.
+                if stdin.write_all(sql.as_bytes()).is_err() || stdin.flush().is_err() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        (stop, handle)
     }
 }
 
@@ -587,14 +614,14 @@ fn one_call_transaction_conflict_is_retried_by_the_cli() {
     setup.send(&format!(".import {} r\n", csv.display()));
     setup.wait_for("Imported");
     setup.quit();
-    // The background committer: autocommit inserts into t, one per line.
+    // The background committer: autocommit inserts into t, one per line,
+    // fed continuously until the conflict is observed. A fixed burst can
+    // finish before P2's transaction window even opens (P2 spawns/opens
+    // after it), so the conflict would never happen; a continuous feed
+    // guarantees overlapping frames on any machine speed.
     let mut p1 = Cli::spawn(&dir, None);
     p1.open("db.pink");
-    let mut script = String::new();
-    for _ in 0..500 {
-        script.push_str("INSERT INTO t VALUES (-1);\n");
-    }
-    p1.send(&script);
+    let (stop, feeder) = p1.feed_until_stopped("INSERT INTO t VALUES (-1);\n");
     let mut p2 = Cli::spawn(&dir, None);
     p2.open("db.pink");
     // P2's whole transaction as one input line.
@@ -606,9 +633,14 @@ fn one_call_transaction_conflict_is_retried_by_the_cli() {
     // the CLI reports it and re-runs the whole buffered call.
     let line = p2.expect_error("write conflict");
     assert!(line.contains("main.t"), "{line}");
-    p2.wait_for("Retrying the transaction");
-    // Stop the committer so the retry (which re-runs the reads) commits.
+    // Stop the committer first: the retry (which re-runs the reads) then sees
+    // a quiescent store and commits within the bounded budget. The conflict
+    // line is printed before the first retry starts, so killing here leaves
+    // at most that retry exposed to a straggler frame.
+    stop.store(true, Ordering::SeqCst);
     p1.kill();
+    let _ = feeder.join();
+    p2.wait_for("Retrying the transaction");
     p2.wait_for("Transaction committed.");
     p2.quit();
     let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
