@@ -74,7 +74,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 40h | Lake: incremental saves, `.lake gc`, `lake_scan` SQL access + time travel, bulk typed decode, encode panic guard | queued | — |
 | 40i | Extension trust + distribution: Ed25519 artifact signatures, SQL `INSTALL`, Linux artifacts, Python wheel, standalone Go module | queued | — |
 | 40j | Test depth: window/plan unit tests, WAL fuzz, persist property tests, duckdiff gated in CI | queued | — |
-| 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | queued | — |
+| 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | in progress | worktree `wt-pkfk` (patch integration) |
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
 | 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + JavaScript procedures (optional embedded engine; WAL-replay determinism must be solved) | queued | — |
@@ -90,21 +90,24 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 54 | Core extension: **math** — `sqrt`, `pow`, `log`/`ln`/`exp`, trig, `floor`/`ceil`, `sign`, `greatest`/`least`, `random` (volatile-flagged) | queued | `extensions/math` |
 | 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) — done: column-vs-literal comparison fast path (`filter_str` 5.39 → 1.60 ms, battery 235.5 ms best-ever); audit deltas attributed (per-chunk literal Vectors + codegen/thermal noise), fused-path choice validated | done | core |
 | 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
-| 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | queued | — |
+| 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | in progress | worktree `wt-lake-encryption` (patch integration) |
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | done | landed; duckdiff 88 → 155 probes |
-| 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | queued | — |
+| 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | in progress | worktree `wt-prepared` (patch integration) |
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
-| 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | queued | — |
+| 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | in progress | worktree `wt-types` (patch integration) |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Parallel feature work (Oct 2026): waves 58 (SQL completeness), 60 (functions) and
-61 (optimizer work) were built in dedicated git worktrees and all three landed on
-main one at a time (60 → 61 → 58) with full gates plus CI; 45o landed first
-(optimistic commits). 59 (prepared statements) and 62 (DECIMAL/INTERVAL types) are
-queued; the schema-feature waves (declarative PK/FK constraints, indexes,
-materialized views) remain in the numbered queue.
+Parallel feature work (Oct 2026): the first batch — waves 58 (SQL completeness),
+60 (functions) and 61 (optimizer work) — landed one at a time (60 → 61 → 58)
+with full gates plus CI. **Second batch in flight**: waves 57 (lake encryption),
+59 (prepared statements), 62 (DECIMAL/INTERVAL) and 41 (PK/FK constraints) run in
+four worktrees (`wt-lake-encryption`, `wt-prepared`, `wt-types`, `wt-pkfk`) off
+41fd01b; each integrates as a patch with full gates + CI, one at a time. Note:
+41 and 62 both bump the `.pink` on-disk format — reconcile versions/tags at
+integration. Indexes (42), materialized views (43), stored procedures (44) and
+the remaining queue (46–49, 51–56) stay numbered.
 
 Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
