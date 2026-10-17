@@ -60,14 +60,16 @@ fn print_help() {
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     if cfg!(any(feature = "lake", feature = "lake-lite")) {
         if cfg!(feature = "s3") {
-            println!(
-                "  .lake save <dir|s3://bucket/prefix> [force]   snapshot the store into a lake"
-            );
+            println!("  .lake save <dir|s3://bucket/prefix> [force] [author '…'] [message '…']");
+            println!("                                snapshot the store into a lake");
             println!(
                 "  .lake open <dir|s3://…> [v]  load the lake's latest (or version v) into memory"
             );
         } else {
-            println!("  .lake save <dir> [force]  snapshot the store into a lake directory");
+            println!(
+                "  .lake save <dir> [force] [author '…'] [message '…']  snapshot the store \
+                 into a lake"
+            );
             println!(
                 "  .lake open <dir> [v]      load the lake's latest (or version v) into memory"
             );
@@ -78,9 +80,16 @@ fn print_help() {
         println!("  .lake detach <dir|s3://…>    detach one attached lake");
         println!("  .lake attached              list attached lakes and their tables");
         println!("  .lake versions <dir|s3://…>  list the lake's published versions");
+        println!(
+            "  .lake snapshots <dir|s3://…>  per-version records: time, author, message, changes"
+        );
         println!("  .lake tables <dir|s3://…>    list the current version's tables and row counts");
         println!(
             "  .lake info <dir|s3://…>      show the lake's format version, versions, and tables"
+        );
+        println!(
+            "  FROM t AT (VERSION => n)     query an attached lake table at a version \
+             (or AT (TIMESTAMP => TIMESTAMP '…'))"
         );
         if !cfg!(feature = "s3") {
             println!("  .lake s3:// URLs need a build with the `s3` feature");

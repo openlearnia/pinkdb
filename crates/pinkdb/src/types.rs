@@ -408,6 +408,62 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     Some(days * 86_400_000_000 + h * 3_600_000_000 + mi * 60_000_000 + sec * 1_000_000 + micros)
 }
 
+/// `YYYY-MM-DDTHH:MM:SS[.ffffff]Z` → microseconds since the Unix epoch: the
+/// ISO-8601 UTC form pink-lake manifests store as `updated` (millisecond
+/// precision). A missing fraction and up to 6 fractional digits are accepted;
+/// the trailing `Z` is required. Anything else is `None` — callers report a
+/// malformed record rather than guessing an instant.
+///
+/// This is deliberately separate from [`parse_timestamp`]: that one parses the
+/// engine's naive TIMESTAMP literals (no zone suffix). It exists so the
+/// `AT (TIMESTAMP => …)` clause can accept the exact string `.lake snapshots`
+/// prints, and so the lake layer validates manifest times with the engine's
+/// own date rules.
+pub fn parse_iso8601_utc(s: &str) -> Option<i64> {
+    let date = s.strip_suffix('Z')?;
+    let (date_part, time_part) = date.split_once('T')?;
+    let shaped = date_part.len() == 10
+        && date_part.bytes().enumerate().all(|(i, b)| {
+            matches!(i, 4 | 7)
+                .then(|| b == b'-')
+                .unwrap_or(b.is_ascii_digit())
+        });
+    if !shaped || time_part.len() < 8 {
+        return None;
+    }
+    // Full calendar validation (leap days included) through the same parser
+    // DATE literals use, so a lake time can never disagree with a query.
+    let days = parse_date(date_part)? as i64;
+    let (hms, frac) = match time_part.split_once('.') {
+        Some((h, f)) => {
+            if f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (h, Some(f))
+        }
+        None => (time_part, None),
+    };
+    if hms.len() != 8 || hms.as_bytes()[2] != b':' || hms.as_bytes()[5] != b':' {
+        return None;
+    }
+    let num = |lo: usize, hi: usize| hms[lo..hi].parse::<i64>().ok();
+    let (h, mi, sec) = (num(0, 2)?, num(3, 5)?, num(6, 8)?);
+    if h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let micros = match frac {
+        None => 0,
+        Some(f) => {
+            let mut v: i64 = f.parse().ok()?;
+            for _ in f.len()..6 {
+                v *= 10;
+            }
+            v
+        }
+    };
+    Some(days * 86_400_000_000 + h * 3_600_000_000 + mi * 60_000_000 + sec * 1_000_000 + micros)
+}
+
 /// `YYYY-MM-DD`.
 pub fn format_date(days: i32) -> String {
     let (y, m, d) = civil_from_days(days);
@@ -1407,6 +1463,51 @@ mod tests {
         // Format→parse round trip.
         for us in [0, 1, -1, 86_400_000_000, 1_234_567_890_123_456] {
             assert_eq!(parse_timestamp(&format_timestamp(us)), Some(us), "us {us}");
+        }
+    }
+
+    /// The manifest `updated` form: strict `Z`-suffixed ISO-8601 UTC.
+    #[test]
+    fn iso8601_utc_parse() {
+        assert_eq!(parse_iso8601_utc("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_utc("2026-10-17T12:30:36.029Z"),
+            Some(1_792_240_236_029_000)
+        );
+        // A leap day, consistent with `parse_date`.
+        assert_eq!(
+            parse_iso8601_utc("2020-02-29T00:00:00Z"),
+            parse_timestamp("2020-02-29 00:00:00")
+        );
+        // The exact inverse of the lake formatter for a spread of instants.
+        for us in [
+            0,
+            1_000, // 1 ms
+            86_400_000_000,
+            1_792_240_236_029_000,
+        ] {
+            let (days, h, mi, sec, micro) = split_timestamp(us);
+            let iso = format!(
+                "{}T{h:02}:{mi:02}:{sec:02}.{:03}Z",
+                format_date(days),
+                micro / 1_000
+            );
+            assert_eq!(parse_iso8601_utc(&iso), Some(us / 1_000 * 1_000), "{iso}");
+        }
+        // Malformed or non-UTC input is a clean None, never a guess.
+        for bad in [
+            "2020-02-29T00:00:00",       // missing Z
+            "2020-02-29T00:00:00+05:30", // offsets are not this format
+            "2020-02-30T00:00:00.000Z",
+            "2021-02-29T00:00:00.000Z",
+            "2020-13-01T00:00:00.000Z",
+            "2020-02-29 00:00:00.000Z",
+            "2020-02-29T24:00:00.000Z",
+            "2020-02-29T00:00:00.1234567Z",
+            "2020-02-29T00:00:00.Z",
+            "2020-0x-29T00:00:00Z",
+        ] {
+            assert_eq!(parse_iso8601_utc(bad), None, "{bad}");
         }
     }
 }

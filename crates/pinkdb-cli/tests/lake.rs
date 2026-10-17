@@ -249,15 +249,20 @@ fn lake_errors_are_clear() {
     assert!(out.contains("is not a pink-lake directory"), "{out}");
 
     // Usage errors.
-    let out =
-        run(".lake save\n.lake open\n.lake versions\n.lake tables\n.lake info\n.lake\n.quit\n");
+    let out = run(
+        ".lake save\n.lake open\n.lake versions\n.lake snapshots\n.lake tables\n.lake info\n.lake\n\
+         .quit\n",
+    );
     assert!(out.contains("Usage: .lake save <dir>"), "{out}");
     assert!(out.contains("Usage: .lake open <dir> [version]"), "{out}");
     assert!(out.contains("Usage: .lake versions <dir>"), "{out}");
+    assert!(out.contains("Usage: .lake snapshots <dir>"), "{out}");
     assert!(out.contains("Usage: .lake tables <dir>"), "{out}");
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
-        out.contains("Usage: .lake <save|open|attach|detach|attached|versions|tables|info> ..."),
+        out.contains(
+            "Usage: .lake <save|open|attach|detach|attached|versions|snapshots|tables|info> ..."
+        ),
         "{out}"
     );
 
@@ -1406,4 +1411,166 @@ fn lean_written_v1_stats_fixture_attaches_in_the_full_build() {
         probe.contains("decodes: 1 load"),
         "the fallback must materialize:\n{probe}"
     );
+}
+
+/// `.lake save author/message` records a commit message on the version it
+/// publishes, and `.lake snapshots` lists every version's record — time,
+/// author, message, counts, change summary (wave 64).
+#[test]
+fn save_records_messages_and_snapshots_lists_them() {
+    let dir = scratch("snapshot_records");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE DATABASE lake;\n\
+         USE lake;\n\
+         CREATE TABLE t (x INTEGER);\n\
+         INSERT INTO t VALUES (1), (2);\n\
+         .lake save {lake} author 'alice' message 'first save'\n\
+         INSERT INTO t VALUES (3);\n\
+         .lake save {lake} message \"second save\"\n\
+         .lake snapshots {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    assert!(out.contains("Saved lake version 3"), "{out}");
+    assert!(out.contains("version 3 (current)"), "{out}");
+    // v2's record: author, message and the change summary of a first save.
+    let v2 = out
+        .split("version 2\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(v2.contains("author:  alice"), "{v2}");
+    assert!(v2.contains("message: first save"), "{v2}");
+    assert!(v2.contains("tables:  1 (2 rows)"), "{v2}");
+    assert!(v2.contains("changes: created: lake.t"), "{v2}");
+    // 2 is not current anymore.
+    assert!(!out.contains("version 2 (current)"), "{out}");
+    // v3's record: the message only — the v2 message must not repeat.
+    let v3 = out
+        .split("version 3 (current)")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(v3.contains("message: second save"), "{v3}");
+    assert!(!v3.contains("author:"), "{v3}");
+    assert!(v3.contains("tables:  1 (3 rows)"), "{v3}");
+    assert!(
+        v3.contains("changes: rewritten: lake.t; rows: lake.t +1"),
+        "{v3}"
+    );
+    // v1 (the create) records nothing.
+    let v1 = out
+        .split("version 1\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(v1.contains("changes: (not recorded)"), "{v1}");
+    // Every record carries a publish time.
+    assert!(out.contains("time:    20"), "{out}");
+    // A malformed option prints the usage line (like every other `.lake`
+    // usage error) and leaves the session running.
+    let (stdout, stderr, code) = run_captured(&format!(
+        "CREATE TABLE t (x INTEGER);\n.lake save {lake} message\n.quit\n",
+        lake = lake.display()
+    ));
+    assert_eq!(code, 0, "usage lines do not fail the script");
+    assert!(
+        stdout.contains("Usage: .lake save <dir> [force] [author '<name>'] [message '<text>']"),
+        "stdout: {stdout} stderr: {stderr}"
+    );
+    cleanup(&dir);
+}
+
+/// Time travel through the CLI: `AT (VERSION => n)` reads an attached lake's
+/// older version, `AT (TIMESTAMP => …)` takes the time `.lake snapshots`
+/// prints, and every refusal (unknown version, store table, malformed clause)
+/// is a clean error that leaves the session alive.
+#[test]
+fn time_travel_queries_and_errors_on_an_attached_lake() {
+    let dir = scratch("time_travel");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE DATABASE lake;\n\
+         USE lake;\n\
+         CREATE TABLE t (x INTEGER);\n\
+         INSERT INTO t VALUES (1);\n\
+         .lake save {lake} message 'one row'\n\
+         INSERT INTO t VALUES (2), (3);\n\
+         .lake save {lake} message 'three rows'\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 3"), "{out}");
+
+    // The printed publish times, straight out of the listing.
+    let listing = run(&format!(
+        ".lake snapshots {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    let mut times = listing
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("time:").map(str::trim))
+        .collect::<Vec<_>>();
+    assert_eq!(times.len(), 3, "{listing}");
+    let v3_time = times.pop().unwrap().to_string();
+    let v2_time = times.pop().unwrap().to_string();
+
+    let (stdout, stderr, code) = run_captured(&format!(
+        ".lake attach {lake}\n\
+         USE lake;\n\
+         SELECT 'at-v2' AS m, COUNT(*) AS v FROM t AT (VERSION => 2);\n\
+         SELECT 'at-v3-1' AS m, x AS v FROM t AT (VERSION => 3) WHERE x = 1;\n\
+         SELECT 'at-v3-3' AS m, x AS v FROM t AT (VERSION => 3) WHERE x = 3;\n\
+         SELECT 'at-v3-ts' AS m, COUNT(*) AS v FROM t AT (TIMESTAMP => TIMESTAMP '{v3_time}');\n\
+         SELECT 'at-v2-ts' AS m, COUNT(*) AS v FROM t AS old AT (TIMESTAMP => '{v2_time}');\n\
+         SELECT 'current' AS m, COUNT(*) AS v FROM t;\n\
+         SELECT * FROM t AT (VERSION => 1);\n\
+         SELECT * FROM t AT (VERSION => 99);\n\
+         CREATE TABLE plain (x INTEGER);\n\
+         SELECT * FROM plain AT (VERSION => 2);\n\
+         SELECT * FROM t AT (VERSION 2);\n\
+         SELECT 'still-alive' AS m, COUNT(*) AS v FROM t;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    // Each marked row pairs the probe name with the version's answer: v2
+    // holds one row, v3 three, both timestamp forms resolve to the same
+    // versions, and the current version is untouched by any of it.
+    let marked = |marker: &str, value: &str| {
+        stdout
+            .lines()
+            .any(|l| l.starts_with(&format!("│ {marker}")) && l.contains(&format!("│ {value} ")))
+    };
+    for (marker, value) in [
+        ("at-v2", "1"),
+        ("at-v3-1", "1"),
+        ("at-v3-3", "3"),
+        ("at-v3-ts", "3"),
+        ("at-v2-ts", "1"),
+        ("current", "3"),
+        ("still-alive", "3"),
+    ] {
+        assert!(
+            marked(marker, value),
+            "{marker} → {value} missing from\n{stdout}\n{stderr}"
+        );
+    }
+    // Every refusal names its reason.
+    let errors = stderr.matches("Error: ").count();
+    assert_eq!(errors, 4, "stderr: {stderr}");
+    assert!(
+        stderr.contains("table \"lake.t\" does not exist at version 1"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("no snapshot found at version 99"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("has no snapshot history"),
+        "store tables cannot time-travel: {stderr}"
+    );
+    assert!(stderr.contains("parse error"), "{stderr}");
+    // A script that reported errors exits non-zero (the CLI's contract).
+    assert_eq!(code, 1);
+    cleanup(&dir);
 }

@@ -2,8 +2,13 @@
 //!
 //! `std` has no date formatter, so this is the standard days-to-civil
 //! algorithm (Howard Hinnant's `civil_from_days`) over the Unix epoch.
+//! Parsing lives in the engine ([`pinkdb::types::parse_iso8601_utc`]) so the
+//! `AT (TIMESTAMP => …)` clause and the lake layer agree on one definition;
+//! this module re-exports it and keeps the writer here.
 
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub(crate) use pinkdb::types::parse_iso8601_utc;
 
 /// `2026-10-14T12:34:56.789Z` (millisecond precision, UTC).
 pub(crate) fn iso8601_utc(time: SystemTime) -> String {
@@ -76,6 +81,50 @@ mod tests {
             iso8601_utc(UNIX_EPOCH - Duration::from_secs(5)),
             "1970-01-01T00:00:00.000Z"
         );
+    }
+
+    /// `updated` round-trips through the parser (the save-time formatter is
+    /// the only producer of manifest times).
+    #[test]
+    fn iso8601_round_trips_and_validates() {
+        for (secs, millis) in [(0u64, 0u32), (1_000_000_000, 0), (1_700_000_000, 123)] {
+            let text = iso8601_utc(at(secs, millis));
+            assert_eq!(
+                parse_iso8601_utc(&text),
+                Some(secs as i64 * 1_000_000 + millis as i64 * 1_000),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_iso8601_utc("2020-02-29T00:00:00.000Z"),
+            Some(1_582_934_400 * 1_000_000)
+        );
+        // Fractional digits beyond milliseconds still parse (a hand-edited
+        // manifest), missing fraction too.
+        assert_eq!(
+            parse_iso8601_utc("2020-02-29T00:00:00.123456Z"),
+            Some(1_582_934_400 * 1_000_000 + 123_456)
+        );
+        assert_eq!(
+            parse_iso8601_utc("2020-02-29T00:00:00Z"),
+            Some(1_582_934_400 * 1_000_000)
+        );
+        // Malformed times are a clean None, never a guessed instant.
+        for bad in [
+            "",
+            "2020-02-29T00:00:00",
+            "2020-02-30T00:00:00.000Z",
+            "2021-02-29T00:00:00.000Z",
+            "2020-13-01T00:00:00.000Z",
+            "2020-02-29 00:00:00.000Z",
+            "2020-02-29T24:00:00.000Z",
+            "20-02-29T00:00:00.000Z",
+            "2020-02-29T00:00:00.1234567Z",
+            "2020-02-29T00:00:00.Z",
+            "2020-0x-29T00:00:00Z",
+        ] {
+            assert_eq!(parse_iso8601_utc(bad), None, "{bad}");
+        }
     }
 
     /// The SigV4 timestamp pair (used by the `s3` feature).

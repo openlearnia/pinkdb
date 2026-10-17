@@ -237,6 +237,10 @@ pub enum FromSource {
 pub struct FromClause {
     pub source: FromSource,
     pub alias: Option<String>,
+    /// `AT (VERSION => n)` / `AT (TIMESTAMP => ts)`, written after the alias
+    /// (`FROM t AS x AT (VERSION => 1)`), DuckLake's shape. Only table
+    /// references may carry one.
+    pub at: Option<crate::attached::AtSpec>,
     /// Chained joins, left-deep, in written order: each `ON` condition sees
     /// every table to its left plus its own right-hand source.
     pub joins: Vec<JoinClause>,
@@ -260,6 +264,8 @@ pub struct JoinClause {
     pub kind: JoinKind,
     pub source: FromSource,
     pub alias: Option<String>,
+    /// `AT (...)` after this join's table reference (see [`FromClause::at`]).
+    pub at: Option<crate::attached::AtSpec>,
     /// `ON` condition; `None` for CROSS JOIN, which has no condition.
     pub on: Option<Expr>,
 }

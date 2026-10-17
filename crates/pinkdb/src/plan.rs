@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use crate::attached::AtSpec;
 use crate::sql::ast::{JoinKind, Select, SetOp, SortSpec};
 use crate::sql::binder::{BoundAgg, BoundExpr, BoundWindow};
 use crate::types::{DataType, Value};
@@ -122,10 +123,13 @@ pub enum LogicalPlan {
         types: Vec<DataType>,
     },
     /// Full scan of a table. `db: None` names a CTE (binder-resolved);
-    /// `Some(db)` is a catalog table in that database.
+    /// `Some(db)` is a catalog table in that database. `at: Some(spec)` is a
+    /// time-travel scan: exactly the attached lake table's contents as of
+    /// that version/timestamp (`AT (VERSION => n)` / `AT (TIMESTAMP => ts)`).
     Scan {
         db: Option<String>,
         table: String,
+        at: Option<AtSpec>,
     },
     /// One empty row — `SELECT` without `FROM`.
     SingleRow,
@@ -366,6 +370,7 @@ pub(crate) fn collect_tables_read(
         LogicalPlan::Scan {
             db: Some(db),
             table,
+            ..
         } => {
             out.insert((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
         }

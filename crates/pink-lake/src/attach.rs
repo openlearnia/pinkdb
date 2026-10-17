@@ -22,6 +22,26 @@
 //! a table on first use through the very same path [`Lake::load`] uses, so
 //! materialized values are identical to `.lake open`.
 //!
+//! # Time travel
+//!
+//! `FROM t AT (VERSION => n)` / `AT (TIMESTAMP => ts)` on an attached table
+//! resolves through the same machinery, one version at a time (wave 64): the
+//! target version's manifest is read, then a *version attachment* is built
+//! exactly like `.lake attach <dir> <version>` builds one — every footer /
+//! statistics block validated, every data file of that version checked to
+//! exist — and cached per version, so repeated queries pay the metadata reads
+//! once. The target is capped at the version this attachment is pinned to:
+//! `.lake attach dir 3` can travel to 1–3, never to a version published after
+//! it attached. An unknown version, a timestamp before the first snapshot, or
+//! a table that did not exist at the target version is a clean error from
+//! [`pinkdb::AttachedLake::table_at`]; a data file missing from an old
+//! version is the same clean error [`Lake::load`] would give.
+//!
+//! Everything else is an ordinary attachment, so the engine's statistics
+//! fast paths work on a time-travel scan unchanged: `COUNT(*)`/`MIN`/`MAX`
+//! over `t AT (VERSION => 1)` are answered from that version's published
+//! statistics without decoding a data file.
+//!
 //! Every check `.lake open` performs at load time runs at attach time
 //! instead, where it can: the metadata segment parses, the Vortex dtype
 //! agrees with the declared schema, the file's `db.table` identity matches
@@ -37,13 +57,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pinkdb::attached::AttachedScan;
-use pinkdb::{AttachedLake, AttachedTable, DataTable, PinkDb, PinkDbError};
+use pinkdb::{AtSpec, AttachedLake, AttachedTable, DataTable, PinkDb, PinkDbError};
 
 use crate::catalog::FileFormat;
 use crate::storage::{Head, Storage};
 #[cfg(feature = "vortex-format")]
 use crate::vortex_file;
-use crate::{only_table, path_str, split_key, validate_rel_path, Lake, LakeError, Result};
+use crate::{
+    manifest_for, only_table, path_str, published_versions, split_key, validate_rel_path, Lake,
+    LakeError, Result,
+};
 
 /// What [`Lake::attach`] read and pinned.
 #[derive(Debug)]
@@ -103,6 +126,38 @@ pub(crate) struct LakeAttachment {
     /// Columns decoded in total (diagnostics and tests: projection pushdown
     /// must decode only the referenced columns).
     columns_decoded: AtomicU64,
+    /// The version this attachment is pinned to (the attach version). Time
+    /// travel reaches `1..=pinned` (see the module docs).
+    pinned: u64,
+    /// Time-travel attachments built for one version each, cached.
+    views: Mutex<HashMap<u64, Arc<LakeAttachment>>>,
+    /// (version, parsed publish time) for every version this attachment
+    /// may travel to, ascending — loaded once from the manifests, cached.
+    index: Mutex<Option<SnapshotTimes>>,
+}
+
+/// One version's publish time as this attachment's index caches it: the
+/// parsed `updated` value in microseconds, or `None` when the manifest's time
+/// did not parse (a tampered manifest — excluded from timestamp resolution).
+type SnapshotTimes = Arc<Vec<(u64, Option<i64>)>>;
+
+/// One version's attachment as a time-travel read sees it: the pinned
+/// attachment itself (no rebuild for `AT (VERSION => <pinned>)`) or a cached
+/// per-version attachment.
+#[derive(Debug)]
+enum VersionView<'a> {
+    Pinned(&'a LakeAttachment),
+    Built(Arc<LakeAttachment>),
+}
+
+impl std::ops::Deref for VersionView<'_> {
+    type Target = LakeAttachment;
+    fn deref(&self) -> &LakeAttachment {
+        match self {
+            VersionView::Pinned(attachment) => attachment,
+            VersionView::Built(attachment) => attachment,
+        }
+    }
 }
 
 /// One table's materialized state: the columns decoded so far, plus NULL
@@ -344,14 +399,142 @@ impl AttachedLake for LakeAttachment {
     }
 
     fn decode_stats(&self) -> (u64, u64) {
-        (
-            self.loads.load(Ordering::Relaxed),
-            self.columns_decoded.load(Ordering::Relaxed),
-        )
+        // Time-travel views decode through their own attachments; count them
+        // in (they are cached inside this attachment, part of its cost).
+        let mut loads = self.loads.load(Ordering::Relaxed);
+        let mut columns = self.columns_decoded.load(Ordering::Relaxed);
+        let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
+        for view in views.values() {
+            loads += view.loads.load(Ordering::Relaxed);
+            columns += view.columns_decoded.load(Ordering::Relaxed);
+        }
+        (loads, columns)
+    }
+
+    fn table_at(
+        &self,
+        db: &str,
+        table: &str,
+        at: AtSpec,
+    ) -> std::result::Result<AttachedTable, PinkDbError> {
+        let version = self.resolve_version(at)?;
+        let view = self.view(version)?;
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        view.descriptor(&key).cloned().ok_or_else(|| {
+            PinkDbError::Catalog(format!(
+                "table \"{db}.{table}\" does not exist at version {version} of lake {} \
+                 (AT ({at}))",
+                self.location
+            ))
+        })
+    }
+
+    fn load_at(
+        &self,
+        db: &str,
+        table: &str,
+        at: AtSpec,
+    ) -> std::result::Result<Arc<DataTable>, PinkDbError> {
+        Ok(self.load_projected_at(db, table, at, None)?.table)
+    }
+
+    fn load_projected_at(
+        &self,
+        db: &str,
+        table: &str,
+        at: AtSpec,
+        columns: Option<&[usize]>,
+    ) -> std::result::Result<AttachedScan, PinkDbError> {
+        let version = self.resolve_version(at)?;
+        let view = self.view(version)?;
+        view.load_projected(db, table, columns)
     }
 }
 
 impl LakeAttachment {
+    /// The published versions this attachment may travel to, ascending, with
+    /// each manifest's parsed publish time. Loaded once (one small manifest
+    /// read per version, capped at the pinned version); a version that
+    /// disappears between the listing and the read (an expired snapshot) is
+    /// skipped, exactly like [`Lake::versions`].
+    fn snapshot_index(&self) -> std::result::Result<SnapshotTimes, PinkDbError> {
+        let mut guard = self.index.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(index) = &*guard {
+            return Ok(Arc::clone(index));
+        }
+        let versions = published_versions(&*self.storage, self.pinned).map_err(catalog_error)?;
+        let mut index = Vec::with_capacity(versions.len());
+        for version in versions {
+            match manifest_for(&*self.storage, &self.root, Some(version)) {
+                Ok((manifest, _)) => {
+                    index.push((version, crate::time::parse_iso8601_utc(&manifest.updated)))
+                }
+                Err(LakeError::VersionNotFound { .. }) => continue,
+                Err(LakeError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue
+                }
+                Err(e) => return Err(catalog_error(e)),
+            }
+        }
+        let index = Arc::new(index);
+        *guard = Some(Arc::clone(&index));
+        Ok(index)
+    }
+
+    /// Resolve a time-travel target to a version this attachment serves:
+    /// exactly `n` for a version, the newest snapshot at or before `ts` for a
+    /// timestamp (DuckLake's inclusive `snapshot_time <= ts` rule). Beyond
+    /// the pinned version, or before the first snapshot, is a clean
+    /// "no snapshot found" error.
+    fn resolve_version(&self, at: AtSpec) -> std::result::Result<u64, PinkDbError> {
+        let index = self.snapshot_index()?;
+        match at {
+            AtSpec::Version(v) => index
+                .iter()
+                .find(|(version, _)| *version == v)
+                .map(|(version, _)| *version)
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!(
+                        "no snapshot found at version {v} in lake {}",
+                        self.location
+                    ))
+                }),
+            AtSpec::Timestamp(us) => index
+                .iter()
+                .rev()
+                .find(|(_, time)| time.is_some_and(|t| t <= us))
+                .map(|(version, _)| *version)
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!(
+                        "no snapshot found at timestamp {} in lake {}",
+                        pinkdb::types::format_timestamp(us),
+                        self.location
+                    ))
+                }),
+        }
+    }
+
+    /// One version's attachment: the pinned attachment itself, or a cached
+    /// footer-only/statistics-only attachment of that version's manifest —
+    /// exactly what `.lake attach <dir> <version>` would build, so every
+    /// validation runs and the target version's data files are what queries
+    /// materialize.
+    fn view(&self, version: u64) -> std::result::Result<VersionView<'_>, PinkDbError> {
+        if version == self.pinned {
+            return Ok(VersionView::Pinned(self));
+        }
+        let mut views = self.views.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(view) = views.get(&version) {
+            return Ok(VersionView::Built(Arc::clone(view)));
+        }
+        let (attachment, _) = build_from(&self.storage, &self.root, Some(version))
+            .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+        views.insert(version, Arc::clone(&attachment));
+        Ok(VersionView::Built(attachment))
+    }
+
     /// The v1 `.pink` materialization: the same decode `.lake open` performs
     /// (`Storage::local_copy` + [`PinkDb::open`]), then the attach contract's
     /// checks against the published descriptor — the file must hold exactly
@@ -383,6 +566,12 @@ impl LakeAttachment {
         )
         .map_err(|e| PinkDbError::Execution(e.to_string()))
     }
+}
+
+/// Wrap a lake metadata error as an engine catalog error (resolution and
+/// listing failures are metadata problems, not query execution ones).
+fn catalog_error(e: LakeError) -> PinkDbError {
+    PinkDbError::Catalog(e.to_string())
 }
 
 /// [`Lake::load`]'s per-file decode for one Vortex table: read the file,
@@ -589,8 +778,19 @@ pub(crate) fn build(
     lake: &Lake,
     version: Option<u64>,
 ) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
-    let (manifest, manifest_path) = lake.manifest(version)?;
-    let root = lake.path().to_path_buf();
+    build_from(&lake.storage, lake.path(), version)
+}
+
+/// [`build`] without a [`Lake`] handle: the storage root and the version to
+/// pin. Time-travel views are built through this same function, so a version
+/// query validates exactly like `.lake attach <dir> <version>`.
+pub(crate) fn build_from(
+    storage: &Arc<dyn Storage>,
+    root: &std::path::Path,
+    version: Option<u64>,
+) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
+    let (manifest, manifest_path) = manifest_for(&**storage, root, version)?;
+    let root = root.to_path_buf();
     let mut tables: Vec<AttachedTable> = Vec::with_capacity(manifest.tables.len());
     let mut files: HashMap<(String, String), AttachedEntry> = HashMap::new();
     #[cfg(feature = "vortex-format")]
@@ -610,8 +810,8 @@ pub(crate) fn build(
         }
         let rel = &entry.files[0];
         validate_rel_path(rel)?;
-        let path = lake.storage.abs(rel);
-        match lake.storage.head(rel)? {
+        let path = storage.abs(rel);
+        match storage.head(rel)? {
             Head::File => {}
             Head::Missing => {
                 return Err(LakeError::Io {
@@ -636,9 +836,9 @@ pub(crate) fn build(
             FileFormat::Vortex => {
                 #[cfg(feature = "vortex-format")]
                 {
-                    let local = lake.storage.local_path(rel).is_some();
+                    let local = storage.local_path(rel).is_some();
                     remote |= !local;
-                    let footer = vortex_file::read_footer(&path, &*lake.storage, rel)?;
+                    let footer = vortex_file::read_footer(&path, &**storage, rel)?;
                     if !footer.db.eq_ignore_ascii_case(dbname)
                         || !footer.table.eq_ignore_ascii_case(table)
                     {
@@ -710,13 +910,16 @@ pub(crate) fn build(
     }
     let attachment = Arc::new(LakeAttachment {
         location: root.display().to_string(),
-        storage: Arc::clone(&lake.storage),
+        storage: Arc::clone(storage),
         root,
         files,
         tables,
         cache: Mutex::new(HashMap::new()),
         loads: AtomicU64::new(0),
         columns_decoded: AtomicU64::new(0),
+        pinned: manifest.version,
+        views: Mutex::new(HashMap::new()),
+        index: Mutex::new(None),
     });
     let report = AttachmentReport {
         version: manifest.version,

@@ -558,6 +558,12 @@ The manifests (`catalog.json` and every snapshot) share one shape:
 }
 ```
 
+Wave 64 adds the optional **snapshot record** to that shape — `"author"`,
+`"commit_message"` and `"changes"` (see "Snapshot records and time travel"
+below). All three are additive and absent when a save records nothing, so an
+older reader ignores them and a manifest written today without a message is
+byte-identical to the pre-wave-64 shape.
+
 **Format history and defaults:**
 
 | catalog `format_version` | data file | written by | read by this build |
@@ -674,6 +680,40 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
   attachment and `.lake attached` lists them; `.lake save` skips attached tables
   with a note; `.lake open` drops them all; and a durable database refuses
   mutating SQL that reads an attached table (its logged text could not replay).
+- **Snapshot records and time travel (wave 64).** Every save records the
+  version's publish time in the manifest's `updated` field (millisecond
+  ISO-8601 UTC — that field has been there since wave 34) and can record an
+  author, a commit message and a **change summary**: `.lake save <dir>
+  [force] [author '<name>'] [message '<text>']` carries DuckLake's
+  `ducklake_set_commit_message` metadata, and `Lake::set_commit_message`
+  attaches it to the next published save (kept across a failed save, cleared
+  by a successful one). The summary is computed at save time from the
+  previous manifest (`tables_created`/`tables_dropped`, `tables_rewritten` —
+  every surviving table, since a whole-store save writes fresh files — and
+  `rows_added`/`rows_removed` for tables present in both); it is absent for
+  the create-time empty version and when the previous manifest is
+  unavailable. `.lake snapshots <dir>` lists every version's record: time,
+  author, message, `(tables, rows)` and the summary.
+  **`FROM t AT (VERSION => n)` / `AT (TIMESTAMP => ts)`** queries an attached
+  table as of a published version: `n` is a pinkdb version (1-based;
+  DuckLake's snapshot ids count from 0), a timestamp resolves to the newest
+  snapshot published at or before it (inclusive, DuckLake's `snapshot_time <=
+  ts`), and both accept the exact strings `.lake snapshots` prints
+  (`TIMESTAMP '2026-10-17 12:30:36.029'` or the manifest's
+  `'2026-10-17T12:30:36.029Z'`). Time travel is an **attach-only**
+  capability: it reaches versions `1..=the attached version` of that
+  attachment (a pinned `.lake attach dir 3` never sees a later version), a
+  store table refuses with "has no snapshot history" (DuckLake: "Catalog type
+  does not support time travel"), CTEs and views refuse, an unknown version
+  or a timestamp before the first snapshot is a clean "no snapshot found"
+  error, and a table that did not exist at the target version names it. The
+  statistics fast paths work per version, so `COUNT(*)`/`MIN`/`MAX` over
+  `AT (VERSION => n)` decode no data file. DuckLake's
+  `ducklake_default_version` setting has no pinkdb counterpart on purpose: it
+  is not a per-query default — it selects the *storage format version for new
+  catalogs*, and the probe build rejects every explicit value ("Unsupported
+  ducklake_version") — so pinkdb skips the setting rather than inventing
+  different semantics under the same name.
 - **One live writer handle per lake** (no file locking; concurrent readers
   of published versions are fine). A handle that saves after another
   handle/process moved the catalog fails with `LakeError::Conflict`
@@ -722,11 +762,19 @@ db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
 
 let version = save_store(&db, "mylake")?;  // creates the lake, publishes v2
 let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
+lake.set_commit_message(Some("alice".into()), Some("two rows".into()));
 let v3 = lake.write_from_store(&db)?;      // full snapshot in Vortex, version 3
 let tables = lake.tables()?;               // [("main.t", 2)]
 let versions = lake.versions()?;           // [1, 2, 3]
+let records = lake.snapshots()?;           // per-version time/author/message/changes
 let latest = lake.load(None)?;             // rebuild the latest
 let old = lake.load(Some(2))?;             // rebuild a specific snapshot
+
+// Attach the lake read-only and query a published version by name:
+// let report = lake.attach(None)?;
+// db.attach_lake(report.lake.clone())?;
+// db.execute("SELECT * FROM t AT (VERSION => 2);")?;          // exactly v2's rows
+// db.execute("SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '2026-10-17 12:30:36');")?;
 
 // With the `s3` feature, every location may be an object-storage URL:
 // let mut lake = Lake::open_url("s3://bucket/prefix")?;  // env credentials
@@ -753,7 +801,9 @@ cargo build -p pinkdb-cli --features s3          # lean lake + S3/R2 (= lake-lit
 ```
 
 ```text
-.lake save <dir>          snapshot the store (version, tables, rows, bytes)
+.lake save <dir> [force] [author '<name>'] [message '<text>']
+                          snapshot the store (version, tables, rows, bytes);
+                          author/message record the version's commit metadata
 .lake open <dir> [ver]    replace the in-memory store with the lake
                           (session database resets to main; PINKDB_KEY is kept)
 .lake attach <dir> [ver]  attach the lake read-only, from its statistics only
@@ -761,8 +811,13 @@ cargo build -p pinkdb-cli --features s3          # lean lake + S3/R2 (= lake-lit
 .lake detach <dir>        detach one attached lake from this session
 .lake attached            list this session's attached lakes and their tables
 .lake versions <dir>      published versions (current marked)
+.lake snapshots <dir>     per-version records: time, author, message, counts,
+                          change summary
 .lake tables <dir>        current version's db.table names + row counts
 .lake info <dir>          format version, current version, snapshots, tables
+
+SELECT * FROM t AT (VERSION => 2);                -- attached tables only
+SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '2026-10-17 12:30:36.029');
 ```
 
 With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see

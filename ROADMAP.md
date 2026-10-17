@@ -97,7 +97,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | done | landed; `.pink` v5, protocol v6, FFI text cells; duckdiff 155 → 165 |
 | 63 | Lake writes, DuckLake parity: incremental lake commits — append new immutable data files with per-file row ranges instead of whole-table rewrites, positional delete files for DELETE/UPDATE (merge-on-read; deletion-vector option as a follow-up), writable attached lakes, per-commit manifests, concurrent-writer retry/backoff (`max_retry_count`/`retry_backoff`/`retry_wait_ms` parity), WAL-logged for durable sessions | queued | DuckLake-parity program |
-| 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | queued | DuckLake-parity program |
+| 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | done | landed; DuckLake-pinned AT semantics (literals only, capped at the attached version), per-version stats fast paths, manifest records + `.lake snapshots` + commit messages; `default_version` probed to be a catalog-format selector, not a read default — skipped |
 | 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | queued | DuckLake-parity program |
 | 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | queued | DuckLake-parity program |
 | 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | DuckLake-parity program |
@@ -116,12 +116,14 @@ statements, 62 DECIMAL/INTERVAL, 41 PK/FK constraints) finished as: **59, 62
 and 41 landed** (the two `.pink` v5 proposals were reconciled into one v5 —
 constraint section gated by flags bit 0 plus DECIMAL/INTERVAL dtype tags; wave
 41 also shipped conservative FK→PK join elimination), and **57 stays parked**
-with its patch secured (`wt-lake-encryption`). **Third batch in flight** (max
-two worktrees per the disk-space policy): wave 63 (incremental lake writes) in
-`wt-lake-incr` and wave 64 (lake time travel) in `wt-lake-versions`, both off
-8b401cd; each integrates as a patch with full gates + CI, one at a time.
-Indexes (42), materialized views (43), stored procedures (44), the extensions
-block (51–56) and the file-format extensions (70–72) stay numbered.
+with its patch secured (`wt-lake-encryption`). **Third batch**: wave 64 (lake
+time travel) **landed**; wave 63 (incremental lake writes) still in flight in
+`wt-lake-incr`, off 8b401cd — its integration reconciles the flagged overlaps
+in `pink-lake/src/{lib,catalog,attach}.rs` with the landed 64. Each batch wave
+integrates as a patch with full gates + CI, one at a time (max two worktrees
+per the disk-space policy). Indexes (42), materialized views (43), stored
+procedures (44), the extensions block (51–56) and the file-format extensions
+(70–72) stay numbered.
 
 Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
@@ -968,3 +970,32 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   is pinned at the file (IPC/Feather) + C-Data-Interface level instead. Also:
   stale queue rows 40d–40g marked absorbed by waves 58–62; the wave-41 macOS
   flake fix verified green in CI (`8b401cd`).
+- 2026-10-17 — Wave 64 (lake time travel & snapshot metadata): `FROM t AT
+  (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached lake tables
+  (first source or any `JOIN` source, optional alias *before* the clause — the
+  exact shape DuckLake accepts; literals only). The clause binds at bind time
+  against the target version's own footer/statistics descriptor (the version's
+  schema comes from itself); unknown versions, timestamps before the first
+  snapshot and tables that did not exist at the target version are clean
+  errors. Timestamp = newest snapshot with `time <= ts` (inclusive), pinned by
+  live DuckLake probes; the reachable version set is capped at the attached
+  version. Per-version stats fast paths: `COUNT`/`MIN`/`MAX` decode no data
+  file, projected scans decode only referenced columns. Manifests gained
+  optional per-version records (`author`, `commit_message`, computed change
+  summary; a manifest without them is byte-identical to the pre-64 shape);
+  `.lake snapshots` lists time/author/message/changes with the current version
+  marked; `.lake save … author/message` + `Lake::set_commit_message` +
+  `Lake::snapshots()` add the API. Probed divergences documented: DuckDB
+  *silently ignores* `AT` on CTEs (pinkdb refuses instead — wrong-answer
+  trap), DuckDB accepts constant expressions in the clause (pinkdb takes
+  literals), `ducklake_default_version` probed to be a new-catalog storage
+  selector, not a read default → skipped. Library surface: `AtSpec` +
+  `AttachedLake::{table_at, load_at, load_projected_at}` (defaults refuse, so
+  implementors compile unchanged). Gates on main: fmt, clippy (pinkdb ±
+  encryption, pink-lake ± vortex-format, CLI lake,s3), pinkdb **458/458**
+  (+prepared 22; encryption 475 + 21), CLI lake,s3 **93** (lake 24,
+  multiprocess 27/27), pink-lake 21 + 10 (+1 ignored) and vortex lake **46**,
+  `bench/duckdiff.py` **171/171**, workspace green. Integration: patch applied
+  clean (`--3way`, 20 files, +2,507/−117); wave-63 overlaps flagged in
+  `pink-lake/src/{lib,catalog,attach}.rs` + the lake test files — reconcile
+  when 63 lands. Worktree `wt-lake-versions` removed after landing.

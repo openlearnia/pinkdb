@@ -20,10 +20,21 @@
 //! `.pink` single-table bytes.
 //!
 //! Schema and typing live inside the data files, never here.
+//!
+//! Wave 64 adds the optional **snapshot record** to a manifest:
+//! `"author"`, `"commit_message"` and `"changes"` (see
+//! [`crate::snapshot::ChangeSummary`]). The record is additive — an older
+//! reader ignores the fields (serde does not deny unknown fields), and every
+//! field is optional, so the manifest shape of a save that recorded nothing
+//! is byte-identical to the pre-wave-64 shape. `"version"` and `"updated"`
+//! (the version's publish time, millisecond ISO-8601 UTC) were already there;
+//! together they are the per-version record `.lake snapshots` lists.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+use crate::snapshot::ChangeSummary;
 
 /// The data-file format of one table entry.
 ///
@@ -52,6 +63,20 @@ pub(crate) struct Catalog {
     pub(crate) updated: String,
     pub(crate) version: u64,
     pub(crate) tables: BTreeMap<String, TableEntry>,
+    /// The save that published this version: the author it recorded
+    /// (`ducklake_set_commit_message`'s `author`), if any. Optional and
+    /// additive; absent in manifests saved without a message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) author: Option<String>,
+    /// The save's commit message, if any (DuckLake's `commit_message`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) commit_message: Option<String>,
+    /// What this version changed relative to the one before it, computed at
+    /// save time from the two manifests (see [`ChangeSummary`]). Absent for
+    /// the empty `create` manifest and when the previous manifest was
+    /// unavailable (e.g. expired snapshots).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) changes: Option<ChangeSummary>,
 }
 
 /// One table of one version: the immutable data files it is made of and the

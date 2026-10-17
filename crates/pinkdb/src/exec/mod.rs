@@ -539,9 +539,10 @@ fn scan_chunks(t: &DataTable) -> Vec<DataChunk> {
 /// materialize the columns this plan references (the exact decode `.lake
 /// open` performs, projected) and scan the result like any other table for
 /// the rest of the session. A projection the analysis could not bound leaves
-/// every column decoded.
+/// every column decoded. A time-travel scan (`at`) reads the attached lake at
+/// the target version instead of the pinned one.
 fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
-    let LogicalPlan::Scan { db: qdb, table } = plan else {
+    let LogicalPlan::Scan { db: qdb, table, at } = plan else {
         unreachable!("scan_output needs a Scan node");
     };
     if qdb.is_none() {
@@ -552,7 +553,10 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
     let projected = cx.projections.for_scan(plan);
     if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
-        let scan = lake.load_projected(lookup, table, projected)?;
+        let scan = match at {
+            None => lake.load_projected(lookup, table, projected)?,
+            Some(at) => lake.load_projected_at(lookup, table, *at, projected)?,
+        };
         let (names, types) = scan.table.schema().into_iter().unzip();
         return Ok(Output {
             chunks: scan.chunks(),
@@ -657,13 +661,21 @@ fn attached_stats_aggregate(
     let LogicalPlan::Scan {
         db: Some(db),
         table,
+        at,
     } = input
     else {
         return Ok(None);
     };
-    let Some((attached, _)) = cx.db.attached_lookup(db, table) else {
+    let Some((pinned, lake)) = cx.db.attached_lookup(db, table) else {
         return Ok(None);
     };
+    // `AT` asks about another version: the exact statistics of *that*
+    // version's descriptor answer the same way, with no decode.
+    let versioned = match at {
+        None => None,
+        Some(at) => Some(lake.table_at(db, table, *at)?),
+    };
+    let attached = versioned.as_ref().unwrap_or(pinned);
     let mut values = Vec::with_capacity(aggs.len());
     for agg in aggs {
         let Some(value) = attached_aggregate_value(attached, agg) else {
@@ -1441,15 +1453,21 @@ struct JoinSide<'a> {
 /// default.
 fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
     match plan {
-        LogicalPlan::Scan { db: qdb, table } => {
+        LogicalPlan::Scan { db: qdb, table, at } => {
             if qdb.is_none() {
                 if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
                     return Some(out.chunks.iter().map(|c| c.num_rows() as u64).sum());
                 }
             }
             let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
-            if let Some((attached, _)) = cx.db.attached_lookup(lookup, table) {
-                return Some(attached.rows);
+            if let Some((attached, lake)) = cx.db.attached_lookup(lookup, table) {
+                // A time-travel target's own row count is exact too; a target
+                // this lake cannot resolve keeps the unknown-size default
+                // (the query itself will surface the error).
+                return match at {
+                    None => Some(attached.rows),
+                    Some(at) => lake.table_at(lookup, table, *at).ok().map(|t| t.rows),
+                };
             }
             cx.db
                 .table_in(lookup, table)
@@ -3538,11 +3556,15 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
             };
             format!("{name} ({} cols)", types.len())
         }
-        LogicalPlan::Scan { db, table } => {
-            if db.is_none() {
+        LogicalPlan::Scan { db, table, at } => {
+            let text = if db.is_none() {
                 format!("Scan CTE {table}")
             } else {
                 format!("Scan {}", qualify(db, table))
+            };
+            match at {
+                None => text,
+                Some(at) => format!("{text} AT ({at})"),
             }
         }
         LogicalPlan::SingleRow => "SingleRow".to_string(),
@@ -9924,6 +9946,7 @@ mod tests {
         let scan = LogicalPlan::Scan {
             db: Some(db.current_db().to_string()),
             table: "w".to_string(),
+            at: None,
         };
         assert_eq!(estimate_rows(&cx, &scan), Some(rows));
         assert_eq!(
@@ -9988,6 +10011,7 @@ mod tests {
                 &LogicalPlan::Scan {
                     db: Some("main".to_string()),
                     table: "nope".to_string(),
+                    at: None,
                 }
             ),
             None

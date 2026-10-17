@@ -838,3 +838,94 @@ fn lean_s3_attach_answers_from_statistics() {
         db.table("t").unwrap().num_cols()
     );
 }
+
+/// Time travel over the lean (v1 `.pink`) format: each version's data file
+/// is decoded through its published statistics block, statistics-only reads
+/// never open an old file, and the version boundaries are exactly the
+/// saves' (wave 64).
+#[test]
+fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
+    let dir = scratch("lean_time_travel");
+    let lake_dir = dir.join("lake");
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+        .unwrap();
+    let mut lake = Lake::create(&lake_dir).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'one');").unwrap();
+    lake.write_from_store(&db).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.execute("INSERT INTO t VALUES (2, 'two');").unwrap();
+    lake.write_from_store(&db).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.execute("DELETE FROM t WHERE x = 1;").unwrap();
+    lake.write_from_store(&db).unwrap();
+
+    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!((records[3].tables, records[3].rows), (1, 1));
+    // Change summaries come from the manifests' own counts, v1 included.
+    let changes = records[3].changes.as_ref().unwrap();
+    assert_eq!(changes.tables_rewritten, vec!["main.t"]);
+    assert_eq!(changes.rows_removed.get("main.t"), Some(&1));
+
+    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let lake = std::sync::Arc::clone(&report.lake);
+    let mut attached = PinkDb::new();
+    attached.attach_lake(report.lake.clone()).unwrap();
+    // Statistics-only reads decode nothing — the current version and a
+    // version target alike.
+    assert_eq!(
+        select_rows(&mut attached, "SELECT COUNT(*) FROM t;"),
+        vec![vec![Value::Bigint(1)]]
+    );
+    assert_eq!(
+        select_rows(
+            &mut attached,
+            "SELECT COUNT(*), MIN(x), MAX(x) FROM t AT (VERSION => 3);"
+        ),
+        vec![vec![Value::Bigint(2), Value::Integer(1), Value::Integer(2)]]
+    );
+    assert_eq!(
+        lake.decode_stats(),
+        (0, 0),
+        "v1 statistics blocks must answer AT without opening a data file"
+    );
+    // A scan of the old version opens exactly that version's file...
+    assert_eq!(
+        select_rows(
+            &mut attached,
+            "SELECT s FROM t AT (VERSION => 3) WHERE x = 2;"
+        ),
+        vec![vec![Value::Varchar("two".to_string())]]
+    );
+    assert_eq!(lake.decode_stats().0, 1);
+    // ...v2's version file is a different decode, and the current version
+    // decodes its own file once (then caches).
+    assert_eq!(
+        select_rows(&mut attached, "SELECT x FROM t AT (VERSION => 2);"),
+        vec![vec![Value::Integer(1)]]
+    );
+    assert_eq!(
+        select_rows(&mut attached, "SELECT x FROM t;"),
+        vec![vec![Value::Integer(2)]]
+    );
+    assert_eq!(lake.decode_stats().0, 3);
+    assert_eq!(
+        select_rows(&mut attached, "SELECT x FROM t AT (VERSION => 2);"),
+        vec![vec![Value::Integer(1)]],
+        "the version attachment caches"
+    );
+    assert_eq!(lake.decode_stats().0, 3);
+    // v1 has no table at all, and unknown versions are clean errors.
+    let err = attached
+        .execute("SELECT * FROM t AT (VERSION => 1);")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not exist at version 1"), "{err}");
+    let err = attached
+        .execute("SELECT * FROM t AT (VERSION => 9);")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("no snapshot found at version 9"), "{err}");
+    cleanup(&dir);
+}

@@ -26,7 +26,7 @@ pub mod types;
 pub mod vector;
 pub mod wal;
 
-pub use attached::{AttachedLake, AttachedScan, AttachedTable, ColumnStats};
+pub use attached::{AtSpec, AttachedLake, AttachedScan, AttachedTable, ColumnStats};
 pub use crypto::EncryptionKey;
 pub use db::{Connection, Database};
 pub use exec::QueryResult;

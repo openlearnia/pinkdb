@@ -25,6 +25,41 @@ use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector};
 
+/// A time-travel target for one table reference: DuckLake's
+/// `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` clause after a table name.
+///
+/// Versions are the lake's own published snapshot versions (1-based; DuckLake
+/// counts snapshots from 0 — pinkdb's version 1 is the empty catalog `create`
+/// publishes, so version `n` here is DuckLake's snapshot `n - 1`). A
+/// timestamp is microseconds since the Unix epoch: it resolves to the newest
+/// snapshot published at or before it, exactly like DuckLake's inclusive
+/// `snapshot_time <= ts` rule.
+///
+/// Only an [`AttachedLake`] can serve time travel: a store table has no
+/// version history. The binder resolves a [`AtSpec`] through
+/// [`AttachedLake::table_at`], so an unknown version or a timestamp before the
+/// first snapshot is a clean bind-time error, never a silent fallback to the
+/// latest version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtSpec {
+    /// `AT (VERSION => n)`: exactly the published snapshot `n`.
+    Version(u64),
+    /// `AT (TIMESTAMP => ts)`: the newest snapshot with `snapshot_time <= ts`
+    /// (microseconds since the epoch).
+    Timestamp(i64),
+}
+
+impl fmt::Display for AtSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AtSpec::Version(v) => write!(f, "VERSION => {v}"),
+            AtSpec::Timestamp(us) => {
+                write!(f, "TIMESTAMP => {}", crate::types::format_timestamp(*us))
+            }
+        }
+    }
+}
+
 /// The exact statistics of one attached-table column, as far as the lake
 /// layer could prove them.
 ///
@@ -176,6 +211,47 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
     fn decode_stats(&self) -> (u64, u64) {
         (0, 0)
     }
+
+    /// The descriptor of one table as of a time-travel target (`AT`), for the
+    /// binder's scope: the schema and exact statistics that version's data
+    /// files publish. `db`/`table` are matched case-insensitively.
+    ///
+    /// The default implementation refuses: time travel is an attachment
+    /// capability, and a lake that cannot resolve the target must say so
+    /// before any row is produced.
+    fn table_at(&self, db: &str, table: &str, at: AtSpec) -> Result<AttachedTable> {
+        let _ = (db, table, at);
+        Err(PinkDbError::Catalog(format!(
+            "lake {} does not support time travel; rebuild it with a lake layer that \
+             serves `AT (VERSION => …)`",
+            self.location()
+        )))
+    }
+
+    /// Materialize one table exactly as of a time-travel target (`AT`), cached
+    /// by the implementation like [`AttachedLake::load`]. The default
+    /// implementation refuses; see [`AttachedLake::table_at`].
+    fn load_at(&self, db: &str, table: &str, at: AtSpec) -> Result<Arc<DataTable>> {
+        let _ = (db, table, at);
+        Err(PinkDbError::Catalog(format!(
+            "lake {} does not support time travel; rebuild it with a lake layer that \
+             serves `AT (VERSION => …)`",
+            self.location()
+        )))
+    }
+
+    /// Materialize only `columns` of one table exactly as of a time-travel
+    /// target; the time-travel twin of [`AttachedLake::load_projected`].
+    fn load_projected_at(
+        &self,
+        db: &str,
+        table: &str,
+        at: AtSpec,
+        columns: Option<&[usize]>,
+    ) -> Result<AttachedScan> {
+        let _ = columns;
+        Ok(AttachedScan::complete(self.load_at(db, table, at)?))
+    }
 }
 
 impl PinkDb {
@@ -304,6 +380,29 @@ impl PinkDb {
             Err(e) => match self.attached_lookup(db, name) {
                 Some((t, _)) => Ok(t.schema.clone()),
                 None => Err(e),
+            },
+        }
+    }
+
+    /// The schema of `db.name` as of a time-travel target (`AT`): the version
+    /// must be served by an attached lake. A store table has no version
+    /// history — DuckLake answers a non-DuckLake catalog with "Catalog type
+    /// does not support time travel"; this engine names the table and the way
+    /// in. An unknown table keeps the store's normal "not found" error.
+    pub fn visible_table_schema_at(
+        &self,
+        db: &str,
+        name: &str,
+        at: AtSpec,
+    ) -> Result<Vec<(String, DataType)>> {
+        match self.attached_lookup(db, name) {
+            Some((_, lake)) => Ok(lake.table_at(db, name, at)?.schema),
+            None => match self.table_in(db, name) {
+                Ok(_) => Err(PinkDbError::Catalog(format!(
+                    "table \"{db}.{name}\" has no snapshot history: AT ({at}) time travel \
+                     works on lake tables attached with .lake attach"
+                ))),
+                Err(e) => Err(e),
             },
         }
     }
@@ -1288,6 +1387,429 @@ mod tests {
         assert!(
             fake.loads.load(Ordering::Relaxed) >= 1,
             "the corpus contains NaNs: some MIN/MAX must have fallen back"
+        );
+    }
+
+    /// One version's table data: the schema it was written with and its rows.
+    type VersionData = (Vec<(String, DataType)>, Vec<Vec<Value>>);
+
+    /// A fake lake with a version history: each version holds one table's
+    /// data plus a publish time; `table_at`/`load_projected_at` resolve
+    /// exactly like `pink-lake`'s attachment (version equality, inclusive
+    /// timestamp, table-missing and no-snapshot errors), so the engine's
+    /// binder/executor plumbing is pinned against the real semantics.
+    #[derive(Debug)]
+    struct VersionedLake {
+        location: String,
+        /// `(version, time_micros)` ascending.
+        versions: Vec<(u64, i64)>,
+        /// One entry per version that has the table; a version without an
+        /// entry means the table did not exist there (like the empty v1
+        /// lake).
+        data: Vec<(u64, VersionData)>,
+        /// One entry per `load_projected_at` call: `(version, bound columns)`.
+        requests: Mutex<Vec<(u64, Option<Vec<usize>>)>>,
+        loads: AtomicU64,
+    }
+
+    impl VersionedLake {
+        /// Versions 1..=3: v1 has no `t`, v2 holds two rows, v3 three.
+        fn new(location: &str) -> Self {
+            let schema = vec![
+                ("a".to_string(), DataType::Integer),
+                ("b".to_string(), DataType::Varchar),
+            ];
+            let row = |a: i32, b: &str| vec![Value::Integer(a), Value::Varchar(b.to_string())];
+            Self {
+                location: location.to_string(),
+                versions: vec![(1, 1_000_000), (2, 2_000_000), (3, 3_000_000)],
+                data: vec![
+                    (2, (schema.clone(), vec![row(1, "x"), row(2, "y")])),
+                    (
+                        3,
+                        (schema.clone(), vec![row(1, "x"), row(2, "y"), row(3, "z")]),
+                    ),
+                ],
+                requests: Mutex::new(Vec::new()),
+                loads: AtomicU64::new(0),
+            }
+        }
+
+        /// The descriptor of `t` at `version`, or `None` when it did not
+        /// exist there.
+        fn descriptor(&self, version: u64) -> Option<AttachedTable> {
+            let (_, (schema, rows)) = self.data.iter().find(|(v, _)| *v == version)?;
+            Some(AttachedTable {
+                db: "main".to_string(),
+                table: "t".to_string(),
+                rows: rows.len() as u64,
+                schema: schema.clone(),
+                stats: stats_for(schema, rows),
+            })
+        }
+
+        fn resolve(&self, at: AtSpec) -> Result<u64> {
+            match at {
+                AtSpec::Version(v) => self
+                    .versions
+                    .iter()
+                    .find(|(version, _)| *version == v)
+                    .map(|(version, _)| *version)
+                    .ok_or_else(|| {
+                        PinkDbError::Catalog(format!(
+                            "no snapshot found at version {v} in lake {}",
+                            self.location
+                        ))
+                    }),
+                AtSpec::Timestamp(us) => self
+                    .versions
+                    .iter()
+                    .rev()
+                    .find(|(_, time)| *time <= us)
+                    .map(|(version, _)| *version)
+                    .ok_or_else(|| {
+                        PinkDbError::Catalog(format!(
+                            "no snapshot found at timestamp {} in lake {}",
+                            crate::types::format_timestamp(us),
+                            self.location
+                        ))
+                    }),
+            }
+        }
+    }
+
+    impl AttachedLake for VersionedLake {
+        fn location(&self) -> &str {
+            &self.location
+        }
+        fn tables(&self) -> &[AttachedTable] {
+            unreachable!("VersionedLake serves descriptors through table_at")
+        }
+        fn load(&self, _db: &str, _table: &str) -> Result<Arc<DataTable>> {
+            unreachable!("VersionedLake serves data through load_projected_at")
+        }
+        fn table_at(&self, db: &str, table: &str, at: AtSpec) -> Result<AttachedTable> {
+            assert!(db.eq_ignore_ascii_case("main") && table.eq_ignore_ascii_case("t"));
+            let version = self.resolve(at)?;
+            self.descriptor(version).ok_or_else(|| {
+                PinkDbError::Catalog(format!(
+                    "table \"{db}.{table}\" does not exist at version {version} of lake {}",
+                    self.location
+                ))
+            })
+        }
+        fn load_projected_at(
+            &self,
+            db: &str,
+            table: &str,
+            at: AtSpec,
+            columns: Option<&[usize]>,
+        ) -> Result<AttachedScan> {
+            self.table_at(db, table, at)?;
+            let version = self.resolve(at)?;
+            self.requests
+                .lock()
+                .unwrap()
+                .push((version, columns.map(<[usize]>::to_vec)));
+            self.loads.fetch_add(1, Ordering::Relaxed);
+            let (_, (schema, rows)) = self.data.iter().find(|(v, _)| *v == version).unwrap();
+            let mut table_data = DataTable::new("t".to_string(), schema.clone()).unwrap();
+            for row in rows {
+                table_data.append_row(row.clone()).unwrap();
+            }
+            Ok(AttachedScan::complete(Arc::new(table_data)))
+        }
+    }
+
+    /// A session with a `VersionedLake` whose *pinned* descriptors are v3's:
+    /// `attach_lake` needs the pinned tables, `AT` scans resolve through
+    /// `table_at`.
+    fn versioned_session() -> (PinkDb, Arc<VersionedLake>) {
+        let lake = Arc::new(VersionedLake::new("/tmp/versions"));
+        let pinned = lake.descriptor(3).unwrap();
+        let pinned = FakeLake::with_stats(
+            "/tmp/versions",
+            "main",
+            "t",
+            pinned.schema,
+            vec![
+                vec![Value::Integer(1), Value::Varchar("x".to_string())],
+                vec![Value::Integer(2), Value::Varchar("y".to_string())],
+                vec![Value::Integer(3), Value::Varchar("z".to_string())],
+            ],
+            pinned.stats,
+        );
+        // Replace the pinned lake's loader with one that forwards `AT`
+        // targets to the versioned lake: a small adapter keeps both roles.
+        let adapter = Arc::new(VersionedAdapter {
+            inner: Arc::clone(&lake),
+            pinned: Arc::new(pinned),
+        });
+        let mut db = PinkDb::new();
+        db.attach_lake(adapter as Arc<dyn AttachedLake>).unwrap();
+        (db, lake)
+    }
+
+    /// The pinned descriptors of [`VersionedLake`] (v3) plus its `AT`
+    /// resolution, so one attachment serves both paths.
+    #[derive(Debug)]
+    struct VersionedAdapter {
+        inner: Arc<VersionedLake>,
+        pinned: Arc<FakeLake>,
+    }
+
+    impl AttachedLake for VersionedAdapter {
+        fn location(&self) -> &str {
+            &self.inner.location
+        }
+        fn tables(&self) -> &[AttachedTable] {
+            self.pinned.tables()
+        }
+        fn load(&self, db: &str, table: &str) -> Result<Arc<DataTable>> {
+            self.pinned.load(db, table)
+        }
+        fn table_at(&self, db: &str, table: &str, at: AtSpec) -> Result<AttachedTable> {
+            self.inner.table_at(db, table, at)
+        }
+        fn load_projected_at(
+            &self,
+            db: &str,
+            table: &str,
+            at: AtSpec,
+            columns: Option<&[usize]>,
+        ) -> Result<AttachedScan> {
+            self.inner.load_projected_at(db, table, at, columns)
+        }
+    }
+
+    /// `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` bind through the
+    /// attachment, return exactly the target version's rows, and push the
+    /// projection through to the version's decode.
+    #[test]
+    fn time_travel_scans_bind_and_execute_through_the_lake() {
+        let (mut db, lake) = versioned_session();
+        // The pinned version answers an ordinary (non-AT) query unchanged.
+        assert_eq!(
+            query(&mut db, "SELECT COUNT(*) FROM t;"),
+            vec![vec![Value::Bigint(3)]]
+        );
+        // v2 through the AT clause, columns and all.
+        assert_eq!(
+            query(&mut db, "SELECT a, b FROM t AT (VERSION => 2) ORDER BY a;"),
+            vec![
+                vec![Value::Integer(1), Value::Varchar("x".to_string())],
+                vec![Value::Integer(2), Value::Varchar("y".to_string())],
+            ]
+        );
+        // The projection the analysis bounded is what the version's decode
+        // was asked for (`a` and `b`), against version 2.
+        assert_eq!(
+            lake.requests.lock().unwrap().clone(),
+            vec![(2, Some(vec![0, 1]))]
+        );
+        // A narrower projection pushes exactly its columns through.
+        assert_eq!(
+            query(&mut db, "SELECT b FROM t AT (VERSION => 3) LIMIT 1;"),
+            vec![vec![Value::Varchar("x".to_string())]]
+        );
+        assert_eq!(
+            lake.requests.lock().unwrap().clone(),
+            vec![(2, Some(vec![0, 1])), (3, Some(vec![1]))]
+        );
+        // An alias before the clause, inside a join, and an aggregate.
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*), MIN(old.a) FROM t old AT (VERSION => 2) \
+                 JOIN t new AT (VERSION => 3) ON old.a = new.a;"
+            ),
+            vec![vec![Value::Bigint(2), Value::Integer(1)]]
+        );
+        // The clause nests in derived tables, CTEs and subqueries, and a
+        // time-travel read feeds INSERT ... SELECT like any scan.
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*) FROM (SELECT a FROM t AT (VERSION => 2)) s;"
+            ),
+            vec![vec![Value::Bigint(2)]]
+        );
+        assert_eq!(
+            query(
+                &mut db,
+                "WITH c AS (SELECT * FROM t AT (VERSION => 3)) SELECT COUNT(*) FROM c;"
+            ),
+            vec![vec![Value::Bigint(3)]]
+        );
+        db.execute("CREATE TABLE sink (a INTEGER);").unwrap();
+        db.execute("INSERT INTO sink SELECT a FROM t AT (VERSION => 2);")
+            .unwrap();
+        assert_eq!(
+            query(&mut db, "SELECT COUNT(*) FROM sink;"),
+            vec![vec![Value::Bigint(2)]]
+        );
+        // Timestamps resolve inclusively: exactly v2's publish time and
+        // anything after it (before v3's) is v2.
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*) FROM t AT (TIMESTAMP => TIMESTAMP '1970-01-01 00:00:02');"
+            ),
+            vec![vec![Value::Bigint(2)]]
+        );
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*) FROM t AT (TIMESTAMP => '1970-01-01 00:00:02.5');"
+            ),
+            vec![vec![Value::Bigint(2)]]
+        );
+        // The ISO-8601 UTC form `.lake snapshots` prints is accepted too.
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*) FROM t AT (TIMESTAMP => TIMESTAMP '1970-01-01T00:00:03Z');"
+            ),
+            vec![vec![Value::Bigint(3)]]
+        );
+        // v1: the table did not exist yet.
+        let err = db
+            .execute("SELECT * FROM t AT (VERSION => 1);")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist at version 1"), "{err}");
+        // Unknown versions and times before the first snapshot are clean.
+        let err = db
+            .execute("SELECT * FROM t AT (VERSION => 9);")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no snapshot found at version 9"), "{err}");
+        let err = db
+            .execute("SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '1970-01-01 00:00:00.5');")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no snapshot found at timestamp 1970-01-01 00:00:00.500000"),
+            "{err}"
+        );
+    }
+
+    /// Statistics fast paths read the *target version's* descriptor: the
+    /// version's own COUNT/MIN/MAX answer without materializing anything.
+    #[test]
+    fn time_travel_stats_fast_paths_use_the_version_descriptor() {
+        let (mut db, lake) = versioned_session();
+        assert_eq!(
+            query(
+                &mut db,
+                "SELECT COUNT(*), COUNT(b), MIN(a), MAX(a), MIN(b), MAX(b) \
+                 FROM t AT (VERSION => 2);"
+            ),
+            vec![vec![
+                Value::Bigint(2),
+                Value::Bigint(2),
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Varchar("x".to_string()),
+                Value::Varchar("y".to_string()),
+            ]]
+        );
+        assert_eq!(
+            lake.loads.load(Ordering::Relaxed),
+            0,
+            "statistics answers must not decode a version"
+        );
+        // A shape the statistics cannot prove falls back to the version's
+        // own decode.
+        assert_eq!(
+            query(&mut db, "SELECT SUM(a) FROM t AT (VERSION => 2);"),
+            vec![vec![Value::Bigint(3)]]
+        );
+        assert_eq!(lake.loads.load(Ordering::Relaxed), 1);
+    }
+
+    /// Time travel is a capability of attached lakes only: store tables,
+    /// CTEs, views and lakes without the capability refuse cleanly, and the
+    /// session keeps working.
+    #[test]
+    fn time_travel_refusals_are_clean() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE plain (x INTEGER);").unwrap();
+        db.execute("INSERT INTO plain VALUES (1);").unwrap();
+        let err = db
+            .execute("SELECT * FROM plain AT (VERSION => 2);")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("has no snapshot history") && err.contains("AT (VERSION => 2)"),
+            "{err}"
+        );
+        let err = db
+            .execute("SELECT * FROM nosuch AT (VERSION => 2);")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nosuch"), "{err}");
+
+        // A lake without the capability (the trait's default refusal).
+        let mut db2 = PinkDb::new();
+        db2.attach_lake(lake()).unwrap();
+        let err = db2
+            .execute("SELECT * FROM t AT (VERSION => 2);")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not support time travel"), "{err}");
+
+        // A CTE or a view named like the table cannot time-travel either.
+        let mut db3 = PinkDb::new();
+        db3.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db3.execute("CREATE VIEW v AS SELECT a FROM t;").unwrap();
+        let err = db3
+            .execute("WITH t AS (SELECT 1 AS a) SELECT * FROM t AT (VERSION => 1);")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not available on the CTE \"t\""), "{err}");
+        let err = db3
+            .execute("SELECT * FROM v AT (VERSION => 1);")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not available on the view \"v\""), "{err}");
+        // The session still answers after every refusal.
+        assert_eq!(
+            query(&mut db3, "SELECT COUNT(*) FROM t;"),
+            vec![vec![Value::Bigint(0)]]
+        );
+    }
+
+    /// EXPLAIN names the time-travel target, and `plan_schema` sees the
+    /// version's schema.
+    #[test]
+    fn explain_shows_the_time_travel_target() {
+        let (mut db, _) = versioned_session();
+        let rows = query(&mut db, "EXPLAIN SELECT b FROM t AT (VERSION => 2);");
+        let text = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Varchar(s) => s.clone(),
+                other => panic!("explain row is not text: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Scan main.t AT (VERSION => 2)"), "{text}");
+        let rows = query(
+            &mut db,
+            "EXPLAIN SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '1970-01-01 00:00:02.5');",
+        );
+        let text = rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Varchar(s) => s.clone(),
+                other => panic!("explain row is not text: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("AT (TIMESTAMP => 1970-01-01 00:00:02.500000)"),
+            "{text}"
         );
     }
 }

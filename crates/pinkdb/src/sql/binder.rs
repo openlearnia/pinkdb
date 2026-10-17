@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::ast::*;
+use crate::attached::AtSpec;
 use crate::plan::LogicalPlan;
 use crate::storage::{
     DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
@@ -3868,6 +3869,7 @@ fn bind_select_in(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Logi
             from: Some(FromClause {
                 source: FromSource::Derived(Box::new(head)),
                 alias: Some("__setop".to_string()),
+                at: None,
                 joins: Vec::new(),
             }),
             where_clause: None,
@@ -3970,7 +3972,7 @@ pub(crate) fn plan_schema(
     plan: &LogicalPlan,
 ) -> Result<Vec<(String, DataType)>> {
     match plan {
-        LogicalPlan::Scan { db: qdb, table } => {
+        LogicalPlan::Scan { db: qdb, table, at } => {
             if qdb.is_none() {
                 if let Some((_, schema)) = ctes
                     .iter()
@@ -3982,8 +3984,12 @@ pub(crate) fn plan_schema(
             }
             let lookup = qdb.as_deref().unwrap_or(default_db);
             // Attached lake tables are visible to queries (they are not in
-            // the store themselves).
-            db.visible_table_schema(lookup, table)
+            // the store themselves); an `AT` target resolves the schema from
+            // the target version's own descriptor.
+            match at {
+                None => db.visible_table_schema(lookup, table),
+                Some(at) => db.visible_table_schema_at(lookup, table, *at),
+            }
         }
         LogicalPlan::SingleRow => Ok(Vec::new()),
         LogicalPlan::Filter { input, .. }
@@ -4061,6 +4067,7 @@ fn bind_source(
     binder: &mut Binder,
     source: &FromSource,
     alias: &Option<String>,
+    at: Option<AtSpec>,
 ) -> Result<(ScopeTable, LogicalPlan)> {
     match source {
         FromSource::Table { db: qdb, name } => {
@@ -4072,6 +4079,15 @@ fn bind_source(
                     .rev()
                     .find(|(n, _)| n.eq_ignore_ascii_case(name))
                 {
+                    if let Some(at) = at {
+                        // DuckLake silently ignores the clause here; a
+                        // silently ignored time-travel request is a
+                        // wrong-answer trap, so this engine refuses instead.
+                        return Err(PinkDbError::Catalog(format!(
+                            "time travel is not available on the CTE \"{name}\" (AT ({at}) \
+                             works on lake tables)"
+                        )));
+                    }
                     let eff = alias.clone().unwrap_or_else(|| name.clone());
                     return Ok((
                         ScopeTable {
@@ -4081,12 +4097,19 @@ fn bind_source(
                         LogicalPlan::Scan {
                             db: None,
                             table: name.clone(),
+                            at: None,
                         },
                     ));
                 }
             }
             let lookup_db = binder.resolve_db(qdb)?;
             if let Ok(view) = db.view_in(&lookup_db, name) {
+                if let Some(at) = at {
+                    return Err(PinkDbError::Catalog(format!(
+                        "time travel is not available on the view \"{name}\" (AT ({at}) \
+                         works on lake tables)"
+                    )));
+                }
                 // Views rebind per use (like derived tables): the scope always
                 // matches the freshly bound plan, so catalog drift surfaces
                 // as errors, never stale indices. The body resolves
@@ -4121,7 +4144,13 @@ fn bind_source(
                     sub,
                 ));
             }
-            let columns = db.visible_table_schema(&lookup_db, name)?;
+            // With an `AT` target the scope comes from the *version's*
+            // descriptor (an attached lake reads that version's footer /
+            // statistics block); without one, the ordinary visible schema.
+            let columns = match at {
+                None => db.visible_table_schema(&lookup_db, name)?,
+                Some(at) => db.visible_table_schema_at(&lookup_db, name, at)?,
+            };
             let eff = alias.clone().unwrap_or_else(|| name.clone());
             Ok((
                 ScopeTable {
@@ -4131,10 +4160,20 @@ fn bind_source(
                 LogicalPlan::Scan {
                     db: Some(lookup_db),
                     table: name.clone(),
+                    at,
                 },
             ))
         }
         FromSource::Derived(q) => {
+            if let Some(at) = at {
+                // The parser refuses `(SELECT …) alias AT (…)`, so this is a
+                // defensive path for a hand-built AST: a clean error, never a
+                // silently ignored time-travel target.
+                let _ = at;
+                return Err(PinkDbError::Parse(
+                    "AT is only valid after a table name".to_string(),
+                ));
+            }
             let alias = alias
                 .clone()
                 .ok_or_else(|| PinkDbError::Parse("derived table needs an alias".to_string()))?;
@@ -4230,12 +4269,12 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     // FROM (+ left-deep join chain). Returns the base plan and left width.
     let mut base: LogicalPlan;
     if let Some(from) = &sel.from {
-        let (left, left_plan) = bind_source(db, binder, &from.source, &from.alias)?;
+        let (left, left_plan) = bind_source(db, binder, &from.source, &from.alias, from.at)?;
         let mut left_cols = left.columns.len();
         base = left_plan;
         binder.tables.push(left);
         for join in &from.joins {
-            let (right, right_plan) = bind_source(db, binder, &join.source, &join.alias)?;
+            let (right, right_plan) = bind_source(db, binder, &join.source, &join.alias, join.at)?;
             if binder.tables.iter().any(|t| t.name == right.name) {
                 return Err(PinkDbError::Catalog(format!(
                     "table name \"{}\" specified more than once (use an alias)",

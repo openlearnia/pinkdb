@@ -11,6 +11,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use pink_lake::{save_store, validate_store, Lake, LakeError, FORMAT_VERSION};
 use pinkdb::{DataTable, DataType, PinkDb, Value, Vector, CHUNK_SIZE};
@@ -2160,6 +2161,532 @@ fn v1_stats_fixture_attaches_in_the_full_build() {
             "the v1 data file {} must stay",
             file.display()
         );
+    }
+    cleanup(&dir);
+}
+
+// ---------- time travel and snapshot records (wave 64) ----------
+
+/// A three-version lake: v2 holds `t` with two rows, v3 adds a row, v4 adds
+/// another. Returns `(scratch, lake_dir, versions)` where `versions` is the
+/// per-version record list read through [`Lake::snapshots`].
+fn time_travel_lake(tag: &str) -> (PathBuf, PathBuf, Vec<pink_lake::SnapshotInfo>) {
+    let dir = scratch(tag);
+    let lake_dir = dir.join("lake");
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+        .unwrap();
+    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'one'), (2, 'two');")
+        .unwrap();
+    lake.write_from_store(&db).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.execute("INSERT INTO t VALUES (3, 'three');").unwrap();
+    lake.write_from_store(&db).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    db.execute("INSERT INTO t VALUES (4, 'four');").unwrap();
+    lake.write_from_store(&db).unwrap();
+    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    (dir, lake_dir, records)
+}
+
+/// The engine's rows for `sql` on an attached lake, or the error text.
+fn try_rows(db: &mut PinkDb, sql: &str) -> Result<Vec<Vec<Value>>, String> {
+    match db.execute(sql) {
+        Ok(mut results) => match results.pop().unwrap() {
+            pinkdb::QueryResult::Selected { rows, .. } => Ok(rows),
+            other => panic!("expected rows, got {other:?}"),
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Reading an older version returns exactly that version's rows, and the
+/// current version is unchanged by any number of time-travel reads.
+#[test]
+fn time_travel_reads_exact_old_versions() {
+    let (dir, lake_dir, records) = time_travel_lake("tt_versions");
+    assert_eq!(
+        records.iter().map(|r| r.version).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    assert_eq!(report.version, 4);
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+
+    // Every version reads back its own rows, in file order.
+    assert_eq!(
+        try_rows(&mut db, "SELECT x, s FROM t AT (VERSION => 2) ORDER BY x;").unwrap(),
+        vec![
+            vec![Value::Integer(1), Value::Varchar("one".to_string())],
+            vec![Value::Integer(2), Value::Varchar("two".to_string())],
+        ]
+    );
+    assert_eq!(
+        try_rows(&mut db, "SELECT x FROM t AT (VERSION => 3) ORDER BY x;").unwrap(),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+    // v1 is the empty lake: the table did not exist yet.
+    let err = try_rows(&mut db, "SELECT * FROM t AT (VERSION => 1);").unwrap_err();
+    assert!(
+        err.contains("does not exist at version 1"),
+        "unexpected error: {err}"
+    );
+    // The current version answers the same after all those reads.
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
+        vec![vec![Value::Bigint(4)]]
+    );
+    // Window clauses, joins, aggregates and aliases all work on a version.
+    assert_eq!(
+        try_rows(
+            &mut db,
+            "SELECT COUNT(*), MIN(x), MAX(x) FROM t AS a AT (VERSION => 2);"
+        )
+        .unwrap(),
+        vec![vec![Value::Bigint(2), Value::Integer(1), Value::Integer(2)]]
+    );
+    assert_eq!(
+        try_rows(
+            &mut db,
+            "SELECT old.x, new.x FROM t old AT (VERSION => 2) \
+             JOIN t new AT (VERSION => 4) ON old.x = new.x ORDER BY old.x;"
+        )
+        .unwrap(),
+        vec![
+            vec![Value::Integer(1), Value::Integer(1)],
+            vec![Value::Integer(2), Value::Integer(2)],
+        ]
+    );
+    // The engine refuses time travel on a store table (DuckLake: "catalog
+    // type does not support time travel") and on views; both are clean
+    // errors, and the session keeps working.
+    db.execute("CREATE TABLE plain (x INTEGER);").unwrap();
+    let err = try_rows(&mut db, "SELECT * FROM plain AT (VERSION => 2);").unwrap_err();
+    assert!(err.contains("has no snapshot history"), "{err}");
+    db.execute("CREATE VIEW v AS SELECT * FROM t;").unwrap();
+    let err = try_rows(&mut db, "SELECT * FROM v AT (VERSION => 2);").unwrap_err();
+    assert!(err.contains("not available on the view"), "{err}");
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
+        vec![vec![Value::Bigint(4)]]
+    );
+    cleanup(&dir);
+}
+
+/// `AT (TIMESTAMP => …)` resolves to the newest snapshot at or before the
+/// timestamp, inclusively; before the first snapshot it is a clean error.
+#[test]
+fn time_travel_timestamp_resolves_inclusively() {
+    let (dir, lake_dir, records) = time_travel_lake("tt_timestamp");
+    // The writer's millisecond times must be strictly increasing across the
+    // three saves for this test to have a single right answer; the 5 ms
+    // sleeps make that true, and a failure here is a real (not flaky-time)
+    // signal.
+    for pair in records.windows(2) {
+        assert!(
+            pair[0].time < pair[1].time,
+            "snapshot times must increase: {} then {}",
+            pair[0].time,
+            pair[1].time
+        );
+        assert!(pair[0].time_micros.unwrap() < pair[1].time_micros.unwrap());
+    }
+    let ts = |v: u64| {
+        records
+            .iter()
+            .find(|r| r.version == v)
+            .unwrap()
+            .time
+            .clone()
+    };
+    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+
+    // The exact publish time of v3 is inside v3 (inclusive), and 1 ms before
+    // v4's publish time is still v3.
+    assert_eq!(
+        try_rows(
+            &mut db,
+            &format!(
+                "SELECT COUNT(*) FROM t AT (TIMESTAMP => TIMESTAMP '{}');",
+                ts(3)
+            )
+        )
+        .unwrap(),
+        vec![vec![Value::Bigint(3)]]
+    );
+    let before_v4 = records
+        .iter()
+        .find(|r| r.version == 4)
+        .unwrap()
+        .time_micros
+        .unwrap()
+        - 1_000;
+    let before_v4 = pinkdb::types::format_timestamp(before_v4);
+    assert_eq!(
+        try_rows(
+            &mut db,
+            &format!("SELECT COUNT(*) FROM t AT (TIMESTAMP => TIMESTAMP '{before_v4}');")
+        )
+        .unwrap(),
+        vec![vec![Value::Bigint(3)]]
+    );
+    // A bare string literal is accepted too (DuckLake casts it).
+    assert_eq!(
+        try_rows(
+            &mut db,
+            &format!("SELECT COUNT(*) FROM t AT (TIMESTAMP => '{}');", ts(2))
+        )
+        .unwrap(),
+        vec![vec![Value::Bigint(2)]]
+    );
+    // Before the first snapshot: clean error naming the timestamp.
+    let before_v1 = records
+        .iter()
+        .find(|r| r.version == 1)
+        .unwrap()
+        .time_micros
+        .unwrap()
+        - 1_000;
+    let before_v1 = pinkdb::types::format_timestamp(before_v1);
+    let err = try_rows(
+        &mut db,
+        &format!("SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '{before_v1}');"),
+    )
+    .unwrap_err();
+    assert!(
+        err.contains("no snapshot found at timestamp") && err.contains(&before_v1),
+        "unexpected error: {err}"
+    );
+    // A malformed timestamp is a parse error, never a guessed instant.
+    let err = try_rows(
+        &mut db,
+        "SELECT * FROM t AT (TIMESTAMP => TIMESTAMP 'not a time');",
+    )
+    .unwrap_err();
+    assert!(err.contains("parse error"), "{err}");
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
+        vec![vec![Value::Bigint(4)]]
+    );
+    cleanup(&dir);
+}
+
+/// Unknown, unpublished and out-of-range versions are clean errors, and the
+/// session keeps answering afterwards.
+#[test]
+fn time_travel_unknown_versions_are_clean_errors() {
+    let (dir, lake_dir, _) = time_travel_lake("tt_unknown");
+    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+    for sql in [
+        "SELECT * FROM t AT (VERSION => 0);",
+        "SELECT * FROM t AT (VERSION => 99);",
+        "SELECT * FROM t AT (VERSION => 18446744073709551615);",
+    ] {
+        let err = try_rows(&mut db, sql).unwrap_err();
+        assert!(err.contains("no snapshot found at version"), "{sql}: {err}");
+        assert!(err.contains("lake"), "{sql}: {err}");
+    }
+    // Parse errors: the clause takes exactly the two documented literal
+    // forms; everything else fails the parse without disturbing the session.
+    for sql in [
+        "SELECT * FROM t AT (VERSION 3);",
+        "SELECT * FROM t AT VERSION 3;",
+        "SELECT * FROM t AT (FOO => 3);",
+        "SELECT * FROM t AT ();",
+        "SELECT * FROM t AT (VERSION => );",
+        "SELECT * FROM t AT (VERSION => 'x');",
+        "SELECT * FROM t AT (VERSION => 1.5);",
+        "SELECT * FROM t AT (VERSION => 3) AS z;",
+    ] {
+        let err = try_rows(&mut db, sql).unwrap_err();
+        assert!(err.contains("parse error"), "{sql}: {err}");
+    }
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
+        vec![vec![Value::Bigint(4)]]
+    );
+    // A table that did not exist at the target version is named in the error.
+    let mut db2 = PinkDb::new();
+    db2.execute("CREATE TABLE later (y INTEGER);").unwrap();
+    let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.write_from_store(&db2).unwrap();
+    let report = lake.attach(None).unwrap();
+    let mut db3 = PinkDb::new();
+    db3.attach_lake(report.lake.clone()).unwrap();
+    let err = try_rows(&mut db3, "SELECT * FROM later AT (VERSION => 2);").unwrap_err();
+    assert!(
+        err.contains("later") && err.contains("does not exist at version 2"),
+        "{err}"
+    );
+    cleanup(&dir);
+}
+
+/// Statistics fast paths work per version: `COUNT(*)`/`MIN`/`MAX` over
+/// `AT (VERSION => n)` answer from that version's footer without decoding,
+/// while a filtered read decodes that version's file and caches it.
+#[test]
+fn time_travel_stats_fast_paths_do_not_decode() {
+    let (dir, lake_dir, _) = time_travel_lake("tt_stats");
+    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let lake = Arc::clone(&report.lake);
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t AT (VERSION => 2);").unwrap(),
+        vec![vec![Value::Bigint(2)]]
+    );
+    assert_eq!(
+        try_rows(
+            &mut db,
+            "SELECT MIN(x), MAX(x), COUNT(s) FROM t AT (VERSION => 3);"
+        )
+        .unwrap(),
+        vec![vec![Value::Integer(1), Value::Integer(3), Value::Bigint(3)]]
+    );
+    let (loads, columns) = lake.decode_stats();
+    assert_eq!(
+        loads, 0,
+        "statistics answers must not decode; {columns} cols"
+    );
+    // A predicate read materializes v2 only, and a second pass reuses it.
+    assert_eq!(
+        try_rows(
+            &mut db,
+            "SELECT COUNT(*) FROM t AT (VERSION => 2) WHERE x > 1;"
+        )
+        .unwrap(),
+        vec![vec![Value::Bigint(1)]]
+    );
+    assert_eq!(lake.decode_stats().0, 1);
+    let _ = try_rows(&mut db, "SELECT SUM(x) FROM t AT (VERSION => 2);").unwrap();
+    assert_eq!(lake.decode_stats().0, 1, "the version attachment is cached");
+    // The pinned current version is unaffected (no decode either).
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
+        vec![vec![Value::Bigint(4)]]
+    );
+    assert_eq!(lake.decode_stats().0, 1);
+    cleanup(&dir);
+}
+
+/// Time travel never reaches past the version an attachment is pinned to,
+/// and the pinned version is served by the attachment itself.
+#[test]
+fn time_travel_is_capped_at_the_attached_version() {
+    let (dir, lake_dir, _) = time_travel_lake("tt_capped");
+    let report = Lake::open(&lake_dir).unwrap().attach(Some(2)).unwrap();
+    assert_eq!(report.version, 2);
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+    // The pinned tables are v2's; v3/v4 are not reachable from this handle.
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t;").unwrap(),
+        vec![vec![Value::Bigint(2)]]
+    );
+    for sql in [
+        "SELECT * FROM t AT (VERSION => 3);",
+        "SELECT * FROM t AT (VERSION => 4);",
+    ] {
+        let err = try_rows(&mut db, sql).unwrap_err();
+        assert!(err.contains("no snapshot found at version"), "{sql}: {err}");
+    }
+    // v1 is reachable (the table did not exist), v2 is the pinned version.
+    let err = try_rows(&mut db, "SELECT * FROM t AT (VERSION => 1);").unwrap_err();
+    assert!(err.contains("does not exist at version 1"), "{err}");
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t AT (VERSION => 2);").unwrap(),
+        vec![vec![Value::Bigint(2)]]
+    );
+    cleanup(&dir);
+}
+
+/// Commit messages and change summaries are recorded per version, cleared
+/// after the save that publishes them, and survive a reopen.
+#[test]
+fn snapshot_records_carry_messages_and_change_summaries() {
+    let dir = scratch("snapshot_records");
+    let lake_dir = dir.join("lake");
+    let mut db = PinkDb::new();
+    let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+
+    // Version 2: two tables, an author and a message.
+    db.execute("CREATE TABLE t (x INTEGER);").unwrap();
+    db.execute("CREATE TABLE u (y INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+    db.execute("INSERT INTO u VALUES (9);").unwrap();
+    lake.set_commit_message(Some("alice".to_string()), Some("add t and u".to_string()));
+    lake.write_from_store(&db).unwrap();
+
+    // Version 3: rows added, no message set — the pending record must not be
+    // repeated.
+    db.execute("INSERT INTO t VALUES (3), (4), (5);").unwrap();
+    lake.write_from_store(&db).unwrap();
+
+    // Version 4: a message only, "bob" as the author.
+    db.execute("DROP TABLE u;").unwrap();
+    db.execute("UPDATE t SET x = 0 WHERE x = 1;").unwrap();
+    lake.set_commit_message(Some("bob".to_string()), Some("drop u".to_string()));
+    lake.write_from_store(&db).unwrap();
+
+    // Reopened from disk, the records are exactly what each save recorded.
+    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0].version, 1);
+    assert_eq!(records[0].author, None);
+    assert_eq!(records[0].message, None);
+    assert_eq!(records[0].changes, None, "create records no change summary");
+    assert_eq!((records[0].tables, records[0].rows), (0, 0));
+
+    assert_eq!(records[1].author.as_deref(), Some("alice"));
+    assert_eq!(records[1].message.as_deref(), Some("add t and u"));
+    assert_eq!((records[1].tables, records[1].rows), (2, 3));
+    let changes = records[1].changes.as_ref().unwrap();
+    assert_eq!(changes.tables_created, vec!["main.t", "main.u"]);
+    assert!(changes.tables_dropped.is_empty());
+    assert!(changes.tables_rewritten.is_empty());
+    // A created table's rows are the table itself: no row delta is recorded.
+    assert!(changes.rows_added.is_empty());
+
+    assert_eq!(records[2].author, None, "the message must not repeat");
+    assert_eq!(records[2].message, None);
+    let changes = records[2].changes.as_ref().unwrap();
+    assert!(changes.tables_created.is_empty());
+    // A whole-store save writes fresh files for every surviving table, so
+    // both are "rewritten" even though only `t`'s rows moved.
+    assert_eq!(changes.tables_rewritten, vec!["main.t", "main.u"]);
+    assert_eq!(changes.rows_added.get("main.t"), Some(&3));
+    assert_eq!(records[2].tables, 2);
+
+    assert_eq!(records[3].author.as_deref(), Some("bob"));
+    assert_eq!(records[3].message.as_deref(), Some("drop u"));
+    let changes = records[3].changes.as_ref().unwrap();
+    assert_eq!(changes.tables_dropped, vec!["main.u"]);
+    assert_eq!(changes.tables_rewritten, vec!["main.t"]);
+    assert!(
+        changes.rows_added.is_empty(),
+        "x=1 became x=0, no row moved"
+    );
+    assert!((records[3].tables, records[3].rows) == (1, 5));
+    for record in &records {
+        assert!(record.time_micros.is_some(), "{}", record.time);
+    }
+
+    // The record is in the manifest JSON itself (additive fields next to the
+    // pre-wave-64 shape).
+    let catalog = read_json(&lake_dir.join("catalog.json"));
+    assert_eq!(catalog["commit_message"], "drop u");
+    assert_eq!(catalog["author"], "bob");
+    assert_eq!(catalog["changes"]["tables_dropped"][0], "main.u");
+    // A save that fails keeps the pending record for the retry — and
+    // publishes nothing.
+    let mut stale = Lake::open(&lake_dir).unwrap();
+    Lake::open(&lake_dir)
+        .unwrap()
+        .write_from_store(&db)
+        .unwrap();
+    stale.set_commit_message(Some("carol".to_string()), Some("retry me".to_string()));
+    assert!(
+        stale.write_from_store(&db).is_err(),
+        "stale handle conflicts"
+    );
+    let records_after = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    assert_eq!(records_after.len(), 5);
+    assert_eq!(records_after[3].message.as_deref(), Some("drop u"));
+    assert_eq!(records_after[4].message, None, "the winner records nothing");
+    assert!(
+        records_after
+            .iter()
+            .all(|r| r.message.as_deref() != Some("retry me")),
+        "the failed save's pending record must not publish"
+    );
+    cleanup(&dir);
+}
+
+/// Time travel resolves through a v1 `.pink` lake's statistics blocks: the
+/// attached `lake_v1_v4_stats` fixture (the lean writer's cross-build pin)
+/// answers `AT (VERSION => 2)` from its published blocks — no data file
+/// opened — and names the version in the error for a version before the
+/// table existed.
+#[test]
+fn time_travel_on_a_v1_stats_fixture_resolves_versions() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4_stats");
+    let report = Lake::open(&fixture).unwrap().attach(None).unwrap();
+    assert_eq!(report.version, 2);
+    let lake = Arc::clone(&report.lake);
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+    let fid = select_rows(&mut db, "SELECT COUNT(*) FROM main.fid;");
+    assert_eq!(fid, vec![vec![Value::Bigint(6)]]);
+    // The same answer through the AT path (the pinned version), still
+    // statistics-only.
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM main.fid AT (VERSION => 2);").unwrap(),
+        vec![vec![Value::Bigint(6)]]
+    );
+    assert_eq!(lake.decode_stats(), (0, 0), "no data file may be opened");
+    // v1 is the empty lake: every table did not exist yet.
+    let err = try_rows(&mut db, "SELECT * FROM main.fid AT (VERSION => 1);").unwrap_err();
+    assert!(err.contains("does not exist at version 1"), "{err}");
+    let err = try_rows(&mut db, "SELECT * FROM main.fid AT (VERSION => 3);").unwrap_err();
+    assert!(err.contains("no snapshot found at version 3"), "{err}");
+}
+
+/// A snapshot whose publish time does not parse (a hand-edited/tampered
+/// manifest) is still a version — `AT (VERSION => n)` reads it — but it is
+/// excluded from `AT (TIMESTAMP => …)` resolution rather than guessed at, and
+/// `snapshots()` reports `time_micros: None` with the raw string.
+#[test]
+fn unparseable_snapshot_times_are_listed_but_never_guessed_at() {
+    let (dir, lake_dir, records) = time_travel_lake("tt_bad_time");
+    let v4 = lake_dir.join("snapshots/4.json");
+    let original_time = records[3].time.clone();
+    let tampered = std::fs::read_to_string(&v4)
+        .unwrap()
+        .replace(&original_time, "not-a-time");
+    assert_ne!(tampered, std::fs::read_to_string(&v4).unwrap());
+    std::fs::write(&v4, tampered).unwrap();
+
+    let records = Lake::open(&lake_dir).unwrap().snapshots().unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[3].time, "not-a-time");
+    assert_eq!(records[3].time_micros, None);
+    // The rest of the record is untouched by the tampered time.
+    assert!(records[3].changes.is_some());
+
+    let report = Lake::open(&lake_dir).unwrap().attach(None).unwrap();
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+    // The version still resolves and reads its four rows.
+    assert_eq!(
+        try_rows(&mut db, "SELECT COUNT(*) FROM t AT (VERSION => 4);").unwrap(),
+        vec![vec![Value::Bigint(4)]]
+    );
+    // The timestamp the tampered manifest used to carry no longer resolves to
+    // v4: the newest *parseable* snapshot at or before it is v3.
+    let err = try_rows(
+        &mut db,
+        &format!(
+            "SELECT COUNT(*) FROM t AT (TIMESTAMP => TIMESTAMP '{}');",
+            original_time.replace('T', " ").trim_end_matches('Z')
+        ),
+    );
+    match err {
+        Ok(rows) => assert_eq!(
+            rows,
+            vec![vec![Value::Bigint(3)]],
+            "an unparseable time must be skipped, not guessed"
+        ),
+        Err(e) => panic!("{e}"),
     }
     cleanup(&dir);
 }

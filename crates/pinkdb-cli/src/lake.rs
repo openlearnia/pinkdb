@@ -83,28 +83,87 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "detach" => cmd_detach(db, rest),
         "attached" => cmd_attached(db, rest),
         "versions" => cmd_versions(rest),
+        "snapshots" => cmd_snapshots(rest),
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
-        "" => println!("Usage: .lake <save|open|attach|detach|attached|versions|tables|info> ..."),
+        "" => println!(
+            "Usage: .lake <save|open|attach|detach|attached|versions|snapshots|tables|info> ..."
+        ),
         other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
+    }
+}
+
+/// The `.lake save` usage line (kept in one place: the argument parser and
+/// both of its error paths print it).
+const SAVE_USAGE: &str = "Usage: .lake save <dir> [force] [author '<name>'] [message '<text>']";
+
+/// One option *value*: `"…"` / `'…'` (spaces included) or a bare word, plus
+/// the remaining text. Quotes are stripped.
+fn take_value(input: &str) -> Option<(String, &str)> {
+    let s = input.trim_start();
+    let mut chars = s.char_indices();
+    match chars.next() {
+        Some((_, q @ ('"' | '\''))) => {
+            let mut value = String::new();
+            for (i, c) in chars {
+                if c == q {
+                    return Some((value, &s[i + c.len_utf8()..]));
+                }
+                value.push(c);
+            }
+            None
+        }
+        Some((_, _)) => {
+            let end = s.find(char::is_whitespace).unwrap_or(s.len());
+            Some((s[..end].to_string(), &s[end..]))
+        }
+        None => None,
     }
 }
 
 /// `.lake save <location>`: snapshot every database/table of the current
 /// store (a directory or an `s3://bucket/prefix` URL with the `s3` feature).
+/// `author '<name>'` / `message '<text>'` record the version's commit
+/// metadata, like DuckLake's `ducklake_set_commit_message`.
 fn cmd_save(db: &PinkDb, arg: &str) {
-    let Some((dir, rest)) = take_token(arg) else {
-        println!("Usage: .lake save <dir> [force]{HINT}");
+    let Some((dir, mut rest)) = take_token(arg) else {
+        println!("{SAVE_USAGE}{HINT}");
         return;
     };
-    let force = match rest.trim() {
-        "" => false,
-        "force" => true,
-        _ => {
-            println!("Usage: .lake save <dir> [force]{HINT}");
-            return;
+    let mut force = false;
+    let mut author: Option<String> = None;
+    let mut message: Option<String> = None;
+    loop {
+        let tail = rest.trim_start();
+        if tail.is_empty() {
+            break;
         }
-    };
+        let Some((token, after)) = take_token(tail) else {
+            break;
+        };
+        match token.to_ascii_lowercase().as_str() {
+            "force" => {
+                force = true;
+                rest = after;
+            }
+            "author" | "message" => {
+                let Some((value, after)) = take_value(after) else {
+                    println!("{SAVE_USAGE}{HINT}");
+                    return;
+                };
+                if token.eq_ignore_ascii_case("author") {
+                    author = Some(value);
+                } else {
+                    message = Some(value);
+                }
+                rest = after;
+            }
+            _ => {
+                println!("{SAVE_USAGE}{HINT}");
+                return;
+            }
+        }
+    }
     let dir = unquote(&dir);
     // An open transaction's rows are applied in place but uncommitted: a
     // lake snapshot must never publish them.
@@ -137,6 +196,9 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             );
             return;
         }
+    }
+    if author.is_some() || message.is_some() {
+        lake.set_commit_message(author, message);
     }
     let t0 = Instant::now();
     match lake.write_from_store_report(db) {
@@ -401,6 +463,89 @@ fn cmd_versions(arg: &str) {
                     println!("{v} (current)");
                 } else {
                     println!("{v}");
+                }
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake snapshots <dir>`: every published version's record — publish time,
+/// author, commit message, table/row counts and the change summary relative
+/// to the version before it (DuckLake's `snapshots()` row, one per version).
+fn cmd_snapshots(arg: &str) {
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("Usage: .lake snapshots <dir>{HINT}");
+        return;
+    };
+    if !rest.trim().is_empty() {
+        println!("Usage: .lake snapshots <dir>{HINT}");
+        return;
+    }
+    let dir = unquote(&dir);
+    let lake = match Lake::open_url(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match lake.snapshots() {
+        Ok(records) if records.is_empty() => println!("(no snapshots)"),
+        Ok(records) => {
+            let current = lake.current_version();
+            for info in records {
+                if info.version == current {
+                    println!("version {} (current)", info.version);
+                } else {
+                    println!("version {}", info.version);
+                }
+                println!("  time:    {}", info.time);
+                if let Some(author) = &info.author {
+                    println!("  author:  {author}");
+                }
+                if let Some(message) = &info.message {
+                    println!("  message: {message}");
+                }
+                println!(
+                    "  tables:  {} ({} row{})",
+                    info.tables,
+                    info.rows,
+                    plural(info.rows as usize)
+                );
+                match &info.changes {
+                    None => println!("  changes: (not recorded)"),
+                    Some(changes) if changes.is_empty() => println!("  changes: (none)"),
+                    Some(changes) => {
+                        let mut parts = Vec::new();
+                        if !changes.tables_created.is_empty() {
+                            parts.push(format!("created: {}", changes.tables_created.join(", ")));
+                        }
+                        if !changes.tables_dropped.is_empty() {
+                            parts.push(format!("dropped: {}", changes.tables_dropped.join(", ")));
+                        }
+                        if !changes.tables_rewritten.is_empty() {
+                            parts.push(format!(
+                                "rewritten: {}",
+                                changes.tables_rewritten.join(", ")
+                            ));
+                        }
+                        let mut rows: Vec<String> = changes
+                            .rows_added
+                            .iter()
+                            .map(|(table, n)| format!("{table} +{n}"))
+                            .collect();
+                        rows.extend(
+                            changes
+                                .rows_removed
+                                .iter()
+                                .map(|(table, n)| format!("{table} -{n}")),
+                        );
+                        if !rows.is_empty() {
+                            parts.push(format!("rows: {}", rows.join(", ")));
+                        }
+                        println!("  changes: {}", parts.join("; "));
+                    }
                 }
             }
         }

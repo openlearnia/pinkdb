@@ -714,6 +714,16 @@ fn int_value(text: &str) -> std::result::Result<Value, &'static str> {
     }
 }
 
+/// The value of an `AT (TIMESTAMP => …)` literal, in either accepted form:
+/// the engine's own TIMESTAMP text (`YYYY-MM-DD HH:MM:SS[.ffffff]`, `T`
+/// separator allowed) or the ISO-8601 UTC form lake manifests store
+/// (`YYYY-MM-DDTHH:MM:SS[.fff]Z` — exactly what `.lake snapshots` prints).
+fn at_timestamp_value(text: &str) -> std::result::Result<i64, &'static str> {
+    crate::types::parse_timestamp(text)
+        .or_else(|| crate::types::parse_iso8601_utc(text))
+        .ok_or("valid TIMESTAMP literal")
+}
+
 peg::parser! {
     grammar peg_sql() for str {
         use super::{apply_cmp, desugar_case, int_value, CmpTail};
@@ -1179,11 +1189,14 @@ peg::parser! {
             / name:ident() { name }
 
         rule from_clause() -> FromClause
-            = kw(Keyword::From) source:from_source() alias:alias()? joins:(j:join_clause() { j })* {?
+            = kw(Keyword::From) source:from_source() suffix:source_suffix() joins:(j:join_clause() { j })* {?
+                  let (alias, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
+                  } else if matches!(&source, FromSource::Derived(_)) && at.is_some() {
+                      Err("AT is only valid after a table name")
                   } else {
-                      Ok(FromClause { source, alias, joins })
+                      Ok(FromClause { source, alias, at, joins })
                   }
               }
 
@@ -1191,23 +1204,71 @@ peg::parser! {
             = lparen() q:select() rparen() { FromSource::Derived(Box::new(q)) }
             / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
 
+        /// A from/join source's `[alias] [AT (...)]` suffix, in either legal
+        /// order of appearance: `t AT (...)` (no alias) or `t [AS] alias
+        /// [AT (...)]`. DuckLake's shape is exactly this — an alias after the
+        /// `AT` clause is a syntax error there and here. PEG tries the bare
+        /// `AT` case first so a table named like the clause's keyword can
+        /// still take `AT` as its own alias when no parenthesized target
+        /// follows.
+        rule source_suffix() -> (Option<String>, Option<crate::attached::AtSpec>)
+            = at:at_clause() { (None, Some(at)) }
+            / alias:alias() at:at_clause()? { (Some(alias), at) }
+            / { (None, None) }
+
+        /// `AT (VERSION => n)` / `AT (TIMESTAMP => TIMESTAMP '<literal>')`.
+        /// `AT`, `VERSION` and `TIMESTAMP`'s inner literal are matched as
+        /// words/literals so nothing reserved changes: a column named `at`
+        /// keeps working. DuckLake accepts arbitrary constant expressions
+        /// here; this engine accepts exactly the two documented literal
+        /// forms and rejects the rest with a parse error.
+        rule at_clause() -> crate::attached::AtSpec
+            = word("at") lparen() spec:at_spec() rparen() { spec }
+
+        rule at_spec() -> crate::attached::AtSpec
+            = word("version") arrow() v:version_integer() { crate::attached::AtSpec::Version(v) }
+            / word("timestamp") arrow() ts:at_timestamp() { crate::attached::AtSpec::Timestamp(ts) }
+
+        /// `=>` (DuckLake's named-argument arrow; `= >` is accepted too).
+        rule arrow() = "=" ws() ">" ws()
+
+        /// A `u64` decimal literal; anything larger is a clean parse error.
+        rule version_integer() -> u64
+            = n:$(['0'..='9']+) ws() {? n.parse::<u64>().or(Err("version number")) }
+
+        /// A timestamp literal: `TIMESTAMP '<text>'` or a bare string (DuckLake
+        /// casts a plain string to TIMESTAMPTZ; this engine has one naive
+        /// TIMESTAMP type). Two textual forms are accepted, because
+        /// `.lake snapshots` prints the second one and pasting it must work:
+        /// the engine's own `YYYY-MM-DD HH:MM:SS[.ffffff]` (a `T` separator
+        /// included) and the manifests' ISO-8601 UTC form `…T…[.fff]Z`.
+        rule at_timestamp() -> i64
+            = kw(Keyword::Timestamp) s:string_lit() {? at_timestamp_value(&s) }
+            / s:string_lit() {? at_timestamp_value(&s) }
+
         /// One join step: `CROSS JOIN src` (no condition) or
         /// `[INNER|LEFT|RIGHT|FULL [OUTER]] JOIN src ON cond`. Each `ON`
         /// condition binds against every table to its left plus its own
         /// right-hand source (multi-way joins are left-deep).
         rule join_clause() -> JoinClause
-            = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() alias:alias()? {?
+            = kw(Keyword::Cross) kw(Keyword::Join) source:from_source() suffix:source_suffix() {?
+                  let (alias, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
+                  } else if matches!(&source, FromSource::Derived(_)) && at.is_some() {
+                      Err("AT is only valid after a table name")
                   } else {
-                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, on: None })
+                      Ok(JoinClause { kind: JoinKind::Cross, source, alias, at, on: None })
                   }
               }
-            / kind:join_kind() source:from_source() alias:alias()? kw(Keyword::On) on:expr() {?
+            / kind:join_kind() source:from_source() suffix:source_suffix() kw(Keyword::On) on:expr() {?
+                  let (alias, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
+                  } else if matches!(&source, FromSource::Derived(_)) && at.is_some() {
+                      Err("AT is only valid after a table name")
                   } else {
-                      Ok(JoinClause { kind, source, alias, on: Some(on) })
+                      Ok(JoinClause { kind, source, alias, at, on: Some(on) })
                   }
               }
 
@@ -3919,5 +3980,110 @@ mod tests {
             valid > 0 && invalid > 0,
             "expected a valid/invalid mix: {valid} valid, {invalid} invalid"
         );
+    }
+
+    /// `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` — DuckLake's time-travel
+    /// clause after a table reference and its alias. The grammar accepts
+    /// exactly the documented literal forms; everything else is a parse
+    /// error, and none of it disturbs identifier-shaped input (`at` stays a
+    /// usable alias/column name).
+    #[test]
+    fn at_clause_parses_in_both_forms_and_stays_out_of_the_way() {
+        use crate::attached::AtSpec;
+        // No alias: the clause binds directly.
+        let Statement::Select(sel) = parse_one("SELECT * FROM t AT (VERSION => 3);") else {
+            panic!()
+        };
+        let from = sel.from.unwrap();
+        assert_eq!(from.alias, None);
+        assert_eq!(from.at, Some(AtSpec::Version(3)));
+        // Lowercase keywords and any whitespace before `(`.
+        let Statement::Select(sel) = parse_one("SELECT * FROM main.t at(version=>7);") else {
+            panic!()
+        };
+        assert_eq!(sel.from.unwrap().at, Some(AtSpec::Version(7)));
+        // An alias may come before the clause (`AS` optional), DuckLake's
+        // shape; an alias *after* it is a parse error.
+        for sql in [
+            "SELECT * FROM t AS z AT (VERSION => 2);",
+            "SELECT * FROM t z AT (VERSION => 2);",
+        ] {
+            let Statement::Select(sel) = parse_one(sql) else {
+                panic!()
+            };
+            let from = sel.from.unwrap();
+            assert_eq!(from.alias.as_deref(), Some("z"), "{sql}");
+            assert_eq!(from.at, Some(AtSpec::Version(2)), "{sql}");
+        }
+        // Both timestamp spellings: the engine's own text and the ISO-8601
+        // UTC form `.lake snapshots` prints.
+        let Statement::Select(sel) =
+            parse_one("SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '2026-10-17 12:30:36.029');")
+        else {
+            panic!()
+        };
+        assert_eq!(
+            sel.from.unwrap().at,
+            Some(AtSpec::Timestamp(
+                crate::types::parse_timestamp("2026-10-17 12:30:36.029").unwrap()
+            ))
+        );
+        let Statement::Select(sel) =
+            parse_one("SELECT * FROM t AT (TIMESTAMP => '2026-10-17T12:30:36.029Z');")
+        else {
+            panic!()
+        };
+        assert_eq!(
+            sel.from.unwrap().at,
+            Some(AtSpec::Timestamp(1_792_240_236_029_000))
+        );
+        // A join source carries its own clause.
+        let Statement::Select(sel) = parse_one(
+            "SELECT * FROM a x AT (VERSION => 1) JOIN b y AT (VERSION => 2) ON x.id = y.id;",
+        ) else {
+            panic!()
+        };
+        let from = sel.from.unwrap();
+        assert_eq!(from.at, Some(AtSpec::Version(1)));
+        assert_eq!(from.alias.as_deref(), Some("x"));
+        let join = &from.joins[0];
+        assert_eq!(join.at, Some(AtSpec::Version(2)));
+        assert_eq!(join.alias.as_deref(), Some("y"));
+        // `at` is not reserved: a table aliased `at`, a column named `at`, and
+        // a table named `at` all keep parsing with no time-travel target.
+        let Statement::Select(sel) = parse_one("SELECT * FROM t at;") else {
+            panic!()
+        };
+        let from = sel.from.unwrap();
+        assert_eq!(from.alias.as_deref(), Some("at"));
+        assert_eq!(from.at, None);
+        let Statement::Select(sel) = parse_one("SELECT at, version FROM at;") else {
+            panic!()
+        };
+        assert!(sel.from.unwrap().at.is_none());
+        assert!(parse("SELECT * FROM t AS at;").is_ok());
+        // Malformed clauses are clean parse errors (and never bind errors).
+        for bad in [
+            "SELECT * FROM t AT VERSION 3;",
+            "SELECT * FROM t AT (VERSION 3);",
+            "SELECT * FROM t AT (VERSION => );",
+            "SELECT * FROM t AT (VERSION => 'x');",
+            "SELECT * FROM t AT (VERSION => 1.5);",
+            "SELECT * FROM t AT (VERSION => -1);",
+            "SELECT * FROM t AT (FOO => 1);",
+            "SELECT * FROM t AT ();",
+            "SELECT * FROM t AT (VERSION => 1 AS z);",
+            "SELECT * FROM t AT (VERSION => 1) AS z;",
+            "SELECT * FROM t AT (TIMESTAMP => TIMESTAMP 'not a time');",
+            "SELECT * FROM (SELECT 1) z AT (VERSION => 1);",
+            // Placeholders are not bindable inside the clause (it is parsed
+            // as a literal target, so `?` never reaches the prepared path).
+            "SELECT * FROM t AT (VERSION => ?);",
+        ] {
+            assert!(
+                matches!(parse(bad), Err(PinkDbError::Parse(_))),
+                "{bad} must be a parse error"
+            );
+        }
     }
 }

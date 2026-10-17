@@ -1130,6 +1130,7 @@ fn plan_width(db: &crate::storage::PinkDb, plan: &LogicalPlan) -> Option<usize> 
         LogicalPlan::Scan {
             db: Some(dbname),
             table,
+            ..
         } => db.table_in(dbname, table).ok().map(|t| t.num_cols()),
         LogicalPlan::SingleRow => Some(0),
         LogicalPlan::Filter { input, .. }
@@ -1166,6 +1167,7 @@ fn column_origin(
         LogicalPlan::Scan {
             db: Some(dbname),
             table,
+            ..
         } => {
             let t = db.table_in(dbname, table).ok()?;
             (index < t.num_cols()).then(|| {
@@ -1255,6 +1257,7 @@ fn fk_join_eliminable(
     let LogicalPlan::Scan {
         db: Some(ref_db),
         table: ref_table,
+        ..
     } = right
     else {
         return false;

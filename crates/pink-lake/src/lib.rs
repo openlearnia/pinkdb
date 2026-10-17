@@ -102,6 +102,24 @@
 //! [`Lake::load`] takes the latest version (the catalog) or one specific
 //! snapshot.
 //!
+//! Every version also carries a **snapshot record** (wave 64; see the
+//! `snapshot` module): `updated` is its publish time (millisecond ISO-8601
+//! UTC, written since wave 34), and a save may add an `author`, a
+//! `commit_message` ([`Lake::set_commit_message`], DuckLake's
+//! `ducklake_set_commit_message`) and a `changes` summary diffed from the
+//! previous manifest. [`Lake::snapshots`] reads those records back without
+//! touching a data file, and `.lake snapshots` prints them. Reading a
+//! version's *data* (rather than its record) is [`Lake::load`] or
+//! [`Lake::attach`]; an attachment additionally serves per-query time travel
+//! (`FROM t AT (VERSION => n)` / `AT (TIMESTAMP => ts)`) over the versions up
+//! to the one it is pinned to (see the `attach` module).
+//!
+//! DuckLake's `ducklake_default_version` setting is deliberately **not**
+//! mirrored: it is not a per-query read default — it selects the storage
+//! format version for *new catalogs*, and the probed DuckDB build rejects
+//! every explicit value ("Unsupported ducklake_version 'n'"). A pinkdb
+//! setting under the same name would mean something else, so there is none.
+//!
 //! # Crash safety and durability
 //!
 //! Publication order is data files → snapshot manifest → `catalog.json`. Each
@@ -203,6 +221,7 @@ mod local;
 mod mock_s3;
 #[cfg(feature = "s3")]
 mod s3;
+mod snapshot;
 mod stats;
 mod storage;
 mod time;
@@ -212,6 +231,7 @@ mod vortex_file;
 pub use attach::AttachmentReport;
 use catalog::{Catalog, FileFormat, TableEntry};
 use local::{LocalStorage, CATALOG_FILE};
+pub use snapshot::{ChangeSummary, SnapshotInfo};
 use storage::{Head, Location, Storage, VersionTag};
 
 #[cfg(feature = "s3")]
@@ -440,6 +460,11 @@ pub struct Lake {
     storage: Arc<dyn Storage>,
     format_version: u32,
     version: u64,
+    /// The author/commit message [`Lake::set_commit_message`] recorded for the
+    /// next published save (DuckLake's `ducklake_set_commit_message`
+    /// transaction metadata). Kept across a failed save, cleared by a
+    /// successful one.
+    pending_commit: Option<(Option<String>, Option<String>)>,
 }
 
 impl Lake {
@@ -484,6 +509,9 @@ impl Lake {
             updated: time::iso8601_utc(SystemTime::now()),
             version: 1,
             tables: BTreeMap::new(),
+            author: None,
+            commit_message: None,
+            changes: None,
         };
         let bytes = manifest_json(&manifest, &root)?;
         // Adopt (do not rewrite) an empty version-1 snapshot a concurrent or
@@ -519,6 +547,7 @@ impl Lake {
             storage,
             format_version: FORMAT_VERSION,
             version: 1,
+            pending_commit: None,
         })
     }
 
@@ -544,6 +573,7 @@ impl Lake {
             storage,
             format_version: manifest.format_version,
             version: manifest.version,
+            pending_commit: None,
         })
     }
 
@@ -623,6 +653,44 @@ impl Lake {
         self.version
     }
 
+    /// Record the author and commit message for the **next** published save,
+    /// like DuckLake's `ducklake_set_commit_message(catalog, author, message)`:
+    /// the metadata lands on the version that save publishes. `None` clears a
+    /// field; the pair is cleared once a save succeeds and kept when one
+    /// fails, so a retry still carries it.
+    pub fn set_commit_message(&mut self, author: Option<String>, message: Option<String>) {
+        self.pending_commit = Some((author, message));
+    }
+
+    /// The per-version records of every published version, ascending: the
+    /// publish time (`updated`), author, commit message and change summary of
+    /// each manifest, plus its table and row counts (see [`SnapshotInfo`]).
+    ///
+    /// The set is exactly [`Lake::versions`]: only manifests at or below the
+    /// handle's current version, named canonically, that parse and declare
+    /// their own version. Reading a snapshot that disappears between the
+    /// listing and this read (an expired or deleted one) skips it, exactly
+    /// like [`Lake::versions`].
+    pub fn snapshots(&self) -> Result<Vec<SnapshotInfo>> {
+        let mut out = Vec::new();
+        for version in self.versions()? {
+            match manifest_for(&*self.storage, &self.root, Some(version)) {
+                Ok((manifest, _)) => {
+                    let time_micros = time::parse_iso8601_utc(&manifest.updated);
+                    out.push(SnapshotInfo::of(&manifest, time_micros));
+                }
+                Err(LakeError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue
+                }
+                Err(LakeError::VersionNotFound { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
     /// Published snapshot versions, ascending: every `snapshots/<v>.json`
     /// that is named canonically (`<decimal>`, no leading zeros), declares
     /// its own version `v`, and parses. A leftover manifest from an
@@ -633,39 +701,7 @@ impl Lake {
     /// silently missing version; one deleted between listing and reading is
     /// skipped.
     pub fn versions(&self) -> Result<Vec<u64>> {
-        let mut out = Vec::new();
-        for name in self.storage.list("snapshots")? {
-            let Some(v) = name
-                .strip_suffix(".json")
-                .and_then(canonical_version_number)
-            else {
-                continue;
-            };
-            if v < 1 || v > self.version {
-                continue;
-            }
-            let rel = format!("snapshots/{name}");
-            let path = self.storage.abs(&rel);
-            let bytes = match self
-                .storage
-                .read(&rel, &format!("reading {}", path.display()))
-            {
-                Ok(bytes) => bytes,
-                Err(LakeError::Io { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound =>
-                {
-                    continue
-                }
-                Err(e) => return Err(e),
-            };
-            match read_manifest(&path, &bytes) {
-                Ok(manifest) if manifest.version == v => out.push(v),
-                _ => continue,
-            }
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(out)
+        published_versions(&*self.storage, self.version)
     }
 
     /// The current version's tables: `(db.table, rows)`, sorted by name.
@@ -829,11 +865,27 @@ impl Lake {
                 );
             }
         }
+        // The per-version record: the author/message [`Lake::set_commit_message`]
+        // recorded for this save (kept pending until the save succeeds below),
+        // and the change summary — the diff against the previous version's
+        // manifest. That manifest is a best-effort read: an expired or
+        // tampered-away predecessor means the summary is simply absent.
+        let (author, commit_message) = match &self.pending_commit {
+            Some((author, message)) => (author.clone(), message.clone()),
+            None => (None, None),
+        };
+        let previous = manifest_for(&*self.storage, &self.root, Some(self.version))
+            .ok()
+            .map(|(manifest, _)| manifest);
+        let changes = previous.map(|previous| ChangeSummary::diff(&previous.tables, &tables));
         let manifest = Catalog {
             format_version: FORMAT_VERSION,
             updated: time::iso8601_utc(SystemTime::now()),
             version,
             tables,
+            author,
+            commit_message,
+            changes,
         };
         let bytes = manifest_json(&manifest, &self.root)?;
         // Create-only, never replace: an existing snapshot version is a
@@ -892,6 +944,9 @@ impl Lake {
             self.storage.reconcile_snapshot(version, &bytes)?;
         }
         self.version = version;
+        // The commit record is published; a later save without a new
+        // `set_commit_message` must not repeat it.
+        self.pending_commit = None;
         // A save publishes this build's format (v3 Vortex with
         // `vortex-format`, v1 `.pink` without it), so a handle that opened a
         // v1 lake reports the new format once a Vortex build has migrated it
@@ -908,36 +963,7 @@ impl Lake {
     /// The manifest for the latest version (`None`) or one snapshot, with the
     /// path it was read from (for error attribution).
     fn manifest(&self, version: Option<u64>) -> Result<(Catalog, PathBuf)> {
-        match version {
-            None => {
-                let manifest = read_catalog(&*self.storage, &self.root)?;
-                Ok((manifest, self.root.join(CATALOG_FILE)))
-            }
-            Some(v) => {
-                let rel = format!("snapshots/{v}.json");
-                let path = self.storage.abs(&rel);
-                if !self.storage.exists(&rel)? {
-                    return Err(LakeError::VersionNotFound {
-                        path: self.root.clone(),
-                        version: v,
-                    });
-                }
-                let bytes = self
-                    .storage
-                    .read(&rel, &format!("reading {}", path.display()))?;
-                let manifest = read_manifest(&path, &bytes)?;
-                if manifest.version != v {
-                    return Err(LakeError::Corrupt {
-                        path,
-                        message: format!(
-                            "snapshot file declares version {}, expected {v}",
-                            manifest.version
-                        ),
-                    });
-                }
-                Ok((manifest, path))
-            }
-        }
+        manifest_for(&*self.storage, &self.root, version)
     }
 
     /// A save-time conflict: `snapshots/<version>.json` is already there.
@@ -1223,6 +1249,79 @@ pub fn validate_store(db: &PinkDb) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The manifest for the latest version (`None`) or one snapshot, with the path
+/// it was read from (for error attribution). Free function so an attachment —
+/// which holds only the storage and the root, not the [`Lake`] handle — can
+/// read arbitrary versions for time travel.
+pub(crate) fn manifest_for(
+    storage: &dyn Storage,
+    root: &Path,
+    version: Option<u64>,
+) -> Result<(Catalog, PathBuf)> {
+    match version {
+        None => {
+            let manifest = read_catalog(storage, root)?;
+            Ok((manifest, root.join(CATALOG_FILE)))
+        }
+        Some(v) => {
+            let rel = format!("snapshots/{v}.json");
+            let path = storage.abs(&rel);
+            if !storage.exists(&rel)? {
+                return Err(LakeError::VersionNotFound {
+                    path: root.to_path_buf(),
+                    version: v,
+                });
+            }
+            let bytes = storage.read(&rel, &format!("reading {}", path.display()))?;
+            let manifest = read_manifest(&path, &bytes)?;
+            if manifest.version != v {
+                return Err(LakeError::Corrupt {
+                    path,
+                    message: format!(
+                        "snapshot file declares version {}, expected {v}",
+                        manifest.version
+                    ),
+                });
+            }
+            Ok((manifest, path))
+        }
+    }
+}
+
+/// The published snapshot versions at or below `up_to`, ascending (see
+/// [`Lake::versions`] for exactly what counts as published). Free function so
+/// attachments can list versions without a [`Lake`] handle.
+pub(crate) fn published_versions(storage: &dyn Storage, up_to: u64) -> Result<Vec<u64>> {
+    let mut out = Vec::new();
+    for name in storage.list("snapshots")? {
+        let Some(v) = name
+            .strip_suffix(".json")
+            .and_then(canonical_version_number)
+        else {
+            continue;
+        };
+        if v < 1 || v > up_to {
+            continue;
+        }
+        let rel = format!("snapshots/{name}");
+        let path = storage.abs(&rel);
+        let bytes = match storage.read(&rel, &format!("reading {}", path.display())) {
+            Ok(bytes) => bytes,
+            Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        match read_manifest(&path, &bytes) {
+            Ok(manifest) if manifest.version == v => out.push(v),
+            _ => continue,
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 /// Read and validate `catalog.json`.
