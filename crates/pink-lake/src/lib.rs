@@ -1155,12 +1155,17 @@ impl Lake {
         // The previous version's manifest, read before the data loop: a full
         // save **preserves the partitioning** of a table that is saved again
         // under the same key (the store itself has no partition concept), so
-        // re-saving a partitioned table re-splits its rows the same way. A
-        // best-effort read: an expired or tampered predecessor simply saves
-        // every table unpartitioned.
-        let previous = manifest_for(&*self.storage, &self.root, Some(self.version))
-            .ok()
-            .map(|(manifest, _)| manifest);
+        // re-saving a partitioned table re-splits its rows the same way. The
+        // handle is at the head (`ensure_catalog_unchanged` above), and
+        // `catalog.json` is byte-identical to a healthy snapshot, so fall back
+        // to the catalog when the snapshot read fails: an unreadable
+        // predecessor must not silently reset the lake-wide monotonic
+        // `schema_version` (or drop a partition spec). If even the catalog
+        // cannot be read, the save fails loudly.
+        let previous = match manifest_for(&*self.storage, &self.root, Some(self.version)) {
+            Ok((manifest, _)) => Some(manifest),
+            Err(_) => Some(crate::read_catalog(&*self.storage, &self.root)?),
+        };
         let mut tables: BTreeMap<String, TableEntry> = BTreeMap::new();
         let mut deltas: BTreeMap<String, catalog::TableDelta> = BTreeMap::new();
         let mut bytes_written = 0u64;

@@ -1207,3 +1207,26 @@ fn commit_on_a_legacy_v1_lake_is_refused() {
     assert_eq!(reopened.current_version(), 2);
     cleanup(&dir);
 }
+
+#[test]
+fn a_missing_predecessor_snapshot_does_not_reset_the_schema_version() {
+    let dir = scratch("schema-monotonic");
+    let mut db = store(2);
+    save_store(&db, &dir).unwrap(); // create (v1) + save (v2), schema_version 1
+    let catalog = read_json(&dir.join("catalog.json"));
+    assert_eq!(catalog["schema_version"], 1, "{catalog}");
+
+    let mut lake = Lake::open(&dir).unwrap();
+    assert_eq!(lake.current_version(), 2);
+    // Make the current version's snapshot unreadable; catalog.json is the
+    // byte-identical head and must preserve the lake-wide counter.
+    std::fs::remove_file(dir.join("snapshots/2.json")).unwrap();
+    db.execute("CREATE TABLE u (i INTEGER);").unwrap();
+    lake.write_from_store(&db).unwrap(); // v3, a schema change
+    let catalog = read_json(&dir.join("catalog.json"));
+    assert_eq!(
+        catalog["schema_version"], 2,
+        "the lake-wide schema counter must stay monotonic: {catalog}"
+    );
+    cleanup(&dir);
+}
