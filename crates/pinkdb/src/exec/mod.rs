@@ -153,6 +153,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db: qdb,
             name,
             schema,
+            constraints,
             if_not_exists,
         } => {
             let target = resolve_db(db, qdb);
@@ -162,7 +163,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             if *if_not_exists && db.table_in(&target, name).is_ok() {
                 return Ok(QueryResult::Created);
             }
-            db.create_table_in(&target, name, schema.clone())?;
+            db.create_table_with_constraints_in(
+                &target,
+                name,
+                schema.clone(),
+                constraints.clone(),
+            )?;
             Ok(QueryResult::Created)
         }
         LogicalPlan::CreateTableAs {
@@ -815,22 +821,33 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 types: vec![DataType::Varchar],
             })
         }
-        LogicalPlan::Describe { schema } => {
+        LogicalPlan::Describe { columns } => {
             // DuckDB's DESCRIBE shape: (column_name, column_type, null, key,
-            // default, extra); every v1 column is nullable and has no key,
-            // default, or extra.
-            let n = schema.len();
+            // default, extra). `null` is NO for NOT NULL and PRIMARY KEY
+            // columns; `key` is PRI/UNI for declared key columns; `default`
+            // and `extra` are always NULL.
+            let n = columns.len();
             let mut column_name = Vector::with_capacity(DataType::Varchar, n);
             let mut column_type = Vector::with_capacity(DataType::Varchar, n);
             let mut null = Vector::with_capacity(DataType::Varchar, n);
             let mut key = Vector::with_capacity(DataType::Varchar, n);
             let mut default = Vector::with_capacity(DataType::Varchar, n);
             let mut extra = Vector::with_capacity(DataType::Varchar, n);
-            for (name, dtype) in schema {
-                column_name.push_valid(Value::Varchar(name.clone()))?;
-                column_type.push_valid(Value::Varchar(dtype.to_string()))?;
-                null.push_valid(Value::Varchar("YES".to_string()))?;
-                key.push_null()?;
+            for c in columns {
+                column_name.push_valid(Value::Varchar(c.name.clone()))?;
+                column_type.push_valid(Value::Varchar(c.dtype.to_string()))?;
+                null.push_valid(Value::Varchar(
+                    if c.not_null { "NO" } else { "YES" }.to_string(),
+                ))?;
+                match c.key {
+                    Some(crate::storage::KeyKind::Primary) => {
+                        key.push_valid(Value::Varchar("PRI".to_string()))?
+                    }
+                    Some(crate::storage::KeyKind::Unique) => {
+                        key.push_valid(Value::Varchar("UNI".to_string()))?
+                    }
+                    None => key.push_null()?,
+                }
                 default.push_null()?;
                 extra.push_null()?;
             }
@@ -3498,7 +3515,7 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::Checkpoint => "Checkpoint".to_string(),
         LogicalPlan::ShowTables { db } => format!("ShowTables {db}"),
         LogicalPlan::ShowDatabases => "ShowDatabases".to_string(),
-        LogicalPlan::Describe { schema } => format!("Describe ({} cols)", schema.len()),
+        LogicalPlan::Describe { columns } => format!("Describe ({} cols)", columns.len()),
         LogicalPlan::Explain { plan } => {
             children.push(plan);
             "Explain".to_string()
@@ -10106,5 +10123,450 @@ mod tests {
             rows
         };
         assert_eq!(rows(&fused.chunks), rows(&materialized));
+    }
+
+    // ---------- wave 41: declarative constraints (metadata, not enforced) ----------
+
+    /// Parent/child tables with declared constraints. `c`'s foreign key is
+    /// NOT NULL and references `p`'s primary key, so the declared posture
+    /// allows FK→PK join elimination.
+    fn wave41_db() -> PinkDb {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO p VALUES (1, 10), (2, 20);")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE c (cid INTEGER PRIMARY KEY, pid INTEGER NOT NULL REFERENCES p(id), \
+             note VARCHAR);",
+        )
+        .unwrap();
+        db.execute("INSERT INTO c VALUES (100, 1, 'a'), (101, 2, 'b');")
+            .unwrap();
+        db
+    }
+
+    fn explain_lines(db: &mut PinkDb, sql: &str) -> Vec<String> {
+        select(db, &format!("EXPLAIN {sql};"))
+            .into_iter()
+            .map(|r| match r[0].clone() {
+                V::Varchar(s) => s,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// DDL records constraints in the catalog and `DESCRIBE` reports them
+    /// DuckDB-style: `key` = PRI/UNI, `null` = NO for NOT NULL and PRIMARY
+    /// KEY columns (pinned against DuckDB v2.0.0-alpha46057).
+    #[test]
+    fn wave41_describe_reports_keys_and_nullability() {
+        let mut db = wave41_db();
+        assert_eq!(
+            select(&mut db, "DESCRIBE p;"),
+            vec![
+                vec![
+                    V::Varchar("id".into()),
+                    V::Varchar("INTEGER".into()),
+                    V::Varchar("NO".into()),
+                    V::Varchar("PRI".into()),
+                    V::Null,
+                    V::Null,
+                ],
+                vec![
+                    V::Varchar("v".into()),
+                    V::Varchar("INTEGER".into()),
+                    V::Varchar("YES".into()),
+                    V::Null,
+                    V::Null,
+                    V::Null,
+                ],
+            ]
+        );
+        // The foreign key column is NOT NULL but prints no key marker; the
+        // composite primary key marks every member, and UNIQUE prints UNI.
+        db.execute("CREATE TABLE q (a INTEGER, b INTEGER, u VARCHAR UNIQUE, PRIMARY KEY (a, b));")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "DESCRIBE q;"),
+            vec![
+                vec![
+                    V::Varchar("a".into()),
+                    V::Varchar("INTEGER".into()),
+                    V::Varchar("NO".into()),
+                    V::Varchar("PRI".into()),
+                    V::Null,
+                    V::Null,
+                ],
+                vec![
+                    V::Varchar("b".into()),
+                    V::Varchar("INTEGER".into()),
+                    V::Varchar("NO".into()),
+                    V::Varchar("PRI".into()),
+                    V::Null,
+                    V::Null,
+                ],
+                vec![
+                    V::Varchar("u".into()),
+                    V::Varchar("VARCHAR".into()),
+                    V::Varchar("YES".into()),
+                    V::Varchar("UNI".into()),
+                    V::Null,
+                    V::Null,
+                ],
+            ]
+        );
+        // A column that is both PRIMARY KEY and UNIQUE prints PRI (DuckDB
+        // precedence).
+        db.execute("CREATE TABLE r (x INTEGER PRIMARY KEY UNIQUE, y INTEGER NOT NULL);")
+            .unwrap();
+        let rows = select(&mut db, "DESCRIBE r;");
+        assert_eq!(rows[0][3], V::Varchar("PRI".into()));
+        assert_eq!(rows[0][2], V::Varchar("NO".into()));
+        assert_eq!(rows[1][2], V::Varchar("NO".into()));
+        assert_eq!(rows[1][3], V::Null);
+    }
+
+    /// Constraints are metadata: INSERT/UPDATE never checks them (DuckDB's
+    /// informational posture). Dangling references, NULL keys, duplicate
+    /// keys, and duplicate uniques all go through.
+    #[test]
+    fn wave41_constraints_are_metadata_only() {
+        let mut db = wave41_db();
+        // Dangling foreign key value.
+        db.execute("INSERT INTO c VALUES (102, 999, 'dangling');")
+            .unwrap();
+        // NULL in a NOT NULL column; duplicate primary key.
+        db.execute("INSERT INTO c VALUES (103, NULL, NULL);")
+            .unwrap();
+        db.execute("INSERT INTO c VALUES (100, 1, 'dup');").unwrap();
+        // NULL/duplicate parent keys.
+        db.execute("INSERT INTO p VALUES (NULL, 0), (1, 0);")
+            .unwrap();
+        // UPDATE into a dangling reference.
+        db.execute("UPDATE c SET pid = 424242 WHERE cid = 100;")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM c;"),
+            vec![vec![V::Bigint(5)]]
+        );
+        // UNIQUE is not enforced either.
+        db.execute("CREATE TABLE uq (x INTEGER UNIQUE);").unwrap();
+        db.execute("INSERT INTO uq VALUES (1), (1), (NULL), (NULL);")
+            .unwrap();
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM uq;"),
+            vec![vec![V::Bigint(4)]]
+        );
+    }
+
+    /// DDL-time validation mirrors DuckDB: the referenced table must exist,
+    /// the referenced columns must name exactly one of its PRIMARY KEY /
+    /// UNIQUE constraints, the counts must match, and the types must be
+    /// compatible.
+    #[test]
+    fn wave41_ddl_validation_errors() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE nokey (a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE uq (a INTEGER UNIQUE, b INTEGER);")
+            .unwrap();
+        for (sql, needle) in [
+            (
+                "CREATE TABLE bad1 (x INTEGER REFERENCES missing(id));",
+                "does not exist",
+            ),
+            (
+                "CREATE TABLE bad2 (x INTEGER REFERENCES nokey(a));",
+                "does not have a primary key or unique constraint",
+            ),
+            (
+                "CREATE TABLE bad3 (x INTEGER REFERENCES p(v));",
+                "does not have a primary key or unique constraint",
+            ),
+            (
+                "CREATE TABLE bad4 (x INTEGER REFERENCES nokey);",
+                "there is no primary key or unique constraint",
+            ),
+            (
+                "CREATE TABLE bad5 (x INTEGER REFERENCES p(zz));",
+                "has no column",
+            ),
+            (
+                "CREATE TABLE bad6 (x INTEGER REFERENCES uq(a, b));",
+                "must be the same",
+            ),
+            (
+                "CREATE TABLE bad7 (x VARCHAR REFERENCES p(id));",
+                "incompatible types",
+            ),
+            (
+                "CREATE TABLE bad8 (a INTEGER, b INTEGER, PRIMARY KEY (zz));",
+                "has no column",
+            ),
+            (
+                "CREATE TABLE bad9 (a INTEGER PRIMARY KEY, PRIMARY KEY (a));",
+                "more than one primary key",
+            ),
+            (
+                "CREATE TABLE bad10 (a INTEGER, b INTEGER, UNIQUE (a, a));",
+                "appears more than once",
+            ),
+            (
+                "CREATE TABLE bad11 (a INTEGER, b INTEGER, FOREIGN KEY (a) REFERENCES uq(a, b));",
+                "must be the same",
+            ),
+        ] {
+            let err = db.execute(sql).unwrap_err().to_string();
+            assert!(err.contains(needle), "{sql}: {err}");
+        }
+        // Nothing half-created.
+        assert!(db.table_in("main", "bad1").is_err());
+        // The valid FK-to-UNIQUE form (order matters, like DuckDB).
+        db.execute("CREATE TABLE ok1 (x INTEGER REFERENCES uq(a));")
+            .unwrap();
+    }
+
+    /// Named constraints and the Snowflake-style `RELY` / `NOT ENFORCED`
+    /// suffixes are accepted and recorded (suffixes dropped).
+    #[test]
+    fn wave41_named_and_suffix_forms() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE p (id INTEGER UNIQUE, v INTEGER);")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE t (a INTEGER, b INTEGER, \
+             c INTEGER UNIQUE NOT ENFORCED, \
+             CONSTRAINT pk PRIMARY KEY (a, b) RELY, \
+             FOREIGN KEY (c) REFERENCES p(id) NOT ENFORCED);",
+        )
+        .unwrap();
+        let t = db.table("t").unwrap();
+        assert_eq!(t.constraints.keys.len(), 2);
+        // Declaration order: the column-level UNIQUE first, then the named
+        // table-level PRIMARY KEY.
+        assert_eq!(t.constraints.keys[0].name, None);
+        assert_eq!(t.constraints.keys[0].kind, crate::storage::KeyKind::Unique);
+        assert_eq!(t.constraints.keys[0].columns, vec![2]);
+        assert_eq!(t.constraints.keys[1].name.as_deref(), Some("pk"));
+        assert_eq!(t.constraints.keys[1].kind, crate::storage::KeyKind::Primary);
+        assert_eq!(t.constraints.keys[1].columns, vec![0, 1]);
+        assert_eq!(t.constraints.foreign_keys.len(), 1);
+        assert_eq!(t.constraints.foreign_keys[0].columns, vec![2]);
+        assert_eq!(t.constraints.foreign_keys[0].ref_table, "p");
+        assert_eq!(t.constraints.foreign_keys[0].ref_columns, vec![0]);
+        // Constraints survive a transaction rollback (catalog snapshot).
+        db.execute("BEGIN; CREATE TABLE rolled (x INTEGER PRIMARY KEY); ROLLBACK;")
+            .unwrap();
+        assert!(db.table("rolled").is_err());
+    }
+
+    /// FK→PK join elimination: the declared, NOT NULL, single-column foreign
+    /// key lets the optimizer drop the parent join when no parent column is
+    /// used above it.
+    #[test]
+    fn wave41_fk_join_elimination_fires() {
+        let mut db = wave41_db();
+        let lines = explain_lines(&mut db, "SELECT c.cid FROM c JOIN p ON c.pid = p.id");
+        assert!(
+            !lines.iter().any(|l| l.contains("Join")),
+            "the parent join must be eliminated: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("Scan main.c")), "{lines:?}");
+        // Results agree with the declaration satisfied (and with the join
+        // written out).
+        let with_join = select(
+            &mut db,
+            "SELECT c.cid FROM c JOIN p ON c.pid = p.id ORDER BY 1;",
+        );
+        let without = select(&mut db, "SELECT cid FROM c ORDER BY 1;");
+        assert_eq!(with_join, without);
+        // A UNIQUE parent key is an elimination target too.
+        db.execute("CREATE TABLE up (id INTEGER UNIQUE);").unwrap();
+        db.execute("CREATE TABLE uc (x INTEGER NOT NULL REFERENCES up(id));")
+            .unwrap();
+        let lines = explain_lines(&mut db, "SELECT uc.x FROM uc JOIN up ON uc.x = up.id");
+        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // COUNT(*) through the declared join: the aggregate consumes no
+        // parent column, so the join still disappears.
+        let lines = explain_lines(&mut db, "SELECT COUNT(*) FROM c JOIN p ON c.pid = p.id");
+        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        assert_eq!(
+            select(&mut db, "SELECT COUNT(*) FROM c JOIN p ON c.pid = p.id;"),
+            vec![vec![V::Bigint(2)]]
+        );
+        // GROUP BY a child column with an aggregate over the child side.
+        let lines = explain_lines(
+            &mut db,
+            "SELECT c.note, COUNT(*) FROM c JOIN p ON c.pid = p.id GROUP BY c.note",
+        );
+        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+    }
+
+    /// The elimination must NOT fire when a parent column is referenced above
+    /// the join, when the foreign key is nullable, when the parent side is
+    /// filtered, or when the join carries extra conditions.
+    #[test]
+    fn wave41_fk_join_elimination_stays_conservative() {
+        let mut db = wave41_db();
+        // Parent column projected.
+        let lines = explain_lines(&mut db, "SELECT c.cid, p.v FROM c JOIN p ON c.pid = p.id");
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // Parent column in a filter above the join.
+        let lines = explain_lines(
+            &mut db,
+            "SELECT c.cid FROM c JOIN p ON c.pid = p.id WHERE p.v = 10",
+        );
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // Parent column in an extra ON conjunct.
+        let lines = explain_lines(
+            &mut db,
+            "SELECT c.cid FROM c JOIN p ON c.pid = p.id AND p.v = 10",
+        );
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // A nullable foreign key: an inner join would drop NULL-key rows, so
+        // the elimination must not fire.
+        db.execute("CREATE TABLE cn (x INTEGER REFERENCES p(id));")
+            .unwrap();
+        let lines = explain_lines(&mut db, "SELECT cn.x FROM cn JOIN p ON cn.x = p.id");
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // No foreign key at all (a join on the same columns) stays.
+        db.execute("CREATE TABLE nf (id INTEGER PRIMARY KEY, pid INTEGER NOT NULL);")
+            .unwrap();
+        let lines = explain_lines(&mut db, "SELECT nf.id FROM nf JOIN p ON nf.pid = p.id");
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // A join to a table that is not the declared parent stays.
+        db.execute("CREATE TABLE other (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let lines = explain_lines(
+            &mut db,
+            "SELECT c.cid FROM c JOIN other ON c.pid = other.id",
+        );
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // LEFT JOIN is not eliminated (only the INNER rule is implemented).
+        let lines = explain_lines(&mut db, "SELECT c.cid FROM c LEFT JOIN p ON c.pid = p.id");
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+    }
+
+    /// A composite foreign key eliminates only when every key column pair is
+    /// covered, and the join order may differ from the declared order.
+    #[test]
+    fn wave41_composite_fk_elimination() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE p2 (a INTEGER, b INTEGER, PRIMARY KEY (a, b));")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE c2 (x INTEGER NOT NULL, y INTEGER NOT NULL, \
+             FOREIGN KEY (x, y) REFERENCES p2(a, b));",
+        )
+        .unwrap();
+        let lines = explain_lines(
+            &mut db,
+            "SELECT c2.x FROM c2 JOIN p2 ON c2.x = p2.a AND c2.y = p2.b",
+        );
+        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // Same pairs, written in the other order — still eliminated.
+        let lines = explain_lines(
+            &mut db,
+            "SELECT c2.x FROM c2 JOIN p2 ON c2.y = p2.b AND c2.x = p2.a",
+        );
+        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        // Partial key coverage: the join can match several parents, stays.
+        let lines = explain_lines(&mut db, "SELECT c2.x FROM c2 JOIN p2 ON c2.x = p2.a");
+        assert!(lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+    }
+
+    /// A stale declaration cannot eliminate: dropping and re-creating the
+    /// parent without its key invalidates the foreign key at plan time.
+    #[test]
+    fn wave41_stale_fk_never_eliminates() {
+        let mut db = wave41_db();
+        // Baseline: eliminated.
+        let lines = explain_lines(&mut db, "SELECT c.cid FROM c JOIN p ON c.pid = p.id");
+        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        db.execute("DROP TABLE p;").unwrap();
+        db.execute("CREATE TABLE p (id INTEGER, v INTEGER);")
+            .unwrap();
+        let lines = explain_lines(&mut db, "SELECT c.cid FROM c JOIN p ON c.pid = p.id");
+        assert!(
+            lines.iter().any(|l| l.contains("Join")),
+            "a re-created parent without a key must keep the join: {lines:?}"
+        );
+    }
+
+    /// The elimination is result-preserving on conforming data, and a chain
+    /// eliminates the innermost declared join while keeping the undeclared
+    /// one.
+    #[test]
+    fn wave41_elimination_preserves_results() {
+        let mut db = wave41_db();
+        db.execute(
+            "CREATE TABLE o (oid INTEGER PRIMARY KEY, cid INTEGER NOT NULL REFERENCES c(cid), \
+             amt INTEGER);",
+        )
+        .unwrap();
+        db.execute("INSERT INTO o VALUES (1, 100, 5), (2, 101, 7);")
+            .unwrap();
+        // Both joins are declared foreign keys and the only projected column
+        // comes from the first table: both are eliminated.
+        let lines = explain_lines(
+            &mut db,
+            "SELECT o.oid FROM o JOIN c ON o.cid = c.cid JOIN p ON c.pid = p.id",
+        );
+        let joins = lines.iter().filter(|l| l.contains("Join")).count();
+        assert_eq!(joins, 0, "both declared joins are eliminated: {lines:?}");
+        let got = select(
+            &mut db,
+            "SELECT o.oid FROM o JOIN c ON o.cid = c.cid JOIN p ON c.pid = p.id ORDER BY 1;",
+        );
+        assert_eq!(got, vec![vec![V::Integer(1)], vec![V::Integer(2)]]);
+        // The same chain with an UNDECLARED o→c join keeps exactly that
+        // join (the c→p foreign key still eliminates).
+        db.execute("CREATE TABLE o2 (oid INTEGER PRIMARY KEY, cid INTEGER NOT NULL);")
+            .unwrap();
+        db.execute("INSERT INTO o2 VALUES (1, 100), (2, 101);")
+            .unwrap();
+        let lines = explain_lines(
+            &mut db,
+            "SELECT o2.oid FROM o2 JOIN c ON o2.cid = c.cid JOIN p ON c.pid = p.id",
+        );
+        let joins = lines.iter().filter(|l| l.contains("Join")).count();
+        assert_eq!(joins, 1, "only the undeclared join remains: {lines:?}");
+        let got = select(
+            &mut db,
+            "SELECT o2.oid FROM o2 JOIN c ON o2.cid = c.cid JOIN p ON c.pid = p.id ORDER BY 1;",
+        );
+        assert_eq!(got, vec![vec![V::Integer(1)], vec![V::Integer(2)]]);
+    }
+
+    /// Declared foreign keys work across databases (`REFERENCES db.table`)
+    /// and eliminate the cross-database join the same way.
+    #[test]
+    fn wave41_cross_database_fk() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE DATABASE d2;").unwrap();
+        db.execute("CREATE TABLE d2.p (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO d2.p VALUES (1, 10);").unwrap();
+        db.execute("CREATE TABLE c (cid INTEGER, pid INTEGER NOT NULL REFERENCES d2.p(id));")
+            .unwrap();
+        db.execute("INSERT INTO c VALUES (7, 1);").unwrap();
+        let fk = &db.table("c").unwrap().constraints.foreign_keys[0];
+        assert_eq!(fk.ref_db, "d2");
+        assert_eq!(fk.ref_table, "p");
+        let lines = explain_lines(
+            &mut db,
+            "SELECT c.cid FROM c JOIN d2.p AS x ON c.pid = x.id",
+        );
+        assert!(!lines.iter().any(|l| l.contains("Join")), "{lines:?}");
+        assert_eq!(
+            select(
+                &mut db,
+                "SELECT c.cid FROM c JOIN d2.p AS x ON c.pid = x.id;"
+            ),
+            vec![vec![V::Integer(7)]]
+        );
     }
 }

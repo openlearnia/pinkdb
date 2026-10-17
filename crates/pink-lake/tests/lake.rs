@@ -1275,7 +1275,7 @@ fn v1_fixture_lake_still_loads_bit_exactly() {
     );
 
     // Every data file is value-exact: load the mini v2 store, re-save it as
-    // the current (v4) format, and compare the reloaded stores bit-exactly.
+    // the current (v5) format, and compare the reloaded stores bit-exactly.
     for rel in catalog_data_files(&fixture) {
         let path = fixture.join(&rel);
         let mini = PinkDb::open(path.to_str().unwrap()).unwrap();

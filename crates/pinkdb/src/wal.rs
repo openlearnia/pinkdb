@@ -4521,7 +4521,7 @@ mod tests {
         );
     }
 
-    /// T6: a checkpoint publishes the current format (v4) and a durable
+    /// T6: a checkpoint publishes the current format (v5) and a durable
     /// reopen replays later WAL records on top of it.
     #[test]
     fn checkpoint_publishes_v5_and_replays_later_records() {

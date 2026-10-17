@@ -3,7 +3,9 @@
 //! Layout v5 (all integers little-endian):
 //! ```text
 //! magic "PINKDB05" (8 bytes)
-//! flags u32                 (0 in v5.0; unknown bits are a hard error)
+//! flags u32                 (0 = no optional sections; bit 0 = tables carry
+//!                            a constraint section; unknown bits are a hard
+//!                            error)
 //! db_count u32
 //! per database:
 //!   name_len u32 + name bytes
@@ -11,7 +13,19 @@
 //!   per table:
 //!     name_len u32 + name bytes
 //!     col_count u32
-//!     per column: name_len u32 + name bytes, dtype u8
+//!     per column: name_len u32 + name bytes, dtype u8 (tag 7 = DECIMAL:
+//!       precision u8 + scale u8 follow; tag 8 = INTERVAL)
+//!     if flags bit 0:
+//!       constraint_count u32
+//!       per constraint:
+//!         kind u8 (0=PRIMARY KEY, 1=UNIQUE, 2=FOREIGN KEY, 3=NOT NULL)
+//!         name_len u32 + name bytes (0 = unnamed; NOT NULL names are not
+//!                                    persisted)
+//!         col_count u32 + col_count × col_idx u32
+//!         if kind == 2 (FOREIGN KEY):
+//!           ref_db_len u32 + ref_db bytes (lowercased; non-empty)
+//!           ref_table_len u32 + ref_table bytes (lowercased; non-empty)
+//!           ref_col_count u32 + ref_col_count × ref_col_idx u32
 //!     num_rows u64
 //!     per column: chunk_count u32
 //!       per chunk:
@@ -26,7 +40,15 @@
 //! the CRC trailer; v3 files (`PINKDB03`) are v2 + a CRC; v1 files
 //! (`PINKDB01`) hold a flat table list and load as a single `main` database;
 //! v4 files (`PINKDB04`) are the v5 container without the DECIMAL/INTERVAL
-//! dtype tags. `open` accepts all five; writes are always v5.
+//! dtype tags and without the constraint section. `open` accepts all five;
+//! writes are always v5.
+//!
+//! The constraint section carries declarative `PRIMARY KEY` / `UNIQUE` /
+//! `FOREIGN KEY` / `NOT NULL` declarations (readers of v4-and-older simply
+//! see unconstrained tables). Constraints are metadata: they are never
+//! enforced on INSERT/UPDATE, only reported by `DESCRIBE` and trusted by the
+//! optimizer. `RELY` / `[NOT] ENFORCED` suffixes are dropped at parse time;
+//! a named `NOT NULL`'s name is not persisted (it is not observable).
 //!
 //! Payloads store every row including NULL placeholders; validity is applied
 //! afterwards. Per-chunk encoding is picked by size (smallest wins), with a
@@ -63,7 +85,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
-use crate::storage::PinkDb;
+use crate::storage::{ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints};
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{Vector, VectorData, CHUNK_SIZE};
 
@@ -76,9 +98,22 @@ const MAGIC_V3: &[u8; 8] = b"PINKDB03";
 /// bitpacked dictionary codes, ALP, the all-valid validity flag).
 const MAGIC_V4: &[u8; 8] = b"PINKDB04";
 /// Version 5 = v4 + the DECIMAL/INTERVAL dtype tags (7/8; DECIMAL carries
-/// its precision and scale in the schema). Older builds refuse it cleanly
-/// through the shared newer-magic path.
+/// its precision and scale in the schema) and a per-table declarative-
+/// constraint section, gated by `FLAG_CONSTRAINTS` in the flags word (a
+/// constraint-free, tag-free v5 body is byte-identical to a v4 body). Older
+/// builds refuse it cleanly through the shared newer-magic path.
 const MAGIC_V5: &[u8; 8] = b"PINKDB05";
+
+/// Flags bit 0 (v5+): every table carries the constraint section described in
+/// the module docs. Set iff at least one table has constraints.
+const FLAG_CONSTRAINTS: u32 = 0x1;
+
+/// Constraint-section kinds (one byte per constraint).
+const CK_PRIMARY_KEY: u8 = 0;
+const CK_UNIQUE: u8 = 1;
+const CK_FOREIGN_KEY: u8 = 2;
+const CK_NOT_NULL: u8 = 3;
+
 const ENC_PLAIN: u8 = 0;
 const ENC_RLE: u8 = 1;
 const ENC_DICT: u8 = 2;
@@ -2054,7 +2089,19 @@ impl PinkDb {
     ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         let mut w = Writer::new();
         w.bytes(MAGIC_V5);
-        w.u32(0); // flags: no optional sections in v4.0
+        // The constraint section exists iff some table has constraints (the
+        // flags word is written before the tables, so decide it up front).
+        let with_constraints = self.list_databases().iter().any(|db| {
+            self.list_tables_in(db).iter().any(|t| {
+                self.table_in(db, t)
+                    .is_ok_and(|t| !t.constraints.is_empty())
+            })
+        });
+        w.u32(if with_constraints {
+            FLAG_CONSTRAINTS
+        } else {
+            0
+        });
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
         dbs.sort();
@@ -2077,6 +2124,9 @@ impl PinkDb {
                         w.u8(*precision);
                         w.u8(*scale);
                     }
+                }
+                if with_constraints {
+                    write_constraints(&mut w, &t.constraints);
                 }
                 w.u64(t.num_rows() as u64);
                 let n_chunks = t.num_chunks();
@@ -2276,14 +2326,14 @@ impl PinkDb {
         }
     }
 
-    /// Decode a serialized `.pink` image (v1, v2, v3 or v4 magic).
+    /// Decode a serialized `.pink` image (v1, v2, v3, v4 or v5 magic).
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
         let data = if data.starts_with(MAGIC_V3)
             || data.starts_with(MAGIC_V4)
             || data.starts_with(MAGIC_V5)
         {
             // Verify the trailer before decoding anything.
-            if data.len() < MAGIC_V4.len() + 4 {
+            if data.len() < MAGIC_V5.len() + 4 {
                 return Err(PinkDbError::Execution(
                     "corrupt file: truncated before the checksum".to_string(),
                 ));
@@ -2301,12 +2351,14 @@ impl PinkDb {
         };
         let mut r = Reader::new(data);
         let magic = r.take(8)?;
-        let (v2, v4) = if magic == MAGIC_V5 || magic == MAGIC_V4 {
-            (true, true)
+        let (v2, flags, v5) = if magic == MAGIC_V5 {
+            (true, true, true)
+        } else if magic == MAGIC_V4 {
+            (true, true, false)
         } else if magic == MAGIC_V3 || magic == MAGIC_V2 {
-            (true, false)
+            (true, false, false)
         } else if magic == MAGIC {
-            (false, false)
+            (false, false, false)
         } else if magic.starts_with(b"PINKDB0") && magic[7] > b'5' && magic[7].is_ascii_digit() {
             return Err(PinkDbError::Execution(format!(
                 "written by a newer pinkdb (format v{}); upgrade pinkdb",
@@ -2317,11 +2369,19 @@ impl PinkDb {
                 "not a .pink file (bad magic)".to_string(),
             ));
         };
-        if v4 {
-            let flags = r.u32()?;
-            if flags != 0 {
+        let mut constraints = false;
+        if flags {
+            let f = r.u32()?;
+            if v5 {
+                if f & !FLAG_CONSTRAINTS != 0 {
+                    return Err(PinkDbError::Execution(format!(
+                        "unsupported .pink v5 flags 0x{f:08x}; upgrade pinkdb"
+                    )));
+                }
+                constraints = f & FLAG_CONSTRAINTS != 0;
+            } else if f != 0 {
                 return Err(PinkDbError::Execution(format!(
-                    "unsupported .pink v4 flags 0x{flags:08x}; upgrade pinkdb"
+                    "unsupported .pink v4 flags 0x{f:08x}; upgrade pinkdb"
                 )));
             }
         }
@@ -2335,7 +2395,7 @@ impl PinkDb {
                 db.create_database(&dbname)?;
                 let n_tables = r.u32()?;
                 for _ in 0..n_tables {
-                    load_table(&mut r, &mut db, &dbname, v4)?;
+                    load_table(&mut r, &mut db, &dbname, v5, constraints)?;
                 }
             }
             if db.list_databases().is_empty() {
@@ -2346,7 +2406,7 @@ impl PinkDb {
             db.create_database("main")?;
             let n_tables = r.u32()?;
             for _ in 0..n_tables {
-                load_table(&mut r, &mut db, "main", v4)?;
+                load_table(&mut r, &mut db, "main", false, false)?;
             }
         }
         if !r.end() {
@@ -2362,9 +2422,138 @@ impl PinkDb {
     }
 }
 
+/// Encode one table's declarative constraints (see the module-level layout).
+/// Keys are written first (declaration order), then foreign keys, then the
+/// NOT NULL column list — the cross-category order is not observable, so it is
+/// not preserved.
+fn write_constraints(w: &mut Writer, c: &TableConstraints) {
+    w.u32((c.keys.len() + c.foreign_keys.len() + c.not_null.len()) as u32);
+    for k in &c.keys {
+        w.u8(match k.kind {
+            KeyKind::Primary => CK_PRIMARY_KEY,
+            KeyKind::Unique => CK_UNIQUE,
+        });
+        w.str(k.name.as_deref().unwrap_or(""));
+        w.u32(k.columns.len() as u32);
+        for col in &k.columns {
+            w.u32(*col as u32);
+        }
+    }
+    for fk in &c.foreign_keys {
+        w.u8(CK_FOREIGN_KEY);
+        w.str(fk.name.as_deref().unwrap_or(""));
+        w.u32(fk.columns.len() as u32);
+        for col in &fk.columns {
+            w.u32(*col as u32);
+        }
+        w.str(&fk.ref_db);
+        w.str(&fk.ref_table);
+        w.u32(fk.ref_columns.len() as u32);
+        for col in &fk.ref_columns {
+            w.u32(*col as u32);
+        }
+    }
+    for col in &c.not_null {
+        w.u8(CK_NOT_NULL);
+        w.str("");
+        w.u32(1);
+        w.u32(*col as u32);
+    }
+}
+
+/// Decode one table's constraint section from `r` (v5 files with flags bit 0
+/// set). `n_cols` bounds every column index; almost-empty constraints and
+/// out-of-range indices are corrupt-file errors, never panics.
+fn read_constraints(r: &mut Reader, n_cols: usize) -> Result<TableConstraints> {
+    let count = r.u32()? as usize;
+    // The smallest constraint costs 13 bytes (kind + empty name + one
+    // column); never size an allocation from the unvalidated count.
+    if count > r.remaining() / 13 + 1 {
+        return r.err("constraint count exceeds the remaining file");
+    }
+    let mut out = TableConstraints::default();
+    for _ in 0..count {
+        let kind = r.u8()?;
+        let name = r.str()?;
+        let name = (!name.is_empty()).then_some(name);
+        let n = r.u32()? as usize;
+        if n > r.remaining() / 4 + 1 {
+            return r.err("constraint column count exceeds the remaining file");
+        }
+        let mut cols = Vec::with_capacity(n.min(1024));
+        for _ in 0..n {
+            let c = r.u32()? as usize;
+            if c >= n_cols {
+                return r.err("constraint column index out of range");
+            }
+            cols.push(c);
+        }
+        match kind {
+            CK_PRIMARY_KEY | CK_UNIQUE => {
+                if cols.is_empty() {
+                    return r.err("key constraint with no columns");
+                }
+                out.keys.push(KeyConstraint {
+                    name,
+                    kind: if kind == CK_PRIMARY_KEY {
+                        KeyKind::Primary
+                    } else {
+                        KeyKind::Unique
+                    },
+                    columns: cols,
+                });
+            }
+            CK_FOREIGN_KEY => {
+                if cols.is_empty() {
+                    return r.err("foreign key with no columns");
+                }
+                let ref_db = r.str()?;
+                let ref_table = r.str()?;
+                if ref_db.is_empty() || ref_table.is_empty() {
+                    return r.err("foreign key with an empty reference");
+                }
+                let rn = r.u32()? as usize;
+                if rn > r.remaining() / 4 + 1 {
+                    return r.err("foreign key reference count exceeds the remaining file");
+                }
+                if rn != cols.len() {
+                    return r.err("foreign key referencing/referenced column count mismatch");
+                }
+                let mut ref_cols = Vec::with_capacity(rn.min(1024));
+                for _ in 0..rn {
+                    ref_cols.push(r.u32()? as usize);
+                }
+                out.foreign_keys.push(ForeignKeyConstraint {
+                    name,
+                    columns: cols,
+                    ref_db: ref_db.to_ascii_lowercase(),
+                    ref_table: ref_table.to_ascii_lowercase(),
+                    ref_columns: ref_cols,
+                });
+            }
+            CK_NOT_NULL => {
+                if cols.len() != 1 {
+                    return r.err("NOT NULL constraint must name exactly one column");
+                }
+                out.not_null.push(cols[0]);
+            }
+            other => {
+                return r.err(&format!("unknown constraint kind {other}"));
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Decode one table from `r` into `db`'s `dbname` database. `v4` selects the
 /// v4-only error messages (reserved tags, unknown flags).
-fn load_table(r: &mut Reader, db: &mut PinkDb, dbname: &str, v4: bool) -> Result<()> {
+fn load_table(
+    r: &mut Reader,
+    db: &mut PinkDb,
+    dbname: &str,
+    v4: bool,
+    constraints: bool,
+) -> Result<()> {
     let name = r.str()?;
     let n_cols = r.u32()? as usize;
     // Each column costs at least 5 bytes (name length + dtype tag).
@@ -2388,6 +2577,11 @@ fn load_table(r: &mut Reader, db: &mut PinkDb, dbname: &str, v4: bool) -> Result
         };
         schema.push((col, dtype));
     }
+    let constraints = if constraints {
+        read_constraints(r, n_cols)?
+    } else {
+        TableConstraints::default()
+    };
     let num_rows = r.u64()? as usize;
     // Decode each column's chunks into shared vectors (no per-row Value
     // materialization, no transposition).
@@ -2422,7 +2616,7 @@ fn load_table(r: &mut Reader, db: &mut PinkDb, dbname: &str, v4: bool) -> Result
             )));
         }
     }
-    db.create_table_in(dbname, &name, schema)?;
+    db.create_table_with_constraints_in(dbname, &name, schema, constraints)?;
     let t = db.table_mut_in(dbname, &name)?;
     for ci in 0..n_chunks {
         let chunk: Vec<Arc<Vector>> = columns.iter().map(|c| Arc::clone(&c[ci])).collect();
@@ -2634,10 +2828,12 @@ mod tests {
     use super::*;
     use crate::vector::CHUNK_SIZE;
 
-    /// Pinned v5 size/CRC of [`golden_db`]'s image (see
-    /// `golden_v5_bytes_are_pinned`).
+    /// Pinned v5 size and body CRC of [`golden_db`]'s image (see
+    /// `golden_v5_bytes_are_pinned`). The CRC is over the body *without* the
+    /// trailer: a CRC over the whole file (trailer included) is the fixed
+    /// data+trailer identity constant and would not notice content drift.
     const GOLDEN_V5_LEN: usize = 111775;
-    const GOLDEN_V5_CRC: u32 = 558161692;
+    const GOLDEN_V5_BODY_CRC: u32 = 1766647982;
 
     fn roundtrip(db: &PinkDb) -> PinkDb {
         let path = temp_file("rt");
@@ -3122,7 +3318,7 @@ mod tests {
         let full = db.to_bytes().unwrap();
         assert!(full.starts_with(MAGIC_V5));
         // A flipped payload bit is a checksum error, not a silent wrong value.
-        for i in MAGIC_V4.len()..full.len() {
+        for i in MAGIC_V5.len()..full.len() {
             let mut bad = full.clone();
             bad[i] ^= 0x01;
             let err = PinkDb::load_bytes(&bad).expect_err("bit flip must be detected");
@@ -3164,13 +3360,15 @@ mod tests {
         data[..8].copy_from_slice(b"PINKDB0X");
         let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
         assert!(err.contains("bad magic"), "{err}");
-        // Unknown v4 flags bits are a hard error (re-checksummed so the
-        // flags check, not the CRC, is what fires).
+        // Unknown v5 flags bits are a hard error (re-checksummed so the flags
+        // check, not the CRC, is what fires). Bit 0 (the constraint section)
+        // is known; its absence/presence is exercised by the constraint
+        // round-trip tests.
         let mut data = full.clone();
-        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        data[8..12].copy_from_slice(&2u32.to_le_bytes());
         fix_crc(&mut data);
         let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
-        assert!(err.contains("unsupported .pink v4 flags"), "{err}");
+        assert!(err.contains("unsupported .pink v5 flags"), "{err}");
     }
 
     /// Reserved v4 tags (7..=9) are rejected with an upgrade hint, distinct
@@ -4209,12 +4407,14 @@ mod tests {
     fn golden_v5_bytes_are_pinned() {
         let db = golden_db();
         let bytes = db.to_bytes().unwrap();
-        // Recomputed once when the v5 codecs stabilized; guards accidental
-        // format drift (encoders are pure by contract).
+        // Recomputed once when the v5 container stabilized (v4 codecs + the
+        // v5 magic; the golden store has no constraints and no DECIMAL/
+        // INTERVAL columns, so its body doubles as the v4-shape pin); guards
+        // accidental format/content drift (encoders are pure by contract).
         assert_eq!(bytes.len(), GOLDEN_V5_LEN, "file length drifted");
         assert_eq!(
-            crate::wal::crc32(&bytes),
-            GOLDEN_V5_CRC,
+            crate::wal::crc32(&bytes[..bytes.len() - 4]),
+            GOLDEN_V5_BODY_CRC,
             "file bytes drifted"
         );
         assert_eq!(db.to_bytes_impl(false).unwrap(), bytes, "serial ≠ parallel");
@@ -4712,5 +4912,144 @@ mod tests {
         assert_eq!(n.null_count, 3 + CHUNK_SIZE as u64);
         assert_eq!(n.min, None);
         assert_eq!(n.max, None);
+    }
+
+    // ---------- wave 41: declarative constraints in the v5 section ----------
+
+    /// A constrained store keeps its constraints exactly through save/open,
+    /// and the v5 flags bit 0 marks the constraint section.
+    #[test]
+    fn wave41_constraints_roundtrip_through_v5() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE c (cid INTEGER, pid INTEGER NOT NULL REFERENCES p(id), note VARCHAR UNIQUE);")
+            .unwrap();
+        db.execute("CREATE TABLE u (a INTEGER, b INTEGER, UNIQUE (a, b));")
+            .unwrap();
+        db.execute("CREATE TABLE free (x INTEGER);").unwrap();
+        let bytes = db.to_bytes().unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V5);
+        assert_eq!(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            FLAG_CONSTRAINTS,
+            "a constrained store sets flags bit 0"
+        );
+        let back = PinkDb::load_bytes(&bytes).unwrap();
+        for name in ["p", "c", "u", "free"] {
+            assert_eq!(
+                db.table(name).unwrap().constraints,
+                back.table(name).unwrap().constraints,
+                "constraints of {name}"
+            );
+        }
+        assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
+        // A constraint-free store keeps flags 0 (the body stays v4-shaped).
+        let mut plain = PinkDb::new();
+        plain
+            .create_table("t", vec![("x".to_string(), DataType::Integer)])
+            .unwrap();
+        let plain_bytes = plain.to_bytes().unwrap();
+        assert_eq!(&plain_bytes[8..12], 0u32.to_le_bytes());
+        assert_eq!(
+            PinkDb::load_bytes(&plain_bytes)
+                .unwrap()
+                .to_bytes()
+                .unwrap(),
+            plain_bytes
+        );
+        // DESCRIBE answers identically after the reopen.
+        let mut back = back;
+        let before = db.execute("DESCRIBE c;").unwrap().pop().unwrap();
+        let after = back.execute("DESCRIBE c;").unwrap().pop().unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// A corrupt constraint section is a clean error, never a panic.
+    #[test]
+    fn wave41_corrupt_constraints_error() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER, CONSTRAINT kz PRIMARY KEY (a));")
+            .unwrap();
+        let full = db.to_bytes().unwrap();
+        // Locate the constraint by its (distinctive) name; the kind byte sits
+        // 5 bytes before the name (kind u8 + name_len u32).
+        let at = full
+            .windows(2)
+            .position(|w| w == b"kz")
+            .expect("constraint name in the image");
+        assert_eq!(full[at - 5], CK_PRIMARY_KEY);
+        // Unknown kind.
+        let mut bad = full.clone();
+        bad[at - 5] = 9;
+        fix_crc(&mut bad);
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(err.contains("unknown constraint kind 9"), "{err}");
+        // Out-of-range column index (the table has one column): the single
+        // col_idx u32 follows the name + col_count u32.
+        let mut bad = full.clone();
+        bad[at + 2 + 4..at + 2 + 8].copy_from_slice(&7u32.to_le_bytes());
+        fix_crc(&mut bad);
+        let err = PinkDb::load_bytes(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("constraint column index out of range"),
+            "{err}"
+        );
+    }
+
+    /// A durable reopen re-derives the constraints from the logged DDL text:
+    /// both from the checkpoint and from WAL replay alone.
+    #[test]
+    fn wave41_durable_reopen_replays_constraints() {
+        let ckpt = temp_file("w41_ckpt");
+        let ckpt = std::path::PathBuf::from(format!("{}.db", ckpt.display()));
+        let wal = std::path::PathBuf::from(format!("{}.wal", ckpt.display()));
+        // Case 1: everything in the WAL (no checkpoint).
+        {
+            let mut db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
+            db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);")
+                .unwrap();
+            db.execute(
+                "CREATE TABLE c (cid INTEGER PRIMARY KEY, \
+                 pid INTEGER NOT NULL REFERENCES p(id));",
+            )
+            .unwrap();
+            db.execute("INSERT INTO c VALUES (1, 1);").unwrap();
+        }
+        {
+            let mut db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
+            let rows = db.execute("DESCRIBE c;").unwrap().pop().unwrap();
+            let crate::QueryResult::Selected { rows, .. } = rows else {
+                panic!()
+            };
+            // cid is the primary key; pid is a NOT NULL foreign key (no key
+            // marker, DuckDB's rule).
+            assert_eq!(rows[0][3], Value::Varchar("PRI".to_string()));
+            assert_eq!(rows[0][2], Value::Varchar("NO".to_string()));
+            assert_eq!(rows[1][3], Value::Null);
+            assert_eq!(rows[1][2], Value::Varchar("NO".to_string()));
+            assert_eq!(
+                db.table("c").unwrap().constraints.foreign_keys[0].ref_table,
+                "p"
+            );
+            // Case 2: checkpointed, then reopened (constraints come from the
+            // .pink section).
+            db.execute("CHECKPOINT;").unwrap();
+        }
+        {
+            let db = PinkDb::open_durable(ckpt.to_str().unwrap()).unwrap();
+            assert_eq!(db.table("c").unwrap().constraints.foreign_keys.len(), 1);
+            assert_eq!(
+                db.table("p")
+                    .unwrap()
+                    .constraints
+                    .primary_key()
+                    .unwrap()
+                    .columns,
+                vec![0]
+            );
+        }
+        let _ = std::fs::remove_file(&ckpt);
+        let _ = std::fs::remove_file(&wal);
     }
 }

@@ -17,7 +17,9 @@ use std::rc::Rc;
 
 use super::ast::*;
 use crate::plan::LogicalPlan;
-use crate::storage::{DataTable, PinkDb};
+use crate::storage::{
+    DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
+};
 use crate::types::{
     extract_field, DataType, ExtractField, PinkDbError, Result, Value, DECIMAL_MAX_PRECISION,
 };
@@ -2941,14 +2943,9 @@ pub(crate) fn bind_tracked_with(
         Statement::CreateTable {
             db: qdb,
             name,
-            columns,
+            items,
             if_not_exists,
-        } => empty(LogicalPlan::CreateTable {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
-            name: name.clone(),
-            schema: columns.clone(),
-            if_not_exists: *if_not_exists,
-        }),
+        } => bind_create_table(db, default_db, qdb.as_deref(), name, items, *if_not_exists),
         Statement::CreateTableAs {
             db: qdb,
             name,
@@ -3389,6 +3386,298 @@ fn bind_insert_select(
     ))
 }
 
+/// Bind `CREATE TABLE t (items...)`: build the schema and resolve the
+/// declarative constraints.
+///
+/// Constraints are **metadata**: foreign keys are validated here (the
+/// referenced table must exist and the referenced columns must be exactly one
+/// of its `PRIMARY KEY`/`UNIQUE` constraints, with compatible types — DuckDB's
+/// DDL-time rule) but nothing is ever enforced on INSERT/UPDATE. `RELY` /
+/// `[NOT] ENFORCED` were already accepted (and dropped) by the parser. A
+/// dangling reference is therefore a `CREATE TABLE` error, exactly like
+/// DuckDB's; unenforced *data* is not.
+fn bind_create_table(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: Option<&str>,
+    name: &str,
+    items: &[TableItem],
+    if_not_exists: bool,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let mut schema: Vec<(String, DataType)> = Vec::new();
+    let mut constraints = TableConstraints::default();
+    // Named constraints are echoes of the DDL; only the declaration matters.
+    for item in items {
+        match item {
+            TableItem::Column(col) => {
+                let idx = schema.len();
+                if schema
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(&col.name))
+                {
+                    return Err(PinkDbError::Catalog(format!(
+                        "duplicate column name \"{}\"",
+                        col.name
+                    )));
+                }
+                schema.push((col.name.clone(), col.dtype));
+                for c in &col.constraints {
+                    bind_column_constraint(db, &target, name, &schema, idx, c, &mut constraints)?;
+                }
+            }
+            TableItem::Constraint(tc) => {
+                bind_table_constraint(db, &target, name, &schema, tc, &mut constraints)?;
+            }
+        }
+    }
+    if schema.is_empty() {
+        return Err(PinkDbError::Catalog(
+            "cannot create table with no columns".to_string(),
+        ));
+    }
+    Ok((
+        LogicalPlan::CreateTable {
+            db: Some(target),
+            name: name.to_string(),
+            schema,
+            constraints,
+            if_not_exists,
+        },
+        Vec::new(),
+    ))
+}
+
+/// Resolve a key/foreign-key column-name list to schema indices.
+fn resolve_constraint_columns(
+    schema: &[(String, DataType)],
+    table: &str,
+    what: &str,
+    columns: &[String],
+) -> Result<Vec<usize>> {
+    if columns.is_empty() {
+        return Err(PinkDbError::Catalog(format!(
+            "{what} needs at least one column"
+        )));
+    }
+    let mut out = Vec::with_capacity(columns.len());
+    for c in columns {
+        let idx = schema
+            .iter()
+            .position(|(n, _)| n.eq_ignore_ascii_case(c))
+            .ok_or_else(|| {
+                PinkDbError::Catalog(format!("table \"{table}\" has no column \"{c}\""))
+            })?;
+        if out.contains(&idx) {
+            return Err(PinkDbError::Catalog(format!(
+                "column \"{c}\" appears more than once in the {what}"
+            )));
+        }
+        out.push(idx);
+    }
+    Ok(out)
+}
+
+fn bind_column_constraint(
+    db: &PinkDb,
+    target: &str,
+    table: &str,
+    schema: &[(String, DataType)],
+    idx: usize,
+    c: &ColumnConstraint,
+    out: &mut TableConstraints,
+) -> Result<()> {
+    match &c.kind {
+        ColumnConstraintKind::PrimaryKey => {
+            push_key(out, table, c.name.clone(), KeyKind::Primary, vec![idx])
+        }
+        ColumnConstraintKind::Unique => {
+            push_key(out, table, c.name.clone(), KeyKind::Unique, vec![idx])
+        }
+        ColumnConstraintKind::NotNull => {
+            out.not_null.push(idx);
+            Ok(())
+        }
+        ColumnConstraintKind::References {
+            ref_table,
+            ref_columns,
+        } => bind_foreign_key(
+            db,
+            target,
+            schema,
+            c.name.clone(),
+            &[idx],
+            ref_table,
+            ref_columns.as_deref(),
+            out,
+        ),
+    }
+}
+
+fn bind_table_constraint(
+    db: &PinkDb,
+    target: &str,
+    table: &str,
+    schema: &[(String, DataType)],
+    tc: &TableConstraint,
+    out: &mut TableConstraints,
+) -> Result<()> {
+    match tc {
+        TableConstraint::PrimaryKey { name, columns } => {
+            let cols = resolve_constraint_columns(schema, table, "PRIMARY KEY", columns)?;
+            push_key(out, table, name.clone(), KeyKind::Primary, cols)
+        }
+        TableConstraint::Unique { name, columns } => {
+            let cols = resolve_constraint_columns(schema, table, "UNIQUE", columns)?;
+            push_key(out, table, name.clone(), KeyKind::Unique, cols)
+        }
+        TableConstraint::ForeignKey {
+            name,
+            columns,
+            ref_table,
+            ref_columns,
+        } => {
+            let cols = resolve_constraint_columns(schema, table, "FOREIGN KEY", columns)?;
+            bind_foreign_key(
+                db,
+                target,
+                schema,
+                name.clone(),
+                &cols,
+                ref_table,
+                ref_columns.as_deref(),
+                out,
+            )
+        }
+    }
+}
+
+fn push_key(
+    out: &mut TableConstraints,
+    table: &str,
+    name: Option<String>,
+    kind: KeyKind,
+    columns: Vec<usize>,
+) -> Result<()> {
+    if kind == KeyKind::Primary && out.primary_key().is_some() {
+        return Err(PinkDbError::Catalog(format!(
+            "table \"{table}\" has more than one primary key"
+        )));
+    }
+    out.keys.push(KeyConstraint {
+        name,
+        kind,
+        columns,
+    });
+    Ok(())
+}
+
+/// Resolve and validate one `REFERENCES`/`FOREIGN KEY` declaration against the
+/// *current* catalog (DuckDB's DDL-time rule): the referenced table must
+/// exist, the referenced columns must name exactly one of its PRIMARY
+/// KEY/UNIQUE constraints (order included), and every pair must have
+/// compatible types. Nothing is enforced on writes afterwards.
+#[allow(clippy::too_many_arguments)]
+fn bind_foreign_key(
+    db: &PinkDb,
+    target: &str,
+    schema: &[(String, DataType)],
+    name: Option<String>,
+    columns: &[usize],
+    ref_table: &RefTable,
+    ref_columns: Option<&[String]>,
+    out: &mut TableConstraints,
+) -> Result<()> {
+    let ref_db = match &ref_table.db {
+        Some(q) => {
+            if !db.database_exists(q) {
+                return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
+            }
+            q.to_ascii_lowercase()
+        }
+        None => target.to_string(),
+    };
+    let ref_t = db.table_in(&ref_db, &ref_table.name).map_err(|_| {
+        PinkDbError::Catalog(format!(
+            "failed to create foreign key: table \"{}\" does not exist",
+            ref_table.name
+        ))
+    })?;
+    let ref_constraints = ref_t.constraints.clone();
+    let ref_names: Vec<String> = ref_t.columns.iter().map(|c| c.name.clone()).collect();
+    let ref_types: Vec<DataType> = ref_t.columns.iter().map(|c| c.dtype).collect();
+    let ref_cols: Vec<usize> = match ref_columns {
+        Some(cols) => cols
+            .iter()
+            .map(|c| {
+                ref_names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case(c))
+                    .ok_or_else(|| {
+                        PinkDbError::Catalog(format!(
+                            "table \"{}\" has no column \"{c}\"",
+                            ref_table.name
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<usize>>>()?,
+        // A bare `REFERENCES u` means u's primary key (DuckDB).
+        None => match ref_constraints.primary_key() {
+            Some(k) => k.columns.clone(),
+            None => {
+                return Err(PinkDbError::Catalog(format!(
+                    "failed to create foreign key: there is no primary key or unique \
+                     constraint for referenced table \"{}\"",
+                    ref_table.name
+                )));
+            }
+        },
+    };
+    if ref_cols.len() != columns.len() {
+        return Err(PinkDbError::Catalog(format!(
+            "the number of referencing and referenced columns for foreign keys must be \
+             the same ({} vs {})",
+            columns.len(),
+            ref_cols.len()
+        )));
+    }
+    if ref_constraints.key_on(&ref_cols).is_none() {
+        let cols = ref_cols
+            .iter()
+            .map(|&i| ref_names[i].as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(PinkDbError::Catalog(format!(
+            "failed to create foreign key: referenced table \"{}\" does not have a \
+             primary key or unique constraint on the columns {cols}",
+            ref_table.name
+        )));
+    }
+    // Type compatibility (DuckDB's rule): equal types or the INTEGER →
+    // BIGINT → DOUBLE widening used by INSERT coercion.
+    for (child, &parent) in columns.iter().zip(ref_cols.iter()) {
+        let (child_name, child_type) = &schema[*child];
+        let parent_type = ref_types[parent];
+        if !DataTable::can_coerce(*child_type, parent_type)
+            && !DataTable::can_coerce(parent_type, *child_type)
+        {
+            return Err(PinkDbError::Catalog(format!(
+                "failed to create foreign key: incompatible types between column \"{}\" \
+                 (\"{}\") and column \"{}\" (\"{}\")",
+                ref_names[parent], parent_type, child_name, child_type
+            )));
+        }
+    }
+    out.foreign_keys.push(ForeignKeyConstraint {
+        name,
+        columns: columns.to_vec(),
+        ref_db,
+        ref_table: ref_table.name.to_ascii_lowercase(),
+        ref_columns: ref_cols,
+    });
+    Ok(())
+}
+
 /// Bind `CREATE TABLE t AS SELECT ...`: infer the new table's schema from the
 /// query's output (names + types).
 fn bind_create_table_as(
@@ -3438,7 +3727,18 @@ fn bind_describe(
         None => default_db.to_ascii_lowercase(),
     };
     if let Ok(t) = db.table_in(&lookup, name) {
-        return Ok((LogicalPlan::Describe { schema: t.schema() }, Vec::new()));
+        let columns = t
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| crate::plan::DescribeColumn {
+                name: c.name.clone(),
+                dtype: c.dtype,
+                not_null: t.constraints.is_not_null(i),
+                key: t.constraints.column_key_kind(i),
+            })
+            .collect();
+        return Ok((LogicalPlan::Describe { columns }, Vec::new()));
     }
     if let Ok(view) = db.view_in(&lookup, name) {
         let view = view.clone();
@@ -3452,11 +3752,29 @@ fn bind_describe(
                 s.0 = c.clone();
             }
         }
-        return Ok((LogicalPlan::Describe { schema }, Vec::new()));
+        let columns = schema
+            .into_iter()
+            .map(|(name, dtype)| crate::plan::DescribeColumn {
+                name,
+                dtype,
+                not_null: false,
+                key: None,
+            })
+            .collect();
+        return Ok((LogicalPlan::Describe { columns }, Vec::new()));
     }
     // Attached lake tables are visible to queries (they are not in the store).
     let schema = db.visible_table_schema(&lookup, name)?;
-    Ok((LogicalPlan::Describe { schema }, Vec::new()))
+    let columns = schema
+        .into_iter()
+        .map(|(name, dtype)| crate::plan::DescribeColumn {
+            name,
+            dtype,
+            not_null: false,
+            key: None,
+        })
+        .collect();
+    Ok((LogicalPlan::Describe { columns }, Vec::new()))
 }
 
 /// Durable databases replay committed SQL text, and views are never

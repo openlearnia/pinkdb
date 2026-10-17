@@ -13,7 +13,8 @@ pub enum Statement {
         /// Explicit `db.` qualifier, if written (resolved at bind).
         db: Option<String>,
         name: String,
-        columns: Vec<(String, crate::types::DataType)>,
+        /// Columns and table-level constraints, in written order.
+        items: Vec<TableItem>,
         /// `IF NOT EXISTS`: an existing table makes the statement a no-op.
         if_not_exists: bool,
     },
@@ -105,6 +106,73 @@ pub enum InsertSource {
     Values(Vec<Vec<Expr>>),
     /// `SELECT ...` (or WITH ... SELECT).
     Select(Box<Select>),
+}
+
+/// One `CREATE TABLE` item list entry: a column definition or a table-level
+/// constraint. Constraints are **declarative metadata**: they are recorded in
+/// the catalog and used by the optimizer, never enforced on writes (like
+/// DuckDB's informational foreign keys).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableItem {
+    Column(ColumnDef),
+    Constraint(TableConstraint),
+}
+
+/// A column definition with its inline constraints:
+/// `a INTEGER PRIMARY KEY`, `b INTEGER REFERENCES u(x) NOT NULL`, ...
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnDef {
+    pub name: String,
+    pub dtype: crate::types::DataType,
+    pub constraints: Vec<ColumnConstraint>,
+}
+
+/// `CONSTRAINT name <constraint>` (the name is optional).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnConstraint {
+    pub name: Option<String>,
+    pub kind: ColumnConstraintKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnConstraintKind {
+    PrimaryKey,
+    Unique,
+    NotNull,
+    /// `REFERENCES t [(cols)]` — the referenced column list defaults to the
+    /// referenced table's primary key at bind time.
+    References {
+        ref_table: RefTable,
+        ref_columns: Option<Vec<String>>,
+    },
+}
+
+/// A table-level constraint (`PRIMARY KEY (a, b)`, `FOREIGN KEY (a)
+/// REFERENCES u(x)`, `UNIQUE (a)`, ...). `RELY` / `[NOT] ENFORCED` suffixes
+/// are accepted and dropped: every constraint here is declarative metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableConstraint {
+    PrimaryKey {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    Unique {
+        name: Option<String>,
+        columns: Vec<String>,
+    },
+    ForeignKey {
+        name: Option<String>,
+        columns: Vec<String>,
+        ref_table: RefTable,
+        ref_columns: Option<Vec<String>>,
+    },
+}
+
+/// A referenced table name: `u` or `db.u`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefTable {
+    pub db: Option<String>,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

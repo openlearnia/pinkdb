@@ -928,11 +928,93 @@ peg::parser! {
             / kw(Keyword::Create) kw(Keyword::Table) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {
                   Statement::CreateTableAs { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne }
               }
-            / kw(Keyword::Create) kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_column()
-              rest:(comma() c:table_column() { c })* rparen() {
-                  let mut columns = vec![first];
-                  columns.extend(rest);
-                  Statement::CreateTable { db: t.0, name: t.1, columns, if_not_exists: ifne }
+            / kw(Keyword::Create) kw(Keyword::Table) ifne:if_not_exists() t:table_ref() lparen() first:table_item()
+              rest:(comma() i:table_item() { i })* rparen() {
+                  let mut items = vec![first];
+                  items.extend(rest);
+                  Statement::CreateTable { db: t.0, name: t.1, items, if_not_exists: ifne }
+              }
+
+        /// One `CREATE TABLE` list entry: a table-level constraint or a
+        /// column definition. The constraint alternatives are tried first so
+        /// `PRIMARY KEY (a)` is not read as a column named `primary`.
+        rule table_item() -> TableItem
+            = c:table_constraint() { TableItem::Constraint(c) }
+            / d:column_def() { TableItem::Column(d) }
+
+        rule column_def() -> ColumnDef
+            = name:ident() ty:type_name() constraints:column_constraints() {
+                  ColumnDef { name, dtype: ty, constraints }
+              }
+
+        rule column_constraints() -> Vec<ColumnConstraint>
+            = c:(column_constraint()*) { c }
+
+        /// `[CONSTRAINT name] <column constraint>` plus the optional
+        /// `RELY` / `[NOT] ENFORCED` trailer (accepted and dropped: every
+        /// constraint this engine records is declarative metadata).
+        rule column_constraint() -> ColumnConstraint
+            = word("constraint") name:ident() k:column_constraint_kind() constraint_suffix() {
+                  ColumnConstraint { name: Some(name), kind: k }
+              }
+            / k:column_constraint_kind() constraint_suffix() {
+                  ColumnConstraint { name: None, kind: k }
+              }
+
+        /// `NOT NULL` is tried before any suffix-carrying form so a following
+        /// `NOT ENFORCED` can never steal the `NOT` of `NOT NULL`.
+        rule column_constraint_kind() -> ColumnConstraintKind
+            = word("primary") word("key") { ColumnConstraintKind::PrimaryKey }
+            / word("unique") { ColumnConstraintKind::Unique }
+            / kw(Keyword::Not) kw(Keyword::Null) { ColumnConstraintKind::NotNull }
+            / word("references") t:table_ref() cols:col_name_list()? {
+                  ColumnConstraintKind::References {
+                      ref_table: RefTable { db: t.0, name: t.1 },
+                      ref_columns: cols,
+                  }
+              }
+
+        /// `RELY` / `NORELY` / `ENFORCED` / `NOT ENFORCED`, any order, any
+        /// number of times (Snowflake-style; declarative-only in this engine).
+        rule constraint_suffix()
+            = (word("rely") / word("norely") / word("enforced") / kw(Keyword::Not) word("enforced"))*
+
+        rule table_constraint() -> TableConstraint
+            = word("constraint") name:ident() c:table_constraint_body() {
+                  match c {
+                      TableConstraint::PrimaryKey { columns, .. } => {
+                          TableConstraint::PrimaryKey { name: Some(name), columns }
+                      }
+                      TableConstraint::Unique { columns, .. } => {
+                          TableConstraint::Unique { name: Some(name), columns }
+                      }
+                      TableConstraint::ForeignKey { columns, ref_table, ref_columns, .. } => {
+                          TableConstraint::ForeignKey {
+                              name: Some(name),
+                              columns,
+                              ref_table,
+                              ref_columns,
+                          }
+                      }
+                  }
+              }
+            / c:table_constraint_body() { c }
+
+        rule table_constraint_body() -> TableConstraint
+            = word("primary") word("key") cols:col_name_list() constraint_suffix() {
+                  TableConstraint::PrimaryKey { name: None, columns: cols }
+              }
+            / word("unique") cols:col_name_list() constraint_suffix() {
+                  TableConstraint::Unique { name: None, columns: cols }
+              }
+            / word("foreign") word("key") cols:col_name_list() word("references") t:table_ref()
+              rcols:col_name_list()? constraint_suffix() {
+                  TableConstraint::ForeignKey {
+                      name: None,
+                      columns: cols,
+                      ref_table: RefTable { db: t.0, name: t.1 },
+                      ref_columns: rcols,
+                  }
               }
 
         rule table_column() -> (String, DataType) = name:ident() ty:type_name() { (name, ty) }
@@ -2974,6 +3056,117 @@ mod tests {
             parse_one("INSERT INTO t VALUES (1, 'x'), (2, 'y');"),
             Statement::Insert { .. }
         ));
+    }
+
+    /// Declarative constraints parse in both the column and the table form,
+    /// with `CONSTRAINT name` prefixes and `RELY` / `[NOT] ENFORCED`
+    /// suffixes. The recorded AST keeps only the declarations (the suffix is
+    /// dropped).
+    #[test]
+    fn create_table_constraint_shapes() {
+        let s = parse_one(
+            "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER REFERENCES u(x), \
+             c INTEGER UNIQUE, d INTEGER NOT NULL);",
+        );
+        let Statement::CreateTable { items, .. } = s else {
+            panic!()
+        };
+        assert_eq!(items.len(), 4);
+        let TableItem::Column(a) = &items[0] else {
+            panic!()
+        };
+        assert_eq!(a.name, "a");
+        assert_eq!(a.constraints.len(), 1);
+        assert_eq!(a.constraints[0].kind, ColumnConstraintKind::PrimaryKey);
+        assert_eq!(a.constraints[0].name, None);
+        let TableItem::Column(b) = &items[1] else {
+            panic!()
+        };
+        match &b.constraints[0].kind {
+            ColumnConstraintKind::References {
+                ref_table,
+                ref_columns,
+            } => {
+                assert_eq!(ref_table.db, None);
+                assert_eq!(ref_table.name, "u");
+                assert_eq!(ref_columns.as_deref(), Some(["x".to_string()].as_slice()));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Table-level forms, named, with suffixes; the constraint item keeps
+        // its written position in the list.
+        let s = parse_one(
+            "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER, \
+             CONSTRAINT pk PRIMARY KEY (a, b), FOREIGN KEY (b) REFERENCES u(x) \
+             NOT ENFORCED, UNIQUE (c) RELY);",
+        );
+        let Statement::CreateTable { items, .. } = s else {
+            panic!()
+        };
+        assert!(matches!(items[0], TableItem::Column(_)));
+        assert!(matches!(items[1], TableItem::Column(_)));
+        assert!(matches!(items[2], TableItem::Column(_)));
+        match &items[3] {
+            TableItem::Constraint(TableConstraint::PrimaryKey { name, columns }) => {
+                assert_eq!(name.as_deref(), Some("pk"));
+                assert_eq!(columns, &["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match &items[4] {
+            TableItem::Constraint(TableConstraint::ForeignKey {
+                columns,
+                ref_table,
+                ref_columns,
+                ..
+            }) => {
+                assert_eq!(columns, &["b".to_string()]);
+                assert_eq!(ref_table.name, "u");
+                assert_eq!(ref_columns.as_deref(), Some(["x".to_string()].as_slice()));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            &items[5],
+            TableItem::Constraint(TableConstraint::Unique { name: None, .. })
+        ));
+        // A bare `REFERENCES u` (no column list) parses: the primary key of
+        // `u` is the target, resolved at bind time.
+        let s =
+            parse_one("CREATE TABLE t (a INTEGER REFERENCES u, b INTEGER CONSTRAINT nn NOT NULL);");
+        let Statement::CreateTable { items, .. } = s else {
+            panic!()
+        };
+        let TableItem::Column(a) = &items[0] else {
+            panic!()
+        };
+        match &a.constraints[0].kind {
+            ColumnConstraintKind::References { ref_columns, .. } => assert!(ref_columns.is_none()),
+            other => panic!("{other:?}"),
+        }
+        let TableItem::Column(b) = &items[1] else {
+            panic!()
+        };
+        assert_eq!(b.constraints[0].name.as_deref(), Some("nn"));
+        assert_eq!(b.constraints[0].kind, ColumnConstraintKind::NotNull);
+        // Reserved words stay usable as column names.
+        let s = parse_one("CREATE TABLE t (key INTEGER, unique INTEGER, constraint INTEGER);");
+        let Statement::CreateTable { items, .. } = s else {
+            panic!()
+        };
+        assert_eq!(items.len(), 3);
+        // Malformed constraints are parse errors.
+        for bad in [
+            "CREATE TABLE t (a INTEGER PRIMARY KEY (a));", // column PK takes no list
+            "CREATE TABLE t (a INTEGER, FOREIGN KEY (a));",
+            "CREATE TABLE t (a INTEGER, FOREIGN KEY (a) u(x));",
+            "CREATE TABLE t (a INTEGER UNIQUE (a));",
+        ] {
+            assert!(
+                matches!(parse(bad), Err(PinkDbError::Parse(_))),
+                "{bad} must not parse"
+            );
+        }
     }
 
     #[test]

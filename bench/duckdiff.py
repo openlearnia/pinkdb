@@ -208,6 +208,13 @@ CREATE TABLE typed (a BIGINT, b TIMESTAMP);
 CREATE VIEW emp_view AS SELECT id, name FROM emp WHERE id > 1;
 CREATE TABLE dt (x DECIMAL(6,2), iv INTERVAL);
 INSERT INTO dt VALUES ('1.25', '1 day'), ('2.50', '2 hours'), (NULL, NULL);
+-- wave 41: declarative constraints (metadata only; DESCRIBE parity + FK joins).
+CREATE TABLE keys_p (id INTEGER PRIMARY KEY, code VARCHAR UNIQUE, v INTEGER NOT NULL, w INTEGER);
+INSERT INTO keys_p VALUES (1, 'a', 10, 100), (2, 'b', 20, 200);
+CREATE TABLE keys_c (cid INTEGER, pid INTEGER NOT NULL REFERENCES keys_p(id), note VARCHAR, PRIMARY KEY (cid, note));
+INSERT INTO keys_c VALUES (1, 1, 'x'), (2, 2, 'y');
+CREATE TABLE fk_null_c (cid INTEGER, pid INTEGER REFERENCES keys_p(id));
+INSERT INTO fk_null_c VALUES (1, 1), (2, NULL);
 """
 
 # (label, sql, ordered, expect_error)
@@ -360,6 +367,13 @@ QUERIES = [
     ("describe-view", "DESCRIBE emp_view;", True, False),
     ("describe-all-types", "DESCRIBE typed;", True, False),
     ("describe-empty-names", "DESCRIBE jz;", True, False),
+    # --- wave 41: declarative constraints, DESCRIBE keys + FK joins ---
+    ("describe-keys", "DESCRIBE keys_p;", True, False),
+    ("describe-keys-fk", "DESCRIBE keys_c;", True, False),
+    ("fk-join-elim", "SELECT c.cid FROM keys_c c JOIN keys_p p ON c.pid = p.id ORDER BY 1;", True, False),
+    ("fk-join-parent-col", "SELECT c.cid, p.v FROM keys_c c JOIN keys_p p ON c.pid = p.id ORDER BY 1;", True, False),
+    ("fk-nullable-join", "SELECT n.cid FROM fk_null_c n JOIN keys_p p ON n.pid = p.id ORDER BY 1;", True, False),
+    ("fk-dangling-ddl", "CREATE TABLE fk_bad_ddl (x INTEGER REFERENCES no_such_table(id));", False, True),
     ("left-join-non-equi", "SELECT a.x AS ax, b.x AS bx FROM jx a LEFT JOIN jy b ON a.x > b.x ORDER BY ax NULLS LAST, bx NULLS LAST;", True, False),
     ("right-join-non-equi", "SELECT a.x AS ax, b.x AS bx FROM jx a RIGHT JOIN jy b ON a.x > b.x ORDER BY bx NULLS LAST, ax NULLS LAST;", True, False),
     ("full-join-non-equi", "SELECT a.x AS ax, b.x AS bx FROM jx a FULL JOIN jy b ON a.x > b.x ORDER BY ax NULLS LAST, bx NULLS LAST;", True, False),

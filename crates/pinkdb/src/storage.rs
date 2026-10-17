@@ -68,6 +68,11 @@ pub struct DataTable {
     pub name: String,
     pub columns: Vec<Column>,
     pub num_rows: usize,
+    /// Declarative constraints (PRIMARY KEY / UNIQUE / FOREIGN KEY / NOT
+    /// NULL): catalog metadata only, **never enforced** on INSERT/UPDATE.
+    /// `DESCRIBE` reports them and the optimizer may trust them (see
+    /// [`crate::optimizer`]).
+    pub constraints: TableConstraints,
     /// Mutation stamp for optimistic-concurrency conflict detection. Drawn
     /// from a process-wide counter on creation and on every
     /// append/update/delete batch, so it is unique across tables: a table
@@ -77,8 +82,109 @@ pub struct DataTable {
     pub version: u64,
 }
 
+/// The kind of a declarative key constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Primary,
+    Unique,
+}
+
+/// A `PRIMARY KEY` / `UNIQUE` constraint: an ordered column list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeyConstraint {
+    /// `CONSTRAINT <name>` if written.
+    pub name: Option<String>,
+    pub kind: KeyKind,
+    /// Column indices in declaration order (non-empty).
+    pub columns: Vec<usize>,
+}
+
+/// A `FOREIGN KEY` constraint: this table's columns → a key of another table.
+/// Validated at `CREATE TABLE` time (the referenced columns must be a
+/// `PRIMARY KEY` or `UNIQUE` of the referenced table) and never enforced on
+/// writes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKeyConstraint {
+    /// `CONSTRAINT <name>` if written.
+    pub name: Option<String>,
+    /// This table's column indices, in declaration order.
+    pub columns: Vec<usize>,
+    /// Lowercased referenced database name.
+    pub ref_db: String,
+    /// Lowercased referenced table name.
+    pub ref_table: String,
+    /// Referenced column indices, in declaration order (same length as
+    /// `columns`; position `i` references `ref_columns[i]`).
+    pub ref_columns: Vec<usize>,
+}
+
+/// Everything declarative a table carries. Default = an unconstrained table
+/// (byte-compatible with a pre-constraint catalog).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TableConstraints {
+    /// `PRIMARY KEY` / `UNIQUE` constraints in declaration order.
+    pub keys: Vec<KeyConstraint>,
+    /// `FOREIGN KEY` constraints in declaration order.
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
+    /// Column indices declared `NOT NULL` (in declaration order). A PRIMARY
+    /// KEY column is additionally NOT NULL *implied*; see
+    /// [`TableConstraints::is_not_null`].
+    pub not_null: Vec<usize>,
+}
+
+impl TableConstraints {
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.foreign_keys.is_empty() && self.not_null.is_empty()
+    }
+
+    /// The table's primary key, if declared.
+    pub fn primary_key(&self) -> Option<&KeyConstraint> {
+        self.keys.iter().find(|k| k.kind == KeyKind::Primary)
+    }
+
+    /// The `key` marker `DESCRIBE` prints for a column: `PRI` when the column
+    /// is part of the primary key (which wins), else `UNI` when it is part of
+    /// any UNIQUE constraint (DuckDB's precedence).
+    pub fn column_key_kind(&self, col: usize) -> Option<KeyKind> {
+        let mut uniq = false;
+        for k in &self.keys {
+            if k.columns.contains(&col) {
+                match k.kind {
+                    KeyKind::Primary => return Some(KeyKind::Primary),
+                    KeyKind::Unique => uniq = true,
+                }
+            }
+        }
+        uniq.then_some(KeyKind::Unique)
+    }
+
+    /// Whether the column is NOT NULL: declared so, or implied by the PRIMARY
+    /// KEY (DuckDB semantics).
+    pub fn is_not_null(&self, col: usize) -> bool {
+        self.not_null.contains(&col)
+            || self
+                .primary_key()
+                .is_some_and(|pk| pk.columns.contains(&col))
+    }
+
+    /// The `PRIMARY KEY`/`UNIQUE` constraint whose columns are exactly `cols`
+    /// (ordered match, DuckDB's foreign-key rule), if any.
+    pub fn key_on(&self, cols: &[usize]) -> Option<&KeyConstraint> {
+        self.keys.iter().find(|k| k.columns.as_slice() == cols)
+    }
+}
+
 impl DataTable {
     pub fn new(name: String, schema: Vec<(String, DataType)>) -> Result<Self> {
+        Self::new_with_constraints(name, schema, TableConstraints::default())
+    }
+
+    /// [`DataTable::new`] plus the declarative constraints of `CREATE TABLE`.
+    pub fn new_with_constraints(
+        name: String,
+        schema: Vec<(String, DataType)>,
+        constraints: TableConstraints,
+    ) -> Result<Self> {
         if schema.is_empty() {
             return Err(PinkDbError::Catalog(
                 "cannot create table with no columns".to_string(),
@@ -93,6 +199,22 @@ impl DataTable {
                 )));
             }
         }
+        // Constraint indices address this schema (the binder and the `.pink`
+        // reader both validate before constructing; a hand-built set that
+        // does not is a programming error).
+        debug_assert!(
+            constraints
+                .keys
+                .iter()
+                .all(|k| !k.columns.is_empty() && k.columns.iter().all(|c| *c < schema.len()))
+                && constraints.foreign_keys.iter().all(|fk| {
+                    !fk.columns.is_empty()
+                        && fk.columns.len() == fk.ref_columns.len()
+                        && fk.columns.iter().all(|c| *c < schema.len())
+                })
+                && constraints.not_null.iter().all(|c| *c < schema.len()),
+            "constraint indices must address the table schema"
+        );
         Ok(Self {
             name,
             columns: schema
@@ -100,6 +222,7 @@ impl DataTable {
                 .map(|(name, dtype)| Column::new(name, dtype))
                 .collect(),
             num_rows: 0,
+            constraints,
             version: next_table_version(),
         })
     }
@@ -134,6 +257,7 @@ impl DataTable {
             name,
             columns,
             num_rows,
+            constraints: TableConstraints::default(),
             version: next_table_version(),
         }
     }
@@ -1233,6 +1357,19 @@ impl PinkDb {
         name: &str,
         schema: Vec<(String, DataType)>,
     ) -> Result<()> {
+        self.create_table_with_constraints_in(db, name, schema, TableConstraints::default())
+    }
+
+    /// [`PinkDb::create_table_in`] with declarative constraints (metadata
+    /// only; never enforced on writes). The binder has already validated them
+    /// (foreign keys against the referenced table's keys).
+    pub fn create_table_with_constraints_in(
+        &mut self,
+        db: &str,
+        name: &str,
+        schema: Vec<(String, DataType)>,
+        constraints: TableConstraints,
+    ) -> Result<()> {
         if let Some(err) = self.attached_read_only(db, name) {
             return Err(err);
         }
@@ -1248,8 +1385,10 @@ impl PinkDb {
                 "a view named \"{name}\" already exists"
             )));
         }
-        cat.tables
-            .insert(key, DataTable::new(name.to_string(), schema)?);
+        cat.tables.insert(
+            key,
+            DataTable::new_with_constraints(name.to_string(), schema, constraints)?,
+        );
         Ok(())
     }
 

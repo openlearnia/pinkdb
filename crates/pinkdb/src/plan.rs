@@ -14,6 +14,10 @@ pub enum LogicalPlan {
         db: Option<String>,
         name: String,
         schema: Vec<(String, DataType)>,
+        /// Declarative constraints (PRIMARY KEY / UNIQUE / FOREIGN KEY / NOT
+        /// NULL): metadata only, never enforced. Already validated by the
+        /// binder (foreign keys against the referenced table's keys).
+        constraints: crate::storage::TableConstraints,
         /// `IF NOT EXISTS`: an existing table makes this a no-op.
         if_not_exists: bool,
     },
@@ -102,7 +106,7 @@ pub enum LogicalPlan {
     ShowDatabases,
     /// `DESCRIBE <table>`: the resolved schema, printed DuckDB-shaped.
     Describe {
-        schema: Vec<(String, DataType)>,
+        columns: Vec<DescribeColumn>,
     },
     /// `EXPLAIN <select>`: a printable textual plan (never executed).
     Explain {
@@ -200,6 +204,20 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         offset: usize,
     },
+}
+
+/// One `DESCRIBE` output row: `(column_name, column_type, null, key)` plus the
+/// always-NULL `default`/`extra` columns the executor appends.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DescribeColumn {
+    pub name: String,
+    pub dtype: DataType,
+    /// `NO` when the column is declared NOT NULL or is part of the PRIMARY KEY
+    /// (DuckDB's `null` column).
+    pub not_null: bool,
+    /// The `key` marker: `PRI` for primary-key columns, `UNI` for UNIQUE ones
+    /// (PRI wins), `NULL` otherwise.
+    pub key: Option<crate::storage::KeyKind>,
 }
 
 /// True for row-producing queries (safe under a shared read lock).
@@ -353,7 +371,6 @@ pub(crate) fn collect_tables_read(
         }
         LogicalPlan::Scan { db: None, .. }
         | LogicalPlan::SingleRow
-        | LogicalPlan::CreateTable { .. }
         | LogicalPlan::Begin
         | LogicalPlan::Commit
         | LogicalPlan::Rollback
@@ -368,6 +385,15 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::ShowDatabases
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint => {}
+        // `CREATE TABLE` reads the declared foreign-key targets: the binder
+        // validated their keys against the catalog, so the statement depends
+        // on them (a concurrent DROP/recreate that changes the key is a
+        // conflict for the write-set validation).
+        LogicalPlan::CreateTable { constraints, .. } => {
+            for fk in &constraints.foreign_keys {
+                out.insert((fk.ref_db.clone(), fk.ref_table.clone()));
+            }
+        }
         LogicalPlan::Explain { plan } => collect_tables_read(plan, default_db, out),
         LogicalPlan::CreateTableAs { query, .. } => collect_tables_read(query, default_db, out),
         LogicalPlan::InsertSelect { query, .. } => {

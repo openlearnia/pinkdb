@@ -74,7 +74,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 40h | Lake: incremental saves, `.lake gc`, `lake_scan` SQL access + time travel, bulk typed decode, encode panic guard | queued | — |
 | 40i | Extension trust + distribution: Ed25519 artifact signatures, SQL `INSTALL`, Linux artifacts, Python wheel, standalone Go module | queued | — |
 | 40j | Test depth: window/plan unit tests, WAL fuzz, persist property tests, duckdiff gated in CI | queued | — |
-| 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | in progress | worktree `wt-pkfk` (patch integration) |
+| 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | done | landed; DuckDB-pinned DDL validation, DESCRIBE `PRI`/`UNI` parity, conservative FK→PK join elimination; `.pink` v5 constraint section (flags bit 0) composed with wave 62's dtype tags; duckdiff 165 → 171 |
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | queued | — |
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
 | 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + JavaScript procedures (optional embedded engine; WAL-replay determinism must be solved) | queued | — |
@@ -899,3 +899,45 @@ Java bindings.
   57, 62 and 41 stay parked with their patches secured. Lesson: at most two
   concurrent worktrees with private targets on this machine; write patch
   artifacts at milestones; check free space before dispatching.
+- 2026-10-17 — Wave 41 (primary/foreign keys): declarative `PRIMARY KEY` /
+  `UNIQUE` / `NOT NULL` / `REFERENCES` in column and table form (`CONSTRAINT
+  name` prefix; `RELY` / `NORELY` / `[NOT] ENFORCED` accepted and dropped; all
+  keywords non-reserved, so `CREATE TABLE t (key INTEGER, unique INTEGER)`
+  still parses). Catalog: `TableConstraints` on `DataTable`; DDL-time
+  validation pinned against DuckDB alpha (referenced table must exist; the
+  referenced column list must be exactly one of its PK/UNIQUE constraints,
+  count and types checked, widening-only INTEGER→BIGINT→DOUBLE; a bare
+  `REFERENCES u` uses u's PK; cross-database references resolve in the
+  created table's database). Constraints are **metadata only** —
+  INSERT/UPDATE never enforce them (dangling FKs, duplicate keys, NULLs in
+  PK/NOT NULL columns all accepted; explicit tests) — and `DESCRIBE` reports
+  `PRI`/`UNI` keys plus `NO` nullability for PK/NOT NULL. Optimizer:
+  conservative FK→PK join elimination (top-down column liveness; fires only
+  for INNER joins whose key pairs are exactly one declared FK on the left
+  table, every FK column NOT NULL by declaration, and the parent *currently*
+  declaring PK/UNIQUE on the referenced columns — a stale FK after DROP/
+  recreate never fires; documented caveat: declarations are trusted, not
+  verified, so a wrong declaration changes results). Persistence: the two v5
+  proposals are reconciled into **one v5** — flags bit 0 gates the per-table
+  constraint section (kind/name/column indexes; FK refs carry
+  database+table+columns) and wave 62's DECIMAL/INTERVAL dtype tags 7/8 live
+  in the schema block; a constraint-free, tag-free v5 body stays
+  byte-identical to v4; corrupt sections are clean errors; WAL replay
+  re-derives constraints from DDL text (checkpoint and replay-only paths
+  tested). The golden pin now CRCs the body without the trailer (the old
+  whole-file CRC was the data+trailer identity constant and could not notice
+  drift). DuckDB α divergence (documented, intentional): α *enforces*
+  constraints and rejects `RELY`/`NOT ENFORCED`, and does no FK→PK
+  elimination — differential probes use conforming data only. Integration:
+  the 17-file worktree patch applied `--3way` minus `website/` (12 files; the
+  encryption.rs hunk was a no-op after wave 62's v5 asserts); conflicts
+  resolved by hand in `persist.rs` (9 hunks — flags docs/constants merged,
+  the `with_constraints` probe kept, reader `(v2, flags, v5)` tuple, body-CRC
+  golden), `binder.rs` (import union), `duckdiff.py` (seed union: decimal +
+  constraint tables), `lake_lite.rs` (v5 message). Website edits from the
+  patch were **excluded** (main carries uncommitted site WIP on the same
+  pages) — constraint docs for sql.html/persistence.html are a follow-up.
+  Gates on main: fmt, clippy (pinkdb all-targets, CLI lake,s3, pink-lake),
+  pinkdb **452/452** (+prepared 22; encryption 469 + 21), CLI lake+s3 **91**
+  (multiprocess 27/27), pink-lake 29 + vortex 38, `bench/duckdiff.py`
+  **171/171**, workspace green. Worktree `wt-pkfk` removed after landing.

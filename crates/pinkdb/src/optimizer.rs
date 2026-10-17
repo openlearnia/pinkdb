@@ -1,4 +1,5 @@
-//! v1 optimizer: constant folding + predicate pushdown.
+//! v1 optimizer: constant folding + predicate pushdown + FK→PK join
+//! elimination.
 //!
 //! - Constant folding evaluates column-free expression trees at bind time
 //!   (`1 + 2` → `3`, `true AND x` stays — only fully constant trees fold).
@@ -7,6 +8,10 @@
 //!   Conjuncts over just the GROUP BY keys also move below `Aggregate`
 //!   (a HAVING on keys becomes a WHERE on the aggregate's input); filters
 //!   never move below `Limit`.
+//! - FK→PK join elimination drops a declared-referential `INNER JOIN` whose
+//!   parent-side columns are unused: constraints are declarative metadata, so
+//!   the optimizer *trusts* them — see [`eliminate_fk_joins`] for the exact
+//!   rule and its caveat.
 
 use crate::exec::expr::eval_expr;
 use crate::plan::{shift_columns, LogicalPlan};
@@ -15,11 +20,14 @@ use crate::sql::binder::BoundExpr;
 use crate::types::DataType;
 use crate::vector::DataChunk;
 
-/// Optimize a bound plan: constant folding + predicate pushdown.
+/// Optimize a bound plan: constant folding + predicate pushdown + FK→PK join
+/// elimination.
 /// Takes the database for the folding evaluation context (folds never touch
-/// stored data — only column-free expressions are evaluated).
+/// stored data — only column-free expressions are evaluated) and for the
+/// declarative constraints the elimination rule reads.
 pub fn optimize(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     let plan = pushdown(fold_plan(db, plan));
+    let plan = eliminate_fk_joins(db, plan);
     fold_plan(db, plan)
 }
 
@@ -1052,6 +1060,568 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             offset,
         },
         leaf => leaf,
+    }
+}
+
+// ---------- FK→PK join elimination ----------
+
+/// Column liveness for the top-down elimination pass: which of a node's
+/// output columns are referenced anywhere above it.
+#[derive(Debug, Clone)]
+enum Live {
+    /// Every output column is needed (the conservative default — also what
+    /// nodes whose width cannot be derived pass down).
+    All,
+    /// Exactly the `true` positions.
+    Cols(Vec<bool>),
+}
+
+impl Live {
+    fn mark(&mut self, i: usize) {
+        if let Live::Cols(m) = self {
+            if let Some(b) = m.get_mut(i) {
+                *b = true;
+            }
+        }
+    }
+
+    /// Mark every column an expression references (AggRef/WindowRef sentinels
+    /// are not columns and are skipped).
+    fn mark_expr(&mut self, e: &BoundExpr) {
+        let mut cols = Vec::new();
+        columns_in(e, &mut cols);
+        for c in cols {
+            if c != usize::MAX {
+                self.mark(c);
+            }
+        }
+    }
+
+    /// True when every output column from `from` on is dead. `All` is never
+    /// all-dead and a mask too short to judge is conservatively live.
+    fn dead_from(&self, from: usize) -> bool {
+        match self {
+            Live::All => false,
+            Live::Cols(m) => m.get(from..).is_some_and(|rest| rest.iter().all(|b| !b)),
+        }
+    }
+
+    /// The first `n` positions of this liveness (the identity projection of a
+    /// wider node, e.g. one `SetOp` branch).
+    fn take(&self, n: usize) -> Live {
+        match self {
+            Live::All => Live::All,
+            Live::Cols(m) => Live::Cols(m[..n.min(m.len())].to_vec()),
+        }
+    }
+
+    /// All-dead mask of width `n` (for nodes that compute their own input
+    /// liveness from scratch).
+    fn none_of(n: usize) -> Live {
+        Live::Cols(vec![false; n])
+    }
+}
+
+/// Exact output width of `plan` when it can be derived (`None` = unknown; the
+/// pass then stays conservative). Catalog scans resolve against the store;
+/// a CTE scan (`db: None`) does not.
+fn plan_width(db: &crate::storage::PinkDb, plan: &LogicalPlan) -> Option<usize> {
+    match plan {
+        LogicalPlan::Scan {
+            db: Some(dbname),
+            table,
+        } => db.table_in(dbname, table).ok().map(|t| t.num_cols()),
+        LogicalPlan::SingleRow => Some(0),
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. } => plan_width(db, input),
+        LogicalPlan::Project { exprs, .. } => Some(exprs.len()),
+        LogicalPlan::Aggregate { keys, aggs, .. } => Some(keys.len() + aggs.len()),
+        LogicalPlan::Window { input, windows, .. } => Some(plan_width(db, input)? + windows.len()),
+        LogicalPlan::Join { left, right, .. } | LogicalPlan::NestedLoopJoin { left, right, .. } => {
+            Some(plan_width(db, left)? + plan_width(db, right)?)
+        }
+        LogicalPlan::SetOp { types, .. } => Some(types.len()),
+        LogicalPlan::Cte { body, .. } => plan_width(db, body),
+        _ => None,
+    }
+}
+
+/// Where one output column of `plan` comes from: `(database, table, column
+/// index, nullable-by-outer-join)`. Resolvable through transparent nodes
+/// (filters, sorts, limits, distincts, passthrough projections) and joins —
+/// with the outer-join flag set for columns that can be NULL-extended on the
+/// way, so the elimination rule can reject them. `None` = opaque (CTEs, set
+/// operations, computed projections, aggregates, ...): the pass then makes no
+/// claim about the column.
+#[allow(clippy::type_complexity)]
+fn column_origin(
+    db: &crate::storage::PinkDb,
+    plan: &LogicalPlan,
+    index: usize,
+) -> Option<(String, String, usize, bool)> {
+    match plan {
+        LogicalPlan::Scan {
+            db: Some(dbname),
+            table,
+        } => {
+            let t = db.table_in(dbname, table).ok()?;
+            (index < t.num_cols()).then(|| {
+                (
+                    dbname.to_ascii_lowercase(),
+                    table.to_ascii_lowercase(),
+                    index,
+                    false,
+                )
+            })
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Distinct { input }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. } => column_origin(db, input, index),
+        LogicalPlan::Project { input, exprs, .. } => match exprs.get(index)? {
+            BoundExpr::Column { index: i, .. } => column_origin(db, input, *i),
+            _ => None,
+        },
+        LogicalPlan::Window {
+            input, input_cols, ..
+        } => (index < *input_cols)
+            .then(|| column_origin(db, input, index))
+            .flatten(),
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_cols,
+            ..
+        }
+        | LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            left_cols,
+            ..
+        } => {
+            let on_left = index < *left_cols;
+            let base = if on_left { 0 } else { *left_cols };
+            let side = if on_left { left } else { right };
+            let mut origin = column_origin(db, side, index - base)?;
+            origin.3 |= match kind {
+                JoinKind::Inner | JoinKind::Cross => false,
+                // LEFT null-extends only its right side, RIGHT only its left.
+                JoinKind::Left => !on_left,
+                JoinKind::Right => on_left,
+                JoinKind::Full => true,
+            };
+            Some(origin)
+        }
+        _ => None,
+    }
+}
+
+/// True when `left INNER JOIN right ON left_keys = right_keys` is an identity
+/// on the left side and can therefore be replaced by `left`.
+///
+/// The rule (DuckDB's declarative posture: the optimizer *trusts* the
+/// declarations even though they are never enforced on writes):
+/// - `right` is a bare catalog-table scan (a filter/projection on the parent
+///   side would change which rows qualify);
+/// - the join keys are exactly the column pairs of one declared
+///   `FOREIGN KEY` on the left side's base table (resolved through inner
+///   joins), with the child columns NOT NULL *by declaration* — a nullable
+///   key would make the inner join drop NULL-key rows that the child side
+///   keeps;
+/// - the key columns do not flow through the null-extending side of an outer
+///   join inside the left subtree;
+/// - the parent table *currently* declares PRIMARY KEY/UNIQUE on exactly the
+///   referenced columns (a re-created parent that lost its key makes the
+///   stale foreign key unusable).
+///
+/// Caveat: unenforced declarations can be wrong (a dangling reference, a
+/// duplicate parent key, or a NOT NULL column holding NULL) — then this
+/// rewrite changes results. That is exactly the documented trade-off of using
+/// informational constraints.
+#[allow(clippy::too_many_arguments)]
+fn fk_join_eliminable(
+    db: &crate::storage::PinkDb,
+    left: &LogicalPlan,
+    right: &LogicalPlan,
+    left_keys: &[BoundExpr],
+    right_keys: &[BoundExpr],
+) -> bool {
+    let LogicalPlan::Scan {
+        db: Some(ref_db),
+        table: ref_table,
+    } = right
+    else {
+        return false;
+    };
+    if left_keys.is_empty() || left_keys.len() != right_keys.len() {
+        return false;
+    }
+    let Ok(ref_t) = db.table_in(ref_db, ref_table) else {
+        return false;
+    };
+    // The left keys must be bare columns of one base table.
+    let mut child_cols = Vec::with_capacity(left_keys.len());
+    for e in left_keys {
+        let BoundExpr::Column { index, .. } = e else {
+            return false;
+        };
+        let Some((cdb, ctable, ccol, outer_nullable)) = column_origin(db, left, *index) else {
+            return false;
+        };
+        if outer_nullable {
+            return false;
+        }
+        child_cols.push((cdb, ctable, ccol));
+    }
+    let (child_db, child_table, _) = &child_cols[0];
+    if child_cols
+        .iter()
+        .any(|(d, t, _)| d != child_db || t != child_table)
+    {
+        return false;
+    }
+    let Ok(child_t) = db.table_in(child_db, child_table) else {
+        return false;
+    };
+    let cols: Vec<usize> = child_cols.iter().map(|(_, _, c)| *c).collect();
+    // A FK on exactly these child columns (any declaration order). The
+    // length guard keeps hand-built constraint sets (the public Rust API)
+    // from indexing past `ref_columns`.
+    let Some(fk) = child_t.constraints.foreign_keys.iter().find(|fk| {
+        fk.columns.len() == cols.len()
+            && fk.ref_columns.len() == fk.columns.len()
+            && fk.columns.iter().all(|c| cols.contains(c))
+            && cols.iter().all(|c| fk.columns.contains(c))
+    }) else {
+        return false;
+    };
+    if !fk.ref_db.eq_ignore_ascii_case(ref_db) || !fk.ref_table.eq_ignore_ascii_case(ref_table) {
+        return false;
+    }
+    // Every FK column must be NOT NULL by declaration (see the rule above).
+    if !fk
+        .columns
+        .iter()
+        .all(|c| child_t.constraints.is_not_null(*c))
+    {
+        return false;
+    }
+    // Each join pair maps a child key column to its referenced column, and
+    // every FK position is covered exactly once.
+    let mut seen = vec![false; fk.columns.len()];
+    for (i, e) in right_keys.iter().enumerate() {
+        let BoundExpr::Column { index: rcol, .. } = e else {
+            return false;
+        };
+        let Some(pos) = fk.columns.iter().position(|c| *c == cols[i]) else {
+            return false;
+        };
+        if seen[pos] || fk.ref_columns[pos] != *rcol {
+            return false;
+        }
+        seen[pos] = true;
+    }
+    // The parent still declares a key on exactly the referenced columns.
+    ref_t.constraints.key_on(&fk.ref_columns).is_some()
+}
+
+/// Liveness of a transparent node's input: the same mask when the input width
+/// is known, else `All` (conservative).
+fn pass_live(db: &crate::storage::PinkDb, input: &LogicalPlan, live: &Live) -> Live {
+    match plan_width(db, input) {
+        Some(w) => live.take(w),
+        None => Live::All,
+    }
+}
+
+/// FK→PK join elimination: replace `child INNER JOIN parent ON child.fk =
+/// parent.pk` by the child side whenever the parent's columns are unused
+/// above the join and the join keys are exactly a declared foreign key
+/// ([`fk_join_eliminable`]).
+///
+/// Column liveness flows top-down so "the parent's columns are unused" is
+/// exact: a join whose right side still feeds a projection, filter, sort key,
+/// aggregate argument, ... is never eliminated. Constraints are declarative
+/// metadata (never enforced on writes), so the rewrite trusts them.
+pub fn eliminate_fk_joins(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
+    let live = match plan_width(db, &plan) {
+        Some(w) => Live::Cols(vec![true; w]),
+        None => Live::All,
+    };
+    elim(db, plan, &live)
+}
+
+/// One recursive step of [`eliminate_fk_joins`]; `live` describes which of
+/// `plan`'s output columns are used above.
+fn elim(db: &crate::storage::PinkDb, plan: LogicalPlan, live: &Live) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_cols,
+        } => {
+            // Child liveness: what is live above, plus this join's own keys.
+            let (mut left_live, mut right_live) =
+                match (live, plan_width(db, &left), plan_width(db, &right)) {
+                    (Live::Cols(m), Some(lw), Some(rw)) if m.len() >= lw + rw => (
+                        Live::Cols(m[..lw].to_vec()),
+                        Live::Cols(m[lw..lw + rw].to_vec()),
+                    ),
+                    _ => (Live::All, Live::All),
+                };
+            for e in &left_keys {
+                left_live.mark_expr(e);
+            }
+            for e in &right_keys {
+                right_live.mark_expr(e);
+            }
+            if kind == JoinKind::Inner
+                && live.dead_from(left_cols)
+                && fk_join_eliminable(db, &left, &right, &left_keys, &right_keys)
+            {
+                // The join is an identity on the child side; the child's own
+                // key columns are no longer needed either.
+                let child_live = live.take(left_cols);
+                return elim(db, *left, &child_live);
+            }
+            LogicalPlan::Join {
+                kind,
+                left: Box::new(elim(db, *left, &left_live)),
+                right: Box::new(elim(db, *right, &right_live)),
+                left_keys,
+                right_keys,
+                left_cols,
+            }
+        }
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } => {
+            let (mut left_live, mut right_live) =
+                match (live, plan_width(db, &left), plan_width(db, &right)) {
+                    (Live::Cols(m), Some(lw), Some(rw)) if m.len() >= lw + rw => (
+                        Live::Cols(m[..lw].to_vec()),
+                        Live::Cols(m[lw..lw + rw].to_vec()),
+                    ),
+                    _ => (Live::All, Live::All),
+                };
+            if let Some(on) = &on {
+                left_live.mark_expr(on);
+                right_live.mark_expr(on);
+            }
+            LogicalPlan::NestedLoopJoin {
+                kind,
+                left: Box::new(elim(db, *left, &left_live)),
+                right: Box::new(elim(db, *right, &right_live)),
+                on,
+                left_cols,
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            let mut inner = pass_live(db, &input, live);
+            inner.mark_expr(&predicate);
+            LogicalPlan::Filter {
+                input: Box::new(elim(db, *input, &inner)),
+                predicate,
+            }
+        }
+        LogicalPlan::Sort { input, keys } => {
+            let mut inner = pass_live(db, &input, live);
+            for (e, _) in &keys {
+                inner.mark_expr(e);
+            }
+            LogicalPlan::Sort {
+                input: Box::new(elim(db, *input, &inner)),
+                keys,
+            }
+        }
+        LogicalPlan::Distinct { input } => {
+            let inner = pass_live(db, &input, live);
+            LogicalPlan::Distinct {
+                input: Box::new(elim(db, *input, &inner)),
+            }
+        }
+        LogicalPlan::Limit { input, limit } => {
+            let inner = pass_live(db, &input, live);
+            LogicalPlan::Limit {
+                input: Box::new(elim(db, *input, &inner)),
+                limit,
+            }
+        }
+        LogicalPlan::Offset { input, offset } => {
+            let inner = pass_live(db, &input, live);
+            LogicalPlan::Offset {
+                input: Box::new(elim(db, *input, &inner)),
+                offset,
+            }
+        }
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => {
+            // Input liveness: the columns of the live output expressions.
+            let inner = match plan_width(db, &input) {
+                Some(w) => {
+                    let mut m = Live::none_of(w);
+                    match live {
+                        Live::All => {
+                            for e in &exprs {
+                                m.mark_expr(e);
+                            }
+                        }
+                        Live::Cols(out) => {
+                            for (i, e) in exprs.iter().enumerate() {
+                                if out.get(i).copied().unwrap_or(true) {
+                                    m.mark_expr(e);
+                                }
+                            }
+                        }
+                    }
+                    m
+                }
+                None => Live::All,
+            };
+            LogicalPlan::Project {
+                input: Box::new(elim(db, *input, &inner)),
+                exprs,
+                names,
+            }
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            let inner = match plan_width(db, &input) {
+                Some(w) => {
+                    let mut m = Live::none_of(w);
+                    for k in &keys {
+                        m.mark_expr(k);
+                    }
+                    for a in &aggs {
+                        if let Some(e) = &a.arg {
+                            m.mark_expr(e);
+                        }
+                    }
+                    m
+                }
+                None => Live::All,
+            };
+            LogicalPlan::Aggregate {
+                input: Box::new(elim(db, *input, &inner)),
+                keys,
+                aggs,
+            }
+        }
+        LogicalPlan::Window {
+            input,
+            windows,
+            input_cols,
+        } => {
+            let inner = match plan_width(db, &input) {
+                Some(w) => {
+                    let mut m = Live::none_of(w);
+                    match live {
+                        Live::All => {
+                            // Output = input ++ windows; every input column is
+                            // live.
+                            m = Live::Cols(vec![true; w]);
+                        }
+                        Live::Cols(out) => {
+                            for i in 0..w {
+                                if out.get(i).copied().unwrap_or(true) {
+                                    m.mark(i);
+                                }
+                            }
+                        }
+                    }
+                    for win in &windows {
+                        if let Some(e) = &win.arg {
+                            m.mark_expr(e);
+                        }
+                        for e in &win.partition {
+                            m.mark_expr(e);
+                        }
+                        for (e, _) in &win.order {
+                            m.mark_expr(e);
+                        }
+                    }
+                    m
+                }
+                None => Live::All,
+            };
+            LogicalPlan::Window {
+                input: Box::new(elim(db, *input, &inner)),
+                windows,
+                input_cols,
+            }
+        }
+        LogicalPlan::SetOp {
+            op,
+            left,
+            right,
+            types,
+        } => {
+            // Both branches are positionally identical; each gets the same
+            // liveness (truncated to its own width).
+            let lw = plan_width(db, &left);
+            let rw = plan_width(db, &right);
+            let llive = match lw {
+                Some(w) => live.take(w),
+                None => Live::All,
+            };
+            let rlive = match rw {
+                Some(w) => live.take(w),
+                None => Live::All,
+            };
+            LogicalPlan::SetOp {
+                op,
+                left: Box::new(elim(db, *left, &llive)),
+                right: Box::new(elim(db, *right, &rlive)),
+                types,
+            }
+        }
+        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+            name,
+            query: Box::new(elim(db, *query, &Live::All)),
+            body: Box::new(elim(db, *body, live)),
+        },
+        LogicalPlan::InsertSelect {
+            db: qdb,
+            table,
+            columns,
+            query,
+        } => LogicalPlan::InsertSelect {
+            db: qdb,
+            table,
+            columns,
+            query: Box::new(elim(db, *query, &Live::All)),
+        },
+        LogicalPlan::CreateTableAs {
+            db: qdb,
+            name,
+            query,
+            if_not_exists,
+        } => LogicalPlan::CreateTableAs {
+            db: qdb,
+            name,
+            query: Box::new(elim(db, *query, &Live::All)),
+            if_not_exists,
+        },
+        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+            plan: Box::new(elim(db, *plan, &Live::All)),
+        },
+        // Leaves (scans, DML without a query child, DDL, ...) carry no joins.
+        other => other,
     }
 }
 
