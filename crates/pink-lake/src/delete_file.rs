@@ -61,12 +61,24 @@ pub(crate) fn decode(bytes: &[u8], path: &std::path::Path) -> Result<Vec<u64>> {
             "delete file does not start with the PINKDL1 magic".to_string(),
         ));
     }
-    let count = u64::from_le_bytes(
+    let declared = u64::from_le_bytes(
         bytes[DELETE_MAGIC.len()..DELETE_MAGIC.len() + 8]
             .try_into()
             .expect("8 bytes"),
-    ) as usize;
-    let expected = DELETE_MAGIC.len() + 8 + count * 8;
+    );
+    let count = usize::try_from(declared).map_err(|_| {
+        corrupt(format!(
+            "delete file declares {declared} positions, too many for this platform"
+        ))
+    })?;
+    let expected = count
+        .checked_mul(8)
+        .and_then(|n| n.checked_add(DELETE_MAGIC.len() + 8))
+        .ok_or_else(|| {
+            corrupt(format!(
+                "delete file declares {declared} positions, whose byte length overflows"
+            ))
+        })?;
     if bytes.len() != expected {
         return Err(corrupt(format!(
             "delete file declares {count} positions ({expected} bytes), but is {} bytes",
@@ -162,6 +174,15 @@ mod tests {
             b.extend_from_slice(&2u64.to_le_bytes());
             b.extend_from_slice(&5u64.to_le_bytes());
             b.extend_from_slice(&5u64.to_le_bytes());
+            b
+        };
+        assert!(decode(&bytes, path).is_err());
+        // A giant position count overflows the expected byte length: it must be
+        // a clean Corrupt, never an over-allocation abort.
+        let bytes = {
+            let mut b = Vec::new();
+            b.extend_from_slice(DELETE_MAGIC);
+            b.extend_from_slice(&(1u64 << 61).to_le_bytes());
             b
         };
         assert!(decode(&bytes, path).is_err());
