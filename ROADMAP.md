@@ -889,7 +889,8 @@ Java bindings.
   private target dirs plus main's caches filled the volume (100%, 897 MiB
   free); builds in every worktree began failing and the failure cascades
   killed the agents with model-input-limit errors (57, 59 and 62 confirmed;
-  41 never reported and its target was freed — treated as failed). Recovery:
+  41's agent survived the incident (actively working; its freed target just
+  forces a rebuild). Recovery:
   every worktree's source was secured as a patch artifact
   (`wt-lake-encryption` 3,759 / `wt-pkfk` 2,843 / `wt-types` 2,993 /
   `wt-prepared` 3,698 lines), then all four private targets, main's
