@@ -475,8 +475,18 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| conn.prepare(&sql)));
                 match outcome {
                     Ok(Ok(stmt)) => {
+                        let Some(next) = next_handle.checked_add(1) else {
+                            let _ = protocol::write_response(
+                                &mut writer,
+                                &Response::Error {
+                                    message: "prepared-statement handle space exhausted"
+                                        .to_string(),
+                                },
+                            );
+                            continue;
+                        };
                         let handle = next_handle;
-                        next_handle += 1;
+                        next_handle = next;
                         let parameter_count = stmt.parameter_count() as u32;
                         prepared.insert(handle, stmt);
                         if protocol::write_response(

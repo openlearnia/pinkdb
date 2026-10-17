@@ -111,7 +111,18 @@ pub fn save_repositories_to(path: &Path, urls: &[String]) -> Result<(), String> 
         .map_err(|e| format!("cannot serialize repositories config: {e}"))?;
     body.push('\n');
     let tmp = temp_path(path);
-    if let Err(e) = fs::write(&tmp, &body) {
+    // `create_new` (never follow a planted symlink / truncate a stale file);
+    // the temp name carries a per-process counter so it is not predictable.
+    let write = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()
+        });
+    if let Err(e) = write {
         let _ = fs::remove_file(&tmp);
         return Err(format!("cannot write {}: {e}", tmp.display()));
     }
@@ -123,11 +134,17 @@ pub fn save_repositories_to(path: &Path, urls: &[String]) -> Result<(), String> 
 }
 
 fn temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repositories.json".to_string());
-    path.with_file_name(format!("{name}.tmp-{}", process::id()))
+    path.with_file_name(format!(
+        "{name}.tmp-{}-{}",
+        process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 /// Append `url` (canonicalized) unless it is already configured; returns the
@@ -211,8 +228,10 @@ fn allow_plain_http() -> bool {
 fn is_loopback_host(host_port: &str) -> bool {
     let host = if let Some(rest) = host_port.strip_prefix('[') {
         match rest.split_once(']') {
-            Some((h, _)) => h,
-            None => return false,
+            // After the closing bracket only an optional `:port` may follow:
+            // `[::1]evil.com` is a different host, not loopback.
+            Some((h, after)) if after.is_empty() || after.starts_with(':') => h,
+            _ => return false,
         }
     } else {
         host_port.split(':').next().unwrap_or("")

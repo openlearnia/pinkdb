@@ -721,7 +721,9 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             repo_unavailable(".installed");
         }
         ".save" => {
-            let path = rest.split_whitespace().next().unwrap_or("");
+            let path = take_token(rest)
+                .map(|(p, _)| unquote(&p))
+                .unwrap_or_default();
             if path.is_empty() {
                 println!("Usage: .save <file.pink>");
             } else {
@@ -734,10 +736,10 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                 // let the WAL replay committed rows twice). Any other target
                 // is a snapshot, refused when it would clobber another
                 // database whose WAL still holds records.
-                let result = if db.is_bound_to(path) {
+                let result = if db.is_bound_to(&path) {
                     db.checkpoint()
                 } else {
-                    db.save_snapshot(path)
+                    db.save_snapshot(&path)
                 };
                 match result {
                     Ok(()) => {
@@ -763,7 +765,9 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
             }
         }
         ".open" => {
-            let path = rest.split_whitespace().next().unwrap_or("");
+            let path = take_token(rest)
+                .map(|(p, _)| unquote(&p))
+                .unwrap_or_default();
             if path.is_empty() {
                 println!("Usage: .open <file.pink>");
             } else {
@@ -771,7 +775,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                 // the current store first so its WAL handle is closed (the
                 // per-operation lease means this is an optimization, not a
                 // lock requirement).
-                if db.is_bound_to(path) {
+                if db.is_bound_to(&path) {
                     let key = db.encryption_key().cloned();
                     *db = PinkDb::new();
                     db.set_encryption_key(key);
@@ -780,8 +784,8 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                 // both the checkpoint and the snapshot path encrypt.
                 let opts = durable_options();
                 let result = match db.encryption_key() {
-                    Some(k) => PinkDb::open_durable_with_key_and_options(path, k, opts),
-                    None => PinkDb::open_durable_with_options(path, opts),
+                    Some(k) => PinkDb::open_durable_with_key_and_options(&path, k, opts),
+                    None => PinkDb::open_durable_with_options(&path, opts),
                 };
                 match result {
                     Ok((new_db, info)) => {
@@ -867,8 +871,33 @@ fn display_value(v: &Value) -> String {
                 format!("{x}")
             }
         }
+        // Stored text is untrusted: never emit raw control characters (a
+        // terminal escape sequence in a row would inject output).
+        Value::Varchar(s) => sanitize_cell(s),
         _ => v.to_string(),
     }
+}
+
+/// Escape control characters in a displayed VARCHAR cell: `\n`/`\r` become a
+/// space (a newline would break the box) and every other control (notably ESC)
+/// is shown as `\u{..}`.
+fn sanitize_cell(s: &str) -> String {
+    if !s.chars().any(char::is_control) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\t' => out.push('\t'),
+            '\n' | '\r' => out.push(' '),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "\\u{{{:x}}}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Formats a `SELECT` result as the DuckDB-style box table: header names,
