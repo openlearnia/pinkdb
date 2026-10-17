@@ -6342,6 +6342,26 @@ mod tests {
         assert_eq!(rows, vec![vec![V::Integer(8)]]);
     }
 
+    #[test]
+    fn set_operation_null_arm_adopts_the_other_type() {
+        let mut db = PinkDb::new();
+        // A bare NULL branch adopts the other branch's type (ORDER BY 1 puts
+        // NULLs last).
+        let rows = select(&mut db, "SELECT NULL UNION ALL SELECT 'x' ORDER BY 1;");
+        assert_eq!(rows, vec![vec![V::Varchar("x".to_string())], vec![V::Null]]);
+        let rows = select(
+            &mut db,
+            "SELECT 1, NULL UNION ALL SELECT 2, 'a' ORDER BY 1;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Integer(1), V::Null],
+                vec![V::Integer(2), V::Varchar("a".to_string())],
+            ]
+        );
+    }
+
     // --- phase 8: window functions ---
 
     fn win_db() -> PinkDb {

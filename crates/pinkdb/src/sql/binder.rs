@@ -4164,15 +4164,72 @@ fn bind_pair_types(
         )));
     }
     let mut types = Vec::with_capacity(left_schema.len());
-    for ((_, l), (_, r)) in left_schema.iter().zip(right_schema.iter()) {
-        types.push(coalesce_common(*l, *r)?);
+    // A branch column that is a bare NULL literal adopts the other branch's
+    // type (like COALESCE/CASE) rather than failing numeric-tower unification,
+    // and is cast so the branch's vector matches the set-operation's type.
+    let left_null = null_literal_columns(&left, left_schema.len());
+    let right_null = null_literal_columns(&right, right_schema.len());
+    for (i, ((_, l), (_, r))) in left_schema.iter().zip(right_schema.iter()).enumerate() {
+        let t = if left_null[i] && !right_null[i] {
+            *r
+        } else if right_null[i] && !left_null[i] {
+            *l
+        } else {
+            coalesce_common(*l, *r)?
+        };
+        types.push(t);
     }
+    let left = cast_null_columns(left, &left_null, &left_schema, &types);
+    let right = cast_null_columns(right, &right_null, &right_schema, &types);
     Ok(LogicalPlan::SetOp {
         op,
         left: Box::new(left),
         right: Box::new(right),
         types,
     })
+}
+
+/// Per output column: true when a top-level `Project` emits a bare NULL there.
+fn null_literal_columns(plan: &LogicalPlan, len: usize) -> Vec<bool> {
+    let LogicalPlan::Project { exprs, .. } = plan else {
+        return vec![false; len];
+    };
+    (0..len)
+        .map(|i| matches!(exprs.get(i), Some(BoundExpr::Literal(Value::Null))))
+        .collect()
+}
+
+/// Cast a `Project`'s bare-NULL output columns to the set-operation's type
+/// when they differ from the literal's own (default) type.
+fn cast_null_columns(
+    plan: LogicalPlan,
+    is_null: &[bool],
+    schema: &[(String, DataType)],
+    types: &[DataType],
+) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Project {
+            input,
+            mut exprs,
+            names,
+        } => {
+            for (i, e) in exprs.iter_mut().enumerate() {
+                if is_null.get(i).copied().unwrap_or(false) && schema[i].1 != types[i] {
+                    let dtype = types[i];
+                    *e = BoundExpr::Cast {
+                        expr: Box::new(e.clone()),
+                        dtype,
+                    };
+                }
+            }
+            LogicalPlan::Project {
+                input,
+                exprs,
+                names,
+            }
+        }
+        other => other,
+    }
 }
 
 /// Output schema of a bound plan: (column name, type) per output column.
