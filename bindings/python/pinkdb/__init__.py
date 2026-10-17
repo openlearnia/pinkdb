@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import ctypes
 import datetime as _datetime
+import decimal as _decimal
 import os
 import threading
 from pathlib import Path
@@ -72,6 +73,7 @@ _STMT_KINDS = {
     13: "used",
     14: "loaded_extension",
     15: "checkpointed",
+    16: "altered_table",
 }
 
 # ----- value / column type tags (PINKDB_TYPE_*) -----
@@ -84,6 +86,8 @@ _TYPE_DOUBLE = 4
 _TYPE_VARCHAR = 5
 _TYPE_DATE = 6
 _TYPE_TIMESTAMP = 7
+_TYPE_DECIMAL = 8
+_TYPE_INTERVAL = 9
 
 _TYPE_NAMES = {
     _TYPE_NULL: "null",
@@ -94,6 +98,8 @@ _TYPE_NAMES = {
     _TYPE_VARCHAR: "varchar",
     _TYPE_DATE: "date",
     _TYPE_TIMESTAMP: "timestamp",
+    _TYPE_DECIMAL: "decimal",
+    _TYPE_INTERVAL: "interval",
 }
 
 _EPOCH_DATE = _datetime.date(1970, 1, 1)
@@ -290,6 +296,13 @@ def _value_to_python(v: _PinkValue):
                 f"TIMESTAMP value {v.int64} (microseconds since epoch) is "
                 "outside Python's datetime range"
             ) from exc
+    # DECIMAL and INTERVAL arrive as text cells (the FFI's canonical text):
+    # DECIMAL maps to an exact Decimal, INTERVAL keeps its canonical text.
+    if tag in (_TYPE_DECIMAL, _TYPE_INTERVAL):
+        if not v.text_ptr or v.text_len == 0:
+            return "" if tag == _TYPE_INTERVAL else _decimal.Decimal(0)
+        text = ctypes.string_at(v.text_ptr, v.text_len).decode("utf-8")
+        return _decimal.Decimal(text) if tag == _TYPE_DECIMAL else text
     raise Error(f"unknown value type tag {tag} from the native library")
 
 

@@ -80,6 +80,8 @@ const (
 	kindLoadedExtension int32 = 14
 	// kindCheckpointed is `CHECKPOINT` (a no-op for in-memory databases).
 	kindCheckpointed int32 = 15
+	// kindAlteredTable is `ALTER TABLE`.
+	kindAlteredTable int32 = 16
 )
 
 var kindNames = map[int32]string{
@@ -99,6 +101,7 @@ var kindNames = map[int32]string{
 	kindUsed:            "used",
 	kindLoadedExtension: "loaded_extension",
 	kindCheckpointed:    "checkpointed",
+	kindAlteredTable:    "altered_table",
 }
 
 // Value and column type tags; these mirror the PINKDB_TYPE_* values in
@@ -112,6 +115,8 @@ const (
 	typeVarchar   int32 = 5
 	typeDate      int32 = 6
 	typeTimestamp int32 = 7
+	typeDecimal   int32 = 8
+	typeInterval  int32 = 9
 )
 
 var typeNames = map[int32]string{
@@ -123,6 +128,8 @@ var typeNames = map[int32]string{
 	typeVarchar:   "varchar",
 	typeDate:      "date",
 	typeTimestamp: "timestamp",
+	typeDecimal:   "decimal",
+	typeInterval:  "interval",
 }
 
 // Result is one statement's outcome, materialized as Go values.
@@ -374,6 +381,17 @@ func valueToGo(v C.pink_value) (any, error) {
 		return dateFromDays(int64(v.int64))
 	case typeTimestamp:
 		return timestampFromMicros(int64(v.int64))
+	case typeDecimal, typeInterval:
+		// DECIMAL and INTERVAL arrive as text cells (the FFI's canonical
+		// text); Go has no built-in decimal, so both surface as strings.
+		if v.text_ptr == nil || v.text_len == 0 {
+			return "", nil
+		}
+		if uint64(v.text_len) > math.MaxInt32 {
+			return nil, fmt.Errorf(
+				"pinkdb: text value of %d bytes is too large", uint64(v.text_len))
+		}
+		return C.GoStringN(v.text_ptr, C.int(v.text_len)), nil
 	default:
 		return nil, fmt.Errorf("pinkdb: unknown value type tag %d (ABI mismatch?)", int32(v.type_tag))
 	}

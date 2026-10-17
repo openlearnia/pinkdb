@@ -11,6 +11,7 @@ repo-relative ``target/release`` directory (see ``pinkdb/__init__.py``).
 
 import copy
 import datetime
+import decimal
 import gc
 import math
 import os
@@ -253,6 +254,24 @@ class StatementKindTests(unittest.TestCase):
         self.assertEqual(results[-1].rows, [[1]])
         self.assertEqual(results[-1].affected, 0)
         self.assertIsNone(results[-1].name)
+
+
+class DecimalIntervalTests(unittest.TestCase):
+    def test_decimal_and_interval_values(self):
+        with pinkdb.connect_memory() as db:
+            res = db.execute(
+                "SELECT 1.5::DECIMAL(4,2) AS d, INTERVAL '1 day' AS iv;"
+            )[0]
+            self.assertEqual(res.column_types, ["decimal", "interval"])
+            self.assertEqual(res.rows[0][0], decimal.Decimal("1.50"))
+            self.assertIsInstance(res.rows[0][1], str)
+            self.assertIn("day", res.rows[0][1])
+
+    def test_altered_table_kind(self):
+        with pinkdb.connect_memory() as db:
+            db.execute("CREATE TABLE t (x INTEGER);")
+            res = db.execute("ALTER TABLE t ADD COLUMN y INTEGER DEFAULT 0;")[0]
+            self.assertEqual(res.kind, "altered_table")
 
 
 class ErrorTests(unittest.TestCase):

@@ -352,6 +352,34 @@ func TestDateAndTimestampRangeMapping(t *testing.T) {
 	}
 }
 
+func TestDecimalIntervalAndAlteredTable(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	res, err := db.Execute("SELECT 1.5::DECIMAL(4,2) AS d, INTERVAL '1 day' AS iv;")
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := res[0].ColumnTypes; len(got) != 2 || got[0] != "decimal" || got[1] != "interval" {
+		t.Fatalf("column types: %v", got)
+	}
+	if got := res[0].Rows[0][0]; got != "1.50" {
+		t.Fatalf("decimal cell: %v", got)
+	}
+	if got, ok := res[0].Rows[0][1].(string); !ok || got == "" {
+		t.Fatalf("interval cell: %v", res[0].Rows[0][1])
+	}
+	if _, err := db.Execute("CREATE TABLE t (x INTEGER);"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	res, err = db.Execute("ALTER TABLE t ADD COLUMN y INTEGER DEFAULT 0;")
+	if err != nil {
+		t.Fatalf("alter: %v", err)
+	}
+	if res[0].Kind != "altered_table" {
+		t.Fatalf("kind: %q", res[0].Kind)
+	}
+}
+
 func TestErrorKeepsHandleUsable(t *testing.T) {
 	db := mustOpenMemory(t)
 	defer db.Close()
