@@ -1970,14 +1970,14 @@ ties in ORDER BY have no stable order on either engine).
   words; quote identifiers to use them as names (`"use"` works)
 - Durable commits refuse statements that read a session-local view (views are
   never persisted); `.import` checkpoints, so it needs a settled transaction
-- Correlated subqueries are rejected (uncorrelated only); no FULL joins and
-  CROSS joins are rejected
+- Correlated subqueries are rejected (uncorrelated only); `NATURAL` and `USING`
+  joins are rejected (write an explicit `ON` condition instead)
 - Window functions are SELECT/ORDER-BY only (not WHERE/GROUP BY/HAVING)
 - Aggregates in ORDER BY need a select alias or position
 - General ORDER BY expressions must be aliases, positions, or GROUP BY keys
 - `%` is integer-only
 - Mixed DATE/TIMESTAMP comparison is rejected; timestamps never mix with
-  integers (no INTERVAL type in v1); no time zones (naive UTC)
+  integers; no time zones (naive UTC)
 - Expression nesting is capped at 24 levels (parentheses, `CASE` arms and
   consecutive unary operators counted together); deeper input returns a clean
   `Parse` error (`expression nesting too deep`) instead of

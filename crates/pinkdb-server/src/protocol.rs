@@ -47,7 +47,7 @@ use pinkdb::{DataType, Value};
 /// v5: [`Request::Prepare`] / [`Request::ExecutePrepared`] and
 /// [`Response::Prepared`] carry server-side prepared statements with `?`
 /// parameters.
-/// v5: `DECIMAL`/`INTERVAL` value and dtype tags (DECIMAL's precision/scale
+/// v6: `DECIMAL`/`INTERVAL` value and dtype tags (DECIMAL's precision/scale
 /// ride after its dtype tag).
 /// v7: [`DoneKind::AlteredTable`] (tag 17) reports `ALTER TABLE`.
 pub const PROTOCOL_VERSION: u32 = 7;

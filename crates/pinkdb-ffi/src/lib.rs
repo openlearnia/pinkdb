@@ -395,7 +395,16 @@ pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
 #[no_mangle]
 pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
     clear_error();
-    Box::into_raw(Box::new(PinkHandle { db: PinkDb::new() }))
+    // A panic must never unwind across the extern "C" boundary.
+    match catch_unwind(AssertUnwindSafe(|| {
+        Box::new(PinkHandle { db: PinkDb::new() })
+    })) {
+        Ok(handle) => Box::into_raw(handle),
+        Err(_) => {
+            set_error("internal error: panicked while opening the database");
+            ptr::null_mut()
+        }
+    }
 }
 
 /// Close a handle opened by [`pinkdb_open`]/[`pinkdb_open_memory`]. NULL-safe.
@@ -631,6 +640,15 @@ fn value_from_pink(v: &PinkValue) -> Result<pinkdb::Value, String> {
                 .map_err(|_| format!("DATE payload {} does not fit in i32", v.int64))?,
         ),
         PINKDB_TYPE_TIMESTAMP => pinkdb::Value::Timestamp(v.int64),
+        // Results carry DECIMAL/INTERVAL as text cells; binding a *parameter*
+        // back is not supported in ABI v1 (cast the text in SQL).
+        PINKDB_TYPE_DECIMAL | PINKDB_TYPE_INTERVAL => {
+            return Err(
+                "DECIMAL/INTERVAL cannot be bound as parameters in ABI v1; pass the canonical \
+                 text and CAST it in SQL"
+                    .to_string(),
+            )
+        }
         other => return Err(format!("unknown value type tag {other}")),
     })
 }

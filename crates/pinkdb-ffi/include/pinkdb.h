@@ -17,10 +17,11 @@
  *   always trust `text_len`.
  * - Handles are NOT thread-safe: never call into one handle from two threads
  *   at once (serialize calls, e.g. with a mutex — the Go and Python bindings
- *   do). A durable file is open in at most one handle at a time (an exclusive
- *   lock on `<file>.lock`; a second `pinkdb_open` of it fails until the
- *   first is closed), so share that one handle; in-memory handles are
- *   independent. Errors are thread-local; `pinkdb_last_error` returns NULL
+ *   do). A durable file may be opened by several handles/processes; writes are
+ *   serialized by a per-file write lease, and concurrent transactions use
+ *   optimistic COMMIT validation (a conflict is a retryable error, never a
+ *   silent lost update). In-memory handles are independent. Errors are
+ *   thread-local; `pinkdb_last_error` returns NULL
  *   when the last call on the calling thread succeeded.
  * - SQL is passed as (pointer, length) and must be valid UTF-8. Passing a
  *   NULL pointer with a non-zero length, or invalid UTF-8, is an error.
