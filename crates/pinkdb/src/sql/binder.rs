@@ -18,7 +18,9 @@ use std::rc::Rc;
 use super::ast::*;
 use crate::plan::LogicalPlan;
 use crate::storage::{DataTable, PinkDb};
-use crate::types::{extract_field, DataType, ExtractField, PinkDbError, Result, Value};
+use crate::types::{
+    extract_field, DataType, ExtractField, PinkDbError, Result, Value, DECIMAL_MAX_PRECISION,
+};
 
 // ---------- bound expressions ----------
 
@@ -514,7 +516,7 @@ impl BoundExpr {
 // ---------- type rules ----------
 
 fn is_numeric(t: DataType) -> bool {
-    matches!(t, DataType::Integer | DataType::Bigint | DataType::Double)
+    t.is_numeric()
 }
 
 /// The type a bare `?` operand takes from the other side of a binary
@@ -533,7 +535,37 @@ fn fixed_operand_dtype(op: BinaryOp, other: DataType) -> Option<DataType> {
     })
 }
 
-/// INTEGER → BIGINT → DOUBLE.
+/// DECIMAL `(precision, scale)` of a value operand: DECIMAL keeps its own,
+/// INTEGER/BIGINT widen like DuckDB (`INTEGER → DECIMAL(10,0)`,
+/// `BIGINT → DECIMAL(19,0)`); anything else (DOUBLE) is not decimal-exact.
+fn decimal_operand_width(t: DataType) -> Option<(u8, u8)> {
+    match t {
+        DataType::Decimal { precision, scale } => Some((precision, scale)),
+        DataType::Integer => Some((10, 0)),
+        DataType::Bigint => Some((19, 0)),
+        _ => None,
+    }
+}
+
+fn clamp_precision(precision: i32, scale: u8) -> u8 {
+    precision.clamp(scale as i32, DECIMAL_MAX_PRECISION as i32) as u8
+}
+
+/// Common DECIMAL type for comparisons/UNION/CASE (DuckDB rule):
+/// `scale = max(s1, s2)`, `precision = max(p1-s1, p2-s2) + scale`, capped
+/// at 38.
+fn decimal_common(a: (u8, u8), b: (u8, u8)) -> DataType {
+    let scale = a.1.max(b.1);
+    let int_digits = (a.0 - a.1).max(b.0 - b.1) as i32;
+    DataType::Decimal {
+        precision: clamp_precision(int_digits + scale as i32, scale),
+        scale,
+    }
+}
+
+/// INTEGER → BIGINT → DOUBLE, with DECIMAL as a first-class numeric type.
+/// DECIMAL ⊕ DOUBLE is DOUBLE; DECIMAL ⊕ INTEGER widens the integer to its
+/// decimal width (DuckDB rule).
 pub(crate) fn common_numeric(a: DataType, b: DataType) -> Result<DataType> {
     if !is_numeric(a) || !is_numeric(b) {
         return Err(PinkDbError::Type(format!(
@@ -542,34 +574,56 @@ pub(crate) fn common_numeric(a: DataType, b: DataType) -> Result<DataType> {
     }
     Ok(match (a, b) {
         (DataType::Double, _) | (_, DataType::Double) => DataType::Double,
+        (DataType::Decimal { .. }, _) | (_, DataType::Decimal { .. }) => {
+            let wa = decimal_operand_width(a).expect("numeric without a decimal width");
+            let wb = decimal_operand_width(b).expect("numeric without a decimal width");
+            decimal_common(wa, wb)
+        }
         (DataType::Bigint, _) | (_, DataType::Bigint) => DataType::Bigint,
         _ => DataType::Integer,
     })
 }
 
 fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> {
+    use BinaryOp::{Add, Divide, Multiply, Subtract};
+    let temporal =
+        |t: DataType| matches!(t, DataType::Date | DataType::Timestamp | DataType::Interval);
     // Dates: `date ± integer` is day arithmetic; `date - date` counts days
-    // (BIGINT). Timestamps never mix with integers in v1 (that needs
-    // INTERVAL types).
+    // (BIGINT). INTERVAL adds month/day/time arithmetic (DuckDB signatures):
+    // interval ± interval → INTERVAL, date/timestamp ± interval → TIMESTAMP,
+    // timestamp - timestamp → INTERVAL, interval *|/ number → INTERVAL.
     match (op, l, r) {
-        (BinaryOp::Add, DataType::Date, DataType::Integer)
-        | (BinaryOp::Add, DataType::Integer, DataType::Date)
-        | (BinaryOp::Subtract, DataType::Date, DataType::Integer) => return Ok(DataType::Date),
-        (BinaryOp::Subtract, DataType::Date, DataType::Date) => return Ok(DataType::Bigint),
+        (Add, DataType::Date, DataType::Integer)
+        | (Add, DataType::Integer, DataType::Date)
+        | (Subtract, DataType::Date, DataType::Integer) => return Ok(DataType::Date),
+        (Subtract, DataType::Date, DataType::Date) => return Ok(DataType::Bigint),
+        (Add | Subtract, DataType::Interval, DataType::Interval) => return Ok(DataType::Interval),
+        (Add, DataType::Date | DataType::Timestamp, DataType::Interval)
+        | (Add, DataType::Interval, DataType::Date | DataType::Timestamp) => {
+            return Ok(DataType::Timestamp);
+        }
+        (Subtract, DataType::Date | DataType::Timestamp, DataType::Interval) => {
+            return Ok(DataType::Timestamp);
+        }
+        (Subtract, DataType::Timestamp, DataType::Timestamp)
+        | (Subtract, DataType::Timestamp, DataType::Date)
+        | (Subtract, DataType::Date, DataType::Timestamp) => return Ok(DataType::Interval),
+        (Multiply | Divide, DataType::Interval, _) | (Multiply, _, DataType::Interval)
+            if is_numeric(l) || is_numeric(r) =>
+        {
+            return Ok(DataType::Interval);
+        }
         _ => {}
     }
-    if l == DataType::Date
-        || r == DataType::Date
-        || l == DataType::Timestamp
-        || r == DataType::Timestamp
-    {
+    if temporal(l) || temporal(r) {
         return Err(PinkDbError::Type(format!(
             "operator {op:?} does not support {l} and {r} in v1"
         )));
     }
     match op {
         BinaryOp::Divide => {
-            // DuckDB rule: int / int → DOUBLE.
+            // DuckDB rule: int / int → DOUBLE; DECIMAL / DECIMAL → DOUBLE
+            // (decimal division widens both sides to DOUBLE).
             if !is_numeric(l) || !is_numeric(r) {
                 return Err(PinkDbError::Type(format!(
                     "non-numeric operands for `/`: {l} and {r}"
@@ -588,7 +642,53 @@ fn arithmetic_dtype(op: BinaryOp, l: DataType, r: DataType) -> Result<DataType> 
                     "`%` needs integer operands in v1".to_string(),
                 ));
             }
+            if matches!(l, DataType::Decimal { .. }) || matches!(r, DataType::Decimal { .. }) {
+                let wa = decimal_operand_width(l).expect("numeric without a decimal width");
+                let wb = decimal_operand_width(r).expect("numeric without a decimal width");
+                // DuckDB: min integer digits + the wider scale.
+                let scale = wa.1.max(wb.1);
+                let int_digits = (wa.0 - wa.1).min(wb.0 - wb.1) as i32;
+                return Ok(DataType::Decimal {
+                    precision: clamp_precision(int_digits + scale as i32, scale),
+                    scale,
+                });
+            }
             common_numeric(l, r)
+        }
+        BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Multiply
+            if matches!(l, DataType::Decimal { .. }) || matches!(r, DataType::Decimal { .. }) =>
+        {
+            if l == DataType::Double || r == DataType::Double {
+                return Ok(DataType::Double);
+            }
+            let wa = decimal_operand_width(l).expect("numeric without a decimal width");
+            let wb = decimal_operand_width(r).expect("numeric without a decimal width");
+            let (p, s) = match op {
+                // DuckDB: s = max(s1,s2), p = max(p1-s1, p2-s2) + s + 1.
+                Add | Subtract => {
+                    let scale = wa.1.max(wb.1);
+                    let int_digits = (wa.0 - wa.1).max(wb.0 - wb.1) as i32;
+                    (clamp_precision(int_digits + scale as i32 + 1, scale), scale)
+                }
+                // DuckDB: s = s1+s2 (an error past 38), p = p1+p2 capped.
+                _ => {
+                    let scale = wa.1 as u16 + wb.1 as u16;
+                    if scale > DECIMAL_MAX_PRECISION as u16 {
+                        return Err(PinkDbError::Type(format!(
+                            "Needed scale {scale} to accurately represent the multiplication \
+                             result, but this is out of range of the DECIMAL type. Max scale \
+                             is {DECIMAL_MAX_PRECISION}."
+                        )));
+                    }
+                    let scale = scale as u8;
+                    let p = (wa.0 as u16 + wb.0 as u16).min(DECIMAL_MAX_PRECISION as u16) as u8;
+                    (p.max(scale), scale)
+                }
+            };
+            Ok(DataType::Decimal {
+                precision: p,
+                scale: s,
+            })
         }
         _ => common_numeric(l, r),
     }
@@ -620,11 +720,13 @@ fn check_cast(from: DataType, to: DataType) -> Result<()> {
     if from == to {
         return Ok(());
     }
-    // Numeric tower (both directions; float→int truncates).
+    // Numeric tower (both directions; float→int truncates, DECIMAL rounds
+    // and range-checks).
     if from.is_numeric() && to.is_numeric() {
         return Ok(());
     }
-    // Everything formats to VARCHAR; VARCHAR parses to everything.
+    // Everything formats to VARCHAR; VARCHAR parses to everything
+    // (including INTERVAL).
     if from == DataType::Varchar || to == DataType::Varchar {
         return Ok(());
     }
@@ -650,6 +752,7 @@ fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
         || (l == DataType::Varchar && r == DataType::Varchar)
         || (l == DataType::Date && r == DataType::Date)
         || (l == DataType::Timestamp && r == DataType::Timestamp)
+        || (l == DataType::Interval && r == DataType::Interval)
     {
         return match op {
             // LIKE only compares strings.
@@ -1754,7 +1857,7 @@ impl<'a> Binder<'a> {
             // else must match the registered argument type exactly — ABI v1
             // inserts no implicit casts.
             if !matches!(b, BoundExpr::Literal(Value::Null))
-                && crate::ext::ext_type_of(b.dtype()) != want
+                && crate::ext::ext_type_of(b.dtype()) != Some(want)
             {
                 return Err(PinkDbError::Type(format!(
                     "{func_name} argument {} must be {want}, got {} (use CAST)",
@@ -1866,6 +1969,12 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
         AggFunc::Sum => match arg.expect("sum has an arg") {
             DataType::Integer | DataType::Bigint => Ok(DataType::Bigint),
             DataType::Double => Ok(DataType::Double),
+            // SUM(DECIMAL(p,s)) → DECIMAL(38,s) with a runtime overflow check
+            // (DuckDB).
+            DataType::Decimal { scale, .. } => Ok(DataType::Decimal {
+                precision: DECIMAL_MAX_PRECISION,
+                scale,
+            }),
             _ => Err(PinkDbError::Type(
                 "SUM needs a numeric argument".to_string(),
             )),
@@ -1877,6 +1986,7 @@ fn agg_dtype(func: AggFunc, arg: Option<DataType>) -> Result<DataType> {
                 && t != DataType::Boolean
                 && t != DataType::Date
                 && t != DataType::Timestamp
+                && t != DataType::Interval
             {
                 return Err(PinkDbError::Type(
                     "MIN/MAX need an orderable argument".to_string(),
@@ -1924,6 +2034,32 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
                 return Err(PinkDbError::Type(
                     "round digits must be numeric".to_string(),
                 ));
+            }
+            // DECIMAL keeps its family: ROUND(d) → DECIMAL(p,0),
+            // ROUND(d,n) → DECIMAL(p,n) for 0 ≤ n < s, DECIMAL(p,0) for
+            // n < 0, and unchanged DECIMAL(p,s) for n ≥ s (DuckDB). The
+            // digits must be a constant (the result type depends on it).
+            if let DataType::Decimal { precision, scale } = args[0].dtype() {
+                let digits = match args.get(1) {
+                    None => 0i64,
+                    Some(BoundExpr::Literal(Value::Integer(n))) => *n as i64,
+                    Some(BoundExpr::Literal(Value::Bigint(n))) => *n,
+                    Some(a) => {
+                        return Err(PinkDbError::Type(format!(
+                            "round digits must be a constant integer, got {}",
+                            a.dtype()
+                        )));
+                    }
+                };
+                let out_scale = if digits >= scale as i64 {
+                    scale
+                } else {
+                    digits.max(0) as u8
+                };
+                return Ok(DataType::Decimal {
+                    precision: precision.max(out_scale).max(1),
+                    scale: out_scale,
+                });
             }
             Ok(DataType::Double)
         }
@@ -2102,6 +2238,15 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
                 return Err(PinkDbError::Type(format!(
                     "{func:?} needs a numeric argument"
                 )));
+            }
+            // FLOOR/CEIL on DECIMAL return DECIMAL(p,0) (DuckDB).
+            if func != ScalarFunc::Sqrt {
+                if let DataType::Decimal { precision, .. } = args[0].dtype() {
+                    return Ok(DataType::Decimal {
+                        precision,
+                        scale: 0,
+                    });
+                }
             }
             Ok(DataType::Double)
         }

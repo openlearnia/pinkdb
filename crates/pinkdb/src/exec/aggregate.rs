@@ -11,7 +11,7 @@ use super::expr::eval_expr;
 use super::Cx;
 use crate::plan::{compare_values, num_cmp};
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
-use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::types::{decimal_fits, DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
 use rayon::prelude::*;
 
@@ -57,6 +57,22 @@ fn encode_value(buf: &mut Vec<u8>, v: &Value) {
         Value::Timestamp(us) => {
             buf.push(7);
             buf.extend_from_slice(&us.to_le_bytes());
+        }
+        // DECIMAL keys carry their scale (same encoding as the vector path).
+        Value::Decimal(v, scale) => {
+            buf.push(8);
+            buf.push(*scale);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            buf.push(9);
+            buf.extend_from_slice(&months.to_le_bytes());
+            buf.extend_from_slice(&days.to_le_bytes());
+            buf.extend_from_slice(&micros.to_le_bytes());
         }
     }
 }
@@ -129,6 +145,16 @@ pub(crate) enum Acc {
     },
     SumFloat {
         sum: f64,
+        non_null: bool,
+    },
+    /// DECIMAL SUM: exact i128 accumulation at the input's scale. The result
+    /// type is DECIMAL(38, scale) (DuckDB); `overflow` records an i128
+    /// excursion (the true total may still come back in range, so the error
+    /// is only raised by `finalize` when the *value* cannot be represented).
+    SumDecimal {
+        sum: i128,
+        scale: u8,
+        overflow: bool,
         non_null: bool,
     },
     Avg {
@@ -218,6 +244,10 @@ impl Acc {
                 *sum += x as f64;
                 *non_null = true;
             }
+            // A decimal SUM slot never sees an INTEGER cell (its argument
+            // column is DECIMAL); route it through `update` for the same
+            // conversion the generic path would apply.
+            Acc::SumDecimal { .. } => self.update(Some(&Value::Bigint(x))),
             Acc::Avg { sum, count } => {
                 *sum += x as f64;
                 *count += 1;
@@ -243,6 +273,9 @@ impl Acc {
                 *sum += x;
                 *non_null = true;
             }
+            // A decimal SUM slot never sees a DOUBLE cell; route it through
+            // `update` (which folds it like the generic path would).
+            Acc::SumDecimal { .. } => self.update(Some(&Value::Double(x))),
             Acc::Avg { sum, count } => {
                 *sum += x;
                 *count += 1;
@@ -259,6 +292,16 @@ impl Acc {
     pub(crate) fn update_vec(&mut self, v: &Vector, i: usize) {
         if v.is_null(i) {
             return self.update(None);
+        }
+        // DECIMAL cells feed SUM/AVG through the exact i128 path; MIN/MAX and
+        // COUNT(DISTINCT) use the generic compare/encode arms below.
+        if let VectorData::Decimal { values, scale, .. } = v.data() {
+            if matches!(
+                self,
+                Acc::SumInt { .. } | Acc::SumDecimal { .. } | Acc::Avg { .. }
+            ) {
+                return self.add_decimal(values[i], *scale);
+            }
         }
         match self {
             // `update(Some(_))` increments for every non-NULL payload.
@@ -303,6 +346,11 @@ impl Acc {
                 }
                 _ => {}
             },
+            Acc::SumDecimal { .. } => {
+                if let VectorData::Decimal { values, scale, .. } = v.data() {
+                    self.add_decimal(values[i], *scale);
+                }
+            }
             Acc::Avg { sum, count } => match v.data() {
                 VectorData::Int32(d) => {
                     *sum += d[i] as f64;
@@ -314,6 +362,10 @@ impl Acc {
                 }
                 VectorData::Float64(d) => {
                     *sum += d[i];
+                    *count += 1;
+                }
+                VectorData::Decimal { values, scale, .. } => {
+                    *sum += crate::types::decimal_to_f64(values[i], *scale);
                     *count += 1;
                 }
                 _ => {}
@@ -385,6 +437,11 @@ impl Acc {
                 }
                 _ => {}
             },
+            Acc::SumDecimal { .. } => {
+                if let Some(Value::Decimal(x, scale)) = arg {
+                    self.add_decimal(*x, *scale);
+                }
+            }
             Acc::Avg { sum, count } => match arg {
                 Some(Value::Integer(i)) => {
                     *sum += *i as f64;
@@ -396,6 +453,10 @@ impl Acc {
                 }
                 Some(Value::Double(x)) => {
                     *sum += *x;
+                    *count += 1;
+                }
+                Some(Value::Decimal(x, scale)) => {
+                    *sum += crate::types::decimal_to_f64(*x, *scale);
                     *count += 1;
                 }
                 _ => {}
@@ -427,6 +488,62 @@ impl Acc {
 
     /// Merge another accumulator of the same aggregate into this one
     /// (for parallel aggregation: per-partition partials combine in order).
+    /// DECIMAL SUM cell: exact i128 add at the accumulator's scale. A
+    /// different-scale cell (which the binder never produces for one SUM
+    /// slot) rescales first.
+    #[inline]
+    fn add_decimal(&mut self, x: i128, scale: u8) {
+        // A fresh SUM accumulator starts as `SumInt` (no dtype at `Acc::new`
+        // time); the first DECIMAL cell converts it.
+        if let Acc::SumInt {
+            sum,
+            wraps,
+            non_null,
+        } = self
+        {
+            let exact = exact_sum(*sum, *wraps);
+            let mut overflow = false;
+            let sum = match exact.checked_mul(crate::types::POW10_I128[scale as usize]) {
+                Some(v) => v,
+                None => {
+                    overflow = true;
+                    0
+                }
+            };
+            let non_null = *non_null;
+            *self = Acc::SumDecimal {
+                sum,
+                scale,
+                overflow,
+                non_null,
+            };
+        }
+        match self {
+            Acc::SumDecimal {
+                sum,
+                scale: acc_scale,
+                overflow,
+                non_null,
+            } => {
+                match crate::types::rescale_decimal(x, scale, *acc_scale) {
+                    Some(y) => match sum.checked_add(y) {
+                        Some(next) => *sum = next,
+                        None => *overflow = true,
+                    },
+                    None => *overflow = true,
+                }
+                *non_null = true;
+            }
+            Acc::Avg { sum, count } => {
+                *sum += crate::types::decimal_to_f64(x, scale);
+                *count += 1;
+            }
+            Acc::MinMax { .. } => unreachable!("MIN/MAX use update_vec"),
+            Acc::CountDistinct(_) => unreachable!("COUNT(DISTINCT) uses update_vec"),
+            other => other.update(Some(&Value::Decimal(x, scale))),
+        }
+    }
+
     pub(crate) fn merge(&mut self, other: Acc) {
         // Owned matching keeps every combination explicit and total.
         let mine = std::mem::replace(self, Acc::Count(0));
@@ -492,6 +609,82 @@ impl Acc {
                 sum: exact_sum(a, aw) as f64 + b,
                 non_null: an || bn,
             },
+            (
+                Acc::SumDecimal {
+                    sum: a,
+                    scale: ascale,
+                    overflow: aov,
+                    non_null: an,
+                },
+                Acc::SumDecimal {
+                    sum: b,
+                    scale: bscale,
+                    overflow: bov,
+                    non_null: bn,
+                },
+            ) => {
+                // Both partials saw the same column, so the scales agree; a
+                // disagreeing scale can only come from a test-built partial.
+                let mut sum = a;
+                let mut overflow = aov || bov;
+                match crate::types::rescale_decimal(b, bscale, ascale) {
+                    Some(y) => match sum.checked_add(y) {
+                        Some(next) => sum = next,
+                        None => overflow = true,
+                    },
+                    None => overflow = true,
+                }
+                Acc::SumDecimal {
+                    sum,
+                    scale: ascale,
+                    overflow,
+                    non_null: an || bn,
+                }
+            }
+            // A fresh SUM partial (never fed a cell) converts to the other
+            // side's scale; a fed one would have been SumDecimal already.
+            (
+                Acc::SumInt {
+                    sum: a,
+                    wraps: aw,
+                    non_null: an,
+                },
+                Acc::SumDecimal {
+                    sum: b,
+                    scale,
+                    overflow: bov,
+                    non_null: bn,
+                },
+            )
+            | (
+                Acc::SumDecimal {
+                    sum: b,
+                    scale,
+                    overflow: bov,
+                    non_null: bn,
+                },
+                Acc::SumInt {
+                    sum: a,
+                    wraps: aw,
+                    non_null: an,
+                },
+            ) => {
+                let mut overflow = bov;
+                let mut sum = b;
+                match exact_sum(a, aw).checked_mul(crate::types::POW10_I128[scale as usize]) {
+                    Some(y) => match sum.checked_add(y) {
+                        Some(next) => sum = next,
+                        None => overflow = true,
+                    },
+                    None => overflow = true,
+                }
+                Acc::SumDecimal {
+                    sum,
+                    scale,
+                    overflow,
+                    non_null: an || bn,
+                }
+            }
             (Acc::Avg { sum: a, count: ac }, Acc::Avg { sum: b, count: bc }) => Acc::Avg {
                 sum: a + b,
                 count: ac + bc,
@@ -552,6 +745,23 @@ impl Acc {
                     Value::Double(*sum)
                 }
             }
+            Acc::SumDecimal {
+                sum,
+                scale,
+                overflow,
+                non_null,
+            } => {
+                if !*non_null {
+                    Value::Null
+                } else if *overflow || !decimal_fits(*sum, crate::types::DECIMAL_MAX_PRECISION) {
+                    return Err(PinkDbError::Execution(
+                        "Overflow in SUM of DECIMAL: the result does not fit in DECIMAL(38)"
+                            .to_string(),
+                    ));
+                } else {
+                    Value::Decimal(*sum, *scale)
+                }
+            }
             Acc::Avg { sum, count } => {
                 if *count == 0 {
                     Value::Null
@@ -582,6 +792,24 @@ fn compare_cell(data: &VectorData, i: usize, c: &Value) -> std::cmp::Ordering {
         (VectorData::VarChar(d), Value::Varchar(y)) => d[i].as_ref().cmp(y.as_str()),
         (VectorData::Date32(d), Value::Date(y)) => d[i].cmp(y),
         (VectorData::TimestampMicros(d), Value::Timestamp(y)) => d[i].cmp(y),
+        (VectorData::Decimal { values, scale, .. }, Value::Decimal(y, ys)) => {
+            crate::types::decimal_cmp(values[i], *scale, *y, *ys)
+        }
+        (VectorData::Interval(d), Value::Interval { .. }) => {
+            let y = match c {
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                } => crate::types::Interval {
+                    months: *months,
+                    days: *days,
+                    micros: *micros,
+                },
+                _ => unreachable!(),
+            };
+            crate::types::interval_cmp(d[i], y)
+        }
         _ => compare_values(&cell_value(data, i), c),
     }
 }
@@ -596,6 +824,12 @@ fn cell_value(data: &VectorData, i: usize) -> Value {
         VectorData::VarChar(d) => Value::Varchar(d[i].to_string()),
         VectorData::Date32(d) => Value::Date(d[i]),
         VectorData::TimestampMicros(d) => Value::Timestamp(d[i]),
+        VectorData::Decimal { values, scale, .. } => Value::Decimal(values[i], *scale),
+        VectorData::Interval(d) => Value::Interval {
+            months: d[i].months,
+            days: d[i].days,
+            micros: d[i].micros,
+        },
     }
 }
 

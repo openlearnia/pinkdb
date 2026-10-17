@@ -18,7 +18,9 @@ use crate::plan::compare_values;
 use crate::sql::ast::BinaryOp;
 use crate::sql::binder::{common_numeric, BoundExpr, ScalarFunc};
 use crate::types::FastSet;
-use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::types::{
+    decimal_fits, format_decimal, rescale_decimal, DataType, PinkDbError, Result, Value, POW10_I128,
+};
 use crate::vector::{DataChunk, Vector, VectorData};
 
 /// Evaluate `expr` over every row of `chunk`.
@@ -105,6 +107,29 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
                             out.push_null()?;
                         } else {
                             out.push_float64(-x)?;
+                        }
+                    }
+                }
+                (VectorData::Decimal { values, scale, .. }, DataType::Decimal { .. }) => {
+                    for (i, &x) in values.iter().enumerate() {
+                        if v.is_null(i) {
+                            out.push_null()?;
+                        } else {
+                            out.push_decimal(
+                                x.checked_neg().ok_or_else(|| {
+                                    overflow_err("negation", "DECIMAL", format_args!("-({x})"))
+                                })?,
+                                *scale,
+                            )?;
+                        }
+                    }
+                }
+                (VectorData::Interval(src), DataType::Interval) => {
+                    for (i, iv) in src.iter().enumerate() {
+                        if v.is_null(i) {
+                            out.push_null()?;
+                        } else {
+                            out.push_interval(crate::types::interval_negate(*iv))?;
                         }
                     }
                 }
@@ -509,6 +534,45 @@ fn eval_comparison(
                     cmp_scalar(op, &col, a, s, scalar_left, |x, y| x.cmp(y), &mut out)?;
                     true
                 }
+                // DECIMAL vs DECIMAL literal of the same scale: no rescaling.
+                (VectorData::Decimal { values, scale, .. }, Value::Decimal(sv, ss))
+                    if scale == ss =>
+                {
+                    cmp_scalar(
+                        op,
+                        &col,
+                        values.as_slice(),
+                        sv,
+                        scalar_left,
+                        |x, y| x.cmp(y),
+                        &mut out,
+                    )?;
+                    true
+                }
+                (
+                    VectorData::Interval(a),
+                    Value::Interval {
+                        months,
+                        days,
+                        micros,
+                    },
+                ) => {
+                    let sv = crate::types::Interval {
+                        months: *months,
+                        days: *days,
+                        micros: *micros,
+                    };
+                    cmp_scalar(
+                        op,
+                        &col,
+                        a.as_slice(),
+                        &sv,
+                        scalar_left,
+                        |x, y| crate::types::interval_cmp(*x, *y),
+                        &mut out,
+                    )?;
+                    true
+                }
                 _ => false,
             };
             if handled {
@@ -556,6 +620,39 @@ fn eval_comparison(
             }
             (VectorData::TimestampMicros(a), VectorData::TimestampMicros(b)) => {
                 cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
+            }
+            (
+                VectorData::Decimal {
+                    values: a,
+                    scale: sa,
+                    ..
+                },
+                VectorData::Decimal {
+                    values: b,
+                    scale: sb,
+                    ..
+                },
+            ) => {
+                cmp_loop(
+                    op,
+                    &l,
+                    &r,
+                    a,
+                    b,
+                    |x, y| crate::types::decimal_cmp(*x, *sa, *y, *sb),
+                    &mut out,
+                )?;
+            }
+            (VectorData::Interval(a), VectorData::Interval(b)) => {
+                cmp_loop(
+                    op,
+                    &l,
+                    &r,
+                    a,
+                    b,
+                    |x, y| crate::types::interval_cmp(*x, *y),
+                    &mut out,
+                )?;
             }
             _ => unreachable!("same dtype implies same vector layout"),
         }
@@ -652,19 +749,110 @@ pub(crate) fn coerce_to(v: &Vector, target: DataType) -> Result<Vector> {
             let data = VectorData::Float64(src.iter().map(|&x| x as f64).collect());
             Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
-        // Everything else: existing generic loop (errors unchanged).
-        _ => {
-            let mut out = Vector::new_empty(target);
-            for i in 0..v.len() {
+        // DECIMAL → DOUBLE: `/` widens both sides to DOUBLE (DuckDB rule);
+        // explicit casts and comparisons use the exact rescale rules.
+        (VectorData::Decimal { values, scale, .. }, DataType::Double) => {
+            let data = VectorData::Float64(
+                values
+                    .iter()
+                    .map(|&x| crate::types::decimal_to_f64(x, *scale))
+                    .collect(),
+            );
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
+        // DECIMAL → DECIMAL rescale: exact when widening the scale, rounding
+        // half away from zero when narrowing (DuckDB's cast rule).
+        (
+            VectorData::Decimal { values, scale, .. },
+            DataType::Decimal {
+                precision,
+                scale: want,
+            },
+        ) => {
+            let mut out: Vec<i128> = Vec::with_capacity(values.len());
+            for (i, &x) in values.iter().enumerate() {
                 if v.is_null(i) {
-                    out.push_null()?;
+                    out.push(0);
                     continue;
                 }
-                out.push_valid(coerce_value(v.get(i), target)?)?;
+                let y = rescale_decimal(x, *scale, want)
+                    .filter(|y| decimal_fits(*y, precision))
+                    .ok_or_else(|| {
+                        PinkDbError::Execution(format!(
+                            "cannot coerce {} to DECIMAL({precision},{want}): value out of range",
+                            format_decimal(x, *scale)
+                        ))
+                    })?;
+                out.push(y);
             }
-            Ok(out)
+            let data = VectorData::Decimal {
+                values: out,
+                precision,
+                scale: want,
+            };
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
         }
+        (VectorData::Int32(src), DataType::Decimal { precision, scale }) => {
+            let mut out: Vec<i128> = Vec::with_capacity(src.len());
+            for (i, &x) in src.iter().enumerate() {
+                if v.is_null(i) {
+                    out.push(0);
+                    continue;
+                }
+                out.push(
+                    crate::types::int_to_decimal(x as i128, precision, scale).ok_or_else(|| {
+                        PinkDbError::Execution(format!(
+                            "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
+                        ))
+                    })?,
+                );
+            }
+            let data = VectorData::Decimal {
+                values: out,
+                precision,
+                scale,
+            };
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
+        (VectorData::Int64(src), DataType::Decimal { precision, scale }) => {
+            let mut out: Vec<i128> = Vec::with_capacity(src.len());
+            for (i, &x) in src.iter().enumerate() {
+                if v.is_null(i) {
+                    out.push(0);
+                    continue;
+                }
+                out.push(
+                    crate::types::int_to_decimal(x as i128, precision, scale).ok_or_else(|| {
+                        PinkDbError::Execution(format!(
+                            "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
+                        ))
+                    })?,
+                );
+            }
+            let data = VectorData::Decimal {
+                values: out,
+                precision,
+                scale,
+            };
+            Ok(Vector::from_parts(data, v.validity().to_vec(), v.len()))
+        }
+        // Everything else: existing generic loop (errors unchanged).
+        _ => generic_coerce(v, target),
     }
+}
+
+/// Per-row `coerce_value` loop (the fallback for shapes the typed fast paths
+/// do not cover).
+fn generic_coerce(v: &Vector, target: DataType) -> Result<Vector> {
+    let mut out = Vector::new_empty(target);
+    for i in 0..v.len() {
+        if v.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        out.push_valid(coerce_value(v.get(i), target)?)?;
+    }
+    Ok(out)
 }
 
 fn coerce_value(v: Value, target: DataType) -> Result<Value> {
@@ -672,6 +860,56 @@ fn coerce_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
+        (Value::Decimal(x, from), DataType::Double) => {
+            Ok(Value::Double(crate::types::decimal_to_f64(x, from)))
+        }
+        // INSERT/UPDATE coercion of a VARCHAR cell into the target column
+        // type parses like a cast (DuckDB accepts string literals for typed
+        // columns).
+        (Value::Varchar(s), DataType::Decimal { precision, scale }) => {
+            crate::types::parse_decimal_str(&s, precision, scale)
+                .map(|x| Value::Decimal(x, scale))
+                .map_err(PinkDbError::Type)
+        }
+        (Value::Varchar(s), DataType::Interval) => match crate::types::parse_interval(&s) {
+            Some(iv) => Ok(Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            }),
+            None => Err(PinkDbError::Type(format!(
+                "cannot parse \"{s}\" as INTERVAL"
+            ))),
+        },
+        (Value::Decimal(x, from), DataType::Decimal { precision, scale }) => {
+            let y = crate::types::rescale_decimal(x, from, scale)
+                .filter(|y| crate::types::decimal_fits(*y, precision))
+                .ok_or_else(|| {
+                    PinkDbError::Execution(format!(
+                        "cannot coerce {}: value out of range",
+                        crate::types::format_decimal(x, from)
+                    ))
+                })?;
+            Ok(Value::Decimal(y, scale))
+        }
+        (Value::Integer(i), DataType::Decimal { precision, scale }) => {
+            crate::types::int_to_decimal(i as i128, precision, scale)
+                .map(|x| Value::Decimal(x, scale))
+                .ok_or_else(|| {
+                    PinkDbError::Execution(format!(
+                        "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
+                    ))
+                })
+        }
+        (Value::Bigint(i), DataType::Decimal { precision, scale }) => {
+            crate::types::int_to_decimal(i as i128, precision, scale)
+                .map(|x| Value::Decimal(x, scale))
+                .ok_or_else(|| {
+                    PinkDbError::Execution(format!(
+                        "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
+                    ))
+                })
+        }
         (v, _) => Err(PinkDbError::Execution(format!("cannot coerce {v}"))),
     }
 }
@@ -687,6 +925,29 @@ fn negate_value(v: Value, dtype: DataType) -> Result<Value> {
             .map(Value::Bigint)
             .ok_or_else(|| overflow_err("negation", "BIGINT", format_args!("-({i})"))),
         (Value::Double(x), DataType::Double) => Ok(Value::Double(-x)),
+        (Value::Decimal(x, scale), DataType::Decimal { .. }) => x
+            .checked_neg()
+            .map(|y| Value::Decimal(y, scale))
+            .ok_or_else(|| overflow_err("negation", "DECIMAL", format_args!("-({x})"))),
+        (
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+            DataType::Interval,
+        ) => {
+            let iv = crate::types::interval_negate(crate::types::Interval {
+                months,
+                days,
+                micros,
+            });
+            Ok(Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            })
+        }
         (v, t) => Err(PinkDbError::Execution(format!("cannot negate {v} as {t}"))),
     }
 }
@@ -701,9 +962,18 @@ fn eval_arith(
 ) -> Result<Vector> {
     let l = eval_expr(left, chunk, cx)?;
     let r = eval_expr(right, chunk, cx)?;
-    // Dates skip numeric coercion (it rejects them): day arithmetic below.
-    if l.dtype() == DataType::Date || r.dtype() == DataType::Date {
-        return eval_date_arith(op, &l, &r, dtype);
+    // Temporal types skip numeric coercion (it rejects them): day/month
+    // arithmetic below.
+    let temporal =
+        |d: DataType| matches!(d, DataType::Date | DataType::Timestamp | DataType::Interval);
+    if temporal(l.dtype()) || temporal(r.dtype()) {
+        return eval_temporal_arith(op, &l, &r, dtype);
+    }
+    // DECIMAL multiplication must run on the operands' own scales (the
+    // result's scale is their sum), so it never goes through the target-type
+    // coercion below.
+    if op == BinaryOp::Multiply && matches!(dtype, DataType::Decimal { .. }) {
+        return eval_decimal_mul(&l, &r, dtype);
     }
     // Integer division by zero errors even though `/` widens to DOUBLE
     // (DuckDB rule); 0.0/0.0 with a float operand stays IEEE Inf/NaN.
@@ -741,6 +1011,54 @@ fn eval_arith(
     Ok(out)
 }
 
+/// DECIMAL `*`: the operands contribute their own scales, the result scale is
+/// their sum (DuckDB rule). Operands are DECIMAL columns/literals or the
+/// integer types the binder converts to DECIMAL(10,0)/DECIMAL(19,0).
+fn eval_decimal_mul(l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
+    let (lv, ls) = decimal_operand(l)?;
+    let (rv, rs) = decimal_operand(r)?;
+    let DataType::Decimal { precision, .. } = dtype else {
+        unreachable!("eval_decimal_mul on non-decimal result type")
+    };
+    let mut out = Vector::new_empty(dtype);
+    for i in 0..l.len() {
+        if l.is_null(i) || r.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        let (a, b) = (lv[i], rv[i]);
+        let product = a
+            .checked_mul(b)
+            .filter(|p| crate::types::decimal_fits(*p, precision));
+        let product = product.ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "Overflow in multiplication of DECIMAL({precision}) ({} * {})",
+                crate::types::format_decimal(a, ls),
+                crate::types::format_decimal(b, rs)
+            ))
+        })?;
+        out.push_decimal(product, ls + rs)?;
+    }
+    Ok(out)
+}
+
+/// A DECIMAL operand as unscaled i128 values plus their scale. Integer
+/// operands are scale-0 values (the decimal *widths* only matter at bind
+/// time, for the result precision).
+fn decimal_operand(v: &Vector) -> Result<(Vec<i128>, u8)> {
+    Ok(match v.data() {
+        VectorData::Decimal { values, scale, .. } => (values.clone(), *scale),
+        VectorData::Int32(src) => (src.iter().map(|&x| x as i128).collect(), 0),
+        VectorData::Int64(src) => (src.iter().map(|&x| x as i128).collect(), 0),
+        other => {
+            return Err(PinkDbError::Execution(format!(
+                "decimal multiplication needs numeric operands, got {:?}",
+                other.dtype()
+            )));
+        }
+    })
+}
+
 /// Typed kernels for same-layout operands (both sides already coerced to
 /// `dtype`). `Ok(None)` ⇒ combination not covered: caller runs the generic
 /// per-row loop, which keeps the old behavior (including its errors).
@@ -765,8 +1083,87 @@ fn arith_typed(op: BinaryOp, int_div: bool, l: &Vector, r: &Vector) -> Result<Op
             }
             _ => Ok(None),
         },
+        // Both sides are already coerced to the result DECIMAL's scale, so
+        // `+`, `-` and `%` are plain i128 operations with a precision check.
+        (
+            VectorData::Decimal {
+                values: a,
+                precision,
+                scale,
+            },
+            VectorData::Decimal { values: b, .. },
+        ) => match op {
+            BinaryOp::Add | BinaryOp::Subtract | BinaryOp::Modulo => {
+                Ok(Some(arith_decimal(op, l, r, a, b, *precision, *scale)?))
+            }
+            // `*` never reaches here (eval_arith routes it earlier); `/` is
+            // typed DOUBLE by the binder.
+            _ => Ok(None),
+        },
         _ => Ok(None),
     }
+}
+
+/// DECIMAL `+`/`-`/`%` at a shared scale, with DuckDB's overflow error.
+fn arith_decimal(
+    op: BinaryOp,
+    l: &Vector,
+    r: &Vector,
+    a: &[i128],
+    b: &[i128],
+    precision: u8,
+    scale: u8,
+) -> Result<Vector> {
+    let what = match op {
+        BinaryOp::Add => "addition",
+        BinaryOp::Subtract => "subtraction",
+        BinaryOp::Modulo => "modulo",
+        _ => unreachable!("arith_decimal: {op:?}"),
+    };
+    let mut out = Vector::new_empty(DataType::Decimal { precision, scale });
+    for (i, (&x, &y)) in a.iter().zip(b).enumerate() {
+        if l.is_null(i) || r.is_null(i) {
+            out.push_null()?;
+            continue;
+        }
+        let detail = || {
+            format!(
+                "({} {} {})",
+                crate::types::format_decimal(x, scale),
+                match op {
+                    BinaryOp::Add => "+",
+                    BinaryOp::Subtract => "-",
+                    _ => "%",
+                },
+                crate::types::format_decimal(y, scale)
+            )
+        };
+        let v = match op {
+            BinaryOp::Add => x
+                .checked_add(y)
+                .filter(|v| crate::types::decimal_fits(*v, precision)),
+            BinaryOp::Subtract => x
+                .checked_sub(y)
+                .filter(|v| crate::types::decimal_fits(*v, precision)),
+            _ => {
+                if y == 0 {
+                    return Err(PinkDbError::Execution(format!(
+                        "Division by zero in expression {}",
+                        detail()
+                    )));
+                }
+                Some(x.wrapping_rem(y))
+            }
+        }
+        .ok_or_else(|| {
+            PinkDbError::Execution(format!(
+                "Overflow in {what} of DECIMAL({precision}) {}",
+                detail()
+            ))
+        })?;
+        out.push_decimal(v, scale)?;
+    }
+    Ok(out)
 }
 
 /// DuckDB-style integer overflow error (`+`/`-`/`*`, negation, `abs`).
@@ -865,35 +1262,42 @@ fn arith_f64(
     Ok(out)
 }
 
-fn eval_date_arith(op: BinaryOp, l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
+/// DATE/TIMESTAMP/INTERVAL arithmetic: `date ± integer` days, `date - date`
+/// days, `date/timestamp ± interval` → TIMESTAMP, `timestamp - timestamp`
+/// → INTERVAL, `interval ± interval`, `interval *|/ number`. All month
+/// arithmetic clamps at month end (DuckDB rule).
+fn eval_temporal_arith(op: BinaryOp, l: &Vector, r: &Vector, dtype: DataType) -> Result<Vector> {
     let mut out = Vector::new_empty(dtype);
     for i in 0..l.len() {
         if l.is_null(i) || r.is_null(i) {
             out.push_null()?;
             continue;
         }
-        let v = match (op, l.get(i), r.get(i)) {
-            (BinaryOp::Add, Value::Date(d), Value::Integer(n))
-            | (BinaryOp::Add, Value::Integer(n), Value::Date(d)) => Value::Date(
-                d.checked_add(n)
-                    .ok_or_else(|| date_out_of_range(d, "+", n))?,
-            ),
-            (BinaryOp::Subtract, Value::Date(d), Value::Integer(n)) => Value::Date(
-                d.checked_sub(n)
-                    .ok_or_else(|| date_out_of_range(d, "-", n))?,
-            ),
-            (BinaryOp::Subtract, Value::Date(a), Value::Date(b)) => {
-                Value::Bigint(a as i64 - b as i64)
-            }
-            (op, a, b) => {
-                return Err(PinkDbError::Execution(format!(
-                    "operator {op:?} does not support {a} and {b}"
-                )));
-            }
-        };
+        let v = temporal_arith(op, l.get(i), r.get(i))?;
         out.push_valid(v)?;
     }
     Ok(out)
+}
+
+fn as_interval(v: &Value) -> Result<crate::types::Interval> {
+    match v {
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => Ok(crate::types::Interval {
+            months: *months,
+            days: *days,
+            micros: *micros,
+        }),
+        v => Err(PinkDbError::Execution(format!(
+            "expected an INTERVAL, got {v}"
+        ))),
+    }
+}
+
+fn interval_out_of_range() -> PinkDbError {
+    PinkDbError::Execution("interval out of range".to_string())
 }
 
 fn date_out_of_range(d: i32, sym: &str, n: i32) -> PinkDbError {
@@ -901,6 +1305,132 @@ fn date_out_of_range(d: i32, sym: &str, n: i32) -> PinkDbError {
         "date out of range: {} {sym} {n} days",
         Value::Date(d)
     ))
+}
+
+fn as_interval_number(v: &Value) -> Result<f64> {
+    match v {
+        Value::Integer(i) => Ok(*i as f64),
+        Value::Bigint(i) => Ok(*i as f64),
+        Value::Double(x) => Ok(*x),
+        Value::Decimal(x, scale) => Ok(crate::types::decimal_to_f64(*x, *scale)),
+        v => Err(PinkDbError::Execution(format!(
+            "interval arithmetic needs a number, got {v}"
+        ))),
+    }
+}
+
+fn timestamp_out_of_range() -> PinkDbError {
+    PinkDbError::Execution("timestamp out of range".to_string())
+}
+
+fn timestamp_us_for_date(d: i32) -> Result<i64> {
+    (d as i64)
+        .checked_mul(86_400_000_000)
+        .ok_or_else(timestamp_out_of_range)
+}
+
+fn temporal_arith(op: BinaryOp, a: Value, b: Value) -> Result<Value> {
+    use crate::types::*;
+    // Shorthand constructors.
+    let mk_iv = |iv: Interval| Value::Interval {
+        months: iv.months,
+        days: iv.days,
+        micros: iv.micros,
+    };
+    match (op, &a, &b) {
+        (BinaryOp::Add, Value::Date(d), Value::Integer(n))
+        | (BinaryOp::Add, Value::Integer(n), Value::Date(d)) => Ok(Value::Date(
+            d.checked_add(*n)
+                .ok_or_else(|| date_out_of_range(*d, "+", *n))?,
+        )),
+        (BinaryOp::Subtract, Value::Date(d), Value::Integer(n)) => Ok(Value::Date(
+            d.checked_sub(*n)
+                .ok_or_else(|| date_out_of_range(*d, "-", *n))?,
+        )),
+        (BinaryOp::Subtract, Value::Date(x), Value::Date(y)) => {
+            Ok(Value::Bigint(*x as i64 - *y as i64))
+        }
+        (BinaryOp::Add, Value::Interval { .. }, Value::Interval { .. }) => {
+            let (ai, bi) = (as_interval(&a)?, as_interval(&b)?);
+            interval_add(ai, bi)
+                .map(mk_iv)
+                .ok_or_else(interval_out_of_range)
+        }
+        (BinaryOp::Subtract, Value::Interval { .. }, Value::Interval { .. }) => {
+            let (ai, bi) = (as_interval(&a)?, as_interval(&b)?);
+            interval_sub(ai, bi)
+                .map(mk_iv)
+                .ok_or_else(interval_out_of_range)
+        }
+        (BinaryOp::Add, Value::Date(d), Value::Interval { .. })
+        | (BinaryOp::Add, Value::Interval { .. }, Value::Date(d)) => {
+            let iv = as_interval(&b)?;
+            date_add_interval(*d, iv)
+                .map(Value::Timestamp)
+                .ok_or_else(timestamp_out_of_range)
+        }
+        (BinaryOp::Subtract, Value::Date(d), Value::Interval { .. }) => {
+            let iv = interval_negate(as_interval(&b)?);
+            date_add_interval(*d, iv)
+                .map(Value::Timestamp)
+                .ok_or_else(timestamp_out_of_range)
+        }
+        (BinaryOp::Add, Value::Timestamp(us), Value::Interval { .. })
+        | (BinaryOp::Add, Value::Interval { .. }, Value::Timestamp(us)) => {
+            let iv = as_interval(&b)?;
+            timestamp_add_interval(*us, iv)
+                .map(Value::Timestamp)
+                .ok_or_else(timestamp_out_of_range)
+        }
+        (BinaryOp::Subtract, Value::Timestamp(us), Value::Interval { .. }) => {
+            let iv = interval_negate(as_interval(&b)?);
+            timestamp_add_interval(*us, iv)
+                .map(Value::Timestamp)
+                .ok_or_else(timestamp_out_of_range)
+        }
+        (BinaryOp::Subtract, Value::Timestamp(x), Value::Timestamp(y)) => Ok(Value::Interval {
+            months: 0,
+            days: 0,
+            micros: x - y,
+        }),
+        (BinaryOp::Subtract, Value::Timestamp(x), Value::Date(d)) => Ok(Value::Interval {
+            months: 0,
+            days: 0,
+            micros: x - timestamp_us_for_date(*d)?,
+        }),
+        (BinaryOp::Subtract, Value::Date(d), Value::Timestamp(x)) => Ok(Value::Interval {
+            months: 0,
+            days: 0,
+            micros: timestamp_us_for_date(*d)? - x,
+        }),
+        (BinaryOp::Multiply, Value::Interval { .. }, _) => {
+            let iv = as_interval(&a)?;
+            let f = as_interval_number(&b)?;
+            interval_mul(iv, f)
+                .map(mk_iv)
+                .ok_or_else(interval_out_of_range)
+        }
+        (BinaryOp::Multiply, _, Value::Interval { .. }) => {
+            let iv = as_interval(&b)?;
+            let f = as_interval_number(&a)?;
+            interval_mul(iv, f)
+                .map(mk_iv)
+                .ok_or_else(interval_out_of_range)
+        }
+        (BinaryOp::Divide, Value::Interval { .. }, _) => {
+            let iv = as_interval(&a)?;
+            let f = as_interval_number(&b)?;
+            if f == 0.0 {
+                return Err(PinkDbError::Execution("division by zero".to_string()));
+            }
+            interval_div(iv, f)
+                .map(mk_iv)
+                .ok_or_else(interval_out_of_range)
+        }
+        (op, a, b) => Err(PinkDbError::Execution(format!(
+            "operator {op:?} does not support {a} and {b}"
+        ))),
+    }
 }
 
 fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
@@ -922,6 +1452,34 @@ fn arith_values(op: BinaryOp, l: Value, r: Value) -> Result<Value> {
             };
             Ok(Value::Double(v))
         }
+        // Decimal `+`/`-`/`%`: both values arrive at the result scale.
+        (Value::Decimal(a, sa), Value::Decimal(b, sb)) => {
+            debug_assert_eq!(sa, sb, "decimal values are coerced to one scale");
+            let scale = sa.max(sb);
+            let (a, b) = if sa < sb {
+                (crate::types::rescale_decimal(a, sa, sb).unwrap_or(a), b)
+            } else if sb < sa {
+                (a, crate::types::rescale_decimal(b, sb, sa).unwrap_or(b))
+            } else {
+                (a, b)
+            };
+            let v = match op {
+                BinaryOp::Add => a.checked_add(b),
+                BinaryOp::Subtract => a.checked_sub(b),
+                BinaryOp::Multiply => a.checked_mul(b),
+                BinaryOp::Modulo => {
+                    if b == 0 {
+                        return Err(PinkDbError::Execution(
+                            "Division by zero in expression".to_string(),
+                        ));
+                    }
+                    Some(a.wrapping_rem(b))
+                }
+                _ => unreachable!("binder types {op:?} on DECIMAL"),
+            };
+            v.map(|v| Value::Decimal(v, scale))
+                .ok_or_else(|| PinkDbError::Execution("Overflow in DECIMAL arithmetic".to_string()))
+        }
         (l, r) => Err(PinkDbError::Execution(format!(
             "arithmetic on non-numeric values: {l}, {r}"
         ))),
@@ -935,6 +1493,9 @@ fn as_i64(v: &Value) -> Result<i64> {
         Value::Integer(i) => Ok(*i as i64),
         Value::Bigint(i) => Ok(*i),
         Value::Double(x) => Ok(*x as i64),
+        Value::Decimal(x, scale) => crate::types::rescale_decimal(*x, *scale, 0)
+            .and_then(|v| i64::try_from(v).ok())
+            .ok_or_else(|| PinkDbError::Execution(format!("expected numeric, got {v}"))),
         _ => Err(PinkDbError::Execution(format!("expected numeric, got {v}"))),
     }
 }
@@ -944,8 +1505,55 @@ fn as_f64(v: &Value) -> Result<f64> {
         Value::Integer(i) => Ok(*i as f64),
         Value::Bigint(i) => Ok(*i as f64),
         Value::Double(x) => Ok(*x),
+        Value::Decimal(x, scale) => Ok(crate::types::decimal_to_f64(*x, *scale)),
         _ => Err(PinkDbError::Execution(format!("expected numeric, got {v}"))),
     }
+}
+
+/// DECIMAL `abs`/`round`/`floor`/`ceil`/`sign` (DuckDB keeps the numeric
+/// family on DECIMAL: ABS keeps the type, ROUND/FLOOR/CEIL return
+/// DECIMAL(p, n)/DECIMAL(p, 0)).
+fn decimal_scalar(func: ScalarFunc, dtype: DataType, v: &Value) -> Result<Option<Value>> {
+    let Value::Decimal(x, scale) = v else {
+        return Ok(None);
+    };
+    let DataType::Decimal { precision, .. } = dtype else {
+        return Ok(None);
+    };
+    Ok(match func {
+        ScalarFunc::Abs => Some(Value::Decimal(
+            x.checked_abs()
+                .ok_or_else(|| overflow_err("abs", "DECIMAL", format_args!("abs({x})")))?,
+            *scale,
+        )),
+        ScalarFunc::Sign => Some(Value::Integer(x.signum() as i32)),
+        // FLOOR rounds toward -inf, CEIL toward +inf (DuckDB: FLOOR(-1.5) =
+        // -2, CEIL(-1.5) = -1); both return DECIMAL(p, 0).
+        ScalarFunc::Floor => {
+            let q = if *scale == 0 {
+                *x
+            } else {
+                x.div_euclid(POW10_I128[*scale as usize])
+            };
+            let q = decimal_fits(q, precision)
+                .then_some(q)
+                .ok_or_else(|| overflow_err("floor", "DECIMAL", format_args!("floor of {v}")))?;
+            Some(Value::Decimal(q, 0))
+        }
+        ScalarFunc::Ceil => {
+            let q = if *scale == 0 {
+                *x
+            } else {
+                -(-x).div_euclid(POW10_I128[*scale as usize])
+            };
+            let q = decimal_fits(q, precision)
+                .then_some(q)
+                .ok_or_else(|| overflow_err("ceil", "DECIMAL", format_args!("ceil of {v}")))?;
+            Some(Value::Decimal(q, 0))
+        }
+        // The general ROUND path handles decimal digits below.
+        _ => None,
+    })
 }
 
 fn eval_scalar(func: ScalarFunc, dtype: DataType, args: &[Vector]) -> Result<Vector> {
@@ -1178,7 +1786,74 @@ fn apply_scalar_loose(func: ScalarFunc, row: &[Value]) -> Result<Value> {
     }
 }
 
+/// DECIMAL `round(d[, n])` under DuckDB's result-type rules: `n >= scale`
+/// keeps the scale, `0 <= n < scale` narrows to `n`, `n < 0` returns
+/// `DECIMAL(p, 0)` rounded at `10^-n`.
+fn decimal_round(x: i128, scale: u8, digits: i64, precision: u8) -> Result<Value> {
+    let out_of_range = || {
+        overflow_err(
+            "round",
+            "DECIMAL",
+            format_args!("round of {}", format_decimal(x, scale)),
+        )
+    };
+    if digits >= scale as i64 {
+        return Ok(Value::Decimal(x, scale));
+    }
+    if digits >= 0 {
+        let want = digits as u8;
+        let y = rescale_decimal(x, scale, want).ok_or_else(out_of_range)?;
+        return Ok(Value::Decimal(y, want));
+    }
+    let drop = (-digits) as u32;
+    if drop > 38 {
+        return Ok(Value::Decimal(0, 0));
+    }
+    let unit = POW10_I128[drop as usize];
+    // Round x / unit half away from zero, then scale back up. `unit` is
+    // 10^(scale + drop) in unscaled terms.
+    let divisor = unit
+        .checked_mul(POW10_I128[scale as usize])
+        .ok_or_else(out_of_range)?;
+    let q = div_round_half_away(x, divisor);
+    let v = q
+        .checked_mul(divisor)
+        .filter(|v| decimal_fits(*v, precision));
+    v.map(|v| Value::Decimal(v, 0)).ok_or_else(out_of_range)
+}
+
+/// Half-away-from-zero integer division (positive divisor).
+fn div_round_half_away(v: i128, d: i128) -> i128 {
+    debug_assert!(d > 0);
+    if v >= 0 {
+        let (q, r) = (v / d, v % d);
+        if r * 2 >= d {
+            q + 1
+        } else {
+            q
+        }
+    } else {
+        -div_round_half_away(-v, d)
+    }
+}
+
 fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Value> {
+    // DECIMAL keeps the numeric family (ABS/ROUND/FLOOR/CEIL/SIGN).
+    if matches!(row[0], Value::Decimal(..)) {
+        if let Some(v) = decimal_scalar(func, dtype, &row[0])? {
+            return Ok(v);
+        }
+        if func == ScalarFunc::Round {
+            let Value::Decimal(x, scale) = row[0] else {
+                unreachable!("checked above")
+            };
+            let DataType::Decimal { precision, .. } = dtype else {
+                unreachable!("decimal round has a decimal result type")
+            };
+            let digits = if row.len() > 1 { as_i64(&row[1])? } else { 0 };
+            return decimal_round(x, scale, digits, precision);
+        }
+    }
     match func {
         ScalarFunc::Abs => match &row[0] {
             Value::Integer(i) => i
@@ -1192,6 +1867,15 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             Value::Double(x) => Ok(Value::Double(x.abs())),
             v => Err(PinkDbError::Execution(format!("abs of {v}"))),
         },
+        ScalarFunc::Floor | ScalarFunc::Ceil => {
+            // Non-decimal numerics keep the historical DOUBLE result.
+            let x = as_f64(&row[0])?;
+            Ok(Value::Double(if func == ScalarFunc::Floor {
+                x.floor()
+            } else {
+                x.ceil()
+            }))
+        }
         ScalarFunc::Round => {
             let x = as_f64(&row[0])?;
             let digits = if row.len() > 1 { as_i64(&row[1])? } else { 0 };
@@ -1354,8 +2038,6 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
             })
         }
         ScalarFunc::Sqrt => Ok(Value::Double(as_f64(&row[0])?.sqrt())),
-        ScalarFunc::Floor => Ok(Value::Double(as_f64(&row[0])?.floor())),
-        ScalarFunc::Ceil => Ok(Value::Double(as_f64(&row[0])?.ceil())),
         ScalarFunc::Sign => match &row[0] {
             Value::Integer(i) => Ok(Value::Integer(i.signum())),
             Value::Bigint(i) => Ok(Value::Integer(i.signum() as i32)),
@@ -1611,6 +2293,9 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Integer(i), DataType::Bigint) => Ok(Value::Bigint(i as i64)),
         (Value::Integer(i), DataType::Double) => Ok(Value::Double(i as f64)),
         (Value::Bigint(i), DataType::Double) => Ok(Value::Double(i as f64)),
+        (Value::Decimal(x, from), DataType::Double) => {
+            Ok(Value::Double(crate::types::decimal_to_f64(x, from)))
+        }
         (Value::Bigint(i), DataType::Integer) => i32::try_from(i)
             .map(Value::Integer)
             .map_err(|_| cast_out_of_range(&Value::Bigint(i), DataType::Integer)),
@@ -1680,6 +2365,45 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
         (Value::Timestamp(us), DataType::Date) => {
             Ok(Value::Date(us.div_euclid(86_400_000_000) as i32))
         }
+        // DECIMAL ↔ numeric. DECIMAL → INTEGER/BIGINT rounds half away from
+        // zero (DuckDB: CAST(DECIMAL '12.7' AS INTEGER) = 13), DECIMAL →
+        // DOUBLE divides by the power of ten in f64.
+        (Value::Decimal(x, scale), DataType::Integer) => {
+            let d =
+                crate::types::rescale_decimal(x, scale, 0).filter(|v| i32::try_from(*v).is_ok());
+            d.map(|v| Value::Integer(v as i32))
+                .ok_or_else(|| cast_out_of_range(&Value::Decimal(x, scale), DataType::Integer))
+        }
+        (Value::Decimal(x, scale), DataType::Bigint) => {
+            let d =
+                crate::types::rescale_decimal(x, scale, 0).filter(|v| i64::try_from(*v).is_ok());
+            d.map(|v| Value::Bigint(v as i64))
+                .ok_or_else(|| cast_out_of_range(&Value::Decimal(x, scale), DataType::Bigint))
+        }
+        // Anything numeric → DECIMAL(precision, scale): rounding half away
+        // from zero, precision overflow is an error.
+        (v, DataType::Decimal { precision, scale }) => {
+            let out = match &v {
+                Value::Integer(i) => crate::types::int_to_decimal(*i as i128, precision, scale),
+                Value::Bigint(i) => crate::types::int_to_decimal(*i as i128, precision, scale),
+                Value::Decimal(x, from) => crate::types::rescale_decimal(*x, *from, scale)
+                    .filter(|y| crate::types::decimal_fits(*y, precision)),
+                Value::Double(x) => crate::types::f64_to_decimal(*x, precision, scale),
+                Value::Varchar(s) => crate::types::parse_decimal_str(s, precision, scale).ok(),
+                _ => None,
+            };
+            out.map(|y| Value::Decimal(y, scale))
+                .ok_or_else(|| cast_out_of_range(&v, DataType::Decimal { precision, scale }))
+        }
+        // VARCHAR → INTERVAL (INTERVAL → VARCHAR rides the generic
+        // "everything formats to VARCHAR" arm above).
+        (Value::Varchar(s), DataType::Interval) => crate::types::parse_interval(s.as_str())
+            .map(|iv| Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            })
+            .ok_or_else(|| PinkDbError::Execution(format!("cannot CAST \"{s}\" AS INTERVAL"))),
         (v, t) => Err(PinkDbError::Execution(format!("cannot CAST {v} AS {t}"))),
     }
 }

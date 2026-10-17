@@ -937,11 +937,25 @@ peg::parser! {
 
         rule table_column() -> (String, DataType) = name:ident() ty:type_name() { (name, ty) }
 
-        /// A type name: usually an identifier, but DATE/TIMESTAMP lex as keywords.
+        /// A type name: usually an identifier, but DATE/TIMESTAMP lex as
+        /// keywords. DECIMAL/NUMERIC take an optional `(p)`/`(p,s)` parameter
+        /// list (`DECIMAL` alone is `DECIMAL(18,3)`, DuckDB's default).
         rule type_name() -> DataType
             = kw(Keyword::Date) { DataType::Date }
             / kw(Keyword::Timestamp) { DataType::Timestamp }
-            / s:ident() {? DataType::from_sql(&s).ok_or("known column type") }
+            / s:ident() p:type_params() {?
+                  DataType::from_sql_params(&s, &p).ok_or("known column type")
+              }
+
+        rule type_params() -> Vec<i64>
+            = lparen() first:type_param() rest:(comma() p:type_param() { p })* rparen() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+            / { Vec::new() }
+
+        rule type_param() -> i64 = n:int_text() ws() {? n.parse::<i64>().or(Err("integer")) }
 
         rule col_name_list() -> Vec<String>
             = lparen() first:ident() rest:(comma() c:ident() { c })* rparen() {
@@ -1244,7 +1258,20 @@ peg::parser! {
         rule unary() -> Expr
             = minus() e:unary() { Expr::Unary { op: UnaryOp::Negate, expr: Box::new(e) } }
             / plus() e:unary() { Expr::Unary { op: UnaryOp::Plus, expr: Box::new(e) } }
-            / primary()
+            / cast_postfix()
+
+        /// Postgres-style `x::TYPE` casts, chained left to right. `::` binds
+        /// tighter than any operator (it sits under `unary`, so `-x::INT` is
+        /// `-(x::INT)` and `a || b::VARCHAR` casts only `b`).
+        rule cast_postfix() -> Expr
+            = e:primary() rest:(dcolon() ty:type_name() { ty })* {
+                  rest.into_iter().fold(e, |expr, dtype| Expr::Cast {
+                      expr: Box::new(expr),
+                      dtype,
+                  })
+              }
+
+        rule dcolon() = "::" ws()
 
         rule primary() -> Expr
             = v:number() { Expr::Literal(v) }
@@ -1255,6 +1282,7 @@ peg::parser! {
             / date_literal()
             / timestamp_literal()
             / parameter()
+            / interval_literal()
             / cast_expr()
             / case_expr()
             / star() { Expr::Star }
@@ -1293,6 +1321,22 @@ peg::parser! {
         rule extract_part() -> String
             = s:string_lit() { s }
             / i:ident() { i }
+
+        /// `INTERVAL '...'` — matched as a bare word (like `extract`) so
+        /// `interval` stays usable as a column/table name and a type name.
+        rule interval_literal() -> Expr
+            = interval_name() s:string_lit() {?
+                  crate::types::parse_interval(&s)
+                      .map(|iv| Expr::Literal(Value::Interval {
+                          months: iv.months,
+                          days: iv.days,
+                          micros: iv.micros,
+                      }))
+                      .ok_or("valid INTERVAL literal")
+              }
+
+        rule interval_name()
+            = s:ident_raw() ws() {? if s.eq_ignore_ascii_case("interval") { Ok(()) } else { Err("INTERVAL") } }
 
         rule date_literal() -> Expr
             = kw(Keyword::Date) s:string_lit() {?

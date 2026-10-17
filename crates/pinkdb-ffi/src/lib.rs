@@ -63,6 +63,10 @@ pub const PINKDB_TYPE_DOUBLE: i32 = 4;
 pub const PINKDB_TYPE_VARCHAR: i32 = 5;
 pub const PINKDB_TYPE_DATE: i32 = 6;
 pub const PINKDB_TYPE_TIMESTAMP: i32 = 7;
+/// v1 additive: DECIMAL/INTERVAL are marshaled as text (canonical DuckDB
+/// forms) in `text`/`text_len`; `i`/`d` stay zero.
+pub const PINKDB_TYPE_DECIMAL: i32 = 8;
+pub const PINKDB_TYPE_INTERVAL: i32 = 9;
 
 // ----- thread-local error -----
 
@@ -197,6 +201,32 @@ impl Cell {
                 d: 0.0,
                 text: None,
             },
+            Value::Decimal(x, scale) => {
+                let mut b = pinkdb::types::format_decimal(*x, *scale).into_bytes();
+                b.push(0);
+                Cell {
+                    tag: PINKDB_TYPE_DECIMAL,
+                    is_null: false,
+                    i: 0,
+                    d: 0.0,
+                    text: Some(b),
+                }
+            }
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                let mut b = pinkdb::types::format_interval(*months, *days, *micros).into_bytes();
+                b.push(0);
+                Cell {
+                    tag: PINKDB_TYPE_INTERVAL,
+                    is_null: false,
+                    i: 0,
+                    d: 0.0,
+                    text: Some(b),
+                }
+            }
         }
     }
 
@@ -225,6 +255,8 @@ fn dtype_tag(t: DataType) -> i32 {
         DataType::Varchar => PINKDB_TYPE_VARCHAR,
         DataType::Date => PINKDB_TYPE_DATE,
         DataType::Timestamp => PINKDB_TYPE_TIMESTAMP,
+        DataType::Decimal { .. } => PINKDB_TYPE_DECIMAL,
+        DataType::Interval => PINKDB_TYPE_INTERVAL,
     }
 }
 

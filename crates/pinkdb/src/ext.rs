@@ -54,15 +54,18 @@ use crate::vector::{Vector, VectorData};
 
 /// Map an engine type to its ABI tag.
 #[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn ext_type_of(dtype: DataType) -> ExtType {
+pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
     match dtype {
-        DataType::Boolean => ExtType::Boolean,
-        DataType::Integer => ExtType::Integer,
-        DataType::Bigint => ExtType::Bigint,
-        DataType::Double => ExtType::Double,
-        DataType::Varchar => ExtType::Varchar,
-        DataType::Date => ExtType::Date,
-        DataType::Timestamp => ExtType::Timestamp,
+        DataType::Boolean => Some(ExtType::Boolean),
+        DataType::Integer => Some(ExtType::Integer),
+        DataType::Bigint => Some(ExtType::Bigint),
+        DataType::Double => Some(ExtType::Double),
+        DataType::Varchar => Some(ExtType::Varchar),
+        DataType::Date => Some(ExtType::Date),
+        DataType::Timestamp => Some(ExtType::Timestamp),
+        // ABI v1 has no DECIMAL/INTERVAL argument types; the binder's
+        // exact-type check rejects such arguments with its usual message.
+        DataType::Decimal { .. } | DataType::Interval => None,
     }
 }
 
@@ -253,6 +256,11 @@ pub(crate) fn push_ext_arg<'a>(
         VectorData::VarChar(v) => ExtArg::Varchar(v[row].as_bytes()),
         VectorData::Date32(v) => ExtArg::Date(v[row]),
         VectorData::TimestampMicros(v) => ExtArg::Timestamp(v[row]),
+        // Unreachable: `ext_type_of` rejects these in the binder's exact-type
+        // check before any callback can run.
+        VectorData::Decimal { .. } | VectorData::Interval(_) => {
+            unreachable!("extensions v1 do not accept DECIMAL/INTERVAL arguments")
+        }
     });
 }
 
@@ -337,8 +345,16 @@ mod tests {
             DataType::Date,
             DataType::Timestamp,
         ] {
-            assert_eq!(dtype_of_ext(ext_type_of(dtype)), dtype);
+            assert_eq!(dtype_of_ext(ext_type_of(dtype).unwrap()), dtype);
         }
+        assert_eq!(
+            ext_type_of(DataType::Decimal {
+                precision: 4,
+                scale: 2
+            }),
+            None
+        );
+        assert_eq!(ext_type_of(DataType::Interval), None);
     }
 
     #[test]

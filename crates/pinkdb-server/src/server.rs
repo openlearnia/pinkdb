@@ -105,6 +105,8 @@ fn row_encoded_len(row: &[Value]) -> usize {
                 Value::Boolean(_) => 1,
                 Value::Integer(_) | Value::Date(_) => 4,
                 Value::Bigint(_) | Value::Double(_) | Value::Timestamp(_) => 8,
+                Value::Decimal(_, _) => 16 + 1,
+                Value::Interval { .. } => 16,
                 Value::Varchar(s) => 4 + s.len(),
             }
         })

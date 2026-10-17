@@ -1,9 +1,9 @@
 //! Persistence: a single-file on-disk columnar format (`.pink`).
 //!
-//! Layout v4 (all integers little-endian):
+//! Layout v5 (all integers little-endian):
 //! ```text
-//! magic "PINKDB04" (8 bytes)
-//! flags u32                 (0 in v4.0; unknown bits are a hard error)
+//! magic "PINKDB05" (8 bytes)
+//! flags u32                 (0 in v5.0; unknown bits are a hard error)
 //! db_count u32
 //! per database:
 //!   name_len u32 + name bytes
@@ -24,8 +24,9 @@
 //!
 //! v2 files (`PINKDB02`) are the v4 container without the `flags` word and
 //! the CRC trailer; v3 files (`PINKDB03`) are v2 + a CRC; v1 files
-//! (`PINKDB01`) hold a flat table list and load as a single `main` database.
-//! `open` accepts all four; writes are always v4.
+//! (`PINKDB01`) hold a flat table list and load as a single `main` database;
+//! v4 files (`PINKDB04`) are the v5 container without the DECIMAL/INTERVAL
+//! dtype tags. `open` accepts all five; writes are always v5.
 //!
 //! Payloads store every row including NULL placeholders; validity is applied
 //! afterwards. Per-chunk encoding is picked by size (smallest wins), with a
@@ -63,7 +64,7 @@ use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
 use crate::storage::PinkDb;
-use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{Vector, VectorData, CHUNK_SIZE};
 
 const MAGIC: &[u8; 8] = b"PINKDB01";
@@ -74,7 +75,10 @@ const MAGIC_V3: &[u8; 8] = b"PINKDB03";
 /// Version 4 = v3 + a `flags` word and the typed codecs (delta bitpack,
 /// bitpacked dictionary codes, ALP, the all-valid validity flag).
 const MAGIC_V4: &[u8; 8] = b"PINKDB04";
-
+/// Version 5 = v4 + the DECIMAL/INTERVAL dtype tags (7/8; DECIMAL carries
+/// its precision and scale in the schema). Older builds refuse it cleanly
+/// through the shared newer-magic path.
+const MAGIC_V5: &[u8; 8] = b"PINKDB05";
 const ENC_PLAIN: u8 = 0;
 const ENC_RLE: u8 = 1;
 const ENC_DICT: u8 = 2;
@@ -307,6 +311,54 @@ fn chunk_column_stats(v: &Vector) -> ChunkColumnStats {
                 nan_count: 0,
             }
         }
+        VectorData::Decimal { values, scale, .. } => {
+            let (min, max) = int_stats(v, values);
+            ChunkColumnStats {
+                null_count,
+                min: min.map(|x| Value::Decimal(x, *scale)),
+                max: max.map(|x| Value::Decimal(x, *scale)),
+                nan_count: 0,
+            }
+        }
+        VectorData::Interval(data) => {
+            let (mut min, mut max): (Option<Interval>, Option<Interval>) = (None, None);
+            let mut see = |x: Interval| {
+                if min.is_none_or(|m| crate::types::interval_cmp(x, m) == std::cmp::Ordering::Less)
+                {
+                    min = Some(x);
+                }
+                if max
+                    .is_none_or(|m| crate::types::interval_cmp(x, m) == std::cmp::Ordering::Greater)
+                {
+                    max = Some(x);
+                }
+            };
+            if v.has_nulls() {
+                for (i, &x) in data.iter().enumerate() {
+                    if v.is_valid(i) {
+                        see(x);
+                    }
+                }
+            } else {
+                for &x in data {
+                    see(x);
+                }
+            }
+            ChunkColumnStats {
+                null_count,
+                min: min.map(|iv| Value::Interval {
+                    months: iv.months,
+                    days: iv.days,
+                    micros: iv.micros,
+                }),
+                max: max.map(|iv| Value::Interval {
+                    months: iv.months,
+                    days: iv.days,
+                    micros: iv.micros,
+                }),
+                nan_count: 0,
+            }
+        }
     }
 }
 
@@ -370,6 +422,11 @@ fn dtype_tag(t: DataType) -> u8 {
         DataType::Varchar => 4,
         DataType::Date => 5,
         DataType::Timestamp => 6,
+        // DECIMAL and INTERVAL are tags 7/8. DECIMAL's tag is incomplete: the
+        // schema writer stores precision and scale immediately after it, and
+        // the schema reader assembles the type before any chunk is read.
+        DataType::Decimal { .. } => 7,
+        DataType::Interval => 8,
     }
 }
 
@@ -1393,6 +1450,42 @@ fn encode_chunk_typed(v: &Vector) -> (u8, Vec<u8>) {
             consider_best(&mut best, ENC_BITPACK, enc_ints_bitpack(&nums));
             consider_best(&mut best, ENC_DELTA_BITPACK, enc_ints_delta(&nums));
         }
+        // 128-bit fixed-point DECIMAL: `u32 row count | raw unscaled values`
+        // (the schema carries precision/scale on disk). Invalid rows are
+        // zeroed so the bytes stay deterministic; validity wins on decode.
+        DataType::Decimal { .. } => {
+            let VectorData::Decimal { values, .. } = v.data() else {
+                unreachable!("decimal chunk has a non-decimal payload")
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, &x) in values.iter().enumerate() {
+                let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                w.bytes(&x.to_le_bytes());
+            }
+            best = Some((ENC_PLAIN, w.buf));
+        }
+        // INTERVAL: `u32 row count | months(i32) days(i32) micros(i64)` each.
+        DataType::Interval => {
+            let VectorData::Interval(values) = v.data() else {
+                unreachable!("interval chunk has a non-interval payload")
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, iv) in values.iter().enumerate() {
+                let (months, days, micros) = if nulls && !v.is_valid(i) {
+                    (0i32, 0i32, 0i64)
+                } else {
+                    (iv.months, iv.days, iv.micros)
+                };
+                w.bytes(&months.to_le_bytes());
+                w.bytes(&days.to_le_bytes());
+                w.bytes(&micros.to_le_bytes());
+            }
+            best = Some((ENC_PLAIN, w.buf));
+        }
         DataType::Double => {
             let values = float64_payload(v);
             let bits: Vec<u64> = values.iter().map(|x| x.to_bits()).collect();
@@ -1617,6 +1710,39 @@ fn decode_payload(
         (DataType::Timestamp, ENC_PLAIN) => {
             let n = r.chunk_count("chunk length")?;
             Ok((VectorData::TimestampMicros(r.i64_vec(n)?), n))
+        }
+        (DataType::Decimal { precision, scale }, ENC_PLAIN) => {
+            let n = r.chunk_count("chunk length")?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                let bytes = r.take(16)?;
+                let mut buf = [0u8; 16];
+                buf.copy_from_slice(bytes);
+                values.push(i128::from_le_bytes(buf));
+            }
+            Ok((
+                VectorData::Decimal {
+                    values,
+                    precision,
+                    scale,
+                },
+                n,
+            ))
+        }
+        (DataType::Interval, ENC_PLAIN) => {
+            let n = r.chunk_count("chunk length")?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                let months = r.i32()?;
+                let days = r.i32()?;
+                let micros = r.i64()?;
+                values.push(Interval {
+                    months,
+                    days,
+                    micros,
+                });
+            }
+            Ok((VectorData::Interval(values), n))
         }
         (DataType::Integer, ENC_RLE) | (DataType::Date, ENC_RLE) => {
             let n = r.chunk_count("chunk length")?;
@@ -1927,7 +2053,7 @@ impl PinkDb {
         collect_stats: bool,
     ) -> Result<(Vec<u8>, Vec<SavedTableStats>)> {
         let mut w = Writer::new();
-        w.bytes(MAGIC_V4);
+        w.bytes(MAGIC_V5);
         w.u32(0); // flags: no optional sections in v4.0
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
@@ -1946,6 +2072,11 @@ impl PinkDb {
                 for (col, dtype) in &schema {
                     w.str(col);
                     w.u8(dtype_tag(*dtype));
+                    // DECIMAL is the one tag whose parameters ride along.
+                    if let DataType::Decimal { precision, scale } = dtype {
+                        w.u8(*precision);
+                        w.u8(*scale);
+                    }
                 }
                 w.u64(t.num_rows() as u64);
                 let n_chunks = t.num_chunks();
@@ -2147,7 +2278,10 @@ impl PinkDb {
 
     /// Decode a serialized `.pink` image (v1, v2, v3 or v4 magic).
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
-        let data = if data.starts_with(MAGIC_V3) || data.starts_with(MAGIC_V4) {
+        let data = if data.starts_with(MAGIC_V3)
+            || data.starts_with(MAGIC_V4)
+            || data.starts_with(MAGIC_V5)
+        {
             // Verify the trailer before decoding anything.
             if data.len() < MAGIC_V4.len() + 4 {
                 return Err(PinkDbError::Execution(
@@ -2167,13 +2301,13 @@ impl PinkDb {
         };
         let mut r = Reader::new(data);
         let magic = r.take(8)?;
-        let (v2, v4) = if magic == MAGIC_V4 {
+        let (v2, v4) = if magic == MAGIC_V5 || magic == MAGIC_V4 {
             (true, true)
         } else if magic == MAGIC_V3 || magic == MAGIC_V2 {
             (true, false)
         } else if magic == MAGIC {
             (false, false)
-        } else if magic.starts_with(b"PINKDB0") && magic[7] > b'4' && magic[7].is_ascii_digit() {
+        } else if magic.starts_with(b"PINKDB0") && magic[7] > b'5' && magic[7].is_ascii_digit() {
             return Err(PinkDbError::Execution(format!(
                 "written by a newer pinkdb (format v{}); upgrade pinkdb",
                 magic[7] - b'0'
@@ -2240,7 +2374,18 @@ fn load_table(r: &mut Reader, db: &mut PinkDb, dbname: &str, v4: bool) -> Result
     let mut schema = Vec::with_capacity(n_cols);
     for _ in 0..n_cols {
         let col = r.str()?;
-        let dtype = dtype_from_tag(r.u8()?)?;
+        let tag = r.u8()?;
+        let dtype = match tag {
+            7 => {
+                let precision = r.u8()?;
+                let scale = r.u8()?;
+                crate::types::decimal_type(precision, scale).ok_or_else(|| {
+                    PinkDbError::Execution("corrupt file: bad DECIMAL precision/scale".to_string())
+                })?
+            }
+            8 => DataType::Interval,
+            other => dtype_from_tag(other)?,
+        };
         schema.push((col, dtype));
     }
     let num_rows = r.u64()? as usize;
@@ -2317,6 +2462,38 @@ fn plain_payload(v: &Vector) -> Vec<u8> {
         }
         DataType::Boolean => enc_bool_plain(&bool_payload(v)),
         DataType::Varchar => enc_strs_plain(&varchar_payload(v)),
+        DataType::Decimal { .. } => {
+            let VectorData::Decimal { values, .. } = v.data() else {
+                unreachable!()
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, &x) in values.iter().enumerate() {
+                let x = if nulls && !v.is_valid(i) { 0 } else { x };
+                w.bytes(&x.to_le_bytes());
+            }
+            w.buf
+        }
+        DataType::Interval => {
+            let VectorData::Interval(values) = v.data() else {
+                unreachable!()
+            };
+            let nulls = v.has_nulls();
+            let mut w = Writer::new();
+            w.u32(values.len() as u32);
+            for (i, iv) in values.iter().enumerate() {
+                let (m, d, us) = if nulls && !v.is_valid(i) {
+                    (0i32, 0i32, 0i64)
+                } else {
+                    (iv.months, iv.days, iv.micros)
+                };
+                w.bytes(&m.to_le_bytes());
+                w.bytes(&d.to_le_bytes());
+                w.bytes(&us.to_le_bytes());
+            }
+            w.buf
+        }
     }
 }
 
@@ -2457,16 +2634,16 @@ mod tests {
     use super::*;
     use crate::vector::CHUNK_SIZE;
 
-    /// Pinned v4 size/CRC of [`golden_db`]'s image (see
-    /// `golden_v4_bytes_are_pinned`).
-    const GOLDEN_V4_LEN: usize = 111775;
-    const GOLDEN_V4_CRC: u32 = 558161692;
+    /// Pinned v5 size/CRC of [`golden_db`]'s image (see
+    /// `golden_v5_bytes_are_pinned`).
+    const GOLDEN_V5_LEN: usize = 111775;
+    const GOLDEN_V5_CRC: u32 = 558161692;
 
     fn roundtrip(db: &PinkDb) -> PinkDb {
         let path = temp_file("rt");
         db.save(path.to_str().unwrap()).unwrap();
         let data = std::fs::read(&path).unwrap();
-        assert!(data.starts_with(MAGIC_V4));
+        assert!(data.starts_with(MAGIC_V5));
         let back = PinkDb::open(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
         back
@@ -2943,7 +3120,7 @@ mod tests {
             .append_row(vec![Value::Integer(7)])
             .unwrap();
         let full = db.to_bytes().unwrap();
-        assert!(full.starts_with(MAGIC_V4));
+        assert!(full.starts_with(MAGIC_V5));
         // A flipped payload bit is a checksum error, not a silent wrong value.
         for i in MAGIC_V4.len()..full.len() {
             let mut bad = full.clone();
@@ -2973,7 +3150,7 @@ mod tests {
             .append_row(vec![Value::Integer(7)])
             .unwrap();
         let full = db.to_bytes().unwrap();
-        for (magic, version) in [(b"PINKDB05", 5u8), (b"PINKDB09", 9)] {
+        for (magic, version) in [(b"PINKDB06", 6u8), (b"PINKDB09", 9)] {
             let mut data = full.clone();
             data[..8].copy_from_slice(magic);
             let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
@@ -3309,6 +3486,28 @@ mod tests {
         }
         match dtype {
             DataType::Boolean => Value::Boolean(i.is_multiple_of(3)),
+            DataType::Decimal { scale, .. } => Value::Decimal(
+                match i % 6 {
+                    0 => 0,
+                    1 => -1,
+                    2 => i128::from(i as i64) * 100_003,
+                    3 => -i128::from(i as i64) * 7,
+                    4 => 999_999_999,
+                    _ => i128::from(i as i64) % 97 - 48,
+                },
+                scale,
+            ),
+            DataType::Interval => Value::Interval {
+                months: match i % 5 {
+                    0 => 0,
+                    1 => 12,
+                    2 => -3,
+                    3 => i32::MAX,
+                    _ => (i as i32) % 120,
+                },
+                days: (i as i32) % 31 - 15,
+                micros: (i as i64).wrapping_mul(1_000_003) % 86_400_000_000,
+            },
             DataType::Integer => Value::Integer(match i % 8 {
                 0 => i32::MIN,
                 1 => i32::MAX,
@@ -3657,7 +3856,7 @@ mod tests {
         // The whole file carries no validity words for this table: 3 chunks
         // × (1 tag + 4 validity_len + payload) — check the framed length is 0
         // by decoding it back (the payload itself is checked above).
-        assert!(bytes.starts_with(MAGIC_V4));
+        assert!(bytes.starts_with(MAGIC_V5));
     }
 
     /// A fixed multi-dtype corpus, used by the golden/identity tests.
@@ -4007,15 +4206,15 @@ mod tests {
     }
 
     #[test]
-    fn golden_v4_bytes_are_pinned() {
+    fn golden_v5_bytes_are_pinned() {
         let db = golden_db();
         let bytes = db.to_bytes().unwrap();
-        // Recomputed once when the v4 codecs stabilized; guards accidental
+        // Recomputed once when the v5 codecs stabilized; guards accidental
         // format drift (encoders are pure by contract).
-        assert_eq!(bytes.len(), GOLDEN_V4_LEN, "file length drifted");
+        assert_eq!(bytes.len(), GOLDEN_V5_LEN, "file length drifted");
         assert_eq!(
             crate::wal::crc32(&bytes),
-            GOLDEN_V4_CRC,
+            GOLDEN_V5_CRC,
             "file bytes drifted"
         );
         assert_eq!(db.to_bytes_impl(false).unwrap(), bytes, "serial ≠ parallel");
@@ -4132,14 +4331,19 @@ mod tests {
         };
         for case in 0..2000 {
             let n = (next() % 300) as usize;
-            let dtype = match next() % 7 {
+            let dtype = match next() % 9 {
                 0 => DataType::Boolean,
                 1 => DataType::Integer,
                 2 => DataType::Bigint,
                 3 => DataType::Double,
                 4 => DataType::Varchar,
                 5 => DataType::Date,
-                _ => DataType::Timestamp,
+                6 => DataType::Timestamp,
+                7 => DataType::Decimal {
+                    precision: 18,
+                    scale: 3,
+                },
+                _ => DataType::Interval,
             };
             let mut values: Vec<Value> = Vec::with_capacity(n);
             for _ in 0..n {
@@ -4158,6 +4362,12 @@ mod tests {
                     }
                     DataType::Date => Value::Date(r as i32),
                     DataType::Timestamp => Value::Timestamp(r as i64),
+                    DataType::Decimal { scale, .. } => Value::Decimal(r as i128, scale),
+                    DataType::Interval => Value::Interval {
+                        months: (r % 1000) as i32,
+                        days: (r % 60) as i32,
+                        micros: r as i64 % 86_400_000_000,
+                    },
                 };
                 values.push(if r % 11 == 0 { Value::Null } else { val });
             }

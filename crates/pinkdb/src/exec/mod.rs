@@ -2705,8 +2705,31 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) ->
         }
         VectorData::Date32(d) => push_be(out, ((d[idx] ^ i32::MIN) as u32) as u64, 4, desc),
         VectorData::TimestampMicros(d) => push_be(out, (d[idx] ^ i64::MIN) as u64, 8, desc),
+        // DECIMAL: one scale per column, so plain i128 order works (sign bit
+        // flipped like the integer encodings).
+        VectorData::Decimal { values, .. } => push_be_i128(out, values[idx], desc),
+        // INTERVAL: encode the comparison key (months → 30 days, days →
+        // micros), which is monotone in `interval_cmp`.
+        VectorData::Interval(d) => {
+            let iv = d[idx];
+            let key = iv.months as i128 * 30 * 86_400_000_000i128
+                + iv.days as i128 * 86_400_000_000i128
+                + iv.micros as i128;
+            push_be_i128(out, key, desc);
+        }
     }
     true
+}
+
+/// Big-endian i128 with the sign bit flipped (ascending byte order); `desc`
+/// inverts the bytes.
+fn push_be_i128(out: &mut Vec<u8>, x: i128, desc: bool) {
+    let be = (x ^ i128::MIN).to_be_bytes();
+    if desc {
+        out.extend(be.iter().map(|b| !b));
+    } else {
+        out.extend_from_slice(&be);
+    }
 }
 
 /// Pack all rows' keys into one arena. `None` ⇒ the byte order cannot

@@ -152,7 +152,7 @@ fn lean_save_open_versions_tables_info() {
     for file in &files {
         assert_eq!(file.extension().unwrap(), "pink");
         assert!(
-            std::fs::read(file).unwrap().starts_with(b"PINKDB04"),
+            std::fs::read(file).unwrap().starts_with(b"PINKDB05"),
             "{} is not engine v4 `.pink` bytes",
             file.display()
         );

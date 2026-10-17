@@ -1284,7 +1284,7 @@ fn v1_fixture_lake_still_loads_bit_exactly() {
         let original = std::fs::read(&path).unwrap();
         assert!(original.starts_with(b"PINKDB02"), "{rel}");
         let resaved = std::fs::read(&resaved).unwrap();
-        assert!(resaved.starts_with(b"PINKDB04"), "{rel}");
+        assert!(resaved.starts_with(b"PINKDB05"), "{rel}");
         let back = PinkDb::open(scratch.join("resaved.pink").to_str().unwrap()).unwrap();
         assert_same_store(&mini, &back);
     }

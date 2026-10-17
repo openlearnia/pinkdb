@@ -47,7 +47,9 @@ use pinkdb::{DataType, Value};
 /// v5: [`Request::Prepare`] / [`Request::ExecutePrepared`] and
 /// [`Response::Prepared`] carry server-side prepared statements with `?`
 /// parameters.
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v5: `DECIMAL`/`INTERVAL` value and dtype tags (DECIMAL's precision/scale
+/// ride after its dtype tag).
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -90,6 +92,10 @@ mod value_tag {
     pub const VARCHAR: u8 = 5;
     pub const DATE: u8 = 6;
     pub const TIMESTAMP: u8 = 7;
+    /// v6: `DECIMAL(i128 unscaled | u8 scale)` and
+    /// `INTERVAL(months i32 | days i32 | micros i64)`.
+    pub const DECIMAL: u8 = 8;
+    pub const INTERVAL: u8 = 9;
 }
 
 /// DataType tag bytes (one per [`DataType`] variant).
@@ -101,6 +107,10 @@ mod dtype_tag {
     pub const VARCHAR: u8 = 4;
     pub const DATE: u8 = 5;
     pub const TIMESTAMP: u8 = 6;
+    /// v6: DECIMAL writes precision and scale bytes after the tag; INTERVAL
+    /// carries no parameters.
+    pub const DECIMAL: u8 = 7;
+    pub const INTERVAL: u8 = 8;
 }
 
 // ---------- errors ----------
@@ -413,6 +423,11 @@ impl Response {
                 for (name, dtype) in names.iter().zip(types) {
                     put_str(&mut buf, name)?;
                     put_u8(&mut buf, dtype_byte(*dtype));
+                    // v6: DECIMAL's parameters ride after the tag.
+                    if let DataType::Decimal { precision, scale } = dtype {
+                        put_u8(&mut buf, *precision);
+                        put_u8(&mut buf, *scale);
+                    }
                 }
             }
             Response::Rows { rows } => {
@@ -688,6 +703,21 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) -> Result<(), ProtocolError> {
             put_u8(buf, value_tag::TIMESTAMP);
             buf.extend_from_slice(&us.to_le_bytes());
         }
+        Value::Decimal(x, scale) => {
+            put_u8(buf, value_tag::DECIMAL);
+            buf.extend_from_slice(&x.to_le_bytes());
+            put_u8(buf, *scale);
+        }
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            put_u8(buf, value_tag::INTERVAL);
+            buf.extend_from_slice(&months.to_le_bytes());
+            buf.extend_from_slice(&days.to_le_bytes());
+            buf.extend_from_slice(&micros.to_le_bytes());
+        }
     }
     Ok(())
 }
@@ -701,6 +731,8 @@ fn dtype_byte(dtype: DataType) -> u8 {
         DataType::Varchar => dtype_tag::VARCHAR,
         DataType::Date => dtype_tag::DATE,
         DataType::Timestamp => dtype_tag::TIMESTAMP,
+        DataType::Decimal { .. } => dtype_tag::DECIMAL,
+        DataType::Interval => dtype_tag::INTERVAL,
     }
 }
 
@@ -792,6 +824,23 @@ impl<'a> Reader<'a> {
                     b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
                 ]))
             }
+            value_tag::DECIMAL => {
+                let b = self.take(16, what)?;
+                let mut x = [0u8; 16];
+                x.copy_from_slice(b);
+                let scale = self.u8(what)?;
+                Value::Decimal(i128::from_le_bytes(x), scale)
+            }
+            value_tag::INTERVAL => {
+                let b = self.take(16, what)?;
+                Value::Interval {
+                    months: i32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+                    days: i32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                    micros: i64::from_le_bytes([
+                        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+                    ]),
+                }
+            }
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown value tag {other}"
@@ -810,6 +859,16 @@ impl<'a> Reader<'a> {
             dtype_tag::VARCHAR => DataType::Varchar,
             dtype_tag::DATE => DataType::Date,
             dtype_tag::TIMESTAMP => DataType::Timestamp,
+            dtype_tag::DECIMAL => {
+                let precision = self.u8(what)?;
+                let scale = self.u8(what)?;
+                pinkdb::types::decimal_type(precision, scale).ok_or_else(|| {
+                    ProtocolError::Malformed(format!(
+                        "bad DECIMAL precision/scale {precision},{scale}"
+                    ))
+                })?
+            }
+            dtype_tag::INTERVAL => DataType::Interval,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown data type tag {other}"

@@ -311,6 +311,9 @@ fn nonzero_double(v: Option<Value>) -> Option<Value> {
 /// The lowercase type name a [`StatsBlock`] stores.
 #[cfg(any(not(feature = "vortex-format"), test))]
 pub(crate) fn dtype_name(dtype: DataType) -> String {
+    if let DataType::Decimal { precision, scale } = dtype {
+        return format!("decimal({precision},{scale})");
+    }
     match dtype {
         DataType::Boolean => "boolean",
         DataType::Integer => "integer",
@@ -319,12 +322,20 @@ pub(crate) fn dtype_name(dtype: DataType) -> String {
         DataType::Varchar => "varchar",
         DataType::Date => "date",
         DataType::Timestamp => "timestamp",
+        DataType::Interval => "interval",
+        DataType::Decimal { .. } => unreachable!("handled above"),
     }
     .to_string()
 }
 
 /// [`dtype_name`] in reverse; `None` for an unknown name.
 pub(crate) fn dtype_from_name(name: &str) -> Option<DataType> {
+    if let Some(rest) = name.strip_prefix("decimal(") {
+        let (p, s) = rest.strip_suffix(')')?.split_once(',')?;
+        let precision: u8 = p.parse().ok()?;
+        let scale: u8 = s.parse().ok()?;
+        return pinkdb::types::decimal_type(precision, scale);
+    }
     Some(match name {
         "boolean" => DataType::Boolean,
         "integer" => DataType::Integer,
@@ -333,6 +344,7 @@ pub(crate) fn dtype_from_name(name: &str) -> Option<DataType> {
         "varchar" => DataType::Varchar,
         "date" => DataType::Date,
         "timestamp" => DataType::Timestamp,
+        "interval" => DataType::Interval,
         _ => return None,
     })
 }
@@ -351,6 +363,17 @@ pub(crate) fn encode_value(dtype: DataType, v: &Value) -> Option<String> {
         // Bit-exact: JSON has no NaN/±INF and `-0.0` must stay distinguishable.
         (DataType::Double, Value::Double(x)) => format!("{:016x}", x.to_bits()),
         (DataType::Varchar, Value::Varchar(s)) => s.clone(),
+        (DataType::Decimal { scale, .. }, Value::Decimal(x, s)) if *s == scale => {
+            pinkdb::types::format_decimal(*x, *s)
+        }
+        (
+            DataType::Interval,
+            Value::Interval {
+                months,
+                days,
+                micros,
+            },
+        ) => pinkdb::types::format_interval(*months, *days, *micros),
         _ => return None,
     })
 }
@@ -374,6 +397,18 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
             Value::Double(f64::from_bits(u64::from_str_radix(s, 16).ok()?))
         }
         DataType::Varchar => Value::Varchar(s.to_string()),
+        DataType::Decimal { precision, scale } => Value::Decimal(
+            pinkdb::types::parse_decimal_str(s, precision, scale).ok()?,
+            scale,
+        ),
+        DataType::Interval => {
+            let iv = pinkdb::types::parse_interval(s)?;
+            Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            }
+        }
     })
 }
 

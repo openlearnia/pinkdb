@@ -95,7 +95,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | done | landed (engine + protocol v5 + FFI + client); Python/Go wrappers follow in wave 69 |
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
-| 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | in progress | worktree `wt-types` (patch integration) |
+| 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | done | landed; `.pink` v5, protocol v6, FFI text cells; duckdiff 155 → 165 |
 | 63 | Lake writes, DuckLake parity: incremental lake commits — append new immutable data files with per-file row ranges instead of whole-table rewrites, positional delete files for DELETE/UPDATE (merge-on-read; deletion-vector option as a follow-up), writable attached lakes, per-commit manifests, concurrent-writer retry/backoff (`max_retry_count`/`retry_backoff`/`retry_wait_ms` parity), WAL-logged for durable sessions | queued | DuckLake-parity program |
 | 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | queued | DuckLake-parity program |
 | 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | queued | DuckLake-parity program |
@@ -835,6 +835,35 @@ Java bindings.
   per-query time travel, evolution, partitioning and maintenance. All six stay
   queued for the next worktree batch after the in-flight four land
   (rate-limit cap: max four concurrent agents).
+- 2026-10-17 — Wave 62 (DECIMAL and INTERVAL; salvaged from the disk-full
+  incident's worktree and finished by hand): `Value::Decimal(i128, scale)` +
+  `DataType::Decimal{p,s}` and `Value::Interval{months, days, micros}` +
+  `DataType::Interval` end to end — literals (`CAST`, `::`), canonical display
+  (`format_decimal` trailing-zero rules, `format_interval`), arithmetic with
+  DuckDB's promotion rules (`+ - *` keep scale/width with the 38-digit caps,
+  `/` widens both sides to DOUBLE, `%` uses min integer digits), comparisons,
+  `SUM`/`AVG`, INSERT/CSV coercion from text and numerics, date ± interval,
+  month-end clamping, interval `*`/`/`, MIN/MAX — every rule pinned with
+  probes. Storage: `.pink` **v5** (dtype tags 7/8; DECIMAL's precision/scale
+  ride after the tag; PLAIN i128 and months/days/micros payloads; exact
+  min/max stats; v1–v4 stay readable, older builds refuse v5 via the
+  newer-magic path). Lake: lean `.pink` v1 lakes store both types (stats
+  encoding extended); the **Vortex writer refuses them with a clear
+  "not supported yet" error** — the Vortex mapping is a follow-up. Front ends:
+  protocol **v6** value/dtype tags with round-trip tests; FFI additive
+  `PINKDB_TYPE_DECIMAL/INTERVAL` cells marshaled as canonical text (+ header
+  enumerators); wave-59's `value_literal` renderer gained exact
+  `CAST('…' AS DECIMAL(38,s))` / `INTERVAL '…'` arms so bound DML replays.
+  Integration notes: conflicts with wave 59 resolved in `protocol.rs` (docs
+  merged → v6), `binder.rs` (placeholder helper ∪ decimal width/scale helpers)
+  and `peg_parser.rs` (kept both `?` and `INTERVAL` alternatives); a
+  `.pink.lock`/`.wal` test artifact was excluded from the patch and removed.
+  Gates on main: fmt, clippy (core + CLI), pinkdb 438/438 (+prepared 22),
+  encryption 455/455 (+21), server (protocol 22, server 25), FFI, CLI lake+s3
+  (multiprocess 27/27), pink-lake default + vortex-format, `bench/duckdiff.py`
+  **165/165**, workspace green. Follow-ups (not scheduled): DECIMAL/INTERVAL
+  in Vortex lakes; SQL numeric literals auto-typing as DECIMAL; a
+  prepared-parameter durable replay test for the new types.
 - 2026-10-17 — Wave 59 (prepared statements): `?` placeholders in the parser;
   inference + binding in the new `prepared` module (`PreparedStatement::parse`,
   parameter types resolved against the catalog at bind time, `CAST(? AS t)` to

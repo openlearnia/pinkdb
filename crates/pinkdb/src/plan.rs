@@ -855,6 +855,52 @@ pub fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
+        // DECIMAL compares numerically across scales; INTERVAL normalizes
+        // months to 30-day months (DuckDB rules).
+        (Value::Decimal(x, sx), Value::Decimal(y, sy)) => {
+            crate::types::decimal_cmp(*x, *sx, *y, *sy)
+        }
+        (Value::Decimal(x, sx), y) if y.data_type() == Some(DataType::Double) => {
+            num_cmp(crate::types::decimal_to_f64(*x, *sx), as_double(y))
+        }
+        (x, Value::Decimal(y, sy)) if x.data_type() == Some(DataType::Double) => {
+            num_cmp(as_double(x), crate::types::decimal_to_f64(*y, *sy))
+        }
+        (Value::Decimal(x, sx), Value::Integer(y)) => {
+            crate::types::decimal_cmp(*x, *sx, *y as i128, 0)
+        }
+        (Value::Integer(x), Value::Decimal(y, sy)) => {
+            crate::types::decimal_cmp(*x as i128, 0, *y, *sy)
+        }
+        (Value::Decimal(x, sx), Value::Bigint(y)) => {
+            crate::types::decimal_cmp(*x, *sx, *y as i128, 0)
+        }
+        (Value::Bigint(x), Value::Decimal(y, sy)) => {
+            crate::types::decimal_cmp(*x as i128, 0, *y, *sy)
+        }
+        (
+            Value::Interval {
+                months: am,
+                days: ad,
+                micros: au,
+            },
+            Value::Interval {
+                months: bm,
+                days: bd,
+                micros: bu,
+            },
+        ) => crate::types::interval_cmp(
+            crate::types::Interval {
+                months: *am,
+                days: *ad,
+                micros: *au,
+            },
+            crate::types::Interval {
+                months: *bm,
+                days: *bd,
+                micros: *bu,
+            },
+        ),
         // Binder rejects mixed-type comparisons; order deterministically anyway.
         _ => format!("{a:?}").cmp(&format!("{b:?}")),
     }
@@ -878,6 +924,15 @@ pub(crate) fn win_output_schema(
 pub(crate) fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {
     // NaN sorts equal to itself here (grouping/display edge, not ORDER truth).
     x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// A DOUBLE `Value` (the mixed decimal/double comparator's helper; callers
+/// guard the type).
+fn as_double(v: &Value) -> f64 {
+    match v {
+        Value::Double(x) => *x,
+        _ => unreachable!("as_double on a non-DOUBLE value"),
+    }
 }
 
 /// Subtract `by` from every column index in `expr` (used to rebase

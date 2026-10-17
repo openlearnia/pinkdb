@@ -76,7 +76,11 @@ enum {
     PINKDB_TYPE_DOUBLE = 4,
     PINKDB_TYPE_VARCHAR = 5,
     PINKDB_TYPE_DATE = 6,
-    PINKDB_TYPE_TIMESTAMP = 7
+    PINKDB_TYPE_TIMESTAMP = 7,
+    /* v1 additive: DECIMAL/INTERVAL render into `text` (canonical DuckDB
+       forms); `i`/`d` are zero. */
+    PINKDB_TYPE_DECIMAL = 8,
+    PINKDB_TYPE_INTERVAL = 9
 };
 
 /* One result value, passed by value.

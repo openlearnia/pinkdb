@@ -177,6 +177,74 @@ impl DataTable {
             (Value::Varchar(s), DataType::Varchar) => Ok(Value::Varchar(s)),
             (Value::Date(d), DataType::Date) => Ok(Value::Date(d)),
             (Value::Timestamp(us), DataType::Timestamp) => Ok(Value::Timestamp(us)),
+            // DECIMAL/INTERVAL columns accept numeric values and string cells
+            // (parsed like an implicit cast), mirroring DuckDB's INSERT/CSV
+            // behavior.
+            (Value::Decimal(x, from), DataType::Decimal { precision, scale }) => {
+                crate::types::rescale_decimal(x, from, scale)
+                    .filter(|y| crate::types::decimal_fits(*y, precision))
+                    .map(|y| Value::Decimal(y, scale))
+                    .ok_or_else(|| {
+                        PinkDbError::Type(format!(
+                            "cannot coerce {} to DECIMAL({precision},{scale}): value out of range",
+                            crate::types::format_decimal(x, from)
+                        ))
+                    })
+            }
+            (Value::Integer(i), DataType::Decimal { precision, scale }) => {
+                crate::types::int_to_decimal(i as i128, precision, scale)
+                    .map(|x| Value::Decimal(x, scale))
+                    .ok_or_else(|| {
+                        PinkDbError::Type(format!(
+                            "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
+                        ))
+                    })
+            }
+            (Value::Bigint(i), DataType::Decimal { precision, scale }) => {
+                crate::types::int_to_decimal(i as i128, precision, scale)
+                    .map(|x| Value::Decimal(x, scale))
+                    .ok_or_else(|| {
+                        PinkDbError::Type(format!(
+                            "cannot coerce {i} to DECIMAL({precision},{scale}): value out of range"
+                        ))
+                    })
+            }
+            (Value::Double(x), DataType::Decimal { precision, scale }) => {
+                crate::types::f64_to_decimal(x, precision, scale)
+                    .map(|v| Value::Decimal(v, scale))
+                    .ok_or_else(|| {
+                        PinkDbError::Type(format!(
+                            "cannot coerce {x} to DECIMAL({precision},{scale}): value out of range"
+                        ))
+                    })
+            }
+            (Value::Varchar(s), DataType::Decimal { precision, scale }) => {
+                crate::types::parse_decimal_str(&s, precision, scale)
+                    .map(|x| Value::Decimal(x, scale))
+                    .map_err(PinkDbError::Type)
+            }
+            (
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+                DataType::Interval,
+            ) => Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            }),
+            (Value::Varchar(s), DataType::Interval) => match crate::types::parse_interval(&s) {
+                Some(iv) => Ok(Value::Interval {
+                    months: iv.months,
+                    days: iv.days,
+                    micros: iv.micros,
+                }),
+                None => Err(PinkDbError::Type(format!(
+                    "cannot parse \"{s}\" as INTERVAL"
+                ))),
+            },
             (v, t) => Err(PinkDbError::Type(format!("cannot coerce {v} to {t}"))),
         }
     }

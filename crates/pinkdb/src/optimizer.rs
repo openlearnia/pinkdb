@@ -107,6 +107,12 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         && rebuilt.is_aggregate_free()
         && !rebuilt.has_subquery()
         && !rebuilt.contains_dynamic_scalar()
+        // A folded value cannot carry a parameterized type (a DECIMAL value
+        // only knows its scale, not its precision) while downstream
+        // output-schema/flush paths read the type off the expression, so
+        // DECIMAL/INTERVAL casts stay unfolded. Evaluation is per-row either
+        // way; this is a correctness guard, not a perf choice.
+        && !contains_parameterized_cast(&rebuilt)
     {
         if let Ok(v) = eval_expr(&rebuilt, &const_chunk(), cx) {
             if v.len() == 1 {
@@ -115,6 +121,42 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         }
     }
     rebuilt
+}
+
+/// True when any node of `expr` is a cast whose target type carries
+/// parameters a `Value` cannot round-trip (DECIMAL precision, INTERVAL).
+/// Such a tree must not be constant-folded into a literal.
+fn contains_parameterized_cast(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Cast { expr, dtype } => {
+            matches!(
+                dtype,
+                crate::types::DataType::Decimal { .. } | crate::types::DataType::Interval
+            ) || contains_parameterized_cast(expr)
+        }
+        BoundExpr::Literal(_) | BoundExpr::Column { .. } | BoundExpr::AggRef { .. } => false,
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. } => contains_parameterized_cast(e),
+        BoundExpr::Binary { left, right, .. } => {
+            contains_parameterized_cast(left) || contains_parameterized_cast(right)
+        }
+        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            args.iter().any(contains_parameterized_cast)
+        }
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
+            branches
+                .iter()
+                .any(|(c, v)| contains_parameterized_cast(c) || contains_parameterized_cast(v))
+                || else_
+                    .as_ref()
+                    .is_some_and(|e| contains_parameterized_cast(e))
+        }
+        // Subqueries/dynamic calls/window refs: not folded anyway.
+        _ => false,
+    }
 }
 
 fn fold_aggs(

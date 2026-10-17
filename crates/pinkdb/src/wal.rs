@@ -4524,7 +4524,7 @@ mod tests {
     /// T6: a checkpoint publishes the current format (v4) and a durable
     /// reopen replays later WAL records on top of it.
     #[test]
-    fn checkpoint_publishes_v4_and_replays_later_records() {
+    fn checkpoint_publishes_v5_and_replays_later_records() {
         let ckpt = tmp_ckpt("v4_ckpt");
         {
             let db = crate::Database::open(ckpt.to_str().unwrap()).unwrap();
@@ -4534,7 +4534,7 @@ mod tests {
                 .unwrap();
             c.execute("checkpoint;").unwrap();
             let bytes = std::fs::read(&ckpt).unwrap();
-            assert!(bytes.starts_with(b"PINKDB04"), "checkpoint publishes v4");
+            assert!(bytes.starts_with(b"PINKDB05"), "checkpoint publishes v5");
             // A commit after the checkpoint: the WAL record must survive.
             c.execute("INSERT INTO t VALUES (3, 'three');").unwrap();
         }

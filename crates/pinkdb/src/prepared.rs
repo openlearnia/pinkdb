@@ -298,6 +298,21 @@ pub(crate) fn value_literal(value: &Value) -> Result<String> {
         Value::Double(x) if x.is_sign_negative() => "CAST('-inf' AS DOUBLE)".to_string(),
         Value::Double(_) => "CAST('inf' AS DOUBLE)".to_string(),
         Value::Varchar(s) => format!("'{}'", s.replace('\'', "''")),
+        // DECIMAL keeps its exact unscaled value: pin through the widest
+        // precision, which every engine-produced DECIMAL(p ≤ 38) fits.
+        Value::Decimal(x, scale) => format!(
+            "CAST('{}' AS DECIMAL(38,{scale}))",
+            crate::types::format_decimal(*x, *scale)
+        ),
+        // INTERVAL's canonical text round-trips through its literal form.
+        Value::Interval {
+            months,
+            days,
+            micros,
+        } => format!(
+            "INTERVAL '{}'",
+            crate::types::format_interval(*months, *days, *micros)
+        ),
         Value::Date(days) if (MIN_LITERAL_DAY..=MAX_LITERAL_DAY).contains(days) => {
             format!("DATE '{}'", crate::types::format_date(*days))
         }

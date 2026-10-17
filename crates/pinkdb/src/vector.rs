@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use crate::types::{DataType, PinkDbError, Result, Value};
+use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 
 /// Max rows per vector / chunk. DuckDB uses 2048; so do we.
 pub const CHUNK_SIZE: usize = 2048;
@@ -22,10 +22,19 @@ pub enum VectorData {
     VarChar(Vec<Arc<str>>),
     Date32(Vec<i32>),
     TimestampMicros(Vec<i64>),
+    /// DECIMAL: unscaled i128 values. Precision/scale ride with the payload
+    /// so [`Vector::dtype`] reconstructs the column's `DECIMAL(p,s)` exactly.
+    Decimal {
+        values: Vec<i128>,
+        precision: u8,
+        scale: u8,
+    },
+    /// INTERVAL: DuckDB's `(months, days, micros)` triples.
+    Interval(Vec<Interval>),
 }
 
 impl VectorData {
-    fn dtype(&self) -> DataType {
+    pub(crate) fn dtype(&self) -> DataType {
         match self {
             VectorData::Boolean(_) => DataType::Boolean,
             VectorData::Int32(_) => DataType::Integer,
@@ -34,6 +43,13 @@ impl VectorData {
             VectorData::VarChar(_) => DataType::Varchar,
             VectorData::Date32(_) => DataType::Date,
             VectorData::TimestampMicros(_) => DataType::Timestamp,
+            VectorData::Decimal {
+                precision, scale, ..
+            } => DataType::Decimal {
+                precision: *precision,
+                scale: *scale,
+            },
+            VectorData::Interval(_) => DataType::Interval,
         }
     }
 
@@ -52,6 +68,8 @@ impl VectorData {
             VectorData::VarChar(v) => v.len(),
             VectorData::Date32(v) => v.len(),
             VectorData::TimestampMicros(v) => v.len(),
+            VectorData::Decimal { values, .. } => values.len(),
+            VectorData::Interval(v) => v.len(),
         }
     }
 
@@ -64,6 +82,12 @@ impl VectorData {
             DataType::Varchar => VectorData::VarChar(Vec::with_capacity(cap)),
             DataType::Date => VectorData::Date32(Vec::with_capacity(cap)),
             DataType::Timestamp => VectorData::TimestampMicros(Vec::with_capacity(cap)),
+            DataType::Decimal { precision, scale } => VectorData::Decimal {
+                values: Vec::with_capacity(cap),
+                precision,
+                scale,
+            },
+            DataType::Interval => VectorData::Interval(Vec::with_capacity(cap)),
         }
     }
 }
@@ -135,6 +159,32 @@ impl Vector {
             }
             Value::Date(d) => (VectorData::Date32(vec![*d; n]), true),
             Value::Timestamp(us) => (VectorData::TimestampMicros(vec![*us; n]), true),
+            Value::Decimal(v, scale) => (
+                VectorData::Decimal {
+                    values: vec![*v; n],
+                    precision: crate::types::decimal_digits(*v)
+                        .max(*scale as u32)
+                        .clamp(1, crate::types::DECIMAL_MAX_PRECISION as u32)
+                        as u8,
+                    scale: *scale,
+                },
+                true,
+            ),
+            Value::Interval {
+                months,
+                days,
+                micros,
+            } => (
+                VectorData::Interval(vec![
+                    Interval {
+                        months: *months,
+                        days: *days,
+                        micros: *micros,
+                    };
+                    n
+                ]),
+                true,
+            ),
         };
         let mut validity = vec![if all_valid { u64::MAX } else { 0 }; mask_len(n)];
         if all_valid && !n.is_multiple_of(64) {
@@ -173,6 +223,8 @@ impl Vector {
             VectorData::VarChar(v) => v.push(Arc::from("")),
             VectorData::Date32(v) => v.push(0),
             VectorData::TimestampMicros(v) => v.push(0),
+            VectorData::Decimal { values, .. } => values.push(0),
+            VectorData::Interval(v) => v.push(Interval::default()),
         }
     }
 
@@ -278,6 +330,12 @@ impl Vector {
             VectorData::VarChar(v) => Value::Varchar(v[idx].to_string()),
             VectorData::Date32(v) => Value::Date(v[idx]),
             VectorData::TimestampMicros(v) => Value::Timestamp(v[idx]),
+            VectorData::Decimal { values, scale, .. } => Value::Decimal(values[idx], *scale),
+            VectorData::Interval(v) => Value::Interval {
+                months: v[idx].months,
+                days: v[idx].days,
+                micros: v[idx].micros,
+            },
         }
     }
 
@@ -307,6 +365,21 @@ impl Vector {
             (VectorData::VarChar(v), Value::Varchar(s)) => v.push(s.into()),
             (VectorData::Date32(v), Value::Date(d)) => v.push(d),
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v.push(us),
+            (VectorData::Decimal { values, scale, .. }, Value::Decimal(v, s)) if s == *scale => {
+                values.push(v);
+            }
+            (
+                VectorData::Interval(v),
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+            ) => v.push(Interval {
+                months,
+                days,
+                micros,
+            }),
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
                     "type mismatch: cannot push {other} into {:?} vector",
@@ -382,6 +455,30 @@ impl Vector {
         Ok(())
     }
 
+    /// Typed DECIMAL append: the value's scale must match the column's.
+    pub(crate) fn push_decimal(&mut self, v: i128, scale: u8) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Decimal {
+                values, scale: s, ..
+            } if *s == scale => values.push(v),
+            data => return Err(typed_push_error("a decimal", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
+    /// Typed INTERVAL append.
+    pub(crate) fn push_interval(&mut self, iv: Interval) -> Result<()> {
+        self.check_room()?;
+        match &mut self.data {
+            VectorData::Interval(v) => v.push(iv),
+            data => return Err(typed_push_error("an interval", data.dtype())),
+        }
+        self.finish_typed_push();
+        Ok(())
+    }
+
     /// Shared tail of the typed push helpers: bump `len`, mark the new row valid.
     fn finish_typed_push(&mut self) {
         self.len += 1;
@@ -417,6 +514,12 @@ impl Vector {
                 d.extend_from_slice(&s[start..start + len]);
             }
             (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
+                d.extend_from_slice(&s[start..start + len]);
+            }
+            (VectorData::Interval(d), VectorData::Interval(s)) => {
                 d.extend_from_slice(&s[start..start + len]);
             }
             _ => unreachable!("extend_from: vector dtype mismatch"),
@@ -460,6 +563,23 @@ impl Vector {
             (VectorData::VarChar(v), Value::Varchar(s)) => v[idx] = s.into(),
             (VectorData::Date32(v), Value::Date(d)) => v[idx] = d,
             (VectorData::TimestampMicros(v), Value::Timestamp(us)) => v[idx] = us,
+            (VectorData::Decimal { values, scale, .. }, Value::Decimal(v, s)) if s == *scale => {
+                values[idx] = v;
+            }
+            (
+                VectorData::Interval(v),
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+            ) => {
+                v[idx] = Interval {
+                    months,
+                    days,
+                    micros,
+                }
+            }
             (_, Value::Null) => {} // placeholder stays; bit cleared below
             (data, other) => {
                 return Err(PinkDbError::Type(format!(
@@ -527,6 +647,22 @@ impl Vector {
                 buf.push(7);
                 buf.extend_from_slice(&v[idx].to_le_bytes());
             }
+            // DECIMAL keys encode the scale too: the tag byte keeps them out
+            // of other domains, and the scale keeps two different types'
+            // keys apart (mixed-scale keys are coerced to a common type
+            // before hashing, so equality and grouping agree).
+            VectorData::Decimal { values, scale, .. } => {
+                buf.push(8);
+                buf.push(*scale);
+                buf.extend_from_slice(&values[idx].to_le_bytes());
+            }
+            VectorData::Interval(v) => {
+                buf.push(9);
+                let iv = &v[idx];
+                buf.extend_from_slice(&iv.months.to_le_bytes());
+                buf.extend_from_slice(&iv.days.to_le_bytes());
+                buf.extend_from_slice(&iv.micros.to_le_bytes());
+            }
         }
     }
     /// Copy element `idx` from `other` into `self` (for UPDATE-adjacent
@@ -552,6 +688,10 @@ impl Vector {
             (VectorData::VarChar(d), VectorData::VarChar(s)) => d.push(s[idx].clone()),
             (VectorData::Date32(d), VectorData::Date32(s)) => d.push(s[idx]),
             (VectorData::TimestampMicros(d), VectorData::TimestampMicros(s)) => d.push(s[idx]),
+            (VectorData::Decimal { values: d, .. }, VectorData::Decimal { values: s, .. }) => {
+                d.push(s[idx])
+            }
+            (VectorData::Interval(d), VectorData::Interval(s)) => d.push(s[idx]),
             _ => {
                 return Err(PinkDbError::Execution(
                     "push_from needs matching vector types".to_string(),

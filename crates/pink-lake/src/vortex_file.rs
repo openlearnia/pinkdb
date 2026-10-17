@@ -129,6 +129,10 @@ impl TypeTag {
             DataType::Varchar => TypeTag::Varchar,
             DataType::Date => TypeTag::Date,
             DataType::Timestamp => TypeTag::Timestamp,
+            // Refused at the encode entry: there is no Vortex mapping yet.
+            DataType::Decimal { .. } | DataType::Interval => {
+                unreachable!("DECIMAL/INTERVAL are refused at the Vortex encode entry")
+            }
         }
     }
 
@@ -341,6 +345,20 @@ fn encode_table_with_metadata(
             message: format!(
                 "table \"{dbname}.{table}\" has no columns and cannot be encoded as \
                  a Vortex file"
+            ),
+        });
+    }
+    // DECIMAL and INTERVAL have no Vortex storage mapping yet: the engine's
+    // persistence (`.pink` v5) and the lean `lake-lite` lake format support
+    // both. Refuse at the encode entry instead of mis-encoding.
+    if let Some((name, dtype)) = schema
+        .iter()
+        .find(|(_, t)| matches!(t, DataType::Decimal { .. } | DataType::Interval))
+    {
+        return Err(LakeError::NotRepresentable {
+            message: format!(
+                "column \"{name}\" ({dtype}) is not supported by the Vortex lake format \
+                 yet; use the lean `lake-lite` build or the engine's `.pink` persistence"
             ),
         });
     }
@@ -782,6 +800,19 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
         DataType::Varchar => VectorData::VarChar(vec![Arc::from(""); rows]),
         DataType::Date => VectorData::Date32(vec![0; rows]),
         DataType::Timestamp => VectorData::TimestampMicros(vec![0; rows]),
+        DataType::Decimal { precision, scale } => VectorData::Decimal {
+            values: vec![0; rows],
+            precision,
+            scale,
+        },
+        DataType::Interval => VectorData::Interval(vec![
+            pinkdb::types::Interval {
+                months: 0,
+                days: 0,
+                micros: 0,
+            };
+            rows
+        ]),
     };
     // No validity words: every row reads NULL.
     Vector::from_raw(data, Vec::new())
@@ -1235,6 +1266,10 @@ fn field_dtype(t: DataType, nullability: Nullability) -> DType {
         DataType::Bigint | DataType::Timestamp => DType::Primitive(PType::I64, nullability),
         DataType::Double => DType::Primitive(PType::F64, nullability),
         DataType::Varchar => DType::Utf8(nullability),
+        // Refused at the encode entry: there is no Vortex mapping yet.
+        DataType::Decimal { .. } | DataType::Interval => {
+            unreachable!("DECIMAL/INTERVAL are refused at the Vortex encode entry")
+        }
     }
 }
 
@@ -1553,6 +1588,11 @@ fn decode_column(
                 }
             }
             VectorData::Float64(v)
+        }
+        // Never written: the encode entry refuses these types, so no file
+        // this build reads carries them.
+        DataType::Decimal { .. } | DataType::Interval => {
+            unreachable!("DECIMAL/INTERVAL are refused at the Vortex encode entry")
         }
     };
     Ok(Vector::from_raw(data, words))

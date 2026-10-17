@@ -173,6 +173,21 @@ fn push_field(col: &mut Vector, field: &str, dtype: DataType) -> Result<()> {
                 "cannot parse \"{c}\" as BOOLEAN"
             ))),
         },
+        DataType::Decimal { precision, scale } => {
+            let v =
+                crate::types::parse_decimal_str(c, precision, scale).map_err(PinkDbError::Type)?;
+            col.push_valid(Value::Decimal(v, scale))
+        }
+        DataType::Interval => match crate::types::parse_interval(c) {
+            Some(iv) => col.push_valid(Value::Interval {
+                months: iv.months,
+                days: iv.days,
+                micros: iv.micros,
+            }),
+            None => Err(PinkDbError::Type(format!(
+                "cannot parse \"{c}\" as INTERVAL"
+            ))),
+        },
         DataType::Integer => c
             .parse::<i32>()
             .map(Value::Integer)

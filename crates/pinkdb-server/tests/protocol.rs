@@ -465,3 +465,44 @@ fn result_set_length_mismatch_does_not_encode() {
     let err = encode_response(&response).unwrap_err();
     assert!(err.to_string().contains("2 names but 1 types"), "{err}");
 }
+
+#[test]
+fn decimal_and_interval_values_round_trip() {
+    let rows = vec![
+        vec![
+            Value::Decimal(0, 0),
+            Value::Decimal(-123_456_789_012_345_678_901_234_567_890, 18),
+            Value::Decimal(i128::MIN, 38),
+            Value::Decimal(i128::MAX, 38),
+            Value::Interval {
+                months: i32::MIN,
+                days: i32::MAX,
+                micros: i64::MIN,
+            },
+            Value::Interval {
+                months: 0,
+                days: 0,
+                micros: i64::MAX,
+            },
+        ],
+        vec![
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ],
+    ];
+    response_round_trip(Response::Rows { rows });
+    response_round_trip(Response::ResultSet {
+        names: vec!["d".to_string(), "iv".to_string()],
+        types: vec![
+            DataType::Decimal {
+                precision: 18,
+                scale: 3,
+            },
+            DataType::Interval,
+        ],
+    });
+}

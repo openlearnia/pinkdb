@@ -206,6 +206,8 @@ CREATE TABLE dk (k DOUBLE, v INTEGER);
 INSERT INTO dk VALUES (1.0, 1), (1.5, 2), (2.0, 3);
 CREATE TABLE typed (a BIGINT, b TIMESTAMP);
 CREATE VIEW emp_view AS SELECT id, name FROM emp WHERE id > 1;
+CREATE TABLE dt (x DECIMAL(6,2), iv INTERVAL);
+INSERT INTO dt VALUES ('1.25', '1 day'), ('2.50', '2 hours'), (NULL, NULL);
 """
 
 # (label, sql, ordered, expect_error)
@@ -371,6 +373,17 @@ QUERIES = [
     ("bad-range-no-order", "SELECT x, SUM(x) OVER (RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM nn;", False, True),
     ("bad-range-varchar", "SELECT x, SUM(x) OVER (ORDER BY CAST(x AS VARCHAR) RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM nn;", False, True),
     ("bad-count-distinct-star", "SELECT COUNT(DISTINCT *) FROM nn;", False, True),
+    # --- wave 62: DECIMAL / INTERVAL ---
+    ("dec-add", "SELECT CAST('12.34' AS DECIMAL(6,2)) + CAST('1.66' AS DECIMAL(6,2));", False, False),
+    ("dec-display", "SELECT CAST('5' AS DECIMAL(6,2)), CAST('-0.05' AS DECIMAL(6,2)), CAST('12.345' AS DECIMAL(6,1));", False, False),
+    ("dec-mul-div-mod", "SELECT CAST('1.5' AS DECIMAL(4,1)) * CAST('2.0' AS DECIMAL(4,1)), CAST('1.0' AS DECIMAL(4,1)) / CAST('3.0' AS DECIMAL(4,1)), CAST('6.0' AS DECIMAL(4,1)) % CAST('4.0' AS DECIMAL(4,1));", False, False),
+    ("dec-cast-cmp", "SELECT CAST(CAST('1.5' AS DECIMAL(4,1)) AS DOUBLE), CAST(CAST('1.5' AS DECIMAL(4,1)) AS VARCHAR), CAST('3.5' AS DECIMAL(4,1)) = 3.5, CAST('3.5' AS DECIMAL(4,1)) > 3.4;", False, False),
+    ("dec-agg", "SELECT SUM(x), AVG(x), MIN(x), MAX(x), COUNT(x) FROM dt;", False, False),
+    ("interval-lit", "SELECT INTERVAL '1 day 02:00:00', INTERVAL '2 months' - INTERVAL '15 days';", False, False),
+    ("interval-arith", "SELECT INTERVAL '1 day' * 2, INTERVAL '1 day' / 2;", False, False),
+    ("interval-date", "SELECT DATE '2024-01-31' + INTERVAL '1 month', TIMESTAMP '2024-03-31 10:00:00' + INTERVAL '2 days 3 hours';", False, False),
+    ("interval-cast-agg", "SELECT CAST('1 day' AS INTERVAL), MIN(iv), MAX(iv) FROM dt;", False, False),
+    ("interval-ident", "SELECT 7 AS interval;", False, False),
 ]
 
 
