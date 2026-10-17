@@ -43,6 +43,38 @@ fn seeded() -> PinkDb {
 }
 
 #[test]
+fn add_column_default_expression_depth_is_bounded() {
+    let mut db = seeded();
+    // A left-deep chain in the DEFAULT must hit the AST-depth guard instead of
+    // recursing through bind/execute: the depth walk used to skip the default.
+    let deep = format!("1{}", "+1".repeat(200));
+    let e = err(
+        &mut db,
+        &format!("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT {deep};"),
+    );
+    assert!(e.contains("too deep"), "{e}");
+}
+
+#[test]
+fn prepared_add_column_default_binds_a_placeholder() {
+    let mut db = seeded();
+    // A `?` in the ALTER default must be renumbered to a parameter rank (it
+    // used to keep its byte offset, failing with "no parameter slot").
+    let stmt = db
+        .prepare("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT ?;")
+        .unwrap();
+    db.execute_prepared(&stmt, &[Value::Integer(7)]).unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT n FROM t ORDER BY i;"),
+        vec![
+            vec![Value::Integer(7)],
+            vec![Value::Integer(7)],
+            vec![Value::Integer(7)],
+        ]
+    );
+}
+
+#[test]
 fn add_column_with_default_materializes_and_later_inserts_use_it() {
     let mut db = seeded();
     let results = db

@@ -252,6 +252,15 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                 ast::Statement::Select(select) => {
                     work.push((NodeRef::Select(select), child));
                 }
+                ast::Statement::AlterTable {
+                    op:
+                        ast::AlterTableOp::AddColumn {
+                            default: Some(e), ..
+                        },
+                    ..
+                } => {
+                    work.push((NodeRef::Expr(e), child));
+                }
                 _ => {}
             },
             NodeRef::Select(select) => {
@@ -460,6 +469,14 @@ fn take_statement_children(
         }
         ast::Statement::Select(select) => {
             selects.push(std::mem::replace(select, empty_select()));
+        }
+        ast::Statement::AlterTable {
+            op: ast::AlterTableOp::AddColumn { default, .. },
+            ..
+        } => {
+            if let Some(e) = default.take() {
+                exprs.push(e);
+            }
         }
         _ => {}
     }

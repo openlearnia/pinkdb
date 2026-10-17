@@ -345,6 +345,12 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
             ..
         } => collect_expr_offsets(e, out),
         Statement::Select(sel) => collect_select_offsets(sel, out),
+        Statement::AlterTable {
+            op: AlterTableOp::AddColumn {
+                default: Some(e), ..
+            },
+            ..
+        } => collect_expr_offsets(e, out),
         _ => {}
     }
 }
@@ -473,6 +479,12 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
             ..
         } => apply_expr_ranks(e, offsets),
         Statement::Select(sel) => apply_select_ranks(sel, offsets),
+        Statement::AlterTable {
+            op: AlterTableOp::AddColumn {
+                default: Some(e), ..
+            },
+            ..
+        } => apply_expr_ranks(e, offsets),
         _ => {}
     }
 }
