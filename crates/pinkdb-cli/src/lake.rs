@@ -98,8 +98,10 @@ fn lake_key() -> Option<pink_lake::EncryptionKey> {
     match pink_lake::EncryptionKey::from_env() {
         Ok(key) => key,
         Err(e) => {
+            // Fail closed: a set-but-invalid PINKDB_KEY must never fall through
+            // to a plaintext lake. (The REPL also checks at startup.)
             cli_error!("{e}");
-            None
+            std::process::exit(2);
         }
     }
 }
@@ -181,10 +183,10 @@ fn commit_settings() -> CommitSettings {
     }
     if let Ok(raw) = std::env::var("PINKDB_LAKE_RETRY_BACKOFF") {
         match raw.trim().parse::<f64>() {
-            Ok(v) if v >= 0.0 => settings.retry_backoff = v,
+            Ok(v) if v.is_finite() && v >= 0.0 => settings.retry_backoff = v,
             _ => eprintln!(
-                "warning: PINKDB_LAKE_RETRY_BACKOFF={raw:?} is not a non-negative number; \
-                 using {}",
+                "warning: PINKDB_LAKE_RETRY_BACKOFF={raw:?} is not a finite non-negative \
+                 number; using {}",
                 settings.retry_backoff
             ),
         }
@@ -887,7 +889,10 @@ fn set_baseline_version_only(location: &str, version: u64) {
 /// writes — and new commits (and a `.lake save` of the table) split rows
 /// into one data file per partition value set.
 fn cmd_partition(db: &PinkDb, arg: &str) {
-    let _ = db;
+    if db.in_transaction() {
+        cli_error!(".lake partition is not allowed inside a transaction; COMMIT or ROLLBACK first");
+        return;
+    }
     let usage = "Usage: .lake partition <dir> <table> by (<key>, ...) | clear{HINT}";
     let Some((dir, rest)) = take_token(arg) else {
         println!("{usage}");

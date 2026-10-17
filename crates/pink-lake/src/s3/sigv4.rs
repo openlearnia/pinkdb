@@ -86,12 +86,32 @@ pub(crate) struct Signature {
     pub(crate) signature: String,
 }
 
+/// SigV4 canonicalization of a header value: trim, and collapse each run of
+/// spaces/tabs to a single space (AWS's rule; a signed double space would
+/// otherwise `SignatureDoesNotMatch`).
+fn canonical_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_space = false;
+    for c in value.trim().chars() {
+        if c == ' ' || c == '\t' {
+            if !in_space {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(c);
+            in_space = false;
+        }
+    }
+    out
+}
+
 /// Sign one request with `credentials`.
 pub(crate) fn sign(credentials: &Credentials, input: &SigningInput<'_>) -> Signature {
     let mut headers: Vec<(String, String)> = input
         .headers
         .iter()
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+        .map(|(name, value)| (name.to_ascii_lowercase(), canonical_value(value)))
         .collect();
     if let Some(token) = &credentials.session_token {
         // The token is part of the request; make sure it is signed even when
@@ -100,7 +120,7 @@ pub(crate) fn sign(credentials: &Credentials, input: &SigningInput<'_>) -> Signa
             .iter()
             .any(|(name, _)| name == "x-amz-security-token")
         {
-            headers.push(("x-amz-security-token".to_string(), token.trim().to_string()));
+            headers.push(("x-amz-security-token".to_string(), canonical_value(token)));
         }
     }
     headers.sort();
@@ -215,6 +235,13 @@ mod tests {
 
     fn at(secs: u64) -> (String, String) {
         amz_date_utc(UNIX_EPOCH + Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn canonical_header_values_collapse_internal_whitespace() {
+        assert_eq!(canonical_value("  a   b\t c  "), "a b c");
+        assert_eq!(canonical_value("plain"), "plain");
+        assert_eq!(canonical_value("   "), "");
     }
 
     /// AWS SigV4 test suite `get-vanilla`: the plainest request there is, in

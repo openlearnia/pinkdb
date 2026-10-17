@@ -587,13 +587,18 @@ mod imp {
         prefix.copy_from_slice(&data[19..27]);
         let binding_len = u32::from_le_bytes(data[27..31].try_into().expect("4 bytes")) as usize;
         let mut pos = HEADER_FIXED_LEN;
-        if data.len() < pos + binding_len {
+        // Checked: on a 32-bit target `pos + binding_len` can wrap for a crafted
+        // (up to u32::MAX) length, letting the slice below panic.
+        let Some(binding_end) = pos
+            .checked_add(binding_len)
+            .filter(|end| *end <= data.len())
+        else {
             return Err(tampered(path, "truncated binding"));
-        }
-        let binding = std::str::from_utf8(&data[pos..pos + binding_len])
+        };
+        let binding = std::str::from_utf8(&data[pos..binding_end])
             .map_err(|_| tampered(path, "binding is not valid UTF-8"))?
             .to_string();
-        pos += binding_len;
+        pos = binding_end;
         let derivation = match kdf {
             KDF_RAW => Derivation::Raw,
             KDF_ARGON2ID => {

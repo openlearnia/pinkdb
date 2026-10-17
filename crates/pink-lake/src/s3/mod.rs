@@ -1340,7 +1340,10 @@ impl S3Client {
         loop {
             let outcome = self.execute_once(method, key, query_pairs, extra, body);
             let retryable = match &outcome {
-                Ok(response) if matches!(response.status, 429 | 503) => true,
+                // A conditional write must not be retried on a transient error:
+                // the request may have committed, and a retry would see its own
+                // object (a bogus 412/conflict). Same guard as 5xx/transport.
+                Ok(response) if matches!(response.status, 429 | 503) => !conditional,
                 Ok(response) if matches!(response.status, 500 | 502 | 504) => !conditional,
                 Err(S3Error::Transport { .. }) => !conditional,
                 _ => false,
