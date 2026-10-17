@@ -357,7 +357,13 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
 fn crypto_domain(rel: &str) -> (crypto::Domain, &str) {
     if rel == CATALOG_FILE || rel.starts_with("snapshots/") {
         // Manifests are bound to nothing path-like: catalog.json and
-        // snapshots/<v>.json are the same bytes by construction.
+        // snapshots/<v>.json are the same bytes by construction, so the
+        // byte-identity invariant forces a binding that names neither path nor
+        // version. Consequence (deliberate, documented): a same-key manifest
+        // from another lake/version authenticates here — the caller's
+        // declared-`version`-vs-filename check is what rejects a mismatch, and
+        // a same-version replay across lakes sharing one key remains a known
+        // rollback surface, traded for the invariant.
         (crypto::Domain::Manifest, "")
     } else if rel.starts_with("commits/") {
         (crypto::Domain::Commit, rel)
@@ -438,6 +444,11 @@ impl CryptoStorage {
         match &self.crypto {
             None => Ok(bytes.to_vec()),
             Some(crypto) => {
+                // An explicit "already sealed" marker for the one seam that
+                // hands over ciphertext (`seal_manifest`: seal once, publish
+                // twice). Only manifest bytes can arrive pre-sealed, and no
+                // current writer produces non-container bytes beginning with
+                // the magic, so this cannot silently skip encrypting real data.
                 if crypto::is_container(bytes) {
                     return Ok(bytes.to_vec());
                 }
