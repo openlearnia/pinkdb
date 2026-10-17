@@ -39,13 +39,7 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             let v = eval_expr(expr, chunk, cx)?;
             eval_cast(&v, *dtype)
         }
-        BoundExpr::Coalesce { args, dtype } => {
-            let mut vecs = Vec::with_capacity(args.len());
-            for a in args {
-                vecs.push(eval_expr(a, chunk, cx)?);
-            }
-            eval_coalesce(*dtype, &vecs)
-        }
+        BoundExpr::Coalesce { args, dtype } => eval_coalesce(args, *dtype, chunk, cx),
         BoundExpr::Case {
             branches,
             else_,
@@ -2415,7 +2409,9 @@ pub(crate) fn cast_value(v: Value, target: DataType) -> Result<Value> {
 }
 
 /// `CASE WHEN c THEN v ... [ELSE e]`: first TRUE condition wins per row
-/// (NULL conditions never match). Missing ELSE is NULL.
+/// (NULL conditions never match). Missing ELSE is NULL. Each condition and
+/// value arm is evaluated only for the rows still undecided, so an unselected
+/// arm's row-dependent error (e.g. `y / x` when `x = 0`) is never raised.
 fn eval_case(
     branches: &[(BoundExpr, BoundExpr)],
     else_: &Option<Box<BoundExpr>>,
@@ -2423,51 +2419,105 @@ fn eval_case(
     chunk: &DataChunk,
     cx: &Cx,
 ) -> Result<Vector> {
-    let mut conds = Vec::with_capacity(branches.len());
-    let mut vals = Vec::with_capacity(branches.len());
+    let n = chunk.num_rows();
+    let mut slots: Vec<Option<Value>> = vec![None; n];
+    let mut undecided: Vec<usize> = (0..n).collect();
     for (c, v) in branches {
-        conds.push(eval_expr(c, chunk, cx)?);
-        vals.push(eval_expr(v, chunk, cx)?);
-    }
-    let els = match else_ {
-        Some(e) => Some(eval_expr(e, chunk, cx)?),
-        None => None,
-    };
-    let mut out = Vector::new_empty(dtype);
-    for i in 0..chunk.num_rows() {
-        let mut placed = false;
-        for (c, v) in conds.iter().zip(vals.iter()) {
-            if !c.is_null(i) && as_bool(c, i)? {
-                out.push_value(v.get(i))?;
-                placed = true;
-                break;
+        if undecided.is_empty() {
+            break;
+        }
+        // First branch (nothing decided yet) evaluates on the whole chunk.
+        let cond = if undecided.len() == n {
+            eval_expr(c, chunk, cx)?
+        } else {
+            eval_expr(c, &chunk.gather(&undecided), cx)?
+        };
+        let mut selected = Vec::new();
+        let mut rest = Vec::with_capacity(undecided.len());
+        for (j, &row) in undecided.iter().enumerate() {
+            if !cond.is_null(j) && as_bool(&cond, j)? {
+                selected.push(row);
+            } else {
+                rest.push(row);
             }
         }
-        if !placed {
-            match &els {
-                Some(e) => out.push_value(e.get(i))?,
-                None => out.push_null()?,
+        if !selected.is_empty() {
+            let vals = if selected.len() == n {
+                eval_expr(v, chunk, cx)?
+            } else {
+                eval_expr(v, &chunk.gather(&selected), cx)?
+            };
+            for (k, &row) in selected.iter().enumerate() {
+                slots[row] = Some(vals.get(k));
             }
+        }
+        undecided = rest;
+    }
+    if !undecided.is_empty() {
+        match else_ {
+            Some(e) => {
+                let vals = if undecided.len() == n {
+                    eval_expr(e, chunk, cx)?
+                } else {
+                    eval_expr(e, &chunk.gather(&undecided), cx)?
+                };
+                for (k, &row) in undecided.iter().enumerate() {
+                    slots[row] = Some(vals.get(k));
+                }
+            }
+            None => {
+                for &row in &undecided {
+                    slots[row] = Some(Value::Null);
+                }
+            }
+        }
+    }
+    let mut out = Vector::new_empty(dtype);
+    for s in slots {
+        match s {
+            Some(Value::Null) | None => out.push_null()?,
+            Some(v) => out.push_value(v)?,
         }
     }
     Ok(out)
 }
 
 /// `COALESCE`: first non-NULL argument per row (all args share the dtype).
-fn eval_coalesce(dtype: DataType, args: &[Vector]) -> Result<Vector> {
-    let n = args.first().map(|v| v.len()).unwrap_or(0);
-    let mut out = Vector::new_empty(dtype);
-    for i in 0..n {
-        let mut placed = false;
-        for v in args {
-            if !v.is_null(i) {
-                out.push_valid(v.get(i))?;
-                placed = true;
-                break;
+/// Each argument is evaluated only for the rows still unresolved, so an
+/// unselected argument's row-dependent error is never raised.
+fn eval_coalesce(
+    args: &[BoundExpr],
+    dtype: DataType,
+    chunk: &DataChunk,
+    cx: &Cx,
+) -> Result<Vector> {
+    let n = chunk.num_rows();
+    let mut slots: Vec<Option<Value>> = vec![None; n];
+    let mut undecided: Vec<usize> = (0..n).collect();
+    for a in args {
+        if undecided.is_empty() {
+            break;
+        }
+        let vals = if undecided.len() == n {
+            eval_expr(a, chunk, cx)?
+        } else {
+            eval_expr(a, &chunk.gather(&undecided), cx)?
+        };
+        let mut rest = Vec::with_capacity(undecided.len());
+        for (j, &row) in undecided.iter().enumerate() {
+            if vals.is_null(j) {
+                rest.push(row);
+            } else {
+                slots[row] = Some(vals.get(j));
             }
         }
-        if !placed {
-            out.push_null()?;
+        undecided = rest;
+    }
+    let mut out = Vector::new_empty(dtype);
+    for s in slots {
+        match s {
+            Some(Value::Null) | None => out.push_null()?,
+            Some(v) => out.push_value(v)?,
         }
     }
     Ok(out)

@@ -6378,6 +6378,25 @@ mod tests {
         assert_eq!(rows, vec![vec![V::Bigint(1)], vec![V::Bigint(2)]]);
     }
 
+    #[test]
+    fn case_and_coalesce_do_not_evaluate_unselected_arms() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (x INTEGER, y INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (0, 5), (2, 5);").unwrap();
+        // `y / x` is evaluated only where x <> 0 (it used to divide by zero on
+        // the x = 0 row and fail the whole query).
+        let rows = select(
+            &mut db,
+            "SELECT CASE WHEN x <> 0 THEN y / x ELSE 0 END FROM t ORDER BY 1;",
+        );
+        assert_eq!(rows, vec![vec![V::Double(0.0)], vec![V::Double(2.5)]]);
+        // COALESCE: the second arm (`x / x`) is skipped when `y` is non-NULL
+        // (and the result type unifies to DOUBLE).
+        let rows = select(&mut db, "SELECT COALESCE(y, x / x) FROM t ORDER BY 1;");
+        assert_eq!(rows, vec![vec![V::Double(5.0)], vec![V::Double(5.0)]]);
+    }
+
     // --- phase 8: window functions ---
 
     fn win_db() -> PinkDb {
