@@ -1036,3 +1036,12 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   content-sync (a concurrent same-table append makes the next diff refuse
   rather than silently drop rows); diffs are O(table rows). Worktree
   `wt-lake-incr` removed after landing.
+- 2026-10-17 — Wave-63 CI follow-up (`e155568` was red in three jobs): the
+  feature-less build's `lake_disabled` test still expected the pre-63 "lean:
+  v1 `.pink` data files" rebuild hint, and the S3 Docker script pinned
+  `format version:  3` — both updated to the merged messages ("lean: `.pink`
+  data files", `format version:  4`; the S3 conflict-message asserts were
+  checked and are unchanged). Local gates now include the **feature-less CLI
+  suite** plus the whole CLI feature matrix — none / `lake-lite` /
+  `lake-lite,s3` / `lake` / `lake,s3` — all green (the gap: every earlier run
+  had a lake feature on, so `lake_disabled` never compiled).

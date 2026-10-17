@@ -27,7 +27,7 @@ fn lake_dot_commands_report_the_missing_feature() {
         "{text}"
     );
     assert!(
-        text.contains("`--features lake-lite` (lean: v1 `.pink` data files)"),
+        text.contains("`--features lake-lite` (lean: `.pink` data files)"),
         "the lean alternative must be named too:\n{text}"
     );
     assert!(
