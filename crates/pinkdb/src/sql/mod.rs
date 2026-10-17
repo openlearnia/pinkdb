@@ -285,8 +285,12 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                 for item in &select.order_by {
                     work.push((NodeRef::Order(item), child));
                 }
-                for (_, branch) in &select.unions {
-                    work.push((NodeRef::Select(branch), child));
+                // Each union arm deepens the left-associative set-op fold the
+                // binder builds, so charge the arms cumulatively: a long UNION
+                // chain must hit the cap instead of overflowing the plan
+                // recursion (`plan_schema`/`eval`/`fold_plan`/drop walk it).
+                for (i, (_, branch)) in select.unions.iter().enumerate() {
+                    work.push((NodeRef::Select(branch), child + i));
                 }
             }
             NodeRef::Expr(expr) => match expr {
@@ -346,8 +350,10 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
             },
             NodeRef::FromClause(from) => {
                 work.push((NodeRef::FromSource(&from.source), child));
-                for join in &from.joins {
-                    work.push((NodeRef::Join(join), child));
+                // A join chain folds into a left-deep plan; charge each join
+                // cumulatively so a very long chain hits the cap.
+                for (i, join) in from.joins.iter().enumerate() {
+                    work.push((NodeRef::Join(join), child + i));
                 }
             }
             NodeRef::FromSource(source) => {
@@ -757,6 +763,32 @@ mod tests {
     #[test]
     fn huge_chain_is_rejected_and_freed_without_recursion() {
         let sql = chain_sql(100_000);
+        let msg = parse_statements(&sql).expect_err("too deep").to_string();
+        assert!(msg.contains("expression too deep"), "{msg}");
+    }
+
+    /// A long `UNION ALL` chain folds into a left-deep set-op plan; the depth
+    /// guard must charge the fold so the statement is rejected cleanly rather
+    /// than overflowing the plan recursion.
+    #[test]
+    fn union_chain_depth_is_bounded() {
+        let mut sql = String::from("SELECT 1");
+        for i in 1..200 {
+            sql.push_str(&format!(" UNION ALL SELECT {}", i + 1));
+        }
+        sql.push(';');
+        let msg = parse_statements(&sql).expect_err("too deep").to_string();
+        assert!(msg.contains("expression too deep"), "{msg}");
+    }
+
+    /// A long `JOIN` chain folds left-deep too; the guard must charge it.
+    #[test]
+    fn join_chain_depth_is_bounded() {
+        let mut sql = String::from("SELECT * FROM t t0");
+        for i in 1..200 {
+            sql.push_str(&format!(" JOIN t t{i} ON t{}.i = t{i}.i", i - 1));
+        }
+        sql.push(';');
         let msg = parse_statements(&sql).expect_err("too deep").to_string();
         assert!(msg.contains("expression too deep"), "{msg}");
     }
