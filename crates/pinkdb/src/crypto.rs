@@ -258,6 +258,13 @@ pub(crate) fn is_container(data: &[u8]) -> bool {
     data.starts_with(ENC_MAGIC)
 }
 
+/// Whether a container `version` is one this build reads: a fresh checkpoint,
+/// a WAL, or a legacy (v1) file. A newer version is a hard error, never a torn
+/// creation — a newer build may have written records this one cannot parse.
+pub(crate) fn is_known_container_version(version: u32) -> bool {
+    version == ENC_VERSION || version == ENC_VERSION_V1 || version == WAL_CONTAINER_VERSION
+}
+
 fn corrupt(what: &str) -> PinkDbError {
     PinkDbError::Execution(format!("encrypted file: {what}"))
 }

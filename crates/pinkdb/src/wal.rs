@@ -1325,6 +1325,10 @@ enum HeaderError {
     /// A `PINKENC1` container whose public header did not parse.
     #[cfg(feature = "encryption")]
     Container(String),
+    /// A `PINKENC1` container whose version this build does not understand
+    /// (never a torn creation).
+    #[cfg(feature = "encryption")]
+    ContainerVersion(u32),
     /// An encrypted v2 container whose fixed publish block is missing or
     /// malformed.
     #[cfg(feature = "encryption")]
@@ -2802,6 +2806,15 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
         }
         #[cfg(feature = "encryption")]
         {
+            // An unsupported container version is never a torn creation: a
+            // newer build may have written records this one cannot parse, so
+            // refuse with a hard error rather than recreate the file.
+            if data.len() >= 12 {
+                let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
+                if !crypto::is_known_container_version(version) {
+                    return Err(HeaderError::ContainerVersion(version));
+                }
+            }
             let enc = crypto::parse_container_header(data)
                 .map_err(|e| HeaderError::Container(e.to_string()))?;
             let payload_start = enc.payload_start;
@@ -2940,6 +2953,11 @@ fn header_error(path: &Path, e: &HeaderError) -> String {
         #[cfg(feature = "encryption")]
         HeaderError::Container(msg) => format!("{}: {msg}", path.display()),
         #[cfg(feature = "encryption")]
+        HeaderError::ContainerVersion(v) => format!(
+            "{}: unsupported container version {v} (a newer build wrote this file)",
+            path.display()
+        ),
+        #[cfg(feature = "encryption")]
         HeaderError::BadPublishBlock { what, .. } => {
             format!("{}: {what}", path.display())
         }
@@ -2958,6 +2976,8 @@ fn header_torn(data_len: usize, e: &HeaderError) -> bool {
         | HeaderError::BadCrc
         | HeaderError::Reserved => data_len <= HEADER_LEN,
         HeaderError::BadVersion(_) => false,
+        #[cfg(feature = "encryption")]
+        HeaderError::ContainerVersion(_) => false,
         #[cfg(feature = "encryption")]
         HeaderError::Container(_) => data_len <= crypto::MAX_HEADER_LEN + ENC_PUBLISH_BLOCK_LEN,
         #[cfg(feature = "encryption")]
@@ -5212,6 +5232,21 @@ mod tests {
 
         cleanup(&p2);
         cleanup(&p);
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn an_unsupported_container_version_is_never_torn() {
+        // A short file whose container header names a future version must be a
+        // hard error, not a torn creation (its records, if any, are preserved
+        // for a newer build).
+        let mut data = crate::crypto::ENC_MAGIC.to_vec();
+        data.extend_from_slice(&99u32.to_le_bytes());
+        data.resize(32, 0);
+        let err = parse_wal_header(&data).unwrap_err();
+        assert!(matches!(err, HeaderError::ContainerVersion(99)), "{err:?}");
+        assert!(!header_torn(data.len(), &err), "must not be torn");
+        assert!(header_error(Path::new("w"), &err).contains("99"));
     }
 
     #[test]
