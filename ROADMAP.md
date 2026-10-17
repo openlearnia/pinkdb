@@ -96,6 +96,12 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | in progress | worktree `wt-types` (patch integration) |
+| 63 | Lake writes, DuckLake parity: incremental lake commits — append new immutable data files with per-file row ranges instead of whole-table rewrites, positional delete files for DELETE/UPDATE (merge-on-read; deletion-vector option as a follow-up), writable attached lakes, per-commit manifests, concurrent-writer retry/backoff (`max_retry_count`/`retry_backoff`/`retry_wait_ms` parity), WAL-logged for durable sessions | queued | DuckLake-parity program |
+| 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | queued | DuckLake-parity program |
+| 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | queued | DuckLake-parity program |
+| 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | queued | DuckLake-parity program |
+| 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | DuckLake-parity program |
+| 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | queued | DuckLake-parity program |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
@@ -136,6 +142,13 @@ disjoint writes, with an honest no-win on replay-bound write-heavy workloads.
 at rest** — one Argon2id KDF per lake session (salt in the catalog), AEAD containers for
 the catalog/snapshots and the data files, `PINKDB_KEY` UX consistent with the engine,
 plaintext lakes unaffected.
+
+DuckLake parity program (Oct 17; queued as waves 63–68, to dispatch in a later
+worktree batch — the four in-flight worktrees are the concurrency cap):
+incremental lake writes/mutations (63), time travel + snapshot metadata (64),
+schema evolution (65), partitioning + zone-map pruning (66), maintenance/
+compaction (67), inlined small writes + CDC (68). The probed feature delta is
+recorded in the progress log below.
 
 Deferred (not currently scheduled): Parquet read (`pinkdb-parquet`); JS/wasm, Node-native, and
 Java bindings.
@@ -799,3 +812,25 @@ Java bindings.
   per-query 0.63–0.93× (pink's eager Vortex open dominates its cold cost at
   10M, while DuckLake's lazy attach stays ~60 ms flat), in-session in-memory
   queries <1/32/21/22 ms (count/groupby/filter/orderby).
+- 2026-10-17 — DuckLake feature-gap audit (probed live against the ducklake
+  extension on DuckDB v2.0.0-alpha46057; 26 `ducklake_*` functions, settings
+  and SQL surfaces exercised): confirmed absent from pink-lake — mutable tables
+  (INSERT/UPDATE/DELETE; snapshots show `inlined_insert`, deletes via positional
+  files, `ducklake_write_deletion_vectors` option), per-query time travel
+  (`AT (VERSION => n)` and `AT (TIMESTAMP => ts)` both resolved live,
+  `ducklake_default_version`), snapshot metadata (`snapshots()`: 0-based ids,
+  snapshot_time, schema_version, change-summary map, author, commit_message;
+  `ducklake_set_commit_message`), CDC macros
+  (`table_insertions/deletions/changes(table, start, end)`), schema evolution
+  (ALTER ADD COLUMN DEFAULT reads back on old rows), `PARTITIONED BY` file
+  splitting, data inlining (`ducklake_default_data_inlining_row_limit=10`,
+  `flush_inlined_data`), maintenance functions (`merge_adjacent_files` ran;
+  `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`,
+  `delete_orphaned_files`, `list_files`, `scan`, `table_info`), optimistic
+  writer retry controls (`max_retry_count`, `retry_backoff`, `retry_wait_ms`),
+  `add_data_files`, and info/introspection functions. Queued as waves 63–68;
+  note that pink-lake's `open + mutate + save` already provides whole-store
+  edit-then-publish semantics — the gap is incremental commits, delete files,
+  per-query time travel, evolution, partitioning and maintenance. All six stay
+  queued for the next worktree batch after the in-flight four land
+  (rate-limit cap: max four concurrent agents).
