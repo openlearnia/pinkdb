@@ -2246,14 +2246,13 @@ fn decode_payload(payload: &[u8]) -> std::result::Result<(Vec<String>, Option<Fr
     Ok((stmts, sets))
 }
 
-/// Parse records from `start` onward. A short read, a CRC mismatch (plaintext)
-/// or failed authentication where more bytes follow (encrypted), or an LSN
-/// that does not continue the strictly increasing sequence stops the scan
-/// (torn tail / framing corruption); a malformed CRC-valid/authenticated
-/// payload is a hard error. For an encrypted WAL an authentication failure on
+/// Parse records from `start` onward. A short read, or an LSN that does not
+/// continue the strictly increasing sequence, stops the scan (torn tail /
+/// framing corruption); a malformed CRC-valid/authenticated payload is a hard
+/// error. A CRC mismatch (plaintext) or authentication failure (encrypted) on
 /// the last framed record is indistinguishable from a torn write, so the tail
-/// policy applies there; a complete mis-authenticating record with bytes after
-/// it is mid-file tampering and is a hard error. `prev_lsn` is the LSN of the
+/// policy applies there; a complete bad record with bytes after it is mid-file
+/// tampering and is a hard error (both paths). `prev_lsn` is the LSN of the
 /// last record before `start` (0 for a full scan) and `ordinal_base` the
 /// number of records before it (the encrypted nonce ordinal base). Returns
 /// the records and the offset just past the last intact record.
@@ -2346,7 +2345,15 @@ fn parse_records(
             None => {
                 let payload = &data[payload_start..end];
                 if crc32(payload) != crc {
-                    break;
+                    if end == data.len() {
+                        // Tail: a CRC mismatch here is indistinguishable from a
+                        // torn write — the tail policy applies.
+                        break;
+                    }
+                    return Err(format!(
+                        "corrupt WAL record at offset {pos} (lsn {lsn}): CRC mismatch \
+                         with more records after it (tampered or corrupted mid-file)"
+                    ));
                 }
                 if current_payloads {
                     decode_payload(payload).map_err(|e| {
@@ -5070,6 +5077,54 @@ mod tests {
         write_raw_wal_payload(&wal, &payload);
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
         assert!(err.to_string().contains("corrupt WAL record"), "{err}");
+        cleanup(&p);
+    }
+
+    #[test]
+    fn plaintext_crc_mismatch_mid_file_is_a_hard_error() {
+        let p = tmp_ckpt("plaincrcmid");
+        let wal = wal_path(&p);
+        write_raw_wal(
+            &wal,
+            &[
+                vec!["CREATE TABLE t (a INTEGER);".to_string()],
+                vec!["INSERT INTO t VALUES (1);".to_string()],
+                vec!["INSERT INTO t VALUES (2);".to_string()],
+            ],
+        );
+        // Flip a payload byte of the FIRST record while records follow: this is
+        // mid-file corruption, so replay hard-errors instead of silently
+        // truncating the committed records after it.
+        let mut bytes = std::fs::read(&wal).unwrap();
+        bytes[HEADER_LEN + RECORD_HEADER_LEN] ^= 0xff;
+        std::fs::write(&wal, &bytes).unwrap();
+        let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("corrupt WAL record"), "{msg}");
+        assert!(msg.contains("mid-file"), "{msg}");
+
+        // The same flip on the LAST record is a torn-tail CRC mismatch and still
+        // truncates cleanly: the intact prefix replays (table t, no rows).
+        let p2 = tmp_ckpt("plaincrctail");
+        let wal2 = wal_path(&p2);
+        write_raw_wal(
+            &wal2,
+            &[
+                vec!["CREATE TABLE t (a INTEGER);".to_string()],
+                vec!["INSERT INTO t VALUES (1);".to_string()],
+            ],
+        );
+        let mut bytes = std::fs::read(&wal2).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&wal2, &bytes).unwrap();
+        let mut db = PinkDb::open_durable(p2.to_str().unwrap()).unwrap();
+        assert_eq!(
+            ints(&mut db, "SELECT a FROM t ORDER BY a;"),
+            Vec::<i64>::new()
+        );
+
+        cleanup(&p2);
         cleanup(&p);
     }
 
