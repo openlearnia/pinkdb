@@ -16,7 +16,7 @@
 //   - the #/<name> details route: `.install <name>` / `.install
 //     <name>@<version>` commands, metadata table, download URL, raw entry;
 //   - the not-found hash route;
-//   - the design pass: the three self-hosted fonts load, headings use the
+//   - the "soft data-zine" design pass: the three self-hosted fonts load, headings use the
 //     display face, the top bar and sidebar mark the active page, margin
 //     notes render, all requests stay first-party, body text keeps a
 //     readable column; the theme toggle switches and persists, and the
@@ -24,7 +24,7 @@
 //   - responsive: no horizontal overflow at 390px and 1280px on the landing
 //     page, a docs page, the extensions page and the Worker info page;
 //   - reduced motion: animations (the loading spinner) short-circuit;
-//   - the Worker `/` info page: heading, docs link, docs tokens (bg/accent),
+//   - the Worker `/` info page: heading, docs link, paper/ink palette,
 //     favicon, script-free, and /index.json answering 200 with
 //     Access-Control-Allow-Origin: * (from the page context);
 //   - no console errors (CORS failures, exceptions, failed resources) during
@@ -381,6 +381,7 @@ try {
       mono: document.fonts.check('400 13px "JetBrains Mono"'),
       skip: Boolean(document.querySelector(".skip-link")),
       activeNav: activeNav ? activeNav.getAttribute("aria-current") : null,
+      ticker: Boolean(document.querySelector(".ticker-track")),
       hosts,
       scrollWidth: document.documentElement.scrollWidth,
       viewport: document.documentElement.clientWidth,
@@ -398,6 +399,7 @@ try {
   );
   check(design.skip, "the skip link is present");
   check(design.activeNav === "page", "the top bar marks Extensions as the current page", String(design.activeNav));
+  check(design.ticker, "the ticker strip is present on the catalog page");
   const docsHost = new URL(DOCS).host;
   const repoHost = new URL(REPO).host;
   const thirdParty = design.hosts.filter(
@@ -513,19 +515,14 @@ try {
     "info page context: /index.json answers 200 with Access-Control-Allow-Origin: *",
     JSON.stringify(indexFetch));
   const workerDesign = await cdp.evaluate(`({
-    bg: getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(),
-    accent: getComputedStyle(document.documentElement).getPropertyValue("--accent").trim(),
     paper: getComputedStyle(document.documentElement).getPropertyValue("--paper").trim(),
-    dark: matchMedia("(prefers-color-scheme: dark)").matches,
-    mark: document.querySelectorAll(".brand-mark .brand-mark-bar").length,
+    ink: getComputedStyle(document.documentElement).getPropertyValue("--ink").trim(),
     favicon: Boolean(document.querySelector('link[rel="icon"]')),
     script: document.querySelectorAll("script").length,
     bodyFont: getComputedStyle(document.body).fontFamily,
   })`);
-  const workerTokens = workerDesign.dark ? ["#0e0d10", "#f472a6"] : ["#ffffff", "#c2255c"];
-  check(workerDesign.bg === workerTokens[0] && workerDesign.accent === workerTokens[1] && workerDesign.paper === "",
-    "info page uses the docs tokens (neutral bg, pink accent, no paper palette)", JSON.stringify(workerDesign));
-  check(workerDesign.mark === 3, "info page carries the docs brand mark", String(workerDesign.mark));
+  check(workerDesign.paper === "#f7f1e8" && workerDesign.ink === "#241f1c",
+    "info page uses the paper/ink palette", JSON.stringify(workerDesign));
   check(workerDesign.favicon, "info page carries a favicon");
   check(workerDesign.script === 0, "info page stays script-free", String(workerDesign.script));
   check(/ui-sans-serif|system-ui/.test(workerDesign.bodyFont),

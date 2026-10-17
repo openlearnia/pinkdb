@@ -4,7 +4,23 @@
      (marked __PURE_END__) is lifted and tested by
      ext-repo/worker/verify-ui.mjs. -->
 
+<div class="ticker" aria-hidden="true">
+  <div class="ticker-track">
+    <span>format v1 &#183; immutable artifacts</span>
+    <span>sha-256 verified before loading</span>
+    <span>install in one line: .install &lt;name&gt;</span>
+    <span>catalog is plain JSON behind CORS *</span>
+    <span>publish with ext-repo/publish.sh</span>
+    <span>format v1 &#183; immutable artifacts</span>
+    <span>sha-256 verified before loading</span>
+    <span>install in one line: .install &lt;name&gt;</span>
+    <span>catalog is plain JSON behind CORS *</span>
+    <span>publish with ext-repo/publish.sh</span>
+  </div>
+</div>
+
 <div id="ext-intro">
+  <p class="kicker">extension repository</p>
   <h1>Extensions</h1>
   <p class="lede">Built extension artifacts from the pinkdb extension repository —
   search the catalog, inspect metadata, and install one in a pinkdb shell with
@@ -19,7 +35,7 @@
     <svg viewBox="0 0 720 262" role="img" aria-label="Sketch of the route an extension takes: publish.sh uploads the dylib to the R2 bucket, the Worker serves index.json and the artifact bytes, this page renders the catalog, and a pinkdb shell installs the extension by name.">
       <defs>
         <marker id="sk-arrowhead" markerWidth="8" markerHeight="8" refX="5.5" refY="5" orient="auto">
-          <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--text-3)" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--ink)" stroke-width="1.8" stroke-linecap="round"/>
         </marker>
       </defs>
 
@@ -58,7 +74,7 @@
 
       <text class="sk-label-sm" x="4" y="252">write-once: publish, hash, never touch the bytes again</text>
     </svg>
-    <figcaption class="sk-figure-caption">How an extension is published and installed: the repository is a write-once store; the catalog is the
+    <figcaption class="sk-figure-caption">Fig. 3 — the repository is a write-once store; the catalog is the
     index of what exists, and every shell re-verifies the hash before calling into the dylib.</figcaption>
   </figure>
 </div>
@@ -351,7 +367,7 @@
     var primary = pickPrimary(entries);
     var parts = [
       '<a class="backlink" href="#/"><span aria-hidden="true">&#8592;</span> All extensions</a>',
-      '<p class="kicker">Extension</p>',
+      '<p class="kicker">extension</p>',
       "<h1>" + esc(primary.name) + "</h1>",
       '<p class="lede">' + esc(primary.description == null ? "" : primary.description) + "</p>",
       '<div class="badges">' +
@@ -402,7 +418,7 @@
 
   function errorView(message) {
     return [
-      '<p class="kicker">Repository</p>',
+      '<p class="kicker">repository</p>',
       "<h1>Catalog unavailable</h1>",
       '<div class="empty error">',
       "<p>" + esc(message) + "</p>",
@@ -420,7 +436,7 @@
       ? "Nothing in the catalog matches the extension name <code>" + esc(value) + "</code>."
       : "The page has no route for <code>" + esc(value) + "</code>.";
     return [
-      '<p class="kicker">Not found</p>',
+      '<p class="kicker">not found</p>',
       "<h1>" + heading + "</h1>",
       '<p class="lede">' + lead + "</p>",
       '<p><a class="button" href="#/">Back to the catalog</a> ' +

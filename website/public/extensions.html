@@ -6,8 +6,8 @@
 <title>Extensions — pinkdb</title>
 <meta name="description" content="The pinkdb extension catalog: browse published artifacts (name, version, platform, ABI, SHA-256), install with .install &lt;name&gt;, and download the immutable bytes.">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0b0d17" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
 <link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/extensions.html">
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="pinkdb docs">
@@ -90,18 +90,8 @@
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="site-header">
-  <div class="header-row">
-    <a class="brand" href="./" aria-label="pinkdb home">
-      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-        <defs><linearGradient id="brand-grad" x1="0" y1="0" x2="1" y2="1"><stop offset="0" class="brand-grad-a"/><stop offset="1" class="brand-grad-b"/></linearGradient></defs>
-        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
-        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
-        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
-        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
-      </svg>
-      <span class="brand-name">pinkdb</span>
-      <span class="brand-tag">docs</span>
-    </a>
+  <div class="container header-row">
+    <a class="brand" href="./"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
     <nav class="site-nav" aria-label="Site">
       <ul>
         <li><a href="docs/getting-started">Docs</a></li>
@@ -116,15 +106,12 @@
       <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
       <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
     </button>
-    <a class="header-gh" href="https://github.com/openlearnia/pinkdb" rel="noopener" aria-label="pinkdb on GitHub">
-      <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
-      <span class="header-gh-label">GitHub</span>
-    </a>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
     </div>
   </div>
 </header>
 <main id="main">
-<div class="docs-shell">
+<div class="container docs-shell">
 <aside class="sidebar">
 <input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
 <label class="sidebar-toggle" for="sidebar-toggle">
@@ -192,7 +179,23 @@
      (marked __PURE_END__) is lifted and tested by
      ext-repo/worker/verify-ui.mjs. -->
 
+<div class="ticker" aria-hidden="true">
+  <div class="ticker-track">
+    <span>format v1 &#183; immutable artifacts</span>
+    <span>sha-256 verified before loading</span>
+    <span>install in one line: .install &lt;name&gt;</span>
+    <span>catalog is plain JSON behind CORS *</span>
+    <span>publish with ext-repo/publish.sh</span>
+    <span>format v1 &#183; immutable artifacts</span>
+    <span>sha-256 verified before loading</span>
+    <span>install in one line: .install &lt;name&gt;</span>
+    <span>catalog is plain JSON behind CORS *</span>
+    <span>publish with ext-repo/publish.sh</span>
+  </div>
+</div>
+
 <div id="ext-intro">
+  <p class="kicker">extension repository</p>
   <h1>Extensions</h1>
   <p class="lede">Built extension artifacts from the pinkdb extension repository —
   search the catalog, inspect metadata, and install one in a pinkdb shell with
@@ -207,7 +210,7 @@
     <svg viewBox="0 0 720 262" role="img" aria-label="Sketch of the route an extension takes: publish.sh uploads the dylib to the R2 bucket, the Worker serves index.json and the artifact bytes, this page renders the catalog, and a pinkdb shell installs the extension by name.">
       <defs>
         <marker id="sk-arrowhead" markerWidth="8" markerHeight="8" refX="5.5" refY="5" orient="auto">
-          <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--text-3)" stroke-width="1.8" stroke-linecap="round"/>
+          <path d="M0.5 0.5 L5.5 5 L0.5 9.5" fill="none" stroke="var(--ink)" stroke-width="1.8" stroke-linecap="round"/>
         </marker>
       </defs>
 
@@ -246,7 +249,7 @@
 
       <text class="sk-label-sm" x="4" y="252">write-once: publish, hash, never touch the bytes again</text>
     </svg>
-    <figcaption class="sk-figure-caption">How an extension is published and installed: the repository is a write-once store; the catalog is the
+    <figcaption class="sk-figure-caption">Fig. 3 — the repository is a write-once store; the catalog is the
     index of what exists, and every shell re-verifies the hash before calling into the dylib.</figcaption>
   </figure>
 </div>
@@ -539,7 +542,7 @@
     var primary = pickPrimary(entries);
     var parts = [
       '<a class="backlink" href="#/"><span aria-hidden="true">&#8592;</span> All extensions</a>',
-      '<p class="kicker">Extension</p>',
+      '<p class="kicker">extension</p>',
       "<h1>" + esc(primary.name) + "</h1>",
       '<p class="lede">' + esc(primary.description == null ? "" : primary.description) + "</p>",
       '<div class="badges">' +
@@ -590,7 +593,7 @@
 
   function errorView(message) {
     return [
-      '<p class="kicker">Repository</p>',
+      '<p class="kicker">repository</p>',
       "<h1>Catalog unavailable</h1>",
       '<div class="empty error">',
       "<p>" + esc(message) + "</p>",
@@ -608,7 +611,7 @@
       ? "Nothing in the catalog matches the extension name <code>" + esc(value) + "</code>."
       : "The page has no route for <code>" + esc(value) + "</code>.";
     return [
-      '<p class="kicker">Not found</p>',
+      '<p class="kicker">not found</p>',
       "<h1>" + heading + "</h1>",
       '<p class="lede">' + lead + "</p>",
       '<p><a class="button" href="#/">Back to the catalog</a> ' +
@@ -856,44 +859,16 @@
 </div>
 </main>
 <footer class="site-footer">
-  <div class="footer-grid">
-    <div class="footer-brand">
-      <p class="footer-name">pinkdb</p>
-      <p>An embedded analytical SQL database in Rust — columnar, vectorized, and small enough to link into anything.</p>
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
     </div>
-    <div>
-      <p class="footer-title">Learn</p>
-      <ul>
-        <li><a href="docs/getting-started">Getting started</a></li>
-        <li><a href="docs/sql">SQL reference</a></li>
-        <li><a href="docs/guide-csv-to-lake">Guides</a></li>
-        <li><a href="docs/bindings">APIs &amp; bindings</a></li>
-      </ul>
-    </div>
-    <div>
-      <p class="footer-title">Ecosystem</p>
-      <ul>
-        <li><a href="extensions">Extension catalog</a></li>
-        <li><a href="docs/extensions">Writing extensions</a></li>
-        <li><a href="docs/server">Server</a></li>
-      </ul>
-    </div>
-    <div>
-      <p class="footer-title">Project</p>
-      <ul>
-        <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a></li>
-        <li><a href="docs/roadmap">Roadmap</a></li>
-        <li><a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></li>
-      </ul>
-    </div>
-  </div>
-  <div class="footer-base">
-    <p>Static, self-hosted type, no trackers, no cookies.</p>
-    <div class="theme-switch" role="group" aria-label="Colour theme" hidden>
-      <button type="button" data-theme-choice="system" aria-pressed="true">System</button>
-      <button type="button" data-theme-choice="light" aria-pressed="false">Light</button>
-      <button type="button" data-theme-choice="dark" aria-pressed="false">Dark</button>
-    </div>
+    <p><a href="docs/getting-started">Docs</a> · <a href="extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

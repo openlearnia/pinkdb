@@ -4,9 +4,8 @@
 Outputs (committed, then copied verbatim into ``public/assets/`` by
 ``build.py``):
 
-- ``src/assets/favicon.png``     64x64   brand mark: pink rounded square, three
-                                          bars (raster fallback, transparent corners)
-- ``src/assets/og.png``          1200x630 social card in the docs' light theme
+- ``src/assets/favicon.png``     64x64   paper chip + pink dot (raster fallback)
+- ``src/assets/og.png``          1200x630 social card, "soft data-zine" styling
 
 Everything is drawn with a tiny supersampled software rasteriser, so the
 build stays dependency-free. Run from anywhere:
@@ -17,6 +16,7 @@ build stays dependency-free. Run from anywhere:
 from __future__ import annotations
 
 import math
+import random
 import struct
 import zlib
 from pathlib import Path
@@ -24,33 +24,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "assets"
 
-# Light-theme tokens from src/assets/style.css.
-BG = (0xFF, 0xFF, 0xFF)
-BG_SUBTLE = (0xFA, 0xFA, 0xFB)
-SURFACE = (0xF6, 0xF6, 0xF8)
-BORDER = (0xE6, 0xE4, 0xEA)
-TEXT = (0x17, 0x15, 0x1B)
-TEXT_2 = (0x47, 0x43, 0x4F)
-TEXT_3 = (0x6B, 0x65, 0x75)
-ACCENT = (0xC2, 0x25, 0x5C)
-ACCENT_SOFT = (0xFD, 0xF0, 0xF5)
-ACCENT_BORDER = (0xF5, 0xC6, 0xD8)
-WHITE = (0xFF, 0xFF, 0xFF)
+PAPER = (0xF7, 0xF1, 0xE8)
+PAPER_2 = (0xFB, 0xF7, 0xF0)
+PAPER_3 = (0xEF, 0xE6, 0xD8)
+TAPE = (0xE7, 0xDB, 0xC9)
+INK = (0x24, 0x1F, 0x1C)
+PINK = (0xC9, 0x55, 0x7A)
+PINK_DEEP = (0xA6, 0x3A, 0x5E)
+BLUE = (0x2C, 0x4A, 0x66)
 
 
 class Canvas:
-    """RGBA canvas (premultiplied) with supersampled, bounding-box-limited
-    drawing. ``background=None`` starts fully transparent."""
+    """Opaque RGB canvas with supersampled, bounding-box-limited drawing."""
 
-    def __init__(self, width: int, height: int, background=BG, ss: int = 4):
+    def __init__(self, width: int, height: int, background=PAPER, ss: int = 4):
         self.width = width
         self.height = height
         self.ss = ss
         self.w = width * ss
         self.h = height * ss
-        self.opaque = background is not None
-        fill = (*background, 1.0) if background is not None else (0.0, 0.0, 0.0, 0.0)
-        self.buf = [fill] * (self.w * self.h)
+        self.buf = [background] * (self.w * self.h)
 
     def _fill(self, test, bbox, color, alpha: float = 1.0) -> None:
         """Fill pixels whose centre passes ``test``; ``bbox`` in final coords."""
@@ -69,12 +62,11 @@ class Canvas:
             for px in range(x0, x1):
                 if test((px + 0.5) / ss, y):
                     index = row + px
-                    r, g, b, a = buf[index]
+                    r, g, b = buf[index]
                     buf[index] = (
                         cr * alpha + r * (1 - alpha),
                         cg * alpha + g * (1 - alpha),
                         cb * alpha + b * (1 - alpha),
-                        alpha + a * (1 - alpha),
                     )
 
     # -- shapes (final-resolution coordinates) ----------------------------
@@ -103,6 +95,11 @@ class Canvas:
         self._fill(lambda px, py: math.hypot(px - cx, py - cy) <= r,
                    (cx - r, cy - r, cx + r, cy + r), color, alpha)
 
+    def ring(self, cx, cy, r, width, color, alpha: float = 1.0) -> None:
+        self._fill(lambda px, py: abs(math.hypot(px - cx, py - cy) - r) <= width / 2,
+                   (cx - r - width, cy - r - width, cx + r + width, cy + r + width),
+                   color, alpha)
+
     def line(self, x1, y1, x2, y2, width, color, alpha: float = 1.0) -> None:
         half = width / 2
         dx, dy = x2 - x1, y2 - y1
@@ -116,6 +113,47 @@ class Canvas:
         self._fill(test, (min(x1, x2) - half, min(y1, y2) - half,
                           max(x1, x2) + half, max(y1, y2) + half), color, alpha)
 
+    def dashed_line(self, x1, y1, x2, y2, width, dash, gap, color, alpha: float = 1.0) -> None:
+        total = math.hypot(x2 - x1, y2 - y1)
+        travelled = 0.0
+        while travelled < total:
+            end = min(travelled + dash, total)
+            t0, t1 = travelled / total, end / total
+            self.line(x1 + (x2 - x1) * t0, y1 + (y2 - y1) * t0,
+                      x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1, width, color, alpha)
+            travelled += dash + gap
+
+    def rot_rect(self, cx, cy, w, h, angle_deg, color, alpha: float = 1.0) -> None:
+        theta = math.radians(-angle_deg)
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        half_w, half_h = w / 2, h / 2
+        reach = math.hypot(half_w, half_h)
+        diag = math.degrees(math.atan2(half_h, half_w))
+        corners = [
+            _rotate(cx, cy, reach, angle_deg - diag),
+            _rotate(cx, cy, reach, angle_deg + diag),
+        ]
+        xs = [p[0] for p in corners]
+        ys = [p[1] for p in corners]
+        box = (min(xs), min(ys), max(xs), max(ys))
+
+        def test(px, py):
+            dx, dy = px - cx, py - cy
+            rx = dx * cos_t + dy * sin_t
+            ry = -dx * sin_t + dy * cos_t
+            return abs(rx) <= half_w and abs(ry) <= half_h
+
+        self._fill(test, box, color, alpha)
+
+    def grain(self, coverage: float = 0.05, seed: int = 42, radius: float = 1.1) -> None:
+        rng = random.Random(seed)
+        count = int(self.width * self.height * coverage / (math.pi * radius * radius))
+        for _ in range(count):
+            x = rng.uniform(0, self.width)
+            y = rng.uniform(0, self.height)
+            tone = INK if rng.random() < 0.7 else PINK_DEEP
+            self.circle(x, y, rng.uniform(0.4, radius), tone, rng.uniform(0.05, 0.14))
+
     # -- output -----------------------------------------------------------
 
     def save(self, path: Path) -> None:
@@ -127,38 +165,34 @@ class Canvas:
             rows = [self.buf[(y * ss + sy) * self.w:(y * ss + sy) * self.w + self.w]
                     for sy in range(ss)]
             for x in range(self.width):
-                r = g = b = a = 0.0
+                r = g = b = 0.0
                 for row in rows:
                     for sx in range(ss):
-                        pr, pg, pb, pa = row[x * ss + sx]
+                        pr, pg, pb = row[x * ss + sx]
                         r += pr
                         g += pg
                         b += pb
-                        a += pa
-                a /= area
-                if self.opaque:
-                    raw += bytes((round(r / area), round(g / area), round(b / area)))
-                elif a <= 0.0:
-                    raw += bytes(4)
-                else:
-                    # Un-premultiply for straight-alpha PNG.
-                    raw += bytes((min(255, round(r / area / a)), min(255, round(g / area / a)),
-                                  min(255, round(b / area / a)), round(a * 255)))
-        path.write_bytes(_png(self.width, self.height, bytes(raw), alpha=not self.opaque))
+                raw += bytes((round(r / area), round(g / area), round(b / area)))
+        path.write_bytes(_png(self.width, self.height, bytes(raw)))
 
 
-def _png(width: int, height: int, raw: bytes, alpha: bool = False) -> bytes:
+def _rotate(cx, cy, r, angle_deg):
+    theta = math.radians(angle_deg)
+    return cx + r * math.cos(theta), cy + r * math.sin(theta)
+
+
+def _png(width: int, height: int, raw: bytes) -> bytes:
     def chunk(tag: bytes, data: bytes) -> bytes:
         return (struct.pack(">I", len(data)) + tag + data
                 + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
 
     return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6 if alpha else 2, 0, 0, 0))
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(raw, 9))
             + chunk(b"IEND", b""))
 
 
-# 5x7 bitmap glyphs (rows top to bottom; '#' = filled).
+# 5x7 bitmap glyphs (rows top to bottom; '#' = ink).
 FONT: dict[str, tuple[str, ...]] = {
     " ": tuple("....." for _ in range(7)),
     ".": (".....", ".....", ".....", ".....", ".....", ".##..", ".##.."),
@@ -170,9 +204,6 @@ FONT: dict[str, tuple[str, ...]] = {
     "c": (".....", ".###.", "#....", "#....", "#....", ".###.", "....."),
     "d": ("....#", "....#", ".####", "#...#", "#...#", ".####", "....."),
     "e": (".....", ".###.", "#...#", "#####", "#....", ".###.", "....."),
-    "f": ("..##.", ".#...", "####.", ".#...", ".#...", ".#...", "....."),
-    "g": (".....", ".####", "#...#", "#...#", ".####", "....#", ".###."),
-    "h": ("#....", "#....", "####.", "#...#", "#...#", "#...#", "....."),
     "i": (".#...", ".....", "##...", ".#...", ".#...", ".###.", "....."),
     "k": ("#....", "#....", "#..#.", "#.#..", "##...", "#.#..", "....."),
     "l": ("##...", ".#...", ".#...", ".#...", ".#...", ".###.", "....."),
@@ -188,7 +219,6 @@ FONT: dict[str, tuple[str, ...]] = {
     "w": (".....", "#...#", "#...#", "#.#.#", "#.#.#", ".#.#.", "....."),
     "x": (".....", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "....."),
     "y": (".....", "#...#", "#...#", ".####", "....#", ".###.", "....."),
-    "z": (".....", "#####", "...#.", "..#..", ".#...", "#####", "....."),
     "B": ("####.", "#...#", "####.", "#...#", "#...#", "####.", "....."),
     "D": ("####.", "#...#", "#...#", "#...#", "#...#", "####.", "....."),
     "R": ("####.", "#...#", "####.", "#.#..", "#..#.", "#...#", "....."),
@@ -198,7 +228,6 @@ FONT: dict[str, tuple[str, ...]] = {
 
 
 def draw_text(canvas: Canvas, text: str, x: float, y: float, scale: float, color, alpha=1.0) -> float:
-    """Draw ``text`` with the bitmap font; returns the right edge."""
     advance = (5 + 1) * scale
     for index, char in enumerate(text):
         glyph = FONT.get(char)
@@ -208,69 +237,55 @@ def draw_text(canvas: Canvas, text: str, x: float, y: float, scale: float, color
         for row, line in enumerate(glyph):
             for col, cell in enumerate(line):
                 if cell == "#":
-                    # Slightly overlapping cells keep strokes solid.
-                    canvas.rect(ox + col * scale - 0.25, y + row * scale - 0.25,
-                                scale + 0.5, scale + 0.5, color, alpha)
+                    canvas.rect(ox + col * scale, y + row * scale, scale, scale, color, alpha)
     return x + len(text) * advance - scale
 
 
-def text_width(text: str, scale: float) -> float:
-    return len(text) * 6 * scale - scale
-
-
-def brand_mark(canvas: Canvas, x: float, y: float, size: float,
-               bg=ACCENT, bar=WHITE, alpha: float = 1.0) -> None:
-    """The docs brand mark (layout.html's 24-unit SVG), scaled to ``size``."""
-    u = size / 24
-    canvas.rounded_rect(x + 1 * u, y + 1 * u, 22 * u, 22 * u, 6.5 * u, bg, alpha)
-    for bx, by, bh in ((6, 12, 6), (10.5, 8, 10), (15, 5.5, 12.5)):
-        canvas.rounded_rect(x + bx * u, y + by * u, 3 * u, bh * u, 1.2 * u, bar, alpha)
-
-
 def make_favicon() -> None:
-    # Fill the whole tile (the SVG's 1-unit margin is too small to matter at
-    # 64 px and a full tile reads better as a touch icon).
-    canvas = Canvas(64, 64, None, ss=4)
-    canvas.rounded_rect(0, 0, 64, 64, 64 * 6.5 / 22, ACCENT)
-    u = 64 / 22
-    for bx, by, bh in ((6, 12, 6), (10.5, 8, 10), (15, 5.5, 12.5)):
-        canvas.rounded_rect((bx - 1) * u, (by - 1) * u, 3 * u, bh * u, 1.2 * u, WHITE)
+    canvas = Canvas(64, 64, PAPER, ss=4)
+    canvas.rounded_rect(2, 2, 60, 60, 15, INK)
+    canvas.rounded_rect(4.5, 4.5, 55, 55, 13, PAPER)
+    canvas.line(14, 21, 36, 21, 5.5, INK, 0.85)
+    canvas.line(14, 31, 29, 31, 5.5, INK, 0.85)
+    canvas.circle(42.5, 42.5, 11.6, INK)
+    canvas.circle(42.5, 42.5, 9.4, PINK)
     canvas.save(OUT / "favicon.png")
 
 
 def make_og() -> None:
-    W, H = 1200, 630
-    canvas = Canvas(W, H, BG, ss=2)
+    canvas = Canvas(1200, 630, PAPER, ss=2)
 
-    # Right-hand motif: the brand mark's three ascending bars, large, in a
-    # soft pink panel bleeding off the edge.
-    canvas.rounded_rect(860, 70, 420, 490, 36, ACCENT_SOFT)
-    for bx, top, alpha in ((915, 330, 0.35), (1020, 230, 0.6), (1125, 150, 1.0)):
-        canvas.rounded_rect(bx, top, 72, 500 - top, 16, ACCENT, alpha)
-    canvas.rect(885, 500, 400, 3, ACCENT_BORDER)
+    # Ambient paper shapes: a big pink sun, tape strips, a torn slab.
+    canvas.circle(1040, 150, 150, PINK)
+    canvas.ring(1040, 150, 150, 9, INK, 0.9)
+    canvas.rot_rect(150, 92, 250, 52, -3.5, TAPE, 0.95)
+    canvas.rot_rect(1080, 470, 300, 46, 2.5, PAPER_3, 1.0)
+    canvas.dashed_line(70, 452, 1130, 452, 5, 16, 12, INK, 0.75)
 
-    # Brand row: mark + wordmark + "docs" pill.
-    brand_mark(canvas, 80, 78, 64)
-    right = draw_text(canvas, "pinkdb", 164, 89, 6, TEXT)
-    pill_x = right + 22
-    canvas.rounded_rect(pill_x, 88, 118, 44, 22, BORDER)
-    canvas.rounded_rect(pill_x + 2, 90, 114, 40, 20, BG)
-    draw_text(canvas, "docs", pill_x + 22, 99, 3.2, TEXT_3)
+    # Index card holding the URL line.
+    canvas.rounded_rect(70, 486, 950, 78, 12, PAPER_2)
+    canvas.line(73, 489, 1017, 489, 3, INK, 0.5)
+    canvas.line(73, 561, 1017, 561, 3, INK, 0.5)
+    canvas.line(73, 489, 73, 561, 3, INK, 0.5)
+    canvas.line(1017, 489, 1017, 561, 3, INK, 0.5)
 
-    # Headline, two lines, "duckdb" in the accent.
-    scale = 9
-    line_2 = 228 + 7 * scale + 26
-    draw_text(canvas, "a mini ", 80, 228, scale, TEXT)
-    draw_text(canvas, "duckdb", 80 + text_width("a mini ", scale) + scale, 228, scale, ACCENT)
-    draw_text(canvas, "in rust", 80, line_2, scale, TEXT)
+    # Wordmark + a pink version sticker.
+    draw_text(canvas, "pinkdb", 78, 150, 18, INK)
+    canvas.rounded_rect(950, 352, 190, 54, 7, PINK)
+    canvas.line(952, 354, 1138, 354, 4, INK, 0.9)
+    canvas.line(952, 404, 1138, 404, 4, INK, 0.9)
+    canvas.line(952, 354, 952, 404, 4, INK, 0.9)
+    canvas.line(1138, 354, 1138, 404, 4, INK, 0.9)
+    draw_text(canvas, "wave 26", 957, 370, 4.4, PAPER_2)
 
-    # Sub-line and footer.
-    draw_text(canvas, "columnar \u00b7 vectorized \u00b7 embedded", 82, 420, 3.6, TEXT_2)
-    canvas.rect(80, 498, 700, 2, BORDER)
-    draw_text(canvas, "docs \u00b7 extensions \u00b7 lake \u00b7 bindings", 82, 526, 3.2, TEXT_3)
+    draw_text(canvas, "a mini duckdb in rust", 78, 352, 6.4, INK, 0.92)
+    draw_text(canvas, "docs \u00b7 extensions \u00b7 c abi", 98, 503, 5.6, BLUE)
 
-    # Accent rule along the top edge.
-    canvas.rect(0, 0, W, 6, ACCENT)
+    # Cut-line ticks + pink spine at the bottom edge.
+    canvas.rect(0, 606, 1200, 24, PINK)
+    canvas.rect(0, 606, 1200, 5, INK, 0.85)
+
+    canvas.grain(coverage=0.045)
     canvas.save(OUT / "og.png")
 
 

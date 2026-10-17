@@ -1,14 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" role="img" aria-label="pinkdb">
-  <style>
-    .bg { fill: #c2255c; }
-    .bar { fill: #ffffff; }
-    @media (prefers-color-scheme: dark) {
-      .bg { fill: #f472a6; }
-      .bar { fill: #1b0a12; }
-    }
-  </style>
-  <rect x="1" y="1" width="22" height="22" rx="6.5" class="bg"/>
-  <rect x="6" y="12" width="3" height="6" rx="1.2" class="bar"/>
-  <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="bar"/>
-  <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="bar"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="pinkdb">
+  <rect width="32" height="32" rx="8" fill="#F7F1E8"/>
+  <rect x="1.4" y="1.4" width="29.2" height="29.2" rx="6.8" fill="none" stroke="#241F1C" stroke-width="2.4"/>
+  <path d="M7.5 10.5h11M7.5 15.5h7.5" stroke="#241F1C" stroke-width="2.6" stroke-linecap="round" opacity="0.82"/>
+  <circle cx="21.4" cy="21.4" r="5.9" fill="#C9557A" stroke="#241F1C" stroke-width="2.4"/>
 </svg>

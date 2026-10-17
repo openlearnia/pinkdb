@@ -20,7 +20,7 @@ fragment uses the ``docs/`` default.
 
 Layouts
 -------
-- ``home``  (index.html): full-width landing page, no sidebar.
+- ``home``  (index.html): hero page, full-width container, no sidebar.
 - ``docs``  (default): left sidebar with the grouped documentation nav and
   active-page highlighting, a section eyebrow, permalinked ``<h2>``
   headings, previous/next links and an edit-on-GitHub link, and (on wide
@@ -696,7 +696,7 @@ def render(layout: str, fragment_name: str, meta: dict) -> str:
 
     layout_kind = meta.get("layout", "docs")
     if layout_kind == "home":
-        main = f'<div class="home">\n{fragment}\n</div>'
+        main = f'<div class="container home">\n{fragment}\n</div>'
     elif layout_kind == "narrow":
         main = f'<div class="container narrow">\n{fragment}\n</div>'
     else:
@@ -707,7 +707,7 @@ def render(layout: str, fragment_name: str, meta: dict) -> str:
         eyebrow = (f'<p class="eyebrow">{html.escape(found[0]["title"])}</p>\n'
                    if found else "")
         sidebar = render_sidebar(out_rel, nav_key)
-        shell_cls = "docs-shell has-toc" if toc_html else "docs-shell"
+        shell_cls = "container docs-shell has-toc" if toc_html else "container docs-shell"
         main = (
             f'<div class="{shell_cls}">\n'
             f'<aside class="sidebar">\n{sidebar}\n</aside>\n'

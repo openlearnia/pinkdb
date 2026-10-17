@@ -75,10 +75,9 @@ export default {
 };
 
 function infoPage() {
-  // Info page in the docs' product-docs language: neutral surfaces, one pink
-  // accent, light + dark from prefers-color-scheme, the rounded-square brand
-  // mark. System fonts only (the Worker ships no font files, and nothing here
-  // may hit a third party). Styling lives inline; no scripts.
+  // "Soft data-zine" info page: the same paper/ink/pink language as the docs
+  // site, with system fonts only (the Worker ships no font files, and nothing
+  // here may hit a third party). Styling lives inline; no scripts.
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -86,274 +85,226 @@ function infoPage() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>pinkdb extension repository</title>
 <meta name="description" content="Machine endpoints of the pinkdb extension repository (format v1): the catalog at /index.json (CORS *), artifact bytes under /artifacts/. The browsable catalog UI lives in the pinkdb docs.">
-<meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0e0d10" media="(prefers-color-scheme: dark)">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#F7F1E8">
 <meta property="og:type" content="website">
 <meta property="og:title" content="pinkdb extension repository">
 <meta property="og:description" content="Format v1 machine endpoints: /index.json (CORS *) and immutable artifact bytes under /artifacts/.">
 <meta property="og:url" content="https://pinkdb-ext-repo.defaultcms.workers.dev/">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect x='1' y='1' width='22' height='22' rx='6.5' fill='%23c2255c'/%3E%3Cg fill='%23fff'%3E%3Crect x='6' y='12' width='3' height='6' rx='1.2'/%3E%3Crect x='10.5' y='8' width='3' height='10' rx='1.2'/%3E%3Crect x='15' y='5.5' width='3' height='12.5' rx='1.2'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23F7F1E8'/%3E%3Cpath d='M7.5 10.5h11M7.5 15.5h7.5' stroke='%23241F1C' stroke-width='2.6' stroke-linecap='round'/%3E%3Ccircle cx='21.4' cy='21.4' r='5.9' fill='%23C9557A' stroke='%23241F1C' stroke-width='2.4'/%3E%3C/svg%3E">
 <style>
 :root {
-  color-scheme: light dark;
-  --bg: #ffffff;
-  --bg-subtle: #fafafb;
-  --surface: #f6f6f8;
-  --border: #e6e4ea;
-  --border-strong: #d3d0d9;
-  --text: #17151b;
-  --text-2: #47434f;
-  --text-3: #6b6575;
-  --accent: #c2255c;
-  --accent-text: #b81f56;
-  --accent-soft: #fdf0f5;
-  --accent-border: #f5c6d8;
-  --on-accent: #ffffff;
-  --code-bg: #f7f7f9;
+  color-scheme: light;
+  --paper: #f7f1e8;
+  --paper-2: #fcf8f1;
+  --paper-3: #efe6d6;
+  --tape: rgba(228, 214, 191, 0.85);
+  --ink: #241f1c;
+  --ink-2: #52483f;
+  --ink-3: #6e6156;
+  --line-strong: #b9a88f;
+  --pink: #c9557a;
+  --pink-deep: #a63a5e;
+  --pink-soft: #f4dbe2;
+  --blue: #2c4a66;
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-  --radius-sm: 6px;
-  --radius: 10px;
-  --radius-lg: 14px;
-  --shadow-sm: 0 1px 2px rgba(23, 21, 27, 0.05);
-  --shadow: 0 1px 2px rgba(23, 21, 27, 0.04), 0 4px 16px -4px rgba(23, 21, 27, 0.08);
-  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0e0d10;
-    --bg-subtle: #121115;
-    --surface: #17161b;
-    --border: #2a2830;
-    --border-strong: #3a3742;
-    --text: #edebf0;
-    --text-2: #bdb8c5;
-    --text-3: #9a95a3;
-    --accent: #f472a6;
-    --accent-text: #f58fb6;
-    --accent-soft: #2a1520;
-    --accent-border: #5a2a3f;
-    --on-accent: #1b0a12;
-    --code-bg: #141317;
-    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px -6px rgba(0, 0, 0, 0.5);
-  }
+  --shadow-sm: 2px 3px 0 rgba(36, 31, 28, 0.2);
+  --shadow: 4px 5px 0 rgba(36, 31, 28, 0.16);
 }
 * { box-sizing: border-box; }
-html { background: var(--bg); }
+html { background: var(--paper); }
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text);
+  background: var(--paper);
+  color: var(--ink);
   font-family: var(--sans);
-  font-size: 16px;
+  font-size: 16.5px;
   line-height: 1.65;
   -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
 }
-::selection { background: var(--accent-soft); color: var(--text); }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-a { color: var(--accent-text); text-underline-offset: 3px; }
-.top {
-  border-bottom: 1px solid var(--border);
-  background: var(--bg);
+/* One fixed, non-interactive paper grain over everything. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  pointer-events: none;
+  opacity: 0.34;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='190' height='190'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.82' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='190' height='190' filter='url(%23n)' opacity='0.2'/%3E%3C/svg%3E");
+  background-size: 190px 190px;
 }
-.top-inner {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-  max-width: 56rem;
-  height: 3.75rem;
-  margin-inline: auto;
-  padding-inline: clamp(1.25rem, 5vw, 2rem);
-}
-.brand {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.55rem;
-  color: var(--text);
-  text-decoration: none;
-}
-.brand-mark { width: 1.6rem; height: 1.6rem; flex: none; }
-.brand-mark-bg { fill: var(--accent); }
-.brand-mark-bar { fill: var(--on-accent); }
-.brand-name { font-weight: 700; font-size: 1.15rem; letter-spacing: -0.03em; }
-.brand-tag {
-  font-size: 0.75rem;
-  font-weight: 600;
-  color: var(--text-3);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 0.05rem 0.5rem;
-  line-height: 1.5;
-}
-.brand:hover .brand-name { color: var(--accent-text); }
-.top-link {
-  margin-left: auto;
-  padding: 0.38rem 0.75rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-2);
-  font-size: 0.875rem;
-  font-weight: 500;
-  text-decoration: none;
-  transition: color 0.15s var(--ease), border-color 0.15s var(--ease), background-color 0.15s var(--ease);
-}
-.top-link:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface); }
+::selection { background: var(--pink-soft); color: var(--ink); }
+:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; border-radius: 3px; }
 main {
-  max-width: 56rem;
+  position: relative;
+  max-width: 60rem;
   margin-inline: auto;
-  padding: clamp(2.5rem, 8vw, 4.5rem) clamp(1.25rem, 5vw, 2rem) clamp(3rem, 8vw, 5rem);
+  padding: clamp(2.6rem, 9vw, 5.5rem) clamp(1.25rem, 5vw, 3rem) clamp(3rem, 8vw, 5rem);
+}
+.sun {
+  position: absolute;
+  top: clamp(0.5rem, 4vw, 2rem);
+  right: clamp(1rem, 5vw, 3rem);
+  width: clamp(5rem, 16vw, 9rem);
+  height: clamp(5rem, 16vw, 9rem);
+  border-radius: 50%;
+  background: var(--pink);
+  border: 2.5px solid var(--ink);
+  box-shadow: 6px 8px 0 rgba(36, 31, 28, 0.14);
+  rotate: 7deg;
+  pointer-events: none;
+}
+.tape {
+  position: absolute;
+  top: clamp(2rem, 7vw, 4rem);
+  left: clamp(1.4rem, 6vw, 3.4rem);
+  width: 5.2rem;
+  height: 1.4rem;
+  background: var(--tape);
+  border-inline: 1px dashed rgba(36, 31, 28, 0.28);
+  rotate: -3deg;
+  pointer-events: none;
 }
 .kicker {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-  margin: 0 0 1.25rem;
-  padding: 0.25rem 0.75rem 0.25rem 0.3rem;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--bg);
-  color: var(--text-2);
-  font-size: 0.82rem;
-  font-weight: 500;
+  display: inline-block;
+  margin: 0 0 1.1rem;
+  padding: 0.18rem 0.62rem 0.22rem;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  background: var(--paper-3);
+  border: 1.6px solid var(--ink);
+  border-radius: 4px 8px 5px 9px;
   box-shadow: var(--shadow-sm);
-}
-.kicker b {
-  padding: 0.05rem 0.5rem;
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent-text);
-  font-size: 0.75rem;
-  font-weight: 650;
+  rotate: -1.6deg;
 }
 h1 {
   margin: 0 0 0.9rem;
-  font-size: clamp(2rem, 5.4vw, 3rem);
-  font-weight: 750;
-  line-height: 1.05;
-  letter-spacing: -0.04em;
-  max-width: 20ch;
-  text-wrap: balance;
+  font-family: var(--sans);
+  font-size: clamp(2rem, 5.6vw, 3.1rem);
+  font-weight: 800;
+  line-height: 1.02;
+  letter-spacing: -0.035em;
+  max-width: 22ch;
 }
-h2 {
-  margin: 2.75rem 0 0.75rem;
-  font-size: 0.8rem;
-  font-weight: 650;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-3);
-}
-.lede { margin: 0; font-size: 1.125rem; line-height: 1.6; color: var(--text-2); max-width: 60ch; }
+.lede { margin: 0 0 0.4rem; font-size: 1.1rem; line-height: 1.6; color: var(--ink-2); max-width: 62ch; }
 p { max-width: 68ch; }
-.links {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
-  gap: 1rem;
-  list-style: none;
-  margin: 2.25rem 0 0;
-  padding: 0;
-}
+.cut { border: 0; border-top: 2px dashed var(--line-strong); margin: 2.1rem 0 1.9rem; }
+.links { list-style: none; padding: 0; margin: 0 0 2rem; display: grid; gap: 1.2rem; }
 .card {
   position: relative;
-  padding: 1.1rem 1.2rem 1.2rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  background: var(--bg);
-  transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
+  background: var(--paper-2);
+  border: 1.8px solid var(--ink);
+  border-radius: 10px 16px 12px 18px;
+  box-shadow: var(--shadow);
+  padding: 1.05rem 1.2rem 1.15rem;
+  transition: translate 0.2s cubic-bezier(0.2, 0.7, 0.2, 1), box-shadow 0.2s cubic-bezier(0.2, 0.7, 0.2, 1), rotate 0.2s cubic-bezier(0.2, 0.7, 0.2, 1);
 }
-.card:hover { border-color: var(--border-strong); box-shadow: var(--shadow); }
-.card.primary { border-color: var(--accent-border); background: var(--accent-soft); }
-.card.primary:hover { border-color: var(--accent); }
+.card:hover { translate: -2px -3px; rotate: -0.4deg; box-shadow: 6px 8px 0 rgba(36, 31, 28, 0.16); }
+.card::before {
+  content: "";
+  position: absolute;
+  top: -0.66rem;
+  left: 1.5rem;
+  width: 4.4rem;
+  height: 1.28rem;
+  background: var(--tape);
+  border-inline: 1px dashed rgba(36, 31, 28, 0.26);
+  rotate: -2.2deg;
+  pointer-events: none;
+}
 .num {
   display: inline-block;
-  margin-bottom: 0.45rem;
+  margin-bottom: 0.5rem;
+  padding: 0.06rem 0.45rem 0.1rem;
   font-family: var(--mono);
   font-size: 0.72rem;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  color: var(--accent-text);
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--pink-deep);
+  border: 1.5px solid var(--ink);
+  border-radius: 3px 6px 4px 7px;
+  box-shadow: var(--shadow-sm);
+  rotate: -2deg;
 }
 .card a {
   display: block;
   font-weight: 650;
-  font-size: 1.02rem;
-  color: var(--text);
-  text-decoration: none;
+  font-size: 1.05rem;
+  color: var(--blue);
+  text-decoration: underline;
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 3px;
+  text-decoration-color: rgba(44, 74, 102, 0.35);
 }
-/* Whole-card links (one link per card). */
-.card a::after { content: ""; position: absolute; inset: 0; border-radius: inherit; }
-.card:hover a { color: var(--accent-text); }
-.note { display: block; margin-top: 0.3rem; color: var(--text-2); font-size: 0.92rem; line-height: 1.6; }
+.card a:hover { color: var(--pink-deep); text-decoration-color: var(--pink); }
+.note { display: block; margin-top: 0.25rem; color: var(--ink-2); font-size: 0.9rem; }
 code {
   font-family: var(--mono);
-  font-size: 0.86em;
+  font-size: 0.85em;
   font-variant-numeric: tabular-nums;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 0.1em 0.35em;
+  background: var(--paper-3);
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  padding: 0.06em 0.32em;
   overflow-wrap: anywhere;
 }
 .route {
-  margin: 0 0 0.9rem;
-  padding: 0.95rem 1.1rem;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  margin: 0 0 1.1rem;
+  padding: 0.95rem 1.05rem 1rem;
+  background: var(--paper-2);
+  background-image: repeating-linear-gradient(to bottom, transparent 0 27px, rgba(44, 74, 102, 0.05) 27px 28px);
+  border: 1.8px solid var(--ink);
+  border-radius: 8px 12px 9px 13px;
+  box-shadow: var(--shadow);
   font-family: var(--mono);
   font-size: 0.84rem;
-  line-height: 1.65;
-  color: var(--text);
+  color: var(--ink);
   overflow-x: auto;
 }
-.route .seg { color: var(--accent-text); }
-.meta { margin: 0; font-size: 0.9rem; color: var(--text-3); max-width: 70ch; }
-.chips { display: flex; flex-wrap: wrap; gap: 0.5rem; list-style: none; margin: 1.25rem 0 0; padding: 0; }
+.meta { margin: 0.4rem 0 0; font-family: var(--mono); font-size: 0.78rem; color: var(--ink-3); max-width: 70ch; }
+.chips { display: flex; flex-wrap: wrap; gap: 0.55rem; list-style: none; margin: 1.5rem 0 0; padding: 0; }
 .chips li {
-  padding: 0.2rem 0.65rem;
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  background: var(--bg-subtle);
-  color: var(--text-2);
   font-family: var(--mono);
-  font-size: 0.75rem;
+  font-size: 0.74rem;
+  color: var(--ink-2);
+  background: var(--paper-2);
+  border: 1.6px solid var(--ink);
+  border-radius: 5px 9px 6px 10px;
+  padding: 0.2rem 0.6rem 0.24rem;
+  box-shadow: var(--shadow-sm);
   font-variant-numeric: tabular-nums;
 }
+.chips li:nth-child(odd) { rotate: -1.3deg; background: var(--paper-3); }
+.chips li:nth-child(even) { rotate: 1deg; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.001ms !important; }
 }
-@media (max-width: 30rem) {
-  .brand-tag { display: none; }
+@media (max-width: 40rem) {
+  body { font-size: 16px; }
+  .sun { opacity: 0.85; }
 }
 </style>
 </head>
 <body>
-<header class="top">
-  <div class="top-inner">
-    <a class="brand" href="${DOCS_URL}/" aria-label="pinkdb docs">
-      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-        <rect x="1" y="1" width="22" height="22" rx="6.5" class="brand-mark-bg"/>
-        <rect x="6" y="12" width="3" height="6" rx="1.2" class="brand-mark-bar"/>
-        <rect x="10.5" y="8" width="3" height="10" rx="1.2" class="brand-mark-bar"/>
-        <rect x="15" y="5.5" width="3" height="12.5" rx="1.2" class="brand-mark-bar"/>
-      </svg>
-      <span class="brand-name">pinkdb</span>
-      <span class="brand-tag">extensions</span>
-    </a>
-    <a class="top-link" href="${DOCS_URL}/">Docs</a>
-  </div>
-</header>
 <main>
-  <p class="kicker"><b>format v${FORMAT_VERSION}</b> Extension repository</p>
+  <span class="sun" aria-hidden="true"></span>
+  <span class="tape" aria-hidden="true"></span>
+  <p class="kicker">extension repository &#183; format v${FORMAT_VERSION}</p>
   <h1>pinkdb extension repository</h1>
   <p class="lede">Hosted, immutable catalog of built pinkdb extension artifacts
   (C ABI v1, format v${FORMAT_VERSION}). This Worker serves the machine
   endpoints; the browsable catalog UI lives in the docs.</p>
 
+  <hr class="cut">
+
   <ul class="links">
-    <li class="card primary">
+    <li class="card">
       <span class="num">01</span>
       <a href="${DOCS_URL}/extensions">Browse the catalog in the docs</a>
       <span class="note">Search, per-extension metadata, <code>.install &lt;name&gt;</code> commands and downloads.</span>
@@ -365,8 +316,7 @@ code {
     </li>
   </ul>
 
-  <h2>Artifact route</h2>
-  <pre class="route">/artifacts/<span class="seg">&lt;name&gt;</span>/<span class="seg">&lt;version&gt;</span>/<span class="seg">&lt;platform&gt;</span>/<span class="seg">&lt;file&gt;</span></pre>
+  <pre class="route">/artifacts/&lt;name&gt;/&lt;version&gt;/&lt;platform&gt;/&lt;file&gt;</pre>
   <p class="meta">format v${FORMAT_VERSION} &#183; immutable bytes, byte-identical downloads
   &#183; always verify the SHA-256 from the catalog before loading. No directory
   listings, no writes.</p>

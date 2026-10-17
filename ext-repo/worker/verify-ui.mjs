@@ -8,8 +8,8 @@
 // (https://pinkdb-docs.defaultcms.workers.dev). Checks, in order:
 //   1. local Worker: GET / is the short info page — self-contained, no
 //      catalog script, links to the docs Extensions page and /index.json,
-//      styled with the docs' neutral + pink tokens (light and dark) using
-//      system fonts only; OPTIONS /index.json answers the CORS preflight; with a stubbed
+//      styled with the docs' "soft data-zine" palette using system fonts
+//      only; OPTIONS /index.json answers the CORS preflight; with a stubbed
 //      R2 binding GET /index.json (200/304/404) carries
 //      Access-Control-Allow-Origin: *; /artifacts/… keeps the 405 for
 //      OPTIONS (only the catalog is CORS-enabled);
@@ -29,7 +29,7 @@
 //      (the extensions page marks it active); no generated page loads an
 //      external asset;
 //   4. design system: the generated stylesheet and font files are the
-//      docs set (light + dark colour tokens, three self-hosted OFL
+//      "soft data-zine" set (day/night paper/ink/pink tokens, three self-hosted OFL
 //      families with licences, swap, tabular numerals, reduced-motion
 //      guards); every page carries favicon + canonical + OpenGraph metadata;
 //   5. live docs: GET <docs>/extensions answers 200 text/html with the
@@ -170,20 +170,7 @@ check(
   "info page loads no external assets",
   assetViolations(localPage).join(", "),
 );
-check(
-  localPage.includes("--bg: #ffffff") && localPage.includes("--accent: #c2255c") &&
-    localPage.includes("--accent: #f472a6"),
-  "info page uses the docs' light + dark tokens (neutral surfaces, pink accent)",
-);
-check(
-  /@media \(prefers-color-scheme: dark\)\s*\{\s*:root/.test(localPage) &&
-    localPage.includes('content="light dark"'),
-  "info page follows prefers-color-scheme (light + dark)",
-);
-check(
-  !localPage.includes("--paper") && !localPage.includes("--ink"),
-  "info page drops the old paper/ink palette",
-);
+check(localPage.includes("--paper: #f7f1e8"), "info page uses the docs' paper palette");
 check(
   localPage.includes("ui-sans-serif") && localPage.includes("ui-monospace"),
   "info page keeps to a system type stack",
@@ -201,12 +188,8 @@ check(
   "info page carries an inline (data URI) favicon",
 );
 check(
-  localPage.includes('class="brand-mark"') && (localPage.match(/class="brand-mark-bar"/g) || []).length === 3,
-  "info page carries the docs brand mark (rounded square, three bars)",
-);
-check(
-  !localPage.includes('class="tape"') && !localPage.includes('class="sun"'),
-  "info page drops the zine ornaments (tape strip, pink sun)",
+  localPage.includes('class="tape"') && localPage.includes('class="sun"'),
+  "info page keeps the zine motifs (tape strip, pink sun)",
 );
 
 const preflight = await localFetch("/index.json", { method: "OPTIONS" });
@@ -408,11 +391,12 @@ if (existsSync(cssPath)) {
     check(css.includes(`font-family: "${family}"`),
       `stylesheet declares the self-hosted ${family} face`);
   }
-  check(css.includes("--bg:") && css.includes("--text:") && css.includes("--accent:"),
-    "stylesheet defines the bg/text/accent colour tokens");
-  check(/--bg:\s*light-dark\(/.test(css) && css.includes(':root[data-theme="dark"]') &&
-      css.includes(':root[data-theme="light"]'),
-    "stylesheet ships light-dark() tokens with a data-theme override");
+  check(css.includes("--paper: light-dark(#f7f1e8,") && css.includes("--ink: light-dark(#241f1c,"),
+    "stylesheet keeps the paper/ink palette tokens (day edition first)");
+  check(css.includes(':root[data-theme="dark"]') && css.includes(':root[data-theme="light"]'),
+    "stylesheet ships the night edition with a data-theme override");
+  check(/\.ticker-track\s*\{[^}]*animation/.test(css),
+    "stylesheet animates the ticker strip");
   check(/font-variant-numeric:\s*tabular-nums/.test(css),
     "data surfaces use tabular numerals");
   check(css.includes("prefers-reduced-motion"),
@@ -453,12 +437,12 @@ check(
 
 const landing = readFileSync(join(SITE, "index.html"), "utf8");
 check(
-  landing.includes('class="terminal"') && landing.includes('role="img"'),
-  "landing page carries the labelled terminal sample",
+  landing.includes('class="ticker"') && landing.includes("ticker-track"),
+  "landing page carries the ticker strip",
 );
 check(
-  landing.includes('class="stats"') && landing.includes('class="pillars"'),
-  "landing page carries the key-number strip and the feature pillars",
+  landing.includes('class="hero-sun"') && landing.includes('class="chips"'),
+  "landing page carries the zine hero (pink sun, data chips)",
 );
 check(
   readFileSync(join(SITE, "extensions.html"), "utf8").includes("sk-arrowhead"),
@@ -474,7 +458,7 @@ check(
   check(
     page.includes("<script data-theme-script>") && page.includes("data-theme-toggle") &&
       page.includes('data-theme-choice="system"'),
-    "pages carry the theme script, the header toggle and the footer System/Light/Dark switch",
+    "pages carry the theme script, the header toggle and the footer Auto/Day/Night switch",
   );
 }
 check(

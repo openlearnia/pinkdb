@@ -8,37 +8,34 @@ catalog fetched at runtime from the repository Worker
 (`https://pinkdb-ext-repo.defaultcms.workers.dev/index.json`; the Worker sends CORS
 `*` for it).
 
-## Design
+## Art direction — "soft data-zine"
 
-A clean product-docs look on cool slate neutrals: **pink** is the brand
-(`--accent`: primary buttons, active states, the logo, highlights) and **indigo**
-is the second colour (`--link`: links, info callouts, code functions, focus
-rings). Every colour token at the top of `src/assets/style.css` is a
-`light-dark(<light>, <dark>)` pair, and every text pairing meets WCAG AA in both
-schemes.
+The site reads like a warm-paper zine about data: paper `#F7F1E8`, warm ink
+`#241F1C`, one desaturated pink accent `#C9557A` (plus ink blue `#2C4A66` for
+links), warm-tinted greys only, a fixed paper-grain overlay, hard offset shadows
+from a single top-left light source, dashed "cut lines", sticker badges, tape
+strips, index-card code blocks, margin notes, sketchy inline SVG diagrams, and a
+ticker strip on the landing and Extensions pages.
 
-**Theme switching.** By default the page follows the OS (`color-scheme: light
-dark`). A small inline script in `layout.html` (`<script data-theme-script>`)
-lets visitors pin a theme: the sun/moon button in the header flips light/dark,
-and the System / Light / Dark switch in the footer can return to the OS
-setting. The choice is stored in `localStorage` (`pinkdb-theme`) and applied as
-`data-theme` on `<html>` before first paint, which sets `color-scheme` and so
-flips every token. Without JavaScript both controls stay hidden and the site
-simply follows the OS.
+Two editions share the design: **day paper** (above) and **night paper** — warm
+near-black paper `#1B1815`, cream ink `#F0E7DA`, a lifted pink `#DC7B9C` — with
+chalk-line borders and stronger offset shadows. Every colour token in
+`src/assets/style.css` is a `light-dark(<day>, <night>)` pair; non-colour
+switches (shadow strength, grain blend) sit in one small night block.
 
-- **Header** — sticky, translucent; brand, the `TOPNAV` sections (Docs, Guides,
-  API, Extensions, Roadmap) with the current section underlined, the theme
-  toggle, and GitHub.
-- **Docs pages** — three columns on wide screens: sticky sidebar, a ~46rem
-  article column, and the "on this page" rail (≥80rem). Each article gets a
-  section eyebrow, permalinked `<h2>`s, previous/next links in sidebar order and
-  an "Edit this page on GitHub" link. Below 60rem the sidebar collapses into a
-  "Docs / <page>" disclosure bar (a checkbox, no script).
-- **Code** — every `<pre class="code" data-lang>` block gets a header bar with its
-  language and build-time syntax colouring (SQL, shell, Rust, C, Go, Python,
-  TOML, JSON); `text` blocks are labelled "Output" and left plain.
-- **Landing** — hero with a terminal sample, a key-numbers strip, four feature
-  pillars, a three-step quickstart, the facts table and a closing call to action.
+**Theme switching.** By default the page follows the OS. A small inline script
+in `layout.html` (`<script data-theme-script>`) lets visitors pin an edition: the
+sticker button in the header flips day/night, and the Auto / Day / Night tabs in
+the footer return to the OS setting. The choice is stored in `localStorage`
+(`pinkdb-theme`) and applied as `data-theme` on `<html>` before first paint.
+Without JavaScript both controls stay hidden and the site follows the OS.
+
+**Docs pages** keep the zine furniture (numbered section headings, index-card
+code blocks, sticker kickers) and add: a section sticker above the title,
+permalinked `<h2>`s, the "on this page" rail on every page, previous/next cards
+in sidebar order, an "Edit this page on GitHub" link, and build-time syntax
+colouring for SQL, shell, Rust, C, Go, Python, TOML and JSON blocks (each block
+gets a language sticker; `text` blocks are labelled "Output").
 
 Type is self-hosted (see `src/assets/fonts/README.md` for provenance and the
 subsetting commands):

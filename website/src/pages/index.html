@@ -1,222 +1,233 @@
-<section class="hero">
-  <div class="hero-inner">
-    <div>
-      <p class="hero-pill"><b>Rust</b> Embedded analytical SQL</p>
-      <h1>pinkdb — a mini <span class="hero-mark">DuckDB</span> in Rust</h1>
-      <p class="lede">Link it into your program or run the CLI: columnar vectors,
-      vectorized execution, SQL with joins, CTEs and window functions, durable
-      <code>.pink</code> files with a write-ahead log, a lake layer over local disk or
-      S3/R2, and C, Python and Go bindings.</p>
-      <div class="hero-actions">
-        <a class="button primary" href="{{root}}docs/getting-started.html">Get started &#8594;</a>
-        <a class="button" href="{{root}}docs/sql.html">SQL reference</a>
-        <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">View on GitHub &#8599;</a>
-      </div>
-    </div>
-    <div class="terminal" role="img" aria-label="Terminal session: build the pinkdb CLI, import sales.csv, run a GROUP BY query that returns two rows, and save the database to sales.pink.">
-      <div class="terminal-bar"><i></i><i></i><i></i><span>pinkdb</span></div>
-<pre aria-hidden="true"><span class="t-prompt">$</span> cargo build --release -p pinkdb-cli
-<span class="t-prompt">$</span> ./target/release/pinkdb
-<span class="t-prompt">pinkdb&gt;</span> .import sales.csv sales
-<span class="t-prompt">pinkdb&gt;</span> <span class="t-kw">SELECT</span> region, AVG(total) <span class="t-kw">FROM</span> sales
-   ...&gt; <span class="t-kw">GROUP BY</span> region <span class="t-kw">ORDER BY</span> 2 <span class="t-kw">DESC</span>;
-<span class="t-dim">┌─────────┬────────────┐
-│ region  │ avg(total) │
-│ VARCHAR │ DOUBLE     │
-├─────────┼────────────┤</span>
-<span class="t-dim">│</span> west    <span class="t-dim">│</span> 175.0      <span class="t-dim">│</span>
-<span class="t-dim">│</span> east    <span class="t-dim">│</span> 50.5       <span class="t-dim">│</span>
-<span class="t-dim">└─────────┴────────────┘
-2 rows</span>
-<span class="t-prompt">pinkdb&gt;</span> .save sales.pink</pre>
-    </div>
+<div class="ticker" aria-hidden="true">
+  <div class="ticker-track">
+    <span>~2.4 MB default binary</span>
+    <span>1M rows &#8594; 2.68 MB .pink</span>
+    <span>lean lake 2.69 MB &#183; full lake 45.3 MB</span>
+    <span>Vortex or .pink lake data files</span>
+    <span>S3 / R2 lakes with conflict detection</span>
+    <span>C &#183; Python &#183; Go bindings</span>
+    <span>loadable extensions &#183; catalog live</span>
+    <span>zero async &#183; zero unsafe in the core</span>
+    <span>~2.4 MB default binary</span>
+    <span>1M rows &#8594; 2.68 MB .pink</span>
+    <span>lean lake 2.69 MB &#183; full lake 45.3 MB</span>
+    <span>Vortex or .pink lake data files</span>
+    <span>S3 / R2 lakes with conflict detection</span>
+    <span>C &#183; Python &#183; Go bindings</span>
+    <span>loadable extensions &#183; catalog live</span>
+    <span>zero async &#183; zero unsafe in the core</span>
   </div>
+</div>
+
+<section class="hero">
+  <div class="hero-sun" aria-hidden="true"></div>
+  <p class="kicker">embedded analytical SQL in rust</p>
+  <h1>pinkdb — a mini <span class="hero-mark">DuckDB</span> in Rust</h1>
+  <svg class="sketch-underline" viewBox="0 0 260 18" aria-hidden="true" focusable="false">
+    <path class="sk-pink-stroke" d="M4 12 C 40 6, 70 14, 104 9 S 168 4, 204 10 S 246 12, 256 7"/>
+    <path class="sk-stroke" d="M12 15 C 62 11, 122 16, 182 12" opacity="0.35"/>
+  </svg>
+  <p class="lede">Link it into your program or run the CLI: columnar vectors, vectorized
+  execution, SQL with joins, CTEs and window functions, CSV import, durable
+  <code>.pink</code> files with a write-ahead log, a lake layer over local disk or
+  S3/R2, and C, Python and Go bindings. The default build is <strong>~2.4 MB</strong> —
+  zero async in the core, zero <code>unsafe</code> outside the FFI and
+  extension-loader crates.</p>
+  <div class="hero-actions">
+    <a class="button primary" href="{{root}}docs/getting-started.html">Get started</a>
+    <a class="button" href="{{root}}docs/roadmap.html">Roadmap</a>
+    <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub &#8599;</a>
+  </div>
+  <ul class="chips">
+    <li class="chip">binary <span class="chip-num">~2.4 MB</span> default</li>
+    <li class="chip">lake sizes <span class="chip-num">2.7</span>–<span class="chip-num">45 MB</span></li>
+    <li class="chip">bindings <span class="chip-num">C &#183; Python &#183; Go</span></li>
+    <li class="chip"><span class="chip-num">0</span> async</li>
+    <li class="chip"><span class="chip-num">0</span> unsafe in core</li>
+  </ul>
 </section>
 
-<ul class="stats" aria-label="Key numbers">
-  <li><span class="stat-value">~2.4 MB</span><span class="stat-label">default release binary</span></li>
-  <li><span class="stat-value">2.68 MB</span><span class="stat-label">1M rows as a <code>.pink</code> file</span></li>
-  <li><span class="stat-value">C · Py · Go</span><span class="stat-label">bindings over one C ABI</span></li>
-  <li><span class="stat-value">0 unsafe</span><span class="stat-label">in the core — and zero async</span></li>
+<h2>What it is</h2>
+
+<p>pinkdb is an <strong>embeddable analytical SQL engine</strong> written in Rust, in
+the spirit of DuckDB: in-process, columnar, vectorized, with a small dependency
+footprint and no server required. It ships as a library crate
+(<code>pinkdb</code>), a CLI REPL (<code>pinkdb-cli</code>, a thin consumer of the
+library), a network server (<code>pinkdb-server</code>) and a C ABI
+(<code>pinkdb-ffi</code>).</p>
+
+<p>Capabilities are opt-in cargo features, so you only pay for what you use: the
+default build is <strong>2,436,320 B</strong>, the lean lake build adds the
+<code>.lake</code> commands for <strong>2,692,464 B</strong>, and the full lake build
+with the Vortex format is <strong>45,333,984 B</strong>. Nothing extra is compiled
+unless asked for — no crypto, TLS or format code in the default binary.</p>
+
+<aside class="marginalia">
+  <span class="margin-tag">honest by design</span>
+  <p>The SQL surface is deliberately small and growing in the open. Everything listed
+  here is implemented and tested; what is queued lives on the
+  <a href="{{root}}docs/roadmap.html">roadmap</a>, and the
+  <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">engineering
+  log on GitHub</a> has the detail.</p>
+</aside>
+
+<h2>Features</h2>
+
+<ul class="cards">
+  <li class="card">
+    <h3><a href="{{root}}docs/api-rust.html">Embeddable engine</a></h3>
+    <p>Link the <code>pinkdb</code> crate and run SQL in-process. No daemon, no
+    runtime dependencies, ready for embedding.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/sql.html">Vectorized columnar core</a></h3>
+    <p>Typed column vectors and ≤2,048-row chunks; every operator runs over whole
+    chunks, in parallel via rayon.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/getting-started.html">CSV import</a></h3>
+    <p>One command infers the schema per column, parses files in parallel, and
+    auto-detects <code>DATE</code> and <code>TIMESTAMP</code>.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/persistence.html">Durable <code>.pink</code> files</a></h3>
+    <p>Single-file v4 columnar format with delta, dictionary, ALP and LZ encodings;
+    bit-exact round trips and a CRC-32 guard.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/persistence.html">WAL &amp; crash recovery</a></h3>
+    <p>A durable open replays the write-ahead log, checkpoints atomically, and
+    recovers an interrupted checkpoint on the next open.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/guide-durable-multiprocess.html">Multi-process writers</a></h3>
+    <p>Any local process may open a durable database read-write; writers serialize
+    on a short-held write lease, readers never block.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/lake.html">Lake layer</a></h3>
+    <p>Decoupled metadata: a JSON catalog plus immutable per-table snapshots.
+    Vortex data files, or lean <code>.pink</code> v4 files with no Vortex
+    dependency.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/lake.html">S3 / R2 object storage</a></h3>
+    <p>An <code>s3://</code> lake over AWS S3, Cloudflare R2 or any S3-compatible
+    endpoint, with conditional-write conflict detection.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/lake.html">Read-only attach</a></h3>
+    <p><code>.lake attach</code> opens a published snapshot without decoding column
+    data; exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> come from stored
+    statistics.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/server.html">Network server</a></h3>
+    <p><code>pinkdb-server</code> over TCP with a compact framed protocol and a
+    remote CLI mode — one thread per connection, no async runtime.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/bindings.html">C · Python · Go bindings</a></h3>
+    <p>A C ABI v1 (<code>pinkdb-ffi</code>) with a hand-written header, plus
+    dependency-free Python and Go wrappers, and Rust natively.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/extensions.html">Loadable extensions</a></h3>
+    <p>Register scalar SQL functions from a shared library at runtime — or
+    <code>.install</code> one from the extension catalog.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/guide-encryption.html">At-rest encryption</a></h3>
+    <p>Optional <code>PINKENC1</code> containers: AES-256-GCM with Argon2id
+    passphrase derivation, for checkpoints and the WAL.</p>
+  </li>
+  <li class="card">
+    <h3><a href="{{root}}docs/sql.html">SQL surface</a></h3>
+    <p>DDL/DML, inner and outer equi-joins, CTEs, subqueries, window functions,
+    aggregates, transactions and multiple databases per store.</p>
+  </li>
 </ul>
 
-<section class="home-section" aria-labelledby="features">
-  <div class="section-head">
-    <h2 id="features">Everything in one small engine</h2>
-    <p>Capabilities are opt-in cargo features, so you only pay for what you use —
-    no crypto, TLS or format code lands in the default binary unless asked for.</p>
-  </div>
+<h2>Key facts</h2>
 
-  <ul class="pillars">
-    <li class="pillar card">
-      <div class="pillar-head">
-        <span class="pillar-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg></span>
-        <h3>Query engine</h3>
-      </div>
-      <ul>
-        <li><a href="{{root}}docs/api-rust.html">Embeddable</a>
-          <p>Link the <code>pinkdb</code> crate and run SQL in-process — no daemon, no runtime dependencies.</p></li>
-        <li><a href="{{root}}docs/sql.html">Vectorized columnar core</a>
-          <p>Typed column vectors in ≤2,048-row chunks; every operator runs over whole chunks, in parallel via rayon.</p></li>
-        <li><a href="{{root}}docs/sql.html">SQL surface</a>
-          <p>DDL/DML, inner and outer equi-joins, CTEs, subqueries, window functions, aggregates and transactions.</p></li>
-        <li><a href="{{root}}docs/getting-started.html">CSV import</a>
-          <p>One command infers the schema per column, parses in parallel, and detects <code>DATE</code> and <code>TIMESTAMP</code>.</p></li>
-      </ul>
-    </li>
-    <li class="pillar card">
-      <div class="pillar-head">
-        <span class="pillar-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></span>
-        <h3>Durable storage</h3>
-      </div>
-      <ul>
-        <li><a href="{{root}}docs/persistence.html">Single-file <code>.pink</code> format</a>
-          <p>Columnar v4 files with delta, dictionary, ALP and LZ encodings; bit-exact round trips and a CRC-32 guard.</p></li>
-        <li><a href="{{root}}docs/persistence.html">WAL &amp; crash recovery</a>
-          <p>A durable open replays the write-ahead log, checkpoints atomically, and recovers interrupted checkpoints.</p></li>
-        <li><a href="{{root}}docs/guide-durable-multiprocess.html">Multi-process writers</a>
-          <p>Any local process may open a durable database read-write; writers serialize on a short write lease.</p></li>
-        <li><a href="{{root}}docs/guide-encryption.html">At-rest encryption</a>
-          <p>Optional AES-256-GCM containers with Argon2id passphrase derivation, for checkpoints and the WAL.</p></li>
-      </ul>
-    </li>
-    <li class="pillar card">
-      <div class="pillar-head">
-        <span class="pillar-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19a4.5 4.5 0 1 0-1.4-8.8A6 6 0 0 0 4.5 12.5 3.5 3.5 0 0 0 6 19z"/></svg></span>
-        <h3>Lake &amp; object storage</h3>
-      </div>
-      <ul>
-        <li><a href="{{root}}docs/lake.html">Lake layer</a>
-          <p>A JSON catalog plus immutable per-table snapshots, stored as Vortex or lean <code>.pink</code> v4 data files.</p></li>
-        <li><a href="{{root}}docs/guide-s3-lake.html">S3 / R2 lakes</a>
-          <p><code>s3://</code> lakes on AWS S3, Cloudflare R2 or any S3-compatible endpoint, with conflict detection.</p></li>
-        <li><a href="{{root}}docs/lake.html">Read-only attach</a>
-          <p>Open a published snapshot without decoding column data; exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> come from stored statistics.</p></li>
-      </ul>
-    </li>
-    <li class="pillar card">
-      <div class="pillar-head">
-        <span class="pillar-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m8 7-5 5 5 5"/><path d="m16 7 5 5-5 5"/><path d="m14 4-4 16"/></svg></span>
-        <h3>Integrations</h3>
-      </div>
-      <ul>
-        <li><a href="{{root}}docs/bindings.html">C · Python · Go bindings</a>
-          <p>A C ABI v1 with a hand-written header, plus dependency-free Python and Go wrappers — and Rust natively.</p></li>
-        <li><a href="{{root}}docs/server.html">Network server</a>
-          <p><code>pinkdb-server</code> over TCP with a compact framed protocol and a remote CLI mode.</p></li>
-        <li><a href="{{root}}docs/extensions.html">Loadable extensions</a>
-          <p>Register scalar SQL functions from a shared library — or <code>.install</code> one from the <a href="{{root}}extensions.html">catalog</a>.</p></li>
-      </ul>
-    </li>
-  </ul>
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Fact</th><th>Value</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Binaries</td>
+      <td>default <strong>2.44 MB</strong> · lean lake <strong>2.69 MB</strong> ·
+      full lake <strong>45.3 MB</strong> (release, Apple Silicon)</td>
+    </tr>
+    <tr>
+      <td>Persistence</td>
+      <td><code>.pink</code> v4 single-file columnar format; 1M rows →
+      <strong>2.68 MB</strong>, 10M rows → <strong>26.8 MB</strong></td>
+    </tr>
+    <tr>
+      <td>SQL</td>
+      <td>CSV import, joins (INNER/LEFT/RIGHT equi), CTEs, subqueries, window
+      functions, aggregates, <code>CAST</code>, dates; transactions and
+      multi-database sessions</td>
+    </tr>
+    <tr>
+      <td>Durability</td>
+      <td>write-ahead log + atomic checkpoints; durable databases are
+      multi-process, with a 5&nbsp;s busy timeout for writers</td>
+    </tr>
+    <tr>
+      <td>Lake</td>
+      <td>catalog + immutable snapshots; Vortex or <code>.pink</code> v4 data
+      files; read-only attach answers exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code></td>
+    </tr>
+    <tr>
+      <td>Object storage</td>
+      <td><code>s3://</code> locations on AWS S3, Cloudflare R2 or any
+      S3-compatible endpoint (opt-in <code>s3</code> feature)</td>
+    </tr>
+    <tr>
+      <td>Bindings</td>
+      <td>Rust (native), C (ABI v1), Python (<code>ctypes</code>, no dependencies),
+      Go (<code>cgo</code>)</td>
+    </tr>
+    <tr>
+      <td>Extensions</td>
+      <td>loadable native scalar functions (ABI v1), C and Go SDKs, and a hosted
+      <a href="{{root}}extensions.html">extension catalog</a></td>
+    </tr>
+    <tr>
+      <td>DuckDB parity</td>
+      <td>differentially tested against DuckDB on a committed query corpus; the
+      current corpus matches on both engines</td>
+    </tr>
+  </tbody>
+</table>
+</div>
 
-  <aside class="marginalia">
-    <span class="margin-tag">Honest by design</span>
-    <p>The SQL surface is deliberately small and growing in the open. Everything listed
-    here is implemented and tested; what is queued lives on the
-    <a href="{{root}}docs/roadmap.html">roadmap</a>, and the
-    <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">engineering
-    log on GitHub</a> has the detail.</p>
-  </aside>
-</section>
+<h2>Quickstart</h2>
 
-<section class="home-section" aria-labelledby="quickstart">
-  <div class="section-head">
-    <h2 id="quickstart">Quickstart</h2>
-    <p>Import, query, save — the whole loop takes a minute.</p>
-  </div>
-  <ol class="quickstart">
-    <li>
-      <h3>Build the CLI</h3>
-      <p>The default build has no optional features.</p>
 <pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli
 ./target/release/pinkdb</code></pre>
-    </li>
-    <li>
-      <h3>Import and query</h3>
-      <p>Schema is inferred per column.</p>
+
 <pre class="code" data-lang="sql"><code>.import sales.csv sales
-SELECT region, AVG(total)
-FROM sales GROUP BY region;</code></pre>
-    </li>
-    <li>
-      <h3>Save it</h3>
-      <p>One durable, columnar file.</p>
-<pre class="code" data-lang="sql"><code>.save sales.pink
-.open sales.pink</code></pre>
-    </li>
-  </ol>
-</section>
+SELECT region, AVG(total) FROM sales GROUP BY region ORDER BY 2 DESC;</code></pre>
 
-<section class="home-section" aria-labelledby="facts">
-  <div class="section-head">
-    <h2 id="facts">At a glance</h2>
-    <p>Numbers from the repository, measured on release builds.</p>
-  </div>
-  <div class="table-wrap">
-  <table>
-    <tbody>
-      <tr>
-        <td>Binaries</td>
-        <td>default <strong>2.44 MB</strong> · lean lake <strong>2.69 MB</strong> ·
-        full lake <strong>45.3 MB</strong> (release, Apple Silicon)</td>
-      </tr>
-      <tr>
-        <td>Persistence</td>
-        <td><code>.pink</code> v4 single-file columnar format; 1M rows →
-        <strong>2.68 MB</strong>, 10M rows → <strong>26.8 MB</strong></td>
-      </tr>
-      <tr>
-        <td>SQL</td>
-        <td>CSV import, joins (INNER/LEFT/RIGHT equi), CTEs, subqueries, window
-        functions, aggregates, <code>CAST</code>, dates; transactions and
-        multi-database sessions</td>
-      </tr>
-      <tr>
-        <td>Durability</td>
-        <td>write-ahead log + atomic checkpoints; durable databases are
-        multi-process, with a 5&nbsp;s busy timeout for writers</td>
-      </tr>
-      <tr>
-        <td>Lake</td>
-        <td>catalog + immutable snapshots; Vortex or <code>.pink</code> v4 data
-        files; read-only attach answers exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code></td>
-      </tr>
-      <tr>
-        <td>Object storage</td>
-        <td><code>s3://</code> locations on AWS S3, Cloudflare R2 or any
-        S3-compatible endpoint (opt-in <code>s3</code> feature)</td>
-      </tr>
-      <tr>
-        <td>Bindings</td>
-        <td>Rust (native), C (ABI v1), Python (<code>ctypes</code>, no dependencies),
-        Go (<code>cgo</code>)</td>
-      </tr>
-      <tr>
-        <td>Extensions</td>
-        <td>loadable native scalar functions (ABI v1), C and Go SDKs, and a hosted
-        <a href="{{root}}extensions.html">extension catalog</a></td>
-      </tr>
-      <tr>
-        <td>DuckDB parity</td>
-        <td>differentially tested against DuckDB on a committed query corpus; the
-        current corpus matches on both engines</td>
-      </tr>
-    </tbody>
-  </table>
-  </div>
-</section>
+<pre class="code" data-lang="text"><code>┌─────────┬────────────┐
+│ region  │ avg(total) │
+│ VARCHAR │ DOUBLE     │
+├─────────┼────────────┤
+│ west    │ 175.0      │
+│ east    │ 50.5       │
+└─────────┴────────────┘
+2 rows
+Run Time (s): real 0.000</code></pre>
 
-<section class="cta" aria-labelledby="cta-title">
-  <div class="cta-inner">
-    <div>
-      <h2 id="cta-title">Start building with pinkdb</h2>
-      <p>Build the CLI, import a CSV and save your first <code>.pink</code> database —
-      then embed it from Rust, C, Python or Go.</p>
-    </div>
-    <div class="hero-actions">
-      <a class="button primary" href="{{root}}docs/getting-started.html">Read the guide &#8594;</a>
-      <a class="button" href="{{root}}docs/roadmap.html">Roadmap</a>
-    </div>
-  </div>
-</section>
+<p>That is the whole loop: import, query, save. The
+<a href="{{root}}docs/getting-started.html">getting-started guide</a> continues with
+<code>.save</code>/<code>.open</code>, the build matrix, and the library API.</p>
+
+<div class="hero-actions">
+  <a class="button primary" href="{{root}}docs/getting-started.html">Get started</a>
+  <a class="button" href="{{root}}docs/roadmap.html">Roadmap</a>
+  <a class="button ghost" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub &#8599;</a>
+</div>
