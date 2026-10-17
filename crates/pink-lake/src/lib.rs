@@ -500,6 +500,9 @@ pub enum LakeError {
     /// modified/truncated ciphertext, a missing terminal frame, or a container
     /// sealed for another domain/path. Never a partial read.
     Tampered { path: PathBuf, message: String },
+    /// An encrypted container whose *version* this build does not understand:
+    /// it was sealed by a newer pinkdb. Not corruption — upgrade to open it.
+    UnsupportedContainer { path: PathBuf, found: u32 },
     /// A maintenance/introspection argument that cannot be honored — the
     /// DuckLake `InvalidInputException` family: `expire_snapshots` given both
     /// `versions` and `older_than`, a `delete_threshold` outside `0..=1`, a
@@ -618,6 +621,12 @@ impl fmt::Display for LakeError {
                     path.display()
                 )
             }
+            LakeError::UnsupportedContainer { path, found } => write!(
+                f,
+                "unsupported encrypted-container version {found} at {} (written by a newer \
+                 pinkdb — upgrade to open it)",
+                path.display()
+            ),
             LakeError::BadKey { message } => write!(f, "invalid encryption key: {message}"),
             LakeError::InvalidOption { message } => write!(f, "{message}"),
             LakeError::Internal { message } => write!(f, "internal lake error: {message}"),
@@ -2234,11 +2243,11 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                     // block was never published (attach refuses those with the
                     // clear "no statistics" message).
                     if let Some(partition) = partition {
-                        for key in partition.keys() {
-                            if crate::catalog::PartitionKey::parse(key).is_err() {
+                        for pkey in partition.keys() {
+                            if crate::catalog::PartitionKey::parse(pkey).is_err() {
                                 return Err(corrupt(format!(
                                     "table \"{key}\": data file \"{rel}\" carries a partition \
-                                     key that is not a column name or bucket(N, column)"
+                                     key \"{pkey}\" that is not a column name or bucket(N, column)"
                                 )));
                             }
                         }
@@ -2641,6 +2650,32 @@ mod tests {
         let snapshot = PathBuf::from("snapshots/2.json");
         let err = split_key("nodot", &snapshot).unwrap_err().to_string();
         assert!(err.contains("snapshots/2.json"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_file_partition_key_names_the_table_not_the_key() {
+        let catalog = serde_json::json!({
+            "format_version": 5,
+            "version": 2,
+            "updated": "2026-01-01T00:00:00.000Z",
+            "tables": {
+                "main.t": {
+                    "format": "pink",
+                    "rows": 1,
+                    "files": [{
+                        "path": "data/main.t/f.pink",
+                        "rows": 1,
+                        "partition": { "year(ts)": "x" }
+                    }]
+                }
+            }
+        });
+        let bytes = serde_json::to_vec(&catalog).unwrap();
+        let err = read_manifest(Path::new("catalog.json"), &bytes)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("table \"main.t\""), "{err}");
+        assert!(err.contains("year(ts)"), "{err}");
     }
 
     #[test]

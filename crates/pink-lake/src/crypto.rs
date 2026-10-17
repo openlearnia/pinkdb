@@ -545,9 +545,11 @@ mod imp {
     }
 
     /// Structural header parse (no crypto). Every structural problem is a
-    /// clear [`LakeError::Tampered`]: the header of a lake container is
-    /// authenticated by the key-check, so a header that does not even parse
-    /// is a damaged or foreign file, never a wrong-key case.
+    /// clear [`LakeError::Tampered`] except an unsupported container *version*,
+    /// which is [`crate::LakeError::UnsupportedContainer`] (written by a newer
+    /// pinkdb, not corruption): the header of a lake container is authenticated
+    /// by the key-check, so a header that does not even parse is a damaged or
+    /// foreign file, never a wrong-key case.
     fn parse_header(path: &Path, data: &[u8]) -> Result<ParsedHeader> {
         if !is_container(data) {
             return Err(tampered(
@@ -560,13 +562,10 @@ mod imp {
         }
         let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
         if version != CONTAINER_VERSION {
-            return Err(tampered(
-                path,
-                format!(
-                    "unsupported container version {version} (this build writes and reads \
-                     version {CONTAINER_VERSION})"
-                ),
-            ));
+            return Err(crate::LakeError::UnsupportedContainer {
+                path: path.to_path_buf(),
+                found: version,
+            });
         }
         let cipher = data[12];
         if cipher != CIPHER_AES256_GCM {
@@ -1291,6 +1290,24 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
         assert!(err.to_string().contains("PINKENC1"), "{err}");
+    }
+
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn an_unsupported_container_version_is_not_tampering() {
+        // A container whose version this build does not know is an upgrade
+        // error, not corruption/tampering.
+        let crypto = Crypto::new(EncryptionKey::from_passphrase("lake version")).unwrap();
+        let mut data = ENC_MAGIC.to_vec();
+        data.extend_from_slice(&99u32.to_le_bytes());
+        data.resize(128, 0);
+        let err = crypto
+            .open(&path(), Domain::Manifest, "", &data)
+            .unwrap_err();
+        assert!(
+            matches!(err, LakeError::UnsupportedContainer { found: 99, .. }),
+            "{err:?}"
+        );
     }
 
     #[cfg(feature = "encryption")]
