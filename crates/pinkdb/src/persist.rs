@@ -2310,10 +2310,14 @@ impl PinkDb {
     /// bytes). Views are session-local and never persisted.
     ///
     /// Always writes plaintext; use [`PinkDb::save_with_key`] (feature
-    /// `encryption`) for an encrypted container.
+    /// `encryption`) for an encrypted container. The write is atomic (a temp
+    /// sibling renamed over the target), and it refuses inside a transaction or
+    /// over a target whose sidecar WAL still holds committed records.
     pub fn save(&self, path: &str) -> Result<()> {
-        std::fs::write(path, self.to_pink_bytes()?)?;
-        Ok(())
+        self.ensure_wal_healthy()?;
+        self.guard_snapshot_target(path)?;
+        let bytes = self.to_pink_bytes()?;
+        Self::write_atomic(std::path::Path::new(path), &bytes)
     }
 
     /// [`PinkDb::save`] with at-rest encryption: the v2 bytes are sealed into
@@ -2329,9 +2333,9 @@ impl PinkDb {
         #[cfg(feature = "encryption")]
         {
             self.ensure_wal_healthy()?;
+            self.guard_snapshot_target(path)?;
             let sealed = crate::crypto::seal_container(&self.to_bytes()?, key, 0)?;
-            std::fs::write(path, sealed)?;
-            Ok(())
+            Self::write_atomic(std::path::Path::new(path), &sealed)
         }
     }
 
@@ -2358,6 +2362,39 @@ impl PinkDb {
         let mut f = std::fs::File::create(path)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        Ok(())
+    }
+
+    /// Write `bytes` to `path` atomically: a unique temp sibling is written and
+    /// fsynced, then renamed over the target, then the parent directory is
+    /// fsynced. An interrupted write leaves the previous target intact; a
+    /// failure removes the temp file.
+    fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".tmp-{}-{seq}", std::process::id()));
+        let tmp = std::path::PathBuf::from(tmp);
+        let write = (|| -> Result<()> {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            f.write_all(bytes)?;
+            f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = write {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        crate::wal::sync_parent_dir(path);
         Ok(())
     }
 

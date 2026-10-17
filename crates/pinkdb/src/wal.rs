@@ -2983,7 +2983,7 @@ fn parent_dir(path: &Path) -> PathBuf {
 /// Best-effort directory fsync so a rename survives a crash. (Portability:
 /// opening a directory for `sync_all` is not supported everywhere, so the
 /// failure is ignored — the file-level fsyncs remain.)
-fn sync_parent_dir(path: &Path) {
+pub(crate) fn sync_parent_dir(path: &Path) {
     if let Ok(f) = File::open(parent_dir(path)) {
         let _ = f.sync_all();
     }
@@ -4235,6 +4235,33 @@ impl PinkDb {
         }
     }
 
+    /// Guards every plain snapshot (`save`/`save_with_key`): never serialize an
+    /// open transaction (a mid-`BEGIN` snapshot resurrects rolled-back rows),
+    /// and never overwrite a target whose sidecar WAL still holds committed
+    /// records (the target's next durable open would replay them on top of the
+    /// snapshot). Writing over the *bound* path is a checkpoint, not a
+    /// snapshot; see [`PinkDb::checkpoint`].
+    pub(crate) fn guard_snapshot_target(&self, path: &str) -> Result<()> {
+        if self.in_transaction() {
+            return Err(PinkDbError::Execution(
+                "cannot save inside a transaction; COMMIT or ROLLBACK first".to_string(),
+            ));
+        }
+        let target_wal = wal_path(Path::new(path));
+        if target_wal.exists()
+            && probe_wal(&target_wal, self.encryption_key.as_ref())?
+                .map(|p| p.has_records)
+                .unwrap_or(false)
+        {
+            return Err(PinkDbError::Execution(format!(
+                "refusing to save over {path}: {} holds committed WAL records; \
+                 open that database durably and checkpoint it instead",
+                target_wal.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// A plain snapshot with a durability guard: refuse to write over a
     /// target whose sidecar WAL still holds committed records. The target's
     /// next durable open would replay those records on top of this snapshot —
@@ -4248,18 +4275,7 @@ impl PinkDb {
     pub fn save_snapshot(&self, path: &str) -> Result<()> {
         let target = Path::new(path);
         check_artifact_mode(target, self.encryption_key.as_ref())?;
-        let target_wal = wal_path(target);
-        if target_wal.exists()
-            && probe_wal(&target_wal, self.encryption_key.as_ref())?
-                .map(|p| p.has_records)
-                .unwrap_or(false)
-        {
-            return Err(PinkDbError::Execution(format!(
-                "refusing to save over {path}: {} holds committed WAL records; \
-                 open that database durably and checkpoint it instead",
-                target_wal.display()
-            )));
-        }
+        self.guard_snapshot_target(path)?;
         // A live lease on the target means a process is writing or
         // checkpointing it: refuse instead of racing. The lock is held for
         // the snapshot itself, so nothing can slip in between the check and
@@ -4627,6 +4643,63 @@ mod tests {
         // Reopening recovers the durable prefix.
         let mut db = durable(&ckpt);
         assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
+    }
+
+    #[test]
+    fn save_refuses_inside_a_transaction() {
+        let p = tmp_ckpt("savetxn");
+        let out = p.with_extension("snap.pink");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("BEGIN; INSERT INTO t VALUES (1);").unwrap();
+        // A mid-transaction snapshot would resurrect the rolled-back row.
+        let err = db.save(out.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("inside a transaction"), "{err}");
+        assert!(!out.exists(), "a refused save writes nothing");
+        db.execute("ROLLBACK;").unwrap();
+        cleanup(&p);
+    }
+
+    #[test]
+    fn save_refuses_over_a_target_whose_wal_has_records() {
+        let p = tmp_ckpt("savewal");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        // The bound WAL holds the committed row: saving the bound path would
+        // make the next durable open replay it on top of the snapshot.
+        let err = db.save(p.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("committed WAL records"), "{err}");
+        // The target was not touched, so the durable row still replays.
+        drop(db);
+        let mut back = durable(&p);
+        assert_eq!(ints(&mut back, "SELECT a FROM t;"), vec![1]);
+        drop(back);
+        cleanup(&p);
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file() {
+        let p = tmp_ckpt("saveatomic");
+        let out = p.with_extension("out.pink");
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        db.save(out.to_str().unwrap()).unwrap();
+        assert!(out.exists());
+        let leftovers: Vec<String> = std::fs::read_dir(out.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+        // Overwriting replaces the bytes wholesale.
+        db.execute("INSERT INTO t VALUES (2);").unwrap();
+        db.save(out.to_str().unwrap()).unwrap();
+        let mut back = PinkDb::open(out.to_str().unwrap()).unwrap();
+        assert_eq!(ints(&mut back, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        cleanup(&p);
     }
 
     fn durable(p: &Path) -> PinkDb {
