@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SQL dialect — pinkdb</title>
+<meta name="description" content="pinkdb&#x27;s SQL dialect at a glance: supported statements, queries, types and literals, and the known divergences from DuckDB (correlated subqueries, USING/NATURAL joins, three-part references).">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/dialect.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="SQL dialect — pinkdb">
+<meta property="og:description" content="pinkdb&#x27;s SQL dialect at a glance: supported statements, queries, types and literals, and the known divergences from DuckDB (correlated subqueries, USING/NATURAL joins, three-part references).">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/dialect.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">SQL dialect</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="dialect" class="active" aria-current="page">SQL dialect</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
+<li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<p class="eyebrow">Reference</p>
+<h1>SQL dialect</h1>
+
+<p class="doc-meta">pinkdb's SQL dialect targets <strong>DuckDB compatibility</strong>:
+the committed differential corpus (171 probes) runs against both engines and must
+match. This page is the quick reference for what the dialect accepts, what it
+differs on, and what is intentionally absent — the reasoning behind every row lives
+in the <a href="../docs/sql">SQL reference</a> and the
+<a href="../docs/roadmap">roadmap</a>.</p>
+
+<h2 id="statements">Statements<a class="anchor" href="#statements" aria-label="Permalink: Statements">#</a></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Statement</th><th>Status</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>SELECT</code> (joins, CTEs, windows, set operations)</td><td>✅</td><td>see the query table below</td></tr>
+    <tr><td><code>CREATE TABLE [IF NOT EXISTS]</code></td><td>✅</td><td>column and table-form constraints (<code>PRIMARY KEY</code>/<code>UNIQUE</code>/<code>NOT NULL</code>/<code>REFERENCES</code>, <code>CONSTRAINT</code> names, <code>RELY</code>/<code>[NOT] ENFORCED</code> accepted and dropped) — metadata only, never enforced</td></tr>
+    <tr><td><code>CREATE TABLE … AS SELECT</code></td><td>✅</td><td>CTAS</td></tr>
+    <tr><td><code>ALTER TABLE</code></td><td>✗</td><td>engine tables: not supported; lake tables get schema evolution in wave 65</td></tr>
+    <tr><td><code>CREATE INDEX</code> / <code>DROP INDEX</code></td><td>✗</td><td>planned (wave 42)</td></tr>
+    <tr><td><code>CREATE MATERIALIZED VIEW</code></td><td>✗</td><td>planned (wave 43)</td></tr>
+    <tr><td><code>CREATE VIEW</code> / <code>DROP VIEW</code></td><td>✅</td><td>session-local and per-database; bodies rebound per use</td></tr>
+    <tr><td><code>INSERT … VALUES</code> / <code>INSERT … SELECT</code></td><td>✅</td><td>explicit column lists supported</td></tr>
+    <tr><td><code>UPDATE</code> / <code>DELETE</code></td><td>✅</td><td>statement-atomic; <code>SET</code> expressions see pre-update values</td></tr>
+    <tr><td><code>BEGIN</code> / <code>COMMIT</code> / <code>ROLLBACK</code></td><td>✅</td><td>whole-store snapshot isolation; no savepoints or nested transactions</td></tr>
+    <tr><td><code>CREATE DATABASE</code> / <code>DROP DATABASE</code> / <code>USE</code></td><td>✅</td><td>refused inside a transaction (create/drop)</td></tr>
+    <tr><td><code>CHECKPOINT</code></td><td>✅</td><td>durable databases; no-op in memory, refused inside a transaction</td></tr>
+    <tr><td><code>LOAD EXTENSION</code></td><td>✅</td><td>server clients need <code>--allow-load-extension</code>; refused inside a transaction</td></tr>
+    <tr><td><code>SHOW TABLES</code> / <code>SHOW DATABASES</code></td><td>✅</td><td>only these two <code>SHOW</code> forms</td></tr>
+    <tr><td><code>DESCRIBE t</code></td><td>✅</td><td>DuckDB-shaped: <code>PRI</code>/<code>UNI</code> key markers and <code>NO</code>/<code>YES</code> nullability</td></tr>
+    <tr><td><code>EXPLAIN SELECT …</code></td><td>✅</td><td>optimized plan text (index-free, zone-map and time-travel aware)</td></tr>
+    <tr><td><code>PREPARE</code>/<code>EXECUTE</code> (SQL)</td><td>✗</td><td>placeholders are <code>?</code> through the bind API, server protocol and FFI — no SQL-level statements</td></tr>
+    <tr><td><code>SET</code></td><td>✗</td><td>configuration is build flags and <code>PINKDB_*</code>/<code>AWS_*</code> environment variables</td></tr>
+    <tr><td><code>COPY</code> (files)</td><td>✗</td><td>CSV in via <code>.import</code> (local and, from wave 75, <code>https://</code> / <code>s3://</code>); remote exports are a follow-up</td></tr>
+    <tr><td><code>ATTACH</code> (SQL)</td><td>✗</td><td>lakes attach with the <code>.lake attach</code> dot-command; Iceberg <code>ATTACH</code> is planned (wave 72)</td></tr>
+    <tr><td><code>TRUNCATE</code>, <code>VACUUM</code>, <code>ANALYZE</code></td><td>✗</td><td>use <code>DELETE</code>; maintenance waves cover lake compaction (wave 67)</td></tr>
+    <tr><td>Table functions, <code>FROM 'file.csv'</code></td><td>✗</td><td><code>read_csv('url')</code> arrives with wave 75; <code>read_parquet</code>/<code>read_arrow</code> with waves 70–71</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="queries-and-clauses">Queries and clauses<a class="anchor" href="#queries-and-clauses" aria-label="Permalink: Queries and clauses">#</a></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Feature</th><th>Status</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>INNER</code>/<code>LEFT</code>/<code>RIGHT</code>/<code>FULL</code>/<code>CROSS</code> joins</td><td>✅</td><td>multi-way and composite conditions (<code>ON a = b AND c = d</code>); conditions can be arbitrary expressions (equality takes the hash fast path)</td></tr>
+    <tr><td><code>JOIN … USING (…)</code>, <code>NATURAL JOIN</code></td><td>✗</td><td>rejected with a parse error</td></tr>
+    <tr><td>Subqueries: scalar, <code>IN</code>, <code>EXISTS</code></td><td>✅</td><td><strong>uncorrelated only</strong> — correlated subqueries are rejected (the main deliberate gap)</td></tr>
+    <tr><td><code>WITH</code> (CTEs), column aliases</td><td>✅</td><td><code>WITH RECURSIVE</code> is not supported</td></tr>
+    <tr><td>Window functions</td><td>✅</td><td><code>ROW_NUMBER</code>, <code>RANK</code>, <code>DENSE_RANK</code>, <code>LAG</code>, <code>LEAD</code>, <code>NTILE</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, aggregates <code>OVER</code>; <code>PARTITION BY</code>/<code>ORDER BY</code>, <code>ROWS</code> and <code>RANGE</code> frames (validated; no nesting; SELECT list and <code>ORDER BY</code> only)</td></tr>
+    <tr><td><code>QUALIFY</code></td><td>✗</td><td>filter with a subquery over the windowed result or re-select</td></tr>
+    <tr><td><code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code> <code>[ALL]</code></td><td>✅</td><td>numeric type unification; a trailing <code>ORDER BY</code>/<code>LIMIT</code> applies to the whole set (branch-level clauses need parentheses and are unsupported)</td></tr>
+    <tr><td><code>GROUP BY</code> / <code>HAVING</code> / <code>COUNT(DISTINCT …)</code> / <code>DISTINCT</code></td><td>✅</td><td><code>GROUPING SETS</code>/<code>ROLLUP</code>/<code>CUBE</code> are not supported</td></tr>
+    <tr><td><code>ORDER BY … [NULLS FIRST|LAST]</code>, positional</td><td>✅</td><td>general expressions must be select aliases, positions or GROUP BY keys; the engine default is <code>NULLS LAST</code></td></tr>
+    <tr><td><code>LIMIT</code> / <code>OFFSET</code></td><td>✅</td><td></td></tr>
+    <tr><td><code>PIVOT</code>/<code>UNPIVOT</code>/<code>TABLESAMPLE</code>/<code>LATERAL</code></td><td>✗</td><td>not scheduled</td></tr>
+    <tr><td><code>AT (VERSION =&gt; n)</code> / <code>AT (TIMESTAMP =&gt; ts)</code></td><td>✅ lake-only</td><td>attached lake tables (literal targets, capped at the attached version); store tables, CTEs and views are refused — DuckDB silently ignores <code>AT</code> on CTEs, pinkdb errors</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="types-and-literals">Types and literals<a class="anchor" href="#types-and-literals" aria-label="Permalink: Types and literals">#</a></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Type / literal</th><th>Status</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>BOOLEAN</code>/<code>BOOL</code></td><td>✅</td><td></td></tr>
+    <tr><td><code>INTEGER</code>/<code>INT</code>, <code>BIGINT</code></td><td>✅</td><td>i32 / i64 (i64 also as <code>LONG</code>)</td></tr>
+    <tr><td><code>DOUBLE</code>/<code>FLOAT</code>/<code>REAL</code></td><td>✅</td><td>f64</td></tr>
+    <tr><td><code>DECIMAL(p, s)</code>/<code>NUMERIC</code>/<code>DEC</code></td><td>✅</td><td>i128 fixed point, precision ≤ 38; DuckDB promotion rules (<code>+ - *</code> keep scale, <code>/</code> widens to DOUBLE)</td></tr>
+    <tr><td><code>VARCHAR</code>/<code>TEXT</code>/<code>STRING</code></td><td>✅</td><td>UTF-8</td></tr>
+    <tr><td><code>DATE</code>, <code>TIMESTAMP</code>/<code>DATETIME</code></td><td>✅</td><td>naive timestamps in microseconds, no time zone</td></tr>
+    <tr><td><code>INTERVAL</code></td><td>✅</td><td>months + days + microseconds; literal form is <code>INTERVAL '1 day 2 hours'</code>; month-end clamping like DuckDB</td></tr>
+    <tr><td>String literals <code>'…'</code>, quoted identifiers <code>"…"</code></td><td>✅</td><td><code>''</code>/<code>""</code> escapes; <code>--</code> and <code>/* */</code> comments</td></tr>
+    <tr><td><code>CAST(x AS t)</code> and <code>x::t</code></td><td>✅</td><td><code>TRY_CAST</code> is not supported</td></tr>
+    <tr><td>DECIMAL literals</td><td>~</td><td>write <code>CAST('12.34' AS DECIMAL(6, 2))</code>; bare numeric literals with a decimal point are <code>DOUBLE</code> (DuckDB's auto-DECIMAL typing is a follow-up)</td></tr>
+    <tr><td>Parameters <code>?</code></td><td>✅</td><td>through the prepare/bind API, server protocol v6 and FFI (no SQL <code>PREPARE</code>)</td></tr>
+    <tr><td><code>ILIKE</code>, <code>SIMILAR TO</code>, <code>LIKE … ESCAPE</code></td><td>✗</td><td><code>LIKE</code>/<code>NOT LIKE</code> with <code>%</code>/<code>_</code> only</td></tr>
+    <tr><td><code>SMALLINT</code>/<code>TINYINT</code>/<code>U*</code> integers, <code>TIME</code>, <code>TIMESTAMPTZ</code>, <code>BLOB</code>, <code>UUID</code>, nested types (<code>LIST</code>/<code>STRUCT</code>/<code>MAP</code>), <code>ENUM</code></td><td>✗</td><td>not implemented</td></tr>
+  </tbody>
+</table>
+</div>
+
+<h2 id="known-divergences-from-duckdb">Known divergences from DuckDB<a class="anchor" href="#known-divergences-from-duckdb" aria-label="Permalink: Known divergences from DuckDB">#</a></h2>
+
+<ul>
+  <li><strong>Correlated subqueries are rejected</strong> (DuckDB runs them) — the
+  dialect's largest deliberate gap; uncorrelated subqueries and <code>EXISTS</code>
+  behave like DuckDB.</li>
+  <li><strong><code>JOIN … USING</code> and <code>NATURAL JOIN</code> are parse
+  errors</strong> — write the <code>ON</code> condition.</li>
+  <li><strong>Three-part column references</strong> (<code>db.table.col</code>) are
+  not supported — alias the table (<code>SELECT x.col FROM db.table AS x</code>).</li>
+  <li><strong><code>AT</code> on CTEs:</strong> DuckDB silently ignores it; pinkdb
+  refuses (a wrong-answer trap avoided on purpose).</li>
+  <li><strong><code>ILIKE</code>, <code>TRY_CAST</code>, <code>SIMILAR TO</code>,
+  <code>LIKE … ESCAPE</code></strong> are absent (use <code>LOWER(x) LIKE …</code>).</li>
+  <li><strong>EXPLAIN</strong> prints pinkdb's plan format, not DuckDB's tree
+  rendering.</li>
+  <li><strong>Extension surfaces differ</strong>: no SQL <code>COPY</code>,
+  <code>SET</code>, <code>ATTACH</code> or table functions yet — files come in via
+  <code>.import</code>, configuration via environment, lakes via
+  <code>.lake</code> commands (see the statement table).</li>
+  <li><strong>Defaults worth knowing:</strong> <code>ORDER BY</code> defaults to
+  <code>NULLS LAST</code>; <code>int / int</code> is <code>DOUBLE</code>;
+  integer overflow is an error; <code>SUM</code> over integers is exact.</li>
+</ul>
+
+<ul class="next-links">
+  <li><a href="../docs/sql">SQL reference →</a></li>
+  <li><a href="../docs/roadmap">Roadmap →</a></li>
+  <li><a href="../docs/persistence">Persistence →</a></li>
+</ul>
+
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="sql"><span class="pager-dir">Previous</span><span class="pager-title">SQL</span></a><a class="pager-link next" href="persistence"><span class="pager-dir">Next</span><span class="pager-title">Persistence</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/dialect.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#statements">Statements</a></li>
+  <li><a href="#queries-and-clauses">Queries and clauses</a></li>
+  <li><a href="#types-and-literals">Types and literals</a></li>
+  <li><a href="#known-divergences-from-duckdb">Known divergences from DuckDB</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

@@ -11,6 +11,9 @@ one-liners below.
 ## 2026-10-17
 
 ### Wave 73 — docs catch-up, changelog & site wiring
+- Follow-up: a **SQL dialect reference** page — statements / queries / types
+  tables plus the known-divergences list (correlated subqueries, USING/NATURAL
+  joins, three-part references, CTE `AT` handling) — added under Reference.
 - Website docs brought current through waves 58–64: **SQL** (prepared statements
   with the `prepare` → `bind` → `execute_bound` flow, DECIMAL/INTERVAL with the
   DuckDB promotion rules, declarative keys + FK→PK elimination, full/multi-way

@@ -95,6 +95,7 @@ NAV = [
         "items": [
             {"key": "cli", "label": "CLI & REPL", "out": "docs/cli.html"},
             {"key": "sql", "label": "SQL", "out": "docs/sql.html"},
+            {"key": "dialect", "label": "SQL dialect", "out": "docs/dialect.html"},
             {"key": "persistence", "label": "Persistence", "out": "docs/persistence.html"},
             {"key": "lake", "label": "Lake", "out": "docs/lake.html"},
             {"key": "server", "label": "Server", "out": "docs/server.html"},
@@ -346,6 +347,16 @@ PAGES = {
             "statements, DECIMAL/INTERVAL, keys, lake time travel and "
             "incremental commits — what changed on pinkdb's user-facing "
             "surfaces."
+        ),
+    },
+    "dialect.html": {
+        "out": "docs/dialect.html",
+        "nav": "dialect",
+        "title": "SQL dialect — pinkdb",
+        "description": (
+            "pinkdb's SQL dialect at a glance: supported statements, queries, "
+            "types and literals, and the known divergences from DuckDB "
+            "(correlated subqueries, USING/NATURAL joins, three-part references)."
         ),
     },
     "extensions.html": {
