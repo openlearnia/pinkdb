@@ -40,6 +40,19 @@ fn cleanup(dir: &Path) {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let target = to.join(e.file_name());
+        if e.file_type().unwrap().is_dir() {
+            copy_dir(&e.path(), &target);
+        } else {
+            std::fs::copy(e.path(), &target).unwrap();
+        }
+    }
+}
+
 fn read_json(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
 }
@@ -1164,5 +1177,33 @@ fn diff_commits_refuse_concurrent_same_table_changes() {
     let rows = rows_of(&Lake::open(&lake_dir).unwrap().load(None).unwrap());
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0], (101, "v1".to_string()));
+    cleanup(&dir);
+}
+
+#[test]
+fn commit_on_a_legacy_v1_lake_is_refused() {
+    // A pre-incremental (format_version 1) head lists each table as one plain
+    // data-file path with the row count only at the table level. Publishing a
+    // v5 entry for it would write a catalog the reader rejects, so a commit is
+    // refused with a migration hint and the lake stays readable.
+    let dir = scratch("legacy-v1-commit");
+    let lake_dir = dir.join("lake");
+    copy_dir(
+        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1"),
+        &lake_dir,
+    );
+    let mut lake = Lake::open(&lake_dir).unwrap();
+    assert_eq!(lake.format_version(), 1);
+
+    let mut commit = Commit::new();
+    commit.drop_table("analytics.u");
+    let err = lake.commit(&commit).unwrap_err();
+    assert!(matches!(err, LakeError::NotRepresentable { .. }), "{err:?}");
+    assert!(err.to_string().contains("format_version 1"), "{err}");
+
+    // Nothing was published: the lake still opens at v1.
+    let reopened = Lake::open(&lake_dir).unwrap();
+    assert_eq!(reopened.format_version(), 1);
+    assert_eq!(reopened.current_version(), 2);
     cleanup(&dir);
 }

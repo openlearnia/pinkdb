@@ -1017,6 +1017,19 @@ pub(crate) fn entry_layout(
     Ok(out)
 }
 
+/// The error for a commit attempted on a pre-incremental (`format_version`
+/// 1–3) lake: those entries carry one path-only data file and no per-file row
+/// counts, so a commit would publish a catalog the reader rejects.
+fn pre_incremental_head(format_version: u32) -> LakeError {
+    LakeError::NotRepresentable {
+        message: format!(
+            "this lake is format_version {format_version} (one data file per table, no per-file \
+             row counts); incremental commits need a format_version 4 entry — re-save the lake \
+             to migrate it to the current format, then commit"
+        ),
+    }
+}
+
 impl Lake {
     /// Publish an incremental commit with the default [`CommitSettings`]
     /// (DuckLake's retry defaults).
@@ -1046,6 +1059,14 @@ impl Lake {
     ) -> Result<CommitReport> {
         if commit.is_empty() {
             return Ok(CommitReport::noop(self.version));
+        }
+        // A pre-incremental head (format_version 1–3) lists each table as one
+        // plain data-file path with the row count only at the table level;
+        // appending per-file entries to it would publish a catalog the reader
+        // rejects. Refuse before uploading anything (the authoritative check on
+        // the freshly-read head is in `try_publish_commit`).
+        if self.format_version < 4 {
+            return Err(pre_incremental_head(self.format_version));
         }
         for key in commit
             .appends
@@ -1426,6 +1447,14 @@ impl Lake {
         let head = self
             .read_catalog_for_commit()
             .map_err(PublishFailure::Fatal)?;
+        // The head on disk governs: a legacy (format_version 1–3) entry lists
+        // one path-only data file, so the committed manifest would be written
+        // at format_version 5 with an entry the reader rejects.
+        if head.format_version < 4 {
+            return Err(PublishFailure::Fatal(pre_incremental_head(
+                head.format_version,
+            )));
+        }
         let version = self
             .version
             .checked_add(1)
