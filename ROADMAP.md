@@ -779,3 +779,20 @@ Java bindings.
   workspace green. Follow-up candidates (not scheduled): extend the fast path to
   mixed numeric widths (`filter_num` unchanged at 2.31 ms), LIKE constant
   folding, and a cool-machine re-audit of the join queries.
+- 2026-10-17 — Fresh-day benchmark record (all harnesses; DuckDB still
+  v2.0.0-alpha46057 — `lake_bench.py` prints its normalized "v2.0.0" — with
+  duckdiff **155/155** against it; the final 2.0 is expected Oct 21). Standing
+  battery 1M best-of-7: **TOTAL 234.0 ms** (best yet; 235.5 on Oct 16, 248.7
+  pre-wave-55): filter_str 1.67, filter_num 2.30, group_id 46.8, distinct_id
+  47.5, windows 13.5/13.6, joins 9.4/15.6/24.1/5.2, order_str 29.2.
+  Multi-writer txn-read, 4 procs: **2.55×** (0.363→0.143 s; the serialized
+  baseline binary 1.00×); honest no-win cases measured: txn-write 0.77×,
+  autocommit 0.80×. Durable 10k inserts / 3 checkpoints: `Sync` inserts 39.4 s
+  (the fsync floor), `Batch` inserts **225.0 ms** (best yet), selects 459–488
+  ms, checkpoints 52–54 ms. Lake vs DuckLake: @1M stored **2.5 MB vs 12.5 MB**
+  (metadata 643 B vs 3.8 MB), cold e2e open 0.009 vs 0.059 s, cold per-query
+  0.14–0.19× (pink faster); @10M stored **25.1 MB vs 91.4 MB** (identical to
+  the previous record — byte-stable), cold open 0.037 vs 0.059 s, cold
+  per-query 0.63–0.93× (pink's eager Vortex open dominates its cold cost at
+  10M, while DuckLake's lazy attach stays ~60 ms flat), in-session in-memory
+  queries <1/32/21/22 ms (count/groupby/filter/orderby).
