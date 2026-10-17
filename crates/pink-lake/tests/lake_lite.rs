@@ -88,6 +88,11 @@ fn all_tables(db: &PinkDb) -> Vec<(String, String)> {
     out
 }
 
+/// Rows of the fixture's `main.fid` table.
+fn fidelity_rows(db: &PinkDb) -> u64 {
+    db.table_in("main", "fid").unwrap().num_rows() as u64
+}
+
 /// Total rows across every table of every database.
 fn total_rows(db: &PinkDb) -> u64 {
     all_tables(db)
@@ -130,42 +135,56 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
     }
 }
 
-/// The lean writer publishes a v1 lake: `format_version` 1 catalogs and
-/// snapshots, entries with no `format` field, and `data/…/<uuid>.pink` data
-/// files holding the engine's own bytes — then loads it back bit-exactly.
+/// The lean writer publishes a v4 lake: `format_version` 4 catalogs and
+/// snapshots, entries with `"format": "pink"` and object-shaped `files` with
+/// per-file row counts and CRC-protected statistics blocks, plus the
+/// per-commit delta manifest — then loads it back bit-exactly.
 #[test]
-fn lean_save_publishes_a_v1_lake_and_reloads_bit_exactly() {
-    assert_eq!(FORMAT_VERSION, 1, "a lean build writes v1");
+fn lean_save_publishes_a_v4_lake_and_reloads_bit_exactly() {
+    assert_eq!(FORMAT_VERSION, 4, "a lean build writes v4");
     let dir = scratch("roundtrip");
     let lake_dir = dir.join("lake");
     let expected = common::fidelity_store();
     let mut lake = Lake::create(&lake_dir).unwrap();
-    assert_eq!(lake.format_version(), 1, "create publishes a v1 lake");
+    assert_eq!(lake.format_version(), 4, "create publishes a v4 lake");
     let report = lake.write_from_store_report(&expected).unwrap();
     assert_eq!(report.version, 2);
     assert_eq!(report.tables, all_tables(&expected).len());
     assert_eq!(report.rows, total_rows(&expected));
 
-    // The on-disk shape is exactly the wave-34 v1 layout, plus the wave-45k
-    // CRC-protected statistics block per entry.
+    // The on-disk shape: a v4 entry per table, `.pink` files as objects with
+    // their row counts and statistics blocks.
     let catalog = read_json(&lake_dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 1, "{catalog}");
+    assert_eq!(catalog["format_version"], 4, "{catalog}");
     assert_eq!(catalog["version"], 2, "{catalog}");
     for (key, entry) in catalog["tables"].as_object().unwrap() {
+        assert_eq!(entry["format"], "pink", "{key}: {entry}");
         assert!(
-            entry.get("format").is_none(),
-            "{key} must not declare a format: {entry}"
+            entry.get("stats").is_none(),
+            "{key}: entry-level stats are v1"
         );
-        let file = entry["files"][0].as_str().unwrap();
-        assert!(file.ends_with(".pink"), "{key}: {file}");
-        let stats = entry
-            .get("stats")
-            .unwrap_or_else(|| panic!("{key}: no stats"));
+        let file = &entry["files"][0];
+        let path = file["path"].as_str().unwrap();
+        assert!(path.ends_with(".pink"), "{key}: {path}");
+        assert_eq!(file["rows"], entry["rows"], "{key}");
+        let stats = &file["stats"];
         assert_eq!(stats["table"], key.as_str(), "{key}");
-        assert_eq!(stats["file"], file, "{key}");
+        assert_eq!(stats["file"], path, "{key}");
         assert_eq!(stats["rows"], entry["rows"], "{key}");
         assert!(stats["crc32"].is_u64(), "{key}: no CRC");
     }
+    // The delta manifest lists this commit's files and row movement.
+    let commit = read_json(&lake_dir.join("commits/2.json"));
+    assert_eq!(commit["version"], 2, "{commit}");
+    assert_eq!(commit["base_version"], 1, "{commit}");
+    assert_eq!(
+        commit["tables"].as_object().unwrap().len(),
+        all_tables(&expected).len()
+    );
+    let fidelity = fidelity_rows(&expected);
+    let entry = &commit["tables"]["main.fid"];
+    assert_eq!(entry["rows_added"], fidelity, "{entry}");
+    assert_eq!(entry["replaced"], true, "{entry}");
     // The single-writer invariant: `catalog.json` is byte-identical to the
     // snapshot of its version (statistics included).
     assert_eq!(
@@ -212,6 +231,7 @@ fn lean_save_publishes_a_v1_lake_and_reloads_bit_exactly() {
     assert!(lake.load(Some(1)).unwrap().list_tables().is_empty());
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
     assert_eq!(lake.versions().unwrap(), vec![1, 2, 3]);
+    assert_eq!(lake.commits().unwrap(), vec![2, 3], "one delta per save");
     assert_eq!(lake.tables().unwrap().len(), all_tables(&expected).len());
     assert!(lake.missing_data_files().unwrap().is_empty());
     cleanup(&dir);
@@ -249,7 +269,7 @@ fn lean_save_is_deterministic_for_the_same_store() {
             .unwrap()
             .iter()
             .map(|(k, e)| {
-                let mut s = e["stats"].clone();
+                let mut s = e["files"][0]["stats"].clone();
                 let obj = s.as_object_mut().unwrap();
                 obj.remove("file");
                 obj.remove("crc32");
@@ -328,7 +348,7 @@ fn unsupported_future_format_versions_are_named() {
     let lake = dir.join("lake");
     std::fs::create_dir_all(&lake).unwrap();
     let manifest = serde_json::json!({
-        "format_version": 4,
+        "format_version": 5,
         "updated": "2026-10-15T00:00:00.000Z",
         "version": 1,
         "tables": {},
@@ -340,14 +360,15 @@ fn unsupported_future_format_versions_are_named() {
     .unwrap();
     let err = Lake::open(&lake).unwrap_err();
     assert!(
-        matches!(err, LakeError::Unsupported { found: 4, .. }),
+        matches!(err, LakeError::Unsupported { found: 5, .. }),
         "{err:?}"
     );
     assert!(
         err.to_string()
-            .contains("unsupported lake format_version 4"),
+            .contains("unsupported lake format_version 5"),
         "{err}"
     );
+    assert!(err.to_string().contains("newer pinkdb"), "{err}");
     cleanup(&dir);
 }
 
@@ -412,7 +433,7 @@ fn v1_v4_fixture_written_by_the_lean_writer_loads_bit_exactly() {
 /// back bit-exactly.
 #[cfg(feature = "s3")]
 #[test]
-fn lean_s3_v1_roundtrip() {
+fn lean_s3_v4_roundtrip() {
     let mock = mock_s3::MockS3::start();
     let config = S3Config::new("lite-bucket")
         .with_prefix("lakes/lite")
@@ -422,14 +443,15 @@ fn lean_s3_v1_roundtrip() {
         .with_credentials(mock.access_key_id(), "mock-secret");
     let expected = common::fidelity_store();
     let mut lake = Lake::create_s3(config).unwrap();
-    assert_eq!(lake.format_version(), 1);
+    assert_eq!(lake.format_version(), 4);
     lake.write_from_store(&expected).unwrap();
 
     let keys = mock.keys();
     assert!(
         keys.iter().any(|k| k.ends_with(".pink")),
-        "v1 data files are `.pink` objects: {keys:?}"
+        "lean data files are `.pink` objects: {keys:?}"
     );
+    assert!(keys.iter().any(|k| k.ends_with("commits/2.json")));
     assert!(
         !keys.iter().any(|k| k.ends_with(".vortex")),
         "a lean build writes no Vortex objects: {keys:?}"
@@ -696,8 +718,8 @@ fn lean_attach_fast_paths_decode_nothing_and_fallbacks_decode_once() {
     save_store(&db, &lake_dir).unwrap();
     let lake = Lake::open(&lake_dir).unwrap();
     let report = lake.attach(None).unwrap();
-    assert_eq!(report.format_version, 1);
-    assert!(!report.remote, "a v1 attach reads no data file");
+    assert_eq!(report.format_version, 4);
+    assert!(!report.remote, "a `.pink` attach reads no data file");
     let mut attached = PinkDb::new();
     attached.attach_lake(report.lake.clone()).unwrap();
     let mut opened = lake.load(None).unwrap();
@@ -758,9 +780,10 @@ fn lean_attach_refuses_corrupted_and_stats_less_lakes() {
     let catalog_path = lake_dir.join("catalog.json");
     let mut catalog: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
-    let min = &catalog["tables"]["main.t"]["stats"]["columns"][0]["min"];
+    let min = &catalog["tables"]["main.t"]["files"][0]["stats"]["columns"][0]["min"];
     assert!(min.is_string(), "{min}");
-    catalog["tables"]["main.t"]["stats"]["columns"][0]["min"] = serde_json::json!("424242");
+    catalog["tables"]["main.t"]["files"][0]["stats"]["columns"][0]["min"] =
+        serde_json::json!("424242");
     std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
     let lake = Lake::open(&lake_dir).unwrap();
     let err = lake.attach(None).unwrap_err().to_string();
@@ -773,14 +796,13 @@ fn lean_attach_refuses_corrupted_and_stats_less_lakes() {
     // refusal (never an empty-statistics attach).
     let mut catalog: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&catalog_path).unwrap()).unwrap();
-    catalog["tables"]["main.t"]
+    catalog["tables"]["main.t"]["files"][0]
         .as_object_mut()
         .unwrap()
         .remove("stats");
     std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
     let lake = Lake::open(&lake_dir).unwrap();
     let err = lake.attach(None).unwrap_err().to_string();
-    assert!(err.contains("format_version 1"), "{err}");
     assert!(err.contains("without a statistics block"), "{err}");
     assert!(err.contains("use .lake open"), "{err}");
     assert_same_store(&db, &lake.load(None).unwrap());

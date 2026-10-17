@@ -46,7 +46,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(not(feature = "vortex-format"), test))]
 use pinkdb::persist::SavedTableStats;
 use pinkdb::{ColumnStats, DataType, Value};
 
@@ -106,9 +105,9 @@ impl StatsBlock {
     /// collected during the encode. `key` is the flat `db.table` catalog key,
     /// `file` the lake-relative path of the one data file.
     ///
-    /// Only a lean (`vortex-format`-less) build writes v1 `.pink` data files,
-    /// so the block *writer* exists there only; every build reads blocks.
-    #[cfg(any(not(feature = "vortex-format"), test))]
+    /// Every build writes blocks now: a `vortex-format` build still appends
+    /// `.pink` files to a lean lake's v4 entries, and those carry per-file
+    /// blocks.
     pub(crate) fn from_saved(key: &str, file: &str, saved: &SavedTableStats) -> Result<Self> {
         let mut columns = Vec::with_capacity(saved.columns.len());
         for col in &saved.columns {
@@ -172,7 +171,6 @@ impl StatsBlock {
 
     /// Fill in the CRC after all fields are set (the writer path; see
     /// [`StatsBlock::from_saved`]).
-    #[cfg(any(not(feature = "vortex-format"), test))]
     pub(crate) fn seal(&mut self) {
         self.crc32 = self.compute_crc();
     }
@@ -309,7 +307,6 @@ fn nonzero_double(v: Option<Value>) -> Option<Value> {
 }
 
 /// The lowercase type name a [`StatsBlock`] stores.
-#[cfg(any(not(feature = "vortex-format"), test))]
 pub(crate) fn dtype_name(dtype: DataType) -> String {
     if let DataType::Decimal { precision, scale } = dtype {
         return format!("decimal({precision},{scale})");
@@ -352,7 +349,6 @@ pub(crate) fn dtype_from_name(name: &str) -> Option<DataType> {
 /// Canonical textual encoding of one min/max statistic (see the module
 /// docs). `None` when the value's shape does not match `dtype` — a writer bug
 /// that must never become a wrong answer.
-#[cfg(any(not(feature = "vortex-format"), test))]
 pub(crate) fn encode_value(dtype: DataType, v: &Value) -> Option<String> {
     Some(match (dtype, v) {
         (DataType::Boolean, Value::Boolean(b)) => b.to_string(),

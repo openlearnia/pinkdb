@@ -113,7 +113,7 @@ fn lake_s3_save_open_versions_tables_info() {
         &mock,
         &format!(".lake info {url}\n.lake versions {url}\n.lake tables {url}\n.quit\n"),
     );
-    assert!(out.contains("format version:  3"), "{out}");
+    assert!(out.contains("format version:  4"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
     assert!(out.contains("snapshots:       2 (1, 2)"), "{out}");
     assert!(out.contains("main.t (2 rows)"), "{out}");

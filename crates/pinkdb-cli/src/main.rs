@@ -59,33 +59,28 @@ fn print_help() {
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     if cfg!(any(feature = "lake", feature = "lake-lite")) {
-        if cfg!(feature = "s3") {
-            println!("  .lake save <dir|s3://bucket/prefix> [force] [author '…'] [message '…']");
-            println!("                                snapshot the store into a lake");
-            println!(
-                "  .lake open <dir|s3://…> [v]  load the lake's latest (or version v) into memory"
-            );
-        } else {
-            println!(
-                "  .lake save <dir> [force] [author '…'] [message '…']  snapshot the store \
-                 into a lake"
-            );
-            println!(
-                "  .lake open <dir> [v]      load the lake's latest (or version v) into memory"
-            );
-        }
+        #[cfg(feature = "s3")]
+        const LAKE: &str = "<dir|s3://bucket/prefix>";
+        #[cfg(not(feature = "s3"))]
+        const LAKE: &str = "<dir>";
+        println!("  .lake save {LAKE} [force] [author '…'] [message '…']");
+        println!("                                snapshot the store into a lake");
+        println!("  .lake open {LAKE} [v]      load the lake's latest (or version v) into memory");
+        println!("  .lake attach {LAKE} [v] [read-only|write]");
+        println!("        read-only (default): query the lake from its statistics");
+        println!("        write: materialize its tables into the session store");
         println!(
-            "  .lake attach <dir|s3://…> [v]  attach a lake read-only, from its statistics only"
+            "  .lake commit {LAKE}        publish the writable attach as one incremental version"
         );
-        println!("  .lake detach <dir|s3://…>    detach one attached lake");
+        println!("  .lake detach {LAKE} [force]  detach one attached lake");
         println!("  .lake attached              list attached lakes and their tables");
-        println!("  .lake versions <dir|s3://…>  list the lake's published versions");
+        println!("  .lake versions {LAKE}       list the lake's published versions");
         println!(
-            "  .lake snapshots <dir|s3://…>  per-version records: time, author, message, changes"
+            "  .lake snapshots {LAKE}      per-version records: time, author, message, changes"
         );
-        println!("  .lake tables <dir|s3://…>    list the current version's tables and row counts");
+        println!("  .lake tables {LAKE}         list the current version's tables and row counts");
         println!(
-            "  .lake info <dir|s3://…>      show the lake's format version, versions, and tables"
+            "  .lake info {LAKE}           show the lake's format version, versions, and tables"
         );
         println!(
             "  FROM t AT (VERSION => n)     query an attached lake table at a version \
@@ -95,7 +90,9 @@ fn print_help() {
             println!("  .lake s3:// URLs need a build with the `s3` feature");
         }
         if !cfg!(feature = "lake") {
-            println!("  (lean lake build: v1 `.pink` data files; v2/v3 Vortex lakes need `lake`)");
+            println!(
+                "  (lean lake build: `.pink` data files, format_version 4); Vortex needs `lake`"
+            );
         }
     } else {
         println!("  .lake <subcommand>     (not built; needs the `lake` or `lake-lite` feature)");
@@ -130,7 +127,8 @@ fn lake_unavailable(cmd: &str) {
     cli_error!("{cmd} is not available: this pinkdb binary was built without the lake feature;");
     eprintln!(
         "       rebuild with `cargo build -p pinkdb-cli --features lake` (full: Vortex data \
-         files, attach, s3 with `,s3`) or `--features lake-lite` (lean: v1 `.pink` data files)."
+         files, incremental writes, attach, s3 with `,s3`) or `--features lake-lite` (lean: \
+         `.pink` data files)."
     );
 }
 

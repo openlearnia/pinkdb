@@ -12,58 +12,55 @@
 //! <lake>/
 //!   catalog.json                current catalog (authoritative for "latest")
 //!   snapshots/<version>.json    immutable manifests, one per published version
-//!   data/<table>/<uuid>.vortex  immutable per-table data files (v2/v3, Vortex)
-//!   data/<table>/<uuid>.pink    v1 data files (engine persistence bytes)
+//!   commits/<version>.json      immutable per-commit delta manifests (audit)
+//!   data/<table>/<uuid>.vortex  immutable per-table data files (v4, Vortex)
+//!   data/<table>/<uuid>.pink    `.pink` data files (v1/v4 lean builds)
+//!   data/<table>/<uuid>.pinkdel positional delete files (v4; see delete_file)
 //! ```
 //!
 //! `catalog.json` and every snapshot manifest are JSON of the same shape:
 //!
 //! ```json
 //! {
-//!   "format_version": 3,
+//!   "format_version": 4,
 //!   "updated": "2026-10-14T12:34:56.789Z",
 //!   "version": 2,
 //!   "tables": {
-//!     "main.t":      { "files": ["data/main.t/3f2a….vortex"], "rows": 5, "format": "vortex" },
-//!     "analytics.u": { "files": ["data/analytics.u/9c01….vortex"], "rows": 1, "format": "vortex" }
+//!     "main.t": {
+//!       "files": [
+//!         { "path": "data/main.t/3f2a….vortex", "rows": 5 },
+//!         { "path": "data/main.t/9c01….vortex", "rows": 2 }
+//!       ],
+//!       "deletes": [
+//!         { "path": "data/main.t/77aa….pinkdel", "file": "data/main.t/3f2a….vortex",
+//!           "count": 1 }
+//!       ],
+//!       "rows": 6,
+//!       "format": "vortex"
+//!     }
 //!   }
 //! }
 //! ```
 //!
-//! A `format_version` 1 entry additionally carries `"stats"`: the exact
-//! per-column schema and statistics the lean writer collected while encoding
-//! the `.pink` data file, CRC-sealed against the entry's key, file path and
-//! row count (see the `stats` module docs). `.lake attach` reads that block
-//! without opening the data file; a v1 entry saved before the block existed
-//! is refused with a clear message.
+//! A `format_version` 4 entry is **incremental**: every data file carries its
+//! own exact row count, scans union the files in listed order, and each
+//! `deletes` entry names one **positional delete file** (0-based positions
+//! within the one data file it targets) whose rows the reader drops
+//! (merge-on-read). `rows` is the logical count and must equal
+//! `sum(files.rows) - sum(deletes.count)`. A v4 entry's `format` is
+//! `"vortex"` in a `vortex-format` build or `"pink"` (the engine's
+//! single-table `.pink` bytes) in a lean one; a v4 `.pink` file carries its
+//! own CRC-protected statistics block *inside* its `files` object, so attach
+//! can merge exact per-column statistics across an append-only file list
+//! without opening any file (until a delete file makes them unknowable).
 //!
-//! Schema and typing stay inside the data files (the statistics block
-//! duplicates v1 entries' schema so attach can serve it without a data-file
-//! read; the data file stays authoritative for loading). **With the
-//! `vortex-format` feature (not on by default; the full CLI builds enable
-//! it) Vortex is the format for new writes** ([`FORMAT_VERSION`] 3; version 2
-//! lakes, with one row block per engine chunk, stay readable): every new data
-//! file is a plain Vortex file holding one struct array — one field per
-//! column, row order preserved, `-0.0` and NaN payloads bit-exact — plus a
-//! `pinkdb.table` metadata segment carrying the table's `db`/`table` identity
-//! and its pinkdb column schema (the `vortex_file` module docs have the
-//! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
-//! `vortex.timestamp` extension cannot represent the full engine range).
-//! **Without the feature** — the lean `lake-lite` builds — this crate writes
-//! **`format_version` 1** lakes: one engine `.pink` single-table persistence
-//! file per table ([`PinkDb::to_pink_bytes_with_stats`], the wave-34 layout;
-//! today's engine writes v4 bytes) **plus a CRC-protected statistics block on
-//! every entry** (the exact per-column facts the same encode pass collected;
-//! see the `stats` module docs), and reads exactly those. Reading a v2/v3
-//! Vortex lake in such a build is a clear [`LakeError::FeatureMissing`] at the
-//! first manifest parse — never a corrupt-file error and never a wrong-format
-//! guess. A `format_version` 1 lake stays readable in every build: its entries
-//! have no `format` field and its data files open standalone with
-//! [`PinkDb::open`]. Opening an old lake and saving again publishes this
-//! build's format: a v3 snapshot in a `vortex-format` build (a full rewrite in
-//! Vortex — the migration path), still v1 without it. A manifest with any
-//! other `format_version` — or a v2/v3 entry that omits `format` or declares
-//! anything but `"vortex"`, or a v1 entry that declares one — is a clear
+//! Versions 1–3 remain readable and are never written any more: a v1 entry
+//! (the wave-34 lean format) is one `.pink` file as a plain string path plus
+//! one entry-level `"stats"` block; versions 2 and 3 are one `.vortex` file
+//! as a plain string path (`"format": "vortex"`), v3 with larger row blocks.
+//! A v1–v3 entry that omits `format` (v2/v3) or declares the wrong one, a
+//! manifest with any other `format_version`, a v4 file object without a row
+//! count, or a v4 table whose row count does not add up is a clear
 //! [`LakeError::Unsupported`]/[`LakeError::Corrupt`] error, never a guess.
 //! Decoding a corrupt Vortex data file is the same clear [`LakeError::Corrupt`]
 //! error: the whole decoder boundary is guarded, so a panic inside Vortex's
@@ -71,25 +68,50 @@
 //! still print one line to stderr first; the crate does not swap the global
 //! hook).
 //!
+//! **With the `vortex-format` feature (not on by default; the full CLI builds
+//! enable it) Vortex is the format for new writes**: every new data file is a
+//! plain Vortex file holding one struct array — one field per column, row
+//! order preserved, `-0.0` and NaN payloads bit-exact — plus a
+//! `pinkdb.table` metadata segment carrying the table's `db`/`table` identity
+//! and its pinkdb column schema (the `vortex_file` module docs have the
+//! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
+//! `vortex.timestamp` extension cannot represent the full engine range).
+//! **Without the feature** — the lean `lake-lite` builds — new writes are
+//! engine `.pink` single-table persistence files
+//! ([`PinkDb::to_pink_bytes_with_stats`]) **plus a CRC-protected statistics
+//! block per file** (the exact per-column facts the same encode pass
+//! collected; see the `stats` module docs). Reading a v4 Vortex lake in a lean
+//! build is a clear [`LakeError::FeatureMissing`] at the first manifest parse
+//! — never a corrupt-file error and never a wrong-format guess. A v4 `.pink`
+//! lake stays readable in every build (its data files open standalone with
+//! [`PinkDb::open`]).
+//!
 //! `.lake open` (every build) and `.lake attach` (every build) are the two
 //! ways in: `open` eagerly loads a version into the store, `attach` reads
 //! only the catalog, the manifest, and the statistics layer — a Vortex data
-//! file's footer, metadata segment and stored statistics, or a v1 `.pink`
-//! entry's published statistics block (no data file is opened at attach for
-//! v1) — and lazily materializes the one table a query actually scans, with
-//! exact `COUNT`/`MIN`/`MAX` answered straight from those statistics.
-//! Attached lakes are read-only, session-local, and never part of a save, a
-//! checkpoint, or the WAL. A v1 lake saved before statistics blocks existed
-//! (or with its block corrupted) is refused with a clear error — `.lake open`
-//! remains the way in.
+//! file's footer, metadata segment and stored statistics, or the per-file
+//! `.pink` statistics blocks (no data file is opened at attach) — and lazily
+//! materializes the one table a query actually scans, with exact
+//! `COUNT`/`MIN`/`MAX` answered straight from those statistics. Attached
+//! lakes are read-only, session-local, and never part of a save, a
+//! checkpoint, or the WAL; the write path is [`commit`](Lake::commit) (see
+//! the `incremental` module), which appends immutable data files and
+//! positional delete files and **never rewrites a published file**.
 //!
 //! # Snapshots and versioning
 //!
 //! [`Lake::write_from_store`] writes a full snapshot: every table of every
 //! database of the store is written to a fresh data file (one file per table
-//! per version — a writer never appends and never reuses), then the manifest is
-//! published as `snapshots/<version>.json`, then `catalog.json` is replaced
-//! with the same bytes. A version number is `previous + 1`, computed with
+//! per version — a full save never appends and never reuses), then the
+//! manifest is published as `snapshots/<version>.json`, then `catalog.json`
+//! is replaced with the same bytes. [`Lake::commit`] (and the higher-level
+//! [`Lake::commit_from_tables`]) publishes an **incremental** version on top
+//! of one: appended files are added to the table's file list, positional
+//! deletes become delete files, and **no file a previous version references
+//! is rewritten, replaced, or reused for new data** — the `incremental`
+//! module documents the delta format. Each commit also writes
+//! `commits/<version>.json`, an append-only delta manifest (audit, never a
+//! load-time input). A version number is `previous + 1`, computed with
 //! `checked_add` and capped at [`MAX_VERSION`]; a lake whose next version
 //! would exceed the cap is a clear [`LakeError::Overflow`], never a wrap.
 //! Every manifest's `version` must be in `1..=MAX_VERSION` (a tampered
@@ -122,20 +144,24 @@
 //!
 //! # Crash safety and durability
 //!
-//! Publication order is data files → snapshot manifest → `catalog.json`. Each
-//! write goes to a **unique** temp sibling (`<name>.<uuid>.tmp`, created with
-//! `create_new(true)` so a planted symlink or an older writer's temp file is
-//! never followed or truncated), is fsynced, and is then renamed (catalog,
-//! data files) or hard-linked (snapshot manifests) into place; the parent
-//! directory is fsynced afterwards, best-effort. A crash anywhere can only
-//! leave *unreferenced* leftovers: the previous catalog still loads, and
-//! stray data files, stray `.tmp` files, and snapshots above the catalog's
-//! version are ignored — [`Lake::versions`] lists only manifests that parse
-//! and declare their own canonical version. A stray manifest at exactly the
-//! *next* version cannot be told apart from a published one, so a save that
-//! lands on it refuses with [`LakeError::Conflict`] instead of replacing it;
-//! delete the unpublished stray (the catalog still points at the previous
-//! version) to continue.
+//! Publication order is data and delete files → commit manifest
+//! (`commits/<version>.json`) → snapshot manifest (`snapshots/<version>.json`)
+//! → `catalog.json`. Each write goes to a **unique** temp sibling
+//! (`<name>.<uuid>.tmp`, created with `create_new(true)` so a planted symlink
+//! or an older writer's temp file is never followed or truncated), is
+//! fsynced, and is then renamed (catalog, data files) or hard-linked
+//! (snapshot manifests) into place; the parent directory is fsynced
+//! afterwards, best-effort. A crash anywhere can only leave *unreferenced*
+//! leftovers: the previous catalog still loads, and stray data files, stray
+//! `.tmp` files, and snapshots above the catalog's version are ignored —
+//! [`Lake::versions`] lists only manifests that parse and declare their own
+//! canonical version. A stray manifest at exactly the *next* version cannot
+//! be told apart from a published one, so a save or commit that lands on it
+//! refuses with [`LakeError::Conflict`] instead of replacing it; delete the
+//! unpublished stray (the catalog still points at the previous version) to
+//! continue. A stray **commit delta** at the next version (never with its
+//! snapshot) is self-healing: the retry that reaches that version overwrites
+//! it, because the snapshot is the authoritative manifest.
 //!
 //! This is **process-crash safety**: after a `kill -9`, the previous version
 //! always loads. It is deliberately *not* a power-loss guarantee on APFS:
@@ -153,10 +179,15 @@
 //! reopen the lake") before its catalog replacement — and two writers racing
 //! for the same version cannot both win: the snapshot link is atomic, so
 //! exactly one publishes `snapshots/<v>.json`, and `catalog.json` is
-//! byte-identical to the snapshot of its version. Over S3 both publications
-//! are conditional writes (`If-None-Match: *`, `If-Match: <etag>`), which
-//! AWS S3 / Cloudflare R2 evaluate atomically with the write commit. An
-//! endpoint that rejects conditionals refuses the write
+//! byte-identical to the snapshot of its version. A **commit** whose publish
+//! conflicts is retried under [`CommitSettings`] (DuckLake's
+//! `ducklake_max_retry_count`/`ducklake_retry_backoff`/`ducklake_retry_wait_ms`,
+//! defaults 10 / 1.5 / 100 ms), rebasing the already-written immutable files
+//! onto the new head; a delta whose base files the head no longer contains
+//! is refused, never silently re-applied. Over S3 both publications are
+//! conditional writes (`If-None-Match: *`, `If-Match: <etag>`), which AWS
+//! S3 / Cloudflare R2 evaluate atomically with the write commit. An endpoint
+//! that rejects conditionals refuses the write
 //! ([`LakeError::UnsupportedEndpoint`]) unless the single-writer degraded
 //! fallback is explicitly opted into — see the `s3` feature docs and the
 //! README.
@@ -216,6 +247,8 @@ use pinkdb::{DataTable, DataType, PinkDb};
 
 mod attach;
 mod catalog;
+mod delete_file;
+mod incremental;
 mod local;
 #[cfg(test)]
 mod mock_s3;
@@ -229,7 +262,8 @@ mod time;
 mod vortex_file;
 
 pub use attach::AttachmentReport;
-use catalog::{Catalog, FileFormat, TableEntry};
+use catalog::{Catalog, DeleteRef, FileFormat, FileRef, TableEntry};
+pub use incremental::{Commit, CommitReport, CommitSettings, WritableAttachment};
 use local::{LocalStorage, CATALOG_FILE};
 pub use snapshot::{ChangeSummary, SnapshotInfo};
 use storage::{Head, Location, Storage, VersionTag};
@@ -239,37 +273,32 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 
 /// The catalog format version this build writes (and its newest read).
 ///
-/// Version 3 (wave 45): Vortex data files with 8,192-row / ~1 MiB row blocks
-/// (the loader re-chunks them into engine chunks). Version 2: Vortex data
-/// files with one block per engine chunk — still read. Both declare
-/// `"format": "vortex"` on every entry; the bump exists so builds that only
-/// know version 2 (whose loader rejects blocks over 2,048 rows) refuse a
-/// version 3 lake with a clear "unsupported format_version" error instead of
-/// a misleading corrupt-file one.
+/// Version 4 (wave 63): the incremental format — every data file carries its
+/// own row count, a table lists a growing, never-rewritten file list, and
+/// positional delete files (merge-on-read) express `DELETE`/`UPDATE`. Written
+/// by every build: Vortex data files with `vortex-format`, engine `.pink`
+/// files (with a per-file statistics block) without it.
 ///
-/// A build with the (default-off) `vortex-format` feature writes version 3;
-/// without it — the lean `lake-lite` builds — this build writes **version 1**
-/// only: entries carry no `format`, data files are engine `.pink` bytes, and
-/// every entry carries a CRC-protected statistics block (wave 45k).
-/// Version 2 and 3 lakes are refused by such a build with a clear
+/// Versions 1–3 stay readable and are never written any more. Version 3
+/// (wave 45): Vortex data files with 8,192-row / ~1 MiB row blocks. Version
+/// 2: Vortex data files with one block per engine chunk. Both list one
+/// `.vortex` file as a plain string and declare `"format": "vortex"` on
+/// every entry. Version 1 (wave 34): one engine `.pink` file per entry (no
+/// `format` field) plus one entry-level statistics block.
+///
+/// A build without `vortex-format` — the lean `lake-lite` builds — writes v4
+/// with `.pink` files and refuses a v4 (or v2/v3) Vortex lake with a clear
 /// [`LakeError::FeatureMissing`], never a corrupt-file error.
-#[cfg(feature = "vortex-format")]
-pub const FORMAT_VERSION: u32 = 3;
-
-/// The catalog format version a build without `vortex-format` writes: the v1
-/// `.pink` data-file format with a statistics block on every entry (see
-/// [`FORMAT_VERSION`] and the `stats` module).
-#[cfg(not(feature = "vortex-format"))]
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The oldest catalog format version this build still reads.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 
-/// The newest catalog format version this codebase knows: 3 (Vortex 0.88
-/// files with the wave-45 layout). A build without `vortex-format` refuses
-/// versions 2 and 3 with [`LakeError::FeatureMissing`]; a manifest above this
-/// (a future format) is [`LakeError::Unsupported`] in every build.
-pub const MAX_FORMAT_VERSION: u32 = 3;
+/// The newest catalog format version this codebase knows: 4 (the incremental
+/// format). A manifest above this (a future format) is
+/// [`LakeError::Unsupported`] in every build; a v4 Vortex lake in a build
+/// without `vortex-format` is [`LakeError::FeatureMissing`].
+pub const MAX_FORMAT_VERSION: u32 = 4;
 
 /// The largest manifest `version` this build reads or writes.
 ///
@@ -358,20 +387,28 @@ impl fmt::Display for LakeError {
                 write!(f, "corrupt lake metadata at {}: {message}", path.display())
             }
             LakeError::Unsupported { path, found } => {
-                if cfg!(feature = "vortex-format") {
+                if *found > MAX_FORMAT_VERSION {
                     write!(
                         f,
                         "unsupported lake format_version {found} at {} (this build reads \
-                         format_version {MIN_FORMAT_VERSION} in its v1 `.pink` form and \
-                         reads/writes format_version {FORMAT_VERSION} in its Vortex form)",
+                         format_version {MIN_FORMAT_VERSION}..={MAX_FORMAT_VERSION}; the lake \
+                         was written by a newer pinkdb — upgrade to open it)",
+                        path.display()
+                    )
+                } else if cfg!(feature = "vortex-format") {
+                    write!(
+                        f,
+                        "unsupported lake format_version {found} at {} (this build reads \
+                         format_version {MIN_FORMAT_VERSION}..={FORMAT_VERSION} including the \
+                         v1 `.pink` form)",
                         path.display()
                     )
                 } else {
                     write!(
                         f,
                         "unsupported lake format_version {found} at {} (this build reads/writes \
-                         format_version {FORMAT_VERSION} in its v1 `.pink` form; Vortex \
-                         format_version 2/3 needs the `vortex-format` feature)",
+                         format_version {FORMAT_VERSION} with `.pink` data files; Vortex \
+                         format_version 2/3/4 needs the `vortex-format` feature)",
                         path.display()
                     )
                 }
@@ -726,8 +763,8 @@ impl Lake {
     /// Vortex data file's footer, metadata segment and stored statistics
     /// (`vortex-format` builds; no column data is read or decoded, unless the
     /// files live on object storage — whole-object reads, still no decode),
-    /// or the v1 `.pink` entry's published statistics block (every build:
-    /// the manifest is all attach reads; `data` files are never opened).
+    /// or the `.pink` files' published statistics blocks (every build: the
+    /// manifest is all attach reads; `data` files are never opened).
     ///
     /// The returned [`AttachmentReport`] carries the version-pinned
     /// [`pinkdb::AttachedLake`] handle; register it with
@@ -736,26 +773,59 @@ impl Lake {
     /// identity against its catalog key, the declared schema, and the row
     /// count against the manifest. It never mutates the lake.
     ///
-    /// A `.pink` entry saved before statistics existed (no `stats` block)
-    /// and a table with more than one data file are refused with a clear
-    /// error; `.lake open` remains the way to load those. A `vortex-format`
-    /// build attaches v1 `.pink` lakes with statistics exactly like a lean
-    /// build, and refuses v1 lakes without them the same way.
+    /// A multi-file table (the v4 incremental format) merges its files'
+    /// statistics when every file carries a block and the table has no
+    /// positional deletes; once a delete file exists the per-column facts can
+    /// no longer be proven without reading data, so those columns fall back
+    /// to materialization (the row count stays exact). A `.pink` entry
+    /// without statistics blocks is refused with a clear error; `.lake open`
+    /// remains the way to load it.
     pub fn attach(&self, version: Option<u64>) -> Result<AttachmentReport> {
         let (_, report) = attach::build(self, version)?;
         Ok(report)
     }
 
+    /// The published commit-delta manifest versions, ascending: every
+    /// `commits/<v>.json` naming a version at or below the current one (and
+    /// below this build's newest format). The delta manifests are the
+    /// append-only audit trail of how each version was built (which data and
+    /// delete files it added); the snapshot manifests stay authoritative for
+    /// loading.
+    pub fn commits(&self) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        for name in self.storage.list("commits")? {
+            let Some(v) = name
+                .strip_suffix(".json")
+                .and_then(canonical_version_number)
+            else {
+                continue;
+            };
+            if v < 1 || v > self.version {
+                continue;
+            }
+            out.push(v);
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Referenced data files that are missing (or not a valid `data/…` path):
     /// `(table key, path)`, sorted by table then path. This is the cheap
     /// integrity check behind `.lake tables`/`.lake info`: a table can only
-    /// be advertised while every data file it names is present. It does not
-    /// read the files (that is what [`Lake::load`] does).
+    /// be advertised while every data file — and every positional delete
+    /// file — it names is present. It does not read the files (that is what
+    /// [`Lake::load`] does).
     pub fn missing_data_files(&self) -> Result<Vec<(String, PathBuf)>> {
         let (manifest, _) = self.manifest(None)?;
         let mut out = Vec::new();
         for (key, entry) in &manifest.tables {
-            for rel in &entry.files {
+            for rel in entry
+                .files
+                .iter()
+                .map(FileRef::path)
+                .chain(entry.deletes.iter().map(|d| d.path.as_str()))
+            {
                 if validate_rel_path(rel).is_err() || !matches!(self.storage.head(rel)?, Head::File)
                 {
                     out.push((key.clone(), self.storage.abs(rel)));
@@ -795,72 +865,38 @@ impl Lake {
         if self.storage.exists(&snapshot_rel)? {
             return Err(self.snapshot_exists_error(version));
         }
+        let format = self.write_format();
         let mut tables: BTreeMap<String, TableEntry> = BTreeMap::new();
+        let mut deltas: BTreeMap<String, catalog::TableDelta> = BTreeMap::new();
         let mut bytes_written = 0u64;
         let mut rows = 0u64;
         for dbname in db.list_databases() {
             for name in db.list_tables_in(&dbname) {
                 let src = table_in(db, &dbname, &name)?;
                 let key = format!("{dbname}.{name}");
-                let dir = format!("data/{}", encode_key(&key));
-                let id = fresh_id();
-                // One data file per table either way (the loader is driven by
-                // the catalog's `format` field, never by the extension), and
-                // the publication order below is identical: the data file is
-                // finished (fsynced / one atomic PUT) before anything
-                // references it. Only the encoder differs:
-                //
-                // - `vortex-format`: a Vortex file (catalog format_version 3),
-                //   streamed into the store — locally straight into a unique
-                //   `create_new` temp sibling, then fsync + rename; over S3
-                //   buffered for one atomic PUT. Statistics live in the
-                //   Vortex footer; the entry carries none.
-                // - without it (the lean builds): the wave-34 v1 layout — the
-                //   engine's own `.pink` single-table bytes (catalog
-                //   format_version 1) via `put`, same temp→fsync→rename /
-                //   single-PUT atomicity. The same encode pass collects the
-                //   exact per-column statistics, published in the entry's
-                //   CRC-protected `stats` block (`.lake attach` answers
-                //   COUNT/MIN/MAX from it without opening the file).
-                #[cfg(feature = "vortex-format")]
-                let (rel_file, format, stats, written) = {
-                    let rel_file = format!("{dir}/{id}.vortex");
-                    let written = self.storage.put_streamed(&rel_file, &mut |sink| {
-                        vortex_file::encode_table_into(&dbname, &name, src, sink)
-                    })?;
-                    (rel_file, Some(FileFormat::Vortex), None, written)
-                };
-                #[cfg(not(feature = "vortex-format"))]
-                let (rel_file, format, stats, written) = {
-                    let rel_file = format!("{dir}/{id}.pink");
-                    let mini = single_table_store(&dbname, &name, src)?;
-                    let (bytes, saved) =
-                        mini.to_pink_bytes_with_stats()
-                            .map_err(|e| LakeError::Engine {
-                                context: format!("saving table \"{key}\""),
-                                source: e,
-                            })?;
-                    let saved = saved
-                        .iter()
-                        .find(|s| s.db == dbname && s.table == name)
-                        .ok_or_else(|| LakeError::Internal {
-                            message: format!(
-                                "the single-table encoder for \"{key}\" returned no statistics"
-                            ),
-                        })?;
-                    let block = stats::StatsBlock::from_saved(&key, &rel_file, saved)?;
-                    self.storage.put(&rel_file, &bytes)?;
-                    (rel_file, None, Some(block), bytes.len() as u64)
-                };
+                // One data file per table, written before anything references
+                // it (see [`Lake::write_data_file`] for the encoders).
+                let (file, written) = self.write_data_file(&key, Some(format), src)?;
                 bytes_written += written;
                 rows += src.num_rows() as u64;
+                deltas.insert(
+                    key.clone(),
+                    catalog::TableDelta {
+                        data_files: vec![file.clone()],
+                        delete_files: Vec::new(),
+                        rows_added: src.num_rows() as u64,
+                        rows_deleted: 0,
+                        replaced: true,
+                    },
+                );
                 tables.insert(
                     key,
                     TableEntry {
-                        files: vec![rel_file],
+                        files: vec![file],
                         rows: src.num_rows() as u64,
-                        format,
-                        stats,
+                        format: Some(format),
+                        stats: None,
+                        deletes: Vec::new(),
                     },
                 );
             }
@@ -888,6 +924,27 @@ impl Lake {
             changes,
         };
         let bytes = manifest_json(&manifest, &self.root)?;
+        let commit_manifest = catalog::CommitManifest {
+            format_version: FORMAT_VERSION,
+            version,
+            base_version: version - 1,
+            updated: time::iso8601_utc(SystemTime::now()),
+            tables: deltas,
+        };
+        let commit_bytes = commit_manifest_json(&commit_manifest)?;
+        // Same publication order as a commit: the delta manifest, the
+        // snapshot, then the catalog.
+        let commit_rel = format!("commits/{version}.json");
+        if !self.storage.put_new(&commit_rel, &commit_bytes)? {
+            let snapshot_exists = self.storage.exists(&snapshot_rel)?;
+            if snapshot_exists {
+                return Err(self.snapshot_exists_error(version));
+            }
+            // A stray delta from a crashed attempt that never linked its
+            // snapshot: the snapshot is authoritative, so heal it.
+            self.storage.put(&commit_rel, &commit_bytes)?;
+        }
+        bytes_written += commit_bytes.len() as u64;
         // Create-only, never replace: an existing snapshot version is a
         // published version (or an unpublished stray the caller must remove).
         // Locally a hard link; over S3 `If-None-Match: *`.
@@ -895,27 +952,161 @@ impl Lake {
             return Err(self.snapshot_exists_error(version));
         }
         bytes_written += bytes.len() as u64;
+        self.replace_catalog(version, &bytes, "save")?;
+        bytes_written += bytes.len() as u64;
+        Ok(SaveReport {
+            version,
+            tables: manifest.tables.len(),
+            rows,
+            bytes_written,
+        })
+    }
+
+    /// The data-file format this build writes: Vortex with `vortex-format`,
+    /// engine `.pink` bytes without it.
+    fn write_format(&self) -> FileFormat {
+        #[cfg(feature = "vortex-format")]
+        {
+            FileFormat::Vortex
+        }
+        #[cfg(not(feature = "vortex-format"))]
+        {
+            FileFormat::Pink
+        }
+    }
+
+    /// Write one immutable data file for `key` holding `src`, returning its
+    /// manifest reference (path, row count, and — for `.pink` files — the
+    /// CRC-protected statistics block the same encode pass collected) and the
+    /// bytes written. `format` defaults to this build's
+    /// [`write_format`](Lake::write_format) and must be explicit to append a
+    /// file to an entry of the other format.
+    ///
+    /// - `vortex-format`: a Vortex file, streamed — locally straight into a
+    ///   unique `create_new` temp sibling plus fsync + rename; over S3
+    ///   buffered for one atomic PUT. Statistics live in the Vortex footer.
+    /// - `.pink`: the engine's own single-table persistence bytes via `put`,
+    ///   same temp→fsync→rename / single-PUT atomicity; the entry's per-file
+    ///   `stats` block lets `.lake attach` answer `COUNT`/`MIN`/`MAX` without
+    ///   opening the file.
+    fn write_data_file(
+        &self,
+        key: &str,
+        format: Option<FileFormat>,
+        src: &DataTable,
+    ) -> Result<(FileRef, u64)> {
+        let (dbname, table) = split_key(key, &self.root.join(CATALOG_FILE))?;
+        let dir = format!("data/{}", encode_key(key));
+        let id = fresh_id();
+        let rows = src.num_rows() as u64;
+        match format.unwrap_or_else(|| self.write_format()) {
+            FileFormat::Vortex => {
+                #[cfg(feature = "vortex-format")]
+                {
+                    let rel = format!("{dir}/{id}.vortex");
+                    let written = self.storage.put_streamed(&rel, &mut |sink| {
+                        vortex_file::encode_table_into(dbname, table, src, sink)
+                    })?;
+                    Ok((
+                        FileRef::Entry {
+                            path: rel,
+                            rows,
+                            stats: None,
+                        },
+                        written,
+                    ))
+                }
+                #[cfg(not(feature = "vortex-format"))]
+                {
+                    let _ = (dbname, table, id, dir);
+                    Err(LakeError::FeatureMissing {
+                        feature: "vortex-format",
+                        message: "writing a Vortex data file needs the `vortex-format` feature"
+                            .to_string(),
+                    })
+                }
+            }
+            FileFormat::Pink => {
+                let rel = format!("{dir}/{id}.pink");
+                let mini = single_table_store(dbname, table, src)?;
+                let (bytes, saved) =
+                    mini.to_pink_bytes_with_stats()
+                        .map_err(|e| LakeError::Engine {
+                            context: format!("saving table \"{key}\""),
+                            source: e,
+                        })?;
+                let saved = saved
+                    .iter()
+                    .find(|s| s.db == dbname && s.table == table)
+                    .ok_or_else(|| LakeError::Internal {
+                        message: format!(
+                            "the single-table encoder for \"{key}\" returned no statistics"
+                        ),
+                    })?;
+                let block = stats::StatsBlock::from_saved(key, &rel, saved)?;
+                self.storage.put(&rel, &bytes)?;
+                Ok((
+                    FileRef::Entry {
+                        path: rel,
+                        rows,
+                        stats: Some(block),
+                    },
+                    bytes.len() as u64,
+                ))
+            }
+        }
+    }
+
+    /// Write one positional delete file for `key`'s `file` (see the
+    /// `delete_file` module) and return its manifest reference plus the bytes
+    /// written.
+    fn write_delete_file(
+        &self,
+        key: &str,
+        file: &str,
+        positions: &[u64],
+    ) -> Result<(DeleteRef, u64)> {
+        split_key(key, &self.root.join(CATALOG_FILE))?;
+        validate_rel_path(file)?;
+        let positions = delete_file::normalize(positions.to_vec());
+        let dir = format!("data/{}", encode_key(key));
+        let rel = format!("{dir}/{}.pinkdel", fresh_id());
+        let bytes = delete_file::encode(&positions);
+        self.storage.put(&rel, &bytes)?;
+        Ok((
+            DeleteRef {
+                path: rel,
+                file: file.to_string(),
+                count: positions.len() as u64,
+            },
+            bytes.len() as u64,
+        ))
+    }
+
+    /// Replace `catalog.json` with the manifest of `version` after re-checking
+    /// that the catalog still declares the version this handle is based on
+    /// (so a concurrent publication can never produce a catalog that
+    /// disagrees with the snapshot of its version), with the degraded
+    /// (check-then-put) endpoint reconciliation. Updates this handle.
+    fn replace_catalog(&mut self, version: u64, bytes: &[u8], what: &str) -> Result<()> {
         // Re-check that the catalog is still the version our snapshot was
         // taken from, right before replacing it, and replace it
         // conditionally: `If-Match: <etag>` over S3 (a 412 is the conflict
-        // below), a file-identity re-check locally. A concurrent writer can
-        // never end up with a catalog that disagrees with the snapshot of its
-        // version.
+        // below), a file-identity re-check locally.
         let catalog_tag = self.ensure_catalog_unchanged()?;
         if !self
             .storage
-            .put_if_match(CATALOG_FILE, &bytes, &catalog_tag)?
+            .put_if_match(CATALOG_FILE, bytes, &catalog_tag)?
         {
             return Err(LakeError::Conflict {
                 path: self.storage.abs(CATALOG_FILE),
                 message: format!(
-                    "catalog.json changed while this save was in flight (this handle is based \
-                     on version {}); reopen the lake",
+                    "catalog.json changed while this {what} was in flight (this handle is \
+                     based on version {}); reopen the lake",
                     self.version
                 ),
             });
         }
-        bytes_written += bytes.len() as u64;
         // A degraded (check-then-put) endpoint cannot make the replace
         // atomic, so verify what actually got published before reporting
         // success: read the catalog back, and if another writer's catalog is
@@ -935,29 +1126,22 @@ impl Lake {
                 return Err(LakeError::Conflict {
                     path,
                     message: format!(
-                        "catalog.json changed while this save was in flight (this handle is \
-                         based on version {}); reopen the lake",
+                        "catalog.json changed while this {what} was in flight (this handle \
+                         is based on version {}); reopen the lake",
                         self.version
                     ),
                 });
             }
-            self.storage.reconcile_snapshot(version, &bytes)?;
+            self.storage.reconcile_snapshot(version, bytes)?;
         }
         self.version = version;
         // The commit record is published; a later save without a new
         // `set_commit_message` must not repeat it.
         self.pending_commit = None;
-        // A save publishes this build's format (v3 Vortex with
-        // `vortex-format`, v1 `.pink` without it), so a handle that opened a
-        // v1 lake reports the new format once a Vortex build has migrated it
-        // (a lean build keeps publishing v1 and reports 1).
+        // A publish writes this build's format (v4), so a handle that opened
+        // an older-format lake reports the new format afterwards.
         self.format_version = FORMAT_VERSION;
-        Ok(SaveReport {
-            version,
-            tables: manifest.tables.len(),
-            rows,
-            bytes_written,
-        })
+        Ok(())
     }
 
     /// The manifest for the latest version (`None`) or one snapshot, with the
@@ -1032,10 +1216,11 @@ impl Lake {
     }
 
     /// Build a [`PinkDb`] from a manifest by loading every referenced data
-    /// file. Databases are recreated from the flat `db.table` keys; `main`
-    /// always exists in the result (an empty `main` if it had no tables).
-    /// `manifest_path` is the file the manifest came from (catalog or
-    /// snapshot) and is what errors about the manifest point at.
+    /// file and applying every positional delete on top of it (merge-on-read,
+    /// per file). Databases are recreated from the flat `db.table` keys;
+    /// `main` always exists in the result (an empty `main` if it had no
+    /// tables). `manifest_path` is the file the manifest came from (catalog
+    /// or snapshot) and is what errors about the manifest point at.
     fn rebuild(&self, manifest: &Catalog, manifest_path: &Path) -> Result<PinkDb> {
         let mut db = PinkDb::new();
         for (key, entry) in &manifest.tables {
@@ -1053,64 +1238,33 @@ impl Lake {
                 });
             }
             let format = entry.format();
+            let layout = self.entry_layout(entry, key, manifest_path)?;
             let mut created = false;
-            for (i, rel) in entry.files.iter().enumerate() {
+            for (i, (rel, file_rows, deleted)) in layout.iter().enumerate() {
                 validate_rel_path(rel)?;
-                let path = self.storage.abs(rel);
-                let mini = match format {
-                    // v1: the engine's own single-table persistence bytes,
-                    // opened by path (over object storage this downloads a
-                    // temp copy that is removed when dropped).
-                    FileFormat::Pink => {
-                        let copy = self
-                            .storage
-                            .local_copy(rel, &format!("loading data file \"{rel}\""))?;
-                        PinkDb::open(path_str(copy.path())?).map_err(|e| LakeError::Engine {
-                            context: format!("loading data file \"{rel}\" for table \"{key}\""),
-                            source: e,
-                        })?
-                    }
-                    // v2/v3: a Vortex file that decodes into the same shape.
-                    // The bytes are moved into the decoder's buffer (zero
-                    // copy).
-                    FileFormat::Vortex => {
-                        #[cfg(feature = "vortex-format")]
-                        {
-                            let bytes = self
-                                .storage
-                                .read(rel, &format!("loading data file \"{rel}\""))?;
-                            vortex_file::decode_table_owned(&path, bytes)?
-                        }
-                        #[cfg(not(feature = "vortex-format"))]
-                        {
-                            // Unreachable: `read_manifest` refuses a v2/v3
-                            // manifest in a build without the feature long
-                            // before a Vortex entry could get here. Kept as a
-                            // clear error, not a panic.
-                            return Err(LakeError::FeatureMissing {
-                                feature: "vortex-format",
-                                message: format!(
-                                    "the data file \"{rel}\" is a Vortex file, and this build \
-                                     was built without Vortex format support — rebuild with \
-                                     the `vortex-format` feature (for the CLI: \
-                                     `cargo build -p pinkdb-cli --features lake`)"
-                                ),
-                            });
-                        }
-                    }
-                };
+                let mini = self.open_data_file(rel, format)?;
                 let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
                 if !file_db.eq_ignore_ascii_case(dbname)
                     || !file_table.name.eq_ignore_ascii_case(table)
                 {
                     return Err(LakeError::Corrupt {
-                        path,
+                        path: self.storage.abs(rel),
                         message: format!(
                             "data file holds {file_db}.{}, but the catalog says \"{key}\"",
                             file_table.name
                         ),
                     });
                 }
+                if file_table.num_rows() as u64 != *file_rows {
+                    return Err(LakeError::Corrupt {
+                        path: self.storage.abs(rel),
+                        message: format!(
+                            "data file has {} rows, but the catalog says {file_rows}",
+                            file_table.num_rows()
+                        ),
+                    });
+                }
+                let file_table = apply_file_deletes(file_table, deleted, key, rel)?;
                 if !created {
                     db.create_table_in(dbname, table, file_table.schema())
                         .map_err(|e| LakeError::Engine {
@@ -1127,11 +1281,11 @@ impl Lake {
                     })?;
                 if i > 0 && dst.schema() != file_table.schema() {
                     return Err(LakeError::Corrupt {
-                        path,
+                        path: self.storage.abs(rel),
                         message: format!("data files of table \"{key}\" disagree on the schema"),
                     });
                 }
-                copy_chunks(file_table, dst, rel)?;
+                copy_chunks(&file_table, dst, rel)?;
             }
             let loaded = table_in(&db, dbname, table)?;
             if loaded.num_rows() as u64 != entry.rows {
@@ -1146,6 +1300,53 @@ impl Lake {
             }
         }
         Ok(db)
+    }
+
+    /// Decode one data file into its one-table store (the caller checks the
+    /// file's identity, schema and row count against the manifest).
+    fn open_data_file(&self, rel: &str, format: FileFormat) -> Result<PinkDb> {
+        let path = self.storage.abs(rel);
+        match format {
+            // The engine's own single-table persistence bytes, opened by path
+            // (over object storage this downloads a temp copy that is removed
+            // when dropped).
+            FileFormat::Pink => {
+                let copy = self
+                    .storage
+                    .local_copy(rel, &format!("loading data file \"{rel}\""))?;
+                PinkDb::open(path_str(copy.path())?).map_err(|e| LakeError::Engine {
+                    context: format!("loading data file \"{rel}\""),
+                    source: e,
+                })
+            }
+            // A Vortex file that decodes into the same shape. The bytes are
+            // moved into the decoder's buffer (zero copy).
+            FileFormat::Vortex => {
+                #[cfg(feature = "vortex-format")]
+                {
+                    let bytes = self
+                        .storage
+                        .read(rel, &format!("loading data file \"{rel}\""))?;
+                    vortex_file::decode_table_owned(&path, bytes)
+                }
+                #[cfg(not(feature = "vortex-format"))]
+                {
+                    // Unreachable: `read_manifest` refuses a Vortex entry in a
+                    // build without the feature long before a file could get
+                    // here. Kept as a clear error, not a panic.
+                    let _ = &path;
+                    Err(LakeError::FeatureMissing {
+                        feature: "vortex-format",
+                        message: format!(
+                            "the data file \"{rel}\" is a Vortex file, and this build was \
+                             built without Vortex format support — rebuild with the \
+                             `vortex-format` feature (for the CLI: \
+                             `cargo build -p pinkdb-cli --features lake`)"
+                        ),
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -1351,12 +1552,26 @@ fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
 /// metadata, reported as a clean [`LakeError::Corrupt`] (this path is plain
 /// JSON, no Vortex decode involved).
 ///
-/// `format_version` must be in [`MIN_FORMAT_VERSION`]`..=`[`FORMAT_VERSION`].
-/// A version 1 manifest is all-`.pink` by definition: an entry there must not
-/// declare `"format": "vortex"`. A version 2 manifest must declare a `format`
-/// on every entry, and that format must be `"vortex"` — the v2 writer emits
-/// Vortex only, so a missing field or a `"pink"` entry is corrupt v2
-/// metadata, not a silent `.pink` downgrade.
+/// `format_version` must be in [`MIN_FORMAT_VERSION`]`..=`[`FORMAT_VERSION`]`.
+/// Per-version shape rules (all violations are [`LakeError::Corrupt`], never
+/// a silent downgrade):
+///
+/// - **v1**: entries are `.pink` files as plain string paths; an entry must
+///   not declare `"format": "vortex"`, may carry one entry-level `stats`
+///   block, and must not carry `deletes`.
+/// - **v2/v3**: entries are `.vortex` files as plain string paths and must
+///   declare `"format": "vortex"`; no `stats`, no `deletes`.
+/// - **v4**: entries must declare `"format"` (`"pink"` or `"vortex"`), list
+///   their files as objects with exact row counts, and may carry positional
+///   delete files. `stats` lives per `.pink` file (never on the entry, never
+///   on a Vortex file), every delete must target one of the entry's files,
+///   and the logical row count must equal `sum(files.rows) -
+///   sum(deletes.count)`.
+///
+/// A build without `vortex-format` refuses a manifest whose entries need
+/// Vortex data files (v2/v3, or a v4 entry declaring `"vortex"`) with a
+/// clear [`LakeError::FeatureMissing`] at this very first parse, before any
+/// data file is touched.
 fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
     let manifest: Catalog = serde_json::from_slice(bytes).map_err(|e| LakeError::Corrupt {
         path: path.to_path_buf(),
@@ -1369,22 +1584,6 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
             found: manifest.format_version,
         });
     }
-    // A build without `vortex-format` reads v1 only. Refuse a v2/v3 lake here
-    // — at the very first manifest parse, before any data file is touched —
-    // with a feature error, never a corrupt-file one.
-    #[cfg(not(feature = "vortex-format"))]
-    if (2..=MAX_FORMAT_VERSION).contains(&manifest.format_version) {
-        return Err(LakeError::FeatureMissing {
-            feature: "vortex-format",
-            message: format!(
-                "{} is a format_version {} lake (Vortex data files); this build was built \
-                 without Vortex format support — rebuild with the `vortex-format` feature \
-                 (for the CLI: `cargo build -p pinkdb-cli --features lake`)",
-                path.display(),
-                manifest.format_version
-            ),
-        });
-    }
     if manifest.version < 1 || manifest.version > MAX_VERSION {
         return Err(LakeError::Corrupt {
             path: path.to_path_buf(),
@@ -1394,48 +1593,153 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
             ),
         });
     }
+    let v = manifest.format_version;
+    let corrupt = |message: String| LakeError::Corrupt {
+        path: path.to_path_buf(),
+        message,
+    };
+    // A build without `vortex-format` refuses a manifest that needs Vortex
+    // data files at this very first parse, before any data file is touched,
+    // with a feature error — never a corrupt-file one. v2/v3 are all-Vortex
+    // by definition; a v4 entry declaring `"vortex"` is refused per entry
+    // below.
+    #[cfg(not(feature = "vortex-format"))]
+    if (2..=3).contains(&v) {
+        return Err(LakeError::FeatureMissing {
+            feature: "vortex-format",
+            message: format!(
+                "{} is a format_version {v} lake (Vortex data files); this build was built \
+                 without Vortex format support — rebuild with the `vortex-format` feature \
+                 (for the CLI: `cargo build -p pinkdb-cli --features lake`)",
+                path.display(),
+            ),
+        });
+    }
     for (key, entry) in &manifest.tables {
-        if manifest.format_version != 1 && entry.stats.is_some() {
-            return Err(LakeError::Corrupt {
-                path: path.to_path_buf(),
-                message: format!(
-                    "table \"{key}\" declares a statistics block in a format_version {} \
-                     manifest (statistics blocks belong to v1 `.pink` entries; Vortex \
-                     statistics live in the data file's footer)",
-                    manifest.format_version
-                ),
-            });
+        if v != 1 && entry.stats.is_some() {
+            return Err(corrupt(format!(
+                "table \"{key}\" declares an entry-level statistics block in a format_version \
+                 {v} manifest (statistics blocks belong to v1 `.pink` entries; v4 `.pink` \
+                 files carry their own per-file block, and Vortex statistics live in the \
+                 data file's footer)"
+            )));
         }
-        match (manifest.format_version, entry.format) {
+        if v != 4 && !entry.deletes.is_empty() {
+            return Err(corrupt(format!(
+                "table \"{key}\" declares positional delete files in a format_version {v} \
+                 manifest (deletes are part of the v4 incremental format)"
+            )));
+        }
+        match (v, entry.format) {
             (1, Some(FileFormat::Vortex)) => {
-                return Err(LakeError::Corrupt {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "table \"{key}\" declares a vortex data file in a format_version 1 \
-                         manifest (version 1 data files are engine `.pink` bytes)"
-                    ),
-                });
+                return Err(corrupt(format!(
+                    "table \"{key}\" declares a vortex data file in a format_version 1 \
+                     manifest (version 1 data files are engine `.pink` bytes)"
+                )));
             }
-            (v @ (2 | 3), None) => {
-                return Err(LakeError::Corrupt {
-                    path: path.to_path_buf(),
-                    message: format!(
-                        "table \"{key}\" does not declare a data file format (a format_version \
-                         {v} entry requires `\"format\": \"vortex\"`)"
-                    ),
-                });
+            (2 | 3, None) => {
+                return Err(corrupt(format!(
+                    "table \"{key}\" does not declare a data file format (a format_version \
+                     {v} entry requires `\"format\": \"vortex\"`)"
+                )));
             }
-            (v @ (2 | 3), Some(FileFormat::Pink)) => {
-                return Err(LakeError::Corrupt {
-                    path: path.to_path_buf(),
+            (2 | 3, Some(FileFormat::Pink)) => {
+                return Err(corrupt(format!(
+                    "table \"{key}\" declares a pink data file in a format_version {v} \
+                     manifest (Vortex-era writers emit Vortex only; `.pink` data files are \
+                     format_version 1)"
+                )));
+            }
+            (4, None) => {
+                return Err(corrupt(format!(
+                    "table \"{key}\" does not declare a data file format (a format_version 4 \
+                     entry requires `\"format\"`: \"pink\" or \"vortex\")"
+                )));
+            }
+            (4, Some(FileFormat::Vortex)) => {
+                #[cfg(not(feature = "vortex-format"))]
+                return Err(LakeError::FeatureMissing {
+                    feature: "vortex-format",
                     message: format!(
-                        "table \"{key}\" declares a pink data file in a format_version {v} \
-                         manifest (Vortex-era writers emit Vortex only; `.pink` data files are \
-                         format_version 1)"
+                        "{}: table \"{key}\" uses Vortex data files (format_version 4); this \
+                         build was built without Vortex format support — rebuild with the \
+                         `vortex-format` feature (for the CLI: `cargo build -p pinkdb-cli \
+                         --features lake`)",
+                        path.display(),
                     ),
                 });
             }
             _ => {}
+        }
+    }
+    for (key, entry) in &manifest.tables {
+        for file in &entry.files {
+            match (v, file) {
+                (1..=3, FileRef::Entry { .. }) => {
+                    return Err(corrupt(format!(
+                        "table \"{key}\" lists a data file as an object in a format_version \
+                         {v} manifest (only v4 entries carry per-file row counts)"
+                    )));
+                }
+                (4, FileRef::Path(_)) => {
+                    return Err(corrupt(format!(
+                        "table \"{key}\" lists a data file without its row count (a \
+                         format_version 4 entry lists files as {{\"path\", \"rows\"}} \
+                         objects)"
+                    )));
+                }
+                (
+                    4,
+                    FileRef::Entry {
+                        path: rel, stats, ..
+                    },
+                ) => {
+                    validate_rel_path(rel)?;
+                    if entry.format() == FileFormat::Vortex && stats.is_some() {
+                        return Err(corrupt(format!(
+                            "table \"{key}\" carries a statistics block on its Vortex file \
+                             \"{rel}\" (Vortex statistics live in the data file's footer)"
+                        )));
+                    }
+                }
+                (1..=3, FileRef::Path(rel)) => validate_rel_path(rel)?,
+                _ => {}
+            }
+        }
+        if v == 4 {
+            if entry.files.is_empty() {
+                return Err(corrupt(format!(
+                    "table \"{key}\" has no data files (a format_version 4 table always lists \
+                     at least one)"
+                )));
+            }
+            let data_rows = entry.data_rows().ok_or_else(|| {
+                corrupt(format!(
+                    "table \"{key}\" overflows u64 rows across its data files"
+                ))
+            })?;
+            let deleted = entry.deleted_rows().ok_or_else(|| {
+                corrupt(format!(
+                    "table \"{key}\" overflows u64 rows across its delete files"
+                ))
+            })?;
+            if data_rows < deleted || data_rows - deleted != entry.rows {
+                return Err(corrupt(format!(
+                    "table \"{key}\" declares {} rows, but its files hold {data_rows} rows and \
+                     its delete files drop {deleted} (the manifest disagrees with itself)",
+                    entry.rows
+                )));
+            }
+            for d in &entry.deletes {
+                validate_rel_path(&d.path)?;
+                if !entry.files.iter().any(|f| f.path() == d.file) {
+                    return Err(corrupt(format!(
+                        "table \"{key}\": delete file \"{}\" targets \"{}\", which is not one \
+                         of the table's data files",
+                        d.path, d.file
+                    )));
+                }
+            }
         }
     }
     Ok(manifest)
@@ -1445,6 +1749,15 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
 fn manifest_json(manifest: &Catalog, path: &Path) -> Result<Vec<u8>> {
     let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|e| LakeError::Internal {
         message: format!("serializing {}: {e}", path.display()),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Serialize a commit delta manifest (pretty JSON + trailing newline).
+fn commit_manifest_json(manifest: &catalog::CommitManifest) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|e| LakeError::Internal {
+        message: format!("serializing a commit manifest: {e}"),
     })?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -1584,7 +1897,7 @@ pub(crate) fn only_table<'a>(
 /// including NaN payloads and `-0.0` — with `append_chunk`'s chunking rules
 /// (a ragged tail is merged, never left ragged). `context` names the source
 /// for errors.
-fn copy_chunks(src: &DataTable, dst: &mut DataTable, context: &str) -> Result<()> {
+pub(crate) fn copy_chunks(src: &DataTable, dst: &mut DataTable, context: &str) -> Result<()> {
     for i in 0..src.num_chunks() {
         let chunk = src.scan_chunk(i).ok_or_else(|| LakeError::Internal {
             message: format!("chunk {i} of {context} disappeared while copying"),
@@ -1598,14 +1911,63 @@ fn copy_chunks(src: &DataTable, dst: &mut DataTable, context: &str) -> Result<()
     Ok(())
 }
 
-/// A one-table [`PinkDb`] holding `src` (the wave-34 v1 data-file encoder;
-/// `vortex-format`-less builds only). The mini store holds exactly the
-/// source's database and table (the default `main` of a fresh store is
-/// dropped when the table lives elsewhere); its chunks are shared with `src`
-/// (no deep copy) and appended with `append_chunk`'s chunking rules, exactly
-/// what the v1 loader's `copy_chunks` reverses. The engine's `.pink` encoder
-/// is then byte-deterministic for a given dense table.
-#[cfg(not(feature = "vortex-format"))]
+/// Materialize one data file's rows with its positional deletes applied
+/// (merge-on-read): `positions` are 0-based row positions within the decoded
+/// file, ascending. Rows are deleted chunk by chunk (the engine's
+/// `delete_from_chunk`), so values, chunking of untouched chunks, and NaN
+/// payloads are untouched; a chunk left empty is dropped. The returned table
+/// shares storage with `table` except in the chunks that lost rows.
+pub(crate) fn apply_file_deletes(
+    table: &DataTable,
+    positions: &[u64],
+    key: &str,
+    rel: &str,
+) -> Result<DataTable> {
+    if positions.is_empty() {
+        return Ok(table.clone());
+    }
+    let total = table.num_rows() as u64;
+    if let Some(&bad) = positions.iter().find(|&&p| p >= total) {
+        return Err(LakeError::Corrupt {
+            path: PathBuf::from(rel),
+            message: format!(
+                "table \"{key}\": delete position {bad} is outside \"{rel}\" ({total} rows)"
+            ),
+        });
+    }
+    let mut by_chunk: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    let mut start = 0usize;
+    for c in 0..table.num_chunks() {
+        let len = table.columns[0].chunks[c].len();
+        for &p in positions {
+            let p = p as usize;
+            if p >= start && p < start + len {
+                by_chunk.entry(c).or_default().push(p - start);
+            }
+        }
+        start += len;
+    }
+    let mut out = table.clone();
+    // Descending chunk order: `delete_from_chunk` may drop an emptied chunk,
+    // which would shift the indices of every later one.
+    for (chunk, drop) in by_chunk.into_iter().rev() {
+        out.delete_from_chunk(chunk, &drop)
+            .map_err(|e| LakeError::Engine {
+                context: format!("applying deletes to \"{rel}\" (table \"{key}\")"),
+                source: e,
+            })?;
+    }
+    Ok(out)
+}
+
+/// A one-table [`PinkDb`] holding `src` (the `.pink` data-file encoder). The
+/// mini store holds exactly the source's database and table (the default
+/// `main` of a fresh store is dropped when the table lives elsewhere); its
+/// chunks are shared with `src` (no deep copy) and appended with
+/// `append_chunk`'s chunking rules, exactly what the loader's `copy_chunks`
+/// reverses. The engine's `.pink` encoder is then byte-deterministic for a
+/// given dense table. Every build needs it: a `vortex-format` build still
+/// appends `.pink` files to a lean lake's v4 entries.
 fn single_table_store(dbname: &str, table: &str, src: &DataTable) -> Result<PinkDb> {
     let mut mini = empty_structure(dbname, table, src.schema(), "saving")?;
     let dst = mini

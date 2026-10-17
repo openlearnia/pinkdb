@@ -115,7 +115,7 @@ fn save_open_query_and_metadata_commands() {
     assert!(lake.join("snapshots/1.json").is_file());
     assert!(lake.join("snapshots/2.json").is_file());
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 3"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 4"), "{catalog}");
     assert!(catalog.contains("\"version\": 2"), "{catalog}");
     assert!(catalog.contains("\"main.t\""), "{catalog}");
     assert!(catalog.contains("\"analytics.u\""), "{catalog}");
@@ -134,7 +134,7 @@ fn save_open_query_and_metadata_commands() {
         ".lake info {lake}\n.lake versions {lake}\n.lake tables {lake}\n.quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("format version:  3"), "{out}");
+    assert!(out.contains("format version:  4"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
     assert!(out.contains("snapshots:       2 (1, 2)"), "{out}");
     assert!(out.contains("tables (2):"), "{out}");
@@ -261,7 +261,7 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|attach|detach|attached|versions|snapshots|tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|detach|attached|versions|snapshots|tables|info> ..."
         ),
         "{out}"
     );
@@ -1035,7 +1035,7 @@ fn attach_errors_are_clear_and_never_panic() {
     let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", v1.display()));
     assert_eq!(code, 1);
     assert!(
-        err.contains("format_version 1") && err.contains("use .lake open"),
+        err.contains("without a statistics block") && err.contains("use .lake open"),
         "{out}\n{err}"
     );
 
@@ -1086,12 +1086,30 @@ fn attach_errors_are_clear_and_never_panic() {
     let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", wrong_rows.display()));
     assert_eq!(code, 1);
     assert!(
-        err.contains("has 1 rows, but the catalog says 2"),
+        err.contains("has 1 rows, but the manifest says 2"),
         "{out}\n{err}"
     );
 
-    // A table with two data files is refused (this build attaches one file
-    // per table; use `.lake open`).
+    // A table whose file list does not carry row counts (a hand-edited v4
+    // manifest) is refused at parse.
+    let no_rows = dir.join("no_row_counts_lake");
+    copy_dir(&lake, &no_rows);
+    for name in ["catalog.json", "snapshots/2.json"] {
+        let path = no_rows.join(name);
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Remove the *file object's* `"rows"` (the first occurrence, inside
+        // the files array); the entry-level one must stay.
+        let needle = ",\n          \"rows\": 1";
+        let patched = text.replacen(needle, "", 1);
+        assert_ne!(text, patched, "file rows field not found in {name}");
+        std::fs::write(&path, patched).unwrap();
+    }
+    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", no_rows.display()));
+    assert_eq!(code, 1);
+    assert!(err.contains("without its row count"), "{out}\n{err}");
+
+    // A table with two data files (the v4 append shape) attaches and unions
+    // them in manifest order: the descriptors merge the files' statistics.
     let two_files = dir.join("two_file_lake");
     copy_dir(&lake, &two_files);
     let data = std::fs::read_dir(two_files.join("data/main.t"))
@@ -1113,14 +1131,26 @@ fn attach_errors_are_clear_and_never_panic() {
     for name in ["catalog.json", "snapshots/2.json"] {
         let path = two_files.join(name);
         let text = std::fs::read_to_string(&path).unwrap();
-        let needle = format!("\"{first_rel}\"");
-        let patched = text.replace(&needle, &format!("\"{first_rel}\", \"{second_rel}\""));
-        assert_ne!(text, patched, "file list not found in {name}");
+        let needle =
+            format!("{{\n          \"path\": \"{first_rel}\",\n          \"rows\": 1\n        }}");
+        // The same values under one logical table; the entry-level row count
+        // must add up.
+        let replacement = format!(
+            "{{\n          \"path\": \"{first_rel}\",\n          \"rows\": 1\n        }},\n        {{\n          \"path\": \"{second_rel}\",\n          \"rows\": 1\n        }}"
+        );
+        let patched = text
+            .replace(&needle, &replacement)
+            .replace("      \"rows\": 1,\n", "      \"rows\": 2,\n");
+        assert_ne!(text, patched, "file object not found in {name}");
         std::fs::write(&path, patched).unwrap();
     }
-    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", two_files.display()));
-    assert_eq!(code, 1);
-    assert!(err.contains("data files"), "{out}\n{err}");
+    let out = run(&format!(
+        ".lake attach {}\nSELECT COUNT(*) FROM t;\nSELECT MIN(a), MAX(s) FROM t;\n         .lake attached\n.quit\n",
+        two_files.display()
+    ));
+    assert!(out.contains("Attached"), "{out}");
+    assert!(out.contains("│ 2 "), "both files' rows: {out}");
+    assert!(out.contains("2 row"), "{out}");
     cleanup(&dir);
 }
 
@@ -1180,7 +1210,11 @@ fn attach_never_touches_the_lake() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     entries.sort();
-    assert_eq!(entries, vec!["catalog.json", "data", "snapshots"], "{out}");
+    assert_eq!(
+        entries,
+        vec!["catalog.json", "commits", "data", "snapshots"],
+        "{out}"
+    );
     cleanup(&dir);
 }
 
@@ -1336,7 +1370,7 @@ fn lean_written_v1_v4_fixture_opens_queries_and_migrates() {
          .quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("format version:  1"), "{out}");
+    assert!(out.contains("format version:  1"), "{out}"); // the v1 fixture stays v1
     assert!(out.contains("Opened lake version 2"), "{out}");
     assert!(out.contains("│ 6 "), "fid has 6 rows: {out}");
     assert!(out.contains("│ 2148 "), "big has 2148 rows: {out}");
@@ -1355,7 +1389,7 @@ fn lean_written_v1_v4_fixture_opens_queries_and_migrates() {
     ));
     assert!(out.contains("Saved lake version 3"), "{out}");
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 3"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 4"), "{catalog}");
     assert!(catalog.contains(".vortex"), "{catalog}");
     for path in before {
         assert!(path.is_file(), "v1 file {} must stay", path.display());
@@ -1572,5 +1606,275 @@ fn time_travel_queries_and_errors_on_an_attached_lake() {
     assert!(stderr.contains("parse error"), "{stderr}");
     // A script that reported errors exits non-zero (the CLI's contract).
     assert_eq!(code, 1);
+    cleanup(&dir);
+}
+
+/// The writable attach route: `.lake attach <dir> write` materializes the
+/// lake into the session store, DML accumulates there, and `.lake commit`
+/// publishes exactly the difference as one incremental version — appended
+/// rows land in new data files and deletes become positional delete files,
+/// while every previously published data file stays byte- and
+/// mtime-identical. A commit with nothing to publish is a no-op.
+#[test]
+fn writable_attach_commit_appends_without_rewriting() {
+    let dir = scratch("commit");
+    let lake = dir.join("lake");
+    let mut script = String::from("CREATE TABLE t (a INTEGER, s VARCHAR);\n");
+    for chunk in (0..200).collect::<Vec<_>>().chunks(50) {
+        let values: Vec<String> = chunk.iter().map(|i| format!("({i}, 'v{i}')")).collect();
+        script.push_str(&format!("INSERT INTO t VALUES {};\n", values.join(", ")));
+    }
+    script.push_str(&format!(
+        ".lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    let out = run(&script);
+    assert!(out.contains("Saved lake version 2"), "{out}");
+
+    // Snapshot the published data files: bytes + mtime.
+    let before: Vec<(PathBuf, Vec<u8>, std::time::SystemTime)> = data_files(&lake.join("data"))
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            let mtime = std::fs::metadata(&p).unwrap().modified().unwrap();
+            (p, bytes, mtime)
+        })
+        .collect();
+    assert_eq!(before.len(), 1, "one file per table per save");
+
+    // Materialize writable, mutate through DML, commit.
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         INSERT INTO t VALUES (999, 'late');\n\
+         UPDATE t SET s = 'up' WHERE a = 0;\n\
+         DELETE FROM t WHERE a = 1;\n\
+         .lake commit {lake}\n\
+         SELECT COUNT(*), MIN(a), MAX(a), COUNT(s) FROM t;\n\
+         .lake attached\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("Attached") && out.contains("writable"),
+        "the writable attach must report itself:\n{out}"
+    );
+    assert!(out.contains("Committed lake version 3"), "{out}");
+    assert!(out.contains("2 files: 1 data, 1 delete"), "{out}");
+    // UPDATE = delete + append: the insert and the updated value are the two
+    // appended rows; the deleted row and the updated-away row are the two
+    // positional deletes.
+    assert!(out.contains("+2 rows"), "{out}");
+    assert!(out.contains("-2 rows"), "{out}");
+    assert!(out.contains("0 retries"), "{out}");
+    // 200 - 2 deleted + 2 appended (the insert and the updated value): the
+    // session sees its own rows.
+    assert!(out.contains("│ 200 "), "{out}");
+    assert!(out.contains("│ 999 "), "{out}");
+    // The attachment is clean now and stays attached.
+    assert!(out.contains("(writable)"), "{out}");
+    assert!(out.contains("no uncommitted changes"), "{out}");
+
+    // No published data file was rewritten or touched.
+    for (path, bytes, mtime) in &before {
+        let found = data_files(&lake.join("data"))
+            .into_iter()
+            .find(|p| p == path);
+        let found = found.expect("the original data file must stay");
+        assert_eq!(&std::fs::read(&found).unwrap(), bytes, "{}", path.display());
+        assert_eq!(
+            std::fs::metadata(&found).unwrap().modified().unwrap(),
+            *mtime,
+            "{} was touched",
+            path.display()
+        );
+    }
+    // The new version lists both data files plus the delete file, and the
+    // v4 manifest adds up.
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(catalog.contains("\"format_version\": 4"), "{catalog}");
+    assert!(catalog.contains("\"rows\": 200"), "{catalog}");
+    assert!(
+        catalog.contains("\"rows\": 2"),
+        "the appended file carries its own rows: {catalog}"
+    );
+    assert!(catalog.contains("\"count\": 2"), "{catalog}");
+    assert!(catalog.contains("pinkdel"), "{catalog}");
+    assert!(
+        lake.join("commits/3.json").is_file(),
+        "each commit writes its delta manifest"
+    );
+
+    // Committing again publishes nothing (idempotent).
+    let out = run(&format!(
+        ".lake attach {lake} write\n.lake commit {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("Nothing to commit") && out.contains("version 3"),
+        "{out}"
+    );
+
+    // The committed lake reads back with the exact logical content.
+    let out = run(&format!(
+        ".lake open {lake}\n\
+         SELECT COUNT(*), MIN(a), MAX(a), COUNT(s) FROM t;\n\
+         SELECT s FROM t WHERE a = 0;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Opened lake version 3"), "{out}");
+    assert!(out.contains("│ 200 "), "{out}");
+    assert!(out.contains("up"), "the updated value survives: {out}");
+    cleanup(&dir);
+}
+
+/// Writable-attach lifecycle guards: detaching with pending changes refuses
+/// (force drops the attachment and keeps the tables), `.lake open` refuses to
+/// discard pending changes, and detaching clean is fine.
+#[test]
+fn writable_attach_detach_and_open_guards() {
+    let dir = scratch("commit_guards");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (a INTEGER);\nINSERT INTO t VALUES (1), (2);\n\
+         .lake save {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+
+    // Pending changes: detach refuses; open refuses.
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         INSERT INTO t VALUES (3);\n\
+         .lake detach {lake}\n\
+         .lake open {lake}\n\
+         .lake detach {lake} force\n\
+         .lake open {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("uncommitted changes") && out.contains("commit"),
+        "{out}"
+    );
+    assert!(
+        out.contains("would discard the uncommitted changes"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Detached writable attach") && out.contains("ordinary tables"),
+        "{out}"
+    );
+    // After the forced detach the attachment is gone, so open replaces the
+    // store (the row that was never committed is gone with it).
+    assert!(out.contains("Opened lake version 2"), "{out}");
+
+    // Clean detach: no refusal.
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         .lake commit {lake}\n\
+         .lake detach {lake}\n\
+         .lake attached\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Nothing to commit"), "{out}");
+    assert!(out.contains("Detached writable attach"), "{out}");
+    assert!(out.contains("(no attached lakes)"), "{out}");
+
+    // `.lake commit` without a writable attach is a clear error.
+    let (out, err, code) = run_captured(&format!(".lake commit {}\n.quit\n", lake.display()));
+    assert_eq!(code, 1);
+    assert!(
+        err.contains("no writable attach") && err.contains("write first"),
+        "{out}\n{err}"
+    );
+
+    // `.lake save` publishes the store and re-pins the writable attach.
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         INSERT INTO t VALUES (7);\n\
+         .lake save {lake}\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 3"), "{out}");
+    assert!(out.contains("re-pinned to version 3"), "{out}");
+    assert!(out.contains("Nothing to commit"), "{out}");
+    cleanup(&dir);
+}
+
+/// A durable session's WAL covers writable-attach commits: statements are
+/// logged, the materialized tables are checkpointed at attach time, and a
+/// crash-recovered session re-attaches by adoption and re-commits
+/// idempotently — a commit that already landed publishes nothing, and a
+/// change that never reached the lake is published exactly once.
+#[test]
+fn durable_session_wal_covers_lake_commits() {
+    let dir = scratch("commit_wal");
+    let lake = dir.join("lake");
+    let db = dir.join("d.pink");
+    let db = db.display().to_string();
+
+    // Session 1: durable, save v2, writable attach (checkpoints), insert,
+    // commit v3, exit without a final checkpoint (the WAL holds the insert).
+    let out = run(&format!(
+        ".open {db}\n\
+         CREATE TABLE t (a INTEGER);\n\
+         INSERT INTO t VALUES (1), (2);\n\
+         .lake save {lake}\n\
+         .lake attach {lake} write\n\
+         INSERT INTO t VALUES (3);\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Committed lake version 3"), "{out}");
+
+    // Session 2: reopen (WAL replay), adopt the recovered table, and commit:
+    // the change is already in the lake, so nothing is published.
+    let out = run(&format!(
+        ".open {db}\n\
+         .lake attach {lake} write\n\
+         .lake commit {lake}\n\
+         SELECT COUNT(*) FROM t;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Replayed"), "the WAL must replay: {out}");
+    assert!(out.contains("adopted"), "{out}");
+    assert!(out.contains("Nothing to commit"), "{out}");
+    assert!(out.contains("│ 3 "), "{out}");
+
+    // Session 3: insert without committing, then exit (a crash window).
+    let out = run(&format!(
+        ".open {db}\n\
+         .lake attach {lake} write\n\
+         INSERT INTO t VALUES (4);\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Opened"), "{out}");
+
+    // Session 4: reopen, re-attach, commit: exactly the lost change lands.
+    let out = run(&format!(
+        ".open {db}\n\
+         .lake attach {lake} write\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Committed lake version 4"), "{out}");
+    assert!(out.contains("+1 row"), "{out}");
+
+    // Session 5: idempotent again, and the lake reads back with all rows.
+    let out = run(&format!(
+        ".lake open {lake}\n\
+         SELECT COUNT(*), MIN(a), MAX(a) FROM t;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Opened lake version 4"), "{out}");
+    assert!(out.contains("│ 4 "), "{out}");
     cleanup(&dir);
 }

@@ -4,22 +4,44 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 3,
+//!   "format_version": 4,
 //!   "updated": "<iso8601>",
 //!   "version": 3,
 //!   "tables": {
-//!     "main.t": { "files": ["data/main.t/<uuid>.vortex"], "rows": 5, "format": "vortex" }
+//!     "main.t": {
+//!       "files": [
+//!         { "path": "data/main.t/<uuid>.vortex", "rows": 5 },
+//!         { "path": "data/main.t/<uuid>.vortex", "rows": 3 }
+//!       ],
+//!       "deletes": [
+//!         { "path": "data/main.t/<uuid>.pinkdel", "file": "data/main.t/<a-uuid>.vortex",
+//!           "count": 1 }
+//!       ],
+//!       "rows": 7,
+//!       "format": "vortex"
+//!     }
 //!   }
 //! }
 //! ```
 //!
-//! `format_version` 2 and 3 are Vortex lakes (3: larger row blocks, the
-//! default for new writes): every table entry declares `"format": "vortex"`
-//! (those writers emit Vortex only, so a `"pink"` entry there is corrupt). A `format_version` 1 manifest — written by
-//! the wave-34 writer — has no `format` field and implies the engine's
-//! `.pink` single-table bytes.
+//! `format_version` 4 (the incremental format) lists each data file with its
+//! own exact row count and may carry **positional delete files**: every delete
+//! file names the one data file whose positions it drops (`file`) and how many
+//! it drops (`count`); `rows` is the logical row count (data rows minus
+//! deleted positions) and must equal `sum(files.rows) - sum(deletes.count)`.
+//! Every entry declares its `format`: `"vortex"` in a `vortex-format` build,
+//! `"pink"` (the engine's single-table `.pink` bytes, with a per-file
+//! CRC-protected statistics block) in a lean one.
 //!
-//! Schema and typing live inside the data files, never here.
+//! `format_version` 2 and 3 are single-file Vortex lakes (3: larger row
+//! blocks), readable but not written any more; a v1 manifest — written by the
+//! wave-34 lean writer — has no `format` field, implies the engine's `.pink`
+//! bytes, and carries one entry-level statistics block. In v1–v3 every entry
+//! lists exactly one data file, as a plain string path.
+//!
+//! Schema and typing live inside the data files, never here (a v1/v4 lean
+//! entry's statistics block duplicates the schema so attach can serve it
+//! without a data-file read; the data file stays authoritative for loading).
 //!
 //! Wave 64 adds the optional **snapshot record** to a manifest:
 //! `"author"`, `"commit_message"` and `"changes"` (see
@@ -39,16 +61,117 @@ use crate::snapshot::ChangeSummary;
 /// The data-file format of one table entry.
 ///
 /// `Pink` is the engine's own `.pink` single-table persistence bytes (the v1
-/// lake format: a `format_version` 1 manifest has no `format` field at all,
-/// so it loads as `Pink`); `Vortex` is a Vortex file (the v2 default and the
-/// only format a v2 manifest may declare). Serialized as a lowercase string.
+/// lake format, and the v4 lean format); `Vortex` is a Vortex file (the v2/v3
+/// format and the v4 `vortex-format` format). Serialized as a lowercase
+/// string. Unambiguous in every version: a v1 entry has no `format` field at
+/// all (it loads as `Pink`), and a v4 entry must declare one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum FileFormat {
-    /// The engine's `.pink` single-table persistence bytes (format_version 1).
+    /// The engine's `.pink` single-table persistence bytes (format_version 1,
+    /// or 4 in a lean build).
     Pink,
-    /// A Vortex file (format_version 2 and 3; 3 is the default for new writes).
+    /// A Vortex file (format_version 2/3, or 4 in a `vortex-format` build).
     Vortex,
+}
+
+/// One data file of a table entry.
+///
+/// A v1–v3 manifest lists a plain string path (one file per entry, no row
+/// information); a v4 manifest lists an object with the file's exact row
+/// count, and — for `.pink` files — the CRC-protected statistics block that
+/// describes it, so `.lake attach` can merge per-file statistics across an
+/// append-only file list without opening any file.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub(crate) enum FileRef {
+    /// v1–v3: a plain lake-relative path (the entry's single data file).
+    Path(String),
+    /// v4: the path, the file's exact row count, and (`.pink` files only) its
+    /// statistics block.
+    Entry {
+        path: String,
+        rows: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stats: Option<crate::stats::StatsBlock>,
+    },
+}
+
+/// Hand-written so a malformed v4 file object gets a precise message (the
+/// derived untagged deserializer reports only "data did not match any
+/// variant", which hides that a row count is missing).
+impl<'de> Deserialize<'de> for FileRef {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Path(String),
+            Entry {
+                path: String,
+                rows: Option<u64>,
+                stats: Option<crate::stats::StatsBlock>,
+            },
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Path(path) => Ok(FileRef::Path(path)),
+            Repr::Entry { path, rows, stats } => {
+                let Some(rows) = rows else {
+                    return Err(D::Error::custom(format!(
+                        "data file \"{path}\" is listed without its row count (a \
+                         format_version 4 entry lists files as \
+                         {{\"path\": \"…\", \"rows\": n}} objects)"
+                    )));
+                };
+                Ok(FileRef::Entry { path, rows, stats })
+            }
+        }
+    }
+}
+
+impl FileRef {
+    /// The data file's lake-relative path.
+    pub(crate) fn path(&self) -> &str {
+        match self {
+            FileRef::Path(path) => path,
+            FileRef::Entry { path, .. } => path,
+        }
+    }
+
+    /// The file's exact row count; `None` for a v1–v3 entry (which carries no
+    /// per-file row information).
+    pub(crate) fn rows(&self) -> Option<u64> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry { rows, .. } => Some(*rows),
+        }
+    }
+
+    /// The file's statistics block (v4 `.pink` files only).
+    pub(crate) fn stats(&self) -> Option<&crate::stats::StatsBlock> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry { stats, .. } => stats.as_ref(),
+        }
+    }
+}
+
+/// One positional delete file of a v4 table entry: the rows it deletes from
+/// one data file, by 0-based position within that file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DeleteRef {
+    /// The delete file's lake-relative path.
+    pub(crate) path: String,
+    /// The data file (lake-relative path) whose positions it drops. Must name
+    /// one of the entry's `files`; positions are per that file, unaffected by
+    /// any other delete file or data file.
+    pub(crate) file: String,
+    /// Number of positions in the delete file (its exact row count), checked
+    /// against the file's contents when it is read.
+    pub(crate) count: u64,
 }
 
 /// One version of a lake. Keys of `tables` are flat `db.table` names; a
@@ -79,32 +202,31 @@ pub(crate) struct Catalog {
     pub(crate) changes: Option<ChangeSummary>,
 }
 
-/// One table of one version: the immutable data files it is made of and the
-/// total row count (checked on load).
+/// One table of one version: the immutable data files it is made of, the
+/// positional delete files applied on top of them, and the logical row count
+/// (checked on load).
 ///
-/// A v2 writer always emits exactly one `.vortex` file per table; a v1
-/// manifest's entries have no `format` (they are engine `.pink` bytes), and
-/// the loader appends multiple files in order (forward-compatible).
-///
-/// A v1 entry may also carry a `StatsBlock` (see the `stats` module): the
-/// exact per-column statistics `.lake attach` answers
-/// `COUNT`/`COUNT(col)`/`MIN`/`MAX` from without opening the data file. The
-/// block is published atomically with the entry (catalog and snapshot are
-/// byte-identical) and CRC-protected; a v1 entry without one is a lake saved
-/// before statistics existed, and attach refuses it with a clear message. A
-/// v2/v3 (Vortex) entry must not carry one — Vortex statistics live in the
-/// file footer.
+/// A v4 writer appends: a table's entry grows by new data files (and delete
+/// files) from commit to commit, and never rewrites a file it published
+/// before. A v1–v3 entry has exactly one `.pink`/`.vortex` data file (as a
+/// plain string path, no `deletes`), and a v1 entry may carry one entry-level
+/// `stats` block (see the `stats` module); v4 `.pink` entries carry one
+/// per-file stats block inside each `files` object instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TableEntry {
-    pub(crate) files: Vec<String>,
+    pub(crate) files: Vec<FileRef>,
+    /// Logical rows: data rows minus the positions every delete file drops.
     pub(crate) rows: u64,
-    /// The data-file format; required in a `format_version` 2 manifest,
+    /// The data-file format; required in a `format_version` 2+ manifest,
     /// absent (⇒ [`FileFormat::Pink`]) in a `format_version` 1 manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) format: Option<FileFormat>,
     /// The v1 `.pink` statistics block (see the struct docs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stats: Option<crate::stats::StatsBlock>,
+    /// v4 positional delete files (see [`DeleteRef`]); empty for v1–v3.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) deletes: Vec<DeleteRef>,
 }
 
 impl TableEntry {
@@ -113,4 +235,62 @@ impl TableEntry {
     pub(crate) fn format(&self) -> FileFormat {
         self.format.unwrap_or(FileFormat::Pink)
     }
+
+    /// Sum of the data files' row counts, when every file carries one (v4).
+    pub(crate) fn data_rows(&self) -> Option<u64> {
+        let mut total = 0u64;
+        for file in &self.files {
+            total = total.checked_add(file.rows()?)?;
+        }
+        Some(total)
+    }
+
+    /// Sum of the delete files' counts.
+    pub(crate) fn deleted_rows(&self) -> Option<u64> {
+        let mut total = 0u64;
+        for d in &self.deletes {
+            total = total.checked_add(d.count)?;
+        }
+        Some(total)
+    }
+}
+
+/// One commit's delta manifest (`commits/<version>.json`): the data and
+/// delete files this commit added, per table, plus the logical row movement.
+///
+/// Written append-only (create-only, like a snapshot) *before* the snapshot
+/// manifest and the catalog that reference the same files, so the audit trail
+/// is never ahead of the authoritative state. A full snapshot (`.lake save`)
+/// also writes one: `replaced` marks a table whose whole file list this commit
+/// replaced (a full rewrite), as opposed to an append/delete delta on top of
+/// the base version's files.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CommitManifest {
+    pub(crate) format_version: u32,
+    /// The version this commit published.
+    pub(crate) version: u64,
+    /// The version the commit is based on (`version - 1` for a conflict-free
+    /// publish; a retried commit rebases onto the head it finally lands on).
+    pub(crate) base_version: u64,
+    pub(crate) updated: String,
+    pub(crate) tables: BTreeMap<String, TableDelta>,
+}
+
+/// One table's change inside a [`CommitManifest`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct TableDelta {
+    /// Data files this commit added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) data_files: Vec<FileRef>,
+    /// Delete files this commit added.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) delete_files: Vec<DeleteRef>,
+    /// Rows the commit appended.
+    pub(crate) rows_added: u64,
+    /// Rows the commit deleted (by position).
+    pub(crate) rows_deleted: u64,
+    /// True when this commit replaced the table's whole file list (a full
+    /// snapshot of that table, not an append/delete delta).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) replaced: bool,
 }

@@ -187,13 +187,13 @@ fn v2_fixture_lake_still_loads() {
     let loaded = lake.load(None).unwrap();
     assert_same_store(&expected, &loaded);
 
-    // Re-save into a scratch copy: a v3 snapshot that loads identically.
+    // Re-save into a scratch copy: a v4 snapshot that loads identically.
     let dir = scratch("v2_migrate");
     let copy = dir.join("lake");
     copy_dir(&fixture, &copy);
     let mut lake = Lake::open(&copy).unwrap();
     lake.write_from_store(&loaded).unwrap();
-    assert_eq!(lake.format_version(), 3);
+    assert_eq!(lake.format_version(), 4);
     assert_same_store(&expected, &Lake::open(&copy).unwrap().load(None).unwrap());
     // The old v2 snapshot stays loadable from the upgraded lake.
     assert_same_store(
@@ -218,10 +218,10 @@ fn snapshot_roundtrip_is_bit_exact() {
     assert_eq!(report.rows, 3 + (CHUNK_SIZE as u64 + 100) + 1 + 2);
     assert!(report.bytes_written > 0);
 
-    // Catalog shape: v3, one Vortex file per table, `format` declared.
+    // Catalog shape: v4, one Vortex file per table, `format` declared.
     let catalog = read_json(&dir.join("catalog.json"));
     assert_eq!(catalog["format_version"], FORMAT_VERSION);
-    assert_eq!(FORMAT_VERSION, 3, "v3 is the current Vortex layout");
+    assert_eq!(FORMAT_VERSION, 4, "v4 is the current incremental layout");
     assert_eq!(catalog["version"], 2);
     let updated = catalog["updated"].as_str().unwrap();
     assert_eq!(updated.len(), 24, "ISO-8601 millis: {updated}");
@@ -247,10 +247,15 @@ fn snapshot_roundtrip_is_bit_exact() {
             1,
             "the writer emits one file per table ({key})"
         );
-        let rel = files[0].as_str().unwrap();
+        let rel = files[0]["path"].as_str().unwrap();
         assert!(rel.starts_with("data/"), "{rel}");
         assert!(rel.ends_with(".vortex"), "{rel}");
         assert!(dir.join(rel).is_file(), "{rel} missing");
+        assert_eq!(files[0]["rows"], entry["rows"], "{key}");
+        assert!(
+            files[0].get("stats").is_none(),
+            "{key}: Vortex statistics live in the file footer"
+        );
     }
     assert!(dir.join("snapshots/1.json").is_file());
     assert!(dir.join("snapshots/2.json").is_file());
@@ -479,30 +484,26 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     // A valid catalog whose table references a path outside data/.
     lake.write_from_store(&db).unwrap();
     let mut evil = read_json(&dir.join("catalog.json"));
-    evil["tables"]["main.t"]["files"] = serde_json::json!(["../evil.pink"]);
+    evil["tables"]["main.t"]["files"] = serde_json::json!([{"path": "../evil.pink", "rows": 3}]);
     write_json(&dir.join("catalog.json"), &evil);
-    let lake = Lake::open(&dir).unwrap();
-    let err = lake.load(None).unwrap_err().to_string();
+    let err = Lake::open(&dir).unwrap_err().to_string();
     assert!(err.contains("corrupt lake metadata"), "{err}");
     assert!(err.contains("under data/"), "{err}");
 
     // An absolute path is refused too.
     let mut abs = read_json(&dir.join("catalog.json"));
-    abs["tables"]["main.t"]["files"] = serde_json::json!(["/etc/passwd"]);
+    abs["tables"]["main.t"]["files"] = serde_json::json!([{"path": "/etc/passwd", "rows": 3}]);
     write_json(&dir.join("catalog.json"), &abs);
-    assert!(lake
-        .load(None)
-        .unwrap_err()
-        .to_string()
-        .contains("under data/"));
+    let err = Lake::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("under data/"), "{err}");
 
     // An unsupported format_version is named, not misparsed.
     let mut future = read_json(&dir.join("catalog.json"));
-    future["format_version"] = serde_json::json!(4);
+    future["format_version"] = serde_json::json!(5);
     write_json(&dir.join("catalog.json"), &future);
     let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("unsupported lake format_version 4"), "{err}");
-    assert!(err.contains("Vortex form"), "{err}");
+    assert!(err.contains("unsupported lake format_version 5"), "{err}");
+    assert!(err.contains("newer pinkdb"), "{err}");
 
     // A version 2 manifest must declare a format on every entry; a missing
     // one is corrupt v2 metadata, not a silent `.pink` downgrade.
@@ -634,12 +635,11 @@ fn a_table_entry_can_list_several_data_files() {
     std::fs::copy(&src[0], files_dir.join(&grafted_name)).unwrap();
 
     let mut catalog = read_json(&dir.join("catalog.json"));
-    let existing = catalog["tables"]["main.t"]["files"][0]
-        .as_str()
-        .unwrap()
-        .to_string();
-    catalog["tables"]["main.t"]["files"] =
-        serde_json::json!([existing, format!("data/main.t/{grafted_name}")]);
+    let existing = catalog["tables"]["main.t"]["files"][0].clone();
+    catalog["tables"]["main.t"]["files"] = serde_json::json!([
+        existing,
+        {"path": format!("data/main.t/{grafted_name}"), "rows": 3}
+    ]);
     catalog["tables"]["main.t"]["rows"] = serde_json::json!(6);
     write_json(&dir.join("catalog.json"), &catalog);
     write_json(&dir.join("snapshots/2.json"), &catalog);
@@ -652,15 +652,13 @@ fn a_table_entry_can_list_several_data_files() {
         Some(Value::Varchar("v4".into()))
     );
 
-    // A row count that disagrees with the files is corrupt.
+    // A row count that disagrees with the files is corrupt (caught at parse:
+    // the v4 manifest must add up).
     catalog["tables"]["main.t"]["rows"] = serde_json::json!(999);
     write_json(&dir.join("catalog.json"), &catalog);
-    let lake = Lake::open(&dir).unwrap();
-    let err = lake.load(None).unwrap_err().to_string();
-    assert!(
-        err.contains("has 6 rows, but the catalog says 999"),
-        "{err}"
-    );
+    let err = Lake::open(&dir).unwrap_err().to_string();
+    assert!(err.contains("declares 999 rows"), "{err}");
+    assert!(err.contains("hold 6 rows"), "{err}");
 
     cleanup(&dir);
     cleanup(&other);
@@ -673,13 +671,16 @@ fn files_with_mismatched_table_names_are_rejected() {
     let mut lake = Lake::create(&dir).unwrap();
     lake.write_from_store(&db).unwrap();
 
-    // Point main.t's catalog entry at the data file of analytics.u.
+    // Point main.t's catalog entry at the data file of analytics.u (with a
+    // row count that satisfies the manifest, so only the file's own identity
+    // can catch the swap).
     let mut catalog = read_json(&dir.join("catalog.json"));
-    let u_file = catalog["tables"]["analytics.u"]["files"][0]
+    let u_file = catalog["tables"]["analytics.u"]["files"][0]["path"]
         .as_str()
         .unwrap()
         .to_string();
-    catalog["tables"]["main.t"]["files"] = serde_json::json!([u_file]);
+    let t_rows = catalog["tables"]["main.t"]["rows"].as_u64().unwrap();
+    catalog["tables"]["main.t"]["files"] = serde_json::json!([{"path": u_file, "rows": t_rows}]);
     write_json(&dir.join("catalog.json"), &catalog);
 
     let lake = Lake::open(&dir).unwrap();
@@ -702,11 +703,11 @@ fn same_schema_equal_rows_swaps_are_detected_by_identity() {
     // Point `main.a` at `main.b`'s data file: name, schema and row count all
     // match, so only the `pinkdb.table` identity can reject the swap.
     let mut catalog = read_json(&dir.join("catalog.json"));
-    let b_file = catalog["tables"]["main.b"]["files"][0]
+    let b_file = catalog["tables"]["main.b"]["files"][0]["path"]
         .as_str()
         .unwrap()
         .to_string();
-    catalog["tables"]["main.a"]["files"] = serde_json::json!([b_file]);
+    catalog["tables"]["main.a"]["files"] = serde_json::json!([{"path": b_file, "rows": 1}]);
     write_json(&dir.join("catalog.json"), &catalog);
 
     let lake = Lake::open(&dir).unwrap();
@@ -1159,8 +1160,9 @@ fn error_paths_point_at_the_manifest_that_is_wrong() {
 
     // A snapshot with a flat key that is not `db.table` names the snapshot.
     let mut snap = read_json(&dir.join("snapshots/2.json"));
-    snap["tables"] =
-        serde_json::json!({"nodot": {"files": ["data/x.vortex"], "rows": 1, "format": "vortex"}});
+    snap["tables"] = serde_json::json!({
+        "nodot": {"files": [{"path": "data/x.vortex", "rows": 1}], "rows": 1, "format": "vortex"}
+    });
     write_json(&dir.join("snapshots/2.json"), &snap);
     let err = lake.load(Some(2)).unwrap_err().to_string();
     assert!(err.contains("snapshots/2.json"), "{err}");
@@ -1182,7 +1184,7 @@ fn error_paths_point_at_the_manifest_that_is_wrong() {
     write_json(&dir.join("snapshots/2.json"), &snap);
     let err = lake.load(Some(2)).unwrap_err().to_string();
     assert!(err.contains("snapshots/2.json"), "{err}");
-    assert!(err.contains("catalog says 999"), "{err}");
+    assert!(err.contains("declares 999 rows"), "{err}");
 
     // The same catalog-level mismatch names catalog.json.
     let mut cat = read_json(&dir.join("catalog.json"));
@@ -1190,7 +1192,7 @@ fn error_paths_point_at_the_manifest_that_is_wrong() {
     write_json(&dir.join("catalog.json"), &cat);
     let err = lake.load(None).unwrap_err().to_string();
     assert!(err.contains("catalog.json"), "{err}");
-    assert!(err.contains("catalog says 999"), "{err}");
+    assert!(err.contains("declares 999 rows"), "{err}");
     cleanup(&dir);
 }
 
@@ -1340,15 +1342,18 @@ fn v1_lake_migrates_to_vortex_on_save() {
     let old = lake.load(None).unwrap();
     assert_same_store(&expected, &old);
 
-    // Saving again publishes a v3 snapshot: a full rewrite in Vortex.
+    // Saving again publishes a v4 snapshot: a full rewrite in Vortex.
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
-    assert_eq!(lake.format_version(), 3, "the handle now reports v3");
+    assert_eq!(lake.format_version(), 4, "the handle now reports v4");
     let catalog = read_json(&dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 3);
+    assert_eq!(catalog["format_version"], 4);
     for (key, entry) in catalog["tables"].as_object().unwrap() {
         assert_eq!(entry["format"], "vortex", "{key}");
         assert!(
-            entry["files"][0].as_str().unwrap().ends_with(".vortex"),
+            entry["files"][0]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with(".vortex"),
             "{key}"
         );
     }
@@ -1419,9 +1424,9 @@ fn v1_v4_fixture_written_by_the_lean_writer_loads_and_migrates() {
         "the lean writer's bytes load to the exact store the full build writes"
     );
 
-    // Saving migrates to v3 (Vortex) without touching the v1 files.
+    // Saving migrates to v4 (Vortex) without touching the v1 files.
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
-    assert_eq!(lake.format_version(), 3);
+    assert_eq!(lake.format_version(), 4);
     let migrated = lake.load(None).unwrap();
     assert_same_store(&expected, &migrated);
     assert_eq!(
@@ -1451,7 +1456,7 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
     let original_bytes = store_bytes(&db, &dir, "original");
 
     let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.format_version(), 3, "create publishes a v3 lake");
+    assert_eq!(lake.format_version(), 4, "create publishes a v4 lake");
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
 
@@ -1562,9 +1567,10 @@ fn catalog_format_fields_are_validated() {
     assert!(err.contains("corrupt lake metadata"), "{err}");
     assert!(err.contains("parquet"), "{err}");
 
-    // A v2 entry declaring `"pink"` is corrupt: the v2 writer emits Vortex
-    // only, so this is tampered metadata, not a downgrade.
+    // A v3 entry declaring `"pink"` is corrupt: the v3 writer emits Vortex
+    // only, so this is tampered metadata, not a downgrade (v4 allows pink).
     let mut cat = read_json(&dir.join("catalog.json"));
+    cat["format_version"] = serde_json::json!(3);
     cat["tables"]["main.t"]["format"] = serde_json::json!("pink");
     write_json(&dir.join("catalog.json"), &cat);
     let err = Lake::open(&dir).unwrap_err().to_string();
@@ -1974,11 +1980,12 @@ fn attach_refusals_are_clean_errors() {
     let err = Lake::open(&missing).unwrap_err().to_string();
     assert!(err.contains("is not a pink-lake directory"), "{err}");
 
-    // A v1 lake: no statistics to read.
+    // A v1 lake without statistics blocks: nothing to read without a data
+    // file, refused with a clear pointer.
     let fixture = v1_fixture_dir();
     let lake = Lake::open(&fixture).unwrap();
     let err = lake.attach(None).unwrap_err().to_string();
-    assert!(err.contains("format_version 1"), "{err}");
+    assert!(err.contains("without a statistics block"), "{err}");
     assert!(err.contains("use .lake open"), "{err}");
 
     // A missing data file.
@@ -2009,25 +2016,21 @@ fn attach_refusals_are_clean_errors() {
     let rows = catalog["tables"][&key]["rows"].as_u64().unwrap();
     catalog["tables"][&key]["rows"] = serde_json::json!(rows + 1);
     write_json(&lake_dir.join("catalog.json"), &catalog);
-    let err = Lake::open(&lake_dir)
-        .unwrap()
-        .attach(None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("but the catalog says"), "{err}");
+    let err = Lake::open(&lake_dir).unwrap_err().to_string();
+    assert!(err.contains("manifest disagrees with itself"), "{err}");
+    assert!(
+        err.contains(&format!("declares {} rows", rows + 1)),
+        "{err}"
+    );
 
-    // A table with two data files.
+    // A multi-file table (the v4 append shape) attaches: the descriptors
+    // merge the files' statistics, and materialization unions them in order.
     let lake_dir = dir.join("two_files");
     save_store(&db, &lake_dir).unwrap();
     let files = data_files(&lake_dir);
     let data_dir = files[0].parent().unwrap().to_path_buf();
     let second = data_dir.join("second.vortex");
     std::fs::copy(&files[0], &second).unwrap();
-    let rel_first = files[0]
-        .strip_prefix(&lake_dir)
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
     let rel_second = second
         .strip_prefix(&lake_dir)
         .unwrap()
@@ -2041,14 +2044,27 @@ fn attach_refusals_are_clean_errors() {
         .next()
         .unwrap()
         .clone();
-    catalog["tables"][&key]["files"] = serde_json::json!([rel_first, rel_second]);
+    let first_file = catalog["tables"][&key]["files"][0].clone();
+    let first_rows = first_file["rows"].as_u64().unwrap();
+    catalog["tables"][&key]["files"] = serde_json::json!([
+        first_file,
+        {"path": rel_second, "rows": first_rows}
+    ]);
+    catalog["tables"][&key]["rows"] = serde_json::json!(first_rows * 2);
     write_json(&lake_dir.join("catalog.json"), &catalog);
-    let err = Lake::open(&lake_dir)
-        .unwrap()
-        .attach(None)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("data files"), "{err}");
+    let lake = Lake::open(&lake_dir).unwrap();
+    let report = lake.attach(None).unwrap();
+    let attached = report.lake;
+    let table = attached
+        .tables()
+        .iter()
+        .find(|t| format!("{}.{}", t.db, t.table) == key)
+        .unwrap();
+    assert_eq!(table.rows, first_rows * 2, "the manifest's logical rows");
+    // The union materializes in file order (the copied file appended).
+    let union_rows = attached.load(&table.db, &table.table).unwrap();
+    assert_eq!(union_rows.num_rows() as u64, first_rows * 2);
+    assert_eq!(union_rows.get(0, 0), union_rows.get(first_rows as usize, 0));
     cleanup(&dir);
 }
 
@@ -2139,7 +2155,7 @@ fn v1_stats_fixture_attaches_in_the_full_build() {
     );
 
     // And a v1 lake with statistics migrates on save like any v1 lake:
-    // opening it into a store and saving again publishes a v3 snapshot with
+    // opening it into a store and saving again publishes a v4 snapshot with
     // the same values, leaving the v1 files (and their blocks) untouched.
     let dir = scratch("v1_stats_migrate");
     let copy = dir.join("lake");
@@ -2149,7 +2165,7 @@ fn v1_stats_fixture_attaches_in_the_full_build() {
     let store = migrated.load(None).unwrap();
     migrated.write_from_store(&store).unwrap();
     let catalog = read_json(&copy.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 3, "{catalog}");
+    assert_eq!(catalog["format_version"], 4, "{catalog}");
     assert_eq!(
         catalog["tables"]["main.fid"]["format"], "vortex",
         "{catalog}"

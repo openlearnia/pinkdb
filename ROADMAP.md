@@ -96,7 +96,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 60 | Functions (worktree `wt-functions`): window `lag`/`lead`/`ntile`/`first_value`/`last_value` + remaining scalar gaps, DuckDB-pinned semantics | done | landed; duckdiff 60 → 88 probes |
 | 61 | Optimizer work (worktree `wt-optimizer`): projection pushdown, LIMIT short-circuiting, join build-side choice, filter-through-aggregate | done | landed; battery 267 → 249 ms, duckdiff 88/88 |
 | 62 | Types: DECIMAL and INTERVAL (storage, arithmetic, casts, CSV/persist encodings, DuckDB semantics) | done | landed; `.pink` v5, protocol v6, FFI text cells; duckdiff 155 → 165 |
-| 63 | Lake writes, DuckLake parity: incremental lake commits — append new immutable data files with per-file row ranges instead of whole-table rewrites, positional delete files for DELETE/UPDATE (merge-on-read; deletion-vector option as a follow-up), writable attached lakes, per-commit manifests, concurrent-writer retry/backoff (`max_retry_count`/`retry_backoff`/`retry_wait_ms` parity), WAL-logged for durable sessions | queued | DuckLake-parity program |
+| 63 | Lake writes, DuckLake parity: incremental lake commits — append new immutable data files with per-file row ranges instead of whole-table rewrites, positional delete files for DELETE/UPDATE (merge-on-read; deletion-vector option as a follow-up), writable attached lakes, per-commit manifests, concurrent-writer retry/backoff (`max_retry_count`/`retry_backoff`/`retry_wait_ms` parity), WAL-logged for durable sessions | done | landed; catalog v4 (per-file rows + `pinkdel` delete files + `commits/<v>.json` deltas), `Lake::commit`/`commit_from_tables`, writable attach + retry parity (10/1.5/100ms probed), 1M-row demo: 7.6 KB / 0.54 s per commit, 0 bytes rewritten |
 | 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | done | landed; DuckLake-pinned AT semantics (literals only, capped at the attached version), per-version stats fast paths, manifest records + `.lake snapshots` + commit messages; `default_version` probed to be a catalog-format selector, not a read default — skipped |
 | 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | queued | DuckLake-parity program |
 | 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | queued | DuckLake-parity program |
@@ -116,12 +116,11 @@ statements, 62 DECIMAL/INTERVAL, 41 PK/FK constraints) finished as: **59, 62
 and 41 landed** (the two `.pink` v5 proposals were reconciled into one v5 —
 constraint section gated by flags bit 0 plus DECIMAL/INTERVAL dtype tags; wave
 41 also shipped conservative FK→PK join elimination), and **57 stays parked**
-with its patch secured (`wt-lake-encryption`). **Third batch**: wave 64 (lake
-time travel) **landed**; wave 63 (incremental lake writes) still in flight in
-`wt-lake-incr`, off 8b401cd — its integration reconciles the flagged overlaps
-in `pink-lake/src/{lib,catalog,attach}.rs` with the landed 64. Each batch wave
-integrates as a patch with full gates + CI, one at a time (max two worktrees
-per the disk-space policy). Indexes (42), materialized views (43), stored
+with its patch secured (`wt-lake-encryption`). **Third batch** (63 + 64, in `wt-lake-incr` / `wt-lake-versions` off 8b401cd):
+both **landed** — 64 first, then 63 integrated on top with the flagged
+`pink-lake/src/{lib,catalog,attach}.rs` overlaps resolved by hand (14
+conflicts). Each batch wave integrates as a patch with full gates + CI, one at
+a time (max two worktrees per the disk-space policy). Indexes (42), materialized views (43), stored
 procedures (44), the extensions block (51–56) and the file-format extensions
 (70–72) stay numbered.
 
@@ -999,3 +998,41 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   clean (`--3way`, 20 files, +2,507/−117); wave-63 overlaps flagged in
   `pink-lake/src/{lib,catalog,attach}.rs` + the lake test files — reconcile
   when 63 lands. Worktree `wt-lake-versions` removed after landing.
+- 2026-10-17 — Wave 63 (incremental lake writes): catalog **v4** — every data
+  file is listed with its exact row count, appends publish one new immutable
+  file per table and never rewrite a published file (byte- and mtime-verified
+  by tests), scans union the file list in manifest order. Positional **delete
+  files** (`<uuid>.pinkdel`; `PINKDL1` + sorted unique u64 positions, bound
+  per data file in the manifest) implement merge-on-read DELETE/UPDATE;
+  corruption/truncation/misorder/out-of-bounds are clean errors. Per-commit
+  **delta manifests** (`commits/<v>.json`) list each commit's files and row
+  movement; `Lake::commits()` + `.lake info` show them. `Lake::commit` +
+  `commit_from_tables` (exact row-level diff — bit-exact for DOUBLE NaN/−0.0,
+  duplicate- and order-safe; chunk-addressed so a 1M-row diff stays fast) +
+  `plan_tables_commit`; **writable attached lakes** (`.lake attach <dir>
+  write`, `.lake commit`, guarded `.lake detach`; adoption recovery, new
+  tables documented outside scope, schema changes refuse → wave 65).
+  **Retry/backoff parity**: `CommitSettings { max_retry_count: 10,
+  retry_backoff: 1.5, retry_wait_ms: 100 }` (probed DuckLake defaults), wait
+  = `retry_wait_ms·backoff^(attempt−1)`, rebase on conflict, bounded, with
+  `PINKDB_LAKE_*` overrides. WAL: attach checkpoints the materialized tables,
+  commit flushes the WAL first; crash-window CLI tests show idempotent
+  re-commits (a committed change publishes nothing, an uncommitted one
+  exactly once). Demo (1M-row CSV): commit v3 wrote **7,567 B** (1 data + 1
+  delete file) in **0.536 s** vs a 2.6 MB / 0.089 s full save — **0 bytes
+  rewritten** (commit/base = 0.0029). Gates: pink-lake default 24 + 12 + 10
+  (vortex: 44 + 12 + lake **46**), CLI lake,s3 **27** lake tests +
+  multiprocess 27/27, pinkdb **458/458** (+prepared 22; encryption 475 + 21),
+  duckdiff **171/171**, workspace green; fmt/clippy clean (pink-lake ±
+  vortex-format, CLI lake,s3). Integration on top of the landed wave 64:
+  **14 conflicts resolved by hand** — catalog docs union (one v4 shape + wave
+  64's optional snapshot record), `.lake` help/usage unions, CLI test unions,
+  both README sections; `build` split into the wave-64 storage-rooted
+  `build_from` (needed by time-travel views) with `entry_layout` extracted to
+  a storage-parameterized free function shared by both paths; commit publishes
+  now record author/message + a diffed change summary like saves
+  (`pending_commit` cleared on success). Known limits: deletion vectors and
+  data inlining not implemented (inlining = wave 68); attached writes are
+  content-sync (a concurrent same-table append makes the next diff refuse
+  rather than silently drop rows); diffs are O(table rows). Worktree
+  `wt-lake-incr` removed after landing.

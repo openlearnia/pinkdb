@@ -135,7 +135,7 @@ fn lean_save_open_versions_tables_info() {
     assert!(out.contains("2 tables, 3 rows"), "{out}");
     assert!(out.contains("Opened lake version 2"), "{out}");
     assert!(out.contains("2 (current)"), "{out}");
-    assert!(out.contains("format version:  1"), "{out}");
+    assert!(out.contains("format version:  4"), "{out}");
     assert!(out.contains("main.t (2 rows)"), "{out}");
     assert!(out.contains("analytics.u (1 row)"), "{out}");
     // The reloaded values are the inserted ones (NULL included).
@@ -145,8 +145,8 @@ fn lean_save_open_versions_tables_info() {
     // The on-disk shape: a v1 catalog, no `format` fields, `.pink` data
     // files with the engine's own magic.
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 1"), "{catalog}");
-    assert!(!catalog.contains("\"format\""), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 4"), "{catalog}");
+    assert!(catalog.contains("\"format\": \"pink\""), "{catalog}");
     let files = data_files(&lake.join("data"));
     assert_eq!(files.len(), 2);
     for file in &files {
@@ -328,7 +328,6 @@ fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
     let stats_less =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v1_v4");
     let out = run(&format!(".lake attach {}\n.quit\n", stats_less.display()));
-    assert!(out.contains("format_version 1"), "{out}");
     assert!(out.contains("without a statistics block"), "{out}");
     assert!(out.contains("use .lake open"), "{out}");
 

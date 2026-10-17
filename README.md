@@ -531,7 +531,14 @@ Wave 45i adds the lean **`lake-lite`** build: the same lake over `.pink` v4
 data files with no Vortex dependency, and wave 45k brings attach to it — a
 lean save publishes a CRC-protected per-column statistics block in the
 manifest (`statistics-only` attach), so exact `COUNT`/`MIN`/`MAX` read no data
-file in either build (see "Lean lake (feature `lake-lite`)" below).
+file in either build (see "Lean lake (feature `lake-lite`)" below). Wave 63
+makes every lake **incremental** (`format_version` 4): appends add new
+immutable data files and never rewrite published ones, `DELETE`/`UPDATE`
+become positional delete files applied merge-on-read, each commit writes an
+append-only delta manifest (`commits/<version>.json`), `.lake attach … write`
++ `.lake commit` publish through the attached-database route, and a
+conflicting commit retries with DuckLake's settings (see "Incremental
+commits" below).
 
 A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
 key prefix with exactly this layout):
@@ -540,20 +547,36 @@ key prefix with exactly this layout):
 mylake/
 ├── catalog.json               current state (authoritative "latest")
 ├── snapshots/<version>.json   immutable manifest per published version
-├── data/<table>/<uuid>.vortex immutable per-table Vortex files (v2, default)
-└── data/<table>/<uuid>.pink   v1 data files (engine persistence bytes, still read)
+├── commits/<version>.json     immutable per-commit delta manifest (audit)
+├── data/<table>/<uuid>.vortex immutable per-table Vortex files (v4, default)
+├── data/<table>/<uuid>.pink   `.pink` data files (v1/v4 lean builds)
+└── data/<table>/<uuid>.pinkdel positional delete files (v4; merge-on-read)
 ```
 
 The manifests (`catalog.json` and every snapshot) share one shape:
 
 ```json
 {
-  "format_version": 3,
+  "format_version": 4,
   "updated": "2026-10-14T02:11:50.760Z",
   "version": 2,
   "tables": {
-    "analytics.u": { "files": ["data/analytics.u/e9a4….vortex"], "rows": 1, "format": "vortex" },
-    "main.t":      { "files": ["data/main.t/831a….vortex"], "rows": 2, "format": "vortex" }
+    "analytics.u": {
+      "files": [{ "path": "data/analytics.u/e9a4….vortex", "rows": 1 }],
+      "rows": 1,
+      "format": "vortex"
+    },
+    "main.t": {
+      "files": [
+        { "path": "data/main.t/831a….vortex", "rows": 2 },
+        { "path": "data/main.t/c709….vortex", "rows": 1 }
+      ],
+      "deletes": [
+        { "path": "data/main.t/2ab1….pinkdel", "file": "data/main.t/831a….vortex", "count": 1 }
+      ],
+      "rows": 2,
+      "format": "vortex"
+    }
   }
 }
 ```
@@ -570,18 +593,19 @@ byte-identical to the pre-wave-64 shape.
 |---|---|---|---|
 | 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes; a lean (`lake-lite`) save also publishes a CRC-protected per-column statistics block in the entry (wave 45k) | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`); `.lake attach` reads the statistics block, opening no data file |
 | 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry; one row block per 2,048-row engine chunk | waves 35–40 | yes |
-| 3 | as 2, but row blocks of 8,192 rows / ~1 MiB (fewer blocks → less per-block stats/compression work on save) | this build (default) | yes |
+| 3 | as 2, but row blocks of 8,192 rows / ~1 MiB (fewer blocks → less per-block stats/compression work on save) | waves 45 | yes |
+| 4 | **incremental**: every data file is listed as `{path, rows}`, a table's file list grows by appended files, positional delete files (`<uuid>.pinkdel`) drop rows merge-on-read, `rows` must equal `sum(files.rows) − sum(deletes.count)`, and `format` is `"vortex"` (full build) or `"pink"` (lean build; each `.pink` file carries its own CRC-protected statistics block) | this build (default) | yes |
 
 **Migration:** open an old lake and `.lake save` again — the next snapshot is a
-full rewrite in Vortex (`format_version` 3); old snapshots and their data
-files stay untouched, so every published version still loads. A lean
-`lake-lite` build instead writes and reads only `format_version` 1 and refuses
-a v2/v3 lake with the rebuild-with-`lake` error (a lean-written v1 lake opens
-bit-exactly in a full build, which migrates it on the next save). Builds older
-than wave 45 read up to `format_version` 2 and refuse a v3 lake with a clear
-"unsupported lake format_version 3" error. Any unknown `format_version`, a
-v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
-`"vortex"` are clear errors, never a guess.
+full rewrite in this build's v4 format; old snapshots and their data files stay
+untouched, so every published version still loads. A lean `lake-lite` build
+refuses a v4 (or v2/v3) **Vortex** lake with the rebuild-with-`lake` error (a
+lean-written lake opens bit-exactly in a full build, which migrates it on the
+next save), and a v1/v2/v3 lake stays readable in both builds. Any unknown
+`format_version` (a lake written by a newer pinkdb) refuses with "the lake was
+written by a newer pinkdb — upgrade to open it", and a wrong-shape entry (a
+v2/v3 entry without `format`, a v4 file object without its row count, a v4
+manifest whose rows do not add up) is a clear `Corrupt` error, never a guess.
 
 - **Schema and typing live in the data files.** A data file is a plain
   Vortex file: one struct array, one field per column, row order preserved;
@@ -597,21 +621,25 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
   through a calendar type limited to about ±20 000 years and **panics** on
   extreme timestamps (±6.31e17 µs) during statistics computation, so no bit
   pattern is left to chance — see below.
-- **Every save is a full snapshot.** `write_from_store` writes every table of
-  every database to a fresh data file, publishes `snapshots/<version>.json`
-  (`version = previous + 1`, via `checked_add` and capped at `MAX_VERSION`,
-  so a tampered `version: u64::MAX` or a lake at the cap is a clear error,
-  never a wrap), then replaces `catalog.json` with the same bytes. Old
-  versions and their data files are never modified — and a snapshot file that
-  already exists is never replaced: `save` that would land on a published
-  version (e.g. after restoring an older `catalog.json`) fails with a
-  conflict instead of clobbering it. `load(Some(v))` restores any published
-  version, `load(None)` the latest. The writer emits exactly one data file
-  per table per version — a very large table still becomes one file
-  (multi-file entries load fine; they are reserved for future writers). There
-  is no appending, compaction or GC — each save costs one full rewrite, and
-  old versions' files stay.
-- **Atomicity order: data files → snapshot → catalog.** Locally every write
+- **Every save is a full snapshot; commits are incremental.** `write_from_store`
+  writes every table of every database to a fresh data file, publishes
+  `snapshots/<version>.json` (`version = previous + 1`, via `checked_add` and
+  capped at `MAX_VERSION`, so a tampered `version: u64::MAX` or a lake at the
+  cap is a clear error, never a wrap), then replaces `catalog.json` with the
+  same bytes. Old versions and their data files are never modified — and a
+  snapshot file that already exists is never replaced: `save` that would land
+  on a published version (e.g. after restoring an older `catalog.json`) fails
+  with a conflict instead of clobbering it. `load(Some(v))` restores any
+  published version, `load(None)` the latest. A **commit**
+  (`Lake::commit`/`commit_from_tables`, `.lake commit`) publishes a new
+  version made of the previous files **plus** one new data file per appended
+  row batch and one positional delete file per (table, data file) —
+  `UPDATE` is a delete of the old position plus an append — so a commit that
+  adds a few rows to a 1M-row table writes only those rows. A table's data
+  files are never rewritten, replaced or reused for new data. There is no
+  compaction or GC yet (maintenance is a later wave), so old versions' files
+  stay.
+- **Atomicity order: data files → delta manifest → snapshot → catalog.** Locally every write
   goes to a *unique* temp sibling (`<name>.<uuid>.tmp`, created with
   `create_new(true)` so a planted symlink or an older writer's temp file is
   never followed or truncated), is fsynced, then renamed into place (catalog,
@@ -624,7 +652,11 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
   **process-crash safety**: after a `kill -9` the previous version always
   loads, and stray data files, `.tmp` files and snapshots above the catalog's
   version are ignored (`versions` lists only manifests that parse and declare
-  their own canonical version). It is *not* a power-loss guarantee on APFS:
+  their own canonical version; `commits()` lists the delta manifests). A
+  stray delta manifest at the next version (never with its snapshot) is
+  self-healing: the retry that reaches that version overwrites it, because
+  the snapshot is the authoritative manifest. It is *not* a power-loss
+  guarantee on APFS:
   `fsync(2)`/`File::sync_all` can return before the drive flushes its cache;
   only `F_FULLFSYNC` would, and this crate deliberately adds no
   unsafe/libc dependency for it (a future opt-in mode could). One leftover is
@@ -662,13 +694,18 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
 - **Read-only attach (wave 45d): `.lake attach <dir|s3> [version]`** reads the
   catalog, the chosen manifest and every data file's footer, metadata and
   statistics — no column data is decoded (over object storage the whole objects
-  are read, still without decoding). A v1 `.pink` lake attaches from the
-  manifest's **statistics block** instead (wave 45k; the lean save publishes
-  it): not even the data file is opened, and a block that fails its CRC-32
-  checksum, disagrees with the entry (table/file/rows), declares an unreadable
-  version or carries an undecodable value refuses with a clear "use .lake
-  open" / re-save message, never a guess; a lake saved before 45k (no block)
-  refuses the same way. Attached tables are session-local and
+  are read, still without decoding). A `.pink` lake attaches from the
+  manifest's **statistics blocks** instead (wave 45k; v4 stores one per file,
+  v1 one per entry): not even the data file is opened, and a block that fails
+  its CRC-32 checksum, disagrees with the entry (table/file/rows), declares an
+  unreadable version or carries an undecodable value refuses with a clear
+  "use .lake open" / re-save message, never a guess; a lake saved before
+  45k (no block) refuses the same way. A v4 table with several files merges
+  the per-file statistics (NULL counts add up, min/max fold) as long as every
+  file proves them; once the table has **delete files** the per-column facts
+  are no longer provable without reading data, so they fall back to
+  materialization while the row count stays exact (`COUNT(*)` keeps its fast
+  path). Attached tables are session-local and
   read-only: they resolve under their `db.table` names, `.tables`/`.schema` mark
   them (`t (3 rows, attached)`), and every mutation over one is refused
   (`attached lake tables are read-only`). Exact `COUNT(*)`/`COUNT(col)`/`MIN`/
@@ -680,6 +717,28 @@ v2/v3 entry without a `format` field, and a v2/v3 entry declaring anything but
   attachment and `.lake attached` lists them; `.lake save` skips attached tables
   with a note; `.lake open` drops them all; and a durable database refuses
   mutating SQL that reads an attached table (its logged text could not replay).
+- **Incremental commits, DuckLake parity (wave 63).** `Lake::commit` takes
+  appended rows (`Commit::append`, encoded into one new immutable data file
+  per table) and positional deletes (`Commit::delete_positions`); readers
+  union the data files in listed order and drop each delete file's positions
+  from its file. `Lake::commit_from_tables(base_version, base, current)`
+  computes the exact row-level diff (bit-exact for `DOUBLE` — NaN payloads
+  and `-0.0` are themselves; duplicate rows and order handled) and publishes
+  it; `WritableAttachment` is the `.lake attach … write` route on top: it
+  materializes the pinned version, the caller mutates with ordinary DML, and
+  `.lake commit` publishes the difference (durable sessions flush the WAL
+  first and re-attach by adoption after recovery, so commits are idempotent).
+  A conflicting publish retries with DuckLake's writer controls —
+  `max_retry_count` (default 10), `retry_backoff` (1.5) and `retry_wait_ms`
+  (100, the wait doubles per retry by the backoff factor) — rebasing the
+  already-written immutable files onto the new head; a delta whose base file
+  the head no longer contains, or positions another commit already deleted,
+  is refused, never re-applied. The CLI reads the overrides from
+  `PINKDB_LAKE_MAX_RETRY_COUNT`, `PINKDB_LAKE_RETRY_BACKOFF` and
+  `PINKDB_LAKE_RETRY_WAIT_MS`. Every published version also writes
+  `commits/<version>.json`, an append-only delta manifest listing the data
+  and delete files that commit added and its row movement (audit; the
+  snapshot stays authoritative for loading).
 - **Snapshot records and time travel (wave 64).** Every save records the
   version's publish time in the manifest's `updated` field (millisecond
   ISO-8601 UTC — that field has been there since wave 34) and can record an
@@ -764,8 +823,16 @@ let version = save_store(&db, "mylake")?;  // creates the lake, publishes v2
 let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
 lake.set_commit_message(Some("alice".into()), Some("two rows".into()));
 let v3 = lake.write_from_store(&db)?;      // full snapshot in Vortex, version 3
-let tables = lake.tables()?;               // [("main.t", 2)]
-let versions = lake.versions()?;           // [1, 2, 3]
+
+// Incremental: append rows as one new immutable data file (nothing else is
+// rewritten) and/or record positional deletes.
+let mut commit = pink_lake::Commit::new();
+commit.append("main.t", std::sync::Arc::new(appended_rows));  // same schema
+commit.delete_positions("main.t", "data/main.t/<uuid>.vortex", &[0]);
+let report = lake.commit(&commit)?;        // v4: files + rows reported
+
+let tables = lake.tables()?;               // [("main.t", 3)]
+let versions = lake.versions()?;           // [1, 2, 3, 4]
 let records = lake.snapshots()?;           // per-version time/author/message/changes
 let latest = lake.load(None)?;             // rebuild the latest
 let old = lake.load(Some(2))?;             // rebuild a specific snapshot
@@ -788,10 +855,10 @@ Vortex lake over S3/R2):
 | Build | CLI features | Lake | Data files | Release size |
 |---|---|---|---|---|
 | default | — | no `.lake` commands | — | 2,436,320 B |
-| lean lake | `lake-lite` | all `.lake` commands incl. read-only `.lake attach` (statistics-only: exact `COUNT`/`MIN`/`MAX` from the manifest's stats block, 0 data-file reads; anything else lazily decodes) | `.pink` v4 (catalog `format_version` 1) | 2,692,464 B (+250 KiB over default, −40.7 MiB vs full) |
-| lean lake + S3 | `lake-lite,s3` (plain `s3` implies it) | as above, `s3://bucket/prefix` locations | `.pink` v4 | 4,701,120 B |
-| full lake | `lake` | all `.lake` commands incl. read-only `.lake attach` (footer-only statistics fast paths) | Vortex (v2/v3 lakes) | 45,333,984 B |
-| full lake + S3 | `lake,s3` | as above, `s3://` locations | Vortex (v2/v3 lakes) | ≈47.3 MB (full + the same ≈2 MB S3 client) |
+| lean lake | `lake-lite` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 2,692,464 B (+250 KiB over default, −40.7 MiB vs full) |
+| lean lake + S3 | `lake-lite,s3` (plain `s3` implies it) | as above, `s3://bucket/prefix` locations | `.pink` | 4,701,120 B |
+| full lake | `lake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 45,333,984 B |
+| full lake + S3 | `lake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈47.3 MB (full + the same ≈2 MB S3 client) |
 
 ```sh
 cargo build -p pinkdb-cli --features lake        # full lake, local directories
@@ -806,25 +873,44 @@ cargo build -p pinkdb-cli --features s3          # lean lake + S3/R2 (= lake-lit
                           author/message record the version's commit metadata
 .lake open <dir> [ver]    replace the in-memory store with the lake
                           (session database resets to main; PINKDB_KEY is kept)
-.lake attach <dir> [ver]  attach the lake read-only, from its statistics only
-                          (session-local)
-.lake detach <dir>        detach one attached lake from this session
+.lake attach <dir> [ver] [read-only|write]
+                          read-only (default): attach from statistics only
+                          write: materialize the lake's tables into the store
+                            (a same-named, same-shape store table is adopted),
+                            mutate them with DML, publish with .lake commit
+.lake commit <dir>        publish the writable attach's change as one
+                          incremental version (appended data files + positional
+                          delete files; nothing published is rewritten)
+.lake detach <dir> [force] detach one attached lake (refuses with uncommitted
+                          writable changes; force keeps the tables as ordinary
+                          store tables)
 .lake attached            list this session's attached lakes and their tables
 .lake versions <dir>      published versions (current marked)
 .lake snapshots <dir>     per-version records: time, author, message, counts,
                           change summary
 .lake tables <dir>        current version's db.table names + row counts
-.lake info <dir>          format version, current version, snapshots, tables
+.lake info <dir>          format version, current version, snapshots, commits,
+                          tables
 
 SELECT * FROM t AT (VERSION => 2);                -- attached tables only
 SELECT * FROM t AT (TIMESTAMP => TIMESTAMP '2026-10-17 12:30:36.029');
 ```
 
+Incremental writes in the REPL:
+
+```text
+.lake save mylake                        # v2: full snapshot
+.lake attach mylake write                # materialize v2 writable
+INSERT INTO t VALUES (...);
+UPDATE t SET ...; DELETE FROM t WHERE ...;
+.lake commit mylake                      # v3: appends + deletes only
+```
+
 With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see
 the next subsection. In a lean `lake-lite` build, `.lake attach` works
-statistics-only, from the stats block a lean save publishes (a lake saved
-before 45k refuses with a re-save message); v2/v3 Vortex lakes are refused
-with the rebuild-with-`lake` error. See "Lean lake" below.
+statistics-only, from the stats blocks a lean save publishes (a lake saved
+before 45k refuses with a re-save message); Vortex lakes are refused with the
+rebuild-with-`lake` error. See "Lean lake" below.
 
 `.lake tables`/`.lake info` also warn about tables whose referenced data file
 is missing, instead of advertising data a load cannot read. Without the
@@ -845,19 +931,21 @@ same size. See the dependency/build note above.
 
 The same lake layer without the Vortex dependency: a `lake-lite` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
-single-table persistence bytes) and publishes `format_version` 1 catalogs —
-no `vortex` crate and none of its ~218 transitive crates, a 2.69 MB binary
-instead of 45.3 MB. It enables every `.lake` command (save/open/attach/
-versions/tables/info) and S3/R2 (`s3` implies `lake-lite`), with the same
-layout, atomic publish order and conflict semantics. `.lake attach` is
-**statistics-only**: each lean save publishes a CRC-32-protected per-column
-statistics block in the manifest (rows, exact NULL counts, bit-exact min/max
-as canonical strings per type, NaN counts), collected inside the same parallel
-chunk-encode pass as the data file — save cost +1 ms @1M / +17 ms @10M, the
-`.pink` bytes unchanged — so attach answers exact `COUNT`/`COUNT(col)`/`MIN`/
-`MAX` with zero data-file reads, and a full Vortex build attaches `.pink` lakes
-from the same block. A lake saved without a block refuses attach with a
-re-save-the-store message; a v2/v3 Vortex lake is refused with the clear
+single-table persistence bytes) under `format_version` 4 catalogs (each file
+object carries its own statistics block) — no `vortex` crate and none of its
+~218 transitive crates, a 2.69 MB binary instead of 45.3 MB. It enables every
+`.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
+(`s3` implies `lake-lite`), with the same layout, incremental commits, atomic
+publish order and conflict semantics. `.lake attach` is **statistics-only**:
+each lean save/commit publishes a CRC-32-protected per-column statistics block
+per data file (rows, exact NULL counts, bit-exact min/max as canonical strings
+per type, NaN counts), collected inside the same parallel chunk-encode pass as
+the data file — save cost +1 ms @1M / +17 ms @10M, the `.pink` bytes unchanged
+— so attach answers exact `COUNT`/`COUNT(col)`/`MIN`/`MAX` with zero
+data-file reads, and a full Vortex build attaches `.pink` lakes from the same
+blocks (a table with positional deletes falls back for the per-column facts,
+row counts stay exact). A lake saved without a block refuses attach with a
+re-save-the-store message; a Vortex lake is refused with the clear
 rebuild-with-`lake` error instead of being guessed at.
 
 Measured trade-offs (release, Apple Silicon, sales corpus): eager `.lake open`
@@ -1786,10 +1874,11 @@ ties in ORDER BY have no stable order on either engine).
   plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
   credentials come only from the environment or explicit config (no
   profiles/IMDS/SSO); the lean `lake-lite` build writes and reads only
-  `.pink` v4 data files (catalog `format_version` 1), attaches them
-  statistics-only (exact `COUNT`/`MIN`/`MAX` from the manifest's stats block;
-  `.pink` has no projected reader, so a fallback decodes the whole table) and
-  refuses a v2/v3 Vortex lake with the rebuild-with-`lake` error
+  `.pink` data files (v4 catalogs), attaches them
+  statistics-only (exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks;
+  `.pink` has no projected reader, so a fallback decodes the whole table),
+  supports `.lake attach … write` + `.lake commit`, and refuses a Vortex lake
+  with the rebuild-with-`lake` error
 - Extensions repository: artifacts are verified by SHA-256 from the catalog
   (no signatures yet), and only `darwin-arm64` builds are published
 - Known gaps and their scheduled waves are tracked in `docs/GAPS.md`
