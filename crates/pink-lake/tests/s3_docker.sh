@@ -838,7 +838,9 @@ printf '%s\n' "$KEYS" | grep -qxF "itest/snapshots/1.json" || fail "itest/snapsh
 printf '%s\n' "$KEYS" | grep -qxF "itest/snapshots/2.json" || fail "itest/snapshots/2.json is missing"
 printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.vortex$' \
     || fail "the roundtrip's Vortex data object is missing"
-assert_listing_count "$KEYS" "itest/" 4
+printf '%s\n' "$KEYS" | grep -qxF "itest/commits/2.json" \
+    || fail "itest/commits/2.json (the v2 delta manifest) is missing"
+assert_listing_count "$KEYS" "itest/" 5
 note "keys: $(printf '%s ' $KEYS)"
 
 # catalog.json == snapshots/<version>.json (bytes), fetched + cmp.
@@ -1069,6 +1071,11 @@ ok "conc/snapshots/1..$FINAL all exist"
 DATA_COUNT="$(printf '%s\n' "$CONC_KEYS" | grep -cE '^conc/data/')"
 printf '%s\n' "$CONC_KEYS" | grep -qE '^conc/data/main\.[A-Za-z0-9_-]+/[0-9a-f-]+\.vortex$' \
     || fail "conc data objects are missing"
+for v in $(seq 2 "$FINAL"); do
+    printf '%s\n' "$CONC_KEYS" | grep -qxF "conc/commits/$v.json" \
+        || fail "conc/commits/$v.json (the v$v delta manifest) is missing"
+done
+ok "conc/commits/2..$FINAL all exist"
 # Every published version above the empty v1 has exactly one referenced data
 # object; a writer that lost after uploading, and an extra claimant of a
 # version on a non-atomic server, may leave unreferenced leftovers
@@ -1080,7 +1087,7 @@ LEFTOVER_MAX=$((FINAL - 1 + RACE_CONFLICTS + CLAIMS - UNIQUE_VERSIONS))
 if [ "$DATA_COUNT" -gt "$LEFTOVER_MAX" ]; then
     fail "more data objects ($DATA_COUNT) than referenced + possible leftovers ($LEFTOVER_MAX)"
 fi
-assert_listing_count "$CONC_KEYS" "conc/" "$((1 + FINAL + DATA_COUNT))"
+assert_listing_count "$CONC_KEYS" "conc/" "$((1 + FINAL + (FINAL - 1) + DATA_COUNT))"
 ok "conc/data: $DATA_COUNT object(s), $((DATA_COUNT - (FINAL - 1))) unreferenced leftover(s) from conflicted writers"
 
 # --- concurrency (b): a slow save deterministically loses one version ------

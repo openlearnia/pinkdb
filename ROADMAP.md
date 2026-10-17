@@ -1044,4 +1044,8 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   checked and are unchanged). Local gates now include the **feature-less CLI
   suite** plus the whole CLI feature matrix — none / `lake-lite` /
   `lake-lite,s3` / `lake` / `lake,s3` — all green (the gap: every earlier run
-  had a lake feature on, so `lake_disabled` never compiled).
+  had a lake feature on, so `lake_disabled` never compiled). Second pass: the
+  S3 Docker script's object-count expectations now include the per-version
+  `commits/<v>.json` sidecars (`itest/` 4 → **5** with an explicit key check;
+  `conc/` gains `(FINAL − 1)` commit files, positively asserted for every
+  version). `bash -n` clean; the Docker job re-verifies on CI.
