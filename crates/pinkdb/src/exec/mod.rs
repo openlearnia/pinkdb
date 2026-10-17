@@ -98,6 +98,9 @@ pub(crate) struct Cx<'a> {
     pub(crate) ctes: HashMap<String, Output>,
     pub(crate) memo: std::sync::Arc<std::sync::Mutex<HashMap<usize, Memo>>>,
     pub(crate) projections: std::sync::Arc<crate::plan::ScanProjections>,
+    /// The simple pruning predicates each attached-lake scan may use (wave
+    /// 66): analyzed once with the projections, consumed by `scan_output`.
+    pub(crate) prunes: std::sync::Arc<crate::plan::ScanFilters>,
 }
 
 #[derive(Clone)]
@@ -116,12 +119,16 @@ impl<'a> Cx<'a> {
             // No projection bound: every attached-lake scan materializes in
             // full (the pre-projection behavior).
             projections: std::sync::Arc::new(crate::plan::ScanProjections::default()),
+            // No pruning bound: every attached-lake scan decodes every file.
+            prunes: std::sync::Arc::new(crate::plan::ScanFilters::default()),
         }
     }
 
-    /// Bind the statement's scan projections (analyzed once, up front).
+    /// Bind the statement's scan projections and pruning predicates
+    /// (analyzed once, up front).
     pub(crate) fn with_projections(mut self, plan: &LogicalPlan) -> Self {
         self.projections = std::sync::Arc::new(crate::plan::ScanProjections::of(plan));
+        self.prunes = std::sync::Arc::new(crate::plan::ScanFilters::of(plan));
         self
     }
 }
@@ -553,9 +560,13 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
     let projected = cx.projections.for_scan(plan);
     if let Some((_, lake)) = cx.db.attached_lookup(lookup, table) {
+        // The simple `WHERE` conjuncts this scan may be pruned by (analyzed
+        // with the projections). The lake decodes only the files whose zone
+        // maps leave the predicate satisfiable.
+        let prunes = cx.prunes.for_scan(plan);
         let scan = match at {
-            None => lake.load_projected(lookup, table, projected)?,
-            Some(at) => lake.load_projected_at(lookup, table, *at, projected)?,
+            None => lake.load_filtered(lookup, table, projected, prunes)?,
+            Some(at) => lake.load_filtered_at(lookup, table, *at, projected, prunes)?,
         };
         let (names, types) = scan.table.schema().into_iter().unzip();
         return Ok(Output {
@@ -1123,6 +1134,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 ctes,
                 memo: cx.memo.clone(),
                 projections: cx.projections.clone(),
+                prunes: cx.prunes.clone(),
             };
             eval(&child, body)
         }

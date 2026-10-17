@@ -51,12 +51,156 @@
 //! is byte-identical to the pre-wave-64 shape. `"version"` and `"updated"`
 //! (the version's publish time, millisecond ISO-8601 UTC) were already there;
 //! together they are the per-version record `.lake snapshots` lists.
+//!
+//! Wave 66 adds two additive fields for partitioning:
+//!
+//! ```json
+//! "main.t": {
+//!   "files": [
+//!     { "path": "data/main.t/<uuid>.vortex", "rows": 2,
+//!       "partition": { "b": "x" },
+//!       "stats": { …zone map… } }
+//!   ],
+//!   "rows": 2,
+//!   "format": "vortex",
+//!   "partition_by": [ { "column": "b", "transform": "identity" } ]
+//! }
+//! ```
+//!
+//! `partition_by` is the table's current partition specification (a vector of
+//! [`PartitionKey`]s, mirroring DuckLake's `ducklake_partition_column` rows:
+//! the column plus its transform, DuckLake's own `"identity"` / `"bucket(4)"`
+//! spelling). `partition` on a data file is the value the file was written
+//! under, keyed by the partition key's [`PartitionKey::key_text`] (`"b"` for
+//! an identity key, `"bucket(4, b)"` for a bucket key); a JSON `null` value is
+//! a SQL NULL. Both fields are optional and additive, so an unpartitioned
+//! lake's manifest shape is unchanged, and both are validated structurally
+//! when a manifest is read (a table must not partition on the same key twice,
+//! every file partition key must be a parseable key, and a file partition
+//! value must decode under its column's type at attach time, where the schema
+//! is known).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::snapshot::ChangeSummary;
+
+/// One partition key of a table's partition specification (wave 66), the
+/// maker-side twin of DuckLake's `ducklake_partition_column` row: the key
+/// column plus its transform.
+///
+/// `transform` uses DuckLake's own spelling: `"identity"` for a bare column,
+/// `"bucket(N)"` for `bucket(N, column)`. Only identity is written and pruned
+/// by this build; `bucket(N)` is accepted structurally (a newer writer's
+/// lake stays readable) but its values are never used for pruning — see
+/// [`PartitionKey::is_identity`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PartitionKey {
+    /// The column the key partitions on, as the spec wrote it (matched
+    /// case-insensitively against the table's schema).
+    pub(crate) column: String,
+    /// The partition transform, DuckLake-spelled: `"identity"` or
+    /// `"bucket(N)"`.
+    pub(crate) transform: String,
+}
+
+/// Why a partition key text did not parse (the DDL error text).
+pub(crate) fn partition_key_error(text: &str) -> String {
+    format!(
+        "invalid partition key \"{text}\": expected a column name or \
+         bucket(N, column)"
+    )
+}
+
+impl PartitionKey {
+    /// Parse one partition-key text: a bare column name (identity), or
+    /// `bucket(N, column)` with `N >= 1`. Anything else — including the
+    /// DuckLake transforms this build does not implement (`year`, `month`,
+    /// `day`, `hour`, `epoch_*`, `truncate`) — is refused; DuckLake itself
+    /// supports `year, month, day, hour, epoch_year, epoch_month, epoch_day,
+    /// epoch_hour, and bucket` and reports anything else as an unsupported
+    /// partition function.
+    pub(crate) fn parse(text: &str) -> std::result::Result<Self, String> {
+        let trimmed = text.trim();
+        if let Some(rest) = trimmed.strip_suffix(')') {
+            if let Some(inner) = rest.strip_prefix("bucket(") {
+                let Some((n, column)) = inner.split_once(',') else {
+                    return Err(partition_key_error(text));
+                };
+                let column = column.trim();
+                let ok = n.trim().parse::<u32>().is_ok_and(|n| n >= 1)
+                    && !column.is_empty()
+                    && !column.contains('(')
+                    && !column.contains(')');
+                if !ok {
+                    return Err(partition_key_error(text));
+                }
+                return Ok(PartitionKey {
+                    column: column.to_string(),
+                    transform: format!("bucket({})", n.trim()),
+                });
+            }
+            return Err(partition_key_error(text));
+        }
+        if trimmed.is_empty()
+            || trimmed.contains('(')
+            || trimmed.contains(',')
+            || trimmed.contains(char::is_whitespace)
+        {
+            return Err(partition_key_error(text));
+        }
+        Ok(PartitionKey {
+            column: trimmed.to_string(),
+            transform: "identity".to_string(),
+        })
+    }
+
+    /// True for an identity key — the only transform this build writes,
+    /// records file values for, and prunes by.
+    pub(crate) fn is_identity(&self) -> bool {
+        self.transform == "identity"
+    }
+
+    /// Structurally valid: a non-empty column and a transform this build
+    /// understands (`identity`, or `bucket(N)` with `N >= 1`).
+    pub(crate) fn is_valid(&self) -> bool {
+        !self.column.is_empty()
+            && !self.column.contains('(')
+            && !self.column.contains(',')
+            && (self.is_identity() || matches!(self.bucket(), Some(n) if n >= 1))
+    }
+
+    /// The canonical key text a file's `partition` map is keyed by:
+    /// the bare column for identity, `bucket(N, column)` otherwise.
+    pub(crate) fn key_text(&self) -> String {
+        if self.is_identity() {
+            self.column.clone()
+        } else if self.transform.starts_with("bucket(") {
+            format!("bucket({}, {})", bucket_n(&self.transform), self.column)
+        } else {
+            format!("{}({})", self.transform, self.column)
+        }
+    }
+
+    /// The `bucket` modulus of a `bucket(N)` transform; `None` otherwise.
+    pub(crate) fn bucket(&self) -> Option<u32> {
+        self.transform
+            .strip_prefix("bucket(")?
+            .strip_suffix(')')?
+            .parse()
+            .ok()
+    }
+}
+
+/// The raw `N` of a `bucket(N)` transform (a string, so a malformed
+/// transform keeps its own spelling in error messages).
+fn bucket_n(transform: &str) -> &str {
+    transform
+        .strip_prefix("bucket(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(transform)
+}
 
 /// The data-file format of one table entry.
 ///
@@ -82,6 +226,14 @@ pub(crate) enum FileFormat {
 /// count, and — for `.pink` files — the CRC-protected statistics block that
 /// describes it, so `.lake attach` can merge per-file statistics across an
 /// append-only file list without opening any file.
+///
+/// Wave 66 adds two optional fields to the v4 object: `stats` may also carry
+/// the CRC-protected zone map of a **Vortex** file (published at write time
+/// from the same facts the Vortex footer stores; attach cross-checks the two
+/// and prefers the block, which can be more informative for truncated string
+/// statistics), and `partition` is the file's partition value map (one entry
+/// per partition key, keyed by [`PartitionKey::key_text`]; `None` is a SQL
+/// NULL). Both are additive: a manifest without them keeps its old shape.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(crate) enum FileRef {
@@ -94,6 +246,12 @@ pub(crate) enum FileRef {
         rows: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stats: Option<crate::stats::StatsBlock>,
+        /// The file's written partition values, keyed by the partition key's
+        /// [`PartitionKey::key_text`]; a `None` value is SQL NULL. Absent for
+        /// an unpartitioned file (every pre-wave-66 file included) and for a
+        /// file written before the table's spec was set.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        partition: Option<BTreeMap<String, Option<String>>>,
     },
 }
 
@@ -114,11 +272,17 @@ impl<'de> Deserialize<'de> for FileRef {
                 path: String,
                 rows: Option<u64>,
                 stats: Option<crate::stats::StatsBlock>,
+                partition: Option<BTreeMap<String, Option<String>>>,
             },
         }
         match Repr::deserialize(deserializer)? {
             Repr::Path(path) => Ok(FileRef::Path(path)),
-            Repr::Entry { path, rows, stats } => {
+            Repr::Entry {
+                path,
+                rows,
+                stats,
+                partition,
+            } => {
                 let Some(rows) = rows else {
                     return Err(D::Error::custom(format!(
                         "data file \"{path}\" is listed without its row count (a \
@@ -126,7 +290,12 @@ impl<'de> Deserialize<'de> for FileRef {
                          {{\"path\": \"…\", \"rows\": n}} objects)"
                     )));
                 };
-                Ok(FileRef::Entry { path, rows, stats })
+                Ok(FileRef::Entry {
+                    path,
+                    rows,
+                    stats,
+                    partition,
+                })
             }
         }
     }
@@ -150,12 +319,33 @@ impl FileRef {
         }
     }
 
-    /// The file's statistics block (v4 `.pink` files only).
+    /// The file's statistics block: the v4 `.pink` per-file block, or the
+    /// catalog-published Vortex zone map (both v4). `None` for v1–v3 paths
+    /// (the v1 entry-level block lives on the entry) and for a file published
+    /// without one.
     pub(crate) fn stats(&self) -> Option<&crate::stats::StatsBlock> {
         match self {
             FileRef::Path(_) => None,
             FileRef::Entry { stats, .. } => stats.as_ref(),
         }
+    }
+
+    /// The file's partition value map (v4), if it was written under a
+    /// partition spec.
+    pub(crate) fn partition(&self) -> Option<&BTreeMap<String, Option<String>>> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry { partition, .. } => partition.as_ref(),
+        }
+    }
+
+    /// Set this file's partition value map (a no-op on a v1–v3 [`FileRef::Path`],
+    /// which never carries one).
+    pub(crate) fn with_partition(mut self, partition: BTreeMap<String, Option<String>>) -> Self {
+        if let FileRef::Entry { partition: p, .. } = &mut self {
+            *p = Some(partition);
+        }
+        self
     }
 }
 
@@ -227,6 +417,13 @@ pub(crate) struct TableEntry {
     /// v4 positional delete files (see [`DeleteRef`]); empty for v1–v3.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) deletes: Vec<DeleteRef>,
+    /// The table's partition specification (wave 66; see [`PartitionKey`]).
+    /// Files written while it is set carry their [`FileRef::partition`]
+    /// values; files written earlier (or before `.lake partition`) carry
+    /// none and simply cannot be pruned by partition. Absent on an
+    /// unpartitioned table — the pre-wave-66 shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) partition_by: Option<Vec<PartitionKey>>,
 }
 
 impl TableEntry {
@@ -234,6 +431,11 @@ impl TableEntry {
     /// `format` field are engine `.pink` bytes.
     pub(crate) fn format(&self) -> FileFormat {
         self.format.unwrap_or(FileFormat::Pink)
+    }
+
+    /// The entry's partition keys, or an empty slice when unpartitioned.
+    pub(crate) fn partition_keys(&self) -> &[PartitionKey] {
+        self.partition_by.as_deref().unwrap_or(&[])
     }
 
     /// Sum of the data files' row counts, when every file carries one (v4).
@@ -293,4 +495,12 @@ pub(crate) struct TableDelta {
     /// snapshot of that table, not an append/delete delta).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) replaced: bool,
+    /// True when this commit changed the table's partition specification.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) partition_changed: bool,
+    /// The table's partition specification **after** this commit, when it has
+    /// one (a spec change to `None` — cleared — carries only
+    /// `partition_changed`). Absent when the commit did not change it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) partition_by: Option<Vec<PartitionKey>>,
 }

@@ -261,7 +261,7 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|attach|commit|detach|attached|versions|snapshots|tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|partition|detach|attached|versions|snapshots|tables|info> ..."
         ),
         "{out}"
     );
@@ -896,12 +896,12 @@ fn attach_decode_stats_show_projection_pushdown() {
     assert_eq!(
         stats,
         vec![
-            "decodes: 0 loads, 0 columns", // attach reads footers only
-            "decodes: 0 loads, 0 columns", // every aggregate came from statistics
-            "decodes: 1 load, 1 column",   // ORDER BY b: b only
-            "decodes: 2 loads, 2 columns", // + c
-            "decodes: 3 loads, 3 columns", // + a
-            "decodes: 3 loads, 3 columns", // SELECT *: everything was cached
+            "decodes: 0 loads, 0 columns, 0 files", // attach reads footers only
+            "decodes: 0 loads, 0 columns, 0 files", // every aggregate came from statistics
+            "decodes: 1 load, 1 column, 1 file",    // ORDER BY b: b only
+            "decodes: 2 loads, 2 columns, 2 files", // + c (the file decodes again)
+            "decodes: 3 loads, 3 columns, 3 files", // + a
+            "decodes: 3 loads, 3 columns, 3 files", // SELECT *: everything was cached
         ],
         "{out}"
     );
@@ -1108,42 +1108,21 @@ fn attach_errors_are_clear_and_never_panic() {
     assert_eq!(code, 1);
     assert!(err.contains("without its row count"), "{out}\n{err}");
 
-    // A table with two data files (the v4 append shape) attaches and unions
-    // them in manifest order: the descriptors merge the files' statistics.
+    // A table with two data files (a v4 incremental append) attaches and
+    // unions them in manifest order: the descriptors merge the files'
+    // statistics. Built through the real write path, not a hand-edit: a
+    // hand-edit would have to fix the catalog zone map's CRC.
     let two_files = dir.join("two_file_lake");
-    copy_dir(&lake, &two_files);
-    let data = std::fs::read_dir(two_files.join("data/main.t"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let second = data.with_file_name("second.vortex");
-    std::fs::copy(&data, &second).unwrap();
-    let first_rel = format!(
-        "data/main.t/{}",
-        data.file_name().unwrap().to_string_lossy()
-    );
-    let second_rel = format!(
-        "data/main.t/{}",
-        second.file_name().unwrap().to_string_lossy()
-    );
-    for name in ["catalog.json", "snapshots/2.json"] {
-        let path = two_files.join(name);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let needle =
-            format!("{{\n          \"path\": \"{first_rel}\",\n          \"rows\": 1\n        }}");
-        // The same values under one logical table; the entry-level row count
-        // must add up.
-        let replacement = format!(
-            "{{\n          \"path\": \"{first_rel}\",\n          \"rows\": 1\n        }},\n        {{\n          \"path\": \"{second_rel}\",\n          \"rows\": 1\n        }}"
-        );
-        let patched = text
-            .replace(&needle, &replacement)
-            .replace("      \"rows\": 1,\n", "      \"rows\": 2,\n");
-        assert_ne!(text, patched, "file object not found in {name}");
-        std::fs::write(&path, patched).unwrap();
-    }
+    run(&format!(
+        "CREATE TABLE t (a INTEGER, s VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'x');\n\
+         .lake save {two_files}\n\
+         .lake attach {two_files} write\n\
+         INSERT INTO t VALUES (2, 'y');\n\
+         .lake commit {two_files}\n\
+         .quit\n",
+        two_files = two_files.display()
+    ));
     let out = run(&format!(
         ".lake attach {}\nSELECT COUNT(*) FROM t;\nSELECT MIN(a), MAX(s) FROM t;\n         .lake attached\n.quit\n",
         two_files.display()
@@ -1151,6 +1130,12 @@ fn attach_errors_are_clear_and_never_panic() {
     assert!(out.contains("Attached"), "{out}");
     assert!(out.contains("│ 2 "), "both files' rows: {out}");
     assert!(out.contains("2 row"), "{out}");
+    // The merged statistics answer COUNT/MIN/MAX over both files without
+    // decoding either.
+    assert!(
+        out.contains("decodes: 0 loads, 0 columns, 0 files"),
+        "{out}"
+    );
     cleanup(&dir);
 }
 
@@ -1876,5 +1861,131 @@ fn durable_session_wal_covers_lake_commits() {
     ));
     assert!(out.contains("Opened lake version 4"), "{out}");
     assert!(out.contains("│ 4 "), "{out}");
+    cleanup(&dir);
+}
+
+/// `.lake partition` end to end (wave 66): set a spec, commit split by value,
+/// read with file pruning (the decode counters prove which files were
+/// touched), then clear the spec and commit unpartitioned again.
+#[test]
+fn partition_spec_splits_commits_prunes_and_clears() {
+    let dir = scratch("partition");
+    let lake = dir.join("lake");
+
+    // Session 1: create, save, partition, commit appended rows.
+    let out = run(&format!(
+        "CREATE TABLE t (id INTEGER, region VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'east'), (2, 'west');\n\
+         .lake save {lake}\n\
+         .lake partition {lake} t by (region)\n\
+         .lake attach {lake} write\n\
+         INSERT INTO t VALUES (3, 'south'), (4, 'south'), (5, 'north');\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Partitioned main.t by (region)"), "{out}");
+    // The three appended rows split into two files (south ×2, north ×1).
+    assert!(out.contains("2 files: 2 data, 0 delete"), "{out}");
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(catalog.contains("\"partition_by\""), "{catalog}");
+    assert!(catalog.contains("\"column\": \"region\""), "{catalog}");
+    assert!(catalog.contains("\"south\""), "{catalog}");
+    assert!(catalog.contains("\"north\""), "{catalog}");
+
+    // Session 2: read-only attach: predicates prune whole files from the zone
+    // maps, and the counters show exactly which files decoded.
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         .lake attached\n\
+         SELECT id FROM t WHERE region = 'north';\n\
+         .lake attached\n\
+         SELECT id FROM t WHERE region = 'south';\n\
+         .lake attached\n\
+         SELECT MIN(id), MAX(id) FROM t;\n\
+         .lake attached\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    let stats: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("decodes:"))
+        .collect();
+    assert_eq!(
+        stats,
+        vec![
+            "decodes: 0 loads, 0 columns, 0 files",
+            // v2's unpartitioned file (region range east..west) plus the
+            // north file: the south file is pruned by its partition value.
+            "decodes: 1 load, 2 columns, 2 files",
+            // Same shape for south; the north file is pruned.
+            "decodes: 2 loads, 4 columns, 4 files",
+            // MIN/MAX answer from the published statistics (no deletes).
+            "decodes: 2 loads, 4 columns, 4 files",
+        ],
+        "{out}"
+    );
+    assert!(out.contains("│ 5 "), "{out}"); // the north row
+    assert!(out.contains("│ 3 ") && out.contains("│ 4 "), "{out}");
+
+    // Session 3: clear the spec, then a new commit is one unpartitioned file.
+    let out = run(&format!(
+        ".lake partition {lake} t clear\n\
+         .lake partition {lake} t clear\n\
+         .lake attach {lake} write\n\
+         INSERT INTO t VALUES (6, 'east');\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Cleared the partition specification"), "{out}");
+    assert!(out.contains("has no partition specification"), "{out}");
+    assert!(out.contains("1 file: 1 data, 0 delete"), "{out}");
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(!catalog.contains("partition_by"), "{catalog}");
+    // Old files keep their recorded values; the new one carries none.
+    assert!(catalog.contains("\"south\""), "{catalog}");
+    cleanup(&dir);
+}
+
+/// `.lake partition` argument and DDL errors, pinned to the probed DuckLake
+/// rules: unsupported transforms name DuckLake's supported set, duplicate
+/// keys are refused, and missing tables/columns are clean errors.
+#[test]
+fn partition_command_errors_are_reported() {
+    let dir = scratch("partition_err");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (id INTEGER, region VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'east');\n\
+         .lake save {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+
+    let out = run(&format!(
+        ".lake partition {lake} t by (truncate(2, region))\n\
+         .lake partition {lake} t by (region, region)\n\
+         .lake partition {lake} t by (nope)\n\
+         .lake partition {lake} ghost by (x)\n\
+         .lake partition {lake} t\n\
+         .lake partition {lake} t by ()\n\
+         .lake partition {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("unsupported partition key \"truncate(2, region)\""),
+        "{out}"
+    );
+    assert!(out.contains("year, month, day, hour"), "{out}");
+    assert!(out.contains("duplicate partition key \"region\""), "{out}");
+    assert!(out.contains("does not exist"), "{out}");
+    assert!(out.contains("does not exist in the lake"), "{out}");
+    assert!(out.contains("Usage: .lake partition"), "{out}");
+    // The failed commands published nothing: the lake is still version 2.
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(catalog.contains("\"version\": 2"), "{catalog}");
     cleanup(&dir);
 }

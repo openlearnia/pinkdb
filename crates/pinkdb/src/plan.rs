@@ -615,6 +615,344 @@ fn node_addr(plan: &LogicalPlan) -> usize {
     plan as *const LogicalPlan as usize
 }
 
+/// The simple pruning predicates each `Scan` in a plan can be pushed, keyed
+/// by the scan node's address (wave 66, lake-scan stage 3): the conjuncts of
+/// every `Filter` chain that sits **directly** over a qualified scan — only
+/// `Filter`, `Limit` and `Offset` nodes pass predicates down (every other
+/// node reorders, rebinds, or re-evaluates columns, so a predicate must not
+/// cross it). A scan with no entry has no pushable predicate.
+///
+/// Extraction is deliberately narrow and always conservative: `column op
+/// literal` (either operand order), `IS NULL`/`IS NOT NULL`, joined by `AND`.
+/// An `OR` anywhere, a non-literal comparison, a mismatched literal type, or
+/// any expression shape this analysis does not model simply yields no
+/// predicate for that conjunct — the lake then decodes the file. A wrong
+/// predicate could silently drop rows, so nothing is inferred beyond exact
+/// binder-bound shapes.
+#[derive(Debug, Default)]
+pub(crate) struct ScanFilters {
+    /// Scan node address → predicates (all conjunctive). A `Scan` with no
+    /// entry has none.
+    map: HashMap<usize, Vec<crate::attached::PrunePredicate>>,
+}
+
+impl ScanFilters {
+    /// Analyze `plan` (the whole statement plan, subqueries included).
+    pub(crate) fn of(plan: &LogicalPlan) -> Self {
+        let mut filters = Self::default();
+        walk_scan_filters(plan, &[], &mut filters.map);
+        filters
+    }
+
+    /// The predicates `scan` (a [`LogicalPlan::Scan`]) may be pruned by.
+    pub(crate) fn for_scan(&self, scan: &LogicalPlan) -> &[crate::attached::PrunePredicate] {
+        debug_assert!(matches!(scan, LogicalPlan::Scan { .. }));
+        self.map
+            .get(&node_addr(scan))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
+/// Walk `plan` accumulating the conjuncts of every `Filter` chain that stays
+/// directly over a scan. `inherited` holds the predicates gathered from the
+/// chain above this node; only `Filter` (adds its conjuncts), `Limit` and
+/// `Offset` (pass everything through) keep it alive.
+fn walk_scan_filters(
+    plan: &LogicalPlan,
+    inherited: &[crate::attached::PrunePredicate],
+    out: &mut HashMap<usize, Vec<crate::attached::PrunePredicate>>,
+) {
+    use crate::attached::PrunePredicate;
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let mut here: Vec<PrunePredicate> = inherited.to_vec();
+            collect_prune_predicates(predicate, &mut here);
+            walk_scan_filters(input, &here, out);
+        }
+        LogicalPlan::Limit { input, .. } | LogicalPlan::Offset { input, .. } => {
+            walk_scan_filters(input, inherited, out);
+        }
+        LogicalPlan::Scan { db: Some(_), .. } => {
+            if !inherited.is_empty() {
+                out.entry(node_addr(plan))
+                    // The same node reached through two parents may only use
+                    // the predicates every path proves (the intersection);
+                    // an empty intersection disables pruning for it.
+                    .and_modify(|existing| existing.retain(|p| inherited.contains(p)))
+                    .or_insert_with(|| inherited.to_vec());
+            }
+        }
+        // Any other node breaks the chain: recurse into its children with no
+        // inherited predicates (columns are rebound/reordered there). The
+        // match mirrors `collect_tables_read`; a variant listed as a leaf
+        // holds no child plan to analyze.
+        LogicalPlan::Scan { db: None, .. }
+        | LogicalPlan::SingleRow
+        | LogicalPlan::Begin
+        | LogicalPlan::Commit
+        | LogicalPlan::Rollback
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Use { .. }
+        | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::ShowTables { .. }
+        | LogicalPlan::ShowDatabases
+        | LogicalPlan::Describe { .. }
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CreateTable { .. } => {}
+        LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
+        LogicalPlan::CreateTableAs { query, .. } | LogicalPlan::InsertSelect { query, .. } => {
+            walk_scan_filters(query, &[], out)
+        }
+        LogicalPlan::Insert { rows, .. } => {
+            for row in rows {
+                for e in row {
+                    walk_expr_subquery_filters(e, out);
+                }
+            }
+        }
+        LogicalPlan::Update {
+            sets, predicate, ..
+        } => {
+            for (_, e) in sets {
+                walk_expr_subquery_filters(e, out);
+            }
+            if let Some(p) = predicate {
+                walk_expr_subquery_filters(p, out);
+            }
+        }
+        LogicalPlan::Delete { predicate, .. } => {
+            if let Some(p) = predicate {
+                walk_expr_subquery_filters(p, out);
+            }
+        }
+        LogicalPlan::SetOp { left, right, .. } => {
+            walk_scan_filters(left, &[], out);
+            walk_scan_filters(right, &[], out);
+        }
+        LogicalPlan::Cte { query, body, .. } => {
+            walk_scan_filters(query, &[], out);
+            walk_scan_filters(body, &[], out);
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            walk_scan_filters(input, &[], out);
+            for w in windows {
+                for e in w
+                    .arg
+                    .iter()
+                    .chain(w.partition.iter())
+                    .chain(w.order.iter().map(|(e, _)| e))
+                {
+                    walk_expr_subquery_filters(e, out);
+                }
+            }
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            walk_scan_filters(left, &[], out);
+            walk_scan_filters(right, &[], out);
+            for k in left_keys.iter().chain(right_keys) {
+                walk_expr_subquery_filters(k, out);
+            }
+        }
+        LogicalPlan::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            walk_scan_filters(left, &[], out);
+            walk_scan_filters(right, &[], out);
+            if let Some(on) = on {
+                walk_expr_subquery_filters(on, out);
+            }
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            walk_scan_filters(input, &[], out);
+            for e in keys
+                .iter()
+                .chain(aggs.iter().filter_map(|a| a.arg.as_ref()))
+            {
+                walk_expr_subquery_filters(e, out);
+            }
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            walk_scan_filters(input, &[], out);
+            for e in exprs {
+                walk_expr_subquery_filters(e, out);
+            }
+        }
+        LogicalPlan::Sort { input, keys } => {
+            walk_scan_filters(input, &[], out);
+            for (e, _) in keys {
+                walk_expr_subquery_filters(e, out);
+            }
+        }
+        LogicalPlan::Distinct { input } => walk_scan_filters(input, &[], out),
+    }
+}
+
+/// Analyze the subquery plans an expression holds (their own filters apply to
+/// their own scans). The expression's own shape is irrelevant here.
+fn walk_expr_subquery_filters(
+    expr: &crate::sql::binder::BoundExpr,
+    out: &mut HashMap<usize, Vec<crate::attached::PrunePredicate>>,
+) {
+    use crate::sql::binder::BoundExpr;
+    match expr {
+        BoundExpr::Literal(_) | BoundExpr::Column { .. } => {}
+        BoundExpr::Binary { left, right, .. } => {
+            walk_expr_subquery_filters(left, out);
+            walk_expr_subquery_filters(right, out);
+        }
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. }
+        | BoundExpr::Cast { expr: e, .. } => walk_expr_subquery_filters(e, out),
+        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            for a in args {
+                walk_expr_subquery_filters(a, out);
+            }
+        }
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
+            for (c, v) in branches {
+                walk_expr_subquery_filters(c, out);
+                walk_expr_subquery_filters(v, out);
+            }
+            if let Some(e) = else_ {
+                walk_expr_subquery_filters(e, out);
+            }
+        }
+        BoundExpr::InSubquery { expr, query, .. } => {
+            walk_expr_subquery_filters(expr, out);
+            walk_scan_filters(query, &[], out);
+        }
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            walk_scan_filters(query, &[], out)
+        }
+        BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. }
+        | BoundExpr::DynamicScalar { .. } => {}
+    }
+}
+
+/// Extract the pushable predicates of one `Filter` predicate (its `AND`
+/// conjuncts). `out` keeps the predicates of the enclosing chain.
+fn collect_prune_predicates(
+    expr: &crate::sql::binder::BoundExpr,
+    out: &mut Vec<crate::attached::PrunePredicate>,
+) {
+    use crate::attached::PrunePredicate;
+    use crate::sql::ast::BinaryOp;
+    use crate::sql::binder::BoundExpr;
+    match expr {
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+            ..
+        } => {
+            collect_prune_predicates(left, out);
+            collect_prune_predicates(right, out);
+        }
+        BoundExpr::Binary {
+            op, left, right, ..
+        } => {
+            // `column op literal`, or `literal op column` (flipped).
+            let direct = match (&**left, &**right) {
+                (BoundExpr::Column { index, dtype }, BoundExpr::Literal(v)) => {
+                    Some((*index, *dtype, v, false))
+                }
+                (BoundExpr::Literal(v), BoundExpr::Column { index, dtype }) => {
+                    Some((*index, *dtype, v, true))
+                }
+                _ => None,
+            };
+            let Some((column, column_dtype, literal, flipped)) = direct else {
+                return;
+            };
+            if literal.is_null() {
+                // A comparison with NULL is never true; the executor's
+                // filter drops every row anyway. No predicate is pushed
+                // (pruning everything is equivalent but noisy).
+                return;
+            }
+            let Some(literal_dtype) = literal.data_type() else {
+                return;
+            };
+            if !prunable_types(column_dtype, literal_dtype) {
+                return;
+            }
+            let op = if flipped { flip(*op) } else { *op };
+            let Some(prune_op) = prune_op(op) else {
+                return;
+            };
+            out.push(PrunePredicate::compare(column, prune_op, literal.clone()));
+        }
+        BoundExpr::IsNull { expr, negated } => {
+            if let BoundExpr::Column { index, .. } = &**expr {
+                out.push(PrunePredicate::null_test(*index, *negated));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The [`PruneOp`] of a comparison operator; `None` for `AND`/`OR`/`LIKE`/
+/// arithmetic (never pushed).
+fn prune_op(op: crate::sql::ast::BinaryOp) -> Option<crate::attached::PruneOp> {
+    use crate::attached::PruneOp;
+    use crate::sql::ast::BinaryOp;
+    Some(match op {
+        BinaryOp::Eq => PruneOp::Eq,
+        BinaryOp::NotEq => PruneOp::NotEq,
+        BinaryOp::Lt => PruneOp::Lt,
+        BinaryOp::LtEq => PruneOp::LtEq,
+        BinaryOp::Gt => PruneOp::Gt,
+        BinaryOp::GtEq => PruneOp::GtEq,
+        _ => return None,
+    })
+}
+
+/// The operator when the operands are swapped (`literal < column` becomes
+/// `column > literal`).
+fn flip(op: crate::sql::ast::BinaryOp) -> crate::sql::ast::BinaryOp {
+    use crate::sql::ast::BinaryOp;
+    match op {
+        BinaryOp::Lt => BinaryOp::Gt,
+        BinaryOp::LtEq => BinaryOp::GtEq,
+        BinaryOp::Gt => BinaryOp::Lt,
+        BinaryOp::GtEq => BinaryOp::LtEq,
+        other => other,
+    }
+}
+
+/// Whether a literal of `literal_dtype` may be compared to statistics of
+/// `column_dtype` under `compare_values`'s semantics. Exact types always may;
+/// the numeric family (INTEGER/BIGINT/DOUBLE/DECIMAL) compares numerically
+/// across widths. Anything else is not pushed — a fabricated ordering (the
+/// generic fallback) must never prune a file.
+fn prunable_types(column_dtype: DataType, literal_dtype: DataType) -> bool {
+    if column_dtype == literal_dtype {
+        return true;
+    }
+    let numeric = |t: DataType| {
+        matches!(
+            t,
+            DataType::Integer | DataType::Bigint | DataType::Double | DataType::Decimal { .. }
+        )
+    };
+    numeric(column_dtype) && numeric(literal_dtype)
+}
+
 /// Which of a node's input columns a consumer reads: an explicit set, or
 /// `All` when the shape cannot be bounded (a correct fallback: every column
 /// is decoded).
@@ -1059,4 +1397,175 @@ pub(crate) fn agg_output_schema(
         types.push(a.dtype);
     }
     (names, types)
+}
+
+#[cfg(test)]
+mod scan_filter_tests {
+    use super::*;
+    use crate::attached::{PruneOp, PrunePredicate};
+    use crate::sql::ast::BinaryOp;
+
+    fn scan(table: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            db: Some("main".to_string()),
+            table: table.to_string(),
+            at: None,
+        }
+    }
+
+    fn filter(input: LogicalPlan, predicate: BoundExpr) -> LogicalPlan {
+        LogicalPlan::Filter {
+            input: Box::new(input),
+            predicate,
+        }
+    }
+
+    fn col(index: usize) -> BoundExpr {
+        BoundExpr::Column {
+            index,
+            dtype: DataType::Integer,
+        }
+    }
+
+    fn lit(i: i32) -> BoundExpr {
+        BoundExpr::Literal(Value::Integer(i))
+    }
+
+    fn cmp(op: BinaryOp, left: BoundExpr, right: BoundExpr) -> BoundExpr {
+        BoundExpr::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+            dtype: DataType::Boolean,
+        }
+    }
+
+    fn and(left: BoundExpr, right: BoundExpr) -> BoundExpr {
+        BoundExpr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+            dtype: DataType::Boolean,
+        }
+    }
+
+    /// A filter chain stays pushable through `Limit`/`Offset`; every other
+    /// node (here `Project` and `Aggregate`) breaks it: the analysis must
+    /// never hand a scan predicates that address pre-rebinding columns.
+    #[test]
+    fn scan_filters_stop_at_rebinding_nodes() {
+        // Filter → Limit → Filter → Scan: both filters' conjuncts reach the
+        // scan, in chain order.
+        let plan = filter(
+            LogicalPlan::Limit {
+                input: Box::new(filter(scan("t"), cmp(BinaryOp::Lt, col(1), lit(5)))),
+                limit: 10,
+            },
+            cmp(BinaryOp::Gt, col(0), lit(1)),
+        );
+        let LogicalPlan::Filter { input, .. } = &plan else {
+            unreachable!()
+        };
+        let LogicalPlan::Limit { input, .. } = &**input else {
+            unreachable!()
+        };
+        let LogicalPlan::Filter { input, .. } = &**input else {
+            unreachable!()
+        };
+        let scan_node = &**input;
+        let filters = ScanFilters::of(&plan);
+        assert_eq!(
+            filters.for_scan(scan_node),
+            &[
+                PrunePredicate::compare(0, PruneOp::Gt, Value::Integer(1)),
+                PrunePredicate::compare(1, PruneOp::Lt, Value::Integer(5)),
+            ]
+        );
+
+        // Filter → Project → Scan: nothing crosses the Project.
+        let plan = filter(
+            LogicalPlan::Project {
+                input: Box::new(scan("t")),
+                exprs: vec![col(0)],
+                names: vec!["i".to_string()],
+            },
+            cmp(BinaryOp::Eq, col(0), lit(1)),
+        );
+        let LogicalPlan::Filter { input, .. } = &plan else {
+            unreachable!()
+        };
+        let LogicalPlan::Project { input, .. } = &**input else {
+            unreachable!()
+        };
+        assert!(ScanFilters::of(&plan).for_scan(input).is_empty());
+
+        // Filter → Aggregate → Scan: nothing crosses the Aggregate.
+        let plan = filter(
+            LogicalPlan::Aggregate {
+                input: Box::new(scan("t")),
+                keys: vec![col(0)],
+                aggs: Vec::new(),
+            },
+            cmp(BinaryOp::Eq, col(0), lit(1)),
+        );
+        let LogicalPlan::Filter { input, .. } = &plan else {
+            unreachable!()
+        };
+        let LogicalPlan::Aggregate { input, .. } = &**input else {
+            unreachable!()
+        };
+        assert!(ScanFilters::of(&plan).for_scan(input).is_empty());
+
+        // An OR is not a conjunction: nothing is pushed.
+        let plan = filter(
+            scan("t"),
+            cmp(
+                BinaryOp::Or,
+                cmp(BinaryOp::Lt, col(0), lit(1)),
+                cmp(BinaryOp::Gt, col(0), lit(2)),
+            ),
+        );
+        let LogicalPlan::Filter { input, .. } = &plan else {
+            unreachable!()
+        };
+        assert!(ScanFilters::of(&plan).for_scan(input).is_empty());
+
+        // An AND of exact conjuncts pushes both, left to right.
+        let plan = filter(
+            scan("t"),
+            and(
+                cmp(BinaryOp::Eq, col(0), lit(3)),
+                BoundExpr::IsNull {
+                    expr: Box::new(col(1)),
+                    negated: true,
+                },
+            ),
+        );
+        let LogicalPlan::Filter { input, .. } = &plan else {
+            unreachable!()
+        };
+        assert_eq!(
+            ScanFilters::of(&plan).for_scan(input),
+            &[
+                PrunePredicate::compare(0, PruneOp::Eq, Value::Integer(3)),
+                PrunePredicate::null_test(1, true),
+            ]
+        );
+
+        // A comparison whose literal is a non-matching type (VARCHAR literal
+        // against an INTEGER column) is never pushed: `compare_values` must
+        // not order what the binder would have rejected.
+        let plan = filter(
+            scan("t"),
+            cmp(
+                BinaryOp::Eq,
+                col(0),
+                BoundExpr::Literal(Value::Varchar("x".to_string())),
+            ),
+        );
+        let LogicalPlan::Filter { input, .. } = &plan else {
+            unreachable!()
+        };
+        assert!(ScanFilters::of(&plan).for_scan(input).is_empty());
+    }
 }

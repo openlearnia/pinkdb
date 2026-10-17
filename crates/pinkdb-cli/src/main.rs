@@ -72,6 +72,9 @@ fn print_help() {
         println!(
             "  .lake commit {LAKE}        publish the writable attach as one incremental version"
         );
+        println!("  .lake partition {LAKE} <t> by (<key>, ...) | clear");
+        println!("                                set/clear a table's partition spec (identity or");
+        println!("                                bucket(N, col)); new writes split per value set");
         println!("  .lake detach {LAKE} [force]  detach one attached lake");
         println!("  .lake attached              list attached lakes and their tables");
         println!("  .lake versions {LAKE}       list the lake's published versions");

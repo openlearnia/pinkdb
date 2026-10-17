@@ -252,10 +252,13 @@ fn snapshot_roundtrip_is_bit_exact() {
         assert!(rel.ends_with(".vortex"), "{rel}");
         assert!(dir.join(rel).is_file(), "{rel} missing");
         assert_eq!(files[0]["rows"], entry["rows"], "{key}");
-        assert!(
-            files[0].get("stats").is_none(),
-            "{key}: Vortex statistics live in the file footer"
-        );
+        // Wave 66: a Vortex file also carries a catalog-published zone map
+        // (CRC-protected, cross-checked against the footer at attach).
+        let stats = &files[0]["stats"];
+        assert_eq!(stats["table"], key.as_str(), "{key}");
+        assert_eq!(stats["file"], rel, "{key}");
+        assert_eq!(stats["rows"], entry["rows"], "{key}");
+        assert!(stats["crc32"].is_u64(), "{key}: no CRC");
     }
     assert!(dir.join("snapshots/1.json").is_file());
     assert!(dir.join("snapshots/2.json").is_file());
@@ -2148,7 +2151,7 @@ fn v1_stats_fixture_attaches_in_the_full_build() {
     // The stats-only shapes decoded nothing; the gated shapes (fid's NaN
     // column `d`, `analytics.a.b`'s `-0.0` column `z`) materialized exactly
     // their two tables, and every other query reused the caches.
-    let (loads, _) = report.lake.decode_stats();
+    let (loads, ..) = report.lake.decode_stats();
     assert_eq!(
         loads, 2,
         "only the two gated tables may materialize (got {loads})"
@@ -2469,7 +2472,7 @@ fn time_travel_stats_fast_paths_do_not_decode() {
         .unwrap(),
         vec![vec![Value::Integer(1), Value::Integer(3), Value::Bigint(3)]]
     );
-    let (loads, columns) = lake.decode_stats();
+    let (loads, columns, _files) = lake.decode_stats();
     assert_eq!(
         loads, 0,
         "statistics answers must not decode; {columns} cols"
@@ -2649,7 +2652,7 @@ fn time_travel_on_a_v1_stats_fixture_resolves_versions() {
         try_rows(&mut db, "SELECT COUNT(*) FROM main.fid AT (VERSION => 2);").unwrap(),
         vec![vec![Value::Bigint(6)]]
     );
-    assert_eq!(lake.decode_stats(), (0, 0), "no data file may be opened");
+    assert_eq!(lake.decode_stats(), (0, 0, 0), "no data file may be opened");
     // v1 is the empty lake: every table did not exist yet.
     let err = try_rows(&mut db, "SELECT * FROM main.fid AT (VERSION => 1);").unwrap_err();
     assert!(err.contains("does not exist at version 1"), "{err}");

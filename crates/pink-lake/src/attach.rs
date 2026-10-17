@@ -27,6 +27,33 @@
 //! the affected queries materialize; the row count stays exact and
 //! `COUNT(*)` keeps its fast path.
 //!
+//! # Pruned scans (wave 66)
+//!
+//! Per **file**, attach also keeps the file's own zone map and partition
+//! values. When a query's `WHERE` carries simple conjuncts (`col op literal`
+//! / `IS [NOT] NULL`, extracted by the engine's plan analysis),
+//! [`pinkdb::AttachedLake::load_filtered`] skips every data file the map
+//! proves cannot match — no decode, no bytes read for that file — and
+//! decodes the survivors (only the referenced columns, where the format
+//! supports a projection). Execution still applies the filter; pruning only
+//! removes files that provably contribute nothing, so answers are identical
+//! to a full scan.
+//!
+//! A file-level zone map stays valid after deletes (deleting rows only
+//! shrinks the value set): a pruned file could not have matched the
+//! predicate *before* its deletes either. That is the opposite direction
+//! from the table-level aggregates above, which fall back — both rules are
+//! exact, and neither is an approximation. A pruned load is never merged
+//! into the session cache (it is a different row set); a query whose
+//! predicates cannot prune takes the ordinary cached path unchanged.
+//!
+//! # Counters
+//!
+//! [`pinkdb::AttachedLake::decode_stats`] reports `(loads, columns decoded,
+//! files decoded)` over the attachment and its time-travel views — the
+//! observability behind "a statistics-only query decodes nothing" and "a
+//! pruned scan decodes only the matching files".
+//!
 //! The result is a [`pinkdb::AttachedLake`]: descriptors the engine can
 //! answer exact `COUNT`/`MIN`/`MAX` from, and a per-table loader that decodes
 //! a table on first use through the very same path [`Lake::load`] uses
@@ -69,11 +96,12 @@ use pinkdb::{
     AtSpec, AttachedLake, AttachedTable, ColumnStats, DataTable, PinkDb, PinkDbError, Value,
 };
 
-use crate::catalog::{DeleteRef, FileFormat, TableEntry};
+use crate::catalog::{DeleteRef, FileFormat, PartitionKey, TableEntry};
 use crate::incremental::entry_layout;
 use crate::storage::{Head, Storage};
 #[cfg(feature = "vortex-format")]
 use crate::vortex_file;
+use crate::zone::{self, FileFacts};
 use crate::{
     apply_file_deletes, copy_chunks, manifest_for, only_table, path_str, published_versions,
     split_key, validate_rel_path, Lake, LakeError, Result,
@@ -120,13 +148,29 @@ enum AttachedFormat {
 /// A `.pink` file's schema and gated statistics, as attach wants them.
 type SchemaAndStats = (Vec<(String, pinkdb::DataType)>, Vec<ColumnStats>);
 
-/// One data file of an attached table: its exact row count and the physical
-/// positions its delete files drop (merge-on-read).
+/// One data file of an attached table: its exact row count, the physical
+/// positions its delete files drop (merge-on-read), its per-column zone map
+/// (when any metadata proves one), and its recorded partition values.
 #[derive(Debug, Clone)]
 struct AttachedFile {
     rel: String,
     rows: u64,
     deletes: Vec<u64>,
+    /// The file's per-column exact facts, in schema order. `None` when no
+    /// metadata carries them (e.g. a `.pink` file published without a block):
+    /// the file can never be pruned, but it always decodes correctly.
+    ///
+    /// Unlike the table-level statistics (`merge_file_stats`, which falls
+    /// back to unknown once any delete file exists), a per-file zone map
+    /// stays usable for pruning with deletes: deleting rows only shrinks the
+    /// value set, so a file that provably could not match a predicate before
+    /// deletes still cannot after them (see `crate::zone`).
+    zone: Option<Vec<ColumnStats>>,
+    /// The file's partition value map, keyed by
+    /// [`crate::catalog::PartitionKey::key_text`]; not necessarily aligned
+    /// with the table's current spec (a file written before the spec was set
+    /// carries none; a spec change does not rewrite old files).
+    partition: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
 /// One attached table's data-file list plus how to materialize it.
@@ -134,6 +178,11 @@ struct AttachedFile {
 struct AttachedEntry {
     db: String,
     table: String,
+    /// Column names/types in scan order (validated at attach time), the
+    /// schema every file of the table agrees on.
+    schema: Vec<(String, pinkdb::DataType)>,
+    /// The table's partition specification at this version (possibly empty).
+    keys: Vec<PartitionKey>,
     files: Vec<AttachedFile>,
     format: AttachedFormat,
 }
@@ -161,6 +210,10 @@ pub(crate) struct LakeAttachment {
     /// Columns decoded in total (diagnostics and tests: projection pushdown
     /// must decode only the referenced columns).
     columns_decoded: AtomicU64,
+    /// Data files decoded in total (diagnostics and tests: file pruning must
+    /// decode only the files whose zone maps leave a predicate
+    /// satisfiable).
+    files_decoded: AtomicU64,
     /// The version this attachment is pinned to (the attach version). Time
     /// travel reaches `1..=pinned` (see the module docs).
     pinned: u64,
@@ -215,6 +268,13 @@ impl LakeAttachment {
     #[cfg(all(test, feature = "vortex-format"))]
     pub(crate) fn columns_decoded(&self) -> u64 {
         self.columns_decoded.load(Ordering::Relaxed)
+    }
+
+    /// Data files decoded by this attachment's loads (tests: a pruned scan
+    /// must decode only the files it could not prove empty of matches).
+    #[cfg(test)]
+    pub(crate) fn files_decoded(&self) -> u64 {
+        self.files_decoded.load(Ordering::Relaxed)
     }
 
     /// The table descriptor for a lowercased `(db, table)` key.
@@ -306,6 +366,8 @@ impl AttachedLake for LakeAttachment {
                 };
                 self.columns_decoded
                     .fetch_add(decoded_count, Ordering::Relaxed);
+                self.files_decoded
+                    .fetch_add(entry.files.len() as u64, Ordering::Relaxed);
                 let (fresh, _fresh_present) = self
                     .load_entry(&entry, Some(&missing))
                     .map_err(|e| PinkDbError::Execution(e.to_string()))?;
@@ -338,6 +400,8 @@ impl AttachedLake for LakeAttachment {
                 };
                 self.columns_decoded
                     .fetch_add(decoded_count, Ordering::Relaxed);
+                self.files_decoded
+                    .fetch_add(entry.files.len() as u64, Ordering::Relaxed);
                 let full = entry.format == AttachedFormat::Pink || requested.iter().all(|&w| w);
                 let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
                 let (table, present) = self
@@ -356,17 +420,81 @@ impl AttachedLake for LakeAttachment {
         }
     }
 
-    fn decode_stats(&self) -> (u64, u64) {
+    fn load_filtered(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+        predicates: &[pinkdb::PrunePredicate],
+    ) -> std::result::Result<AttachedScan, PinkDbError> {
+        let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        if predicates.is_empty() {
+            return self.load_projected(db, table, columns);
+        }
+        let Some(entry) = self.files.get(&key).cloned() else {
+            return Err(PinkDbError::Catalog(format!(
+                "lake {} has no table \"{db}.{table}\"",
+                self.location
+            )));
+        };
+        let survivors: Vec<AttachedFile> = entry
+            .files
+            .iter()
+            .filter(|file| {
+                let facts = FileFacts {
+                    rows: file.rows,
+                    zone: file.zone.as_deref(),
+                    partition: file.partition.as_ref(),
+                };
+                !zone::file_prunes(facts, &entry.keys, &entry.schema, predicates)
+            })
+            .cloned()
+            .collect();
+        if survivors.len() == entry.files.len() {
+            // Nothing pruned: take the ordinary cached path, so a query whose
+            // predicates cannot prune behaves exactly as before (and shares
+            // the materialized columns).
+            return self.load_projected(db, table, columns);
+        }
+        // A pruned load is a different row set than the full table, so it is
+        // never merged into the session cache: it decodes its surviving files
+        // (only the requested columns, where the format supports a
+        // projection) and is returned as-is.
+        let requested = self.requested_columns(&key, columns);
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        self.files_decoded
+            .fetch_add(survivors.len() as u64, Ordering::Relaxed);
+        let decoded_count = if entry.format == AttachedFormat::Pink {
+            requested.len() as u64
+        } else {
+            requested.iter().filter(|&&w| w).count() as u64
+        };
+        self.columns_decoded
+            .fetch_add(decoded_count, Ordering::Relaxed);
+        let full = entry.format == AttachedFormat::Pink || requested.iter().all(|&w| w);
+        let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
+        let (table, present) = self
+            .load_some(&entry, &survivors, if full { None } else { Some(&decoded) })
+            .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+        Ok(AttachedScan {
+            table: Arc::new(table),
+            present,
+        })
+    }
+
+    fn decode_stats(&self) -> (u64, u64, u64) {
         // Time-travel views decode through their own attachments; count them
         // in (they are cached inside this attachment, part of its cost).
         let mut loads = self.loads.load(Ordering::Relaxed);
         let mut columns = self.columns_decoded.load(Ordering::Relaxed);
+        let mut files = self.files_decoded.load(Ordering::Relaxed);
         let views = self.views.lock().unwrap_or_else(|p| p.into_inner());
         for view in views.values() {
             loads += view.loads.load(Ordering::Relaxed);
             columns += view.columns_decoded.load(Ordering::Relaxed);
+            files += view.files_decoded.load(Ordering::Relaxed);
         }
-        (loads, columns)
+        (loads, columns, files)
     }
 
     fn table_at(
@@ -406,6 +534,19 @@ impl AttachedLake for LakeAttachment {
         let version = self.resolve_version(at)?;
         let view = self.view(version)?;
         view.load_projected(db, table, columns)
+    }
+
+    fn load_filtered_at(
+        &self,
+        db: &str,
+        table: &str,
+        at: AtSpec,
+        columns: Option<&[usize]>,
+        predicates: &[pinkdb::PrunePredicate],
+    ) -> std::result::Result<AttachedScan, PinkDbError> {
+        let version = self.resolve_version(at)?;
+        let view = self.view(version)?;
+        view.load_filtered(db, table, columns, predicates)
     }
 }
 
@@ -502,8 +643,29 @@ impl LakeAttachment {
         entry: &AttachedEntry,
         columns: Option<&[usize]>,
     ) -> Result<(DataTable, Vec<bool>)> {
+        self.load_some(entry, &entry.files, columns)
+    }
+
+    /// [`LakeAttachment::load_entry`] over a chosen subset of the entry's
+    /// files (the survivors of file pruning). An empty subset decodes
+    /// nothing and yields an empty table with the entry's full schema.
+    fn load_some(
+        &self,
+        entry: &AttachedEntry,
+        files: &[AttachedFile],
+        columns: Option<&[usize]>,
+    ) -> Result<(DataTable, Vec<bool>)> {
+        if files.is_empty() {
+            let table = DataTable::new(entry.table.clone(), entry.schema.clone()).map_err(|e| {
+                LakeError::Engine {
+                    context: format!("preparing the empty pruned scan of \"{}\"", entry.key()),
+                    source: e,
+                }
+            })?;
+            return Ok((table, vec![true; entry.schema.len()]));
+        }
         let mut union: Option<(DataTable, Vec<bool>)> = None;
-        for (i, file) in entry.files.iter().enumerate() {
+        for (i, file) in files.iter().enumerate() {
             let (table, present) = load_file(&*self.storage, &self.root, entry, file, columns)?;
             match &mut union {
                 None => union = Some((table, present)),
@@ -743,10 +905,6 @@ fn pink_file_stats(
     manifest_path: &std::path::Path,
 ) -> Result<SchemaAndStats> {
     let rel = file.path();
-    let corrupt = |message: String| LakeError::Corrupt {
-        path: manifest_path.to_path_buf(),
-        message,
-    };
     // v4: the block rides inside the file's manifest object. v1: the entry
     // carries one block for its single file.
     let (block, file_rows) = match file.stats() {
@@ -765,6 +923,28 @@ fn pink_file_stats(
             }
         },
     };
+    let rows = file_rows.unwrap_or(entry.rows);
+    block_schema_and_stats(entry_key, rel, rows, block, manifest_path)
+}
+
+/// Verify one statistics block against its entry and turn it into the
+/// `(schema, gated stats)` attach needs: the CRC and block version
+/// ([`crate::stats::StatsBlock::schema_and_stats`]), the block's
+/// `table`/`file`/`rows` against the catalog key, the file's path and its
+/// row count. Shared by the `.pink` per-file block and the wave-66
+/// catalog-published Vortex zone map, so a block pasted under another file
+/// can never attach in either format.
+fn block_schema_and_stats(
+    entry_key: &str,
+    rel: &str,
+    rows: u64,
+    block: &crate::stats::StatsBlock,
+    manifest_path: &std::path::Path,
+) -> Result<SchemaAndStats> {
+    let corrupt = |message: String| LakeError::Corrupt {
+        path: manifest_path.to_path_buf(),
+        message,
+    };
     let (schema, stats) = block.schema_and_stats(manifest_path)?;
     if block.table != entry_key {
         return Err(corrupt(format!(
@@ -779,7 +959,6 @@ fn pink_file_stats(
             block.file
         )));
     }
-    let rows = file_rows.unwrap_or(entry.rows);
     if block.rows != rows {
         return Err(corrupt(format!(
             "table \"{entry_key}\": the statistics block of \"{rel}\" declares {} rows, but \
@@ -788,6 +967,56 @@ fn pink_file_stats(
         )));
     }
     Ok((schema, stats))
+}
+
+/// The catalog-published zone map of one **Vortex** file: its block,
+/// CRC-verified and cross-checked exactly like a `.pink` file's (the same
+/// shared gate), so a block pasted under another file can never attach.
+#[cfg(feature = "vortex-format")]
+fn vortex_catalog_stats(
+    entry_key: &str,
+    file: &crate::catalog::FileRef,
+    manifest_path: &std::path::Path,
+) -> Result<Option<SchemaAndStats>> {
+    let Some(block) = file.stats() else {
+        return Ok(None);
+    };
+    let rows = file.rows().ok_or_else(|| LakeError::Corrupt {
+        path: manifest_path.to_path_buf(),
+        message: format!(
+            "table \"{entry_key}\": data file \"{}\" has no row count",
+            file.path()
+        ),
+    })?;
+    Ok(Some(block_schema_and_stats(
+        entry_key,
+        file.path(),
+        rows,
+        block,
+        manifest_path,
+    )?))
+}
+
+/// Whether a catalog zone map is compatible with the file footer's own
+/// statistics (the authority): every field the footer proves must match.
+/// The block may be *more* informative than the footer (a truncated VARCHAR
+/// statistic the footer writes `Inexact` is `None` there while the block can
+/// still carry the exact value), so a footer-unknown field never
+/// contradicts.
+#[cfg(feature = "vortex-format")]
+fn zone_stats_compatible(block: &ColumnStats, footer: &ColumnStats) -> bool {
+    if let (Some(b), Some(f)) = (block.null_count, footer.null_count) {
+        if b != f {
+            return false;
+        }
+    }
+    let field_ok = |b: &Option<Value>, f: &Option<Value>| match f {
+        Some(f) => b
+            .as_ref()
+            .is_some_and(|b| pinkdb::plan::compare_values(b, f).is_eq()),
+        None => true,
+    };
+    field_ok(&block.min, &footer.min) && field_ok(&block.max, &footer.max)
 }
 
 /// Fold per-file statistics into one table's: NULL counts add up,
@@ -931,7 +1160,10 @@ pub(crate) fn build_from(
         if format != FileFormat::Pink {
             statistics_only = false;
         }
-        // Per-file (schema, stats), in manifest order.
+        // Per-file (schema, stats), in manifest order. The stats are the
+        // file's zone map (wave 66): the `.pink` block's gated column facts,
+        // or for Vortex the footer's, cross-checked against a
+        // catalog-published block when one rides on the file.
         let mut per_file: Vec<(u64, Vec<ColumnStats>)> = Vec::with_capacity(entry.files.len());
         let mut schema: Option<Vec<(String, pinkdb::DataType)>> = None;
         for file in &entry.files {
@@ -969,7 +1201,44 @@ pub(crate) fn build_from(
                                 ),
                             });
                         }
-                        (footer.schema, footer.stats)
+                        // A catalog-published zone map must not contradict
+                        // the file's own footer (the footer is the authority;
+                        // the block may be the more informative of the two —
+                        // a truncated VARCHAR statistic the footer refuses
+                        // can still be exact in the block). Any field the
+                        // footer proves must match.
+                        let block_stats = match vortex_catalog_stats(key, file, &manifest_path)? {
+                            Some((block_schema, block_stats)) => {
+                                if block_schema != footer.schema {
+                                    return Err(LakeError::Corrupt {
+                                        path: manifest_path.clone(),
+                                        message: format!(
+                                            "table \"{key}\": the catalog zone map of \"{}\" \
+                                             disagrees with the file's footer on the schema",
+                                            file.path()
+                                        ),
+                                    });
+                                }
+                                for (i, (b, f)) in block_stats.iter().zip(&footer.stats).enumerate()
+                                {
+                                    if !zone_stats_compatible(b, f) {
+                                        return Err(LakeError::Corrupt {
+                                            path: manifest_path.clone(),
+                                            message: format!(
+                                                "table \"{key}\": the catalog zone map of \
+                                                 \"{}\" disagrees with the file's footer on \
+                                                 column {i}",
+                                                file.path()
+                                            ),
+                                        });
+                                    }
+                                }
+                                Some(block_stats)
+                            }
+                            None => None,
+                        };
+                        let stats = block_stats.unwrap_or(footer.stats);
+                        (footer.schema, stats)
                     }
                     #[cfg(not(feature = "vortex-format"))]
                     {
@@ -1004,20 +1273,92 @@ pub(crate) fn build_from(
             path: manifest_path.clone(),
             message: format!("table \"{key}\" has no data files"),
         })?;
+        // The partition spec: every key column must exist, and every file's
+        // recorded partition value must decode under that column's type and
+        // agree with the file's zone map (a misplaced or tampered value must
+        // never silently prune a matching file).
+        let keys: Vec<PartitionKey> = entry.partition_keys().to_vec();
+        for spec_key in &keys {
+            if zone::schema_column_index(&schema, &spec_key.column).is_none() {
+                return Err(LakeError::Corrupt {
+                    path: manifest_path.clone(),
+                    message: format!(
+                        "table \"{key}\": partition key column \"{}\" does not exist in the \
+                         data files' schema",
+                        spec_key.column
+                    ),
+                });
+            }
+        }
+        for (file, (_, file_stats)) in entry.files.iter().zip(&per_file) {
+            let Some(partition) = file.partition() else {
+                continue;
+            };
+            for (text, value) in partition {
+                let parsed = match PartitionKey::parse(text) {
+                    Ok(parsed) => parsed,
+                    Err(_) => {
+                        return Err(LakeError::Corrupt {
+                            path: manifest_path.clone(),
+                            message: format!(
+                                "table \"{key}\": data file \"{}\" carries partition key \
+                                 {text:?}, which is not a column name or bucket(N, column)",
+                                file.path()
+                            ),
+                        })
+                    }
+                };
+                if !parsed.is_identity() {
+                    // A bucket value is the writer's own label; there is no
+                    // column fact to cross-check it against (and this build
+                    // never prunes by one).
+                    continue;
+                }
+                let Some(idx) = zone::schema_column_index(&schema, &parsed.column) else {
+                    return Err(LakeError::Corrupt {
+                        path: manifest_path.clone(),
+                        message: format!(
+                            "table \"{key}\": data file \"{}\" carries a partition value for \
+                             unknown column \"{}\"",
+                            file.path(),
+                            parsed.column
+                        ),
+                    });
+                };
+                if let Err(message) = zone::cross_check_partition_value(
+                    file.rows().unwrap_or(entry.rows),
+                    file_stats.get(idx),
+                    value,
+                    schema[idx].1,
+                ) {
+                    return Err(LakeError::Corrupt {
+                        path: manifest_path.clone(),
+                        message: format!(
+                            "table \"{key}\": data file \"{}\" fails its partition check: \
+                             {message}",
+                            file.path()
+                        ),
+                    });
+                }
+            }
+        }
         let stats = merge_file_stats(&per_file, !entry.deletes.is_empty());
         let attached = AttachedTable {
             db: dbname.to_string(),
             table: table.to_string(),
             rows: entry.rows,
-            schema,
+            schema: schema.clone(),
             stats,
         };
         let file_list: Vec<AttachedFile> = layout
             .iter()
-            .map(|(rel, rows, deletes)| AttachedFile {
+            .zip(entry.files.iter().zip(per_file.iter()))
+            .map(|((rel, rows, deletes), (file, (_, stats)))| AttachedFile {
                 rel: rel.clone(),
                 rows: *rows,
                 deletes: deletes.clone(),
+                zone: Some(stats.clone()),
+                partition: file.partition().cloned(),
             })
             .collect();
         let lkey = (dbname.to_ascii_lowercase(), table.to_ascii_lowercase());
@@ -1035,6 +1376,8 @@ pub(crate) fn build_from(
             AttachedEntry {
                 db: dbname.to_string(),
                 table: table.to_string(),
+                schema,
+                keys,
                 files: file_list,
                 format: if format == FileFormat::Pink {
                     AttachedFormat::Pink
@@ -1054,6 +1397,7 @@ pub(crate) fn build_from(
         cache: Mutex::new(HashMap::new()),
         loads: AtomicU64::new(0),
         columns_decoded: AtomicU64::new(0),
+        files_decoded: AtomicU64::new(0),
         pinned: manifest.version,
         views: Mutex::new(HashMap::new()),
         index: Mutex::new(None),
@@ -1193,9 +1537,11 @@ mod tests {
         // A filtered scan materializes the table exactly once.
         let rows = query(&mut store, "SELECT COUNT(*) FROM t WHERE i > 0;");
         assert_eq!(db.loads(), 1);
+        assert_eq!(db.files_decoded(), 1, "the one data file decoded");
         assert_eq!(rows, vec![vec![Value::Bigint(1)]]);
         let _ = query(&mut store, "SELECT SUM(i) FROM t;");
         assert_eq!(db.loads(), 1, "materialized tables are reused");
+        assert_eq!(db.files_decoded(), 1, "no extra file decode");
         // The empty table answers counts and NULL min/max without decoding.
         assert_eq!(
             query(
@@ -1322,11 +1668,13 @@ mod tests {
                 path: "data/main.t/x.pink".to_string(),
                 rows: 3,
                 stats: block,
+                partition: None,
             }],
             rows: 3,
             format: Some(FileFormat::Pink),
             stats: None,
             deletes: Vec::new(),
+            partition_by: None,
         };
         let path = std::path::Path::new("snapshots/2.json");
         let key = "main.t";
@@ -1388,6 +1736,7 @@ mod tests {
             format: None,
             stats: Some(block),
             deletes: Vec::new(),
+            partition_by: None,
         };
         let (schema, stats) = pink_file_stats(key, &v1, &v1.files[0], path).unwrap();
         assert_eq!(schema[0].0, "i");

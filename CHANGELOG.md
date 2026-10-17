@@ -10,6 +10,21 @@ one-liners below.
 
 ## 2026-10-17
 
+### Wave 66 — lake partitioning & pruning ✅
+- Lake tables can be **partitioned**: identity values or `bucket(N)` labels are
+  recorded per file, commits write **one data file per partition value set**,
+  and spec changes (`.lake partition … by (…) | clear`) never rewrite old
+  files.
+- Every v4 data file publishes a CRC-protected **zone map** in the catalog
+  (Vortex files newly); the planner prunes whole files for exact predicates —
+  `WHERE region = 'x'` reads only that partition's file, and disjoint ranges
+  read zero.
+- `COUNT`/`MIN`/`MAX` honesty rules are preserved (fall back once positional
+  deletes exist); pruning stays correct with deletes and across time travel.
+- Limits (documented): bucket labels are pinkdb's own hash (no cross-engine
+  numbers, no bucket-value pruning); `year/month/…` transforms are refused by
+  name.
+
 ### Wave 73 — docs catch-up, changelog & site wiring
 - Follow-up: a **SQL dialect reference** page — statements / queries / types
   tables plus the known-divergences list (correlated subqueries, USING/NATURAL

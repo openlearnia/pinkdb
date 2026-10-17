@@ -93,6 +93,75 @@ impl ColumnStats {
     }
 }
 
+/// The comparison one [`PrunePredicate`] applies: `col <op> literal`, or the
+/// NULL tests (which carry no literal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneOp {
+    /// `col = literal`.
+    Eq,
+    /// `col <> literal`.
+    NotEq,
+    /// `col < literal`.
+    Lt,
+    /// `col <= literal`.
+    LtEq,
+    /// `col > literal`.
+    Gt,
+    /// `col >= literal`.
+    GtEq,
+    /// `col IS NULL`.
+    IsNull,
+    /// `col IS NOT NULL`.
+    IsNotNull,
+}
+
+/// One simple conjunctive predicate the executor pushes into an attached-lake
+/// scan so the lake layer can skip whole data files whose zone maps prove no
+/// row can match (wave 66; lake-scan stage 3).
+///
+/// Only the shapes the planner could bind exactly are pushed: `column op
+/// literal` (either operand order) and `IS [NOT] NULL`, as conjuncts of a
+/// `WHERE` over a plain scan of one attached table. Everything else is never
+/// pushed, and a lake is always free to ignore predicates — pruning is an
+/// optimization, and a pruned file's rows may not exist in the result only
+/// when the zone maps prove they cannot match. The lake validates the
+/// predicate's column/dtype against the file's schema and skips anything it
+/// cannot interpret.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrunePredicate {
+    /// Column index in the attached table's schema (the zone maps' order).
+    pub column: usize,
+    /// The comparison.
+    pub op: PruneOp,
+    /// The literal; `None` exactly for [`PruneOp::IsNull`] /
+    /// [`PruneOp::IsNotNull`].
+    pub value: Option<Value>,
+}
+
+impl PrunePredicate {
+    /// A `column op value` predicate.
+    pub fn compare(column: usize, op: PruneOp, value: Value) -> Self {
+        Self {
+            column,
+            op,
+            value: Some(value),
+        }
+    }
+
+    /// A `column IS [NOT] NULL` predicate.
+    pub fn null_test(column: usize, negated: bool) -> Self {
+        Self {
+            column,
+            op: if negated {
+                PruneOp::IsNotNull
+            } else {
+                PruneOp::IsNull
+            },
+            value: None,
+        }
+    }
+}
+
 /// One table an attached lake offers, as read from the data file's footer
 /// (row count + schema + per-column statistics; no column data decoded).
 #[derive(Debug, Clone, PartialEq)]
@@ -205,11 +274,33 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
         Ok(AttachedScan::complete(self.load(db, table)?))
     }
 
-    /// Data-file decode counters `(decodes, columns decoded)` for
-    /// diagnostics: `COUNT(*)`/`MIN`/`MAX` fast paths leave both at zero,
-    /// and a projected materialization counts only the columns it decoded.
-    fn decode_stats(&self) -> (u64, u64) {
-        (0, 0)
+    /// [`AttachedLake::load_projected`] with pruning predicates: the lake
+    /// layer may skip whole data files whose zone maps prove no row can match
+    /// any predicate, decoding only the files that may. The result is exactly
+    /// the rows a full scan plus the predicates' *filter* would keep, minus
+    /// nothing — a file may only be skipped when every predicate's zone-map
+    /// test proves it cannot match. A lake that cannot prune (or whose files
+    /// have no zone maps) must decode the file anyway.
+    ///
+    /// The default implementation ignores the predicates and falls back to
+    /// [`AttachedLake::load_projected`], which is always correct.
+    fn load_filtered(
+        &self,
+        db: &str,
+        table: &str,
+        columns: Option<&[usize]>,
+        predicates: &[PrunePredicate],
+    ) -> Result<AttachedScan> {
+        let _ = predicates;
+        self.load_projected(db, table, columns)
+    }
+
+    /// Data-file decode counters `(decodes, columns decoded, files decoded)`
+    /// for diagnostics: `COUNT(*)`/`MIN`/`MAX` fast paths leave all three at
+    /// zero, a projected materialization counts only the columns it decoded,
+    /// and a pruned scan counts only the data files it actually decoded.
+    fn decode_stats(&self) -> (u64, u64, u64) {
+        (0, 0, 0)
     }
 
     /// The descriptor of one table as of a time-travel target (`AT`), for the
@@ -251,6 +342,23 @@ pub trait AttachedLake: fmt::Debug + Send + Sync {
     ) -> Result<AttachedScan> {
         let _ = columns;
         Ok(AttachedScan::complete(self.load_at(db, table, at)?))
+    }
+
+    /// [`AttachedLake::load_filtered`] as of a time-travel target: pruning
+    /// reads **that version's** zone maps and file layout, so a pruned
+    /// `AT (VERSION => n)` scan sees exactly the older version's matching
+    /// files. The default implementation ignores the predicates and falls
+    /// back to [`AttachedLake::load_projected_at`].
+    fn load_filtered_at(
+        &self,
+        db: &str,
+        table: &str,
+        at: AtSpec,
+        columns: Option<&[usize]>,
+        predicates: &[PrunePredicate],
+    ) -> Result<AttachedScan> {
+        let _ = predicates;
+        self.load_projected_at(db, table, at, columns)
     }
 }
 
@@ -331,13 +439,14 @@ impl PinkDb {
     }
 
     /// Per attached lake, the location and its data-file decode counters
-    /// `(decodes, columns decoded)` so far (see [`AttachedLake::decode_stats`]).
-    pub fn attached_decode_stats(&self) -> Vec<(String, u64, u64)> {
+    /// `(decodes, columns decoded, files decoded)` so far (see
+    /// [`AttachedLake::decode_stats`]).
+    pub fn attached_decode_stats(&self) -> Vec<(String, u64, u64, u64)> {
         self.attached_lakes
             .iter()
             .map(|l| {
-                let (loads, columns) = l.decode_stats();
-                (l.location().to_string(), loads, columns)
+                let (loads, columns, files) = l.decode_stats();
+                (l.location().to_string(), loads, columns, files)
             })
             .collect()
     }
@@ -666,6 +775,9 @@ mod tests {
         /// One entry per `load_projected` call: the analysis's bound (`None`
         /// = unbounded, every column).
         requests: Mutex<Vec<Option<Vec<usize>>>>,
+        /// One entry per `load_filtered` call: the pruning predicates the
+        /// analysis pushed to the lake.
+        filters: Mutex<Vec<Vec<PrunePredicate>>>,
     }
 
     impl RecordingLake {
@@ -682,11 +794,16 @@ mod tests {
                 }],
                 rows,
                 requests: Mutex::new(Vec::new()),
+                filters: Mutex::new(Vec::new()),
             }
         }
 
         fn requests(&self) -> Vec<Option<Vec<usize>>> {
             self.requests.lock().unwrap().clone()
+        }
+
+        fn filters(&self) -> Vec<Vec<PrunePredicate>> {
+            self.filters.lock().unwrap().clone()
         }
     }
 
@@ -764,6 +881,16 @@ mod tests {
                 table: Arc::new(table),
                 present,
             })
+        }
+        fn load_filtered(
+            &self,
+            db: &str,
+            table: &str,
+            columns: Option<&[usize]>,
+            predicates: &[PrunePredicate],
+        ) -> Result<AttachedScan> {
+            self.filters.lock().unwrap().push(predicates.to_vec());
+            self.load_projected(db, table, columns)
         }
     }
 
@@ -888,6 +1015,103 @@ mod tests {
             let mut want = expected;
             want.sort();
             assert_eq!(got, want, "{sql}");
+        }
+    }
+
+    /// The pruning-predicate analysis, query by query: exactly the simple
+    /// conjuncts over a plain scan are pushed (either operand order, NULL
+    /// tests, through `LIMIT`), and everything else — `OR`, expressions,
+    /// column-vs-column, comparisons across a `Project`, a type the zone maps
+    /// cannot order — pushes nothing. Every query also runs against the same
+    /// rows in a plain store and must produce identical answers.
+    #[test]
+    fn scan_analysis_pushes_only_exact_conjuncts() {
+        let eq = |i: i32| PrunePredicate::compare(0, PruneOp::Eq, Value::Integer(i));
+        let cases: Vec<(&str, Vec<Vec<PrunePredicate>>)> = vec![
+            // Statistics fast paths scan nothing.
+            ("SELECT COUNT(*) FROM t;", vec![]),
+            // No filter: an empty push (the lake decodes every file).
+            ("SELECT SUM(i) FROM t;", vec![vec![]]),
+            // One equality.
+            ("SELECT COUNT(*) FROM t WHERE i = 3;", vec![vec![eq(3)]]),
+            // Either operand order.
+            ("SELECT COUNT(*) FROM t WHERE 3 = i;", vec![vec![eq(3)]]),
+            (
+                "SELECT COUNT(*) FROM t WHERE 3 < i;",
+                vec![vec![PrunePredicate::compare(
+                    0,
+                    PruneOp::Gt,
+                    Value::Integer(3),
+                )]],
+            ),
+            // NULL tests.
+            (
+                "SELECT COUNT(*) FROM t WHERE i IS NULL;",
+                vec![vec![PrunePredicate::null_test(0, false)]],
+            ),
+            (
+                "SELECT COUNT(*) FROM t WHERE i IS NOT NULL;",
+                vec![vec![PrunePredicate::null_test(0, true)]],
+            ),
+            // AND conjuncts accumulate; the string column is index 3.
+            (
+                "SELECT COUNT(*) FROM t WHERE i > 1 AND s = 'x';",
+                vec![vec![
+                    PrunePredicate::compare(0, PruneOp::Gt, Value::Integer(1)),
+                    PrunePredicate::compare(3, PruneOp::Eq, Value::Varchar("x".to_string())),
+                ]],
+            ),
+            // OR, expressions, column-vs-column, LIKE: nothing is proven.
+            ("SELECT COUNT(*) FROM t WHERE i > 1 OR i < 2;", vec![vec![]]),
+            ("SELECT COUNT(*) FROM t WHERE i + 1 > 2;", vec![vec![]]),
+            ("SELECT COUNT(*) FROM t WHERE i = i;", vec![vec![]]),
+            ("SELECT COUNT(*) FROM t WHERE s LIKE 'v%';", vec![vec![]]),
+            // The optimizer pushes this filter through the trivial projection
+            // first, so the analysis sees a direct filter over the scan and
+            // pushes the (rebased) predicate.
+            (
+                "SELECT COUNT(*) FROM (SELECT i, s FROM t) x WHERE i = 1;",
+                vec![vec![eq(1)]],
+            ),
+            // LIMIT passes predicates down.
+            (
+                "SELECT i FROM t WHERE i > 1 LIMIT 2;",
+                vec![vec![PrunePredicate::compare(
+                    0,
+                    PruneOp::Gt,
+                    Value::Integer(1),
+                )]],
+            ),
+            // A subquery's own scan carries its own predicate.
+            (
+                "SELECT (SELECT COUNT(*) FROM t WHERE i = 1) FROM (SELECT 1) q;",
+                vec![vec![eq(1)]],
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let (schema, rows) = analysis_corpus();
+            let fake = Arc::new(RecordingLake::new(
+                "/tmp/lake-prune-analysis",
+                schema.clone(),
+                rows.clone(),
+            ));
+            let mut attached = PinkDb::new();
+            attached.attach_lake(fake.clone()).unwrap();
+            let mut plain = PinkDb::new();
+            let cols: Vec<String> = schema.iter().map(|(n, t)| format!("{n} {t}")).collect();
+            plain
+                .execute(&format!("CREATE TABLE t ({});", cols.join(", ")))
+                .unwrap();
+            for row in &rows {
+                plain
+                    .table_mut("t")
+                    .unwrap()
+                    .append_row(row.clone())
+                    .unwrap();
+            }
+            assert_rows_same(&query(&mut attached, sql), &query(&mut plain, sql), sql);
+            assert_eq!(fake.filters(), expected, "{sql}");
         }
     }
 

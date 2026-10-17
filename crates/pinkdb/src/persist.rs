@@ -85,7 +85,9 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
-use crate::storage::{ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints};
+use crate::storage::{
+    DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
+};
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{Vector, VectorData, CHUNK_SIZE};
 
@@ -2061,6 +2063,45 @@ fn encode_chunk_with_stats(
         Vec::new()
     };
     (encoded, stats)
+}
+
+/// Exact per-column statistics of one table's rows, collected without
+/// encoding anything (wave 66).
+///
+/// `pink-lake` uses this to publish a **Vortex** data file's zone map in the
+/// catalog: the same [`SavedTableStats`] facts a `.pink` encode collects
+/// during its pass, computed here by one linear scan of the table's chunk
+/// payloads (no per-row `Value` materialization except the per-chunk
+/// min/max). The facts are ungated (`nan_count` and zero doubles are kept);
+/// `pink-lake` applies the one exactness gate shared with the Vortex footer
+/// path, so the two formats cannot drift apart.
+pub fn table_stats(db: &str, table: &str, src: &DataTable) -> SavedTableStats {
+    let schema = src.schema();
+    let mut accs: Vec<ColumnStatsAcc> = schema.iter().map(|_| ColumnStatsAcc::new()).collect();
+    for c in 0..src.num_chunks() {
+        if let Some(chunk) = src.scan_chunk(c) {
+            for (acc, v) in accs.iter_mut().zip(chunk.columns.iter()) {
+                acc.merge(&chunk_column_stats(v));
+            }
+        }
+    }
+    SavedTableStats {
+        db: db.to_string(),
+        table: table.to_string(),
+        rows: src.num_rows() as u64,
+        columns: schema
+            .iter()
+            .zip(accs)
+            .map(|((col, dtype), acc)| SavedColumnStats {
+                name: col.clone(),
+                dtype: *dtype,
+                null_count: acc.null_count,
+                min: acc.min,
+                max: acc.max,
+                nan_count: acc.nan_count,
+            })
+            .collect(),
+    }
 }
 
 impl PinkDb {

@@ -434,3 +434,43 @@ fn lean_s3_save_open_roundtrip() {
         "a lean build must write no Vortex objects: {keys:?}"
     );
 }
+
+/// `.lake partition` in the lean build (wave 66): `.pink` commits split by
+/// partition value and reads prune whole `.pink` files (which carry their
+/// zone maps in the catalog's CRC-protected per-file blocks).
+#[test]
+fn lean_partition_splits_commits_and_prunes() {
+    let dir = scratch("partition");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (id INTEGER, region VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'east'), (2, 'west');\n\
+         .lake save {lake}\n\
+         .lake partition {lake} t by (region)\n\
+         .lake attach {lake} write\n\
+         INSERT INTO t VALUES (3, 'south'), (4, 'south'), (5, 'north');\n\
+         .lake commit {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Partitioned main.t by (region)"), "{out}");
+    assert!(out.contains("2 files: 2 data, 0 delete"), "{out}");
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(catalog.contains("\"partition_by\""), "{catalog}");
+    assert!(catalog.contains(".pink"), "{catalog}");
+    assert!(!catalog.contains(".vortex"), "{catalog}");
+
+    // Read-only attach: a partitioned predicate decodes only the surviving
+    // files (the v2 file plus the matching partition file).
+    let out = run(&format!(
+        ".lake attach {lake}\n\
+         SELECT id FROM t WHERE region = 'north';\n\
+         .lake attached\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Attached"), "{out}");
+    assert!(out.contains("│ 5 "), "{out}");
+    assert!(out.contains("decodes: 1 load, 2 columns, 2 files"), "{out}");
+    cleanup(&dir);
+}

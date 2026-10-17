@@ -608,7 +608,7 @@ fn v1_v4_stats_fixture_attaches_bit_exactly() {
     // The fixture's own decodes: the fast paths above never decoded a table
     // except the fallbacks (SUM/AVG/filter/`d`'s NaN-gated MIN/MAX are all
     // gated to materialize), which cache.
-    let (loads, _) = report.lake.decode_stats();
+    let (loads, ..) = report.lake.decode_stats();
     assert!(loads >= 1, "the fallback queries must have materialized");
     cleanup(&dir);
 }
@@ -909,7 +909,7 @@ fn lean_time_travel_reads_old_versions_through_the_stats_blocks() {
     );
     assert_eq!(
         lake.decode_stats(),
-        (0, 0),
+        (0, 0, 0),
         "v1 statistics blocks must answer AT without opening a data file"
     );
     // A scan of the old version opens exactly that version's file...

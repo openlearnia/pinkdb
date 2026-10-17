@@ -7,14 +7,20 @@
 //! version's data files **plus** the files the commit adds — never a rewrite:
 //!
 //! - an **append** writes the added rows into one new immutable data file per
-//!   table and lists it (with its exact row count) after the table's existing
-//!   files, so scans union the files in order;
+//!   table — or, for a partitioned table (wave 66), one file per partition
+//!   value set, each carrying its values — and lists them (with exact row
+//!   counts) after the table's existing files, so scans union the files in
+//!   order;
 //! - a **delete** writes one **positional delete file** per (table, data
 //!   file) pair, listing the 0-based positions *within that data file*; the
 //!   reader applies them on top of the decoded file (merge-on-read), and
 //!   `UPDATE` is simply a delete of the old position plus an append;
 //! - a **drop** removes the table's entry from the catalog (its files stay on
-//!   disk: any earlier version stays loadable, exactly as with `.lake save`).
+//!   disk: any earlier version stays loadable, exactly as with `.lake save`);
+//! - a **repartition** ([`Commit::set_partition`]/[`Commit::clear_partition`],
+//!   DuckLake's `ALTER TABLE … SET PARTITIONED BY`) records a new partition
+//!   spec on the table's entry; existing files keep their recorded values,
+//!   new appends split by the new spec.
 //!
 //! Every published version (including a full `.lake save`) also writes
 //! `commits/<version>.json`, an append-only delta manifest listing the data
@@ -58,7 +64,7 @@ use std::time::Duration;
 
 use pinkdb::{AttachedLake, DataTable, PinkDb, Value};
 
-use crate::catalog::{CommitManifest, DeleteRef, FileRef, TableDelta, TableEntry};
+use crate::catalog::{CommitManifest, DeleteRef, FileRef, PartitionKey, TableDelta, TableEntry};
 use crate::local::CATALOG_FILE;
 use crate::{delete_file, split_key, Lake, LakeError, Result};
 
@@ -121,6 +127,10 @@ pub struct Commit {
     appends: BTreeMap<String, Arc<DataTable>>,
     deletes: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
     drops: BTreeSet<String>,
+    /// Per-table partition specification changes (wave 66): `Some(keys)` sets
+    /// the spec, `None` clears it. Applied to the table's catalog entry when
+    /// the commit publishes; the table must exist.
+    partition_changes: BTreeMap<String, Option<Vec<PartitionKey>>>,
     /// Table entries a row-level diff was computed against (`None` = the
     /// table must not exist), set by [`Lake::commit_from_tables`]. When one
     /// of these tables changed in the lake before the publish lands, the
@@ -174,9 +184,64 @@ impl Commit {
         self
     }
 
+    /// Set `table`'s partition specification (wave 66), mirroring DuckLake's
+    /// `ALTER TABLE … SET PARTITIONED BY`: the published version records the
+    /// spec, and the commit's own appends split into one data file per
+    /// value set (later commits split the same way). Keys are the `.lake
+    /// partition` texts — a column name (identity) or `bucket(N, column)`;
+    /// any other transform is refused with DuckLake's own supported set in
+    /// the message. The table must exist in the head when the commit
+    /// publishes.
+    pub fn set_partition<S: AsRef<str>>(&mut self, table: &str, keys: &[S]) -> Result<&mut Self> {
+        let mut parsed = Vec::with_capacity(keys.len());
+        for key in keys {
+            let text = key.as_ref();
+            let key = PartitionKey::parse(text).map_err(|_| LakeError::NotRepresentable {
+                message: format!(
+                    "unsupported partition key \"{text}\" for table \"{table}\": expected a \
+                     column name or bucket(N, column) (DuckLake supports year, month, day, \
+                     hour, epoch_year, epoch_month, epoch_day, epoch_hour, and bucket; this \
+                     build implements identity columns and bucket)"
+                ),
+            })?;
+            parsed.push(key);
+        }
+        if parsed.is_empty() {
+            return Err(LakeError::NotRepresentable {
+                message: format!(
+                    "table \"{table}\": a partition specification needs at least one key"
+                ),
+            });
+        }
+        for (i, key) in parsed.iter().enumerate() {
+            if parsed[..i].iter().any(|k| k.key_text() == key.key_text()) {
+                return Err(LakeError::NotRepresentable {
+                    message: format!(
+                        "table \"{table}\": duplicate partition key \"{}\" (expression \
+                         matches an earlier partition key)",
+                        key.key_text()
+                    ),
+                });
+            }
+        }
+        self.partition_changes
+            .insert(table.to_string(), Some(parsed));
+        Ok(self)
+    }
+
+    /// Clear `table`'s partition specification (existing files keep their
+    /// recorded values; new writes are unpartitioned).
+    pub fn clear_partition(&mut self, table: &str) -> &mut Self {
+        self.partition_changes.insert(table.to_string(), None);
+        self
+    }
+
     /// True when the commit changes nothing.
     pub fn is_empty(&self) -> bool {
-        self.appends.is_empty() && self.deletes.is_empty() && self.drops.is_empty()
+        self.appends.is_empty()
+            && self.deletes.is_empty()
+            && self.drops.is_empty()
+            && self.partition_changes.is_empty()
     }
 
     /// Require `key`'s entry in the head to still equal `entry` (`None`: the
@@ -212,10 +277,13 @@ pub struct CommitReport {
     pub retries: u32,
     /// True when a version was published; false for a no-op commit.
     pub committed: bool,
-    /// Tables this commit changed (appends or deletes).
+    /// Tables this commit changed (appends, deletes, or partition specs).
     pub tables_changed: usize,
     /// Tables this commit dropped.
     pub tables_dropped: usize,
+    /// Tables whose partition specification this commit set, changed, or
+    /// cleared.
+    pub tables_repartitioned: usize,
     /// Data files written.
     pub data_files: usize,
     /// Delete files written.
@@ -239,6 +307,7 @@ impl CommitReport {
             committed: false,
             tables_changed: 0,
             tables_dropped: 0,
+            tables_repartitioned: 0,
             data_files: 0,
             delete_files: 0,
             bytes_written: 0,
@@ -863,7 +932,8 @@ impl Lake {
                     }
                     Err(e) => return Err(e),
                 }
-                uploaded = Some(self.upload_commit(commit)?);
+                let specs = self.upload_partition_specs(commit)?;
+                uploaded = Some(self.upload_commit(commit, &specs)?);
             }
             match self.try_publish_commit(
                 commit,
@@ -902,6 +972,107 @@ impl Lake {
         settings: &CommitSettings,
     ) -> Result<CommitReport> {
         let (commit, _after) = self.plan_tables_commit(base_version, base, current)?;
+        self.commit_with_settings(&commit, settings)
+    }
+
+    /// Set one table's partition specification, publishing exactly one
+    /// version — DuckLake's `ALTER TABLE … SET PARTITIONED BY`, with the
+    /// pinkdb surface `.lake partition <dir> <table> by (…)`.
+    ///
+    /// Keys are parsed like [`Commit::set_partition`] (a column name, or
+    /// `bucket(N, column)`); every identity key's column must exist in the
+    /// table's schema (read the way `.lake attach` reads it: from the data
+    /// files' statistics blocks or Vortex footers). Existing data files keep
+    /// their recorded partition values — like DuckLake, the spec governs new
+    /// writes, not files already published — and re-setting the identical
+    /// spec is a no-op ([`CommitReport::committed`] `false`). A concurrent
+    /// publish to the table makes the call fail with the usual conflict.
+    pub fn set_partition_spec(
+        &mut self,
+        table: &str,
+        keys: &[String],
+        settings: &CommitSettings,
+    ) -> Result<CommitReport> {
+        split_key(table, &self.root)?;
+        let (manifest, manifest_path) = self.manifest(None)?;
+        let entry = manifest
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| LakeError::Corrupt {
+                path: manifest_path.clone(),
+                message: format!(
+                    "table \"{table}\" does not exist in the lake; create it (and commit it) \
+                     before setting a partition specification"
+                ),
+            })?;
+        let mut commit = Commit::new();
+        commit.set_partition(table, keys)?;
+        let parsed = commit
+            .partition_changes
+            .get(table)
+            .and_then(|spec| spec.clone())
+            .expect("set_partition recorded the spec");
+        if entry.partition_by.as_ref() == Some(&parsed) {
+            return Ok(CommitReport::noop(self.version));
+        }
+        // The table's schema lives in its data files; attach reads it without
+        // materializing anything.
+        let (tdb, ttable) = split_key(table, &self.root)?;
+        let (attachment, _) = crate::attach::build_from(&self.storage, &self.root, None)?;
+        let schema = attachment
+            .tables()
+            .iter()
+            .find(|t| t.db.eq_ignore_ascii_case(tdb) && t.table.eq_ignore_ascii_case(ttable))
+            .map(|t| t.schema.clone())
+            .ok_or_else(|| LakeError::Internal {
+                message: format!("the attachment is missing table \"{table}\""),
+            })?;
+        for key in &parsed {
+            if crate::zone::schema_column_index(&schema, &key.column).is_none() {
+                return Err(LakeError::NotRepresentable {
+                    message: format!(
+                        "table \"{table}\": partition key column \"{}\" does not exist \
+                         (columns: {})",
+                        key.column,
+                        schema
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                });
+            }
+        }
+        commit.expect_table(table, Some(entry));
+        self.commit_with_settings(&commit, settings)
+    }
+
+    /// Clear one table's partition specification, publishing exactly one
+    /// version: new writes are unpartitioned, existing files keep their
+    /// recorded values (they are simply no longer interpreted). Clearing a
+    /// table with no spec is a no-op.
+    pub fn clear_partition_spec(
+        &mut self,
+        table: &str,
+        settings: &CommitSettings,
+    ) -> Result<CommitReport> {
+        split_key(table, &self.root)?;
+        let (manifest, manifest_path) = self.manifest(None)?;
+        let entry = manifest
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| LakeError::Corrupt {
+                path: manifest_path.clone(),
+                message: format!("table \"{table}\" does not exist in the lake"),
+            })?;
+        if entry.partition_by.is_none() {
+            return Ok(CommitReport::noop(self.version));
+        }
+        let mut commit = Commit::new();
+        commit.clear_partition(table);
+        commit.expect_table(table, Some(entry));
         self.commit_with_settings(&commit, settings)
     }
 
@@ -1023,13 +1194,21 @@ impl Lake {
     }
 
     /// Write every data and delete file the commit adds (immutable, uniquely
-    /// named), returning what the publish loop should reference.
-    fn upload_commit(&self, commit: &Commit) -> Result<UploadedCommit> {
+    /// named), returning what the publish loop should reference. The appends
+    /// follow the head's partition specification (or the spec this same
+    /// commit sets for a table it creates): each distinct partition value set
+    /// becomes its own data file carrying those values.
+    fn upload_commit(
+        &self,
+        commit: &Commit,
+        specs: &BTreeMap<String, Vec<PartitionKey>>,
+    ) -> Result<UploadedCommit> {
         let mut uploaded = UploadedCommit::default();
         for (key, rows) in &commit.appends {
-            let (file, bytes) = self.write_data_file(key, None, rows)?;
+            let keys = specs.get(key).map(Vec::as_slice).unwrap_or(&[]);
+            let (files, bytes) = self.write_data_files(key, None, keys, rows)?;
             uploaded.bytes += bytes;
-            uploaded.appends.insert(key.clone(), file);
+            uploaded.appends.insert(key.clone(), files);
         }
         for (key, files) in &commit.deletes {
             for (file, positions) in files {
@@ -1043,6 +1222,30 @@ impl Lake {
             }
         }
         Ok(uploaded)
+    }
+
+    /// The partition specs the commit's appends must be split by: the head
+    /// version's spec per appended table, or — for a table this commit
+    /// creates (`partition_changes` without a head entry) — the spec being
+    /// set. Read without touching this handle's cached version (the commit
+    /// loop has already checked the catalog is still the head).
+    fn upload_partition_specs(
+        &self,
+        commit: &Commit,
+    ) -> Result<BTreeMap<String, Vec<PartitionKey>>> {
+        let head = crate::read_catalog(&*self.storage, &self.root)?;
+        let mut out = BTreeMap::new();
+        for key in commit.appends.keys() {
+            let spec = head
+                .tables
+                .get(key)
+                .and_then(|entry| entry.partition_by.clone())
+                .or_else(|| commit.partition_changes.get(key).cloned().flatten());
+            if let Some(spec) = spec {
+                out.insert(key.clone(), spec);
+            }
+        }
+        Ok(out)
     }
 
     /// One publish attempt: build the new catalog from the current head plus
@@ -1096,13 +1299,13 @@ impl Lake {
                 deltas.insert(key.clone(), TableDelta::default());
             }
         }
-        for (key, file) in &uploaded.appends {
+        for (key, files) in &uploaded.appends {
             let appended = commit.appends.get(key).expect("uploaded append has rows");
             let added = appended.num_rows() as u64;
             rows_added += added;
             match tables.get_mut(key) {
                 Some(entry) => {
-                    entry.files.push(file.clone());
+                    entry.files.extend(files.iter().cloned());
                     entry.rows = entry.rows.checked_add(added).ok_or_else(|| {
                         PublishFailure::Fatal(LakeError::Corrupt {
                             path: self.storage.abs(CATALOG_FILE),
@@ -1110,7 +1313,7 @@ impl Lake {
                         })
                     })?;
                     let delta = deltas.entry(key.clone()).or_default();
-                    delta.data_files.push(file.clone());
+                    delta.data_files.extend(files.iter().cloned());
                     delta.rows_added += added;
                 }
                 None => {
@@ -1123,19 +1326,29 @@ impl Lake {
                             ),
                         }));
                     }
+                    // A table this commit creates takes the partition spec the
+                    // same commit sets for it, if any (its appends were
+                    // already split by that spec — see
+                    // `upload_partition_specs`).
+                    let spec = commit.partition_changes.get(key).cloned().flatten();
                     tables.insert(
                         key.clone(),
                         TableEntry {
-                            files: vec![file.clone()],
+                            files: files.clone(),
                             rows: added,
                             format: Some(self.write_format()),
                             stats: None,
                             deletes: Vec::new(),
+                            partition_by: spec.clone(),
                         },
                     );
                     let delta = deltas.entry(key.clone()).or_default();
-                    delta.data_files.push(file.clone());
+                    delta.data_files.extend(files.iter().cloned());
                     delta.rows_added += added;
+                    if spec.is_some() {
+                        delta.partition_changed = true;
+                        delta.partition_by = spec;
+                    }
                 }
             }
         }
@@ -1222,6 +1435,27 @@ impl Lake {
                 delta.rows_deleted += pos.len() as u64;
             }
         }
+        // Partition-spec changes last (a spec set on a table this commit
+        // creates was applied at creation): the table must exist, and the
+        // change is recorded in the delta manifest for the audit trail.
+        for (key, spec) in &commit.partition_changes {
+            let entry = tables.get_mut(key).ok_or_else(|| {
+                PublishFailure::Fatal(LakeError::Corrupt {
+                    path: self.storage.abs(CATALOG_FILE),
+                    message: format!(
+                        "table \"{key}\" does not exist; a commit cannot set or clear its \
+                         partition specification"
+                    ),
+                })
+            })?;
+            if entry.partition_by == *spec {
+                continue;
+            }
+            entry.partition_by = spec.clone();
+            let delta = deltas.entry(key.clone()).or_default();
+            delta.partition_changed = true;
+            delta.partition_by = spec.clone();
+        }
         // The per-version record, mirroring a save: the author/message kept
         // pending by `Lake::set_commit_message` and the change summary diffed
         // against the base manifest (absent when it is unavailable).
@@ -1252,8 +1486,12 @@ impl Lake {
         };
         let commit_bytes =
             crate::commit_manifest_json(&commit_manifest).map_err(PublishFailure::Fatal)?;
-        let tables_changed: BTreeSet<&String> =
-            commit.appends.keys().chain(commit.deletes.keys()).collect();
+        let tables_changed: BTreeSet<&String> = commit
+            .appends
+            .keys()
+            .chain(commit.deletes.keys())
+            .chain(commit.partition_changes.keys())
+            .collect();
         let report = CommitReport {
             version,
             base_version: origin,
@@ -1265,7 +1503,16 @@ impl Lake {
                 .iter()
                 .filter(|k| head.tables.contains_key(*k))
                 .count(),
-            data_files: uploaded.appends.len(),
+            tables_repartitioned: commit
+                .partition_changes
+                .iter()
+                .filter(|(k, spec)| {
+                    head.tables
+                        .get(*k)
+                        .is_none_or(|entry| entry.partition_by.as_ref() != spec.as_ref())
+                })
+                .count(),
+            data_files: uploaded.appends.values().map(Vec::len).sum(),
             delete_files: uploaded.deletes.values().map(BTreeMap::len).sum(),
             bytes_written: uploaded.bytes
                 + commit_bytes.len() as u64
@@ -1334,8 +1581,9 @@ impl Lake {
 /// The files one commit uploads before publishing.
 #[derive(Debug, Default)]
 struct UploadedCommit {
-    /// `db.table` → the appended data file.
-    appends: BTreeMap<String, FileRef>,
+    /// `db.table` → the appended data files, one per partition value set
+    /// (exactly one for an unpartitioned table).
+    appends: BTreeMap<String, Vec<FileRef>>,
     /// `db.table` → data file → the delete file to add.
     deletes: BTreeMap<String, BTreeMap<String, DeleteRef>>,
     bytes: u64,

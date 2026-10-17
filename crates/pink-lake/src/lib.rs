@@ -49,10 +49,42 @@
 //! (merge-on-read). `rows` is the logical count and must equal
 //! `sum(files.rows) - sum(deletes.count)`. A v4 entry's `format` is
 //! `"vortex"` in a `vortex-format` build or `"pink"` (the engine's
-//! single-table `.pink` bytes) in a lean one; a v4 `.pink` file carries its
-//! own CRC-protected statistics block *inside* its `files` object, so attach
-//! can merge exact per-column statistics across an append-only file list
-//! without opening any file (until a delete file makes them unknowable).
+//! single-table `.pink` bytes) in a lean one; every v4 data file carries a
+//! CRC-protected statistics/zone-map block in its `files` object — for
+//! `.pink` the exact facts its encode pass collected, for Vortex the same
+//! facts published from the writer and cross-checked against the file's own
+//! footer at attach — so aggregate fast paths and **file pruning** work
+//! without decoding anything.
+//!
+//! # Partitioning (wave 66)
+//!
+//! A table may declare a **partition specification** (DuckLake's
+//! `CREATE TABLE … PARTITIONED BY` / `ALTER TABLE … SET PARTITIONED BY`,
+//! surfaced as `.lake partition`): a list of identity columns and/or
+//! `bucket(N, column)` transforms. A commit (or save) that writes rows to a
+//! partitioned table splits them into **one data file per partition value
+//! set** and records each file's values (`"partition": {"region": "east"}`,
+//! SQL NULL as a JSON `null`); DuckLake splits its Parquet files the same
+//! way, and the values land in its own metadata rows
+//! (`ducklake_file_partition_value`). The spec changes only what *new writes*
+//! do — files already published keep their recorded values (and stay
+//! readable without them), exactly like DuckLake's versioned partition
+//! records. [`Lake::set_partition_spec`]/[`Lake::clear_partition_spec`]
+//! publish a spec change as one version, and `Commit::set_partition` can set
+//! a spec in the same commit that creates a table.
+//!
+//! # Pruned scans
+//!
+//! Attachment builds a per-file **zone map** (from each file's block/footer)
+//! and a scan whose `WHERE` carries simple `col op literal` / `IS [NOT] NULL`
+//! conjuncts skips whole data files those maps prove cannot match (see the
+//! `zone` module): a query filtered to one partition value of a partitioned
+//! table decodes only the matching files, and a range predicate prunes files
+//! by min/max on any column. Pruning is conservative — unknown statistics
+//! never prune, and a file with positional deletes is still prunable
+//! (deleting rows only shrinks its value set), while the table-level
+//! `COUNT`/`MIN`/`MAX` fast paths keep their wave-63 honesty rule (any
+//! delete file makes the per-column facts unknown).
 //!
 //! Versions 1–3 remain readable and are never written any more: a v1 entry
 //! (the wave-34 lean format) is one `.pink` file as a plain string path plus
@@ -260,9 +292,10 @@ mod storage;
 mod time;
 #[cfg(feature = "vortex-format")]
 mod vortex_file;
+mod zone;
 
 pub use attach::AttachmentReport;
-use catalog::{Catalog, DeleteRef, FileFormat, FileRef, TableEntry};
+use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
 pub use incremental::{Commit, CommitReport, CommitSettings, WritableAttachment};
 use local::{LocalStorage, CATALOG_FILE};
 pub use snapshot::{ChangeSummary, SnapshotInfo};
@@ -278,6 +311,11 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 /// positional delete files (merge-on-read) express `DELETE`/`UPDATE`. Written
 /// by every build: Vortex data files with `vortex-format`, engine `.pink`
 /// files (with a per-file statistics block) without it.
+///
+/// Wave 66 extends v4 additively (no version bump): an entry may declare a
+/// `partition_by` spec, a data file may record its `partition` values and a
+/// zone map (`stats`) in every format; an older v4 reader ignores the fields
+/// and reads the same files (it just cannot prune or interpret partitions).
 ///
 /// Versions 1–3 stay readable and are never written any more. Version 3
 /// (wave 45): Vortex data files with 8,192-row / ~1 MiB row blocks. Version
@@ -866,6 +904,15 @@ impl Lake {
             return Err(self.snapshot_exists_error(version));
         }
         let format = self.write_format();
+        // The previous version's manifest, read before the data loop: a full
+        // save **preserves the partitioning** of a table that is saved again
+        // under the same key (the store itself has no partition concept), so
+        // re-saving a partitioned table re-splits its rows the same way. A
+        // best-effort read: an expired or tampered predecessor simply saves
+        // every table unpartitioned.
+        let previous = manifest_for(&*self.storage, &self.root, Some(self.version))
+            .ok()
+            .map(|(manifest, _)| manifest);
         let mut tables: BTreeMap<String, TableEntry> = BTreeMap::new();
         let mut deltas: BTreeMap<String, catalog::TableDelta> = BTreeMap::new();
         let mut bytes_written = 0u64;
@@ -874,29 +921,39 @@ impl Lake {
             for name in db.list_tables_in(&dbname) {
                 let src = table_in(db, &dbname, &name)?;
                 let key = format!("{dbname}.{name}");
-                // One data file per table, written before anything references
-                // it (see [`Lake::write_data_file`] for the encoders).
-                let (file, written) = self.write_data_file(&key, Some(format), src)?;
+                let keys: Vec<PartitionKey> = previous
+                    .as_ref()
+                    .and_then(|p| p.tables.get(&key))
+                    .and_then(|e| e.partition_by.clone())
+                    .unwrap_or_default();
+                // One data file per partition value set (exactly one for an
+                // unpartitioned or empty table), written before anything
+                // references it (see [`Lake::write_data_files`] for the
+                // encoders).
+                let (files, written) = self.write_data_files(&key, Some(format), &keys, src)?;
                 bytes_written += written;
                 rows += src.num_rows() as u64;
                 deltas.insert(
                     key.clone(),
                     catalog::TableDelta {
-                        data_files: vec![file.clone()],
+                        data_files: files.clone(),
                         delete_files: Vec::new(),
                         rows_added: src.num_rows() as u64,
                         rows_deleted: 0,
                         replaced: true,
+                        partition_changed: false,
+                        partition_by: None,
                     },
                 );
                 tables.insert(
                     key,
                     TableEntry {
-                        files: vec![file],
+                        files,
                         rows: src.num_rows() as u64,
                         format: Some(format),
                         stats: None,
                         deletes: Vec::new(),
+                        partition_by: (!keys.is_empty()).then_some(keys),
                     },
                 );
             }
@@ -904,15 +961,12 @@ impl Lake {
         // The per-version record: the author/message [`Lake::set_commit_message`]
         // recorded for this save (kept pending until the save succeeds below),
         // and the change summary — the diff against the previous version's
-        // manifest. That manifest is a best-effort read: an expired or
-        // tampered-away predecessor means the summary is simply absent.
+        // manifest (read above). A previous manifest that was unavailable
+        // means the summary is simply absent.
         let (author, commit_message) = match &self.pending_commit {
             Some((author, message)) => (author.clone(), message.clone()),
             None => (None, None),
         };
-        let previous = manifest_for(&*self.storage, &self.root, Some(self.version))
-            .ok()
-            .map(|(manifest, _)| manifest);
         let changes = previous.map(|previous| ChangeSummary::diff(&previous.tables, &tables));
         let manifest = Catalog {
             format_version: FORMAT_VERSION,
@@ -976,19 +1030,22 @@ impl Lake {
     }
 
     /// Write one immutable data file for `key` holding `src`, returning its
-    /// manifest reference (path, row count, and — for `.pink` files — the
-    /// CRC-protected statistics block the same encode pass collected) and the
-    /// bytes written. `format` defaults to this build's
+    /// manifest reference (path, row count, and the CRC-protected
+    /// statistics/zone-map block the writer published for it) and the bytes
+    /// written. `format` defaults to this build's
     /// [`write_format`](Lake::write_format) and must be explicit to append a
     /// file to an entry of the other format.
     ///
     /// - `vortex-format`: a Vortex file, streamed — locally straight into a
     ///   unique `create_new` temp sibling plus fsync + rename; over S3
-    ///   buffered for one atomic PUT. Statistics live in the Vortex footer.
+    ///   buffered for one atomic PUT. The Vortex footer carries the
+    ///   statistics; wave 66 additionally publishes the same facts as the
+    ///   file's catalog zone map (CRC-protected, cross-checked against the
+    ///   footer at attach), so pruning never needs the footer.
     /// - `.pink`: the engine's own single-table persistence bytes via `put`,
     ///   same temp→fsync→rename / single-PUT atomicity; the entry's per-file
     ///   `stats` block lets `.lake attach` answer `COUNT`/`MIN`/`MAX` without
-    ///   opening the file.
+    ///   opening the file, and now also prunes by zone map.
     fn write_data_file(
         &self,
         key: &str,
@@ -1007,11 +1064,17 @@ impl Lake {
                     let written = self.storage.put_streamed(&rel, &mut |sink| {
                         vortex_file::encode_table_into(dbname, table, src, sink)
                     })?;
+                    // The catalog zone map for this file: the exact facts the
+                    // Vortex footer will also carry (the encoder is lossless;
+                    // the shared gate drops what it cannot prove).
+                    let saved = pinkdb::persist::table_stats(dbname, table, src);
+                    let block = stats::StatsBlock::from_saved(key, &rel, &saved)?;
                     Ok((
                         FileRef::Entry {
                             path: rel,
                             rows,
-                            stats: None,
+                            stats: Some(block),
+                            partition: None,
                         },
                         written,
                     ))
@@ -1050,11 +1113,99 @@ impl Lake {
                         path: rel,
                         rows,
                         stats: Some(block),
+                        partition: None,
                     },
                     bytes.len() as u64,
                 ))
             }
         }
+    }
+
+    /// Write `src` as one or more data files under the partition spec `keys`
+    /// (wave 66): with keys, the rows are grouped by their partition value
+    /// set — one file per distinct set, ordered deterministically by the
+    /// label tuple — and every file records its own
+    /// [`FileRef::partition`] values. An unpartitioned table, or an empty
+    /// one, still gets exactly one file (a 0-row file carries no partition
+    /// value). Returns the manifest references in file order and the bytes
+    /// written.
+    ///
+    /// DuckLake semantics: inserting rows is what assigns partitions — each
+    /// distinct value set lands in its own data file, and a later commit
+    /// appends another file per value set (files are never merged here; that
+    /// is wave 67's `merge_adjacent_files`). Unlike DuckLake, the file path
+    /// stays a flat `data/<key>/<uuid>` — partition values live in the
+    /// catalog, not the path.
+    fn write_data_files(
+        &self,
+        key: &str,
+        format: Option<FileFormat>,
+        keys: &[PartitionKey],
+        src: &DataTable,
+    ) -> Result<(Vec<FileRef>, u64)> {
+        if keys.is_empty() || src.num_rows() == 0 {
+            let (file, written) = self.write_data_file(key, format, src)?;
+            return Ok((vec![file], written));
+        }
+        let schema = src.schema();
+        let mut plan: Vec<(&PartitionKey, usize, DataType)> = Vec::with_capacity(keys.len());
+        for k in keys {
+            let idx = zone::schema_column_index(&schema, &k.column).ok_or_else(|| {
+                LakeError::NotRepresentable {
+                    message: format!(
+                        "table \"{key}\" partitions on column \"{}\", but its schema has no \
+                         such column (columns: {})",
+                        k.column,
+                        schema
+                            .iter()
+                            .map(|(n, _)| n.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            })?;
+            plan.push((k, idx, schema[idx].1));
+        }
+        // Group flat row indices by the label tuple, preserving each group's
+        // source order (ascending indices).
+        let mut groups: BTreeMap<Vec<Option<String>>, Vec<usize>> = BTreeMap::new();
+        let mut row = 0usize;
+        for c in 0..src.num_chunks() {
+            let chunk = src.scan_chunk(c).ok_or_else(|| LakeError::Internal {
+                message: format!("chunk {c} of \"{key}\" disappeared while partitioning"),
+            })?;
+            for r in 0..chunk.num_rows {
+                let mut label = Vec::with_capacity(plan.len());
+                for (k, idx, dtype) in &plan {
+                    let value = chunk.columns[*idx].get(r);
+                    label.push(zone::partition_label(k, *dtype, &value).ok_or_else(|| {
+                        LakeError::NotRepresentable {
+                            message: format!(
+                                "table \"{key}\": partition value {value:?} of column \"{}\" \
+                                 cannot be recorded",
+                                k.column
+                            ),
+                        }
+                    })?);
+                }
+                groups.entry(label).or_default().push(row);
+                row += 1;
+            }
+        }
+        let mut files = Vec::with_capacity(groups.len());
+        let mut written = 0u64;
+        for (label, indices) in groups {
+            let sub = crate::incremental::sub_table(src, &indices)?;
+            let (file, bytes) = self.write_data_file(key, format, &sub)?;
+            written += bytes;
+            let partition: BTreeMap<String, Option<String>> = label
+                .into_iter()
+                .zip(keys.iter())
+                .map(|(value, k)| (k.key_text(), value))
+                .collect();
+            files.push(file.with_partition(partition));
+        }
+        Ok((files, written))
     }
 
     /// Write one positional delete file for `key`'s `file` (see the
@@ -1630,6 +1781,42 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                  manifest (deletes are part of the v4 incremental format)"
             )));
         }
+        if v != 4 && entry.partition_by.is_some() {
+            return Err(corrupt(format!(
+                "table \"{key}\" declares a partition specification in a format_version {v} \
+                 manifest (partitioning is part of the v4 incremental format)"
+            )));
+        }
+        if let Some(keys) = &entry.partition_by {
+            if keys.is_empty() {
+                return Err(corrupt(format!(
+                    "table \"{key}\" declares an empty partition specification (a partitioned \
+                     table lists at least one partition key)"
+                )));
+            }
+            for spec_key in keys {
+                if !spec_key.is_valid() {
+                    return Err(corrupt(format!(
+                        "table \"{key}\" declares partition key column \"{}\" with an unknown \
+                         transform \"{}\" (this build understands \"identity\" and \
+                         \"bucket(N)\")",
+                        spec_key.column, spec_key.transform
+                    )));
+                }
+            }
+            for (i, spec_key) in keys.iter().enumerate() {
+                if keys[..i]
+                    .iter()
+                    .any(|k| k.key_text() == spec_key.key_text())
+                {
+                    return Err(corrupt(format!(
+                        "table \"{key}\" partitions on \"{}\" twice (every partition key must \
+                         be unique)",
+                        spec_key.key_text()
+                    )));
+                }
+            }
+        }
         match (v, entry.format) {
             (1, Some(FileFormat::Vortex)) => {
                 return Err(corrupt(format!(
@@ -1691,15 +1878,29 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                 (
                     4,
                     FileRef::Entry {
-                        path: rel, stats, ..
+                        path: rel,
+                        stats: _stats,
+                        partition,
+                        ..
                     },
                 ) => {
                     validate_rel_path(rel)?;
-                    if entry.format() == FileFormat::Vortex && stats.is_some() {
-                        return Err(corrupt(format!(
-                            "table \"{key}\" carries a statistics block on its Vortex file \
-                             \"{rel}\" (Vortex statistics live in the data file's footer)"
-                        )));
+                    // A statistics block may ride on a `.pink` file (its
+                    // per-file statistics) or on a Vortex file (the
+                    // catalog-published zone map, cross-checked against the
+                    // footer at attach). Files written before wave 66 (Vortex
+                    // without a block) stay valid, as do `.pink` files whose
+                    // block was never published (attach refuses those with the
+                    // clear "no statistics" message).
+                    if let Some(partition) = partition {
+                        for key in partition.keys() {
+                            if crate::catalog::PartitionKey::parse(key).is_err() {
+                                return Err(corrupt(format!(
+                                    "table \"{key}\": data file \"{rel}\" carries a partition \
+                                     key that is not a column name or bucket(N, column)"
+                                )));
+                            }
+                        }
                     }
                 }
                 (1..=3, FileRef::Path(rel)) => validate_rel_path(rel)?,

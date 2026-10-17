@@ -284,6 +284,42 @@ INSERT INTO t VALUES (...);
   default.)</li>
 </ul>
 
+<h2 id="partitioning-and-pruning">Partitioning and pruning<a class="anchor" href="#partitioning-and-pruning" aria-label="Permalink: Partitioning and pruning">#</a></h2>
+
+<p>Lake tables can be <strong>partitioned</strong>: commits then split their
+appends into one data file per distinct partition value set, and every v4 data
+file publishes a CRC-protected per-file <strong>zone map</strong> in the catalog
+(min/max/null counts, computed at write time — for Vortex files too, and
+cross-checked against the file's own footer at attach).</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-f">.lake</span> partition mylake t by (region)          <span class="tok-c">-- identity values</span>
+<span class="tok-f">.lake</span> partition mylake t by (bucket(<span class="tok-n">4</span>, id))   <span class="tok-c">-- bucket labels</span>
+<span class="tok-f">.lake</span> partition mylake t clear                <span class="tok-c">-- new writes unpartitioned again</span></code></pre></div>
+
+<ul>
+  <li><strong>Spec changes never rewrite old files.</strong> Files keep the
+  partition values they were written with; after a clear they are simply no
+  longer interpreted as partitions.</li>
+  <li><strong>Predicates prune whole files.</strong> The planner extracts exact
+  conjuncts (<code>col op literal</code> in either order, <code>IS [NOT]
+  NULL</code>) and skips files whose zone map — or, stronger, whose identity
+  partition value — proves no row can match; survivors decode only the
+  projected columns. <code>WHERE region = 'x'</code> reads one partition's file;
+  a disjoint range reads zero. <code>.lake attached</code> shows the decoded
+  file count per table, and pruning works per version under
+  <code>AT (VERSION/TIMESTAMP =&gt; …)</code>.</li>
+  <li><strong>Correctness with deletes:</strong> positional deletes only shrink a
+  file's value set, so pruning stays valid with them; the
+  <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> exactness fallback once
+  deletes exist is unchanged.</li>
+  <li><strong>Limits, on purpose:</strong> bucket labels use pinkdb's own stable
+  FNV-1a hash (not DuckDB's bucket numbers, and bucket values are never
+  interpreted as column facts for pruning); <code>year</code>/<code>month</code>/
+  <code>day</code>/<code>hour</code>/<code>epoch_*</code> transforms are refused
+  by name; files written before a spec carry no partition values (they decode
+  correctly, but only zone-map pruning applies to them).</li>
+</ul>
+
 <h2 id="two-data-formats-one-lake-api">Two data formats, one lake API<a class="anchor" href="#two-data-formats-one-lake-api" aria-label="Permalink: Two data formats, one lake API">#</a></h2>
 
 <p>There are two builds of the lake layer with the same commands:</p>
@@ -334,6 +370,9 @@ INSERT INTO t VALUES (...);
 <span class="tok-f">.lake</span> attach mylake            <span class="tok-c">-- attach read-only (see below)</span>
 <span class="tok-f">.lake</span> attach mylake <span class="tok-n">2</span> write    <span class="tok-c">-- or writable, pinned to a version (see commits above)</span>
 <span class="tok-f">.lake</span> commit mylake            <span class="tok-c">-- publish the writable attach's changes</span>
+<span class="tok-f">.lake</span> partition mylake t by (region)          <span class="tok-c">-- partition new writes by identity value</span>
+<span class="tok-f">.lake</span> partition mylake t by (bucket(<span class="tok-n">4</span>, id))   <span class="tok-c">-- or by bucket labels</span>
+<span class="tok-f">.lake</span> partition mylake t clear                <span class="tok-c">-- stop partitioning (old files untouched)</span>
 <span class="tok-f">.lake</span> detach mylake [force]
 <span class="tok-f">.lake</span> attached</code></pre></div>
 
@@ -542,6 +581,7 @@ export <span class="tok-v">AWS_REGION</span>=auto
   <li><a href="#what-a-lake-is">What a lake is</a></li>
   <li><a href="#incremental-commits">Incremental commits</a></li>
   <li><a href="#time-travel">Time travel</a></li>
+  <li><a href="#partitioning-and-pruning">Partitioning and pruning</a></li>
   <li><a href="#two-data-formats-one-lake-api">Two data formats, one lake API</a></li>
   <li><a href="#using-a-lake">Using a lake</a></li>
   <li><a href="#read-only-attach">Read-only attach</a></li>

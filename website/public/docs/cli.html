@@ -281,6 +281,12 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       (append-only data files + positional deletes; retry settings below)</td>
     </tr>
     <tr>
+      <td><code>.lake partition &lt;dir|s3://…&gt; &lt;table&gt; by (col, bucket(N, col), …) | clear</code></td>
+      <td>set (or clear) a table's partition spec — new writes split one data
+      file per partition value set; spec changes never rewrite published
+      files</td>
+    </tr>
+    <tr>
       <td><code>.lake detach &lt;dir|s3://…&gt; [force]</code></td>
       <td>detach one attached lake; a writable attachment with uncommitted changes
       refuses unless <code>force</code> (which keeps the tables as ordinary store

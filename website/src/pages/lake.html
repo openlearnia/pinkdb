@@ -107,6 +107,42 @@ SELECT COUNT(*) FROM t AS old AT (VERSION =&gt; 1) JOIN t ON old.id = t.id;</cod
   default.)</li>
 </ul>
 
+<h2>Partitioning and pruning</h2>
+
+<p>Lake tables can be <strong>partitioned</strong>: commits then split their
+appends into one data file per distinct partition value set, and every v4 data
+file publishes a CRC-protected per-file <strong>zone map</strong> in the catalog
+(min/max/null counts, computed at write time — for Vortex files too, and
+cross-checked against the file's own footer at attach).</p>
+
+<pre class="code" data-lang="sql"><code>.lake partition mylake t by (region)          -- identity values
+.lake partition mylake t by (bucket(4, id))   -- bucket labels
+.lake partition mylake t clear                -- new writes unpartitioned again</code></pre>
+
+<ul>
+  <li><strong>Spec changes never rewrite old files.</strong> Files keep the
+  partition values they were written with; after a clear they are simply no
+  longer interpreted as partitions.</li>
+  <li><strong>Predicates prune whole files.</strong> The planner extracts exact
+  conjuncts (<code>col op literal</code> in either order, <code>IS [NOT]
+  NULL</code>) and skips files whose zone map — or, stronger, whose identity
+  partition value — proves no row can match; survivors decode only the
+  projected columns. <code>WHERE region = 'x'</code> reads one partition's file;
+  a disjoint range reads zero. <code>.lake attached</code> shows the decoded
+  file count per table, and pruning works per version under
+  <code>AT (VERSION/TIMESTAMP =&gt; …)</code>.</li>
+  <li><strong>Correctness with deletes:</strong> positional deletes only shrink a
+  file's value set, so pruning stays valid with them; the
+  <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> exactness fallback once
+  deletes exist is unchanged.</li>
+  <li><strong>Limits, on purpose:</strong> bucket labels use pinkdb's own stable
+  FNV-1a hash (not DuckDB's bucket numbers, and bucket values are never
+  interpreted as column facts for pruning); <code>year</code>/<code>month</code>/
+  <code>day</code>/<code>hour</code>/<code>epoch_*</code> transforms are refused
+  by name; files written before a spec carry no partition values (they decode
+  correctly, but only zone-map pruning applies to them).</li>
+</ul>
+
 <h2>Two data formats, one lake API</h2>
 
 <p>There are two builds of the lake layer with the same commands:</p>
@@ -157,6 +193,9 @@ SELECT COUNT(*) FROM t AS old AT (VERSION =&gt; 1) JOIN t ON old.id = t.id;</cod
 .lake attach mylake            -- attach read-only (see below)
 .lake attach mylake 2 write    -- or writable, pinned to a version (see commits above)
 .lake commit mylake            -- publish the writable attach's changes
+.lake partition mylake t by (region)          -- partition new writes by identity value
+.lake partition mylake t by (bucket(4, id))   -- or by bucket labels
+.lake partition mylake t clear                -- stop partitioning (old files untouched)
 .lake detach mylake [force]
 .lake attached</code></pre>
 

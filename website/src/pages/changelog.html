@@ -9,6 +9,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-17</h2>
+<h3>Wave 66 — lake partitioning &amp; pruning ✅</h3>
+<ul>
+<li>Lake tables can be <strong>partitioned</strong>: identity values or <code>bucket(N)</code> labels are recorded per file, commits write <strong>one data file per partition value set</strong>, and spec changes (<code>.lake partition … by (…) | clear</code>) never rewrite old files.</li>
+<li>Every v4 data file publishes a CRC-protected <strong>zone map</strong> in the catalog (Vortex files newly); the planner prunes whole files for exact predicates — <code>WHERE region = 'x'</code> reads only that partition's file, and disjoint ranges read zero.</li>
+<li><code>COUNT</code>/<code>MIN</code>/<code>MAX</code> honesty rules are preserved (fall back once positional deletes exist); pruning stays correct with deletes and across time travel.</li>
+<li>Limits (documented): bucket labels are pinkdb's own hash (no cross-engine numbers, no bucket-value pruning); <code>year/month/…</code> transforms are refused by name.</li>
+</ul>
 <h3>Wave 73 — docs catch-up, changelog &amp; site wiring</h3>
 <ul>
 <li>Follow-up: a <strong>SQL dialect reference</strong> page — statements / queries / types tables plus the known-divergences list (correlated subqueries, USING/NATURAL joins, three-part references, CTE <code>AT</code> handling) — added under Reference.</li>

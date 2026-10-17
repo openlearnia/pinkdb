@@ -538,7 +538,18 @@ become positional delete files applied merge-on-read, each commit writes an
 append-only delta manifest (`commits/<version>.json`), `.lake attach … write`
 + `.lake commit` publish through the attached-database route, and a
 conflicting commit retries with DuckLake's settings (see "Incremental
-commits" below).
+commits" below). Wave 66 mirrors DuckLake's **partitioning and pruning**:
+`.lake partition <dir> <table> by (<key>, …)` (identity columns and
+`bucket(N, col)`; DuckLake's `ALTER TABLE … SET PARTITIONED BY`) records a
+per-table spec in the catalog, commits **split appended rows into one data
+file per partition value set** and record each file's values
+(`ducklake_file_partition_value`'s twin), every data file publishes a
+per-file zone map (the lean `.pink` block, or the Vortex catalog block
+cross-checked against the file footer), and an attached scan whose `WHERE`
+carries simple comparisons (`=`, ranges, `IS [NOT] NULL`) **skips whole data
+files without decoding them** — pruning a partitioned table by its partition
+column reads only the matching files (see "Partitioning and pruning"
+below).
 
 A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
 key prefix with exactly this layout):
@@ -594,7 +605,7 @@ byte-identical to the pre-wave-64 shape.
 | 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes; a lean (`lake-lite`) save also publishes a CRC-protected per-column statistics block in the entry (wave 45k) | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`); `.lake attach` reads the statistics block, opening no data file |
 | 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry; one row block per 2,048-row engine chunk | waves 35–40 | yes |
 | 3 | as 2, but row blocks of 8,192 rows / ~1 MiB (fewer blocks → less per-block stats/compression work on save) | waves 45 | yes |
-| 4 | **incremental**: every data file is listed as `{path, rows}`, a table's file list grows by appended files, positional delete files (`<uuid>.pinkdel`) drop rows merge-on-read, `rows` must equal `sum(files.rows) − sum(deletes.count)`, and `format` is `"vortex"` (full build) or `"pink"` (lean build; each `.pink` file carries its own CRC-protected statistics block) | this build (default) | yes |
+| 4 | **incremental**: every data file is listed as `{path, rows}`, a table's file list grows by appended files, positional delete files (`<uuid>.pinkdel`) drop rows merge-on-read, `rows` must equal `sum(files.rows) − sum(deletes.count)`, and `format` is `"vortex"` (full build) or `"pink"` (lean build; each `.pink` file carries its own CRC-protected statistics block). Wave 66 adds (additively): a table's `partition_by` spec, a data file's `partition` values, and a catalog-published zone map (`stats`) on Vortex files too — an older v4 reader ignores the fields and reads the same files | this build (default) | yes |
 
 **Migration:** open an old lake and `.lake save` again — the next snapshot is a
 full rewrite in this build's v4 format; old snapshots and their data files stay
@@ -773,6 +784,40 @@ manifest whose rows do not add up) is a clear `Corrupt` error, never a guess.
   catalogs*, and the probe build rejects every explicit value ("Unsupported
   ducklake_version") — so pinkdb skips the setting rather than inventing
   different semantics under the same name.
+- **Partitioning and pruning, DuckLake parity (wave 66).**
+  `.lake partition <dir> <table> by (<key>, …)` (or `… clear`) sets or
+  clears a table's partition specification as one catalog version — the
+  pinkdb surface for DuckLake's `ALTER TABLE … SET PARTITIONED BY`. A key is
+  an identity column (`region`) or `bucket(N, column)`; DuckLake's other
+  transforms (`year`, `month`, `day`, `hour`, `epoch_*`, `truncate`) are
+  refused with its own supported set named in the message, duplicate keys
+  are refused like DuckLake's "matches an earlier partition key", and every
+  key column must exist in the table's schema. A commit (or save) that
+  writes rows to a partitioned table **splits them into one data file per
+  partition value set**, and the catalog records each file's values —
+  `ducklake_file_partition_value`'s twin (identity values exact, bucket
+  labels from pinkdb's own stable FNV hash, SQL NULL as JSON `null`).
+  Existing files are never rewritten: a spec change governs new writes
+  only, exactly like DuckLake's versioned partition records. Every data
+  file also publishes a **zone map** — the exact per-column min/max/NULL
+  facts — for `.pink` files in the existing CRC-protected per-file block
+  and for Vortex files in a catalog block cross-checked against the file's
+  own footer at attach. An attached scan whose `WHERE` carries simple
+  conjuncts (`col = literal`, ranges, `IS [NOT] NULL`, `AND`-combined;
+  extracted by the planner, never inferred through `OR`/expressions)
+  **skips whole files the zone maps prove cannot match — no decode**, then
+  decodes the survivors with the ordinary projection pushdown. A file with
+  positional deletes is still prunable (deleting rows only shrinks its
+  value set), while the table-level `COUNT`/`MIN`/`MAX` fast paths keep
+  their wave-63 fallback once any delete file exists — both rules stay
+  exact. `.lake attached` reports `(loads, columns, files)` decoded, and
+  time travel prunes from **that version's** file list and zone maps.
+  Limits: bucket values are pinkdb's own (DuckLake records DuckDB's hash;
+  the numbers are not comparable across engines), no `year`/`month`/… time
+  transforms yet (the full set is probed and refused by name), no bucket
+  pruning (a `bucket` file still prunes through its column zone maps), and
+  old files written before a spec carry no values until rewritten
+  (`.lake save` re-splits a table under its preserved spec).
 - **One live writer handle per lake** (no file locking; concurrent readers
   of published versions are fine). A handle that saves after another
   handle/process moved the catalog fails with `LakeError::Conflict`
@@ -904,6 +949,8 @@ Incremental writes in the REPL:
 INSERT INTO t VALUES (...);
 UPDATE t SET ...; DELETE FROM t WHERE ...;
 .lake commit mylake                      # v3: appends + deletes only
+.lake partition mylake t by (region)     # v4: spec; later writes split per value
+.lake partition mylake t clear           # new writes unpartitioned again
 ```
 
 With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see
@@ -944,8 +991,11 @@ the data file — save cost +1 ms @1M / +17 ms @10M, the `.pink` bytes unchanged
 — so attach answers exact `COUNT`/`COUNT(col)`/`MIN`/`MAX` with zero
 data-file reads, and a full Vortex build attaches `.pink` lakes from the same
 blocks (a table with positional deletes falls back for the per-column facts,
-row counts stay exact). A lake saved without a block refuses attach with a
-re-save-the-store message; a Vortex lake is refused with the clear
+row counts stay exact). The same blocks are the lean build's **zone maps**:
+`.lake partition` works identically (one `.pink` data file per partition
+value set, values in the catalog) and a pruned scan skips a `.pink` file
+entirely without opening it. A lake saved without a block refuses attach with
+a re-save-the-store message; a Vortex lake is refused with the clear
 rebuild-with-`lake` error instead of being guessed at.
 
 Measured trade-offs (release, Apple Silicon, sales corpus): eager `.lake open`

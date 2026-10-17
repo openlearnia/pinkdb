@@ -99,7 +99,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 63 | Lake writes, DuckLake parity: incremental lake commits — append new immutable data files with per-file row ranges instead of whole-table rewrites, positional delete files for DELETE/UPDATE (merge-on-read; deletion-vector option as a follow-up), writable attached lakes, per-commit manifests, concurrent-writer retry/backoff (`max_retry_count`/`retry_backoff`/`retry_wait_ms` parity), WAL-logged for durable sessions | done | landed; catalog v4 (per-file rows + `pinkdel` delete files + `commits/<v>.json` deltas), `Lake::commit`/`commit_from_tables`, writable attach + retry parity (10/1.5/100ms probed), 1M-row demo: 7.6 KB / 0.54 s per commit, 0 bytes rewritten |
 | 64 | Lake time travel & snapshot metadata, DuckLake parity: `AT (VERSION => n)` / `AT (TIMESTAMP => ts)` per query on attached tables, per-version records (time, author, commit message, change summary), `.lake snapshots` listing, commit messages on save, `default_version` setting (optional) | done | landed; DuckLake-pinned AT semantics (literals only, capped at the attached version), per-version stats fast paths, manifest records + `.lake snapshots` + commit messages; `default_version` probed to be a catalog-format selector, not a read default — skipped |
 | 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | in progress | agent died in the Oct-17 disk-full cascade (`database or disk is full`); partial secured — `wt-lake-schema/partial-stuck.diff` (5,272 lines / 29 files); re-dispatch a continuation once sessions are cleared |
-| 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | in progress | agent stuck in the same cascade; partial secured — `wt-lake-partition/partial-stuck.diff` (4,796 lines / 16 files) |
+| 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | done | landed; identity + `bucket(N)` specs recorded in the catalog (additive to v4), one data file per partition value per commit, per-file zone maps (Vortex via `persist::table_stats`), planner-extracted conjunct pruning with decode counters; bucket labels are pinkdb's own FNV-1a (no bucket-value pruning; documented); duckdiff 171/171 |
 | 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | queued | user-flagged: **start after 66** (closes the lake-parity block with 68) |
 | 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | queued | DuckLake-parity program |
 | 69 | Prepared statements in the Python and Go bindings: wrapper ergonomics + tests over the FFI entry points landed in 59 | queued | follows 59 |
@@ -1106,3 +1106,33 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   at a time, 65 first). Lesson: every agent brief carries the disk guard
   (check `df` before/after heavy builds; prefer debug gates; keep release
   builds out of worktrees unless the wave needs duckdiff).
+- 2026-10-17 — Wave 66 (lake partitioning & pruning): identity and
+  `bucket(N)`-style partition specs recorded in catalog v4 entries
+  (`TableEntry.partition_by` + per-file `partition` values — additive, an older
+  v4 reader ignores them); commits split appended rows into one data file per
+  distinct partition value set, and a full `.lake save` preserves the spec and
+  re-splits; `Commit::set_partition`/`Lake::set_partition_spec` + `.lake
+  partition` publish spec changes without rewriting old files. Every v4 data
+  file now publishes a CRC-protected per-file **zone map** in the catalog —
+  Vortex files newly, computed at write time and cross-checked against their
+  footer at attach (tampered or misplaced values are refused, never silently
+  pruned). The planner extracts exact conjuncts (comparisons in either operand
+  order, `IS [NOT] NULL`, through `Limit`/`Offset` only) and skips whole files
+  whose zone map or identity partition value proves no match, decoding
+  survivors with the existing projection pushdown; `decode_stats()` is now
+  `(loads, columns, files)` and `.lake attached` prints files. Pruning is
+  version-correct across time travel, stays valid with positional deletes
+  (deletes only shrink a file's value set) and the `COUNT`/`MIN`/`MAX`
+  honesty fallback once deletes exist is preserved. DuckLake-pinned: spec DDL
+  errors (unsupported transforms named, duplicates, missing columns), metadata
+  shape (transform strings, varchar partition values, NULLs), `EXPLAIN`'s
+  per-file read counts, one file per value per commit. Honest limits: bucket
+  labels use pinkdb's own stable FNV-1a (no cross-engine numbers, no
+  bucket-value pruning); `year/month/day/hour/epoch_*` transforms refused by
+  name; pre-spec files are unprunable but decoded correctly. Gates on main:
+  fmt, clippy (pink-lake ± vortex-format, pinkdb, CLI lake,s3), pink-lake
+  28 + 12 + 10 + **12** (vortex: 48 + 12 + 46 + **13**), pinkdb **460/460**
+  (+prepared 22; encryption 477 + 21), CLI lake,s3 **29** (multiprocess 27/27)
+  + the full CLI feature matrix, duckdiff **171/171**, workspace green.
+  Recovered from the Oct-17 disk-full stall (partial secured, continued in
+  place). Worktree `wt-lake-partition` removed after landing.

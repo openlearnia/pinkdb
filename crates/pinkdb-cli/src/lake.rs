@@ -52,6 +52,24 @@
 //! the WAL before publishing, which makes the commit idempotent across a
 //! crash: replaying a recovered session re-attaches and `.lake commit`
 //! publishes nothing when the change already landed.
+//!
+//! # Partitioning (wave 66)
+//!
+//! `.lake partition <dir> <table> by (<key>, …)` sets a table's partition
+//! specification (DuckLake's `ALTER TABLE … SET PARTITIONED BY`) as one
+//! catalog version; `… clear` removes it. A key is a column name (identity)
+//! or `bucket(N, column)`; DuckLake's other transforms are refused with its
+//! own supported set named in the message, duplicate keys are refused like
+//! DuckLake's "matches an earlier partition key", and every key column must
+//! exist in the table's schema. New writes then split into **one data file
+//! per partition value set** — a `.lake commit` of appended rows and a
+//! `.lake save` of the table alike — and the catalog records each file's
+//! values; existing files are never rewritten (DuckLake semantics).
+//!
+//! Read-only attaches prune: a `WHERE` carrying simple comparisons (`col =
+//! literal`, ranges, `IS [NOT] NULL`) over zoned/partitioned columns decodes
+//! only the data files that can still match, and `.lake attached` shows the
+//! files decoded per lake.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -150,6 +168,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "open" => cmd_open(db, rest),
         "attach" => cmd_attach(db, rest),
         "commit" => cmd_commit(db, rest),
+        "partition" => cmd_partition(db, rest),
         "detach" => cmd_detach(db, rest),
         "attached" => cmd_attached(db, rest),
         "versions" => cmd_versions(rest),
@@ -157,7 +176,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!(
-            "Usage: .lake <save|open|attach|commit|detach|attached|versions|snapshots|tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|partition|detach|attached|versions|snapshots|tables|info> ..."
         ),
         other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
     }
@@ -760,6 +779,149 @@ fn set_baseline_version_only(location: &str, version: u64) {
         .insert(location.to_string(), version);
 }
 
+/// `.lake partition <location> <table> by (<key>, …)` — DuckLake's
+/// `ALTER TABLE … SET PARTITIONED BY`, published as one catalog version:
+///
+/// ```text
+/// .lake partition ./lake t by (region)
+/// .lake partition ./lake main.t by (bucket(4, id), region)
+/// .lake partition ./lake t clear
+/// ```
+///
+/// A key is a column name (identity) or `bucket(N, column)`; DuckLake's
+/// transforms this build does not implement (`year`, `month`, `day`, `hour`,
+/// `epoch_*`) and anything else are refused with DuckLake's own supported
+/// set in the message. The table must already exist in the lake
+/// (`<name>` means `main.<name>`); every key column must exist in its
+/// schema. Existing files keep their recorded values — the spec governs new
+/// writes — and new commits (and a `.lake save` of the table) split rows
+/// into one data file per partition value set.
+fn cmd_partition(db: &PinkDb, arg: &str) {
+    let _ = db;
+    let usage = "Usage: .lake partition <dir> <table> by (<key>, ...) | clear{HINT}";
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return;
+    };
+    let Some((table, rest)) = take_token(rest) else {
+        println!("{usage}");
+        return;
+    };
+    let dir = unquote(&dir);
+    let table = unquote(&table);
+    // A bare table name means main.<name> (the flat catalog's key shape).
+    let key = if table.contains('.') {
+        table.clone()
+    } else {
+        format!("main.{table}")
+    };
+    let rest = rest.trim();
+    let lower = rest.to_ascii_lowercase();
+    // `Some(keys)` with an empty vector is `clear`; `None` is a usage error.
+    let keys: Option<Vec<String>> = if lower == "clear" {
+        Some(Vec::new())
+    } else if let Some(group) = lower.strip_prefix("by").map(str::trim).and_then(|r| {
+        r.strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+            .map(|inner| inner.to_string())
+    }) {
+        // Split on top-level commas only: `bucket(4, id)` keeps its inner
+        // comma.
+        let mut parts = Vec::new();
+        let mut depth = 0usize;
+        let mut current = String::new();
+        for c in group.chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    current.push(c);
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(c);
+                }
+                ',' if depth == 0 => {
+                    parts.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(c),
+            }
+        }
+        parts.push(current.trim().to_string());
+        parts.retain(|p| !p.is_empty());
+        (!parts.is_empty()).then_some(parts)
+    } else {
+        None
+    };
+    let Some(keys) = keys else {
+        println!("{usage}");
+        return;
+    };
+    // A writable attachment of the same lake would be invalidated by the
+    // new version (its base changes): refuse and point at the recovery.
+    {
+        let writables = writables();
+        if writables.contains_key(&dir) {
+            cli_error!(
+                "{dir} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir}) it before changing its partition specification"
+            );
+            return;
+        }
+    }
+    let mut lake = match Lake::open_url(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let settings = commit_settings();
+    let t0 = Instant::now();
+    let result = if keys.is_empty() {
+        lake.clear_partition_spec(&key, &settings)
+    } else {
+        lake.set_partition_spec(&key, &keys, &settings)
+    };
+    match result {
+        Ok(report) if !report.committed => {
+            if keys.is_empty() {
+                println!("Table {key} in {dir} has no partition specification (nothing to clear)");
+            } else {
+                println!(
+                    "Table {key} in {dir} is already partitioned by ({}); nothing published",
+                    keys.join(", ")
+                );
+            }
+        }
+        Ok(report) => {
+            set_baseline_version_only(&dir, report.version);
+            if keys.is_empty() {
+                println!(
+                    "Cleared the partition specification of {key} in {dir} (version {} in \
+                     {:.3}s); existing files keep their values",
+                    report.version,
+                    t0.elapsed().as_secs_f64(),
+                );
+            } else {
+                println!(
+                    "Partitioned {key} by ({}) in {dir} (version {} in {:.3}s; new writes \
+                     split into one data file per {} value)",
+                    keys.join(", "),
+                    report.version,
+                    t0.elapsed().as_secs_f64(),
+                    if keys.len() == 1 {
+                        "partition"
+                    } else {
+                        "partition-value set"
+                    },
+                );
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
 /// `.lake detach <dir> [force]`: drop one attached lake from this session. A
 /// writable attach with uncommitted changes refuses unless `force` is given
 /// (which keeps the store tables as ordinary tables and abandons the
@@ -817,7 +979,7 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
         println!("(no attached lakes)");
     }
     let stats = db.attached_decode_stats();
-    for ((location, tables), (_, loads, columns)) in lakes.into_iter().zip(stats) {
+    for ((location, tables), (_, loads, columns, files)) in lakes.into_iter().zip(stats) {
         println!("{location}");
         for t in tables {
             println!(
@@ -829,9 +991,10 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
             );
         }
         println!(
-            "  decodes: {loads} load{}, {columns} column{}",
+            "  decodes: {loads} load{}, {columns} column{}, {files} file{}",
             plural(loads as usize),
-            plural(columns as usize)
+            plural(columns as usize),
+            plural(files as usize)
         );
     }
     for (location, wa) in writables().iter() {
