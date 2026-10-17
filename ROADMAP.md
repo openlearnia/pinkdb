@@ -1231,3 +1231,21 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   **171/171**. Clean apply, **zero conflicts**. Worktree `wt-lake-maint`
   removed after landing. **Dispatch freeze in effect: no new waves until the
   user says otherwise.**
+- 2026-10-17 — Post-freeze benchmark session (final tree `b3154e7`, Apple
+  Silicon, best-of-N, DuckDB α46057 reference): standing battery **250.8 ms**
+  (per-query: count 0.03, filter_num 2.25, filter_str 1.60, proj_func 18.2,
+  group_region 3.39, group_id 50.3, order_num_topn 2.64, order_str 29.8,
+  distinct_lowcard 3.9, distinct_id 49.6, window_row_number 15.7,
+  window_count_star 16.0, join_self 9.0, join_group 15.5, join_mat 26.0,
+  join_probe 6.8; vs the fresh-day 234.0 ms — variance/thermal, same codegen
+  class). Differential: **duckdiff 175/175** including the 1M big battery;
+  DuckDB on the same corpus: COUNT 2 ms, GROUP BY 16 ms (pinkdb 2.2 / 3.4 ms
+  warm). Lake vs DuckLake: 1M — **2.5 MB vs 12.5 MB** stored, ingest
+  0.114 s vs 0.137 s, cold e2e 0.009 vs 0.058 s, cold per-query **0.11–0.20×**;
+  10M — **25.1 MB vs 91.4 MB**, ingest 0.63 vs 0.31 s, cold open 0.032 s,
+  cold per-query **0.64–0.96×** (count 38 vs 60, groupby 73 vs 83, filter 62
+  vs 74, orderby 75 vs 78 ms). Attach fast paths (1M, cold process): COUNT
+  4.7 ms, filter 9.0, orderby 11.2, groupby 12.6; statistics probe
+  COUNT+MIN+MAX = **0 decodes**. Multi-writer (4 processes, txn-read):
+  serial 0.344 s vs concurrent 0.143 s → **2.41×**, verify ok (previous
+  record 2.55×).
