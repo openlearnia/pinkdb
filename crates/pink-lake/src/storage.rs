@@ -1,11 +1,12 @@
 //! The internal storage abstraction behind a lake.
 //!
-//! A lake needs six operations and nothing more: read one object, read with a
-//! version tag, create-if-absent, replace, list the files under a prefix,
-//! and delete. [`LocalStorage`](crate::local::LocalStorage) is the original
-//! directory implementation (wave 34/35, unchanged files/atomicity/errors);
-//! the feature-gated S3 backend implements the same operations over the S3
-//! REST API (AWS S3, Cloudflare R2, MinIO, …).
+//! A lake needs eight operations and nothing more: read one object, read with
+//! a version tag, create-if-absent, replace, list the files under a prefix,
+//! list everything under a prefix recursively, stat one object, and delete.
+//! [`LocalStorage`](crate::local::LocalStorage) is the original directory
+//! implementation (wave 34/35, unchanged files/atomicity/errors); the
+//! feature-gated S3 backend implements the same operations over the S3 REST
+//! API (AWS S3, Cloudflare R2, MinIO, …).
 //!
 //! Two operations carry the single-writer contract:
 //!
@@ -38,6 +39,20 @@ pub(crate) enum Head {
     /// device, … Object storage never reports this (a `dir/` key is still an
     /// object).
     NotAFile,
+}
+
+/// What [`Storage::stat`] found: one stored object's size and last-modified
+/// time.
+///
+/// `size` is the **stored** object's byte length, so for an encrypted lake it
+/// is the ciphertext size (the container framing adds a plaintext header, a
+/// key-check block and per-1-MiB-frame tags; see the `crypto` module). The
+/// modification time is the backend's own (`mtime` locally, the object's
+/// `Last-Modified` over S3), in microseconds since the Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjectInfo {
+    pub(crate) size: u64,
+    pub(crate) modified_micros: Option<i64>,
 }
 
 /// An opaque storage version tag.
@@ -106,6 +121,12 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// What is at `rel` (missing / a regular file / something else).
     fn head(&self, rel: &str) -> Result<Head>;
 
+    /// One object's size and last-modified time: `None` when nothing is
+    /// there. Used by lake maintenance (the `cleanup_old_files` /
+    /// `delete_orphaned_files` age gate and the `.lake files` / `.lake
+    /// table_info` listings). A directory (or any non-file) reads as `None`.
+    fn stat(&self, rel: &str) -> Result<Option<ObjectInfo>>;
+
     /// Read one object. `context` names the failed operation in the same
     /// style as the local backend (`reading <abs>`, `loading data file "…"`).
     fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>>;
@@ -157,10 +178,23 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// empty; subdirectories are not listed.
     fn list(&self, rel: &str) -> Result<Vec<String>>;
 
-    /// Delete one object. The lake itself never deletes published data (every
-    /// version stays loadable), so no lake code path calls this today; it is
-    /// part of the storage surface for leftover cleanup and tests.
-    #[allow(dead_code)]
+    /// Every *file* under `rel`, recursively, as paths **relative to
+    /// `rel`** (`"<subdir>/<name>"`, `/`-separated and sorted). A missing
+    /// location reads as empty. Unlike [`Storage::list`] (the manifest-facing
+    /// direct-children listing) this is the object inventory maintenance
+    /// scans for unreferenced data objects (`.lake files --all`,
+    /// `cleanup_old_files`, `delete_orphaned_files`); it returns names only,
+    /// never directories.
+    fn list_recursive(&self, rel: &str) -> Result<Vec<String>>;
+
+    /// Delete one object. Published versions are never mutated (every
+    /// retained version stays loadable), so only maintenance touches this:
+    /// `expire_snapshots` removes *expired* `snapshots/<v>.json` and their
+    /// `commits/<v>.json`, and `cleanup_old_files` /
+    /// `delete_orphaned_files` remove `data/` objects no retained version
+    /// references. A missing object is a backend-specific answer (S3 DELETE
+    /// is idempotent; locally it is a `NotFound` I/O error the maintenance
+    /// code treats as already-deleted).
     fn delete(&self, rel: &str) -> Result<()>;
 
     /// A local path for one object (see [`LocalCopy`]). Only the v1 `.pink`
@@ -340,6 +374,12 @@ impl Storage for CryptoStorage {
         self.inner.head(rel)
     }
 
+    fn stat(&self, rel: &str) -> Result<Option<ObjectInfo>> {
+        // The stored object's facts (ciphertext size for an encrypted
+        // session): maintenance reasons about *objects*, never plaintext.
+        self.inner.stat(rel)
+    }
+
     fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
         let stored = self.inner.read(rel, context)?;
         self.plain(rel, stored)
@@ -394,6 +434,10 @@ impl Storage for CryptoStorage {
 
     fn list(&self, rel: &str) -> Result<Vec<String>> {
         self.inner.list(rel)
+    }
+
+    fn list_recursive(&self, rel: &str) -> Result<Vec<String>> {
+        self.inner.list_recursive(rel)
     }
 
     fn delete(&self, rel: &str) -> Result<()> {

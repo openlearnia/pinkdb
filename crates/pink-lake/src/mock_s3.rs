@@ -46,11 +46,31 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// One stored object: bytes + version tag (the "ETag", quotes included).
+/// One stored object: bytes + version tag (the "ETag", quotes included) +
+/// the object's last-modified time (whole Unix seconds), enough for the
+/// S3 `HEAD`-backed `Storage::stat`.
 #[derive(Clone)]
 struct Object {
     bytes: Vec<u8>,
     etag: String,
+    modified_secs: i64,
+}
+
+impl Object {
+    fn new(bytes: Vec<u8>, etag: String) -> Self {
+        Self {
+            bytes,
+            etag,
+            modified_secs: now_secs(),
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Default)]
@@ -235,13 +255,22 @@ impl MockS3 {
     pub fn put_object(&self, key: &str, bytes: &[u8]) {
         let mut store = self.state.store.lock().unwrap();
         let etag = next_etag(&mut store);
-        store.objects.insert(
-            key.to_string(),
-            Object {
-                bytes: bytes.to_vec(),
-                etag,
-            },
-        );
+        store
+            .objects
+            .insert(key.to_string(), Object::new(bytes.to_vec(), etag));
+    }
+
+    /// Backdate one stored object's `Last-Modified` time (the maintenance
+    /// age-gate fixture). `false` when the key does not exist.
+    pub fn set_object_modified(&self, key: &str, modified_secs: i64) -> bool {
+        let mut store = self.state.store.lock().unwrap();
+        match store.objects.get_mut(key) {
+            Some(object) => {
+                object.modified_secs = modified_secs;
+                true
+            }
+            None => false,
+        }
     }
 
     /// Read one stored object back (for assertions).
@@ -562,11 +591,16 @@ fn handle(mut stream: TcpStream, state: Arc<State>) {
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         response.status,
         status_text(response.status),
-        response.body.len()
+        response
+            .content_length
+            .unwrap_or(response.body.len() as u64)
     )
     .unwrap();
     if let Some(etag) = &response.etag {
         write!(out, "ETag: {etag}\r\n").unwrap();
+    }
+    if let Some(modified) = &response.last_modified {
+        write!(out, "Last-Modified: {modified}\r\n").unwrap();
     }
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&response.body);
@@ -613,11 +647,30 @@ struct Response {
     status: u16,
     etag: Option<String>,
     body: Vec<u8>,
+    /// Overrides the wire `Content-Length` (a HEAD response carries the
+    /// object's real size with an empty body).
+    content_length: Option<u64>,
+    /// The wire `Last-Modified` (HTTP-date) for object responses.
+    last_modified: Option<String>,
 }
 
 impl Response {
     fn new(status: u16, etag: Option<String>, body: Vec<u8>) -> Self {
-        Self { status, etag, body }
+        Self {
+            status,
+            etag,
+            body,
+            content_length: None,
+            last_modified: None,
+        }
+    }
+
+    /// The object facts S3 exposes: `Content-Length` always, `Last-Modified`
+    /// in IMF-fixdate form.
+    fn object_meta(mut self, len: u64, modified_secs: i64) -> Self {
+        self.content_length = Some(len);
+        self.last_modified = Some(http_date(modified_secs));
+        self
     }
 
     fn text(status: u16, body: &str) -> Self {
@@ -630,6 +683,41 @@ impl Response {
             &format!("<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>{message}</Message></Error>"),
         )
     }
+}
+
+/// `Sun, 06 Nov 1994 08:49:37 GMT` for Unix seconds (the one date form this
+/// mock emits).
+fn http_date(secs: i64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let weekday = WEEKDAYS[days.rem_euclid(7) as usize];
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{weekday}, {day:02} {} {year:04} {:02}:{:02}:{:02} GMT",
+        MONTHS[(month - 1) as usize],
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
+/// Days since the epoch → `(year, month, day)` (the same civil-date math the
+/// crate's time module uses).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 fn respond(
@@ -700,11 +788,19 @@ fn respond(
             list_objects_v2(state, &params)
         }
         "GET" => match state.store.lock().unwrap().objects.get(&key).cloned() {
-            Some(object) => Response::new(200, Some(object.etag), object.bytes),
+            Some(object) => {
+                let len = object.bytes.len() as u64;
+                Response::new(200, Some(object.etag), object.bytes)
+                    .object_meta(len, object.modified_secs)
+            }
             None => Response::error(404, "NoSuchKey", "The specified key does not exist."),
         },
         "HEAD" => match state.store.lock().unwrap().objects.get(&key).cloned() {
-            Some(object) => Response::new(200, Some(object.etag), Vec::new()),
+            Some(object) => {
+                let len = object.bytes.len() as u64;
+                Response::new(200, Some(object.etag), Vec::new())
+                    .object_meta(len, object.modified_secs)
+            }
             None => Response::new(404, None, Vec::new()),
         },
         "PUT" => put_object(state, &key, headers, body),
@@ -771,13 +867,9 @@ fn put_object(state: &State, key: &str, headers: &[(String, String)], body: &[u8
         }
     }
     let etag = next_etag(&mut store);
-    store.objects.insert(
-        key.to_string(),
-        Object {
-            bytes: body.to_vec(),
-            etag: etag.clone(),
-        },
-    );
+    store
+        .objects
+        .insert(key.to_string(), Object::new(body.to_vec(), etag.clone()));
     Response::new(200, Some(etag), Vec::new())
 }
 

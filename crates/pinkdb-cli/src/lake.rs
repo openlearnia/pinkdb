@@ -81,7 +81,10 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Instant;
 
-use pink_lake::{CommitSettings, Lake, WritableAttachment};
+use pink_lake::{
+    CleanupSettings, CommitSettings, ExpireSettings, Lake, MergeSettings, RewriteSettings,
+    WritableAttachment,
+};
 use pinkdb::PinkDb;
 
 use crate::{plural, take_token, unquote};
@@ -210,6 +213,15 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "attach" => cmd_attach(db, rest),
         "commit" => cmd_commit(db, rest),
         "partition" => cmd_partition(db, rest),
+        "merge" => cmd_merge(rest),
+        "rewrite" => cmd_rewrite(rest),
+        "expire" => cmd_expire(rest),
+        "cleanup" => cmd_cleanup(rest, CleanupKind::Old),
+        "orphans" => cmd_cleanup(rest, CleanupKind::Orphaned),
+        "files" => cmd_files(rest),
+        "table_info" | "tableinfo" => cmd_table_info(rest),
+        "options" => cmd_options(rest),
+        "settings" => cmd_settings(rest),
         "detach" => cmd_detach(db, rest),
         "attached" => cmd_attached(db, rest),
         "versions" => cmd_versions(rest),
@@ -217,7 +229,9 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!(
-            "Usage: .lake <save|open|attach|commit|partition|detach|attached|versions|snapshots|tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|partition|merge|rewrite|expire|cleanup|\
+             orphans|files|table_info|options|settings|detach|attached|versions|snapshots|\
+             tables|info> ..."
         ),
         other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
     }
@@ -1318,4 +1332,691 @@ fn warn_missing_data_files(lake: &Lake) {
         }
         Err(e) => cli_error!("{e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance (wave 67): merge / rewrite / expire / cleanup / orphans, and
+// the files / table_info / options / settings introspection.
+
+/// The parsed shape every maintenance command shares: the location, bare
+/// tokens (a table name, or flags like `all`/`dry-run`), and `key=value`
+/// options.
+struct MaintenanceArgs {
+    dir: String,
+    bare: Vec<String>,
+    options: Vec<(String, String)>,
+}
+
+/// Parse `<dir> [bare…] [key=value…]` for one maintenance command; `usage`
+/// is printed on any malformed token.
+fn parse_maintenance_args(usage: &str, arg: &str) -> Option<MaintenanceArgs> {
+    let Some((dir, mut rest)) = take_token(arg) else {
+        println!("{usage}");
+        return None;
+    };
+    let dir = unquote(&dir);
+    let mut bare = Vec::new();
+    let mut options = Vec::new();
+    loop {
+        let tail = rest.trim_start();
+        if tail.is_empty() {
+            break;
+        }
+        let Some((token, after)) = take_token(tail) else {
+            break;
+        };
+        rest = after;
+        let token = unquote(&token);
+        match token.split_once('=') {
+            Some((key, value)) => options.push((key.to_ascii_lowercase(), value.to_string())),
+            None => bare.push(token),
+        }
+    }
+    Some(MaintenanceArgs { dir, bare, options })
+}
+
+/// A bare table token → the flat catalog key (like `.lake partition`:
+/// `t` means `main.t`; a dotted token is used as written).
+fn flat_table_key(token: &str) -> String {
+    if token.contains('.') {
+        token.to_string()
+    } else {
+        format!("main.{token}")
+    }
+}
+
+/// A refused-with-summary usage error for an unexpected bare token.
+fn unexpected_token(usage: &str) {
+    println!("{usage}");
+}
+
+/// `older_than=<iso8601>` → microseconds since the Unix epoch (the unit the
+/// maintenance settings use; [`pinkdb::types::parse_iso8601_utc`] is the
+/// same parser the engine's `AT (TIMESTAMP => …)` uses).
+fn parse_time_option(key: &str, value: &str) -> Option<i64> {
+    match pinkdb::types::parse_iso8601_utc(value.trim_matches('\'')) {
+        Some(micros) => Some(micros),
+        None => {
+            cli_error!(
+                "invalid {key}={value:?}: expected an ISO-8601 UTC timestamp like \
+                 2026-10-17T00:00:00Z"
+            );
+            None
+        }
+    }
+}
+
+/// `versions=2,3` / `versions=[2,3]` → the version list.
+fn parse_versions_option(value: &str) -> Option<Vec<u64>> {
+    let inner = value.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut out = Vec::new();
+    for part in inner.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.parse::<u64>() {
+            Ok(version) => out.push(version),
+            Err(_) => {
+                cli_error!("invalid version {part:?}: expected a positive integer");
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The shared refuse-when-attached-writable guard for the commands that
+/// publish a version (a writable attachment's base would go stale; the
+/// session's `.lake commit` must land or be detached first).
+fn writable_refusal(dir: &str, what: &str) -> Option<String> {
+    writables().contains_key(dir).then(|| {
+        format!(
+            "{dir} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir}) it before {what}"
+        )
+    })
+}
+
+/// `.lake merge <dir> [table] [min_file_size=N] [max_file_size=N]
+/// [max_compacted_files=N]` — DuckLake's `ducklake_merge_adjacent_files`:
+/// publish one new version whose tables reference consolidated data files,
+/// never touching a published file. Files merge only when they share
+/// partition values and schema epoch, have no positional deletes, and pass
+/// the size filters; a group needs at least two files.
+fn cmd_merge(arg: &str) {
+    let usage = "Usage: .lake merge <dir> [table] [min_file_size=N] [max_file_size=N] \
+                 [max_compacted_files=N]";
+    let Some(args) = parse_maintenance_args(usage, arg) else {
+        return;
+    };
+    if args.bare.len() > 1 {
+        unexpected_token(usage);
+        return;
+    }
+    let table = args.bare.first().map(|token| flat_table_key(token));
+    let mut settings = MergeSettings::default();
+    for (key, value) in &args.options {
+        let parsed = value.parse::<u64>();
+        match (key.as_str(), parsed) {
+            ("min_file_size", Ok(v)) => settings.min_file_size = Some(v),
+            ("max_file_size", Ok(v)) => settings.max_file_size = Some(v),
+            ("max_compacted_files", Ok(v)) => settings.max_compacted_files = Some(v),
+            (key @ ("min_file_size" | "max_file_size" | "max_compacted_files"), Err(_)) => {
+                cli_error!("invalid {key}={value:?}: expected a non-negative integer");
+                return;
+            }
+            _ => {
+                unexpected_token(usage);
+                return;
+            }
+        }
+    }
+    let dir = args.dir;
+    if let Some(refusal) = writable_refusal(&dir, "merging its files") {
+        cli_error!("{refusal}");
+        return;
+    }
+    let mut lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let t0 = Instant::now();
+    match lake.merge_adjacent_files(table.as_deref(), &settings) {
+        Ok(report) if !report.committed => println!(
+            "Nothing to merge in {dir} (no eligible file group: candidates must share \
+             partition values and schema epoch, carry no deletes, and number at least two)"
+        ),
+        Ok(report) => {
+            set_baseline_version_only(&dir, report.version);
+            for table in &report.tables {
+                println!(
+                    "{}: merged {} file{} into {}",
+                    table.table,
+                    table.files_processed,
+                    plural(table.files_processed as usize),
+                    table.files_created
+                );
+            }
+            println!(
+                "Merged {} file{} into {} in {dir} (version {}, {} bytes written, {:.3}s)",
+                report.files_processed(),
+                plural(report.files_processed() as usize),
+                report.files_created(),
+                report.version,
+                report.bytes_written,
+                t0.elapsed().as_secs_f64(),
+            );
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake rewrite <dir> [table] [delete_threshold=F] [max_compacted_files=N]`
+/// — DuckLake's `ducklake_rewrite_data_files`: materialize the deletes of the
+/// files whose delete ratio reaches the threshold (default 0.95) into fresh
+/// data files, dropping their delete files from the new version.
+fn cmd_rewrite(arg: &str) {
+    let usage = "Usage: .lake rewrite <dir> [table] [delete_threshold=F] \
+                 [max_compacted_files=N]";
+    let Some(args) = parse_maintenance_args(usage, arg) else {
+        return;
+    };
+    if args.bare.len() > 1 {
+        unexpected_token(usage);
+        return;
+    }
+    let table = args.bare.first().map(|token| flat_table_key(token));
+    let mut settings = RewriteSettings::default();
+    for (key, value) in &args.options {
+        match key.as_str() {
+            "delete_threshold" => match value.parse::<f64>() {
+                Ok(v) if (0.0..=1.0).contains(&v) => settings.delete_threshold = v,
+                _ => {
+                    cli_error!(
+                        "invalid delete_threshold={value:?}: expected a ratio between 0 and 1"
+                    );
+                    return;
+                }
+            },
+            "max_compacted_files" => match value.parse::<u64>() {
+                Ok(v) => settings.max_compacted_files = Some(v),
+                Err(_) => {
+                    cli_error!(
+                        "invalid max_compacted_files={value:?}: expected a non-negative integer"
+                    );
+                    return;
+                }
+            },
+            _ => {
+                unexpected_token(usage);
+                return;
+            }
+        }
+    }
+    let dir = args.dir;
+    if let Some(refusal) = writable_refusal(&dir, "rewriting its files") {
+        cli_error!("{refusal}");
+        return;
+    }
+    let mut lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let t0 = Instant::now();
+    match lake.rewrite_data_files(table.as_deref(), &settings) {
+        Ok(report) if !report.committed => println!(
+            "Nothing to rewrite in {dir} (no file's delete ratio reaches the threshold; the \
+             default is 0.95 — pass delete_threshold=0 to rewrite any file with deletes)"
+        ),
+        Ok(report) => {
+            set_baseline_version_only(&dir, report.version);
+            for table in &report.tables {
+                println!(
+                    "{}: rewrote {} file{} into {}",
+                    table.table,
+                    table.files_processed,
+                    plural(table.files_processed as usize),
+                    table.files_created
+                );
+            }
+            println!(
+                "Rewrote {} file{} into {} in {dir} (version {}, {} bytes written, {:.3}s)",
+                report.files_processed(),
+                plural(report.files_processed() as usize),
+                report.files_created(),
+                report.version,
+                report.bytes_written,
+                t0.elapsed().as_secs_f64(),
+            );
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake expire <dir> [versions=a,b,c] [older_than=<iso8601>] [keep=N]
+/// [dry-run]` — DuckLake's `ducklake_expire_snapshots`: remove old
+/// `snapshots/<v>.json` + `commits/<v>.json`, never the current version.
+/// `keep=N` always retains the newest N versions (a pinkdb addition);
+/// `versions` and `older_than` are mutually exclusive (DuckLake's rule).
+fn cmd_expire(arg: &str) {
+    let usage = "Usage: .lake expire <dir> [versions=a,b,c] [older_than=<iso8601>] [keep=N] \
+                 [dry-run]";
+    let Some(args) = parse_maintenance_args(usage, arg) else {
+        return;
+    };
+    let mut settings = ExpireSettings::default();
+    let mut bare_ok = true;
+    for token in &args.bare {
+        match token.to_ascii_lowercase().as_str() {
+            "dry-run" | "dry_run" | "dryrun" => settings.dry_run = true,
+            _ => bare_ok = false,
+        }
+    }
+    if !bare_ok {
+        unexpected_token(usage);
+        return;
+    }
+    for (key, value) in &args.options {
+        match key.as_str() {
+            "versions" => match parse_versions_option(value) {
+                Some(versions) => settings.versions = Some(versions),
+                None => return,
+            },
+            "older_than" => match parse_time_option("older_than", value) {
+                Some(micros) => settings.older_than_micros = Some(micros),
+                None => return,
+            },
+            "keep" => match value.parse::<u64>() {
+                Ok(v) => settings.retain_last = Some(v),
+                Err(_) => {
+                    cli_error!("invalid keep={value:?}: expected a non-negative integer");
+                    return;
+                }
+            },
+            _ => {
+                unexpected_token(usage);
+                return;
+            }
+        }
+    }
+    let dir = args.dir;
+    let mut lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match lake.expire_snapshots(&settings) {
+        Ok(report) if report.versions.is_empty() => {
+            if settings.dry_run {
+                println!("Nothing to expire in {dir} (no version matched the rule)");
+            } else {
+                println!("Nothing expired in {dir} (no version matched the rule)");
+            }
+        }
+        Ok(report) => {
+            for info in &report.versions {
+                println!(
+                    "{} version {} ({})",
+                    if report.dry_run {
+                        "would expire"
+                    } else {
+                        "expired"
+                    },
+                    info.version,
+                    info.time,
+                );
+            }
+            if report.dry_run {
+                println!(
+                    "{} snapshot{} would be expired ({} bytes); re-run without dry-run to \
+                     delete them",
+                    report.versions.len(),
+                    plural(report.versions.len()),
+                    report.bytes,
+                );
+            } else {
+                println!(
+                    "Expired {} snapshot{} from {dir} ({} bytes freed; earlier versions can no \
+                     longer be opened)",
+                    report.versions.len(),
+                    plural(report.versions.len()),
+                    report.bytes,
+                );
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// Which cleanup flavor a command line is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CleanupKind {
+    /// `ducklake_cleanup_old_files` — `.lake cleanup`.
+    Old,
+    /// `ducklake_delete_orphaned_files` — `.lake orphans` (the same scan:
+    /// pinkdb has no scheduled-deletion queue, see the `pink-lake`
+    /// maintenance module docs).
+    Orphaned,
+}
+
+/// `.lake cleanup <dir> [older_than=<iso8601>] [all] [dry-run] [confirm]` /
+/// `.lake orphans …` — delete `data/` objects no retained version references,
+/// behind an age gate (default 2 days, DuckLake's `delete_older_than`) and an
+/// explicit `dry-run`/`confirm`.
+fn cmd_cleanup(arg: &str, kind: CleanupKind) {
+    let (sub, what) = match kind {
+        CleanupKind::Old => ("cleanup", "cleaned up"),
+        CleanupKind::Orphaned => ("orphans", "deleted"),
+    };
+    let usage =
+        format!("Usage: .lake {sub} <dir> [older_than=<iso8601>] [all] [dry-run] [confirm]");
+    let Some(args) = parse_maintenance_args(&usage, arg) else {
+        return;
+    };
+    let mut settings = CleanupSettings::default();
+    let mut bare_ok = true;
+    for token in &args.bare {
+        match token.to_ascii_lowercase().as_str() {
+            "all" => settings.all = true,
+            "dry-run" | "dry_run" | "dryrun" => settings.dry_run = true,
+            "confirm" => settings.confirm = true,
+            _ => bare_ok = false,
+        }
+    }
+    if !bare_ok {
+        unexpected_token(&usage);
+        return;
+    }
+    for (key, value) in &args.options {
+        match key.as_str() {
+            "older_than" => match parse_time_option("older_than", value) {
+                Some(micros) => settings.older_than_micros = Some(micros),
+                None => return,
+            },
+            _ => {
+                unexpected_token(&usage);
+                return;
+            }
+        }
+    }
+    let dir = args.dir;
+    let mut lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let result = match kind {
+        CleanupKind::Old => lake.cleanup_old_files(&settings),
+        CleanupKind::Orphaned => lake.delete_orphaned_files(&settings),
+    };
+    match result {
+        Ok(report) if report.paths.is_empty() => {
+            println!("Nothing to {sub} in {dir} (no object is unreferenced)");
+        }
+        Ok(report) => {
+            for path in &report.paths {
+                if report.dry_run {
+                    println!("would delete {path}");
+                } else {
+                    println!("deleted {path}");
+                }
+            }
+            if report.dry_run {
+                println!(
+                    "{} object{} would be {} ({} bytes); re-run with confirm to delete",
+                    report.paths.len(),
+                    plural(report.paths.len()),
+                    what,
+                    report.bytes,
+                );
+            } else {
+                println!(
+                    "Deleted {} object{} from {dir} ({} bytes freed; still-referenced versions \
+                     are untouched)",
+                    report.paths.len(),
+                    plural(report.paths.len()),
+                    report.bytes,
+                );
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake files <dir> [table] [all] [version=N]` — DuckLake's
+/// `ducklake_list_files`: one line per data file (and per delete-file
+/// pairing). `all` also lists `data/` objects no retained version references
+/// (marked `unreferenced`), exactly the cleanup scan.
+fn cmd_files(arg: &str) {
+    let usage = "Usage: .lake files <dir> [table] [all] [version=N]";
+    let Some(args) = parse_maintenance_args(usage, arg) else {
+        return;
+    };
+    let mut table: Option<String> = None;
+    let mut all = false;
+    let mut bare_ok = true;
+    for token in &args.bare {
+        if token.eq_ignore_ascii_case("all") {
+            all = true;
+        } else if table.is_none() {
+            table = Some(flat_table_key(token));
+        } else {
+            bare_ok = false;
+        }
+    }
+    if !bare_ok {
+        unexpected_token(usage);
+        return;
+    }
+    let mut version: Option<u64> = None;
+    for (key, value) in &args.options {
+        match key.as_str() {
+            "version" => match value.parse::<u64>() {
+                Ok(v) => version = Some(v),
+                Err(_) => {
+                    cli_error!("invalid version={value:?}: expected a positive integer");
+                    return;
+                }
+            },
+            _ => {
+                unexpected_token(usage);
+                return;
+            }
+        }
+    }
+    let dir = args.dir;
+    let lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match lake.list_files(table.as_deref(), version, all) {
+        Ok(files) if files.is_empty() => println!("(no files)"),
+        Ok(files) => {
+            let referenced = files.iter().filter(|info| info.referenced).count();
+            for info in &files {
+                print_file_info(info);
+            }
+            if all {
+                println!(
+                    "{} file{} ({} referenced, {} unreferenced)",
+                    files.len(),
+                    plural(files.len()),
+                    referenced,
+                    files.len() - referenced,
+                );
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// One `.lake files` line: the path, then the fields this file records (or,
+/// for an unreferenced object, just the size).
+fn print_file_info(info: &pink_lake::LakeFileInfo) {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(table) = &info.table {
+        parts.push(format!("table={table}"));
+    }
+    if let Some(rows) = info.rows {
+        parts.push(format!("rows={rows}"));
+    }
+    if let Some(size) = info.size_bytes {
+        parts.push(format!("size={size}"));
+    }
+    if let Some(schema_version) = info.schema_version {
+        parts.push(format!("schema_version={schema_version}"));
+    }
+    if let Some(partition) = &info.partition {
+        parts.push(format!("partition={}", partition_text(partition)));
+    }
+    if let Some(delete) = &info.delete_file {
+        let rows = info.delete_file_rows.unwrap_or(0);
+        parts.push(format!(
+            "delete={delete} ({rows} position{})",
+            plural(rows as usize)
+        ));
+    }
+    if !info.referenced {
+        parts.push("unreferenced".to_string());
+    }
+    println!("{}: {}", info.path, parts.join(" "));
+}
+
+/// `{region=east, day=NULL}`-style text for a file's partition values.
+fn partition_text(partition: &BTreeMap<String, Option<String>>) -> String {
+    partition
+        .iter()
+        .map(|(key, value)| match value {
+            Some(value) => format!("{key}={value}"),
+            None => format!("{key}=NULL"),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// `.lake table_info <dir>` — DuckLake's `ducklake_table_info`: per-table
+/// file/delete-file counts and sizes, rows, schema epoch and partition spec.
+fn cmd_table_info(arg: &str) {
+    let usage = "Usage: .lake table_info <dir>";
+    let Some(args) = parse_maintenance_args(usage, arg) else {
+        return;
+    };
+    if !args.bare.is_empty() || !args.options.is_empty() {
+        unexpected_token(usage);
+        return;
+    }
+    let dir = args.dir;
+    let lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match lake.table_info() {
+        Ok(tables) if tables.is_empty() => println!("(no tables)"),
+        Ok(tables) => {
+            for info in tables {
+                let partition = if info.partition_by.is_empty() {
+                    String::new()
+                } else {
+                    format!(", partitioned by ({})", info.partition_by.join(", "))
+                };
+                println!(
+                    "{}: {} file{}, {}, {} delete file{}, {}, {} row{}, schema version {}{}",
+                    info.table,
+                    info.file_count,
+                    plural(info.file_count as usize),
+                    bytes_text(info.file_size_bytes),
+                    info.delete_file_count,
+                    plural(info.delete_file_count as usize),
+                    bytes_text(info.delete_file_size_bytes),
+                    info.rows,
+                    plural(info.rows as usize),
+                    info.schema_version,
+                    partition,
+                );
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `123 bytes`, or `(size unknown)` when no stat could read it.
+fn bytes_text(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) => format!("{bytes} bytes"),
+        None => "(size unknown)".to_string(),
+    }
+}
+
+/// `.lake options <dir>` — DuckLake's `ducklake_options`: the catalog's
+/// read-only facts (pinkdb has no settings store, so these are facts, not
+/// knobs).
+fn cmd_options(arg: &str) {
+    let usage = "Usage: .lake options <dir>";
+    let Some(args) = parse_maintenance_args(usage, arg) else {
+        return;
+    };
+    if !args.bare.is_empty() || !args.options.is_empty() {
+        unexpected_token(usage);
+        return;
+    }
+    let dir = args.dir;
+    let lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match lake.options() {
+        Ok(options) => {
+            for option in options {
+                println!(
+                    "{}: {}  ({})",
+                    option.name, option.value, option.description
+                );
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake settings <dir>` — DuckLake's `ducklake_settings` trio.
+fn cmd_settings(arg: &str) {
+    let usage = "Usage: .lake settings <dir>";
+    let Some(args) = parse_maintenance_args(usage, arg) else {
+        return;
+    };
+    if !args.bare.is_empty() || !args.options.is_empty() {
+        unexpected_token(usage);
+        return;
+    }
+    let dir = args.dir;
+    let lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let settings = lake.settings();
+    println!("catalog_type:      {}", settings.catalog_type);
+    println!("extension_version: {}", settings.extension_version);
+    println!("data_path:         {}", settings.data_path);
 }

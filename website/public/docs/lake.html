@@ -474,6 +474,43 @@ file”).</p>
   plaintext lakes stay byte-identical.</li>
 </ul>
 
+<h2 id="maintenance">Maintenance<a class="anchor" href="#maintenance" aria-label="Permalink: Maintenance">#</a></h2>
+
+<p>Lakes accumulate small files (incremental commits) and old versions. The
+maintenance commands publish their work as <strong>ordinary new versions</strong> —
+nothing already published is ever mutated:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-f">.lake</span> merge mylake          <span class="tok-c">-- compact eligible data files (one new version)</span>
+<span class="tok-f">.lake</span> rewrite mylake        <span class="tok-c">-- materialize heavily-deleted files</span>
+<span class="tok-f">.lake</span> expire mylake         <span class="tok-c">-- expire old snapshots (by version list / cutoff / keep-N)</span>
+<span class="tok-f">.lake</span> cleanup mylake        <span class="tok-c">-- delete unreferenced data files (dry-run + age gate first)</span>
+<span class="tok-f">.lake</span> files mylake          <span class="tok-c">-- per-file listing: rows, size, partition, epoch, referenced</span></code></pre></div>
+
+<ul>
+  <li><strong>Merge rules</strong> (pinned to DuckLake): only live data files
+  <em>without positional deletes</em>, passing the byte-size filters, and sharing
+  <strong>partition values and schema epoch</strong> in groups of ≥2 are
+  consolidated; the merged file carries the group's partition values and exact
+  statistics, and pruning keeps working. Source files stay byte-identical on disk
+  (tests pin bytes and mtimes). <code>rewrite</code> handles the delete-bearing
+  files instead: past a delete-ratio threshold, positions are materialized and the
+  delete file is dropped.</li>
+  <li><strong>Expiration</strong> removes old <code>snapshots/&lt;v&gt;.json</code>
+  and their commit deltas — never the current version; time travel to an expired
+  version reports a clean <code>no snapshot version</code> error.</li>
+  <li><strong>Cleanup is conservative</strong>: only objects under <code>data/</code>
+  that <em>no retained version references</em> (old merged-away files,
+  crashed-writer leftovers) are eligible, behind a default 2-day age gate and an
+  explicit dry-run/confirm (a would-delete call without either is refused; runs
+  are idempotent). <code>.lake orphans</code> is the age-bypassing variant. pinkdb
+  has no scheduled-deletion queue, so both run the same scan (documented rather
+  than faked).</li>
+  <li><strong>Introspection</strong>: <code>.lake files</code>,
+  <code>.lake table_info</code>, <code>.lake options</code>,
+  <code>.lake settings</code> mirror DuckLake's listing shape (rows, sizes,
+  partition values, epochs, referenced-or-not).</li>
+</ul>
+
 <h2 id="writer-semantics-and-conflicts">Writer semantics and conflicts<a class="anchor" href="#writer-semantics-and-conflicts" aria-label="Permalink: Writer semantics and conflicts">#</a></h2>
 
 <ul>
@@ -627,6 +664,7 @@ export <span class="tok-v">AWS_REGION</span>=auto
   <li><a href="#using-a-lake">Using a lake</a></li>
   <li><a href="#read-only-attach">Read-only attach</a></li>
   <li><a href="#encryption-at-rest">Encryption at rest</a></li>
+  <li><a href="#maintenance">Maintenance</a></li>
   <li><a href="#writer-semantics-and-conflicts">Writer semantics and conflicts</a></li>
   <li><a href="#s3-r2-object-storage">S3 / R2 object storage</a></li>
   <li><a href="#which-build-should-i-use">Which build should I use?</a></li>

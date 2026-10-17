@@ -780,3 +780,139 @@ fn s3_degraded_fallback_reconciles_the_encrypted_pair_from_stored_bytes() {
     let loaded = reader.load(None).unwrap();
     assert_eq!(loaded.list_databases().len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Maintenance (wave 67) on an encrypted lake.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn encrypted_lake_maintenance_round_trip() {
+    use pink_lake::{CleanupSettings, Commit, ExpireSettings, MergeSettings};
+    use std::sync::Arc;
+
+    let dir = scratch("maint");
+    let lake_dir = dir.join("lake");
+    // Three commits → three encrypted data-file objects.
+    let mut lake = Lake::create_with_key(&lake_dir, key()).unwrap();
+    let sub = |rows: &[(i32, &str)]| {
+        let mut t = pinkdb::DataTable::new(
+            "t".to_string(),
+            vec![
+                ("id".to_string(), pinkdb::DataType::Integer),
+                ("s".to_string(), pinkdb::DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        for (id, s) in rows {
+            t.append_row(vec![Value::Integer(*id), Value::Varchar(s.to_string())])
+                .unwrap();
+        }
+        Arc::new(t)
+    };
+    for chunk in [&[(1, "a"), (2, "b")][..], &[(3, "c")], &[(4, "d")]] {
+        let mut commit = Commit::new();
+        commit.append("main.t", sub(chunk));
+        lake.commit(&commit).unwrap();
+    }
+
+    // Merge: the new data file is sealed like every other object, the
+    // sources stay ciphertext-identical, and stats-fast attach still works
+    // (COUNT/MIN/MAX from the sealed manifest, zero decodes).
+    use std::collections::BTreeMap;
+    let source_bytes: BTreeMap<PathBuf, Vec<u8>> = data_files(&lake_dir)
+        .into_iter()
+        .map(|p| {
+            let bytes = std::fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    let report = lake
+        .merge_adjacent_files(None, &MergeSettings::default())
+        .unwrap();
+    assert!(report.committed);
+    assert_eq!(report.files_processed(), 3);
+    for (path, bytes) in &source_bytes {
+        assert_eq!(&std::fs::read(path).unwrap(), bytes, "{}", path.display());
+    }
+    assert_eq!(data_files(&lake_dir).len(), 4, "3 sources + 1 merged file");
+    let report = Lake::open_with_key(&lake_dir, key()).unwrap().attach(None);
+    let report = report.unwrap();
+    assert!(report.encrypted);
+    assert_eq!(report.tables, 1);
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake.clone()).unwrap();
+    let counts = db
+        .execute("SELECT COUNT(*), MIN(id), MAX(id) FROM t;")
+        .unwrap();
+    match counts.first().unwrap() {
+        QueryResult::Selected { rows, .. } => assert_eq!(rows.len(), 1),
+        other => panic!("{other:?}"),
+    }
+
+    // Expire the pre-merge snapshots (their sealed objects disappear), then
+    // clean the unreferenced sources: dry run deletes nothing, confirm
+    // deletes the ciphertext containers.
+    let mut lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    lake.expire_snapshots(&ExpireSettings {
+        retain_last: Some(1),
+        ..ExpireSettings::default()
+    })
+    .unwrap();
+    assert_eq!(lake.versions().unwrap().len(), 1);
+    let dry = lake
+        .cleanup_old_files(&CleanupSettings {
+            all: true,
+            dry_run: true,
+            ..CleanupSettings::default()
+        })
+        .unwrap();
+    assert_eq!(dry.paths.len(), 3, "{dry:?}");
+    for path in &dry.paths {
+        assert!(lake_dir.join(path).exists(), "dry run deleted {path}");
+    }
+    let real = lake
+        .cleanup_old_files(&CleanupSettings {
+            all: true,
+            confirm: true,
+            ..CleanupSettings::default()
+        })
+        .unwrap();
+    assert!(real.deleted);
+    for path in &real.paths {
+        assert!(!lake_dir.join(path).exists(), "{path} survived");
+    }
+    // The keyed lake still opens and reads; a keyless open still refuses.
+    let lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    let loaded = lake.load(None).unwrap();
+    assert_eq!(loaded.table("t").unwrap().num_rows(), 4);
+    let err = Lake::open(&lake_dir).unwrap_err();
+    assert!(matches!(err, LakeError::Encrypted { .. }), "{err:?}");
+    // The maintenance report itself never leaked plaintext container bytes:
+    // every data object starts with the magic.
+    for path in data_files(&lake_dir) {
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..8], MAGIC, "{}", path.display());
+    }
+    cleanup(&dir);
+}
+
+/// Every `data/` file of a lake (recursively).
+fn data_files(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                walk(&e.path(), out);
+            } else {
+                out.push(e.path());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let data = dir.join("data");
+    if data.exists() {
+        walk(&data, &mut out);
+    }
+    out.sort();
+    out
+}

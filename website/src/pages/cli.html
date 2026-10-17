@@ -110,6 +110,27 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       files</td>
     </tr>
     <tr>
+      <td><code>.lake merge | rewrite &lt;dir|s3://…&gt; [table]</code></td>
+      <td>maintenance: consolidate eligible data files (<code>merge</code>) or
+      materialize heavily-deleted ones (<code>rewrite</code>) as one new version;
+      published files are never mutated</td>
+    </tr>
+    <tr>
+      <td><code>.lake expire &lt;dir|s3://…&gt;</code></td>
+      <td>expire old snapshots + commit deltas (by versions / older-than / keep-N;
+      never the current version)</td>
+    </tr>
+    <tr>
+      <td><code>.lake cleanup | orphans &lt;dir|s3://…&gt;</code></td>
+      <td>delete unreferenced <code>data/</code> objects (dry-run/confirm + age
+      gate; <code>orphans</code> bypasses the age gate)</td>
+    </tr>
+    <tr>
+      <td><code>.lake files | table_info | options | settings &lt;dir|s3://…&gt;</code></td>
+      <td>introspection: per-file listing, table stats, lake options and
+      settings</td>
+    </tr>
+    <tr>
       <td><code>.lake detach &lt;dir|s3://…&gt; [force]</code></td>
       <td>detach one attached lake; a writable attachment with uncommitted changes
       refuses unless <code>force</code> (which keeps the tables as ordinary store

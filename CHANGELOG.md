@@ -10,6 +10,20 @@ one-liners below.
 
 ## 2026-10-17
 
+### Wave 67 — lake maintenance ✅
+- **Compaction**: `merge_adjacent_files` publishes one new version referencing
+  consolidated files — groups of delete-free files sharing partition values and
+  schema epoch (≥2 members) merge into one; source files are **never touched**
+  (bytes and mtimes pinned by tests) and row counts/zone maps stay exact.
+  `rewrite_data_files` materializes deletes above a threshold.
+- **Retention**: `expire_snapshots` removes old snapshots + commit deltas
+  (explicit versions, `older_than`, or `retain_last` — never the current
+  version); `cleanup_old_files` / `delete_orphaned_files` delete only
+  unreferenced `data/` objects, behind a 2-day age gate and an explicit
+  dry-run/confirm; encrypted lakes included.
+- **Introspection**: `.lake files / table_info / options / settings` (+
+  `merge`, `rewrite`, `expire`, `cleanup`, `orphans`).
+
 ### Wave 57 — lake encryption at rest ✅
 - With the `encryption` feature, a keyed session (`PINKDB_KEY`, consistent with
   the engine) seals **every lake object** — catalogs, snapshots, commit deltas,

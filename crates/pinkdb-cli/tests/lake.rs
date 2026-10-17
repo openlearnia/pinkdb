@@ -261,7 +261,9 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|attach|commit|partition|detach|attached|versions|snapshots|tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|partition|merge|rewrite|expire|cleanup|\
+             orphans|files|table_info|options|settings|detach|attached|versions|snapshots|\
+             tables|info> ..."
         ),
         "{out}"
     );
@@ -2239,5 +2241,120 @@ fn partition_command_errors_are_reported() {
     // The failed commands published nothing: the lake is still version 2.
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
     assert!(catalog.contains("\"version\": 2"), "{catalog}");
+    cleanup(&dir);
+}
+
+/// Wave 67: the maintenance commands end to end — merge, files, table_info,
+/// expire (dry-run then real), cleanup (dry-run, refusal, confirm), options
+/// and settings — with the published-data immutability checked on disk.
+#[test]
+fn maintenance_commands_merge_expire_and_cleanup() {
+    let dir = scratch("maint");
+    let lake = dir.join("lake");
+    // v2 saves one file; two writable-attach commits append two more.
+    run(&format!(
+        "CREATE TABLE t (id INTEGER, s VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'a'), (2, 'b');\n\
+         .lake save {lake}\n\
+         .lake attach {lake} write\n\
+         INSERT INTO t VALUES (3, 'c');\n\
+         .lake commit {lake}\n\
+         INSERT INTO t VALUES (4, 'd');\n\
+         .lake commit {lake}\n\
+         .lake detach {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    let data_dir = lake.join("data/main.t");
+    let before: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|e| {
+            let path = e.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    assert_eq!(before.len(), 3, "three data files before the merge");
+
+    // Merge and inspect. The 2-day cleanup gate protects the merged sources
+    // even after `all` until their snapshots are expired, so this run shows
+    // "nothing to clean" and the dry-run expiration of version 2.
+    let out = run(&format!(
+        ".lake merge {lake}\n\
+         .lake files {lake}\n\
+         .lake table_info {lake}\n\
+         .lake cleanup {lake} all dry-run\n\
+         .lake expire {lake} versions=2 dry-run\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("main.t: merged 3 files into 1"), "{out}");
+    assert!(out.contains("Merged 3 files into 1 in"), "{out}");
+    assert!(out.contains("version 5"), "{out}");
+    // The head file listing: one consolidated file with the exact rows.
+    assert!(out.contains("table=main.t rows=4"), "{out}");
+    assert!(out.contains("schema_version=1"), "{out}");
+    // Table info: one file, four rows.
+    assert!(out.contains("main.t: 1 file,"), "{out}");
+    assert!(out.contains(", 4 rows,"), "{out}");
+    // Every source is still referenced by a retained snapshot.
+    assert!(out.contains("Nothing to cleanup in"), "{out}");
+    assert!(out.contains("would expire version 2"), "{out}");
+    assert!(!out.contains("Error:"), "{out}");
+
+    // The merge never mutated a published file: byte-identical sources plus
+    // the new consolidated one.
+    for (path, bytes) in &before {
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            bytes,
+            "{} changed",
+            path.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_dir(&data_dir).unwrap().count(),
+        4,
+        "three sources + one merged file"
+    );
+
+    // Expire every pre-merge snapshot: the three sources become
+    // unreferenced. Cleanup previews, refuses without confirmation, then
+    // deletes on confirm; time travel to the expired version fails cleanly.
+    let out = run(&format!(
+        ".lake expire {lake} versions=2,3,4\n\
+         .lake cleanup {lake} all dry-run\n\
+         .lake cleanup {lake} all\n\
+         .lake cleanup {lake} all confirm\n\
+         .lake files {lake} all\n\
+         .lake options {lake}\n\
+         .lake settings {lake}\n\
+         .lake open {lake} 2\n\
+         .lake open {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("expired version 2"), "{out}");
+    assert!(out.contains("expired version 3"), "{out}");
+    assert!(out.contains("expired version 4"), "{out}");
+    assert!(out.contains("Expired 3 snapshots from"), "{out}");
+    assert!(out.contains("3 objects would be cleaned up"), "{out}");
+    assert!(
+        out.contains("refusing to delete 3 unreferenced lake object(s) without confirmation"),
+        "{out}"
+    );
+    assert!(out.contains("Deleted 3 objects from"), "{out}");
+    assert!(
+        out.contains("1 file (1 referenced, 0 unreferenced)"),
+        "{out}"
+    );
+    assert!(out.contains("data_format: "), "{out}");
+    assert!(out.contains("data_path: "), "{out}");
+    assert!(out.contains("catalog_type:      json"), "{out}");
+    assert!(out.contains("extension_version: "), "{out}");
+    assert!(out.contains("has no snapshot version 2"), "{out}");
+    assert!(!out.contains("Error: corrupt"), "{out}");
+    // Only the consolidated head file remains.
+    assert_eq!(std::fs::read_dir(&data_dir).unwrap().count(), 1);
     cleanup(&dir);
 }

@@ -9,6 +9,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-17</h2>
+<h3>Wave 67 — lake maintenance ✅</h3>
+<ul>
+<li><strong>Compaction</strong>: <code>merge_adjacent_files</code> publishes one new version referencing consolidated files — groups of delete-free files sharing partition values and schema epoch (≥2 members) merge into one; source files are <strong>never touched</strong> (bytes and mtimes pinned by tests) and row counts/zone maps stay exact. <code>rewrite_data_files</code> materializes deletes above a threshold.</li>
+<li><strong>Retention</strong>: <code>expire_snapshots</code> removes old snapshots + commit deltas (explicit versions, <code>older_than</code>, or <code>retain_last</code> — never the current version); <code>cleanup_old_files</code> / <code>delete_orphaned_files</code> delete only unreferenced <code>data/</code> objects, behind a 2-day age gate and an explicit dry-run/confirm; encrypted lakes included.</li>
+<li><strong>Introspection</strong>: <code>.lake files / table_info / options / settings</code> (+ <code>merge</code>, <code>rewrite</code>, <code>expire</code>, <code>cleanup</code>, <code>orphans</code>).</li>
+</ul>
 <h3>Wave 57 — lake encryption at rest ✅</h3>
 <ul>
 <li>With the <code>encryption</code> feature, a keyed session (<code>PINKDB_KEY</code>, consistent with the engine) seals <strong>every lake object</strong> — catalogs, snapshots, commit deltas, data files, delete files — as <code>PNKLAKE1</code> <strong>AES-256-GCM</strong> containers under one Argon2id derivation per session. A <code>Storage</code>-level decorator means commits, deletes, time travel and retry paths are covered with no per-call-site code.</li>

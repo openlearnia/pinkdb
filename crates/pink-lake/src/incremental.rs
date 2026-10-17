@@ -1743,7 +1743,7 @@ impl Lake {
     /// the exact same bytes go to `snapshots/<v>.json` and to `catalog.json`,
     /// so the byte-identity invariant survives encryption (see
     /// `Storage::seal_manifest`).
-    fn publish_commit_version(
+    pub(crate) fn publish_commit_version(
         &mut self,
         version: u64,
         commit_bytes: &[u8],
@@ -1775,7 +1775,7 @@ impl Lake {
 
     /// Read `catalog.json` for a commit attempt: whatever version it names
     /// becomes this handle's base (a rebase).
-    fn read_catalog_for_commit(&mut self) -> Result<crate::catalog::Catalog> {
+    pub(crate) fn read_catalog_for_commit(&mut self) -> Result<crate::catalog::Catalog> {
         let manifest = crate::read_catalog(&*self.storage, &self.root)?;
         self.version = manifest.version;
         self.format_version = manifest.format_version;
@@ -1783,7 +1783,7 @@ impl Lake {
     }
 
     /// Re-read the catalog after a conflict: the new head becomes the base.
-    fn rebase_catalog(&mut self) -> Result<()> {
+    pub(crate) fn rebase_catalog(&mut self) -> Result<()> {
         let manifest = crate::read_catalog(&*self.storage, &self.root)?;
         self.version = manifest.version;
         self.format_version = manifest.format_version;

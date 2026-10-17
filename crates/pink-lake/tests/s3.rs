@@ -1370,3 +1370,217 @@ fn attach_over_s3_is_footer_only_and_matches_load() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Maintenance (wave 67) over the mock: merge / expire / cleanup / files.
+// ---------------------------------------------------------------------------
+
+/// An S3 lake whose `main.t` is built from one appended file per chunk.
+fn s3_appended_lake(mock: &MockS3, prefix: &str, chunks: &[&[(i32, &str)]]) -> Lake {
+    let mut lake = Lake::create_s3(mock_config(mock, "test-bucket", prefix)).unwrap();
+    for chunk in chunks {
+        let mut table = pinkdb::DataTable::new(
+            "t".to_string(),
+            vec![
+                ("id".to_string(), pinkdb::DataType::Integer),
+                ("s".to_string(), pinkdb::DataType::Varchar),
+            ],
+        )
+        .unwrap();
+        for (id, s) in *chunk {
+            table
+                .append_row(vec![Value::Integer(*id), Value::Varchar(s.to_string())])
+                .unwrap();
+        }
+        let mut commit = pink_lake::Commit::new();
+        commit.append("main.t", std::sync::Arc::new(table));
+        lake.commit(&commit).unwrap();
+    }
+    lake
+}
+
+#[test]
+fn maintenance_over_s3_merges_expires_and_cleans_only_unreferenced_objects() {
+    let mock = MockS3::start();
+    let scratch = scratch("maint");
+    let prefix = "maint";
+    let mut lake = s3_appended_lake(
+        &mock,
+        prefix,
+        &[&[(1, "a"), (2, "b")], &[(3, "c")], &[(4, "d")]],
+    );
+    let data_keys: Vec<String> = mock
+        .keys()
+        .into_iter()
+        .filter(|k| k.starts_with(&format!("{prefix}/data/main.t/")))
+        .collect();
+    assert_eq!(data_keys.len(), 3, "{data_keys:?}");
+    let bytes_before: Vec<Option<Vec<u8>>> = data_keys.iter().map(|k| mock.object(k)).collect();
+
+    // Merge: one consolidated object, version published, source objects
+    // byte-identical (never rewritten over S3 either).
+    let report = lake
+        .merge_adjacent_files(None, &pink_lake::MergeSettings::default())
+        .unwrap();
+    assert!(report.committed);
+    assert_eq!(report.files_processed(), 3);
+    assert_eq!(report.files_created(), 1);
+    for (key, bytes) in data_keys.iter().zip(&bytes_before) {
+        assert_eq!(&mock.object(key), bytes, "{key} changed");
+    }
+    // create + 3 commits + the merge version.
+    assert_eq!(lake.versions().unwrap().len(), 5);
+
+    // S3 `stat` reads size + Last-Modified: the listing and table info
+    // carry real sizes.
+    let files = lake.list_files(None, None, false).unwrap();
+    assert_eq!(files.len(), 1);
+    assert!(files[0].size_bytes.is_some_and(|s| s > 0));
+    let info = lake.table_info().unwrap();
+    assert_eq!(info[0].file_count, 1);
+    assert!(info[0].file_size_bytes.is_some_and(|s| s > 0));
+    assert_eq!(info[0].rows, 4);
+
+    // Expire the pre-merge snapshots; their commit deltas go too, and the
+    // catalog is untouched.
+    let report = lake
+        .expire_snapshots(&pink_lake::ExpireSettings {
+            versions: Some(vec![2, 3]),
+            dry_run: false,
+            ..pink_lake::ExpireSettings::default()
+        })
+        .unwrap();
+    assert_eq!(report.version_numbers(), vec![2, 3]);
+    assert_eq!(mock.object(&format!("{prefix}/snapshots/2.json")), None);
+    assert_eq!(mock.object(&format!("{prefix}/commits/2.json")), None);
+    assert!(lake.load(None).is_ok());
+
+    // Cleanup: nothing yet (the remaining snapshot 4 still references the
+    // merged sources)... expire it, then the three sources become
+    // unreferenced. Dry run first: nothing is deleted.
+    let report = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            all: true,
+            dry_run: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap();
+    assert!(report.paths.is_empty(), "{report:?}");
+    lake.expire_snapshots(&pink_lake::ExpireSettings {
+        retain_last: Some(1),
+        ..pink_lake::ExpireSettings::default()
+    })
+    .unwrap();
+    let dry = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            all: true,
+            dry_run: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap();
+    assert_eq!(dry.paths.len(), 3, "{dry:?}");
+    for path in &dry.paths {
+        assert!(
+            mock.object(&format!("{prefix}/{path}")).is_some(),
+            "dry run deleted {path}"
+        );
+    }
+    // Without confirmation the call is refused, nothing deleted.
+    let err = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            all: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap_err();
+    assert!(matches!(err, LakeError::NotRepresentable { .. }), "{err:?}");
+    // Confirmed: gone; running twice is a no-op.
+    let real = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            all: true,
+            confirm: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap();
+    assert!(real.deleted);
+    assert_eq!(real.paths.len(), 3);
+    for path in &real.paths {
+        assert_eq!(mock.object(&format!("{prefix}/{path}")), None, "{path}");
+    }
+    let again = lake
+        .delete_orphaned_files(&pink_lake::CleanupSettings {
+            all: true,
+            confirm: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap();
+    assert!(again.paths.is_empty());
+    assert!(lake.load(None).is_ok());
+    std::fs::remove_dir_all(&scratch).ok();
+}
+
+#[test]
+fn maintenance_age_gate_reads_last_modified_over_s3() {
+    let mock = MockS3::start();
+    let scratch = scratch("maint-age");
+    let prefix = "gate";
+    let mut lake = s3_appended_lake(&mock, prefix, &[&[(1, "a")], &[(2, "b")]]);
+
+    // Two unreferenced leftovers: one backdated, one fresh.
+    let old_key = format!("{prefix}/data/main.t/crashed.pink.tmp");
+    let young_key = format!("{prefix}/data/main.t/fresh.pink.tmp");
+    mock.put_object(&old_key, b"crashed writer leftover");
+    mock.put_object(&young_key, b"fresh leftover");
+    let old_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        - 9 * 86_400;
+    assert!(mock.set_object_modified(&old_key, old_secs));
+
+    // The default 2-day gate exposes the backdated object only.
+    let report = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            dry_run: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap();
+    assert!(report
+        .paths
+        .contains(&"data/main.t/crashed.pink.tmp".to_string()));
+    assert!(!report
+        .paths
+        .contains(&"data/main.t/fresh.pink.tmp".to_string()));
+
+    // `all` skips the gate and lists both.
+    let report = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            all: true,
+            dry_run: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap();
+    assert_eq!(report.paths.len(), 2, "{report:?}");
+    // The listing's `all` mode agrees with the cleanup scan.
+    let files = lake.list_files(None, None, true).unwrap();
+    let unreferenced: Vec<&pink_lake::LakeFileInfo> =
+        files.iter().filter(|f| !f.referenced).collect();
+    assert_eq!(unreferenced.len(), 2);
+    assert!(unreferenced.iter().all(|f| f.size_bytes.is_some()));
+
+    // Backdate the fresh one too; the default gate now lists both, and the
+    // confirmed run deletes exactly them.
+    assert!(mock.set_object_modified(&young_key, old_secs));
+    let report = lake
+        .cleanup_old_files(&pink_lake::CleanupSettings {
+            confirm: true,
+            ..pink_lake::CleanupSettings::default()
+        })
+        .unwrap();
+    assert_eq!(report.paths.len(), 2, "{report:?}");
+    assert_eq!(mock.object(&old_key), None);
+    assert_eq!(mock.object(&young_key), None);
+    // The lake remains fully loadable.
+    assert!(lake.load(None).is_ok());
+    assert_eq!(lake.table_info().unwrap()[0].file_count, 2);
+    std::fs::remove_dir_all(&scratch).ok();
+}

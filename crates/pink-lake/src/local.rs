@@ -18,7 +18,7 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use super::storage::{Head, LocalCopy, Storage, VersionTag};
+use super::storage::{Head, LocalCopy, ObjectInfo, Storage, VersionTag};
 use crate::{fresh_id, LakeError, Result};
 
 /// The catalog file name inside the lake root.
@@ -178,6 +178,29 @@ impl Storage for LocalStorage {
         }
     }
 
+    fn stat(&self, rel: &str) -> Result<Option<ObjectInfo>> {
+        let path = self.abs(rel);
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => {
+                let modified_micros = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_micros().min(i64::MAX as u128) as i64);
+                Ok(Some(ObjectInfo {
+                    size: meta.len(),
+                    modified_micros,
+                }))
+            }
+            Ok(_) => Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(LakeError::Io {
+                context: format!("reading metadata of {}", path.display()),
+                source: e,
+            }),
+        }
+    }
+
     fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
         let path = self.abs(rel);
         fs::read(&path).map_err(|e| LakeError::Io {
@@ -296,6 +319,50 @@ impl Storage for LocalStorage {
             context: format!("deleting {}", path.display()),
             source: e,
         })
+    }
+
+    /// Every file under `rel` (any depth), as `/`-joined paths relative to
+    /// `rel`, sorted; symlinked directories are not followed (a symlink to a
+    /// file counts as a file, exactly as `list` treats it).
+    fn list_recursive(&self, rel: &str) -> Result<Vec<String>> {
+        let path = self.abs(rel);
+        let mut out = Vec::new();
+        let mut stack: Vec<(PathBuf, String)> = vec![(path.clone(), String::new())];
+        while let Some((dir, prefix)) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(LakeError::Io {
+                        context: format!("listing {}", dir.display()),
+                        source: e,
+                    })
+                }
+            };
+            for entry in entries {
+                let entry = entry.map_err(|e| LakeError::Io {
+                    context: format!("listing {}", dir.display()),
+                    source: e,
+                })?;
+                let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let child = entry.path();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let joined = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if is_dir {
+                    stack.push((child, joined));
+                } else if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    out.push(joined);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     fn local_copy(&self, rel: &str, _context: &str) -> Result<LocalCopy> {

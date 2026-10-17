@@ -77,7 +77,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::storage::{Head, LocalCopy, Storage, VersionTag};
+use crate::storage::{Head, LocalCopy, ObjectInfo, Storage, VersionTag};
 use crate::{fresh_id, LakeError, Result};
 
 use sigv4::{Credentials, SigningInput};
@@ -909,6 +909,79 @@ impl Storage for S3Storage {
         Ok(names)
     }
 
+    fn stat(&self, rel: &str) -> Result<Option<ObjectInfo>> {
+        let context = format!("HEAD {}", self.abs(rel).display());
+        match self.client.stat_object(&self.key(rel)) {
+            Ok(Some((size, modified_micros))) => {
+                self.bucket_confirmed.store(true, Ordering::Relaxed);
+                Ok(Some(ObjectInfo {
+                    size,
+                    modified_micros,
+                }))
+            }
+            Ok(None) => {
+                self.confirm_bucket_after_404(&context)?;
+                Ok(None)
+            }
+            Err(e) => Err(self.map(&context, e)),
+        }
+    }
+
+    /// Every object under `rel`, recursively, relative to `rel`. One
+    /// paginated ListObjectsV2 walk with no delimiter (the endpoint's own
+    /// key ordering is not relied upon; the result is sorted).
+    fn list_recursive(&self, rel: &str) -> Result<Vec<String>> {
+        let prefix = if rel.is_empty() {
+            self.prefix.clone()
+        } else {
+            self.key(rel)
+        };
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{prefix}/")
+        };
+        let context = format!("LIST {}", self.abs(rel).display());
+        let mut names = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            pages += 1;
+            if pages > self.list_page_cap {
+                return Err(LakeError::Io {
+                    context: context.clone(),
+                    source: io::Error::other(format!(
+                        "the listing did not finish after {} pages; the endpoint kept returning \
+                         a continuation token (a broken ListObjectsV2 implementation?)",
+                        self.list_page_cap
+                    )),
+                });
+            }
+            let page = self
+                .client
+                .list_objects(&prefix, "", token.as_deref())
+                .map_err(|e| self.map(&context, e))?;
+            self.bucket_confirmed.store(true, Ordering::Relaxed);
+            for key in page.keys {
+                let Some(name) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if name.is_empty() || name.ends_with('/') {
+                    // A zero-byte `dir/` marker is not a file.
+                    continue;
+                }
+                names.push(name.to_string());
+            }
+            match page.next_token {
+                Some(next) => token = Some(next),
+                None => break,
+            }
+        }
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     fn delete(&self, rel: &str) -> Result<()> {
         let context = format!("DELETE {}", self.abs(rel).display());
         self.client
@@ -1184,6 +1257,18 @@ struct ListPage {
     next_token: Option<String>,
 }
 
+/// One raw HTTP response as `execute` returns it, with the headers lake
+/// maintenance needs (`Content-Length`, `Last-Modified` — stat only; the
+/// other callers ignore them).
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    etag: Option<String>,
+    body: Vec<u8>,
+    content_length: Option<u64>,
+    last_modified: Option<String>,
+}
+
 /// Client failures before they are mapped to [`LakeError`].
 #[derive(Debug)]
 enum S3Error {
@@ -1248,14 +1333,15 @@ impl S3Client {
         query_pairs: &[(&str, &str)],
         extra: &[(&'static str, String)],
         body: &[u8],
-    ) -> std::result::Result<(u16, Option<String>, Vec<u8>), S3Error> {
+    ) -> std::result::Result<HttpResponse, S3Error> {
         let conditional = extra.iter().any(|(name, _)| name.starts_with("if-"));
         let mut attempt = 0u32;
         loop {
             let outcome = self.execute_once(method, key, query_pairs, extra, body);
             let retryable = match &outcome {
-                Ok((429 | 503, _, _)) => true,
-                Ok((500 | 502 | 504, _, _)) | Err(S3Error::Transport { .. }) => !conditional,
+                Ok(response) if matches!(response.status, 429 | 503) => true,
+                Ok(response) if matches!(response.status, 500 | 502 | 504) => !conditional,
+                Err(S3Error::Transport { .. }) => !conditional,
                 _ => false,
             };
             if !retryable || attempt >= self.retries {
@@ -1275,7 +1361,7 @@ impl S3Client {
         query_pairs: &[(&str, &str)],
         extra: &[(&'static str, String)],
         body: &[u8],
-    ) -> std::result::Result<(u16, Option<String>, Vec<u8>), S3Error> {
+    ) -> std::result::Result<HttpResponse, S3Error> {
         let query = canonical_query(query_pairs);
         let target = self.endpoint.target(&self.bucket, key, &query);
         let context = format!("{method} {}", target.url);
@@ -1379,7 +1465,21 @@ impl S3Client {
                     source: io::Error::other(e.to_string()),
                 })?
         };
-        Ok((status, etag, bytes))
+        Ok(HttpResponse {
+            status,
+            etag,
+            body: bytes,
+            content_length: response
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok()),
+            last_modified: response
+                .headers()
+                .get("last-modified")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string),
+        })
     }
 
     /// The `s3://bucket/key` form, for error contexts.
@@ -1421,20 +1521,49 @@ impl S3Client {
     }
 
     fn get_object(&self, key: &str) -> std::result::Result<Get, S3Error> {
-        let (status, etag, body) = self.execute("GET", key, &[], &[], b"")?;
-        match status {
-            200 => Ok(Get::Found { bytes: body, etag }),
+        let response = self.execute("GET", key, &[], &[], b"")?;
+        match response.status {
+            200 => Ok(Get::Found {
+                bytes: response.body,
+                etag: response.etag,
+            }),
             404 => Ok(Get::NotFound),
-            other => Err(self.status_error(&format!("GET {}", self.abs(key)), other, &body)),
+            other => {
+                Err(self.status_error(&format!("GET {}", self.abs(key)), other, &response.body))
+            }
         }
     }
 
     fn head_object(&self, key: &str) -> std::result::Result<bool, S3Error> {
-        let (status, _etag, body) = self.execute("HEAD", key, &[], &[], b"")?;
-        match status {
+        let response = self.execute("HEAD", key, &[], &[], b"")?;
+        match response.status {
             200 => Ok(true),
             404 => Ok(false),
-            other => Err(self.status_error(&format!("HEAD {}", self.abs(key)), other, &body)),
+            other => {
+                Err(self.status_error(&format!("HEAD {}", self.abs(key)), other, &response.body))
+            }
+        }
+    }
+
+    /// A HEAD with the object's facts: `None` when it does not exist. An
+    /// endpoint that omits `Content-Length`/`Last-Modified` answers `size`
+    /// 0 / `None` — the maintenance age gate then treats the object as
+    /// ageless and only `cleanup_all` touches it.
+    fn stat_object(&self, key: &str) -> std::result::Result<Option<(u64, Option<i64>)>, S3Error> {
+        let response = self.execute("HEAD", key, &[], &[], b"")?;
+        match response.status {
+            200 => Ok(Some((
+                response.content_length.unwrap_or(0),
+                response
+                    .last_modified
+                    .as_deref()
+                    .and_then(parse_http_date)
+                    .map(|secs| secs.saturating_mul(1_000_000)),
+            ))),
+            404 => Ok(None),
+            other => {
+                Err(self.status_error(&format!("HEAD {}", self.abs(key)), other, &response.body))
+            }
         }
     }
 
@@ -1461,8 +1590,8 @@ impl S3Client {
         let mut attempts = 0;
         loop {
             attempts += 1;
-            let (status, _etag, body) = self.execute("PUT", key, &[], &extra, bytes)?;
-            match status {
+            let response = self.execute("PUT", key, &[], &extra, bytes)?;
+            match response.status {
                 200 => return Ok(Put::Written),
                 // `If-Match` on a vanished object is a precondition failure.
                 404 if matches!(condition, Condition::IfMatch(_)) => {
@@ -1476,7 +1605,7 @@ impl S3Client {
                     continue;
                 }
                 other => {
-                    let error = self.status_error(&context, other, &body);
+                    let error = self.status_error(&context, other, &response.body);
                     if condition.is_conditional() && is_unsupported_conditional(other, &error) {
                         return Ok(Put::ConditionalUnsupported);
                     }
@@ -1488,12 +1617,12 @@ impl S3Client {
 
     fn delete_object(&self, key: &str) -> std::result::Result<(), S3Error> {
         let context = format!("DELETE {}", self.abs(key));
-        let (status, _etag, body) = self.execute("DELETE", key, &[], &[], b"")?;
-        match status {
+        let response = self.execute("DELETE", key, &[], &[], b"")?;
+        match response.status {
             200 | 204 => Ok(()),
             // S3 DELETE is idempotent: a missing object is success.
             404 => Ok(()),
-            other => Err(self.status_error(&context, other, &body)),
+            other => Err(self.status_error(&context, other, &response.body)),
         }
     }
 
@@ -1512,11 +1641,11 @@ impl S3Client {
             pairs.push(("continuation-token", token));
         }
         let context = format!("LIST s3://{}/{}", self.bucket, prefix);
-        let (status, _etag, body) = self.execute("GET", "", &pairs, &[], b"")?;
-        if status != 200 {
-            return Err(self.status_error(&context, status, &body));
+        let response = self.execute("GET", "", &pairs, &[], b"")?;
+        if response.status != 200 {
+            return Err(self.status_error(&context, response.status, &response.body));
         }
-        let text = String::from_utf8_lossy(&body).into_owned();
+        let text = String::from_utf8_lossy(&response.body).into_owned();
         let mut keys = Vec::new();
         for contents in xml_blocks(&text, "Contents") {
             if let Some(key) = xml_field(&contents, "Key") {
@@ -1554,6 +1683,61 @@ fn is_unsupported_conditional(status: u16, error: &S3Error) -> bool {
 
 // ---------------------------------------------------------------------------
 // Minimal XML helpers (ListObjectsV2 / error responses; std only).
+
+/// Parse an HTTP `Last-Modified`/`Date` header in the IMF-fixdate form S3
+/// sends (`Sun, 06 Nov 1994 08:49:37 GMT`) into Unix seconds. `None` for
+/// anything else — an unparsable header must never be guessed at, and the
+/// maintenance age gate then treats the object as ageless.
+fn parse_http_date(text: &str) -> Option<i64> {
+    let rest = text.split_once(", ").map(|(_, rest)| rest).unwrap_or(text);
+    let mut parts = rest.split(' ');
+    let day: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = match parts.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts.next()?.parse().ok()?;
+    let time = parts.next()?;
+    if !parts.next()?.eq_ignore_ascii_case("GMT") {
+        return None;
+    }
+    let mut clock = time.split(':');
+    let hour: i64 = clock.next()?.parse().ok()?;
+    let minute: i64 = clock.next()?.parse().ok()?;
+    let second: i64 = clock.next()?.parse().ok()?;
+    if clock.next().is_some()
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=60).contains(&second)
+    {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Days since the Unix epoch for a civil date (Howard Hinnant's
+/// `days_from_civil`, the inverse of `crate::time::civil_from_days`).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
 
 /// The text of the first `<tag>…</tag>` element, entity-decoded.
 fn xml_field(body: &str, tag: &str) -> Option<String> {

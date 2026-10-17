@@ -207,6 +207,25 @@
 //! every explicit value ("Unsupported ducklake_version 'n'"). A pinkdb
 //! setting under the same name would mean something else, so there is none.
 //!
+//! # Maintenance (wave 67)
+//!
+//! [`Lake::merge_adjacent_files`] and [`Lake::rewrite_data_files`] consolidate
+//! data files by publishing one new version that references fresh immutable
+//! files — candidates must share partition values and schema epoch, merge
+//! skips delete-bearing files (rewrite is the tool for those), and every
+//! source file stays on disk byte-identical for the versions that reference
+//! it. [`Lake::expire_snapshots`] removes old `snapshots/<v>.json` +
+//! `commits/<v>.json` (never the current version; time travel to an expired
+//! version is a clean error). [`Lake::cleanup_old_files`] /
+//! [`Lake::delete_orphaned_files`] delete `data/` objects no retained
+//! version references, behind a two-day age gate and an explicit
+//! `dry-run`/`confirm`. [`Lake::list_files`], [`Lake::table_info`],
+//! [`Lake::options`] and [`Lake::settings`] are the DuckLake
+//! `ducklake_list_files` / `ducklake_table_info` / `ducklake_options` /
+//! `ducklake_settings` introspection, docked to this catalog. The
+//! `maintenance` module documents every rule, the live DuckLake probes
+//! behind them, and the honest differences.
+//!
 //! # Crash safety and durability
 //!
 //! Publication order is data and delete files → commit manifest
@@ -325,6 +344,7 @@ mod crypto;
 mod delete_file;
 mod incremental;
 mod local;
+mod maintenance;
 #[cfg(test)]
 mod mock_s3;
 #[cfg(feature = "s3")]
@@ -343,6 +363,11 @@ use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry}
 pub use crypto::EncryptionKey;
 pub use incremental::{Commit, CommitReport, CommitSettings, WritableAttachment};
 use local::{LocalStorage, CATALOG_FILE};
+pub use maintenance::{
+    CleanupReport, CleanupSettings, CompactionReport, ExpireReport, ExpireSettings, LakeFileInfo,
+    LakeOption, LakeSettings, MergeSettings, RewriteSettings, TableCompaction, TableInfo,
+    DEFAULT_RETENTION_SECS,
+};
 pub use snapshot::{ChangeSummary, SnapshotInfo};
 use storage::{CryptoStorage, Head, Location, Storage, VersionTag};
 
@@ -475,6 +500,12 @@ pub enum LakeError {
     /// modified/truncated ciphertext, a missing terminal frame, or a container
     /// sealed for another domain/path. Never a partial read.
     Tampered { path: PathBuf, message: String },
+    /// A maintenance/introspection argument that cannot be honored — the
+    /// DuckLake `InvalidInputException` family: `expire_snapshots` given both
+    /// `versions` and `older_than`, a `delete_threshold` outside `0..=1`, a
+    /// `min_file_size` not below `max_file_size`. The message is
+    /// DuckLake-shaped where one exists.
+    InvalidOption { message: String },
     /// The key material itself is unusable (e.g. a non-UTF-8 `PINKDB_KEY`).
     BadKey { message: String },
     /// A bug in this crate (e.g. serializing its own structs).
@@ -588,6 +619,7 @@ impl fmt::Display for LakeError {
                 )
             }
             LakeError::BadKey { message } => write!(f, "invalid encryption key: {message}"),
+            LakeError::InvalidOption { message } => write!(f, "{message}"),
             LakeError::Internal { message } => write!(f, "internal lake error: {message}"),
         }
     }
@@ -1166,6 +1198,8 @@ impl Lake {
                         replaced: true,
                         partition_changed: false,
                         partition_by: None,
+                        compacted_files: Vec::new(),
+                        removed_delete_files: Vec::new(),
                     },
                 );
                 tables.insert(
@@ -2328,6 +2362,28 @@ fn encode_key(key: &str) -> String {
     out
 }
 
+/// Percent-decode one `encode_key` segment back to a catalog key (the
+/// inverse, for reporting only: `.lake files --all` names an unreferenced
+/// object's table). `None` on a malformed escape or non-UTF-8 bytes — a
+/// tampered name is reported as unknown, never guessed.
+pub(crate) fn decode_key(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = char::from(*bytes.get(i + 1)?).to_digit(16)?;
+            let lo = char::from(*bytes.get(i + 2)?).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// A fresh data-file id: 32 hex chars in UUID shape from a splitmix64 mixer
 /// over clock + pid + stack address + a process counter. Uniqueness (not
 /// cryptographic randomness) is the requirement. Also used by
@@ -2622,6 +2678,27 @@ mod tests {
             assert_ne!(encoded, ".");
             assert_ne!(encoded, "..");
         }
+    }
+
+    #[test]
+    fn decode_key_inverts_encode_key() {
+        for key in [
+            "main.t",
+            "analytics.u_1-x",
+            "a/b",
+            "a b",
+            "héllo",
+            "a.b.c",
+            "%2e",
+        ] {
+            let encoded = encode_key(key);
+            assert_eq!(decode_key(&encoded).as_deref(), Some(key), "{key:?}");
+        }
+        // Malformed escapes and non-UTF-8 are a clean None.
+        assert_eq!(decode_key("%"), None);
+        assert_eq!(decode_key("%2"), None);
+        assert_eq!(decode_key("%zz"), None);
+        assert_eq!(decode_key("%FF"), None);
     }
 
     #[test]

@@ -552,7 +552,14 @@ cross-checked against the file footer), and an attached scan whose `WHERE`
 carries simple comparisons (`=`, ranges, `IS [NOT] NULL`) **skips whole data
 files without decoding them** — pruning a partitioned table by its partition
 column reads only the matching files (see "Partitioning and pruning"
-below).
+below). Wave 67 adds **maintenance**: `.lake merge` / `.lake rewrite`
+consolidate data files into one new version (published files are never
+mutated), `.lake expire` removes old snapshots + commit manifests, `.lake
+cleanup` / `.lake orphans` delete `data/` objects no retained version
+references — both behind a two-day age gate and an explicit
+`dry-run`/`confirm` — and `.lake files` / `.lake table_info` / `.lake
+options` / `.lake settings` are DuckLake's list/info introspection (see
+"Maintenance" below).
 
 A lake is a directory (or, with the `s3` feature, an `s3://bucket/prefix`
 key prefix with exactly this layout):
@@ -830,6 +837,43 @@ manifest whose rows do not add up) is a clear `Corrupt` error, never a guess.
   pruning (a `bucket` file still prunes through its column zone maps), and
   old files written before a spec carry no values until rewritten
   (`.lake save` re-splits a table under its preserved spec).
+- **Maintenance, DuckLake parity (wave 67).** `Lake::merge_adjacent_files`
+  (`.lake merge <dir> [table] [min_file_size=N] [max_file_size=N]
+  [max_compacted_files=N]`) is `ducklake_merge_adjacent_files`: it publishes
+  one new version whose table entries reference consolidated data files —
+  never a rewrite of a published file (tests pin bytes *and* mtimes). A file
+  is only a candidate when it carries no positional deletes (DuckLake skips
+  delete-bearing files; `rewrite` is the tool for them), and files group by
+  **partition values + schema epoch**, with at least two per group, exactly
+  DuckLake's `DuckLakeCompactionGroup` rules probed live (the merge of 3 of
+  4 files, the 2-file floor, and the `>=`/`<` size filters). The merged
+  file's rows and zone map are exact (same writer path as any data file),
+  so stats-fast `COUNT`/`MIN`/`MAX` and filter pruning work unchanged.
+  `Lake::rewrite_data_files` (`.lake rewrite`) materializes the deletes of
+  the files whose delete ratio reaches `delete_threshold` (DuckLake's
+  default 0.95) and drops their delete files from the new manifest.
+  `Lake::expire_snapshots` (`.lake expire [versions=a,b] [older_than=T]
+  [keep=N] [dry-run]`) removes old `snapshots/<v>.json` + `commits/<v>.json`
+  — never the current version, `versions` and `older_than` mutually
+  exclusive — and time travel to an expired version is the ordinary clean
+  `no snapshot version` error. `Lake::cleanup_old_files` /
+  `Lake::delete_orphaned_files` (`.lake cleanup` / `.lake orphans
+  [older_than=T] [all] [dry-run] [confirm]`) delete `data/` objects **no
+  retained version references** (merged-away files after expiration, crashed
+  writers' `.tmp` leftovers), behind the probed DuckLake default age gate
+  (`delete_older_than` = 2 days; `all` = `cleanup_all`) and an explicit
+  `dry-run`/`confirm` — a call that would delete without either is refused.
+  Honest limits: pinkdb stores no `ducklake_files_scheduled_for_deletion`
+  queue, so `cleanup` and `delete_orphaned_files` run the same object scan
+  (documented, not faked); compaction never merges files of different
+  schema epochs (DuckLake v1.1 can fold older schemas into the latest); and
+  an object whose age cannot be read (no `Last-Modified` over S3) is never
+  deleted without `all`. Introspection mirrors DuckLake too: `.lake files`
+  (`ducklake_list_files`; rows, size, partition values, schema epoch,
+  delete pairing, and `all` marks objects no retained version references),
+  `.lake table_info` (`ducklake_table_info`), `.lake options`
+  (`ducklake_options` — read-only catalog facts) and `.lake settings`
+  (`ducklake_settings`).
 - **One live writer handle per lake** (no file locking; concurrent readers
   of published versions are fine). A handle that saves after another
   handle/process moved the catalog fails with `LakeError::Conflict`

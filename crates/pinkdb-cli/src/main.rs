@@ -75,6 +75,24 @@ fn print_help() {
         println!("  .lake partition {LAKE} <t> by (<key>, ...) | clear");
         println!("                                set/clear a table's partition spec (identity or");
         println!("                                bucket(N, col)); new writes split per value set");
+        println!(
+            "  .lake merge {LAKE} [t] [min_file_size=N] [max_file_size=N] [max_compacted_files=N]"
+        );
+        println!(
+            "                                consolidate adjacent data files into one version"
+        );
+        println!("  .lake rewrite {LAKE} [t] [delete_threshold=F] [max_compacted_files=N]");
+        println!("                                materialize delete files into fresh data files");
+        println!("  .lake expire {LAKE} [versions=a,b] [older_than=T] [keep=N] [dry-run]");
+        println!("                                remove old snapshots + commit manifests");
+        println!("  .lake cleanup {LAKE} [older_than=T] [all] [dry-run] [confirm]");
+        println!("  .lake orphans {LAKE} [older_than=T] [all] [dry-run] [confirm]");
+        println!("                                delete data objects no version references");
+        println!("  .lake files {LAKE} [t] [all] [version=N]");
+        println!("                                list data files (rows, size, partition, epoch)");
+        println!("  .lake table_info {LAKE}     per-table file/delete counts and sizes");
+        println!("  .lake options {LAKE}        catalog facts (data path, format, encryption)");
+        println!("  .lake settings {LAKE}       catalog_type / extension_version / data_path");
         println!("  .lake detach {LAKE} [force]  detach one attached lake");
         println!("  .lake attached              list attached lakes and their tables");
         println!("  .lake versions {LAKE}       list the lake's published versions");

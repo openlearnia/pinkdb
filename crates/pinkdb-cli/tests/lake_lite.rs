@@ -474,3 +474,52 @@ fn lean_partition_splits_commits_and_prunes() {
     assert!(out.contains("decodes: 1 load, 2 columns, 2 files"), "{out}");
     cleanup(&dir);
 }
+
+/// Wave 67 in the lean build: `.lake merge` consolidates `.pink` data files,
+/// `.lake expire`/`.lake cleanup` prune the metadata and unreferenced
+/// objects, and the introspection commands report them.
+#[test]
+fn lean_maintenance_merge_expire_cleanup() {
+    let dir = scratch("maint");
+    let lake = dir.join("lake");
+    run(&format!(
+        "CREATE TABLE t (id INTEGER);\n\
+         INSERT INTO t VALUES (1), (2);\n\
+         .lake save {lake}\n\
+         .lake attach {lake} write\n\
+         INSERT INTO t VALUES (3);\n\
+         .lake commit {lake}\n\
+         .lake detach {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    let out = run(&format!(
+        ".lake merge {lake}\n\
+         .lake files {lake}\n\
+         .lake expire {lake} versions=2,3\n\
+         .lake cleanup {lake} all dry-run\n\
+         .lake cleanup {lake} all confirm\n\
+         .lake open {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Merged 2 files into 1 in"), "{out}");
+    assert!(out.contains("table=main.t rows=3"), "{out}");
+    assert!(out.contains("Expired 2 snapshots from"), "{out}");
+    // After the expiration both merged sources are unreferenced.
+    assert!(out.contains("2 objects would be cleaned up"), "{out}");
+    assert!(out.contains("Deleted 2 objects from"), "{out}");
+    assert!(out.contains("Opened lake version 4"), "{out}");
+    assert!(!out.contains("Error:"), "{out}");
+    // The consolidated data file is a lean `.pink` file; no Vortex anywhere.
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(catalog.contains(".pink"), "{catalog}");
+    assert!(!catalog.contains(".vortex"), "{catalog}");
+    let data: Vec<String> = std::fs::read_dir(lake.join("data/main.t"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(data.len(), 1, "{data:?}");
+    assert!(data[0].ends_with(".pink"), "{data:?}");
+    cleanup(&dir);
+}

@@ -641,4 +641,15 @@ pub(crate) struct TableDelta {
     /// `partition_changed`). Absent when the commit did not change it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) partition_by: Option<Vec<PartitionKey>>,
+    /// Maintenance (wave 67): the data files this commit **consolidated
+    /// from** (`merge_adjacent_files` / `rewrite_data_files`). Their rows now
+    /// live in the listed `data_files`; the source files stay on disk for the
+    /// versions that reference them. Absent on ordinary commits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) compacted_files: Vec<String>,
+    /// Maintenance (wave 67): the delete files this commit **materialized
+    /// and dropped** (`rewrite_data_files`); their positions are baked into
+    /// the rewritten data files. Absent on ordinary commits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) removed_delete_files: Vec<String>,
 }
