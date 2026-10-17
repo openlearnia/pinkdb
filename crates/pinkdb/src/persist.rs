@@ -244,12 +244,12 @@ fn chunk_column_stats(v: &Vector) -> ChunkColumnStats {
     let null_count = v.null_count() as u64;
     match v.data() {
         VectorData::Boolean(data) => {
-            let (mut min, mut max) = (false, false);
+            let (mut has_false, mut has_true) = (false, false);
             let mut see = |x: bool| {
-                if !x {
-                    min = true;
+                if x {
+                    has_true = true;
                 } else {
-                    max = true;
+                    has_false = true;
                 }
             };
             if v.has_nulls() {
@@ -263,10 +263,15 @@ fn chunk_column_stats(v: &Vector) -> ChunkColumnStats {
                     see(x);
                 }
             }
+            // Min/max are the actual extreme values (DuckDB semantics): a
+            // column of only `true` is min = max = true, and only `false` is
+            // min = max = false — never "one of min/max" (a stats block must
+            // carry both or neither).
+            let any = has_false || has_true;
             ChunkColumnStats {
                 null_count,
-                min: min.then_some(Value::Boolean(false)),
-                max: max.then_some(Value::Boolean(true)),
+                min: any.then_some(Value::Boolean(!has_false)),
+                max: any.then_some(Value::Boolean(has_true)),
                 nan_count: 0,
             }
         }
@@ -4811,6 +4816,42 @@ mod tests {
             "10M rows: encode {plain:.3}s, encode+stats {with_stats:.3}s, stats cost {:+.1} ms",
             (with_stats - plain) * 1000.0
         );
+    }
+
+    /// Boolean stats carry true min/max *values* (DuckDB semantics), never
+    /// "seen a false/true" flags: a column of only `true` is min = max =
+    /// `true`, only `false` is min = max = `false`, all-NULL is neither — so a
+    /// stats block always carries both extremes or neither (the lake
+    /// statistics-block validator refuses anything else).
+    #[test]
+    fn boolean_stats_are_true_min_max_values() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE TABLE t (b BOOLEAN); \
+             INSERT INTO t VALUES (true), (NULL);",
+        )
+        .unwrap();
+        let t = db.table_in("main", "t").unwrap();
+        let stats = table_stats("main", "t", &t);
+        let col = &stats.columns[0];
+        assert_eq!(col.min, Some(Value::Boolean(true)), "{col:?}");
+        assert_eq!(col.max, Some(Value::Boolean(true)), "{col:?}");
+
+        db.execute("CREATE TABLE f (b BOOLEAN); INSERT INTO f VALUES (false), (false);")
+            .unwrap();
+        let f = db.table_in("main", "f").unwrap();
+        let stats = table_stats("main", "f", &f);
+        let col = &stats.columns[0];
+        assert_eq!(col.min, Some(Value::Boolean(false)), "{col:?}");
+        assert_eq!(col.max, Some(Value::Boolean(false)), "{col:?}");
+
+        db.execute("CREATE TABLE n (b BOOLEAN); INSERT INTO n VALUES (NULL);")
+            .unwrap();
+        let n = db.table_in("main", "n").unwrap();
+        let stats = table_stats("main", "n", &n);
+        let col = &stats.columns[0];
+        assert_eq!(col.min, None, "{col:?}");
+        assert_eq!(col.max, None, "{col:?}");
     }
 
     /// `to_pink_bytes_with_stats` reports exact facts and leaves the bytes
