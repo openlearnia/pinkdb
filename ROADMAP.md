@@ -1,6 +1,6 @@
 # pinkdb Roadmap
 
-Single source of truth for wave status; update after every wave. Known gaps in done waves: [docs/GAPS.md](docs/GAPS.md).
+Single source of truth for wave status; update after every wave. Known gaps in done waves: [docs/GAPS.md](docs/GAPS.md). User-facing summary: [CHANGELOG.md](CHANGELOG.md) — appended at every integration; the website docs are refreshed in the docs catch-up wave (73).
 
 ## Packaging principles
 
@@ -106,8 +106,11 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 70 | Core extension: **parquet** — read: `read_parquet` / `parquet_scan` (globs, multi-file, `union_by_name`, hive-partition + `filename` columns, column subset), projection + filter pushdown via row-group statistics (min/max/null counts), introspection (`parquet_schema`, `parquet_metadata`, `parquet_file_metadata`, `parquet_kv_metadata`), direct `FROM 'file.parquet'` replacement scan; write: `COPY … (FORMAT parquet)` (snappy default; zstd/gzip/uncompressed; `row_group_size`; per-column stats) with the α-probed physical mapping (DECIMAL→INT32 or FIXED_LEN_BYTE_ARRAY, TIMESTAMP→INT64 micros, DATE→INT32 days, INTERVAL→FIXED_LEN_BYTE_ARRAY) | queued | crate `pinkdb-parquet` (wasm-compatible); nested types + parquet encryption deferred |
 | 71 | Core extension: **arrow** — Arrow IPC (Feather v2) file read/write (`read_arrow` + `FROM 'file.arrow'`, `COPY … (FORMAT arrow)`) over the arrow-rs crates; Arrow **C Data Interface** in the FFI (query-result export + Arrow-array scan input, zero-copy where the layout allows) for pyarrow/Polars/DuckDB/ADBC hosts; DuckDB α ships no loadable `arrow` extension on this platform (probed: HTTP 404), so parity is pinned at the file level (arrow-rs/pyarrow round-trips; pyarrow pip-installable) and at the C ABI level, not via SQL | queued | crate `pinkdb-arrow` (wasm-compatible); Python/Go wrapper ergonomics follow-up |
 | 72 | Core extension: **iceberg** — Iceberg v2 reads from the local filesystem: `iceberg_scan` (newest snapshot) plus the α-probed introspection set (`iceberg_metadata`, `iceberg_snapshots`, `iceberg_scan_plan`, `iceberg_scan_tasks`, `iceberg_column_stats`, `iceberg_partition_stats`, schema/table properties), time travel, `ATTACH … (TYPE iceberg)` catalogs (local first; REST follow-up), over parquet data files (depends on wave 70) | queued | crate `pinkdb-iceberg`; writes/maintenance (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, truncate, property mutations, `iceberg_to_ducklake`) deferred until the α surface is probed |
+| 73 | Docs catch-up & changelog wiring: bring the website pages current through the landed waves (58–64 now; extend as 65–68 land) — SQL completeness, prepared statements, DECIMAL/INTERVAL, PK/FK, lake time travel, incremental commits — fold in the wave-41 constraint docs excluded at integration, link CHANGELOG.md from the site + README, and add a docs-freshness check to CI | queued | needs the uncommitted website redesign WIP in the working tree to land (or be handed over) first |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
+
+Docs discipline: every integrated wave appends a [CHANGELOG.md](CHANGELOG.md) entry (the integrator does it together with the ROADMAP progress entry) and keeps `README.md` current for user-visible surfaces; loadable-extension waves also update their in-repo docs. The website pages are handled in the docs catch-up wave (73).
 
 Parallel feature work (Oct 2026): the first batch — waves 58 (SQL completeness),
 60 (functions) and 61 (optimizer work) — landed one at a time (60 → 61 → 58)
