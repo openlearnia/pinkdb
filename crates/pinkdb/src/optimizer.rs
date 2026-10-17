@@ -6,8 +6,10 @@
 //! - Predicate pushdown moves `Filter` below `Project` (transparent columns),
 //!   `Sort`, and `Distinct`, and splits conjuncts across `Join` inputs.
 //!   Conjuncts over just the GROUP BY keys also move below `Aggregate`
-//!   (a HAVING on keys becomes a WHERE on the aggregate's input); filters
-//!   never move below `Limit`.
+//!   (a HAVING on keys becomes a WHERE on the aggregate's input); conjuncts
+//!   over bare partition-key columns move below `Window`, while any other
+//!   input-column conjunct stays above so the window still sees every input
+//!   row; filters never move below `Limit`.
 //! - FK→PK join elimination drops a declared-referential `INNER JOIN` whose
 //!   parent-side columns are unused: constraints are declarative metadata, so
 //!   the optimizer *trusts* them — see [`eliminate_fk_joins`] for the exact
@@ -888,6 +890,27 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             windows,
             input_cols,
         } => {
+            // A conjunct may move below the Window only when it is constant
+            // within every window's partition, i.e. it filters solely on bare
+            // partition-key columns. Pushing any other input-column conjunct
+            // would recompute ROW_NUMBER/RANK/SUM/FIRST_VALUE/… over just the
+            // surviving rows (a window must see every input row).
+            let mut safe: Option<Vec<usize>> = None;
+            for w in &windows {
+                let cols: Vec<usize> = w
+                    .partition
+                    .iter()
+                    .filter_map(|p| match p {
+                        BoundExpr::Column { index, .. } => Some(*index),
+                        _ => None,
+                    })
+                    .collect();
+                safe = Some(match safe {
+                    None => cols,
+                    Some(prev) => prev.into_iter().filter(|c| cols.contains(c)).collect(),
+                });
+            }
+            let safe = safe.unwrap_or_default();
             let mut conjuncts = Vec::new();
             split_conjuncts(pred, &mut conjuncts);
             let mut keep = Vec::new();
@@ -895,7 +918,7 @@ fn push_one_level(input: LogicalPlan, pred: BoundExpr) -> (LogicalPlan, bool) {
             for c in conjuncts {
                 let mut cols = Vec::new();
                 columns_in(&c, &mut cols);
-                if !cols.is_empty() && cols.iter().all(|i| *i < input_cols) {
+                if !cols.is_empty() && cols.iter().all(|i| *i < input_cols && safe.contains(i)) {
                     push.push(c);
                 } else {
                     keep.push(c);

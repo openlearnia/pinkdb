@@ -6321,6 +6321,62 @@ mod tests {
     }
 
     #[test]
+    fn filter_above_window_keeps_every_input_row() {
+        let mut db = win_db();
+        // An outer filter over a windowed subquery must NOT be pushed below the
+        // window: ROW_NUMBER must still number every input row (5,5,10,20 →
+        // 1,2,3,4), so the survivors keep ranks 3 and 4.
+        let rows = select(
+            &mut db,
+            "SELECT amount, rn FROM \
+                (SELECT amount, ROW_NUMBER() OVER (ORDER BY amount) AS rn FROM sales) s \
+             WHERE amount > 5 ORDER BY amount;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Integer(10), V::Bigint(3)],
+                vec![V::Integer(20), V::Bigint(4)],
+            ]
+        );
+
+        // Same for a partitioned aggregate: a filter on a NON-partition column
+        // must not shrink the partition the window sees (west's sum stays 30).
+        let rows = select(
+            &mut db,
+            "SELECT region, amount, t FROM \
+                (SELECT region, amount, SUM(amount) OVER (PARTITION BY region) AS t FROM sales) s \
+             WHERE amount > 10 ORDER BY region, amount;",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                V::Varchar("west".to_string()),
+                V::Integer(20),
+                V::Bigint(30)
+            ]]
+        );
+
+        // A filter on the partition key itself IS constant within each
+        // partition, so it may move below the window and stays correct.
+        let rows = select(
+            &mut db,
+            "SELECT region, amount, rn FROM \
+                (SELECT region, amount, \
+                        ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn \
+                 FROM sales) s \
+             WHERE region = 'west' ORDER BY amount;",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![V::Varchar("west".to_string()), V::Integer(10), V::Bigint(1)],
+                vec![V::Varchar("west".to_string()), V::Integer(20), V::Bigint(2)],
+            ]
+        );
+    }
+
+    #[test]
     fn window_agg_frames() {
         let mut db = win_db();
         // Default cumulative frame with ORDER BY is DuckDB's RANGE BETWEEN
