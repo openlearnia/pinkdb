@@ -10,6 +10,25 @@ one-liners below.
 
 ## 2026-10-17
 
+### Wave 73 — docs catch-up, changelog & site wiring
+- Website docs brought current through waves 58–64: **SQL** (prepared statements
+  with the `prepare` → `bind` → `execute_bound` flow, DECIMAL/INTERVAL with the
+  DuckDB promotion rules, declarative keys + FK→PK elimination, full/multi-way
+  joins, the new function set, `EXPLAIN`/`SHOW`/`DESCRIBE`, set operations),
+  **persistence** (`.pink` v5 with the constraint section and type tags; WAL v4
+  touched sets; optimistic commits and `PINKDB_TXN_RETRIES`), **lake**
+  (incremental commits with the 1M-row numbers and DuckLake retry knobs, writable
+  attach, `AT (VERSION/TIMESTAMP)` time travel, per-version records, catalog
+  `format_version` 4), **CLI** (new `.lake` commands, author/message, retry env
+  vars), **server** (protocol v6, `Prepare`/`ExecutePrepared`/`Prepared` frames),
+  plus landing/roadmap/API/guide updates.
+- New **Changelog** docs page generated from this file
+  (`website/tools/make-changelog.py`), linked from the sidebar, footer and
+  roadmap page.
+- CI's docs job now regenerates the changelog fragment + the site and **fails on a
+  stale diff** — regenerate-and-commit is enforced; `website/README.md` documents
+  the tooling.
+
 ### Wave 63 — incremental lake writes ✅
 - Lake commits now **append**: each commit writes one new immutable data file
   per table (with its exact row count in the catalog) and never rewrites a

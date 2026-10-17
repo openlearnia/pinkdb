@@ -1,8 +1,9 @@
 <h1>Lake</h1>
 
 <p class="doc-meta">A lake keeps <strong>metadata and data storage decoupled</strong>: a
-small JSON catalog, an immutable manifest per published version, and one immutable data
-file per table — on local disk or in an S3/R2 bucket.</p>
+small JSON catalog, an immutable manifest per published version, and immutable data
+files that are <strong>appended, never rewritten</strong> — on local disk or in an
+S3/R2 bucket. Incremental commits, writable attachments and time travel included.</p>
 
 <h2>What a lake is</h2>
 
@@ -10,18 +11,101 @@ file per table — on local disk or in an S3/R2 bucket.</p>
 <code>s3://bucket/prefix</code> key prefix) with exactly this layout:</p>
 
 <pre class="code" data-lang="text"><code>mylake/
-├── catalog.json               current state (the authoritative "latest")
-├── snapshots/&lt;version&gt;.json   immutable manifest per published version
-├── data/&lt;table&gt;/&lt;uuid&gt;.vortex immutable per-table data files (full lake)
-└── data/&lt;table&gt;/&lt;uuid&gt;.pink   lean data files (no Vortex; still readable)</code></pre>
+├── catalog.json                       current state (the authoritative "latest")
+├── snapshots/&lt;version&gt;.json            immutable manifest per published version
+├── commits/&lt;version&gt;.json              per-version delta manifest (what the commit added)
+├── data/&lt;table&gt;/&lt;uuid&gt;.vortex          immutable data files (full lake)
+├── data/&lt;table&gt;/&lt;uuid&gt;.pink            lean data files (no Vortex; still readable)
+└── data/&lt;table&gt;/&lt;uuid&gt;.pinkdel          positional delete files (merge-on-read)</code></pre>
 
-<p>Every save is a <strong>full snapshot</strong>: all tables are written to fresh
-data files, <code>snapshots/&lt;version&gt;.json</code> is published, then
-<code>catalog.json</code> is replaced with the same bytes. Published versions and
-their data files are never modified — so every version ever published still loads.
-There is no append, compaction or garbage collection; each save costs one full
-rewrite. Snapshot publication happens before the catalog update, so a crash leaves
-either the old version or the new one, never a mix.</p>
+<p>Every published version is immutable: <code>snapshots/&lt;version&gt;.json</code> is
+create-only (a hard link locally, <code>If-None-Match: *</code> over S3) and every
+data file is written once under a fresh name.
+<code>catalog.json</code> is always byte-identical to the snapshot of its version,
+and publication order (files → delta manifest → snapshot → catalog) means a crash
+leaves either the old version or the new one, never a mix — so every version ever
+published still loads.</p>
+
+<h2>Incremental commits</h2>
+
+<p><code>.lake save</code> still publishes a <strong>full snapshot</strong> (every
+table rewritten to fresh files). A <strong>commit</strong> publishes only the
+difference:</p>
+
+<pre class="code" data-lang="text"><code>.lake attach mylake write      # materialize the pinned version into the session store
+UPDATE t SET ...;              # ordinary SQL accumulates in the store
+DELETE FROM t WHERE ...;
+INSERT INTO t VALUES (...);
+.lake commit mylake            # publish exactly the difference as one new version
+.lake detach mylake</code></pre>
+
+<ul>
+  <li><strong>Appends write new files.</strong> Each commit adds one new immutable
+  data file per changed table, listed after the existing files with its exact row
+  count; scans union the file list in order. Previously published files are never
+  rewritten — a 1M-row lake committed 4 rows in <strong>7.6 KB / 0.54 s with 0
+  bytes rewritten</strong> (a full save of the same table writes 2.6 MB).</li>
+  <li><strong>Deletes are positional files.</strong> <code>DELETE</code> records the
+  dropped positions in a <code>.pinkdel</code> file bound to the data file it
+  targets; readers apply it at read time (merge-on-read), and
+  <code>UPDATE</code> is a delete + append.</li>
+  <li><strong>Every version writes <code>commits/&lt;v&gt;.json</code></strong>, a delta
+  manifest listing the data and delete files the commit added plus its row movement
+  (audit; the snapshot stays authoritative for loading).</li>
+  <li><strong>Concurrent writers retry with rebase.</strong> A commit whose base
+  changed publishes again on the new head, bounded by DuckLake's writer controls —
+  <code>max_retry_count</code> (default 10), <code>retry_backoff</code> (1.5) and
+  <code>retry_wait_ms</code> (100, the wait grows by the backoff factor each
+  attempt). The CLI overrides them with
+  <code>PINKDB_LAKE_MAX_RETRY_COUNT</code>, <code>PINKDB_LAKE_RETRY_BACKOFF</code>
+  and <code>PINKDB_LAKE_RETRY_WAIT_MS</code>. A delta whose base file the head no
+  longer contains, or positions another commit already deleted, is refused — never
+  re-applied.</li>
+  <li><strong>Durable sessions are crash-safe.</strong> <code>.lake attach … write</code>
+  checkpoints the materialized tables and <code>.lake commit</code> flushes the WAL
+  before publishing, so a recovered session re-attaches by adoption and commits
+  idempotently: a change that already reached the lake publishes nothing, and one
+  that never did publishes exactly once.</li>
+  <li><strong>Writable attachments are content-sync, not op-replay.</strong> A commit
+  reconciles the table to the session's content; if another writer appended to an
+  in-scope table meanwhile, the next diff refuses instead of silently dropping their
+  rows (re-attach prints a reconciliation note when adopted content differs). New
+  tables created in the session are outside the attachment's scope — a
+  <code>.lake save</code> publishes them.</li>
+</ul>
+
+<h2>Time travel</h2>
+
+<p>Attached lake tables can be queried <strong>as of a published version</strong>:</p>
+
+<pre class="code" data-lang="sql"><code>SELECT * FROM t AT (VERSION =&gt; 2);
+SELECT * FROM t AT (TIMESTAMP =&gt; TIMESTAMP '2026-10-17 12:30:36.029');
+SELECT COUNT(*) FROM t AS old AT (VERSION =&gt; 1) JOIN t ON old.id = t.id;</code></pre>
+
+<ul>
+  <li>The clause works on the first <code>FROM</code> source or any joined source,
+  with an optional alias <em>before</em> it; targets are literals (a version number,
+  or a timestamp literal / string in either the engine format or the manifest's
+  ISO-8601 UTC form).</li>
+  <li><strong>Timestamps resolve inclusively</strong>: the newest snapshot published
+  at or before the given time. Unknown versions, a timestamp before the first
+  snapshot, and tables that did not exist at the target version are clean errors —
+  nothing is produced.</li>
+  <li>An attachment reaches versions <code>1..=the attached version</code>
+  (<code>.lake attach dir 3</code> never sees a later version); store tables are
+  refused with “has no snapshot history”, and so are CTEs and views.</li>
+  <li><strong>Statistics fast paths work per version</strong>: exact
+  <code>COUNT(*)</code>/<code>MIN</code>/<code>MAX</code> over
+  <code>AT (VERSION =&gt; n)</code> decode no data file, and projected scans decode
+  only the columns they reference.</li>
+  <li><code>.lake snapshots &lt;dir&gt;</code> lists every version's record —
+  publish time, author, commit message, <code>(tables, rows)</code> and a change
+  summary — and <code>.lake save … author '&lt;name&gt;' message '&lt;text&gt;'</code>
+  (or <code>Lake::set_commit_message</code>) attaches metadata to the next
+  published version. (DuckLake's <code>ducklake_default_version</code> has no pinkdb
+  counterpart on purpose: it selects a new-catalog storage format, not a read
+  default.)</li>
+</ul>
 
 <h2>Two data formats, one lake API</h2>
 
@@ -33,14 +117,15 @@ either the old version or the new one, never a mix.</p>
   <tbody>
     <tr>
       <td>lean lake (<code>lake-lite</code>)</td>
-      <td><code>.pink</code> v4 (the engine's single-table bytes)</td>
-      <td><code>format_version</code> 1</td>
+      <td><code>.pink</code> v5 (the engine's single-table bytes, with a per-file
+      statistics block in the manifest)</td>
+      <td><code>format_version</code> 4</td>
       <td class="num">2.69 MB</td>
     </tr>
     <tr>
       <td>full lake (<code>lake</code>)</td>
       <td>Vortex (the default lake format)</td>
-      <td><code>format_version</code> 2 or 3</td>
+      <td><code>format_version</code> 4</td>
       <td class="num">45.3 MB</td>
     </tr>
   </tbody>
@@ -48,15 +133,13 @@ either the old version or the new one, never a mix.</p>
 </div>
 
 <ul>
-  <li>The full build is <strong>Vortex-first</strong>: current saves write
-  <code>format_version</code> 3 (8,192-row / ~1 MiB blocks); v2 lakes load and migrate
-  on the next save. Old <code>.pink</code> data files (v1 lakes) are still readable
-  and also migrate on save.</li>
-  <li>The lean build writes and reads only <code>format_version</code> 1
-  (<code>.pink</code> data files) and refuses a v2/v3 lake with a clear
-  “rebuild with <code>lake</code>” error. A lake written by the lean build opens
-  <strong>bit-exactly</strong> in a full build, which migrates it on the next save
-  and leaves the old files untouched.</li>
+  <li>Both builds write and read the current format — <strong>catalog
+  <code>format_version</code> 4</strong> — and both support incremental commits and
+  time travel. Older lakes stay readable: v1–v3 catalogs (single-file Vortex v2/v3
+  and lean v1) load and migrate on the next save, leaving old files untouched.</li>
+  <li>The lean build decodes <code>.pink</code> data files only and refuses a Vortex
+  lake with a clear “rebuild with <code>lake</code>” error. A lake written by the
+  lean build opens <strong>bit-exactly</strong> in a full build.</li>
   <li><code>s3</code> implies <code>lake-lite</code>; use <code>lake,s3</code> for the
   full Vortex lake over S3/R2.</li>
 </ul>
@@ -64,13 +147,17 @@ either the old version or the new one, never a mix.</p>
 <h2>Using a lake</h2>
 
 <pre class="code" data-lang="sql"><code>.lake save mylake              -- publish a full snapshot of the store
+.lake save mylake message 'added orders'   -- with commit metadata (author too)
 .lake versions mylake          -- published versions (the current one is marked)
+.lake snapshots mylake         -- per-version records: time, author, message, changes
 .lake tables mylake            -- current version's db.table names + row counts
-.lake info mylake              -- format version, current version, snapshots, tables
+.lake info mylake              -- format version, current version, snapshots, commits, tables
 .lake open mylake              -- replace the in-memory store with the latest
 .lake open mylake 3            -- or with a specific published version
 .lake attach mylake            -- attach read-only (see below)
-.lake detach mylake
+.lake attach mylake 2 write    -- or writable, pinned to a version (see commits above)
+.lake commit mylake            -- publish the writable attach's changes
+.lake detach mylake [force]
 .lake attached</code></pre>
 
 <p>From a program, the same operations live in the <code>pink-lake</code> crate:</p>
@@ -83,11 +170,20 @@ db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);")?;
 
 let version = save_store(&amp;db, "mylake")?;  // creates the lake, publishes v2
 let mut lake = Lake::open("mylake")?;      // v1 is the create-time empty catalog
+lake.set_commit_message(Some("alice".into()), Some("two rows".into()));
 let v3 = lake.write_from_store(&amp;db)?;      // full snapshot, version 3
-let tables = lake.tables()?;               // [("main.t", 2)]
-let versions = lake.versions()?;           // [1, 2, 3]
-let latest = lake.load(None)?;             // rebuild the latest version
-let old = lake.load(Some(2))?;             // rebuild a specific snapshot</code></pre>
+
+// Incremental: append rows as one new immutable data file (nothing else is
+// rewritten) and/or record positional deletes.
+let mut commit = pink_lake::Commit::new();
+commit.append("main.t", std::sync::Arc::new(appended_rows));  // same schema
+commit.delete_positions("main.t", "data/main.t/&lt;uuid&gt;.vortex", &amp;[0]);
+let report = lake.commit(&amp;commit)?;
+
+let tables = lake.tables()?;
+let versions = lake.versions()?;
+let records = lake.snapshots()?;           // per-version time/author/message/changes
+let old = lake.load(Some(2))?;             // rebuild a specific version</code></pre>
 
 <p><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code> are
 refused inside a transaction, and <code>.lake open</code> refuses to detach a durable
@@ -104,18 +200,18 @@ session without loading any table into memory. No column data is decoded:</p>
   <li>In a <strong>full (Vortex)</strong> build it reads the catalog, the manifest
   and each data file's footer, metadata and statistics — no column decode.</li>
   <li>In a <strong>lean</strong> build it reads a CRC-32-protected per-column
-  statistics block that every lean save publishes in the manifest, so
-  <strong>no data file is opened at all</strong>. A lake saved before that block
-  existed refuses attach with a re-save message, never a guess.</li>
+  statistics block that every lean save publishes, so <strong>no data file is opened
+  at all</strong>. A lake saved before that block existed refuses attach with a
+  re-save message, never a guess.</li>
   <li>Exact <code>COUNT(*)</code>, <code>COUNT(col)</code>, <code>MIN</code> and
   <code>MAX</code> answers come from the stored statistics under strict gates (exact
   null counts, exact min/max, no ambiguous <code>±0.0</code> stat; a multi-aggregate
   query is all-or-nothing). Anything unproven materializes the one table the query
   touches, decoding only the columns it references.</li>
-  <li>Attached tables are session-local and <strong>read-only</strong>: they resolve
-  under their <code>db.table</code> names, <code>.tables</code>/<code>.schema</code>
-  mark them (<code>t (3 rows, attached)</code>), and every mutation over one is
-  refused. <code>.lake save</code> skips attached tables with a note.</li>
+  <li>Once positional deletes exist on a table, per-column facts fall back — row
+  counts and <code>COUNT(*)</code> stay exact, the rest materializes.</li>
+  <li>Attached tables are session-local; read-only attachments refuse every
+  mutation. <code>.lake save</code> skips attached tables with a note.</li>
   <li>Measured: a cold attach plus <code>COUNT</code>/<code>MIN</code>/<code>MAX</code>
   takes ~2.6 ms at 1M rows and ~2.3 ms at 10M rows in the lean build; the attach
   overhead (~0.1–0.2 ms) is constant in file size.</li>
@@ -128,16 +224,18 @@ session without loading any table into memory. No column data is decoded:</p>
   between lake writers; concurrent readers of published versions are fine). A handle
   that saves after another writer published a version fails with
   <code>another writer published version N; reopen the lake</code> before replacing
-  the catalog.</li>
-  <li>Publishing the same version twice is impossible: the snapshot is create-only
-  (a hard link locally, <code>If-None-Match: *</code> over S3), so of two racing
-  writers exactly one wins. <code>catalog.json</code> is always byte-identical to the
-  snapshot of its version.</li>
+  the catalog — unless it retries: incremental commits rebase under the retry
+  settings above.</li>
+  <li>Publishing the same version twice is impossible: the snapshot is create-only,
+  so of two racing writers exactly one wins. <code>catalog.json</code> is always
+  byte-identical to the snapshot of its version.</li>
   <li>The CLI additionally tracks each lake's version baseline per session:
   <code>.lake save [force]</code> — <code>force</code> overrides the stale-baseline
   conflict check.</li>
-  <li>Every save is a full rewrite of every table, so plan for the disk/time cost of
-  the snapshot, not an append.</li>
+  <li>Full saves rewrite every table; plan for the disk/time cost of a snapshot, or
+  commit incrementally. Schema changes, partitioning and compaction are in progress
+  (lake-parity waves 65–68); data inlining (tiny commits kept in metadata) is
+  queued too.</li>
 </ul>
 
 <h2>S3 / R2 object storage</h2>
@@ -155,8 +253,8 @@ export AWS_ENDPOINT_URL=https://&lt;account&gt;.r2.cloudflarestorage.com
 export AWS_REGION=auto
 
 ./target/release/pinkdb
-#   .lake save    s3://my-bucket/lakes/demo
-#   .lake open    s3://my-bucket/lakes/demo
+#   .lake save     s3://my-bucket/lakes/demo
+#   .lake attach   s3://my-bucket/lakes/demo
 #   .lake versions s3://my-bucket/lakes/demo</code></pre>
 
 <div class="table-wrap">
@@ -239,8 +337,8 @@ export AWS_REGION=auto
   <li><strong>Just a database file?</strong> Skip the lake — the default build's
   <code>.pink</code> + WAL is the whole story.</li>
   <li><strong>Versioned snapshots, local disk, lean binary?</strong> Use
-  <code>lake-lite</code>: all the commands, statistics-only attach, and a 2.69 MB
-  binary.</li>
+  <code>lake-lite</code>: all the commands (incremental commits and time travel
+  included), statistics-only attach, and a 2.69 MB binary.</li>
   <li><strong>Vortex data files and footer-based attach?</strong> Use the full
   <code>lake</code> build, at the cost of a 45.3 MB binary. The data-size gap is
   small: on the reference sales corpus the lean build's <code>.pink</code> files are

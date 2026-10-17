@@ -167,6 +167,7 @@
 <p class="side-group-title">Project</p>
 <ul>
 <li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
 </ul>
 </div>
 </nav>
@@ -223,7 +224,7 @@ unchanged.</p>
 
 <p>One TCP connection is one session. Every message is a frame: a <code>u32</code>
 little-endian length prefix + a <code>u8</code> message type + body. The protocol
-version is <strong>4</strong> (<code>Hello</code> is the required first request; a
+version is <strong>6</strong> (<code>Hello</code> is the required first request; a
 mismatched version is rejected with a clear error).</p>
 
 <div class="table-wrap">
@@ -233,13 +234,14 @@ mismatched version is rejected with a clear error).</p>
     <tr>
       <td>Requests</td>
       <td><code>Hello { protocol_version }</code>, <code>Execute { sql }</code>,
+      <code>Prepare { sql }</code>, <code>ExecutePrepared { handle, params }</code>,
       <code>Ping</code></td>
     </tr>
     <tr>
       <td>Responses</td>
       <td><code>HelloOk { server_version, protocol_version }</code>,
-      <code>Pong</code>, and per statement one result group:
-      <code>ResultSet { names, types }</code> → chunked
+      <code>Prepared { parameter_types }</code>, <code>Pong</code>, and per
+      statement one result group: <code>ResultSet { names, types }</code> → chunked
       <code>Rows { count, columns, values... }</code> → <code>Done { kind }</code></td>
     </tr>
     <tr>
@@ -254,11 +256,13 @@ mismatched version is rejected with a clear error).</p>
 </div>
 
 <p>Rows are encoded as typed values (a tag byte plus payload for
-NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP), with a <code>DataType</code> tag byte.
-The client reconstructs pinkdb's public <code>QueryResult</code>/<code>Value</code>
-types, so remote results render exactly like local ones. Each connection gets its own
-<code>Connection</code>, so <code>USE</code> and transactions are isolated per TCP
-client.</p>
+NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP/DECIMAL/INTERVAL), with a
+<code>DataType</code> tag byte. Prepared statements are connection-local handles
+(capped at 1024 per connection; unknown handles and bind/type errors are ordinary
+errors). The client reconstructs pinkdb's public
+<code>QueryResult</code>/<code>Value</code> types, so remote results render exactly
+like local ones. Each connection gets its own <code>Connection</code>, so
+<code>USE</code> and transactions are isolated per TCP client.</p>
 
 <h2 id="robustness">Robustness<a class="anchor" href="#robustness" aria-label="Permalink: Robustness">#</a></h2>
 
@@ -343,7 +347,7 @@ client.</p>
       <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
       <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
     </div>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

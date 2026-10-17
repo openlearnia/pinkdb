@@ -167,6 +167,7 @@
 <p class="side-group-title">Project</p>
 <ul>
 <li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
 </ul>
 </div>
 </nav>
@@ -280,7 +281,10 @@ db.set_busy_timeout(std::time::Duration::from_secs(<span class="tok-n">10</span>
   writers off one encrypted WAL, where concurrency would risk nonce reuse.</li>
   <li><strong>Cross-process conflicts are per statement.</strong>
   <code>BEGIN..COMMIT</code> keeps its snapshot-isolation semantics; overlapping
-  commits abort with a write conflict you can retry.</li>
+  commits abort with a write conflict you can retry — and the CLI retries a whole
+  one-call transaction automatically (<code>PINKDB_TXN_RETRIES</code>, default 3;
+  <code>0</code> reports the first conflict instead). Commits validate their
+  touched (and read) sets, so disjoint writers do not conflict at all.</li>
 </ul>
 
 <ul class="next-links">
@@ -317,7 +321,7 @@ db.set_busy_timeout(std::time::Duration::from_secs(<span class="tok-n">10</span>
       <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
       <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
     </div>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

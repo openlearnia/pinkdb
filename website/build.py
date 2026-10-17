@@ -127,6 +127,7 @@ NAV = [
         "section": "roadmap",
         "items": [
             {"key": "roadmap", "label": "Roadmap", "out": "docs/roadmap.html"},
+            {"key": "changelog", "label": "Changelog", "out": "docs/changelog.html"},
         ],
     },
 ]
@@ -334,6 +335,17 @@ PAGES = {
             "planned: TLS, RBAC, async object storage, wasm extensions, the "
             "Rust extension SDK, and core json/string/math/datetime "
             "extensions."
+        ),
+    },
+    "changelog.html": {
+        "out": "docs/changelog.html",
+        "nav": "changelog",
+        "title": "Changelog — pinkdb",
+        "description": (
+            "One entry per wave, newest first: SQL completeness, prepared "
+            "statements, DECIMAL/INTERVAL, keys, lake time travel and "
+            "incremental commits — what changed on pinkdb's user-facing "
+            "surfaces."
         ),
     },
     "extensions.html": {

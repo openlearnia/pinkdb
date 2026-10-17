@@ -91,8 +91,9 @@ unless asked for — no crypto, TLS or format code in the default binary.</p>
   </li>
   <li class="card">
     <h3><a href="{{root}}docs/persistence.html">Durable <code>.pink</code> files</a></h3>
-    <p>Single-file v4 columnar format with delta, dictionary, ALP and LZ encodings;
-    bit-exact round trips and a CRC-32 guard.</p>
+    <p>Single-file v5 columnar format with delta, dictionary, ALP and LZ encodings,
+    constraint metadata and DECIMAL/INTERVAL; bit-exact round trips and a CRC-32
+    guard.</p>
   </li>
   <li class="card">
     <h3><a href="{{root}}docs/persistence.html">WAL &amp; crash recovery</a></h3>
@@ -102,13 +103,15 @@ unless asked for — no crypto, TLS or format code in the default binary.</p>
   <li class="card">
     <h3><a href="{{root}}docs/guide-durable-multiprocess.html">Multi-process writers</a></h3>
     <p>Any local process may open a durable database read-write; writers serialize
-    on a short-held write lease, readers never block.</p>
+    on a short-held write lease, readers never block, and optimistic commits abort
+    or retry conflicting ones.</p>
   </li>
   <li class="card">
     <h3><a href="{{root}}docs/lake.html">Lake layer</a></h3>
-    <p>Decoupled metadata: a JSON catalog plus immutable per-table snapshots.
-    Vortex data files, or lean <code>.pink</code> v4 files with no Vortex
-    dependency.</p>
+    <p>Decoupled metadata: a JSON catalog plus immutable per-version manifests;
+    <strong>incremental commits</strong> that append files instead of rewriting
+    tables, writable attachments, and <strong>time travel</strong> over published
+    versions. Vortex or lean <code>.pink</code> data files.</p>
   </li>
   <li class="card">
     <h3><a href="{{root}}docs/lake.html">S3 / R2 object storage</a></h3>
@@ -143,8 +146,9 @@ unless asked for — no crypto, TLS or format code in the default binary.</p>
   </li>
   <li class="card">
     <h3><a href="{{root}}docs/sql.html">SQL surface</a></h3>
-    <p>DDL/DML, inner and outer equi-joins, CTEs, subqueries, window functions,
-    aggregates, transactions and multiple databases per store.</p>
+    <p>DDL/DML, inner/outer/full/cross and multi-way joins, CTEs, subqueries, window
+    functions, aggregates, DECIMAL/INTERVAL, declarative keys, prepared statements,
+    transactions and multiple databases per store.</p>
   </li>
 </ul>
 
@@ -161,24 +165,26 @@ unless asked for — no crypto, TLS or format code in the default binary.</p>
     </tr>
     <tr>
       <td>Persistence</td>
-      <td><code>.pink</code> v4 single-file columnar format; 1M rows →
+      <td><code>.pink</code> v5 single-file columnar format; 1M rows →
       <strong>2.68 MB</strong>, 10M rows → <strong>26.8 MB</strong></td>
     </tr>
     <tr>
       <td>SQL</td>
-      <td>CSV import, joins (INNER/LEFT/RIGHT equi), CTEs, subqueries, window
-      functions, aggregates, <code>CAST</code>, dates; transactions and
-      multi-database sessions</td>
+      <td>CSV import, full/multi-way joins, CTEs, subqueries, window functions,
+      aggregates, DECIMAL/INTERVAL, keys, prepared statements, <code>CAST</code>,
+      dates; transactions and multi-database sessions</td>
     </tr>
     <tr>
       <td>Durability</td>
       <td>write-ahead log + atomic checkpoints; durable databases are
-      multi-process, with a 5&nbsp;s busy timeout for writers</td>
+      multi-process with optimistic commits, and a 5&nbsp;s busy timeout for
+      writers</td>
     </tr>
     <tr>
       <td>Lake</td>
-      <td>catalog + immutable snapshots; Vortex or <code>.pink</code> v4 data
-      files; read-only attach answers exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code></td>
+      <td>incremental commits (append-only files + positional deletes), time travel
+      and per-version records; Vortex or <code>.pink</code> data files; read-only
+      attach answers exact <code>COUNT</code>/<code>MIN</code>/<code>MAX</code></td>
     </tr>
     <tr>
       <td>Object storage</td>

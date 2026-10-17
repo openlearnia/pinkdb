@@ -106,11 +106,11 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 70 | Core extension: **parquet** — read: `read_parquet` / `parquet_scan` (globs, multi-file, `union_by_name`, hive-partition + `filename` columns, column subset), projection + filter pushdown via row-group statistics (min/max/null counts), introspection (`parquet_schema`, `parquet_metadata`, `parquet_file_metadata`, `parquet_kv_metadata`), direct `FROM 'file.parquet'` replacement scan; write: `COPY … (FORMAT parquet)` (snappy default; zstd/gzip/uncompressed; `row_group_size`; per-column stats) with the α-probed physical mapping (DECIMAL→INT32 or FIXED_LEN_BYTE_ARRAY, TIMESTAMP→INT64 micros, DATE→INT32 days, INTERVAL→FIXED_LEN_BYTE_ARRAY) | queued | crate `pinkdb-parquet` (wasm-compatible); nested types + parquet encryption deferred |
 | 71 | Core extension: **arrow** — Arrow IPC (Feather v2) file read/write (`read_arrow` + `FROM 'file.arrow'`, `COPY … (FORMAT arrow)`) over the arrow-rs crates; Arrow **C Data Interface** in the FFI (query-result export + Arrow-array scan input, zero-copy where the layout allows) for pyarrow/Polars/DuckDB/ADBC hosts; DuckDB α ships no loadable `arrow` extension on this platform (probed: HTTP 404), so parity is pinned at the file level (arrow-rs/pyarrow round-trips; pyarrow pip-installable) and at the C ABI level, not via SQL | queued | crate `pinkdb-arrow` (wasm-compatible); Python/Go wrapper ergonomics follow-up |
 | 72 | Core extension: **iceberg** — Iceberg v2 reads from the local filesystem: `iceberg_scan` (newest snapshot) plus the α-probed introspection set (`iceberg_metadata`, `iceberg_snapshots`, `iceberg_scan_plan`, `iceberg_scan_tasks`, `iceberg_column_stats`, `iceberg_partition_stats`, schema/table properties), time travel, `ATTACH … (TYPE iceberg)` catalogs (local first; REST follow-up), over parquet data files (depends on wave 70) | queued | crate `pinkdb-iceberg`; writes/maintenance (`iceberg_rewrite_data_files`, `iceberg_rollback_to_snapshot`, truncate, property mutations, `iceberg_to_ducklake`) deferred until the α surface is probed |
-| 73 | Docs catch-up & changelog wiring: bring the website pages current through the landed waves (58–64 now; extend as 65–68 land) — SQL completeness, prepared statements, DECIMAL/INTERVAL, PK/FK, lake time travel, incremental commits — fold in the wave-41 constraint docs excluded at integration, link CHANGELOG.md from the site + README, and add a docs-freshness check to CI | queued | needs the uncommitted website redesign WIP in the working tree to land (or be handed over) first |
+| 73 | Docs catch-up & changelog wiring: bring the website pages current through the landed waves (58–64 now; extend as 65–68 land) — SQL completeness, prepared statements, DECIMAL/INTERVAL, PK/FK, lake time travel, incremental commits — fold in the wave-41 constraint docs excluded at integration, link CHANGELOG.md from the site + README, and add a docs-freshness check to CI | done | landed; site current through 64 (prepared/DECIMAL/keys/lake pages), generated changelog page + nav/footer links, CI fails on stale site output; the redesign WIP landed first (`544cc3f`) |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
-Docs discipline: every integrated wave appends a [CHANGELOG.md](CHANGELOG.md) entry (the integrator does it together with the ROADMAP progress entry) and keeps `README.md` current for user-visible surfaces; loadable-extension waves also update their in-repo docs. The website pages are handled in the docs catch-up wave (73).
+Docs discipline: every integrated wave appends a [CHANGELOG.md](CHANGELOG.md) entry (the integrator does it together with the ROADMAP progress entry) and keeps `README.md` current for user-visible surfaces; the website pages ship with the wave too (wave 73 brought them current through 64; the CI docs job fails on stale generated output). Loadable-extension waves also update their in-repo docs.
 
 Parallel feature work (Oct 2026): the first batch — waves 58 (SQL completeness),
 60 (functions) and 61 (optimizer work) — landed one at a time (60 → 61 → 58)
@@ -1052,3 +1052,27 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   `commits/<v>.json` sidecars (`itest/` 4 → **5** with an explicit key check;
   `conc/` gains `(FINAL − 1)` commit files, positively asserted for every
   version). `bash -n` clean; the Docker job re-verifies on CI.
+- 2026-10-17 — Wave 73 (docs catch-up & changelog wiring): the user's
+  uncommitted site redesign landed first (`544cc3f` — soft data-zine, day/night
+  editions, docs furniture, regenerated `public/`), then every stale page was
+  brought current through waves 58–64: `sql.html` (prepared statements with the
+  engine `prepare` → `bind` → `execute_bound` flow plus protocol/FFI notes;
+  DECIMAL(38,s)/INTERVAL with the probed rules; declarative keys + FK→PK join
+  elimination; full/multi-way/cross joins; RANGE frames; the wave-60
+  scalar/window set; EXPLAIN/SHOW/DESCRIBE; set operations; a corrected
+  "not supported" list), `persistence.html` (**v5** — constraint section + type
+  tags, `PINKDB05`; WAL **v4** touched sets; optimistic commits +
+  `PINKDB_TXN_RETRIES`), `lake.html` (incremental commits with the 1M-row
+  7.6 KB demo + DuckLake retry knobs, writable-attach lifecycle,
+  `AT (VERSION/TIMESTAMP)` time travel, `.lake snapshots` records, catalog
+  `format_version` **4**, lean data files = `.pink` **v5**), `cli.html`
+  (`.lake commit/snapshots/attach write/detach force`, author/message, the new
+  env vars), `server.html` (protocol **v6**, `Prepare`/`ExecutePrepared`/
+  `Prepared` frames, DECIMAL/INTERVAL value tags),
+  `index.html`/`roadmap.html`/`api-rust.html`/`getting-started.html`/
+  `guide-durable-multiprocess.html` refresh. New generated
+  `docs/changelog.html` (`website/tools/make-changelog.py`, markdown subset)
+  linked from the sidebar ("Project" group), the footer and the roadmap page.
+  CI's docs job now runs the changelog generator + `build.py` and fails on a
+  stale `git diff` — regenerate-and-commit is enforced; `website/README.md`
+  documents the tooling.

@@ -167,6 +167,7 @@
 <p class="side-group-title">Project</p>
 <ul>
 <li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
 </ul>
 </div>
 </nav>
@@ -256,8 +257,9 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       replay the sidecar WAL, and replace the whole store</td>
     </tr>
     <tr>
-      <td><code>.lake save &lt;dir|s3://…&gt; [force]</code></td>
-      <td>publish a full lake snapshot; <code>force</code> overrides this session's
+      <td><code>.lake save &lt;dir|s3://…&gt; [force] [author '&lt;name&gt;'] [message '&lt;text&gt;']</code></td>
+      <td>publish a full lake snapshot, optionally recording the author and commit
+      message on the new version; <code>force</code> overrides this session's
       stale-baseline conflict check</td>
     </tr>
     <tr>
@@ -266,12 +268,22 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       default)</td>
     </tr>
     <tr>
-      <td><code>.lake attach &lt;dir|s3://…&gt; [version]</code></td>
-      <td>attach a lake read-only for this session, from its statistics only</td>
+      <td><code>.lake attach &lt;dir|s3://…&gt; [version] [read-only|write]</code></td>
+      <td>attach a lake for this session, from its statistics only —
+      <code>read-only</code> is the default; <code>write</code> materializes the
+      (optionally pinned) version into the store for DML and <code>.lake
+      commit</code></td>
     </tr>
     <tr>
-      <td><code>.lake detach &lt;dir|s3://…&gt;</code></td>
-      <td>detach one attached lake from this session</td>
+      <td><code>.lake commit &lt;dir|s3://…&gt;</code></td>
+      <td>publish a writable attachment's changes as one incremental version
+      (append-only data files + positional deletes; retry settings below)</td>
+    </tr>
+    <tr>
+      <td><code>.lake detach &lt;dir|s3://…&gt; [force]</code></td>
+      <td>detach one attached lake; a writable attachment with uncommitted changes
+      refuses unless <code>force</code> (which keeps the tables as ordinary store
+      tables)</td>
     </tr>
     <tr>
       <td><code>.lake attached</code></td>
@@ -282,12 +294,17 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
       <td>list the lake's published versions (the current one is marked)</td>
     </tr>
     <tr>
+      <td><code>.lake snapshots &lt;dir|s3://…&gt;</code></td>
+      <td>list per-version records: time, author, message, counts and change
+      summary</td>
+    </tr>
+    <tr>
       <td><code>.lake tables &lt;dir|s3://…&gt;</code></td>
       <td>list the current version's <code>db.table</code> names and row counts</td>
     </tr>
     <tr>
       <td><code>.lake info &lt;dir|s3://…&gt;</code></td>
-      <td>show format version, current version, snapshots and tables</td>
+      <td>show format version, current version, snapshots, commits and tables</td>
     </tr>
     <tr>
       <td><code>.install &lt;name[@version]&gt;</code></td>
@@ -395,6 +412,20 @@ pinkdb &lt; setup.sql || echo <span class="tok-s">"setup failed"</span></code></
       (<code>5000</code>).</td>
     </tr>
     <tr>
+      <td><code>PINKDB_TXN_RETRIES</code></td>
+      <td>how many times a conflicting one-call transaction (<code>BEGIN; …;
+      COMMIT;</code> as one input) is retried after a cross-process write conflict.
+      Default 3; <code>0</code> reports the first conflict instead of retrying.</td>
+    </tr>
+    <tr>
+      <td><code>PINKDB_LAKE_*</code></td>
+      <td>incremental-commit retry knobs:
+      <code>PINKDB_LAKE_MAX_RETRY_COUNT</code> (default 10),
+      <code>PINKDB_LAKE_RETRY_BACKOFF</code> (1.5) and
+      <code>PINKDB_LAKE_RETRY_WAIT_MS</code> (100) — DuckLake's writer
+      controls.</td>
+    </tr>
+    <tr>
       <td><code>PINKDB_HOME</code></td>
       <td>where the extension cache and repository config live. Default:
       <code>~/.pinkdb</code>.</td>
@@ -467,7 +498,7 @@ warning instead of being silently ignored.</p>
       <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
       <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
     </div>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

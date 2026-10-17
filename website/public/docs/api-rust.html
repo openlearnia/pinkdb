@@ -167,6 +167,7 @@
 <p class="side-group-title">Project</p>
 <ul>
 <li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
 </ul>
 </div>
 </nav>
@@ -352,17 +353,26 @@ db.save_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;
 <span class="tok-k">let</span> <span class="tok-k">mut</span> lake = Lake::open(<span class="tok-s">"mylake"</span>)?;            <span class="tok-c">// or Lake::open_url("s3://…") with `s3`</span>
 <span class="tok-k">let</span> v = lake.write_from_store(&amp;db)?;             <span class="tok-c">// publish a new full snapshot</span>
 <span class="tok-k">let</span> versions = lake.versions()?;                 <span class="tok-c">// [1, 2, 3]</span>
+<span class="tok-k">let</span> records = lake.snapshots()?;                 <span class="tok-c">// per-version time/author/message/changes</span>
 <span class="tok-k">let</span> tables = lake.tables()?;                     <span class="tok-c">// [("main.t", 2)]</span>
 <span class="tok-k">let</span> db = lake.load(<span class="tok-k">None</span>)?;                       <span class="tok-c">// rebuild the latest version</span>
 <span class="tok-k">let</span> db = lake.load(<span class="tok-k">Some</span>(<span class="tok-n">2</span>))?;                    <span class="tok-c">// or a specific one</span>
 <span class="tok-k">let</span> report = lake.attach(<span class="tok-k">None</span>)?;                 <span class="tok-c">// read-only attachment (statistics)</span>
+
+<span class="tok-c">// Incremental: append rows as one new immutable data file (nothing else is</span>
+<span class="tok-c">// rewritten) and/or record positional deletes.</span>
+<span class="tok-k">let</span> <span class="tok-k">mut</span> commit = pink_lake::Commit::new();
+commit.append(<span class="tok-s">"main.t"</span>, rows);                   <span class="tok-c">// same schema as the table</span>
+commit.delete_positions(<span class="tok-s">"main.t"</span>, <span class="tok-s">"data/main.t/&lt;uuid&gt;.vortex"</span>, &amp;[<span class="tok-n">0</span>]);
+<span class="tok-k">let</span> report = lake.commit(&amp;commit)?;              <span class="tok-c">// one new version, retried on conflicts</span>
 <span class="tok-c">// save_store_s3 / save_store_url for object storage</span>
 <span class="tok-c">// S3Config::new(bucket).with_prefix(..).with_region(..)</span>
 <span class="tok-c">//     .with_endpoint(..).with_credentials(..) for explicit configuration</span></code></pre></div>
 
-<p class="doc-meta">One live writer handle per lake; loads and attachments can run
-concurrently from published versions. Details on the
-<a href="../docs/lake">Lake page</a>.</p>
+<p class="doc-meta">One live writer handle per lake; commits rebase-and-retry under
+the DuckLake-style writer controls, attachments can query older versions
+(<code>AT (VERSION =&gt; n)</code>), and loads run concurrently from published
+versions. Details on the <a href="../docs/lake">Lake page</a>.</p>
 
 <h2 id="how-the-engine-works">How the engine works<a class="anchor" href="#how-the-engine-works" aria-label="Permalink: How the engine works">#</a></h2>
 
@@ -420,7 +430,7 @@ concurrently from published versions. Details on the
       <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
       <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
     </div>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

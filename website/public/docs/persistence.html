@@ -167,6 +167,7 @@
 <p class="side-group-title">Project</p>
 <ul>
 <li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
 </ul>
 </div>
 </nav>
@@ -183,8 +184,8 @@ can copy anywhere.</p>
 
 <p><code>db.save("x.pink")</code> writes every database and table to one file;
 <code>PinkDb::open("x.pink")</code> loads it back (<code>.save</code> /
-<code>.open</code> in the REPL). The current format is <strong>v4</strong>
-(<code>PINKDB04</code>), ending in a CRC-32 of the whole image. Views are
+<code>.open</code> in the REPL). The current format is <strong>v5</strong>
+(<code>PINKDB05</code>), ending in a CRC-32 of the whole image. Views are
 session-local and are never persisted.</p>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> pinkdb::PinkDb;
@@ -199,7 +200,13 @@ db.save(<span class="tok-s">"x.pink"</span>)?;                 <span class="tok-
   <li>Data is stored per column in ≤2,048-row chunks. Each chunk picks its smallest
   encoding: integers choose between raw, RLE, bitpacking and DELTA_BITPACK; doubles
   raw, RLE or ALP (bit-exact exceptions); booleans bitpacked or RLE; strings raw,
-  dictionary, RLE or DICT_BITPACK.</li>
+  dictionary, RLE or DICT_BITPACK; <code>DECIMAL</code> rides as 128-bit fixed point
+  and <code>INTERVAL</code> as months/days/microseconds.</li>
+  <li><strong>v5</strong> adds the <code>DECIMAL</code>/<code>INTERVAL</code> dtype
+  tags and an optional per-table <strong>constraint section</strong> (declarative
+  <code>PRIMARY KEY</code> / <code>UNIQUE</code> / <code>FOREIGN KEY</code> /
+  <code>NOT NULL</code> metadata, gated by a flags word) — a constraint-free v5 body
+  is byte-identical to v4.</li>
   <li>An <strong>LZ frame</strong> (a hand-rolled LZ77, no dependencies) wraps a
   chunk when it saves space — text corpora shrink 3–5×: a JSON-like corpus went
   70.4 MB → 15.7 MB, logs 118.7 → 44.5 MB, URLs 103.5 → 41.4 MB. Random data and
@@ -212,8 +219,9 @@ db.save(<span class="tok-s">"x.pink"</span>)?;                 <span class="tok-
   rows is <strong>26.8 MB</strong>.</li>
   <li>Files are forward-incompatible on purpose: a newer format is refused with a
   clean “newer format” error, never guessed at. Older files stay readable: v1
-  (a flat table list), v2 (the databases layout) and v3 (v2 + the CRC trailer) all
-  load; v1 tables become the single <code>main</code> database.</li>
+  (a flat table list), v2 (the databases layout), v3 (v2 + the CRC trailer) and v4
+  (the flags word + typed codecs) all load; v1 tables become the single
+  <code>main</code> database.</li>
 </ul>
 
 <h2 id="durable-databases-and-the-wal">Durable databases and the WAL<a class="anchor" href="#durable-databases-and-the-wal" aria-label="Permalink: Durable databases and the WAL">#</a></h2>
@@ -225,10 +233,12 @@ unit: an autocommit statement individually, <code>BEGIN..COMMIT</code> as one re
 at <code>COMMIT</code> (a <code>ROLLBACK</code> or conflict abort logs nothing).</p>
 
 <ul>
-  <li>The WAL format is <code>PINKWAL1</code> version <strong>3</strong>: a
+  <li>The WAL format is <code>PINKWAL1</code> version <strong>4</strong>: a
   generation, a fresh 16-byte <code>wal_id</code> per file creation (so a replaced
-  file is never mistaken for the old one), a header CRC and two 24-byte commit
-  slots. Rolled generations are named <code>&lt;wal&gt;.&lt;gen&gt;.roll</code>.</li>
+  file is never mistaken for the old one), a header CRC, two 24-byte commit slots,
+  and a per-frame <strong>touched-object set</strong> (the new v4 payload — what
+  optimistic multi-writer commits validate against). Rolled generations are named
+  <code>&lt;wal&gt;.&lt;gen&gt;.roll</code>.</li>
   <li>Recovery is idempotent: a mid-file framing corruption stops replay at the
   first bad record and reports the discarded byte count. A CRC-valid record that
   fails to parse, bind or execute is a hard error — committed data is never silently
@@ -264,6 +274,13 @@ cleanup.</p>
   <li><strong>Cross-process transactions serialize</strong> on the lease;
   <code>BEGIN..COMMIT</code> runs on a private snapshot, committing writes to the WAL
   under the lease.</li>
+  <li><strong>Optimistic commits.</strong> A commit validates its frame's touched-set
+  (and, for writes computed from reads, the read-set) against what other writers
+  published since its snapshot: disjoint writes commit, overlapping ones abort with
+  a write conflict. The CLI retries a conflicting one-call transaction automatically
+  (<code>PINKDB_TXN_RETRIES</code>, default 3; <code>0</code> reports the first
+  conflict instead) — see <a href="../docs/guide-durable-multiprocess">the
+  multi-process guide</a>.</li>
   <li>An open on a filesystem that reports locking unsupported <strong>fails
   closed</strong> (<code>LockMode::Required</code>, the default);
   <code>LockMode::UnsafeSingleProcess</code> is the explicit opt-out. There is no
@@ -394,7 +411,7 @@ db.save_with_key(<span class="tok-s">"x.pink"</span>, &amp;key)?;               
       <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
       <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
     </div>
-    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
   </div>
 </footer>
 </body>

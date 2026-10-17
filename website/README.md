@@ -82,7 +82,8 @@ page itself (the Extensions catalog).
 website/
 ├── build.py            # site generator (Python 3 stdlib only)
 ├── tools/
-│   └── make-assets.py  # regenerates favicon.png + the OpenGraph card (stdlib PNG writer)
+│   ├── make-assets.py  # regenerates favicon.png + the OpenGraph card (stdlib PNG writer)
+│   └── make-changelog.py  # renders ../CHANGELOG.md into src/pages/changelog.html
 ├── verify-browser.mjs  # headless-Chrome pass over the live docs + repository
 ├── deploy.sh           # build + `wrangler deploy`
 ├── wrangler.toml       # Workers static-assets config (`./public` as the directory)
@@ -100,8 +101,16 @@ website/
 ## Build
 
 ```sh
+python3 tools/make-changelog.py   # CHANGELOG.md → src/pages/changelog.html (do this first)
 python3 build.py
 ```
+
+The changelog page is generated, never edited by hand: `tools/make-changelog.py`
+renders the repo-root `CHANGELOG.md` into `src/pages/changelog.html` (a small
+markdown subset: `##`/`###` headings, lists, paragraphs, inline code/bold/links).
+CI re-runs the tool and `build.py` and fails if `git diff` finds the committed
+fragment or `public/` stale — so after editing `CHANGELOG.md`, regenerate and
+commit both.
 
 This wipes and regenerates `public/`:
 

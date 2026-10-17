@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changelog — pinkdb</title>
+<meta name="description" content="One entry per wave, newest first: SQL completeness, prepared statements, DECIMAL/INTERVAL, keys, lake time travel and incremental commits — what changed on pinkdb&#x27;s user-facing surfaces.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/changelog.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Changelog — pinkdb">
+<meta property="og:description" content="One entry per wave, newest first: SQL completeness, prepared statements, DECIMAL/INTERVAL, keys, lake time travel and incremental commits — what changed on pinkdb&#x27;s user-facing surfaces.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/changelog.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="getting-started">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a href="roadmap" class="active">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Changelog</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
+<li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog" class="active" aria-current="page">Changelog</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<p class="eyebrow">Project</p>
+<!-- generated by website/tools/make-changelog.py from CHANGELOG.md —
+     edit CHANGELOG.md, regenerate, and commit both. -->
+<h1>Changelog</h1>
+
+<p class="doc-meta">One entry per wave, newest first — what changed on
+pinkdb's user-facing surfaces. The full engineering detail (probes, gate
+counts, integration notes) lives in the
+<a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
+progress log</a>.</p>
+
+<h2 id="2026-10-17">2026-10-17<a class="anchor" href="#2026-10-17" aria-label="Permalink: 2026-10-17">#</a></h2>
+<h3>Wave 73 — docs catch-up, changelog &amp; site wiring</h3>
+<ul>
+<li>Website docs brought current through waves 58–64: <strong>SQL</strong> (prepared statements with the <code>prepare</code> → <code>bind</code> → <code>execute_bound</code> flow, DECIMAL/INTERVAL with the DuckDB promotion rules, declarative keys + FK→PK elimination, full/multi-way joins, the new function set, <code>EXPLAIN</code>/<code>SHOW</code>/<code>DESCRIBE</code>, set operations), <strong>persistence</strong> (<code>.pink</code> v5 with the constraint section and type tags; WAL v4 touched sets; optimistic commits and <code>PINKDB_TXN_RETRIES</code>), <strong>lake</strong> (incremental commits with the 1M-row numbers and DuckLake retry knobs, writable attach, <code>AT (VERSION/TIMESTAMP)</code> time travel, per-version records, catalog <code>format_version</code> 4), <strong>CLI</strong> (new <code>.lake</code> commands, author/message, retry env vars), <strong>server</strong> (protocol v6, <code>Prepare</code>/<code>ExecutePrepared</code>/<code>Prepared</code> frames), plus landing/roadmap/API/guide updates.</li>
+<li>New <strong>Changelog</strong> docs page generated from this file (<code>website/tools/make-changelog.py</code>), linked from the sidebar, footer and roadmap page.</li>
+<li>CI's docs job now regenerates the changelog fragment + the site and <strong>fails on a stale diff</strong> — regenerate-and-commit is enforced; <code>website/README.md</code> documents the tooling.</li>
+</ul>
+<h3>Wave 63 — incremental lake writes ✅</h3>
+<ul>
+<li>Lake commits now <strong>append</strong>: each commit writes one new immutable data file per table (with its exact row count in the catalog) and never rewrites a published file — a 1M-row lake committed 4 rows in <strong>7.6 KB / 0.54 s with 0 bytes rewritten</strong> (vs a 2.6 MB full save).</li>
+<li><strong>DELETE / UPDATE</strong> write positional delete files applied at read time (merge-on-read); every published version also writes a small <code>commits/&lt;v&gt;.json</code> delta manifest.</li>
+<li><strong>Writable attached lakes</strong>: <code>.lake attach &lt;dir&gt; write</code>, mutate with normal SQL, <code>.lake commit</code> publishes the diff; guarded <code>.lake detach</code>; durable sessions replay commits idempotently after a crash.</li>
+<li><strong>Concurrent-writer retry</strong> with DuckLake's settings and defaults (<code>max_retry_count</code> 10, <code>retry_backoff</code> 1.5, <code>retry_wait_ms</code> 100 — rebase on conflict, bounded, clean failure).</li>
+<li>Fixes after landing: the feature-less build message and the S3 Docker expectations updated for the new catalog format (<code>format_version</code> 4).</li>
+</ul>
+<h3>Wave 64 — lake time travel &amp; snapshot metadata ✅</h3>
+<ul>
+<li>Query any published lake version: <code>SELECT … FROM t AT (VERSION =&gt; n)</code> / <code>AT (TIMESTAMP =&gt; ts)</code> on attached lake tables, with DuckLake-pinned resolution (timestamp = newest snapshot at or before it, inclusive).</li>
+<li><strong>Per-version records</strong>: <code>.lake snapshots</code> lists time, author, message, <code>(tables, rows)</code> and a change summary; <code>.lake save … author '…' message '…'</code> attaches commit metadata.</li>
+<li>Statistics fast paths work per version: <code>COUNT</code>/<code>MIN</code>/<code>MAX</code> over an older version decode no data files.</li>
+<li><code>ducklake_default_version</code> deliberately not mirrored (probed: it selects a new-catalog storage format, not a read default).</li>
+</ul>
+<h3>Wave 41 — primary / foreign keys ✅</h3>
+<ul>
+<li>Declarative <code>PRIMARY KEY</code> / <code>UNIQUE</code> / <code>NOT NULL</code> / <code>REFERENCES</code> in column and table form (<code>CONSTRAINT</code> names; <code>RELY</code> / <code>[NOT] ENFORCED</code> accepted and dropped), validated at DDL time like DuckDB.</li>
+<li>Constraints are <strong>metadata-only</strong> — writes never enforce them; <code>DESCRIBE</code> reports <code>PRI</code>/<code>UNI</code> markers and nullability.</li>
+<li>Optimizer: conservative <strong>FK→PK join elimination</strong> (declarations are trusted, not verified — documented).</li>
+</ul>
+<h3>Wave 62 — DECIMAL and INTERVAL types ✅</h3>
+<ul>
+<li>Full DECIMAL(38) and INTERVAL support: literals, arithmetic with DuckDB's promotion rules, comparisons, sums, CSV import/export, date ± interval.</li>
+<li><code>.pink</code> v5 (new type tags), server protocol v6, FFI text cells for both.</li>
+</ul>
+<h3>Wave 59 — prepared statements ✅</h3>
+<ul>
+<li><code>?</code> placeholders with bind-time type inference; engine <code>prepare</code> → <code>bind</code> → <code>execute</code>; server protocol <code>Prepare</code>/<code>ExecutePrepared</code>; FFI prepare/bind/execute. (Python/Go wrappers: wave 69, queued.)</li>
+</ul>
+<h3>Process notes (no user-visible change)</h3>
+<ul>
+<li>DuckLake feature-gap audit (live probes) queued as waves 63–68; extension waves 70–72 queued (parquet, arrow, iceberg).</li>
+<li>Disk-full incident and recovery: the four-worktree batch was salvaged and landed wave by wave.</li>
+<li>Multiprocess test-harness determinism fix (macOS CI flake).</li>
+<li>Fresh-day benchmark record: query battery 234 ms; multi-writer 2.55×; lake 25.1 MB vs DuckLake 91.4 MB at 10M rows.</li>
+</ul>
+<h2 id="2026-10-16">2026-10-16<a class="anchor" href="#2026-10-16" aria-label="Permalink: 2026-10-16">#</a></h2>
+<ul>
+<li><strong>Wave 55</strong> — performance round (column-vs-literal comparison fast path; battery best 235.5 ms).</li>
+<li><strong>Wave 58</strong> — SQL completeness (multi-way/composite/non-equi/CROSS/FULL joins, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, INTERSECT/EXCEPT, COUNT(DISTINCT), EXPLAIN, SHOW/DESCRIBE, window frames).</li>
+<li><strong>Wave 60</strong> — functions (<code>lag</code>/<code>lead</code>/<code>ntile</code>/<code>first_value</code>/<code>last_value</code> + scalar gaps).</li>
+<li><strong>Wave 61</strong> — optimizer (projection pushdown, LIMIT short-circuit, join build-side choice, filter-through-aggregate).</li>
+<li><strong>Wave 45o</strong> — optimistic multi-writer commits (stage 5): concurrent local writers on one durable store with WAL touched sets and automatic retry.</li>
+<li><strong>Wave 45n</strong> — multi-process stability hardening (chaos soak harness).</li>
+<li><strong>Wave 45m</strong> — multi-process durable <code>.pink</code> writers.</li>
+<li>Benchmark audit (battery ≈253 ms on an idle machine) and integration close-out (45o → 60 → 61 → 58 → CI green); first fully green nine-job CI pipeline.</li>
+</ul>
+<h2 id="2026-10-15">2026-10-15<a class="anchor" href="#2026-10-15" aria-label="Permalink: 2026-10-15">#</a></h2>
+<ul>
+<li><strong>Wave 45k</strong> — exact attach fast paths for lean lakes (published per-column statistics blocks).</li>
+<li><strong>Wave 45j</strong> — <code>.pink</code> LZ frames (text corpora 3–5× smaller).</li>
+<li><strong>Wave 45i</strong> — lean lake build (<code>lake-lite</code>, 2.69 MB).</li>
+<li><strong>Wave 45h</strong> — <code>.pink</code> format v4 (flags word, typed codecs).</li>
+<li><strong>Wave 45e</strong> — <code>.lake attach</code> projection pushdown.</li>
+<li><strong>Wave 45d</strong> — <code>.lake attach</code> (footer-only, statistics-driven).</li>
+<li><strong>Wave 45c</strong> — lake open 3.7× faster.</li>
+<li><strong>Wave 45b</strong> — writer block-size A/B.</li>
+<li><strong>Wave 45</strong> — recurring performance wave, expanded into the lake-scan program (sub-waves 45b–45o).</li>
+</ul>
+<h2 id="2026-10-14">2026-10-14<a class="anchor" href="#2026-10-14" aria-label="Permalink: 2026-10-14">#</a></h2>
+<ul>
+<li><strong>Wave 40c</strong> — CI + docs truthfulness (fmt gate, macOS/MSRV/audit jobs, docs sync).</li>
+<li><strong>Wave 40b</strong> — durability and operability hardening.</li>
+<li><strong>Wave 40a</strong> — safety hardening from the waves 0–40 gap audit.</li>
+<li><strong>Wave 40</strong> — performance tuning.</li>
+<li><strong>Wave 39</strong> — CI/CD publishing of extensions.</li>
+<li><strong>Wave 36</strong> — S3 bucket support for lake storage + file reading.</li>
+<li><strong>Waves 35 + 35b</strong> — Vortex default lake format + parser cleanup.</li>
+<li><strong>Wave 34</strong> — pink-lake minimal lake layer.</li>
+<li><strong>Wave 33</strong> — custom repositories + client-side INSTALL.</li>
+<li><strong>Wave 32</strong> — extensions repository.</li>
+<li><strong>Wave 31</strong> — Go extension SDK.</li>
+<li><strong>Wave 30</strong> — C/C++ extension SDK.</li>
+</ul>
+<h2 id="2026-10-13">2026-10-13<a class="anchor" href="#2026-10-13" aria-label="Permalink: 2026-10-13">#</a></h2>
+<ul>
+<li><strong>Wave 29</strong> — extensions support (native ABI v1 + runtime loader).</li>
+<li><strong>Wave 28</strong> — Go binding.</li>
+<li><strong>Waves 37–38</strong> — documentation website + hosting.</li>
+<li><strong>Wave 27</strong> — Python binding.</li>
+<li><strong>Wave 26</strong> — C ABI (<code>pinkdb-ffi</code>).</li>
+</ul>
+<h2 id="2026-10-12">2026-10-12<a class="anchor" href="#2026-10-12" aria-label="Permalink: 2026-10-12">#</a></h2>
+<ul>
+<li><strong>Wave 25</strong> — at-rest encryption (<code>PINKENC1</code>: AES-256-GCM + Argon2id).</li>
+<li><strong>Wave 24</strong> — network server (<code>pinkdb-server</code>, protocol v2).</li>
+<li><strong>Wave 23</strong> — multi-database (<code>CREATE/DROP DATABASE</code>, <code>USE</code>, <code>db.table</code>).</li>
+<li><strong>Wave 22</strong> — WAL / crash recovery.</li>
+<li><strong>Wave 21</strong> — PEG parser default.</li>
+<li><strong>Wave 20</strong> — outer joins.</li>
+<li><strong>Wave 19</strong> — join fast path.</li>
+</ul>
+<h2 id="2026-10-11">2026-10-11<a class="anchor" href="#2026-10-11" aria-label="Permalink: 2026-10-11">#</a></h2>
+<ul>
+<li><strong>Wave 18</strong> — UNION binder fix for derived tables/CTEs/views/subqueries.</li>
+<li><strong>Wave 17</strong> — performance tuning.</li>
+</ul>
+<p>Waves 0–16 (through 2026-10-10) predate this changelog — core engine, SQL, CSV, CLI, persistence and the first extension groundwork; see the git history and the ROADMAP wave table.</p>
+<ul class="next-links">
+  <li><a href="../docs/roadmap">Roadmap →</a></li>
+  <li><a href="https://github.com/openlearnia/pinkdb/blob/main/CHANGELOG.md" rel="noopener">CHANGELOG.md on GitHub →</a></li>
+</ul>
+
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="roadmap"><span class="pager-dir">Previous</span><span class="pager-title">Roadmap</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/changelog.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#2026-10-17">2026-10-17</a></li>
+  <li><a href="#2026-10-16">2026-10-16</a></li>
+  <li><a href="#2026-10-15">2026-10-15</a></li>
+  <li><a href="#2026-10-14">2026-10-14</a></li>
+  <li><a href="#2026-10-13">2026-10-13</a></li>
+  <li><a href="#2026-10-12">2026-10-12</a></li>
+  <li><a href="#2026-10-11">2026-10-11</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

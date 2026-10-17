@@ -177,17 +177,26 @@ let version = save_store(&amp;db, "mylake")?;        // create + save
 let mut lake = Lake::open("mylake")?;            // or Lake::open_url("s3://…") with `s3`
 let v = lake.write_from_store(&amp;db)?;             // publish a new full snapshot
 let versions = lake.versions()?;                 // [1, 2, 3]
+let records = lake.snapshots()?;                 // per-version time/author/message/changes
 let tables = lake.tables()?;                     // [("main.t", 2)]
 let db = lake.load(None)?;                       // rebuild the latest version
 let db = lake.load(Some(2))?;                    // or a specific one
 let report = lake.attach(None)?;                 // read-only attachment (statistics)
+
+// Incremental: append rows as one new immutable data file (nothing else is
+// rewritten) and/or record positional deletes.
+let mut commit = pink_lake::Commit::new();
+commit.append("main.t", rows);                   // same schema as the table
+commit.delete_positions("main.t", "data/main.t/&lt;uuid&gt;.vortex", &amp;[0]);
+let report = lake.commit(&amp;commit)?;              // one new version, retried on conflicts
 // save_store_s3 / save_store_url for object storage
 // S3Config::new(bucket).with_prefix(..).with_region(..)
 //     .with_endpoint(..).with_credentials(..) for explicit configuration</code></pre>
 
-<p class="doc-meta">One live writer handle per lake; loads and attachments can run
-concurrently from published versions. Details on the
-<a href="{{root}}docs/lake.html">Lake page</a>.</p>
+<p class="doc-meta">One live writer handle per lake; commits rebase-and-retry under
+the DuckLake-style writer controls, attachments can query older versions
+(<code>AT (VERSION =&gt; n)</code>), and loads run concurrently from published
+versions. Details on the <a href="{{root}}docs/lake.html">Lake page</a>.</p>
 
 <h2>How the engine works</h2>
 

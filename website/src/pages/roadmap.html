@@ -4,7 +4,8 @@
 planned. This page is the product view; the change-by-change engineering log — with
 measurements and benchmark notes — lives in
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">ROADMAP.md</a>
-on GitHub.</p>
+on GitHub, and the wave-by-wave summary in the
+<a href="{{root}}docs/changelog.html">changelog</a>.</p>
 
 <h2>Shipped</h2>
 
@@ -16,22 +17,34 @@ on GitHub.</p>
   </li>
   <li class="card">
     <h3>SQL surface</h3>
-    <p>DDL/DML, INNER/LEFT/RIGHT equi-joins, CTEs, derived tables and uncorrelated
-    subqueries, window functions, aggregates, CASE/CAST/COALESCE/LIKE, dates and
-    timestamps, UNION, views, snapshot transactions, multiple databases.
-    Differentially tested against DuckDB.</p>
+    <p>DDL/DML, inner/outer/full/cross and multi-way joins, CTEs, derived tables and
+    uncorrelated subqueries, window functions (<code>lag</code>/<code>lead</code>/
+    <code>ntile</code>/frames), aggregates, CASE/CAST/COALESCE/LIKE, dates and
+    timestamps, DECIMAL and INTERVAL, set operations, views, snapshot transactions,
+    transactions, multiple databases, <code>EXPLAIN</code>/<code>SHOW</code>/
+    <code>DESCRIBE</code>, and prepared statements (<code>?</code> placeholders with
+    a bind API). Differentially tested against DuckDB.</p>
+  </li>
+  <li class="card">
+    <h3>Keys</h3>
+    <p>Declarative <code>PRIMARY KEY</code>/<code>UNIQUE</code>/<code>NOT NULL</code>/
+    <code>REFERENCES</code> constraints, validated at DDL time like DuckDB and
+    reported by <code>DESCRIBE</code>. Metadata-only (never enforced on writes), with
+    conservative FK→PK join elimination in the optimizer.</p>
   </li>
   <li class="card">
     <h3>Persistence</h3>
-    <p>Single-file <code>.pink</code> v4 columnar format with delta, dictionary,
-    ALP and LZ encodings; bit-exact round trips; a write-ahead log with atomic
-    checkpoints and crash recovery.</p>
+    <p>Single-file <code>.pink</code> v5 columnar format (delta, dictionary, ALP and
+    LZ encodings; constraint metadata; DECIMAL/INTERVAL); bit-exact round trips; a
+    write-ahead log (v4, touched-object sets) with atomic checkpoints and crash
+    recovery.</p>
   </li>
   <li class="card">
     <h3>Multi-process databases</h3>
-    <p>Any number of local processes can open a durable database read-write;
-    writers serialize on a per-operation write lease and readers refresh from the
-    WAL.</p>
+    <p>Any number of local processes can open a durable database read-write; writers
+    serialize on a per-operation write lease, readers refresh from the WAL, and
+    optimistic commits validate their touched/read sets — conflicting ones abort or
+    retry (bounded), never a silent lost update.</p>
   </li>
   <li class="card">
     <h3>At-rest encryption</h3>
@@ -40,9 +53,15 @@ on GitHub.</p>
   </li>
   <li class="card">
     <h3>Lake layer</h3>
-    <p>JSON catalog plus immutable snapshots; full snapshots per save; Vortex or
-    lean <code>.pink</code> v4 data files; version restore. Read-only attach answers
-    exact COUNT/MIN/MAX from stored statistics.</p>
+    <p>JSON catalog (<code>format_version</code> 4) plus immutable per-version
+    manifests; <strong>incremental commits</strong> (append-only data files and
+    positional deletes, never rewriting published files), <strong>writable
+    attachments</strong> (<code>.lake attach … write</code> + <code>.lake
+    commit</code>), <strong>time travel</strong> (<code>AT (VERSION =&gt; n)</code> /
+    <code>AT (TIMESTAMP =&gt; ts)</code>), per-version records
+    (<code>.lake snapshots</code>), retry/backoff parity with DuckLake, and
+    statistics-fast read-only attach. Vortex or lean <code>.pink</code> data
+    files.</p>
   </li>
   <li class="card">
     <h3>Object storage</h3>
@@ -51,14 +70,15 @@ on GitHub.</p>
   </li>
   <li class="card">
     <h3>Network server</h3>
-    <p><code>pinkdb-server</code> over a framed binary protocol (version 4) with a
-    remote CLI mode, durable <code>--file</code> mode, connection caps and idle
-    timeouts.</p>
+    <p><code>pinkdb-server</code> over a framed binary protocol (version 6, with
+    prepared-statement frames) and a remote CLI mode, durable <code>--file</code>
+    mode, connection caps and idle timeouts.</p>
   </li>
   <li class="card">
     <h3>Bindings</h3>
-    <p>Rust natively; a C ABI (v1) with a hand-written header; dependency-free
-    Python (<code>ctypes</code>) and Go (<code>cgo</code>) wrappers.</p>
+    <p>Rust natively; a C ABI (v1) with a hand-written header (prepared-statement
+    entry points included); dependency-free Python (<code>ctypes</code>) and Go
+    (<code>cgo</code>) wrappers.</p>
   </li>
   <li class="card">
     <h3>Extensions</h3>
@@ -71,13 +91,26 @@ on GitHub.</p>
 <h2>In progress</h2>
 
 <ul>
-  <li><strong>Durable multi-process hardening.</strong> The first slice — any
-  process read-write, per-operation write lease, lock-free epoch refresh, WAL v3 —
-  is shipped. The follow-up round is a stability focus: chaos soaks, fuzzing, and
-  closing the known gaps around replay and recovery edge cases.</li>
+  <li><strong>DuckLake parity, part two (waves 65–68).</strong> Incremental commits
+  (<code>format_version</code> 4) and time travel are shipped; next: schema evolution
+  on lake tables (<code>ALTER TABLE</code> with catalog schema versions), partition
+  splits with per-file zone-map pruning, maintenance/compaction, and inlined small
+  writes.</li>
 </ul>
 
 <h2>Planned</h2>
+
+<h3>SQL and the engine</h3>
+
+<ul>
+  <li><strong>Indexes:</strong> <code>CREATE INDEX</code>/<code>DROP INDEX</code>,
+  equality hash indexes plus zone-map shortcuts, and an optimizer index-vs-scan
+  choice.</li>
+  <li><strong>Materialized views:</strong> <code>CREATE MATERIALIZED VIEW</code> and
+  on-demand full refresh.</li>
+  <li><strong>Stored procedures:</strong> a small SQL procedural language (plus an
+  optional JavaScript engine, WAL-replay safe).</li>
+</ul>
 
 <h3>Server security and operations</h3>
 
@@ -94,41 +127,6 @@ on GitHub.</p>
   synchronous.</li>
 </ul>
 
-<h3>SQL and the engine</h3>
-
-<ul>
-  <li><strong>SQL completeness:</strong> multi-way, composite and non-equi joins,
-  <code>CROSS</code>/<code>FULL</code> joins, <code>INSERT ... SELECT</code>, CTAS,
-  <code>IF [NOT] EXISTS</code>, <code>OFFSET</code>, <code>NULLS FIRST/LAST</code>,
-  <code>INTERSECT</code>/<code>EXCEPT</code>, <code>COUNT(DISTINCT)</code>,
-  <code>EXPLAIN</code>, <code>SHOW</code>/<code>DESCRIBE</code>, RANGE window
-  frames.</li>
-  <li><strong>Prepared statements and parameters:</strong> placeholders, a bind API,
-  and the front-end support that follows (protocol, FFI, Python, Go).</li>
-  <li><strong>Functions and types:</strong> <code>lag</code>/<code>lead</code>/
-  <code>ntile</code>/<code>first_value</code>/<code>last_value</code>, remaining
-  scalar gaps, <code>DECIMAL</code> and <code>INTERVAL</code> types.</li>
-  <li><strong>Schema features:</strong> declarative primary/foreign keys and
-  constraints (metadata used by the optimizer), indexes with zone-map support, and
-  materialized views.</li>
-  <li><strong>Optimizer work:</strong> projection pushdown, LIMIT short-circuiting,
-  join build-side choice, filter-through-aggregate.</li>
-</ul>
-
-<h3>Lake</h3>
-
-<ul>
-  <li><strong>Incremental saves and <code>.lake gc</code>:</strong> appending
-  changes instead of full-snapshot rewrites, with garbage collection for retired
-  versions.</li>
-  <li><strong>Scan pruning:</strong> per-chunk statistics and filter/zone-map
-  pruning for attached lakes (the planned third stage of the lake-scan work) plus
-  lean projection pushdown.</li>
-  <li><strong>SQL access to lakes:</strong> a <code>lake_scan</code> table function
-  and time travel over published versions.</li>
-  <li><strong>Faster decode:</strong> bulk typed lake decode on the open path.</li>
-</ul>
-
 <h3>Extensions and distribution</h3>
 
 <ul>
@@ -137,6 +135,9 @@ on GitHub.</p>
   never WAL-logs volatile calls).</li>
   <li><strong>Core extensions:</strong> <code>json</code>, <code>string</code>,
   <code>math</code> and <code>datetime</code> function packs.</li>
+  <li><strong>File-format extensions:</strong> parquet (read/write with statistics
+  pushdown), Arrow (IPC files + the C Data Interface), and Iceberg v2 reads with
+  time travel — as separate crates/extensions.</li>
   <li><strong>Extension trust:</strong> Ed25519 artifact signatures, SQL
   <code>INSTALL</code>, Linux artifacts.</li>
   <li><strong>Extensions on wasm:</strong> a pluggable loading model for wasm
@@ -156,7 +157,6 @@ on GitHub.</p>
 <p>Not currently scheduled:</p>
 
 <ul>
-  <li>Parquet read support (<code>pinkdb-parquet</code>).</li>
   <li>JS/wasm, Node-native and Java bindings.</li>
 </ul>
 
@@ -164,10 +164,11 @@ on GitHub.</p>
 
 <p>Change-by-change detail — measurements, benchmarks, and design notes — lives in
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">ROADMAP.md</a>
-on GitHub.</p>
+on GitHub; the wave-by-wave summary in the
+<a href="{{root}}docs/changelog.html">changelog</a>.</p>
 
 <ul class="next-links">
+  <li><a href="{{root}}docs/changelog.html">Changelog →</a></li>
   <li><a href="{{root}}docs/getting-started.html">Getting started →</a></li>
-  <li><a href="{{root}}docs/sql.html">SQL reference →</a></li>
   <li><a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub →</a></li>
 </ul>

@@ -341,5 +341,9 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: python3 website/build.py
-        run: python3 website/build.py
+      - name: generate docs (build must be committed)
+        run: |
+          python3 website/tools/make-changelog.py
+          python3 website/build.py
+          git diff --exit-code -- website/public website/src/pages/changelog.html \
+            || { echo "::error::website output is stale — run website/tools/make-changelog.py + website/build.py and commit the result"; exit 1; }

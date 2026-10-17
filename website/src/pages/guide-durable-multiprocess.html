@@ -105,7 +105,10 @@ db.set_busy_timeout(std::time::Duration::from_secs(10));
   writers off one encrypted WAL, where concurrency would risk nonce reuse.</li>
   <li><strong>Cross-process conflicts are per statement.</strong>
   <code>BEGIN..COMMIT</code> keeps its snapshot-isolation semantics; overlapping
-  commits abort with a write conflict you can retry.</li>
+  commits abort with a write conflict you can retry — and the CLI retries a whole
+  one-call transaction automatically (<code>PINKDB_TXN_RETRIES</code>, default 3;
+  <code>0</code> reports the first conflict instead). Commits validate their
+  touched (and read) sets, so disjoint writers do not conflict at all.</li>
 </ul>
 
 <ul class="next-links">

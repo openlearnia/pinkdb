@@ -1,14 +1,17 @@
 <h1>SQL reference</h1>
 
 <p class="doc-meta">The SQL surface pinkdb implements today — DDL/DML, joins, CTEs,
-subqueries, window functions, aggregates and transactions — plus an honest list of
-what is not supported yet.</p>
+subqueries, window functions, aggregates, prepared statements and transactions — plus
+an honest list of what is not supported yet.</p>
 
 <h2>DDL and DML</h2>
 
 <pre class="code" data-lang="sql"><code>CREATE TABLE t (id BIGINT, name VARCHAR, price DOUBLE);
 CREATE TABLE db1.t (...);            -- qualified: any db.table target works
+CREATE TABLE t2 AS SELECT ...;       -- CTAS
+CREATE TABLE IF NOT EXISTS t (...);  -- IF [NOT] EXISTS on CREATE/DROP TABLE
 INSERT INTO t VALUES (1, 'x', 9.5), (2, NULL, 3.0);
+INSERT INTO t SELECT ...;            -- INSERT ... SELECT
 UPDATE t SET price = price * 1.1 WHERE id &gt; 1;   -- SET exprs see pre-update values
 DELETE FROM t WHERE price IS NULL;               -- NULL never matches
 BEGIN; UPDATE t SET price = 0; ROLLBACK;         -- flat snapshot transactions
@@ -18,6 +21,26 @@ USE db1;                             -- per-session current database (default: m
 DROP TABLE t;  DROP VIEW v;
 CREATE VIEW v [(cols)] AS SELECT ...;  -- session-local, rebound per use
 CHECKPOINT;                          -- persist + roll the WAL (durable databases)</code></pre>
+
+<p>Declarative constraints are accepted in column and table form
+(<code>PRIMARY KEY</code>, <code>UNIQUE</code>, <code>NOT NULL</code>,
+<code>REFERENCES u(x)</code> / <code>FOREIGN KEY ... REFERENCES ...</code>, with an
+optional <code>CONSTRAINT name</code> prefix):</p>
+
+<pre class="code" data-lang="sql"><code>CREATE TABLE orders (
+  id     INTEGER PRIMARY KEY,          -- implies NOT NULL
+  code   VARCHAR UNIQUE,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  note   VARCHAR,
+  CONSTRAINT uq UNIQUE (user_id, code)
+);</code></pre>
+
+<p>The declarations are validated at DDL time like DuckDB's (the referenced table
+must exist and the referenced columns must be exactly one of its PRIMARY KEY or
+UNIQUE constraints), but they are <strong>metadata only</strong>: writes never
+enforce them, and <code>DESCRIBE</code> reports them (<code>PRI</code>/<code>UNI</code>
+markers plus nullability). The optimizer uses a declared foreign key for
+conservative FK→PK join elimination — declarations are trusted, not verified.</p>
 
 <p><code>UPDATE</code> and <code>DELETE</code> are statement-atomic: the statement
 sees the pre-update values and either applies completely or not at all.
@@ -29,34 +52,41 @@ second committer with a write-conflict error instead of a silent lost update.</p
   <span class="margin-tag">duckdb conventions</span>
   <p>Integer overflow is an error (not a wrap), <code>int / int</code> is a
   <code>DOUBLE</code>, DOUBLE → integer casts round half away from zero, and
-  <code>SUM</code> over integers is computed exactly.</p>
+  <code>SUM</code> over integers is computed exactly. <code>DECIMAL</code>
+  arithmetic follows DuckDB's promotion rules: <code>+ - *</code> keep the scale
+  with 38-digit caps, <code>/</code> widens to <code>DOUBLE</code>.</p>
 </aside>
 
 <h2>SELECT</h2>
 
 <pre class="code" data-lang="sql"><code>SELECT [DISTINCT] expr [AS alias], ...
-FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT [OUTER] / RIGHT [OUTER], equi-join
+FROM t [JOIN u ON t.x = u.y]      -- INNER / LEFT / RIGHT / FULL [OUTER], CROSS
+  | FROM a JOIN b ON ... JOIN c ON ...   -- multi-way (n-ary) joins
   | FROM db1.t                    -- qualified tables resolve in that database
   | FROM (SELECT ...) AS s         -- derived tables (alias required)
   | WITH w AS (SELECT ...) ...     -- CTEs, incl. WITH w(a, b) AS column aliases
 WHERE expr                        -- IS [NOT] NULL, BETWEEN, IN (subquery|list), EXISTS
 GROUP BY ... HAVING ...
-ORDER BY expr [ASC|DESC], ...      -- NULLS LAST both ways; ORDER BY 2 positional
-LIMIT n;
+ORDER BY expr [ASC|DESC] [NULLS FIRST|NULLS LAST], ...   -- ORDER BY 2 positional
+LIMIT n [OFFSET m];
 
--- Scalar subqueries (SELECT ...) anywhere an expression goes:
--- uncorrelated only: exactly 1 row x 1 col, 0 rows -> NULL.
--- UNION [ALL|DISTINCT] combines query results (numeric types unify).</code></pre>
+COUNT(DISTINCT x)                 -- inside aggregates
+SELECT ... UNION [ALL|DISTINCT] SELECT ...
+SELECT ... INTERSECT [ALL] SELECT ...
+SELECT ... EXCEPT [ALL] SELECT ...
+EXPLAIN SELECT ...                -- the query plan
+SHOW TABLES;  DESCRIBE t;         -- introspection</code></pre>
 
 <h3>Joins</h3>
 
 <ul>
-  <li>Equi-joins with a single equality predicate: <code>INNER</code>,
-  <code>LEFT [OUTER]</code>, <code>RIGHT [OUTER]</code>.</li>
+  <li><code>INNER</code>, <code>LEFT [OUTER]</code>, <code>RIGHT [OUTER]</code>,
+  <code>FULL [OUTER]</code> and <code>CROSS</code> joins; join conditions may be
+  arbitrary expressions (non-equi predicates, composite <code>ON a = b AND c = d</code>,
+  and multi-way chains are accepted). Equality predicates still take the hash-join
+  fast path.</li>
   <li>Outer joins NULL-extend the unmatched side's columns.</li>
   <li>Cross-database joins work: <code>db1.t JOIN db2.u</code>.</li>
-  <li>No <code>FULL</code> joins; <code>CROSS</code> joins are rejected with a clear
-  parse error.</li>
 </ul>
 
 <h3>Subqueries and CTEs</h3>
@@ -74,24 +104,49 @@ LIMIT n;
 <h3>Set operations and views</h3>
 
 <ul>
-  <li><code>UNION [ALL|DISTINCT]</code> with numeric type unification. An
-  <code>ORDER BY</code>/<code>LIMIT</code> after the set operation applies to the
-  whole result; branch-level clauses need parentheses and are unsupported today.</li>
+  <li><code>UNION</code>, <code>INTERSECT</code> and <code>EXCEPT</code>
+  (<code>ALL</code> keeps duplicates, the default deduplicates) with numeric type
+  unification. An <code>ORDER BY</code>/<code>LIMIT</code> after the set operation
+  applies to the whole result; branch-level clauses need parentheses and are
+  unsupported today.</li>
   <li><code>CREATE VIEW v [(cols)] AS ...</code> — session-local and per-database;
   bodies are self-contained (the caller's CTEs never leak in) and rebound per
   use.</li>
 </ul>
 
+<h2>Prepared statements</h2>
+
+<p><code>?</code> placeholders are supported with bind-time type inference against
+the catalog; a <code>CAST(? AS t)</code> pins a parameter's type. Prepared
+statements run through the normal statement path with the bound values substituted
+as SQL literals, so durable stores log the substituted SQL and replay exactly.</p>
+
+<pre class="code" data-lang="rust"><code>use pinkdb::{PinkDb, Value};
+
+let mut db = PinkDb::new();
+let mut conn = db.connect();
+let stmt = conn.prepare("INSERT INTO t VALUES (?, ?, ?)")?;  // parameter_count() == 3
+let bound = stmt.bind(&amp;db, "main", &amp;[Value::Integer(1), Value::from("x"), Value::Null])?;
+conn.execute_bound(&amp;bound)?;   // run (repeatable; the bind is reusable)</code></pre>
+
+<p>The server protocol carries the same flow (<code>Prepare</code> /
+<code>ExecutePrepared</code> frames, protocol v6) and the C ABI has
+prepare/bind/execute entry points. The Python and Go wrapper ergonomics are queued
+as a follow-up wave.</p>
+
 <h2>Aggregates and window functions</h2>
 
 <ul>
-  <li>Aggregates: <code>COUNT(*)</code> / <code>COUNT(x)</code>, <code>SUM</code>,
-  <code>AVG</code>, <code>MIN</code>, <code>MAX</code>.</li>
+  <li>Aggregates: <code>COUNT(*)</code> / <code>COUNT(x)</code> /
+  <code>COUNT(DISTINCT x)</code>, <code>SUM</code>, <code>AVG</code>,
+  <code>MIN</code>, <code>MAX</code>.</li>
   <li>Window functions: <code>ROW_NUMBER</code>, <code>RANK</code>,
-  <code>DENSE_RANK</code>, and aggregates <code>OVER</code> with
-  <code>PARTITION BY</code> / <code>ORDER BY</code> / <code>ROWS</code> frames. The
-  default frame is cumulative with <code>ORDER BY</code> and whole-partition without
-  it. No <code>RANGE</code> frames and no nesting.</li>
+  <code>DENSE_RANK</code>, <code>LAG</code>, <code>LEAD</code>,
+  <code>NTILE</code>, <code>FIRST_VALUE</code>, <code>LAST_VALUE</code>, and
+  aggregates <code>OVER</code> with <code>PARTITION BY</code> /
+  <code>ORDER BY</code> / <code>ROWS</code> and <code>RANGE</code> frames (frames
+  are validated; no nesting). The default frame is cumulative with
+  <code>ORDER BY</code> and whole-partition without it.</li>
   <li>Window functions are allowed in the SELECT list and <code>ORDER BY</code> only
   (not in <code>WHERE</code>/<code>GROUP BY</code>/<code>HAVING</code>).</li>
   <li>Aggregates in <code>ORDER BY</code> need a select alias or position; general
@@ -102,14 +157,27 @@ LIMIT n;
 <h2>Scalar functions and expressions</h2>
 
 <ul>
-  <li><code>abs</code>, <code>round</code> (1–2 args), <code>upper</code>,
-  <code>lower</code>, <code>length</code>, <code>substr</code>.</li>
-  <li><code>CAST(x AS type)</code>: the numeric tower both ways, bool ↔ numeric,
+  <li>Math: <code>abs</code>, <code>round</code>, <code>ceil</code>/<code>ceiling</code>,
+  <code>floor</code>, <code>sqrt</code>, <code>pow</code>/<code>power</code>,
+  <code>sign</code>, <code>mod</code>, <code>greatest</code>,
+  <code>least</code>.</li>
+  <li>Strings: <code>upper</code>, <code>lower</code>, <code>length</code>,
+  <code>substr</code>, <code>trim</code>/<code>ltrim</code>/<code>rtrim</code>,
+  <code>replace</code>, <code>concat</code>.</li>
+  <li><code>CAST(x AS type)</code>: the numeric tower both ways (including
+  <code>DECIMAL</code> and <code>INTERVAL</code> from/to text), bool ↔ numeric,
   varchar parse/format, date ↔ timestamp; bad input and out-of-range narrowing
   error.</li>
-  <li><code>COALESCE(a, b, ...)</code> with a common result type;
+  <li><code>COALESCE(a, b, ...)</code>, <code>NULLIF(a, b)</code>, and
   <code>LIKE</code>/<code>NOT LIKE</code> with <code>%</code>/<code>_</code>
   patterns.</li>
+  <li>Dates and timestamps: <code>year</code>, <code>month</code>, <code>day</code>,
+  <code>hour</code>, <code>minute</code>, <code>second</code>,
+  <code>date_trunc(part, x)</code> (with DuckDB part aliases like
+  <code>dow</code>/<code>doy</code>/<code>isodow</code>/<code>isoweek</code>/
+  <code>isoyear</code>/<code>week</code>/<code>quarter</code>),
+  <code>extract(part FROM x)</code>/<code>date_part</code>, and
+  <code>epoch</code>/<code>epoch_ms</code>.</li>
   <li><code>CASE WHEN c THEN v ... [ELSE e] END</code> and the simple
   <code>CASE x WHEN v ...</code> form. NULL conditions never match; result types
   unify like <code>COALESCE</code>.</li>
@@ -127,30 +195,36 @@ LIMIT n;
     <tr><td><code>INTEGER</code></td><td>i32</td></tr>
     <tr><td><code>BIGINT</code></td><td>i64</td></tr>
     <tr><td><code>DOUBLE</code></td><td>f64</td></tr>
+    <tr><td><code>DECIMAL(p, s)</code></td><td>i128 fixed point; scale 0–38, precision up
+    to 38 digits</td></tr>
     <tr><td><code>VARCHAR</code></td><td>UTF-8 strings</td></tr>
     <tr><td><code>DATE</code></td><td>days since epoch</td></tr>
     <tr><td><code>TIMESTAMP</code></td><td>microseconds, naive (no time zone)</td></tr>
+    <tr><td><code>INTERVAL</code></td><td>months + days + microseconds</td></tr>
   </tbody>
 </table>
 </div>
 
 <pre class="code" data-lang="sql"><code>DATE '2024-02-29'
-TIMESTAMP '2024-03-15 12:30:45.5'</code></pre>
+TIMESTAMP '2024-03-15 12:30:45.5'
+CAST('12.34' AS DECIMAL(6, 2))       -- DECIMAL literals arrive as casts
+INTERVAL '1 day 2 hours'</code></pre>
 
-<p>Date operations: <code>date ± integer</code> adds/subtracts days,
-<code>date - date</code> yields <code>BIGINT</code> days, and <code>year(x)</code>,
-<code>month(x)</code>, <code>day(x)</code>, <code>hour(x)</code>,
-<code>minute(x)</code>, <code>second(x)</code> and <code>date_trunc(part, x)</code>
-are available. CSV import auto-detects <code>YYYY-MM-DD</code> as
-<code>DATE</code> and <code>YYYY-MM-DD HH:MM:SS[.f]</code> as
-<code>TIMESTAMP</code>.</p>
+<p>Date and interval operations: <code>date ± integer</code> adds/subtracts days,
+<code>date - date</code> yields <code>BIGINT</code> days, <code>date ± interval</code>
+and <code>interval ± interval</code> work with DuckDB's month-end clamping, and
+intervals scale with <code>*</code>/<code>/</code> by numbers. CSV import
+auto-detects <code>YYYY-MM-DD</code> as <code>DATE</code> and
+<code>YYYY-MM-DD HH:MM:SS[.f]</code> as <code>TIMESTAMP</code>.</p>
 
 <h3>Coercion rules</h3>
 
 <ul>
-  <li><code>INTEGER → BIGINT → DOUBLE</code>.</li>
-  <li><code>int / int → DOUBLE</code> (the DuckDB rule). <code>%</code> is
-  integer-only.</li>
+  <li><code>INTEGER → BIGINT → DOUBLE</code>; <code>DECIMAL</code> participates with
+  DuckDB's width/scale promotion (string and numeric input coerce at
+  INSERT/CSV/CAST boundaries).</li>
+  <li><code>int / int → DOUBLE</code> (the DuckDB rule); <code>DECIMAL / DECIMAL</code>
+  widens both sides to <code>DOUBLE</code>. <code>%</code> is integer-only.</li>
   <li>Integer overflow is an error, like DuckDB (<code>+</code>/<code>-</code>/<code>*</code>,
   negation, <code>abs</code>, date ± n, narrowing casts); <code>SUM</code> over
   integers is exact and errors only when the final value does not fit
@@ -158,7 +232,7 @@ are available. CSV import auto-detects <code>YYYY-MM-DD</code> as
   <li>Integer division/modulo by zero is an error; <code>0.0</code> float division is
   IEEE.</li>
   <li>Mixed <code>DATE</code>/<code>TIMESTAMP</code> comparison is rejected;
-  timestamps never mix with integers (no <code>INTERVAL</code> type today).</li>
+  timestamps never mix with integers — use <code>date ± interval</code>.</li>
 </ul>
 
 <h2>Three-valued logic</h2>
@@ -169,7 +243,7 @@ are available. CSV import auto-detects <code>YYYY-MM-DD</code> as
   <li><code>COUNT(x)</code>, <code>SUM</code> and <code>AVG</code> skip NULLs;
   <code>COUNT(*)</code> counts rows.</li>
   <li>NULL group keys group together; NULL join keys never match.</li>
-  <li>LEFT/RIGHT joins NULL-extend the unmatched side's columns.</li>
+  <li>LEFT/RIGHT/FULL joins NULL-extend the unmatched side's columns.</li>
   <li><code>CASE</code> conditions that evaluate to NULL never match.</li>
 </ul>
 
@@ -207,25 +281,19 @@ it and never affects other sessions: the shared store is untouched.</p>
 <a href="{{root}}docs/roadmap.html">roadmap</a>.</p>
 
 <ul>
-  <li><strong>Joins:</strong> no <code>FULL</code> or <code>CROSS</code> joins, no
-  multi-way or composite/non-equi join conditions.</li>
-  <li><strong>SQL completeness (planned):</strong> <code>INSERT ... SELECT</code>,
-  CTAS, <code>IF [NOT] EXISTS</code>, <code>OFFSET</code>,
-  <code>NULLS FIRST/LAST</code>, <code>INTERSECT</code>/<code>EXCEPT</code>,
-  <code>COUNT(DISTINCT)</code>, <code>EXPLAIN</code>,
-  <code>SHOW</code>/<code>DESCRIBE</code>, <code>RANGE</code> window frames.</li>
-  <li><strong>Prepared statements (planned):</strong> placeholders and a bind API are
-  not available yet on any front-end.</li>
-  <li><strong>More functions and types (planned):</strong>
-  <code>lag</code>/<code>lead</code>/<code>ntile</code>, <code>DECIMAL</code>,
-  <code>INTERVAL</code>; core <code>json</code>, <code>string</code>,
-  <code>math</code> and <code>datetime</code> extensions.</li>
-  <li><strong>Schema features (planned):</strong> keys and constraints
-  (metadata), indexes, materialized views, stored procedures.</li>
-  <li><strong>Limits today:</strong> correlated subqueries are rejected; expression
-  nesting is capped at 24 levels and statement depth at 64 nodes (deeper input is a
-  clean parse error, never a stack overflow); aggregates in <code>ORDER BY</code>
-  need an alias or position.</li>
+  <li><strong>Correlated subqueries</strong> are rejected (uncorrelated subqueries
+  and <code>EXISTS</code> work).</li>
+  <li><strong>Indexes</strong> (<code>CREATE INDEX</code>), <strong>materialized
+  views</strong> and <strong>stored procedures</strong> are planned
+  (waves 42–44).</li>
+  <li><strong>Function packs</strong> — <code>json</code>, <code>string</code>,
+  <code>math</code> and <code>datetime</code> as core extensions — are queued.</li>
+  <li><strong>File-format extensions</strong> — parquet, Arrow and Iceberg — are
+  queued (waves 70–72).</li>
+  <li><strong>Limits today:</strong> expression nesting is capped at 24 levels and
+  statement depth at 64 nodes (deeper input is a clean parse error, never a stack
+  overflow); aggregates in <code>ORDER BY</code> need an alias or position; no
+  nested transactions or savepoints.</li>
 </ul>
 
 <ul class="next-links">
