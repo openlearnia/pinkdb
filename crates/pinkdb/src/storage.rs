@@ -7,8 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-#[cfg(not(target_arch = "wasm32"))]
-use pinkdb_ext_loader::{DynamicFunction, LoadedExtension};
+use pinkdb_ext_loader::{ExtFunction, ExtHandle};
 
 use crate::crypto::EncryptionKey;
 use crate::sql::ast::Select;
@@ -823,19 +822,19 @@ pub struct DbCatalog {
 pub struct PinkDb {
     /// Key = lowercased database name.
     pub(crate) databases: HashMap<String, DbCatalog>,
-    /// Loadable-extension scalar functions (ABI v1, wave 29A), keyed by
-    /// lowercased name. Registered by [`PinkDb::load_extension`]; shared by
-    /// every clone of the store. Empty for a stock engine, in which case the
-    /// binder/executor behave exactly as before. Native-only: wasm32 links no
-    /// extension loader (`LOAD EXTENSION` errors there).
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) dynamic_functions: HashMap<String, DynamicFunction>,
-    /// Every successfully loaded extension (ABI v1), keyed by lowercased
-    /// declared name. Holds the library handle, so an extension that
-    /// registered no functions still stays mapped; also pins duplicate loads
-    /// by name. Native-only, like [`PinkDb::dynamic_functions`].
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) loaded_extensions: HashMap<String, LoadedExtension>,
+    /// Loadable-extension scalar functions (ABI v1 `dlopen`, wave 29A; linked
+    /// registry, wave 49), keyed by lowercased name. Registered by
+    /// [`PinkDb::load_extension`] / [`PinkDb::load_linked_extension`]; shared
+    /// by every clone of the store. Empty for a stock engine, in which case
+    /// the binder/executor behave exactly as before. Native targets hold the
+    /// `dlopen` variant, wasm targets the linked one; the field itself is
+    /// target-independent.
+    pub(crate) dynamic_functions: HashMap<String, ExtFunction>,
+    /// Every successfully loaded extension, keyed by lowercased declared
+    /// name. Holds the handle, so an extension that registered no functions
+    /// still stays alive (natively the library stays mapped); also pins
+    /// duplicate loads by name.
+    pub(crate) loaded_extensions: HashMap<String, ExtHandle>,
     /// Lowercased name of the embedded session's current database.
     pub(crate) current_db: String,
     pub(crate) txn_snapshot: Option<Box<PinkDb>>,
@@ -935,9 +934,7 @@ impl Clone for PinkDb {
     fn clone(&self) -> Self {
         Self {
             databases: self.databases.clone(),
-            #[cfg(not(target_arch = "wasm32"))]
             dynamic_functions: self.dynamic_functions.clone(),
-            #[cfg(not(target_arch = "wasm32"))]
             loaded_extensions: self.loaded_extensions.clone(),
             current_db: self.current_db.clone(),
             txn_snapshot: self.txn_snapshot.clone(),
@@ -991,9 +988,7 @@ impl PinkDb {
         }
         Self {
             databases,
-            #[cfg(not(target_arch = "wasm32"))]
             dynamic_functions: HashMap::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             loaded_extensions: HashMap::new(),
             current_db: "main".to_string(),
             txn_snapshot: None,

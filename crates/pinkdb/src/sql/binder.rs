@@ -338,11 +338,13 @@ pub enum BoundExpr {
         query: Box<LogicalPlan>,
         negated: bool,
     },
-    /// Call into a scalar function registered by a loaded extension
-    /// (`PinkDb::load_extension`). `name` is the canonical lowercased
-    /// registry key; args and result are typed exactly as registered (no
-    /// implicit casts in ABI v1). Never constant-folded (an extension
-    /// callback is opaque: it may be impure and may fail).
+    /// Call into a scalar function registered by a loaded extension — a
+    /// native `dlopen` callback or a linked registry function
+    /// (`PinkDb::load_extension` / `PinkDb::load_linked_extension`). `name` is
+    /// the canonical lowercased registry key; args and result are typed
+    /// exactly as registered (no implicit casts in ABI v1). Never
+    /// constant-folded (an extension callback is opaque: it may be impure and
+    /// may fail).
     ///
     /// `Box<str>` + `Box<[BoundExpr]>` (not `String` + `Vec`) keep this
     /// variant no larger than the biggest pre-existing one, so
@@ -1837,16 +1839,9 @@ impl<'a> Binder<'a> {
                 dtype,
             });
         }
-        // Not a built-in: a loaded extension may provide it (case-insensitive).
-        // (On wasm32 the extension loader is not linked: no dynamic functions
-        // can be registered, so the unknown-function error is the whole story.)
-        #[cfg(not(target_arch = "wasm32"))]
-        return self.bind_dynamic_function(name, args, aggs, allow_agg);
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = (args, aggs, allow_agg);
-            Err(PinkDbError::Catalog(format!("unknown function \"{name}\"")))
-        }
+        // Not a built-in: a loaded extension may provide it (case-insensitive)
+        // — a `dlopen` callback or a linked registry function.
+        self.bind_dynamic_function(name, args, aggs, allow_agg)
     }
 
     /// Bind a call to a function registered by a loaded extension.
@@ -1854,11 +1849,8 @@ impl<'a> Binder<'a> {
     /// ABI v1 is strictly typed: every argument's bound type must equal the
     /// registered argument type (a bare `NULL` literal is typeless and is
     /// passed as a NULL of the registered type), and the result type is the
-    /// registered return type.
-    ///
-    /// Native-only: the dynamic registry (and the loader that feeds it) does
-    /// not exist on wasm32.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// registered return type. Both loading models register through the same
+    /// registry, so this is the one binder path for either.
     fn bind_dynamic_function(
         &mut self,
         name: &str,

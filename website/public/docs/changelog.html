@@ -186,6 +186,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
+<h3>Wave 49 — extensions on wasm ✅</h3>
+<ul>
+<li>Extensions now work on <strong>every target</strong> through a new <strong>linked registration</strong> model: extensions register through a safe-Rust API and feed the same engine registry as native ABI v1 extensions. On wasm (where <code>dlopen</code> cannot work), <code>LOAD EXTENSION '&lt;name&gt;'</code> resolves a registered name; unknown names fail with an actionable error.</li>
+<li>The <strong>JS / wasm-bindgen host contract</strong> is pinned — surface, SQL↔JS value mappings and sandbox rules, documented in <code>docs/wasm-extensions.md</code> — with no new dependencies added.</li>
+<li>Native CLI grows ~3.7 KB; the wasm dependency tree gains nothing.</li>
+</ul>
 <h3>Wave 46 — network server TLS ✅</h3>
 <ul>
 <li>Opt-in <code>tls</code> feature: the server serves the same protocol over <strong>rustls</strong>-encrypted TCP (<code>--tls-cert/--tls-key</code>), and the CLI's remote mode gained <code>--tls</code>, <code>--tls-ca-cert</code> and <code>--tls-insecure</code>. Certificate problems refuse startup with precise messages; handshake failures never disturb the accept loop; the default build and dependency graph are unchanged.</li>

@@ -200,8 +200,13 @@ separate from the <code>pinkdb-ffi</code> embedding ABI.</p>
   <li>Extensions are <strong>process-level</strong>: they are not stored in
   <code>.pink</code> snapshots and not part of a transaction.
   <code>LOAD EXTENSION</code> is refused inside <code>BEGIN..COMMIT</code>.</li>
-  <li>Native-only: on wasm targets the statement fails cleanly with
-  <code>extensions are not supported on wasm targets</code>.</li>
+  <li><strong>WebAssembly targets:</strong> native <code>dlopen</code> cannot
+  work in the wasm sandbox, so wasm builds use <strong>linked
+  registration</strong> — extensions compiled into the host register through a
+  safe-Rust API, and <code>LOAD EXTENSION '&lt;name&gt;'</code> resolves a
+  registered name (unknown names fail with an actionable error). The JS /
+  wasm-bindgen host contract is documented in
+  <code>docs/wasm-extensions.md</code>.</li>
 </ul>
 
 <h2 id="installing-from-the-extension-repository">Installing from the extension repository<a class="anchor" href="#installing-from-the-extension-repository" aria-label="Permalink: Installing from the extension repository">#</a></h2>

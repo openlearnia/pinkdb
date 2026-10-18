@@ -317,8 +317,9 @@ on GitHub, and the wave-by-wave summary in the
   time travel — as separate crates/extensions.</li>
   <li><strong>Extension trust:</strong> Ed25519 artifact signatures, SQL
   <code>INSTALL</code>, Linux artifacts.</li>
-  <li><strong>Extensions on wasm:</strong> a pluggable loading model for wasm
-  targets (native <code>dlopen</code> cannot work in the sandbox).</li>
+  <li><strong>Extensions on wasm — side modules:</strong> linked registration
+  landed; loading pre-built WASI side modules through a per-runtime loader
+  remains (feature-gated, out of the default graph).</li>
   <li><strong>Packaging:</strong> a Python wheel and a standalone Go module.</li>
 </ul>
 

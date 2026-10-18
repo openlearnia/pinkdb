@@ -4,11 +4,14 @@
 //! PEG SQL frontend, CSV import. Single connection, single thread, no unsafe,
 //! no async.
 //!
-//! Loadable extensions (ABI v1, `pinkdb-ext-loader`) add scalar functions at
-//! runtime through [`PinkDb::load_extension`]; the unsafe boundary (dlopen and
-//! callback invocation) lives entirely in that crate, the engine stays
+//! Loadable extensions add scalar functions at runtime through
+//! [`PinkDb::load_extension`]: native targets load ABI v1 shared libraries
+//! (`dlopen`), wasm targets resolve names against the linked registry
+//! (`pinkdb_ext_loader::linked`) — the same engine registry either way. The
+//! unsafe boundary (dlopen and callback invocation) lives entirely in the
+//! `pinkdb-ext-loader` crate and is native-only, the engine stays
 //! zero-unsafe, and the built-in binder/executor path is unchanged when no
-//! extension is loaded.
+//! extension is loaded. See `docs/wasm-extensions.md` for the wasm model.
 
 pub mod attached;
 pub mod crypto;

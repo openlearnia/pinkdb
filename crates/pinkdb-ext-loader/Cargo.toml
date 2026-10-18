@@ -3,15 +3,17 @@ name = "pinkdb-ext-loader"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "pinkdb loadable-extension ABI v1: dlopen-based loader and dynamic scalar registry"
+description = "pinkdb extension loading: dlopen ABI v1 (native) plus the linked registry model (wasm, host registration)"
 license = "MIT"
 
 [lib]
 name = "pinkdb_ext_loader"
 
-[dependencies]
-# The one dependency this wave adds, scoped to this crate: dlopen/dlsym.
-# (The host calls it, it calls nothing else back into Rust.)
+# dlopen/dlsym, scoped to this crate — and to native targets: wasm32 has no
+# dynamic linker, so there the crate builds with zero dependencies and the
+# linked registry model (`src/linked.rs`) is the whole loading story.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# The host calls it; it calls nothing else back into Rust.
 libloading = "0.8"
 
 [dev-dependencies]

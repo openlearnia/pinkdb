@@ -1,16 +1,26 @@
 //! C ABI v1 types, mirrored 1:1 from `include/pinkdb_extension.h`.
 //!
+//! The value model ([`ExtType`], [`ExtArg`], [`ExtValue`], the type tags and
+//! the arity limit) is shared by both loading models and builds on every
+//! target. The by-value C structs, callback signatures and host API are the
+//! `dlopen` model's wire format and are therefore native-only ([`crate::
+//! linked`] passes the Rust enums directly).
+//!
 //! Nothing here is unsafe: the structs are plain `repr(C)` data and the enums
 //! are host-side conveniences. All pointer handling that needs `unsafe` lives
 //! in [`crate::function`] and [`crate::host`].
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::ffi::{c_char, c_void};
 use std::fmt;
 
 /// ABI version implemented by this loader and required from extensions.
+#[cfg(not(target_arch = "wasm32"))]
 pub const PINKDB_EXT_ABI_VERSION: u32 = 1;
 
-/// Maximum argument count accepted by [`crate::PinkdbHostApi::register_scalar`].
+/// Maximum argument count accepted by [`crate::PinkdbHostApi::register_scalar`]
+/// and by [`crate::LinkedFunction::new`]. Kept identical for both loading
+/// models so one extension's arity limit does not change with the target.
 pub const PINKDB_EXT_MAX_ARGS: u32 = 64;
 
 // Value / argument type tags (same numbering as the pinkdb C ABI).
@@ -26,6 +36,7 @@ pub const PINKDB_EXT_TYPE_TIMESTAMP: i32 = 7;
 /// One tagged scalar, by value. Same layout family as `pinkdb-ffi`'s
 /// `PinkValue`; for VARCHAR, `text_ptr`/`text_len` carry raw bytes (embedded
 /// NULs allowed, no trailing NUL required).
+#[cfg(not(target_arch = "wasm32"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PinkdbExtValue {
@@ -37,6 +48,7 @@ pub struct PinkdbExtValue {
     pub text_len: usize,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl PinkdbExtValue {
     /// A NULL value of declared tag `type_tag`.
     pub(crate) fn null(type_tag: i32) -> Self {
@@ -51,6 +63,7 @@ impl PinkdbExtValue {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl fmt::Debug for PinkdbExtValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PinkdbExtValue")
@@ -67,13 +80,14 @@ impl fmt::Debug for PinkdbExtValue {
 // reordering a field or changing its type would silently reinterpret every
 // value crossing the ABI. The pointer-width-dependent fields are pinned in the
 // test below.
+#[cfg(not(target_arch = "wasm32"))]
 const _: () = {
     assert!(std::mem::offset_of!(PinkdbExtValue, type_tag) == 0);
     assert!(std::mem::offset_of!(PinkdbExtValue, is_null) == 4);
     assert!(std::mem::offset_of!(PinkdbExtValue, int64) == 8);
     assert!(std::mem::offset_of!(PinkdbExtValue, double) == 16);
 };
-#[cfg(target_pointer_width = "64")]
+#[cfg(all(not(target_arch = "wasm32"), target_pointer_width = "64"))]
 const _: () = {
     assert!(std::mem::offset_of!(PinkdbExtValue, text_ptr) == 24);
     assert!(std::mem::offset_of!(PinkdbExtValue, text_len) == 32);
@@ -82,6 +96,7 @@ const _: () = {
 
 /// An extension's scalar callback. Exported code is called through this
 /// pointer; the callback must be thread-safe (see the header).
+#[cfg(not(target_arch = "wasm32"))]
 pub type PinkdbExtScalarFn = unsafe extern "C" fn(
     user_data: *mut c_void,
     args: *const PinkdbExtValue,
@@ -90,15 +105,19 @@ pub type PinkdbExtScalarFn = unsafe extern "C" fn(
 ) -> i32;
 
 /// `pinkdb_extension_abi_version() -> u32`.
+#[cfg(not(target_arch = "wasm32"))]
 pub type PinkdbExtAbiVersionFn = unsafe extern "C" fn() -> u32;
 /// `pinkdb_extension_name() -> *const c_char`.
+#[cfg(not(target_arch = "wasm32"))]
 pub type PinkdbExtNameFn = unsafe extern "C" fn() -> *const c_char;
 /// `pinkdb_extension_init(api, host_ctx) -> i32`.
+#[cfg(not(target_arch = "wasm32"))]
 pub type PinkdbExtInitFn =
     unsafe extern "C" fn(api: *const PinkdbHostApi, host_ctx: *mut c_void) -> i32;
 
 /// Host-provided services handed to `pinkdb_extension_init`. Mirrors
 /// `PinkdbHostApi` in the header field for field.
+#[cfg(not(target_arch = "wasm32"))]
 #[repr(C)]
 pub struct PinkdbHostApi {
     /// [`PINKDB_EXT_ABI_VERSION`].
@@ -218,6 +237,10 @@ impl ExtArg<'_> {
     }
 
     /// Marshal into the by-value C struct (VARCHAR borrows the bytes).
+    ///
+    /// Native-only: the struct crosses the `dlopen` ABI; the linked model
+    /// (`crate::linked`) passes [`ExtArg`] itself to the callback.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn to_abi(self) -> PinkdbExtValue {
         let (type_tag, is_null, int64, double, text_ptr, text_len) = match self {
             // A NULL argument keeps is_null set, carrying its declared type.
@@ -292,7 +315,7 @@ impl ExtValue {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

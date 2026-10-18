@@ -82,7 +82,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | done | landed; `tls` feature = rustls transport (`Server::bind_tls*`, `--tls-cert/--tls-key`, CLI `--tls/--tls-ca-cert/--tls-insecure`), same protocol v8, cert validation before bind, handshake failures isolated under idle timeout, cap applies; no auth/authorization unchanged (documented); 22 tests (incl. runtime-generated certs); default graph byte-identical, server +1.18 MB only with the feature |
 | 47 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | done | landed; `async-server` feature = tokio listener with one task per connection, engine calls on the blocking pool (`spawn_blocking`, 16 MiB stacks), shared protocol/result codecs via a `FrameSink` trait → **byte-identical frames** to the sync server (test), cap/idle-timeout/panic-isolation/EMFILE/shutdown tests, `--transport sync\|async`; documented carve-out; default graph tokio-free; server +0.38 MB with the feature |
 | 48 | RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), `CREATE USER`/`CREATE ROLE`/`GRANT`/`REVOKE` on databases/tables, session login on the network server, per-connection enforcement (embedded API stays trusted), grants persisted in the catalog + WAL | queued | — |
-| 49 | Extensions on wasm: support loadable/pluggable extensions for wasm targets — either wasm dynamic-linking (pre-built WASI side modules, per-runtime `dlopen` support) or a host-function registration path (JS/wasm-bindgen scripting surface); native `dlopen` extensions are impossible in the wasm sandbox, so a distinct ABI/loading model is required | queued | — |
+| 49 | Extensions on wasm: support loadable/pluggable extensions for wasm targets — either wasm dynamic-linking (pre-built WASI side modules, per-runtime `dlopen` support) or a host-function registration path (JS/wasm-bindgen scripting surface); native `dlopen` extensions are impossible in the wasm sandbox, so a distinct ABI/loading model is required | done | landed; distinct model = **linked registration** — new `pinkdb-ext-loader::linked` (dependency-free, all targets): `LinkedExtension`/`LinkedFunction` metadata, safe-Rust `LinkedScalar` callbacks (`Send + Sync`, panics caught at the boundary, ≤64 args), one-shot process-global registry, `LinkedExtHost::load`; **unified engine registry** (`ExtFunction`/`ExtHandle`: native `Dyn` + `Linked`) drives binder/executor/optimizer/WAL prefixing for both models on every target (wasm stubs gone); on wasm `LOAD EXTENSION '<name>'` resolves registry **names**, native `dlopen` stays first with registry fallback only when nothing is loadable *and* the name is registered (keeps WAL replay of linked `LOAD EXTENSION` working, no path shadowing); pinned **JS/wasm-bindgen contract** (`pinkdb.registerExtension`/`listExtensions`, SQL↔JS value table, sandbox rules) — contract only, no wasm-bindgen dependency; side-module runtime deferred (documented follow-up); **zero new deps** (`libloading` target-gated, wasm tree childless); tests: ext-loader 43 → **59**, pinkdb 564 → **565**, workspace + wasm (1.97.1 & stable) + duckdiff **171/171**; native CLI +3.7 KB, wasm debug cdylib +0.96 MB |
 | 50 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | — |
 | 51 | Rust extension SDK: `ext-sdk/rust` safe wrapper + registration macros for first-party extensions; ABI v1 additive: a deterministic/volatile function flag (the engine refuses to WAL-log volatile calls, preventing replay divergence) | queued | in-repo `ext-sdk/rust` |
 | 52 | Core extension: **json** — `json_extract`, `json_value`, `json_valid`, `json_array_length`, `json_object`, `json_array` (JSON as VARCHAR in v1) | queued | `extensions/json` |
@@ -1483,4 +1483,27 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   Integration on top of wave 47: **6 hand-resolved conflicts** — the TLS bind
   moved inside the async transport's `Sync` arm, `announce` gained a transport
   label (TLS-aware security warning), feature/dep tables and the lock unified.
+  Worktree removed.
+- 2026-10-18 — Wave 49 (extensions on wasm; worktree `wt-wasm`): the distinct
+  ABI/loading model is **linked registration** — extensions register through a
+  safe-Rust API (`pinkdb-ext-loader::linked`: `LinkedExtension` metadata,
+  `LinkedScalar` callbacks with `Send + Sync` and panics caught, one-shot
+  process-global registry) and feed the *same* engine registry as native ABI v1
+  (`ExtFunction` gained a `Linked` variant; binder/executor/optimizer/WAL prefix
+  handle both on every target, and the wasm "extension unsupported" stubs are
+  gone). Resolution: on wasm, `LOAD EXTENSION '<name>'` looks the name up;
+  natively `dlopen` stays first and the registry is consulted only when nothing
+  is loadable at that exact string *and* the name is registered — which is what
+  makes replayed `LOAD EXTENSION '<name>'` WAL records resolve. The
+  **JS/wasm-bindgen contract** (`pinkdb.registerExtension`, SQL↔JS value table
+  incl. DATE/TIMESTAMP reps, sandbox/determinism rules) is pinned as docs
+  (`docs/wasm-extensions.md`) with no wasm-bindgen dependency; a side-module
+  runtime stays a recorded follow-up. Simple scalar extensions cannot add
+  aggregates/table functions yet (recorded). Tests: 8 real-engine linked tests
+  (incl. durable WAL round-trip with checkpoint), registry/WAL failure paths,
+  atomic-registration conflicts; ext-loader 43 → **59**, pinkdb 564 → **565**,
+  duckdiff **171/171**, wasm build green (1.97.1 & stable), fmt/clippy clean.
+  Practical note: local wasm builds must pin the toolchain rustc (`RUSTC=$(rustup
+  which --toolchain 1.97.1 rustc)`), because PATH resolves Homebrew's rustc,
+  whose sysroot lacks wasm std. Integration on main: patch applied cleanly.
   Worktree removed.

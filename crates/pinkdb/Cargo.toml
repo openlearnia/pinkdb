@@ -29,15 +29,12 @@ argon2 = { version = "0.5", optional = true }
 # The JavaScript procedure sandbox, only linked with the `js` feature.
 pinkdb-js = { path = "../pinkdb-js", optional = true }
 
-# Loadable extensions (ABI v1) are native-only by construction: the loader
-# crate links `libloading` (dlopen/dlsym), which does not build for wasm32.
-# The dependency edge is target-gated here, and the engine cfg-gates the
-# dynamic-function registry/binder/executor paths (a wasm build gets a clear
-# "extensions are not supported on wasm targets" error from
-# `PinkDb::load_extension`). Native builds are byte-identical.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# The loader crate owns the only dlopen dependency; the engine side is the
-# dynamic scalar registry + binding + execution of registered callbacks.
+# Loadable extensions, on every target. Native builds use the `dlopen` half
+# (ABI v1) — the loader crate links `libloading` there; wasm builds use the
+# linked registry half (`pinkdb_ext_loader::linked`), whose dependencies are
+# zero (`libloading` is target-gated inside the loader crate). The engine
+# keeps one registry either way: dynamic functions and linked functions are
+# the two `pinkdb_ext_loader::ExtFunction` variants.
 pinkdb-ext-loader = { path = "../pinkdb-ext-loader" }
 
 # Single-process durable-path benchmark: `cargo bench -p pinkdb --bench durable`.

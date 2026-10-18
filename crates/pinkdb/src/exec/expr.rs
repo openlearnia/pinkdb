@@ -9,7 +9,6 @@
 
 use std::cmp::Ordering;
 
-#[cfg(not(target_arch = "wasm32"))]
 use pinkdb_ext_loader::ExtArg;
 
 use super::aggregate::encode_row;
@@ -174,34 +173,22 @@ pub(crate) fn eval_expr(expr: &BoundExpr, chunk: &DataChunk, cx: &Cx) -> Result<
             eval_scalar(*func, *dtype, &vecs)
         }
         BoundExpr::DynamicScalar { name, args, dtype } => {
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                eval_dynamic_scalar(name, args, *dtype, chunk, cx)
-            }
-            // Unreachable in practice (a wasm binder can never build this
-            // variant): mirrors the wasm `PinkDb::load_extension` stub.
-            #[cfg(target_arch = "wasm32")]
-            {
-                let _ = (name, args, dtype, chunk, cx);
-                Err(PinkDbError::Execution(
-                    "extensions are not supported on wasm targets".to_string(),
-                ))
-            }
+            eval_dynamic_scalar(name, args, *dtype, chunk, cx)
         }
     }
 }
 
 /// Row-at-a-time callback into a scalar function registered by a loaded
-/// extension.
+/// extension, whichever loading model registered it.
 ///
 /// Arguments evaluate vector-at-a-time over the chunk (exactly like a static
 /// scalar function); the callback then runs once per row with the ABI's
-/// by-value argument structs. NULL cells are passed through with `is_null`
-/// set — the extension decides what NULL means (documented in
+/// argument values. NULL cells are passed through as an [`ExtArg::Null`] of
+/// the declared type — the extension decides what NULL means (documented in
 /// `pinkdb_extension.h`). VARCHAR arguments borrow their bytes for the call;
-/// VARCHAR results are copied out of extension memory by the loader, which
-/// also frees the extension's buffer immediately.
-#[cfg(not(target_arch = "wasm32"))]
+/// a VARCHAR result is owned by the time it is converted back (the native
+/// loader copied it out of extension memory and freed the buffer; a linked
+/// callback returned `Vec<u8>`).
 fn eval_dynamic_scalar(
     name: &str,
     args: &[BoundExpr],

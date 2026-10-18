@@ -879,9 +879,11 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             {
                 return Ok(QueryResult::LoadedExtension { name });
             }
-            // Process-level side effect: load the cdylib and register its
-            // functions (atomic; a failure registers nothing). The DB stays
-            // usable afterwards either way.
+            // Process-level side effect: load the library (native) or
+            // resolve the name in the linked registry (wasm; natively too,
+            // when nothing is loadable at `path`) and register its functions
+            // (atomic; a failure registers nothing). The DB stays usable
+            // afterwards either way.
             let name = db.load_extension(path)?;
             Ok(QueryResult::LoadedExtension { name })
         }

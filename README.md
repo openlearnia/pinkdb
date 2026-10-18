@@ -80,7 +80,9 @@ zero-unsafe, with
 extension loader `pinkdb-ext-loader`). Dependencies are `csv` + `rustyline`,
 plus `rayon` for parallel execution and `peg` for the SQL parser. The server
 crate adds no external dependencies; the extension loader adds `libloading`
-(dlopen) and the core links it on native targets only (see Extensions below).
+(dlopen) and the core links it on native targets only — wasm builds use the
+linked registry model, which adds no dependency at all (see Extensions
+below).
 With the `encryption` feature the audited RustCrypto crates `aes-gcm` +
 `argon2` are linked (optional dependencies: the default build stays
 crypto-free).
@@ -104,6 +106,7 @@ DROP DATABASE db1;                   -- last database cannot be dropped; droppin
                                      -- current one switches the session to main
 USE db1;                             -- per-session current database (default: main)
 LOAD EXTENSION 'extensions/hello.dylib';   -- load a native extension (ABI v1)
+LOAD EXTENSION 'windowed_math';            -- on wasm: load a linked registry extension
 CREATE PROCEDURE p(a INTEGER, b VARCHAR) AS $$
 BEGIN INSERT INTO t VALUES (a, b); END $$;     -- stored procedure (see below)
 CALL p(1, 'x');                              -- run it; DROP PROCEDURE p removes it
@@ -1642,6 +1645,43 @@ Contract highlights (the header is complete):
   naming the function and code; `init` returning non-zero (or a rejected
   registration) fails the load naming the code/reason. `init` and callbacks
   must not panic/unwind across the ABI boundary.
+
+### Extensions on wasm (linked registry)
+
+A wasm sandbox has no dynamic linker and no filesystem, so ABI v1 cannot be
+loaded there. Wave 49 adds a second, wasm-compatible model: the extension is
+**linked into the host** and published in a process-global registry through a
+safe Rust API, and `LOAD EXTENSION '<name>'` resolves that name instead of a
+path (native targets keep the `dlopen` model; the registry is consulted there
+only when nothing is loadable at the given string — which is how a replayed
+WAL record naming a linked extension resolves).
+
+```rust
+use pinkdb_ext_loader::linked::{self, LinkedExtension, LinkedFunction};
+use pinkdb_ext_loader::{ExtArg, ExtType, ExtValue};
+
+let ext = LinkedExtension::new("windowed_math", vec![
+    LinkedFunction::new("wma_halve", vec![ExtType::Double], ExtType::Double,
+        |args: &[ExtArg<'_>]| match args[0] {
+            ExtArg::Double(x) => Ok(ExtValue::Double(x / 2.0)),
+            ExtArg::Null(_) => Ok(ExtValue::Null),
+            other => Err(format!("unexpected argument {other:?}")),
+        })?,
+])?;
+linked::register(ext)?;                 // host bootstrap (wasm-bindgen start fn)
+// LOAD EXTENSION 'windowed_math'; SELECT wma_halve(5.0);   -- 2.5
+```
+
+The same value model, arity limit, binder, executor and WAL rules as the C
+ABI (see `crates/pinkdb-ext-loader/src/linked.rs`); callbacks are plain Rust
+(`Send + Sync`, panics caught at the boundary), metadata is validated once,
+and registration is one-shot — SQL can activate what the host published but
+can never inject code. No `dlopen`-less dependency was added to the wasm
+graph: `libloading` stays target-gated in the loader crate. The JavaScript
+(wasm-bindgen) surface — `pinkdb.registerExtension` / `pinkdb.listExtensions`
+with its value mapping and determinism rules — is shipped as a pinned
+contract; the binding itself is the recorded follow-up. Full design, limits
+and test matrix: `docs/wasm-extensions.md`.
 
 ### Writing extensions (C/C++)
 

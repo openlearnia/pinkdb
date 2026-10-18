@@ -1,11 +1,11 @@
-//! pinkdb loadable-extension loader — ABI v1.
+//! pinkdb extension loading — two models, one value ABI.
 //!
-//! Loads a shared library (`.dylib` / `.so` / `.dll`) that exports the
-//! versioned C ABI documented in [`include/pinkdb_extension.h`], collects the
-//! scalar functions it registers, and hands them to a host through the
-//! [`ExtHost`] trait. [`load_extension`] is the complete load-and-register
-//! entry point; the engine's `PinkDb::load_extension` is a thin wrapper over
-//! it.
+//! **Native targets** load a shared library (`.dylib` / `.so` / `.dll`) that
+//! exports the versioned C ABI documented in
+//! [`include/pinkdb_extension.h`], collect the scalar functions it registers,
+//! and hand them to a host through the [`ExtHost`] trait. [`load_extension`]
+//! is the complete load-and-register entry point; the engine's
+//! `PinkDb::load_extension` is a thin wrapper over it.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), pinkdb_ext_loader::ExtError> {
@@ -20,11 +20,28 @@
 //! # }
 //! ```
 //!
+//! **wasm targets** have no dynamic linker and no filesystem, so a wasm build
+//! links no `dlopen` at all: extensions are linked into the host and
+//! published to a process-global registry through the safe Rust API of
+//! [`linked`] (the *linked* model — see its module docs for the full
+//! comparison, the loading rules and the JavaScript host-surface contract).
+//! `LOAD EXTENSION '<name>'` there resolves the name against that registry.
+//! The linked model is available on native targets too, where it is the
+//! host-function registration path for embedders (and the fallback that lets
+//! a WAL record naming a linked extension replay).
+//!
+//! Both models share the value model ([`ExtType`], [`ExtArg`], [`ExtValue`]
+//! and the arity limit) and the engine integration: the binder resolves
+//! unknown function names case-insensitively, the executor marshals one row
+//! at a time into ABI values, and [`ExtFunction`] / [`ExtHandle`] are what
+//! the engine's registry stores whichever model produced them.
+//!
 //! The ABI contract (symbol names, value layout, text ownership, and the
 //! thread-safety requirement on callbacks) lives in the header; this crate is
 //! its single host-side implementation. All `unsafe` in the workspace outside
-//! `pinkdb-ffi` is contained here: `dlopen`/`dlsym` (via `libloading`),
-//! invoking extension callbacks, and reading/freeing result text.
+//! `pinkdb-ffi` is contained here and is native-only: `dlopen`/`dlsym` (via
+//! `libloading`), invoking extension callbacks, and reading/freeing result
+//! text.
 //!
 //! [`include/pinkdb_extension.h`]: https://github.com/openlearnia/pinkdb/blob/main/crates/pinkdb-ext-loader/include/pinkdb_extension.h
 
@@ -34,22 +51,170 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 mod abi;
+#[cfg(not(target_arch = "wasm32"))]
 mod function;
+#[cfg(not(target_arch = "wasm32"))]
 mod host;
+pub mod linked;
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::ffi::{CStr, c_void};
 use std::fmt;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 pub use abi::{
-    ExtArg, ExtType, ExtValue, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS, PINKDB_EXT_TYPE_BIGINT,
+    ExtArg, ExtType, ExtValue, PINKDB_EXT_MAX_ARGS, PINKDB_EXT_TYPE_BIGINT,
     PINKDB_EXT_TYPE_BOOLEAN, PINKDB_EXT_TYPE_DATE, PINKDB_EXT_TYPE_DOUBLE, PINKDB_EXT_TYPE_INTEGER,
     PINKDB_EXT_TYPE_NULL, PINKDB_EXT_TYPE_TIMESTAMP, PINKDB_EXT_TYPE_VARCHAR,
-    PinkdbExtAbiVersionFn, PinkdbExtInitFn, PinkdbExtNameFn, PinkdbExtScalarFn, PinkdbExtValue,
-    PinkdbHostApi,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use abi::{
+    PINKDB_EXT_ABI_VERSION, PinkdbExtAbiVersionFn, PinkdbExtInitFn, PinkdbExtNameFn,
+    PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi,
+};
+#[cfg(not(target_arch = "wasm32"))]
 pub use function::DynamicFunction;
+#[cfg(not(target_arch = "wasm32"))]
 pub use host::{TextAllocStats, text_allocation_stats};
+pub use linked::{LinkedExtension, LinkedFunction, LinkedScalar};
+
+/// One callable a host can register, whichever loading model produced it.
+///
+/// The engine's registry stores these (keyed by lowercased name); the binder
+/// and executor reach callbacks only through this type, so a `dlopen`
+/// function and a linked one behave identically from SQL.
+#[derive(Clone, Debug)]
+pub enum ExtFunction {
+    /// A native `dlopen` extension's callback (ABI v1).
+    #[cfg(not(target_arch = "wasm32"))]
+    Dynamic(DynamicFunction),
+    /// The linked model: a Rust callback published by an embedder. `source`
+    /// is the publishing extension's registry name — the string
+    /// `LOAD EXTENSION` takes on wasm (and the WAL records as the function's
+    /// origin).
+    Linked {
+        source: String,
+        func: LinkedFunction,
+    },
+}
+
+impl ExtFunction {
+    /// Registered name (original case).
+    pub fn name(&self) -> &str {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.name(),
+            ExtFunction::Linked { func, .. } => func.name(),
+        }
+    }
+
+    /// Where this function came from: the path it was loaded from
+    /// ([`ExtFunction::Dynamic`]) or the registry name its extension was
+    /// published under ([`ExtFunction::Linked`]). The engine prefixes a WAL
+    /// record that calls the function with `LOAD EXTENSION '<source>'`.
+    pub fn source(&self) -> &str {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.source_path(),
+            ExtFunction::Linked { source, .. } => source,
+        }
+    }
+
+    /// Declared argument count.
+    pub fn n_args(&self) -> usize {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.n_args(),
+            ExtFunction::Linked { func, .. } => func.n_args(),
+        }
+    }
+
+    /// Declared argument types, in order.
+    pub fn arg_types(&self) -> &[ExtType] {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.arg_types(),
+            ExtFunction::Linked { func, .. } => func.arg_types(),
+        }
+    }
+
+    /// Declared return type.
+    pub fn ret_type(&self) -> ExtType {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.ret_type(),
+            ExtFunction::Linked { func, .. } => func.ret_type(),
+        }
+    }
+
+    /// Invoke the callback once (one row) and return its result.
+    ///
+    /// `args` must have exactly [`Self::n_args`] entries of the declared
+    /// types; a violation is reported as [`ExtError::BadResult`] by both
+    /// models rather than being undefined.
+    pub fn call(&self, args: &[ExtArg<'_>]) -> Result<ExtValue, ExtError> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.call(args),
+            ExtFunction::Linked { func, .. } => func.call(args),
+        }
+    }
+}
+
+/// One extension's handle: keeps it alive and named (and, natively, its
+/// library mapped), whichever loading model produced it.
+#[derive(Clone, Debug)]
+pub enum ExtHandle {
+    /// A `dlopen`ed library, held through [`LoadedExtension`].
+    #[cfg(not(target_arch = "wasm32"))]
+    Dynamic(LoadedExtension),
+    /// A linked extension published by the host.
+    Linked(LinkedExtension),
+}
+
+impl ExtHandle {
+    /// The declared extension name.
+    pub fn name(&self) -> &str {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtHandle::Dynamic(e) => e.name(),
+            ExtHandle::Linked(e) => e.name(),
+        }
+    }
+
+    /// The extension's source: the path it was loaded from
+    /// ([`ExtHandle::Dynamic`]) or its registry name
+    /// ([`ExtHandle::Linked`]) — the string `LOAD EXTENSION` takes on that
+    /// target.
+    pub fn source(&self) -> &str {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtHandle::Dynamic(e) => e.path(),
+            ExtHandle::Linked(e) => e.name(),
+        }
+    }
+
+    /// The extension's functions, as engine-registry entries.
+    pub fn functions(&self) -> Vec<ExtFunction> {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtHandle::Dynamic(e) => e
+                .functions()
+                .iter()
+                .map(|f| ExtFunction::Dynamic(f.clone()))
+                .collect(),
+            ExtHandle::Linked(e) => e
+                .functions()
+                .iter()
+                .map(|f| ExtFunction::Linked {
+                    source: e.name().to_string(),
+                    func: f.clone(),
+                })
+                .collect(),
+        }
+    }
+}
 
 /// Everything that can go wrong loading or calling an extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +240,18 @@ pub enum ExtError {
     Callback { function: String, code: i32 },
     /// A callback broke the ABI contract (wrong return type, bad pointer...).
     BadResult { function: String, message: String },
+    /// A linked extension name is not in the process-global registry
+    /// ([`linked::load`]; on wasm that is what `LOAD EXTENSION` resolves
+    /// against).
+    NotRegistered { name: String },
+    /// A linked function's implementation returned an error (a Rust `Err`; a
+    /// wasm-bindgen shim reports a JavaScript exception this way, like the
+    /// C ABI's non-zero callback code).
+    Failed { function: String, message: String },
+    /// A linked function panicked. Caught at the boundary — the linked model
+    /// has no "must not unwind" rule like the C ABI, so a panic is a normal
+    /// statement error there.
+    Panicked { function: String, message: String },
 }
 
 impl ExtError {
@@ -121,6 +298,17 @@ impl fmt::Display for ExtError {
                 f,
                 "extension function {function}() returned an invalid result: {message}"
             ),
+            ExtError::NotRegistered { name } => write!(
+                f,
+                "extension \"{name}\" is not registered (register it at host bootstrap with \
+                 pinkdb_ext_loader::linked::register; wasm targets have no dynamic loader)"
+            ),
+            ExtError::Failed { function, message } => {
+                write!(f, "extension function {function}() failed: {message}")
+            }
+            ExtError::Panicked { function, message } => {
+                write!(f, "extension function {function}() panicked: {message}")
+            }
         }
     }
 }
@@ -133,6 +321,7 @@ impl std::error::Error for ExtError {}
 /// The handle owns an [`Arc`] of the shared library, so the code stays mapped
 /// as long as the host keeps the `LoadedExtension` — even when the extension
 /// registered no functions at all.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct LoadedExtension {
     name: String,
@@ -145,6 +334,7 @@ pub struct LoadedExtension {
     _library: Arc<libloading::Library>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl LoadedExtension {
     /// The name `pinkdb_extension_name` returned.
     pub fn name(&self) -> &str {
@@ -171,6 +361,7 @@ impl LoadedExtension {
 /// A host that can accept a loaded extension's functions.
 ///
 /// Implementations must be atomic: on error nothing may stay registered.
+#[cfg(not(target_arch = "wasm32"))]
 pub trait ExtHost {
     /// Register every function of `ext`; `Err` leaves the host unchanged.
     fn register_extension(&mut self, ext: LoadedExtension) -> Result<(), ExtError>;
@@ -182,6 +373,7 @@ pub trait ExtHost {
 /// Fails — without registering anything — when the library does not open, is
 /// missing an ABI symbol, reports a different ABI version, has an invalid
 /// name, fails `pinkdb_extension_init`, or when `db` rejects a registration.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load_extension<H: ExtHost + ?Sized>(db: &mut H, path: &str) -> Result<String, ExtError> {
     let ext = load(path)?;
     let name = ext.name().to_string();
@@ -194,6 +386,7 @@ pub fn load_extension<H: ExtHost + ?Sized>(db: &mut H, path: &str) -> Result<Str
 /// Symbol checks happen in a fixed order: wrong ABI version is reported before
 /// a missing init symbol, so a foreign library built for a future ABI gets the
 /// version error rather than a confusing symbol error.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
     if path.is_empty() {
         return Err(ExtError::Load {
@@ -302,7 +495,7 @@ pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 

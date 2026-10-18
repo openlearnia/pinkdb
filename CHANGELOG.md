@@ -10,6 +10,17 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 49 — extensions on wasm ✅
+- Extensions now work on **every target** through a new **linked registration**
+  model: extensions register through a safe-Rust API and feed the same engine
+  registry as native ABI v1 extensions. On wasm (where `dlopen` cannot work),
+  `LOAD EXTENSION '<name>'` resolves a registered name; unknown names fail with
+  an actionable error.
+- The **JS / wasm-bindgen host contract** is pinned — surface, SQL↔JS value
+  mappings and sandbox rules, documented in `docs/wasm-extensions.md` — with no
+  new dependencies added.
+- Native CLI grows ~3.7 KB; the wasm dependency tree gains nothing.
+
 ### Wave 46 — network server TLS ✅
 - Opt-in `tls` feature: the server serves the same protocol over
   **rustls**-encrypted TCP (`--tls-cert/--tls-key`), and the CLI's remote mode
