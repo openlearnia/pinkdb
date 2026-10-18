@@ -7,7 +7,7 @@
 mod common;
 
 use pinkdb::{PinkDb, QueryResult, Value};
-use pinkdb_ext_loader::{text_allocation_stats, ExtValue};
+use pinkdb_ext_loader::{ExtValue, text_allocation_stats};
 
 #[test]
 fn ownership_violations_still_free_the_buffer_and_report_cleanly() {

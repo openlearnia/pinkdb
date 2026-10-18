@@ -1,9 +1,9 @@
 [package]
 name = "pink-lake"
 version = "0.1.0"
-edition = "2021"
-# vortex 0.88 requires Rust 1.95.
-rust-version = "1.95"
+edition = "2024"
+# The workspace MSRV: 1.97 (vortex 0.88's own floor was 1.95).
+rust-version = "1.97"
 description = "pink-lake: the minimal pinkdb lake layer — a JSON catalog + immutable per-table data files on local disk (Vortex with the `vortexlake` feature, v1 `.pink` data files without it)"
 license = "MIT"
 

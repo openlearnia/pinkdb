@@ -327,7 +327,7 @@ impl S3Config {
                                   AWS_SECRET_ACCESS_KEY (plus AWS_SESSION_TOKEN for temporary \
                                   credentials), or configure S3Config::with_credentials"
                             .to_string(),
-                    })
+                    });
                 }
             },
             _ => {
@@ -336,7 +336,7 @@ impl S3Config {
                     message: "incomplete S3 credentials: set both the access key id and the \
                               secret access key"
                         .to_string(),
-                })
+                });
             }
         };
         let session_token = self.session_token.filter(|t| !t.is_empty()).or_else(|| {
@@ -1443,24 +1443,22 @@ impl S3Client {
         // A declared body over the cap is refused before any bytes are read
         // (the read below is limited too, for a lying Content-Length). HEAD
         // only reports the object's length, so it is exempt.
-        if method != "HEAD" {
-            if let Some(length) = response
+        if method != "HEAD"
+            && let Some(length) = response
                 .headers()
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
-            {
-                if length > self.max_object_bytes {
-                    return Err(S3Error::Protocol {
-                        context: context.clone(),
-                        message: format!(
-                            "the response is {length} bytes, over this client's {}-byte object cap \
+            && length > self.max_object_bytes
+        {
+            return Err(S3Error::Protocol {
+                context: context.clone(),
+                message: format!(
+                    "the response is {length} bytes, over this client's {}-byte object cap \
                              (no multipart downloads)",
-                            self.max_object_bytes
-                        ),
-                    });
-                }
-            }
+                    self.max_object_bytes
+                ),
+            });
         }
         // Server-provided ETags are echoed into an `If-Match` header; accept
         // only a conservative value so a hostile/broken server cannot inject
@@ -1614,7 +1612,7 @@ impl S3Client {
                 200 => return Ok(Put::Written),
                 // `If-Match` on a vanished object is a precondition failure.
                 404 if matches!(condition, Condition::IfMatch(_)) => {
-                    return Ok(Put::PreconditionFailed)
+                    return Ok(Put::PreconditionFailed);
                 }
                 412 => return Ok(Put::PreconditionFailed),
                 409 if condition.is_conditional() && attempts < CONFLICT_RETRIES => {
@@ -1900,18 +1898,22 @@ mod tests {
             .read_tagged("catalog.json", "reading catalog.json")
             .unwrap();
         assert_eq!(bytes, b"cat-1");
-        assert!(storage
-            .put_if_match("catalog.json", b"cat-2", &tag)
-            .unwrap());
+        assert!(
+            storage
+                .put_if_match("catalog.json", b"cat-2", &tag)
+                .unwrap()
+        );
         assert_eq!(
             storage
                 .read("catalog.json", "reading catalog.json")
                 .unwrap(),
             b"cat-2"
         );
-        assert!(!storage
-            .put_if_match("catalog.json", b"cat-3", &tag)
-            .unwrap());
+        assert!(
+            !storage
+                .put_if_match("catalog.json", b"cat-3", &tag)
+                .unwrap()
+        );
         assert_eq!(
             storage
                 .read("catalog.json", "reading catalog.json")
@@ -2248,9 +2250,11 @@ mod tests {
 
         let error = "<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>";
         assert_eq!(xml_field(error, "Code").as_deref(), Some("NoSuchKey"));
-        assert!(xml_field(error, "Message")
-            .unwrap()
-            .contains("does not exist"));
+        assert!(
+            xml_field(error, "Message")
+                .unwrap()
+                .contains("does not exist")
+        );
         assert_eq!(xml_unescape("a&b<c&d"), "a&b<c&d");
         assert_eq!(xml_unescape("&amp;&lt;&gt;&quot;&apos;"), "&<>\"'");
         assert_eq!(xml_unescape("trailing &"), "trailing &");
@@ -2540,12 +2544,16 @@ mod tests {
 
         storage.put("catalog.json", b"cat-1").unwrap();
         let (_, tag) = storage.read_tagged("catalog.json", "reading").unwrap();
-        assert!(storage
-            .put_if_match("catalog.json", b"cat-2", &tag)
-            .unwrap());
-        assert!(!storage
-            .put_if_match("catalog.json", b"cat-3", &tag)
-            .unwrap());
+        assert!(
+            storage
+                .put_if_match("catalog.json", b"cat-2", &tag)
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .put_if_match("catalog.json", b"cat-3", &tag)
+                .unwrap()
+        );
         assert_eq!(storage.read("catalog.json", "reading").unwrap(), b"cat-2");
     }
 

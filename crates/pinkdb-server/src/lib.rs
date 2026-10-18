@@ -22,8 +22,8 @@ pub mod server;
 
 pub use client::{Client, ClientError};
 pub use protocol::{
+    DoneKind, MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, ROWS_PER_FRAME, Request, Response,
     decode_request, decode_response, encode_request, encode_response, read_request, read_response,
-    write_request, write_response, DoneKind, ProtocolError, Request, Response, MAX_FRAME_SIZE,
-    PROTOCOL_VERSION, ROWS_PER_FRAME,
+    write_request, write_response,
 };
-pub use server::{Server, ServerHandle, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS};
+pub use server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server, ServerHandle};

@@ -19,8 +19,8 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::storage::PinkDb;
-use crate::types::{parse_date, parse_timestamp, DataType, PinkDbError, Result, Value};
-use crate::vector::{Vector, CHUNK_SIZE};
+use crate::types::{DataType, PinkDbError, Result, Value, parse_date, parse_timestamp};
+use crate::vector::{CHUNK_SIZE, Vector};
 
 /// Rows inspected for head-sample inference (DuckDB's documented default).
 const INFER_SAMPLE_ROWS: usize = 20_480;
@@ -152,11 +152,7 @@ fn trim_cell(cell: &str) -> &str {
         (Some(&f), Some(&l)) => f.is_ascii() && l.is_ascii() && !is_ascii_ws(f) && !is_ascii_ws(l),
         _ => true, // empty: nothing to trim
     };
-    if clean {
-        cell
-    } else {
-        cell.trim()
-    }
+    if clean { cell } else { cell.trim() }
 }
 
 /// Parse one raw CSV field into `col` (empty → NULL).
@@ -663,12 +659,11 @@ pub fn parse_table_target(spec: &str) -> Result<(Option<String>, String)> {
     let spec = spec.trim();
     let (first, rest) = take_ident(spec).map_err(PinkDbError::Parse)?;
     let rest = rest.trim_start();
-    if let Some(rest) = rest.strip_prefix('.') {
-        if let Ok((second, tail)) = take_target_tail(rest) {
-            if tail.trim().is_empty() {
-                return Ok((Some(first), second));
-            }
-        }
+    if let Some(rest) = rest.strip_prefix('.')
+        && let Ok((second, tail)) = take_target_tail(rest)
+        && tail.trim().is_empty()
+    {
+        return Ok((Some(first), second));
     } else if rest.is_empty() {
         // A single (possibly quoted) name.
         return Ok((None, first));

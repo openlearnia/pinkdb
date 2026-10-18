@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::storage::{Head, LocalCopy, ObjectInfo, Storage, VersionTag};
-use crate::{fresh_id, LakeError, Result};
+use crate::{LakeError, Result, fresh_id};
 
 /// The catalog file name inside the lake root.
 pub(crate) const CATALOG_FILE: &str = "catalog.json";
@@ -52,10 +52,10 @@ impl LocalStorage {
     /// happened, and on APFS a directory fsync does not flush the drive's own
     /// write cache anyway (see the crate docs on durability).
     fn sync_parent(&self, path: &Path) {
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(dir) = File::open(parent)
+        {
+            let _ = dir.sync_all();
         }
     }
 
@@ -294,7 +294,7 @@ impl Storage for LocalStorage {
                 return Err(LakeError::Io {
                     context: format!("listing {}", path.display()),
                     source: e,
-                })
+                });
             }
         };
         let mut out = Vec::new();
@@ -303,10 +303,10 @@ impl Storage for LocalStorage {
                 context: format!("listing {}", path.display()),
                 source: e,
             })?;
-            if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                if let Some(name) = entry.file_name().to_str() {
-                    out.push(name.to_string());
-                }
+            if entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+                && let Some(name) = entry.file_name().to_str()
+            {
+                out.push(name.to_string());
             }
         }
         out.sort();
@@ -336,7 +336,7 @@ impl Storage for LocalStorage {
                     return Err(LakeError::Io {
                         context: format!("listing {}", dir.display()),
                         source: e,
-                    })
+                    });
                 }
             };
             for entry in entries {

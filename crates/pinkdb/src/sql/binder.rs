@@ -22,7 +22,7 @@ use crate::storage::{
     DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
 use crate::types::{
-    extract_field, DataType, ExtractField, PinkDbError, Result, Value, DECIMAL_MAX_PRECISION,
+    DECIMAL_MAX_PRECISION, DataType, ExtractField, PinkDbError, Result, Value, extract_field,
 };
 
 // ---------- bound expressions ----------
@@ -916,7 +916,7 @@ impl ParamSlots {
             None => {
                 return Err(PinkDbError::Parameter(format!(
                     "internal error: no parameter slot {i}"
-                )))
+                )));
             }
         };
         let dtype = match state.types.get(i).copied().flatten() {
@@ -931,7 +931,7 @@ impl ParamSlots {
                         "could not determine data type of parameter {}: bind a non-NULL \
                          value or add an explicit CAST(? AS <type>)",
                         i + 1
-                    )))
+                    )));
                 }
             },
         };
@@ -1072,10 +1072,10 @@ impl<'a> Binder<'a> {
 
     /// Pin a slot from context (no-op when `expr` is not a bare parameter).
     fn pin_parameter(&self, expr: &Expr, dtype: DataType) -> Result<()> {
-        if let Some(index) = self.bare_unpinned_parameter(expr) {
-            if let Some(slots) = &self.params {
-                slots.pin(index, dtype)?;
-            }
+        if let Some(index) = self.bare_unpinned_parameter(expr)
+            && let Some(slots) = &self.params
+        {
+            slots.pin(index, dtype)?;
         }
         Ok(())
     }
@@ -1095,16 +1095,16 @@ impl<'a> Binder<'a> {
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<(BoundExpr, BoundExpr)> {
-        if let Some(index) = self.bare_unpinned_parameter(left) {
-            if !matches!(right, Expr::Parameter(_)) {
-                let r = self.bind_expr(right, aggs, allow_agg)?;
-                let t = self.inferred_operand_type(op, r.dtype(), index);
-                if let Some(slots) = &self.params {
-                    slots.pin(index, t)?;
-                }
-                let l = self.bind_expr(left, aggs, allow_agg)?;
-                return Ok((l, r));
+        if let Some(index) = self.bare_unpinned_parameter(left)
+            && !matches!(right, Expr::Parameter(_))
+        {
+            let r = self.bind_expr(right, aggs, allow_agg)?;
+            let t = self.inferred_operand_type(op, r.dtype(), index);
+            if let Some(slots) = &self.params {
+                slots.pin(index, t)?;
             }
+            let l = self.bind_expr(left, aggs, allow_agg)?;
+            return Ok((l, r));
         }
         if let Some(index) = self.bare_unpinned_parameter(right) {
             let l = self.bind_expr(left, aggs, allow_agg)?;
@@ -1165,11 +1165,11 @@ impl<'a> Binder<'a> {
         let mut found: Option<(usize, DataType)> = None;
         let mut base = 0;
         for t in &self.tables {
-            if let Some(q) = table {
-                if !t.name.eq_ignore_ascii_case(q) {
-                    base += t.columns.len();
-                    continue;
-                }
+            if let Some(q) = table
+                && !t.name.eq_ignore_ascii_case(q)
+            {
+                base += t.columns.len();
+                continue;
             }
             for (i, (name, dtype)) in t.columns.iter().enumerate() {
                 if name.eq_ignore_ascii_case(col) {
@@ -1216,23 +1216,22 @@ impl<'a> Binder<'a> {
             Expr::Column { table, name } => {
                 // Wave 44: a procedure call's variables shadow columns. The
                 // variable's *value* is bound as a literal (never SQL text).
-                if table.is_none() {
-                    if let Some(value) = self.params.as_ref().and_then(|slots| slots.variable(name))
-                    {
-                        return Ok(BoundExpr::Literal(value));
-                    }
+                if table.is_none()
+                    && let Some(value) = self.params.as_ref().and_then(|slots| slots.variable(name))
+                {
+                    return Ok(BoundExpr::Literal(value));
                 }
                 // Alias substitution (`... ORDER BY x`), with a cycle guard so
                 // `SELECT x AS x` resolves to the column instead of recursing.
                 if table.is_none() && self.allow_alias {
                     let key = name.to_ascii_lowercase();
-                    if !self.resolving.contains(&key) {
-                        if let Some(aliased) = self.aliases.get(&key).cloned() {
-                            self.resolving.push(key);
-                            let bound = self.bind_expr(&aliased, aggs, allow_agg);
-                            self.resolving.pop();
-                            return bound;
-                        }
+                    if !self.resolving.contains(&key)
+                        && let Some(aliased) = self.aliases.get(&key).cloned()
+                    {
+                        self.resolving.push(key);
+                        let bound = self.bind_expr(&aliased, aggs, allow_agg);
+                        self.resolving.pop();
+                        return bound;
                     }
                 }
                 let (index, dtype) = self.lookup_column(table.as_deref(), name)?;
@@ -1623,33 +1622,30 @@ impl<'a> Binder<'a> {
         for o in &over.order {
             order.push((self.bind_expr(&o.expr, aggs, allow_agg)?, SortSpec::of(o)));
         }
-        if let Some(f) = &over.frame {
-            if f.mode == FrameMode::Range {
-                use crate::sql::ast::FrameBound as AstBound;
-                let has_offset = matches!(f.start, AstBound::Preceding(_) | AstBound::Following(_))
-                    || matches!(f.end, AstBound::Preceding(_) | AstBound::Following(_));
-                if order.len() > 1 {
+        if let Some(f) = &over.frame
+            && f.mode == FrameMode::Range
+        {
+            use crate::sql::ast::FrameBound as AstBound;
+            let has_offset = matches!(f.start, AstBound::Preceding(_) | AstBound::Following(_))
+                || matches!(f.end, AstBound::Preceding(_) | AstBound::Following(_));
+            if order.len() > 1 {
+                return Err(PinkDbError::Execution(
+                    "RANGE window frames need at most one ORDER BY expression".to_string(),
+                ));
+            }
+            if has_offset {
+                let Some((key, _)) = order.first() else {
                     return Err(PinkDbError::Execution(
-                        "RANGE window frames need at most one ORDER BY expression".to_string(),
+                        "RANGE frames with an offset need an ORDER BY expression".to_string(),
                     ));
-                }
-                if has_offset {
-                    let Some((key, _)) = order.first() else {
-                        return Err(PinkDbError::Execution(
-                            "RANGE frames with an offset need an ORDER BY expression".to_string(),
-                        ));
-                    };
-                    match key.dtype() {
-                        DataType::Integer
-                        | DataType::Bigint
-                        | DataType::Double
-                        | DataType::Date => {}
-                        t => {
-                            return Err(PinkDbError::Type(format!(
-                                "RANGE frames with an offset need a numeric or DATE ORDER BY \
+                };
+                match key.dtype() {
+                    DataType::Integer | DataType::Bigint | DataType::Double | DataType::Date => {}
+                    t => {
+                        return Err(PinkDbError::Type(format!(
+                            "RANGE frames with an offset need a numeric or DATE ORDER BY \
                                  expression, not {t}"
-                            )));
-                        }
+                        )));
                     }
                 }
             }
@@ -2222,11 +2218,7 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
             // Result type: the first argument's (DuckDB); a bare NULL first
             // argument falls back to the second's type.
             Ok(if null0 {
-                if null1 {
-                    DataType::Integer
-                } else {
-                    t1
-                }
+                if null1 { DataType::Integer } else { t1 }
             } else {
                 t0
             })
@@ -2291,13 +2283,13 @@ fn scalar_dtype(func: ScalarFunc, args: &[BoundExpr]) -> Result<DataType> {
                 )));
             }
             // FLOOR/CEIL on DECIMAL return DECIMAL(p,0) (DuckDB).
-            if func != ScalarFunc::Sqrt {
-                if let DataType::Decimal { precision, .. } = args[0].dtype() {
-                    return Ok(DataType::Decimal {
-                        precision,
-                        scale: 0,
-                    });
-                }
+            if func != ScalarFunc::Sqrt
+                && let DataType::Decimal { precision, .. } = args[0].dtype()
+            {
+                return Ok(DataType::Decimal {
+                    precision,
+                    scale: 0,
+                });
             }
             Ok(DataType::Double)
         }
@@ -3403,14 +3395,14 @@ fn bind_create_view(
     let mut binder = Binder::new(db, &view_db);
     let bound = bind_select_in(db, &mut binder, query)?;
     let schema = plan_schema(db, &view_db, &binder.ctes, &bound)?;
-    if let Some(cols) = cols {
-        if cols.len() != schema.len() {
-            return Err(PinkDbError::Execution(format!(
-                "view \"{name}\" has {} columns but {} aliases",
-                schema.len(),
-                cols.len()
-            )));
-        }
+    if let Some(cols) = cols
+        && cols.len() != schema.len()
+    {
+        return Err(PinkDbError::Execution(format!(
+            "view \"{name}\" has {} columns but {} aliases",
+            schema.len(),
+            cols.len()
+        )));
     }
     let dynamic_functions = binder.dynamic_functions_used();
     Ok((
@@ -3492,12 +3484,12 @@ fn bind_update(
         .as_ref()
         .map(|e| binder.bind_expr(e, &mut no_aggs, false))
         .transpose()?;
-    if let Some(p) = &predicate {
-        if p.dtype() != DataType::Boolean {
-            return Err(PinkDbError::Type(
-                "WHERE needs a BOOLEAN expression".to_string(),
-            ));
-        }
+    if let Some(p) = &predicate
+        && p.dtype() != DataType::Boolean
+    {
+        return Err(PinkDbError::Type(
+            "WHERE needs a BOOLEAN expression".to_string(),
+        ));
     }
     reject_view_dependency(db, &binder.views_used())?;
     let dynamic_functions = binder.dynamic_functions_used();
@@ -3538,12 +3530,12 @@ fn bind_delete(
         .as_ref()
         .map(|e| binder.bind_expr(e, &mut no_aggs, false))
         .transpose()?;
-    if let Some(p) = &predicate {
-        if p.dtype() != DataType::Boolean {
-            return Err(PinkDbError::Type(
-                "WHERE needs a BOOLEAN expression".to_string(),
-            ));
-        }
+    if let Some(p) = &predicate
+        && p.dtype() != DataType::Boolean
+    {
+        return Err(PinkDbError::Type(
+            "WHERE needs a BOOLEAN expression".to_string(),
+        ));
     }
     reject_view_dependency(db, &binder.views_used())?;
     let dynamic_functions = binder.dynamic_functions_used();
@@ -3610,10 +3602,10 @@ fn bind_insert(
         // has one (`ALTER TABLE … ADD COLUMN … DEFAULT`, wave 65); only when a
         // column list is given.
         for (i, cell) in bound.iter_mut().enumerate() {
-            if !order.contains(&i) {
-                if let Some(d) = &t.columns[i].default {
-                    *cell = BoundExpr::Literal(d.clone());
-                }
+            if !order.contains(&i)
+                && let Some(d) = &t.columns[i].default
+            {
+                *cell = BoundExpr::Literal(d.clone());
             }
         }
         for (pos, cell) in row.iter().enumerate() {
@@ -3920,12 +3912,12 @@ fn bind_alter_table(
                     "Table \"{name}\" does not have a column with name \"{from}\""
                 )));
             };
-            if let Some(to_idx) = schema.iter().position(|(n, _)| n.eq_ignore_ascii_case(to)) {
-                if to_idx != from_idx {
-                    return Err(PinkDbError::Catalog(format!(
-                        "Column with name \"{to}\" already exists!"
-                    )));
-                }
+            if let Some(to_idx) = schema.iter().position(|(n, _)| n.eq_ignore_ascii_case(to))
+                && to_idx != from_idx
+            {
+                return Err(PinkDbError::Catalog(format!(
+                    "Column with name \"{to}\" already exists!"
+                )));
             }
             AlterTablePlan::RenameColumn {
                 from: schema[from_idx].0.clone(),
@@ -4567,15 +4559,14 @@ pub(crate) fn plan_schema(
 ) -> Result<Vec<(String, DataType)>> {
     match plan {
         LogicalPlan::Scan { db: qdb, table, at } => {
-            if qdb.is_none() {
-                if let Some((_, schema)) = ctes
+            if qdb.is_none()
+                && let Some((_, schema)) = ctes
                     .iter()
                     .rev()
                     .find(|(n, _)| n.eq_ignore_ascii_case(table))
                 {
                     return Ok(schema.clone());
                 }
-            }
             let lookup = qdb.as_deref().unwrap_or(default_db);
             // Attached lake tables are visible to queries (they are not in
             // the store themselves); an `AT` target resolves the schema from
@@ -4682,35 +4673,34 @@ fn bind_source(
     match source {
         FromSource::Table { db: qdb, name } => {
             // CTEs shadow everything — but only unqualified names.
-            if qdb.is_none() {
-                if let Some((_, schema)) = binder
+            if qdb.is_none()
+                && let Some((_, schema)) = binder
                     .ctes
                     .iter()
                     .rev()
                     .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                {
-                    if let Some(at) = at {
-                        // DuckLake silently ignores the clause here; a
-                        // silently ignored time-travel request is a
-                        // wrong-answer trap, so this engine refuses instead.
-                        return Err(PinkDbError::Catalog(format!(
-                            "time travel is not available on the CTE \"{name}\" (AT ({at}) \
+            {
+                if let Some(at) = at {
+                    // DuckLake silently ignores the clause here; a
+                    // silently ignored time-travel request is a
+                    // wrong-answer trap, so this engine refuses instead.
+                    return Err(PinkDbError::Catalog(format!(
+                        "time travel is not available on the CTE \"{name}\" (AT ({at}) \
                              works on lake tables)"
-                        )));
-                    }
-                    let eff = alias.clone().unwrap_or_else(|| name.clone());
-                    return Ok((
-                        ScopeTable {
-                            name: eff.to_ascii_lowercase(),
-                            columns: schema.clone(),
-                        },
-                        LogicalPlan::Scan {
-                            db: None,
-                            table: name.clone(),
-                            at: None,
-                        },
-                    ));
+                    )));
                 }
+                let eff = alias.clone().unwrap_or_else(|| name.clone());
+                return Ok((
+                    ScopeTable {
+                        name: eff.to_ascii_lowercase(),
+                        columns: schema.clone(),
+                    },
+                    LogicalPlan::Scan {
+                        db: None,
+                        table: name.clone(),
+                        at: None,
+                    },
+                ));
             }
             let lookup_db = binder.resolve_db(qdb)?;
             if let Ok(view) = db.view_in(&lookup_db, name) {
@@ -4966,12 +4956,12 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
     binder.allow_alias = true;
     binder.allow_win = true;
     debug_assert!(where_aggs.is_empty());
-    if let Some(f) = &filter {
-        if f.dtype() != DataType::Boolean {
-            return Err(PinkDbError::Type(
-                "WHERE needs a BOOLEAN expression".to_string(),
-            ));
-        }
+    if let Some(f) = &filter
+        && f.dtype() != DataType::Boolean
+    {
+        return Err(PinkDbError::Type(
+            "WHERE needs a BOOLEAN expression".to_string(),
+        ));
     }
 
     // Expand `*` / `t.*`, then bind select items (aggregates flow into `aggs`).
@@ -5228,20 +5218,19 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             continue;
         }
         // Select alias → reuse that output (no hidden column).
-        if let Expr::Column { table: None, name } = &item.expr {
-            if let Some(pos) = proj_names[..visible]
+        if let Expr::Column { table: None, name } = &item.expr
+            && let Some(pos) = proj_names[..visible]
                 .iter()
                 .position(|n| n.eq_ignore_ascii_case(name))
-            {
-                sort_keys.push((
-                    BoundExpr::Column {
-                        index: pos,
-                        dtype: visible_dtypes[pos],
-                    },
-                    SortSpec::of(item),
-                ));
-                continue;
-            }
+        {
+            sort_keys.push((
+                BoundExpr::Column {
+                    index: pos,
+                    dtype: visible_dtypes[pos],
+                },
+                SortSpec::of(item),
+            ));
+            continue;
         }
         // General expression → hidden sort column. It binds in scan scope;
         // in agg queries it is rebased onto Aggregate-output scope (key

@@ -131,9 +131,10 @@ fn full_cycle_create_save_open_versions_tables() {
         String::from_utf8_lossy(&catalog)
     );
     // The v4 delta manifest is published with the snapshot.
-    assert!(mock
-        .keys()
-        .contains(&"lakes/mine/commits/2.json".to_string()));
+    assert!(
+        mock.keys()
+            .contains(&"lakes/mine/commits/2.json".to_string())
+    );
 
     // The table list of the latest version.
     assert_eq!(
@@ -485,16 +486,20 @@ fn error_mapping_not_found_auth_and_missing_data() {
 #[test]
 fn open_url_reads_the_environment_and_saves_the_full_cycle() {
     let mock = MockS3::start();
-    // This is the one test in this binary that touches process environment,
-    // so it cannot race the explicit-config tests above.
-    std::env::set_var("AWS_ACCESS_KEY_ID", mock.access_key_id());
-    std::env::set_var("AWS_SECRET_ACCESS_KEY", "mock-secret");
-    std::env::set_var("AWS_SESSION_TOKEN", "mock-session-token");
-    std::env::set_var("AWS_ENDPOINT_URL", mock.endpoint());
-    std::env::set_var("AWS_ENDPOINT_URL_S3", mock.endpoint());
-    std::env::set_var("AWS_REGION", "auto");
-    // The mock endpoint is plain http://, a local test server.
-    std::env::set_var("PINKDB_S3_ALLOW_HTTP", "1");
+    // The one test in this binary that mutates the process environment (so
+    // it cannot race the explicit-config tests above). `set_var` is `unsafe`
+    // as of Rust 2024: environment mutation races concurrent reads in other
+    // threads — the same exposure as before the edition, now marked.
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", mock.access_key_id());
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "mock-secret");
+        std::env::set_var("AWS_SESSION_TOKEN", "mock-session-token");
+        std::env::set_var("AWS_ENDPOINT_URL", mock.endpoint());
+        std::env::set_var("AWS_ENDPOINT_URL_S3", mock.endpoint());
+        std::env::set_var("AWS_REGION", "auto");
+        // The mock endpoint is plain http://, a local test server.
+        std::env::set_var("PINKDB_S3_ALLOW_HTTP", "1");
+    }
 
     let db = small_store();
     let mut lake = Lake::create_url("s3://url-bucket/from/env").unwrap();
@@ -1087,10 +1092,11 @@ fn v1_pink_data_files_load_over_s3() {
     let mut lake = lake;
     assert_eq!(lake.write_from_store(&loaded).unwrap(), 2);
     assert_eq!(lake.format_version(), 5);
-    assert!(mock
-        .keys()
-        .iter()
-        .any(|k| k.starts_with("v1/data/main.t/") && k.ends_with(".vortex")));
+    assert!(
+        mock.keys()
+            .iter()
+            .any(|k| k.starts_with("v1/data/main.t/") && k.ends_with(".vortex"))
+    );
     std::fs::remove_dir_all(&scratch).ok();
 }
 
@@ -1558,12 +1564,16 @@ fn maintenance_age_gate_reads_last_modified_over_s3() {
             ..pink_lake::CleanupSettings::default()
         })
         .unwrap();
-    assert!(report
-        .paths
-        .contains(&"data/main.t/crashed.pink.tmp".to_string()));
-    assert!(!report
-        .paths
-        .contains(&"data/main.t/fresh.pink.tmp".to_string()));
+    assert!(
+        report
+            .paths
+            .contains(&"data/main.t/crashed.pink.tmp".to_string())
+    );
+    assert!(
+        !report
+            .paths
+            .contains(&"data/main.t/fresh.pink.tmp".to_string())
+    );
 
     // `all` skips the gate and lists both.
     let report = lake

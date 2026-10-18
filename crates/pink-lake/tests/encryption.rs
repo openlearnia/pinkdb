@@ -20,12 +20,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use pink_lake::{
-    save_store, save_store_with_key, EncryptionKey, Lake, LakeError, WritableAttachment,
+    EncryptionKey, Lake, LakeError, WritableAttachment, save_store, save_store_with_key,
 };
 use pinkdb::{PinkDb, QueryResult, Value};
 
 #[cfg(feature = "s3")]
-use pink_lake::{save_store_s3_with_key, S3Config};
+use pink_lake::{S3Config, save_store_s3_with_key};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 

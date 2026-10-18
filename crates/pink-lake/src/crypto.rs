@@ -710,7 +710,7 @@ mod imp {
                         return Err(wrong_key(
                             path,
                             "the file uses a raw 32-byte key, but a passphrase was supplied",
-                        ))
+                        ));
                     }
                 },
                 Derivation::Argon2 {
@@ -725,7 +725,7 @@ mod imp {
                             path,
                             "the file is passphrase-encrypted (Argon2id), but a raw key was \
                              supplied",
-                        ))
+                        ));
                     }
                 },
             });

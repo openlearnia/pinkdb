@@ -367,17 +367,17 @@ pub use crypto::EncryptionKey;
 pub use incremental::{
     AddFilesReport, Commit, CommitReport, CommitSettings, FlushReport, WritableAttachment,
 };
-use local::{LocalStorage, CATALOG_FILE};
+use local::{CATALOG_FILE, LocalStorage};
 pub use maintenance::{
-    CleanupReport, CleanupSettings, CompactionReport, ExpireReport, ExpireSettings, LakeFileInfo,
-    LakeOption, LakeSettings, MergeSettings, RewriteSettings, TableCompaction, TableInfo,
-    DEFAULT_RETENTION_SECS,
+    CleanupReport, CleanupSettings, CompactionReport, DEFAULT_RETENTION_SECS, ExpireReport,
+    ExpireSettings, LakeFileInfo, LakeOption, LakeSettings, MergeSettings, RewriteSettings,
+    TableCompaction, TableInfo,
 };
 pub use snapshot::{ChangeSummary, SnapshotInfo};
 use storage::{CryptoStorage, Head, Location, Storage, VersionTag};
 
 #[cfg(feature = "s3")]
-pub use s3::{S3Config, DEFAULT_RETRIES};
+pub use s3::{DEFAULT_RETRIES, S3Config};
 
 /// The catalog format version this build writes (and its newest read).
 ///
@@ -1047,7 +1047,7 @@ impl Lake {
                 Err(LakeError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
-                    continue
+                    continue;
                 }
                 Err(LakeError::VersionNotFound { .. }) => continue,
                 Err(e) => return Err(e),
@@ -2148,7 +2148,7 @@ pub(crate) fn published_versions(storage: &dyn Storage, up_to: u64) -> Result<Ve
         let bytes = match storage.read(&rel, &format!("reading {}", path.display())) {
             Ok(bytes) => bytes,
             Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-                continue
+                continue;
             }
             Err(e) => return Err(e),
         };
@@ -2169,13 +2169,13 @@ fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
         Head::Missing => {
             return Err(LakeError::NotALake {
                 path: root.to_path_buf(),
-            })
+            });
         }
         Head::NotAFile => {
             return Err(LakeError::Corrupt {
                 path,
                 message: "catalog.json is not a regular file".to_string(),
-            })
+            });
         }
         Head::File => {}
     }
@@ -2441,14 +2441,14 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                         row.row_id, row.begin, manifest.version
                     )));
                 }
-                if let Some(end) = row.end {
-                    if end < row.begin || end > manifest.version {
-                        return Err(corrupt(format!(
-                            "table \"{key}\": inlined row {} ends at version {end}, outside \
+                if let Some(end) = row.end
+                    && (end < row.begin || end > manifest.version)
+                {
+                    return Err(corrupt(format!(
+                        "table \"{key}\": inlined row {} ends at version {end}, outside \
                              {}..={}",
-                            row.row_id, row.begin, manifest.version
-                        )));
-                    }
+                        row.row_id, row.begin, manifest.version
+                    )));
                 }
                 if row.flushed && row.end.is_none() {
                     return Err(corrupt(format!(
@@ -2457,13 +2457,13 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                         row.row_id
                     )));
                 }
-                if let Some(begin) = seen_rows.get(&row.row_id) {
-                    if *begin == row.begin {
-                        return Err(corrupt(format!(
-                            "table \"{key}\": inlined row {} appears twice for version {}",
-                            row.row_id, row.begin
-                        )));
-                    }
+                if let Some(begin) = seen_rows.get(&row.row_id)
+                    && *begin == row.begin
+                {
+                    return Err(corrupt(format!(
+                        "table \"{key}\": inlined row {} appears twice for version {}",
+                        row.row_id, row.begin
+                    )));
                 }
                 seen_rows.insert(row.row_id, row.begin);
             }

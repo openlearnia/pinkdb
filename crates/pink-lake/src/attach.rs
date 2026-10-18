@@ -107,8 +107,8 @@ use crate::storage::{Head, Storage};
 use crate::vortex_file;
 use crate::zone::{self, FileFacts};
 use crate::{
-    apply_file_deletes, copy_chunks, manifest_for, only_table, path_str, published_versions,
-    split_key, validate_rel_path, Lake, LakeError, Result,
+    Lake, LakeError, Result, apply_file_deletes, copy_chunks, manifest_for, only_table, path_str,
+    published_versions, split_key, validate_rel_path,
 };
 
 /// What [`Lake::attach`] read and pinned.
@@ -323,10 +323,10 @@ impl LakeAttachment {
             }
             _ => vec![true; n_cols],
         };
-        if requested.iter().all(|&w| !w) {
-            if let Some(first) = requested.first_mut() {
-                *first = true;
-            }
+        if requested.iter().all(|&w| !w)
+            && let Some(first) = requested.first_mut()
+        {
+            *first = true;
         }
         requested
     }
@@ -594,7 +594,7 @@ impl LakeAttachment {
                 Err(LakeError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
-                    continue
+                    continue;
                 }
                 Err(e) => return Err(catalog_error(e)),
             }
@@ -768,10 +768,10 @@ fn requested_mask(n_cols: usize, columns: Option<&[usize]>) -> Vec<bool> {
         }
         _ => vec![true; n_cols],
     };
-    if wanted.iter().all(|&w| !w) {
-        if let Some(first) = wanted.first_mut() {
-            *first = true;
-        }
+    if wanted.iter().all(|&w| !w)
+        && let Some(first) = wanted.first_mut()
+    {
+        *first = true;
     }
     wanted
 }
@@ -855,12 +855,11 @@ fn load_file(
                         };
                         let mut physical: Vec<usize> = Vec::new();
                         for (li, on) in wanted.iter().enumerate() {
-                            if *on {
-                                if let Some(pi) = mapping.physical[li] {
-                                    if !physical.contains(&pi) {
-                                        physical.push(pi);
-                                    }
-                                }
+                            if *on
+                                && let Some(pi) = mapping.physical[li]
+                                && !physical.contains(&pi)
+                            {
+                                physical.push(pi);
                             }
                         }
                         physical.sort_unstable();
@@ -1103,7 +1102,7 @@ fn pink_file_stats(
                          this build onwards); use .lake open, or save the store again to \
                          publish statistics"
                     ),
-                })
+                });
             }
         },
     };
@@ -1189,10 +1188,10 @@ fn vortex_catalog_stats(
 /// contradicts.
 #[cfg(feature = "vortexlake")]
 fn zone_stats_compatible(block: &ColumnStats, footer: &ColumnStats) -> bool {
-    if let (Some(b), Some(f)) = (block.null_count, footer.null_count) {
-        if b != f {
-            return false;
-        }
+    if let (Some(b), Some(f)) = (block.null_count, footer.null_count)
+        && b != f
+    {
+        return false;
     }
     let field_ok = |b: &Option<Value>, f: &Option<Value>| match f {
         Some(f) => b
@@ -1371,13 +1370,13 @@ pub(crate) fn build_from(
                             std::io::ErrorKind::NotFound,
                             format!("{} is missing", path.display()),
                         ),
-                    })
+                    });
                 }
                 Head::NotAFile => {
                     return Err(LakeError::Corrupt {
                         path,
                         message: "data file is not a regular file".to_string(),
-                    })
+                    });
                 }
             }
         }
@@ -1589,14 +1588,14 @@ pub(crate) fn build_from(
                             "table \"{key}\" has no data files and no schema record; its \
                              schema is not recorded anywhere"
                         ),
-                    })
+                    });
                 }
             },
             None => {
                 return Err(LakeError::Corrupt {
                     path: manifest_path.clone(),
                     message: format!("table \"{key}\" has no data files"),
-                })
+                });
             }
         };
         // The partition spec: every key column must exist, and every file's
@@ -1633,7 +1632,7 @@ pub(crate) fn build_from(
                                  {text:?}, which is not a column name or bucket(N, column)",
                                 file.path()
                             ),
-                        })
+                        });
                     }
                 };
                 if !parsed.is_identity() {

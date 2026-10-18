@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use pinkdb::{DataType, Database, PinkDb, QueryResult, Value};
 use pinkdb_server::protocol::{
-    self, msg_type, Request, Response, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    self, MAX_FRAME_SIZE, PROTOCOL_VERSION, Request, Response, msg_type,
 };
 use pinkdb_server::{Client, Server, ServerHandle};
 
@@ -1160,9 +1160,10 @@ fn prepared_statements_round_trip_with_parameters() {
 
     // A bind-type error is a normal server error: nothing executes and the
     // connection stays usable.
-    assert!(c
-        .execute_prepared(insert, &[varchar("x"), Value::Integer(1)])
-        .is_err());
+    assert!(
+        c.execute_prepared(insert, &[varchar("x"), Value::Integer(1)])
+            .is_err()
+    );
     assert_eq!(
         rows(c.execute("SELECT COUNT(*) FROM p;").unwrap()),
         vec![vec![Value::Bigint(2)]]
@@ -1170,9 +1171,10 @@ fn prepared_statements_round_trip_with_parameters() {
 
     // An unknown handle and an argument-count mismatch are clean errors.
     let err = c.execute_prepared(987_654, &[]).unwrap_err();
-    assert!(err
-        .to_string()
-        .contains("unknown prepared statement handle"));
+    assert!(
+        err.to_string()
+            .contains("unknown prepared statement handle")
+    );
     assert!(c.execute_prepared(select, &[]).is_err());
 
     // Parse errors surface at prepare time: bad SQL, several statements, and

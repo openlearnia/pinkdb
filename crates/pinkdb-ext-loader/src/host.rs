@@ -2,13 +2,13 @@
 //! `pinkdb_extension_init`, with checked pointer handling and counted
 //! malloc/free for result text.
 
-use std::ffi::{c_char, c_void, CStr};
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::ffi::{CStr, c_char, c_void};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::{
-    ExtType, PinkdbExtScalarFn, PinkdbHostApi, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS,
+    ExtType, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS, PinkdbExtScalarFn, PinkdbHostApi,
 };
 use crate::function::{DynamicFunction, Registration};
 
@@ -16,7 +16,7 @@ use crate::function::{DynamicFunction, Registration};
 // `libc` crate: every Rust binary already links the C runtime, and the
 // extension ABI is defined in terms of plain malloc/free. These are the only
 // two foreign functions the loader calls.
-extern "C" {
+unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
     fn free(ptr: *mut c_void);
 }
@@ -80,10 +80,10 @@ extern "C" fn register_scalar(
 fn record_rejection(ctx: *mut c_void, message: String) {
     // SAFETY: same contract as in `collect`: `ctx` points at the live
     // `Collector` for the duration of init; a NULL ctx is checked.
-    if let Some(collector) = unsafe { ctx.cast::<Collector>().as_mut() } {
-        if collector.error.is_none() {
-            collector.error = Some(message);
-        }
+    if let Some(collector) = unsafe { ctx.cast::<Collector>().as_mut() }
+        && collector.error.is_none()
+    {
+        collector.error = Some(message);
     }
 }
 

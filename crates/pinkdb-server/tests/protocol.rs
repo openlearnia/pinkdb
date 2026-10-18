@@ -5,9 +5,9 @@ use std::io::Cursor;
 
 use pinkdb::{DataType, Value};
 use pinkdb_server::protocol::{
-    decode_request, decode_response, encode_request, encode_response, msg_type, read_response,
-    write_response, DoneKind, ProtocolError, Request, Response, MAX_FRAME_SIZE,
-    MAX_PREPARED_VALUES, MAX_ROWS_PER_FRAME, PROTOCOL_VERSION,
+    DoneKind, MAX_FRAME_SIZE, MAX_PREPARED_VALUES, MAX_ROWS_PER_FRAME, PROTOCOL_VERSION,
+    ProtocolError, Request, Response, decode_request, decode_response, encode_request,
+    encode_response, msg_type, read_response, write_response,
 };
 
 fn request_round_trip(request: Request) {

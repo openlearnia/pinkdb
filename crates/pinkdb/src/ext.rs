@@ -363,9 +363,10 @@ mod tests {
         assert!(db.dynamic_functions.is_empty());
         assert!(db.loaded_extensions.is_empty());
         assert!(db.dynamic_scalar("ext_double_it").is_none());
-        assert!(db
-            .dynamic_function_paths(&["ext_double_it".to_string()])
-            .is_empty());
+        assert!(
+            db.dynamic_function_paths(&["ext_double_it".to_string()])
+                .is_empty()
+        );
         assert!(db.loaded_extension_paths().is_empty());
         // Built-ins are not in the dynamic registry either.
         assert!(db.dynamic_scalar("upper").is_none());

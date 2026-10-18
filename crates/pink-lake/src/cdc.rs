@@ -69,7 +69,7 @@ use crate::catalog::{CommitManifest, DeleteRef, TableEntry};
 use crate::local::CATALOG_FILE;
 use crate::schema::TableSchema;
 use crate::storage::Storage;
-use crate::{only_table, split_key, Lake, LakeError, Result};
+use crate::{Lake, LakeError, Result, only_table, split_key};
 
 /// What one [`ChangeRow`] is: the row version was added (`Insert`) or ended
 /// (`Delete`) at its version. Serialized lowercase, matching DuckLake's
@@ -208,29 +208,30 @@ impl Lake {
                         values,
                     });
                 }
-                if deletions && !row.flushed {
-                    if let Some(end_version) = row.end {
-                        if end_version >= start && end_version <= end {
-                            let values = crate::inlined::decode_row(
-                                record.as_ref().ok_or_else(|| LakeError::Corrupt {
-                                    path: manifest_path.clone(),
-                                    message: format!(
-                                        "table \"{table}\" carries inlined rows but no schema \
+                if deletions
+                    && !row.flushed
+                    && let Some(end_version) = row.end
+                    && end_version >= start
+                    && end_version <= end
+                {
+                    let values = crate::inlined::decode_row(
+                        record.as_ref().ok_or_else(|| LakeError::Corrupt {
+                            path: manifest_path.clone(),
+                            message: format!(
+                                "table \"{table}\" carries inlined rows but no schema \
                                          record"
-                                    ),
-                                })?,
-                                row,
-                                table,
-                                &manifest_path,
-                            )?;
-                            deleted.push(ChangeRow {
-                                version: end_version,
-                                row_id: Some(row.row_id),
-                                change_type: ChangeKind::Delete,
-                                values,
-                            });
-                        }
-                    }
+                            ),
+                        })?,
+                        row,
+                        table,
+                        &manifest_path,
+                    )?;
+                    deleted.push(ChangeRow {
+                        version: end_version,
+                        row_id: Some(row.row_id),
+                        change_type: ChangeKind::Delete,
+                        values,
+                    });
                 }
             }
         }
@@ -407,16 +408,16 @@ impl Lake {
             });
         }
         let rows = file_table.num_rows() as u64;
-        if let Some(expect_rows) = expect_rows {
-            if expect_rows != rows {
-                return Err(LakeError::Corrupt {
-                    path: self.storage.abs(CATALOG_FILE),
-                    message: format!(
-                        "table \"{table}\": commit delta says \"{rel}\" holds {expect_rows} \
+        if let Some(expect_rows) = expect_rows
+            && expect_rows != rows
+        {
+            return Err(LakeError::Corrupt {
+                path: self.storage.abs(CATALOG_FILE),
+                message: format!(
+                    "table \"{table}\": commit delta says \"{rel}\" holds {expect_rows} \
                          rows, but the file holds {rows}"
-                    ),
-                });
-            }
+                ),
+            });
         }
         // A delete position is per the file's physical rows; `.pink` files
         // decode whole and project in memory, Vortex files too on this path.
@@ -512,7 +513,7 @@ fn read_commit_manifest(
     let bytes = match storage.read(&rel, &format!("reading {}", path.display())) {
         Ok(bytes) => bytes,
         Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(None)
+            return Ok(None);
         }
         Err(e) => return Err(e),
     };

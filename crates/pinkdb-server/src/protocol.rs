@@ -281,7 +281,7 @@ impl Request {
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown request message type {other}"
-                )))
+                )));
             }
         };
         r.finish("request")?;
@@ -396,7 +396,7 @@ impl DoneKind {
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"
-                )))
+                )));
             }
         })
     }
@@ -563,7 +563,7 @@ impl Response {
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown response message type {other}"
-                )))
+                )));
             }
         };
         r.finish("response")?;
@@ -829,7 +829,7 @@ impl<'a> Reader<'a> {
                 other => {
                     return Err(ProtocolError::Malformed(format!(
                         "BOOL payload must be 0 or 1, got {other}"
-                    )))
+                    )));
                 }
             },
             value_tag::I32 => {
@@ -879,7 +879,7 @@ impl<'a> Reader<'a> {
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown value tag {other}"
-                )))
+                )));
             }
         })
     }
@@ -907,7 +907,7 @@ impl<'a> Reader<'a> {
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown data type tag {other}"
-                )))
+                )));
             }
         })
     }

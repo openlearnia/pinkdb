@@ -545,10 +545,10 @@ impl Storage for CryptoStorage {
                 let copy = self.inner.local_copy(rel, context)?;
                 // Fail closed before the engine opens a ciphertext file as if
                 // it were a `.pink` one: the first 8 bytes are the magic.
-                if let Some(head) = read_magic(copy.path()) {
-                    if &head == crypto::ENC_MAGIC {
-                        return Err(crypto::encrypted_error(&self.inner.abs(rel)));
-                    }
+                if let Some(head) = read_magic(copy.path())
+                    && &head == crypto::ENC_MAGIC
+                {
+                    return Err(crypto::encrypted_error(&self.inner.abs(rel)));
                 }
                 Ok(copy)
             }

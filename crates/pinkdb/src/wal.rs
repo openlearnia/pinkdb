@@ -102,8 +102,8 @@
 //! ```text
 //! <path>.pink              the published checkpoint
 //! <path>.pink.tmp          checkpoint being written (never trusted when live records exist)
-//! <path>.pink.wal          live WAL, header names its generation `gen`
-//! <path>.pink.wal.<gen>.roll   a rolled-away generation (name == header gen)
+//! <path>.pink.wal            live WAL, the header names its generation
+//! <path>.pink.wal.<gen>.roll   a rolled-away generation (name == header generation)
 //! ```
 //!
 //! The protocol (every step ordered so recovery can tell crash windows apart):
@@ -111,7 +111,7 @@
 //! 1. write `.pink.tmp` (full state) and fsync the file *and its directory*;
 //! 2. rename the live WAL to `.wal.<gen>.roll` (the name carries the
 //!    generation, so a roll can never overwrite another roll) and create a
-//!    fresh header-only WAL with generation `gen + 1`, fsynced;
+//!    fresh header-only WAL with the generation bumped by one, fsynced;
 //! 3. rename `.pink.tmp` → `.pink` (atomic publish), fsync the directory;
 //! 4. remove the roll.
 //!
@@ -209,7 +209,7 @@ pub const WAL_VERSION: u32 = 4;
 const WAL_VERSION_V3: u32 = 3;
 /// The pre-multi-process plaintext version, accepted and upgraded at open.
 const WAL_VERSION_V2: u32 = 2;
-/// v3/v4 plaintext header: magic(8) + version(4) + gen(8) + wal_id(16) +
+/// v3/v4 plaintext header: magic(8) + version(4) + generation(8) + wal_id(16) +
 /// crc32(0..36)(4) + slot A(24) + slot B(24) + reserved(8).
 pub(crate) const HEADER_LEN: usize = 96;
 /// Where records begin in a v3/v4 plaintext WAL (== `HEADER_LEN`).
@@ -231,7 +231,7 @@ const LOCK_SLOT_A: u64 = 0;
 const WAL_SLOT_B: u64 = 64;
 const WAL_SLOT_A: u64 = 40;
 /// The fixed plaintext publish block of an encrypted (container v2) WAL at
-/// `payload_start`: `wal_id [16] | crc32(wal_id||gen||version) u32 | zero u32 |
+/// `payload_start`: `wal_id [16] | crc32(wal_id||generation||version) u32 | zero u32 |
 /// slot A (24) | slot B (24) | zero [16]`; records follow. The block is
 /// deliberately outside the AEAD AAD: slots mutate, and a tampered slot can
 /// at most cause a spurious refresh.
@@ -380,7 +380,7 @@ fn file_read_exact_at(file: &File, buf: &mut [u8], mut offset: u64) -> std::io::
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "short positional read",
-                ))
+                ));
             }
             n => {
                 pos += n;
@@ -399,7 +399,7 @@ fn file_write_all_at(file: &File, buf: &[u8], mut offset: u64) -> std::io::Resul
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
                     "positional write wrote zero bytes",
-                ))
+                ));
             }
             n => {
                 pos += n;
@@ -843,12 +843,12 @@ impl LeaseGuard {
 /// `initial` slot edge seeds slot A for a rebuild/upgrade (design 9.2).
 fn encode_publish_block(
     wal_id: &WalId,
-    gen: u64,
+    generation: u64,
     initial: Option<(u64, u64)>,
 ) -> [u8; ENC_PUBLISH_BLOCK_LEN] {
     let mut b = [0u8; ENC_PUBLISH_BLOCK_LEN];
     b[..16].copy_from_slice(wal_id);
-    let crc = publish_block_crc(wal_id, gen, crypto::WAL_CONTAINER_VERSION);
+    let crc = publish_block_crc(wal_id, generation, crypto::WAL_CONTAINER_VERSION);
     b[16..20].copy_from_slice(&crc.to_le_bytes());
     if let Some((seq, value)) = initial {
         let at = if seq.is_multiple_of(2) {
@@ -861,10 +861,10 @@ fn encode_publish_block(
     b
 }
 
-fn publish_block_crc(wal_id: &WalId, gen: u64, version: u32) -> u32 {
+fn publish_block_crc(wal_id: &WalId, generation: u64, version: u32) -> u32 {
     let mut v = Vec::with_capacity(16 + 12);
     v.extend_from_slice(wal_id);
-    v.extend_from_slice(&gen.to_le_bytes());
+    v.extend_from_slice(&generation.to_le_bytes());
     v.extend_from_slice(&version.to_le_bytes());
     crc32(&v)
 }
@@ -935,7 +935,7 @@ pub struct Wal {
     checkpoint_path: PathBuf,
     policy: SyncPolicy,
     /// Generation of the live WAL; rolls carry the drained generation.
-    gen: u64,
+    generation: u64,
     /// This WAL file incarnation's fresh id (ABA guard across checkpoints).
     wal_id: WalId,
     last_lsn: u64,
@@ -1034,7 +1034,7 @@ impl Wal {
         }
         let position = BasePosition {
             wal_id: self.wal_id,
-            gen: self.gen,
+            generation: self.generation,
             lsn: self.applied.applied_lsn,
             // The cached meta is the last observed one; the commit check
             // re-stats the checkpoint, so a replacement between this capture
@@ -1078,7 +1078,7 @@ impl Wal {
                     return Some((
                         "an upgraded legacy frame (touched set unknown)".to_string(),
                         Some(e.lsn),
-                    ))
+                    ));
                 }
             }
         }
@@ -1147,7 +1147,7 @@ impl Wal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Applied {
     wal_id: WalId,
-    gen: u64,
+    generation: u64,
     wal_dev_ino: Option<(u64, u64)>,
     records_start: u64,
     /// Byte offset just past the last applied frame.
@@ -1210,7 +1210,7 @@ fn ckpt_meta(path: &Path) -> Option<CkptMeta> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BasePosition {
     wal_id: WalId,
-    gen: u64,
+    generation: u64,
     lsn: u64,
     ckpt: Option<CkptMeta>,
 }
@@ -1282,7 +1282,7 @@ impl CommitConflict {
 /// One rolled-away WAL generation found on disk.
 #[derive(Debug)]
 struct Roll {
-    gen: u64,
+    generation: u64,
     path: PathBuf,
 }
 
@@ -1290,15 +1290,15 @@ struct Roll {
 #[derive(Debug)]
 struct WalProbe {
     /// Generation from a valid header (`None` for a torn/absent file).
-    gen: Option<u64>,
+    generation: Option<u64>,
     /// Whether the file holds at least one intact record.
     has_records: bool,
 }
 
-/// The parsed header of a live WAL (`gen`/identity/records start/slots).
+/// The parsed header of a live WAL (`generation`/identity/records start/slots).
 #[derive(Debug)]
 struct WalHeader {
-    gen: u64,
+    generation: u64,
     wal_id: WalId,
     /// Offset where the first record begins.
     records_start: usize,
@@ -1341,7 +1341,7 @@ enum HeaderError {
 /// Every intact record of a freshly scanned WAL file plus its positioning.
 struct OpenedWal {
     file: File,
-    gen: u64,
+    generation: u64,
     wal_id: WalId,
     records_start: u64,
     slots_at: u64,
@@ -1354,11 +1354,11 @@ struct OpenedWal {
 
 impl Wal {
     /// A current-format (v4) plaintext header with the given incarnation id.
-    fn header_for(gen: u64, wal_id: &WalId) -> [u8; HEADER_LEN] {
+    fn header_for(generation: u64, wal_id: &WalId) -> [u8; HEADER_LEN] {
         let mut h = [0u8; HEADER_LEN];
         h[..8].copy_from_slice(WAL_MAGIC);
         h[8..12].copy_from_slice(&WAL_VERSION.to_le_bytes());
-        h[12..20].copy_from_slice(&gen.to_le_bytes());
+        h[12..20].copy_from_slice(&generation.to_le_bytes());
         h[20..36].copy_from_slice(wal_id);
         let crc = crc32(&h[..36]);
         h[36..40].copy_from_slice(&crc.to_le_bytes());
@@ -1367,8 +1367,8 @@ impl Wal {
 
     /// A current header with a fresh incarnation id (test/raw fixtures).
     #[cfg(test)]
-    fn header_fresh(gen: u64) -> [u8; HEADER_LEN] {
-        Self::header_for(gen, &fresh_wal_id())
+    fn header_fresh(generation: u64) -> [u8; HEADER_LEN] {
+        Self::header_for(generation, &fresh_wal_id())
     }
 
     /// Create (or recreate) the WAL file at `path` with just a header and
@@ -1379,7 +1379,7 @@ impl Wal {
     /// non-append fd would overwrite from its cached offset.
     fn create_file(
         path: &Path,
-        gen: u64,
+        generation: u64,
         cipher: Option<RecordCipher>,
     ) -> Result<(File, Option<RecordCipher>, WalId)> {
         let wal_id = fresh_wal_id();
@@ -1395,9 +1395,9 @@ impl Wal {
             match &cipher {
                 Some(c) => {
                     f.write_all(c.header())?;
-                    f.write_all(&encode_publish_block(&wal_id, gen, None))?;
+                    f.write_all(&encode_publish_block(&wal_id, generation, None))?;
                 }
-                None => f.write_all(&Self::header_for(gen, &wal_id))?,
+                None => f.write_all(&Self::header_for(generation, &wal_id))?,
             }
             f.sync_all()?;
         }
@@ -1452,7 +1452,7 @@ impl Wal {
             path: path.to_path_buf(),
             checkpoint_path,
             policy,
-            gen: opened.gen,
+            generation: opened.generation,
             wal_id: opened.wal_id,
             records_start: opened.records_start,
             slots_at: opened.slots_at,
@@ -1579,14 +1579,14 @@ impl Wal {
     /// Returns every intact record of the new incarnation (the caller replays
     /// them all — there is no incremental continuity across incarnations).
     fn reopen_under_lease(&mut self, key: &Option<EncryptionKey>) -> Result<(Vec<Record>, u64)> {
-        let opened = scan_wal(&self.path, key.as_ref(), self.gen.max(1), false)?;
+        let opened = scan_wal(&self.path, key.as_ref(), self.generation.max(1), false)?;
         // The good end is the file length after scanning (a torn tail was
         // already truncated/rebuilt by the scan).
         let end = std::fs::metadata(&self.path)
             .map(|m| m.len())
             .unwrap_or(opened.records_start);
         self.file = opened.file;
-        self.gen = opened.gen;
+        self.generation = opened.generation;
         self.wal_id = opened.wal_id;
         self.records_start = opened.records_start;
         self.slots_at = opened.slots_at;
@@ -1600,7 +1600,7 @@ impl Wal {
         // then records the final position.
         self.applied = Applied {
             wal_id: opened.wal_id,
-            gen: opened.gen,
+            generation: opened.generation,
             wal_dev_ino: file_identity(&self.path),
             records_start: opened.records_start,
             applied_end: opened.records_start,
@@ -1647,10 +1647,10 @@ impl Wal {
             true,
         )
         .map_err(PinkDbError::Execution)?;
-        if let Some(first) = records.first() {
-            if self.applied.applied_lsn.checked_add(1) != Some(first.lsn) {
-                return Ok(None);
-            }
+        if let Some(first) = records.first()
+            && self.applied.applied_lsn.checked_add(1) != Some(first.lsn)
+        {
+            return Ok(None);
         }
         let end = self.applied.applied_end + good_end as u64;
         if end < len {
@@ -1815,17 +1815,16 @@ impl Wal {
         sets: Option<&FrameSets>,
     ) -> Result<()> {
         let mut rec: Vec<String> = Vec::with_capacity(stmts.len() + touched_extensions.len() + 1);
-        if let Some(before) = db_before {
-            if !self
+        if let Some(before) = db_before
+            && !self
                 .session_db
                 .as_deref()
                 .is_some_and(|s| s.eq_ignore_ascii_case(before))
-            {
-                // Quote the name: databases may hold spaces/keywords when
-                // created with a quoted identifier (`CREATE DATABASE
-                // "My Db"`).
-                rec.push(format!("USE \"{}\"", before.replace('"', "\"\"")));
-            }
+        {
+            // Quote the name: databases may hold spaces/keywords when
+            // created with a quoted identifier (`CREATE DATABASE
+            // "My Db"`).
+            rec.push(format!("USE \"{}\"", before.replace('"', "\"\"")));
         }
         let mut prefixed: HashSet<&str> = HashSet::new();
         for path in touched_extensions {
@@ -1873,12 +1872,15 @@ impl Wal {
         // against a replaced lock file must not roll the WAL or publish.
         guard.verify_lock_identity()?;
         let tmp = tmp_path(&self.checkpoint_path);
-        let roll = roll_path(&self.path, self.gen);
+        let roll = roll_path(&self.path, self.generation);
         // A roll of the live generation already existing proves a protocol
         // violation (a live generation is rolled exactly once); overwriting
         // it could destroy records, so refuse.
         if roll.exists() {
-            let msg = format!("a roll file for generation {} already exists", self.gen);
+            let msg = format!(
+                "a roll file for generation {} already exists",
+                self.generation
+            );
             self.poisoned = Some(msg.clone());
             return Err(PinkDbError::Execution(format!(
                 "cannot checkpoint: {} ({msg})",
@@ -1891,11 +1893,11 @@ impl Wal {
         sync_parent_dir(&tmp);
         // 2. Roll the generation: the old records move to a name carrying
         //    their generation (never overwritten), a fresh WAL starts at
-        //    gen + 1 with a fresh `wal_id`. The fresh container cipher is
+        //    generation + 1 with a fresh `wal_id`. The fresh container cipher is
         //    prepared before the rename so a crypto failure cannot leave the
         //    WAL rolled.
         let fresh_gen = self
-            .gen
+            .generation
             .checked_add(1)
             .ok_or_else(|| PinkDbError::Execution("WAL generation counter overflow".to_string()))?;
         let fresh_cipher = match &self.cipher {
@@ -1911,7 +1913,7 @@ impl Wal {
                 guard.bump_epoch(self.last_lsn);
                 self.file = fresh;
                 self.cipher = cipher;
-                self.gen = fresh_gen;
+                self.generation = fresh_gen;
                 self.wal_id = wal_id;
                 self.last_lsn = 0;
                 self.records_start = match &self.cipher {
@@ -1937,7 +1939,7 @@ impl Wal {
                 // fresh WAL contributes nothing yet.
                 self.applied = Applied {
                     wal_id,
-                    gen: fresh_gen,
+                    generation: fresh_gen,
                     wal_dev_ino: file_identity(&self.path),
                     records_start: self.records_start,
                     applied_end: self.records_start,
@@ -2410,12 +2412,12 @@ fn parse_records(
 /// the re-sealed records.
 fn rewrite_encrypted(
     path: &Path,
-    gen: u64,
+    generation: u64,
     records: &[Record],
     old: &RecordCipher,
 ) -> Result<RecordCipher> {
     let wal_id = fresh_wal_id();
-    let mut fresh = old.fork(gen)?;
+    let mut fresh = old.fork(generation)?;
     let last_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
     let rewrite = rewrite_path(path);
     {
@@ -2425,7 +2427,11 @@ fn rewrite_encrypted(
             .truncate(true)
             .open(&rewrite)?;
         f.write_all(fresh.header())?;
-        f.write_all(&encode_publish_block(&wal_id, gen, Some((1, last_lsn))))?;
+        f.write_all(&encode_publish_block(
+            &wal_id,
+            generation,
+            Some((1, last_lsn)),
+        ))?;
         for rec in records {
             let payload = encode_payload(&rec.stmts, rec.sets.as_ref())?;
             let len = record_len_guard(payload.len())?;
@@ -2445,9 +2451,9 @@ fn rewrite_encrypted(
 /// `<wal>.<gen>.upgrade`: temp name for the in-place legacy→v4 plaintext
 /// rewrite. Deliberately not matched by `scan_rolls` (only `.roll` names
 /// are), so a crash mid-upgrade leaves an ignorable temp (design row R1).
-fn upgrade_path(wal: &Path, gen: u64) -> PathBuf {
+fn upgrade_path(wal: &Path, generation: u64) -> PathBuf {
     let mut s = wal.as_os_str().to_os_string();
-    s.push(format!(".{gen}.upgrade"));
+    s.push(format!(".{generation}.upgrade"));
     PathBuf::from(s)
 }
 
@@ -2456,13 +2462,13 @@ fn upgrade_path(wal: &Path, gen: u64) -> PathBuf {
 /// records re-encoded in the v4 payload layout (their touched sets are
 /// unknown). A torn tail is simply not copied. Temp + rename; a crash re-runs
 /// the upgrade (R1).
-fn upgrade_plain(path: &Path, data: &[u8], gen: u64, records_start: usize) -> Result<()> {
+fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize) -> Result<()> {
     let (records, good_end) =
         parse_records(data, records_start, None, 0, 0, false).map_err(PinkDbError::Execution)?;
     let last_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
     let wal_id = fresh_wal_id();
     let mut out = Vec::with_capacity(HEADER_LEN + (good_end - records_start));
-    out.extend_from_slice(&Wal::header_for(gen, &wal_id));
+    out.extend_from_slice(&Wal::header_for(generation, &wal_id));
     let slot = slot_bytes(1, last_lsn, WAL_SLOT_DOMAIN);
     out[WAL_SLOT_A as usize..WAL_SLOT_A as usize + SLOT_LEN].copy_from_slice(&slot);
     for rec in &records {
@@ -2473,7 +2479,7 @@ fn upgrade_plain(path: &Path, data: &[u8], gen: u64, records_start: usize) -> Re
         out.extend_from_slice(&crc32(&payload).to_le_bytes());
         out.extend_from_slice(&payload);
     }
-    let upgrade = upgrade_path(path, gen);
+    let upgrade = upgrade_path(path, generation);
     {
         let mut f = OpenOptions::new()
             .write(true)
@@ -2527,9 +2533,9 @@ fn upgrade_legacy_wal(
         let (old, _) = RecordCipher::from_header(data, k)?;
         let (records, _) = parse_records(data, enc.payload_start, Some(&old), 0, 0, false)
             .map_err(PinkDbError::Execution)?;
-        rewrite_encrypted(path, header.gen, &records, &old)?;
+        rewrite_encrypted(path, header.generation, &records, &old)?;
     } else {
-        upgrade_plain(path, data, header.gen, header.records_start)?;
+        upgrade_plain(path, data, header.generation, header.records_start)?;
     }
     Ok(())
 }
@@ -2560,7 +2566,7 @@ fn wal_header_invalid(path: &Path) -> Result<bool> {
 }
 
 /// The live WAL's on-disk identity, read with one open + header read + fstat:
-/// incarnation `(gen, wal_id)`, where its records start, its file identity,
+/// incarnation `(generation, wal_id)`, where its records start, its file identity,
 /// and its length. Used for the refresh and the optimistic-commit identity
 /// comparisons; the file must already be in a current format (callers
 /// upgrade legacy files first). Reads only the header region, never the whole
@@ -2575,7 +2581,7 @@ fn read_wal_identity(path: &Path) -> Result<WalIdentity> {
     let h =
         parse_wal_header(&buf[..n]).map_err(|e| PinkDbError::Execution(header_error(path, &e)))?;
     Ok(WalIdentity {
-        gen: h.gen,
+        generation: h.generation,
         wal_id: h.wal_id,
         records_start: h.records_start as u64,
         dev_ino: Some(identity_of(&meta)),
@@ -2586,7 +2592,7 @@ fn read_wal_identity(path: &Path) -> Result<WalIdentity> {
 /// See [`read_wal_identity`].
 #[derive(Debug, Clone, Copy)]
 struct WalIdentity {
-    gen: u64,
+    generation: u64,
     wal_id: WalId,
     #[allow(dead_code)] // kept for error context / future checks
     records_start: u64,
@@ -2605,14 +2611,14 @@ fn scan_wal(
     recreate_gen: u64,
     rebuild_encrypted: bool,
 ) -> Result<OpenedWal> {
-    let fresh_cipher = |gen: u64| -> Result<Option<RecordCipher>> {
+    let fresh_cipher = |generation: u64| -> Result<Option<RecordCipher>> {
         match key {
-            Some(k) => Ok(Some(RecordCipher::create(k, gen)?)),
+            Some(k) => Ok(Some(RecordCipher::create(k, generation)?)),
             None => Ok(None),
         }
     };
-    let created = |gen: u64, cipher: Option<RecordCipher>| -> Result<OpenedWal> {
-        let (file, cipher, wal_id) = Wal::create_file(path, gen, cipher)?;
+    let created = |generation: u64, cipher: Option<RecordCipher>| -> Result<OpenedWal> {
+        let (file, cipher, wal_id) = Wal::create_file(path, generation, cipher)?;
         let records_start = match &cipher {
             Some(c) => c.header().len() as u64 + ENC_PUBLISH_BLOCK_LEN as u64,
             None => RECORDS_START as u64,
@@ -2623,7 +2629,7 @@ fn scan_wal(
         };
         Ok(OpenedWal {
             file,
-            gen,
+            generation,
             wal_id,
             records_start,
             slots_at,
@@ -2667,7 +2673,7 @@ fn scan_wal(
     if header.legacy {
         // Upgrade under the lease, then re-scan the (now current) file.
         upgrade_legacy_wal(path, &data, &header, key)?;
-        let mut out = scan_wal(path, key, header.gen, rebuild_encrypted)?;
+        let mut out = scan_wal(path, key, header.generation, rebuild_encrypted)?;
         out.upgraded = true;
         return Ok(out);
     }
@@ -2702,7 +2708,7 @@ fn scan_wal(
             // pass `rebuild_encrypted = false` and keep the prefix, except
             // when they actually discard bytes (a crashed writer's torn
             // tail), where the same reuse argument forces a rebuild.
-            let mut fresh = rewrite_encrypted(path, header.gen, &records, &old)?;
+            let mut fresh = rewrite_encrypted(path, header.generation, &records, &old)?;
             fresh.set_next_counter(record_count.checked_add(1).ok_or_else(|| {
                 PinkDbError::Execution("encrypted WAL: nonce counter overflow".to_string())
             })?);
@@ -2756,7 +2762,7 @@ fn scan_wal(
     let _ = data;
     Ok(OpenedWal {
         file,
-        gen: header.gen,
+        generation: header.generation,
         wal_id,
         records_start,
         slots_at,
@@ -2792,9 +2798,9 @@ fn rewrite_path(wal: &Path) -> PathBuf {
 
 /// `<wal>.<gen>.roll`: the generation in the name is what makes stale rolls
 /// distinguishable from a roll of the live generation.
-fn roll_path(wal: &Path, gen: u64) -> PathBuf {
+fn roll_path(wal: &Path, generation: u64) -> PathBuf {
     let mut s = wal.as_os_str().to_os_string();
-    s.push(format!(".{gen}{ROLL_SUFFIX}"));
+    s.push(format!(".{generation}{ROLL_SUFFIX}"));
     PathBuf::from(s)
 }
 
@@ -2828,7 +2834,7 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
                 // Container v1: no publish block; records start right after
                 // the header. Upgraded under the lease by `scan_wal`.
                 return Ok(WalHeader {
-                    gen: enc.context,
+                    generation: enc.context,
                     wal_id: [0u8; 16],
                     records_start: payload_start,
                     slots_at: 0,
@@ -2858,7 +2864,7 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
             }
             let published_seq = slot_max_in(block, ENC_SLOT_A as usize, WAL_SLOT_DOMAIN);
             return Ok(WalHeader {
-                gen: enc.context,
+                generation: enc.context,
                 wal_id,
                 records_start: payload_start + ENC_PUBLISH_BLOCK_LEN,
                 slots_at: payload_start as u64 + ENC_SLOT_A,
@@ -2898,7 +2904,7 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
                 }
             }
             Ok(WalHeader {
-                gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
+                generation: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
                 wal_id: [0u8; 16],
                 records_start: if version == WAL_VERSION_V2 {
                     V2_RECORDS_START
@@ -2926,7 +2932,7 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
             wal_id.copy_from_slice(&data[20..36]);
             let published_seq = slot_max_in(data, WAL_SLOT_A as usize, WAL_SLOT_DOMAIN);
             Ok(WalHeader {
-                gen: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
+                generation: u64::from_le_bytes(data[12..20].try_into().expect("8 bytes")),
                 wal_id,
                 records_start: HEADER_LEN,
                 slots_at: WAL_SLOT_A,
@@ -3046,7 +3052,7 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
             let cipher = match (&h.enc, key) {
                 (None, Some(_)) => return Err(not_encrypted_with_key(path)),
                 (Some(_), None) => {
-                    return Err(crypto::encrypted_error(&path.display().to_string()))
+                    return Err(crypto::encrypted_error(&path.display().to_string()));
                 }
                 (Some(_), Some(k)) => {
                     let (c, _) = RecordCipher::from_header(&data, k)?;
@@ -3058,12 +3064,12 @@ fn probe_wal(path: &Path, key: Option<&EncryptionKey>) -> Result<Option<WalProbe
                 parse_records(&data, h.records_start, cipher.as_ref(), 0, 0, !h.legacy)
                     .map_err(PinkDbError::Execution)?;
             Ok(Some(WalProbe {
-                gen: Some(h.gen),
+                generation: Some(h.generation),
                 has_records: !records.is_empty(),
             }))
         }
         Err(e) if header_torn(data.len(), &e) => Ok(Some(WalProbe {
-            gen: None,
+            generation: None,
             has_records: false,
         })),
         Err(e) => Err(PinkDbError::Execution(header_error(path, &e))),
@@ -3098,16 +3104,15 @@ fn scan_rolls(wal: &Path) -> Result<Vec<Roll>> {
         if let Some(mid) = name
             .strip_prefix(&prefix)
             .and_then(|r| r.strip_suffix(ROLL_SUFFIX))
+            && let Ok(generation) = mid.parse::<u64>()
         {
-            if let Ok(gen) = mid.parse::<u64>() {
-                rolls.push(Roll {
-                    gen,
-                    path: entry.path(),
-                });
-            }
+            rolls.push(Roll {
+                generation,
+                path: entry.path(),
+            });
         }
     }
-    rolls.sort_by_key(|r| r.gen);
+    rolls.sort_by_key(|r| r.generation);
     for r in &rolls {
         check_roll_header(r)?;
     }
@@ -3134,21 +3139,21 @@ fn check_roll_header(roll: &Roll) -> Result<()> {
     };
     buf.truncate(n);
     match parse_wal_header(&buf) {
-        Ok(h) if h.gen == roll.gen => Ok(()),
+        Ok(h) if h.generation == roll.generation => Ok(()),
         Ok(h) => Err(PinkDbError::Execution(format!(
             "cannot recover: roll file {} is named generation {} but its header says {}; \
              refusing to delete it",
             roll.path.display(),
-            roll.gen,
-            h.gen
+            roll.generation,
+            h.generation
         ))),
         Err(_) => Ok(()),
     }
 }
 
-fn inconsistent_roll(path: &Path, gen: u64, live_gen: u64) -> PinkDbError {
+fn inconsistent_roll(path: &Path, generation: u64, live_gen: u64) -> PinkDbError {
     PinkDbError::Execution(format!(
-        "cannot recover: rolled WAL generation {gen} ({}) does not precede the live WAL \
+        "cannot recover: rolled WAL generation {generation} ({}) does not precede the live WAL \
          generation {live_gen}; refusing to delete records that may not be folded into \
          the checkpoint",
         path.display()
@@ -3172,7 +3177,7 @@ fn remove_rolls(rolls: &[Roll]) -> u64 {
 /// to wrap past `u64::MAX`: a crafted roll name at the top of the range must
 /// yield a clean error, never a panic.
 fn next_gen_after_rolls(rolls: &[Roll]) -> Result<u64> {
-    match rolls.iter().map(|r| r.gen).max() {
+    match rolls.iter().map(|r| r.generation).max() {
         Some(g) => g.checked_add(1).ok_or_else(|| {
             PinkDbError::Execution(format!(
                 "cannot recover: rolled WAL generation {g} is the highest representable; \
@@ -3195,12 +3200,12 @@ fn ensure_live_wal(
     if live_gen.is_some() {
         return Ok(());
     }
-    let gen = next_gen_after_rolls(rolls)?;
+    let generation = next_gen_after_rolls(rolls)?;
     let cipher = match key {
-        Some(k) => Some(RecordCipher::create(k, gen)?),
+        Some(k) => Some(RecordCipher::create(k, generation)?),
         None => None,
     };
-    Wal::create_file(wal, gen, cipher).map(|_| ())
+    Wal::create_file(wal, generation, cipher).map(|_| ())
 }
 /// A keyed store must never publish over (or consume) an artifact of the
 /// other at-rest mode: `.pink`/`.tmp` are checked by their first 8 bytes,
@@ -3246,7 +3251,7 @@ fn recover_checkpoint(
     key: Option<&EncryptionKey>,
 ) -> Result<()> {
     check_recovery_mode(ckpt, tmp, key)?;
-    let live_gen = probe.and_then(|p| p.gen);
+    let live_gen = probe.and_then(|p| p.generation);
     let live_records = probe.map(|p| p.has_records).unwrap_or(false);
 
     if !tmp.exists() {
@@ -3263,8 +3268,8 @@ fn recover_checkpoint(
             }
             if let Some(lgen) = live_gen {
                 for r in rolls {
-                    if r.gen >= lgen {
-                        return Err(inconsistent_roll(&r.path, r.gen, lgen));
+                    if r.generation >= lgen {
+                        return Err(inconsistent_roll(&r.path, r.generation, lgen));
                     }
                 }
             }
@@ -3287,8 +3292,8 @@ fn recover_checkpoint(
             )));
         }
         for r in rolls {
-            if r.gen >= lgen {
-                return Err(inconsistent_roll(&r.path, r.gen, lgen));
+            if r.generation >= lgen {
+                return Err(inconsistent_roll(&r.path, r.generation, lgen));
             }
         }
         let _ = std::fs::remove_file(tmp);
@@ -3311,18 +3316,18 @@ fn recover_checkpoint(
     // lost everything on the next open.
     let max_roll = rolls
         .iter()
-        .map(|r| r.gen)
+        .map(|r| r.generation)
         .max()
         .expect("rolls is non-empty");
-    if let Some(lgen) = live_gen {
-        if max_roll >= lgen {
-            let path = rolls
-                .iter()
-                .find(|r| r.gen == max_roll)
-                .map(|r| r.path.as_path())
-                .expect("max comes from the list");
-            return Err(inconsistent_roll(path, max_roll, lgen));
-        }
+    if let Some(lgen) = live_gen
+        && max_roll >= lgen
+    {
+        let path = rolls
+            .iter()
+            .find(|r| r.generation == max_roll)
+            .map(|r| r.path.as_path())
+            .expect("max comes from the list");
+        return Err(inconsistent_roll(path, max_roll, lgen));
     }
     if let Err(e) = std::fs::rename(tmp, ckpt) {
         return Err(PinkDbError::Io(e));
@@ -3474,7 +3479,7 @@ impl PinkDb {
         // When the live WAL is missing or torn, continue the generation
         // sequence past every roll (recovery has already recreated the file
         // with this generation when that was needed).
-        let recreate_gen = match probe.as_ref().and_then(|p| p.gen) {
+        let recreate_gen = match probe.as_ref().and_then(|p| p.generation) {
             Some(g) => g,
             None => next_gen_after_rolls(&rolls)?,
         };
@@ -3517,7 +3522,7 @@ impl PinkDb {
         );
         handle.mark_applied(Applied {
             wal_id: handle.wal_id,
-            gen: handle.gen,
+            generation: handle.generation,
             wal_dev_ino: wal_id_now,
             records_start: handle.records_start,
             applied_end: std::fs::metadata(&wal)
@@ -3669,7 +3674,7 @@ impl PinkDb {
         let ckpt_now = ckpt_meta(&ckpt);
         let full = ckpt_now != wal.applied.ckpt
             || disk.dev_ino != wal.applied.wal_dev_ino
-            || disk.gen != wal.applied.gen
+            || disk.generation != wal.applied.generation
             || disk.wal_id != wal.applied.wal_id;
 
         let (records, end) = if full {
@@ -3725,7 +3730,7 @@ impl PinkDb {
         };
         wal.mark_applied(Applied {
             wal_id: wal.wal_id,
-            gen: wal.gen,
+            generation: wal.generation,
             wal_dev_ino,
             records_start: wal.records_start,
             applied_end: end,
@@ -3910,10 +3915,10 @@ impl PinkDb {
                         detail: "the live WAL is unreadable (recovered by another process?)"
                             .to_string(),
                         lsn: None,
-                    }))
+                    }));
                 }
             };
-            if disk.gen != base.gen
+            if disk.generation != base.generation
                 || disk.wal_id != base.wal_id
                 || disk.dev_ino != wal.applied.wal_dev_ino
             {
@@ -3960,7 +3965,7 @@ impl PinkDb {
                         object: "the WAL tail".to_string(),
                         detail: "the WAL was rewritten under the transaction (retry)".to_string(),
                         lsn: None,
-                    }))
+                    }));
                 }
             }
         };
@@ -3986,7 +3991,7 @@ impl PinkDb {
                 (file_identity(&wal.path), ckpt_meta(&wal.checkpoint_path));
             let applied = Applied {
                 wal_id: wal.wal_id,
-                gen: wal.gen,
+                generation: wal.generation,
                 wal_dev_ino,
                 records_start: wal.records_start,
                 applied_end: end,
@@ -4128,10 +4133,8 @@ impl PinkDb {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .wants_checkpoint();
-        if due {
-            if let Err(e) = self.checkpoint_with_guard(guard) {
-                eprintln!("pinkdb: automatic checkpoint failed: {e}");
-            }
+        if due && let Err(e) = self.checkpoint_with_guard(guard) {
+            eprintln!("pinkdb: automatic checkpoint failed: {e}");
         }
     }
 
@@ -4166,7 +4169,7 @@ impl PinkDb {
             None => {
                 return Err(PinkDbError::Execution(
                     "database is not durable (no WAL); use save() for a plain snapshot".to_string(),
-                ))
+                ));
             }
         };
         let own_guard;
@@ -4179,7 +4182,7 @@ impl PinkDb {
                     None => {
                         return Err(PinkDbError::Execution(
                             "database is not durable".to_string(),
-                        ))
+                        ));
                     }
                 }
             }
@@ -4204,13 +4207,13 @@ impl PinkDb {
                     "cannot change encryption mode on a live store; reopen it instead".to_string(),
                 ));
             }
-            if let Some(k) = &key {
-                if !guard_wal.key_matches(k) {
-                    return Err(PinkDbError::Execution(
-                        "cannot change the encryption key on a live store; reopen it instead"
-                            .to_string(),
-                    ));
-                }
+            if let Some(k) = &key
+                && !guard_wal.key_matches(k)
+            {
+                return Err(PinkDbError::Execution(
+                    "cannot change the encryption key on a live store; reopen it instead"
+                        .to_string(),
+                ));
             }
             match key {
                 Some(k) => guard_wal.checkpoint(guard, |tmp| self.save_sync_with_key(tmp, &k))?,
@@ -4371,14 +4374,14 @@ impl PinkDb {
         // the target's lock-file epoch to make them re-check (their refresh
         // then compares the checkpoint meta and rebuilds). Best-effort — the
         // epoch is a hint; a failure only delays other processes' refresh.
-        if result.is_ok() {
-            if let Some(f) = &target_lease {
-                let seq = read_slot_max(f, LOCK_SLOT_A, LOCK_SLOT_DOMAIN)
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                if write_slot(f, LOCK_SLOT_A, seq, 0, LOCK_SLOT_DOMAIN).is_err() {
-                    warn_slot_once("lock-file epoch slot");
-                }
+        if result.is_ok()
+            && let Some(f) = &target_lease
+        {
+            let seq = read_slot_max(f, LOCK_SLOT_A, LOCK_SLOT_DOMAIN)
+                .unwrap_or(0)
+                .saturating_add(1);
+            if write_slot(f, LOCK_SLOT_A, seq, 0, LOCK_SLOT_DOMAIN).is_err() {
+                warn_slot_once("lock-file epoch slot");
             }
         }
         drop(target_lease);
@@ -4392,16 +4395,16 @@ impl PinkDb {
 /// database always has a WAL), and canonical parent + file name is the last
 /// resort for paths that exist nowhere.
 fn same_file(a: &Path, b: &Path) -> bool {
-    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
-        if ca == cb {
-            return true;
-        }
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(a), std::fs::canonicalize(b))
+        && ca == cb
+    {
+        return true;
     }
     let (wa, wb) = (wal_path(a), wal_path(b));
-    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(&wa), std::fs::canonicalize(&wb)) {
-        if ca == cb {
-            return true;
-        }
+    if let (Ok(ca), Ok(cb)) = (std::fs::canonicalize(&wa), std::fs::canonicalize(&wb))
+        && ca == cb
+    {
+        return true;
     }
     match (normalized_path(a), normalized_path(b)) {
         (Some(na), Some(nb)) => na == nb,
@@ -4428,8 +4431,8 @@ fn replay_record(db: &mut PinkDb, rec: &Record) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Value;
     use crate::QueryResult;
+    use crate::types::Value;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -4797,9 +4800,9 @@ mod tests {
 
     /// Write a WAL file with the given generation and (lsn, statements)
     /// records, CRCs computed for real.
-    fn write_wal_lsns(path: &Path, gen: u64, records: &[(u64, Vec<String>)]) {
+    fn write_wal_lsns(path: &Path, generation: u64, records: &[(u64, Vec<String>)]) {
         let mut f = std::fs::File::create(path).unwrap();
-        f.write_all(&Wal::header_fresh(gen)).unwrap();
+        f.write_all(&Wal::header_fresh(generation)).unwrap();
         for (lsn, stmts) in records {
             let payload = encode_payload(stmts, None).unwrap();
             f.write_all(&(payload.len() as u32).to_le_bytes()).unwrap();
@@ -5591,7 +5594,7 @@ mod tests {
     fn pre_generation_roll_name_is_refused() {
         let p = tmp_ckpt("legacyroll");
         let legacy = PathBuf::from(format!("{}.roll", wal_path(&p).display()));
-        std::fs::write(&legacy, b"not a gen-named roll").unwrap();
+        std::fs::write(&legacy, b"not a generation-named roll").unwrap();
         let err = PinkDb::open_durable(p.to_str().unwrap()).unwrap_err();
         assert!(
             err.to_string().contains("pre-generation roll name"),
@@ -6368,11 +6371,11 @@ mod tests {
             if let Some(rows) = &img.tmp {
                 write_pink(&tmp_path(&p), rows);
             }
-            for (gen, recs) in &img.rolls {
-                write_wal_lsns(&roll_path(&wal, *gen), *gen, &raw(recs));
+            for (generation, recs) in &img.rolls {
+                write_wal_lsns(&roll_path(&wal, *generation), *generation, &raw(recs));
             }
-            if let Some((gen, recs)) = &img.wal {
-                write_wal_lsns(&wal, *gen, &raw(recs));
+            if let Some((generation, recs)) = &img.wal {
+                write_wal_lsns(&wal, *generation, &raw(recs));
             } else if img.torn_wal {
                 std::fs::write(&wal, b"PIN").unwrap();
             }
@@ -6808,9 +6811,10 @@ mod tests {
         assert_eq!(ints(&mut db, "SELECT a FROM t;"), vec![1]);
         // Same inside a durable transaction (nothing is buffered for COMMIT).
         db.execute("BEGIN;").unwrap();
-        assert!(db
-            .execute("UPDATE t SET a = 3 WHERE a IN (SELECT a FROM v);")
-            .is_err());
+        assert!(
+            db.execute("UPDATE t SET a = 3 WHERE a IN (SELECT a FROM v);")
+                .is_err()
+        );
         db.execute("ROLLBACK;").unwrap();
 
         // In-memory databases keep the old behavior.
@@ -7097,14 +7101,14 @@ mod tests {
 
         // The helper itself refuses the wrap (it backs both call sites).
         let roll = Roll {
-            gen: u64::MAX,
+            generation: u64::MAX,
             path: PathBuf::from("x.pink.wal.18446744073709551615.roll"),
         };
         let err = next_gen_after_rolls(std::slice::from_ref(&roll)).unwrap_err();
         assert!(err.to_string().contains("highest representable"), "{err}");
         assert_eq!(next_gen_after_rolls(&[]).unwrap(), 1);
         let roll = Roll {
-            gen: 7,
+            generation: 7,
             path: PathBuf::from("x"),
         };
         assert_eq!(
@@ -7274,9 +7278,11 @@ mod tests {
             .unwrap();
             assert_eq!(info.replayed_records, 0);
             assert_eq!(ints(&mut again, "SELECT a FROM t;"), vec![1]);
-            assert!(std::fs::read(wal_path(&p))
-                .unwrap()
-                .starts_with(crypto::ENC_MAGIC));
+            assert!(
+                std::fs::read(wal_path(&p))
+                    .unwrap()
+                    .starts_with(crypto::ENC_MAGIC)
+            );
             assert!(!tmp_path(&p).exists());
             assert!(scan_rolls(&wal_path(&p)).unwrap().is_empty());
             drop(again);
@@ -7939,11 +7945,11 @@ mod tests {
         }
 
         /// A hand-built genuine v2 WAL (magic + version 2 + gen + records).
-        fn write_v2_wal(path: &Path, gen: u64, records: &[(u64, &str)]) {
+        fn write_v2_wal(path: &Path, generation: u64, records: &[(u64, &str)]) {
             let mut bytes = Vec::new();
             bytes.extend_from_slice(b"PINKWAL1");
             bytes.extend_from_slice(&2u32.to_le_bytes());
-            bytes.extend_from_slice(&gen.to_le_bytes());
+            bytes.extend_from_slice(&generation.to_le_bytes());
             for (lsn, sql) in records {
                 let mut payload = Vec::new();
                 payload.extend_from_slice(&1u32.to_le_bytes());
@@ -8042,7 +8048,7 @@ mod tests {
         #[test]
         fn fuzz_checkpoint_tmp_windows() {
             let p = tmp_ckpt("tmpfuzz");
-            build_db(&p, 3, Some(3)); // checkpoint holds 1..3; live WAL gen 2, empty
+            build_db(&p, 3, Some(3)); // checkpoint holds 1..3; live WAL generation 2, empty
             let ckpt_bytes = std::fs::read(&p).unwrap();
             let tmp = tmp_path(&p);
             let wal = wal_path(&p);

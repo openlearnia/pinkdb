@@ -27,10 +27,10 @@ pub const DEFAULT_REPOSITORY: &str = "https://pinkdb-ext-repo.defaultcms.workers
 
 /// `$PINKDB_HOME`, defaulting to `$HOME/.pinkdb` (`%USERPROFILE%` on Windows).
 pub fn pinkdb_home() -> Result<PathBuf, String> {
-    if let Some(value) = std::env::var_os("PINKDB_HOME") {
-        if !value.is_empty() {
-            return Ok(PathBuf::from(value));
-        }
+    if let Some(value) = std::env::var_os("PINKDB_HOME")
+        && !value.is_empty()
+    {
+        return Ok(PathBuf::from(value));
     }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

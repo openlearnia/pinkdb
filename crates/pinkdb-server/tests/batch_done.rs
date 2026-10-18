@@ -8,7 +8,7 @@ use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 
-use pinkdb_server::protocol::{self, Request, Response, PROTOCOL_VERSION};
+use pinkdb_server::protocol::{self, PROTOCOL_VERSION, Request, Response};
 
 /// Spawn the real binary, wait for the readiness line and return the child
 /// plus its address.

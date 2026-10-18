@@ -13,13 +13,13 @@ use std::cmp::Ordering;
 use pinkdb_ext_loader::ExtArg;
 
 use super::aggregate::encode_row;
-use super::{eval, Cx, Memo};
+use super::{Cx, Memo, eval};
 use crate::plan::compare_values;
 use crate::sql::ast::BinaryOp;
-use crate::sql::binder::{common_numeric, BoundExpr, ScalarFunc};
+use crate::sql::binder::{BoundExpr, ScalarFunc, common_numeric};
 use crate::types::FastSet;
 use crate::types::{
-    decimal_fits, format_decimal, rescale_decimal, DataType, PinkDbError, Result, Value, POW10_I128,
+    DataType, POW10_I128, PinkDbError, Result, Value, decimal_fits, format_decimal, rescale_decimal,
 };
 use crate::vector::{DataChunk, Vector, VectorData};
 
@@ -1170,7 +1170,7 @@ fn overflow_err(what: &str, ty: &str, detail: std::fmt::Arguments) -> PinkDbErro
 /// wrapped result. `%` keeps `wrapping_rem` (only `MIN % -1` wraps, and its
 /// mathematical result 0 is exactly what wrapping returns).
 macro_rules! checked_int_arith {
-    ($op:expr, $x:expr, $y:expr, $ty:literal) => {{
+    ($op:expr_2021, $x:expr_2021, $y:expr_2021, $ty:literal) => {{
         let (x, y) = ($x, $y);
         match $op {
             BinaryOp::Add => x
@@ -1772,11 +1772,7 @@ fn apply_scalar_loose(func: ScalarFunc, row: &[Value]) -> Result<Value> {
                                 ord == Ordering::Greater
                             }
                         };
-                        if take_v {
-                            v
-                        } else {
-                            b
-                        }
+                        if take_v { v } else { b }
                     }
                 });
             }
@@ -1827,11 +1823,7 @@ fn div_round_half_away(v: i128, d: i128) -> i128 {
     debug_assert!(d > 0);
     if v >= 0 {
         let (q, r) = (v / d, v % d);
-        if r * 2 >= d {
-            q + 1
-        } else {
-            q
-        }
+        if r * 2 >= d { q + 1 } else { q }
     } else {
         -div_round_half_away(-v, d)
     }
@@ -2085,7 +2077,7 @@ fn apply_scalar(func: ScalarFunc, dtype: DataType, row: &[Value]) -> Result<Valu
 /// TIMESTAMP value. Only the fields in [`ExtractField`] are handled; DuckDB's
 /// larger specifier set (julian, era, timezone, ...) is out of v1 scope.
 fn extract_value(field: crate::types::ExtractField, v: &Value) -> Result<Value> {
-    use crate::types::{civil_from_days, days_from_civil, split_timestamp, ExtractField as F};
+    use crate::types::{ExtractField as F, civil_from_days, days_from_civil, split_timestamp};
     let (days, h, mi, s, micro) = match v {
         Value::Date(d) => (*d, 0u32, 0u32, 0u32, 0u32),
         Value::Timestamp(us) => split_timestamp(*us),

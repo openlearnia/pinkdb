@@ -28,8 +28,8 @@ macro_rules! cli_error {
 }
 
 use pinkdb::{DataType, DurableOpenOptions, EncryptionKey, PinkDb, QueryResult, Value};
-use rustyline::error::ReadlineError;
 use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 #[cfg(feature = "client")]
 use pinkdb_server::Client;
@@ -341,11 +341,7 @@ fn cmd_databases(db: &PinkDb) {
 }
 
 fn plural(n: usize) -> &'static str {
-    if n == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if n == 1 { "" } else { "s" }
 }
 
 fn cmd_tables(db: &PinkDb) {
@@ -1162,10 +1158,10 @@ fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
 /// process's write lease before reporting the database busy.
 fn durable_options() -> DurableOpenOptions {
     let mut opts = DurableOpenOptions::default();
-    if let Ok(ms) = std::env::var("PINKDB_BUSY_TIMEOUT_MS") {
-        if let Ok(ms) = ms.trim().parse::<u64>() {
-            opts.busy_timeout = std::time::Duration::from_millis(ms);
-        }
+    if let Ok(ms) = std::env::var("PINKDB_BUSY_TIMEOUT_MS")
+        && let Ok(ms) = ms.trim().parse::<u64>()
+    {
+        opts.busy_timeout = std::time::Duration::from_millis(ms);
     }
     opts
 }
@@ -1242,10 +1238,10 @@ fn main() {
         };
         match rl.readline(prompt) {
             Ok(line) => {
-                if !line.trim().is_empty() {
-                    if let Some(entry) = input.history_entry(&line) {
-                        rl.add_history_entry(entry.as_str()).ok();
-                    }
+                if !line.trim().is_empty()
+                    && let Some(entry) = input.history_entry(&line)
+                {
+                    rl.add_history_entry(entry.as_str()).ok();
                 }
                 if !input.feed(&mut session, &line) {
                     break;

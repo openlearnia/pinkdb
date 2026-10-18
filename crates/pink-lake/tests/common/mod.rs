@@ -7,7 +7,7 @@
 //! TIMESTAMP extremes, a multi-chunk table, an empty table, multiple
 //! databases, and dotted + unicode table names.
 
-use pinkdb::{DataType, PinkDb, Value, CHUNK_SIZE};
+use pinkdb::{CHUNK_SIZE, DataType, PinkDb, Value};
 
 /// The fidelity store described above.
 pub fn fidelity_store() -> PinkDb {

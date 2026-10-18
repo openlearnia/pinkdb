@@ -10,8 +10,8 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use pink_lake::{
@@ -1197,14 +1197,18 @@ fn cleanup_protects_referenced_objects_and_strays_outside_data() {
             ..CleanupSettings::default()
         })
         .unwrap();
-    assert!(report
-        .paths
-        .contains(&"data/main.t/young.pink.tmp".to_string()));
+    assert!(
+        report
+            .paths
+            .contains(&"data/main.t/young.pink.tmp".to_string())
+    );
 
     // The backdated stray *is* visible under the default gate.
-    assert!(report
-        .paths
-        .contains(&"data/main.t/leftover.pink.tmp".to_string()));
+    assert!(
+        report
+            .paths
+            .contains(&"data/main.t/leftover.pink.tmp".to_string())
+    );
 
     // Confirmed deletion removes exactly the in-data leftovers; the
     // outside-data stray and every referenced file stay.

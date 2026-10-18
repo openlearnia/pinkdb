@@ -61,7 +61,7 @@
 
 use std::any::Any;
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -69,6 +69,7 @@ use rayon::prelude::*;
 
 use pinkdb::{ColumnStats, DataChunk, DataTable, DataType, PinkDb, Value, Vector, VectorData};
 use serde::{Deserialize, Serialize};
+use vortex::VortexSessionDefault;
 use vortex::array::arrays::bool::BoolArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{BoolArray, PrimitiveArray, StructArray, VarBinViewArray};
@@ -80,14 +81,13 @@ use vortex::dtype::{DType, FieldNames, Nullability, PType, StructFields};
 use vortex::expr::stats::{Precision, Stat};
 use vortex::expr::{root, select};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
-use vortex::io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex::io::runtime::BlockingRuntime;
+use vortex::io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::ScalarValue;
 use vortex::session::VortexSession;
-use vortex::VortexSessionDefault;
 
-use crate::{empty_single_table_store, LakeError, Result};
+use crate::{LakeError, Result, empty_single_table_store};
 
 /// The user metadata segment key holding the table identity + pinkdb schema.
 pub(crate) const TABLE_METADATA_KEY: &str = "pinkdb.table";
@@ -1380,10 +1380,10 @@ fn bits_from_words(words: &[u64], len: usize) -> BitBuffer {
     bytes.truncate(len.div_ceil(8));
     // Bits past `len` in the last byte are outside the view; clear them so
     // the buffer is canonical regardless of the engine's spare bits.
-    if !len.is_multiple_of(8) {
-        if let Some(last) = bytes.last_mut() {
-            *last &= (1u8 << (len % 8)) - 1;
-        }
+    if !len.is_multiple_of(8)
+        && let Some(last) = bytes.last_mut()
+    {
+        *last &= (1u8 << (len % 8)) - 1;
     }
     BitBuffer::new(ByteBuffer::from(bytes), len)
 }
@@ -1430,7 +1430,7 @@ fn encode_column(
         (dtype, _data) => {
             return Err(LakeError::Internal {
                 message: format!("column dtype {dtype:?} does not match its data layout"),
-            })
+            });
         }
     };
     Ok(array)
@@ -1513,11 +1513,11 @@ fn decode_column(
                 }
                 let key = view.as_u128();
                 let slot = intern_slot(key);
-                if let Some((k, s)) = &cache[slot] {
-                    if *k == key {
-                        out.push(std::sync::Arc::clone(s));
-                        continue;
-                    }
+                if let Some((k, s)) = &cache[slot]
+                    && *k == key
+                {
+                    out.push(std::sync::Arc::clone(s));
+                    continue;
                 }
                 let bytes = values.bytes_at(i);
                 let s = std::str::from_utf8(bytes.as_slice()).map_err(|e| {
@@ -1643,7 +1643,7 @@ fn var_bin_values(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pinkdb::{PinkDb, Value, CHUNK_SIZE};
+    use pinkdb::{CHUNK_SIZE, PinkDb, Value};
 
     /// Fresh-temp-dir counter for the footer tests.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1857,11 +1857,11 @@ mod tests {
                 for bit in [7u32, 0u32] {
                     let mut b = bytes.clone();
                     b[pos] ^= 1 << bit;
-                    if let Err(e) = decode_table(Path::new("victim.vortex"), &b) {
-                        if e.to_string().contains("decoder panic caught") {
-                            found = Some((pos, bit, e));
-                            break;
-                        }
+                    if let Err(e) = decode_table(Path::new("victim.vortex"), &b)
+                        && e.to_string().contains("decoder panic caught")
+                    {
+                        found = Some((pos, bit, e));
+                        break;
                     }
                 }
                 if found.is_some() {

@@ -8,12 +8,12 @@
 use crate::types::FastMap;
 use crate::types::FastSet;
 
-use super::expr::eval_expr;
 use super::Cx;
+use super::expr::eval_expr;
 use crate::plan::{compare_values, num_cmp};
 use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr};
-use crate::types::{decimal_fits, DataType, PinkDbError, Result, Value};
-use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
+use crate::types::{DataType, PinkDbError, Result, Value, decimal_fits};
+use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 use rayon::prelude::*;
 
 pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
@@ -296,13 +296,13 @@ impl Acc {
         }
         // DECIMAL cells feed SUM/AVG through the exact i128 path; MIN/MAX and
         // COUNT(DISTINCT) use the generic compare/encode arms below.
-        if let VectorData::Decimal { values, scale, .. } = v.data() {
-            if matches!(
+        if let VectorData::Decimal { values, scale, .. } = v.data()
+            && matches!(
                 self,
                 Acc::SumInt { .. } | Acc::SumDecimal { .. } | Acc::Avg { .. }
-            ) {
-                return self.add_decimal(values[i], *scale);
-            }
+            )
+        {
+            return self.add_decimal(values[i], *scale);
         }
         match self {
             // `update(Some(_))` increments for every non-NULL payload.
@@ -916,16 +916,17 @@ pub(crate) fn aggregate(
     // Fast path: a single integer/date/timestamp key with no aggregates is
     // just DISTINCT over that column. Use a FastSet directly instead of the
     // full group machinery (no per-group allocations, no encode/clone).
-    if keys.len() == 1 && aggs.is_empty() {
-        if let BoundExpr::Column { index, dtype } = &keys[0] {
-            let idx = *index;
-            let is_int_key = matches!(
-                dtype,
-                DataType::Integer | DataType::Bigint | DataType::Date | DataType::Timestamp
-            );
-            if is_int_key {
-                return fast_distinct_int(cx, inputs, idx, *dtype);
-            }
+    if keys.len() == 1
+        && aggs.is_empty()
+        && let BoundExpr::Column { index, dtype } = &keys[0]
+    {
+        let idx = *index;
+        let is_int_key = matches!(
+            dtype,
+            DataType::Integer | DataType::Bigint | DataType::Date | DataType::Timestamp
+        );
+        if is_int_key {
+            return fast_distinct_int(cx, inputs, idx, *dtype);
         }
     }
     // Phase 1: per-chunk partials in parallel.

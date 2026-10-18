@@ -568,8 +568,8 @@ impl PinkDb {
 mod tests {
     use super::*;
     use crate::types::PinkDbError;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     /// A fake attached lake over in-memory data: descriptors are given, loads
     /// are counted, and the loaded table is built from the descriptor's
@@ -1568,11 +1568,7 @@ mod tests {
         let rules = |v: Value, i: usize| -> Value {
             // Make `n` all-NULL and `i` never NULL: NULL and non-NULL shapes
             // for COUNT(col).
-            if i == 7 {
-                Value::Null
-            } else {
-                v
-            }
+            if i == 7 { Value::Null } else { v }
         };
         let rows: Vec<Vec<Value>> = rows
             .into_iter()

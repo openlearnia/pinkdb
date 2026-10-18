@@ -42,9 +42,9 @@ pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};
-pub use vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
+pub use vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 pub use wal::{
-    DurableOpenOptions, LockMode, RecoveryInfo, SyncPolicy, DEFAULT_AUTO_CHECKPOINT_BYTES,
+    DEFAULT_AUTO_CHECKPOINT_BYTES, DurableOpenOptions, LockMode, RecoveryInfo, SyncPolicy,
 };
 
 impl PinkDb {
@@ -124,12 +124,12 @@ impl PinkDb {
             // commit of the multi-writer path: refuse inside a txn.
             // (LOAD EXTENSION is process-level too: the private snapshot's
             // registry would be discarded at COMMIT/ROLLBACK.)
-            if self.in_transaction() {
-                if let Some(stmt) = plan::refused_in_transaction(&plan) {
-                    return Err(types::PinkDbError::Execution(format!(
-                        "{stmt} is not allowed inside a transaction"
-                    )));
-                }
+            if self.in_transaction()
+                && let Some(stmt) = plan::refused_in_transaction(&plan)
+            {
+                return Err(types::PinkDbError::Execution(format!(
+                    "{stmt} is not allowed inside a transaction"
+                )));
             }
             // A durable store logs mutating statements: one that reads an
             // attached lake table could never replay (the table is

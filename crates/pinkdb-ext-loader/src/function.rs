@@ -11,8 +11,8 @@ use std::fmt;
 use std::slice;
 use std::sync::Arc;
 
-use crate::abi::{ExtArg, ExtType, ExtValue, PinkdbExtScalarFn, PinkdbExtValue};
 use crate::ExtError;
+use crate::abi::{ExtArg, ExtType, ExtValue, PinkdbExtScalarFn, PinkdbExtValue};
 
 /// One scalar function provided by a loaded extension.
 ///

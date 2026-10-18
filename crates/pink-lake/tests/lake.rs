@@ -10,11 +10,11 @@
 mod common;
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{save_store, validate_store, Lake, LakeError, FORMAT_VERSION};
-use pinkdb::{DataTable, DataType, PinkDb, Value, Vector, CHUNK_SIZE};
+use pink_lake::{FORMAT_VERSION, Lake, LakeError, save_store, validate_store};
+use pinkdb::{CHUNK_SIZE, DataTable, DataType, PinkDb, Value, Vector};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -263,9 +263,11 @@ fn snapshot_roundtrip_is_bit_exact() {
     assert!(dir.join("snapshots/1.json").is_file());
     assert!(dir.join("snapshots/2.json").is_file());
     assert_eq!(data_files(&dir.join("data")).len(), 5);
-    assert!(data_files(&dir.join("data"))
-        .iter()
-        .all(|p| p.extension().unwrap() == "vortex"));
+    assert!(
+        data_files(&dir.join("data"))
+            .iter()
+            .all(|p| p.extension().unwrap() == "vortex")
+    );
 
     // Latest load is value- and byte-exact.
     let loaded = lake.load(None).unwrap();
@@ -552,11 +554,12 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
         }),
     );
     let lake = Lake::open(&dir).unwrap();
-    assert!(lake
-        .load(None)
-        .unwrap_err()
-        .to_string()
-        .contains("no data files"));
+    assert!(
+        lake.load(None)
+            .unwrap_err()
+            .to_string()
+            .contains("no data files")
+    );
 
     // A snapshot whose declared version disagrees with its file name.
     let mut wrong = read_json(&dir.join("catalog.json"));
@@ -1144,9 +1147,11 @@ fn missing_data_files_are_reported_but_metadata_still_reads() {
     let missing = lake.missing_data_files().unwrap();
     assert_eq!(missing.len(), 1);
     assert_eq!(missing[0].0, "main.t");
-    assert!(missing[0]
-        .1
-        .ends_with(victim.file_name().unwrap().to_str().unwrap()));
+    assert!(
+        missing[0]
+            .1
+            .ends_with(victim.file_name().unwrap().to_str().unwrap())
+    );
     // Metadata still reads; only a load fails, and it says why.
     assert!(lake.tables().unwrap().iter().any(|(k, _)| k == "main.t"));
     let err = lake.load(None).unwrap_err().to_string();

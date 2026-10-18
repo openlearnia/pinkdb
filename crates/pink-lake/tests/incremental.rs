@@ -10,11 +10,11 @@
 //! the commit semantics — is identical.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pink_lake::{
-    save_store, Commit, CommitSettings, Lake, LakeError, WritableAttachment, FORMAT_VERSION,
+    Commit, CommitSettings, FORMAT_VERSION, Lake, LakeError, WritableAttachment, save_store,
 };
 use pinkdb::{DataTable, PinkDb, Value};
 
@@ -249,10 +249,12 @@ fn commit_appends_without_rewriting_and_the_manifest_records_the_ranges() {
     assert_eq!(files[0]["path"], old_file.as_str(), "{entry}");
     assert_eq!(files[0]["rows"], 1000, "{entry}");
     assert_eq!(files[1]["rows"], 5, "{entry}");
-    assert!(files[1]["path"]
-        .as_str()
-        .unwrap()
-        .ends_with(&format!(".{EXT}")));
+    assert!(
+        files[1]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!(".{EXT}"))
+    );
     assert_eq!(entry["rows"], 1005, "{entry}");
     assert!(entry["deletes"].is_null(), "no deletes yet: {entry}");
 
@@ -882,11 +884,11 @@ fn multi_file_attach_merges_stats_and_gates_on_deletes() {
 
     // Now a delete: rows stay exact, per-column facts become unknowable and
     // the affected queries fall back to a materialization.
-    let data_file = read_json(&lake_dir.join("catalog.json"))["tables"]["main.t"]["files"][0]
-        ["path"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let data_file =
+        read_json(&lake_dir.join("catalog.json"))["tables"]["main.t"]["files"][0]["path"]
+            .as_str()
+            .unwrap()
+            .to_string();
     let mut commit = Commit::new();
     commit.delete_positions("main.t", &data_file, &[0]);
     lake.commit(&commit).unwrap();

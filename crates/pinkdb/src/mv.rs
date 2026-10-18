@@ -498,9 +498,9 @@ pub(crate) fn rebind_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::QueryResult;
     use crate::types::Value;
     use crate::wal::SyncPolicy;
-    use crate::QueryResult;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 

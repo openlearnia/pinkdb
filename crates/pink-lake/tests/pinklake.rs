@@ -21,7 +21,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{save_store, Lake, LakeError, FORMAT_VERSION};
+use pink_lake::{FORMAT_VERSION, Lake, LakeError, save_store};
 use pinkdb::{PinkDb, Value};
 
 #[cfg(feature = "s3")]

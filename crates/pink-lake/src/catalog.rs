@@ -518,8 +518,8 @@ impl ColumnEntry {
                     Some(crate::stats::encode_value(dtype, v).ok_or_else(|| {
                         LakeError::Internal {
                             message: format!(
-                            "column \"{name}\": default {v:?} does not match its {dtype:?} type"
-                        ),
+                                "column \"{name}\": default {v:?} does not match its {dtype:?} type"
+                            ),
                         }
                     })?)
                 }

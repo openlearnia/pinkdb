@@ -1830,8 +1830,8 @@ peg::parser! {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ast::*;
     use super::super::MAX_NESTING_DEPTH;
+    use super::super::ast::*;
     use super::parse_statements as parse;
     use crate::types::{PinkDbError, Value};
 

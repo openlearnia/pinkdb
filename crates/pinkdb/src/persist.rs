@@ -93,7 +93,7 @@ use crate::storage::{
     Column, DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
-use crate::vector::{Vector, VectorData, CHUNK_SIZE};
+use crate::vector::{CHUNK_SIZE, Vector, VectorData};
 
 const MAGIC: &[u8; 8] = b"PINKDB01";
 /// Version 2 adds the database dimension: one file holds every database.
@@ -260,23 +260,21 @@ impl ColumnStatsAcc {
     fn merge(&mut self, chunk: &ChunkColumnStats) {
         self.null_count += chunk.null_count;
         self.nan_count += chunk.nan_count;
-        if let Some(v) = &chunk.min {
-            if self
+        if let Some(v) = &chunk.min
+            && self
                 .min
                 .as_ref()
                 .is_none_or(|m| crate::plan::compare_values(v, m).is_lt())
-            {
-                self.min = Some(v.clone());
-            }
+        {
+            self.min = Some(v.clone());
         }
-        if let Some(v) = &chunk.max {
-            if self
+        if let Some(v) = &chunk.max
+            && self
                 .max
                 .as_ref()
                 .is_none_or(|m| crate::plan::compare_values(v, m).is_gt())
-            {
-                self.max = Some(v.clone());
-            }
+        {
+            self.max = Some(v.clone());
         }
     }
 }
@@ -2946,7 +2944,7 @@ fn read_defaults(r: &mut Reader, n_cols: usize) -> Result<Vec<Option<Value>>> {
             other => {
                 return Err(PinkDbError::Execution(format!(
                     "corrupt file: unknown default value tag {other}"
-                )))
+                )));
             }
         };
         out.push(Some(v));
@@ -3096,12 +3094,12 @@ fn load_table(
     let defaults = if defaults {
         let decoded = read_defaults(r, n_cols)?;
         for ((name, dtype), d) in schema.iter().zip(decoded.iter()) {
-            if let Some(v) = d {
-                if !default_matches(v, *dtype) {
-                    return r.err(&format!(
-                        "default value of column \"{name}\" does not match its type"
-                    ));
-                }
+            if let Some(v) = d
+                && !default_matches(v, *dtype)
+            {
+                return r.err(&format!(
+                    "default value of column \"{name}\" does not match its type"
+                ));
             }
         }
         decoded
@@ -3964,10 +3962,10 @@ mod tests {
         for i in 8..v2.len().saturating_sub(3) {
             let mut bad = v2.clone();
             bad[i..i + 4].copy_from_slice(&u32::MAX.to_le_bytes());
-            if let Err(e) = PinkDb::load_bytes(&bad) {
-                if e.to_string().contains("exceeds the chunk size") {
-                    capped += 1;
-                }
+            if let Err(e) = PinkDb::load_bytes(&bad)
+                && e.to_string().contains("exceeds the chunk size")
+            {
+                capped += 1;
             }
         }
         assert!(
@@ -4495,33 +4493,41 @@ mod tests {
         // e > 18.
         let mut bad = payload.clone();
         bad[4] = 19;
-        assert!(decode(&frame(&bad))
-            .unwrap_err()
-            .to_string()
-            .contains("exponent"));
+        assert!(
+            decode(&frame(&bad))
+                .unwrap_err()
+                .to_string()
+                .contains("exponent")
+        );
         // Reserved int_codec.
         let mut bad = payload.clone();
         bad[5] = 1;
-        assert!(decode(&frame(&bad))
-            .unwrap_err()
-            .to_string()
-            .contains("integer codec"));
+        assert!(
+            decode(&frame(&bad))
+                .unwrap_err()
+                .to_string()
+                .contains("integer codec")
+        );
         // width > 64: byte 4 + 1 + 1 + 8 = 14.
         let mut bad = payload.clone();
         bad[14] = 65;
-        assert!(decode(&frame(&bad))
-            .unwrap_err()
-            .to_string()
-            .contains("width"));
+        assert!(
+            decode(&frame(&bad))
+                .unwrap_err()
+                .to_string()
+                .contains("width")
+        );
         // exception_count > n (the u32 right after the packed codes).
         let width = payload[14] as usize;
         let ex_at = 15 + (3 * width).div_ceil(8);
         let mut bad = payload.clone();
         bad[ex_at..ex_at + 4].copy_from_slice(&9u32.to_le_bytes());
-        assert!(decode(&frame(&bad))
-            .unwrap_err()
-            .to_string()
-            .contains("exception count exceeds"));
+        assert!(
+            decode(&frame(&bad))
+                .unwrap_err()
+                .to_string()
+                .contains("exception count exceeds")
+        );
         // Exception row out of range and non-increasing rows.
         let with_ex: Vec<Value> = vec![
             Value::Double(f64::NAN),
@@ -4533,16 +4539,20 @@ mod tests {
         let rows_at = payload.len() - 2 * 12;
         let mut bad = payload.clone();
         bad[rows_at..rows_at + 4].copy_from_slice(&7u32.to_le_bytes());
-        assert!(decode(&frame(&bad))
-            .unwrap_err()
-            .to_string()
-            .contains("row out of range"));
+        assert!(
+            decode(&frame(&bad))
+                .unwrap_err()
+                .to_string()
+                .contains("row out of range")
+        );
         let mut bad = payload.clone();
         bad[rows_at + 12..rows_at + 16].copy_from_slice(&0u32.to_le_bytes());
-        assert!(decode(&frame(&bad))
-            .unwrap_err()
-            .to_string()
-            .contains("strictly increasing"));
+        assert!(
+            decode(&frame(&bad))
+                .unwrap_err()
+                .to_string()
+                .contains("strictly increasing")
+        );
     }
 
     /// S4: a chunk with no NULLs stores no validity bytes at all, and the
@@ -5631,11 +5641,12 @@ mod tests {
         let bytes = db.to_bytes().unwrap();
         let mut back = PinkDb::load_bytes(&bytes).unwrap();
         assert_eq!(back.to_bytes().unwrap(), bytes, "broken defs round-trip");
-        assert!(back
-            .materialized_view_in("main", "mv")
-            .unwrap()
-            .query
-            .is_none());
+        assert!(
+            back.materialized_view_in("main", "mv")
+                .unwrap()
+                .query
+                .is_none()
+        );
         assert_eq!(ints(&mut back, "SELECT a FROM mv;"), vec![1], "data kept");
         let err = back.execute("REFRESH MATERIALIZED VIEW mv;").unwrap_err();
         assert!(err.to_string().contains("t"), "{err}");

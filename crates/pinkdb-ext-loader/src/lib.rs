@@ -37,19 +37,19 @@ mod abi;
 mod function;
 mod host;
 
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 use std::fmt;
 use std::sync::Arc;
 
 pub use abi::{
-    ExtArg, ExtType, ExtValue, PinkdbExtAbiVersionFn, PinkdbExtInitFn, PinkdbExtNameFn,
-    PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS,
-    PINKDB_EXT_TYPE_BIGINT, PINKDB_EXT_TYPE_BOOLEAN, PINKDB_EXT_TYPE_DATE, PINKDB_EXT_TYPE_DOUBLE,
-    PINKDB_EXT_TYPE_INTEGER, PINKDB_EXT_TYPE_NULL, PINKDB_EXT_TYPE_TIMESTAMP,
-    PINKDB_EXT_TYPE_VARCHAR,
+    ExtArg, ExtType, ExtValue, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS, PINKDB_EXT_TYPE_BIGINT,
+    PINKDB_EXT_TYPE_BOOLEAN, PINKDB_EXT_TYPE_DATE, PINKDB_EXT_TYPE_DOUBLE, PINKDB_EXT_TYPE_INTEGER,
+    PINKDB_EXT_TYPE_NULL, PINKDB_EXT_TYPE_TIMESTAMP, PINKDB_EXT_TYPE_VARCHAR,
+    PinkdbExtAbiVersionFn, PinkdbExtInitFn, PinkdbExtNameFn, PinkdbExtScalarFn, PinkdbExtValue,
+    PinkdbHostApi,
 };
 pub use function::DynamicFunction;
-pub use host::{text_allocation_stats, TextAllocStats};
+pub use host::{TextAllocStats, text_allocation_stats};
 
 /// Everything that can go wrong loading or calling an extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +96,11 @@ impl fmt::Display for ExtError {
                 f,
                 "extension \"{path}\" does not export \"{symbol}\" (not a pinkdb extension, or built against another ABI)"
             ),
-            ExtError::AbiVersion { path, extension, host } => write!(
+            ExtError::AbiVersion {
+                path,
+                extension,
+                host,
+            } => write!(
                 f,
                 "extension \"{path}\" uses ABI version {extension}, host supports version {host}"
             ),
@@ -110,10 +114,9 @@ impl fmt::Display for ExtError {
             ExtError::Registration { message } => {
                 write!(f, "extension registration failed: {message}")
             }
-            ExtError::Callback { function, code } => write!(
-                f,
-                "extension function {function}() failed with code {code}"
-            ),
+            ExtError::Callback { function, code } => {
+                write!(f, "extension function {function}() failed with code {code}")
+            }
             ExtError::BadResult { function, message } => write!(
                 f,
                 "extension function {function}() returned an invalid result: {message}"

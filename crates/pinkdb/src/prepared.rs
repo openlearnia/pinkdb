@@ -58,11 +58,11 @@
 //! identically; only the SQL text the WAL records differs (it carries the
 //! values, not the placeholders).
 
+use crate::QueryResult;
 use crate::sql::ast;
-use crate::sql::binder::{bind_tracked_with, ParamSlots};
+use crate::sql::binder::{ParamSlots, bind_tracked_with};
 use crate::storage::PinkDb;
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::QueryResult;
 
 /// A parsed, reusable single SQL statement with `?` placeholders.
 ///
@@ -143,7 +143,7 @@ impl PreparedStatement {
                     return Err(PinkDbError::Parameter(format!(
                         "internal error: parameter {} did not bind",
                         i + 1
-                    )))
+                    )));
                 }
             }
         }

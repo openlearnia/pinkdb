@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{save_store, CommitSettings, Lake, WritableAttachment};
+use pink_lake::{CommitSettings, Lake, WritableAttachment, save_store};
 use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -158,11 +158,13 @@ fn add_column_with_default_reads_back_on_old_files() {
         .collect();
     assert_eq!(versions, vec![1, 2], "{e}");
     // The data-file extension is whatever this build writes.
-    assert!(e["files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|f| f["path"].as_str().unwrap().ends_with(&format!(".{EXT}"))));
+    assert!(
+        e["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["path"].as_str().unwrap().ends_with(&format!(".{EXT}")))
+    );
     cleanup(&dir);
 }
 
@@ -252,11 +254,13 @@ fn rename_column_projects_old_files_and_time_travel_sees_the_old_name() {
     assert_eq!(e["renames"][0]["version"], 2);
     assert_eq!(e["renames"][0]["from"], "s");
     assert_eq!(e["renames"][0]["to"], "label");
-    assert!(e["columns"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|c| c["name"] != "s"));
+    assert!(
+        e["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["name"] != "s")
+    );
 
     // Time travel: the old version still reads the old name.
     let report = lake.attach(None).unwrap();
@@ -798,8 +802,10 @@ fn time_travel_reads_each_versions_own_schema_and_rows() {
         ]
     );
     // Columns that never existed at a version are still clean errors.
-    assert!(attached
-        .execute(&format!("SELECT n FROM t AT (VERSION => {v1});"))
-        .is_err());
+    assert!(
+        attached
+            .execute(&format!("SELECT n FROM t AT (VERSION => {v1});"))
+            .is_err()
+    );
     cleanup(&dir);
 }

@@ -1,7 +1,7 @@
 //! Integration tests for the C ABI: durable open through a real file, full
 //! value fidelity, and ownership loops.
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 
 use pinkdb_ffi::*;

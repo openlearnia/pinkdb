@@ -70,8 +70,8 @@ use crate::catalog::{
 use crate::local::CATALOG_FILE;
 use crate::storage::Head;
 use crate::{
-    delete_file, manifest_for, only_table, split_key, validate_rel_path, Lake, LakeError, Result,
-    FORMAT_VERSION,
+    FORMAT_VERSION, Lake, LakeError, Result, delete_file, manifest_for, only_table, split_key,
+    validate_rel_path,
 };
 
 /// DuckLake-compatible retry controls for a lake commit (`ducklake_max_retry_count`,
@@ -857,17 +857,13 @@ fn rebuild_logical(
     } else {
         Some(sub_table(current, &diff.appended)?)
     };
-    if !appended_inlined {
-        if let Some(rows) = &appended {
-            crate::copy_chunks(rows, &mut out, "the appended rows")?;
-        }
+    if !appended_inlined && let Some(rows) = &appended {
+        crate::copy_chunks(rows, &mut out, "the appended rows")?;
     }
     let inlined_part = sub_table(&base, &kept_inlined)?;
     crate::copy_chunks(&inlined_part, &mut out, "the inlined rows")?;
-    if appended_inlined {
-        if let Some(rows) = &appended {
-            crate::copy_chunks(rows, &mut out, "the appended rows")?;
-        }
+    if appended_inlined && let Some(rows) = &appended {
+        crate::copy_chunks(rows, &mut out, "the appended rows")?;
     }
     Ok(out)
 }
@@ -1178,7 +1174,7 @@ pub(crate) fn entry_layout(
                          among several; incremental commits need a format_version 4 entry",
                         file.path()
                     ),
-                })
+                });
             }
         };
         out.push((file.path().to_string(), rows, Vec::new()));
@@ -1916,13 +1912,13 @@ impl Lake {
                                     self.storage.abs("").display()
                                 ),
                             ),
-                        })
+                        });
                     }
                     Head::NotAFile => {
                         return Err(LakeError::Corrupt {
                             path: self.storage.abs(rel),
                             message: "the registered path is not a regular file".to_string(),
-                        })
+                        });
                     }
                 }
                 let mini =
@@ -1977,7 +1973,7 @@ impl Lake {
                                      as {:?}, but table \"{table}\" records {:?}",
                                     physical[idx].1, col.dtype
                                 ),
-                            })
+                            });
                         }
                         None => {
                             return Err(LakeError::NotRepresentable {
@@ -1988,7 +1984,7 @@ impl Lake {
                                      — re-save the store to publish a complete file)",
                                     col.name
                                 ),
-                            })
+                            });
                         }
                     }
                 }
@@ -2578,8 +2574,8 @@ impl Lake {
                 let path = self.storage.abs(&dref.path);
                 delete_file::validate_bounds(pos, file_rows, &dref.file, &path)
                     .map_err(PublishFailure::Fatal)?; // Positions already deleted by the head's own delete files
-                                                      // would double-drop rows (and break the row-count invariant):
-                                                      // refuse, never publish a manifest that lies about its rows.
+                // would double-drop rows (and break the row-count invariant):
+                // refuse, never publish a manifest that lies about its rows.
                 for existing in entry.deletes.iter().filter(|d| d.file == dref.file) {
                     let epath = self.storage.abs(&existing.path);
                     let bytes = self

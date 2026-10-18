@@ -23,10 +23,10 @@
 //!   `ignore_extra_columns`).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{save_store, ChangeKind, Commit, CommitSettings, Lake, WritableAttachment};
+use pink_lake::{ChangeKind, Commit, CommitSettings, Lake, WritableAttachment, save_store};
 use pinkdb::{DataTable, PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -607,9 +607,11 @@ fn change_data_renders_insertions_deletions_and_changes() {
     // flushed file's rows are NOT re-reported.
     let insertions = lake.table_insertions("main.t", 1, None).unwrap();
     assert_eq!(insertions.len(), 15, "{insertions:?}");
-    assert!(insertions
-        .iter()
-        .all(|r| r.change_type == ChangeKind::Insert));
+    assert!(
+        insertions
+            .iter()
+            .all(|r| r.change_type == ChangeKind::Insert)
+    );
     let at = |version: u64| -> Vec<(Option<u64>, i32)> {
         insertions
             .iter()
@@ -1294,10 +1296,12 @@ fn registered_files_join_inlined_only_tables() {
 
     let mut lake = Lake::create(&lake_dir).unwrap();
     append(&mut lake, &[(1, Some("a"))]);
-    assert!(entry(&lake_dir, "main.t")["files"]
-        .as_array()
-        .map(Vec::is_empty)
-        .unwrap_or(true));
+    assert!(
+        entry(&lake_dir, "main.t")["files"]
+            .as_array()
+            .map(Vec::is_empty)
+            .unwrap_or(true)
+    );
     let rel = format!("data/main.t/registered.{EXT}");
     write_lake_file(&lake_dir, &rel, &bytes);
     lake.add_data_files("main.t", &[rel]).unwrap();

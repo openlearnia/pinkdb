@@ -867,11 +867,7 @@ pub fn interval_div(iv: Interval, f: f64) -> Option<Interval> {
 }
 
 fn plural(n: i64) -> &'static str {
-    if n == 1 || n == -1 {
-        ""
-    } else {
-        "s"
-    }
+    if n == 1 || n == -1 { "" } else { "s" }
 }
 
 /// `HH:MM:SS[.ffffff]` with trailing fraction zeros trimmed; hours may run

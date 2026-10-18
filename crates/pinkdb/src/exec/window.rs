@@ -15,9 +15,9 @@
 use crate::types::FastMap;
 use std::cmp::Ordering;
 
-use super::aggregate::EvalVec as FusedVec;
-use super::aggregate::{eval_agg_vec, Acc};
 use super::Cx;
+use super::aggregate::EvalVec as FusedVec;
+use super::aggregate::{Acc, eval_agg_vec};
 use crate::plan::compare_values;
 use crate::sql::ast::{FrameMode, SortSpec};
 use crate::sql::binder::{BoundWindow, FrameBound, WindowFunc};
@@ -419,11 +419,7 @@ fn seq_cmp(a: &Value, b: &Value, spec: &SortSpec) -> Ordering {
         }
         (false, false) => {
             let c = compare_values(a, b);
-            if spec.desc {
-                c.reverse()
-            } else {
-                c
-            }
+            if spec.desc { c.reverse() } else { c }
         }
     }
 }
@@ -478,11 +474,7 @@ fn rows_frame(
         Following(k) => pos.saturating_add(k).min(len - 1),
         UnboundedFollowing => len - 1,
     };
-    if lo > hi {
-        None
-    } else {
-        Some((lo, hi))
-    }
+    if lo > hi { None } else { Some((lo, hi)) }
 }
 
 /// RANGE frames: bounds are positions of ORDER BY *values*. Peers (equal
@@ -579,11 +571,7 @@ fn range_frame(
         }
         UnboundedFollowing => len - 1,
     };
-    if lo > hi {
-        None
-    } else {
-        Some((lo, hi))
-    }
+    if lo > hi { None } else { Some((lo, hi)) }
 }
 
 /// The window's first ORDER BY value for one row.

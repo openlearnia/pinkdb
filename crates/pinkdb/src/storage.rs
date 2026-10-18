@@ -13,7 +13,7 @@ use pinkdb_ext_loader::{DynamicFunction, LoadedExtension};
 use crate::crypto::EncryptionKey;
 use crate::sql::ast::Select;
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::vector::{DataChunk, Vector, CHUNK_SIZE};
+use crate::vector::{CHUNK_SIZE, DataChunk, Vector};
 use crate::wal::Wal;
 
 /// Next store-unique table version stamp (see [`DataTable::version`]).
@@ -1627,15 +1627,13 @@ impl PinkDb {
         // passed, so a conflict leaves the (aborted) transaction's changes
         // only in the snapshot being discarded. Read-only transactions (no
         // buffered record) log nothing and never conflict.
-        if writes {
-            if let (Some(g), Some(base)) = (lease.as_ref(), self.txn_base.as_ref()) {
-                let position = base.position();
-                let mut touched = self.txn_touched.clone();
-                touched.canonicalize();
-                if let Some(conflict) = self.optimistic_commit_check(g, &position, &touched)? {
-                    self.rollback()?;
-                    return Err(PinkDbError::Execution(conflict.message("transaction")));
-                }
+        if writes && let (Some(g), Some(base)) = (lease.as_ref(), self.txn_base.as_ref()) {
+            let position = base.position();
+            let mut touched = self.txn_touched.clone();
+            touched.canonicalize();
+            if let Some(conflict) = self.optimistic_commit_check(g, &position, &touched)? {
+                self.rollback()?;
+                return Err(PinkDbError::Execution(conflict.message("transaction")));
             }
         }
         if writes {

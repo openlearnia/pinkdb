@@ -138,10 +138,9 @@ fn is_safe_component(v: &str) -> bool {
     if let Some(digit) = stem
         .strip_prefix("COM")
         .or_else(|| stem.strip_prefix("LPT"))
+        && matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
     {
-        if matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") {
-            return false;
-        }
+        return false;
     }
     true
 }

@@ -20,7 +20,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use ureq::Agent;
 
-use super::catalog::{lookup, Catalog, Entry, Lookup, ABI_VERSION};
+use super::catalog::{ABI_VERSION, Catalog, Entry, Lookup, lookup};
 use super::config::extensions_dir;
 
 /// Catalog size cap (a catalog is a small JSON document).
@@ -40,7 +40,7 @@ pub fn platform_tag() -> Result<String, String> {
         other => {
             return Err(format!(
                 "this platform is not supported by the extension repository: os {other:?}"
-            ))
+            ));
         }
     };
     let arch = match std::env::consts::ARCH {
@@ -49,7 +49,7 @@ pub fn platform_tag() -> Result<String, String> {
         other => {
             return Err(format!(
                 "this platform is not supported by the extension repository: architecture {other:?}"
-            ))
+            ));
         }
     };
     Ok(format!("{os}-{arch}"))
@@ -183,14 +183,13 @@ fn ensure_artifact(
     entry: &Entry,
     dest: &Path,
 ) -> Result<(String, bool), String> {
-    if dest.is_file() {
-        if let Ok(sha) = sha256_file(dest) {
-            if sha == entry.sha256 {
-                return Ok((sha, false));
-            }
-        }
-        // A cached file that does not match the catalog is replaced below.
+    if dest.is_file()
+        && let Ok(sha) = sha256_file(dest)
+        && sha == entry.sha256
+    {
+        return Ok((sha, false));
     }
+    // A cached file that does not match the catalog is replaced below.
     let url = format!("{base}/{}", entry.file);
     let mut response = agent
         .get(&url)

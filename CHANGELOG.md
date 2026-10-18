@@ -10,6 +10,14 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 82 — Rust toolchain upgrade ✅
+- All crates now require **Rust 1.97** and compile as **edition 2024**; CI's
+  MSRV job pins 1.97 (was 1.89 core / 1.95 pink-lake), and the wasm check
+  passes again.
+- Modernized the code where the new edition/compiler asks for it — let-chains
+  (~60 collapsed conditionals), `unsafe(...)` attribute syntax, reserved
+  `gen` renames — with semantics unchanged (duckdiff still 171/171).
+
 ### Wave 44 — stored procedures ✅
 - **SQL procedures**: `CREATE [OR REPLACE] PROCEDURE p(a INTEGER, …) AS $$ … $$`
   (typed `DECLARE`/`SET`, `IF/ELSIF/ELSE`, `WHILE`, nested blocks, `RETURN`,

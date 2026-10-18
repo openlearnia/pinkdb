@@ -19,7 +19,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 
 use pinkdb::{DataType, QueryResult, Value};
 
-use crate::protocol::{self, DoneKind, ProtocolError, Request, Response, PROTOCOL_VERSION};
+use crate::protocol::{self, DoneKind, PROTOCOL_VERSION, ProtocolError, Request, Response};
 
 /// Everything [`Client`] can fail with.
 #[derive(Debug)]
@@ -345,10 +345,10 @@ impl Client {
     /// result through. A server-reported SQL error is not fatal: the
     /// connection stays usable, exactly like the embedded engine.
     fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
-        if let Err(ClientError::Protocol(e)) = &result {
-            if !matches!(e, ProtocolError::Server(_)) {
-                self.broken = true;
-            }
+        if let Err(ClientError::Protocol(e)) = &result
+            && !matches!(e, ProtocolError::Server(_))
+        {
+            self.broken = true;
         }
         result
     }
@@ -415,7 +415,7 @@ fn build_result(
             return Err(ProtocolError::Malformed(
                 "server sent the reserved Done kind Other".to_string(),
             )
-            .into())
+            .into());
         }
         DoneKind::Selected => unreachable!("Selected returned above"),
         DoneKind::Called => unreachable!("Called returned above"),

@@ -152,10 +152,10 @@ pub(crate) fn zone_for_predicate(
             if !key.column.eq_ignore_ascii_case(name) {
                 continue;
             }
-            if let Some(value) = partition.get(&key.key_text()) {
-                if let Some(zone) = partition_zone(facts.rows, value, *dtype) {
-                    return Some(zone);
-                }
+            if let Some(value) = partition.get(&key.key_text())
+                && let Some(zone) = partition_zone(facts.rows, value, *dtype)
+            {
+                return Some(zone);
             }
         }
     }
@@ -233,15 +233,15 @@ pub(crate) fn zone_prunes(
             if all_null {
                 return true;
             }
-            if let Some(min) = &zone.min {
-                if pinkdb::plan::compare_values(literal, min).is_lt() {
-                    return true;
-                }
+            if let Some(min) = &zone.min
+                && pinkdb::plan::compare_values(literal, min).is_lt()
+            {
+                return true;
             }
-            if let Some(max) = &zone.max {
-                if pinkdb::plan::compare_values(literal, max).is_gt() {
-                    return true;
-                }
+            if let Some(max) = &zone.max
+                && pinkdb::plan::compare_values(literal, max).is_gt()
+            {
+                return true;
             }
             false
         }
@@ -338,13 +338,13 @@ pub(crate) fn cross_check_partition_value(
     match value {
         None => {
             // Every row must be NULL.
-            if let Some(nulls) = zone.null_count {
-                if nulls != rows {
-                    return Err(format!(
-                        "the file is recorded as all-NULL under its partition value, but its \
+            if let Some(nulls) = zone.null_count
+                && nulls != rows
+            {
+                return Err(format!(
+                    "the file is recorded as all-NULL under its partition value, but its \
                          zone map proves {nulls} NULLs in {rows} rows"
-                    ));
-                }
+                ));
             }
             if zone.min.is_some() || zone.max.is_some() {
                 return Err(
@@ -361,22 +361,22 @@ pub(crate) fn cross_check_partition_value(
                     "the recorded partition value {text:?} does not decode as {dtype}"
                 ));
             };
-            if let Some(nulls) = zone.null_count {
-                if nulls != 0 {
-                    return Err(format!(
-                        "the file is recorded under partition value {text:?}, but its zone \
+            if let Some(nulls) = zone.null_count
+                && nulls != 0
+            {
+                return Err(format!(
+                    "the file is recorded under partition value {text:?}, but its zone \
                          map proves {nulls} NULLs"
-                    ));
-                }
+                ));
             }
             for (what, stat) in [("min", &zone.min), ("max", &zone.max)] {
-                if let Some(stat) = stat {
-                    if !pinkdb::plan::compare_values(stat, &v).is_eq() {
-                        return Err(format!(
-                            "the file is recorded under partition value {text:?}, but its \
+                if let Some(stat) = stat
+                    && !pinkdb::plan::compare_values(stat, &v).is_eq()
+                {
+                    return Err(format!(
+                        "the file is recorded under partition value {text:?}, but its \
                              zone map {what} is {stat:?}"
-                        ));
-                    }
+                    ));
                 }
             }
             Ok(())
@@ -543,12 +543,9 @@ mod tests {
         let z = zone(None, None, None);
         assert!(cross_check_partition_value(2, Some(&z), &v(), b).is_ok());
         // Undecodable recorded value.
-        assert!(cross_check_partition_value(
-            2,
-            Some(&z),
-            &Some("nope".to_string()),
-            DataType::Integer
-        )
-        .is_err());
+        assert!(
+            cross_check_partition_value(2, Some(&z), &Some("nope".to_string()), DataType::Integer)
+                .is_err()
+        );
     }
 }

@@ -278,7 +278,7 @@ impl TableSchema {
                              record says {:?} (type changes are not part of this wave)",
                             want, file_schema[i].1, col.dtype
                         ),
-                    })
+                    });
                 }
                 None => {
                     return Err(LakeError::Corrupt {
@@ -287,7 +287,7 @@ impl TableSchema {
                             "data file does not hold column \"{want}\", which the table's \
                              schema record declares at schema version {file_version}"
                         ),
-                    })
+                    });
                 }
             }
         }

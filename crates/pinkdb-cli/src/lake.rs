@@ -707,11 +707,11 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
                 let _ = rows;
             }
             Err(_) => {
-                if !db.database_exists(dbname) {
-                    if let Err(e) = db.create_database(dbname) {
-                        cli_error!("{e}");
-                        return;
-                    }
+                if !db.database_exists(dbname)
+                    && let Err(e) = db.create_database(dbname)
+                {
+                    cli_error!("{e}");
+                    return;
                 }
                 if let Err(e) = db.create_table_in(dbname, table, base_table.schema()) {
                     cli_error!("{e}");
@@ -772,18 +772,18 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
     // session's tables already differ from the pinned version (adopted
     // recovery tables, or edits made before re-attaching), say exactly what
     // that means instead of letting a diff quietly drop rows.
-    if adopted > 0 {
-        if let Some(wa) = writables().get(&key) {
-            let changed = wa.changed_tables(db).unwrap_or_default();
-            if !changed.is_empty() {
-                println!(
-                    "Note: {} session table(s) differ from version {base} ({}); .lake commit \
+    if adopted > 0
+        && let Some(wa) = writables().get(&key)
+    {
+        let changed = wa.changed_tables(db).unwrap_or_default();
+        if !changed.is_empty() {
+            println!(
+                "Note: {} session table(s) differ from version {base} ({}); .lake commit \
                      reconciles the lake to the session's content — rows the lake has and the \
                      session lacks are deleted.",
-                    changed.len(),
-                    changed.join(", ")
-                );
-            }
+                changed.len(),
+                changed.join(", ")
+            );
         }
     }
     println!("  publish changes with .lake commit {dir}");
@@ -828,12 +828,12 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
     // is durable before the lake publishes, so a crash can only lose the
     // publication, never the change (re-running .lake commit after reopen is
     // the recovery, and it is idempotent).
-    if db.is_durable() {
-        if let Err(e) = db.flush_wal() {
-            writables().insert(dir.clone(), wa);
-            cli_error!("could not flush the WAL before committing: {e}");
-            return;
-        }
+    if db.is_durable()
+        && let Err(e) = db.flush_wal()
+    {
+        writables().insert(dir.clone(), wa);
+        cli_error!("could not flush the WAL before committing: {e}");
+        return;
     }
     let settings = commit_settings();
     let t0 = Instant::now();

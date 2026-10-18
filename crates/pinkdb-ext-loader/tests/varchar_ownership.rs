@@ -8,7 +8,7 @@
 mod common;
 
 use pinkdb::{PinkDb, QueryResult, Value};
-use pinkdb_ext_loader::{text_allocation_stats, ExtArg, ExtValue};
+use pinkdb_ext_loader::{ExtArg, ExtValue, text_allocation_stats};
 
 #[test]
 fn varchar_results_are_copied_and_freed_without_leaks() {

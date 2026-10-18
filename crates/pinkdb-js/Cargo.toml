@@ -1,8 +1,8 @@
 [package]
 name = "pinkdb-js"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.89"
+edition = "2024"
+rust-version = "1.97"
 description = "pinkdb: the deterministic JavaScript procedure sandbox (optional `js` feature)"
 license = "MIT"
 

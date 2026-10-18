@@ -138,8 +138,8 @@ use crate::incremental::CommitSettings;
 use crate::local::CATALOG_FILE;
 use crate::snapshot::SnapshotInfo;
 use crate::{
-    apply_file_deletes, copy_chunks, manifest_for, next_schema_version, only_table, split_key,
-    validate_rel_path, Lake, LakeError, Result, FORMAT_VERSION,
+    FORMAT_VERSION, Lake, LakeError, Result, apply_file_deletes, copy_chunks, manifest_for,
+    next_schema_version, only_table, split_key, validate_rel_path,
 };
 
 /// The default object-cleanup retention: `2 days`, exactly DuckLake's
@@ -692,10 +692,10 @@ impl Lake {
         let mut planned = Vec::new();
         let mut bytes_written = 0u64;
         for (key, entry) in &head.tables {
-            if let Some(selected) = table {
-                if key != selected {
-                    continue;
-                }
+            if let Some(selected) = table
+                && key != selected
+            {
+                continue;
             }
             // Only v4/v5 entries: a legacy v1–v3 entry lists one data file
             // without per-file counts, so there is nothing to consolidate
@@ -1180,15 +1180,15 @@ impl Lake {
                         .is_some_and(|(_, table_part)| table_part == selected)
             }
         };
-        if let Some(selected) = table {
-            if !manifest.tables.keys().any(|key| matches(key)) {
-                return Err(LakeError::NotRepresentable {
-                    message: format!(
-                        "table \"{selected}\" does not exist in the listed version ({})",
-                        manifest.version
-                    ),
-                });
-            }
+        if let Some(selected) = table
+            && !manifest.tables.keys().any(|key| matches(key))
+        {
+            return Err(LakeError::NotRepresentable {
+                message: format!(
+                    "table \"{selected}\" does not exist in the listed version ({})",
+                    manifest.version
+                ),
+            });
         }
         let mut out = Vec::new();
         for (key, entry) in &manifest.tables {

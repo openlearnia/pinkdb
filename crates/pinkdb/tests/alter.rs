@@ -421,9 +421,10 @@ fn attach_lake_read_only_tables_refuse_alter() {
         vec![vec![Value::Bigint(3)]]
     );
     // ALTER names a type the engine does not know.
-    assert!(db
-        .execute("ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 'x';")
-        .is_err());
+    assert!(
+        db.execute("ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 'x';")
+            .is_err()
+    );
 }
 
 #[test]

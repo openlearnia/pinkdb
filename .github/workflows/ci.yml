@@ -313,22 +313,26 @@ jobs:
           cargo build --release -p pinkdb-ffi
           python3 -m unittest discover -s bindings/python/tests -v
 
-  # Declared minimum Rust versions: 1.89 for the core crates (std file
-  # locking), 1.95 for pink-lake (the vortex dependency's own floor).
+  # Declared minimum Rust version: 1.97 for the whole workspace (edition
+  # 2024). The previous split — 1.89 for the core crates (std file locking),
+  # 1.95 for pink-lake (the vortex dependency's own floor) — is gone; both
+  # floors sit below 1.97. Vortex stays out of this job because it is
+  # feature-gated (`vortexlake`) and the default-feature graph proves the
+  # workspace floor here.
   msrv:
-    name: MSRV (1.89 core)
+    name: MSRV (1.97)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: install Rust 1.89
+      - name: install Rust 1.97
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          toolchain: "1.89"
+          toolchain: "1.97"
 
-      - name: cargo check (default features, core crates)
-        run: cargo check -p pinkdb -p pinkdb-cli -p pinkdb-server -p pinkdb-ffi -p pinkdb-ext-loader
+      - name: cargo check (default features, whole workspace)
+        run: cargo check --workspace --all-targets
 
   # Known-vulnerability scan of Cargo.lock (RustSec advisory database).
   audit:

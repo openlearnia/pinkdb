@@ -15,23 +15,23 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
 
 use aggregate::{
-    aggregate, emit_groups, local_index_capacity, merge_partials, Acc, Group, Partial,
-    HIGH_CARDINALITY_KEYS,
+    Acc, Group, HIGH_CARDINALITY_KEYS, Partial, aggregate, emit_groups, local_index_capacity,
+    merge_partials,
 };
-use aggregate::{eval_agg_vec as eval_fused_vec, EvalVec as FusedVec};
+use aggregate::{EvalVec as FusedVec, eval_agg_vec as eval_fused_vec};
 use expr::{coerce_to, count_true, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
 
 use crate::attached::AttachedTable;
 use crate::plan::{
-    agg_output_schema, compare_values, win_output_schema, AlterTablePlan, LogicalPlan,
+    AlterTablePlan, LogicalPlan, agg_output_schema, compare_values, win_output_schema,
 };
 use crate::sql::ast::{BinaryOp, JoinKind, SortSpec};
-use crate::sql::binder::{common_numeric, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
+use crate::sql::binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, common_numeric};
 use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
+use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 
 /// Result of one statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -587,12 +587,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let tables = db.list_tables_in(&target);
             let mut found = false;
             for tbl in &tables {
-                if let Ok(t) = db.table_in(&target, tbl) {
-                    if t.indexes.iter().any(|i| i.name == *name) {
-                        db.drop_index_in(&target, tbl, name)?;
-                        found = true;
-                        break;
-                    }
+                if let Ok(t) = db.table_in(&target, tbl)
+                    && t.indexes.iter().any(|i| i.name == *name)
+                {
+                    db.drop_index_in(&target, tbl, name)?;
+                    found = true;
+                    break;
                 }
             }
             if !found && !*if_exists {
@@ -717,12 +717,11 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                         .columns
                         .iter()
                         .position(|c| c.name.eq_ignore_ascii_case(to))
+                        && to_idx != from_idx
                     {
-                        if to_idx != from_idx {
-                            return Err(PinkDbError::Catalog(format!(
-                                "Column with name \"{to}\" already exists!"
-                            )));
-                        }
+                        return Err(PinkDbError::Catalog(format!(
+                            "Column with name \"{to}\" already exists!"
+                        )));
                     }
                     table.rename_column_at(from_idx, to.clone())?;
                     Ok(QueryResult::AlteredTable { name: name.clone() })
@@ -875,10 +874,10 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             // it is a no-op instead of the user-facing duplicate error. A
             // different path claiming the same name still fails in
             // `load_extension` (running `init` twice would corrupt it).
-            if db.replaying {
-                if let Some(name) = db.loaded_extension_name_for_path(path) {
-                    return Ok(QueryResult::LoadedExtension { name });
-                }
+            if db.replaying
+                && let Some(name) = db.loaded_extension_name_for_path(path)
+            {
+                return Ok(QueryResult::LoadedExtension { name });
             }
             // Process-level side effect: load the cdylib and register its
             // functions (atomic; a failure registers nothing). The DB stays
@@ -1043,10 +1042,10 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     let LogicalPlan::Scan { db: qdb, table, at } = plan else {
         unreachable!("scan_output needs a Scan node");
     };
-    if qdb.is_none() {
-        if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
-            return Ok(out.clone());
-        }
+    if qdb.is_none()
+        && let Some(out) = cx.ctes.get(&table.to_ascii_lowercase())
+    {
+        return Ok(out.clone());
     }
     let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
     let projected = cx.projections.for_scan(plan);
@@ -2089,10 +2088,10 @@ struct JoinSide<'a> {
 fn estimate_rows(cx: &Cx, plan: &LogicalPlan) -> Option<u64> {
     match plan {
         LogicalPlan::Scan { db: qdb, table, at } => {
-            if qdb.is_none() {
-                if let Some(out) = cx.ctes.get(&table.to_ascii_lowercase()) {
-                    return Some(out.chunks.iter().map(|c| c.num_rows() as u64).sum());
-                }
+            if qdb.is_none()
+                && let Some(out) = cx.ctes.get(&table.to_ascii_lowercase())
+            {
+                return Some(out.chunks.iter().map(|c| c.num_rows() as u64).sum());
             }
             let lookup = qdb.as_deref().unwrap_or_else(|| cx.db.current_db());
             if let Some((attached, lake)) = cx.db.attached_lookup(lookup, table) {
@@ -2906,10 +2905,10 @@ fn fused_join_aggregate(
     // so skipping an unused one is safe; a non-total or subquery-bearing
     // project expr must force the materialized path so it errors exactly as
     // before. (Side classification is irrelevant for exprs nothing reads.)
-    if let Some(exprs) = project {
-        if exprs.iter().any(|e| e.has_subquery() || !expr_is_total(e)) {
-            return Ok(None);
-        }
+    if let Some(exprs) = project
+        && exprs.iter().any(|e| e.has_subquery() || !expr_is_total(e))
+    {
+        return Ok(None);
     }
 
     // Static fusibility: rewrite every key/arg into join space and classify
@@ -3606,11 +3605,11 @@ fn top_n(
                 };
                 if heap.len() < limit {
                     heap.push(cand);
-                } else if let Some(&max) = heap.peek() {
-                    if cand < max {
-                        heap.pop();
-                        heap.push(cand);
-                    }
+                } else if let Some(&max) = heap.peek()
+                    && cand < max
+                {
+                    heap.pop();
+                    heap.push(cand);
                 }
             }
             heap.into_vec()
@@ -3624,11 +3623,11 @@ fn top_n(
     // The generic LIMIT shape gathers a straddling final chunk; do the same
     // so the top-N output equals full-sort-then-truncate exactly (validity
     // mask padding included).
-    if let Some(last) = out.last_mut() {
-        if last.num_rows() < CHUNK_SIZE {
-            let sel: Vec<usize> = (0..last.num_rows()).collect();
-            *last = last.gather(&sel);
-        }
+    if let Some(last) = out.last_mut()
+        && last.num_rows() < CHUNK_SIZE
+    {
+        let sel: Vec<usize> = (0..last.num_rows()).collect();
+        *last = last.gather(&sel);
     }
     Ok(Some(out))
 }
@@ -3681,11 +3680,7 @@ fn sort_legacy(
                 }
                 _ => {
                     let c = compare_values(ka, kb);
-                    if spec.desc {
-                        c.reverse()
-                    } else {
-                        c
-                    }
+                    if spec.desc { c.reverse() } else { c }
                 }
             };
             if ord != Ordering::Equal {
@@ -4797,9 +4792,9 @@ mod tests {
                         expect_k.len() - 1
                     }
                 };
-                expect_k[slot].1 .0 += 1;
+                expect_k[slot].1.0 += 1;
                 if let Some(n) = n {
-                    expect_k[slot].1 .1 = Some(expect_k[slot].1 .1.unwrap_or(0) + n as i64);
+                    expect_k[slot].1.1 = Some(expect_k[slot].1.1.unwrap_or(0) + n as i64);
                 }
             }
         }
@@ -6330,7 +6325,9 @@ mod tests {
                 unreachable!()
             };
             assert!(
-                fused_join_aggregate(&cx, input, keys, aggs).unwrap().is_none(),
+                fused_join_aggregate(&cx, input, keys, aggs)
+                    .unwrap()
+                    .is_none(),
                 "must not fuse: {sql}"
             );
         }
@@ -6418,9 +6415,10 @@ mod tests {
         assert!(db.execute("SELECT ts + 1 FROM ev;").is_err());
         assert!(db.execute("SELECT d + d FROM ev;").is_err());
         assert!(db.execute("SELECT * FROM ev WHERE d = ts;").is_err());
-        assert!(db
-            .execute("SELECT * FROM ev WHERE d = '2024-01-15';")
-            .is_err());
+        assert!(
+            db.execute("SELECT * FROM ev WHERE d = '2024-01-15';")
+                .is_err()
+        );
     }
 
     /// Extreme DATE → TIMESTAMP casts must error, not wrap: `i32::MAX` days
@@ -6430,9 +6428,10 @@ mod tests {
         let mut db = PinkDb::new();
         let rows = select(&mut db, "SELECT DATE '1970-01-01' + 2147483647;");
         assert_eq!(rows[0][0], V::Date(i32::MAX));
-        assert!(db
-            .execute("SELECT CAST(DATE '1970-01-01' + 2147483647 AS TIMESTAMP);")
-            .is_err());
+        assert!(
+            db.execute("SELECT CAST(DATE '1970-01-01' + 2147483647 AS TIMESTAMP);")
+                .is_err()
+        );
     }
 
     #[test]
@@ -6465,9 +6464,10 @@ mod tests {
         );
         assert_eq!(rows[0][0].to_string(), "2024-01-01 00:00:00");
         assert!(db.execute("SELECT hour(d) FROM ev;").is_err());
-        assert!(db
-            .execute("SELECT date_trunc('century', d) FROM ev;")
-            .is_err());
+        assert!(
+            db.execute("SELECT date_trunc('century', d) FROM ev;")
+                .is_err()
+        );
         assert!(db.execute("SELECT SUM(d) FROM ev;").is_err());
     }
 
@@ -6700,11 +6700,12 @@ mod tests {
     #[test]
     fn correlated_is_rejected() {
         let mut db = sub_db();
-        assert!(db
-            .execute(
+        assert!(
+            db.execute(
                 "SELECT dname FROM dept WHERE EXISTS (SELECT * FROM emp WHERE emp.did = dept.did);"
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     fn join_db() -> PinkDb {
@@ -7719,22 +7720,27 @@ mod tests {
         assert_eq!(rows[0][0], V::Varchar("west".to_string()));
         assert_eq!(rows[0][2], V::Bigint(1));
         // Windows forbidden in WHERE / GROUP BY / HAVING.
-        assert!(db
-            .execute("SELECT * FROM sales WHERE RANK() OVER () > 1;")
-            .is_err());
-        assert!(db
-            .execute("SELECT * FROM sales GROUP BY RANK() OVER ();")
-            .is_err());
-        assert!(db
-            .execute("SELECT SUM(amount) FROM sales HAVING RANK() OVER () > 1;")
-            .is_err());
+        assert!(
+            db.execute("SELECT * FROM sales WHERE RANK() OVER () > 1;")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT * FROM sales GROUP BY RANK() OVER ();")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT SUM(amount) FROM sales HAVING RANK() OVER () > 1;")
+                .is_err()
+        );
         // Nested windows rejected; unknown window rejected.
-        assert!(db
-            .execute("SELECT RANK() OVER (ORDER BY SUM(amount) OVER ()) FROM sales;")
-            .is_err());
-        assert!(db
-            .execute("SELECT MEDIAN(amount) OVER () FROM sales;")
-            .is_err());
+        assert!(
+            db.execute("SELECT RANK() OVER (ORDER BY SUM(amount) OVER ()) FROM sales;")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT MEDIAN(amount) OVER () FROM sales;")
+                .is_err()
+        );
     }
 
     fn win_t() -> PinkDb {
@@ -7835,12 +7841,14 @@ mod tests {
             vec![Some(20), None, Some(40), Some(50), Some(60), None]
         );
         // Bad offsets.
-        assert!(db
-            .execute("SELECT lag(v, 1.5) OVER (ORDER BY id) FROM t;")
-            .is_err());
-        assert!(db
-            .execute("SELECT lead(v, id) OVER (ORDER BY id) FROM t;")
-            .is_err());
+        assert!(
+            db.execute("SELECT lag(v, 1.5) OVER (ORDER BY id) FROM t;")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT lead(v, id) OVER (ORDER BY id) FROM t;")
+                .is_err()
+        );
     }
 
     #[test]
@@ -7897,15 +7905,18 @@ mod tests {
         );
         assert_eq!(rows[0][0], V::Null);
         // ntile validation.
-        assert!(db
-            .execute("SELECT ntile(0) OVER (ORDER BY id) FROM t;")
-            .is_err());
-        assert!(db
-            .execute("SELECT ntile(-2) OVER (ORDER BY id) FROM t;")
-            .is_err());
-        assert!(db
-            .execute("SELECT ntile(id) OVER (ORDER BY id) FROM t;")
-            .is_err());
+        assert!(
+            db.execute("SELECT ntile(0) OVER (ORDER BY id) FROM t;")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT ntile(-2) OVER (ORDER BY id) FROM t;")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT ntile(id) OVER (ORDER BY id) FROM t;")
+                .is_err()
+        );
     }
 
     #[test]
@@ -8093,15 +8104,17 @@ mod tests {
         let mut db = win_t();
         assert!(db.execute("SELECT mod(1, 0);").is_err());
         assert!(db.execute("SELECT mod(7.5, 0);").is_err());
-        assert!(db
-            .execute("SELECT extract(zip FROM DATE '2024-01-01');")
-            .is_err());
+        assert!(
+            db.execute("SELECT extract(zip FROM DATE '2024-01-01');")
+                .is_err()
+        );
         assert!(db.execute("SELECT sign(true);").is_err());
         assert!(db.execute("SELECT concat();").is_err());
         assert!(db.execute("SELECT sqrt('a');").is_err());
-        assert!(db
-            .execute("SELECT lag(v, 1, 'x') OVER (ORDER BY id) FROM t;")
-            .is_err());
+        assert!(
+            db.execute("SELECT lag(v, 1, 'x') OVER (ORDER BY id) FROM t;")
+                .is_err()
+        );
     }
 
     // --- phase 9: UPDATE / DELETE ---
@@ -8337,12 +8350,14 @@ mod tests {
             ]
         );
         // Arity + type mismatches.
-        assert!(db
-            .execute("SELECT x FROM a UNION SELECT y, t FROM b;")
-            .is_err());
-        assert!(db
-            .execute("SELECT s FROM a UNION SELECT y FROM b;")
-            .is_err());
+        assert!(
+            db.execute("SELECT x FROM a UNION SELECT y, t FROM b;")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT s FROM a UNION SELECT y FROM b;")
+                .is_err()
+        );
     }
 
     /// {1, 3, 5} + {2, 4}: odd/even split so concatenation order is visible.
@@ -8413,9 +8428,10 @@ mod tests {
             int_rows(&[5, 4])
         );
         // Clauses before a UNION (head or middle branch) are rejected.
-        assert!(db
-            .execute("SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;")
-            .is_err());
+        assert!(
+            db.execute("SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;")
+                .is_err()
+        );
         assert!(db
             .execute("SELECT x FROM a1 UNION ALL SELECT x FROM a2 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a1;")
             .is_err());
@@ -8496,9 +8512,12 @@ mod tests {
             .unwrap();
         assert_eq!(select(&mut db, "SELECT x FROM uv2;"), int_rows(&[5, 4, 3]));
         // Clauses before a UNION are rejected at CREATE VIEW validation too.
-        assert!(db
-            .execute("CREATE VIEW bad AS SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;")
-            .is_err());
+        assert!(
+            db.execute(
+                "CREATE VIEW bad AS SELECT x FROM a1 ORDER BY x LIMIT 1 UNION ALL SELECT x FROM a2;"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8736,9 +8755,10 @@ mod tests {
         );
         assert_eq!(rows, vec![vec![V::Bigint(1), V::Double(1.0)]]);
         // 'one' does not parse as INTEGER.
-        assert!(db
-            .execute("SELECT CAST(s AS INTEGER) FROM a WHERE x = 1;")
-            .is_err());
+        assert!(
+            db.execute("SELECT CAST(s AS INTEGER) FROM a WHERE x = 1;")
+                .is_err()
+        );
         assert!(db.execute("SELECT CAST(x AS DATE) FROM a;").is_err());
         let rows = select(
             &mut db,
@@ -8844,12 +8864,14 @@ mod tests {
             ]
         );
         // Non-boolean conditions + incompatible results rejected.
-        assert!(db
-            .execute("SELECT CASE WHEN id THEN 1 END FROM t;")
-            .is_err());
-        assert!(db
-            .execute("SELECT CASE WHEN true THEN 1 ELSE 'x' END FROM t;")
-            .is_err());
+        assert!(
+            db.execute("SELECT CASE WHEN id THEN 1 END FROM t;")
+                .is_err()
+        );
+        assert!(
+            db.execute("SELECT CASE WHEN true THEN 1 ELSE 'x' END FROM t;")
+                .is_err()
+        );
     }
 
     #[test]
@@ -9088,9 +9110,10 @@ mod tests {
             |rows: &[Vec<V>]| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
         assert_eq!(debug_rows(&rows), debug_rows(&expected));
         assert_eq!(rows.len(), 6);
-        assert!(rows
-            .iter()
-            .any(|r| matches!(r[0], V::Double(x) if x.is_nan())));
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r[0], V::Double(x) if x.is_nan()))
+        );
     }
 
     /// End-to-end `LIMIT` over `ORDER BY` with a NaN key: top-N refuses the
@@ -10009,9 +10032,11 @@ mod tests {
             unreachable!()
         };
         let cx = Cx::new(&db);
-        assert!(fused_join_aggregate(&cx, input, keys, aggs)
-            .unwrap()
-            .is_none());
+        assert!(
+            fused_join_aggregate(&cx, input, keys, aggs)
+                .unwrap()
+                .is_none()
+        );
         // ...and the query must keep materialized semantics: only the matched
         // (q=2) row feeds the sum, so no error and 100/2 = 50.
         assert_eq!(select(&mut db, sql), vec![vec![V::Double(50.0)]]);
@@ -10555,9 +10580,10 @@ mod tests {
         let mut db = PinkDb::new();
         // Last database / duplicate / missing.
         assert!(db.execute("DROP DATABASE main;").is_err());
-        assert!(db
-            .execute("CREATE DATABASE db1; CREATE DATABASE DB1;")
-            .is_err());
+        assert!(
+            db.execute("CREATE DATABASE db1; CREATE DATABASE DB1;")
+                .is_err()
+        );
         assert!(db.execute("USE nope;").is_err());
         db.execute("CREATE DATABASE db2;").unwrap();
         // Dropping the current database switches to main.

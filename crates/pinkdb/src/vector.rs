@@ -295,10 +295,10 @@ impl Vector {
     pub fn from_raw(data: VectorData, mut validity: Vec<u64>) -> Vector {
         let len = data.len();
         validity.resize(mask_len(len), 0);
-        if !len.is_multiple_of(64) {
-            if let Some(last) = validity.last_mut() {
-                *last &= (1u64 << (len % 64)) - 1;
-            }
+        if !len.is_multiple_of(64)
+            && let Some(last) = validity.last_mut()
+        {
+            *last &= (1u64 << (len % 64)) - 1;
         }
         Vector {
             data,

@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
+<h3>Wave 82 — Rust toolchain upgrade ✅</h3>
+<ul>
+<li>All crates now require <strong>Rust 1.97</strong> and compile as <strong>edition 2024</strong>; CI's MSRV job pins 1.97 (was 1.89 core / 1.95 pink-lake), and the wasm check passes again.</li>
+<li>Modernized the code where the new edition/compiler asks for it — let-chains (~60 collapsed conditionals), <code>unsafe(...)</code> attribute syntax, reserved <code>gen</code> renames — with semantics unchanged (duckdiff still 171/171).</li>
+</ul>
 <h3>Wave 44 — stored procedures ✅</h3>
 <ul>
 <li><strong>SQL procedures</strong>: <code>CREATE [OR REPLACE] PROCEDURE p(a INTEGER, …) AS $$ … $$</code> (typed <code>DECLARE</code>/<code>SET</code>, <code>IF/ELSIF/ELSE</code>, <code>WHILE</code>, nested blocks, <code>RETURN</code>, <code>RAISE</code>), <code>DROP PROCEDURE [IF EXISTS]</code>, <code>CALL p(args)</code> — parameters and variables are bound as <strong>values, never spliced SQL</strong>, so injection-shaped input is inert by construction. <code>CALL</code> is statement-atomic, works in transactions, is persisted per database and replays exactly from the WAL.</li>

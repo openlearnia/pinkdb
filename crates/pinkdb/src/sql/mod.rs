@@ -12,7 +12,7 @@ pub mod peg_parser;
 pub(crate) mod split;
 
 use crate::types::{PinkDbError, Result, Value};
-pub use binder::{bind, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
+pub use binder::{AggFunc, BoundAgg, BoundExpr, ScalarFunc, bind};
 pub(crate) use binder::{bind_mv_query, bind_tracked};
 /// Maximum AST depth the parser accepts (see [`check_ast_depth`]).
 ///

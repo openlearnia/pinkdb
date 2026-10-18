@@ -16,7 +16,7 @@
 //!   rule and its caveat.
 
 use crate::exec::expr::eval_expr;
-use crate::plan::{shift_columns, LogicalPlan};
+use crate::plan::{LogicalPlan, shift_columns};
 use crate::sql::ast::{BinaryOp, JoinKind};
 use crate::sql::binder::BoundExpr;
 use crate::types::DataType;
@@ -43,40 +43,39 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
         LogicalPlan::Filter { input, predicate } => {
             let input = apply_indexes(db, *input);
             // Try to match input: Scan + predicate: col = literal.
-            if let LogicalPlan::Scan { db: qdb, table, .. } = &input {
-                if let BoundExpr::Binary {
+            if let LogicalPlan::Scan { db: qdb, table, .. } = &input
+                && let BoundExpr::Binary {
                     op: crate::sql::ast::BinaryOp::Eq,
                     left,
                     right,
                     ..
                 } = &predicate
-                {
-                    // col = literal or literal = col
-                    let (col_idx, lit) = match (&**left, &**right) {
-                        (BoundExpr::Column { index, .. }, BoundExpr::Literal(_)) => {
-                            (*index, right.clone())
-                        }
-                        (BoundExpr::Literal(_), BoundExpr::Column { index, .. }) => {
-                            (*index, left.clone())
-                        }
-                        _ => {
-                            return LogicalPlan::Filter {
-                                input: Box::new(input),
-                                predicate,
-                            }
-                        }
-                    };
-                    let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
-                    if let Ok(t) = db.table_in(lookup, table) {
-                        if let Some(idx) = t.indexes.iter().find(|i| i.column == col_idx) {
-                            return LogicalPlan::IndexScan {
-                                db: qdb.clone(),
-                                table: table.clone(),
-                                index: idx.name.clone(),
-                                value: *lit,
-                            };
-                        }
+            {
+                // col = literal or literal = col
+                let (col_idx, lit) = match (&**left, &**right) {
+                    (BoundExpr::Column { index, .. }, BoundExpr::Literal(_)) => {
+                        (*index, right.clone())
                     }
+                    (BoundExpr::Literal(_), BoundExpr::Column { index, .. }) => {
+                        (*index, left.clone())
+                    }
+                    _ => {
+                        return LogicalPlan::Filter {
+                            input: Box::new(input),
+                            predicate,
+                        };
+                    }
+                };
+                let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
+                if let Ok(t) = db.table_in(lookup, table)
+                    && let Some(idx) = t.indexes.iter().find(|i| i.column == col_idx)
+                {
+                    return LogicalPlan::IndexScan {
+                        db: qdb.clone(),
+                        table: table.clone(),
+                        index: idx.name.clone(),
+                        value: *lit,
+                    };
                 }
             }
             LogicalPlan::Filter {
@@ -389,29 +388,27 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
         // DECIMAL/INTERVAL casts stay unfolded. Evaluation is per-row either
         // way; this is a correctness guard, not a perf choice.
         && !contains_parameterized_cast(&rebuilt)
+        && let Ok(v) = eval_expr(&rebuilt, &const_chunk(), cx)
+            && v.len() == 1
     {
-        if let Ok(v) = eval_expr(&rebuilt, &const_chunk(), cx) {
-            if v.len() == 1 {
-                let value = v.get(0);
-                // A folded NULL would lose the expression's type: a bare
-                // `Literal(Null)` is INTEGER-typed (the `SELECT NULL`
-                // convention), while the folded expression may be BOOLEAN (a
-                // comparison), DATE, … — downstream operators check the type
-                // (`WHERE` needs BOOLEAN), so pin the original type with a
-                // CAST of NULL. Fixes `SELECT * FROM t WHERE NULL` and
-                // `WHERE 1 = NULL` (plus procedure variables that are NULL).
-                if value.is_null() {
-                    let dtype = rebuilt.dtype();
-                    if dtype != DataType::Integer {
-                        return BoundExpr::Cast {
-                            expr: Box::new(BoundExpr::Literal(crate::types::Value::Null)),
-                            dtype,
-                        };
-                    }
-                }
-                return BoundExpr::Literal(value);
+        let value = v.get(0);
+        // A folded NULL would lose the expression's type: a bare
+        // `Literal(Null)` is INTEGER-typed (the `SELECT NULL`
+        // convention), while the folded expression may be BOOLEAN (a
+        // comparison), DATE, … — downstream operators check the type
+        // (`WHERE` needs BOOLEAN), so pin the original type with a
+        // CAST of NULL. Fixes `SELECT * FROM t WHERE NULL` and
+        // `WHERE 1 = NULL` (plus procedure variables that are NULL).
+        if value.is_null() {
+            let dtype = rebuilt.dtype();
+            if dtype != DataType::Integer {
+                return BoundExpr::Cast {
+                    expr: Box::new(BoundExpr::Literal(crate::types::Value::Null)),
+                    dtype,
+                };
             }
         }
+        return BoundExpr::Literal(value);
     }
     rebuilt
 }
@@ -1250,11 +1247,7 @@ fn pushdown(plan: LogicalPlan) -> LogicalPlan {
             // Literals: `WHERE false` still needs the row stream shaped
             // correctly — keep the Filter node (it yields zero rows).
             let (plan, moved) = push_one_level(input, predicate);
-            if moved {
-                pushdown(plan)
-            } else {
-                plan
-            }
+            if moved { pushdown(plan) } else { plan }
         }
         LogicalPlan::Project {
             input,
@@ -1384,10 +1377,10 @@ enum Live {
 
 impl Live {
     fn mark(&mut self, i: usize) {
-        if let Live::Cols(m) = self {
-            if let Some(b) = m.get_mut(i) {
-                *b = true;
-            }
+        if let Live::Cols(m) = self
+            && let Some(b) = m.get_mut(i)
+        {
+            *b = true;
         }
     }
 

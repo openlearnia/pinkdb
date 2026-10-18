@@ -109,11 +109,11 @@
 //! approximated before execution (loop conditions are data-dependent), so the
 //! executor records what really ran.
 
+use crate::QueryResult;
 use crate::plan::LogicalPlan;
 use crate::sql::ast::{Expr, Projection, Statement};
 use crate::storage::PinkDb;
 use crate::types::{DataType, PinkDbError, Result, Value};
-use crate::QueryResult;
 
 /// Maximum `CALL` nesting depth. A procedure may call itself (directly or
 /// through another procedure) up to this depth; the next call is a clean
@@ -1047,14 +1047,14 @@ impl<'a> BodyParser<'a> {
                                                 "expected END, END IF or END WHILE after END, \
                                                  found `{other}`"
                                             ),
-                                        ))
+                                        ));
                                     }
                                 }
                             }
                             _ => {
                                 return Err(
                                     self.err(base, "expected END, END IF or END WHILE after END")
-                                )
+                                );
                             }
                         }),
                         None,
@@ -1226,12 +1226,12 @@ fn parse_declare(name: &str, off: usize, rest: &str) -> Result<(String, DataType
              (DECLARE {var} INTEGER ...)"
         )));
     }
-    if let Some(d) = default_text {
-        if is_trivia_only(d) {
-            return Err(PinkDbError::Parse(format!(
-                "procedure body of \"{name}\" at byte {off}: DEFAULT needs an expression"
-            )));
-        }
+    if let Some(d) = default_text
+        && is_trivia_only(d)
+    {
+        return Err(PinkDbError::Parse(format!(
+            "procedure body of \"{name}\" at byte {off}: DEFAULT needs an expression"
+        )));
     }
     let dtype = parse_type(name, off, type_text.trim())?;
     let default = match default_text {
@@ -2027,9 +2027,9 @@ fn exec_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::QueryResult;
     use crate::types::Value;
     use crate::wal::SyncPolicy;
-    use crate::QueryResult;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2850,10 +2850,7 @@ mod tests {
     fn body_shape_errors_are_clear() {
         let mut db = seeded();
         let cases: &[(&str, &str)] = &[
-            (
-                "CREATE PROCEDURE p(x INTEGER) AS $$ SELECT 1; $$;",
-                "BEGIN",
-            ),
+            ("CREATE PROCEDURE p(x INTEGER) AS $$ SELECT 1; $$;", "BEGIN"),
             (
                 "CREATE PROCEDURE p() AS $$ BEGIN SELECT 1; $$;",
                 "not closed",
@@ -2894,10 +2891,7 @@ mod tests {
                 "CREATE PROCEDURE p() AS $$ BEGIN CREATE DATABASE d; END $$;",
                 "CREATE DATABASE",
             ),
-            (
-                "CREATE PROCEDURE p() AS $$ BEGIN USE main; END $$;",
-                "USE",
-            ),
+            ("CREATE PROCEDURE p() AS $$ BEGIN USE main; END $$;", "USE"),
             (
                 "CREATE PROCEDURE p() AS $$ BEGIN CHECKPOINT; END $$;",
                 "CHECKPOINT",

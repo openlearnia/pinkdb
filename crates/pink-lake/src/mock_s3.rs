@@ -680,7 +680,9 @@ impl Response {
     fn error(status: u16, code: &str, message: &str) -> Self {
         Self::text(
             status,
-            &format!("<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>{message}</Message></Error>"),
+            &format!(
+                "<?xml version=\"1.0\"?><Error><Code>{code}</Code><Message>{message}</Message></Error>"
+            ),
         )
     }
 }
@@ -771,10 +773,10 @@ fn respond(
             None => (rest.to_string(), String::new()),
         }
     };
-    if let Some(buckets) = state.buckets.lock().unwrap().as_ref() {
-        if !buckets.contains(&bucket) {
-            return Response::error(404, "NoSuchBucket", "The specified bucket does not exist.");
-        }
+    if let Some(buckets) = state.buckets.lock().unwrap().as_ref()
+        && !buckets.contains(&bucket)
+    {
+        return Response::error(404, "NoSuchBucket", "The specified bucket does not exist.");
     }
 
     if let Some(injected) = take_injected(state, method, target) {
@@ -834,11 +836,10 @@ fn put_object(state: &State, key: &str, headers: &[(String, String)], body: &[u8
     if conditional {
         state.conditional_attempts.fetch_add(1, Ordering::Relaxed);
     }
-    if conditional {
-        if let Some((status, code)) = state.conditional_rejection.lock().unwrap().clone() {
-            state.conditional_rejections.fetch_add(1, Ordering::Relaxed);
-            return Response::error(status, &code, "conditional writes are not supported");
-        }
+    if conditional && let Some((status, code)) = state.conditional_rejection.lock().unwrap().clone()
+    {
+        state.conditional_rejections.fetch_add(1, Ordering::Relaxed);
+        return Response::error(status, &code, "conditional writes are not supported");
     }
     if conditional && state.conflict_409s.load(Ordering::Relaxed) > 0 {
         state.conflict_409s.fetch_sub(1, Ordering::Relaxed);
@@ -852,16 +853,17 @@ fn put_object(state: &State, key: &str, headers: &[(String, String)], body: &[u8
             object.etag = etag;
         }
     }
-    if let Some(expected) = if_none_match {
-        if expected == "*" && store.objects.contains_key(key) {
-            return Response::error(412, "PreconditionFailed", "object exists");
-        }
+    if let Some(expected) = if_none_match
+        && expected == "*"
+        && store.objects.contains_key(key)
+    {
+        return Response::error(412, "PreconditionFailed", "object exists");
     }
     if let Some(expected) = if_match {
         match store.objects.get(key) {
             None => return Response::error(404, "NoSuchKey", "The specified key does not exist."),
             Some(object) if object.etag != expected => {
-                return Response::error(412, "PreconditionFailed", "etag mismatch")
+                return Response::error(412, "PreconditionFailed", "etag mismatch");
             }
             Some(_) => {}
         }
@@ -886,14 +888,14 @@ fn list_objects_v2(state: &State, params: &BTreeMap<String, String>) -> Response
         let Some(rest) = key.strip_prefix(&prefix) else {
             continue;
         };
-        if !delimiter.is_empty() {
-            if let Some(pos) = rest.find(&delimiter) {
-                let dir = format!("{}{}", prefix, &rest[..pos + delimiter.len()]);
-                if !common.contains(&dir) {
-                    common.push(dir);
-                }
-                continue;
+        if !delimiter.is_empty()
+            && let Some(pos) = rest.find(&delimiter)
+        {
+            let dir = format!("{}{}", prefix, &rest[..pos + delimiter.len()]);
+            if !common.contains(&dir) {
+                common.push(dir);
             }
+            continue;
         }
         entries.push(key.clone());
     }

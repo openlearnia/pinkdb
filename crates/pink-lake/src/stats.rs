@@ -111,21 +111,20 @@ impl StatsBlock {
     pub(crate) fn from_saved(key: &str, file: &str, saved: &SavedTableStats) -> Result<Self> {
         let mut columns = Vec::with_capacity(saved.columns.len());
         for col in &saved.columns {
-            let encode = |v: &Option<Value>| match v {
-                None => Ok(None),
-                Some(v) => {
-                    encode_value(col.dtype, v)
-                        .map(Some)
-                        .ok_or_else(|| LakeError::Internal {
+            let encode =
+                |v: &Option<Value>| match v {
+                    None => Ok(None),
+                    Some(v) => encode_value(col.dtype, v).map(Some).ok_or_else(|| {
+                        LakeError::Internal {
                             message: format!(
                                 "statistics for \"{key}\".{}: {v:?} does not match its {dtype:?} \
                              column",
                                 col.name,
                                 dtype = col.dtype
                             ),
-                        })
-                }
-            };
+                        }
+                    }),
+                };
             columns.push(StatsColumn {
                 name: col.name.clone(),
                 dtype: dtype_name(col.dtype),

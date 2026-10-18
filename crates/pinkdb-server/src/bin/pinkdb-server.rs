@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use pinkdb::Database;
 use std::time::Duration;
 
-use pinkdb_server::{Server, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS};
+use pinkdb_server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5433;

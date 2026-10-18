@@ -24,8 +24,8 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
-use std::ffi::{c_char, CStr, CString};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::ffi::{CStr, CString, c_char};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use pinkdb::{DataType, PinkDb, QueryResult, Value};
@@ -89,7 +89,7 @@ fn clear_error() {
 
 /// Last error on this thread (NULL when none). The pointer stays valid until
 /// the next FFI call on this thread.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_last_error() -> *const c_char {
     LAST_ERROR.with(|e| match &*e.borrow() {
         Some(s) => s.as_ptr(),
@@ -98,7 +98,7 @@ pub extern "C" fn pinkdb_last_error() -> *const c_char {
 }
 
 /// ABI version of this library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_abi_version() -> u32 {
     PINKDB_ABI_VERSION
 }
@@ -409,7 +409,7 @@ fn c_path(path: *const c_char) -> Option<String> {
 
 /// Open a durable database (checkpoint + WAL) at `path` (UTF-8, NUL-terminated
 /// C string). Returns NULL on error; see [`pinkdb_last_error`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
     let Some(path) = c_path(path) else {
         return ptr::null_mut();
@@ -429,7 +429,7 @@ pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
 }
 
 /// Open a fresh in-memory database.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
     clear_error();
     // A panic must never unwind across the extern "C" boundary.
@@ -445,7 +445,7 @@ pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
 }
 
 /// Close a handle opened by [`pinkdb_open`]/[`pinkdb_open_memory`]. NULL-safe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_close(handle: *mut PinkHandle) {
     if handle.is_null() {
         return;
@@ -457,7 +457,7 @@ pub extern "C" fn pinkdb_close(handle: *mut PinkHandle) {
 
 /// Execute one or more SQL statements (UTF-8, `(ptr, len)`, embedded NULs
 /// allowed). Returns NULL on error; free with [`pinkdb_result_free`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_execute(
     handle: *mut PinkHandle,
     sql: *const c_char,
@@ -505,22 +505,26 @@ pub extern "C" fn pinkdb_execute(
 /// bytes for the duration of the returned borrow (the API contract for every
 /// `(ptr, len)` entry point of this crate).
 unsafe fn sql_utf8<'a>(sql: *const c_char, sql_len: usize) -> Option<&'a str> {
-    if sql.is_null() && sql_len > 0 {
-        set_error("null sql pointer with non-zero length");
-        return None;
-    }
-    let bytes: &[u8] = if sql_len == 0 {
-        &[]
-    } else {
-        // SAFETY: non-null (checked above) and valid for `sql_len` bytes per
-        // the API contract.
-        std::slice::from_raw_parts(sql as *const u8, sql_len)
-    };
-    match std::str::from_utf8(bytes) {
-        Ok(t) => Some(t),
-        Err(_) => {
-            set_error("SQL is not valid UTF-8");
-            None
+    // SAFETY: this function's contract (see above) makes the raw-pointer read
+    // below sound; the NULL/non-zero-length check runs first.
+    unsafe {
+        if sql.is_null() && sql_len > 0 {
+            set_error("null sql pointer with non-zero length");
+            return None;
+        }
+        let bytes: &[u8] = if sql_len == 0 {
+            &[]
+        } else {
+            // SAFETY: non-null (checked above) and valid for `sql_len` bytes
+            // per the API contract.
+            std::slice::from_raw_parts(sql as *const u8, sql_len)
+        };
+        match std::str::from_utf8(bytes) {
+            Ok(t) => Some(t),
+            Err(_) => {
+                set_error("SQL is not valid UTF-8");
+                None
+            }
         }
     }
 }
@@ -537,7 +541,7 @@ pub struct PinkPrepared {
 /// statement; NULL on error (see [`pinkdb_last_error`]). A multi-statement
 /// string, or a statement with no placeholders, is refused/allowed the same
 /// way `PinkDb::prepare` is. Free with [`pinkdb_prepared_free`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_prepare(
     handle: *mut PinkHandle,
     sql: *const c_char,
@@ -570,7 +574,7 @@ pub extern "C" fn pinkdb_prepare(
 
 /// Number of `?` placeholders in a prepared statement: the exact number of
 /// values [`pinkdb_execute_prepared`] takes. 0 for a NULL handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_prepared_parameter_count(prepared: *const PinkPrepared) -> usize {
     if prepared.is_null() {
         return 0;
@@ -580,7 +584,7 @@ pub extern "C" fn pinkdb_prepared_parameter_count(prepared: *const PinkPrepared)
 }
 
 /// Free a prepared statement. NULL-safe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_prepared_free(prepared: *mut PinkPrepared) {
     if prepared.is_null() {
         return;
@@ -594,7 +598,7 @@ pub extern "C" fn pinkdb_prepared_free(prepared: *mut PinkPrepared) {
 /// error; free with [`pinkdb_result_free`]. Values are read by value (for
 /// VARCHAR, `text_ptr`/`text_len` must be valid for the call); a wrong count
 /// or a value that cannot bind is a clear error.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_execute_prepared(
     handle: *mut PinkHandle,
     prepared: *const PinkPrepared,
@@ -699,14 +703,14 @@ fn value_from_pink(v: &PinkValue) -> Result<pinkdb::Value, String> {
                 "DECIMAL/INTERVAL cannot be bound as parameters in ABI v1; pass the canonical \
                  text and CAST it in SQL"
                     .to_string(),
-            )
+            );
         }
         other => return Err(format!("unknown value type tag {other}")),
     })
 }
 
 /// Free a result returned by [`pinkdb_execute`]. NULL-safe.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_free(result: *mut PinkResult) {
     if result.is_null() {
         return;
@@ -725,7 +729,7 @@ fn stmt_at<'a>(result: *const PinkResult, statement: usize) -> Option<&'a StmtDa
 }
 
 /// Number of statements in the result.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_statement_count(result: *const PinkResult) -> usize {
     if result.is_null() {
         return 0;
@@ -735,7 +739,7 @@ pub extern "C" fn pinkdb_result_statement_count(result: *const PinkResult) -> us
 }
 
 /// Statement kind tag (e.g. [`PINKDB_STMT_SELECTED`]); -1 when out of range.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_kind(result: *const PinkResult, statement: usize) -> i32 {
     match stmt_at(result, statement) {
         Some(StmtData::Sel(_)) => PINKDB_STMT_SELECTED,
@@ -745,7 +749,7 @@ pub extern "C" fn pinkdb_result_kind(result: *const PinkResult, statement: usize
 }
 
 /// For SELECT results: number of columns (0 for other kinds / out of range).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_column_count(result: *const PinkResult, statement: usize) -> usize {
     match stmt_at(result, statement) {
         Some(StmtData::Sel(s)) => s.names.len(),
@@ -754,7 +758,7 @@ pub extern "C" fn pinkdb_result_column_count(result: *const PinkResult, statemen
 }
 
 /// Column name (NUL-terminated, owned by the result) or NULL when out of range.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_column_name(
     result: *const PinkResult,
     statement: usize,
@@ -771,7 +775,7 @@ pub extern "C" fn pinkdb_result_column_name(
 }
 
 /// Column type tag (e.g. [`PINKDB_TYPE_INTEGER`]); -1 when out of range.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_column_type(
     result: *const PinkResult,
     statement: usize,
@@ -784,7 +788,7 @@ pub extern "C" fn pinkdb_result_column_type(
 }
 
 /// Rows in a SELECT result (0 for other kinds / out of range).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_row_count(result: *const PinkResult, statement: usize) -> usize {
     match stmt_at(result, statement) {
         Some(StmtData::Sel(s)) => s.rows.len(),
@@ -794,7 +798,7 @@ pub extern "C" fn pinkdb_result_row_count(result: *const PinkResult, statement: 
 
 /// Value at (statement, row, column) for a SELECT result. Out-of-range and
 /// non-SELECT statements return a NULL `PinkValue`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_value(
     result: *const PinkResult,
     statement: usize,
@@ -813,7 +817,7 @@ pub extern "C" fn pinkdb_result_value(
 }
 
 /// Affected-row count for INSERT/UPDATE/DELETE results (0 otherwise).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_affected(result: *const PinkResult, statement: usize) -> usize {
     match stmt_at(result, statement) {
         Some(StmtData::Simple { count, .. }) => *count,
@@ -823,7 +827,7 @@ pub extern "C" fn pinkdb_result_affected(result: *const PinkResult, statement: u
 
 /// Object/session name for CREATE/DROP VIEW/TABLE/DATABASE and USE results
 /// (NUL-terminated, owned by the result); NULL otherwise.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_result_name(result: *const PinkResult, statement: usize) -> *const c_char {
     match stmt_at(result, statement) {
         Some(StmtData::Simple { name: Some(n), .. }) => n.as_ptr() as *const c_char,
@@ -1119,9 +1123,11 @@ mod tests {
         let (unknown, _k5) = cell(99, false, 0, 0.0, None);
         let r = pinkdb_execute_prepared(h, prep, [unknown, s].as_ptr(), 2);
         assert!(r.is_null());
-        assert!(last_error_str()
-            .unwrap()
-            .contains("unknown value type tag 99"));
+        assert!(
+            last_error_str()
+                .unwrap()
+                .contains("unknown value type tag 99")
+        );
 
         // NULL binds through the target column's type.
         let (null, _k6) = cell(PINKDB_TYPE_NULL, true, 0, 0.0, None);

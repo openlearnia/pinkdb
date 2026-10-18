@@ -44,12 +44,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
+use crate::QueryResult;
 use crate::crypto::EncryptionKey;
-use crate::plan::{is_read_only, LogicalPlan};
+use crate::plan::{LogicalPlan, is_read_only};
 use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
 use crate::wal::{BaseToken, DurableOpenOptions, Lease, LeaseGuard};
-use crate::QueryResult;
 
 /// One-time warning flag for poisoned-lock recovery (see [`read_lock`]).
 static POISON_WARNED: AtomicBool = AtomicBool::new(false);
@@ -494,37 +494,37 @@ impl Connection {
                 let after = session_after(&result, &pre, &txn.work);
                 // Buffer the committed statement for the transaction's single
                 // WAL record (flushed by txn_commit; never by ROLLBACK).
-                if let Some(text) = sql_text {
-                    if crate::plan::writes_tables(&plan) {
-                        if txn.wal_db_before.is_none() {
-                            txn.wal_db_before = Some(pre.clone());
+                if let Some(text) = sql_text
+                    && crate::plan::writes_tables(&plan)
+                {
+                    if txn.wal_db_before.is_none() {
+                        txn.wal_db_before = Some(pre.clone());
+                    }
+                    txn.wal_stmts.push(text.to_string());
+                    txn.wal_db_after = after.clone();
+                    // The record's replay starts in `pre` (possibly via a
+                    // `USE` prefix) and may switch to `after` (a `USE`):
+                    // both must still exist at COMMIT.
+                    for db in [&pre, &after] {
+                        if !txn.wal_dbs.iter().any(|d| d.eq_ignore_ascii_case(db)) {
+                            txn.wal_dbs.push(db.clone());
                         }
-                        txn.wal_stmts.push(text.to_string());
-                        txn.wal_db_after = after.clone();
-                        // The record's replay starts in `pre` (possibly via a
-                        // `USE` prefix) and may switch to `after` (a `USE`):
-                        // both must still exist at COMMIT.
-                        for db in [&pre, &after] {
-                            if !txn.wal_dbs.iter().any(|d| d.eq_ignore_ascii_case(db)) {
-                                txn.wal_dbs.push(db.clone());
-                            }
+                    }
+                    // Extensions the statement calls: the record is
+                    // prefixed with `LOAD EXTENSION` for every path the
+                    // WAL generation has not loaded yet.
+                    let touched = txn.work.dynamic_function_paths(&dynamic_functions_used);
+                    for p in touched {
+                        if !txn.wal_ext_paths.contains(&p) {
+                            txn.wal_ext_paths.push(p);
                         }
-                        // Extensions the statement calls: the record is
-                        // prefixed with `LOAD EXTENSION` for every path the
-                        // WAL generation has not loaded yet.
-                        let touched = txn.work.dynamic_function_paths(&dynamic_functions_used);
-                        for p in touched {
-                            if !txn.wal_ext_paths.contains(&p) {
-                                txn.wal_ext_paths.push(p);
-                            }
-                        }
-                        // `LOAD EXTENSION` is refused inside a transaction, so
-                        // this is unreachable today; keep the bookkeeping
-                        // correct if that refusal is ever relaxed.
-                        for p in crate::storage::loaded_extension_path(&plan) {
-                            if !txn.wal_ext_loaded.contains(&p) {
-                                txn.wal_ext_loaded.push(p);
-                            }
+                    }
+                    // `LOAD EXTENSION` is refused inside a transaction, so
+                    // this is unreachable today; keep the bookkeeping
+                    // correct if that refusal is ever relaxed.
+                    for p in crate::storage::loaded_extension_path(&plan) {
+                        if !txn.wal_ext_loaded.contains(&p) {
+                            txn.wal_ext_loaded.push(p);
                         }
                     }
                 }
@@ -559,37 +559,37 @@ impl Connection {
                 // append: the bind-time check released its lock, so another
                 // connection could have dropped the database in between — a
                 // logged `USE` for a dead database could never replay.
-                if is_read_only(&plan) {
-                    if let QueryResult::Used { .. } = &result {
-                        let lease = self.db.acquire_lease()?;
-                        if let Some(g) = &lease {
-                            // Refresh before logging: the `USE` record must
-                            // land after every earlier commit.
-                            let mut shared = write_lock(&self.db.shared);
-                            shared.refresh_under_lease(g)?;
-                        }
-                        let shared = read_lock(&self.db.shared);
-                        let after = session_after(&result, &pre, &shared);
-                        if !shared.database_exists(&after) {
-                            return Err(PinkDbError::Catalog(format!(
-                                "database \"{after}\" not found"
-                            )));
-                        }
-                        if let Some(text) = sql_text {
-                            // `USE` touches no table: a known-empty set.
-                            let sets = crate::wal::FrameSets::default();
-                            shared.wal_append_session(
-                                &pre,
-                                &after,
-                                &[text.to_string()],
-                                &[],
-                                &[],
-                                Some(&sets),
-                            )?;
-                        }
-                        drop(shared);
-                        drop(lease);
+                if is_read_only(&plan)
+                    && let QueryResult::Used { .. } = &result
+                {
+                    let lease = self.db.acquire_lease()?;
+                    if let Some(g) = &lease {
+                        // Refresh before logging: the `USE` record must
+                        // land after every earlier commit.
+                        let mut shared = write_lock(&self.db.shared);
+                        shared.refresh_under_lease(g)?;
                     }
+                    let shared = read_lock(&self.db.shared);
+                    let after = session_after(&result, &pre, &shared);
+                    if !shared.database_exists(&after) {
+                        return Err(PinkDbError::Catalog(format!(
+                            "database \"{after}\" not found"
+                        )));
+                    }
+                    if let Some(text) = sql_text {
+                        // `USE` touches no table: a known-empty set.
+                        let sets = crate::wal::FrameSets::default();
+                        shared.wal_append_session(
+                            &pre,
+                            &after,
+                            &[text.to_string()],
+                            &[],
+                            &[],
+                            Some(&sets),
+                        )?;
+                    }
+                    drop(shared);
+                    drop(lease);
                 }
                 // Apply the session transition.
                 self.current_db = match &result {
@@ -759,28 +759,28 @@ impl Connection {
             let writes = shared.plan_writes_of(plan, pre);
             shared.mark_mv_writes(&writes);
         }
-        if let Some(text) = sql_text {
-            if crate::plan::writes_tables(plan) {
-                let after = session_after(result, pre, shared);
-                let touched = shared.dynamic_function_paths(dynamic_functions_used);
-                let loaded = crate::storage::loaded_extension_path(plan);
-                // The optimistic path already computed (and canonicalized)
-                // the statement's set for validation; reuse it instead of
-                // walking the plan again.
-                let sets = match sets {
-                    Some(s) => s.clone(),
-                    None => shared.plan_sets_store(plan, pre),
-                };
-                shared.wal_append_session(
-                    pre,
-                    &after,
-                    &[text.to_string()],
-                    &touched,
-                    &loaded,
-                    Some(&sets),
-                )?;
-                shared.maybe_auto_checkpoint(lease);
-            }
+        if let Some(text) = sql_text
+            && crate::plan::writes_tables(plan)
+        {
+            let after = session_after(result, pre, shared);
+            let touched = shared.dynamic_function_paths(dynamic_functions_used);
+            let loaded = crate::storage::loaded_extension_path(plan);
+            // The optimistic path already computed (and canonicalized)
+            // the statement's set for validation; reuse it instead of
+            // walking the plan again.
+            let sets = match sets {
+                Some(s) => s.clone(),
+                None => shared.plan_sets_store(plan, pre),
+            };
+            shared.wal_append_session(
+                pre,
+                &after,
+                &[text.to_string()],
+                &touched,
+                &loaded,
+                Some(&sets),
+            )?;
+            shared.maybe_auto_checkpoint(lease);
         }
         Ok(())
     }
@@ -865,26 +865,26 @@ impl Connection {
         // for transactions that will produce a WAL record. On a clean result
         // the frames that arrived for *other* tables are applied, so the
         // store is current before the merge below.
-        if !txn.wal_stmts.is_empty() {
-            if let (Some(g), Some(base)) = (lease.as_ref(), txn.base.as_ref()) {
-                let mut ours = crate::wal::FrameSets::default();
-                for (db, name) in txn.table_reads.iter().chain(txn.table_writes.iter()) {
-                    ours.add_table(db, name);
-                }
-                // Database-level conflicts come only from `CREATE`/`DROP
-                // DATABASE` (tracked in `txn.wal_sets`), never from a
-                // statement's *session* database: `conflict_with` treats our db
-                // set as a wildcard over that database's tables, and the
-                // documented contract is table-level granularity. (The session
-                // dbs stay in `txn.wal_dbs` for the existence check below.)
-                ours.extend_databases(&txn.wal_sets);
-                // View DDL is session-local and never logged: no frame can
-                // carry it, so `view_writes` contributes nothing here.
-                ours.canonicalize();
-                let position = base.position();
-                if let Some(conflict) = shared.optimistic_commit_check(g, &position, &ours)? {
-                    return Err(conflict_error(&conflict, "transaction"));
-                }
+        if !txn.wal_stmts.is_empty()
+            && let (Some(g), Some(base)) = (lease.as_ref(), txn.base.as_ref())
+        {
+            let mut ours = crate::wal::FrameSets::default();
+            for (db, name) in txn.table_reads.iter().chain(txn.table_writes.iter()) {
+                ours.add_table(db, name);
+            }
+            // Database-level conflicts come only from `CREATE`/`DROP
+            // DATABASE` (tracked in `txn.wal_sets`), never from a
+            // statement's *session* database: `conflict_with` treats our db
+            // set as a wildcard over that database's tables, and the
+            // documented contract is table-level granularity. (The session
+            // dbs stay in `txn.wal_dbs` for the existence check below.)
+            ours.extend_databases(&txn.wal_sets);
+            // View DDL is session-local and never logged: no frame can
+            // carry it, so `view_writes` contributes nothing here.
+            ours.canonicalize();
+            let position = base.position();
+            if let Some(conflict) = shared.optimistic_commit_check(g, &position, &ours)? {
+                return Err(conflict_error(&conflict, "transaction"));
             }
         }
         // A database dropped since BEGIN makes the transaction's WAL record

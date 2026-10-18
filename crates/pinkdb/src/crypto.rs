@@ -606,7 +606,7 @@ mod imp {
             (None, None) => {
                 return Err(PinkDbError::Execution(
                     "encryption key holds no material".to_string(),
-                ))
+                ));
             }
         };
         let aad_base = spec.aad_base();
@@ -929,7 +929,7 @@ mod imp {
 #[cfg(not(feature = "encryption"))]
 pub(crate) use imp::RecordCipher;
 #[cfg(feature = "encryption")]
-pub(crate) use imp::{open_container, seal_container, RecordCipher};
+pub(crate) use imp::{RecordCipher, open_container, seal_container};
 
 #[cfg(test)]
 mod tests {
@@ -1098,14 +1098,17 @@ mod enc_tests {
     #[test]
     fn from_env_reads_pinkdb_key() {
         // Serialized access: `set_var` affects the whole test process.
+        // `remove_var`/`set_var` are `unsafe` as of Rust 2024 (environment
+        // mutation races concurrent reads in other threads); the lock below
+        // serialises every test in this binary that touches `PINKDB_KEY`.
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK.lock().unwrap();
         let saved = std::env::var("PINKDB_KEY").ok();
-        std::env::remove_var("PINKDB_KEY");
+        unsafe { std::env::remove_var("PINKDB_KEY") };
         assert!(EncryptionKey::from_env().unwrap().is_none());
-        std::env::set_var("PINKDB_KEY", "");
+        unsafe { std::env::set_var("PINKDB_KEY", "") };
         assert!(EncryptionKey::from_env().unwrap().is_none());
-        std::env::set_var("PINKDB_KEY", "sesame");
+        unsafe { std::env::set_var("PINKDB_KEY", "sesame") };
         assert!(EncryptionKey::from_env().unwrap().is_some());
         // A set-but-non-UTF-8 value is a hard error, never a silent fallback
         // to plaintext.
@@ -1113,13 +1116,15 @@ mod enc_tests {
         {
             use std::ffi::OsString;
             use std::os::unix::ffi::OsStringExt;
-            std::env::set_var("PINKDB_KEY", OsString::from_vec(vec![0xFF, 0xFE]));
+            unsafe { std::env::set_var("PINKDB_KEY", OsString::from_vec(vec![0xFF, 0xFE])) };
             let err = EncryptionKey::from_env().unwrap_err();
             assert!(err.to_string().contains("not valid UTF-8"), "{err}");
         }
-        match saved {
-            Some(v) => std::env::set_var("PINKDB_KEY", v),
-            None => std::env::remove_var("PINKDB_KEY"),
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("PINKDB_KEY", v),
+                None => std::env::remove_var("PINKDB_KEY"),
+            }
         }
     }
 

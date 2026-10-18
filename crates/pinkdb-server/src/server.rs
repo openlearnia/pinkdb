@@ -42,7 +42,7 @@ use std::time::Duration;
 
 use pinkdb::{DataType, Database, QueryResult, Value};
 
-use crate::protocol::{self, DoneKind, ProtocolError, Request, Response, PROTOCOL_VERSION};
+use crate::protocol::{self, DoneKind, PROTOCOL_VERSION, ProtocolError, Request, Response};
 
 /// How often the nonblocking accept loop checks the shutdown flag.
 const ACCEPT_POLL: Duration = Duration::from_millis(5);

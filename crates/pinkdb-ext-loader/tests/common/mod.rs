@@ -117,7 +117,7 @@ fn open(library: &Path) -> libloading::Library {
 fn resolve<'a, T>(lib: &'a libloading::Library, name: &str) -> libloading::Symbol<'a, T> {
     let mut symbol = name.as_bytes().to_vec();
     symbol.push(0); // dlsym needs a NUL-terminated name
-                    // SAFETY: the tests know each introspection symbol's C signature.
+    // SAFETY: the tests know each introspection symbol's C signature.
     unsafe { lib.get::<T>(&symbol) }
         .unwrap_or_else(|e| panic!("test extension does not export {name}: {e}"))
 }
