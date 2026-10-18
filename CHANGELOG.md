@@ -29,8 +29,9 @@ one-liners below.
   escaping, checked prepared handles, an FFI unwind guard, DECIMAL/INTERVAL/
   `ALTERED_TABLE` in the Python and Go bindings, a client batch cap + socket
   timeouts, off-thread over-limit rejection, and documentation drift.
-- Deferred (documented): `.pink` string-offset `u32` plumbing; attach `COUNT`
-  with overlapping delete files.
+- No deferred items: the last two (a `.pink` VARCHAR chunk over the `u32`
+  string-offset limit is refused at serialization; attach recomputes the row
+  count from the deduped delete layout) are fixed too.
 
 ### Wave 67 — lake maintenance ✅
 - **Compaction**: `merge_adjacent_files` publishes one new version referencing

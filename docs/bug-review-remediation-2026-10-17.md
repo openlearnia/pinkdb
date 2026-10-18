@@ -43,14 +43,14 @@ and Go suites green.
 | Unchecked LSN `+1` | fixed |
 | `pos + n` overflow in WAL decoders (32-bit) | fixed |
 | Unsupported container version treated as torn | fixed |
-| `.pink` string offsets truncate to `u32` | **deferred** — needs `Result` threaded through the core save encoder; failure mode is a loud decode error on a >4 GiB chunk |
+| `.pink` string offsets truncate to `u32` | fixed — serialization refuses a VARCHAR chunk whose bytes exceed `u32` (the offsets cannot be represented) |
 
 ## P2 — lake / S3 / CLI
 
 | Finding | Status |
 |---|---|
 | `is_container` heuristic can skip encryption | documented (not reachable with current writers); a test now pins the already-sealed marker behavior |
-| Attach `COUNT` with overlapping delete files | **deferred** — the suggested `read_manifest` refusal breaks legitimate disjoint deletes from separate commits; needs attach-side handling |
+| Attach `COUNT` with overlapping delete files | fixed — attach recomputes the row count from the deduped layout and rejects a mismatch (as `Lake::load` does) |
 | Full save resets `schema_version` on an unreadable predecessor | fixed (falls back to the catalog head) |
 | Partition error names the partition key, not the table | fixed |
 | Container version mismatch reported as `Tampered` | fixed (`UnsupportedContainer`) |

@@ -1262,7 +1262,8 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   CASE/COALESCE, WAL fsync/LSN/decoders, conflict set, container versions,
   schema-counter monotonicity, conditional retry, SigV4, CLI guards, bindings
   DECIMAL/INTERVAL/`ALTERED_TABLE`, client caps/timeouts, FFI unwind, docs).
-  Deferred: `.pink` string-offset `u32` plumbing; attach `COUNT` with
-  overlapping delete files. Gates: workspace test/clippy green, duckdiff
+  No deferred items: a `.pink` VARCHAR chunk over the `u32` string-offset
+  limit is refused at serialization, and attach recomputes its row count from
+  the deduped delete layout. Gates: workspace test/clippy green, duckdiff
   171/171 (175/175 big), feature matrices (encryption, lake s3/vortex, CLI
   lake,s3/client/repo, Python 37, Go) green.

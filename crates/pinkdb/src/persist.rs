@@ -1189,6 +1189,8 @@ fn enc_bool_rle(bits: &[bool]) -> Vec<u8> {
 }
 
 /// Plain strings: count + (count+1) offsets + data bytes.
+/// The offsets are `u32`; callers must reject a chunk whose total string bytes
+/// exceed that (see [`varchar_offsets_fit`]).
 fn encode_strs_offsets<T: AsRef<str>>(w: &mut Writer, strs: &[T]) {
     let mut off: u32 = 0;
     w.u32(off);
@@ -1199,6 +1201,11 @@ fn encode_strs_offsets<T: AsRef<str>>(w: &mut Writer, strs: &[T]) {
     for s in strs {
         w.bytes(s.as_ref().as_bytes());
     }
+}
+
+/// Whether a chunk's total VARCHAR bytes fit the v4 `u32` string offsets.
+fn varchar_offsets_fit(total: u64) -> bool {
+    total <= u32::MAX as u64
 }
 
 /// Dictionary (first-occurrence order) + one code per row.
@@ -2215,6 +2222,23 @@ impl PinkDb {
                     })?;
                     scans.push(chunk.columns);
                 }
+                // The v4 string layout stores offsets as `u32`; a chunk whose
+                // total VARCHAR bytes exceed that cannot be encoded faithfully
+                // (the offsets would wrap and the reader would reject the file).
+                // Refuse before writing instead of emitting a corrupt file.
+                for cols in &scans {
+                    for v in cols {
+                        if let VectorData::VarChar(strs) = v.data() {
+                            let total: u64 = strs.iter().map(|s| s.len() as u64).sum();
+                            if !varchar_offsets_fit(total) {
+                                return Err(PinkDbError::Execution(format!(
+                                    "table \"{dbname}.{name}\" has a VARCHAR chunk of {total} \
+                                     bytes, over the .pink format's u32 string-offset limit"
+                                )));
+                            }
+                        }
+                    }
+                }
                 let per_chunk: Vec<(Vec<EncodedCol>, Vec<ChunkColumnStats>)> =
                     if parallel && n_chunks >= PARALLEL_SAVE_MIN_CHUNKS {
                         scans
@@ -3093,6 +3117,13 @@ pub(crate) fn roundtrip_chunk(dtype: DataType, values: Vec<Value>, tag: u8) -> V
 mod tests {
     use super::*;
     use crate::vector::CHUNK_SIZE;
+
+    #[test]
+    fn varchar_offsets_bound_the_u32_limit() {
+        assert!(varchar_offsets_fit(0));
+        assert!(varchar_offsets_fit(u32::MAX as u64));
+        assert!(!varchar_offsets_fit(u32::MAX as u64 + 1));
+    }
 
     /// Pinned v5 size and body CRC of [`golden_db`]'s image (see
     /// `golden_v5_bytes_are_pinned`). The CRC is over the body *without* the
