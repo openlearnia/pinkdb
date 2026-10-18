@@ -948,8 +948,11 @@ mod tests {
             // Several: sort keys, projections, inner select lists.
             ("SELECT i FROM t ORDER BY s;", vec![Some(vec![0, 3])]),
             (
+                // The COUNT(*) ignores the projected column, so the optimizer
+                // drops the projection; the scan then decodes no columns and
+                // COUNT(*) is answered from the stored statistics (no decode).
                 "SELECT COUNT(*) FROM (SELECT d FROM t) x;",
-                vec![Some(vec![2])],
+                vec![],
             ),
             (
                 "SELECT MAX(i) FROM (SELECT i, s FROM t) x;",

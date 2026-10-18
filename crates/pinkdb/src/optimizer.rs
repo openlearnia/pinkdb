@@ -30,7 +30,133 @@ use crate::vector::DataChunk;
 pub fn optimize(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     let plan = pushdown(fold_plan(db, plan));
     let plan = eliminate_fk_joins(db, plan);
+    let plan = drop_count_star_projections(plan);
     fold_plan(db, plan)
+}
+
+/// Drop a `Project` that feeds an aggregate that only counts rows
+/// (`keys == []` and every aggregate is `COUNT(*)`): such an aggregate never
+/// reads a column of its input, so evaluating the projection is pure waste
+/// (e.g. `SELECT COUNT(*) FROM (SELECT upper(x) FROM t)`). Recurses so
+/// nested shapes are covered.
+fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Aggregate {
+            input,
+            keys,
+            aggs,
+        } => {
+            let input = *input;
+            let is_count_star_only = keys.is_empty()
+                && !aggs.is_empty()
+                && aggs.iter().all(|a| {
+                    matches!(a.func, crate::sql::binder::AggFunc::Count)
+                        && a.arg.is_none()
+                        && !a.distinct
+                });
+            let new_input = if is_count_star_only {
+                // COUNT(*) ignores its input's columns and row order, so any
+                // chain of Project / Sort / Window feeding it is pure waste.
+                // (Filter, Limit, Distinct, Join change the row set and must
+                // stay.) Peel them all.
+                let mut cur = input;
+                while let LogicalPlan::Project { input: inner, .. }
+                    | LogicalPlan::Sort { input: inner, .. }
+                    | LogicalPlan::Window { input: inner, .. } = cur
+                {
+                    cur = *inner;
+                }
+                drop_count_star_projections(cur)
+            } else {
+                drop_count_star_projections(input)
+            };
+            LogicalPlan::Aggregate {
+                input: Box::new(new_input),
+                keys,
+                aggs,
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+            input: Box::new(drop_count_star_projections(*input)),
+            predicate,
+        },
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => LogicalPlan::Project {
+            input: Box::new(drop_count_star_projections(*input)),
+            exprs,
+            names,
+        },
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_cols,
+        } => LogicalPlan::Join {
+            kind,
+            left: Box::new(drop_count_star_projections(*left)),
+            right: Box::new(drop_count_star_projections(*right)),
+            left_keys,
+            right_keys,
+            left_cols,
+        },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(drop_count_star_projections(*left)),
+            right: Box::new(drop_count_star_projections(*right)),
+            on,
+            left_cols,
+        },
+        LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
+            input: Box::new(drop_count_star_projections(*input)),
+            keys,
+        },
+        LogicalPlan::Limit { input, limit } => LogicalPlan::Limit {
+            input: Box::new(drop_count_star_projections(*input)),
+            limit,
+        },
+        LogicalPlan::Offset { input, offset } => LogicalPlan::Offset {
+            input: Box::new(drop_count_star_projections(*input)),
+            offset,
+        },
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(drop_count_star_projections(*input)),
+        },
+        LogicalPlan::Window {
+            input,
+            windows,
+            input_cols,
+        } => LogicalPlan::Window {
+            input: Box::new(drop_count_star_projections(*input)),
+            windows,
+            input_cols,
+        },
+        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+            name,
+            query: Box::new(drop_count_star_projections(*query)),
+            body: Box::new(drop_count_star_projections(*body)),
+        },
+        LogicalPlan::SetOp { op, left, right, types } => LogicalPlan::SetOp {
+            op,
+            left: Box::new(drop_count_star_projections(*left)),
+            right: Box::new(drop_count_star_projections(*right)),
+            types,
+        },
+        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+            plan: Box::new(drop_count_star_projections(*plan)),
+        },
+        other => other,
+    }
 }
 
 // ---------- constant folding ----------

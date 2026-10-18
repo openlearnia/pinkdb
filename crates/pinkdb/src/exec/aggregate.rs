@@ -853,12 +853,84 @@ pub(crate) struct Partial {
 ///
 /// Chunks aggregate in parallel (rayon) into per-chunk partials, which merge
 /// in chunk order — group order is deterministic (first-seen row wins).
+/// Fast path for DISTINCT over a single integer/date/timestamp column: avoids
+/// the full group machinery (no per-group allocations, no encode/clone).
+fn fast_distinct_int(
+    _cx: &Cx,
+    inputs: &[DataChunk],
+    idx: usize,
+    dtype: DataType,
+) -> Result<Vec<DataChunk>> {
+    use crate::types::FastSet;
+    let mut seen: FastSet<i64> = FastSet::default();
+    let mut seen_null = false;
+    let mut out_values: Vec<Value> = Vec::new();
+    for chunk in inputs {
+        let col = &chunk.columns[idx];
+        for i in 0..chunk.num_rows() {
+            if col.is_null(i) {
+                if !seen_null {
+                    seen_null = true;
+                    out_values.push(Value::Null);
+                }
+            } else {
+                let v = col.get(i);
+                let key = match v {
+                    Value::Integer(x) => x as i64,
+                    Value::Bigint(x) => x,
+                    Value::Date(x) => x as i64,
+                    Value::Timestamp(x) => x,
+                    _ => unreachable!(),
+                };
+                if seen.insert(key) {
+                    out_values.push(v);
+                }
+            }
+        }
+    }
+    // Emit as chunks.
+    let mut out_chunks = Vec::new();
+    let mut cur = Vector::with_capacity(dtype, CHUNK_SIZE);
+    let mut cur_rows = 0;
+    for v in out_values {
+        if cur_rows >= CHUNK_SIZE {
+            out_chunks.push(DataChunk::new(vec![cur])?);
+            cur = Vector::with_capacity(dtype, CHUNK_SIZE);
+            cur_rows = 0;
+        }
+        cur.push_value(v)?;
+        cur_rows += 1;
+    }
+    if cur_rows > 0 || out_chunks.is_empty() {
+        out_chunks.push(DataChunk::new(vec![cur])?);
+    }
+    Ok(out_chunks)
+}
+
 pub(crate) fn aggregate(
     cx: &Cx,
     inputs: &[DataChunk],
     keys: &[BoundExpr],
     aggs: &[BoundAgg],
 ) -> Result<Vec<DataChunk>> {
+    // Fast path: a single integer/date/timestamp key with no aggregates is
+    // just DISTINCT over that column. Use a FastSet directly instead of the
+    // full group machinery (no per-group allocations, no encode/clone).
+    if keys.len() == 1 && aggs.is_empty() {
+        if let BoundExpr::Column { index, dtype } = &keys[0] {
+            let idx = *index;
+            let is_int_key = matches!(
+                dtype,
+                DataType::Integer
+                    | DataType::Bigint
+                    | DataType::Date
+                    | DataType::Timestamp
+            );
+            if is_int_key {
+                return fast_distinct_int(cx, inputs, idx, *dtype);
+            }
+        }
+    }
     // Phase 1: per-chunk partials in parallel.
     let partials: Vec<Partial> = inputs
         .par_iter()
