@@ -149,6 +149,37 @@ pub enum Statement {
     },
     /// `EXPLAIN <select>`: print the bound (optimized) plan.
     Explain(Box<Select>),
+    /// `CREATE [OR REPLACE] PROCEDURE name(params) [LANGUAGE lang] AS <body>`
+    /// (wave 44). The body is the string literal's text (preferably
+    /// dollar-quoted, `$$ BEGIN ... END $$`); the binder parses it
+    /// ([`crate::procedure::parse_body`]) and stores the definition in the
+    /// database's catalog.
+    CreateProcedure {
+        db: Option<String>,
+        name: String,
+        /// Typed parameters, in written order.
+        params: Vec<(String, crate::types::DataType)>,
+        /// `LANGUAGE SQL | JAVASCRIPT`; defaults to SQL.
+        language: crate::procedure::ProcLanguage,
+        /// The body text exactly as written inside the quotes.
+        body: String,
+        /// `OR REPLACE`: an existing procedure of that name is replaced.
+        or_replace: bool,
+    },
+    /// `DROP PROCEDURE [IF EXISTS] name`.
+    DropProcedure {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
+    /// `CALL name(args...)`: run a stored procedure. The arguments are
+    /// constant expressions (evaluated against an empty scope); `?`
+    /// placeholders are allowed in a prepared statement.
+    Call {
+        db: Option<String>,
+        name: String,
+        args: Vec<Expr>,
+    },
     Select(Select),
 }
 

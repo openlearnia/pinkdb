@@ -16,11 +16,16 @@ pub mod csv;
 pub mod db;
 pub mod exec;
 mod ext;
+/// The optional JavaScript procedure sandbox (cargo feature `js`): the bridge
+/// to `pinkdb-js`, which refuses cleanly when no engine is bound.
+#[cfg(feature = "js")]
+pub(crate) mod js;
 pub(crate) mod mv;
 pub mod optimizer;
 pub mod persist;
 pub mod plan;
 pub mod prepared;
+pub mod procedure;
 pub mod sql;
 pub mod storage;
 pub mod types;
@@ -34,6 +39,7 @@ pub use crypto::EncryptionKey;
 pub use db::{Connection, Database};
 pub use exec::QueryResult;
 pub use prepared::{BoundStatement, PreparedStatement};
+pub use procedure::{ProcLanguage, ProcedureDef};
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};
 pub use vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
@@ -91,6 +97,10 @@ impl PinkDb {
         let texts = Some(texts);
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
+            // Wave 44: the procedure frame is statement-scoped — whatever a
+            // `CALL` recorded belongs to that statement and is read by the
+            // logging/conflict paths below.
+            self.proc_frame_reset();
             // Refresh at the statement boundary (never mid-statement, never
             // inside a transaction): reads served from memory only skip the
             // protocol when the epoch says the on-disk state did not change.
@@ -250,6 +260,10 @@ impl PinkDb {
                 None => (plan, dynamic_functions_used),
             };
             let result = exec::run(self, &plan)?;
+            // Wave 44: a `CALL`'s actual touched set joins the open
+            // transaction's conflict bookkeeping (its pre-execution pass saw
+            // an empty set).
+            self.note_proc_frame_in_txn(&plan);
             // Session transitions are applied before WAL logging so the log
             // record carries the post-statement session database.
             match &result {

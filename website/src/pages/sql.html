@@ -275,6 +275,35 @@ it and never affects other sessions: the shared store is untouched.</p>
   (<code>"use"</code> works).</li>
 </ul>
 
+<h2>Stored procedures</h2>
+
+<pre class="code" data-lang="sql"><code>CREATE PROCEDURE bump(a INTEGER) AS $$
+BEGIN
+  DECLARE n INTEGER DEFAULT 0;
+  UPDATE sales SET total = total + a WHERE region = 'west';
+  RETURN a;
+END
+$$;
+CALL bump(5);
+DROP PROCEDURE bump;</code></pre>
+
+<ul>
+  <li>Bodies support typed <code>DECLARE</code>/<code>SET</code>,
+  <code>IF/ELSIF/ELSE</code>, <code>WHILE</code>, nested blocks,
+  <code>RETURN</code>, <code>RAISE</code> and any ordinary SQL statement
+  (recursion is bounded).</li>
+  <li>Parameters and variables bind as <strong>values, never spliced SQL</strong>
+  — injection-shaped input is inert by construction — and every body statement
+  rebinds against the live catalog (a procedure can create a table, then write
+  to it).</li>
+  <li><code>CALL</code> is statement-atomic and works inside transactions;
+  procedures live per database, persist in <code>.pink</code> files and replay
+  exactly from the WAL.</li>
+  <li>JavaScript procedures (<code>LANGUAGE JAVASCRIPT</code>) are refused
+  cleanly in this build — the quickjs-ng engine binding is the queued
+  follow-up.</li>
+</ul>
+
 <h2>Materialized views</h2>
 
 <pre class="code" data-lang="sql"><code>CREATE MATERIALIZED VIEW totals REFRESH EVERY INTERVAL '5 minutes' AS

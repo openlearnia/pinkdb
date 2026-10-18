@@ -2044,6 +2044,7 @@ dependencies = [
  "csv",
  "peg",
  "pinkdb-ext-loader",
+ "pinkdb-js",
  "rayon",
 ]
 
@@ -2074,6 +2075,10 @@ version = "0.1.0"
 dependencies = [
  "pinkdb",
 ]
+
+[[package]]
+name = "pinkdb-js"
+version = "0.1.0"
 
 [[package]]
 name = "pinkdb-server"

@@ -1028,6 +1028,21 @@ fn render_results(results: &[QueryResult]) {
             }
             QueryResult::Checkpointed => println!("Checkpoint complete."),
             QueryResult::AlteredTable { name } => println!("Table {name} altered."),
+            QueryResult::CreatedProcedure { name } => println!("Procedure {name} created."),
+            QueryResult::DroppedProcedure { name } => println!("Procedure {name} dropped."),
+            QueryResult::Called {
+                name,
+                statements,
+                result,
+            } => {
+                println!(
+                    "Procedure {name} called ({statements} statement{}).",
+                    if *statements == 1 { "" } else { "s" }
+                );
+                if let Some(inner) = result {
+                    render_results(std::slice::from_ref(&**inner));
+                }
+            }
             QueryResult::Selected { names, types, rows } => {
                 if rows.is_empty() {
                     println!("(no rows)");

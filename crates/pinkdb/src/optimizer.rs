@@ -392,7 +392,24 @@ fn fold_expr(cx: &crate::exec::Cx, expr: BoundExpr) -> BoundExpr {
     {
         if let Ok(v) = eval_expr(&rebuilt, &const_chunk(), cx) {
             if v.len() == 1 {
-                return BoundExpr::Literal(v.get(0));
+                let value = v.get(0);
+                // A folded NULL would lose the expression's type: a bare
+                // `Literal(Null)` is INTEGER-typed (the `SELECT NULL`
+                // convention), while the folded expression may be BOOLEAN (a
+                // comparison), DATE, … — downstream operators check the type
+                // (`WHERE` needs BOOLEAN), so pin the original type with a
+                // CAST of NULL. Fixes `SELECT * FROM t WHERE NULL` and
+                // `WHERE 1 = NULL` (plus procedure variables that are NULL).
+                if value.is_null() {
+                    let dtype = rebuilt.dtype();
+                    if dtype != DataType::Integer {
+                        return BoundExpr::Cast {
+                            expr: Box::new(BoundExpr::Literal(crate::types::Value::Null)),
+                            dtype,
+                        };
+                    }
+                }
+                return BoundExpr::Literal(value);
             }
         }
     }

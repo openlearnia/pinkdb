@@ -100,6 +100,23 @@ pub enum QueryResult {
     },
     /// `CHECKPOINT` finished (a no-op for in-memory databases).
     Checkpointed,
+    /// `CREATE PROCEDURE` (wave 44).
+    CreatedProcedure {
+        name: String,
+    },
+    /// `DROP PROCEDURE` (wave 44).
+    DroppedProcedure {
+        name: String,
+    },
+    /// `CALL name(args...)` (wave 44): the procedure ran `statements` body
+    /// statements, and `result` is what it returned — the last statement's
+    /// result, or the `RETURN <expr>` value (a one-row, one-column
+    /// `Selected` named `return`). `None` for a body that ran no statement.
+    Called {
+        name: String,
+        statements: usize,
+        result: Option<Box<QueryResult>>,
+    },
     Selected {
         names: Vec<String>,
         types: Vec<DataType>,
@@ -869,6 +886,89 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let name = db.load_extension(path)?;
             Ok(QueryResult::LoadedExtension { name })
         }
+        LogicalPlan::CreateProcedure {
+            db: qdb,
+            name,
+            def,
+            or_replace,
+        } => {
+            let target = resolve_db(db, qdb);
+            // The procedure shares the table/view/materialized-view name
+            // space at creation: a callable named like a table would make
+            // `CALL` and queries silently disagree. A materialized view is
+            // checked before its backing table (which carries the same name).
+            if db.procedure_in(&target, name).is_ok() && !*or_replace {
+                return Err(PinkDbError::Catalog(format!(
+                    "procedure \"{name}\" already exists in database \"{target}\" \
+                     (use CREATE OR REPLACE PROCEDURE to replace it)"
+                )));
+            }
+            if db.view_in(&target, name).is_ok() {
+                return Err(PinkDbError::Catalog(format!(
+                    "a view named \"{name}\" already exists in database \"{target}\""
+                )));
+            }
+            if db.materialized_view_in(&target, name).is_ok() {
+                return Err(PinkDbError::Catalog(format!(
+                    "a materialized view named \"{name}\" already exists in database \
+                     \"{target}\""
+                )));
+            }
+            if db.table_in(&target, name).is_ok() {
+                return Err(PinkDbError::Catalog(format!(
+                    "a table named \"{name}\" already exists in database \"{target}\""
+                )));
+            }
+            db.procedures_insert_in(&target, name.to_ascii_lowercase(), def.clone())?;
+            Ok(QueryResult::CreatedProcedure { name: name.clone() })
+        }
+        LogicalPlan::DropProcedure {
+            db: qdb,
+            name,
+            if_exists,
+        } => {
+            let target = resolve_db(db, qdb);
+            if db.procedure_in(&target, name).is_err() {
+                if *if_exists {
+                    return Ok(QueryResult::DroppedProcedure { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!(
+                    "procedure \"{name}\" not found in database \"{target}\""
+                )));
+            }
+            db.procedures_remove_in(&target, &name.to_ascii_lowercase());
+            Ok(QueryResult::DroppedProcedure { name: name.clone() })
+        }
+        LogicalPlan::Call {
+            db: qdb,
+            name,
+            args,
+        } => {
+            let target = resolve_db(db, qdb);
+            // The arguments are constant expressions: evaluate them against
+            // an empty single-row chunk, exactly like an ALTER default.
+            let single = DataChunk {
+                columns: Vec::new(),
+                num_rows: 1,
+            };
+            let mut values = Vec::with_capacity(args.len());
+            {
+                let cx = Cx::new(db);
+                for arg in args {
+                    let v = eval_expr(arg, &single, &cx)?;
+                    if v.len() != 1 {
+                        return Err(PinkDbError::Execution(
+                            "a CALL argument did not evaluate to one value".to_string(),
+                        ));
+                    }
+                    values.push(v.get(0));
+                }
+            }
+            // Resolve the definition now (the binder did too, but the catalog
+            // may have been refreshed between bind and execution).
+            let def = db.procedure_in(&target, name)?.clone();
+            crate::procedure::execute_call(db, &target, &def, values)
+        }
         _ => {
             let cx = Cx::new(db).with_projections(plan);
             run_read_with(&cx, plan)
@@ -1254,7 +1354,12 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
-        | LogicalPlan::DropMaterializedView { .. } => Err(PinkDbError::Execution(
+        | LogicalPlan::DropMaterializedView { .. }
+        // Wave 44: `CALL` is handled by `run` (it may write); it never
+        // reaches the row evaluator.
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::Call { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { .. } => scan_output(cx, plan),
@@ -4076,6 +4181,9 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::RefreshMaterializedView { db, name } => {
             format!("RefreshMaterializedView {}", qualify(db, name))
         }
+        LogicalPlan::CreateProcedure { name, .. } => format!("CreateProcedure {name}"),
+        LogicalPlan::DropProcedure { name, .. } => format!("DropProcedure {name}"),
+        LogicalPlan::Call { name, .. } => format!("Call {name}"),
         LogicalPlan::RefreshMaterializedViews { db } => format!(
             "RefreshMaterializedViews {}",
             db.clone().unwrap_or_default()

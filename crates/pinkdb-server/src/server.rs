@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pinkdb::{Database, QueryResult, Value};
+use pinkdb::{DataType, Database, QueryResult, Value};
 
 use crate::protocol::{self, DoneKind, ProtocolError, Request, Response, PROTOCOL_VERSION};
 
@@ -624,32 +624,22 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), ProtocolError> {
     match result {
         QueryResult::Selected { names, types, rows } => {
-            let result_set = Response::ResultSet {
-                names: names.clone(),
-                types: types.clone(),
-            };
-            protocol::write_response(w, &result_set)?;
-            let mut batch: Vec<Vec<Value>> = Vec::new();
-            let mut batch_bytes = 0usize;
-            for row in rows {
-                let row_bytes = row_encoded_len(row);
-                if !batch.is_empty()
-                    && (batch.len() >= protocol::ROWS_PER_FRAME
-                        || batch_bytes + row_bytes > ROWS_FRAME_BUDGET)
-                {
-                    let frame = Response::Rows {
-                        rows: std::mem::take(&mut batch),
-                    };
-                    protocol::write_response(w, &frame)?;
-                    batch_bytes = 0;
-                }
-                batch.push(row.clone());
-                batch_bytes += row_bytes;
-            }
-            if !batch.is_empty() {
-                protocol::write_response(w, &Response::Rows { rows: batch })?;
-            }
+            stream_selected(w, names, types, rows)?;
             done(w, DoneKind::Selected, 0, "")
+        }
+        QueryResult::CreatedProcedure { name } => done(w, DoneKind::Created, 0, name),
+        QueryResult::DroppedProcedure { name } => done(w, DoneKind::DroppedTable, 0, name),
+        QueryResult::Called {
+            name,
+            statements,
+            result,
+        } => {
+            // The call's own result rides the frames before `Done(Called)` —
+            // only a result set can (see `DoneKind::Called`).
+            if let Some(QueryResult::Selected { names, types, rows }) = result.as_deref() {
+                stream_selected(w, names, types, rows)?;
+            }
+            done(w, DoneKind::Called, *statements as u64, name)
         }
         QueryResult::Created => done(w, DoneKind::Created, 0, ""),
         QueryResult::Inserted { count } => done(w, DoneKind::Inserted, *count as u64, ""),
@@ -674,6 +664,45 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
         QueryResult::RefreshedMaterializedViews { .. } => done(w, DoneKind::Created, 0, ""),
         QueryResult::DroppedMaterializedView { name } => done(w, DoneKind::DroppedTable, 0, name),
     }
+}
+
+/// Stream one result set's `ResultSet`/`Rows` frames (batched by count and
+/// encoded size, so a result set of large strings still streams well under
+/// [`protocol::MAX_FRAME_SIZE`]; a single value larger than the frame cap is
+/// unrepresentable and fails with a clear error instead of silently dropping
+/// the connection). The caller sends the matching `Done`.
+fn stream_selected<W: Write>(
+    w: &mut W,
+    names: &[String],
+    types: &[DataType],
+    rows: &[Vec<Value>],
+) -> Result<(), ProtocolError> {
+    let result_set = Response::ResultSet {
+        names: names.to_vec(),
+        types: types.to_vec(),
+    };
+    protocol::write_response(w, &result_set)?;
+    let mut batch: Vec<Vec<Value>> = Vec::new();
+    let mut batch_bytes = 0usize;
+    for row in rows {
+        let row_bytes = row_encoded_len(row);
+        if !batch.is_empty()
+            && (batch.len() >= protocol::ROWS_PER_FRAME
+                || batch_bytes + row_bytes > ROWS_FRAME_BUDGET)
+        {
+            let frame = Response::Rows {
+                rows: std::mem::take(&mut batch),
+            };
+            protocol::write_response(w, &frame)?;
+            batch_bytes = 0;
+        }
+        batch.push(row.clone());
+        batch_bytes += row_bytes;
+    }
+    if !batch.is_empty() {
+        protocol::write_response(w, &Response::Rows { rows: batch })?;
+    }
+    Ok(())
 }
 
 fn done<W: Write>(w: &mut W, kind: DoneKind, count: u64, name: &str) -> Result<(), ProtocolError> {

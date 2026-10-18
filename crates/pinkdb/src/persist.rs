@@ -4,8 +4,12 @@
 //! ```text
 //! magic "PINKDB05" (8 bytes)
 //! flags u32                 (0 = no optional sections; bit 0 = tables carry
-//!                            a constraint section; unknown bits are a hard
-//!                            error)
+//!                            a constraint section, bit 1 = a column-default
+//!                            section, bit 2 = each database carries a
+//!                            materialized-view section, bit 4 = a
+//!                            stored-procedure section; unknown bits are a
+//!                            hard error; bit 3 is reserved for index
+//!                            persistence)
 //! db_count u32
 //! per database:
 //!   name_len u32 + name bytes
@@ -120,9 +124,23 @@ const FLAG_DEFAULTS: u32 = 0x2;
 /// (wave 80: name, refresh policy, defining SQL, last refresh stamp, refresh
 /// count) after its tables. Set iff at least one database has a materialized
 /// view, so stores without them keep v4-shaped bodies byte for byte. An older
-/// v5 build refuses the file cleanly through the unknown-flags check — the
-/// next format-gated section takes bit 3 (`0x8`; index persistence, wave 79).
+/// v5 build refuses the file cleanly through the unknown-flags check — bit 3
+/// (`0x8`) is reserved for index persistence (wave 79), so stored procedures
+/// (wave 44) take bit 4.
 const FLAG_MATERIALIZED_VIEWS: u32 = 0x4;
+
+/// [`FLAG_PROCEDURES`], visible to the crate's tests (the store's flags word
+/// is asserted from `crate::procedure`'s persistence tests).
+#[cfg(test)]
+pub(crate) const FLAG_PROCEDURES_FOR_TEST: u32 = FLAG_PROCEDURES;
+
+/// Flags bit 4 (v5+): every database carries the stored-procedure section
+/// (wave 44: name, typed parameters, language tag, body text) after its
+/// tables and materialized views. Set iff at least one database has a
+/// procedure, so stores without them keep their exact previous bytes. An
+/// older v5 build refuses the file cleanly through the unknown-flags check;
+/// the next format-gated section takes bit 5 (`0x20`).
+const FLAG_PROCEDURES: u32 = 0x10;
 
 /// Column-default value tags (one byte per non-NULL default).
 const VD_BOOL: u8 = 0;
@@ -2193,13 +2211,15 @@ impl PinkDb {
             })
         });
         let with_mvs = self.has_materialized_views();
+        let with_procedures = self.has_procedures();
         w.u32(
             if with_constraints {
                 FLAG_CONSTRAINTS
             } else {
                 0
             } | if with_defaults { FLAG_DEFAULTS } else { 0 }
-                | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 },
+                | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
+                | if with_procedures { FLAG_PROCEDURES } else { 0 },
         );
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
@@ -2311,6 +2331,9 @@ impl PinkDb {
             }
             if with_mvs {
                 write_materialized_views(&mut w, self, dbname);
+            }
+            if with_procedures {
+                write_procedures(&mut w, self, dbname);
             }
         }
         let crc = crate::wal::crc32(&w.buf);
@@ -2531,10 +2554,16 @@ impl PinkDb {
         let mut constraints = false;
         let mut defaults = false;
         let mut mvs = false;
+        let mut procedures = false;
         if flags {
             let f = r.u32()?;
             if v5 {
-                if f & !(FLAG_CONSTRAINTS | FLAG_DEFAULTS | FLAG_MATERIALIZED_VIEWS) != 0 {
+                if f & !(FLAG_CONSTRAINTS
+                    | FLAG_DEFAULTS
+                    | FLAG_MATERIALIZED_VIEWS
+                    | FLAG_PROCEDURES)
+                    != 0
+                {
                     return Err(PinkDbError::Execution(format!(
                         "unsupported .pink v5 flags 0x{f:08x}; upgrade pinkdb"
                     )));
@@ -2542,6 +2571,7 @@ impl PinkDb {
                 constraints = f & FLAG_CONSTRAINTS != 0;
                 defaults = f & FLAG_DEFAULTS != 0;
                 mvs = f & FLAG_MATERIALIZED_VIEWS != 0;
+                procedures = f & FLAG_PROCEDURES != 0;
             } else if f != 0 {
                 return Err(PinkDbError::Execution(format!(
                     "unsupported .pink v4 flags 0x{f:08x}; upgrade pinkdb"
@@ -2562,6 +2592,9 @@ impl PinkDb {
                 }
                 if v5 && mvs {
                     load_materialized_views(&mut r, &mut db, &dbname)?;
+                }
+                if v5 && procedures {
+                    load_procedures(&mut r, &mut db, &dbname)?;
                 }
             }
             if db.list_databases().is_empty() {
@@ -2711,6 +2744,94 @@ fn load_materialized_views(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Res
                 last_attempt_ms: last_refreshed_ms,
                 refresh_count,
                 last_error: None,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+/// One database's stored-procedure section (`FLAG_PROCEDURES`, wave 44): the
+/// count, then per procedure, sorted by lowercased name,
+/// `name, language tag, parameter count × (name, dtype tag [, precision,
+/// scale]), body text`. The **parsed body is not stored**: only the text,
+/// which the loader re-parses (a body is validated at `CREATE`, and a stored
+/// body that no longer parses is a corrupt file). JavaScript bodies are opaque
+/// text and load in every build — running one still needs the `js` feature, so
+/// a build without it reports the refusal at `CALL` time.
+fn write_procedures(w: &mut Writer, db: &PinkDb, dbname: &str) {
+    let procs = db.procedures_in(dbname);
+    w.u32(procs.len() as u32);
+    for (_, def) in &procs {
+        w.str(&def.name);
+        w.u8(def.language.tag());
+        w.u32(def.params.len() as u32);
+        for (name, dtype) in &def.params {
+            w.str(name);
+            w.u8(dtype_tag(*dtype));
+            // DECIMAL rides its precision/scale, exactly like the schema.
+            if let DataType::Decimal { precision, scale } = dtype {
+                w.u8(*precision);
+                w.u8(*scale);
+            }
+        }
+        w.str(&def.source);
+    }
+}
+
+/// Decode one database's stored-procedure section and install the
+/// definitions. A SQL body is re-parsed here; a parse failure is a corrupt
+/// file (the body was validated when the definition was created).
+fn load_procedures(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
+    let n = r.u32()? as usize;
+    // Each procedure costs at least 7 bytes (language, empty counts/strings);
+    // do not size an allocation from the unvalidated count.
+    if n > r.remaining() / 7 + 1 {
+        return r.err("procedure count exceeds the remaining file");
+    }
+    for _ in 0..n {
+        let name = r.str()?;
+        let language = crate::procedure::ProcLanguage::from_tag(r.u8()?)?;
+        let n_params = r.u32()? as usize;
+        if n_params > r.remaining() / 5 + 1 {
+            return r.err("procedure parameter count exceeds the remaining file");
+        }
+        let mut params = Vec::with_capacity(n_params);
+        for _ in 0..n_params {
+            let pname = r.str()?;
+            let tag = r.u8()?;
+            let dtype = if tag == 7 {
+                let precision = r.u8()?;
+                let scale = r.u8()?;
+                DataType::Decimal { precision, scale }
+            } else {
+                dtype_from_tag(tag)?
+            };
+            params.push((pname, dtype));
+        }
+        let source = r.str()?;
+        let body = match language {
+            crate::procedure::ProcLanguage::Sql => {
+                let param_names: Vec<String> = params.iter().map(|(n, _)| n.clone()).collect();
+                Some(
+                    crate::procedure::parse_body(&name, &param_names, &source).map_err(|e| {
+                        PinkDbError::Execution(format!(
+                            "corrupt file: procedure \"{name}\" (database \"{dbname}\") \
+                             does not parse: {e}"
+                        ))
+                    })?,
+                )
+            }
+            crate::procedure::ProcLanguage::JavaScript => None,
+        };
+        db.procedures_insert_in(
+            dbname,
+            name.to_ascii_lowercase(),
+            crate::procedure::ProcedureDef {
+                name,
+                params,
+                language,
+                source,
+                body,
             },
         )?;
     }

@@ -9,7 +9,7 @@ pub mod ast;
 pub mod binder;
 pub(crate) mod keyword;
 pub mod peg_parser;
-mod split;
+pub(crate) mod split;
 
 use crate::types::{PinkDbError, Result, Value};
 pub use binder::{bind, AggFunc, BoundAgg, BoundExpr, ScalarFunc};
@@ -80,6 +80,19 @@ fn nesting_estimate(sql: &str) -> usize {
                     } else {
                         i += 1;
                     }
+                }
+                unary = 0;
+            }
+            b'$' if bytes.get(i + 1) == Some(&b'$') => {
+                // A dollar-quoted string (a procedure body): the grammar lexes
+                // it as one literal, so its parens/CASEs are not nesting.
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'$') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
                 }
                 unary = 0;
             }

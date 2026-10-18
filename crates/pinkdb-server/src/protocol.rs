@@ -50,7 +50,11 @@ use pinkdb::{DataType, Value};
 /// v6: `DECIMAL`/`INTERVAL` value and dtype tags (DECIMAL's precision/scale
 /// ride after its dtype tag).
 /// v7: [`DoneKind::AlteredTable`] (tag 17) reports `ALTER TABLE`.
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8: [`DoneKind::Called`] (tag 18) reports `CALL`: the count is the
+/// numbered body statements the procedure ran, and a result set the call
+/// itself produced (a `SELECT`/`SHOW`/`RETURN` inside the body) precedes the
+/// frame exactly like a plain query's.
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -356,6 +360,15 @@ pub enum DoneKind {
     /// `ALTER TABLE` (v7); `name` is the table's name after the statement (a
     /// `RENAME TO` reports the new one).
     AlteredTable = 17,
+    /// `CALL` (v8, wave 44): `count` is the number of body statements the
+    /// procedure ran and `name` is the procedure. When the call's own result
+    /// is a result set (a `SELECT`/`SHOW`/`RETURN` inside the body), its
+    /// `ResultSet`/`Rows` frames precede this frame, exactly like a plain
+    /// query's; the client nests them back into `QueryResult::Called`'s
+    /// `result`. Any other nested outcome (an `INSERT` count, for instance)
+    /// is streamed as `Called` alone — the remote client reports the call's
+    /// outcome, not every inner statement's.
+    Called = 18,
 }
 
 impl DoneKind {
@@ -379,6 +392,7 @@ impl DoneKind {
             15 => DoneKind::LoadedExtension,
             16 => DoneKind::Checkpointed,
             17 => DoneKind::AlteredTable,
+            18 => DoneKind::Called,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"

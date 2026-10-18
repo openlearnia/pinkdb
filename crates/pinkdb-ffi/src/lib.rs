@@ -315,6 +315,9 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::RefreshedMaterializedView { .. } => PINKDB_STMT_CREATED,
         QueryResult::RefreshedMaterializedViews { .. } => PINKDB_STMT_CREATED,
         QueryResult::DroppedMaterializedView { .. } => PINKDB_STMT_DROPPED_TABLE,
+        QueryResult::CreatedProcedure { .. } => PINKDB_STMT_CREATED,
+        QueryResult::DroppedProcedure { .. } => PINKDB_STMT_DROPPED_TABLE,
+        QueryResult::Called { .. } => PINKDB_STMT_CREATED,
     }
 }
 
@@ -330,18 +333,46 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
                     .map(|row| row.iter().map(Cell::from_value).collect())
                     .collect(),
             }),
+            // `CALL` (wave 44): a call whose own result is a result set is
+            // presented as that row set (the statement stream needs no new
+            // C-ABI entry); any other call outcome is a simple statement whose
+            // count is the number of body statements it ran.
+            QueryResult::Called {
+                name,
+                statements,
+                result: Some(inner),
+            } => match *inner {
+                QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
+                    names: names.into_iter().map(|n| nul_terminated(&n)).collect(),
+                    types: types.into_iter().map(dtype_tag).collect(),
+                    rows: rows
+                        .iter()
+                        .map(|row| row.iter().map(Cell::from_value).collect())
+                        .collect(),
+                }),
+                _ => StmtData::Simple {
+                    kind: PINKDB_STMT_CREATED,
+                    count: statements,
+                    name: Some(nul_terminated(&name)),
+                },
+            },
             other => {
                 let kind = kind_of(&other);
                 let (count, name) = match &other {
                     QueryResult::Inserted { count }
                     | QueryResult::Updated { count }
                     | QueryResult::Deleted { count } => (*count, None),
+                    QueryResult::Called {
+                        name, statements, ..
+                    } => (*statements, Some(nul_terminated(name))),
                     QueryResult::CreatedView { name }
                     | QueryResult::DroppedTable { name }
                     | QueryResult::DroppedView { name }
                     | QueryResult::CreatedDatabase { name }
                     | QueryResult::DroppedDatabase { name }
-                    | QueryResult::AlteredTable { name } => (0, Some(nul_terminated(name))),
+                    | QueryResult::AlteredTable { name }
+                    | QueryResult::CreatedProcedure { name }
+                    | QueryResult::DroppedProcedure { name } => (0, Some(nul_terminated(name))),
                     QueryResult::Used { db } => (0, Some(nul_terminated(db))),
                     QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
                     _ => (0, None),

@@ -16,6 +16,9 @@ client = ["dep:pinkdb-server"]
 # too, the same key encrypts the lake at rest (pink-lake's `encryption`
 # feature): every `.lake` artifact becomes a `PNKLAKE1` container.
 encryption = ["pinkdb/encryption", "pink-lake?/encryption"]
+# Opt-in JavaScript procedures: forwards to `pinkdb/js` (the `pinkdb-js`
+# sandbox contract; the engine binding is the recorded follow-up).
+js = ["pinkdb/js"]
 # Opt-in extension-repository client: `.install`, `.repositories`, `.installed`.
 # Keeps the default binary lean: HTTP + TLS, JSON parsing, and SHA-256 live
 # only behind this feature.

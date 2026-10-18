@@ -1,0 +1,15 @@
+[package]
+name = "pinkdb-js"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+description = "pinkdb: the deterministic JavaScript procedure sandbox (optional `js` feature)"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib"]
+
+# No dependencies on purpose: the sandbox contract is engine-agnostic, and the
+# engine binding (the recorded follow-up) will add exactly one, feature-gated,
+# pure-Rust engine dependency. The default pinkdb build links nothing here.
+[dependencies]

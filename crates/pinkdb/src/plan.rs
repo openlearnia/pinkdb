@@ -170,6 +170,37 @@ pub enum LogicalPlan {
     Explain {
         plan: Box<LogicalPlan>,
     },
+    /// `CREATE [OR REPLACE] PROCEDURE ...` (wave 44): store the parsed
+    /// definition in the target database's catalog. A name that already names
+    /// a table, view or materialized view is refused at execution.
+    CreateProcedure {
+        db: Option<String>,
+        name: String,
+        def: crate::procedure::ProcedureDef,
+        /// `OR REPLACE`: an existing procedure of that name is replaced.
+        or_replace: bool,
+    },
+    /// `DROP PROCEDURE [IF EXISTS] name`.
+    DropProcedure {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
+    /// `CALL name(args...)` (wave 44): run the stored procedure. The
+    /// arguments were bound as constant expressions; the definition is
+    /// resolved against the catalog at execution (a rebind after a lease
+    /// refresh always sees the current one).
+    ///
+    /// The call's *actual* touched set (which tables its statements read and
+    /// wrote) is only known after execution — loop conditions are
+    /// data-dependent — so the executor records it in
+    /// [`crate::storage::PinkDb::proc_frame`] and the logging paths take the
+    /// frame's payload from there.
+    Call {
+        db: Option<String>,
+        name: String,
+        args: Vec<BoundExpr>,
+    },
     /// Set operation (`UNION`/`INTERSECT`/`EXCEPT`, each `[ALL]`): output
     /// names come from the left branch; every column is coerced to the
     /// pairwise common type at execution.
@@ -411,6 +442,15 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::RefreshMaterializedView { .. }
             | LogicalPlan::RefreshMaterializedViews { .. }
             | LogicalPlan::DropMaterializedView { .. }
+            // Wave 44: procedure DDL mutates the catalog (and must replay), and
+            // a CALL is logged as a whole: its statements' effects are the
+            // call's effect, and replay re-executes the (deterministic) call.
+            // A call that wrote nothing is still logged — harmless, and it
+            // keeps the write/lease decisions independent of the body's
+            // data-dependent control flow.
+            | LogicalPlan::CreateProcedure { .. }
+            | LogicalPlan::DropProcedure { .. }
+            | LogicalPlan::Call { .. }
     )
 }
 
@@ -432,6 +472,12 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         LogicalPlan::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
         LogicalPlan::RefreshMaterializedViews { .. } => "REFRESH MATERIALIZED VIEWS",
         LogicalPlan::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
+        // Wave 44: a procedure definition is catalog metadata the per-table
+        // transaction merge does not carry, exactly like a materialized view's.
+        // `CALL` itself is allowed inside a transaction: its statements run
+        // there like hand-written statements.
+        LogicalPlan::CreateProcedure { .. } => "CREATE PROCEDURE",
+        LogicalPlan::DropProcedure { .. } => "DROP PROCEDURE",
         _ => return None,
     })
 }
@@ -533,7 +579,9 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
-        | LogicalPlan::DropMaterializedView { .. } => {}
+        | LogicalPlan::DropMaterializedView { .. }
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::DropProcedure { .. } => {}
         // A materialized view's defining query is part of the statement: the
         // backing table is computed from exactly these reads.
         LogicalPlan::CreateMaterializedView { query, .. } => {
@@ -541,6 +589,14 @@ pub(crate) fn collect_tables_read(
         }
         LogicalPlan::IndexScan { db, table, .. } => {
             out.insert(key(db, table));
+        }
+        // A call's own arguments may hold subqueries (they bind in an empty
+        // scope); the tables its *body* touches are only known after
+        // execution and are reported through `PinkDb::proc_frame`.
+        LogicalPlan::Call { args, .. } => {
+            for e in args {
+                expr_tables_read(e, default_db, out);
+            }
         }
         // `CREATE TABLE` reads the declared foreign-key targets: the binder
         // validated their keys against the catalog, so the statement depends
@@ -864,7 +920,14 @@ fn walk_scan_filters(
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
-        | LogicalPlan::DropMaterializedView { .. } => {}
+        | LogicalPlan::DropMaterializedView { .. }
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::DropProcedure { .. } => {}
+        LogicalPlan::Call { args, .. } => {
+            for a in args {
+                walk_expr_subquery_filters(a, out);
+            }
+        }
         LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
         LogicalPlan::CreateTableAs { query, .. } | LogicalPlan::InsertSelect { query, .. } => {
             walk_scan_filters(query, &[], out)
@@ -1114,6 +1177,212 @@ fn prunable_types(column_dtype: DataType, literal_dtype: DataType) -> bool {
     numeric(column_dtype) && numeric(literal_dtype)
 }
 
+/// True when `plan` (or any subquery inside one of its expressions) calls a
+/// loadable-extension function. The procedure executor refuses such a
+/// statement: a callback is opaque (it may be impure, nondeterministic or
+/// fail), so a durable store could not replay a logged `CALL` that ran it.
+///
+/// Deeper than [`BoundExpr::contains_dynamic_scalar`], which stops at a
+/// subquery boundary because its callers ask a folding question; here the
+/// answer must cover the whole statement.
+pub(crate) fn contains_dynamic_scalar(plan: &LogicalPlan) -> bool {
+    let mut found = false;
+    walk_dynamic_scalars(plan, &mut found);
+    found
+}
+
+/// [`contains_dynamic_scalar`] for one bound expression (subqueries included).
+pub(crate) fn bound_expr_has_dynamic_scalar(expr: &BoundExpr) -> bool {
+    let mut found = false;
+    expr_dynamic(expr, &mut found);
+    found
+}
+
+fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
+    if *found {
+        return;
+    }
+    let mut exprs: Vec<&BoundExpr> = Vec::new();
+    let mut children: Vec<&LogicalPlan> = Vec::new();
+    match plan {
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::SingleRow
+        | LogicalPlan::Begin
+        | LogicalPlan::Commit
+        | LogicalPlan::Rollback
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Use { .. }
+        | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::ShowTables { .. }
+        | LogicalPlan::ShowDatabases
+        | LogicalPlan::ShowMaterializedViews { .. }
+        | LogicalPlan::Describe { .. }
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::DropMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedViews { .. } => {}
+        LogicalPlan::IndexScan { value, .. } => exprs.push(value),
+        LogicalPlan::Call { args, .. } => exprs.extend(args.iter()),
+        LogicalPlan::CreateTableAs { query, .. }
+        | LogicalPlan::InsertSelect { query, .. }
+        | LogicalPlan::CreateMaterializedView { query, .. } => children.push(query),
+        LogicalPlan::Cte { query, body, .. } => {
+            children.push(query);
+            children.push(body);
+        }
+        LogicalPlan::AlterTable { op, .. } => {
+            if let AlterTablePlan::AddColumn {
+                default: Some(e), ..
+            } = op
+            {
+                exprs.push(e);
+            }
+        }
+        LogicalPlan::Insert { rows, .. } => {
+            for row in rows {
+                exprs.extend(row.iter());
+            }
+        }
+        LogicalPlan::Update {
+            sets, predicate, ..
+        } => {
+            exprs.extend(sets.iter().map(|(_, e)| e));
+            if let Some(p) = predicate {
+                exprs.push(p);
+            }
+        }
+        LogicalPlan::Delete { predicate, .. } => {
+            if let Some(p) = predicate {
+                exprs.push(p);
+            }
+        }
+        LogicalPlan::RefreshMaterializedView { .. } => {}
+        LogicalPlan::Explain { plan } => children.push(plan),
+        LogicalPlan::SetOp { left, right, .. } => {
+            children.push(left);
+            children.push(right);
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            children.push(input);
+            exprs.push(predicate);
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            children.push(input);
+            for w in windows {
+                exprs.extend(w.arg.iter());
+                exprs.extend(w.partition.iter());
+                exprs.extend(w.order.iter().map(|(e, _)| e));
+            }
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            children.push(left);
+            children.push(right);
+            exprs.extend(left_keys.iter());
+            exprs.extend(right_keys.iter());
+        }
+        LogicalPlan::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            children.push(left);
+            children.push(right);
+            if let Some(on) = on {
+                exprs.push(on);
+            }
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            children.push(input);
+            exprs.extend(keys.iter());
+            exprs.extend(aggs.iter().filter_map(|a| a.arg.as_ref()));
+        }
+        LogicalPlan::Project {
+            input, exprs: es, ..
+        } => {
+            children.push(input);
+            exprs.extend(es.iter());
+        }
+        LogicalPlan::Distinct { input } => children.push(input),
+        LogicalPlan::Sort { input, keys } => {
+            children.push(input);
+            exprs.extend(keys.iter().map(|(e, _)| e));
+        }
+        LogicalPlan::Limit { input, .. } | LogicalPlan::Offset { input, .. } => {
+            children.push(input)
+        }
+    }
+    for e in exprs {
+        expr_dynamic(e, found);
+        if *found {
+            return;
+        }
+    }
+    for c in children {
+        walk_dynamic_scalars(c, found);
+        if *found {
+            return;
+        }
+    }
+}
+
+/// One expression's dynamic-scalar check, descending into subquery plans (a
+/// subquery's own WHERE/HAVING/key expressions bind in their own scope, so
+/// they are checked through their plan).
+fn expr_dynamic(expr: &BoundExpr, found: &mut bool) {
+    use crate::sql::binder::BoundExpr as E;
+    if *found {
+        return;
+    }
+    match expr {
+        E::DynamicScalar { .. } => *found = true,
+        E::Literal(_) | E::Column { .. } | E::AggRef { .. } | E::WindowRef { .. } => {}
+        E::Not(e)
+        | E::Negate { expr: e, .. }
+        | E::IsNull { expr: e, .. }
+        | E::Cast { expr: e, .. } => expr_dynamic(e, found),
+        E::Binary { left, right, .. } => {
+            expr_dynamic(left, found);
+            expr_dynamic(right, found);
+        }
+        E::Scalar { args, .. } | E::Coalesce { args, .. } => {
+            for a in args {
+                expr_dynamic(a, found);
+            }
+        }
+
+        E::InSubquery { expr, query, .. } => {
+            expr_dynamic(expr, found);
+            walk_dynamic_scalars(query, found);
+        }
+        E::ScalarSubquery { query, .. } | E::Exists { query, .. } => {
+            walk_dynamic_scalars(query, found)
+        }
+        E::Case {
+            branches, else_, ..
+        } => {
+            for (c, v) in branches {
+                expr_dynamic(c, found);
+                expr_dynamic(v, found);
+            }
+            if let Some(e) = else_ {
+                expr_dynamic(e, found);
+            }
+        }
+    }
+}
+
 /// Which of a node's input columns a consumer reads: an explicit set, or
 /// `All` when the shape cannot be bounded (a correct fallback: every column
 /// is decoded).
@@ -1323,7 +1592,17 @@ fn walk_scan_projections(
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
-        | LogicalPlan::DropMaterializedView { .. } => {}
+        | LogicalPlan::DropMaterializedView { .. }
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::DropProcedure { .. } => {}
+        // A call's arguments are constant expressions; a subquery inside one
+        // is analyzed in full.
+        LogicalPlan::Call { args, .. } => {
+            for a in args {
+                let mut need = Needed::All;
+                collect_expr_projections(a, &mut need, out);
+            }
+        }
     }
 }
 

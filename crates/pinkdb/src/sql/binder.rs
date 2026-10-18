@@ -799,6 +799,16 @@ fn comparison_ok(op: BinaryOp, l: DataType, r: DataType) -> Result<()> {
 #[derive(Clone)]
 pub(crate) struct ParamSlots {
     inner: Rc<RefCell<ParamState>>,
+    /// A procedure call's variables (parameters and `DECLARE`s), outermost
+    /// first: a bare, unqualified name that matches one binds to its *value*
+    /// as a literal — variables shadow columns (wave 44). Values are never
+    /// spliced into SQL text, so a call is injection-safe by construction.
+    variables: Vec<(String, Value)>,
+    /// True while binding a statement that will be logged as part of a
+    /// procedure call on a durable store: a read of a session-local view
+    /// cannot replay, so it is refused here (see
+    /// [`crate::procedure`]).
+    logged_procedure: bool,
 }
 
 #[derive(Default)]
@@ -821,7 +831,37 @@ impl ParamSlots {
                 types: vec![None; n],
                 resolved: vec![None; n],
             })),
+            variables: Vec::new(),
+            logged_procedure: false,
         }
+    }
+
+    /// Make a procedure call's variables visible to this bind (wave 44).
+    pub(crate) fn with_variables(mut self, variables: Vec<(String, Value)>) -> Self {
+        self.variables = variables;
+        self
+    }
+
+    /// Mark this bind as a statement of a logged procedure call: a
+    /// session-local view read is refused instead of silently binding.
+    pub(crate) fn with_logged_procedure(mut self, logged: bool) -> Self {
+        self.logged_procedure = logged;
+        self
+    }
+
+    /// The value of the procedure variable `name` (innermost scope wins: the
+    /// list is ordered outermost-first, so the last match is the innermost).
+    pub(crate) fn variable(&self, name: &str) -> Option<Value> {
+        self.variables
+            .iter()
+            .rev()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// True when a view read would break the logged call's replay.
+    pub(crate) fn rejects_view_reads(&self) -> bool {
+        self.logged_procedure
     }
 
     /// The value bound to slot `i` (the raw API value), if any.
@@ -1174,6 +1214,14 @@ impl<'a> Binder<'a> {
                 "`t.*` is only valid in the projection list".to_string(),
             )),
             Expr::Column { table, name } => {
+                // Wave 44: a procedure call's variables shadow columns. The
+                // variable's *value* is bound as a literal (never SQL text).
+                if table.is_none() {
+                    if let Some(value) = self.params.as_ref().and_then(|slots| slots.variable(name))
+                    {
+                        return Ok(BoundExpr::Literal(value));
+                    }
+                }
                 // Alias substitution (`... ORDER BY x`), with a cycle guard so
                 // `SELECT x AS x` resolves to the column instead of recursing.
                 if table.is_none() && self.allow_alias {
@@ -3165,8 +3213,179 @@ pub(crate) fn bind_tracked_with(
             empty(LogicalPlan::LoadExtension { path: path.clone() })
         }
         Statement::Checkpoint => empty(LogicalPlan::Checkpoint),
+        Statement::CreateProcedure {
+            db: qdb,
+            name,
+            params: sig,
+            language,
+            body,
+            or_replace,
+        } => bind_create_procedure(
+            db,
+            default_db,
+            qdb.as_deref(),
+            CreateProcedureArgs {
+                name,
+                sig,
+                language: *language,
+                body,
+                or_replace: *or_replace,
+            },
+        ),
+        Statement::DropProcedure {
+            db: qdb,
+            name,
+            if_exists,
+        } => empty(LogicalPlan::DropProcedure {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        Statement::Call {
+            db: qdb,
+            name,
+            args,
+        } => bind_call(db, default_db, qdb.as_deref(), name, args, params.clone()),
         Statement::Select(sel) => bind_select(db, default_db, sel, params.clone()),
     }
+}
+
+/// The parsed `CREATE [OR REPLACE] PROCEDURE` header the binder validates (a
+/// struct so the helper stays under the argument-count lint).
+struct CreateProcedureArgs<'a> {
+    name: &'a str,
+    sig: &'a [(String, DataType)],
+    language: crate::procedure::ProcLanguage,
+    body: &'a str,
+    or_replace: bool,
+}
+
+/// Bind `CREATE [OR REPLACE] PROCEDURE` (wave 44): validate the signature and
+/// parse the body into the catalog definition the executor stores.
+///
+/// The body's statements are **not bound here**: each rebinds against the
+/// current catalog when the call runs (so a procedure may create a table and
+/// then insert into it), and its variables have no values yet. What is
+/// checked here is everything a definition must satisfy forever: the
+/// language, a duplicate-free signature, and the body's *shape* (the
+/// procedural parser's terminators, declared `SET` targets and the
+/// store-level statements a body may not contain).
+fn bind_create_procedure(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: Option<&str>,
+    args: CreateProcedureArgs<'_>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let CreateProcedureArgs {
+        name,
+        sig,
+        language,
+        body,
+        or_replace,
+    } = args;
+    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    crate::procedure::check_language_available(language)?;
+    // A duplicate parameter name would make the scope ambiguous.
+    for (i, (n, _)) in sig.iter().enumerate() {
+        if sig[..i].iter().any(|(m, _)| m.eq_ignore_ascii_case(n)) {
+            return Err(PinkDbError::Catalog(format!(
+                "procedure \"{name}\": parameter \"{n}\" is declared twice"
+            )));
+        }
+    }
+    let param_names: Vec<String> = sig.iter().map(|(n, _)| n.clone()).collect();
+    let parsed = match language {
+        crate::procedure::ProcLanguage::Sql => {
+            Some(crate::procedure::parse_body(name, &param_names, body)?)
+        }
+        // A JavaScript body is opaque text for the sandbox to evaluate.
+        crate::procedure::ProcLanguage::JavaScript => None,
+    };
+    Ok((
+        LogicalPlan::CreateProcedure {
+            db: Some(target),
+            name: name.to_string(),
+            def: crate::procedure::ProcedureDef {
+                name: name.to_string(),
+                params: sig.to_vec(),
+                language,
+                source: body.to_string(),
+                body: parsed,
+            },
+            or_replace,
+        },
+        Vec::new(),
+    ))
+}
+
+/// Bind `CALL name(args...)`: resolve the procedure, check arity, and bind
+/// every argument as a constant expression (no table scope). Arguments of a
+/// call that a durable store will log must be deterministic: a
+/// loadable-extension callback is refused here, exactly like one inside a
+/// body.
+fn bind_call(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: Option<&str>,
+    name: &str,
+    args: &[Expr],
+    params: Option<ParamSlots>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let def = db.procedure_in(&target, name)?;
+    if args.len() != def.params.len() {
+        return Err(PinkDbError::Catalog(format!(
+            "procedure \"{}\" takes {} argument(s), but {} were given",
+            def.name,
+            def.params.len(),
+            args.len()
+        )));
+    }
+    let mut bound = Vec::with_capacity(args.len());
+    for (i, arg) in args.iter().enumerate() {
+        let value = bind_constant_expr(db, &target, arg, params.clone())?;
+        if crate::plan::bound_expr_has_dynamic_scalar(&value) {
+            return Err(PinkDbError::Execution(format!(
+                "CALL argument {} calls a loadable-extension function; a durable store replays \
+                 a committed CALL statement, and an extension callback is opaque (impure or \
+                 nondeterministic) — evaluate the value into a table or a literal first",
+                i + 1
+            )));
+        }
+        bound.push(value);
+    }
+    Ok((
+        LogicalPlan::Call {
+            db: Some(target),
+            name: def.name.clone(),
+            args: bound,
+        },
+        Vec::new(),
+    ))
+}
+
+/// Bind one expression as a constant (an empty table scope) with optional
+/// `?` slots / procedure variables visible — the shared path for `CALL`
+/// arguments, `ALTER TABLE … DEFAULT`, and every expression a procedure body
+/// evaluates outside a statement (conditions, assignments, `RETURN`,
+/// `RAISE`, `DECLARE … DEFAULT`).
+pub(crate) fn bind_constant_expr(
+    db: &PinkDb,
+    default_db: &str,
+    expr: &Expr,
+    params: Option<ParamSlots>,
+) -> Result<BoundExpr> {
+    let mut binder = Binder::new(db, default_db).with_params(params);
+    binder.allow_win = false;
+    binder.allow_alias = false;
+    let mut aggs = Vec::new();
+    let bound = binder.bind_expr(expr, &mut aggs, false)?;
+    if !aggs.is_empty() {
+        return Err(PinkDbError::Execution(
+            "an aggregate is not allowed here (no table scope)".to_string(),
+        ));
+    }
+    Ok(bound)
 }
 
 /// Bind CREATE VIEW: validate the query now (errors surface at creation),
@@ -4398,7 +4617,11 @@ pub(crate) fn plan_schema(
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
-        | LogicalPlan::DropMaterializedView { .. } => Ok(Vec::new()),
+        | LogicalPlan::DropMaterializedView { .. }
+        // Wave 44: procedure DDL and `CALL` never appear as a query scope.
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::Call { .. } => Ok(Vec::new()),
         LogicalPlan::IndexScan { db: qdb, table, .. } => {
             let lookup = qdb.as_deref().unwrap_or(default_db);
             db.visible_table_schema(lookup, table)
@@ -4491,6 +4714,17 @@ fn bind_source(
             }
             let lookup_db = binder.resolve_db(qdb)?;
             if let Ok(view) = db.view_in(&lookup_db, name) {
+                if binder
+                    .params
+                    .as_ref()
+                    .is_some_and(|slots| slots.rejects_view_reads())
+                {
+                    return Err(PinkDbError::Execution(format!(
+                        "a durable procedure cannot read the session-local view \"{name}\": \
+                         views are never persisted, so the logged CALL could not replay — \
+                         materialize the view into a table first"
+                    )));
+                }
                 if let Some(at) = at {
                     return Err(PinkDbError::Catalog(format!(
                         "time travel is not available on the view \"{name}\" (AT ({at}) \

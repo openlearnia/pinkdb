@@ -2018,6 +2018,12 @@ impl FrameSets {
         self.dbs.push(db.to_ascii_lowercase());
     }
 
+    /// The `(database, table)` pairs (canonical after
+    /// [`FrameSets::canonicalize`]).
+    pub(crate) fn table_pairs(&self) -> &[(String, String)] {
+        &self.tables
+    }
+
     /// Record a whole other touched-set (transaction accumulation).
     pub(crate) fn extend(&mut self, other: &FrameSets) {
         self.tables.extend_from_slice(&other.tables);
@@ -8393,8 +8399,10 @@ mod tests {
         db.execute("CREATE DATABASE db1;").unwrap();
         db.execute("DROP DATABASE db1;").unwrap();
         db.execute("USE main;").unwrap();
-        let recs = records_of(&wal_path(&p));
+        // Every lookup re-reads the frames: later statements in this test
+        // (and the wave-44 `CALL`s below) append records after the first read.
         let sets = |stmts: &str| -> FrameSets {
+            let recs = records_of(&wal_path(&p));
             let rec = recs
                 .iter()
                 .find(|r| r.stmts.iter().any(|s| s.contains(stmts)))
@@ -8425,6 +8433,54 @@ mod tests {
         );
         assert_eq!(sets("DROP DATABASE db1"), sets_of(&[], &["db1"]));
         assert_eq!(sets("USE main"), sets_of(&[], &[]), "USE touches nothing");
+        // Wave 44: a `CALL`'s frame carries the tables its body actually
+        // touched — the set depends on the data (loop conditions, `IF`
+        // branches), so the executor records it and the logging path reads it
+        // back (`PinkDb::proc_frame`).
+        db.execute(
+            "CREATE PROCEDURE touch(v INTEGER) AS $$ BEGIN \
+               DECLARE n INTEGER DEFAULT 0; \
+               WHILE n < 2 DO \
+                 INSERT INTO t VALUES (v + n); \
+                 SET n = n + 1; \
+               END WHILE; \
+               SELECT a FROM v; \
+             END $$;",
+        )
+        .unwrap();
+        db.execute("CALL touch(10);").unwrap();
+        assert_eq!(
+            sets("CALL touch(10)"),
+            sets_of(&[("main", "t"), ("main", "v")], &[]),
+            "a call's writes and reads are the frame's set"
+        );
+        // A call that reads only (no writes) still reports its reads, and one
+        // that touches nothing reports an empty set.
+        db.execute("CREATE PROCEDURE reader() AS $$ BEGIN SELECT a FROM v; END $$;")
+            .unwrap();
+        db.execute("CALL reader();").unwrap();
+        assert_eq!(sets("CALL reader()"), sets_of(&[("main", "v")], &[]));
+        db.execute("CREATE PROCEDURE idle() AS $$ BEGIN DECLARE x INTEGER; END $$;")
+            .unwrap();
+        db.execute("CALL idle();").unwrap();
+        assert_eq!(sets("CALL idle()"), sets_of(&[], &[]));
+        // The frames replay: a reopen lands on the same data. The `WHILE`
+        // loop in `touch` ran twice, so the recorded `CALL` reproduced both
+        // inserts (and `reader`'s SELECT left no trace).
+        drop(db);
+        let mut back = durable(&p);
+        // (The earlier `INSERT … (SELECT MAX(a) FROM v)` wrote one NULL row.)
+        assert_eq!(
+            ints(&mut back, "SELECT a FROM t WHERE a IS NOT NULL ORDER BY a;"),
+            vec![1, 10, 11]
+        );
+        assert!(back.procedure_in("main", "touch").is_ok());
+        assert!(back.procedure_in("main", "idle").is_ok());
+        assert_eq!(
+            ints(&mut back, "SELECT COUNT(*) FROM t;"),
+            vec![4],
+            "the replayed CALLs, the hand-written inserts and the NULL row"
+        );
         cleanup(&p);
     }
 

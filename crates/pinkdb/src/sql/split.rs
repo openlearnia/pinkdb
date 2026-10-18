@@ -6,8 +6,9 @@
 //! source slices for the WAL, and [`nul_in_quoted_identifier`] locates a NUL
 //! byte inside a quoted identifier, which is rejected at parse time because
 //! the C bindings hand names over as NUL-terminated strings. Both skip
-//! string literals (`''` escapes), quoted identifiers (`""` escapes), `--`
-//! line comments and `/* */` block comments exactly like the grammar does.
+//! string literals (`''` escapes), quoted identifiers (`""` escapes), `$$ … $$`
+//! dollar-quoted strings, `--` line comments and `/* */` block comments
+//! exactly like the grammar does.
 
 /// Split `sql` into one source text per statement, mirroring the parser's
 /// top-level `;` splitting. Returns the raw source of every non-empty
@@ -40,6 +41,7 @@ pub(crate) fn statement_texts(sql: &str) -> Vec<String> {
                 }
             }
             b'\'' | b'"' => i = skip_quoted(bytes, i, bytes[i]),
+            b'$' => i = skip_dollar_quoted(bytes, i),
             b';' => {
                 if let Some(s) = start.take() {
                     out.push(sql[s..i].trim_end().to_string());
@@ -92,6 +94,7 @@ pub(crate) fn parameter_offsets(sql: &str) -> Vec<usize> {
                 }
             }
             b'\'' | b'"' => i = skip_quoted(bytes, i, bytes[i]),
+            b'$' => i = skip_dollar_quoted(bytes, i),
             b'?' => {
                 out.push(i);
                 i += 1;
@@ -130,6 +133,7 @@ pub(crate) fn nul_in_quoted_identifier(sql: &str) -> Option<usize> {
                 }
             }
             b'\'' => i = skip_quoted(bytes, i, b'\''),
+            b'$' => i = skip_dollar_quoted(bytes, i),
             b'"' => {
                 let start = i;
                 i += 1;
@@ -156,6 +160,24 @@ pub(crate) fn nul_in_quoted_identifier(sql: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Offset just past a dollar-quoted string starting at `start` (a `$` byte):
+/// `$$ text $$` (see the grammar's `dollar_string`). Only the untagged form is
+/// a string; a `$` that does not open one is an ordinary byte. An unterminated
+/// run simply ends at the end of input (the grammar reports that shape).
+fn skip_dollar_quoted(bytes: &[u8], start: usize) -> usize {
+    if bytes.get(start + 1) != Some(&b'$') {
+        return start + 1;
+    }
+    let mut i = start + 2;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && bytes.get(i + 1) == Some(&b'$') {
+            return i + 2;
+        }
+        i += 1;
+    }
+    i
 }
 
 /// Offset just past a quoted run that started at `start` (an opening `quote`

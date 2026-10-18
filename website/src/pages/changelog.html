@@ -9,6 +9,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-18</h2>
+<h3>Wave 44 — stored procedures ✅</h3>
+<ul>
+<li><strong>SQL procedures</strong>: <code>CREATE [OR REPLACE] PROCEDURE p(a INTEGER, …) AS $$ … $$</code> (typed <code>DECLARE</code>/<code>SET</code>, <code>IF/ELSIF/ELSE</code>, <code>WHILE</code>, nested blocks, <code>RETURN</code>, <code>RAISE</code>), <code>DROP PROCEDURE [IF EXISTS]</code>, <code>CALL p(args)</code> — parameters and variables are bound as <strong>values, never spliced SQL</strong>, so injection-shaped input is inert by construction. <code>CALL</code> is statement-atomic, works in transactions, is persisted per database and replays exactly from the WAL.</li>
+<li><strong>JavaScript procedures</strong>: the sandbox <strong>contract</strong> ships (<code>pinkdb-js</code>: host API, denied-intrinsics determinism policy, conversions) with a clean refusal — the engine binding (quickjs-ng, ~1.1 MB) is the queued follow-up (wave 81).</li>
+</ul>
 <h3>Wave 74 — lake naming sweep ✅</h3>
 <ul>
 <li>The lake builds are now <strong><code>pinklake</code></strong> (the <code>.pink</code>-file lake; formerly <code>lake-lite</code>) and <strong><code>vortexlake</code></strong> (the Vortex-file lake; formerly <code>lake</code>), in cargo features, help text, tests, CI, README and the docs site.</li>

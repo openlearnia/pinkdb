@@ -66,6 +66,8 @@ SQL text
 | `pinkdb::persist` | `.pink` single-file columnar persistence, v4 (typed paths + delta/dict-bitpack/ALP encodings + LZ frames; v1–v3 files load) |
 | `pinkdb::crypto` | optional at-rest encryption (`PINKENC1` container: AES-256-GCM + Argon2id) behind the `encryption` feature; a parse/identity stub otherwise |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
+| `pinkdb::procedure` | Stored procedures: the SQL procedural language (parser + `CALL` executor), catalog definitions, `.pink` section |
+| `pinkdb-js` | Optional (`js` feature) JavaScript procedure sandbox: the deterministic host contract; the engine binding is the recorded follow-up |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
 | `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` v4 with the `pinklake` feature; v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
@@ -99,6 +101,9 @@ DROP DATABASE db1;                   -- last database cannot be dropped; droppin
                                      -- current one switches the session to main
 USE db1;                             -- per-session current database (default: main)
 LOAD EXTENSION 'extensions/hello.dylib';   -- load a native extension (ABI v1)
+CREATE PROCEDURE p(a INTEGER, b VARCHAR) AS $$
+BEGIN INSERT INTO t VALUES (a, b); END $$;     -- stored procedure (see below)
+CALL p(1, 'x');                              -- run it; DROP PROCEDURE p removes it
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [<join> u ON <cond>] ...    -- multi-way; INNER / LEFT [OUTER] / RIGHT [OUTER] /
                                    -- FULL [OUTER] / CROSS JOIN; composite ON
@@ -117,6 +122,79 @@ LIMIT n [OFFSET m] | OFFSET m;
 -- Scalar subqueries `(SELECT ...)` anywhere an expression goes
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
 ```
+
+### Stored procedures
+
+```sql
+CREATE [OR REPLACE] PROCEDURE name(param TYPE, ...) AS $$ ... $$;
+DROP PROCEDURE [IF EXISTS] name;
+CALL name(args, ...);
+```
+
+The body is one `BEGIN ... END` block written as a string literal —
+preferably dollar-quoted (`$$ ... $$`), so inner quotes and semicolons need no
+escaping. Inside it:
+
+* `DECLARE name TYPE [DEFAULT expr]` — a typed local variable (NULL without
+  `DEFAULT`), visible from its declaration onward in its block and in nested
+  blocks;
+* `SET name = expr` (also `SET name := expr`, or a bare `name := expr`) — the
+  value is coerced to the declared type with the engine's INSERT coercion;
+* `IF ... THEN ... [ELSIF ... THEN ...]* [ELSE ...] END IF`, `WHILE ... DO ...
+  END WHILE`, nested `BEGIN ... END` blocks — a condition must be BOOLEAN,
+  NULL counts as false;
+* `RETURN [expr]` — end the call; `RETURN expr` becomes the call's result (a
+  one-row result set named `return`), `RETURN` alone keeps the last
+  statement's result;
+* `RAISE expr` — abort the call with that (VARCHAR) message;
+* any ordinary SQL statement (DML, table DDL, `SELECT`, `SHOW`, `DESCRIBE`,
+  `EXPLAIN`) and nested `CALL`s (recursion is bounded at 32 levels).
+
+`CALL` returns the call's own outcome: the procedure's name, how many body
+statements ran, and the result of the last statement it executed (`SELECT`
+rows, an `Inserted` count, …). Store/process-level statements are refused in a
+body at `CREATE` time (`USE`, transaction control, `CHECKPOINT`,
+`LOAD EXTENSION`, `CREATE`/`DROP DATABASE`, materialized-view DDL and nested
+procedure DDL).
+
+**Values, never text.** Parameters and variables are handed to the binder as
+bound values at each statement's bind, so no input can change the shape of an
+executed statement (injection-safe by construction), and every body statement
+rebinds against the current catalog per call. Variables shadow table columns
+of the same name; qualify the column (`t.x`) to reach it.
+
+**Transactions and atomicity.** A top-level `CALL` is statement-atomic: the
+store is snapshotted first and restored if the body fails, so a failing call
+leaves no trace — not even a table it created. Inside an open transaction the
+same rule applies to the call itself (its own partial effects are undone),
+while the surrounding transaction stays open with its earlier statements and
+its place in the commit order — a statement-level rule, not a savepoint.
+`CREATE`/`DROP PROCEDURE` are refused inside a transaction: the definition is
+catalog metadata, like a materialized view's.
+
+**Durability.** Procedures live per database in the catalog, are written to
+`.pink` (flags bit 4) and replay through the ordinary WAL path: a durable
+store logs the committed `CALL` statement text and replays it by re-executing
+the call. That is sound because the engine has no nondeterministic built-in
+function (no clock, no randomness) and the constructs that could break replay
+are refused while the call runs — a body statement that reads an attached
+lake table, reads a session-local view (durable stores only), or calls a
+loadable-extension function (an opaque callback) fails the call with a clear
+error, and `CALL` arguments must be constant deterministic expressions. A
+call's actual read/write set (it depends on the data: loop conditions, `IF`
+branches) is recorded by the executor into the WAL frame and the transaction's
+conflict set, so multi-writer conflict detection still holds.
+
+**JavaScript procedures** (`LANGUAGE JAVASCRIPT`, syntax
+`CREATE PROCEDURE p(a BIGINT) LANGUAGE JAVASCRIPT AS $$ ... $$`) are an
+optional build (`js` cargo feature) and **refuse cleanly in this release**:
+the `pinkdb-js` crate ships the sandbox *contract* — the deterministic host
+API (`print`, `db.exec`, `db.query`, `db.value`), the denied-intrinsics policy
+(no clock, no randomness, no ambient I/O) and the value conversions — while
+the engine binding is the recorded follow-up. `CREATE PROCEDURE … LANGUAGE
+JAVASCRIPT` without the feature names the rebuild
+(`--features js`); with it, `pinkdb-js` reports the missing engine. The SQL
+procedural language needs no feature and is always available.
 
 ### Databases
 
@@ -2014,6 +2092,20 @@ ties in ORDER BY have no stable order on either engine).
   with the rebuild-with-`vortexlake` error
 - Extensions repository: artifacts are verified by SHA-256 from the catalog
   (no signatures yet), and only `darwin-arm64` builds are published
+- Stored procedures (wave 44): a body's expressions bind at `CALL` time (the
+  catalog may change between calls), so a mistyped condition is a call-time
+  error, not a create-time one; a body cannot `USE`, manage transactions,
+  `CHECKPOINT`, `LOAD EXTENSION`, touch databases or materialized views, or
+  create/drop procedures; recursion is capped at 32 levels; a durable store
+  refuses a procedure that reads a session-local view or calls a
+  loadable-extension function (their replay could not be honest); there is no
+  `SHOW PROCEDURES` (a missing call reports the missing name), no OUT/INOUT
+  parameters and no exception handlers yet
+- JavaScript procedures: the `js` feature links the `pinkdb-js` sandbox
+  *contract* only — `CREATE PROCEDURE … LANGUAGE JAVASCRIPT` refuses in this
+  release (the engine binding is the recorded follow-up); a JavaScript
+  definition loaded from a `.pink` file stays inert and `CALL` reports the
+  same refusal
 - Known gaps and their scheduled waves are tracked in `docs/GAPS.md`
 
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see

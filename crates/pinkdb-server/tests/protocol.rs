@@ -118,6 +118,8 @@ fn done_round_trips_every_kind() {
         DoneKind::DroppedDatabase,
         DoneKind::Used,
         DoneKind::LoadedExtension,
+        DoneKind::AlteredTable,
+        DoneKind::Called,
         DoneKind::Other,
     ];
     for kind in kinds {

@@ -10,6 +10,18 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 44 — stored procedures ✅
+- **SQL procedures**: `CREATE [OR REPLACE] PROCEDURE p(a INTEGER, …) AS $$ … $$`
+  (typed `DECLARE`/`SET`, `IF/ELSIF/ELSE`, `WHILE`, nested blocks, `RETURN`,
+  `RAISE`), `DROP PROCEDURE [IF EXISTS]`, `CALL p(args)` — parameters and
+  variables are bound as **values, never spliced SQL**, so injection-shaped
+  input is inert by construction. `CALL` is statement-atomic, works in
+  transactions, is persisted per database and replays exactly from the WAL.
+- **JavaScript procedures**: the sandbox **contract** ships (`pinkdb-js`:
+  host API, denied-intrinsics determinism policy, conversions) with a clean
+  refusal — the engine binding (quickjs-ng, ~1.1 MB) is the queued follow-up
+  (wave 81).
+
 ### Wave 74 — lake naming sweep ✅
 - The lake builds are now **`pinklake`** (the `.pink`-file lake; formerly
   `lake-lite`) and **`vortexlake`** (the Vortex-file lake; formerly `lake`),

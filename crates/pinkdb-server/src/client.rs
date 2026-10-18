@@ -364,6 +364,18 @@ fn build_result(
         usize::try_from(n)
             .map_err(|_| ProtocolError::Malformed(format!("count {n} exceeds usize")).into())
     };
+    if kind == DoneKind::Called {
+        // `CALL` (v8, wave 44): the call's own result set (when it has one)
+        // arrives as the pending `ResultSet`/`Rows` group; everything else
+        // about the call rides the `Done` payload.
+        let result = current
+            .map(|(names, types, rows)| Box::new(QueryResult::Selected { names, types, rows }));
+        return Ok(QueryResult::Called {
+            name,
+            statements: to_count(count)?,
+            result,
+        });
+    }
     if kind == DoneKind::Selected {
         let (names, types, rows) = current.ok_or_else(|| {
             ProtocolError::Malformed("Done(Selected) without a ResultSet".to_string())
@@ -406,5 +418,6 @@ fn build_result(
             .into())
         }
         DoneKind::Selected => unreachable!("Selected returned above"),
+        DoneKind::Called => unreachable!("Called returned above"),
     })
 }

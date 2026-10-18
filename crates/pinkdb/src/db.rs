@@ -435,6 +435,12 @@ impl Connection {
         if self.txn.is_none() {
             self.db.boundary_mv_refresh()?;
         }
+        // Wave 44: the procedure frame is statement-scoped (see
+        // `PinkDb::proc_frame`); the call's own execution (inside
+        // `autocommit_write`/the transaction snapshot) reads it back.
+        if let Some(txn) = &mut self.txn {
+            txn.work.proc_frame_reset();
+        }
         match &mut self.txn {
             Some(txn) => {
                 // Store/process-level DDL is refused inside a transaction: the
@@ -473,6 +479,18 @@ impl Connection {
                     txn.wal_sets.extend(&stmt_sets);
                 }
                 let result = crate::exec::run(&mut txn.work, &plan)?;
+                // Wave 44: a `CALL`'s actual touched set joins this
+                // transaction's read/write bookkeeping (the pre-execution
+                // pass above saw only its argument subqueries).
+                if matches!(plan, crate::plan::LogicalPlan::Call { .. }) {
+                    txn.wal_sets.extend(&txn.work.proc_frame.touched());
+                    for r in txn.work.proc_frame.reads() {
+                        txn.table_reads.insert(r);
+                    }
+                    for w in txn.work.proc_frame.writes() {
+                        txn.table_writes.insert(w);
+                    }
+                }
                 let after = session_after(&result, &pre, &txn.work);
                 // Buffer the committed statement for the transaction's single
                 // WAL record (flushed by txn_commit; never by ROLLBACK).
@@ -613,6 +631,8 @@ impl Connection {
         pre: &str,
     ) -> Result<QueryResult> {
         let mut shared = write_lock(&self.db.shared);
+        // Wave 44: the procedure frame is statement-scoped.
+        shared.proc_frame_reset();
         // Rebind under the exclusive lock: a concurrent local commit could
         // have changed the catalog between the caller's read-guard bind and
         // this lock.
@@ -1006,6 +1026,11 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
         Statement::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
         Statement::RefreshMaterializedViews => "REFRESH MATERIALIZED VIEWS",
         Statement::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
+        // Wave 44: procedure definitions are catalog metadata the per-table
+        // transaction merge does not carry. `CALL` itself is allowed inside a
+        // transaction: its statements run there like hand-written ones.
+        Statement::CreateProcedure { .. } => "CREATE PROCEDURE",
+        Statement::DropProcedure { .. } => "DROP PROCEDURE",
         _ => return None,
     })
 }
@@ -1078,7 +1103,7 @@ pub(crate) fn record_writes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Value;
+    use crate::types::{DataType, Value};
 
     fn rows_of(mut results: Vec<QueryResult>) -> Vec<Vec<Value>> {
         match results.pop().unwrap() {
@@ -1096,6 +1121,50 @@ mod tests {
         c.execute("CREATE TABLE u (a INTEGER);").unwrap();
         c.execute("INSERT INTO u VALUES (10);").unwrap();
         db
+    }
+
+    /// A constant predicate keeps its type through constant folding: a
+    /// folded NULL is INTEGER-typed as a bare literal, which the executor's
+    /// `WHERE` check used to reject (`SELECT * FROM t WHERE NULL` and
+    /// `WHERE 1 = NULL` failed with "WHERE: expected BOOLEAN, got INTEGER" —
+    /// and so did a procedure comparison of two NULL variables).
+    #[test]
+    fn folded_null_predicates_keep_their_boolean_type() {
+        let db = Database::new();
+        let mut c = db.connect();
+        c.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        c.execute("INSERT INTO t VALUES (1);").unwrap();
+        for (sql, expected) in [
+            ("SELECT a FROM t WHERE 1 = NULL;", 0),
+            ("SELECT a FROM t WHERE NULL IS NULL;", 1),
+            // A comparison whose both sides fold to NULL is the shape a
+            // procedure hits with two NULL variables.
+            ("SELECT a FROM t WHERE 1 + 1 = NULL;", 0),
+        ] {
+            let rows = rows_of(c.execute(sql).unwrap());
+            assert_eq!(rows.len(), expected, "{sql}");
+        }
+        // A bare `WHERE NULL` is (and stays) a bind-time type error: the
+        // binder never types a NULL literal BOOLEAN.
+        let err = c
+            .execute("SELECT a FROM t WHERE NULL;")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BOOLEAN"), "{err}");
+        // A folded constant projection reports its own type, not INTEGER.
+        match c.execute("SELECT 1 = NULL AS x;").unwrap().pop() {
+            Some(QueryResult::Selected { types, rows, .. }) => {
+                assert_eq!(types, vec![DataType::Boolean]);
+                assert_eq!(rows, vec![vec![Value::Null]]);
+            }
+            other => panic!("{other:?}"),
+        }
+        match c.execute("SELECT NULL AS x;").unwrap().pop() {
+            Some(QueryResult::Selected { types, .. }) => {
+                assert_eq!(types, vec![DataType::Integer], "a bare NULL stays INTEGER");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

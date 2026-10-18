@@ -789,7 +789,8 @@ pub struct MaterializedViewDef {
     pub last_error: Option<String>,
 }
 
-/// One database's catalog: its tables and its session-local views.
+/// One database's catalog: its tables, its session-local views, and (wave 44)
+/// its stored procedures.
 #[derive(Debug, Default, Clone)]
 pub struct DbCatalog {
     /// Display name as created (the map key is the lowercased name).
@@ -797,6 +798,8 @@ pub struct DbCatalog {
     pub(crate) tables: HashMap<String, DataTable>,
     pub(crate) views: HashMap<String, ViewDef>,
     pub(crate) materialized_views: HashMap<String, MaterializedViewDef>,
+    /// Stored procedures, keyed by lowercased name.
+    pub(crate) procedures: HashMap<String, crate::procedure::ProcedureDef>,
 }
 
 /// A store of databases.
@@ -904,6 +907,17 @@ pub struct PinkDb {
     /// moved into `mv_pending` at COMMIT, discarded at ROLLBACK (a rolled-back
     /// write must not trigger an ON COMMIT refresh).
     pub(crate) txn_writes: std::collections::HashSet<(String, String)>,
+    /// The `CALL` nesting depth of the statement currently executing (wave
+    /// 44): 0 outside a call. Bounds recursion ([`crate::procedure::
+    /// MAX_CALL_DEPTH`]) and decides where a call's statement-scoped frame
+    /// bookkeeping begins/ends. Never persisted.
+    pub(crate) proc_depth: usize,
+    /// What the `CALL` currently executing actually touched (wave 44): every
+    /// table its statements read or wrote, plus the writes alone (for the
+    /// ON COMMIT trigger). Cleared at each statement boundary — the call's
+    /// logging/conflict paths read it right after the call ran (see
+    /// [`crate::procedure`]).
+    pub(crate) proc_frame: crate::procedure::ProcFrame,
 }
 
 impl Default for PinkDb {
@@ -942,6 +956,13 @@ impl Clone for PinkDb {
             attached_lakes: self.attached_lakes.clone(),
             mv_pending: self.mv_pending.clone(),
             txn_writes: HashSet::new(),
+            // A clone is a snapshot for one statement/transaction: it keeps
+            // the in-flight `CALL` depth (a call's own rollback restores
+            // exactly the depth it ran at) and the statement-scoped procedure
+            // frame (the caller's `proc_frame_reset` clears it at the next
+            // boundary).
+            proc_depth: self.proc_depth,
+            proc_frame: self.proc_frame.clone(),
         }
     }
 }
@@ -991,6 +1012,8 @@ impl PinkDb {
             attached_lakes: Vec::new(),
             mv_pending: HashSet::new(),
             txn_writes: HashSet::new(),
+            proc_depth: 0,
+            proc_frame: crate::procedure::ProcFrame::default(),
         }
     }
 
@@ -1193,6 +1216,68 @@ impl PinkDb {
         Ok(())
     }
 
+    /// A stored procedure of `db` by name (case-insensitive).
+    pub fn procedure_in(&self, db: &str, name: &str) -> Result<&crate::procedure::ProcedureDef> {
+        self.catalog(db)?
+            .procedures
+            .get(&name.to_ascii_lowercase())
+            .ok_or_else(|| {
+                PinkDbError::Catalog(format!(
+                    "procedure \"{name}\" not found in database \"{db}\""
+                ))
+            })
+    }
+
+    /// Install (or replace) one procedure definition.
+    pub(crate) fn procedures_insert_in(
+        &mut self,
+        db: &str,
+        key: String,
+        def: crate::procedure::ProcedureDef,
+    ) -> Result<()> {
+        self.catalog_mut(db)?.procedures.insert(key, def);
+        Ok(())
+    }
+
+    /// Remove one procedure (the caller checks existence for `IF EXISTS`).
+    pub(crate) fn procedures_remove_in(
+        &mut self,
+        db: &str,
+        key: &str,
+    ) -> Option<crate::procedure::ProcedureDef> {
+        self.databases
+            .get_mut(&Self::db_key(db))?
+            .procedures
+            .remove(key)
+    }
+
+    /// Every procedure of `db`, as `(lowercased key, definition)` pairs
+    /// sorted by key — the deterministic order `.pink` writes them in.
+    pub(crate) fn procedures_in(&self, db: &str) -> Vec<(String, crate::procedure::ProcedureDef)> {
+        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, crate::procedure::ProcedureDef)> = cat
+            .procedures
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Does any database hold a procedure? (Cheap gate for the `.pink`
+    /// flags word.)
+    pub(crate) fn has_procedures(&self) -> bool {
+        self.databases.values().any(|c| !c.procedures.is_empty())
+    }
+
+    /// Clear the statement-scoped procedure frame (called at every statement
+    /// boundary; see [`PinkDb::proc_frame`]).
+    pub(crate) fn proc_frame_reset(&mut self) {
+        self.proc_frame.clear();
+    }
+
     pub fn materialized_view_in(&self, db: &str, name: &str) -> Result<&MaterializedViewDef> {
         self.catalog(db)?
             .materialized_views
@@ -1257,6 +1342,20 @@ impl PinkDb {
             crate::plan::collect_tables_read(q, db, &mut out);
         }
         out
+    }
+
+    /// Restore a `CALL`'s statement snapshot (wave 44): the call's partial
+    /// effects are discarded, and everything else is exactly as it was when
+    /// the snapshot was taken — an open transaction stays open with its
+    /// buffered WAL text, its validation sets and (crucially) its registered
+    /// optimistic base, which [`PinkDb::rollback`] would release. The
+    /// session's current database is live, like `rollback`'s.
+    pub(crate) fn proc_snapshot_restore(&mut self, snap: Box<PinkDb>) {
+        let current = self.current_db.clone();
+        let base = self.txn_base.take();
+        *self = *snap;
+        self.current_db = current;
+        self.txn_base = base;
     }
 
     /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.

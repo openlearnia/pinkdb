@@ -195,6 +195,11 @@ impl PinkDb {
     ) -> HashSet<(String, String)> {
         let mut out = HashSet::new();
         crate::db::record_writes(plan, default_db, &mut out, &mut HashSet::new());
+        // Wave 44: a `CALL`'s writes are the ones its statements actually
+        // performed, recorded by the executor (the plan cannot name them).
+        if matches!(plan, LogicalPlan::Call { .. }) {
+            out.extend(self.proc_frame.writes());
+        }
         if let LogicalPlan::RefreshMaterializedViews { db } = plan {
             let target = db.as_deref().unwrap_or(default_db);
             for name in self.materialized_view_names_in(target) {
@@ -250,6 +255,15 @@ impl PinkDb {
     pub(crate) fn plan_sets_store(&self, plan: &LogicalPlan, default_db: &str) -> FrameSets {
         let mut sets = FrameSets::default();
         crate::plan::plan_sets(plan, default_db, &mut sets);
+        // Wave 44: a `CALL`'s body touches tables the plan cannot name
+        // (`plan_sets` covers only its argument subqueries); the executor
+        // recorded what actually ran. Read *after* the call, this is the
+        // frame's payload; read before it (the transaction path's
+        // pre-execution pass), it is empty and the post-execution pass
+        // (`PinkDb::note_proc_frame_in_txn`) adds the real set.
+        if matches!(plan, LogicalPlan::Call { .. }) {
+            sets.extend(&self.proc_frame.touched());
+        }
         for (db, table) in self.mv_reads_of(plan, default_db) {
             sets.add_table(&db, &table);
         }

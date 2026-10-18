@@ -14,6 +14,10 @@ crate-type = ["cdylib", "rlib"]
 # default: default builds link no crypto code and unencrypted files stay
 # byte-identical. `cargo build --features encryption`.
 encryption = ["dep:aes-gcm", "dep:argon2"]
+# Opt-in JavaScript procedures (`CREATE PROCEDURE … LANGUAGE JAVASCRIPT AS
+# $$…$$`): links the pinkdb-js sandbox crate. Off by default — the default
+# build stays engine-free and lean. `cargo build --features js`.
+js = ["dep:pinkdb-js"]
 
 [dependencies]
 csv = "1"
@@ -22,6 +26,8 @@ rayon = "1.12.0"
 # Audited RustCrypto crates, only linked with the `encryption` feature.
 aes-gcm = { version = "0.10", optional = true }
 argon2 = { version = "0.5", optional = true }
+# The JavaScript procedure sandbox, only linked with the `js` feature.
+pinkdb-js = { path = "../pinkdb-js", optional = true }
 
 # Loadable extensions (ABI v1) are native-only by construction: the loader
 # crate links `libloading` (dlopen/dlsym), which does not build for wasm32.

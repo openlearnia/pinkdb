@@ -77,7 +77,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | done | landed; DuckDB-pinned DDL validation, DESCRIBE `PRI`/`UNI` parity, conservative FK→PK join elimination; `.pink` v5 constraint section (flags bit 0) composed with wave 62's dtype tags; duckdiff 165 → 171 |
 | 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | done | landed (user, `a79cd41`): single-column **hash indexes** (`CREATE INDEX [IF NOT EXISTS]` / `DROP INDEX [IF EXISTS]`), `Value → row indices`, per-database scoping, optimizer rewrites `col = literal` → `IndexScan`, CLI/server/FFI result kinds; **`.pink` persistence deferred** (queued as wave 79) |
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | done | landed (user, `2be5d3b`): stored as a queryable table + refresh query in the catalog, `REFRESH` fully recomputes, `IF [NOT] EXISTS`, per-database, WAL-logged, persisted; manual + scheduled refresh policies follow in wave 80 |
-| 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + **JavaScript procedures** (optional embedded engine; WAL-replay determinism must be solved — volatile calls refused or pinned at record time) | in progress | `wt-procs`, dispatched on e7ca6e1; engine choice decided: **quickjs-ng via `rquickjs`** (wave 81, ~1.1 MB instead of Boa's ~30 MB) |
+| 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + **JavaScript procedures** (optional embedded engine; WAL-replay determinism must be solved — volatile calls refused or pinned at record time) | done | SQL language landed (bodies in `$$…$$`, DECLARE/SET/IF/WHILE/nested blocks/RETURN/RAISE, values-never-text binding, atomic `CALL`, WAL replay re-executes deterministically, `.pink` flags bit 4, protocol v8); JS: the `pinkdb-js` sandbox contract + clean refusal landed — **engine binding deferred to wave 81 (quickjs-ng)**; also fixed a pre-existing folded-NULL typing bug |
 | 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c* | done | 4b53844…(part 6) — 1M battery 416 → 245–250 ms (−41%): group_region 6.7 → 3.2, distinct_lowcard 19.4 → 3.8, windows 63 → 13.5, order_str 36 → 29, group_id/distinct_id 62/69 → 50/50, join_probe 21 → 5.3; @10M group_region 68–70 → 33–35 ms (≤60 target met; DuckLake 37–55), import 274 → 173 ms, `.lake save` 632–758 → 296–340 ms (lake format_version 3, 8,192-row blocks, agreed layout change), `.lake open` 618 → 100 ms, data 29.7 → 25 MB, teardown 93 → 16 ms; 516 tests, duckdiff 60/60 + 64/64 big, kill loops clean, clippy/fmt clean |
 | 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | queued | — |
 | 47 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | queued | — |
@@ -1327,6 +1327,38 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   `vortexlake,s3` + `bench/duckdiff.py` **171/171**. Note: measured release
   size 49.0 MB vs the docs' ≈47.3 MB (predates this wave; sizes are the prior
   measurements — re-measure when convenient). Worktree removed.
+- 2026-10-18 — Wave 44 (stored procedures): the **SQL procedural language**
+  ships complete — `CREATE [OR REPLACE] PROCEDURE p(a INTEGER, …) AS $$ … $$`
+  (dollar-quoted bodies), `DROP PROCEDURE [IF EXISTS]`, `CALL p(args)`;
+  bodies support typed `DECLARE`/`SET`, `IF/ELSIF/ELSE`, `WHILE`, nested
+  blocks, `RETURN` (last result or a value), `RAISE`, recursion (bounded at
+  32), and any ordinary SQL statement; transaction/store statements refused at
+  `CREATE`. **Values, never text**: at each statement's bind a variable or
+  parameter becomes a bound literal (`BoundExpr::Literal`) — injection-safe by
+  construction; each body statement rebinds per call, so a body can create a
+  table and then insert into it. **WAL/replay pinned**: the committed `CALL`
+  is logged as one record and replay re-executes it — sound because the engine
+  has no nondeterministic built-ins and opaque/attached/session-local reads
+  are refused per statement; multi-writer touched sets come from the actual
+  executed reads/writes (`PinkDb::proc_frame`, `wal::frames_carry_exact_touched_sets`
+  extended). `CALL` is statement-atomic everywhere (the outermost call
+  snapshots and restores without disturbing an open transaction). Catalog-
+  resident per database, persisted via `.pink` v5 flags **bit 4**
+  (`FLAG_PROCEDURES`; bit 3 still reserved for 79), protocol **v8**
+  (`DoneKind::Called = 18`), CLI/server/FFI rendering incl. a C-extension
+  refusal inside bodies. **JavaScript**: the `pinkdb-js` sandbox crate ships
+  as the *contract* — host API, `DENIED_INTRINSICS`, conversions,
+  `engine_available()` clean refusal at CREATE *and* CALL (inert JS bodies
+  load from files); the engine binding (quickjs-ng via `rquickjs`) is wave
+  **81**. Pre-existing bug fixed on the way: constant-folded NULLs lost their
+  type (`WHERE 1 = NULL`); `fold_expr` now CAST-pins them. Gates on main:
+  fmt/clippy 0 across all sets (incl. `js`), pinkdb **564** (527 + 14 alter +
+  22 prepared + 1 doc; 545 with `encryption,js`), CLI `vortexlake,s3` **108** +
+  matrix (none/`pinklake`/`vortexlake`/`pinklake,s3`/`s3`/`js`), server/FFI
+  green, pink-lake green, workspace clean, `bench/duckdiff.py` **171/171**.
+  Sizes: default CLI 3 130 560 → **3 298 480 B** (+164 KiB), server +148 KiB.
+  Wasm check not runnable locally (toolchain shim) — CI covers it. Worktree
+  removed.
 - 2026-10-17 — Post-freeze benchmark session (final tree `b3154e7`, Apple
   Silicon, best-of-N, DuckDB α46057 reference): standing battery **250.8 ms**
   (per-query: count 0.03, filter_num 2.25, filter_str 1.60, proj_func 18.2,

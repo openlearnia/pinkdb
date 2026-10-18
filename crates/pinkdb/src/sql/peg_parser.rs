@@ -111,6 +111,14 @@ fn reject_parameter_positions(stmts: &[Statement]) -> Result<()> {
                     check_expr_positions(e)?;
                 }
             }
+            // `CALL p(?)`: the argument is an ordinary expression position.
+            // (A procedure *body* never holds a `?`: `procedure::parse_body`
+            // refuses one outright.)
+            Statement::Call { args, .. } => {
+                for e in args {
+                    check_expr_positions(e)?;
+                }
+            }
             Statement::Delete {
                 where_clause: Some(e),
                 ..
@@ -345,6 +353,11 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
             ..
         } => collect_expr_offsets(e, out),
         Statement::Select(sel) => collect_select_offsets(sel, out),
+        Statement::Call { args, .. } => {
+            for e in args {
+                collect_expr_offsets(e, out);
+            }
+        }
         Statement::AlterTable {
             op: AlterTableOp::AddColumn {
                 default: Some(e), ..
@@ -479,6 +492,11 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
             ..
         } => apply_expr_ranks(e, offsets),
         Statement::Select(sel) => apply_select_ranks(sel, offsets),
+        Statement::Call { args, .. } => {
+            for e in args {
+                apply_expr_ranks(e, offsets);
+            }
+        }
         Statement::AlterTable {
             op: AlterTableOp::AddColumn {
                 default: Some(e), ..
@@ -829,10 +847,25 @@ peg::parser! {
 
         rule string_lit() -> String
             = "'" c:string_char()* "'" ws() { c.into_iter().collect() }
+            / dollar_string()
 
         rule string_char() -> char
             = "''" { '\'' }
             / c:[^'\''] { c }
+
+        /// `$$ text $$` — the dollar-quoted string literal (Postgres-style),
+        /// the form procedure bodies are written in: the inner text needs no
+        /// escaping, so a body can hold quotes and semicolons verbatim. Only
+        /// the untagged form is supported (`$tag$` is not part of the SQL
+        /// surface); the body may not contain `$$`.
+        rule dollar_string() -> String
+            = "$$" c:$(("$$" ![_])* (!"$$" [_])*) "$$" ws() {
+                  // The inner capture is one slice; the leading lookahead
+                  // alternative makes the rule fail on `$$$$`-style edges
+                  // precisely where the grammar expects a literal.
+                  c.to_string()
+              }
+            / "$$" "$$" ws() { String::new() }
 
         /// Float lexemes: fraction and/or exponent (mirrors `lex_number`).
         rule float_text() -> &'input str
@@ -876,6 +909,7 @@ peg::parser! {
             / drop()
             / refresh_stmt()
             / checkpoint()
+            / call_stmt()
             / show_stmt()
             / describe_stmt()
             / explain_stmt()
@@ -994,6 +1028,60 @@ peg::parser! {
                   let mut items = vec![first];
                   items.extend(rest);
                   Statement::CreateTable { db: t.0, name: t.1, items, if_not_exists: ifne }
+              }
+            / kw(Keyword::Create) orr:or_replace() word("procedure") t:table_ref() params:proc_params()
+              lang:procedure_language()? kw(Keyword::As) body:string_lit() lang2:procedure_language()? {
+                  let language = lang.or(lang2).unwrap_or(crate::procedure::ProcLanguage::Sql);
+                  Statement::CreateProcedure {
+                      db: t.0,
+                      name: t.1,
+                      params,
+                      language,
+                      body,
+                      or_replace: orr,
+                  }
+              }
+
+        /// `OR REPLACE` on `CREATE PROCEDURE`.
+        rule or_replace() -> bool
+            = word("or") word("replace") { true }
+            / { false }
+
+        /// A procedure's typed parameter list: `(a INTEGER, b VARCHAR)` or
+        /// `()`.
+        rule proc_params() -> Vec<(String, crate::types::DataType)>
+            = lparen() rparen() { Vec::new() }
+            / lparen() first:table_column() rest:(comma() c:table_column() { c })* rparen() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        /// `LANGUAGE SQL` / `LANGUAGE JAVASCRIPT` (optional; SQL is the
+        /// default). Accepted before or after `AS <body>`.
+        rule procedure_language() -> crate::procedure::ProcLanguage
+            = word("language") name:ident() {?
+                  match name.to_ascii_uppercase().as_str() {
+                      "SQL" => Ok(crate::procedure::ProcLanguage::Sql),
+                      "JAVASCRIPT" => Ok(crate::procedure::ProcLanguage::JavaScript),
+                      _ => Err("a procedure language (SQL or JAVASCRIPT)"),
+                  }
+              }
+
+        /// `CALL name(args...)`: run a stored procedure (wave 44). `call` is
+        /// matched as a word, not a reserved keyword, so it stays usable as a
+        /// table/column name.
+        rule call_stmt() -> Statement
+            = word("call") t:table_ref() args:call_args() {
+                  Statement::Call { db: t.0, name: t.1, args }
+              }
+
+        rule call_args() -> Vec<Expr>
+            = lparen() rparen() { Vec::new() }
+            / lparen() first:expr() rest:(comma() e:expr() { e })* rparen() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
               }
 
         /// One `CREATE TABLE` list entry: a table-level constraint or a
@@ -1151,6 +1239,7 @@ peg::parser! {
             / kw(Keyword::Drop) kw(Keyword::Index) ife:if_exists() t:table_ref() { Statement::DropIndex { db: t.0, name: t.1, if_exists: ife } }
             / kw(Keyword::Drop) word("materialized") kw(Keyword::View) ife:if_exists() t:table_ref() { Statement::DropMaterializedView { db: t.0, name: t.1, if_exists: ife } }
             / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
+            / kw(Keyword::Drop) word("procedure") ife:if_exists() t:table_ref() { Statement::DropProcedure { db: t.0, name: t.1, if_exists: ife } }
         /// `ALTER TABLE` (wave 65). `alter`, `add`, `column`, `rename` and
         /// `default` are matched as words, not reserved keywords, so they stay
         /// usable as table/column names (`to` too: `RENAME COLUMN a TO to`).

@@ -452,6 +452,35 @@ it and never affects other sessions: the shared store is untouched.</p>
   (<code>"use"</code> works).</li>
 </ul>
 
+<h2 id="stored-procedures">Stored procedures<a class="anchor" href="#stored-procedures" aria-label="Permalink: Stored procedures">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CREATE</span> PROCEDURE bump(a INTEGER) <span class="tok-k">AS</span> $$
+<span class="tok-k">BEGIN</span>
+  DECLARE n INTEGER DEFAULT <span class="tok-n">0</span>;
+  <span class="tok-k">UPDATE</span> sales <span class="tok-k">SET</span> total = total + a <span class="tok-k">WHERE</span> region = <span class="tok-s">'west'</span>;
+  RETURN a;
+<span class="tok-k">END</span>
+$$;
+CALL bump(<span class="tok-n">5</span>);
+<span class="tok-k">DROP</span> PROCEDURE bump;</code></pre></div>
+
+<ul>
+  <li>Bodies support typed <code>DECLARE</code>/<code>SET</code>,
+  <code>IF/ELSIF/ELSE</code>, <code>WHILE</code>, nested blocks,
+  <code>RETURN</code>, <code>RAISE</code> and any ordinary SQL statement
+  (recursion is bounded).</li>
+  <li>Parameters and variables bind as <strong>values, never spliced SQL</strong>
+  — injection-shaped input is inert by construction — and every body statement
+  rebinds against the live catalog (a procedure can create a table, then write
+  to it).</li>
+  <li><code>CALL</code> is statement-atomic and works inside transactions;
+  procedures live per database, persist in <code>.pink</code> files and replay
+  exactly from the WAL.</li>
+  <li>JavaScript procedures (<code>LANGUAGE JAVASCRIPT</code>) are refused
+  cleanly in this build — the quickjs-ng engine binding is the queued
+  follow-up.</li>
+</ul>
+
 <h2 id="materialized-views">Materialized views<a class="anchor" href="#materialized-views" aria-label="Permalink: Materialized views">#</a></h2>
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CREATE</span> MATERIALIZED <span class="tok-k">VIEW</span> totals REFRESH EVERY INTERVAL <span class="tok-s">'5 minutes'</span> <span class="tok-k">AS</span>
@@ -517,6 +546,7 @@ SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last ref
   <li><a href="#types-and-literals">Types and literals</a></li>
   <li><a href="#three-valued-logic">Three-valued logic</a></li>
   <li><a href="#databases-and-sessions">Databases and sessions</a></li>
+  <li><a href="#stored-procedures">Stored procedures</a></li>
   <li><a href="#materialized-views">Materialized views</a></li>
   <li><a href="#not-supported-yet">Not supported yet</a></li>
 </ul>
