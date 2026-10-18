@@ -1242,6 +1242,26 @@ pub(crate) fn build_from(
         // read from it; the layout read decodes and validates every delete
         // file against the entry.
         let layout = entry_layout(&**storage, entry, key, &manifest_path)?;
+        // `entry.rows` backs the statistics-only `COUNT(*)`. The deduped layout
+        // is the truth: if two delete files target the same data file with
+        // overlapping positions, the manifest's `sum(count)` overstates the
+        // deletion and `entry.rows` would be wrong. Reject the mismatch (as
+        // `Lake::load` does) instead of answering with a wrong count.
+        let decoded_rows: Option<u64> = layout.iter().try_fold(0u64, |acc, (_, rows, deleted)| {
+            let live = rows.checked_sub(deleted.len() as u64)?;
+            acc.checked_add(live)
+        });
+        if decoded_rows != Some(entry.rows) {
+            return Err(LakeError::Corrupt {
+                path: manifest_path.clone(),
+                message: format!(
+                    "table \"{key}\" declares {} rows, but its deduplicated file layout holds {}",
+                    entry.rows,
+                    decoded_rows
+                        .map_or_else(|| "an overflowing count".to_string(), |r| r.to_string())
+                ),
+            });
+        }
         for d in &entry.deletes {
             check_delete_file_present(&**storage, d, key)?;
         }
