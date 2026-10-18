@@ -68,7 +68,17 @@ enum {
     PINKDB_STMT_CHECKPOINTED = 15,
     /* ALTER TABLE: pinkdb_result_name returns the table's name after the
      * statement (a RENAME TO reports the new name). */
-    PINKDB_STMT_ALTERED_TABLE = 16
+    PINKDB_STMT_ALTERED_TABLE = 16,
+    /* Wave 48 RBAC statements. The *_USER / *_ROLE kinds return the user or
+     * role name; GRANTED / REVOKED return the grant's description
+     * ("SELECT ON TABLE main.t TO alice"). */
+    PINKDB_STMT_CREATED_USER = 17,
+    PINKDB_STMT_ALTERED_USER = 18,
+    PINKDB_STMT_DROPPED_USER = 19,
+    PINKDB_STMT_CREATED_ROLE = 20,
+    PINKDB_STMT_DROPPED_ROLE = 21,
+    PINKDB_STMT_GRANTED = 22,
+    PINKDB_STMT_REVOKED = 23
 };
 
 /* Value / column type tags. */

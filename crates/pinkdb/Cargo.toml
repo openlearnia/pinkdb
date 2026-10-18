@@ -11,9 +11,11 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 # Opt-in at-rest encryption (`.pink` checkpoints + sidecar WAL). Off by
-# default: default builds link no crypto code and unencrypted files stay
-# byte-identical. `cargo build --features encryption`.
-encryption = ["dep:aes-gcm", "dep:argon2"]
+# default: default builds link no cipher code and unencrypted files stay
+# byte-identical. `cargo build --features encryption`. (RBAC's Argon2id
+# password hashing is *not* behind a feature: user DDL is part of the
+# default SQL surface.)
+encryption = ["dep:aes-gcm"]
 # Opt-in JavaScript procedures (`CREATE PROCEDURE … LANGUAGE JAVASCRIPT AS
 # $$…$$`): links the pinkdb-js sandbox crate. Off by default — the default
 # build stays engine-free and lean. `cargo build --features js`.
@@ -23,9 +25,17 @@ js = ["dep:pinkdb-js"]
 csv = "1"
 peg = "0.8"
 rayon = "1.12.0"
-# Audited RustCrypto crates, only linked with the `encryption` feature.
+# Audited RustCrypto crates. `argon2` is unconditional (wave 48: RBAC hashes
+# user passwords with Argon2id; the same crate backs the `encryption`
+# feature's passphrase KDF). Default features are off and `rand` is not
+# enabled: the salt comes from `getrandom` directly (target-gated below), so
+# a wasm32 build links no RNG backend through this edge. `aes-gcm` is
+# `encryption`-only.
 aes-gcm = { version = "0.10", optional = true }
-argon2 = { version = "0.5", optional = true }
+argon2 = { version = "0.5", default-features = false, features = [
+    "alloc",
+    "password-hash",
+] }
 # The JavaScript procedure sandbox, only linked with the `js` feature.
 pinkdb-js = { path = "../pinkdb-js", optional = true }
 
@@ -36,6 +46,13 @@ pinkdb-js = { path = "../pinkdb-js", optional = true }
 # keeps one registry either way: dynamic functions and linked functions are
 # the two `pinkdb_ext_loader::ExtFunction` variants.
 pinkdb-ext-loader = { path = "../pinkdb-ext-loader" }
+
+# `getrandom` is the OS-randomness source for RBAC password salts. It is
+# native-only: wasm32 has no backend in this build, so `CREATE USER …
+# PASSWORD '<plaintext>'` refuses cleanly there (verification and
+# `PASSWORD_HASH` need no randomness and keep working).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom = "0.2"
 
 # Single-process durable-path benchmark: `cargo bench -p pinkdb --bench durable`.
 [[bench]]

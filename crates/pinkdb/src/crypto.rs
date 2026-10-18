@@ -109,10 +109,11 @@ pub(crate) const SEGMENT_PLAIN_MAX: usize = 1 << 20;
 
 /// Default Argon2id work factors (OWASP-recommended configuration): 19 MiB,
 /// 2 iterations, 1 lane. Stored in the header, so raising them later keeps
-/// existing files readable.
-const ARGON2_M_COST_KIB: u32 = 19 * 1024;
-const ARGON2_T_COST: u32 = 2;
-const ARGON2_P_COST: u32 = 1;
+/// existing files readable. `crate::rbac` hashes user passwords with the
+/// same configuration.
+pub(crate) const ARGON2_M_COST_KIB: u32 = 19 * 1024;
+pub(crate) const ARGON2_T_COST: u32 = 2;
+pub(crate) const ARGON2_P_COST: u32 = 1;
 /// Upper bounds accepted from a file header: a crafted header must not be
 /// able to make an open burn minutes of Argon2id time or allocate unbounded
 /// memory. Each bound is a small multiple of the default and the combined

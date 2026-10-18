@@ -201,6 +201,49 @@ pub enum LogicalPlan {
         name: String,
         args: Vec<BoundExpr>,
     },
+    /// `CREATE USER [IF NOT EXISTS] name PASSWORD '<plaintext>'` (wave 48).
+    /// The binder hashed the password; only the Argon2id PHC string is in
+    /// the plan, the catalog and the WAL (`crate::rbac::wal_statement_text`
+    /// rewrites the logged statement to its `PASSWORD_HASH` form).
+    CreateUser {
+        name: String,
+        password_hash: String,
+        if_not_exists: bool,
+    },
+    /// `ALTER USER name PASSWORD '<plaintext>'`: replace the user's password
+    /// hash (the plaintext is hashed at bind, exactly like `CREATE USER`).
+    AlterUser {
+        name: String,
+        password_hash: String,
+    },
+    /// `DROP USER [IF EXISTS] name`: removes the user and every membership
+    /// and grant naming it.
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
+    /// `CREATE ROLE [IF NOT EXISTS] name`: a principal that cannot log in,
+    /// only be granted to.
+    CreateRole {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP ROLE [IF EXISTS] name`: removes the role and every membership
+    /// and grant naming it.
+    DropRole {
+        name: String,
+        if_exists: bool,
+    },
+    /// `GRANT …`: privileges on a table or database, the global `ADMIN`, or
+    /// a role membership (wave 48). The binder resolved every name to its
+    /// canonical key; the executor applies the change idempotently.
+    Grant {
+        spec: crate::rbac::GrantSpec,
+    },
+    /// `REVOKE …`: the mirror of [`LogicalPlan::Grant`].
+    Revoke {
+        spec: crate::rbac::GrantSpec,
+    },
     /// Set operation (`UNION`/`INTERSECT`/`EXCEPT`, each `[ALL]`): output
     /// names come from the left branch; every column is coerced to the
     /// pairwise common type at execution.
@@ -451,6 +494,17 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::CreateProcedure { .. }
             | LogicalPlan::DropProcedure { .. }
             | LogicalPlan::Call { .. }
+            // Wave 48: user/role DDL and grants mutate the store's RBAC
+            // catalog, so a durable store logs and replays them. A
+            // `CREATE/ALTER USER` is logged in its `PASSWORD_HASH` form —
+            // the plaintext never reaches the WAL.
+            | LogicalPlan::CreateUser { .. }
+            | LogicalPlan::AlterUser { .. }
+            | LogicalPlan::DropUser { .. }
+            | LogicalPlan::CreateRole { .. }
+            | LogicalPlan::DropRole { .. }
+            | LogicalPlan::Grant { .. }
+            | LogicalPlan::Revoke { .. }
     )
 }
 
@@ -478,6 +532,17 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         // there like hand-written statements.
         LogicalPlan::CreateProcedure { .. } => "CREATE PROCEDURE",
         LogicalPlan::DropProcedure { .. } => "DROP PROCEDURE",
+        // Wave 48: RBAC objects live in the store's catalog, which the
+        // per-table transaction merge does not carry (exactly like a
+        // procedure definition or a database). Refusing them inside a
+        // transaction keeps COMMIT/ROLLBACK from half-applying them.
+        LogicalPlan::CreateUser { .. } => "CREATE USER",
+        LogicalPlan::AlterUser { .. } => "ALTER USER",
+        LogicalPlan::DropUser { .. } => "DROP USER",
+        LogicalPlan::CreateRole { .. } => "CREATE ROLE",
+        LogicalPlan::DropRole { .. } => "DROP ROLE",
+        LogicalPlan::Grant { .. } => "GRANT",
+        LogicalPlan::Revoke { .. } => "REVOKE",
         _ => return None,
     })
 }
@@ -512,6 +577,22 @@ pub(crate) fn plan_sets(plan: &LogicalPlan, default_db: &str, out: &mut crate::w
     match plan {
         LogicalPlan::CreateDatabase { name, .. } | LogicalPlan::DropDatabase { name, .. } => {
             out.add_database(name);
+            return;
+        }
+        // Wave 48: a grant depends on the existence of its object, so the
+        // frame records it — a concurrent `DROP TABLE`/`DROP DATABASE`
+        // elsewhere in the WAL then conflicts instead of leaving a grant
+        // pointing at a vanished object (which could not replay). A user/role
+        // statement is store-global and names no object, so its frame set
+        // stays empty (the same shape `CREATE PROCEDURE` has had since
+        // wave 44).
+        LogicalPlan::Grant { spec } | LogicalPlan::Revoke { spec } => {
+            match &spec.object {
+                crate::rbac::GrantObject::Table { db, table } => out.add_table(db, table),
+                crate::rbac::GrantObject::Database { db } => out.add_database(db),
+                // A role membership names no object either.
+                crate::rbac::GrantObject::Admin | crate::rbac::GrantObject::Role { .. } => {}
+            }
             return;
         }
         _ => {}
@@ -587,6 +668,19 @@ pub(crate) fn collect_tables_read(
         LogicalPlan::CreateMaterializedView { query, .. } => {
             collect_tables_read(query, default_db, out);
         }
+        // Wave 48: a grant's object must exist, so the statement reads it
+        // (the frame's set records the dependency).
+        LogicalPlan::Grant { spec } | LogicalPlan::Revoke { spec } => {
+            if let crate::rbac::GrantObject::Table { db, table } = &spec.object {
+                out.insert((db.clone(), table.clone()));
+            }
+        }
+        // RBAC user/role statements name no table.
+        LogicalPlan::CreateUser { .. }
+        | LogicalPlan::AlterUser { .. }
+        | LogicalPlan::DropUser { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::DropRole { .. } => {}
         LogicalPlan::IndexScan { db, table, .. } => {
             out.insert(key(db, table));
         }
@@ -922,7 +1016,15 @@ fn walk_scan_filters(
         | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. }
         | LogicalPlan::CreateProcedure { .. }
-        | LogicalPlan::DropProcedure { .. } => {}
+        | LogicalPlan::DropProcedure { .. }
+        // Wave 48: RBAC statements hold no child plan to analyze.
+        | LogicalPlan::CreateUser { .. }
+        | LogicalPlan::AlterUser { .. }
+        | LogicalPlan::DropUser { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::Grant { .. }
+        | LogicalPlan::Revoke { .. } => {}
         LogicalPlan::Call { args, .. } => {
             for a in args {
                 walk_expr_subquery_filters(a, out);
@@ -1228,7 +1330,16 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         | LogicalPlan::DropProcedure { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropMaterializedView { .. }
-        | LogicalPlan::RefreshMaterializedViews { .. } => {}
+        | LogicalPlan::RefreshMaterializedViews { .. }
+        // Wave 48: RBAC statements carry no dynamic scalar.
+        | LogicalPlan::CreateUser { .. }
+        | LogicalPlan::AlterUser { .. }
+        | LogicalPlan::DropUser { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::Grant { .. }
+        | LogicalPlan::Revoke { .. }
+        => {}
         LogicalPlan::IndexScan { value, .. } => exprs.push(value),
         LogicalPlan::Call { args, .. } => exprs.extend(args.iter()),
         LogicalPlan::CreateTableAs { query, .. }
@@ -1594,7 +1705,16 @@ fn walk_scan_projections(
         | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. }
         | LogicalPlan::CreateProcedure { .. }
-        | LogicalPlan::DropProcedure { .. } => {}
+        | LogicalPlan::DropProcedure { .. }
+        // Wave 48: RBAC statements scan no table.
+        | LogicalPlan::CreateUser { .. }
+        | LogicalPlan::AlterUser { .. }
+        | LogicalPlan::DropUser { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::Grant { .. }
+        | LogicalPlan::Revoke { .. }
+        => {}
         // A call's arguments are constant expressions; a subquery inside one
         // is analyzed in full.
         LogicalPlan::Call { args, .. } => {

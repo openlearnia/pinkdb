@@ -186,6 +186,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
+<h3>Wave 48 — RBAC: users, roles and enforced grants ✅</h3>
+<ul>
+<li>New <strong>users and roles</strong> hashed with Argon2id: <code>CREATE USER</code>/<code>CREATE ROLE</code>, <code>GRANT</code>/<code>REVOKE</code> (table <code>SELECT</code>/<code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>, database <code>CREATE</code>, global <code>ADMIN</code>), persisted in the catalog + WAL — plaintext passwords never hit disk.</li>
+<li>The network server gains <strong>session login</strong> (protocol v9) and <strong>per-statement enforcement</strong>: an empty catalog trusts connections with a loud startup warning; once a user exists every statement is checked against their grants. Embedded, FFI and wasm use stays trusted by design.</li>
+<li>Remote CLI gains <code>--user</code>/<code>--password</code> (or <code>PINKDB_PASSWORD</code>); without the <code>tls</code> feature, login passwords cross the wire in cleartext — documented.</li>
+</ul>
 <h3>Wave 49 — extensions on wasm ✅</h3>
 <ul>
 <li>Extensions now work on <strong>every target</strong> through a new <strong>linked registration</strong> model: extensions register through a safe-Rust API and feed the same engine registry as native ABI v1 extensions. On wasm (where <code>dlopen</code> cannot work), <code>LOAD EXTENSION '&lt;name&gt;'</code> resolves a registered name; unknown names fail with an actionable error.</li>

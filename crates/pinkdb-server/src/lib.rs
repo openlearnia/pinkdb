@@ -50,15 +50,37 @@
 //!
 //! # Security posture
 //!
-//! **No authentication and no authorization: anyone who can open a TCP
-//! connection to the port gets the full SQL surface of the served database.**
-//! The optional `tls` feature (off by default) adds a rustls-encrypted
-//! transport — see [`tls`] — without changing the protocol or the default
-//! build: it encrypts the transport (and, with a trusted anchor, lets a
-//! client verify *which* server it reached), but it does not identify or
-//! restrict the client. The async transport carries the same posture.
-//! Bind localhost (the default) and treat the port as fully trusted; see the
-//! README's "Network server" section.
+//! **Authentication and authorization are opt-in per store (wave 48).** The
+//! served [`pinkdb::Database`]'s user catalog is the switch:
+//!
+//! - **No users defined** — every connection is trusted and gets the full SQL
+//!   surface of the served database (the pre-wave-48 behavior). The server
+//!   prints a loud warning at startup in this state, and any client can
+//!   create the first user over the wire (`CREATE USER … PASSWORD …`, then
+//!   `GRANT ADMIN …` to it).
+//! - **At least one user defined** — a connection must send a
+//!   `Request::Login` (user name + password) before any statement request is
+//!   accepted; an unauthenticated `Execute`/`Prepare`/`ExecutePrepared` gets
+//!   an `Error` frame (`authentication required: …`), and `Ping` keeps
+//!   working. After a successful login the connection runs as that user and
+//!   the engine checks every statement against its grants (`permission
+//!   denied: …` for a missing privilege). The gate is evaluated per
+//!   statement, so a connection that creates the first user must log in
+//!   before its next statement.
+//! - **The embedded API is trusted by construction.** `pinkdb::Database`
+//!   handles, the C ABI crate and the wasm bindings carry no principal, so
+//!   they run every statement unchecked — exactly as before this wave. Only
+//!   [`pinkdb::Connection::login`] (through `Request::Login` here) puts a
+//!   session under privilege checks.
+//!
+//! Passwords are hashed with Argon2id when the DDL runs; neither the `.pink`
+//! catalog nor the WAL ever holds the plaintext. Transport encryption is a
+//! separate, also-optional concern — the `tls` feature (off by default) adds
+//! a rustls-encrypted transport; it identifies the *server* to the client,
+//! not the client to the server, so it complements the login rather than
+//! replacing it. HTTP-style trust decisions (bind localhost, treat the port
+//! as trusted) still apply; see the README's "Network server" section.
+//! The async transport carries the same posture (and the same login path).
 pub mod client;
 pub mod protocol;
 pub mod server;

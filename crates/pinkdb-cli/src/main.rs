@@ -1028,6 +1028,13 @@ fn render_results(results: &[QueryResult]) {
             QueryResult::AlteredTable { name } => println!("Table {name} altered."),
             QueryResult::CreatedProcedure { name } => println!("Procedure {name} created."),
             QueryResult::DroppedProcedure { name } => println!("Procedure {name} dropped."),
+            QueryResult::CreatedUser { name } => println!("User {name} created."),
+            QueryResult::AlteredUser { name } => println!("User {name} altered."),
+            QueryResult::DroppedUser { name } => println!("User {name} dropped."),
+            QueryResult::CreatedRole { name } => println!("Role {name} created."),
+            QueryResult::DroppedRole { name } => println!("Role {name} dropped."),
+            QueryResult::Granted { description } => println!("Granted {description}."),
+            QueryResult::Revoked { description } => println!("Revoked {description}."),
             QueryResult::Called {
                 name,
                 statements,
@@ -1075,6 +1082,12 @@ fn run_sql_session(session: &mut Session, sql: &str) {
 /// Parsed command line.
 struct Opts {
     host: Option<String>,
+    /// `--user NAME`: log in to the remote server as this user (wave 48).
+    user: Option<String>,
+    /// `--password PASS` (or `PINKDB_PASSWORD`): the login password. Visible
+    /// in the process list and the shell history when passed as a flag, so
+    /// the environment variable is the better habit.
+    password: Option<String>,
     /// `-c` arguments, run in order instead of reading stdin.
     commands: Vec<String>,
     /// `--tls`: encrypt the remote connection (requires a trust source).
@@ -1086,7 +1099,7 @@ struct Opts {
 }
 
 fn print_usage() {
-    println!("Usage: pinkdb [--host HOST:PORT] [-c COMMAND]...");
+    println!("Usage: pinkdb [--host HOST:PORT] [--user NAME] [--password PASS] [-c COMMAND]...");
     println!();
     println!("  -c COMMAND         run SQL or a dot-command, then exit (repeatable)");
     println!("  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)");
@@ -1095,6 +1108,10 @@ fn print_usage() {
     } else {
         println!("                     [client feature: disabled in this build]");
     }
+    println!("  --user NAME        log in to the server as NAME (requires --host)");
+    println!("  --password PASS    the login password; PINKDB_PASSWORD is read when the");
+    println!("                     flag is absent (a flag value is visible to other local");
+    println!("                     users through the process list and the shell history)");
     if cfg!(feature = "tls") {
         println!("  --tls              encrypt the remote connection (TLS)");
         println!("  --tls-ca-cert PATH PEM certificate to trust for the server (a CA, or the");
@@ -1108,6 +1125,8 @@ fn print_usage() {
 fn parse_args() -> Result<Opts, String> {
     let mut opts = Opts {
         host: None,
+        user: None,
+        password: None,
         commands: Vec::new(),
         tls: false,
         tls_ca_cert: None,
@@ -1127,6 +1146,20 @@ fn parse_args() -> Result<Opts, String> {
             other if other.starts_with("--host=") => {
                 opts.host = Some(other["--host=".len()..].to_string());
             }
+            "--user" => {
+                let value = args.next().ok_or("--user requires a name")?;
+                opts.user = Some(value);
+            }
+            other if other.starts_with("--user=") => {
+                opts.user = Some(other["--user=".len()..].to_string());
+            }
+            "--password" => {
+                let value = args.next().ok_or("--password requires a value")?;
+                opts.password = Some(value);
+            }
+            other if other.starts_with("--password=") => {
+                opts.password = Some(other["--password=".len()..].to_string());
+            }
             "--tls" => opts.tls = true,
             "--tls-insecure" => opts.tls_insecure = true,
             "--tls-ca-cert" => {
@@ -1144,7 +1177,47 @@ fn parse_args() -> Result<Opts, String> {
         }
     }
     validate_tls_args(&opts)?;
+    validate_auth_args(&mut opts)?;
     Ok(opts)
+}
+
+/// Reject credential-flag combinations the client cannot honor, and pick up
+/// `PINKDB_PASSWORD` when `--password` is absent (wave 48). Credentials are a
+/// remote-mode feature: without `--host` there is nothing to log in to.
+fn validate_auth_args(opts: &mut Opts) -> Result<(), String> {
+    if opts.password.is_none()
+        && let Ok(value) = std::env::var("PINKDB_PASSWORD")
+        && !value.is_empty()
+    {
+        opts.password = Some(value);
+    }
+    let requested = opts.user.is_some() || opts.password.is_some();
+    if !requested {
+        return Ok(());
+    }
+    if !cfg!(feature = "client") {
+        return Err(
+            "credentials were given, but this pinkdb binary was built without the client \
+             feature;\n       rebuild with `cargo build -p pinkdb-cli --features client`."
+                .to_string(),
+        );
+    }
+    if opts.host.is_none() {
+        return Err(
+            "--user/--password require --host (local sessions are already trusted; \
+                    a local store's users only gate network logins)"
+                .to_string(),
+        );
+    }
+    if opts.user.is_none() {
+        return Err("--password requires --user".to_string());
+    }
+    if opts.password.is_none() {
+        return Err(
+            "--user needs a password: pass --password PASS or set PINKDB_PASSWORD".to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Reject TLS flag combinations the client cannot honor, with a precise
@@ -1229,7 +1302,7 @@ fn build_session(opts: &Opts, key: Option<EncryptionKey>) -> Session {
                 return session;
             }
             match Client::connect(&host) {
-                Ok(client) => Session::Remote(client),
+                Ok(client) => remote_session(client, opts),
                 Err(e) => {
                     eprintln!("Error: cannot connect to {host}: {e}");
                     std::process::exit(1);
@@ -1267,7 +1340,7 @@ fn open_tls_session(host: &str, opts: &Opts) -> Option<Session> {
         None => ClientTrust::Insecure,
     };
     match Client::connect_tls(host, &tls_server_name(host), trust) {
-        Ok(client) => Some(Session::Remote(client)),
+        Ok(client) => Some(remote_session(client, opts)),
         Err(e) => {
             eprintln!("Error: cannot connect to {host} over TLS: {e}");
             std::process::exit(1);
@@ -1279,6 +1352,27 @@ fn open_tls_session(host: &str, opts: &Opts) -> Option<Session> {
 fn open_tls_session(_host: &str, _opts: &Opts) -> Option<Session> {
     // `validate_tls_args` rejects TLS flags in this build.
     None
+}
+
+/// Wrap a connected client as the REPL session, logging in first when
+/// `--user` was given (wave 48). A failed login is fatal: the credentials were
+/// explicit, so continuing unauthenticated would silently run as the server's
+/// anonymous client.
+#[cfg(feature = "client")]
+fn remote_session(mut client: Client, opts: &Opts) -> Session {
+    if let Some(user) = &opts.user {
+        let password = opts.password.as_deref().unwrap_or_default();
+        match client.login(user, password) {
+            Ok(name) => {
+                eprintln!("pinkdb: logged in as {name}");
+            }
+            Err(e) => {
+                eprintln!("Error: cannot log in as {user}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    Session::Remote(client)
 }
 
 /// Durable-open options from the environment: `PINKDB_BUSY_TIMEOUT_MS`

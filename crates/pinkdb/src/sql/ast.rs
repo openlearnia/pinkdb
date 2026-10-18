@@ -180,6 +180,43 @@ pub enum Statement {
         name: String,
         args: Vec<Expr>,
     },
+    /// `CREATE USER [IF NOT EXISTS] name PASSWORD '<plaintext>'` (wave 48).
+    /// `PASSWORD_HASH '<phc>'` is the pre-hashed form the WAL replay uses.
+    CreateUser {
+        name: String,
+        /// The as-written password: hashed on the first bind (memoized on
+        /// this AST, so the multi-writer rebinds derive it once).
+        password: crate::rbac::PasswordSource,
+        if_not_exists: bool,
+    },
+    /// `ALTER USER name PASSWORD '<plaintext>'`: replace a user's password.
+    AlterUser {
+        name: String,
+        password: crate::rbac::PasswordSource,
+    },
+    /// `DROP USER [IF EXISTS] name`.
+    DropUser {
+        name: String,
+        if_exists: bool,
+    },
+    /// `CREATE ROLE [IF NOT EXISTS] name`.
+    CreateRole {
+        name: String,
+        if_not_exists: bool,
+    },
+    /// `DROP ROLE [IF EXISTS] name`.
+    DropRole {
+        name: String,
+        if_exists: bool,
+    },
+    /// `GRANT … TO …` (wave 48): a privilege grant or a role membership.
+    Grant {
+        target: crate::rbac::GrantTarget,
+    },
+    /// `REVOKE … FROM …`: the mirror of [`Statement::Grant`].
+    Revoke {
+        target: crate::rbac::GrantTarget,
+    },
     Select(Select),
 }
 

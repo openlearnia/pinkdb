@@ -18,7 +18,8 @@
 //!
 //! # Messages
 //!
-//! Requests: [`Request::Hello`], [`Request::Execute`], [`Request::Ping`].
+//! Requests: [`Request::Hello`], [`Request::Execute`], [`Request::Ping`],
+//! [`Request::Prepare`], [`Request::ExecutePrepared`], [`Request::Login`].
 //!
 //! Responses: [`Response::HelloOk`], [`Response::Pong`], and, per executed
 //! statement, one result group — [`Response::ResultSet`] followed by zero or
@@ -54,7 +55,13 @@ use pinkdb::{DataType, Value};
 /// numbered body statements the procedure ran, and a result set the call
 /// itself produced (a `SELECT`/`SHOW`/`RETURN` inside the body) precedes the
 /// frame exactly like a plain query's.
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9: [`Request::Login`] (tag 6) authenticates a connection against the
+/// store's users, [`Response::LoggedIn`] (tag 18) confirms it, and the
+/// ready-made results of the RBAC statements (wave 48) get their own
+/// [`DoneKind`]s (tags 19–25). A server whose store has users **requires** a
+/// successful login before `Execute`/`Prepare`/`ExecutePrepared`; a store
+/// with no users keeps the pre-v9 trusted behavior.
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -86,6 +93,10 @@ pub mod msg_type {
     pub const PREPARE: u8 = 4;
     /// v5: execute a prepared statement with one value per placeholder.
     pub const EXECUTE_PREPARED: u8 = 5;
+    /// v9: authenticate this connection (user name + password). Sent after
+    /// `Hello`/`HelloOk` and before the first statement when the server
+    /// requires authentication; a connection may log in again to switch user.
+    pub const LOGIN: u8 = 6;
 
     pub const HELLO_OK: u8 = 10;
     pub const PONG: u8 = 11;
@@ -97,6 +108,9 @@ pub mod msg_type {
     pub const BATCH_DONE: u8 = 16;
     /// v5: reply to `Prepare`; body is the handle and the parameter count.
     pub const PREPARED: u8 = 17;
+    /// v9: reply to `Login`; body is the authenticated user's name as the
+    /// store spells it (the catalog keys are lowercased).
+    pub const LOGGED_IN: u8 = 18;
 }
 
 /// Value tag bytes (one per [`Value`] variant).
@@ -206,6 +220,12 @@ pub enum Request {
     /// order). The reply is one result group plus a `BatchDone`, exactly like
     /// a one-statement `Execute`.
     ExecutePrepared { handle: u64, values: Vec<Value> },
+    /// v9: verify `user`/`password` against the store and adopt that user as
+    /// this connection's principal (wave 48). The reply is
+    /// [`Response::LoggedIn`] on success or an `Error` frame
+    /// (`authentication failed: …`) on failure; the connection stays usable
+    /// either way, so a client can retry.
+    Login { user: String, password: String },
 }
 
 impl Request {
@@ -217,6 +237,7 @@ impl Request {
             Request::Ping => msg_type::PING,
             Request::Prepare { .. } => msg_type::PREPARE,
             Request::ExecutePrepared { .. } => msg_type::EXECUTE_PREPARED,
+            Request::Login { .. } => msg_type::LOGIN,
         }
     }
 
@@ -228,6 +249,7 @@ impl Request {
             Request::Ping => "Ping",
             Request::Prepare { .. } => "Prepare",
             Request::ExecutePrepared { .. } => "ExecutePrepared",
+            Request::Login { .. } => "Login",
         }
     }
 
@@ -245,6 +267,10 @@ impl Request {
                 for value in values {
                     put_value(&mut buf, value)?;
                 }
+            }
+            Request::Login { user, password } => {
+                put_str(&mut buf, user)?;
+                put_str(&mut buf, password)?;
             }
         }
         Ok(buf)
@@ -278,6 +304,10 @@ impl Request {
                 }
                 Request::ExecutePrepared { handle, values }
             }
+            msg_type::LOGIN => Request::Login {
+                user: r.string("Login.user")?,
+                password: r.string("Login.password")?,
+            },
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown request message type {other}"
@@ -324,6 +354,9 @@ pub enum Response {
     /// prepared statement (connection-local) and `parameter_count` is its
     /// number of `?` placeholders.
     Prepared { handle: u64, parameter_count: u32 },
+    /// v9: reply to [`Request::Login`]; `user` is the authenticated user's
+    /// name as the store spells it.
+    LoggedIn { user: String },
     /// The statement (or handshake) failed; the connection stays usable.
     Error { message: String },
 }
@@ -369,6 +402,21 @@ pub enum DoneKind {
     /// is streamed as `Called` alone — the remote client reports the call's
     /// outcome, not every inner statement's.
     Called = 18,
+    /// `CREATE USER` (v9, wave 48); `name` is the user.
+    CreatedUser = 19,
+    /// `ALTER USER … PASSWORD` (v9); `name` is the user.
+    AlteredUser = 20,
+    /// `DROP USER` (v9); `name` is the user.
+    DroppedUser = 21,
+    /// `CREATE ROLE` (v9); `name` is the role.
+    CreatedRole = 22,
+    /// `DROP ROLE` (v9); `name` is the role.
+    DroppedRole = 23,
+    /// `GRANT …` (v9); `name` is the human-readable grant
+    /// (`SELECT ON TABLE main.t TO alice`).
+    Granted = 24,
+    /// `REVOKE …` (v9); `name` names the grant that was removed.
+    Revoked = 25,
 }
 
 impl DoneKind {
@@ -393,6 +441,13 @@ impl DoneKind {
             16 => DoneKind::Checkpointed,
             17 => DoneKind::AlteredTable,
             18 => DoneKind::Called,
+            19 => DoneKind::CreatedUser,
+            20 => DoneKind::AlteredUser,
+            21 => DoneKind::DroppedUser,
+            22 => DoneKind::CreatedRole,
+            23 => DoneKind::DroppedRole,
+            24 => DoneKind::Granted,
+            25 => DoneKind::Revoked,
             other => {
                 return Err(ProtocolError::Malformed(format!(
                     "unknown Done kind {other}"
@@ -413,6 +468,7 @@ impl Response {
             Response::Done { .. } => msg_type::DONE,
             Response::BatchDone { .. } => msg_type::BATCH_DONE,
             Response::Prepared { .. } => msg_type::PREPARED,
+            Response::LoggedIn { .. } => msg_type::LOGGED_IN,
             Response::Error { .. } => msg_type::ERROR,
         }
     }
@@ -427,6 +483,7 @@ impl Response {
             Response::Done { .. } => "Done",
             Response::BatchDone { .. } => "BatchDone",
             Response::Prepared { .. } => "Prepared",
+            Response::LoggedIn { .. } => "LoggedIn",
             Response::Error { .. } => "Error",
         }
     }
@@ -493,6 +550,7 @@ impl Response {
                 put_u64(&mut buf, *handle);
                 put_u32(&mut buf, *parameter_count);
             }
+            Response::LoggedIn { user } => put_str(&mut buf, user)?,
             Response::Error { message } => put_str(&mut buf, message)?,
         }
         Ok(buf)
@@ -556,6 +614,9 @@ impl Response {
             msg_type::PREPARED => Response::Prepared {
                 handle: r.u64("Prepared.handle")?,
                 parameter_count: r.u32("Prepared.parameter_count")?,
+            },
+            msg_type::LOGGED_IN => Response::LoggedIn {
+                user: r.string("LoggedIn.user")?,
             },
             msg_type::ERROR => Response::Error {
                 message: r.string("Error.message")?,

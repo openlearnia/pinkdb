@@ -908,6 +908,7 @@ fn ends_batch(frame: &[u8]) -> bool {
             | Response::Error { .. }
             | Response::Pong
             | Response::Prepared { .. }
+            | Response::LoggedIn { .. }
     )
 }
 
@@ -997,6 +998,47 @@ fn async_and_blocking_servers_emit_identical_frames() {
         Request::ExecutePrepared {
             handle: 999,
             values: vec![],
+        },
+        // Wave 48 (v9): the bootstrap creates the first user (trusted), and
+        // the RBAC statement outcomes ride the same Done frames on both
+        // transports.
+        Request::Execute {
+            sql: "CREATE USER parity_user PASSWORD 'parity-secret';\
+                  CREATE ROLE parity_role;\
+                  GRANT SELECT ON TABLE t TO parity_role;\
+                  GRANT parity_role TO parity_user;"
+                .to_string(),
+        },
+        // Once a user exists, an unauthenticated statement is refused with
+        // the identical Error frame…
+        Request::Execute {
+            sql: "SELECT count(*) FROM t;".to_string(),
+        },
+        // … and the Login exchange (success and failure) is byte-identical.
+        Request::Login {
+            user: "parity_user".to_string(),
+            password: "parity-secret".to_string(),
+        },
+        Request::Login {
+            user: "parity_user".to_string(),
+            password: "wrong".to_string(),
+        },
+        Request::Login {
+            user: "nobody".to_string(),
+            password: "x".to_string(),
+        },
+        // Authenticated: the role's SELECT opens the read, INSERT stays
+        // refused, and user DDL needs ADMIN.
+        Request::Execute {
+            sql: "SELECT count(*) FROM t;".to_string(),
+        },
+        Request::Execute {
+            sql: "INSERT INTO t VALUES (1, 1, 1, 1.0, 'a', DATE '2024-01-01', \
+                  TIMESTAMP '2024-01-01 00:00:00');"
+                .to_string(),
+        },
+        Request::Execute {
+            sql: "ALTER USER parity_user PASSWORD 'rotated';".to_string(),
         },
         Request::Hello {
             protocol_version: PROTOCOL_VERSION,

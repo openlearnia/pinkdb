@@ -7,7 +7,8 @@
 //!                            a constraint section, bit 1 = a column-default
 //!                            section, bit 2 = each database carries a
 //!                            materialized-view section, bit 4 = a
-//!                            stored-procedure section; unknown bits are a
+//!                            stored-procedure section, bit 5 = a
+//!                            store-level RBAC section; unknown bits are a
 //!                            hard error; bit 3 is reserved for index
 //!                            persistence)
 //! db_count u32
@@ -39,6 +40,13 @@
 //!         payload (encoding-specific)
 //! crc32 u32 (IEEE, over every preceding byte including the magic)
 //! ```
+//!
+//! With `FLAG_RBAC` set (wave 48), the CRC is preceded by the store-global
+//! RBAC section (see [`write_rbac`]): users (display name + Argon2id PHC
+//! password hash), roles, role memberships, table grants, database grants
+//! and the global `ADMIN` holders — every name in canonical (lowercased)
+//! key form, sorted. The plaintext of a password is never written: the
+//! hashed form is the only one the catalog (and the WAL) ever see.
 //!
 //! v2 files (`PINKDB02`) are the v4 container without the `flags` word and
 //! the CRC trailer; v3 files (`PINKDB03`) are v2 + a CRC; v1 files
@@ -141,6 +149,16 @@ pub(crate) const FLAG_PROCEDURES_FOR_TEST: u32 = FLAG_PROCEDURES;
 /// older v5 build refuses the file cleanly through the unknown-flags check;
 /// the next format-gated section takes bit 5 (`0x20`).
 const FLAG_PROCEDURES: u32 = 0x10;
+
+/// Flags bit 5 (v5+): the file ends with the store-global RBAC section
+/// (wave 48: users with their Argon2id PHC password hashes, roles, role
+/// memberships, table and database grants, and the global `ADMIN` holders)
+/// after every database. Set iff the store has any RBAC data, so stores
+/// without users keep their exact previous bytes. An older v5 build refuses
+/// the file cleanly through the unknown-flags check (the RBAC section is
+/// unknown to it either way); the next format-gated section takes bit 6
+/// (`0x40`).
+const FLAG_RBAC: u32 = 0x20;
 
 /// Column-default value tags (one byte per non-NULL default).
 const VD_BOOL: u8 = 0;
@@ -2210,6 +2228,7 @@ impl PinkDb {
         });
         let with_mvs = self.has_materialized_views();
         let with_procedures = self.has_procedures();
+        let with_rbac = self.has_rbac_data();
         w.u32(
             if with_constraints {
                 FLAG_CONSTRAINTS
@@ -2217,7 +2236,8 @@ impl PinkDb {
                 0
             } | if with_defaults { FLAG_DEFAULTS } else { 0 }
                 | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
-                | if with_procedures { FLAG_PROCEDURES } else { 0 },
+                | if with_procedures { FLAG_PROCEDURES } else { 0 }
+                | if with_rbac { FLAG_RBAC } else { 0 },
         );
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
@@ -2333,6 +2353,11 @@ impl PinkDb {
             if with_procedures {
                 write_procedures(&mut w, self, dbname);
             }
+        }
+        // The store-global RBAC section rides after every database (users,
+        // roles and grants are not per-database).
+        if with_rbac {
+            write_rbac(&mut w, self);
         }
         let crc = crate::wal::crc32(&w.buf);
         w.u32(crc);
@@ -2553,13 +2578,15 @@ impl PinkDb {
         let mut defaults = false;
         let mut mvs = false;
         let mut procedures = false;
+        let mut rbac = false;
         if flags {
             let f = r.u32()?;
             if v5 {
                 if f & !(FLAG_CONSTRAINTS
                     | FLAG_DEFAULTS
                     | FLAG_MATERIALIZED_VIEWS
-                    | FLAG_PROCEDURES)
+                    | FLAG_PROCEDURES
+                    | FLAG_RBAC)
                     != 0
                 {
                     return Err(PinkDbError::Execution(format!(
@@ -2570,6 +2597,7 @@ impl PinkDb {
                 defaults = f & FLAG_DEFAULTS != 0;
                 mvs = f & FLAG_MATERIALIZED_VIEWS != 0;
                 procedures = f & FLAG_PROCEDURES != 0;
+                rbac = f & FLAG_RBAC != 0;
             } else if f != 0 {
                 return Err(PinkDbError::Execution(format!(
                     "unsupported .pink v4 flags 0x{f:08x}; upgrade pinkdb"
@@ -2605,6 +2633,9 @@ impl PinkDb {
             for _ in 0..n_tables {
                 load_table(&mut r, &mut db, "main", false, false, false)?;
             }
+        }
+        if v5 && rbac {
+            load_rbac(&mut r, &mut db)?;
         }
         if !r.end() {
             return Err(PinkDbError::Execution(
@@ -2746,6 +2777,185 @@ fn load_materialized_views(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Res
         )?;
     }
     Ok(())
+}
+
+/// The store-global RBAC section (`FLAG_RBAC`, wave 48): the users (display
+/// name + Argon2id PHC password hash), the roles, the role memberships, the
+/// table grants, the database grants and the global `ADMIN` holders, each
+/// list sorted by its canonical key.
+///
+/// Only the **hash** of a password is ever written — the DDL statement's
+/// plaintext exists in process memory and nowhere else (the WAL logs the
+/// rewritten `PASSWORD_HASH '<phc>'` form for the same reason). `BTreeMap`
+/// iteration is sorted by key, which is exactly the deterministic write
+/// order, so no explicit sort is needed.
+fn write_rbac(w: &mut Writer, db: &PinkDb) {
+    let rbac = db.rbac();
+    w.u32(rbac.users.len() as u32);
+    for user in rbac.users.values() {
+        w.str(&user.name);
+        w.str(&user.password_hash);
+    }
+    w.u32(rbac.roles.len() as u32);
+    for role in rbac.roles.values() {
+        w.str(role);
+    }
+    let memberships: usize = rbac.memberships.values().map(|r| r.len()).sum();
+    w.u32(memberships as u32);
+    for (member, roles) in &rbac.memberships {
+        for role in roles {
+            w.str(member);
+            w.str(role);
+        }
+    }
+    w.u32(rbac.table_grants.len() as u32);
+    for ((dbname, table), principals) in &rbac.table_grants {
+        w.str(dbname);
+        w.str(table);
+        write_principal_grants(w, principals);
+    }
+    w.u32(rbac.database_grants.len() as u32);
+    for (dbname, principals) in &rbac.database_grants {
+        w.str(dbname);
+        write_principal_grants(w, principals);
+    }
+    w.u32(rbac.admins.len() as u32);
+    for principal in &rbac.admins {
+        w.str(principal);
+    }
+}
+
+/// One object's `principal → privileges` map: the count, then per principal,
+/// `principal, privilege count, privileges`.
+fn write_principal_grants(
+    w: &mut Writer,
+    principals: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<crate::rbac::Privilege>,
+    >,
+) {
+    w.u32(principals.len() as u32);
+    for (principal, privs) in principals {
+        w.str(principal);
+        w.u32(privs.len() as u32);
+        for p in privs {
+            w.u8(p.tag());
+        }
+    }
+}
+
+/// Decode the store-global RBAC section and install it.
+///
+/// Every count is validated against the bytes remaining before it sizes an
+/// allocation (exactly like the other optional sections), unknown privilege
+/// tags are a corrupt-file error, and a user's password hash must parse as a
+/// PHC `argon2id` string — a store that loaded would otherwise hold a user
+/// nobody can log in as. Grants that name a principal or table the catalog no
+/// longer defines load as-is (they are inert): the file records what was
+/// granted, not what exists today.
+fn load_rbac(r: &mut Reader, db: &mut PinkDb) -> Result<()> {
+    let mut rbac = crate::rbac::RbacCatalog::default();
+    let n_users = r.u32()? as usize;
+    // Each user costs at least 8 bytes (two empty strings' length prefixes).
+    if n_users > r.remaining() / 8 + 1 {
+        return r.err("RBAC user count exceeds the remaining file");
+    }
+    for _ in 0..n_users {
+        let name = r.str()?;
+        let password_hash = r.str()?;
+        crate::rbac::validate_password_hash(&password_hash).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "corrupt file: user \"{name}\" has an invalid password hash ({e})"
+            ))
+        })?;
+        rbac.users.insert(
+            name.to_ascii_lowercase(),
+            crate::rbac::UserDef {
+                name,
+                password_hash,
+            },
+        );
+    }
+    let n_roles = r.u32()? as usize;
+    if n_roles > r.remaining() / 4 + 1 {
+        return r.err("RBAC role count exceeds the remaining file");
+    }
+    for _ in 0..n_roles {
+        let name = r.str()?;
+        rbac.roles.insert(name.to_ascii_lowercase(), name);
+    }
+    let n_memberships = r.u32()? as usize;
+    if n_memberships > r.remaining() / 8 + 1 {
+        return r.err("RBAC membership count exceeds the remaining file");
+    }
+    for _ in 0..n_memberships {
+        let member = r.str()?;
+        let role = r.str()?;
+        rbac.memberships
+            .entry(member.to_ascii_lowercase())
+            .or_default()
+            .insert(role.to_ascii_lowercase());
+    }
+    let n_table_grants = r.u32()? as usize;
+    if n_table_grants > r.remaining() / 8 + 1 {
+        return r.err("RBAC table-grant count exceeds the remaining file");
+    }
+    for _ in 0..n_table_grants {
+        let dbname = r.str()?;
+        let table = r.str()?;
+        let principals = read_principal_grants(r)?;
+        rbac.table_grants.insert(
+            (dbname.to_ascii_lowercase(), table.to_ascii_lowercase()),
+            principals,
+        );
+    }
+    let n_db_grants = r.u32()? as usize;
+    if n_db_grants > r.remaining() / 4 + 1 {
+        return r.err("RBAC database-grant count exceeds the remaining file");
+    }
+    for _ in 0..n_db_grants {
+        let dbname = r.str()?;
+        let principals = read_principal_grants(r)?;
+        rbac.database_grants
+            .insert(dbname.to_ascii_lowercase(), principals);
+    }
+    let n_admins = r.u32()? as usize;
+    if n_admins > r.remaining() / 4 + 1 {
+        return r.err("RBAC admin count exceeds the remaining file");
+    }
+    for _ in 0..n_admins {
+        let principal = r.str()?;
+        rbac.admins.insert(principal.to_ascii_lowercase());
+    }
+    *db.rbac_mut() = rbac;
+    Ok(())
+}
+
+/// One object's `principal → privileges` map (the reader side of
+/// [`write_principal_grants`]).
+fn read_principal_grants(
+    r: &mut Reader,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<crate::rbac::Privilege>>>
+{
+    let n = r.u32()? as usize;
+    // Each principal costs at least 8 bytes (name and privilege count).
+    if n > r.remaining() / 8 + 1 {
+        return r.err("RBAC grant principal count exceeds the remaining file");
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for _ in 0..n {
+        let principal = r.str()?;
+        let n_privs = r.u32()? as usize;
+        if n_privs > r.remaining() + 1 {
+            return r.err("RBAC privilege count exceeds the remaining file");
+        }
+        let mut privs = std::collections::BTreeSet::new();
+        for _ in 0..n_privs {
+            privs.insert(crate::rbac::Privilege::from_tag(r.u8()?)?);
+        }
+        out.insert(principal.to_ascii_lowercase(), privs);
+    }
+    Ok(out)
 }
 
 /// One database's stored-procedure section (`FLAG_PROCEDURES`, wave 44): the
@@ -5658,6 +5868,170 @@ mod tests {
         assert_eq!(ints(&mut back, "SELECT a FROM mv;"), vec![7]);
         back.execute("DROP MATERIALIZED VIEW mv;").unwrap();
         assert!(back.materialized_view_in("main", "mv").is_err());
+    }
+
+    /// Wave 48: the RBAC section round-trips (users with their PHC hashes,
+    /// roles, memberships, table/database grants, admins), is byte-identical
+    /// across saves, and a store without RBAC data keeps flags `0` — the
+    /// section is opt-in exactly like every other format-gated one.
+    #[test]
+    fn wave48_rbac_section_round_trips_and_is_deterministic() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute(
+            "CREATE USER alice PASSWORD_HASH '$argon2id$v=19$m=19456,t=2,p=1\
+$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';",
+        )
+        .unwrap();
+        db.execute("CREATE ROLE analyst;").unwrap();
+        db.execute("CREATE ROLE reader;").unwrap();
+        db.execute("GRANT reader TO analyst;").unwrap();
+        db.execute("GRANT analyst TO alice;").unwrap();
+        db.execute("GRANT SELECT ON TABLE t TO reader;").unwrap();
+        db.execute("GRANT CREATE ON DATABASE main TO analyst;")
+            .unwrap();
+        db.execute("GRANT ADMIN TO analyst;").unwrap();
+        let one = db.to_bytes().unwrap();
+        let two = db.to_bytes().unwrap();
+        assert_eq!(one, two, "deterministic bytes");
+        assert_eq!(&one[..8], MAGIC_V5);
+        let flags = u32::from_le_bytes([one[8], one[9], one[10], one[11]]);
+        assert_eq!(flags, FLAG_RBAC, "the RBAC flag bit is set");
+        // No constraints/defaults/MVs/procedures here: the body stays
+        // v4-shaped apart from the section.
+        let mut with_flags_cleared = one.clone();
+        with_flags_cleared[8..12].copy_from_slice(&0u32.to_le_bytes());
+        fix_crc(&mut with_flags_cleared);
+        let err = PinkDb::load_bytes(&with_flags_cleared)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trailing bytes"), "{err}");
+
+        let back = PinkDb::load_bytes(&one).unwrap();
+        assert!(back.has_users());
+        assert_eq!(
+            back.effective_table_privileges("alice", "main", "t"),
+            vec![crate::rbac::Privilege::Select]
+        );
+        assert_eq!(
+            back.effective_database_privileges("alice", "main"),
+            vec![crate::rbac::Privilege::Create]
+        );
+        assert!(back.principal_is_admin("alice"));
+        assert_eq!(
+            back.user_password_hash("ALICE"),
+            Some(
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA\
+$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            )
+        );
+    }
+
+    /// A store with no RBAC data writes no section and flags `0` (so every
+    /// pre-wave-48 `.pink` body stays byte-for-byte identical).
+    #[test]
+    fn wave48_rbac_free_stores_keep_flags_zero() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("CREATE ROLE r; DROP ROLE r;").unwrap();
+        let bytes = db.to_bytes().unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V5);
+        assert_eq!(
+            u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
+            0
+        );
+        // A dropped role left nothing behind: the store loads as before.
+        let back = PinkDb::load_bytes(&bytes).unwrap();
+        assert!(!back.has_users());
+        assert!(!back.has_rbac_data());
+    }
+
+    /// Corrupt RBAC sections are clean errors, never a panic or a silent
+    /// empty catalog: a bad PHC hash, an unknown privilege tag, a count that
+    /// cannot fit, and a truncated section.
+    #[test]
+    fn wave48_corrupt_rbac_sections_error() {
+        // A pristine v5 image with an RBAC section appended by hand, so each
+        // case corrupts exactly one field.
+        let image = |body: &dyn Fn(&mut Writer)| -> Vec<u8> {
+            let mut db = PinkDb::new();
+            db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            let base = db.to_bytes().unwrap();
+            let mut bytes = base[..base.len() - 4].to_vec();
+            bytes[8..12].copy_from_slice(&FLAG_RBAC.to_le_bytes());
+            let mut w = Writer::new();
+            body(&mut w);
+            bytes.extend_from_slice(&w.buf);
+            bytes.extend_from_slice(&[0u8; 4]); // CRC placeholder
+            fix_crc(&mut bytes);
+            bytes
+        };
+        // One user, no roles and no memberships (the head of a section).
+        let user_head = |w: &mut Writer| {
+            w.u32(1);
+            w.str("alice");
+            w.str(
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA\
+$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            );
+            w.u32(0); // roles
+            w.u32(0); // memberships
+        };
+        let user = |w: &mut Writer| {
+            user_head(w);
+            w.u32(0); // table grants
+            w.u32(0); // database grants
+            w.u32(0); // admins
+        };
+        // A hash that does not parse.
+        let bad_hash = image(&|w: &mut Writer| {
+            w.u32(1);
+            w.str("alice");
+            w.str("not-a-hash");
+            w.u32(0);
+            w.u32(0);
+            w.u32(0);
+            w.u32(0);
+            w.u32(0);
+        });
+        let err = PinkDb::load_bytes(&bad_hash).unwrap_err().to_string();
+        assert!(err.contains("invalid password hash"), "bad_hash: {err}");
+        assert!(err.contains("alice"), "bad_hash: {err}");
+        // An unknown privilege tag.
+        let bad_tag = image(&|w: &mut Writer| {
+            user_head(w);
+            w.u32(1); // table grants: one entry
+            w.str("main");
+            w.str("t");
+            w.u32(1); // one principal
+            w.str("alice");
+            w.u32(1); // one privilege
+            w.u8(9); // ← unknown
+            w.u32(0); // database grants
+            w.u32(0); // admins
+        });
+        let err = PinkDb::load_bytes(&bad_tag).unwrap_err().to_string();
+        assert!(err.contains("unknown privilege tag 9"), "bad_tag: {err}");
+        // A user count that cannot fit in the remaining bytes.
+        let bad_count = image(&|w: &mut Writer| {
+            w.u32(0xffff_ffff);
+        });
+        let err = PinkDb::load_bytes(&bad_count).unwrap_err().to_string();
+        assert!(
+            err.contains("user count exceeds the remaining file"),
+            "bad_count: {err}"
+        );
+        // A section cut short in the middle of the trailing admin list.
+        let mut truncated = image(&|w: &mut Writer| {
+            user(w);
+            w.u32(1); // admins: one entry
+            w.str("alice");
+        });
+        truncated.truncate(truncated.len() - 4 - 6);
+        truncated.extend_from_slice(&[0u8; 4]); // CRC placeholder
+        fix_crc(&mut truncated);
+        let err = PinkDb::load_bytes(&truncated).unwrap_err().to_string();
+        assert!(err.contains("corrupt file"), "truncated: {err}");
     }
 
     /// The next format-gated section (bit 3, `0x8`: index persistence) is

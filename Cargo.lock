@@ -2168,6 +2168,7 @@ dependencies = [
  "aes-gcm",
  "argon2",
  "csv",
+ "getrandom 0.2.17",
  "peg",
  "pinkdb-ext-loader",
  "pinkdb-js",

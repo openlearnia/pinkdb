@@ -3230,6 +3230,20 @@ pub(crate) fn bind_tracked_with(
             name,
             args,
         } => bind_call(db, default_db, qdb.as_deref(), name, args, params.clone()),
+        Statement::CreateUser {
+            name,
+            password,
+            if_not_exists,
+        } => bind_create_user(db, name, password, *if_not_exists),
+        Statement::AlterUser { name, password } => bind_alter_user(db, name, password),
+        Statement::DropUser { name, if_exists } => bind_drop_user(db, name, *if_exists),
+        Statement::CreateRole {
+            name,
+            if_not_exists,
+        } => bind_create_role(db, name, *if_not_exists),
+        Statement::DropRole { name, if_exists } => bind_drop_role(db, name, *if_exists),
+        Statement::Grant { target } => bind_grant(db, default_db, target, false),
+        Statement::Revoke { target } => bind_grant(db, default_db, target, true),
         Statement::Select(sel) => bind_select(db, default_db, sel, params.clone()),
     }
 }
@@ -3346,6 +3360,306 @@ fn bind_call(
         },
         Vec::new(),
     ))
+}
+
+/// A plan that references no dynamic (extension) function: the shape every
+/// RBAC catalog statement returns (its definitions are plain SQL text).
+fn no_dynamic(plan: LogicalPlan) -> Result<(LogicalPlan, Vec<String>)> {
+    Ok((plan, Vec::new()))
+}
+
+/// Bind `CREATE USER [IF NOT EXISTS] name PASSWORD …` (wave 48): refuse a
+/// name already taken by a user or role, hash the plaintext (or validate a
+/// supplied PHC hash), and carry the hash into the plan — the plaintext never
+/// goes further than this call.
+fn bind_create_user(
+    db: &PinkDb,
+    name: &str,
+    password: &crate::rbac::PasswordSource,
+    if_not_exists: bool,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let key = name.to_ascii_lowercase();
+    if db.rbac().roles.contains_key(&key) {
+        return Err(PinkDbError::Catalog(format!(
+            "a role named \"{name}\" already exists (pick another name)"
+        )));
+    }
+    if db.rbac().users.contains_key(&key) && !if_not_exists {
+        return Err(PinkDbError::Catalog(format!(
+            "user \"{name}\" already exists (use ALTER USER … PASSWORD to change its password)"
+        )));
+    }
+    let password_hash = checked_password_hash(password)?;
+    no_dynamic(LogicalPlan::CreateUser {
+        name: name.to_string(),
+        password_hash,
+        if_not_exists,
+    })
+}
+
+/// The PHC hash of a `PASSWORD`/`PASSWORD_HASH` clause. A supplied hash must
+/// be a valid Argon2id PHC string; a plaintext is refused when empty (the
+/// hash of the empty string is valid, so the check happens before hashing).
+fn checked_password_hash(password: &crate::rbac::PasswordSource) -> Result<String> {
+    if let Some(hash) = password.prehashed_hash() {
+        crate::rbac::validate_password_hash(hash)?;
+        return Ok(hash.to_string());
+    }
+    if password.is_empty_plaintext() {
+        return Err(PinkDbError::Catalog(
+            "a password must not be empty".to_string(),
+        ));
+    }
+    Ok(password.hashed()?.to_string())
+}
+
+/// Bind `ALTER USER name PASSWORD …`: the user must exist.
+fn bind_alter_user(
+    db: &PinkDb,
+    name: &str,
+    password: &crate::rbac::PasswordSource,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let key = name.to_ascii_lowercase();
+    if db.rbac().roles.contains_key(&key) {
+        return Err(PinkDbError::Catalog(format!(
+            "\"{name}\" is a role, not a user (roles have no password)"
+        )));
+    }
+    if !db.rbac().users.contains_key(&key) {
+        return Err(PinkDbError::Catalog(format!("user \"{name}\" not found")));
+    }
+    let password_hash = checked_password_hash(password)?;
+    no_dynamic(LogicalPlan::AlterUser {
+        name: name.to_string(),
+        password_hash,
+    })
+}
+
+/// Bind `DROP USER [IF EXISTS] name`.
+fn bind_drop_user(db: &PinkDb, name: &str, if_exists: bool) -> Result<(LogicalPlan, Vec<String>)> {
+    let key = name.to_ascii_lowercase();
+    if db.rbac().roles.contains_key(&key) {
+        return Err(PinkDbError::Catalog(format!(
+            "\"{name}\" is a role, not a user (use DROP ROLE)"
+        )));
+    }
+    if !db.rbac().users.contains_key(&key) && !if_exists {
+        return Err(PinkDbError::Catalog(format!("user \"{name}\" not found")));
+    }
+    no_dynamic(LogicalPlan::DropUser {
+        name: name.to_string(),
+        if_exists,
+    })
+}
+
+/// Bind `CREATE ROLE [IF NOT EXISTS] name`.
+fn bind_create_role(
+    db: &PinkDb,
+    name: &str,
+    if_not_exists: bool,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let key = name.to_ascii_lowercase();
+    if db.rbac().users.contains_key(&key) {
+        return Err(PinkDbError::Catalog(format!(
+            "a user named \"{name}\" already exists (pick another name)"
+        )));
+    }
+    if db.rbac().roles.contains_key(&key) && !if_not_exists {
+        return Err(PinkDbError::Catalog(format!(
+            "role \"{name}\" already exists"
+        )));
+    }
+    no_dynamic(LogicalPlan::CreateRole {
+        name: name.to_string(),
+        if_not_exists,
+    })
+}
+
+/// Bind `DROP ROLE [IF EXISTS] name`.
+fn bind_drop_role(db: &PinkDb, name: &str, if_exists: bool) -> Result<(LogicalPlan, Vec<String>)> {
+    let key = name.to_ascii_lowercase();
+    if db.rbac().users.contains_key(&key) {
+        return Err(PinkDbError::Catalog(format!(
+            "\"{name}\" is a user, not a role (use DROP USER)"
+        )));
+    }
+    if !db.rbac().roles.contains_key(&key) && !if_exists {
+        return Err(PinkDbError::Catalog(format!("role \"{name}\" not found")));
+    }
+    no_dynamic(LogicalPlan::DropRole {
+        name: name.to_string(),
+        if_exists,
+    })
+}
+
+/// Bind `GRANT`/`REVOKE` (wave 48): resolve and validate the principal, the
+/// object, the privilege/scope combination and membership cycles, and build
+/// the display form the result reports. The executor re-validates existence
+/// under the store lock: bind and execution are separate lock acquisitions on
+/// the multi-writer paths.
+fn bind_grant(
+    db: &PinkDb,
+    default_db: &str,
+    target: &crate::rbac::GrantTarget,
+    revoke: bool,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    use crate::rbac::{GrantObject, GrantSpec, GrantTarget};
+    let rbac = db.rbac();
+    let resolve = |name: &str| -> Result<String> {
+        let key = name.to_ascii_lowercase();
+        if !rbac.principal_exists(&key) {
+            return Err(PinkDbError::Catalog(format!(
+                "user or role \"{name}\" not found (create it first)"
+            )));
+        }
+        Ok(key)
+    };
+    let spec = match target {
+        GrantTarget::Admin { principal } => {
+            let key = resolve(principal)?;
+            GrantSpec {
+                privs: Vec::new(),
+                object: GrantObject::Admin,
+                description: format!("ADMIN TO {}", rbac.display_of(&key)),
+                principal: key,
+            }
+        }
+        GrantTarget::Role { role, principal } => {
+            let role_key = role.to_ascii_lowercase();
+            if rbac.users.contains_key(&role_key) {
+                return Err(PinkDbError::Catalog(format!(
+                    "\"{role}\" is a user, not a role"
+                )));
+            }
+            if !rbac.roles.contains_key(&role_key) {
+                return Err(PinkDbError::Catalog(format!("role \"{role}\" not found")));
+            }
+            let key = resolve(principal)?;
+            if key == role_key {
+                return Err(PinkDbError::Catalog(format!(
+                    "a principal cannot be a member of itself (\"{role}\")"
+                )));
+            }
+            if rbac.roles_of(&role_key).contains(&key) {
+                return Err(PinkDbError::Catalog(format!(
+                    "granting role \"{}\" to \"{}\" would create a membership cycle",
+                    rbac.display_of(&role_key),
+                    rbac.display_of(&key)
+                )));
+            }
+            GrantSpec {
+                privs: Vec::new(),
+                object: GrantObject::Role {
+                    role: role_key.clone(),
+                },
+                description: format!(
+                    "ROLE {} TO {}",
+                    rbac.display_of(&role_key),
+                    rbac.display_of(&key)
+                ),
+                principal: key,
+            }
+        }
+        GrantTarget::Table {
+            privs,
+            db: qdb,
+            table,
+            principal,
+        } => {
+            let target_db = Binder::new(db, default_db).resolve_db(qdb)?;
+            let table_key = table.to_ascii_lowercase();
+            let table_display = db
+                .table_in(&target_db, table)
+                .map(|t| t.name.clone())
+                .map_err(|_| {
+                    PinkDbError::Catalog(format!(
+                        "table \"{table}\" not found in database \"{target_db}\""
+                    ))
+                })?;
+            let expanded = expand_table_privs(privs)?;
+            let principal = resolve(principal)?;
+            let db_display = db.database_display_name(&target_db);
+            GrantSpec {
+                privs: expanded.clone(),
+                object: GrantObject::Table {
+                    db: target_db,
+                    table: table_key,
+                },
+                description: format!(
+                    "{} ON TABLE {db_display}.{table_display} TO {}",
+                    crate::rbac::Privilege::list(&expanded),
+                    rbac.display_of(&principal)
+                ),
+                principal,
+            }
+        }
+        GrantTarget::Database {
+            privs,
+            db: qdb,
+            principal,
+        } => {
+            let target_db = Binder::new(db, default_db).resolve_db(&Some(qdb.clone()))?;
+            let expanded = expand_database_privs(privs)?;
+            let principal = resolve(principal)?;
+            let db_display = db.database_display_name(&target_db);
+            GrantSpec {
+                privs: expanded.clone(),
+                object: GrantObject::Database {
+                    db: target_db.clone(),
+                },
+                description: format!(
+                    "{} ON DATABASE {db_display} TO {}",
+                    crate::rbac::Privilege::list(&expanded),
+                    rbac.display_of(&principal)
+                ),
+                principal,
+            }
+        }
+    };
+    let plan = if revoke {
+        LogicalPlan::Revoke { spec }
+    } else {
+        LogicalPlan::Grant { spec }
+    };
+    no_dynamic(plan)
+}
+
+/// Expand and validate a `GRANT … ON TABLE` privilege list: `ALL` means the
+/// four table privileges, and a database privilege (`CREATE`) is refused with
+/// the statement form that does accept it.
+fn expand_table_privs(privs: &crate::rbac::GrantPrivs) -> Result<Vec<crate::rbac::Privilege>> {
+    use crate::rbac::Privilege;
+    let expanded = privs.expand_table();
+    if let Some(p) = expanded.iter().find(|p| !Privilege::TABLE.contains(p)) {
+        return Err(PinkDbError::Catalog(format!(
+            "{} is a database privilege: GRANT {} ON DATABASE <db> TO <principal>",
+            p.keyword(),
+            p.keyword()
+        )));
+    }
+    let mut expanded = expanded;
+    expanded.sort();
+    expanded.dedup();
+    Ok(expanded)
+}
+
+/// Expand and validate a `GRANT … ON DATABASE` privilege list: `ALL` means
+/// `CREATE`, and a table privilege is refused with the statement form that
+/// accepts it.
+fn expand_database_privs(privs: &crate::rbac::GrantPrivs) -> Result<Vec<crate::rbac::Privilege>> {
+    use crate::rbac::Privilege;
+    let expanded = privs.expand_database();
+    if let Some(p) = expanded.iter().find(|p| !Privilege::DATABASE.contains(p)) {
+        return Err(PinkDbError::Catalog(format!(
+            "{} is a table privilege: GRANT {} ON TABLE <table> TO <principal>",
+            p.keyword(),
+            p.keyword()
+        )));
+    }
+    let mut expanded = expanded;
+    expanded.sort();
+    expanded.dedup();
+    Ok(expanded)
 }
 
 /// Bind one expression as a constant (an empty table scope) with optional
@@ -4604,7 +4918,15 @@ pub(crate) fn plan_schema(
         // Wave 44: procedure DDL and `CALL` never appear as a query scope.
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
-        | LogicalPlan::Call { .. } => Ok(Vec::new()),
+        | LogicalPlan::Call { .. }
+        // Wave 48: neither do RBAC statements.
+        | LogicalPlan::CreateUser { .. }
+        | LogicalPlan::AlterUser { .. }
+        | LogicalPlan::DropUser { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::Grant { .. }
+        | LogicalPlan::Revoke { .. } => Ok(Vec::new()),
         LogicalPlan::IndexScan { db: qdb, table, .. } => {
             let lookup = qdb.as_deref().unwrap_or(default_db);
             db.visible_table_schema(lookup, table)

@@ -33,6 +33,31 @@ fn host_flag_without_client_feature_is_rejected() {
 }
 
 #[test]
+fn credentials_without_client_feature_are_rejected() {
+    let out = run(&[
+        "--host",
+        "127.0.0.1:1",
+        "--user",
+        "alice",
+        "--password",
+        "x",
+    ]);
+    assert!(
+        !out.status.success(),
+        "--user/--password must fail without the client feature"
+    );
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("built without the client feature"),
+        "output was:\n{text}"
+    );
+}
+
+#[test]
 fn unknown_argument_is_rejected_with_usage() {
     let out = run(&["--bogus"]);
     assert_eq!(out.status.code(), Some(2));

@@ -110,6 +110,15 @@ LOAD EXTENSION 'windowed_math';            -- on wasm: load a linked registry ex
 CREATE PROCEDURE p(a INTEGER, b VARCHAR) AS $$
 BEGIN INSERT INTO t VALUES (a, b); END $$;     -- stored procedure (see below)
 CALL p(1, 'x');                              -- run it; DROP PROCEDURE p removes it
+CREATE USER alice PASSWORD 's3cret';         -- Argon2id hash at DDL time (wave 48)
+ALTER USER alice PASSWORD 'rotated';         -- replace a user's password
+DROP USER [IF EXISTS] alice;
+CREATE ROLE analyst;  DROP ROLE [IF EXISTS] analyst;
+GRANT analyst TO alice;                      -- role membership (transitive; cycles refused)
+GRANT SELECT, INSERT ON TABLE t TO analyst;  -- table privileges (or ALL)
+GRANT CREATE ON DATABASE main TO analyst;    -- database DDL privilege (or ALL)
+GRANT ADMIN TO alice;                        -- global admin: every check passes
+REVOKE SELECT ON TABLE t FROM analyst;       -- GRANT/REVOKE are idempotent
 SELECT [DISTINCT] expr [AS alias], ...
 FROM t [<join> u ON <cond>] ...    -- multi-way; INNER / LEFT [OUTER] / RIGHT [OUTER] /
                                    -- FULL [OUTER] / CROSS JOIN; composite ON
@@ -1428,10 +1437,13 @@ std thread per connection). The optional `async-server` feature adds a
 tokio transport (`--transport async`: async accept + frame I/O, engine calls
 on the blocking pool) that speaks the identical protocol — it is wave 47's
 documented carve-out to the zero-async rule, scoped to the I/O boundary only
-(the executor stays synchronous; see the crate docs). Release binaries:
-`pinkdb` 2.21 MB (2.28 MB with `--features
-encryption`), `pinkdb-server` 2.98 MB (3.37 MB with `--features
-async-server`; Apple Silicon, `--release`, thin LTO).
+(the executor stays synchronous; see the crate docs). Release binaries
+(wave 48; Apple Silicon, `--release`, thin LTO, decimal MB): `pinkdb`
+3.54 MB (3.60 MB with `--features encryption`), `pinkdb-server` 3.24 MB
+(3.67 MB with `--features async-server`). Wave 48 links Argon2id into the
+default build for RBAC password hashing — about +0.23 MB per binary (the
+`encryption` variants grow less: the same crate already backed the
+passphrase KDF there).
 
 ```sh
 # in-memory server on 127.0.0.1:5433
@@ -1493,18 +1505,23 @@ malformed or truncated peer can never make the decoder read out of bounds or
 over-allocate.
 
 Requests: `Hello { protocol_version }` (required first; a mismatched version
-is rejected with a clear error), `Execute { sql }`, `Ping`. Responses:
+is rejected with a clear error), `Execute { sql }`, `Ping`,
+`Prepare { sql }` / `ExecutePrepared { handle, values }` (connection-local
+prepared statements) and `Login { user, password }` (wave 48). Responses:
 `HelloOk { server_version, protocol_version }`, `Pong`, and per statement one
 result group — `ResultSet { names, types }`, then chunked `Rows { count,
 columns, values... }` frames (typed value encoding: a tag byte + payload for
 NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP; `DataType` tag byte), then
 `Done { kind }`. A successful `Execute` batch ends with exactly one
 `BatchDone { statements }` frame and the client reads result groups until it,
-so neither side parses SQL just to count statements. A failing statement ends
-the batch with a single `Error { message }` instead; SQL errors arrive as
-`Error` frames and the connection stays open. The protocol version is 4
-(v4 added the `Done` kind `Checkpointed` for `CHECKPOINT`; v3 added
-`LoadedExtension` for `LOAD EXTENSION`).
+`Prepared { handle, parameter_count }` answers `Prepare` and `LoggedIn
+{ user }` answers `Login`; so neither side parses SQL just to count
+statements. A failing statement ends the batch with a single
+`Error { message }` instead; SQL errors arrive as `Error` frames and the
+connection stays open. The protocol version is **9** (v2 added the
+`BatchDone` terminator, v3 `LoadedExtension`, v4 `Checkpointed`, v5
+prepared statements, v6 DECIMAL/INTERVAL, v7 `AlteredTable`, v8 `Called`,
+v9 the `Login`/`LoggedIn` frames and the RBAC `Done` kinds).
 
 The client (`pinkdb_server::Client`) reconstructs pinkdb's public
 `QueryResult`/`Value`/`DataType`, so the CLI renders remote results with the
@@ -1518,6 +1535,10 @@ fails fast on later calls instead of reading a desynchronized stream.
 `pinkdb --host HOST:PORT` sends every SQL statement to the server and renders
 results with the same box-drawn output and timing line as the embedded REPL.
 SQL (including `USE`, `CREATE DATABASE`, `BEGIN`/`COMMIT`) works unchanged.
+`--user NAME --password PASS` (or `PINKDB_PASSWORD` in the environment, which
+keeps the password out of the process list) logs in first; a server whose
+store has users refuses statements until the login succeeded, and a failed
+login is fatal rather than a silent fallback to the anonymous client.
 The file and catalog dot-commands (`.import`, `.save`, `.open`, `.databases`,
 `.tables`, `.schema`) are not available in remote mode and report
 `Error: <cmd> is not available in remote mode`. The feature is opt-in: the
@@ -1528,19 +1549,46 @@ reported as a warning instead of being silently ignored.
 
 ### Security posture
 
-**No authentication, no TLS, no authorization in this wave.** Anyone who can
-open a TCP connection to the port gets the full SQL surface of the served
-database (queries, writes, DDL) on the one shared store. The server binds
-`127.0.0.1` by default and must stay on localhost or a trusted network: do
-not expose it to the internet or to untrusted clients. Auth and TLS are
-planned; they are explicitly out of scope for this wave.
+**Users, roles and grants decide what a remote connection may do (wave 48);
+the store's catalog is the switch.** Two states, chosen by whether any user
+is defined:
 
-`LOAD EXTENSION` is refused for remote clients unless the server runs with
-`--allow-load-extension` (library: `Server::allow_load_extension(true)`):
-the statement makes the server process load and run a native library from
-its own filesystem, which without authentication would be remote code
-execution. WAL replay at startup still re-loads extensions a durable
-database already recorded.
+- **No users yet** — every connection is trusted and gets the full SQL
+  surface of the served database, exactly like the embedded API. The server
+  prints a loud startup warning in this state. The bootstrap is a normal
+  wire session: `CREATE USER alice PASSWORD '…'` then
+  `GRANT ADMIN TO alice`.
+- **At least one user** — every statement request needs a successful
+  `Login` first (`authentication required: …` otherwise; `Ping` is exempt),
+  and each statement then runs under that user's privileges: table
+  `SELECT`/`INSERT`/`UPDATE`/`DELETE`, database `CREATE` for schema DDL,
+  and the global `ADMIN` (user/role management, `CREATE/DROP DATABASE`,
+  `CHECKPOINT`, `LOAD EXTENSION`, `CALL`, and every other check). Roles are
+  transitive (`GRANT role TO principal`); `SHOW …`/`DESCRIBE` need no
+  privilege. The gate is evaluated per statement, so the connection that
+  creates the first user must log in before its next statement.
+
+Passwords are hashed with Argon2id (19 MiB, t=2, p=1) when the DDL runs; the
+`.pink` catalog and the WAL only ever hold the PHC hash — the plaintext never
+reaches disk. **The embedded API stays trusted**: `Database`/`Connection`
+handles, the C ABI and the wasm bindings carry no principal and run every
+statement unchecked. `pinkdb-server --transport async` carries the same
+posture through the same login path.
+
+Transport encryption is separate and still opt-in: `--tls-cert`/`--tls-key`
+(crate feature `tls`) encrypt the connection and let the client verify the
+server, but they identify the *server*, not the client. Without a trust
+anchor, anyone who can open a TCP connection to the port still reaches the
+login prompt, so bind `127.0.0.1` (the default) or a trusted network, and do
+not expose the port to the internet.
+
+`LOAD EXTENSION` is additionally refused for remote clients unless the
+server runs with `--allow-load-extension` (library:
+`Server::allow_load_extension(true)`): the statement makes the server process
+load and run a native library from its own filesystem, and even with RBAC
+that is a host-level capability (an authenticated session also needs
+`ADMIN`). WAL replay at startup still re-loads extensions a durable database
+already recorded.
 
 ## C ABI (`pinkdb-ffi`)
 
@@ -2092,6 +2140,17 @@ ties in ORDER BY have no stable order on either engine).
 - `CREATE DATABASE` / `DROP DATABASE` / `LOAD EXTENSION` are refused inside a
   transaction; the last database cannot be dropped; `DROP DATABASE` does not
   remove views from other databases (views are per-database and session-local)
+- RBAC (wave 48): `CREATE/ALTER/DROP USER`, `CREATE/DROP ROLE`, `GRANT` and
+  `REVOKE` are refused inside a transaction (the per-table commit merge does
+  not carry store metadata). There are no object owners — `CREATE` on a
+  database lets a session change its schema but grants no table access, so
+  the creator must be granted `SELECT`/… explicitly. `CALL` needs `ADMIN`
+  (a procedure body binds only at call time, so its statements cannot be
+  privilege-checked per statement). `DROP TABLE`/`DROP ROLE`/`DROP USER`/a
+  `RENAME` cascade or move grants; concurrent user DDL from two processes is
+  not conflict-detected by the WAL frame sets (the same shape procedure DDL
+  has). wasm32 builds refuse `CREATE USER … PASSWORD '<plaintext>'` (no OS
+  randomness there) while `PASSWORD_HASH` and verification work
 - Loadable extensions are native-only (wasm builds refuse `LOAD EXTENSION`),
   process-level, and not part of `.pink` snapshots. A durable database
   WAL-logs `LOAD EXTENSION`, and records that call an extension are prefixed

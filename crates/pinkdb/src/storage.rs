@@ -917,6 +917,11 @@ pub struct PinkDb {
     /// logging/conflict paths read it right after the call ran (see
     /// [`crate::procedure`]).
     pub(crate) proc_frame: crate::procedure::ProcFrame,
+    /// The store's users, roles and grants (wave 48). Store-global (a table
+    /// privilege names its database) and persisted in the `.pink` format's
+    /// RBAC section + replayed from the WAL; an empty catalog is the
+    /// documented "no users: every connection is trusted" state.
+    pub(crate) rbac: crate::rbac::RbacCatalog,
 }
 
 impl Default for PinkDb {
@@ -960,6 +965,7 @@ impl Clone for PinkDb {
             // boundary).
             proc_depth: self.proc_depth,
             proc_frame: self.proc_frame.clone(),
+            rbac: self.rbac.clone(),
         }
     }
 }
@@ -1009,6 +1015,7 @@ impl PinkDb {
             txn_writes: HashSet::new(),
             proc_depth: 0,
             proc_frame: crate::procedure::ProcFrame::default(),
+            rbac: crate::rbac::RbacCatalog::default(),
         }
     }
 
@@ -1062,6 +1069,15 @@ impl PinkDb {
 
     pub fn database_exists(&self, name: &str) -> bool {
         self.databases.contains_key(&Self::db_key(name))
+    }
+
+    /// The as-created spelling of a database (for diagnostics), else the key
+    /// itself.
+    pub(crate) fn database_display_name(&self, key: &str) -> String {
+        self.databases
+            .get(&Self::db_key(key))
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| key.to_string())
     }
 
     /// Create a new, empty database. Case-insensitive; errors if it exists.
@@ -1267,6 +1283,17 @@ impl PinkDb {
         self.databases.values().any(|c| !c.procedures.is_empty())
     }
 
+    /// Does the store hold any RBAC data (a user, a role, a membership, a
+    /// grant or an admin)? Cheap gate for the `.pink` flags word.
+    pub(crate) fn has_rbac_data(&self) -> bool {
+        !self.rbac.users.is_empty()
+            || !self.rbac.roles.is_empty()
+            || !self.rbac.memberships.is_empty()
+            || !self.rbac.table_grants.is_empty()
+            || !self.rbac.database_grants.is_empty()
+            || !self.rbac.admins.is_empty()
+    }
+
     /// Clear the statement-scoped procedure frame (called at every statement
     /// boundary; see [`PinkDb::proc_frame`]).
     pub(crate) fn proc_frame_reset(&mut self) {
@@ -1414,6 +1441,11 @@ impl PinkDb {
             .map(|(key, cat)| (key.clone(), cat.views.clone()))
             .collect();
         self.databases = other.databases;
+        // The RBAC catalog is store-global metadata outside `databases`: a
+        // rebuilt store (checkpoint + replayed WAL) is authoritative for it
+        // exactly like it is for tables, so the swap carries users, roles and
+        // grants too.
+        self.rbac = other.rbac;
         for (key, views) in local_views {
             if let Some(cat) = self.databases.get_mut(&key) {
                 for (name, view) in views {
@@ -1480,6 +1512,11 @@ impl PinkDb {
         if self.replaying || !crate::plan::writes_tables(plan) {
             return Ok(());
         }
+        // Wave 48: a `CREATE/ALTER USER` is logged in its `PASSWORD_HASH`
+        // form — the plaintext of the statement text must never reach the
+        // WAL (and the hash is exactly the one the catalog stored).
+        let logged = crate::rbac::wal_statement_text(plan, sql);
+        let sql: &str = &logged;
         let touched = self.dynamic_function_paths(dynamic_functions_used);
         let loaded = loaded_extension_path(plan);
         // The frame's touched set (wave 45o), recorded in the payload so

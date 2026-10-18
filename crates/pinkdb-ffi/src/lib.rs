@@ -56,6 +56,21 @@ pub const PINKDB_STMT_CHECKPOINTED: i32 = 15;
 /// `ALTER TABLE`; `pinkdb_result_name` carries the table's name after the
 /// statement (a `RENAME TO` reports the new name).
 pub const PINKDB_STMT_ALTERED_TABLE: i32 = 16;
+/// `CREATE USER` (wave 48); `pinkdb_result_name` carries the user.
+pub const PINKDB_STMT_CREATED_USER: i32 = 17;
+/// `ALTER USER … PASSWORD`; `pinkdb_result_name` carries the user.
+pub const PINKDB_STMT_ALTERED_USER: i32 = 18;
+/// `DROP USER`; `pinkdb_result_name` carries the user.
+pub const PINKDB_STMT_DROPPED_USER: i32 = 19;
+/// `CREATE ROLE`; `pinkdb_result_name` carries the role.
+pub const PINKDB_STMT_CREATED_ROLE: i32 = 20;
+/// `DROP ROLE`; `pinkdb_result_name` carries the role.
+pub const PINKDB_STMT_DROPPED_ROLE: i32 = 21;
+/// `GRANT …`; `pinkdb_result_name` carries the grant's description
+/// (`SELECT ON TABLE main.t TO alice`).
+pub const PINKDB_STMT_GRANTED: i32 = 22;
+/// `REVOKE …`; `pinkdb_result_name` carries the revoked grant's description.
+pub const PINKDB_STMT_REVOKED: i32 = 23;
 
 // ----- value / column type tags -----
 pub const PINKDB_TYPE_NULL: i32 = 0;
@@ -318,6 +333,13 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::CreatedProcedure { .. } => PINKDB_STMT_CREATED,
         QueryResult::DroppedProcedure { .. } => PINKDB_STMT_DROPPED_TABLE,
         QueryResult::Called { .. } => PINKDB_STMT_CREATED,
+        QueryResult::CreatedUser { .. } => PINKDB_STMT_CREATED_USER,
+        QueryResult::AlteredUser { .. } => PINKDB_STMT_ALTERED_USER,
+        QueryResult::DroppedUser { .. } => PINKDB_STMT_DROPPED_USER,
+        QueryResult::CreatedRole { .. } => PINKDB_STMT_CREATED_ROLE,
+        QueryResult::DroppedRole { .. } => PINKDB_STMT_DROPPED_ROLE,
+        QueryResult::Granted { .. } => PINKDB_STMT_GRANTED,
+        QueryResult::Revoked { .. } => PINKDB_STMT_REVOKED,
     }
 }
 
@@ -372,7 +394,15 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
                     | QueryResult::DroppedDatabase { name }
                     | QueryResult::AlteredTable { name }
                     | QueryResult::CreatedProcedure { name }
-                    | QueryResult::DroppedProcedure { name } => (0, Some(nul_terminated(name))),
+                    | QueryResult::DroppedProcedure { name }
+                    | QueryResult::CreatedUser { name }
+                    | QueryResult::AlteredUser { name }
+                    | QueryResult::DroppedUser { name }
+                    | QueryResult::CreatedRole { name }
+                    | QueryResult::DroppedRole { name } => (0, Some(nul_terminated(name))),
+                    QueryResult::Granted { description } | QueryResult::Revoked { description } => {
+                        (0, Some(nul_terminated(description)))
+                    }
                     QueryResult::Used { db } => (0, Some(nul_terminated(db))),
                     QueryResult::LoadedExtension { name } => (0, Some(nul_terminated(name))),
                     _ => (0, None),

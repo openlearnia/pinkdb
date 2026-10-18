@@ -55,6 +55,63 @@ fn requests_round_trip() {
             Value::Varchar("x".to_string()),
         ],
     });
+    request_round_trip(Request::Login {
+        user: "alice".to_string(),
+        password: "hunter2".to_string(),
+    });
+    request_round_trip(Request::Login {
+        user: "alice".to_string(),
+        password: String::new(),
+    });
+}
+
+/// Wave 48 pins the wire surface of protocol v9: the version number, the
+/// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. A change here is
+/// a protocol change and must bump [`PROTOCOL_VERSION`].
+#[test]
+fn protocol_v9_pins_the_login_frames_and_rbac_done_kinds() {
+    assert_eq!(PROTOCOL_VERSION, 9);
+    assert_eq!(msg_type::LOGIN, 6);
+    assert_eq!(msg_type::LOGGED_IN, 18);
+    for (kind, tag) in [
+        (DoneKind::Selected, 0),
+        (DoneKind::Used, 13),
+        (DoneKind::Other, 14),
+        (DoneKind::LoadedExtension, 15),
+        (DoneKind::Checkpointed, 16),
+        (DoneKind::AlteredTable, 17),
+        (DoneKind::Called, 18),
+        (DoneKind::CreatedUser, 19),
+        (DoneKind::AlteredUser, 20),
+        (DoneKind::DroppedUser, 21),
+        (DoneKind::CreatedRole, 22),
+        (DoneKind::DroppedRole, 23),
+        (DoneKind::Granted, 24),
+        (DoneKind::Revoked, 25),
+    ] {
+        let frame = encode_response(&Response::Done {
+            kind,
+            count: 0,
+            name: String::new(),
+        })
+        .unwrap();
+        assert_eq!(frame[4 + 1], tag as u8, "{kind:?} tag drifted");
+        // The tag decodes back to the same kind.
+        assert_eq!(
+            decode_response(&frame).unwrap(),
+            Response::Done {
+                kind,
+                count: 0,
+                name: String::new(),
+            }
+        );
+    }
+    // A tag past the current surface is still rejected.
+    let bytes = frame(msg_type::DONE, &[26, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    assert!(matches!(
+        decode_response(&bytes),
+        Err(ProtocolError::Malformed(msg)) if msg.contains("unknown Done kind 26")
+    ));
 }
 
 #[test]
@@ -76,6 +133,9 @@ fn responses_round_trip() {
         types: vec![],
     });
     response_round_trip(Response::Rows { rows: vec![] });
+    response_round_trip(Response::LoggedIn {
+        user: "Alice".to_string(),
+    });
     response_round_trip(Response::BatchDone { statements: 0 });
     response_round_trip(Response::BatchDone { statements: 3 });
     response_round_trip(Response::BatchDone {

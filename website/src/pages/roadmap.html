@@ -115,16 +115,10 @@ on GitHub, and the wave-by-wave summary in the
 <h3>Server security and operations</h3>
 
 <ul>
-  <li><strong>TLS for the network server</strong> (rustls + certificate
-  configuration), so remote clients can connect over an encrypted transport.</li>
-  <li><strong>RBAC:</strong> users and roles with Argon2id password hashes,
-  <code>CREATE USER</code>/<code>CREATE ROLE</code>/<code>GRANT</code>/<code>REVOKE</code>
-  on databases and tables, session login and per-connection enforcement; grants
-  persisted and WAL-logged.</li>
-  <li><strong>Async I/O at the boundary:</strong> an optional async storage
-  layer (object stores / S3) and/or async server variant, feature-gated — a
-  documented carve-out where only the I/O boundary goes async; the executor stays
-  synchronous.</li>
+  <li><strong>Server hardening follow-ups:</strong> TLS client certificates and
+  a system trust store, login rate-limiting and an authentication audit log; RBAC
+  introspection (<code>SHOW USERS</code>/<code>SHOW GRANTS</code>) and
+  <code>WITH GRANT OPTION</code>.</li>
 </ul>
 
 <h3>Extensions and distribution</h3>

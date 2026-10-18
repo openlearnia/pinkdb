@@ -117,6 +117,35 @@ pub enum QueryResult {
         statements: usize,
         result: Option<Box<QueryResult>>,
     },
+    /// `CREATE USER` (wave 48).
+    CreatedUser {
+        name: String,
+    },
+    /// `ALTER USER … PASSWORD` (wave 48).
+    AlteredUser {
+        name: String,
+    },
+    /// `DROP USER` (wave 48).
+    DroppedUser {
+        name: String,
+    },
+    /// `CREATE ROLE` (wave 48).
+    CreatedRole {
+        name: String,
+    },
+    /// `DROP ROLE` (wave 48).
+    DroppedRole {
+        name: String,
+    },
+    /// `GRANT …` (wave 48): `description` is the human-readable grant
+    /// (`SELECT ON TABLE main.t TO alice`).
+    Granted {
+        description: String,
+    },
+    /// `REVOKE …` (wave 48); `description` names the grant that was removed.
+    Revoked {
+        description: String,
+    },
     Selected {
         names: Vec<String>,
         types: Vec<DataType>,
@@ -547,6 +576,10 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                 return Ok(QueryResult::DroppedTable { name: name.clone() });
             }
             db.drop_table_in(&target, name)?;
+            // Wave 48: a table's grants go with the table — leaving them
+            // behind would silently hand them to a future table of the same
+            // name.
+            db.rbac_mut().remove_table(&target, name);
             Ok(QueryResult::DroppedTable { name: name.clone() })
         }
         LogicalPlan::CreateIndex {
@@ -728,6 +761,8 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                 }
                 AlterTablePlan::RenameTable { to } => {
                     db.rename_table_in(&target, name, to)?;
+                    // Wave 48: privileges follow the table to its new name.
+                    db.rbac_mut().rename_table(&target, name, to);
                     Ok(QueryResult::AlteredTable { name: to.clone() })
                 }
             }
@@ -848,6 +883,9 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                 return Ok(QueryResult::DroppedDatabase { name: name.clone() });
             }
             db.drop_database(name)?;
+            // Wave 48: a dropped database takes its database-level and
+            // table-level grants with it.
+            db.rbac_mut().remove_database(name);
             Ok(QueryResult::DroppedDatabase { name: name.clone() })
         }
         LogicalPlan::Use { name } => use_result(db, name),
@@ -939,6 +977,119 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             db.procedures_remove_in(&target, &name.to_ascii_lowercase());
             Ok(QueryResult::DroppedProcedure { name: name.clone() })
+        }
+        LogicalPlan::CreateUser {
+            name,
+            password_hash,
+            if_not_exists,
+        } => {
+            let key = name.to_ascii_lowercase();
+            // The binder already hashed the password; the executor only
+            // installs it. Re-validate under the store lock: the bind and the
+            // execution are separate lock acquisitions on the multi-writer
+            // paths, so a concurrent commit may have created the user.
+            if db.rbac().roles.contains_key(&key) {
+                return Err(PinkDbError::Catalog(format!(
+                    "a role named \"{name}\" already exists (pick another name)"
+                )));
+            }
+            if db.rbac().users.contains_key(&key) {
+                if *if_not_exists {
+                    return Ok(QueryResult::CreatedUser { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!(
+                    "user \"{name}\" already exists (use ALTER USER … PASSWORD to change its \
+                     password)"
+                )));
+            }
+            db.rbac_mut().users.insert(
+                key,
+                crate::rbac::UserDef {
+                    name: name.clone(),
+                    password_hash: password_hash.clone(),
+                },
+            );
+            Ok(QueryResult::CreatedUser { name: name.clone() })
+        }
+        LogicalPlan::AlterUser {
+            name,
+            password_hash,
+        } => {
+            let key = name.to_ascii_lowercase();
+            if !db.rbac().users.contains_key(&key) {
+                return Err(PinkDbError::Catalog(format!("user \"{name}\" not found")));
+            }
+            if let Some(def) = db.rbac_mut().users.get_mut(&key) {
+                def.password_hash = password_hash.clone();
+            }
+            Ok(QueryResult::AlteredUser { name: name.clone() })
+        }
+        LogicalPlan::DropUser { name, if_exists } => {
+            let key = name.to_ascii_lowercase();
+            if db.rbac().roles.contains_key(&key) {
+                return Err(PinkDbError::Catalog(format!(
+                    "\"{name}\" is a role, not a user (use DROP ROLE)"
+                )));
+            }
+            if db.rbac_mut().users.remove(&key).is_none() {
+                if *if_exists {
+                    return Ok(QueryResult::DroppedUser { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!("user \"{name}\" not found")));
+            }
+            // A dropped user takes its grants and memberships with it.
+            db.rbac_mut().remove_principal(&key);
+            Ok(QueryResult::DroppedUser { name: name.clone() })
+        }
+        LogicalPlan::CreateRole {
+            name,
+            if_not_exists,
+        } => {
+            let key = name.to_ascii_lowercase();
+            if db.rbac().users.contains_key(&key) {
+                return Err(PinkDbError::Catalog(format!(
+                    "a user named \"{name}\" already exists (pick another name)"
+                )));
+            }
+            if db.rbac().roles.contains_key(&key) {
+                if *if_not_exists {
+                    return Ok(QueryResult::CreatedRole { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!(
+                    "role \"{name}\" already exists"
+                )));
+            }
+            db.rbac_mut().roles.insert(key, name.clone());
+            Ok(QueryResult::CreatedRole { name: name.clone() })
+        }
+        LogicalPlan::DropRole { name, if_exists } => {
+            let key = name.to_ascii_lowercase();
+            if db.rbac().users.contains_key(&key) {
+                return Err(PinkDbError::Catalog(format!(
+                    "\"{name}\" is a user, not a role (use DROP USER)"
+                )));
+            }
+            if db.rbac_mut().roles.remove(&key).is_none() {
+                if *if_exists {
+                    return Ok(QueryResult::DroppedRole { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!("role \"{name}\" not found")));
+            }
+            // A dropped role takes its grants and memberships with it.
+            db.rbac_mut().remove_principal(&key);
+            Ok(QueryResult::DroppedRole { name: name.clone() })
+        }
+        LogicalPlan::Grant { spec } => {
+            crate::rbac::apply_grant(db, spec, false)?;
+            Ok(QueryResult::Granted {
+                description: spec.description.clone(),
+            })
+        }
+        LogicalPlan::Revoke { spec } => {
+            crate::rbac::apply_grant(db, spec, true)?;
+            Ok(QueryResult::Revoked {
+                description: spec.description.clone(),
+            })
         }
         LogicalPlan::Call {
             db: qdb,
@@ -1360,7 +1511,16 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         // reaches the row evaluator.
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
-        | LogicalPlan::Call { .. } => Err(PinkDbError::Execution(
+        | LogicalPlan::Call { .. }
+        // Wave 48: RBAC statements are handled by `run` like every other
+        // catalog mutation.
+        | LogicalPlan::CreateUser { .. }
+        | LogicalPlan::AlterUser { .. }
+        | LogicalPlan::DropUser { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::Grant { .. }
+        | LogicalPlan::Revoke { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { .. } => scan_output(cx, plan),
@@ -4181,6 +4341,13 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::CreateProcedure { name, .. } => format!("CreateProcedure {name}"),
         LogicalPlan::DropProcedure { name, .. } => format!("DropProcedure {name}"),
         LogicalPlan::Call { name, .. } => format!("Call {name}"),
+        LogicalPlan::CreateUser { name, .. } => format!("CreateUser {name}"),
+        LogicalPlan::AlterUser { name, .. } => format!("AlterUser {name}"),
+        LogicalPlan::DropUser { name, .. } => format!("DropUser {name}"),
+        LogicalPlan::CreateRole { name, .. } => format!("CreateRole {name}"),
+        LogicalPlan::DropRole { name, .. } => format!("DropRole {name}"),
+        LogicalPlan::Grant { spec } => format!("Grant {}", spec.description),
+        LogicalPlan::Revoke { spec } => format!("Revoke {}", spec.description),
         LogicalPlan::RefreshMaterializedViews { db } => format!(
             "RefreshMaterializedViews {}",
             db.clone().unwrap_or_default()

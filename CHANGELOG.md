@@ -10,6 +10,18 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 48 — RBAC: users, roles and enforced grants ✅
+- New **users and roles** hashed with Argon2id: `CREATE USER`/`CREATE ROLE`,
+  `GRANT`/`REVOKE` (table `SELECT`/`INSERT`/`UPDATE`/`DELETE`, database `CREATE`,
+  global `ADMIN`), persisted in the catalog + WAL — plaintext passwords never
+  hit disk.
+- The network server gains **session login** (protocol v9) and **per-statement
+  enforcement**: an empty catalog trusts connections with a loud startup warning;
+  once a user exists every statement is checked against their grants. Embedded,
+  FFI and wasm use stays trusted by design.
+- Remote CLI gains `--user`/`--password` (or `PINKDB_PASSWORD`); without the
+  `tls` feature, login passwords cross the wire in cleartext — documented.
+
 ### Wave 49 — extensions on wasm ✅
 - Extensions now work on **every target** through a new **linked registration**
   model: extensions register through a safe-Rust API and feed the same engine

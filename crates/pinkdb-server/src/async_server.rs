@@ -92,8 +92,8 @@ use crate::protocol::{
     self, FRAME_READ_STEP, MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, Request, Response,
 };
 use crate::server::{
-    self, ActiveGuard, CONNECTION_STACK_SIZE, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS,
-    FrameSink, MAX_PREPARED, panic_message,
+    self, AUTH_REQUIRED, ActiveGuard, CONNECTION_STACK_SIZE, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_MAX_CONNECTIONS, FrameSink, MAX_PREPARED, auth_required, panic_message, warn_auth_mode,
 };
 
 /// First retry delay after a failed `accept()`; doubles up to the max
@@ -208,6 +208,7 @@ impl AsyncServer {
     /// [`pinkdb::Connection`]. Failed `accept()` calls are logged and retried
     /// with a short backoff instead of stopping the server.
     pub async fn run(&self) -> io::Result<()> {
+        warn_auth_mode("(async)", &self.db);
         // The std listener was bound (and set nonblocking) in `bind`; wrap it
         // for the reactor. `from_std` requires an IO-enabled runtime context.
         let listener = TcpListener::from_std(self.listener.try_clone()?)?;
@@ -426,7 +427,42 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
             }
         };
         match request {
+            // v9 (wave 48): verify credentials on the blocking pool (an
+            // Argon2id verification is CPU work) and adopt the principal.
+            Request::Login { user, password } => {
+                let ran = run_blocking(&mut stream, conn, idle_timeout, move |conn, sink| {
+                    // `login_reply` is the blocking server's own code path:
+                    // the frames cannot drift between the transports.
+                    let _ = server::login_reply(sink, conn, &user, &password);
+                    Blocked {
+                        close: false,
+                        prepared: None,
+                    }
+                })
+                .await;
+                match ran {
+                    Ran {
+                        conn: Some(c),
+                        blocked,
+                    } => {
+                        conn = *c;
+                        if blocked.close {
+                            return;
+                        }
+                    }
+                    Ran { conn: None, .. } => return,
+                }
+            }
             Request::Execute { sql } => {
+                if auth_required(&db, &conn) {
+                    if send_error(&mut stream, AUTH_REQUIRED, idle_timeout)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 let ran = run_blocking(&mut stream, conn, idle_timeout, move |conn, sink| {
                     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         server::run_statement_hook(&sql);
@@ -513,6 +549,15 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
                 }
             }
             Request::Prepare { sql } => {
+                if auth_required(&db, &conn) {
+                    if send_error(&mut stream, AUTH_REQUIRED, idle_timeout)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 if prepared.len() >= MAX_PREPARED {
                     if send_error(
                         &mut stream,
@@ -603,6 +648,15 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
             // BatchDone terminator. The hook sees the substituted SQL, so
             // statement-count instrumentation matches the embedded path.
             Request::ExecutePrepared { handle, values } => {
+                if auth_required(&db, &conn) {
+                    if send_error(&mut stream, AUTH_REQUIRED, idle_timeout)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 let Some(stmt) = prepared.get(&handle).cloned() else {
                     if send_error(
                         &mut stream,

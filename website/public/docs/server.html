@@ -293,15 +293,18 @@ like local ones. Each connection gets its own <code>Connection</code>, so
 <h2 id="security-posture">Security posture<a class="anchor" href="#security-posture" aria-label="Permalink: Security posture">#</a></h2>
 
 <div class="callout security">
-  <span class="callout-title">No authentication or authorization — TLS is opt-in</span>
-  <p>Anyone who can open a TCP connection to the port gets the full SQL surface of
-  the served database — queries, writes and DDL. A build with the <code>tls</code>
-  feature can encrypt the transport (<code>--tls-cert/--tls-key</code>; clients use
-  <code>--tls</code> + <code>--tls-ca-cert</code>), which protects the wire and lets a
-  client verify which server it reached — but it does not identify or restrict
-  clients. The server binds <code>127.0.0.1</code> by default: keep it on localhost or
-  a trusted network, and never expose it to the internet. Role-based access control
-  is on the <a href="../docs/roadmap">roadmap</a>.</p>
+  <span class="callout-title">Authenticated with RBAC — TLS is opt-in</span>
+  <p>A fresh server with an empty catalog trusts every connection (it says so at
+  startup); once a user exists, connections log in and every statement is checked
+  against that user's grants — table
+  <code>SELECT</code>/<code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>,
+  database <code>CREATE</code> and global <code>ADMIN</code>. A build with the
+  <code>tls</code> feature can encrypt the transport
+  (<code>--tls-cert/--tls-key</code>; clients use <code>--tls</code> +
+  <code>--tls-ca-cert</code>) — without it, login passwords cross the wire in
+  cleartext. The server binds <code>127.0.0.1</code> by default: keep it on
+  localhost or a trusted network. Embedded use (Rust API, FFI, wasm) is trusted by
+  design and does not consult the catalog.</p>
 </div>
 
 <ul>

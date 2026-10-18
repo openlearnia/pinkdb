@@ -153,7 +153,18 @@ impl Database {
             db: self.clone(),
             txn: None,
             current_db,
+            // A plain connect is trusted (see `Connection::principal`).
+            // Network front-ends authenticate with `Connection::login`; the
+            // store's own policy switch is `Database::has_users`.
+            principal: None,
         }
+    }
+
+    /// Is any user defined? The network server's authentication switch:
+    /// while this is `false`, every connection is trusted (the documented
+    /// empty-catalog policy).
+    pub fn has_users(&self) -> bool {
+        read_lock(&self.shared).has_users()
     }
 
     /// True when this database logs commits to a WAL.
@@ -330,6 +341,12 @@ pub struct Connection {
     txn: Option<Txn>,
     /// This connection's current database (lowercased).
     current_db: String,
+    /// The authenticated principal of this session (wave 48), set by
+    /// [`Connection::login`]: `Some(lowercased user name)` makes every
+    /// statement of this connection run under that user's privileges.
+    /// `None` — a plain [`Database::connect`], the FFI, wasm — is the
+    /// documented **trusted** embedded session: no privilege check happens.
+    principal: Option<String>,
 }
 
 impl Connection {
@@ -359,6 +376,34 @@ impl Connection {
     /// The session's current database (lowercased).
     pub fn current_db(&self) -> &str {
         &self.current_db
+    }
+
+    /// Verify `user`'s password against the store and adopt it as this
+    /// session's principal (wave 48): every later statement runs under that
+    /// user's privileges, exactly like a network client that logged in.
+    ///
+    /// Returns the user's display name. An unknown user and a wrong password
+    /// produce the same `authentication failed` error, so a client cannot
+    /// probe which names exist. Re-login is allowed (the new principal
+    /// replaces the old one). A session that never logs in — the embedded
+    /// API — stays trusted: the engine performs no privilege check for it.
+    pub fn login(&mut self, user: &str, password: &str) -> Result<String> {
+        let name = read_lock(&self.db.shared).authenticate(user, password)?;
+        self.principal = Some(user.to_ascii_lowercase());
+        Ok(name)
+    }
+
+    /// The authenticated principal of this session, if any (lowercased).
+    pub fn principal(&self) -> Option<&str> {
+        self.principal.as_deref()
+    }
+
+    /// Forget this session's principal: the connection becomes trusted
+    /// again. Network front-ends do not expose this (a client cannot opt out
+    /// of authentication mid-connection); it exists for embedders that
+    /// logged a connection in for one statement.
+    pub fn logout(&mut self) {
+        self.principal = None;
     }
 
     /// Parse `sql` into a reusable prepared statement (exactly one statement,
@@ -456,6 +501,10 @@ impl Connection {
                 let (plan, dynamic_functions_used) =
                     crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
                 let plan = crate::plan::with_mv_source(plan, sql_text);
+                // Wave 48: an authenticated session is checked in every
+                // transaction state too (the snapshot carries the RBAC
+                // catalog as of BEGIN).
+                enforce(self.principal.as_deref(), &txn.work, &plan, &pre)?;
                 // A durable transaction logs its mutating statements: one
                 // that reads an attached lake table could never replay (the
                 // guard is a no-op for in-memory stores).
@@ -500,7 +549,8 @@ impl Connection {
                     if txn.wal_db_before.is_none() {
                         txn.wal_db_before = Some(pre.clone());
                     }
-                    txn.wal_stmts.push(text.to_string());
+                    txn.wal_stmts
+                        .push(crate::rbac::wal_statement_text(&plan, text));
                     txn.wal_db_after = after.clone();
                     // The record's replay starts in `pre` (possibly via a
                     // `USE` prefix) and may switch to `after` (a `USE`):
@@ -544,6 +594,10 @@ impl Connection {
                 // under the exclusive lock.
                 let shared = read_lock(&self.db.shared);
                 let (plan, _) = crate::sql::bind_tracked(&shared, stmt, &pre)?;
+                // Wave 48: the privilege check runs on the bound plan under
+                // the same lock the bind took, so no statement can slip
+                // between the check and its execution.
+                enforce(self.principal.as_deref(), &shared, &plan, &pre)?;
                 let result = if is_read_only(&plan) {
                     let result = crate::exec::run_read(&shared, &plan);
                     // Release before the `USE` logging below re-locks.
@@ -638,6 +692,7 @@ impl Connection {
         // this lock.
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
+        enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -651,6 +706,7 @@ impl Connection {
             }
             let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
             let plan = crate::plan::with_mv_source(plan, sql_text);
+            enforce(self.principal.as_deref(), &shared, &plan, pre)?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
@@ -718,6 +774,7 @@ impl Connection {
         shared.note_optimistic_fallback_for_test();
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
+        enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -966,6 +1023,11 @@ impl Connection {
                     shared.tables_remove_in(db, name);
                 }
             }
+            // Wave 48: grants follow their table through the same merge — a
+            // transaction's `DROP TABLE`/`RENAME` also decided the table's
+            // grant entry, which lives outside the table itself.
+            let snapshot = txn.work.rbac();
+            shared.rbac_mut().sync_table_grants(snapshot, db, name);
         }
         for (db, name) in &txn.view_writes {
             match txn.work.views_remove_in(db, name) {
@@ -991,6 +1053,22 @@ impl Connection {
                 "no transaction in progress".to_string(),
             )),
         }
+    }
+}
+
+/// Enforce one session principal's privileges on one bound plan (wave 48),
+/// called at every point a statement is about to execute. A no-op for a
+/// trusted session (`principal == None` — the embedded API) and for a store
+/// with no RBAC data at all.
+fn enforce(
+    principal: Option<&str>,
+    store: &PinkDb,
+    plan: &LogicalPlan,
+    default_db: &str,
+) -> Result<()> {
+    match principal {
+        None => Ok(()),
+        Some(principal) => crate::rbac::check_statement(store, principal, plan, default_db),
     }
 }
 
@@ -1031,6 +1109,16 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
         // transaction: its statements run there like hand-written ones.
         Statement::CreateProcedure { .. } => "CREATE PROCEDURE",
         Statement::DropProcedure { .. } => "DROP PROCEDURE",
+        // Wave 48: the RBAC catalog is store metadata the per-table
+        // transaction merge does not carry (exactly like a procedure
+        // definition), so these are refused inside a transaction.
+        Statement::CreateUser { .. } => "CREATE USER",
+        Statement::AlterUser { .. } => "ALTER USER",
+        Statement::DropUser { .. } => "DROP USER",
+        Statement::CreateRole { .. } => "CREATE ROLE",
+        Statement::DropRole { .. } => "DROP ROLE",
+        Statement::Grant { .. } => "GRANT",
+        Statement::Revoke { .. } => "REVOKE",
         _ => return None,
     })
 }

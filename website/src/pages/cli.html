@@ -20,10 +20,12 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
 
 <p>Command-line flags:</p>
 
-<pre class="code" data-lang="text"><code>Usage: pinkdb [--host HOST:PORT] [-c COMMAND]...
+<pre class="code" data-lang="text"><code>Usage: pinkdb [--host HOST:PORT] [--user NAME] [--password PASS] [-c COMMAND]...
 
   -c COMMAND         run SQL or a dot-command, then exit (repeatable)
-  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)</code></pre>
+  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)
+  --user NAME        log in as NAME (needs --password or PINKDB_PASSWORD)
+  --password PASS    the login password (PINKDB_PASSWORD is the fallback)</code></pre>
 
 <h2>Dot-commands</h2>
 
@@ -315,7 +317,10 @@ and transactions) works unchanged; the file and catalog dot-commands
 <code>--host</code> is rejected with
 <code>built without the client feature</code>. <code>PINKDB_KEY</code> is inert in
 remote mode (the server's own at-rest configuration applies) and is reported as a
-warning instead of being silently ignored.</p>
+warning instead of being silently ignored. Servers with users defined require
+credentials — <code>--user</code>/<code>--password</code> (or
+<code>PINKDB_PASSWORD</code>) log in before the first statement; a trusted server
+(empty catalog) needs none.</p>
 
 <ul class="next-links">
   <li><a href="{{root}}docs/server.html">Server &amp; protocol →</a></li>

@@ -910,6 +910,8 @@ peg::parser! {
             / refresh_stmt()
             / checkpoint()
             / call_stmt()
+            / grant_stmt()
+            / revoke_stmt()
             / show_stmt()
             / describe_stmt()
             / explain_stmt()
@@ -996,6 +998,78 @@ peg::parser! {
                   Statement::LoadExtension { path }
               }
 
+        /// `GRANT …` (wave 48): the global `ADMIN` privilege, a table or
+        /// database privilege, or a role membership (`GRANT role TO user`).
+        /// `grant`/`to`/`on` are matched as words/keywords, never as
+        /// reserved words, so they stay usable as names. The privilege list
+        /// is validated at bind time (the scope's expansion of `ALL` depends
+        /// on the `ON` clause).
+        rule grant_stmt() -> Statement
+            = word("grant") word("admin") word("to") principal:ident() {
+                  Statement::Grant { target: crate::rbac::GrantTarget::Admin { principal } }
+              }
+            / word("grant") privs:grant_priv_list() kw(Keyword::On) word("table") t:table_ref()
+              word("to") principal:ident() {
+                  Statement::Grant { target: crate::rbac::GrantTarget::Table {
+                      privs, db: t.0, table: t.1, principal,
+                  } }
+              }
+            / word("grant") privs:grant_priv_list() kw(Keyword::On) word("database") db:ident()
+              word("to") principal:ident() {
+                  Statement::Grant { target: crate::rbac::GrantTarget::Database {
+                      privs, db, principal,
+                  } }
+              }
+            / word("grant") role:ident() word("to") principal:ident() {
+                  Statement::Grant { target: crate::rbac::GrantTarget::Role { role, principal } }
+              }
+
+        /// `REVOKE … FROM …`: the mirror of [`grant_stmt`].
+        rule revoke_stmt() -> Statement
+            = word("revoke") word("admin") word("from") principal:ident() {
+                  Statement::Revoke { target: crate::rbac::GrantTarget::Admin { principal } }
+              }
+            / word("revoke") privs:grant_priv_list() kw(Keyword::On) word("table") t:table_ref()
+              word("from") principal:ident() {
+                  Statement::Revoke { target: crate::rbac::GrantTarget::Table {
+                      privs, db: t.0, table: t.1, principal,
+                  } }
+              }
+            / word("revoke") privs:grant_priv_list() kw(Keyword::On) word("database") db:ident()
+              word("from") principal:ident() {
+                  Statement::Revoke { target: crate::rbac::GrantTarget::Database {
+                      privs, db, principal,
+                  } }
+              }
+            / word("revoke") role:ident() word("from") principal:ident() {
+                  Statement::Revoke { target: crate::rbac::GrantTarget::Role { role, principal } }
+              }
+
+        /// The privilege list of a `GRANT`/`REVOKE`: `ALL [PRIVILEGES]`, or
+        /// one or more privilege words. Privilege words are reserved
+        /// (`SELECT`, `CREATE`, …), so this reads raw identifiers: a table
+        /// named `select` is still reachable through the other statements.
+        rule grant_priv_list() -> crate::rbac::GrantPrivs
+            = word("all") word("privileges")? { crate::rbac::GrantPrivs::all() }
+            / first:grant_priv_word() rest:(comma() p:grant_priv_word() { p })* {
+                  let mut privs = vec![first];
+                  privs.extend(rest);
+                  crate::rbac::GrantPrivs::list(privs)
+              }
+
+        rule grant_priv_word() -> crate::rbac::Privilege
+            = s:ident_raw() ws() {?
+                  crate::rbac::Privilege::parse(s)
+                      .ok_or("a privilege name (SELECT, INSERT, UPDATE, DELETE, CREATE, ALL)")
+              }
+
+        /// The password clause of `CREATE/ALTER USER`: `PASSWORD
+        /// '<plaintext>'` (hashed when the statement binds) or `PASSWORD_HASH
+        /// '<phc>'` (the pre-hashed form WAL replay logs).
+        rule password_clause() -> crate::rbac::PasswordSource
+            = word("password_hash") h:string_lit() { crate::rbac::PasswordSource::prehashed(h) }
+            / word("password") p:string_lit() { crate::rbac::PasswordSource::plaintext(p) }
+
         /// `name` or `db.name` — a table reference. Three-part names are
         /// rejected as soon as the second dot appears, with a clear error
         /// (this alternative reaches furthest and wins, whatever follows the
@@ -1008,7 +1082,14 @@ peg::parser! {
             / name:ident() { (None, name) }
 
         rule create() -> Statement
-            = kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident() {
+            = kw(Keyword::Create) word("user") ifne:if_not_exists() name:ident()
+              p:password_clause() {
+                  Statement::CreateUser { name, password: p, if_not_exists: ifne }
+              }
+            / kw(Keyword::Create) word("role") ifne:if_not_exists() name:ident() {
+                  Statement::CreateRole { name, if_not_exists: ifne }
+              }
+            / kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident() {
                   Statement::CreateDatabase { name, if_not_exists: ifne }
               }
             / kw(Keyword::Create) kw(Keyword::Index) ifne:if_not_exists() name:ident() kw(Keyword::On) t:table_ref() lparen() col:ident() rparen() {
@@ -1233,6 +1314,12 @@ peg::parser! {
             = kw(Keyword::Drop) kw(Keyword::Database) ife:if_exists() name:ident() {
                   Statement::DropDatabase { name, if_exists: ife }
               }
+            / kw(Keyword::Drop) word("user") ife:if_exists() name:ident() {
+                  Statement::DropUser { name, if_exists: ife }
+              }
+            / kw(Keyword::Drop) word("role") ife:if_exists() name:ident() {
+                  Statement::DropRole { name, if_exists: ife }
+              }
             / kw(Keyword::Drop) kw(Keyword::Table) ife:if_exists() t:table_ref() {
                   Statement::DropTable { db: t.0, name: t.1, if_exists: ife }
               }
@@ -1244,7 +1331,10 @@ peg::parser! {
         /// `default` are matched as words, not reserved keywords, so they stay
         /// usable as table/column names (`to` too: `RENAME COLUMN a TO to`).
         rule alter_stmt() -> Statement
-            = word("alter") kw(Keyword::Table) t:table_ref() op:alter_op() {
+            = word("alter") word("user") name:ident() p:password_clause() {
+                  Statement::AlterUser { name, password: p }
+              }
+            / word("alter") kw(Keyword::Table) t:table_ref() op:alter_op() {
                   Statement::AlterTable { db: t.0, name: t.1, op }
               }
 

@@ -4,6 +4,10 @@
 //! public [`QueryResult`]/[`Value`]/[`DataType`] values, so callers (e.g. the
 //! REPL) render remote results with the exact same code as local ones.
 //!
+//! [`Client::login`] (wave 48) authenticates the connection against the
+//! server's user catalog; a server that has users refuses statements until a
+//! login succeeded. [`Client::connect_with_login`] combines both steps.
+//!
 //! ```no_run
 //! use pinkdb_server::Client;
 //!
@@ -208,6 +212,50 @@ impl Client {
             ))
             .into()),
         }
+    }
+
+    /// Connect, perform the handshake, and log in as `user` (wave 48): one
+    /// call for the common remote-mode client.
+    pub fn connect_with_login(
+        addr: impl ToSocketAddrs,
+        user: &str,
+        password: &str,
+    ) -> Result<Client> {
+        let mut client = Self::connect(addr)?;
+        client.login(user, password)?;
+        Ok(client)
+    }
+
+    /// Authenticate this connection (wave 48): the server verifies
+    /// `password` against the store's users and, on success, runs every later
+    /// statement of this connection under that user's privileges. Returns the
+    /// user's name as the store spells it.
+    ///
+    /// `Err(ProtocolError::Server("authentication failed: …"))` for a wrong
+    /// password and for an unknown user (the server does not distinguish
+    /// them); the connection stays usable, so a client may retry or keep
+    /// using it if the server does not require authentication.
+    pub fn login(&mut self, user: &str, password: &str) -> Result<String> {
+        self.check_usable()?;
+        let result = (|| {
+            protocol::write_request(
+                self.reader.get_mut(),
+                &Request::Login {
+                    user: user.to_string(),
+                    password: password.to_string(),
+                },
+            )?;
+            match protocol::read_response(&mut self.reader)? {
+                Response::LoggedIn { user } => Ok(user),
+                Response::Error { message } => Err(ProtocolError::Server(message).into()),
+                other => Err(ProtocolError::Unexpected(format!(
+                    "expected LoggedIn, got {}",
+                    other.kind()
+                ))
+                .into()),
+            }
+        })();
+        self.finish(result)
     }
 
     /// The server's version string (from the handshake).
@@ -503,6 +551,14 @@ fn build_result(
         DoneKind::LoadedExtension => QueryResult::LoadedExtension { name },
         DoneKind::Checkpointed => QueryResult::Checkpointed,
         DoneKind::AlteredTable => QueryResult::AlteredTable { name },
+        // v9 (wave 48): the RBAC statement outcomes.
+        DoneKind::CreatedUser => QueryResult::CreatedUser { name },
+        DoneKind::AlteredUser => QueryResult::AlteredUser { name },
+        DoneKind::DroppedUser => QueryResult::DroppedUser { name },
+        DoneKind::CreatedRole => QueryResult::CreatedRole { name },
+        DoneKind::DroppedRole => QueryResult::DroppedRole { name },
+        DoneKind::Granted => QueryResult::Granted { description: name },
+        DoneKind::Revoked => QueryResult::Revoked { description: name },
         DoneKind::Other => {
             return Err(ProtocolError::Malformed(
                 "server sent the reserved Done kind Other".to_string(),

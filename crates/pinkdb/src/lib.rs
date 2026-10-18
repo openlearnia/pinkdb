@@ -29,6 +29,9 @@ pub mod persist;
 pub mod plan;
 pub mod prepared;
 pub mod procedure;
+/// Role-based access control (wave 48): users, roles, grants, password
+/// hashing, and the privilege check authenticated sessions run under.
+pub mod rbac;
 pub mod sql;
 pub mod storage;
 pub mod types;
@@ -43,6 +46,10 @@ pub use db::{Connection, Database};
 pub use exec::QueryResult;
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};
+pub use rbac::{
+    GrantObject, GrantPrivs, GrantSpec, GrantTarget, PasswordSource, Privilege, UserDef,
+    hash_password, validate_password_hash, verify_password,
+};
 pub use storage::{DataTable, PinkDb, ViewDef};
 pub use types::{DataType, PinkDbError, Value};
 pub use vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};

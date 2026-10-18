@@ -30,8 +30,20 @@
 //!   connection cap. Frame bodies are buffered as they arrive, never sized
 //!   from the untrusted length prefix.
 //! - SQL `LOAD EXTENSION` is refused unless the operator opts in with
-//!   [`Server::allow_load_extension`]: without authentication, letting a
-//!   remote client `dlopen` a host library would be remote code execution.
+//!   [`Server::allow_load_extension`]: letting a remote client `dlopen` a
+//!   host library is remote code execution (and, since wave 48, the SQL
+//!   statement also requires the `ADMIN` privilege on an authenticated
+//!   session).
+//! - **Authentication (wave 48).** The store's user catalog decides: while
+//!   it has **no users**, a connection is trusted (embedded semantics) —
+//!   the pre-wave-48 behavior, warned about loudly at startup. As soon as
+//!   one user exists, every statement request of a connection without a
+//!   successful [`Request::Login`](crate::protocol::Request::Login) is
+//!   refused with an `Error` frame; after the login, each statement runs
+//!   under that user's grants (the engine's per-statement check). `Login`
+//!   itself is answered with `LoggedIn` or the same
+//!   `authentication failed: …` error for an unknown user and a wrong
+//!   password. `Ping` never needs authentication.
 //! - With the crate feature `tls`, [`Server::bind_tls`] serves the same
 //!   protocol over rustls-encrypted TCP. The handshake runs on the
 //!   connection's own thread (under the same idle timeout), so a failed or
@@ -48,7 +60,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pinkdb::{DataType, Database, QueryResult, Value};
+use pinkdb::{Connection, DataType, Database, QueryResult, Value};
 
 use crate::protocol::{self, DoneKind, PROTOCOL_VERSION, ProtocolError, Request, Response};
 
@@ -266,6 +278,7 @@ impl Server {
     /// exhaustion, an aborted handshake, ...): they are logged and retried
     /// with a short backoff instead of stopping the server.
     pub fn run(&self) -> std::io::Result<()> {
+        warn_auth_mode("", &self.db);
         let mut backoff = ACCEPT_ERROR_MIN_BACKOFF;
         while !self.shutdown.load(Ordering::SeqCst) {
             match self.listener.accept() {
@@ -538,7 +551,36 @@ fn serve_client<S: Read + Write>(stream: S, db: Database) {
 
     loop {
         match protocol::read_request(&mut reader) {
+            // v9 (wave 48): verify credentials and adopt the principal. The
+            // connection stays usable on a failure (a client may retry).
+            Ok(Request::Login { user, password }) => {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    login_reply(reader.get_mut(), &mut conn, &user, &password)
+                }));
+                match outcome {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => return,
+                    Err(payload) => {
+                        let message = panic_message(payload.as_ref());
+                        eprintln!("pinkdb-server: login panicked: {message}");
+                        if send_error(
+                            reader.get_mut(),
+                            &format!("internal error: login panicked ({message})"),
+                        )
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
             Ok(Request::Execute { sql }) => {
+                if auth_required(&db, &conn) {
+                    if send_error(reader.get_mut(), AUTH_REQUIRED).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_statement_hook(&sql);
                     conn.execute(&sql)
@@ -611,8 +653,15 @@ fn serve_client<S: Read + Write>(stream: S, db: Database) {
             }
             // v5: parse one statement with `?` placeholders into a
             // connection-local prepared statement. Pure parsing: nothing
-            // executes and nothing is logged.
+            // executes and nothing is logged (but a connection that has not
+            // logged in may not use the parser either).
             Ok(Request::Prepare { sql }) => {
+                if auth_required(&db, &conn) {
+                    if send_error(reader.get_mut(), AUTH_REQUIRED).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if prepared.len() >= MAX_PREPARED {
                     if send_error(
                         reader.get_mut(),
@@ -680,6 +729,12 @@ fn serve_client<S: Read + Write>(stream: S, db: Database) {
             // the BatchDone terminator. The hook sees the substituted SQL,
             // so statement-count instrumentation matches the embedded path.
             Ok(Request::ExecutePrepared { handle, values }) => {
+                if auth_required(&db, &conn) {
+                    if send_error(reader.get_mut(), AUTH_REQUIRED).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 let Some(stmt) = prepared.get(&handle) else {
                     if send_error(
                         reader.get_mut(),
@@ -820,6 +875,56 @@ pub(crate) fn send_result<S: FrameSink + ?Sized>(
         QueryResult::RefreshedMaterializedView { name } => done(w, DoneKind::Created, 0, name),
         QueryResult::RefreshedMaterializedViews { .. } => done(w, DoneKind::Created, 0, ""),
         QueryResult::DroppedMaterializedView { name } => done(w, DoneKind::DroppedTable, 0, name),
+        // v9 (wave 48): the RBAC statement outcomes carry their own kinds so
+        // the remote client reconstructs exactly the embedded result.
+        QueryResult::CreatedUser { name } => done(w, DoneKind::CreatedUser, 0, name),
+        QueryResult::AlteredUser { name } => done(w, DoneKind::AlteredUser, 0, name),
+        QueryResult::DroppedUser { name } => done(w, DoneKind::DroppedUser, 0, name),
+        QueryResult::CreatedRole { name } => done(w, DoneKind::CreatedRole, 0, name),
+        QueryResult::DroppedRole { name } => done(w, DoneKind::DroppedRole, 0, name),
+        QueryResult::Granted { description } => done(w, DoneKind::Granted, 0, description),
+        QueryResult::Revoked { description } => done(w, DoneKind::Revoked, 0, description),
+    }
+}
+
+/// The refusal every statement request gets on a connection that has not
+/// logged in while the store has users (wave 48). Shared by both transports,
+/// so the two cannot drift.
+pub(crate) const AUTH_REQUIRED: &str =
+    "authentication required: this server has users defined; send a Login request first";
+
+/// Does this request need a successful login? (`false` while the store has no
+/// users: the documented empty-catalog policy, and `false` after a login.)
+pub(crate) fn auth_required(db: &Database, conn: &Connection) -> bool {
+    conn.principal().is_none() && db.has_users()
+}
+
+/// Answer one `Login` request: verify the credentials, adopt the principal,
+/// and reply `LoggedIn` (or the identical `authentication failed` `Error`).
+/// Shared by both transports.
+pub(crate) fn login_reply<S: FrameSink + ?Sized>(
+    sink: &mut S,
+    conn: &mut Connection,
+    user: &str,
+    password: &str,
+) -> Result<(), ProtocolError> {
+    match conn.login(user, password) {
+        Ok(name) => sink.send_frame(&Response::LoggedIn { user: name }),
+        Err(e) => send_error(sink, &e.to_string()),
+    }
+}
+
+/// Announce the store's authentication mode at startup (wave 48): a server
+/// with no users is fully trusted, and that must not be a silent surprise.
+pub(crate) fn warn_auth_mode(which: &str, db: &Database) {
+    if db.has_users() {
+        eprintln!(
+            "pinkdb-server{which}: authentication is on — connections must log in              (CREATE USER / GRANT ADMIN manage the users)"
+        );
+    } else {
+        eprintln!(
+            "pinkdb-server{which}: WARNING: no users defined — every connection is trusted              and can run any SQL. Create a user (CREATE USER <name> PASSWORD '<password>'              [ADMIN via GRANT ADMIN <name>]) to require login."
+        );
     }
 }
 
