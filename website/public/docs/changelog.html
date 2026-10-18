@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
+<h3>Wave 74 — lake naming sweep ✅</h3>
+<ul>
+<li>The lake builds are now <strong><code>pinklake</code></strong> (the <code>.pink</code>-file lake; formerly <code>lake-lite</code>) and <strong><code>vortexlake</code></strong> (the Vortex-file lake; formerly <code>lake</code>), in cargo features, help text, tests, CI, README and the docs site.</li>
+<li><strong><code>s3</code> is pure storage</strong>: it implies neither build — combine explicitly, <code>pinklake,s3</code> or <code>vortexlake,s3</code> (<code>--features s3</code> alone has no <code>.lake</code> commands and says so). No old aliases survive.</li>
+</ul>
 <h3>Wave 80 — materialized-view refresh policies ✅</h3>
 <ul>
 <li><strong>Manual</strong>: <code>REFRESH MATERIALIZED VIEW name</code> (and <code>REFRESH name</code>, plus <code>REFRESH MATERIALIZED VIEWS</code> refreshing every view of the database all-or-nothing); <code>SHOW MATERIALIZED VIEWS</code> lists schedule, last refresh time/count and staleness.</li>

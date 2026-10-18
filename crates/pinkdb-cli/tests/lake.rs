@@ -7,7 +7,7 @@
 //! Set `PINKDB_CLI_BIN` to run the whole file against another CLI build
 //! (e.g. a release binary) — the overflow tests then prove release behavior.
 
-#![cfg(feature = "lake")]
+#![cfg(feature = "vortexlake")]
 
 mod common;
 
@@ -817,7 +817,7 @@ fn s3_urls_need_the_s3_feature() {
          .quit\n");
     assert!(out.contains("does not include the `s3` feature"), "{out}");
     assert!(
-        out.contains("cargo build -p pinkdb-cli --features lake,s3"),
+        out.contains("cargo build -p pinkdb-cli --features vortexlake,s3"),
         "{out}"
     );
     assert_eq!(
@@ -1463,7 +1463,7 @@ fn attach_pins_the_requested_version() {
 /// answers the same as a fresh store, and migrates to v3 on the next save —
 /// the full-reads / lean-writes compatibility pin, end to end through the
 /// CLI. The lean side reads the same directory in
-/// `crates/pink-lake/tests/lake_lite.rs`.
+/// `crates/pink-lake/tests/pinklake.rs`.
 #[test]
 fn lean_written_v1_v4_fixture_opens_queries_and_migrates() {
     let fixture =
@@ -1515,7 +1515,7 @@ fn lean_written_v1_v4_fixture_opens_queries_and_migrates() {
 /// (Vortex) build from the manifest alone — `Attached ... statistics-only`,
 /// no data file read — and every answer equals `.lake open` over the same
 /// fixture (which is the same battery the lean CLI runs in
-/// `tests/lake_lite.rs`).
+/// `tests/pinklake.rs`).
 #[test]
 fn lean_written_v1_stats_fixture_attaches_in_the_full_build() {
     let fixture =

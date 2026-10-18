@@ -203,17 +203,17 @@ def preflight(pinkdb: Path, duckdb: str) -> dict:
     if not pinkdb.exists():
         die(
             f"pinkdb binary not found: {pinkdb}",
-            "build it with: cargo build --release -p pinkdb-cli --features lake",
+            "build it with: cargo build --release -p pinkdb-cli --features vortexlake",
         )
     if not os.access(pinkdb, os.X_OK):
         die(f"pinkdb binary is not executable: {pinkdb}")
 
     wall, out, err, rc = run_cmd([str(pinkdb)], ".timer on\n.lake\n.quit\n")
     check_output(out, err, rc, "pinkdb preflight")
-    if "built without the lake feature" in out:
+    if "built without a lake feature" in out:
         die(
-            f"{pinkdb} was built without the lake feature",
-            "rebuild with: cargo build --release -p pinkdb-cli --features lake",
+            f"{pinkdb} was built without a lake feature",
+            "rebuild with: cargo build --release -p pinkdb-cli --features vortexlake",
         )
     if "Usage: .lake" not in out:
         die(f"pinkdb preflight: unexpected .lake output\n{out}\n{err}")
@@ -708,7 +708,7 @@ def main() -> None:
 
     pre = preflight(pinkdb, duckdb)
     print(
-        f"pinkdb: {pre['pinkdb']['path']} ({human_bytes(pre['pinkdb']['bytes'])}, lake feature)"
+        f"pinkdb: {pre['pinkdb']['path']} ({human_bytes(pre['pinkdb']['bytes'])}, lake build)"
     )
     print(
         f"duckdb: {pre['duckdb']['path']} ({pre['duckdb']['version']}, ducklake"

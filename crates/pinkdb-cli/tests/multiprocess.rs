@@ -1269,7 +1269,7 @@ fn refresh_replay_reloads_a_real_extension_across_processes() {
 /// Wave 45n gap (c), with the real pink-lake fixture: an attached lake
 /// survives a full refresh rebuild triggered by another process's checkpoint
 /// (H10: attachments are process-local and the rebuild must preserve them).
-#[cfg(feature = "lake")]
+#[cfg(feature = "vortexlake")]
 #[test]
 fn attached_lake_survives_a_full_rebuild() {
     let dir = scratch("attachrebuild");

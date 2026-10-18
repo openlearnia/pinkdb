@@ -183,11 +183,11 @@ minutes.</p>
 
 <h2 id="1-build-a-lake-enabled-cli">1. Build a lake-enabled CLI<a class="anchor" href="#1-build-a-lake-enabled-cli" aria-label="Permalink: 1. Build a lake-enabled CLI">#</a></h2>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># lean lake: .pink data files, 2.7 MB binary</span>
-cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake-lite
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># pinklake: .pink data files, 2.7 MB binary</span>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> pinklake
 
-<span class="tok-c"># or the full lake: Vortex data files, 45.3 MB binary</span>
-cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake
+<span class="tok-c"># or vortexlake: Vortex data files, 45.3 MB binary</span>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> vortexlake
 ./target/release/pinkdb</code></pre></div>
 
 <h2 id="2-import-the-csv">2. Import the CSV<a class="anchor" href="#2-import-the-csv" aria-label="Permalink: 2. Import the CSV">#</a></h2>
@@ -248,9 +248,9 @@ Attached tables are read-only and session-local.</p>
     not appends. Old versions and their files are kept; there is no GC.</li>
     <li><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code>
     are refused inside a transaction.</li>
-    <li>A lean (<code>lake-lite</code>) build writes and reads only
-    <code>.pink</code> data files; a lake saved by a full build (Vortex) is refused
-    with a clear “rebuild with <code>lake</code>” error.</li>
+    <li>A <code>pinklake</code> build writes and reads only
+    <code>.pink</code> data files; a lake saved by a <code>vortexlake</code> build
+    (Vortex) is refused with a clear “rebuild with <code>vortexlake</code>” error.</li>
     <li>A second writer holding a stale handle gets
     <code>another writer published version N; reopen the lake</code> on save — or use
     <code>.lake save</code> in a fresh shell.</li>

@@ -52,29 +52,35 @@ release builds on Apple Silicon (exact bytes from a recent measurement):</p>
       <td class="num">2.44 MB<br><span class="doc-meta">2,436,320 B</span></td>
     </tr>
     <tr>
-      <td>lean lake</td>
-      <td><code>lake-lite</code></td>
+      <td>pinklake</td>
+      <td><code>pinklake</code></td>
       <td>all <code>.lake</code> commands over <code>.pink</code> v5 data files
       (no Vortex)</td>
       <td class="num">2.69 MB<br><span class="doc-meta">2,692,464 B</span></td>
     </tr>
     <tr>
-      <td>lean lake + S3/R2</td>
-      <td><code>lake-lite,s3</code><br>(plain <code>s3</code> implies it)</td>
-      <td>lean lake on <code>s3://</code> locations</td>
+      <td>pinklake + S3/R2</td>
+      <td><code>pinklake,s3</code></td>
+      <td>pinklake on <code>s3://</code> locations</td>
       <td class="num">4.70 MB<br><span class="doc-meta">4,701,120 B</span></td>
     </tr>
     <tr>
-      <td>full lake</td>
-      <td><code>lake</code></td>
+      <td>vortexlake</td>
+      <td><code>vortexlake</code></td>
       <td>Vortex data files, footer-fast attach</td>
       <td class="num">45.3 MB<br><span class="doc-meta">45,333,984 B</span></td>
     </tr>
     <tr>
-      <td>full lake + S3/R2</td>
-      <td><code>lake,s3</code></td>
-      <td>full lake on <code>s3://</code> locations</td>
+      <td>vortexlake + S3/R2</td>
+      <td><code>vortexlake,s3</code></td>
+      <td>vortexlake on <code>s3://</code> locations</td>
       <td class="num">≈47.3 MB</td>
+    </tr>
+    <tr>
+      <td>s3 only</td>
+      <td><code>s3</code></td>
+      <td>the storage client alone (no <code>.lake</code> commands)</td>
+      <td class="num">≈4.4–4.7 MB<br><span class="doc-meta">not measured</span></td>
     </tr>
   </tbody>
 </table>
@@ -86,8 +92,8 @@ support (about <strong>70 KB</strong> over the default on a thin-LTO release bui
 (≈+2 MB); <code>client</code> adds the remote REPL mode. The features combine, for
 example:</p>
 
-<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features lake,s3
-cargo build --release -p pinkdb-cli --features lake-lite   # lean lake, local disk
+<pre class="code" data-lang="sh"><code>cargo build --release -p pinkdb-cli --features vortexlake,s3
+cargo build --release -p pinkdb-cli --features pinklake     # `.pink` data files, local disk
 cargo build --release -p pinkdb-cli --features encryption
 cargo build --release -p pinkdb-cli --features repo</code></pre>
 

@@ -2340,7 +2340,7 @@ impl PinkDb {
     /// store, no per-row `Value` materialization except the per-chunk
     /// min/max).
     ///
-    /// For the `.lake` layer: a lean (`lake-lite`) save publishes these
+    /// For the `.lake` layer: a `pinklake` save publishes these
     /// facts in the v1 manifest's statistics block, and `.lake attach`
     /// answers exact `COUNT`/`MIN`/`MAX` from them without decoding a data
     /// file. The facts are ungated (`nan_count` and zero doubles are kept);

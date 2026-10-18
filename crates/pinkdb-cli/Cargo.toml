@@ -24,17 +24,19 @@ repo = ["dep:ureq", "dep:serde_json", "dep:sha2"]
 # snapshot the store into a `pink-lake` directory (JSON metadata + immutable
 # Vortex data files). Keeps the default binary lean: lake + JSON metadata +
 # Vortex code lives only behind this feature.
-lake = ["dep:pink-lake", "pink-lake/vortex-format"]
-# Opt-in *lean* lake layer: the same `.lake save/open/versions/tables/info`
-# commands over the v1 `.pink` data-file format, without the Vortex
-# dependency (~42 MB of binary size). No `.lake attach` (its statistics are
-# Vortex-only); reading a v2/v3 Vortex lake fails with a clear feature error.
-lake-lite = ["dep:pink-lake"]
+vortexlake = ["dep:pink-lake", "pink-lake/vortexlake"]
+# Opt-in `pinklake` lake layer: the same `.lake save/open/versions/tables/info`
+# commands plus the statistics-only `.lake attach`, over the v1 `.pink`
+# data-file format, without the Vortex dependency (~42 MB of binary size).
+# Reading a v2/v3 Vortex lake fails with a clear feature error.
+pinklake = ["dep:pink-lake"]
 # Opt-in object storage for the lake: `.lake …` accepts `s3://bucket/prefix`
 # URLs (AWS S3, Cloudflare R2) via pink-lake's `s3` feature (ureq + SigV4).
-# Implies the lean lake (use `lake,s3` for the full one):
-# `cargo build -p pinkdb-cli --features lake,s3` or `--features lake-lite,s3`.
-s3 = ["lake-lite", "pink-lake/s3"]
+# Pure storage: it implies neither lake build, and on its own it adds the
+# storage client but no `.lake` commands. Combine explicitly:
+# `cargo build -p pinkdb-cli --features pinklake,s3` or
+# `--features vortexlake,s3` (add `,encryption` for a keyed lake).
+s3 = ["pink-lake/s3"]
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
@@ -45,5 +47,5 @@ pinkdb-server = { path = "../pinkdb-server", optional = true }
 ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
-# Lake layer (lake feature): catalog + immutable data files.
+# Lake layer (vortexlake/pinklake features): catalog + immutable data files.
 pink-lake = { path = "../pink-lake", optional = true }

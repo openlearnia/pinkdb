@@ -82,7 +82,7 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
     </tr>
     <tr>
       <td><code>.lake save &lt;dir|s3://…&gt; [force] [author '&lt;name&gt;'] [message '&lt;text&gt;']</code></td>
-      <td>publish a full lake snapshot, optionally recording the author and commit
+      <td>publish a full snapshot of the store, optionally recording the author and commit
       message on the new version; <code>force</code> overrides this session's
       stale-baseline conflict check</td>
     </tr>
@@ -176,10 +176,12 @@ pending statement; <code>Ctrl-D</code> and <code>.quit</code> leave the shell.</
 </table>
 </div>
 
-<p>The <code>.lake</code> commands need a build with <code>lake</code> or
-<code>lake-lite</code>; without one they report
-<code>this pinkdb binary was built without the lake feature</code>.
-<code>s3://</code> locations additionally need the <code>s3</code> feature. The
+<p>The <code>.lake</code> commands need a build with <code>vortexlake</code> or
+<code>pinklake</code>; without one they report
+<code>this pinkdb binary was built without a lake feature</code>.
+<code>s3://</code> locations additionally need the <code>s3</code> feature
+combined with a lake build (<code>pinklake,s3</code> / <code>vortexlake,s3</code> —
+<code>s3</code> alone adds only the storage client). The
 <code>.install</code>/<code>.repositories</code>/<code>.installed</code> commands need
 the <code>repo</code> feature.</p>
 

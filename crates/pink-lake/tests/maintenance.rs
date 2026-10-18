@@ -3,7 +3,7 @@
 //! `list_files` / `table_info` / `options` / `settings` introspection.
 //!
 //! Format-agnostic on purpose: the suite runs in a default (lean `.pink`)
-//! build and in a `vortex-format` build; the data-file extension follows the
+//! build and in a `vortexlake` build; the data-file extension follows the
 //! build, everything else — the catalog shape, the compaction semantics, the
 //! statistics/pruning contract — is identical. The S3-mock and encrypted
 //! variants live in `tests/s3.rs` and `tests/encryption.rs`.
@@ -22,9 +22,9 @@ use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 const EXT: &str = "vortex";
-#[cfg(not(feature = "vortex-format"))]
+#[cfg(not(feature = "vortexlake"))]
 const EXT: &str = "pink";
 
 fn scratch(tag: &str) -> PathBuf {
@@ -1351,9 +1351,9 @@ fn table_info_options_and_settings_report_exact_facts() {
     assert_eq!(value("data_path"), lake_dir.display().to_string());
     assert_eq!(value("current_version"), "3");
     assert_eq!(value("encrypted"), "false");
-    #[cfg(feature = "vortex-format")]
+    #[cfg(feature = "vortexlake")]
     assert_eq!(value("data_format"), "vortex");
-    #[cfg(not(feature = "vortex-format"))]
+    #[cfg(not(feature = "vortexlake"))]
     assert_eq!(value("data_format"), "pink");
     let settings = lake.settings();
     assert_eq!(settings.catalog_type, "json");

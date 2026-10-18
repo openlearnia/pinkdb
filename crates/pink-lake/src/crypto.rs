@@ -206,7 +206,7 @@ pub(crate) fn unavailable() -> LakeError {
         feature: "encryption",
         message: "at-rest encryption is not compiled into this pink-lake build; rebuild with \
                   the `encryption` feature (for the CLI: `cargo build -p pinkdb-cli \
-                  --features lake,s3,encryption`)"
+                  --features vortexlake,s3,encryption`)"
             .to_string(),
     }
 }
@@ -791,7 +791,7 @@ mod imp {
         /// A writer that seals what is written through it into `sink` (used
         /// by the Vortex data-file path so a big file is never materialized
         /// whole). Call [`SealWriter::finish`] when the plaintext is done.
-        #[cfg_attr(not(feature = "vortex-format"), allow(dead_code))]
+        #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
         pub(crate) fn sealing_writer<'a>(
             &'a self,
             path: &Path,
@@ -956,9 +956,9 @@ mod imp {
 
     /// [`Crypto::sealing_writer`]'s sink: buffers plaintext up to one frame
     /// and seals each full frame straight into the underlying writer, so a
-    /// data file is never held in memory whole. Only the `vortex-format`
+    /// data file is never held in memory whole. Only the `vortexlake`
     /// writer path uses it (a v1 `.pink` data file is sealed in one pass).
-    #[cfg_attr(not(feature = "vortex-format"), allow(dead_code))]
+    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
     pub(crate) struct SealWriter<'a> {
         path: std::path::PathBuf,
         key: Arc<DerivedKey>,
@@ -970,7 +970,7 @@ mod imp {
         finished: bool,
     }
 
-    #[cfg_attr(not(feature = "vortex-format"), allow(dead_code))]
+    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
     impl SealWriter<'_> {
         fn seal_buffered(&mut self) -> std::io::Result<()> {
             if self.buf.is_empty() {
@@ -1033,7 +1033,7 @@ mod imp {
         }
     }
 
-    #[cfg_attr(not(feature = "vortex-format"), allow(dead_code))]
+    #[cfg_attr(not(feature = "vortexlake"), allow(dead_code))]
     impl Write for SealWriter<'_> {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             if self.finished {
@@ -1110,7 +1110,7 @@ mod imp {
         }
     }
 
-    /// The stub must still satisfy `Write` so the shared `vortex-format`
+    /// The stub must still satisfy `Write` so the shared `vortexlake`
     /// writer path type-checks; it can never be constructed
     /// ([`Crypto::sealing_writer`] always fails first).
     impl std::io::Write for SealWriter<'_> {

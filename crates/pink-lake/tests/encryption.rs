@@ -7,7 +7,7 @@
 //! decoding no data file.
 //!
 //! Runs in every build shape that has the feature: `encryption` alone (lean
-//! `.pink` data files) and `encryption,vortex-format` (Vortex data files);
+//! `.pink` data files) and `encryption,vortexlake` (Vortex data files);
 //! the `s3` feature additionally runs the hermetic-mock ciphertext-CAS test.
 
 #![cfg(feature = "encryption")]
@@ -626,7 +626,7 @@ fn stats_fast_paths_on_an_encrypted_lake_decode_no_data_file() {
         .attach(None)
         .unwrap();
     assert!(report.encrypted);
-    #[cfg(not(feature = "vortex-format"))]
+    #[cfg(not(feature = "vortexlake"))]
     assert!(
         report.statistics_only,
         "a lean encrypted attach reads no data file"

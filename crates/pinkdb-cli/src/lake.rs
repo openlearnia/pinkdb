@@ -1,8 +1,8 @@
 //! `.lake` dot-commands: snapshot the in-memory store into a pinkdb lake and
 //! load versions back.
 //!
-//! Built with the `lake` feature (full: Vortex data files, format_version 4,
-//! `.lake attach` over footers) or `lake-lite` (lean: `.pink` data files,
+//! Built with the `vortexlake` feature (Vortex data files, format_version 4,
+//! `.lake attach` over footers) or `pinklake` (`.pink` data files,
 //! format_version 4, `.lake attach` over the published statistics blocks).
 //!
 //! The lake itself lives in the `pink-lake` crate; this module is only the

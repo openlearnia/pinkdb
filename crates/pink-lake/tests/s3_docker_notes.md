@@ -11,7 +11,7 @@ the CLI's `lake_s3` tests) is the hermetic protocol suite — it even verifies
 SigV4 on every request — but it is a home-grown server inside the test
 process. `s3_docker.sh` is the independent check: a real, separate HTTP
 server in a container, real sockets, driven through the release CLI
-(`cargo build --release -p pinkdb-cli --features lake,s3`) exactly as a user
+(`cargo build --release -p pinkdb-cli --features vortexlake,s3`) exactly as a user
 would. `SERVER=` picks which real server:
 
 ```sh
@@ -336,7 +336,7 @@ cargo test -p pink-lake --features s3 --test s3 live_s3_roundtrip -- --nocapture
 ```
 
 The in-repo CLI test `concurrent_lake_saves_over_s3_stay_consistent`
-(`cargo test -p pinkdb-cli --features lake,s3`) is the hermetic version of the
+(`cargo test -p pinkdb-cli --features vortexlake,s3`) is the hermetic version of the
 one-winner assertion, against the mock's conditional writes.
 
 ## What is asserted where

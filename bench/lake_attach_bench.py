@@ -209,7 +209,10 @@ def main() -> None:
 
     after = Path(args.pinkdb).resolve()
     if not after.exists():
-        die(f"pinkdb not found: {after}", "cargo build --release -p pinkdb-cli --features lake")
+        die(
+            f"pinkdb not found: {after}",
+            "cargo build --release -p pinkdb-cli --features vortexlake",
+        )
     before = Path(args.pinkdb_before).resolve() if args.pinkdb_before else None
     if before is not None and not before.exists():
         die(f"pinkdb-before not found: {before}")

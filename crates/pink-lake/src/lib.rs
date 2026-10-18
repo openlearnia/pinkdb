@@ -48,7 +48,7 @@
 //! within the one data file it targets) whose rows the reader drops
 //! (merge-on-read). `rows` is the logical count and must equal
 //! `sum(files.rows) - sum(deletes.count)`. A v4 entry's `format` is
-//! `"vortex"` in a `vortex-format` build or `"pink"` (the engine's
+//! `"vortex"` in a `vortexlake` build or `"pink"` (the engine's
 //! single-table `.pink` bytes) in a lean one; every v4 data file carries a
 //! CRC-protected statistics/zone-map block in its `files` object — for
 //! `.pink` the exact facts its encode pass collected, for Vortex the same
@@ -100,7 +100,7 @@
 //! still print one line to stderr first; the crate does not swap the global
 //! hook).
 //!
-//! **With the `vortex-format` feature (not on by default; the full CLI builds
+//! **With the `vortexlake` feature (not on by default; the full CLI builds
 //! enable it) Vortex is the format for new writes**: every new data file is a
 //! plain Vortex file holding one struct array — one field per column, row
 //! order preserved, `-0.0` and NaN payloads bit-exact — plus a
@@ -108,7 +108,7 @@
 //! and its pinkdb column schema (the `vortex_file` module docs have the
 //! type mapping; DATE/TIMESTAMP are raw `i32`/`i64` storage because the native
 //! `vortex.timestamp` extension cannot represent the full engine range).
-//! **Without the feature** — the lean `lake-lite` builds — new writes are
+//! **Without the feature** — the `pinklake` builds — new writes are
 //! engine `.pink` single-table persistence files
 //! ([`PinkDb::to_pink_bytes_with_stats`]) **plus a CRC-protected statistics
 //! block per file** (the exact per-column facts the same encode pass
@@ -356,7 +356,7 @@ mod snapshot;
 mod stats;
 mod storage;
 mod time;
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 mod vortex_file;
 mod zone;
 
@@ -394,7 +394,7 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 /// Version 4 (wave 63): the incremental format — every data file carries its
 /// own row count, a table lists a growing, never-rewritten file list, and
 /// positional delete files (merge-on-read) express `DELETE`/`UPDATE`. Written
-/// by every build: Vortex data files with `vortex-format`, engine `.pink`
+/// by every build: Vortex data files with `vortexlake`, engine `.pink`
 /// files (with a per-file statistics block) without it.
 ///
 /// Wave 66 extends v4 additively (no version bump): an entry may declare a
@@ -417,7 +417,7 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 /// every entry. Version 1 (wave 34): one engine `.pink` file per entry (no
 /// `format` field) plus one entry-level statistics block.
 ///
-/// A build without `vortex-format` — the lean `lake-lite` builds — writes v5
+/// A build without `vortexlake` — the `pinklake` builds — writes v5
 /// with `.pink` files and refuses a v5 (or v2/v3/v4) Vortex lake with a clear
 /// [`LakeError::FeatureMissing`], never a corrupt-file error.
 pub const FORMAT_VERSION: u32 = 5;
@@ -428,7 +428,7 @@ pub const MIN_FORMAT_VERSION: u32 = 1;
 /// The newest catalog format version this codebase knows: 5 (the schema
 /// record). A manifest above this (a future format) is
 /// [`LakeError::Unsupported`] in every build; a v5 Vortex lake in a build
-/// without `vortex-format` is [`LakeError::FeatureMissing`].
+/// without `vortexlake` is [`LakeError::FeatureMissing`].
 pub const MAX_FORMAT_VERSION: u32 = 5;
 
 /// The largest manifest `version` this build reads or writes.
@@ -559,7 +559,7 @@ impl fmt::Display for LakeError {
                          was written by a newer pinkdb — upgrade to open it)",
                         path.display()
                     )
-                } else if cfg!(feature = "vortex-format") {
+                } else if cfg!(feature = "vortexlake") {
                     write!(
                         f,
                         "unsupported lake format_version {found} at {} (this build reads \
@@ -572,7 +572,7 @@ impl fmt::Display for LakeError {
                         f,
                         "unsupported lake format_version {found} at {} (this build reads/writes \
                          format_version {FORMAT_VERSION} with `.pink` data files; Vortex \
-                         format_version 2/3/4/5 needs the `vortex-format` feature)",
+                         format_version 2/3/4/5 needs the `vortexlake` feature)",
                         path.display()
                     )
                 }
@@ -983,7 +983,7 @@ impl Lake {
 
     /// The catalog `format_version` this handle last saw: the version the lake
     /// was opened with, or [`FORMAT_VERSION`] after a successful save (a save
-    /// from a v1 lake migrates it to v3 in a `vortex-format` build; a build
+    /// from a v1 lake migrates it to v3 in a `vortexlake` build; a build
     /// without the feature always publishes v1 and keeps reporting 1).
     pub fn format_version(&self) -> u32 {
         self.format_version
@@ -1089,7 +1089,7 @@ impl Lake {
     /// Footer-only *attach* of the latest version (`None`) or a specific
     /// snapshot: read the manifest, then the statistics attach needs — a
     /// Vortex data file's footer, metadata segment and stored statistics
-    /// (`vortex-format` builds; no column data is read or decoded, unless the
+    /// (`vortexlake` builds; no column data is read or decoded, unless the
     /// files live on object storage — whole-object reads, still no decode —
     /// or the lake is encrypted, where each container is unsealed whole
     /// first: the documented stage-1 cost, with footer-range reads over
@@ -1375,14 +1375,14 @@ impl Lake {
         })
     }
 
-    /// The data-file format this build writes: Vortex with `vortex-format`,
+    /// The data-file format this build writes: Vortex with `vortexlake`,
     /// engine `.pink` bytes without it.
     fn write_format(&self) -> FileFormat {
-        #[cfg(feature = "vortex-format")]
+        #[cfg(feature = "vortexlake")]
         {
             FileFormat::Vortex
         }
-        #[cfg(not(feature = "vortex-format"))]
+        #[cfg(not(feature = "vortexlake"))]
         {
             FileFormat::Pink
         }
@@ -1395,7 +1395,7 @@ impl Lake {
     /// [`write_format`](Lake::write_format) and must be explicit to append a
     /// file to an entry of the other format.
     ///
-    /// - `vortex-format`: a Vortex file, streamed — locally straight into a
+    /// - `vortexlake`: a Vortex file, streamed — locally straight into a
     ///   unique `create_new` temp sibling plus fsync + rename; over S3
     ///   buffered for one atomic PUT. The Vortex footer carries the
     ///   statistics; wave 66 additionally publishes the same facts as the
@@ -1417,7 +1417,7 @@ impl Lake {
         let rows = src.num_rows() as u64;
         match format.unwrap_or_else(|| self.write_format()) {
             FileFormat::Vortex => {
-                #[cfg(feature = "vortex-format")]
+                #[cfg(feature = "vortexlake")]
                 {
                     let rel = format!("{dir}/{id}.vortex");
                     let written = self.storage.put_streamed(&rel, &mut |sink| {
@@ -1440,12 +1440,12 @@ impl Lake {
                         written,
                     ))
                 }
-                #[cfg(not(feature = "vortex-format"))]
+                #[cfg(not(feature = "vortexlake"))]
                 {
                     let _ = (dbname, table, id, dir);
                     Err(LakeError::FeatureMissing {
-                        feature: "vortex-format",
-                        message: "writing a Vortex data file needs the `vortex-format` feature"
+                        feature: "vortexlake",
+                        message: "writing a Vortex data file needs the `vortexlake` feature"
                             .to_string(),
                     })
                 }
@@ -1935,26 +1935,26 @@ impl Lake {
             // A Vortex file that decodes into the same shape. The bytes are
             // moved into the decoder's buffer (zero copy).
             FileFormat::Vortex => {
-                #[cfg(feature = "vortex-format")]
+                #[cfg(feature = "vortexlake")]
                 {
                     let bytes = self
                         .storage
                         .read(rel, &format!("loading data file \"{rel}\""))?;
                     vortex_file::decode_table_owned(&path, bytes)
                 }
-                #[cfg(not(feature = "vortex-format"))]
+                #[cfg(not(feature = "vortexlake"))]
                 {
                     // Unreachable: `read_manifest` refuses a Vortex entry in a
                     // build without the feature long before a file could get
                     // here. Kept as a clear error, not a panic.
                     let _ = &path;
                     Err(LakeError::FeatureMissing {
-                        feature: "vortex-format",
+                        feature: "vortexlake",
                         message: format!(
                             "the data file \"{rel}\" is a Vortex file, and this build was \
                              built without Vortex format support — rebuild with the \
-                             `vortex-format` feature (for the CLI: \
-                             `cargo build -p pinkdb-cli --features lake`)"
+                             `vortexlake` feature (for the CLI: \
+                             `cargo build -p pinkdb-cli --features vortexlake`)"
                         ),
                     })
                 }
@@ -2039,7 +2039,7 @@ fn s3_storage(bucket: &str, prefix: &str) -> Result<Arc<dyn Storage>> {
         feature: "s3",
         message: format!(
             "the location {location} needs object-storage support; rebuild with the `s3` \
-             feature (for the CLI: `cargo build -p pinkdb-cli --features lake,s3`)"
+             feature (for the CLI: `cargo build -p pinkdb-cli --features vortexlake,s3`)"
         ),
     })
 }
@@ -2205,7 +2205,7 @@ fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
 ///   and the logical row count must equal `sum(files.rows) -
 ///   sum(deletes.count)`.
 ///
-/// A build without `vortex-format` refuses a manifest whose entries need
+/// A build without `vortexlake` refuses a manifest whose entries need
 /// Vortex data files (v2/v3, or a v4 entry declaring `"vortex"`) with a
 /// clear [`LakeError::FeatureMissing`] at this very first parse, before any
 /// data file is touched.
@@ -2235,19 +2235,19 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
         path: path.to_path_buf(),
         message,
     };
-    // A build without `vortex-format` refuses a manifest that needs Vortex
+    // A build without `vortexlake` refuses a manifest that needs Vortex
     // data files at this very first parse, before any data file is touched,
     // with a feature error — never a corrupt-file one. v2/v3 are all-Vortex
     // by definition; a v4 entry declaring `"vortex"` is refused per entry
     // below.
-    #[cfg(not(feature = "vortex-format"))]
+    #[cfg(not(feature = "vortexlake"))]
     if (2..=3).contains(&v) {
         return Err(LakeError::FeatureMissing {
-            feature: "vortex-format",
+            feature: "vortexlake",
             message: format!(
                 "{} is a format_version {v} lake (Vortex data files); this build was built \
-                 without Vortex format support — rebuild with the `vortex-format` feature \
-                 (for the CLI: `cargo build -p pinkdb-cli --features lake`)",
+                 without Vortex format support — rebuild with the `vortexlake` feature \
+                 (for the CLI: `cargo build -p pinkdb-cli --features vortexlake`)",
                 path.display(),
             ),
         });
@@ -2342,14 +2342,14 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                 )));
             }
             (4 | 5, Some(FileFormat::Vortex)) => {
-                #[cfg(not(feature = "vortex-format"))]
+                #[cfg(not(feature = "vortexlake"))]
                 return Err(LakeError::FeatureMissing {
-                    feature: "vortex-format",
+                    feature: "vortexlake",
                     message: format!(
                         "{}: table \"{key}\" uses Vortex data files (format_version {v}); this \
                          build was built without Vortex format support — rebuild with the \
-                         `vortex-format` feature (for the CLI: `cargo build -p pinkdb-cli \
-                         --features lake`)",
+                         `vortexlake` feature (for the CLI: `cargo build -p pinkdb-cli \
+                         --features vortexlake`)",
                         path.display(),
                     ),
                 });
@@ -2794,8 +2794,8 @@ pub(crate) fn apply_file_deletes(
 /// chunks are shared with `src` (no deep copy) and appended with
 /// `append_chunk`'s chunking rules, exactly what the loader's `copy_chunks`
 /// reverses. The engine's `.pink` encoder is then byte-deterministic for a
-/// given dense table. Every build needs it: a `vortex-format` build still
-/// appends `.pink` files to a lean lake's v4 entries.
+/// given dense table. Every build needs it: a `vortexlake` build still
+/// appends `.pink` files to a pinklake lake's v4 entries.
 fn single_table_store(dbname: &str, table: &str, src: &DataTable) -> Result<PinkDb> {
     let mut mini = empty_structure(dbname, table, src.schema(), "saving")?;
     let dst = mini
@@ -2842,7 +2842,7 @@ fn empty_structure(
 /// The Vortex decoder builds one per data file, so a decoded file has
 /// exactly one database and table — the shape a v1 `.pink` data file opens
 /// as, which is what the loader's checks expect.
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 fn empty_single_table_store(
     dbname: &str,
     table: &str,

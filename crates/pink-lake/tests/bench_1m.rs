@@ -4,14 +4,14 @@
 //! table.
 //!
 //! ```sh
-//! cargo test --release -p pink-lake --features vortex-format --test bench_1m \
+//! cargo test --release -p pink-lake --features vortexlake --test bench_1m \
 //!     -- --ignored --nocapture
 //! ```
 //!
 //! This is a report, not a gate: it prints data-file bytes and save/load wall
-//! time for both formats on the current machine. `vortex-format` builds only.
+//! time for both formats on the current machine. `vortexlake` builds only.
 
-#![cfg(feature = "vortex-format")]
+#![cfg(feature = "vortexlake")]
 
 use std::path::PathBuf;
 use std::time::Instant;

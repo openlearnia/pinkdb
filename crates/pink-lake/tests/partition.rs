@@ -5,7 +5,7 @@
 //! can still match.
 //!
 //! Format-agnostic on purpose: the suite runs in a default (lean `.pink`)
-//! build and in a `vortex-format` build, and the data-file extension follows
+//! build and in a `vortexlake` build, and the data-file extension follows
 //! the build. The catalog shape, the partition values, the zone maps and the
 //! pruning semantics are identical.
 
@@ -18,9 +18,9 @@ use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 const EXT: &str = "vortex";
-#[cfg(not(feature = "vortex-format"))]
+#[cfg(not(feature = "vortexlake"))]
 const EXT: &str = "pink";
 
 fn scratch(tag: &str) -> PathBuf {
@@ -345,10 +345,10 @@ fn zone_map_pruning_decodes_only_matching_files() {
         attached_query(&lake_dir, "SELECT s FROM t WHERE id = 11;");
     assert_eq!(got, vec![vec![Value::Varchar("v11".to_string())]]);
     assert_eq!((loads, files), (1, 1), "one load, one file");
-    #[cfg(feature = "vortex-format")]
+    #[cfg(feature = "vortexlake")]
     assert_eq!(columns, 2, "id (predicate) and s (projection) only");
     // A lean `.pink` projection decodes the whole (single-file) table.
-    #[cfg(not(feature = "vortex-format"))]
+    #[cfg(not(feature = "vortexlake"))]
     assert_eq!(columns, 3, "the `.pink` decode counts every column");
     cleanup(&dir);
 }
@@ -783,7 +783,7 @@ fn tampered_partition_values_and_zone_maps_are_refused() {
     cleanup(&dir);
 }
 
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredBlock {
     version: u32,
@@ -793,7 +793,7 @@ struct StoredBlock {
     columns: Vec<StoredColumn>,
 }
 
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 #[derive(serde::Serialize, serde::Deserialize)]
 struct StoredColumn {
     name: String,
@@ -807,7 +807,7 @@ struct StoredColumn {
     nan: Option<u64>,
 }
 
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 #[test]
 fn vortex_zone_maps_cross_check_against_the_footer() {
     // A catalog zone map that disagrees with the file footer is corrupt:

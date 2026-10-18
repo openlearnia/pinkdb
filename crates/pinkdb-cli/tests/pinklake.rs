@@ -1,13 +1,13 @@
-//! CLI coverage for the lean `lake-lite` feature: `.lake save/open/versions/
+//! CLI coverage for the `pinklake` feature: `.lake save/open/versions/
 //! tables/info` end to end over v1 `.pink` data files (no Vortex),
 //! `.lake attach` over the published statistics block, the refusal of a
 //! stats-less v1 lake and of a v2/v3 Vortex lake, and the `s3` variant.
 //!
-//! This file only compiles when `lake-lite` is on and `lake` (the full,
-//! Vortex-enabled feature) is not; the full feature-on behavior is covered by
+//! This file only compiles when `pinklake` is on and `vortexlake` (the
+//! Vortex-enabled feature) is not; the feature-on behavior is covered by
 //! `tests/lake.rs` and `tests/lake_s3.rs`.
 
-#![cfg(all(feature = "lake-lite", not(feature = "lake")))]
+#![cfg(all(feature = "pinklake", not(feature = "vortexlake")))]
 
 #[cfg(feature = "s3")]
 #[path = "../../pink-lake/src/mock_s3.rs"]
@@ -24,7 +24,7 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// Unique scratch directory for one test.
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "pinkdb_cli_lake_lite_{tag}_{}_{}",
+        "pinkdb_cli_pinklake_{tag}_{}_{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -159,18 +159,18 @@ fn lean_save_open_versions_tables_info() {
     }
     cleanup(&dir);
 
-    // The lean `--features lake-lite` help describes the lean lake and
+    // The `--features pinklake` help describes the pinklake build and
     // offers `.lake attach` (over the v1 statistics block).
     let help = run(".help\n.quit\n");
     assert!(help.contains(".lake save"), "{help}");
-    assert!(help.contains("lean lake build"), "{help}");
+    assert!(help.contains("pinklake build"), "{help}");
     assert!(
         help.contains(".lake attach <dir"),
-        "help must offer attach in a lean build (statistics-only):\n{help}"
+        "help must offer attach in a pinklake build (statistics-only):\n{help}"
     );
     assert!(
-        !help.contains("not built in the lean lake"),
-        "help must not claim attach is missing:\n{help}"
+        !help.contains("needs the `pinklake` or `vortexlake` feature"),
+        "help must not claim the lake commands are missing:\n{help}"
     );
 }
 
@@ -403,7 +403,7 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// The lean lake over mock S3: `.lake save`/`open` work against
+/// The pinklake build over mock S3: `.lake save`/`open` work against
 /// `s3://bucket/prefix` and the data files are `.pink` objects.
 #[cfg(feature = "s3")]
 #[test]

@@ -6,11 +6,11 @@ minutes.</p>
 
 <h2>1. Build a lake-enabled CLI</h2>
 
-<pre class="code" data-lang="sh"><code># lean lake: .pink data files, 2.7 MB binary
-cargo build --release -p pinkdb-cli --features lake-lite
+<pre class="code" data-lang="sh"><code># pinklake: .pink data files, 2.7 MB binary
+cargo build --release -p pinkdb-cli --features pinklake
 
-# or the full lake: Vortex data files, 45.3 MB binary
-cargo build --release -p pinkdb-cli --features lake
+# or vortexlake: Vortex data files, 45.3 MB binary
+cargo build --release -p pinkdb-cli --features vortexlake
 ./target/release/pinkdb</code></pre>
 
 <h2>2. Import the CSV</h2>
@@ -71,9 +71,9 @@ Attached tables are read-only and session-local.</p>
     not appends. Old versions and their files are kept; there is no GC.</li>
     <li><code>.lake save</code>, <code>.lake open</code> and <code>.lake attach</code>
     are refused inside a transaction.</li>
-    <li>A lean (<code>lake-lite</code>) build writes and reads only
-    <code>.pink</code> data files; a lake saved by a full build (Vortex) is refused
-    with a clear “rebuild with <code>lake</code>” error.</li>
+    <li>A <code>pinklake</code> build writes and reads only
+    <code>.pink</code> data files; a lake saved by a <code>vortexlake</code> build
+    (Vortex) is refused with a clear “rebuild with <code>vortexlake</code>” error.</li>
     <li>A second writer holding a stale handle gets
     <code>another writer published version N; reopen the lake</code> on save — or use
     <code>.lake save</code> in a fresh shell.</li>

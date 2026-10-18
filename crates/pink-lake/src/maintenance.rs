@@ -51,7 +51,7 @@
 //! from the same writer path as any other data file (`write_data_file`), and
 //! the manifest's `rows = sum(files) - sum(deletes)` invariant is re-checked
 //! before publishing. Stats-fast attach and filter pruning work on the
-//! merged file unchanged (`vortex-format` footers, `.pink` blocks, the
+//! merged file unchanged (`vortexlake` footers, `.pink` blocks, the
 //! catalog-published zone map); prune tests pin that the surviving decode
 //! counters still fire.
 //!

@@ -2,10 +2,10 @@
 //! crash-atomicity leftovers, corrupt-metadata handling, and the v1 → v2/v3
 //! (`.pink` → Vortex) format history.
 //!
-//! `vortex-format` builds only; the lean (v1 `.pink`) behavior is covered by
-//! `tests/lake_lite.rs`.
+//! `vortexlake` builds only; the lean (v1 `.pink`) behavior is covered by
+//! `tests/pinklake.rs`.
 
-#![cfg(feature = "vortex-format")]
+#![cfg(feature = "vortexlake")]
 
 mod common;
 
@@ -1393,10 +1393,10 @@ fn v1_lake_migrates_to_vortex_on_save() {
 }
 
 /// The compatibility pin in the other direction: `tests/fixtures/lake_v1_v4/`
-/// is a v1 lake written by the **lean** (`vortex-format`-less) writer —
+/// is a v1 lake written by the **lean** (`vortexlake`-less) writer —
 /// engine v4 `.pink` data files under a v1 catalog. The full build opens it
 /// bit-exactly and migrates it to v3 on the next save, while the lean build
-/// reads the same directory in `tests/lake_lite.rs`.
+/// reads the same directory in `tests/pinklake.rs`.
 #[test]
 fn v1_v4_fixture_written_by_the_lean_writer_loads_and_migrates() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4");
@@ -2074,7 +2074,7 @@ fn attach_refusals_are_clean_errors() {
 /// Cross-build pin, full side: the lean-written `lake_v1_v4_stats` fixture —
 /// a `format_version` 1 lake whose entries carry CRC-protected statistics
 /// blocks over `.pink` v4 data files — attaches in this (full,
-/// `vortex-format`) build exactly like it does in a lean build: descriptors
+/// `vortexlake`) build exactly like it does in a lean build: descriptors
 /// equal the decoded truth, fast paths answer from the manifest alone, and a
 /// battery of queries equals `.lake open` over the same fixture.
 #[test]

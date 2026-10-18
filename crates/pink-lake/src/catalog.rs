@@ -29,7 +29,7 @@
 //! file names the one data file whose positions it drops (`file`) and how many
 //! it drops (`count`); `rows` is the logical row count (data rows minus
 //! deleted positions) and must equal `sum(files.rows) - sum(deletes.count)`.
-//! Every entry declares its `format`: `"vortex"` in a `vortex-format` build,
+//! Every entry declares its `format`: `"vortex"` in a `vortexlake` build,
 //! `"pink"` (the engine's single-table `.pink` bytes, with a per-file
 //! CRC-protected statistics block) in a lean one.
 //!
@@ -251,7 +251,7 @@ fn bucket_n(transform: &str) -> &str {
 ///
 /// `Pink` is the engine's own `.pink` single-table persistence bytes (the v1
 /// lake format, and the v4 lean format); `Vortex` is a Vortex file (the v2/v3
-/// format and the v4 `vortex-format` format). Serialized as a lowercase
+/// format and the v4 `vortexlake` format). Serialized as a lowercase
 /// string. Unambiguous in every version: a v1 entry has no `format` field at
 /// all (it loads as `Pink`), and a v4 entry must declare one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,7 +260,7 @@ pub(crate) enum FileFormat {
     /// The engine's `.pink` single-table persistence bytes (format_version 1,
     /// or 4 in a lean build).
     Pink,
-    /// A Vortex file (format_version 2/3, or 4 in a `vortex-format` build).
+    /// A Vortex file (format_version 2/3, or 4 in a `vortexlake` build).
     Vortex,
 }
 

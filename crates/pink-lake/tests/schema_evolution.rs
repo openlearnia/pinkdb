@@ -5,7 +5,7 @@
 //! reading each version's own schema.
 //!
 //! Format-agnostic: runs in a default (lean `.pink`) build and in a
-//! `vortex-format` build; the mapping semantics are the same either way.
+//! `vortexlake` build; the mapping semantics are the same either way.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,7 +15,7 @@ use pinkdb::{PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-const EXT: &str = if cfg!(feature = "vortex-format") {
+const EXT: &str = if cfg!(feature = "vortexlake") {
     "vortex"
 } else {
     "pink"

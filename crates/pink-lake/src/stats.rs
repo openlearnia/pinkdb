@@ -1,7 +1,7 @@
 //! The v1 `.pink` statistics block, and the one exactness gate both lake
 //! formats share.
 //!
-//! A lean (`vortex-format`-less) save writes one engine `.pink` data file per
+//! A lean (`vortexlake`-less) save writes one engine `.pink` data file per
 //! table. Those files carry no statistics section (the engine format is
 //! frozen), so the writer publishes the exact per-column statistics it
 //! collected during the encode ([`pinkdb::PinkDb::to_pink_bytes_with_stats`])
@@ -105,8 +105,8 @@ impl StatsBlock {
     /// collected during the encode. `key` is the flat `db.table` catalog key,
     /// `file` the lake-relative path of the one data file.
     ///
-    /// Every build writes blocks now: a `vortex-format` build still appends
-    /// `.pink` files to a lean lake's v4 entries, and those carry per-file
+    /// Every build writes blocks now: a `vortexlake` build still appends
+    /// `.pink` files to a pinklake lake's v4 entries, and those carry per-file
     /// blocks.
     pub(crate) fn from_saved(key: &str, file: &str, saved: &SavedTableStats) -> Result<Self> {
         let mut columns = Vec::with_capacity(saved.columns.len());

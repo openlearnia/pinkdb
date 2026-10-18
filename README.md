@@ -68,7 +68,7 @@ SQL text
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
-| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the full CLI `lake` feature, `.pink` v4 with the lean `lake-lite` feature (which `s3` implies); v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
+| `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` v4 with the `pinklake` feature; v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
 
 Design rules: Rust edition 2021, zero async; the core is zero-unsafe, with
 `unsafe` contained to exactly two crates (the C ABI `pinkdb-ffi` and the
@@ -521,7 +521,7 @@ store-unique, so a table dropped and recreated underneath a transaction is
 always a conflict. The plain `PinkDb` API remains for single-connection
 embedding.
 
-## Lake layer (feature `lake`)
+## Lake layer (features `pinklake` / `vortexlake`)
 
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
 JSON catalog plus immutable per-table data files, on local disk or (with the
@@ -530,11 +530,11 @@ format**; wave 36 adds S3/R2 object storage; wave 45d adds read-only
 **`.lake attach`** — a footer-only open with exact `COUNT`/`MIN`/`MAX` from
 stored statistics and lazy materialization — and wave 45e adds **projection
 pushdown** (an attached scan decodes only the columns a query references).
-Wave 45i adds the lean **`lake-lite`** build: the same lake over `.pink` v4
+Wave 45i adds the `pinklake` build: the same lake over `.pink` v4
 data files with no Vortex dependency, and wave 45k brings attach to it — a
-lean save publishes a CRC-protected per-column statistics block in the
+pinklake save publishes a CRC-protected per-column statistics block in the
 manifest (`statistics-only` attach), so exact `COUNT`/`MIN`/`MAX` read no data
-file in either build (see "Lean lake (feature `lake-lite`)" below). Wave 63
+file in either build (see "The `pinklake` build" below). Wave 63
 makes every lake **incremental** (`format_version` 4): appends add new
 immutable data files and never rewrite published ones, `DELETE`/`UPDATE`
 become positional delete files applied merge-on-read, each commit writes an
@@ -612,17 +612,18 @@ byte-identical to the pre-wave-64 shape.
 
 | catalog `format_version` | data file | written by | read by this build |
 |---|---|---|---|
-| 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes; a lean (`lake-lite`) save also publishes a CRC-protected per-column statistics block in the entry (wave 45k) | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`); `.lake attach` reads the statistics block, opening no data file |
+| 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes; a `pinklake` save also publishes a CRC-protected per-column statistics block in the entry (wave 45k) | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`); `.lake attach` reads the statistics block, opening no data file |
 | 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry; one row block per 2,048-row engine chunk | waves 35–40 | yes |
 | 3 | as 2, but row blocks of 8,192 rows / ~1 MiB (fewer blocks → less per-block stats/compression work on save) | waves 45 | yes |
-| 4 | **incremental**: every data file is listed as `{path, rows}`, a table's file list grows by appended files, positional delete files (`<uuid>.pinkdel`) drop rows merge-on-read, `rows` must equal `sum(files.rows) − sum(deletes.count)`, and `format` is `"vortex"` (full build) or `"pink"` (lean build; each `.pink` file carries its own CRC-protected statistics block). Wave 66 adds (additively): a table's `partition_by` spec, a data file's `partition` values, and a catalog-published zone map (`stats`) on Vortex files too — an older v4 reader ignores the fields and reads the same files | this build (default) | yes |
+| 4 | **incremental**: every data file is listed as `{path, rows}`, a table's file list grows by appended files, positional delete files (`<uuid>.pinkdel`) drop rows merge-on-read, `rows` must equal `sum(files.rows) − sum(deletes.count)`, and `format` is `"vortex"` (vortexlake build) or `"pink"` (pinklake build; each `.pink` file carries its own CRC-protected statistics block). Wave 66 adds (additively): a table's `partition_by` spec, a data file's `partition` values, and a catalog-published zone map (`stats`) on Vortex files too — an older v4 reader ignores the fields and reads the same files | this build (default) | yes |
 
 **Migration:** open an old lake and `.lake save` again — the next snapshot is a
 full rewrite in this build's v4 format; old snapshots and their data files stay
-untouched, so every published version still loads. A lean `lake-lite` build
-refuses a v4 (or v2/v3) **Vortex** lake with the rebuild-with-`lake` error (a
-lean-written lake opens bit-exactly in a full build, which migrates it on the
-next save), and a v1/v2/v3 lake stays readable in both builds. Any unknown
+untouched, so every published version still loads. A `pinklake` build
+refuses a v4 (or v2/v3) **Vortex** lake with the rebuild-with-`vortexlake`
+error (a pinklake-written lake opens bit-exactly in a vortexlake build, which
+migrates it on the next save), and a v1/v2/v3 lake stays readable in both
+builds. Any unknown
 `format_version` (a lake written by a newer pinkdb) refuses with "the lake was
 written by a newer pinkdb — upgrade to open it", and a wrong-shape entry (a
 v2/v3 entry without `format`, a v4 file object without its row count, a v4
@@ -894,21 +895,21 @@ manifest whose rows do not add up) is a clear `Corrupt` error, never a guess.
   and a load 0.07 s vs 0.11 s (wave 45h: `.pink` v4 shrank the same table's
   `.pink` bytes to 2,679,387 B — 1.015× the Vortex bytes — save 0.029 s, open
   0.026 s). Reproduce with
-  `cargo test --release -p pink-lake --features vortex-format --test bench_1m
+  `cargo test --release -p pink-lake --features vortexlake --test bench_1m
   -- --ignored --nocapture`.
   **Dependency/build note:** `crates/pink-lake` depends on the `vortex`
   crate directly (`default-features = false, features = ["files"]`, opt-in
-  via `vortex-format` since wave 45i); that
+  via `vortexlake` since wave 45i); that
   pulls in ~218 additional crates (vortex-array/file/layout + encodings,
   arrow, prost/flatbuffers, smol/async, jiff) and adds ≈42 MB to the release
-  `pinkdb` binary built with `--features lake`. A cold build is
+  `pinkdb` binary built with `--features vortexlake`. A cold build is
   machine-dependent (minutes for the debug and release trees on Apple
   Silicon; the exact numbers were not reproduced precisely). Note that
   `pink-lake` is a workspace member, but since wave 45i its Vortex format is
   opt-in: root workspace commands (`cargo build`/`cargo test` at the repo
-  root) compile the lean set, and the Vortex tree compiles only for full
-  `lake` builds (the CLI `lake` feature, or `-p pink-lake --features
-  vortex-format`). The default `pinkdb-cli` and the lean `lake-lite` builds
+  root) compile the `.pink` set, and the Vortex tree compiles only for
+  `vortexlake` builds (the CLI `vortexlake` feature, or `-p pink-lake
+  --features vortexlake`). The default `pinkdb-cli` and the `pinklake` builds
   are Vortex-free; see the build table above for current sizes.
 
 Library:
@@ -949,23 +950,26 @@ let old = lake.load(Some(2))?;             // rebuild a specific snapshot
 // let version = save_store_url(&db, "s3://bucket/prefix")?;
 ```
 
-REPL builds (`.lake` commands are opt-in; the full lake is `lake`, the lean
-one `lake-lite`, and **`s3` implies `lake-lite`** — use `lake,s3` for the full
-Vortex lake over S3/R2):
+REPL builds (`.lake` commands are opt-in; `vortexlake` is the Vortex build,
+`pinklake` the `.pink`-data-file build, and **`s3` is pure storage — it
+implies neither lake build**; combine them explicitly, `pinklake,s3` or
+`vortexlake,s3`):
 
 | Build | CLI features | Lake | Data files | Release size |
 |---|---|---|---|---|
 | default | — | no `.lake` commands | — | 2,436,320 B |
-| lean lake | `lake-lite` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 2,692,464 B (+250 KiB over default, −40.7 MiB vs full) |
-| lean lake + S3 | `lake-lite,s3` (plain `s3` implies it) | as above, `s3://bucket/prefix` locations | `.pink` | 4,701,120 B |
-| full lake | `lake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 45,333,984 B |
-| full lake + S3 | `lake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈47.3 MB (full + the same ≈2 MB S3 client) |
+| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 2,692,464 B (+250 KiB over default, −40.7 MiB vs vortexlake) |
+| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 4,701,120 B |
+| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 45,333,984 B |
+| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈47.3 MB (vortexlake + the same ≈2 MB S3 client) |
+| s3 only | `s3` | no `.lake` commands (storage client only) | — | ≈4.4–4.7 MB (default + the S3 client; not measured) |
 
 ```sh
-cargo build -p pinkdb-cli --features lake        # full lake, local directories
-cargo build -p pinkdb-cli --features lake,s3     # full lake + S3/R2 object storage
-cargo build -p pinkdb-cli --features lake-lite   # lean lake (no Vortex), local
-cargo build -p pinkdb-cli --features s3          # lean lake + S3/R2 (= lake-lite,s3)
+cargo build -p pinkdb-cli --features vortexlake        # Vortex data files, local directories
+cargo build -p pinkdb-cli --features vortexlake,s3     # Vortex data files + S3/R2 object storage
+cargo build -p pinkdb-cli --features pinklake          # lean `.pink` data files (no Vortex), local
+cargo build -p pinkdb-cli --features pinklake,s3       # lean `.pink` data files + S3/R2
+cargo build -p pinkdb-cli --features s3                # storage client only (no .lake commands)
 ```
 
 ```text
@@ -1026,52 +1030,53 @@ decoding nothing for `COUNT`/`MIN`/`MAX`; lean `.pink` lakes attach from the
 encrypted manifests' statistics blocks without opening any data file.
 
 With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see
-the next subsection. In a lean `lake-lite` build, `.lake attach` works
-statistics-only, from the stats blocks a lean save publishes (a lake saved
+the next subsection. In a `pinklake` build, `.lake attach` works
+statistics-only, from the stats blocks a pinklake save publishes (a lake saved
 before 45k refuses with a re-save message); Vortex lakes are refused with the
-rebuild-with-`lake` error. See "Lean lake" below.
+rebuild-with-`vortexlake` error. See "The `pinklake` build" below.
 
 `.lake tables`/`.lake info` also warn about tables whose referenced data file
-is missing, instead of advertising data a load cannot read. Without the
-feature, `.lake` reports `this pinkdb binary was built without the lake
+is missing, instead of advertising data a load cannot read. Without any lake
+feature, `.lake` reports `this pinkdb binary was built without a lake
 feature`; without `s3`, an `s3://` location is `this pink-lake build does not
 include the `s3` feature` with the rebuild command. Release `pinkdb` on
 Apple Silicon (2026-10, after the S3 review fixes; pre-45i — the build table
 above has the current sizes): 2,217,792 B default
 (unchanged, **byte-identical** to the pre-S3 build) vs 44,587,232 B with
-`--features lake` (38,121,880 B stripped) and 46,565,744 B with
-`--features lake,s3` (39,792,376 B stripped) — the Vortex array encodings
+`--features vortexlake` (38,121,880 B stripped) and 46,565,744 B with
+`--features vortexlake,s3` (39,792,376 B stripped) — the Vortex array encodings
 dominate; S3 adds ≈1.98 MB raw (ureq/rustls + hmac/sha2). “Stripped” =
 copying the linked binary and running the system `strip` with no flags
 (`strip <file>`, macOS LLVM strip), then `stat -f%z`; `strip -x` gives the
 same size. See the dependency/build note above.
 
-### Lean lake (feature `lake-lite`)
+### The `pinklake` build
 
-The same lake layer without the Vortex dependency: a `lake-lite` build writes
+The same lake layer without the Vortex dependency: a `pinklake` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
 single-table persistence bytes) under `format_version` 4 catalogs (each file
 object carries its own statistics block) — no `vortex` crate and none of its
 ~218 transitive crates, a 2.69 MB binary instead of 45.3 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
-(`s3` implies `lake-lite`), with the same layout, incremental commits, atomic
+(add `,s3`; the storage client alone provides no commands), with the same
+layout, incremental commits, atomic
 publish order and conflict semantics. `.lake attach` is **statistics-only**:
 each lean save/commit publishes a CRC-32-protected per-column statistics block
 per data file (rows, exact NULL counts, bit-exact min/max as canonical strings
 per type, NaN counts), collected inside the same parallel chunk-encode pass as
 the data file — save cost +1 ms @1M / +17 ms @10M, the `.pink` bytes unchanged
 — so attach answers exact `COUNT`/`COUNT(col)`/`MIN`/`MAX` with zero
-data-file reads, and a full Vortex build attaches `.pink` lakes from the same
+data-file reads, and a `vortexlake` build attaches `.pink` lakes from the same
 blocks (a table with positional deletes falls back for the per-column facts,
-row counts stay exact). The same blocks are the lean build's **zone maps**:
+row counts stay exact). The same blocks are the pinklake build's **zone maps**:
 `.lake partition` works identically (one `.pink` data file per partition
 value set, values in the catalog) and a pruned scan skips a `.pink` file
 entirely without opening it. A lake saved without a block refuses attach with
 a re-save-the-store message; a Vortex lake is refused with the clear
-rebuild-with-`lake` error instead of being guessed at.
+rebuild-with-`vortexlake` error instead of being guessed at.
 
 Measured trade-offs (release, Apple Silicon, sales corpus): eager `.lake open`
-is slower than the full build — 0.023 s @1M / 0.238 s @10M printed vs
+is slower than the `vortexlake` build — 0.023 s @1M / 0.238 s @10M printed vs
 0.004 / 0.031 s; attach is the fast start instead: cold `.lake attach` +
 `COUNT`/`MIN`/`MAX` takes **2.64 ms @1M / 2.31 ms @10M** (overhead ~0.1–0.2 ms,
 constant in file size, 0 data-file reads) while eager open costs 29.9 /
@@ -1080,10 +1085,11 @@ constant in file size, 0 data-file reads) while eager open costs 29.9 /
 `.pink` v4. In-session query results are identical, and both builds answer the
 statistics fast paths identically.
 
-Cross-build compatibility is verified both ways: a lake written by the lean
-build opens **bit-exactly** in a full build (the next save migrates it to
-`format_version` 3 and leaves the v1 files untouched), and a lean build
-refuses a v3 lake cleanly; a checked-in fixture pins the lean-written format.
+Cross-build compatibility is verified both ways: a lake written by the
+pinklake build opens **bit-exactly** in a `vortexlake` build (the next save
+migrates it to `format_version` 3 and leaves the v1 files untouched), and a
+pinklake build refuses a v3 lake cleanly; a checked-in fixture pins the
+pinklake-written format.
 
 ### Object storage (S3/R2)
 
@@ -1092,12 +1098,13 @@ The non-default `s3` feature makes any lake location an
 endpoint. It is a minimal **blocking** S3 REST client (`ureq` over rustls +
 `hmac` + `sha2` for AWS SigV4; no aws-sdk, no async runtime) with path-style
 and virtual-hosted addressing; the whole S3 code is compiled only with the
-feature. **`s3` implies the lean `lake-lite` lake** — build with `lake,s3`
-for the full Vortex lake over S3/R2:
+feature. **`s3` is pure storage: it implies neither lake build** — pair it
+with the build you want, `pinklake,s3` or `vortexlake,s3`:
 
 ```sh
-cargo build -p pinkdb-cli --features lake,s3     # full Vortex lake + S3/R2
-cargo build -p pinkdb-cli --features s3          # lean lake + S3/R2 (= lake-lite,s3)
+cargo build -p pinkdb-cli --features vortexlake,s3   # Vortex data files + S3/R2
+cargo build -p pinkdb-cli --features pinklake,s3     # lean `.pink` data files + S3/R2
+cargo build -p pinkdb-cli --features s3              # storage client only (no .lake commands)
 ```
 
 Library: `Lake::open_url("s3://bucket/prefix")`,
@@ -1127,7 +1134,7 @@ export AWS_ACCESS_KEY_ID=<r2-token-key-id>
 export AWS_SECRET_ACCESS_KEY=<r2-token-secret>
 export AWS_ENDPOINT_URL=https://<account>.r2.cloudflarestorage.com
 export AWS_REGION=auto
-cargo build -p pinkdb-cli --features lake,s3
+cargo build -p pinkdb-cli --features vortexlake,s3
 # in the REPL:
 #   .lake save s3://my-bucket/lakes/demo
 #   .lake open s3://my-bucket/lakes/demo
@@ -1835,7 +1842,7 @@ through both lake formats and the same four queries, and prints the raw
 numbers as JSON:
 
 ```sh
-cargo build --release -p pinkdb-cli --features lake
+cargo build --release -p pinkdb-cli --features vortexlake
 python3 bench/lake_bench.py --rows 1000000 --runs 5
 ```
 
@@ -1843,7 +1850,7 @@ Both arms store the table as `lake.sales`, so the SQL text is identical
 (pink-lake is told to import into a database named `lake`; DuckLake attaches
 a catalog named `lake`). Measured 2026-10-14 on this machine (macOS 26.6.2,
 Apple Silicon, 10 CPUs, load average ≈3 during the run; `pinkdb`
-44,567,680 B with `--features lake`; `duckdb` v1.5.5 with the `ducklake`
+44,567,680 B with `--features vortexlake`; `duckdb` v1.5.5 with the `ducklake`
 extension already cached, `INSTALL` ≈1 ms):
 
 | Metric (1M rows) | pink-lake (Vortex) | DuckLake (DuckDB) |
@@ -1987,7 +1994,7 @@ ties in ORDER BY have no stable order on either engine).
   (limit 64)` — the AST is freed iteratively, so even a multi-megabyte chain
   cannot overflow the stack during rejection
 
-- Lake (`lake`/`lake-lite`/`s3` features): every `.lake save` writes a full snapshot of
+- Lake (`vortexlake`/`pinklake`/`s3` features): every `.lake save` writes a full snapshot of
   every table; old versions and orphaned data files are never garbage
   collected; the lake is reached through `.lake open` (whole store into memory)
   or `.lake attach` (read-only, one version pinned, footer-only: exact
@@ -1999,12 +2006,12 @@ ties in ORDER BY have no stable order on either engine).
   store is refused too, since the log could not replay them); lake files are
   plaintext; one S3 object is capped at 5 GiB (no multipart uploads) and
   credentials come only from the environment or explicit config (no
-  profiles/IMDS/SSO); the lean `lake-lite` build writes and reads only
+  profiles/IMDS/SSO); the `pinklake` build writes and reads only
   `.pink` data files (v4 catalogs), attaches them
   statistics-only (exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks;
   `.pink` has no projected reader, so a fallback decodes the whole table),
   supports `.lake attach … write` + `.lake commit`, and refuses a Vortex lake
-  with the rebuild-with-`lake` error
+  with the rebuild-with-`vortexlake` error
 - Extensions repository: artifacts are verified by SHA-256 from the catalog
   (no signatures yet), and only `darwin-arm64` builds are published
 - Known gaps and their scheduled waves are tracked in `docs/GAPS.md`
@@ -2012,7 +2019,7 @@ ties in ORDER BY have no stable order on either engine).
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see
 PLAN.md). At-rest encryption shipped in wave 25 behind the `encryption`
 feature; the network server (`pinkdb-server`) shipped in wave 24; the lake
-layer (`pink-lake`, CLI `lake` feature) shipped in wave 34, became
+layer (`pink-lake`, CLI `vortexlake` feature) shipped in wave 34, became
 Vortex-first in wave 35 (v1 `.pink` lakes still load; open + save migrates)
 and gained S3/R2 object storage in wave 36 (`s3` feature; `s3://` locations,
 conditional-write conflict detection), read-only `.lake attach` (footer-only;
@@ -2020,8 +2027,8 @@ exact `COUNT`/`MIN`/`MAX` from stored statistics; lazy materialize) in wave 45d
 and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
-lean `lake-lite` build (`vortex` optional in pink-lake, `.pink` v4 lake data
-files, 2.69 MB vs 45.3 MB CLI) shipped in wave 45i, and wave 45k gave it exact
+`pinklake` build (`.pink` v4 lake data files, no `vortex` dependency,
+2.69 MB vs 45.3 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for
@@ -2041,15 +2048,16 @@ cargo build            # workspace
 cargo test             # 100+ unit + end-to-end tests
 cargo test -p pinkdb-server                          # protocol + server + durable tests
 cargo test -p pinkdb-cli --features client           # remote-mode CLI tests
-cargo test -p pinkdb-cli --features lake             # lake round-trip + CLI tests
-cargo test -p pinkdb-cli --features lake,s3          # + S3/R2 over a hermetic mock S3
-cargo test -p pinkdb-cli --features lake-lite        # lean lake (no Vortex) round-trips
-cargo test -p pinkdb-cli --features lake-lite,s3     # lean lake + S3/R2 (plain `s3` implies lake-lite)
+cargo test -p pinkdb-cli --features vortexlake       # Vortex lake round-trip + CLI tests
+cargo test -p pinkdb-cli --features vortexlake,s3    # + S3/R2 over a hermetic mock S3
+cargo test -p pinkdb-cli --features pinklake         # lean `.pink` lake round-trips (no Vortex)
+cargo test -p pinkdb-cli --features pinklake,s3      # + S3/R2 over a hermetic mock S3
+cargo test -p pinkdb-cli --features s3               # storage client alone: no .lake commands
 crates/pink-lake/tests/s3_docker.sh                  # real S3 round-trip/race in Docker: SERVER=s3mock (default)|seaweedfs|rustfs (not cargo test)
-cargo build -p pinkdb-cli --features lake            # REPL with .lake commands
-cargo build -p pinkdb-cli --features lake,s3         # REPL with .lake s3:// URLs
-cargo build -p pinkdb-cli --features lake-lite       # REPL with the lean lake (.pink data files)
-PINKDB_CLI_BIN=./target/release/pinkdb cargo test -p pinkdb-cli --features lake  # release CLI (overflow checks off)
+cargo build -p pinkdb-cli --features vortexlake      # REPL with .lake commands
+cargo build -p pinkdb-cli --features vortexlake,s3   # REPL with .lake s3:// URLs
+cargo build -p pinkdb-cli --features pinklake        # REPL with the lean `.pink` lake
+PINKDB_CLI_BIN=./target/release/pinkdb cargo test -p pinkdb-cli --features vortexlake  # release CLI (overflow checks off)
 cargo test -p pinkdb-ext-loader                      # loadable extensions (compiles C test extensions with cc)
 cargo test --features encryption                     # encrypted round-trips + WAL recovery
 cargo build -p pinkdb-cli --features encryption      # REPL with PINKDB_KEY support
@@ -2067,7 +2075,7 @@ only:
 
 | Workflow | Trigger | Jobs / steps |
 |---|---|---|
-| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,vortex-format`, `pinkdb-cli --features lake,s3` / `lake-lite` / `lake-lite,s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + both SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the core crates on Rust 1.89; `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
+| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,vortexlake`, `pinkdb-cli --features vortexlake,s3` / `pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + both SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the core crates on Rust 1.89; `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
 | `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
 | `publish-extensions.yml` | manual dispatch only | builds the C/C++ SDK examples (and any `extensions/*/` built by their own Makefile), runs both SDK smokes, fetches the live catalog, skips already-published coordinates, publishes new artifacts with `ext-repo/publish.sh` (wrangler → R2) and prints the artifact/catalog URLs |
 

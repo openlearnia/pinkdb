@@ -18,8 +18,8 @@ default build links no crypto, TLS or format code; features opt in:</p>
   <thead><tr><th>Feature</th><th>Adds</th></tr></thead>
   <tbody>
     <tr><td><code>encryption</code></td><td><code>PINKENC1</code> at-rest encryption (AES-256-GCM + Argon2id)</td></tr>
-    <tr><td><code>vortex-format</code> (on <code>pink-lake</code>)</td><td>the Vortex lake data format (the CLI's <code>lake</code> feature enables it)</td></tr>
-    <tr><td><code>s3</code> (on <code>pink-lake</code>)</td><td>S3/R2 object storage (implies the lean lake)</td></tr>
+    <tr><td><code>vortexlake</code> (on <code>pink-lake</code>)</td><td>the Vortex lake data format (the CLI's <code>vortexlake</code> feature enables it)</td></tr>
+    <tr><td><code>s3</code> (on <code>pink-lake</code>)</td><td>S3/R2 object storage (pure storage — it implies neither lake build; pair it with the CLI's <code>pinklake</code> / <code>vortexlake</code> features)</td></tr>
   </tbody>
 </table>
 </div>

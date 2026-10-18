@@ -5,7 +5,7 @@
 //! [`Lake::load`] reads first). What it reads from the data files depends on
 //! the entry's format:
 //!
-//! - a **Vortex** entry (`vortex-format` builds): each data file's footer,
+//! - a **Vortex** entry (`vortexlake` builds): each data file's footer,
 //!   the `pinkdb.table` identity/schema segment and the stored statistics —
 //!   no data segment is read and no column is decoded. Locally that is a
 //!   positioned read of the postscript + footer per file; over object storage
@@ -103,7 +103,7 @@ use crate::catalog::{DeleteRef, FileFormat, PartitionKey, TableEntry};
 use crate::incremental::entry_layout;
 use crate::inlined::InlinedFact;
 use crate::storage::{Head, Storage};
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 use crate::vortex_file;
 use crate::zone::{self, FileFacts};
 use crate::{
@@ -153,7 +153,7 @@ enum AttachedFormat {
     /// projected reads exist for this format, so a projection materializes
     /// the whole table and caches it.
     Pink,
-    /// A Vortex file (v2/v3/v4 `vortex-format` entries): projected
+    /// A Vortex file (v2/v3/v4 `vortexlake` entries): projected
     /// footer-only decodes.
     Vortex,
 }
@@ -287,7 +287,7 @@ impl LakeAttachment {
         self.loads.load(Ordering::Relaxed)
     }
 
-    #[cfg(all(test, feature = "vortex-format"))]
+    #[cfg(all(test, feature = "vortexlake"))]
     pub(crate) fn columns_decoded(&self) -> u64 {
         self.columns_decoded.load(Ordering::Relaxed)
     }
@@ -785,7 +785,7 @@ fn requested_mask(n_cols: usize, columns: Option<&[usize]>) -> Vec<bool> {
 /// `columns` are logical column indices (`None` = every logical column);
 /// Vortex files decode only the physical columns a mapped logical column
 /// needs, `.pink` files decode whole and project in memory.
-#[cfg_attr(not(feature = "vortex-format"), allow(unused_variables))]
+#[cfg_attr(not(feature = "vortexlake"), allow(unused_variables))]
 fn load_file(
     storage: &dyn Storage,
     root: &std::path::Path,
@@ -830,7 +830,7 @@ fn load_file(
             }
         }
         AttachedFormat::Vortex => {
-            #[cfg(feature = "vortex-format")]
+            #[cfg(feature = "vortexlake")]
             {
                 // With a record: resolve which physical columns the request
                 // needs (mapped logical ones only — never a dropped column's
@@ -938,15 +938,15 @@ fn load_file(
                 };
                 Ok((table, present))
             }
-            #[cfg(not(feature = "vortex-format"))]
+            #[cfg(not(feature = "vortexlake"))]
             {
                 // Unreachable: `read_manifest` refuses a Vortex entry before
                 // an attach could see one. A clear error, never a panic.
                 Err(LakeError::FeatureMissing {
-                    feature: "vortex-format",
+                    feature: "vortexlake",
                     message: format!(
                         "table \"{key}\" uses a Vortex data file (\"{}\"); this build reads \
-                         `.pink` lakes only — rebuild with the `vortex-format` feature",
+                         `.pink` lakes only — rebuild with the `vortexlake` feature",
                         file.rel
                     ),
                 })
@@ -965,7 +965,7 @@ fn catalog_error(e: LakeError) -> PinkDbError {
 /// decode it into a one-table store, check the file's identity against its
 /// catalog key, and hand the table back (chunks shared by `Arc`, never copied
 /// twice).
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 fn load_table(
     storage: &dyn Storage,
     root: &std::path::Path,
@@ -992,7 +992,7 @@ fn load_table(
 /// [`vortex_file::decode_projected`]'s per-file read for one table: decode
 /// only `columns`, check the file's identity against its catalog key, and
 /// hand the full-schema table (decoded columns + NULL placeholders) back.
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 fn load_projected_table(
     storage: &dyn Storage,
     root: &std::path::Path,
@@ -1156,7 +1156,7 @@ fn block_schema_and_stats(
 /// The catalog-published zone map of one **Vortex** file: its block,
 /// CRC-verified and cross-checked exactly like a `.pink` file's (the same
 /// shared gate), so a block pasted under another file can never attach.
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 fn vortex_catalog_stats(
     entry_key: &str,
     file: &crate::catalog::FileRef,
@@ -1187,7 +1187,7 @@ fn vortex_catalog_stats(
 /// statistic the footer writes `Inexact` is `None` there while the block can
 /// still carry the exact value), so a footer-unknown field never
 /// contradicts.
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 fn zone_stats_compatible(block: &ColumnStats, footer: &ColumnStats) -> bool {
     if let (Some(b), Some(f)) = (block.null_count, footer.null_count) {
         if b != f {
@@ -1320,9 +1320,9 @@ pub(crate) fn build_from(
     let mut files: HashMap<(String, String), AttachedEntry> = HashMap::new();
     let mut statistics_only = true;
     let encrypted = storage.encrypted();
-    #[cfg(feature = "vortex-format")]
+    #[cfg(feature = "vortexlake")]
     let mut remote = false;
-    #[cfg(not(feature = "vortex-format"))]
+    #[cfg(not(feature = "vortexlake"))]
     let remote = false;
     for (key, entry) in &manifest.tables {
         let (dbname, table) = split_key(key, &manifest_path)?;
@@ -1411,7 +1411,7 @@ pub(crate) fn build_from(
             let (file_schema, file_stats) = match format {
                 FileFormat::Pink => pink_file_stats(key, entry, file, &manifest_path)?,
                 FileFormat::Vortex => {
-                    #[cfg(feature = "vortex-format")]
+                    #[cfg(feature = "vortexlake")]
                     {
                         let path = storage.abs(file.path());
                         // A keyed (encrypted) session reports `local_path`
@@ -1483,17 +1483,17 @@ pub(crate) fn build_from(
                         let stats = block_stats.unwrap_or(footer.stats);
                         (footer.schema, stats)
                     }
-                    #[cfg(not(feature = "vortex-format"))]
+                    #[cfg(not(feature = "vortexlake"))]
                     {
                         // Unreachable: `read_manifest` refuses a Vortex entry
                         // before an attach could see one. A clear error,
                         // never a panic.
                         return Err(LakeError::FeatureMissing {
-                            feature: "vortex-format",
+                            feature: "vortexlake",
                             message: format!(
                                 "table \"{key}\" uses a Vortex data file (\"{}\"); this \
                                  build reads `.pink` lakes only — rebuild with the \
-                                 `vortex-format` feature to attach it",
+                                 `vortexlake` feature to attach it",
                                 file.path()
                             ),
                         });
@@ -2112,9 +2112,9 @@ mod tests {
     ///
     /// Projection pushdown exists for Vortex data files only: a v1 `.pink`
     /// entry has no projected reader, so those tests run in the
-    /// `vortex-format` build (the lean `.pink` behavior is pinned by
-    /// `tests/lake_lite.rs` and by the format-agnostic tests above).
-    #[cfg(feature = "vortex-format")]
+    /// `vortexlake` build (the lean `.pink` behavior is pinned by
+    /// `tests/pinklake.rs` and by the format-agnostic tests above).
+    #[cfg(feature = "vortexlake")]
     fn projection_store() -> PinkDb {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (i INTEGER, g BIGINT, d DOUBLE, v VARCHAR, b BOOLEAN);")
@@ -2159,7 +2159,7 @@ mod tests {
     }
 
     /// Row-for-row equality with doubles compared bit-exactly.
-    #[cfg(feature = "vortex-format")]
+    #[cfg(feature = "vortexlake")]
     fn assert_same_rows(a: &[Vec<Value>], b: &[Vec<Value>], what: &str) {
         assert_eq!(a.len(), b.len(), "{what}: row count");
         for (ra, rb) in a.iter().zip(b) {
@@ -2179,7 +2179,7 @@ mod tests {
     /// value-identical (doubles by bit pattern) to the full decode for those
     /// columns, keeps the full decode's chunking in every column, and shares
     /// already-decoded columns across later projections.
-    #[cfg(feature = "vortex-format")]
+    #[cfg(feature = "vortexlake")]
     #[test]
     fn projected_reads_equal_full_reads_and_decode_only_requested_columns() {
         let dir = scratch("projection_values");
@@ -2302,7 +2302,7 @@ mod tests {
     /// decodes its referenced columns only, extensions are incremental, the
     /// fast paths decode nothing at all, and every answer equals the
     /// in-memory execution over the same rows.
-    #[cfg(feature = "vortex-format")]
+    #[cfg(feature = "vortexlake")]
     #[test]
     fn queries_decode_only_their_referenced_columns() {
         let dir = scratch("projection_queries");

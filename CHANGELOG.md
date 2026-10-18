@@ -10,6 +10,14 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 74 — lake naming sweep ✅
+- The lake builds are now **`pinklake`** (the `.pink`-file lake; formerly
+  `lake-lite`) and **`vortexlake`** (the Vortex-file lake; formerly `lake`),
+  in cargo features, help text, tests, CI, README and the docs site.
+- **`s3` is pure storage**: it implies neither build — combine explicitly,
+  `pinklake,s3` or `vortexlake,s3` (`--features s3` alone has no `.lake`
+  commands and says so). No old aliases survive.
+
 ### Wave 80 — materialized-view refresh policies ✅
 - **Manual**: `REFRESH MATERIALIZED VIEW name` (and `REFRESH name`, plus
   `REFRESH MATERIALIZED VIEWS` refreshing every view of the database

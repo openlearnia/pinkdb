@@ -41,7 +41,7 @@ pub fn assert_script_exit(status: ExitStatus) {
 }
 
 /// A deterministic corpus for the `.lake attach` equivalence tests (shared by
-/// the full `tests/lake.rs` and the lean `tests/lake_lite.rs`): the SQL script
+/// the full `tests/lake.rs` and the lean `tests/pinklake.rs`): the SQL script
 /// is returned, two CSVs are written into `dir`. Everything the design calls
 /// out: all-NULL column, empty table, NaN/±0 payloads, negative ints and
 /// extremes, long/outlined strings, and a >65,000-row imported table.

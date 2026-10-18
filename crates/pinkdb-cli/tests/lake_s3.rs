@@ -5,7 +5,7 @@
 //!
 //! This file only compiles when `lake` **and** `s3` are on.
 
-#![cfg(all(feature = "lake", feature = "s3"))]
+#![cfg(all(feature = "vortexlake", feature = "s3"))]
 
 #[path = "../../pink-lake/src/mock_s3.rs"]
 mod mock_s3;

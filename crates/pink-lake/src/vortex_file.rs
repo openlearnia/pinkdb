@@ -349,7 +349,7 @@ fn encode_table_with_metadata(
         });
     }
     // DECIMAL and INTERVAL have no Vortex storage mapping yet: the engine's
-    // persistence (`.pink` v5) and the lean `lake-lite` lake format support
+    // persistence (`.pink` v5) and the `pinklake` lake format support
     // both. Refuse at the encode entry instead of mis-encoding.
     if let Some((name, dtype)) = schema
         .iter()
@@ -358,7 +358,7 @@ fn encode_table_with_metadata(
         return Err(LakeError::NotRepresentable {
             message: format!(
                 "column \"{name}\" ({dtype}) is not supported by the Vortex lake format \
-                 yet; use the lean `lake-lite` build or the engine's `.pink` persistence"
+                 yet; use the `pinklake` build or the engine's `.pink` persistence"
             ),
         });
     }

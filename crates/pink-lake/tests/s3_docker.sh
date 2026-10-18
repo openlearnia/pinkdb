@@ -4,7 +4,7 @@
 # ============================================================================
 #
 # The in-repo `mock_s3.rs` (used by
-# `cargo test -p pink-lake --features s3,vortex-format` and the CLI's
+# `cargo test -p pink-lake --features s3,vortexlake` and the CLI's
 # `lake_s3` tests) is the hermetic protocol suite — it even
 # verifies SigV4 on every request — but it is a home-grown server inside the
 # test process. This script is the independent check: a real, separate HTTP
@@ -723,20 +723,20 @@ if [ -n "${PINKDB_BIN:-}" ]; then
     BIN="$PINKDB_BIN"
     [ -x "$BIN" ] || fail "PINKDB_BIN=$BIN is not executable"
     if ! printf '.help\n.quit\n' | "$BIN" 2>/dev/null | grep -qF 'lake save <dir|s3://bucket/prefix>'; then
-        fail "PINKDB_BIN=$BIN lacks the lake+s3 features (build with --features lake,s3)"
+        fail "PINKDB_BIN=$BIN lacks the lake+s3 features (build with --features vortexlake,s3)"
     fi
     note "using PINKDB_BIN=$BIN"
 elif [ "${SKIP_BUILD:-0}" = "1" ]; then
     BIN="$ROOT/target/release/pinkdb"
     [ -x "$BIN" ] || fail "SKIP_BUILD=1 but $BIN does not exist"
     if ! printf '.help\n.quit\n' | "$BIN" 2>/dev/null | grep -qF 'lake save <dir|s3://bucket/prefix>'; then
-        fail "SKIP_BUILD=1 but $BIN lacks the lake+s3 features (another build may have overwritten it; rebuild with: cargo build --release -p pinkdb-cli --features lake,s3)"
+        fail "SKIP_BUILD=1 but $BIN lacks the lake+s3 features (another build may have overwritten it; rebuild with: cargo build --release -p pinkdb-cli --features vortexlake,s3)"
     fi
     note "SKIP_BUILD=1: using $BIN"
 else
-    step "build the CLI (cargo build --release -p pinkdb-cli --features lake,s3)"
-    (cd "$ROOT" && cargo build --release -p pinkdb-cli --features lake,s3) \
-        || fail "cargo build --release -p pinkdb-cli --features lake,s3 failed"
+    step "build the CLI (cargo build --release -p pinkdb-cli --features vortexlake,s3)"
+    (cd "$ROOT" && cargo build --release -p pinkdb-cli --features vortexlake,s3) \
+        || fail "cargo build --release -p pinkdb-cli --features vortexlake,s3 failed"
     BIN="$ROOT/target/release/pinkdb"
     ok "built $BIN"
 fi
@@ -879,7 +879,7 @@ note "a keyed save writes PNKLAKE1 containers (catalog + snapshots + commit"
 note "deltas + data files + delete files); the harness fetches the objects over"
 note "REST and checks they are ciphertext-only, byte-identical as a pair, and"
 note "openable only with the right key. Requires a CLI built with the"
-note 'the `encryption` feature (the CI build is --features lake,s3,encryption);'
+note 'the `encryption` feature (the CI build is --features vortexlake,s3,encryption);'
 note 'a build without it is reported and skipped.'
 
 ENC_SUPPORTED=0
@@ -889,7 +889,7 @@ if printf '.lake save %s\n.quit\n' "$TMP/enc-probe" | cli_run_keyed "$TMP/enc_pr
 else
     if grep -qF 'does not include the `encryption` feature' "$TMP/enc_probe.log"; then
         warn 'this CLI build has no `encryption` feature: skipping the encrypted roundtrip'
-        warn "  (build with: cargo build --release -p pinkdb-cli --features lake,s3,encryption)"
+        warn "  (build with: cargo build --release -p pinkdb-cli --features vortexlake,s3,encryption)"
     else
         fail "the encryption feature probe failed unexpectedly (see $(basename "$TMP/enc_probe.log"))"
     fi

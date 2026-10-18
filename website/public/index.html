@@ -116,7 +116,7 @@
   <div class="ticker-track">
     <span>~2.4 MB default binary</span>
     <span>1M rows &#8594; 2.68 MB .pink</span>
-    <span>lean lake 2.69 MB &#183; full lake 45.3 MB</span>
+    <span>pinklake 2.69 MB &#183; vortexlake 45.3 MB</span>
     <span>Vortex or .pink lake data files</span>
     <span>S3 / R2 lakes with conflict detection</span>
     <span>C &#183; Python &#183; Go bindings</span>
@@ -124,7 +124,7 @@
     <span>zero async &#183; zero unsafe in the core</span>
     <span>~2.4 MB default binary</span>
     <span>1M rows &#8594; 2.68 MB .pink</span>
-    <span>lean lake 2.69 MB &#183; full lake 45.3 MB</span>
+    <span>pinklake 2.69 MB &#183; vortexlake 45.3 MB</span>
     <span>Vortex or .pink lake data files</span>
     <span>S3 / R2 lakes with conflict detection</span>
     <span>C &#183; Python &#183; Go bindings</span>
@@ -171,8 +171,8 @@ library), a network server (<code>pinkdb-server</code>) and a C ABI
 (<code>pinkdb-ffi</code>).</p>
 
 <p>Capabilities are opt-in cargo features, so you only pay for what you use: the
-default build is <strong>2,436,320 B</strong>, the lean lake build adds the
-<code>.lake</code> commands for <strong>2,692,464 B</strong>, and the full lake build
+default build is <strong>2,436,320 B</strong>, the pinklake build adds the
+<code>.lake</code> commands for <strong>2,692,464 B</strong>, and the vortexlake build
 with the Vortex format is <strong>45,333,984 B</strong>. Nothing extra is compiled
 unless asked for — no crypto, TLS or format code in the default binary.</p>
 
@@ -225,7 +225,7 @@ unless asked for — no crypto, TLS or format code in the default binary.</p>
     <p>Decoupled metadata: a JSON catalog plus immutable per-version manifests;
     <strong>incremental commits</strong> that append files instead of rewriting
     tables, writable attachments, and <strong>time travel</strong> over published
-    versions. Vortex or lean <code>.pink</code> data files.</p>
+    versions. Vortex or <code>.pink</code> data files.</p>
   </li>
   <li class="card">
     <h3><a href="docs/lake">S3 / R2 object storage</a></h3>
@@ -274,8 +274,8 @@ unless asked for — no crypto, TLS or format code in the default binary.</p>
   <tbody>
     <tr>
       <td>Binaries</td>
-      <td>default <strong>2.44 MB</strong> · lean lake <strong>2.69 MB</strong> ·
-      full lake <strong>45.3 MB</strong> (release, Apple Silicon)</td>
+      <td>default <strong>2.44 MB</strong> · pinklake <strong>2.69 MB</strong> ·
+      vortexlake <strong>45.3 MB</strong> (release, Apple Silicon)</td>
     </tr>
     <tr>
       <td>Persistence</td>

@@ -1,16 +1,16 @@
-//! Lean (`vortex-format`-less) lake tests: the v1 `.pink` data-file format is
+//! Lean (`vortexlake`-less) lake tests: the v1 `.pink` data-file format is
 //! the only one this build reads and writes, so every lake here is a v1 lake.
 //! The wave-45k statistics block is written by every save here and is what
 //! `.lake attach` reads without opening a data file.
 //!
-//! `vortex-format` builds run `tests/lake.rs` instead; the two files pin the
+//! `vortexlake` builds run `tests/lake.rs` instead; the two files pin the
 //! same contract from opposite sides, and this one additionally opens the
 //! checked-in `tests/fixtures/lake_v1_v4/` fixture (a v1 lake written by the
 //! **lean writer**, read bit-exactly by the full build in `tests/lake.rs`)
 //! and `tests/fixtures/lake_v1_v4_stats/` (the same store written with
 //! statistics blocks: attached by both builds).
 
-#![cfg(not(feature = "vortex-format"))]
+#![cfg(not(feature = "vortexlake"))]
 
 #[cfg(feature = "s3")]
 #[path = "../src/mock_s3.rs"]
@@ -32,7 +32,7 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// Unique scratch directory for one test.
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
-        "pink_lake_lite_{tag}_{}_{}",
+        "pink_lake_pinklake_{tag}_{}_{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -314,7 +314,7 @@ fn lean_build_refuses_vortex_lakes_with_a_feature_error() {
         text.contains("built without Vortex format support"),
         "{text}"
     );
-    assert!(text.contains("--features lake"), "{text}");
+    assert!(text.contains("--features vortexlake"), "{text}");
     assert!(
         !text.contains("corrupt"),
         "must not read as corrupt metadata: {text}"
@@ -480,14 +480,14 @@ fn lean_s3_v4_roundtrip() {
 /// v1 lake written by **this** lean writer, with the `.pink` v4 data files and
 /// the CRC-protected statistics blocks `.lake attach` reads. It pins the
 /// cross-build contract: the lean build attaches it bit-exactly and so does a
-/// full (`vortex-format`) build (`tests/lake.rs`), which is the lean-writes /
+/// full (`vortexlake`) build (`tests/lake.rs`), which is the lean-writes /
 /// full-attaches compatibility pin.
 ///
 /// Run deliberately, only when the writer's stats-block shape is meant to
 /// change (never as part of a normal test run):
 ///
 /// ```text
-/// cargo test -p pink-lake --test lake_lite -- --ignored generate_v1_v4_stats_fixture
+/// cargo test -p pink-lake --test pinklake -- --ignored generate_v1_v4_stats_fixture
 /// ```
 #[test]
 #[ignore = "writes the checked-in tests/fixtures/lake_v1_v4_stats; run with --ignored"]

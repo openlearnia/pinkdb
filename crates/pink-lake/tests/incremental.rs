@@ -5,7 +5,7 @@
 //! and DuckLake's writer-retry settings.
 //!
 //! Format-agnostic on purpose: the suite runs in a default (lean `.pink`)
-//! build and in a `vortex-format` build, and the data-file extension follows
+//! build and in a `vortexlake` build, and the data-file extension follows
 //! the build. Everything else — the catalog shape, the manifest invariants,
 //! the commit semantics — is identical.
 
@@ -20,9 +20,9 @@ use pinkdb::{DataTable, PinkDb, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "vortex-format")]
+#[cfg(feature = "vortexlake")]
 const EXT: &str = "vortex";
-#[cfg(not(feature = "vortex-format"))]
+#[cfg(not(feature = "vortexlake"))]
 const EXT: &str = "pink";
 
 fn scratch(tag: &str) -> PathBuf {

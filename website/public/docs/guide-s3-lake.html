@@ -183,12 +183,12 @@ optional <code>s3</code> feature.</p>
 
 <h2 id="1-build-with-lake-s3">1. Build with lake + S3<a class="anchor" href="#1-build-with-lake-s3" aria-label="Permalink: 1. Build with lake + S3">#</a></h2>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># lean lake over object storage (4.7 MB binary)</span>
-cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake-lite,s3
-<span class="tok-c"># or: --features s3          (plain `s3` implies `lake-lite`)</span>
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># pinklake over object storage (4.7 MB binary)</span>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> pinklake,s3
 
-<span class="tok-c"># full Vortex lake over object storage (~47.3 MB binary)</span>
-cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake,s3</code></pre></div>
+<span class="tok-c"># vortexlake over object storage (~47.3 MB binary)</span>
+cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> vortexlake,s3
+<span class="tok-c"># `--features s3` alone adds the storage client but no `.lake` commands</span></code></pre></div>
 
 <h2 id="2-configure-credentials">2. Configure credentials<a class="anchor" href="#2-configure-credentials" aria-label="Permalink: 2. Configure credentials">#</a></h2>
 

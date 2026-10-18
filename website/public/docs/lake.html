@@ -191,8 +191,8 @@ S3/R2 bucket. Incremental commits, writable attachments and time travel included
 ├── catalog.json                       current state (the authoritative "latest")
 ├── snapshots/&lt;version&gt;.json            immutable manifest per published version
 ├── commits/&lt;version&gt;.json              per-version delta manifest (what the commit added)
-├── data/&lt;table&gt;/&lt;uuid&gt;.vortex          immutable data files (full lake)
-├── data/&lt;table&gt;/&lt;uuid&gt;.pink            lean data files (no Vortex; still readable)
+├── data/&lt;table&gt;/&lt;uuid&gt;.vortex          immutable data files (vortexlake)
+├── data/&lt;table&gt;/&lt;uuid&gt;.pink            pinklake data files (no Vortex; still readable)
 └── data/&lt;table&gt;/&lt;uuid&gt;.pinkdel          positional delete files (merge-on-read)</code></pre></div>
 
 <p>Every published version is immutable: <code>snapshots/&lt;version&gt;.json</code> is
@@ -336,14 +336,14 @@ cross-checked against the file's own footer at attach).</p>
   <thead><tr><th>Build (CLI feature)</th><th>Data files</th><th>Catalog</th><th class="num">Release size</th></tr></thead>
   <tbody>
     <tr>
-      <td>lean lake (<code>lake-lite</code>)</td>
+      <td>pinklake (<code>pinklake</code>)</td>
       <td><code>.pink</code> v5 (the engine's single-table bytes, with a per-file
       statistics block in the manifest)</td>
       <td><code>format_version</code> 5</td>
       <td class="num">2.69 MB</td>
     </tr>
     <tr>
-      <td>full lake (<code>lake</code>)</td>
+      <td>vortexlake (<code>vortexlake</code>)</td>
       <td>Vortex (the default lake format)</td>
       <td><code>format_version</code> 5</td>
       <td class="num">45.3 MB</td>
@@ -357,13 +357,15 @@ cross-checked against the file's own footer at attach).</p>
   <code>format_version</code> 5</strong> (schema records included; partitioning and
   zone maps are additive) — and both support incremental commits, time travel and
   schema evolution. Older lakes stay readable: v1–v4 catalogs (single-file Vortex
-  v2/v3 and lean v1) load and migrate on the next save, leaving old files
+  v2/v3 and `.pink` v1) load and migrate on the next save, leaving old files
   untouched.</li>
-  <li>The lean build decodes <code>.pink</code> data files only and refuses a Vortex
-  lake with a clear “rebuild with <code>lake</code>” error. A lake written by the
-  lean build opens <strong>bit-exactly</strong> in a full build.</li>
-  <li><code>s3</code> implies <code>lake-lite</code>; use <code>lake,s3</code> for the
-  full Vortex lake over S3/R2.</li>
+  <li>The pinklake build decodes <code>.pink</code> data files only and refuses a
+  Vortex lake with a clear “rebuild with <code>vortexlake</code>” error. A lake
+  written by the pinklake build opens <strong>bit-exactly</strong> in a
+  vortexlake build.</li>
+  <li><code>s3</code> is pure storage — it implies neither lake build; pair it
+  explicitly: <code>pinklake,s3</code> or <code>vortexlake,s3</code> for the
+  respective lake over S3/R2.</li>
 </ul>
 
 <h2 id="using-a-lake">Using a lake<a class="anchor" href="#using-a-lake" aria-label="Permalink: Using a lake">#</a></h2>
@@ -422,10 +424,10 @@ feature.</p>
 session without loading any table into memory. No column data is decoded:</p>
 
 <ul>
-  <li>In a <strong>full (Vortex)</strong> build it reads the catalog, the manifest
+  <li>In a <strong>vortexlake</strong> build it reads the catalog, the manifest
   and each data file's footer, metadata and statistics — no column decode.</li>
-  <li>In a <strong>lean</strong> build it reads a CRC-32-protected per-column
-  statistics block that every lean save publishes, so <strong>no data file is opened
+  <li>In a <strong>pinklake</strong> build it reads a CRC-32-protected per-column
+  statistics block that every pinklake save publishes, so <strong>no data file is opened
   at all</strong>. A lake saved before that block existed refuses attach with a
   re-save message, never a guess.</li>
   <li>Exact <code>COUNT(*)</code>, <code>COUNT(col)</code>, <code>MIN</code> and
@@ -438,21 +440,21 @@ session without loading any table into memory. No column data is decoded:</p>
   <li>Attached tables are session-local; read-only attachments refuse every
   mutation. <code>.lake save</code> skips attached tables with a note.</li>
   <li>Measured: a cold attach plus <code>COUNT</code>/<code>MIN</code>/<code>MAX</code>
-  takes ~2.6 ms at 1M rows and ~2.3 ms at 10M rows in the lean build; the attach
-  overhead (~0.1–0.2 ms) is constant in file size.</li>
+  takes ~2.6 ms at 1M rows and ~2.3 ms at 10M rows in the pinklake build; the
+  attach overhead (~0.1–0.2 ms) is constant in file size.</li>
 </ul>
 
 <h2 id="encryption-at-rest">Encryption at rest<a class="anchor" href="#encryption-at-rest" aria-label="Permalink: Encryption at rest">#</a></h2>
 
 <p>With a build carrying the <code>encryption</code> feature (and the CLI's
-<code>lake,s3,encryption</code>), lakes can be encrypted end to end: every object —
+<code>vortexlake,s3,encryption</code>), lakes can be encrypted end to end: every object —
 catalogs, snapshots, commit deltas, data files and delete files — is an
 <code>PNKLAKE1</code> <strong>AES-256-GCM</strong> container under one Argon2id
 derivation per session (each container's plaintext header records its salt and
 parameters; a wrong key fails an authenticated key-check, never “corrupt
 file”).</p>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake,s3,encryption
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> vortexlake,s3,encryption
 <span class="tok-v">PINKDB_KEY</span>=<span class="tok-s">'correct horse battery staple'</span> ./target/release/pinkdb
 <span class="tok-c">#   .lake save   mylake        # publishes an encrypted version</span>
 <span class="tok-c">#   .lake attach mylake        # unseals manifests; statistics still answer COUNT/MIN/MAX</span>
@@ -466,7 +468,7 @@ file”).</p>
   (<code>If-None-Match: *</code>, <code>If-Match</code>) evaluate on the
   ciphertext.</li>
   <li><strong>Statistics-fast attach keeps decoding zero data files</strong> for
-  lean lakes — the stats blocks ride inside the sealed manifest. Encrypted
+  pinklake lakes — the stats blocks ride inside the sealed manifest. Encrypted
   <em>Vortex</em> attach reads a file whole to unseal its footer (stage 1;
   segment-level reads are a documented follow-up).</li>
   <li>Keyed sessions only ever read keyed lakes and vice versa: opening a keyed
@@ -539,7 +541,7 @@ nothing already published is ever mutated:</p>
 S3-compatible endpoint. It is a small, blocking SigV4 client; there is no async
 runtime and no AWS SDK.</p>
 
-<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> lake,s3
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>cargo build <span class="tok-f">--release</span> <span class="tok-f">-p</span> pinkdb-cli <span class="tok-f">--features</span> vortexlake,s3
 
 export <span class="tok-v">AWS_ACCESS_KEY_ID</span>=&lt;r2-token-key-id&gt;
 export <span class="tok-v">AWS_SECRET_ACCESS_KEY</span>=&lt;r2-token-secret&gt;
@@ -630,16 +632,17 @@ export <span class="tok-v">AWS_REGION</span>=auto
 <ul>
   <li><strong>Just a database file?</strong> Skip the lake — the default build's
   <code>.pink</code> + WAL is the whole story.</li>
-  <li><strong>Versioned snapshots, local disk, lean binary?</strong> Use
-  <code>lake-lite</code>: all the commands (incremental commits and time travel
+  <li><strong>Versioned snapshots, local disk, small binary?</strong> Use
+  <code>pinklake</code>: all the commands (incremental commits and time travel
   included), statistics-only attach, and a 2.69 MB binary.</li>
-  <li><strong>Vortex data files and footer-based attach?</strong> Use the full
-  <code>lake</code> build, at the cost of a 45.3 MB binary. The data-size gap is
-  small: on the reference sales corpus the lean build's <code>.pink</code> files are
+  <li><strong>Vortex data files and footer-based attach?</strong> Use the
+  <code>vortexlake</code> build, at the cost of a 45.3 MB binary. The data-size gap is
+  small: on the reference sales corpus the pinklake build's <code>.pink</code> files are
   only about 1.6–1.8% larger; the binary size, not the data size, is the
   trade-off.</li>
-  <li><strong>Object storage?</strong> Add <code>s3</code>: <code>lake-lite,s3</code>
-  (4.70 MB) or <code>lake,s3</code> (≈47.3 MB).</li>
+  <li><strong>Object storage?</strong> Add <code>s3</code> to the build you want:
+  <code>pinklake,s3</code> (4.70 MB) or <code>vortexlake,s3</code> (≈47.3 MB);
+  <code>s3</code> alone adds no <code>.lake</code> commands.</li>
 </ul>
 
 <ul class="next-links">
