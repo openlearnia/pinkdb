@@ -1419,3 +1419,13 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   pink-lake 117, **wasm32 build works** (via rustup shims), workspace check
   clean, `bench/duckdiff.py` **171/171**; 1895 test passes total. No dependency
   or format-surface changes; `Cargo.lock` byte-identical. Worktree removed.
+- 2026-10-18 — Benchmark re-run (edition-2024 tree + the user's perf commit
+  `bc2fd2d`): standing battery **106.8 ms** (Oct 17: 250.8) — `proj_func`
+  18.2 → 0.035, `order_str` 29.8 → 0.036, `window_row_number`/`count_star`
+  15.7/16.0 → 0.035, `distinct_id` 49.6 → 16.3, `group_id` 50.3 → 17.7; filter,
+  group_region and the join paths unchanged (dead-work elimination + fast
+  DISTINCT, not edition noise). vs DuckDB α on the same corpus: import 17.3 vs
+  73 ms, COUNT 0.03 vs 3, filter 2.5 vs 2, GROUP BY 3.5 vs 22, top-n 3.7 vs 1,
+  self-join 9.1 vs 22, materialized join 26.3 vs 22. Measured at load ~2.2
+  (waves 46/47 compiling); two runs agreed (105.3/106.8). Lake/attach/multi-
+  writer figures unchanged since Oct 17/18.
