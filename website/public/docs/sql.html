@@ -452,6 +452,28 @@ it and never affects other sessions: the shared store is untouched.</p>
   (<code>"use"</code> works).</li>
 </ul>
 
+<h2 id="materialized-views">Materialized views<a class="anchor" href="#materialized-views" aria-label="Permalink: Materialized views">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-k">CREATE</span> MATERIALIZED <span class="tok-k">VIEW</span> totals REFRESH EVERY INTERVAL <span class="tok-s">'5 minutes'</span> <span class="tok-k">AS</span>
+  <span class="tok-k">SELECT</span> region, SUM(total) <span class="tok-k">AS</span> t <span class="tok-k">FROM</span> sales <span class="tok-k">GROUP</span> <span class="tok-k">BY</span> region;
+REFRESH MATERIALIZED <span class="tok-k">VIEW</span> totals;      <span class="tok-c">-- manual (shorthand: REFRESH totals)</span>
+REFRESH MATERIALIZED VIEWS;            <span class="tok-c">-- every view of the session database</span>
+SHOW MATERIALIZED VIEWS;               <span class="tok-c">-- schedule, last refresh, staleness</span>
+<span class="tok-k">DROP</span> MATERIALIZED <span class="tok-k">VIEW</span> totals;</code></pre></div>
+
+<ul>
+  <li>Views are stored as queryable tables plus their defining query —
+  per-database, persisted and WAL-logged.</li>
+  <li>Refresh policies: <code>MANUAL</code> (default), <code>EVERY INTERVAL
+  '…'</code>, <code>ON COMMIT</code>. They are enforced **without background
+  threads** at statement boundaries: the first statement after a view is due
+  (or after a commit that dirtied its base tables) observes fresh data; nothing
+  refreshes inside a transaction.</li>
+  <li><code>SHOW MATERIALIZED VIEWS</code> reports the schedule, last refresh
+  time/count and staleness; an automatic-refresh failure keeps the last good
+  data, records the error and retries with backoff.</li>
+</ul>
+
 <h2 id="not-supported-yet">Not supported yet<a class="anchor" href="#not-supported-yet" aria-label="Permalink: Not supported yet">#</a></h2>
 
 <p>These are real gaps, listed so you can plan around them. Most are scheduled on the
@@ -495,6 +517,7 @@ it and never affects other sessions: the shared store is untouched.</p>
   <li><a href="#types-and-literals">Types and literals</a></li>
   <li><a href="#three-valued-logic">Three-valued logic</a></li>
   <li><a href="#databases-and-sessions">Databases and sessions</a></li>
+  <li><a href="#materialized-views">Materialized views</a></li>
   <li><a href="#not-supported-yet">Not supported yet</a></li>
 </ul>
 <p class="toc-top"><a href="#main">Back to top &#8593;</a></p>

@@ -67,6 +67,11 @@ pub enum QueryResult {
     RefreshedMaterializedView {
         name: String,
     },
+    /// `REFRESH MATERIALIZED VIEWS` (wave 80): every view of the session
+    /// database was recomputed; `names` lists them in sorted order.
+    RefreshedMaterializedViews {
+        names: Vec<String>,
+    },
     DroppedMaterializedView {
         name: String,
     },
@@ -175,6 +180,81 @@ fn use_result(db: &PinkDb, name: &str) -> Result<QueryResult> {
     Ok(QueryResult::Used {
         db: name.to_ascii_lowercase(),
     })
+}
+
+/// Evaluate a materialized view's defining query **without touching the
+/// store**: the schema/rows a refresh would write. Rebinds the definition from
+/// its persisted SQL when the catalog has no bound plan (a file whose base
+/// objects were missing at load), caching the rebound plan.
+fn evaluate_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Result<Output> {
+    let query = match db.materialized_view_in(target, name)?.query.clone() {
+        Some(q) => q,
+        None => {
+            let sql = db.materialized_view_in(target, name)?.query_sql.clone();
+            let plan = crate::mv::rebind_query(db, target, &sql).map_err(|e| {
+                PinkDbError::Catalog(format!(
+                    "materialized view \"{name}\": its defining query cannot be rebound ({e})"
+                ))
+            })?;
+            db.materialized_view_mut_in(target, name)?.query = Some(plan.clone());
+            plan
+        }
+    };
+    let cx = Cx::new(db).with_projections(&query);
+    eval(&cx, &query)
+}
+
+/// Write an already-evaluated result into a materialized view's backing table,
+/// recreating the table when the output schema changed. Shared by `CREATE
+/// MATERIALIZED VIEW` and every refresh: evaluation happens first, so a
+/// failing query can neither clear good data nor leave a half-written table.
+fn store_materialized_view(db: &mut PinkDb, target: &str, name: &str, out: &Output) -> Result<()> {
+    let schema: Vec<(String, DataType)> = out
+        .names
+        .iter()
+        .cloned()
+        .zip(out.types.iter().copied())
+        .collect();
+    let recreate = match db.table_in(target, name) {
+        Ok(t) => t.schema() != schema,
+        Err(_) => true,
+    };
+    if recreate {
+        if db.table_in(target, name).is_ok() {
+            db.drop_table_in(target, name)?;
+        }
+        db.create_table_in(target, name, schema.clone())?;
+    } else {
+        // Same schema: clear in place (the chunk layout and column metadata,
+        // including any indexes, survive).
+        let t = db.table_mut_in(target, name)?;
+        t.num_rows = 0;
+        for col in &mut t.columns {
+            col.chunks = vec![std::sync::Arc::new(Vector::new_empty(col.dtype))];
+        }
+    }
+    let t = db.table_mut_in(target, name)?;
+    for chunk in &out.chunks {
+        for i in 0..chunk.num_rows() {
+            let mut values = Vec::with_capacity(schema.len());
+            for (col, (_, ty)) in chunk.columns.iter().zip(schema.iter()) {
+                values.push(DataTable::coerce(col.get(i), *ty)?);
+            }
+            t.append_row(values)?;
+        }
+    }
+    Ok(())
+}
+
+/// One full refresh: evaluate the defining query, write the result, and stamp
+/// the catalog entry (`last_refreshed`, attempt time, count, clear error).
+/// Shared by the manual statement and the boundary pass (wave 80). Errors
+/// propagate to the caller: the manual statement reports them, the automatic
+/// pass records them in the definition.
+pub(crate) fn refresh_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Result<()> {
+    let out = evaluate_materialized_view(db, target, name)?;
+    store_materialized_view(db, target, name, &out)?;
+    db.mark_refreshed(target, name, crate::mv::now_ms())
 }
 
 /// Execute a bound plan.
@@ -646,93 +726,73 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             name,
             query,
             if_not_exists,
+            policy,
+            source,
         } => {
             let target = resolve_db(db, qdb);
-            if *if_not_exists && db.table_in(&target, name).is_ok() {
-                return Ok(QueryResult::Created);
+            if *if_not_exists
+                && (db.materialized_view_in(&target, name).is_ok()
+                    || db.table_in(&target, name).is_ok())
+            {
+                return Ok(QueryResult::CreatedMaterializedView { name: name.clone() });
             }
             // Evaluate the query first.
             let out = {
                 let cx = Cx::new(db).with_projections(plan);
                 eval(&cx, query)?
             };
-            let schema: Vec<(String, DataType)> = out
-                .names
-                .iter()
-                .cloned()
-                .zip(out.types.iter().copied())
-                .collect();
-            // Drop existing table if any (for refresh-like semantics on create).
+            // Drop an existing same-named *table* (the backing table of a
+            // prior definition, or a plain table) for refresh-like creation
+            // semantics; an existing view needs no handling (bind refuses).
             if db.table_in(&target, name).is_ok() {
                 db.drop_table_in(&target, name)?;
             }
-            db.create_table_in(&target, name, schema.clone())?;
-            let t = db.table_mut_in(&target, name)?;
-            for chunk in &out.chunks {
-                for i in 0..chunk.num_rows() {
-                    let mut values = Vec::with_capacity(schema.len());
-                    for (col, (_, ty)) in chunk.columns.iter().zip(schema.iter()) {
-                        values.push(DataTable::coerce(col.get(i), *ty)?);
-                    }
-                    t.append_row(values)?;
-                }
-            }
-            // Store the refresh query (the bound plan).
+            store_materialized_view(db, &target, name, &out)?;
+            // Store the definition: the bound query, the defining SQL text
+            // (persisted, and the rebuild source when the plan cannot be
+            // rebound), the policy, and the initial refresh stamp — creation
+            // itself computed the data, so the view starts fresh with a
+            // refresh count of zero.
+            let now = crate::mv::now_ms();
             db.materialized_views_insert_in(
                 &target,
                 name.to_ascii_lowercase(),
                 crate::storage::MaterializedViewDef {
                     name: name.clone(),
-                    query: *query.clone(),
+                    query: Some(query.clone()),
+                    query_sql: source.clone(),
+                    policy: *policy,
+                    last_refreshed_ms: now,
+                    last_attempt_ms: now,
+                    refresh_count: 0,
+                    last_error: None,
                 },
             )?;
             Ok(QueryResult::CreatedMaterializedView { name: name.clone() })
         }
         LogicalPlan::RefreshMaterializedView { db: qdb, name } => {
             let target = resolve_db(db, qdb);
-            let mv = db.materialized_view_in(&target, name)?.clone();
-            let query = mv.query;
-            // Drop existing data.
-            if let Ok(t) = db.table_mut_in(&target, name) {
-                // Clear chunks.
-                t.num_rows = 0;
-                for col in &mut t.columns {
-                    col.chunks = vec![std::sync::Arc::new(Vector::new_empty(col.dtype))];
-                }
-            }
-            // Re-evaluate.
-            let out = {
-                let cx = Cx::new(db);
-                // Wrap query in a plan we can eval. The stored query is a LogicalPlan.
-                eval(&cx, &query)?
-            };
-            let schema: Vec<(String, DataType)> = out
-                .names
-                .iter()
-                .cloned()
-                .zip(out.types.iter().copied())
-                .collect();
-            // If schema changed, recreate table.
-            if let Ok(t) = db.table_in(&target, name) {
-                let old_schema: Vec<(String, DataType)> = t.schema();
-                if old_schema != schema {
-                    db.drop_table_in(&target, name)?;
-                    db.create_table_in(&target, name, schema.clone())?;
-                }
-            } else {
-                db.create_table_in(&target, name, schema.clone())?;
-            }
-            let t = db.table_mut_in(&target, name)?;
-            for chunk in &out.chunks {
-                for i in 0..chunk.num_rows() {
-                    let mut values = Vec::with_capacity(schema.len());
-                    for (col, (_, ty)) in chunk.columns.iter().zip(schema.iter()) {
-                        values.push(DataTable::coerce(col.get(i), *ty)?);
-                    }
-                    t.append_row(values)?;
-                }
-            }
+            refresh_materialized_view(db, &target, name)?;
             Ok(QueryResult::RefreshedMaterializedView { name: name.clone() })
+        }
+        LogicalPlan::RefreshMaterializedViews { db: qdb } => {
+            let target = resolve_db(db, qdb);
+            let names = db.materialized_view_names_in(&target);
+            // All-or-nothing: every defining query is evaluated before any
+            // backing table is touched, so one broken view cannot leave the
+            // others half-refreshed. Every query is evaluated against the
+            // *pre-refresh* state (refreshes of views built on views land on
+            // the next boundary pass).
+            let mut evaluated = Vec::with_capacity(names.len());
+            for name in &names {
+                evaluated.push(evaluate_materialized_view(db, &target, name)?);
+            }
+            let now = crate::mv::now_ms();
+            for (name, out) in names.iter().zip(evaluated) {
+                store_materialized_view(db, &target, name, &out)?;
+                db.mark_refreshed(&target, name, now)?;
+            }
+            Ok(QueryResult::RefreshedMaterializedViews { names })
         }
         LogicalPlan::DropMaterializedView {
             db: qdb,
@@ -740,7 +800,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             if_exists,
         } => {
             let target = resolve_db(db, qdb);
-            if db.table_in(&target, name).is_err() {
+            if db.materialized_view_in(&target, name).is_err() {
                 if *if_exists {
                     return Ok(QueryResult::DroppedMaterializedView { name: name.clone() });
                 }
@@ -748,7 +808,12 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                     "materialized view \"{name}\" not found"
                 )));
             }
-            db.drop_table_in(&target, name)?;
+            // The backing table may be absent (`DROP TABLE v` left the
+            // definition dangling): dropping the view must still succeed, and
+            // it always cleans the definition.
+            if db.table_in(&target, name).is_ok() {
+                db.drop_table_in(&target, name)?;
+            }
             db.materialized_views_remove_in(&target, &name.to_ascii_lowercase());
             Ok(QueryResult::DroppedMaterializedView { name: name.clone() })
         }
@@ -1188,6 +1253,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
@@ -1241,6 +1307,55 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 chunks: vec![DataChunk::new(vec![string_vector(&names)?])?],
                 names: vec!["database_name".to_string()],
                 types: vec![DataType::Varchar],
+            })
+        }
+        LogicalPlan::ShowMaterializedViews { db: qdb } => {
+            let target = resolve_db(cx.db, qdb);
+            let rows = cx
+                .db
+                .materialized_view_status_in(&target, crate::mv::now_ms());
+            let mut name = Vector::with_capacity(DataType::Varchar, rows.len());
+            let mut schedule = Vector::with_capacity(DataType::Varchar, rows.len());
+            let mut last_refreshed = Vector::with_capacity(DataType::Varchar, rows.len());
+            let mut refresh_count = Vector::with_capacity(DataType::Bigint, rows.len());
+            let mut stale = Vector::with_capacity(DataType::Boolean, rows.len());
+            let mut last_error = Vector::with_capacity(DataType::Varchar, rows.len());
+            for r in &rows {
+                name.push_valid(Value::Varchar(r.name.clone()))?;
+                schedule.push_valid(Value::Varchar(r.schedule.clone()))?;
+                last_refreshed.push_valid(Value::Varchar(r.last_refreshed.clone()))?;
+                refresh_count.push_valid(Value::Bigint(r.refresh_count as i64))?;
+                stale.push_valid(Value::Boolean(r.stale))?;
+                match &r.last_error {
+                    Some(e) => last_error.push_valid(Value::Varchar(e.clone()))?,
+                    None => last_error.push_null()?,
+                }
+            }
+            Ok(Output {
+                chunks: vec![DataChunk::new(vec![
+                    name,
+                    schedule,
+                    last_refreshed,
+                    refresh_count,
+                    stale,
+                    last_error,
+                ])?],
+                names: vec![
+                    "name".to_string(),
+                    "schedule".to_string(),
+                    "last_refreshed".to_string(),
+                    "refresh_count".to_string(),
+                    "stale".to_string(),
+                    "last_error".to_string(),
+                ],
+                types: vec![
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Bigint,
+                    DataType::Boolean,
+                    DataType::Varchar,
+                ],
             })
         }
         LogicalPlan::Describe { columns } => {
@@ -3961,8 +4076,15 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::RefreshMaterializedView { db, name } => {
             format!("RefreshMaterializedView {}", qualify(db, name))
         }
+        LogicalPlan::RefreshMaterializedViews { db } => format!(
+            "RefreshMaterializedViews {}",
+            db.clone().unwrap_or_default()
+        ),
         LogicalPlan::DropMaterializedView { db, name, .. } => {
             format!("DropMaterializedView {}", qualify(db, name))
+        }
+        LogicalPlan::ShowMaterializedViews { db } => {
+            format!("ShowMaterializedViews {}", db.clone().unwrap_or_default())
         }
         LogicalPlan::IndexScan {
             db, table, index, ..

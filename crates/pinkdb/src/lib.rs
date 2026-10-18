@@ -16,6 +16,7 @@ pub mod csv;
 pub mod db;
 pub mod exec;
 mod ext;
+pub(crate) mod mv;
 pub mod optimizer;
 pub mod persist;
 pub mod plan;
@@ -78,18 +79,16 @@ impl PinkDb {
     pub fn execute(&mut self, sql: &str) -> types::Result<Vec<QueryResult>> {
         self.ensure_wal_healthy()?;
         let stmts = sql::parse_statements(sql)?;
-        // Only durable databases need per-statement source text for the WAL.
-        let texts = if self.is_durable() {
-            let texts = sql::statement_texts(sql)?;
-            if texts.len() != stmts.len() {
-                return Err(types::PinkDbError::Execution(
-                    "internal error: statement source split disagrees with the parser".to_string(),
-                ));
-            }
-            Some(texts)
-        } else {
-            None
-        };
+        // Per-statement source text: the WAL logs committed statements, and a
+        // materialized view persists its defining SQL (wave 80) — the split
+        // runs for in-memory stores too.
+        let texts = sql::statement_texts(sql)?;
+        if texts.len() != stmts.len() {
+            return Err(types::PinkDbError::Execution(
+                "internal error: statement source split disagrees with the parser".to_string(),
+            ));
+        }
+        let texts = Some(texts);
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
             // Refresh at the statement boundary (never mid-statement, never
@@ -98,8 +97,18 @@ impl PinkDb {
             if self.is_durable() && !self.in_transaction() {
                 self.refresh_if_stale()?;
             }
+            // Wave 80: automatic materialized-view refresh at the same
+            // boundary — deferred inside an open transaction, and skipped
+            // during WAL replay (the logged `REFRESH` statements reproduce
+            // it exactly; see `crate::mv`).
+            if !self.in_transaction() && !self.replaying {
+                self.boundary_auto_refresh()?;
+            }
             let session_db = self.current_db().to_string();
             let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
+            // The runner (not the binder) holds the per-statement source text;
+            // a `CREATE MATERIALIZED VIEW` plan persists it (wave 80).
+            let plan = plan::with_mv_source(plan, texts.as_ref().map(|t| t[i].as_str()));
             let plan = optimizer::optimize(self, plan);
             // Store/process-level statements cannot be undone by a snapshot
             // commit of the multi-writer path: refuse inside a txn.
@@ -122,10 +131,22 @@ impl PinkDb {
             // statement read or wrote: COMMIT validates the set against the
             // frames other writers committed (wave 45o). `USE` targets count
             // too: the transaction's record replays them.
-            if self.is_durable() && self.in_transaction() {
-                plan::plan_sets(&plan, &session_db, &mut self.txn_touched);
-                if let plan::LogicalPlan::Use { name } = &plan {
-                    self.txn_touched.add_database(name);
+            if self.in_transaction() {
+                if self.is_durable() {
+                    // Store-aware: a materialized-view statement depends on
+                    // objects the plan alone cannot name (wave 80).
+                    let sets = self.plan_sets_store(&plan, &session_db);
+                    self.txn_touched.extend(&sets);
+                    if let plan::LogicalPlan::Use { name } = &plan {
+                        self.txn_touched.add_database(name);
+                    }
+                }
+                if plan::writes_tables(&plan) && self.has_materialized_views() {
+                    // The transaction's writes become the ON COMMIT trigger
+                    // when it finally commits (never on ROLLBACK) — durable
+                    // and in-memory stores alike.
+                    let writes = self.plan_writes_of(&plan, &session_db);
+                    self.txn_writes.extend(writes);
                 }
             }
             // Autocommit writes to plain tables take the optimistic fast
@@ -172,6 +193,7 @@ impl PinkDb {
                     }
                     self.note_optimistic_fallback_for_test();
                     let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                    let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
                     let p = optimizer::optimize(self, p);
                     if plan::writes_tables(&p) {
                         self.refuse_logged_attached_reads(&p)?;
@@ -190,6 +212,7 @@ impl PinkDb {
                     }
                     _ => {}
                 }
+                self.mark_committed_mv_writes(&plan, &session_db);
                 if let Some(texts) = &texts {
                     self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, Some(&sets))?;
                     self.maybe_auto_checkpoint(lease.as_ref());
@@ -218,6 +241,7 @@ impl PinkDb {
                         // replayed frames may name objects bound above):
                         // rebind against the refreshed state.
                         let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                        let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
                         (optimizer::optimize(self, p), d)
                     } else {
                         (plan, dynamic_functions_used)
@@ -238,6 +262,7 @@ impl PinkDb {
                 }
                 _ => {}
             }
+            self.mark_committed_mv_writes(&plan, &session_db);
             if let Some(texts) = &texts {
                 self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, None)?;
                 self.maybe_auto_checkpoint(lease.as_ref());

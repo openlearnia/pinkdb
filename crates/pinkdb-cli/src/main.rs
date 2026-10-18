@@ -1006,6 +1006,9 @@ fn render_results(results: &[QueryResult]) {
             QueryResult::RefreshedMaterializedView { name } => {
                 println!("Materialized view {name} refreshed.")
             }
+            QueryResult::RefreshedMaterializedViews { names } => {
+                println!("Refreshed {} materialized view(s).", names.len())
+            }
             QueryResult::DroppedMaterializedView { name } => {
                 println!("Materialized view {name} dropped.")
             }

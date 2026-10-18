@@ -80,15 +80,30 @@ pub enum LogicalPlan {
         name: String,
         query: Box<LogicalPlan>,
         if_not_exists: bool,
+        /// The declared refresh policy (wave 80).
+        policy: crate::types::RefreshPolicy,
+        /// The defining statement's source text (`CREATE MATERIALIZED VIEW
+        /// ... AS SELECT ...`), attached by [`LogicalPlan::with_mv_source`]
+        /// and persisted in `.pink`: a bound plan cannot be rendered back to
+        /// SQL, so this is what a reopen rebinds.
+        source: String,
     },
     RefreshMaterializedView {
         db: Option<String>,
         name: String,
     },
+    /// `REFRESH MATERIALIZED VIEWS`: every view of `db`, all-or-nothing.
+    RefreshMaterializedViews {
+        db: Option<String>,
+    },
     DropMaterializedView {
         db: Option<String>,
         name: String,
         if_exists: bool,
+    },
+    /// `SHOW MATERIALIZED VIEWS` of `db` (wave 80).
+    ShowMaterializedViews {
+        db: Option<String>,
     },
     DropTable {
         db: Option<String>,
@@ -324,9 +339,36 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Use { .. }
             | LogicalPlan::ShowTables { .. }
             | LogicalPlan::ShowDatabases
+            | LogicalPlan::ShowMaterializedViews { .. }
             | LogicalPlan::Describe { .. }
             | LogicalPlan::Explain { .. }
     )
+}
+
+/// Attach the statement's source text to a bound `CREATE MATERIALIZED VIEW`
+/// plan (wave 80). The engine persists a view's defining SQL, but a bound plan
+/// cannot be rendered back to text, and the statement runner — not the binder
+/// — holds the per-statement source. Every other plan passes through
+/// unchanged, so callers can wrap every bind result unconditionally.
+pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> LogicalPlan {
+    match plan {
+        LogicalPlan::CreateMaterializedView {
+            db,
+            name,
+            query,
+            if_not_exists,
+            policy,
+            ..
+        } => LogicalPlan::CreateMaterializedView {
+            db,
+            name,
+            query,
+            if_not_exists,
+            policy,
+            source: source.unwrap_or_default().to_string(),
+        },
+        other => other,
+    }
 }
 
 /// True for plans whose committed SQL text has to be logged — exactly the
@@ -361,6 +403,14 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Use { .. }
             | LogicalPlan::LoadExtension { .. }
+            // Wave 80: materialized-view statements mutate the store (the
+            // backing table and the catalog definition), so they are logged:
+            // a durable store replays `CREATE/DROP/REFRESH MATERIALIZED VIEW`
+            // and lands on identical data. (Wave 43 shipped without this.)
+            | LogicalPlan::CreateMaterializedView { .. }
+            | LogicalPlan::RefreshMaterializedView { .. }
+            | LogicalPlan::RefreshMaterializedViews { .. }
+            | LogicalPlan::DropMaterializedView { .. }
     )
 }
 
@@ -373,6 +423,15 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         LogicalPlan::DropDatabase { .. } => "DROP DATABASE",
         LogicalPlan::LoadExtension { .. } => "LOAD EXTENSION",
         LogicalPlan::Checkpoint => "CHECKPOINT",
+        // Wave 80: materialized-view statements carry catalog metadata
+        // (definition, schedule, refresh counters) that the per-table
+        // transaction merge does not cover, and auto-refresh is deferred to
+        // the first boundary after COMMIT anyway — keep them outside
+        // transactions instead of half-applying them.
+        LogicalPlan::CreateMaterializedView { .. } => "CREATE MATERIALIZED VIEW",
+        LogicalPlan::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
+        LogicalPlan::RefreshMaterializedViews { .. } => "REFRESH MATERIALIZED VIEWS",
+        LogicalPlan::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
         _ => return None,
     })
 }
@@ -467,13 +526,19 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
+        | LogicalPlan::ShowMaterializedViews { .. }
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
-        | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. } => {}
+        // A materialized view's defining query is part of the statement: the
+        // backing table is computed from exactly these reads.
+        LogicalPlan::CreateMaterializedView { query, .. } => {
+            collect_tables_read(query, default_db, out);
+        }
         LogicalPlan::IndexScan { db, table, .. } => {
             out.insert(key(db, table));
         }
@@ -788,6 +853,7 @@ fn walk_scan_filters(
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
+        | LogicalPlan::ShowMaterializedViews { .. }
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::AlterTable { .. }
@@ -797,6 +863,7 @@ fn walk_scan_filters(
         | LogicalPlan::IndexScan { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. } => {}
         LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
         LogicalPlan::CreateTableAs { query, .. } | LogicalPlan::InsertSelect { query, .. } => {
@@ -1247,6 +1314,7 @@ fn walk_scan_projections(
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
+        | LogicalPlan::ShowMaterializedViews { .. }
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::CreateIndex { .. }
@@ -1254,6 +1322,7 @@ fn walk_scan_projections(
         | LogicalPlan::IndexScan { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. } => {}
     }
 }

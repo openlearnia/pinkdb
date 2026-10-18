@@ -113,7 +113,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 77 | **SQL macros**: `CREATE MACRO name(params) AS expr` (scalar) and `CREATE MACRO name(params) AS TABLE SELECT …` (table macros), `DROP MACRO [IF EXISTS]`, bind-time parameter substitution (arguments spliced at bind, no dynamic SQL), visibility in `SHOW`/`DESCRIBE`-style introspection, use inside views and other macros (recursion rules probed against α), persisted + WAL-logged like other DDL | queued | engine wave; persistence gains a catalog object — same version policy (clean newer-format refusal, no compat gates) |
 | 78 | **`pinkdb-server` warehouse browsing UI**: feature-gated web console served by the server — static self-hosted assets (no CDNs) + JSON endpoints (databases, schemas, tables, paged row previews, row counts/sizes), read-only browsing first; query console as a follow-up; blocking HTTP/1.1, no async runtime (consistent with the server); binds localhost by default with a loud no-auth warning — **TLS (46) and RBAC (48) are prerequisites for any non-localhost exposure** | queued | new crate `pinkdb-server-ui` (feature of or alongside `pinkdb-server`); reuses the cookieless box-renderer semantics for previews |
 | 79 | Index persistence & hardening (follow-up to the user-landed wave 42): store index definitions in `.pink` (format bump with the clean newer-format refusal), WAL-log `CREATE`/`DROP INDEX` replay exactly, multi-process touched-set coverage, and the optimizer's index-vs-scan choice for range/zone-map skips beyond equality | queued | small; slot per the queue |
-| 80 | Materialized-view refresh policies (extends the user-landed wave 43): **manual refresh completion** — `REFRESH MATERIALIZED VIEW(S)`, `last_refreshed` bookkeeping and a stale flag in introspection (`SHOW MATERIALIZED VIEWS`-style, or extending `SHOW TABLES`) — plus **scheduled refresh**: a declared policy (`REFRESH EVERY INTERVAL '…'`, `REFRESH ON COMMIT`, `MANUAL` default) persisted in the catalog, enforced daemonless at statement boundaries (works embedded and in `pinkdb-server` alike) with deterministic WAL logging of automatic refreshes; no α reference exists (DuckDB has no MVs) — semantics documented | in progress | `wt-mv-refresh`, dispatched on `ec3c0a3` |
+| 80 | Materialized-view refresh policies (extends the user-landed wave 43): **manual refresh completion** — `REFRESH MATERIALIZED VIEW(S)`, `last_refreshed` bookkeeping and a stale flag in introspection (`SHOW MATERIALIZED VIEWS`-style, or extending `SHOW TABLES`) — plus **scheduled refresh**: a declared policy (`REFRESH EVERY INTERVAL '…'`, `REFRESH ON COMMIT`, `MANUAL` default) persisted in the catalog, enforced daemonless at statement boundaries (works embedded and in `pinkdb-server` alike) with deterministic WAL logging of automatic refreshes; no α reference exists (DuckDB has no MVs) — semantics documented | done | landed; `REFRESH name`/`… VIEWS` (all-or-nothing), `SHOW MATERIALIZED VIEWS`, `REFRESH MANUAL\|EVERY INTERVAL\|ON COMMIT` enforced at statement boundaries (never mid-statement/transaction; fixpoint for view chains), automatic refreshes WAL-logged + replay-exact; fixed a wave-43 lineage bug (MV DDL was unlogged/unpersisted); `.pink` v5 flags bit 2, bit 3 reserved for wave 79 |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
@@ -1278,6 +1278,35 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   vortex **174**, +encryption **195**, s3+vortex+encryption **258**, CLI
   matrix incl. `lake,s3` **103** (multiprocess 27/27), workspace clean,
   `bench/duckdiff.py` **171/171**. Clean apply; worktree removed.
+- 2026-10-18 — Wave 80 (MV refresh policies): manual completion —
+  `REFRESH [MATERIALIZED VIEW] name` (shorthand `REFRESH name`), `REFRESH
+  MATERIALIZED VIEWS` (every view of the session database, all-or-nothing:
+  all defining queries evaluate before any table is written), per-view
+  `last_refreshed`/`refresh_count`/`last_error`, and `SHOW MATERIALIZED VIEWS`
+  (schedule, stamps, staleness). Scheduled — `CREATE MATERIALIZED VIEW v
+  REFRESH MANUAL | EVERY INTERVAL '…' | ON COMMIT AS …` (policy before `AS`,
+  Postgres storage-option position), persisted in `.pink` v5 **flags bit 2**
+  (`0x4`; bit 3 reserved for wave 79) with every MV statement now
+  WAL-logged. Enforcement is **daemonless**: one statement-boundary hook in
+  the embedded loop and every `Connection` (so `pinkdb-server` gets it free)
+  plus commit-time dirty marking; `EVERY` is due once per interval since the
+  last attempt, `ON COMMIT` fires the first boundary after a dirty commit,
+  view chains reach a fixpoint in one pass, and neither fires inside a
+  transaction. Automatic refreshes are explicit WAL records, one per boundary
+  pass; replay suppresses the pass (`PinkDb::replaying`) and reproduces data +
+  counters exactly (timestamps are wall-clock, deliberately not payload).
+  Auto failures never wedge (data stays at the last success, `last_error`
+  recorded, retry backed off), evaluation now happens **before** the backing
+  table is touched, and dropping/recreating a base table heals the view.
+  **Lineage fix found while doing this**: wave 43 shipped MV DDL *unlogged*
+  and *unpersisted* — a durable reopen silently lost the definition; MV
+  statements are now `writes_tables` → logged/replayed exactly (pinned).
+  Gates on main: fmt clean (the agent's toolchain-skew note did not reproduce
+  here), clippy all touched configurations, pinkdb **532** (495 lib + 14 alter
+  + 22 prepared + 1 doc), pinkdb-server **57**, pinkdb-ffi **16**, pink-lake
+  vortex green, CLI matrix incl. `lake,s3` **103** (multiprocess 27/27),
+  workspace clean, `bench/duckdiff.py` **171/171**. Two conflicts resolved
+  (rustfmt-style vs 80's new plan variants; took both). Worktree removed.
 - 2026-10-17 — Post-freeze benchmark session (final tree `b3154e7`, Apple
   Silicon, best-of-N, DuckDB α46057 reference): standing battery **250.8 ms**
   (per-query: count 0.03, filter_num 2.25, filter_str 1.60, proj_func 18.2,

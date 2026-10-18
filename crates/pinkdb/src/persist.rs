@@ -116,6 +116,14 @@ const FLAG_CONSTRAINTS: u32 = 0x1;
 /// flags check.
 const FLAG_DEFAULTS: u32 = 0x2;
 
+/// Flags bit 2 (v5+): every database carries the materialized-view section
+/// (wave 80: name, refresh policy, defining SQL, last refresh stamp, refresh
+/// count) after its tables. Set iff at least one database has a materialized
+/// view, so stores without them keep v4-shaped bodies byte for byte. An older
+/// v5 build refuses the file cleanly through the unknown-flags check — the
+/// next format-gated section takes bit 3 (`0x8`; index persistence, wave 79).
+const FLAG_MATERIALIZED_VIEWS: u32 = 0x4;
+
 /// Column-default value tags (one byte per non-NULL default).
 const VD_BOOL: u8 = 0;
 const VD_I32: u8 = 1;
@@ -524,6 +532,16 @@ impl Writer {
     }
 
     fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// Signed integers use their two's-complement byte pattern (identical to
+    /// the unsigned writer for the same bit width).
+    fn i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn i64(&mut self, v: i64) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 
@@ -2174,12 +2192,14 @@ impl PinkDb {
                     .is_ok_and(|t| t.columns.iter().any(|c| c.default.is_some()))
             })
         });
+        let with_mvs = self.has_materialized_views();
         w.u32(
             if with_constraints {
                 FLAG_CONSTRAINTS
             } else {
                 0
-            } | if with_defaults { FLAG_DEFAULTS } else { 0 },
+            } | if with_defaults { FLAG_DEFAULTS } else { 0 }
+                | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 },
         );
         let mut saved: Vec<SavedTableStats> = Vec::new();
         let mut dbs = self.list_databases();
@@ -2288,6 +2308,9 @@ impl PinkDb {
                         w.bytes(&col.payload);
                     }
                 }
+            }
+            if with_mvs {
+                write_materialized_views(&mut w, self, dbname);
             }
         }
         let crc = crate::wal::crc32(&w.buf);
@@ -2507,16 +2530,18 @@ impl PinkDb {
         };
         let mut constraints = false;
         let mut defaults = false;
+        let mut mvs = false;
         if flags {
             let f = r.u32()?;
             if v5 {
-                if f & !(FLAG_CONSTRAINTS | FLAG_DEFAULTS) != 0 {
+                if f & !(FLAG_CONSTRAINTS | FLAG_DEFAULTS | FLAG_MATERIALIZED_VIEWS) != 0 {
                     return Err(PinkDbError::Execution(format!(
                         "unsupported .pink v5 flags 0x{f:08x}; upgrade pinkdb"
                     )));
                 }
                 constraints = f & FLAG_CONSTRAINTS != 0;
                 defaults = f & FLAG_DEFAULTS != 0;
+                mvs = f & FLAG_MATERIALIZED_VIEWS != 0;
             } else if f != 0 {
                 return Err(PinkDbError::Execution(format!(
                     "unsupported .pink v4 flags 0x{f:08x}; upgrade pinkdb"
@@ -2534,6 +2559,9 @@ impl PinkDb {
                 let n_tables = r.u32()?;
                 for _ in 0..n_tables {
                     load_table(&mut r, &mut db, &dbname, v5, constraints, defaults)?;
+                }
+                if v5 && mvs {
+                    load_materialized_views(&mut r, &mut db, &dbname)?;
                 }
             }
             if db.list_databases().is_empty() {
@@ -2597,6 +2625,96 @@ fn write_constraints(w: &mut Writer, c: &TableConstraints) {
         w.u32(1);
         w.u32(*col as u32);
     }
+}
+
+/// Policy tags in a materialized-view section (wave 80).
+const MV_MANUAL: u8 = 0;
+const MV_EVERY: u8 = 1;
+const MV_ON_COMMIT: u8 = 2;
+
+/// One database's materialized-view section (`FLAG_MATERIALIZED_VIEWS`): the
+/// count, then per view, sorted by lowercased name,
+/// `name, policy tag [, months, days, micros], defining SQL, last refresh
+/// stamp (epoch ms), refresh count`. The **bound query is not stored**: only
+/// the defining SQL text, which the loader rebinds (a bound plan cannot be
+/// rendered back to SQL, and a definition whose base tables are missing must
+/// still load). A non-refreshable definition is not a write error, so this is
+/// infallible.
+fn write_materialized_views(w: &mut Writer, db: &PinkDb, dbname: &str) {
+    let views = db.materialized_views_in(dbname);
+    w.u32(views.len() as u32);
+    for (_, def) in &views {
+        w.str(&def.name);
+        match def.policy {
+            crate::types::RefreshPolicy::Manual => w.u8(MV_MANUAL),
+            crate::types::RefreshPolicy::Every { interval } => {
+                w.u8(MV_EVERY);
+                w.i32(interval.months);
+                w.i32(interval.days);
+                w.i64(interval.micros);
+            }
+            crate::types::RefreshPolicy::OnCommit => w.u8(MV_ON_COMMIT),
+        }
+        w.str(&def.query_sql);
+        w.i64(def.last_refreshed_ms);
+        w.u64(def.refresh_count);
+    }
+}
+
+/// Decode one database's materialized-view section and install the
+/// definitions. The defining query is rebound from its persisted SQL; a
+/// definition that cannot rebind (missing base table/view) still loads, with
+/// no bound plan — a refresh retries later and reports the failure, and
+/// `DROP MATERIALIZED VIEW` still removes it.
+fn load_materialized_views(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
+    let n = r.u32()? as usize;
+    // Each view costs at least 9 bytes (empty policy/name/… fields); do not
+    // size an allocation from the unvalidated count.
+    if n > r.remaining() / 9 + 1 {
+        return r.err("materialized-view count exceeds the remaining file");
+    }
+    for _ in 0..n {
+        let name = r.str()?;
+        let policy = match r.u8()? {
+            MV_MANUAL => crate::types::RefreshPolicy::Manual,
+            MV_EVERY => {
+                let months = r.i32()?;
+                let days = r.i32()?;
+                let micros = r.i64()?;
+                crate::types::RefreshPolicy::Every {
+                    interval: crate::types::Interval {
+                        months,
+                        days,
+                        micros,
+                    },
+                }
+            }
+            MV_ON_COMMIT => crate::types::RefreshPolicy::OnCommit,
+            other => return r.err(&format!("unknown materialized-view policy tag {other}")),
+        };
+        let query_sql = r.str()?;
+        let last_refreshed_ms = r.i64()?;
+        let refresh_count = r.u64()?;
+        let query = crate::mv::rebind_query(db, dbname, &query_sql).ok();
+        db.materialized_views_insert_in(
+            dbname,
+            name.to_ascii_lowercase(),
+            crate::storage::MaterializedViewDef {
+                name,
+                query,
+                query_sql,
+                policy,
+                last_refreshed_ms,
+                // The attempt stamp is not persisted: treat the last success
+                // as the last attempt (an `EVERY` view becomes due one full
+                // interval after its last success).
+                last_attempt_ms: last_refreshed_ms,
+                refresh_count,
+                last_error: None,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Encode every column's DEFAULT (wave 65): one presence byte per column,
@@ -3659,10 +3777,12 @@ mod tests {
         assert!(err.contains("bad magic"), "{err}");
         // Unknown v5 flags bits are a hard error (re-checksummed so the flags
         // check, not the CRC, is what fires). Bits 0 (constraint section) and
-        // 1 (column defaults) are known; their absence/presence is exercised
-        // by the constraint/default round-trip tests.
+        // 1 (column defaults) and 2 (materialized views) are known; their
+        // absence/presence is exercised by the constraint/default and
+        // materialized-view round-trip tests. Bit 3 is reserved for the next
+        // format-gated section (index persistence).
         let mut data = full.clone();
-        data[8..12].copy_from_slice(&4u32.to_le_bytes());
+        data[8..12].copy_from_slice(&8u32.to_le_bytes());
         fix_crc(&mut data);
         let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
         assert!(err.contains("unsupported .pink v5 flags"), "{err}");
@@ -5296,6 +5416,134 @@ mod tests {
         let before = db.execute("DESCRIBE c;").unwrap().pop().unwrap();
         let after = back.execute("DESCRIBE c;").unwrap().pop().unwrap();
         assert_eq!(before, after);
+    }
+
+    // ---------- wave 80: materialized views in the v5 MV section ----------
+
+    /// One-column integer result (this module's tests).
+    fn ints(db: &mut PinkDb, sql: &str) -> Vec<i64> {
+        match db.execute(sql).unwrap().pop().unwrap() {
+            crate::QueryResult::Selected { rows, .. } => rows
+                .into_iter()
+                .map(|r| match &r[0] {
+                    Value::Integer(i) => *i as i64,
+                    Value::Bigint(i) => *i,
+                    other => panic!("expected an integer, got {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    /// A store with materialized views sets flags bit 2 and round-trips the
+    /// definitions (schedule, defining SQL, stamps, counters), the backing
+    /// tables and — bit for bit — the file itself.
+    #[test]
+    fn wave80_materialized_views_roundtrip_through_v5() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+        db.execute(
+            "CREATE MATERIALIZED VIEW mv REFRESH EVERY INTERVAL '5 minutes' AS SELECT a FROM t;",
+        )
+        .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW om REFRESH ON COMMIT AS SELECT COUNT(*) AS n FROM t;")
+            .unwrap();
+        db.execute("CREATE MATERIALIZED VIEW plain AS SELECT a * 2 AS a2 FROM t;")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (3);").unwrap();
+        db.execute("REFRESH MATERIALIZED VIEW mv;").unwrap();
+        let bytes = db.to_bytes().unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V5);
+        let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        assert_eq!(flags, FLAG_MATERIALIZED_VIEWS, "MV stores set flags bit 2");
+
+        let mut back = PinkDb::load_bytes(&bytes).unwrap();
+        assert_eq!(back.to_bytes().unwrap(), bytes, "open→save drift");
+        let mv = back.materialized_view_in("main", "mv").unwrap();
+        assert_eq!(
+            mv.policy,
+            crate::types::RefreshPolicy::Every {
+                interval: crate::types::Interval {
+                    months: 0,
+                    days: 0,
+                    micros: 300_000_000
+                }
+            }
+        );
+        assert_eq!(mv.refresh_count, 1);
+        assert_eq!(mv.name, "mv");
+        assert_eq!(
+            back.materialized_view_in("main", "om").unwrap().policy,
+            crate::types::RefreshPolicy::OnCommit
+        );
+        assert_eq!(
+            back.materialized_view_in("main", "plain").unwrap().policy,
+            crate::types::RefreshPolicy::Manual
+        );
+        // The rebound definition is live: refresh after a further write.
+        back.execute("INSERT INTO t VALUES (4);").unwrap();
+        back.execute("REFRESH MATERIALIZED VIEW mv;").unwrap();
+        assert_eq!(ints(&mut back, "SELECT a FROM mv;"), vec![1, 2, 3, 4]);
+        // ... and the ON COMMIT policy survived as a policy, not just a label.
+        back.execute("INSERT INTO t VALUES (5);").unwrap();
+        assert_eq!(ints(&mut back, "SELECT n FROM om;"), vec![5]);
+        // DROPs are not silently resurrected: the section is authoritative.
+        back.execute("DROP MATERIALIZED VIEW plain;").unwrap();
+        let bytes2 = back.to_bytes().unwrap();
+        let again = PinkDb::load_bytes(&bytes2).unwrap();
+        assert!(again.materialized_view_in("main", "plain").is_err());
+    }
+
+    /// A definition whose base table is missing still loads (with no bound
+    /// plan), reports a clear refresh error, heals once the table exists
+    /// again, and drops cleanly. This is the one case the SQL text is the
+    /// only rebuild source.
+    #[test]
+    fn wave80_broken_definition_loads_and_heals() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        db.execute("CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;")
+            .unwrap();
+        db.execute("DROP TABLE t;").unwrap();
+        let bytes = db.to_bytes().unwrap();
+        let mut back = PinkDb::load_bytes(&bytes).unwrap();
+        assert_eq!(back.to_bytes().unwrap(), bytes, "broken defs round-trip");
+        assert!(back
+            .materialized_view_in("main", "mv")
+            .unwrap()
+            .query
+            .is_none());
+        assert_eq!(ints(&mut back, "SELECT a FROM mv;"), vec![1], "data kept");
+        let err = back.execute("REFRESH MATERIALIZED VIEW mv;").unwrap_err();
+        assert!(err.to_string().contains("t"), "{err}");
+        // Once the base table is back, the persisted SQL rebinds the
+        // definition and the view heals.
+        back.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        back.execute("INSERT INTO t VALUES (7);").unwrap();
+        back.execute("REFRESH MATERIALIZED VIEW mv;").unwrap();
+        assert_eq!(ints(&mut back, "SELECT a FROM mv;"), vec![7]);
+        back.execute("DROP MATERIALIZED VIEW mv;").unwrap();
+        assert!(back.materialized_view_in("main", "mv").is_err());
+    }
+
+    /// The next format-gated section (bit 3, `0x8`: index persistence) is
+    /// refused by this build through the shared unknown-flags check — the
+    /// "clean newer-format refusal" rule this section relies on for older
+    /// builds.
+    #[test]
+    fn wave80_unknown_v5_flag_bits_are_refused() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        let mut bytes = db.to_bytes().unwrap();
+        bytes[8..12].copy_from_slice(&0x8u32.to_le_bytes());
+        let n = bytes.len();
+        let crc = crate::wal::crc32(&bytes[..n - 4]);
+        bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
+        assert!(err.contains("upgrade pinkdb"), "{err}");
+        assert!(err.contains("0x00000008"), "{err}");
     }
 
     /// A corrupt constraint section is a clean error, never a panic.

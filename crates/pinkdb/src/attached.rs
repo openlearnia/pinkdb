@@ -545,6 +545,11 @@ impl PinkDb {
         }
         let mut reads = std::collections::HashSet::new();
         crate::plan::collect_tables_read(plan, self.current_db(), &mut reads);
+        // A materialized-view refresh re-evaluates its defining query: the
+        // base tables are reads the plan itself cannot name (wave 80).
+        for (db, table) in self.mv_reads_of(plan, self.current_db()) {
+            reads.insert((db, table));
+        }
         for (db, table) in reads {
             if let Some(location) = self.attached_location_in(&db, &table) {
                 return Err(PinkDbError::Execution(format!(

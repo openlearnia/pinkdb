@@ -10,6 +10,18 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 80 — materialized-view refresh policies ✅
+- **Manual**: `REFRESH MATERIALIZED VIEW name` (and `REFRESH name`, plus
+  `REFRESH MATERIALIZED VIEWS` refreshing every view of the database
+  all-or-nothing); `SHOW MATERIALIZED VIEWS` lists schedule, last refresh
+  time/count and staleness.
+- **Scheduled**: `CREATE MATERIALIZED VIEW v REFRESH MANUAL | EVERY INTERVAL
+  '5 minutes' | ON COMMIT AS SELECT …` — enforced **daemonless** at statement
+  boundaries (embedded and `pinkdb-server` alike; never mid-transaction), with
+  automatic refreshes WAL-logged and replay-exact.
+- Fix: MV definitions are now WAL-logged and persisted — previously a durable
+  reopen silently lost them.
+
 ### Wave 68 — inlined small writes & CDC ✅
 - Tiny commits (≤ 10 rows by default; per-table limits, `PINKDB_LAKE_INLINING_ROW_LIMIT`)
   live **in the catalog metadata** instead of new data files — scans, stats,

@@ -199,6 +199,46 @@ impl Database {
         Ok(())
     }
 
+    /// The statement-boundary automatic materialized-view pass (wave 80) for
+    /// connections: take the lease (durable only), refresh the store first (a
+    /// WAL append below must land after every earlier commit), recompute every
+    /// due view, and log the batch as one record. A statement with no due view
+    /// pays one read-locked scan and nothing else.
+    fn boundary_mv_refresh(&self) -> Result<()> {
+        {
+            let store = read_lock(&self.shared);
+            if !store.has_materialized_views() {
+                return Ok(());
+            }
+            if !store.mv_boundary_has_work(crate::mv::now_ms()) {
+                // Nothing due: drop stale dirty marks so a store with views
+                // nobody depends on does not accumulate them.
+                drop(store);
+                write_lock(&self.shared).mv_pending.clear();
+                return Ok(());
+            }
+        }
+        let lease = self.acquire_lease()?;
+        let mut shared = write_lock(&self.shared);
+        if let Some(g) = &lease {
+            // Another process's commits may carry changed definitions.
+            shared.refresh_under_lease(g)?;
+        }
+        let now = crate::mv::now_ms();
+        if !shared.mv_boundary_has_work(now) {
+            shared.mv_pending.clear();
+        } else {
+            let report = shared.refresh_due_auto_views(now);
+            if !report.stmts.is_empty() {
+                shared.log_auto_refresh(&report)?;
+            }
+        }
+        shared.maybe_auto_checkpoint(lease.as_ref());
+        drop(shared);
+        drop(lease);
+        Ok(())
+    }
+
     /// Checkpoint the durable store: atomically write the bound `.pink` and
     /// roll the WAL generation. Errors for in-memory databases. Takes the
     /// lease before the store lock; the checkpoint refreshes first, so it can
@@ -298,18 +338,16 @@ impl Connection {
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
         read_lock(&self.db.shared).ensure_wal_healthy()?;
         let stmts = crate::sql::parse_statements(sql)?;
-        // Only durable stores need the per-statement source text for the WAL.
-        let texts = if self.db.is_durable() {
-            let texts = crate::sql::statement_texts(sql)?;
-            if texts.len() != stmts.len() {
-                return Err(PinkDbError::Execution(
-                    "internal error: statement source split disagrees with the parser".to_string(),
-                ));
-            }
-            Some(texts)
-        } else {
-            None
-        };
+        // Per-statement source text: the WAL logs committed statements and a
+        // materialized view persists its defining SQL (wave 80), so the split
+        // runs for in-memory databases too.
+        let texts = crate::sql::statement_texts(sql)?;
+        if texts.len() != stmts.len() {
+            return Err(PinkDbError::Execution(
+                "internal error: statement source split disagrees with the parser".to_string(),
+            ));
+        }
+        let texts = Some(texts);
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
             let text = texts.as_ref().map(|t| t[i].as_str());
@@ -390,6 +428,13 @@ impl Connection {
             crate::sql::ast::Statement::Rollback => return self.txn_rollback(),
             _ => {}
         }
+        // Wave 80: automatic materialized-view refresh at the statement
+        // boundary — never inside an open transaction (deferred to the first
+        // boundary after COMMIT/ROLLBACK). Reads pay one shared-locked scan
+        // unless something is due.
+        if self.txn.is_none() {
+            self.db.boundary_mv_refresh()?;
+        }
         match &mut self.txn {
             Some(txn) => {
                 // Store/process-level DDL is refused inside a transaction: the
@@ -404,6 +449,7 @@ impl Connection {
                 let pre = self.current_db.clone();
                 let (plan, dynamic_functions_used) =
                     crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
+                let plan = crate::plan::with_mv_source(plan, sql_text);
                 // A durable transaction logs its mutating statements: one
                 // that reads an attached lake table could never replay (the
                 // guard is a no-op for in-memory stores).
@@ -412,12 +458,18 @@ impl Connection {
                 }
                 record_writes(&plan, &pre, &mut txn.table_writes, &mut txn.view_writes);
                 crate::plan::collect_tables_read(&plan, &pre, &mut txn.table_reads);
+                // A materialized-view statement reads objects the plan cannot
+                // name (its defining query's base tables). MV statements are
+                // refused inside transactions today; keep the read set honest
+                // if that refusal is ever relaxed.
+                for (db, table) in txn.work.mv_reads_of(&plan, &pre) {
+                    txn.table_reads.insert((db, table));
+                }
                 if crate::plan::writes_tables(&plan) {
                     // The frame's set: only statements that get buffered into
                     // the WAL record contribute (a read-only statement's text
                     // never replays).
-                    let mut stmt_sets = crate::wal::FrameSets::default();
-                    crate::plan::plan_sets(&plan, &pre, &mut stmt_sets);
+                    let stmt_sets = txn.work.plan_sets_store(&plan, &pre);
                     txn.wal_sets.extend(&stmt_sets);
                 }
                 let result = crate::exec::run(&mut txn.work, &plan)?;
@@ -565,6 +617,7 @@ impl Connection {
         // have changed the catalog between the caller's read-guard bind and
         // this lock.
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        let plan = crate::plan::with_mv_source(plan, sql_text);
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -577,6 +630,7 @@ impl Connection {
                 shared.refresh_under_lease(g)?;
             }
             let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+            let plan = crate::plan::with_mv_source(plan, sql_text);
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
@@ -643,6 +697,7 @@ impl Connection {
         }
         shared.note_optimistic_fallback_for_test();
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        let plan = crate::plan::with_mv_source(plan, sql_text);
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
@@ -678,6 +733,12 @@ impl Connection {
         lease: Option<&LeaseGuard>,
         sets: Option<&crate::wal::FrameSets>,
     ) -> Result<()> {
+        if crate::plan::writes_tables(plan) {
+            // Wave 80: the committed unit's writes feed the ON COMMIT trigger
+            // for the next statement boundary (a no-op for MV-free stores).
+            let writes = shared.plan_writes_of(plan, pre);
+            shared.mark_mv_writes(&writes);
+        }
         if let Some(text) = sql_text {
             if crate::plan::writes_tables(plan) {
                 let after = session_after(result, pre, shared);
@@ -688,11 +749,7 @@ impl Connection {
                 // walking the plan again.
                 let sets = match sets {
                     Some(s) => s.clone(),
-                    None => {
-                        let mut s = crate::wal::FrameSets::default();
-                        crate::plan::plan_sets(plan, pre, &mut s);
-                        s
-                    }
+                    None => shared.plan_sets_store(plan, pre),
                 };
                 shared.wal_append_session(
                     pre,
@@ -901,6 +958,9 @@ impl Connection {
         if !txn.wal_stmts.is_empty() {
             shared.maybe_auto_checkpoint(lease.as_ref());
         }
+        // Wave 80: the committed transaction's writes feed the ON COMMIT
+        // trigger for the next statement boundary.
+        shared.mark_mv_writes(&txn.table_writes);
         Ok(QueryResult::Committed)
     }
 
@@ -939,6 +999,13 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
         Statement::DropDatabase { .. } => "DROP DATABASE",
         Statement::LoadExtension { .. } => "LOAD EXTENSION",
         Statement::Checkpoint => "CHECKPOINT",
+        // Wave 80: materialized-view definitions, schedules and counters are
+        // store metadata the per-table transaction merge does not cover, and
+        // auto-refresh defers to the first boundary after COMMIT anyway.
+        Statement::CreateMaterializedView { .. } => "CREATE MATERIALIZED VIEW",
+        Statement::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",
+        Statement::RefreshMaterializedViews => "REFRESH MATERIALIZED VIEWS",
+        Statement::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
         _ => return None,
     })
 }
@@ -981,6 +1048,15 @@ pub(crate) fn record_writes(
         LogicalPlan::CreateTable { db, name, .. }
         | LogicalPlan::CreateTableAs { db, name, .. }
         | LogicalPlan::DropTable { db, name, .. } => {
+            tables.insert(key(db, name));
+        }
+        // A materialized-view statement writes its backing table; the
+        // definition itself rides along in the same WAL record (wave 80).
+        // `REFRESH MATERIALIZED VIEWS` names the whole database instead — the
+        // store-side helper `PinkDb::plan_writes_of` resolves its views.
+        LogicalPlan::CreateMaterializedView { db, name, .. }
+        | LogicalPlan::RefreshMaterializedView { db, name }
+        | LogicalPlan::DropMaterializedView { db, name, .. } => {
             tables.insert(key(db, name));
         }
         LogicalPlan::AlterTable { db, name, op } => {

@@ -763,6 +763,64 @@ pub fn interval_sub(a: Interval, b: Interval) -> Option<Interval> {
     interval_add(a, interval_negate(b))
 }
 
+// ---------- materialized-view refresh policy (wave 80) ----------
+
+/// How a materialized view keeps itself fresh.
+///
+/// The policy is part of the view's catalog entry and is persisted in `.pink`
+/// (`CREATE MATERIALIZED VIEW v REFRESH <policy> AS SELECT ...`). Enforcement
+/// is daemonless: `Every` and `OnCommit` views are recomputed at statement
+/// boundaries, never inside an open transaction. [`crate::mv`] documents the
+/// exact freshness guarantee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefreshPolicy {
+    /// Only an explicit `REFRESH` recomputes the view (the default).
+    Manual,
+    /// Recompute at the first statement boundary where at least `interval`
+    /// elapsed since the last refresh attempt. Calendar fields follow DuckDB's
+    /// interval comparison rule (1 month = 30 days, 1 day = 24 h).
+    Every { interval: Interval },
+    /// Recompute at the first statement boundary after a committed unit wrote
+    /// one of the view's base tables (or refreshed a base view).
+    OnCommit,
+}
+
+impl RefreshPolicy {
+    /// The `Every` interval in microseconds under the interval comparison
+    /// rule (months → 30 days, days → 24 h), if this policy has one.
+    pub fn interval_micros(&self) -> Option<i128> {
+        match self {
+            RefreshPolicy::Every { interval } => Some(interval_key(
+                interval.months,
+                interval.days,
+                interval.micros,
+            )),
+            _ => None,
+        }
+    }
+
+    /// Is an `Every` view due `elapsed_us` microseconds after its last
+    /// attempt? A non-positive interval is due immediately (never true for
+    /// `Manual`/`OnCommit`).
+    pub fn due(&self, elapsed_us: i128) -> bool {
+        self.interval_micros().is_some_and(|iv| elapsed_us >= iv)
+    }
+}
+
+impl std::fmt::Display for RefreshPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshPolicy::Manual => write!(f, "manual"),
+            RefreshPolicy::OnCommit => write!(f, "on commit"),
+            RefreshPolicy::Every { interval } => write!(
+                f,
+                "every {}",
+                format_interval(interval.months, interval.days, interval.micros)
+            ),
+        }
+    }
+}
+
 /// Interval × float: months and days multiply field-wise, and each fractional
 /// carry is pushed down (fractional months → 30-day days, fractional days →
 /// microseconds); micros round half to even (DuckDB's rule, pinned by

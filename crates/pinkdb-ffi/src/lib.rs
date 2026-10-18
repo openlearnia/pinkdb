@@ -313,6 +313,7 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::DroppedIndex { .. } => PINKDB_STMT_DROPPED_TABLE,
         QueryResult::CreatedMaterializedView { .. } => PINKDB_STMT_CREATED,
         QueryResult::RefreshedMaterializedView { .. } => PINKDB_STMT_CREATED,
+        QueryResult::RefreshedMaterializedViews { .. } => PINKDB_STMT_CREATED,
         QueryResult::DroppedMaterializedView { .. } => PINKDB_STMT_DROPPED_TABLE,
     }
 }

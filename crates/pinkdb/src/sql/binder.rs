@@ -3019,6 +3019,7 @@ pub(crate) fn bind_tracked_with(
             name,
             query,
             if_not_exists,
+            policy,
         } => {
             let target = Binder::new(db, default_db).resolve_db(qdb)?;
             // Bind the inner query.
@@ -3031,6 +3032,10 @@ pub(crate) fn bind_tracked_with(
                     name: name.clone(),
                     query: Box::new(plan),
                     if_not_exists: *if_not_exists,
+                    policy: *policy,
+                    // The statement's source text is attached by the runner
+                    // (`plan::with_mv_source`): the binder never sees it.
+                    source: String::new(),
                 },
                 dynamic,
             ))
@@ -3041,6 +3046,12 @@ pub(crate) fn bind_tracked_with(
                 name: name.clone(),
             })
         }
+        Statement::RefreshMaterializedViews => empty(LogicalPlan::RefreshMaterializedViews {
+            db: Some(Binder::new(db, default_db).resolve_db(&None)?),
+        }),
+        Statement::ShowMaterializedViews => empty(LogicalPlan::ShowMaterializedViews {
+            db: Some(default_db.to_ascii_lowercase()),
+        }),
         Statement::DropMaterializedView {
             db: qdb,
             name,
@@ -4309,6 +4320,20 @@ fn cast_null_columns(
     }
 }
 
+/// Bind a materialized view's defining query without evaluating it: the
+/// view's own database resolves unqualified names (wave 80). Used by `CREATE
+/// MATERIALIZED VIEW` (which also carries where-clauses/params via the normal
+/// statement path) and by the `.pink` loader, which rebinds a persisted
+/// definition.
+pub(crate) fn bind_mv_query(
+    db: &PinkDb,
+    default_db: &str,
+    query: &crate::sql::ast::Select,
+) -> Result<LogicalPlan> {
+    let mut binder = Binder::new(db, default_db);
+    bind_select_in(db, &mut binder, query)
+}
+
 /// Output schema of a bound plan: (column name, type) per output column.
 /// Used for CTE/derived-table scoping and subquery arity checks. `ctes`
 /// carries the CTEs visible at this point (CTEs shadow catalog tables);
@@ -4365,12 +4390,14 @@ pub(crate) fn plan_schema(
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
+        | LogicalPlan::ShowMaterializedViews { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. } => Ok(Vec::new()),
         LogicalPlan::IndexScan { db: qdb, table, .. } => {
             let lookup = qdb.as_deref().unwrap_or(default_db);

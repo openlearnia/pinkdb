@@ -4,7 +4,7 @@
 //! rows). [`PinkDb`] = map of table name → table. Single connection, single
 //! thread. No persistence in v1.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -757,12 +757,36 @@ pub struct ViewDef {
     pub cols: Option<Vec<String>>,
 }
 
-/// A materialized view: a cached query result stored as a table, plus the
-/// refresh query used by `REFRESH MATERIALIZED VIEW`.
+/// A materialized view: a cached query result stored as a regular table, plus
+/// the defining query used by `REFRESH MATERIALIZED VIEW` and the refresh
+/// policy that schedules automatic recomputation (wave 80).
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaterializedViewDef {
     pub name: String,
-    pub query: crate::plan::LogicalPlan,
+    /// The bound defining query, evaluated by every refresh. `None` when the
+    /// definition could not be rebound (the file names a base table or view
+    /// that does not exist at load time); a refresh then retries rebinding
+    /// `query_sql` and reports the failure if it still cannot bind.
+    pub query: Option<Box<crate::plan::LogicalPlan>>,
+    /// The defining `CREATE MATERIALIZED VIEW ...` statement text, captured at
+    /// parse time and persisted in `.pink` (a bound plan cannot be rendered
+    /// back to SQL). Also the rebuild source when `query` is `None`.
+    pub query_sql: String,
+    /// When (and whether) the view recomputes itself at statement boundaries.
+    pub policy: crate::types::RefreshPolicy,
+    /// Unix epoch **milliseconds** of the last successful refresh. Creation
+    /// counts as the initial computation.
+    pub last_refreshed_ms: i64,
+    /// Unix epoch milliseconds of the last refresh *attempt* (success or
+    /// failure): an `EVERY` view retries at most once per interval, so a
+    /// broken view cannot burn a full evaluation on every statement.
+    pub last_attempt_ms: i64,
+    /// Successful refreshes since creation (creation itself does not count).
+    pub refresh_count: u64,
+    /// The most recent *automatic* refresh failure, cleared by the next
+    /// success. The manual `REFRESH` statement reports its error directly and
+    /// leaves this field untouched.
+    pub last_error: Option<String>,
 }
 
 /// One database's catalog: its tables and its session-local views.
@@ -795,7 +819,7 @@ pub struct DbCatalog {
 #[derive(Debug)]
 pub struct PinkDb {
     /// Key = lowercased database name.
-    databases: HashMap<String, DbCatalog>,
+    pub(crate) databases: HashMap<String, DbCatalog>,
     /// Loadable-extension scalar functions (ABI v1, wave 29A), keyed by
     /// lowercased name. Registered by [`PinkDb::load_extension`]; shared by
     /// every clone of the store. Empty for a stock engine, in which case the
@@ -871,6 +895,15 @@ pub struct PinkDb {
     /// the visible catalog for reads only — never part of the store's own
     /// tables and never touched by `.save`, `.lake save`, or the WAL.
     pub(crate) attached_lakes: Vec<Arc<dyn crate::attached::AttachedLake>>,
+    /// `(database, table)` pairs written by *committed* units (autocommit
+    /// statements and COMMITs) since the last statement-boundary refresh pass
+    /// (wave 80): the ON COMMIT trigger's dirty set. Process-local, never
+    /// persisted, cleared by the pass — see `crate::mv`.
+    pub(crate) mv_pending: std::collections::HashSet<(String, String)>,
+    /// `(database, table)` pairs written by the open embedded transaction:
+    /// moved into `mv_pending` at COMMIT, discarded at ROLLBACK (a rolled-back
+    /// write must not trigger an ON COMMIT refresh).
+    pub(crate) txn_writes: std::collections::HashSet<(String, String)>,
 }
 
 impl Default for PinkDb {
@@ -907,6 +940,8 @@ impl Clone for PinkDb {
             allow_sql_load_extension: self.allow_sql_load_extension,
             replaying: false,
             attached_lakes: self.attached_lakes.clone(),
+            mv_pending: self.mv_pending.clone(),
+            txn_writes: HashSet::new(),
         }
     }
 }
@@ -954,6 +989,8 @@ impl PinkDb {
             allow_sql_load_extension: true,
             replaying: false,
             attached_lakes: Vec::new(),
+            mv_pending: HashSet::new(),
+            txn_writes: HashSet::new(),
         }
     }
 
@@ -1163,6 +1200,65 @@ impl PinkDb {
             .ok_or_else(|| PinkDbError::Catalog(format!("materialized view \"{name}\" not found")))
     }
 
+    /// Mutable access to one materialized view's definition.
+    pub(crate) fn materialized_view_mut_in(
+        &mut self,
+        db: &str,
+        name: &str,
+    ) -> Result<&mut MaterializedViewDef> {
+        let key = name.to_ascii_lowercase();
+        self.catalog_mut(db)?
+            .materialized_views
+            .get_mut(&key)
+            .ok_or_else(|| PinkDbError::Catalog(format!("materialized view \"{name}\" not found")))
+    }
+
+    /// Every materialized view of `db`, as `(lowercased key, definition)`
+    /// pairs sorted by key (deterministic order for `SHOW MATERIALIZED VIEWS`,
+    /// `REFRESH MATERIALIZED VIEWS`, and the boundary refresh pass).
+    pub(crate) fn materialized_views_in(&self, db: &str) -> Vec<(String, MaterializedViewDef)> {
+        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, MaterializedViewDef)> = cat
+            .materialized_views
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Names of every materialized view of `db`, sorted (display names).
+    pub(crate) fn materialized_view_names_in(&self, db: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .databases
+            .get(&Self::db_key(db))
+            .map(|c| {
+                c.materialized_views
+                    .values()
+                    .map(|v| v.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
+    }
+
+    /// The `(lowercased db, lowercased table)` pairs the refresh of the MV
+    /// `(db, name)` reads: its defining query's base tables. Empty for an
+    /// unknown view or one whose query could not be rebound.
+    pub(crate) fn materialized_view_deps(&self, db: &str, name: &str) -> HashSet<(String, String)> {
+        let mut out = HashSet::new();
+        let Ok(mv) = self.materialized_view_in(db, name) else {
+            return out;
+        };
+        if let Some(q) = &mv.query {
+            crate::plan::collect_tables_read(q, db, &mut out);
+        }
+        out
+    }
+
     /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.
     pub fn in_transaction(&self) -> bool {
         self.txn_snapshot.is_some()
@@ -1280,7 +1376,14 @@ impl PinkDb {
         dynamic_functions_used: &[String],
         sets: Option<&crate::wal::FrameSets>,
     ) -> Result<()> {
-        if !crate::plan::writes_tables(plan) {
+        // Replayed statements are already in the WAL and must never be logged
+        // again — not even buffered into an open transaction's record: frame
+        // replay runs *inside* `commit`'s validation span (the transaction is
+        // still open, only its WAL handle is detached), and wave 80 made the
+        // per-statement source text unconditional, which took the old
+        // `is_durable()` shield away. Buffering here would append the frame's
+        // own statements to this transaction's record and replay them twice.
+        if self.replaying || !crate::plan::writes_tables(plan) {
             return Ok(());
         }
         let touched = self.dynamic_function_paths(dynamic_functions_used);
@@ -1289,11 +1392,7 @@ impl PinkDb {
         // other writers can validate optimistic commits against this frame.
         let sets = match sets {
             Some(s) => s.clone(),
-            None => {
-                let mut s = crate::wal::FrameSets::default();
-                crate::plan::plan_sets(plan, &self.current_db.clone(), &mut s);
-                s
-            }
+            None => self.plan_sets_store(plan, &self.current_db.clone()),
         };
         if self.in_transaction() {
             if self.wal_txn_db.is_none() {
@@ -1391,6 +1490,9 @@ impl PinkDb {
         self.wal_txn_ext_loaded.clear();
         self.wal_txn_sets = crate::wal::FrameSets::default();
         self.txn_touched = crate::wal::FrameSets::default();
+        // A new transaction starts with no writes; ROLLBACK must not leave
+        // this transaction's writes in the ON COMMIT dirty set.
+        self.txn_writes.clear();
         // Capture the base *before* taking the snapshot: a frame committed
         // between the two is past the base, so the commit validates it
         // (conservative), while a base captured after the snapshot could miss
@@ -1466,6 +1568,9 @@ impl PinkDb {
         self.wal_txn_ext_loaded.clear();
         self.wal_txn_sets = crate::wal::FrameSets::default();
         self.txn_touched = crate::wal::FrameSets::default();
+        // The transaction's writes are now committed: they become the ON
+        // COMMIT trigger's dirty set for the next statement boundary.
+        self.mv_pending.extend(self.txn_writes.drain());
         self.txn_snapshot = None;
         // The base is released only after the record is durable.
         self.txn_base = None;
@@ -1487,6 +1592,10 @@ impl PinkDb {
                 self.wal_txn_ext_loaded.clear();
                 self.wal_txn_sets = crate::wal::FrameSets::default();
                 self.txn_touched = crate::wal::FrameSets::default();
+                // A rolled-back transaction's writes never happened: drop its
+                // ON COMMIT dirty set (the snapshot restore above already
+                // reverted the pre-`BEGIN` value).
+                self.txn_writes.clear();
                 // The snapshot was cloned without a base; dropping the old
                 // `self` above already unregistered it.
                 self.txn_base = None;

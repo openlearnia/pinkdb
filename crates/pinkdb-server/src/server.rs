@@ -671,6 +671,7 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
         QueryResult::DroppedIndex { name } => done(w, DoneKind::DroppedTable, 0, name),
         QueryResult::CreatedMaterializedView { name } => done(w, DoneKind::Created, 0, name),
         QueryResult::RefreshedMaterializedView { name } => done(w, DoneKind::Created, 0, name),
+        QueryResult::RefreshedMaterializedViews { .. } => done(w, DoneKind::Created, 0, ""),
         QueryResult::DroppedMaterializedView { name } => done(w, DoneKind::DroppedTable, 0, name),
     }
 }

@@ -9,6 +9,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-18</h2>
+<h3>Wave 80 — materialized-view refresh policies ✅</h3>
+<ul>
+<li><strong>Manual</strong>: <code>REFRESH MATERIALIZED VIEW name</code> (and <code>REFRESH name</code>, plus <code>REFRESH MATERIALIZED VIEWS</code> refreshing every view of the database all-or-nothing); <code>SHOW MATERIALIZED VIEWS</code> lists schedule, last refresh time/count and staleness.</li>
+<li><strong>Scheduled</strong>: <code>CREATE MATERIALIZED VIEW v REFRESH MANUAL | EVERY INTERVAL '5 minutes' | ON COMMIT AS SELECT …</code> — enforced <strong>daemonless</strong> at statement boundaries (embedded and <code>pinkdb-server</code> alike; never mid-transaction), with automatic refreshes WAL-logged and replay-exact.</li>
+<li>Fix: MV definitions are now WAL-logged and persisted — previously a durable reopen silently lost them.</li>
+</ul>
 <h3>Wave 68 — inlined small writes &amp; CDC ✅</h3>
 <ul>
 <li>Tiny commits (≤ 10 rows by default; per-table limits, <code>PINKDB_LAKE_INLINING_ROW_LIMIT</code>) live <strong>in the catalog metadata</strong> instead of new data files — scans, stats, time travel, partitions and encryption all see them correctly. <code>.lake flush</code> materializes them into real files and keeps the history.</li>

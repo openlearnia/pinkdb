@@ -1182,3 +1182,75 @@ fn prepared_statements_round_trip_with_parameters() {
 
     assert_server_healthy(&addr);
 }
+
+/// Wave 80: materialized-view refresh policies over the wire. The server
+/// holds one `Connection` per client, so every statement boundary gets the
+/// automatic-refresh pass — creation, manual completion, `REFRESH ALL`,
+/// schedules and staleness all round-trip through the protocol.
+#[test]
+fn materialized_view_refresh_policies_round_trip() {
+    let (_handle, addr) = start();
+    let mut a = Client::connect(&addr).expect("client a");
+    let mut b = Client::connect(&addr).expect("client b");
+
+    a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+    a.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+    a.execute("CREATE MATERIALIZED VIEW mv REFRESH ON COMMIT AS SELECT a FROM t;")
+        .unwrap();
+    a.execute("INSERT INTO t VALUES (3);").unwrap();
+    // b's own boundary refreshes the shared store before its SELECT runs.
+    assert_eq!(
+        rows(b.execute("SELECT a FROM mv;").unwrap()),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)]
+        ]
+    );
+
+    // Introspection over the wire: one row, schedule and counter visible.
+    let show = rows(b.execute("SHOW MATERIALIZED VIEWS;").unwrap());
+    assert_eq!(show.len(), 1);
+    assert_eq!(show[0][0], varchar("mv"));
+    assert_eq!(show[0][1], varchar("on commit"));
+    assert_eq!(show[0][3], Value::Bigint(1));
+
+    // Manual completion: `REFRESH ALL` reports the refreshed set.
+    let refreshed = single(a.execute("REFRESH MATERIALIZED VIEWS;").unwrap());
+    assert!(matches!(
+        refreshed,
+        QueryResult::Created | QueryResult::RefreshedMaterializedViews { .. }
+    ));
+    assert_eq!(
+        rows(a.execute("SELECT a FROM mv;").unwrap()),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)]
+        ]
+    );
+
+    // A scheduled view fires at a client statement boundary.
+    a.execute(
+        "CREATE MATERIALIZED VIEW every_mv REFRESH EVERY INTERVAL '0 seconds' AS SELECT a FROM t;",
+    )
+    .unwrap();
+    a.execute("INSERT INTO t VALUES (4);").unwrap();
+    assert_eq!(
+        rows(a.execute("SELECT a FROM every_mv;").unwrap()),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+            vec![Value::Integer(4)]
+        ]
+    );
+
+    // Errors are clean and the connection stays usable.
+    let err = b
+        .execute("REFRESH MATERIALIZED VIEW not_there;")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not_there"), "{err}");
+    assert_server_healthy(&addr);
+}

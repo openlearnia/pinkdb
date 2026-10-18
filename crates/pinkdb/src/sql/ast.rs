@@ -3,7 +3,7 @@
 //! Statements: `CREATE TABLE`, `INSERT`, `SELECT` (with an optional single
 //! equi-`JOIN` — INNER / LEFT [OUTER] / RIGHT [OUTER]).
 
-use crate::types::Value;
+use crate::types::{RefreshPolicy, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 // v1: a handful of statements alive at once; enum size is irrelevant.
@@ -98,24 +98,36 @@ pub enum Statement {
     ShowTables,
     /// `SHOW DATABASES`: every database in the store, sorted by name.
     ShowDatabases,
-    /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS SELECT ...`.
+    /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [REFRESH <policy>] AS
+    /// SELECT ...`: the query is evaluated once at creation; the view is a
+    /// real table until the next refresh.
     CreateMaterializedView {
         db: Option<String>,
         name: String,
         query: Box<Select>,
         if_not_exists: bool,
+        /// The refresh policy (`REFRESH MANUAL | EVERY INTERVAL '…' | ON
+        /// COMMIT`); defaults to `MANUAL`.
+        policy: RefreshPolicy,
     },
-    /// `REFRESH MATERIALIZED VIEW name`.
+    /// `REFRESH [MATERIALIZED VIEW] name`.
     RefreshMaterializedView {
         db: Option<String>,
         name: String,
     },
+    /// `REFRESH MATERIALIZED VIEWS`: recompute every materialized view of the
+    /// session database, all-or-nothing (every query is evaluated before any
+    /// view is written).
+    RefreshMaterializedViews,
     /// `DROP MATERIALIZED VIEW [IF EXISTS] name`.
     DropMaterializedView {
         db: Option<String>,
         name: String,
         if_exists: bool,
     },
+    /// `SHOW MATERIALIZED VIEWS` (wave 80): name, schedule, last refresh,
+    /// refresh count, staleness and the last refresh error, sorted by name.
+    ShowMaterializedViews,
     /// `CREATE INDEX [IF NOT EXISTS] <name> ON <table>(<col>)`.
     CreateIndex {
         db: Option<String>,

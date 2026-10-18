@@ -275,6 +275,28 @@ it and never affects other sessions: the shared store is untouched.</p>
   (<code>"use"</code> works).</li>
 </ul>
 
+<h2>Materialized views</h2>
+
+<pre class="code" data-lang="sql"><code>CREATE MATERIALIZED VIEW totals REFRESH EVERY INTERVAL '5 minutes' AS
+  SELECT region, SUM(total) AS t FROM sales GROUP BY region;
+REFRESH MATERIALIZED VIEW totals;      -- manual (shorthand: REFRESH totals)
+REFRESH MATERIALIZED VIEWS;            -- every view of the session database
+SHOW MATERIALIZED VIEWS;               -- schedule, last refresh, staleness
+DROP MATERIALIZED VIEW totals;</code></pre>
+
+<ul>
+  <li>Views are stored as queryable tables plus their defining query —
+  per-database, persisted and WAL-logged.</li>
+  <li>Refresh policies: <code>MANUAL</code> (default), <code>EVERY INTERVAL
+  '…'</code>, <code>ON COMMIT</code>. They are enforced **without background
+  threads** at statement boundaries: the first statement after a view is due
+  (or after a commit that dirtied its base tables) observes fresh data; nothing
+  refreshes inside a transaction.</li>
+  <li><code>SHOW MATERIALIZED VIEWS</code> reports the schedule, last refresh
+  time/count and staleness; an automatic-refresh failure keeps the last good
+  data, records the error and retries with backoff.</li>
+</ul>
+
 <h2>Not supported yet</h2>
 
 <p>These are real gaps, listed so you can plan around them. Most are scheduled on the

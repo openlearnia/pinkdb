@@ -897,14 +897,33 @@ peg::parser! {
             = word("if") kw(Keyword::Exists) { true }
             / { false }
 
+        /// The optional `REFRESH <policy>` clause of `CREATE MATERIALIZED
+        /// VIEW` (wave 80). Written *before* `AS` (the position Postgres uses
+        /// for storage options): after the query the word `refresh` could be
+        /// consumed as a from-item alias (`FROM t refresh`), which would make
+        /// the clause ambiguous.
+        rule refresh_policy() -> crate::types::RefreshPolicy
+            = word("refresh") word("every") iv:interval_value() {
+                  crate::types::RefreshPolicy::Every { interval: iv }
+              }
+            / word("refresh") word("on") word("commit") {
+                  crate::types::RefreshPolicy::OnCommit
+              }
+            / word("refresh") word("manual") {
+                  crate::types::RefreshPolicy::Manual
+              }
+            / { crate::types::RefreshPolicy::Manual }
+
         rule use_stmt() -> Statement
             = kw(Keyword::Use) name:ident() { Statement::Use { name } }
 
-        /// `SHOW TABLES` / `SHOW DATABASES` — matched as words, not reserved
-        /// keywords, so `show` and `tables` stay usable as names.
+        /// `SHOW TABLES` / `SHOW DATABASES` / `SHOW MATERIALIZED VIEWS` —
+        /// matched as words, not reserved keywords, so `show` and `tables`
+        /// stay usable as names.
         rule show_stmt() -> Statement
             = word("show") word("tables") { Statement::ShowTables }
             / word("show") word("databases") { Statement::ShowDatabases }
+            / word("show") word("materialized") word("views") { Statement::ShowMaterializedViews }
 
         /// `DESCRIBE <table>`: DuckDB-shaped column metadata.
         rule describe_stmt() -> Statement
@@ -925,8 +944,15 @@ peg::parser! {
                   }
               }
 
+              /// `REFRESH MATERIALIZED VIEWS` (wave 80: every view of the
+              /// session database, all-or-nothing), `REFRESH MATERIALIZED
+              /// VIEW <name>`, and the `REFRESH <name>` shorthand.
               rule refresh_stmt() -> Statement
-              = word("refresh") word("materialized") kw(Keyword::View) t:table_ref() {
+              = word("refresh") word("materialized") word("views") { Statement::RefreshMaterializedViews }
+              / word("refresh") word("materialized") kw(Keyword::View) t:table_ref() {
+                 Statement::RefreshMaterializedView { db: t.0, name: t.1 }
+              }
+              / word("refresh") t:table_ref() {
                  Statement::RefreshMaterializedView { db: t.0, name: t.1 }
               }
 
@@ -954,8 +980,8 @@ peg::parser! {
             / kw(Keyword::Create) kw(Keyword::Index) ifne:if_not_exists() name:ident() kw(Keyword::On) t:table_ref() lparen() col:ident() rparen() {
                   Statement::CreateIndex { db: t.0, name, table: t.1, column: col, if_not_exists: ifne }
               }
-            / kw(Keyword::Create) word("materialized") kw(Keyword::View) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {
-                  Statement::CreateMaterializedView { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne }
+            / kw(Keyword::Create) word("materialized") kw(Keyword::View) ifne:if_not_exists() t:table_ref() policy:refresh_policy() kw(Keyword::As) query:select() {
+                  Statement::CreateMaterializedView { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, policy }
               }
             / kw(Keyword::Create) kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
                   Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query) }
@@ -1526,18 +1552,21 @@ peg::parser! {
             = s:string_lit() { s }
             / i:ident() { i }
 
+        /// `INTERVAL '...'` as a value: used by the `REFRESH EVERY` policy
+        /// clause (an expression literal wraps the same parse).
+        rule interval_value() -> crate::types::Interval
+            = interval_name() s:string_lit() {?
+                  crate::types::parse_interval(&s).ok_or("valid INTERVAL literal")
+              }
+
         /// `INTERVAL '...'` — matched as a bare word (like `extract`) so
         /// `interval` stays usable as a column/table name and a type name.
         rule interval_literal() -> Expr
-            = interval_name() s:string_lit() {?
-                  crate::types::parse_interval(&s)
-                      .map(|iv| Expr::Literal(Value::Interval {
-                          months: iv.months,
-                          days: iv.days,
-                          micros: iv.micros,
-                      }))
-                      .ok_or("valid INTERVAL literal")
-              }
+            = iv:interval_value() { Expr::Literal(Value::Interval {
+                  months: iv.months,
+                  days: iv.days,
+                  micros: iv.micros,
+              }) }
 
         rule interval_name()
             = s:ident_raw() ws() {? if s.eq_ignore_ascii_case("interval") { Ok(()) } else { Err("INTERVAL") } }
@@ -2606,6 +2635,17 @@ mod tests {
         "SHOW TABLES;",
         "SHOW DATABASES;",
         "show tables;",
+        // Wave 80: materialized-view refresh policies and completion forms.
+        "CREATE MATERIALIZED VIEW mv AS SELECT a FROM t;",
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS mv REFRESH MANUAL AS SELECT a FROM t;",
+        "CREATE MATERIALIZED VIEW mv REFRESH EVERY INTERVAL '5 minutes' AS SELECT a FROM t;",
+        "CREATE MATERIALIZED VIEW mv REFRESH ON COMMIT AS SELECT a FROM t;",
+        "create materialized view mv refresh every interval '0 days' as select a from t;",
+        "REFRESH MATERIALIZED VIEW mv;",
+        "REFRESH mv;",
+        "REFRESH MATERIALIZED VIEWS;",
+        "SHOW MATERIALIZED VIEWS;",
+        "DROP MATERIALIZED VIEW IF EXISTS mv;",
         "DESCRIBE t;",
         "DESCRIBE db1.t;",
         "describe \"My Table\";",
@@ -2783,6 +2823,17 @@ mod tests {
         "CREATE TABLE t AS;",
         "CREATE TABLE IF t (a INTEGER);",
         "DROP TABLE IF t;",
+        // Wave 80: the refresh clause is `REFRESH MANUAL | EVERY INTERVAL
+        // '<…>' | ON COMMIT`, and `REFRESH MATERIALIZED VIEWS` takes no name.
+        "CREATE MATERIALIZED VIEW mv REFRESH AS SELECT 1;",
+        "CREATE MATERIALIZED VIEW mv REFRESH EVERY '5 minutes' AS SELECT 1;",
+        "CREATE MATERIALIZED VIEW mv REFRESH EVERY INTERVAL 'nonsense' AS SELECT 1;",
+        "CREATE MATERIALIZED VIEW mv REFRESH ON AS SELECT 1;",
+        "CREATE MATERIALIZED VIEW mv AS SELECT 1 REFRESH MANUAL;",
+        "REFRESH MATERIALIZED VIEWS extra;",
+        "REFRESH MATERIALIZED VIEW;",
+        "SHOW MATERIALIZED;",
+        "SHOW MATERIALIZED VIEW;",
     ];
 
     /// Every valid entry parses, and the raw statement split agrees with the

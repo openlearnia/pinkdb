@@ -3481,7 +3481,15 @@ impl PinkDb {
             lease.clone(),
         )?;
         for rec in &records {
-            replay_record(&mut db, rec)?;
+            // The same replay mode `replay_frames` uses (wave 80): a replayed
+            // statement must not trigger clock-dependent or dirty-driven
+            // materialized-view refreshes — the logged `REFRESH` statements
+            // reproduce those — and a replayed `LOAD EXTENSION` of an already
+            // loaded path is the no-op the WAL intends.
+            db.replaying = true;
+            let result = replay_record(&mut db, rec);
+            db.replaying = false;
+            result?;
         }
         info.replayed_records += records.len() as u64;
         info.replayed_statements += records.iter().map(|r| r.stmts.len() as u64).sum::<u64>();
