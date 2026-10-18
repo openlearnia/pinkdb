@@ -1451,6 +1451,11 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   survival, graceful shutdown, byte-parity. Gates: fmt/docs/workspace clean,
   clippy (server ± feature, CLI client), server 57 default / **74** with the
   feature, pinkdb 564, duckdiff **171/171**. Sizes: server 2,980,912 B default
-  (+16 B), 3,374,352 B with `async-server`. Overlap flagged with wave 46
+  (+16 B), 3,374,352 B with `async-server`. **A/B benchmark** (in-process
+  example `server_bench`, same `Client`, `SELECT COUNT(*)` round trips):
+  1 client 14.7k vs **20.2k** QPS; 8 clients 41.8k vs **64.6k** (1.55×);
+  32 clients 56.0k vs **84.8k** (1.51×, p95 0.69 → 0.50 ms). The async
+  transport wins throughput under concurrency and the tail latency, with
+  equal per-request latency at low load. Overlap flagged with wave 46
   (TLS edits the same server files) — reconcile at 46's integration. Worktree
   removed.
