@@ -75,8 +75,8 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 40i | Extension trust + distribution: Ed25519 artifact signatures, SQL `INSTALL`, Linux artifacts, Python wheel, standalone Go module | queued | — |
 | 40j | Test depth: window/plan unit tests, WAL fuzz, persist property tests, duckdiff gated in CI | queued | — |
 | 41 | Primary/foreign keys, Snowflake-style: declarative `PRIMARY KEY` / `FOREIGN KEY` / `UNIQUE` / `NOT NULL` constraints (metadata, not enforced), `RELY` / `NOT ENFORCED` accepted, persisted in the catalog, used by the optimizer (e.g. FK→PK join elimination) | done | landed; DuckDB-pinned DDL validation, DESCRIBE `PRI`/`UNI` parity, conservative FK→PK join elimination; `.pink` v5 constraint section (flags bit 0) composed with wave 62's dtype tags; duckdiff 165 → 171 |
-| 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | in progress | `wt-index`, dispatched on 7bae38c |
-| 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | queued | — |
+| 42 | Index support: `CREATE INDEX` / `DROP INDEX`, hash indexes for equality lookups + automatic per-chunk zone maps, optimizer index-vs-scan choice, per-database, persisted/WAL-logged | done | landed (user, `a79cd41`): single-column **hash indexes** (`CREATE INDEX [IF NOT EXISTS]` / `DROP INDEX [IF EXISTS]`), `Value → row indices`, per-database scoping, optimizer rewrites `col = literal` → `IndexScan`, CLI/server/FFI result kinds; **`.pink` persistence deferred** (queued as wave 79) |
+| 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | done | landed (user, `2be5d3b`): stored as a queryable table + refresh query in the catalog, `REFRESH` fully recomputes, `IF [NOT] EXISTS`, per-database, WAL-logged, persisted |
 | 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + **JavaScript procedures** (optional embedded engine; WAL-replay determinism must be solved — volatile calls refused or pinned at record time) | queued | **user-flagged next-list item** — dispatch right after the naming sweep (74) once the lake cluster lands |
 | 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c* | done | 4b53844…(part 6) — 1M battery 416 → 245–250 ms (−41%): group_region 6.7 → 3.2, distinct_lowcard 19.4 → 3.8, windows 63 → 13.5, order_str 36 → 29, group_id/distinct_id 62/69 → 50/50, join_probe 21 → 5.3; @10M group_region 68–70 → 33–35 ms (≤60 target met; DuckLake 37–55), import 274 → 173 ms, `.lake save` 632–758 → 296–340 ms (lake format_version 3, 8,192-row blocks, agreed layout change), `.lake open` 618 → 100 ms, data 29.7 → 25 MB, teardown 93 → 16 ms; 516 tests, duckdiff 60/60 + 64/64 big, kill loops clean, clippy/fmt clean |
 | 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | queued | — |
@@ -112,6 +112,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 76 | File-import options (CSV, shared by `.import` and wave-75 `read_csv`): `delimiter` (+ `quote`/`escape`), `encoding` (utf-8 default; latin-1/windows-1252; utf-16 LE/BE with BOM autodetect), `errors=error\|warn` (strict stays the default; `warn` skips bad rows and prints a rejects report with line/column/reason — store-rejects-table as follow-up), `header=auto\|true\|false` and column matching into existing tables **by header name** (case-insensitive; missing columns import as NULL, extra columns follow the error policy; `names=` override), NULL handling: `nullstr=` custom tokens plus the DuckDB empty-field rule (unquoted empty = NULL, quoted empty = empty string — probe α) with an option to keep empties as empty strings. Exposed as `.import <path> [table] [key=value …]` and a `CsvOptions` API struct | queued | after 75 (shares the surface) or alongside — engine/CSV work, disjoint from the lake cluster |
 | 77 | **SQL macros**: `CREATE MACRO name(params) AS expr` (scalar) and `CREATE MACRO name(params) AS TABLE SELECT …` (table macros), `DROP MACRO [IF EXISTS]`, bind-time parameter substitution (arguments spliced at bind, no dynamic SQL), visibility in `SHOW`/`DESCRIBE`-style introspection, use inside views and other macros (recursion rules probed against α), persisted + WAL-logged like other DDL | queued | engine wave; persistence gains a catalog object — same version policy (clean newer-format refusal, no compat gates) |
 | 78 | **`pinkdb-server` warehouse browsing UI**: feature-gated web console served by the server — static self-hosted assets (no CDNs) + JSON endpoints (databases, schemas, tables, paged row previews, row counts/sizes), read-only browsing first; query console as a follow-up; blocking HTTP/1.1, no async runtime (consistent with the server); binds localhost by default with a loud no-auth warning — **TLS (46) and RBAC (48) are prerequisites for any non-localhost exposure** | queued | new crate `pinkdb-server-ui` (feature of or alongside `pinkdb-server`); reuses the cookieless box-renderer semantics for previews |
+| 79 | Index persistence & hardening (follow-up to the user-landed wave 42): store index definitions in `.pink` (format bump with the clean newer-format refusal), WAL-log `CREATE`/`DROP INDEX` replay exactly, multi-process touched-set coverage, and the optimizer's index-vs-scan choice for range/zone-map skips beyond equality | queued | small; slot per the queue |
 
 Cadence: every fifth wave (40, 45, 50, ...) is a performance-tuning wave — no new features, bench-driven speed work against the committed query bench.
 
@@ -140,11 +141,13 @@ procedures with JavaScript, the user-flagged next item)**, then 42 (indexes),
 macros, 78 server UI queued); the file-format block (70–72) plus 75 (httpfs)
 and 76 (import options) runs after the rename. Integrations are one patch at a
 time with full gates + CI (max two worktrees per the disk-space policy; every
-brief now carries the disk guard). **⏸→▶ Freeze lifted (Oct 18, user): resumed in queue order — wave
-**68** (inlined small writes + CDC; closes the lake-parity block) and
-**42** (indexes) are in flight; next up after them: **74 (naming sweep) + 44
-(stored procedures with JavaScript)**, then 43 (matviews), 46… and the
-file-format block (70–72) plus 75 (httpfs) and 76 (import options).**
+brief now carries the disk guard). **▶ Resumed (Oct 18, user):** waves **42 (indexes)** and **43
+(materialized views)** landed in the user's own session (`a79cd41`,
+`2be5d3b`; index `.pink` persistence queued as wave 79 — the wave-42 row
+notes the deferred piece); **68** (inlined writes + CDC) is in flight; next
+dispatches: **74 (naming sweep) + 44 (stored procedures with JavaScript)**,
+then 46… and the file-format block (70–72) plus 75 (httpfs) and 76 (import
+options).
 
 Lake-scan plan (lake workstream, sub-waves 45b–45o) and the multi-process
 durability workstream (45m–45n): stage 1 shipped as 45d — footer-only
@@ -1232,6 +1235,23 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   **171/171**. Clean apply, **zero conflicts**. Worktree `wt-lake-maint`
   removed after landing. **Dispatch freeze in effect: no new waves until the
   user says otherwise.**
+- 2026-10-18 — User-landed batch (their session; commits `fdee077`,
+  `bc2fd2d`, `a350efc`, `eba967e`, `1fd0531`, `a79cd41`, `2be5d3b`): a
+  bug-review remediation close-out (server ETag validation; both FFI
+  result-building paths guarded; a `.pink` VARCHAR chunk over the u32
+  string-offset limit refused cleanly; attach re-checks its declared row count
+  against the deduped layout), engine performance (COUNT(*) dead-work
+  elimination + fast DISTINCT for int/date/timestamp keys), **wave 42** —
+  single-column hash indexes: `CREATE INDEX [IF NOT EXISTS] … ON t(col)` /
+  `DROP INDEX [IF EXISTS]`, per-database scoping, `Value → row indices`, and
+  the optimizer's `Filter(col = literal) → IndexScan` rewrite (CLI/server/FFI
+  result kinds included; **`.pink` persistence explicitly deferred** → queued
+  as wave 79) — and **wave 43** — materialized views:
+  `CREATE MATERIALIZED VIEW … AS SELECT`, `REFRESH [MATERIALIZED VIEW]` (full
+  recompute), `DROP MATERIALIZED VIEW [IF EXISTS]`, stored as a queryable
+  table plus its refresh query in the catalog, per-database, WAL-logged,
+  persisted. Tracker synced (42/43 → done; 79 queued); the wave-42 dispatch
+  agent was cancelled (redundant) with nothing written.
 - 2026-10-17 — Post-freeze benchmark session (final tree `b3154e7`, Apple
   Silicon, best-of-N, DuckDB α46057 reference): standing battery **250.8 ms**
   (per-query: count 0.03, filter_num 2.25, filter_str 1.60, proj_func 18.2,

@@ -185,6 +185,19 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
+<h3>Wave 42 — hash indexes ✅</h3>
+<ul>
+<li><code>CREATE INDEX [IF NOT EXISTS] name ON t (col)</code> and <code>DROP INDEX [IF EXISTS] name</code> (per-database): a single-column <strong>hash index</strong> turns <code>col = literal</code> lookups into an <code>IndexScan</code> instead of a full scan — results are identical either way. <code>.pink</code> persistence is queued as the follow-up (wave 79).</li>
+</ul>
+<h3>Wave 43 — materialized views ✅</h3>
+<ul>
+<li><code>CREATE MATERIALIZED VIEW … AS SELECT</code>, <code>REFRESH [MATERIALIZED VIEW]</code> (full recompute) and <code>DROP MATERIALIZED VIEW [IF EXISTS]</code>: stored as a queryable table plus its refresh query, per-database, WAL-logged and persisted.</li>
+</ul>
+<h3>Engine fixes and performance</h3>
+<ul>
+<li>Bug-review remediation: server ETag validation, both FFI result-building paths guarded, VARCHAR string-offset-limit refusal, attach row-count re-checks. Performance: COUNT(*) dead-work elimination and fast DISTINCT for integer/date/timestamp keys.</li>
+</ul>
 <h2 id="2026-10-17">2026-10-17<a class="anchor" href="#2026-10-17" aria-label="Permalink: 2026-10-17">#</a></h2>
 <h3>Bug-review remediation — P1 + P2 ✅</h3>
 <ul>
@@ -337,6 +350,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-18">2026-10-18</a></li>
   <li><a href="#2026-10-17">2026-10-17</a></li>
   <li><a href="#2026-10-16">2026-10-16</a></li>
   <li><a href="#2026-10-15">2026-10-15</a></li>

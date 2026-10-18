@@ -8,6 +8,26 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-18
+
+### Wave 42 — hash indexes ✅
+- `CREATE INDEX [IF NOT EXISTS] name ON t (col)` and
+  `DROP INDEX [IF EXISTS] name` (per-database): a single-column **hash index**
+  turns `col = literal` lookups into an `IndexScan` instead of a full scan —
+  results are identical either way. `.pink` persistence is queued as the
+  follow-up (wave 79).
+
+### Wave 43 — materialized views ✅
+- `CREATE MATERIALIZED VIEW … AS SELECT`, `REFRESH [MATERIALIZED VIEW]` (full
+  recompute) and `DROP MATERIALIZED VIEW [IF EXISTS]`: stored as a queryable
+  table plus its refresh query, per-database, WAL-logged and persisted.
+
+### Engine fixes and performance
+- Bug-review remediation: server ETag validation, both FFI result-building
+  paths guarded, VARCHAR string-offset-limit refusal, attach row-count
+  re-checks. Performance: COUNT(*) dead-work elimination and fast DISTINCT for
+  integer/date/timestamp keys.
+
 ## 2026-10-17
 
 ### Bug-review remediation — P1 + P2 ✅
