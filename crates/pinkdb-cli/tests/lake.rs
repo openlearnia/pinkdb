@@ -646,7 +646,11 @@ fn concurrent_lake_saves_stay_consistent() {
             2 + winners.len() as u64,
             "round {round}: version chain has a gap"
         );
-        assert_eq!(winners, (3..=version).collect::<Vec<_>>(), "round {round}");
+        // The winner *set* is the invariant; publish order is a race artifact
+        // (a slow stdout flush can report v4 before v3), so compare sorted.
+        let mut sorted = winners.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (3..=version).collect::<Vec<_>>(), "round {round}");
 
         let out = run(&format!(
             ".lake info {lake}\n.quit\n",
