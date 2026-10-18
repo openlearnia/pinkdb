@@ -102,6 +102,14 @@ jobs:
       - name: cargo test -p pinkdb-cli --features repo
         run: cargo test -p pinkdb-cli --features repo
 
+      # Wave 47: the opt-in tokio transport (the documented I/O-boundary
+      # carve-out). The default server build stays async-free.
+      - name: cargo test -p pinkdb-server --features async-server
+        run: cargo test -p pinkdb-server --features async-server
+
+      - name: default pinkdb-server graph has no async runtime (wave 47 carve-out)
+        run: "! cargo tree -p pinkdb-server | grep -q tokio"
+
       - name: cargo clippy, feature sets (-D warnings)
         run: |
           cargo clippy --all-targets -p pinkdb --features encryption -- -D warnings
@@ -113,6 +121,7 @@ jobs:
           cargo clippy --all-targets -p pinkdb-cli --features vortexlake,s3,repo,client,encryption -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
+          cargo clippy --all-targets -p pinkdb-server --features async-server -- -D warnings
 
       # SIGKILL crash-recovery loops against the dev CLI (plain, multi-db,
       # kill-during-checkpoint, encrypted).

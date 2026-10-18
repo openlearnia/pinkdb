@@ -6,6 +6,16 @@ rust-version = "1.97"
 description = "pinkdb network server: TCP server + blocking client for the pinkdb engine"
 license = "MIT"
 
+[features]
+default = []
+# Opt-in async transport (wave 47): a tokio-based listener that speaks the
+# same framed protocol (v8) and drives the same blocking engine calls through
+# `spawn_blocking`, so existing clients work unchanged. This is the documented
+# carve-out to the workspace's zero-async rule, scoped to the I/O boundary
+# only: the executor/engine stay synchronous, and the default build pulls no
+# async runtime (see the crate docs' "Async carve-out" section).
+async-server = ["dep:tokio"]
+
 [lib]
 name = "pinkdb_server"
 path = "src/lib.rs"
@@ -16,3 +26,14 @@ path = "src/bin/pinkdb-server.rs"
 
 [dependencies]
 pinkdb = { path = "../pinkdb" }
+# Async transport (`async-server` feature only): the listener, per-connection
+# frame I/O, timers, and the blocking pool that runs engine calls. `net` +
+# `rt-multi-thread` + `time` + `sync` + `io-util`; no other runtime feature is
+# needed, and the whole dependency is absent from default builds.
+tokio = { version = "1.53", default-features = false, features = [
+    "rt-multi-thread",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+], optional = true }

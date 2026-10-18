@@ -72,7 +72,9 @@ SQL text
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
 | `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` v4 with the `pinklake` feature; v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
 
-Design rules: Rust edition 2024 (MSRV 1.97), zero async; the core is
+Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
+`async-server` transport, wave 47, is the documented I/O-boundary carve-out);
+the core is
 zero-unsafe, with
 `unsafe` contained to exactly two crates (the C ABI `pinkdb-ffi` and the
 extension loader `pinkdb-ext-loader`). Dependencies are `csv` + `rustyline`,
@@ -1418,9 +1420,15 @@ checked against a real service.
 
 `pinkdb-server` is a separate workspace crate (packaging: the core stays
 lean): a TCP server plus a blocking client for a hand-rolled binary protocol.
-No external dependencies, zero async (one std thread per connection), no
-unsafe. Release binaries: `pinkdb` 2.21 MB (2.28 MB with `--features
-encryption`), `pinkdb-server` 1.85 MB (Apple Silicon, `--release`, thin LTO).
+The default build has no external dependencies, no unsafe, and no async (one
+std thread per connection). The optional `async-server` feature adds a
+tokio transport (`--transport async`: async accept + frame I/O, engine calls
+on the blocking pool) that speaks the identical protocol — it is wave 47's
+documented carve-out to the zero-async rule, scoped to the I/O boundary only
+(the executor stays synchronous; see the crate docs). Release binaries:
+`pinkdb` 2.21 MB (2.28 MB with `--features
+encryption`), `pinkdb-server` 2.98 MB (3.37 MB with `--features
+async-server`; Apple Silicon, `--release`, thin LTO).
 
 ```sh
 # in-memory server on 127.0.0.1:5433
@@ -1438,8 +1446,10 @@ cargo build --release -p pinkdb-cli --features client
 `--port` (default `5433`; `0` picks an ephemeral port), `--file` (durable
 `.pink`: the checkpoint loads and the sidecar WAL replays on restart;
 in-memory when omitted), `--max-connections N` (default 128),
-`--idle-timeout SECS` (default 300; `0` = never) and
-`--allow-load-extension` (off by default; see Security posture). The server
+`--idle-timeout SECS` (default 300; `0` = never), `--transport sync|async`
+(default `sync`; `async` is the tokio I/O transport and needs a build with
+the `async-server` feature) and `--allow-load-extension` (off by default; see
+Security posture). The server
 prints its listening address on startup and runs until terminated.
 
 Server robustness, in one place:

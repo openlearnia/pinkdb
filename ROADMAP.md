@@ -80,7 +80,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + **JavaScript procedures** (optional embedded engine; WAL-replay determinism must be solved — volatile calls refused or pinned at record time) | done | SQL language landed (bodies in `$$…$$`, DECLARE/SET/IF/WHILE/nested blocks/RETURN/RAISE, values-never-text binding, atomic `CALL`, WAL replay re-executes deterministically, `.pink` flags bit 4, protocol v8); JS: the `pinkdb-js` sandbox contract + clean refusal landed — **engine binding deferred to wave 81 (quickjs-ng)**; also fixed a pre-existing folded-NULL typing bug |
 | 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c* | done | 4b53844…(part 6) — 1M battery 416 → 245–250 ms (−41%): group_region 6.7 → 3.2, distinct_lowcard 19.4 → 3.8, windows 63 → 13.5, order_str 36 → 29, group_id/distinct_id 62/69 → 50/50, join_probe 21 → 5.3; @10M group_region 68–70 → 33–35 ms (≤60 target met; DuckLake 37–55), import 274 → 173 ms, `.lake save` 632–758 → 296–340 ms (lake format_version 3, 8,192-row blocks, agreed layout change), `.lake open` 618 → 100 ms, data 29.7 → 25 MB, teardown 93 → 16 ms; 516 tests, duckdiff 60/60 + 64/64 big, kill loops clean, clippy/fmt clean |
 | 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | in progress | `wt-tls`, dispatched on 83e44cd |
-| 47 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | in progress | `wt-async`, dispatched on 83e44cd |
+| 47 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | done | landed; `async-server` feature = tokio listener with one task per connection, engine calls on the blocking pool (`spawn_blocking`, 16 MiB stacks), shared protocol/result codecs via a `FrameSink` trait → **byte-identical frames** to the sync server (test), cap/idle-timeout/panic-isolation/EMFILE/shutdown tests, `--transport sync\|async`; documented carve-out; default graph tokio-free; server +0.38 MB with the feature |
 | 48 | RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), `CREATE USER`/`CREATE ROLE`/`GRANT`/`REVOKE` on databases/tables, session login on the network server, per-connection enforcement (embedded API stays trusted), grants persisted in the catalog + WAL | queued | — |
 | 49 | Extensions on wasm: support loadable/pluggable extensions for wasm targets — either wasm dynamic-linking (pre-built WASI side modules, per-runtime `dlopen` support) or a host-function registration path (JS/wasm-bindgen scripting surface); native `dlopen` extensions are impossible in the wasm sandbox, so a distinct ABI/loading model is required | queued | — |
 | 50 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) | queued | — |
@@ -1431,3 +1431,26 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   self-join 9.1 vs 22, materialized join 26.3 vs 22. Measured at load ~2.2
   (waves 46/47 compiling); two runs agreed (105.3/106.8). Lake/attach/multi-
   writer figures unchanged since Oct 17/18.
+
+- 2026-10-18 — Wave 47 (async I/O boundary): the async slice chosen is an
+  **async server variant** (`pinkdb-server/async-server`): a tokio listener
+  runs one task per connection for frame I/O and idle timeouts and executes
+  every engine call on the blocking pool (`spawn_blocking`, same 16 MiB
+  stacks); the wire protocol and result-streaming codecs are shared through a
+  new `FrameSink` trait, and a parity harness proves the frames are
+  **byte-identical** to the blocking server (13-request script incl. errors,
+  prepared statements, duplicate Hello). `--transport sync|async` on the
+  binary (clean exit-2 refusal without the feature); the async runtime is
+  feature-gated and the default dependency graph stays tokio-free (CI guard).
+  The carve-out is documented in `lib.rs` + `async_server.rs`: async lives
+  only at the server's I/O boundary; the executor, planner, storage and WAL
+  stay synchronous — no `async fn` engine API, no async storage bridging.
+  Tests (16): all value types + NULLs, batches, sessions/`USE`, Ping, prepared
+  handles, handshake rules, malformed frames, connection cap, pipelined
+  concurrency, idle timeout, panic isolation, oversized values, EMFILE
+  survival, graceful shutdown, byte-parity. Gates: fmt/docs/workspace clean,
+  clippy (server ± feature, CLI client), server 57 default / **74** with the
+  feature, pinkdb 564, duckdiff **171/171**. Sizes: server 2,980,912 B default
+  (+16 B), 3,374,352 B with `async-server`. Overlap flagged with wave 46
+  (TLS edits the same server files) — reconcile at 46's integration. Worktree
+  removed.

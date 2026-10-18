@@ -3,13 +3,19 @@
 //! ```text
 //! pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
 //!               [--max-connections N] [--idle-timeout SECS]
-//!               [--allow-load-extension]
+//!               [--transport sync|async] [--allow-load-extension]
 //! ```
 //!
 //! Without `--file` the database is in-memory; with it, the server opens the
 //! durable checkpoint + WAL path (wave 22): rows acked to a client survive a
 //! server crash and are replayed on the next start. No authentication and no
 //! TLS in this wave — bind localhost.
+//!
+//! `--transport sync` (the default) is the blocking thread-per-connection
+//! server. `--transport async` is the tokio transport from the optional
+//! `async-server` feature: same protocol, same engine (which stays
+//! synchronous — see the crate docs' "Async carve-out" section), same
+//! robustness knobs; the flag needs a build with that feature.
 
 use std::process::ExitCode;
 
@@ -21,25 +27,38 @@ use pinkdb_server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server};
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5433;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transport {
+    Sync,
+    /// The tokio transport, present only in `async-server` builds (the
+    /// parser refuses `--transport async` otherwise).
+    #[cfg(feature = "async-server")]
+    Async,
+}
+
 struct Args {
     host: String,
     port: u16,
     file: Option<String>,
     max_connections: usize,
     idle_timeout_secs: u64,
+    transport: Transport,
     allow_load_extension: bool,
 }
 
 fn usage() -> &'static str {
     "Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]\n\
      \x20                    [--max-connections N] [--idle-timeout SECS]\n\
-     \x20                    [--allow-load-extension]\n\
+     \x20                    [--transport sync|async] [--allow-load-extension]\n\
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
      \x20 --port PORT            TCP port; 0 picks an ephemeral port (default 5433)\n\
      \x20 --file PATH            durable database (checkpoint + WAL); in-memory when omitted\n\
      \x20 --max-connections N    concurrent clients served (default 128)\n\
      \x20 --idle-timeout SECS    disconnect clients idle this long; 0 = never (default 300)\n\
+     \x20 --transport MODE       sync = blocking thread-per-connection (default);\n\
+     \x20                        async = tokio I/O, same protocol/engine (needs a\n\
+     \x20                        build with the `async-server` feature)\n\
      \x20 --allow-load-extension let clients run LOAD EXTENSION (loads native code on\n\
      \x20                        the server host; off by default)\n\
      \n\
@@ -57,6 +76,7 @@ fn parse_args() -> Result<Args, String> {
         file: None,
         max_connections: DEFAULT_MAX_CONNECTIONS,
         idle_timeout_secs: DEFAULT_IDLE_TIMEOUT.as_secs(),
+        transport: Transport::Sync,
         allow_load_extension: false,
     };
     let mut it = std::env::args().skip(1);
@@ -98,6 +118,23 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("invalid --idle-timeout value {raw:?}"))?;
             }
+            "--transport" => {
+                let raw = value("--transport")?;
+                match raw.as_str() {
+                    "sync" => args.transport = Transport::Sync,
+                    #[cfg(feature = "async-server")]
+                    "async" => args.transport = Transport::Async,
+                    #[cfg(not(feature = "async-server"))]
+                    "async" => {
+                        return Err(
+                            "--transport async requires a build with the `async-server` \
+                             feature (this build has the blocking transport only)"
+                                .to_string(),
+                        );
+                    }
+                    other => return Err(format!("invalid --transport value {other:?}")),
+                }
+            }
             "--allow-load-extension" if inline.is_none() => args.allow_load_extension = true,
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -126,37 +163,68 @@ fn main() -> ExitCode {
         None => Database::new(),
     };
 
-    let server = match Server::bind_with_max_connections(
-        (args.host.as_str(), args.port),
-        db,
-        args.max_connections,
-    ) {
-        Ok(server) => server
-            .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
-            .allow_load_extension(args.allow_load_extension),
-        Err(e) => {
-            eprintln!("Error: cannot bind {}:{}: {e}", args.host, args.port);
-            return ExitCode::FAILURE;
-        }
-    };
-
     let mode = match &args.file {
         Some(path) => format!("durable: {path}"),
         None => "in-memory".to_string(),
     };
-    // The listening line is the readiness signal (tests wait for it).
+
+    match args.transport {
+        Transport::Sync => {
+            let server = match Server::bind_with_max_connections(
+                (args.host.as_str(), args.port),
+                db,
+                args.max_connections,
+            ) {
+                Ok(server) => server
+                    .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
+                    .allow_load_extension(args.allow_load_extension),
+                Err(e) => {
+                    eprintln!("Error: cannot bind {}:{}: {e}", args.host, args.port);
+                    return ExitCode::FAILURE;
+                }
+            };
+            announce(server.local_addr(), &mode);
+            match server.run() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("Error: accept loop stopped: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(feature = "async-server")]
+        Transport::Async => {
+            let server = match pinkdb_server::AsyncServer::bind_with_max_connections(
+                (args.host.as_str(), args.port),
+                db,
+                args.max_connections,
+            ) {
+                Ok(server) => server
+                    .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
+                    .allow_load_extension(args.allow_load_extension),
+                Err(e) => {
+                    eprintln!("Error: cannot bind {}:{}: {e}", args.host, args.port);
+                    return ExitCode::FAILURE;
+                }
+            };
+            announce(server.local_addr(), &mode);
+            match server.run_blocking() {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("Error: async accept loop stopped: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+/// The listening line is the readiness signal (tests wait for it).
+fn announce(addr: std::net::SocketAddr, mode: &str) {
     println!(
         "pinkdb-server v{} listening on {} ({mode})",
         env!("CARGO_PKG_VERSION"),
-        server.local_addr()
+        addr
     );
     eprintln!("pinkdb-server: no authentication, no TLS — keep the bind address trusted");
-
-    match server.run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("Error: accept loop stopped: {e}");
-            ExitCode::FAILURE
-        }
-    }
 }

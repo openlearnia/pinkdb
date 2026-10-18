@@ -10,6 +10,15 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 47 — async I/O at the boundary ✅
+- `pinkdb-server` gains an opt-in **`async-server`** transport: a tokio
+  listener with one task per connection, engine calls on the blocking pool,
+  and **byte-identical protocol frames** to the synchronous server (same
+  client works unchanged). `--transport sync|async`.
+- The "zero async" rule now has its documented carve-out: async lives only at
+  the server I/O boundary — the executor, storage and WAL stay synchronous —
+  and the default build links no runtime (+0.38 MB only with the feature).
+
 ### Wave 82 — Rust toolchain upgrade ✅
 - All crates now require **Rust 1.97** and compile as **edition 2024**; CI's
   MSRV job pins 1.97 (was 1.89 core / 1.95 pink-lake), and the wasm check

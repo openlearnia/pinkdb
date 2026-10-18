@@ -55,14 +55,20 @@ const ACCEPT_ERROR_MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Stack size for connection threads. The engine's AST-depth guard keeps
 /// accepted statements far below this, but the default 2 MiB thread stack is
-/// too close to the worst debug-build recursion depths for comfort.
-const CONNECTION_STACK_SIZE: usize = 16 * 1024 * 1024;
+/// too close to the worst debug-build recursion depths for comfort. The async
+/// transport applies the same size to its runtime's worker and blocking-pool
+/// threads (engine calls run on those).
+pub(crate) const CONNECTION_STACK_SIZE: usize = 16 * 1024 * 1024;
 
 /// Concurrent connections served at once (fd/thread pressure bound).
 pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 
 /// Default idle timeout for client sockets (reads and writes).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Connection-local prepared statements a client may pin (shared by the
+/// blocking and the `async-server` transports so the cap cannot drift).
+pub(crate) const MAX_PREPARED: usize = 1024;
 
 /// Soft cap on the encoded size of one streamed `Rows` frame; batches are
 /// flushed before they grow past it (the hard protocol cap is 64 MiB).
@@ -76,7 +82,7 @@ const ROWS_FRAME_BUDGET: usize = 8 * 1024 * 1024;
 pub static STATEMENT_HOOK: Mutex<Option<fn(&str)>> = Mutex::new(None);
 
 /// Run the hidden statement hook, if one is installed.
-fn run_statement_hook(sql: &str) {
+pub(crate) fn run_statement_hook(sql: &str) {
     let hook = *STATEMENT_HOOK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -85,9 +91,9 @@ fn run_statement_hook(sql: &str) {
     }
 }
 
-/// Decrements the active-connection counter when the connection thread ends,
+/// Decrements the active-connection counter when the connection task ends,
 /// including on unwind.
-struct ActiveGuard(Arc<AtomicUsize>);
+pub(crate) struct ActiveGuard(pub(crate) Arc<AtomicUsize>);
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
@@ -111,6 +117,25 @@ fn row_encoded_len(row: &[Value]) -> usize {
             }
         })
         .sum()
+}
+
+/// Destination for encoded response frames.
+///
+/// The blocking transport writes every frame straight to the socket (`impl
+/// FrameSink for W: Write` below); the `async-server` transport encodes each
+/// frame into the bounded queue its connection task drains to the socket.
+/// Both share [`send_result`]'s streaming and batching logic, so the wire
+/// bytes cannot drift between the two transports.
+pub(crate) trait FrameSink {
+    /// Encode and deliver one response frame. An error ends the connection:
+    /// the frame could not be delivered.
+    fn send_frame(&mut self, response: &Response) -> Result<(), ProtocolError>;
+}
+
+impl<W: Write> FrameSink for W {
+    fn send_frame(&mut self, response: &Response) -> Result<(), ProtocolError> {
+        protocol::write_response(self, response)
+    }
 }
 
 /// A bound, not-yet-running pinkdb server.
@@ -381,7 +406,6 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
     // v5: connection-local prepared statements (`?` placeholders). Handles are
     // handed out in order and die with this connection; the cap bounds the
     // per-connection metadata a client can pin.
-    const MAX_PREPARED: usize = 1024;
     let mut prepared: std::collections::HashMap<u64, pinkdb::PreparedStatement> =
         std::collections::HashMap::new();
     let mut next_handle: u64 = 1;
@@ -604,7 +628,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
 }
 
 /// Human-readable text from a caught panic payload.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -621,7 +645,14 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// strings still streams in frames well under [`protocol::MAX_FRAME_SIZE`]
 /// (a single value larger than the frame cap is unrepresentable and fails
 /// with a clear error instead of silently dropping the connection).
-fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), ProtocolError> {
+///
+/// Shared by both transports: the blocking server passes a frame sink that
+/// writes to the socket, the async server one that queues frames to the
+/// connection task (see [`FrameSink`]).
+pub(crate) fn send_result<S: FrameSink + ?Sized>(
+    w: &mut S,
+    result: &QueryResult,
+) -> Result<(), ProtocolError> {
     match result {
         QueryResult::Selected { names, types, rows } => {
             stream_selected(w, names, types, rows)?;
@@ -671,8 +702,8 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
 /// [`protocol::MAX_FRAME_SIZE`]; a single value larger than the frame cap is
 /// unrepresentable and fails with a clear error instead of silently dropping
 /// the connection). The caller sends the matching `Done`.
-fn stream_selected<W: Write>(
-    w: &mut W,
+fn stream_selected<S: FrameSink + ?Sized>(
+    w: &mut S,
     names: &[String],
     types: &[DataType],
     rows: &[Vec<Value>],
@@ -681,7 +712,7 @@ fn stream_selected<W: Write>(
         names: names.to_vec(),
         types: types.to_vec(),
     };
-    protocol::write_response(w, &result_set)?;
+    w.send_frame(&result_set)?;
     let mut batch: Vec<Vec<Value>> = Vec::new();
     let mut batch_bytes = 0usize;
     for row in rows {
@@ -693,34 +724,37 @@ fn stream_selected<W: Write>(
             let frame = Response::Rows {
                 rows: std::mem::take(&mut batch),
             };
-            protocol::write_response(w, &frame)?;
+            w.send_frame(&frame)?;
             batch_bytes = 0;
         }
         batch.push(row.clone());
         batch_bytes += row_bytes;
     }
     if !batch.is_empty() {
-        protocol::write_response(w, &Response::Rows { rows: batch })?;
+        w.send_frame(&Response::Rows { rows: batch })?;
     }
     Ok(())
 }
 
-fn done<W: Write>(w: &mut W, kind: DoneKind, count: u64, name: &str) -> Result<(), ProtocolError> {
-    protocol::write_response(
-        w,
-        &Response::Done {
-            kind,
-            count,
-            name: name.to_string(),
-        },
-    )
+fn done<S: FrameSink + ?Sized>(
+    w: &mut S,
+    kind: DoneKind,
+    count: u64,
+    name: &str,
+) -> Result<(), ProtocolError> {
+    w.send_frame(&Response::Done {
+        kind,
+        count,
+        name: name.to_string(),
+    })
 }
 
-fn send_error<W: Write>(w: &mut W, message: &str) -> Result<(), ProtocolError> {
-    protocol::write_response(
-        w,
-        &Response::Error {
-            message: message.to_string(),
-        },
-    )
+/// Deliver one `Error` frame through a frame sink.
+pub(crate) fn send_error<S: FrameSink + ?Sized>(
+    w: &mut S,
+    message: &str,
+) -> Result<(), ProtocolError> {
+    w.send_frame(&Response::Error {
+        message: message.to_string(),
+    })
 }

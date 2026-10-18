@@ -593,7 +593,9 @@ pub fn write_frame<W: Write>(w: &mut W, msg_type: u8, body: &[u8]) -> Result<(),
 /// Bytes read per step while receiving a frame body. The body buffer grows
 /// with the bytes that actually arrived, so a peer that announces a large
 /// frame and then stalls pins at most one step, not the announced size.
-const FRAME_READ_STEP: usize = 64 * 1024;
+/// (The `async-server` transport's reader mirrors this rule with the same
+/// step size.)
+pub(crate) const FRAME_READ_STEP: usize = 64 * 1024;
 
 /// Read one frame; returns `(type, body)`. The length prefix is validated
 /// against [`MAX_FRAME_SIZE`], and the body buffer grows with received bytes
