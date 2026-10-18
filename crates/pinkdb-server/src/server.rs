@@ -32,8 +32,16 @@
 //! - SQL `LOAD EXTENSION` is refused unless the operator opts in with
 //!   [`Server::allow_load_extension`]: without authentication, letting a
 //!   remote client `dlopen` a host library would be remote code execution.
+//! - With the crate feature `tls`, [`Server::bind_tls`] serves the same
+//!   protocol over rustls-encrypted TCP. The handshake runs on the
+//!   connection's own thread (under the same idle timeout), so a failed or
+//!   stalled handshake logs and drops that connection while the server keeps
+//!   serving. A plaintext client on a TLS listener (or vice versa) fails its
+//!   own connection and nothing else. TLS encrypts the transport only: there
+//!   is still no authentication, and the connection cap, per-connection
+//!   session isolation and idle timeout are unchanged.
 
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -147,6 +155,10 @@ pub struct Server {
     max_connections: usize,
     active: Arc<AtomicUsize>,
     idle_timeout: Option<Duration>,
+    /// TLS identity when the server was bound via `bind_tls` (crate feature
+    /// `tls`); `None` = plaintext TCP.
+    #[cfg(feature = "tls")]
+    tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Server {
@@ -181,7 +193,47 @@ impl Server {
             max_connections,
             active: Arc::new(AtomicUsize::new(0)),
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            #[cfg(feature = "tls")]
+            tls: None,
         })
+    }
+
+    /// Bind `addr` and serve `db` over TLS (crate feature `tls`) with a PEM
+    /// certificate chain and private key. See
+    /// [`Server::bind_tls_with_max_connections`] for the certificate rules.
+    #[cfg(feature = "tls")]
+    pub fn bind_tls(
+        addr: impl ToSocketAddrs,
+        db: Database,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Server> {
+        Self::bind_tls_with_max_connections(addr, db, DEFAULT_MAX_CONNECTIONS, cert_path, key_path)
+    }
+
+    /// Bind `addr` and serve `db` over TLS with an explicit concurrent-
+    /// connection cap. Everything but the transport behaves exactly like
+    /// [`Server::bind_with_max_connections`].
+    ///
+    /// The certificate and key are loaded and validated *before* the listener
+    /// binds: a missing or unreadable file, PEM that does not parse, an empty
+    /// file, or a key that does not match the leaf certificate refuses
+    /// startup with a message naming the file and the reason. Client
+    /// certificates are not requested; TLS here is transport encryption, not
+    /// authentication.
+    #[cfg(feature = "tls")]
+    pub fn bind_tls_with_max_connections(
+        addr: impl ToSocketAddrs,
+        db: Database,
+        max_connections: usize,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<Server> {
+        let tls = crate::tls::server_config_from_pem(cert_path, key_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let mut server = Self::bind_with_max_connections(addr, db, max_connections)?;
+        server.tls = Some(tls);
+        Ok(server)
     }
 
     /// Let remote clients run SQL `LOAD EXTENSION` (default: refused). Only
@@ -227,6 +279,15 @@ impl Server {
                             "pinkdb-server: connection limit ({}) reached; rejecting {peer}",
                             self.max_connections
                         );
+                        #[cfg(feature = "tls")]
+                        if self.tls.is_some() {
+                            // A TLS listener has no plaintext Error frame to
+                            // send before the handshake, and completing one
+                            // just to report "busy" would spend the capacity
+                            // the cap is defending. Dropping is the honest
+                            // signal.
+                            continue;
+                        }
                         reject_over_limit(stream, self.max_connections);
                         continue;
                     }
@@ -234,11 +295,18 @@ impl Server {
                     self.active.fetch_add(1, Ordering::SeqCst);
                     let db = self.db.clone();
                     let idle_timeout = self.idle_timeout;
+                    #[cfg(feature = "tls")]
+                    let tls = self.tls.clone();
                     if let Err(e) = thread::Builder::new()
                         .name("pinkdb-server-conn".to_string())
                         .stack_size(CONNECTION_STACK_SIZE)
                         .spawn(move || {
                             let _guard = guard;
+                            #[cfg(feature = "tls")]
+                            if let Some(config) = tls {
+                                serve_tls_connection(stream, peer, db, idle_timeout, config);
+                                return;
+                            }
                             serve_connection(stream, db, idle_timeout);
                         })
                     {
@@ -340,15 +408,18 @@ impl Drop for ServerHandle {
     }
 }
 
-/// Serve one client: handshake, then request/response until EOF.
-///
-/// The connection owns a fresh `db.connect()`: its `USE` session, open
-/// transaction and session state are private to this TCP client.
-///
-/// Statement execution runs inside `catch_unwind`: an engine panic becomes an
-/// `Error` frame and a stderr log instead of killing the connection (or, for
-/// a panicking connection thread, the whole process).
+/// Serve one plaintext client: configure the accepted socket, then run the
+/// protocol.
 fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Duration>) {
+    if !configure_socket(&stream, idle_timeout) {
+        return;
+    }
+    serve_client(stream, db);
+}
+
+/// Apply the connection-required socket options to a freshly accepted socket.
+/// Returns `false` when a *fatal* option failed (the caller drops the socket).
+fn configure_socket(stream: &TcpStream, idle_timeout: Option<Duration>) -> bool {
     // BSD-derived kernels (macOS) inherit the listener's O_NONBLOCK on
     // accepted sockets; the connection thread wants blocking IO.
     if let Err(e) = stream.set_nonblocking(false) {
@@ -359,14 +430,69 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
         .and_then(|()| stream.set_write_timeout(idle_timeout))
     {
         eprintln!("pinkdb-server: cannot set the idle timeout on an accepted socket: {e}");
-        return;
+        return false;
     }
     if let Err(e) = stream.set_nodelay(true) {
         eprintln!("pinkdb-server: cannot set TCP_NODELAY on an accepted socket: {e}");
     }
-    let Ok(mut writer) = stream.try_clone() else {
+    true
+}
+
+/// Serve one TLS client (crate feature `tls`): complete the handshake on this
+/// connection's own thread, then run the protocol over the encrypted stream.
+///
+/// The socket's idle timeout is applied before the handshake, so a peer that
+/// connects and never speaks TLS is dropped like any other idle client. A
+/// handshake failure (wrong protocol, untrusted client expectations, bad
+/// record, timeout) is logged and drops only this connection.
+#[cfg(feature = "tls")]
+fn serve_tls_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    db: Database,
+    idle_timeout: Option<Duration>,
+    config: Arc<rustls::ServerConfig>,
+) {
+    if !configure_socket(&stream, idle_timeout) {
         return;
+    }
+    let session = match rustls::ServerConnection::new(config) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("pinkdb-server: cannot start a TLS session for {peer}: {e}");
+            return;
+        }
     };
+    let mut tls = rustls::StreamOwned::new(session, stream);
+    if let Err(e) = tls.conn.complete_io(&mut tls.sock) {
+        eprintln!("pinkdb-server: TLS handshake failed for {peer}: {e}");
+        return;
+    }
+    if tls.conn.is_handshaking() {
+        // `complete_io` returns Ok when no further progress is possible
+        // without more data: the peer stalled past the idle timeout.
+        eprintln!("pinkdb-server: TLS handshake stalled for {peer}; dropping the connection");
+        return;
+    }
+    serve_client(tls, db);
+}
+
+/// Serve the pinkdb framed protocol on an established byte stream (plain TCP
+/// or TLS): `Hello`, then request/response until EOF.
+///
+/// The connection owns a fresh `db.connect()`: its `USE` session, open
+/// transaction and session state are private to this client.
+///
+/// Statement execution runs inside `catch_unwind`: an engine panic becomes an
+/// `Error` frame and a stderr log instead of killing the connection (or, for
+/// a panicking connection thread, the whole process).
+///
+/// Reads go through the `BufReader`; writes go through the *same* stream via
+/// `BufReader::get_mut` (the transport is a single owned object, which is
+/// what rustls' `StreamOwned` needs). Buffered read-ahead is untouched by
+/// writes, and `write_frame` flushes, so a write failure is reported at the
+/// frame that hit it.
+fn serve_client<S: Read + Write>(stream: S, db: Database) {
     let mut reader = BufReader::new(stream);
     let mut conn = db.connect();
 
@@ -375,19 +501,19 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
         Ok(Request::Hello { protocol_version }) => protocol_version,
         Ok(other) => {
             let _ = send_error(
-                &mut writer,
+                reader.get_mut(),
                 &format!("expected a Hello handshake first, got {}", other.kind()),
             );
             return;
         }
         Err(e) => {
-            let _ = send_error(&mut writer, &e.to_string());
+            let _ = send_error(reader.get_mut(), &e.to_string());
             return;
         }
     };
     if protocol_version != PROTOCOL_VERSION {
         let _ = send_error(
-            &mut writer,
+            reader.get_mut(),
             &format!(
                 "protocol version mismatch: server speaks v{PROTOCOL_VERSION}, \
                  client asked for v{protocol_version}"
@@ -399,7 +525,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         protocol_version: PROTOCOL_VERSION,
     };
-    if protocol::write_response(&mut writer, &hello_ok).is_err() {
+    if protocol::write_response(reader.get_mut(), &hello_ok).is_err() {
         return;
     }
 
@@ -423,20 +549,20 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                             Ok(n) => n,
                             Err(_) => {
                                 let _ = send_error(
-                                    &mut writer,
+                                    reader.get_mut(),
                                     "too many statements in one Execute batch",
                                 );
                                 return;
                             }
                         };
                         for result in &results {
-                            if let Err(e) = send_result(&mut writer, result) {
+                            if let Err(e) = send_result(reader.get_mut(), result) {
                                 // A streaming failure (e.g. a single value
                                 // larger than the frame cap) is reported
                                 // before closing; an IO failure just ends the
                                 // thread.
                                 if !matches!(e, ProtocolError::Io(_)) {
-                                    let _ = send_error(&mut writer, &e.to_string());
+                                    let _ = send_error(reader.get_mut(), &e.to_string());
                                 }
                                 return;
                             }
@@ -445,7 +571,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                         // until this frame, so it never parses SQL to count
                         // statements.
                         if protocol::write_response(
-                            &mut writer,
+                            reader.get_mut(),
                             &Response::BatchDone { statements },
                         )
                         .is_err()
@@ -457,7 +583,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                     // connection open (mirrors the embedded REPL). No
                     // BatchDone follows: the Error frame ends the batch.
                     Ok(Err(e)) => {
-                        if send_error(&mut writer, &e.to_string()).is_err() {
+                        if send_error(reader.get_mut(), &e.to_string()).is_err() {
                             return;
                         }
                     }
@@ -468,7 +594,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                         let message = panic_message(payload.as_ref());
                         eprintln!("pinkdb-server: statement panicked: {message}");
                         if send_error(
-                            &mut writer,
+                            reader.get_mut(),
                             &format!("internal error: statement panicked ({message})"),
                         )
                         .is_err()
@@ -479,7 +605,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                 }
             }
             Ok(Request::Ping) => {
-                if protocol::write_response(&mut writer, &Response::Pong).is_err() {
+                if protocol::write_response(reader.get_mut(), &Response::Pong).is_err() {
                     return;
                 }
             }
@@ -489,7 +615,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
             Ok(Request::Prepare { sql }) => {
                 if prepared.len() >= MAX_PREPARED {
                     if send_error(
-                        &mut writer,
+                        reader.get_mut(),
                         "too many prepared statements (per-connection limit 1024)",
                     )
                     .is_err()
@@ -504,7 +630,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                     Ok(Ok(stmt)) => {
                         let Some(next) = next_handle.checked_add(1) else {
                             let _ = protocol::write_response(
-                                &mut writer,
+                                reader.get_mut(),
                                 &Response::Error {
                                     message: "prepared-statement handle space exhausted"
                                         .to_string(),
@@ -517,7 +643,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                         let parameter_count = stmt.parameter_count() as u32;
                         prepared.insert(handle, stmt);
                         if protocol::write_response(
-                            &mut writer,
+                            reader.get_mut(),
                             &Response::Prepared {
                                 handle,
                                 parameter_count,
@@ -531,7 +657,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                     // A parse error (or an unsupported shape) is a normal
                     // response: report it and keep the connection open.
                     Ok(Err(e)) => {
-                        if send_error(&mut writer, &e.to_string()).is_err() {
+                        if send_error(reader.get_mut(), &e.to_string()).is_err() {
                             return;
                         }
                     }
@@ -539,7 +665,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                         let message = panic_message(payload.as_ref());
                         eprintln!("pinkdb-server: prepare panicked: {message}");
                         if send_error(
-                            &mut writer,
+                            reader.get_mut(),
                             &format!("internal error: prepare panicked ({message})"),
                         )
                         .is_err()
@@ -556,7 +682,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
             Ok(Request::ExecutePrepared { handle, values }) => {
                 let Some(stmt) = prepared.get(&handle) else {
                     if send_error(
-                        &mut writer,
+                        reader.get_mut(),
                         &format!("unknown prepared statement handle {handle}"),
                     )
                     .is_err()
@@ -574,14 +700,14 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                     Ok(Ok(result)) => {
                         // A bound statement is exactly one statement: one
                         // result group, then the batch terminator.
-                        if let Err(e) = send_result(&mut writer, &result) {
+                        if let Err(e) = send_result(reader.get_mut(), &result) {
                             if !matches!(e, ProtocolError::Io(_)) {
-                                let _ = send_error(&mut writer, &e.to_string());
+                                let _ = send_error(reader.get_mut(), &e.to_string());
                             }
                             return;
                         }
                         if protocol::write_response(
-                            &mut writer,
+                            reader.get_mut(),
                             &Response::BatchDone { statements: 1 },
                         )
                         .is_err()
@@ -592,7 +718,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                     // Bind/type/execution errors are normal responses; the
                     // connection stays open (mirrors Execute).
                     Ok(Err(e)) => {
-                        if send_error(&mut writer, &e.to_string()).is_err() {
+                        if send_error(reader.get_mut(), &e.to_string()).is_err() {
                             return;
                         }
                     }
@@ -600,7 +726,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                         let message = panic_message(payload.as_ref());
                         eprintln!("pinkdb-server: prepared execute panicked: {message}");
                         if send_error(
-                            &mut writer,
+                            reader.get_mut(),
                             &format!("internal error: statement panicked ({message})"),
                         )
                         .is_err()
@@ -611,7 +737,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
                 }
             }
             Ok(Request::Hello { .. }) => {
-                if send_error(&mut writer, "duplicate Hello handshake").is_err() {
+                if send_error(reader.get_mut(), "duplicate Hello handshake").is_err() {
                     return;
                 }
             }
@@ -620,7 +746,7 @@ fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Durati
             // A malformed or oversized frame cannot be resynchronized: report
             // it if possible, then close the connection.
             Err(e) => {
-                let _ = send_error(&mut writer, &e.to_string());
+                let _ = send_error(reader.get_mut(), &e.to_string());
                 return;
             }
         }

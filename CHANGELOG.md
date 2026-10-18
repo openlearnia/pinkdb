@@ -10,6 +10,15 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 46 — network server TLS ✅
+- Opt-in `tls` feature: the server serves the same protocol over
+  **rustls**-encrypted TCP (`--tls-cert/--tls-key`), and the CLI's remote mode
+  gained `--tls`, `--tls-ca-cert` and `--tls-insecure`. Certificate problems
+  refuse startup with precise messages; handshake failures never disturb the
+  accept loop; the default build and dependency graph are unchanged.
+- Still **no authentication** — TLS encrypts the transport only, which the docs
+  and startup warning state explicitly.
+
 ### Wave 47 — async I/O at the boundary ✅
 - `pinkdb-server` gains an opt-in **`async-server`** transport: a tokio
   listener with one task per connection, engine calls on the blocking pool,

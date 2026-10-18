@@ -50,15 +50,20 @@
 //!
 //! # Security posture
 //!
-//! **No authentication and no TLS in this wave.** Anyone who can open a TCP
-//! connection to the port gets the full SQL surface of the served database.
+//! **No authentication and no authorization: anyone who can open a TCP
+//! connection to the port gets the full SQL surface of the served database.**
+//! The optional `tls` feature (off by default) adds a rustls-encrypted
+//! transport — see [`tls`] — without changing the protocol or the default
+//! build: it encrypts the transport (and, with a trusted anchor, lets a
+//! client verify *which* server it reached), but it does not identify or
+//! restrict the client. The async transport carries the same posture.
 //! Bind localhost (the default) and treat the port as fully trusted; see the
-//! README's "Network server" section. (TLS is wave 46; the async transport
-//! carries the same posture as the blocking one.)
-
+//! README's "Network server" section.
 pub mod client;
 pub mod protocol;
 pub mod server;
+#[cfg(feature = "tls")]
+pub mod tls;
 
 #[cfg(feature = "async-server")]
 pub mod async_server;
@@ -71,5 +76,8 @@ pub use protocol::{
 };
 pub use server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server, ServerHandle};
 
+
 #[cfg(feature = "async-server")]
 pub use async_server::{AsyncServer, AsyncServerHandle};
+#[cfg(feature = "tls")]
+pub use tls::{ClientTrust, TlsConfigError};

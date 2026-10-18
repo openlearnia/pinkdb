@@ -15,7 +15,10 @@ default = []
 # only: the executor/engine stay synchronous, and the default build pulls no
 # async runtime (see the crate docs' "Async carve-out" section).
 async-server = ["dep:tokio"]
-
+# Opt-in TLS transport: rustls (audited, pure Rust) with PEM certificate and
+# key configuration. Off by default: the default build has no TLS code and no
+# TLS dependencies.
+tls = ["dep:rustls", "dep:rustls-pemfile"]
 [lib]
 name = "pinkdb_server"
 path = "src/lib.rs"
@@ -37,3 +40,12 @@ tokio = { version = "1.53", default-features = false, features = [
     "time",
     "sync",
 ], optional = true }
+# TLS transport (`tls` feature): the same rustls + ring stack the repository
+# client and the lake S3 client already use elsewhere in the workspace.
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"], optional = true }
+rustls-pemfile = { version = "2.2", optional = true }
+
+[dev-dependencies]
+# Test-only self-signed certificate generation (the `tls` tests); `ring` is
+# already in the workspace's crypto stack.
+rcgen = "0.14"

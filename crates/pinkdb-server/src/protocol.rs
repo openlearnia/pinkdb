@@ -587,6 +587,12 @@ pub fn write_frame<W: Write>(w: &mut W, msg_type: u8, body: &[u8]) -> Result<(),
     frame.push(msg_type);
     frame.extend_from_slice(body);
     w.write_all(&frame)?;
+    // Flush per frame: a plain `TcpStream` flush is a no-op, while a buffering
+    // transport (the `tls` feature's rustls stream) otherwise swallows a
+    // failed underlying write until the *next* call — which would attribute
+    // the error to the wrong operation. Flushing keeps "the frame was sent"
+    // and "no error" in agreement on every transport.
+    w.flush()?;
     Ok(())
 }
 

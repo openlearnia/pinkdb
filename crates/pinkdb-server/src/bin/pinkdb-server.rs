@@ -4,6 +4,8 @@
 //! pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
 //!               [--max-connections N] [--idle-timeout SECS]
 //!               [--transport sync|async] [--allow-load-extension]
+//!               [--allow-load-extension]
+//!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
 //! ```
 //!
 //! Without `--file` the database is in-memory; with it, the server opens the
@@ -16,6 +18,13 @@
 //! `async-server` feature: same protocol, same engine (which stays
 //! synchronous — see the crate docs' "Async carve-out" section), same
 //! robustness knobs; the flag needs a build with that feature.
+//! server crash and are replayed on the next start.
+//!
+//! `--tls-cert` + `--tls-key` (both, or neither) serve the same protocol over
+//! rustls-encrypted TCP; they are only accepted by a binary built with the
+//! `tls` feature. TLS encrypts the transport — there is still **no
+//! authentication**: every peer that completes a handshake (and, by default,
+//! that is every peer) gets the full SQL surface. Bind localhost.
 
 use std::process::ExitCode;
 
@@ -44,12 +53,18 @@ struct Args {
     idle_timeout_secs: u64,
     transport: Transport,
     allow_load_extension: bool,
+    /// `--tls-cert PATH`: must be paired with `--tls-key`.
+    tls_cert: Option<String>,
+    /// `--tls-key PATH`: must be paired with `--tls-cert`.
+    tls_key: Option<String>,
 }
 
 fn usage() -> &'static str {
     "Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]\n\
      \x20                    [--max-connections N] [--idle-timeout SECS]\n\
      \x20                    [--transport sync|async] [--allow-load-extension]\n\
+     \x20                    [--allow-load-extension]\n\
+     \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
      \x20 --port PORT            TCP port; 0 picks an ephemeral port (default 5433)\n\
@@ -61,12 +76,16 @@ fn usage() -> &'static str {
      \x20                        build with the `async-server` feature)\n\
      \x20 --allow-load-extension let clients run LOAD EXTENSION (loads native code on\n\
      \x20                        the server host; off by default)\n\
+     \x20 --tls-cert PATH        serve TLS with this PEM certificate chain\n\
+     \x20 --tls-key PATH         PEM private key matching --tls-cert (PKCS#8/#1/SEC1);\n\
+     \x20                        both or neither, and only in a build with `tls`\n\
      \n\
      At-rest encryption is not wired into the server: PINKDB_KEY is ignored and\n\
      --file must be a plaintext database (an encrypted one is refused at startup).\n\
      \n\
-     Security: no authentication, no TLS. Keep the bind address on localhost\n\
-     or a trusted network; anyone who can reach the port has full SQL access."
+     Security: no authentication (TLS only encrypts the transport; it does not\n\
+     identify clients). Keep the bind address on localhost or a trusted network;\n\
+     anyone who can reach the port has full SQL access."
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -78,6 +97,8 @@ fn parse_args() -> Result<Args, String> {
         idle_timeout_secs: DEFAULT_IDLE_TIMEOUT.as_secs(),
         transport: Transport::Sync,
         allow_load_extension: false,
+        tls_cert: None,
+        tls_key: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -136,8 +157,17 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--allow-load-extension" if inline.is_none() => args.allow_load_extension = true,
+            "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
+            "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             other => return Err(format!("unknown argument {other:?}")),
         }
+    }
+    // Pairing is validated before anything binds, so a half-configured TLS
+    // listener never starts: both flags or neither.
+    if args.tls_cert.is_some() != args.tls_key.is_some() {
+        return Err(
+            "--tls-cert and --tls-key must be given together (both or neither)".to_string(),
+        );
     }
     Ok(args)
 }
@@ -151,6 +181,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // TLS was asked for: refuse precisely when this binary cannot provide it.
+    if args.tls_cert.is_some() && !cfg!(feature = "tls") {
+        eprintln!(
+            "Error: TLS was requested, but this pinkdb-server was built without TLS support."
+        );
+        eprintln!("       rebuild with `cargo build -p pinkdb-server --features tls`.");
+        return ExitCode::from(2);
+    }
 
     let db = match &args.file {
         Some(path) => match Database::open(path) {
@@ -170,11 +209,31 @@ fn main() -> ExitCode {
 
     match args.transport {
         Transport::Sync => {
-            let server = match Server::bind_with_max_connections(
-                (args.host.as_str(), args.port),
-                db,
-                args.max_connections,
-            ) {
+            let bound = match (&args.tls_cert, &args.tls_key) {
+                (Some(cert), Some(key)) => {
+                    #[cfg(feature = "tls")]
+                    {
+                        Server::bind_tls_with_max_connections(
+                            (args.host.as_str(), args.port),
+                            db,
+                            args.max_connections,
+                            cert,
+                            key,
+                        )
+                    }
+                    #[cfg(not(feature = "tls"))]
+                    {
+                        let _ = (cert, key);
+                        unreachable!("TLS flags are validated in parse_args")
+                    }
+                }
+                _ => Server::bind_with_max_connections(
+                    (args.host.as_str(), args.port),
+                    db,
+                    args.max_connections,
+                ),
+            };
+            let server = match bound {
                 Ok(server) => server
                     .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
                     .allow_load_extension(args.allow_load_extension),
@@ -183,7 +242,15 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            announce(server.local_addr(), &mode);
+            announce(
+                server.local_addr(),
+                &mode,
+                if args.tls_cert.is_some() {
+                    "TLS"
+                } else {
+                    "plaintext"
+                },
+            );
             match server.run() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -207,7 +274,7 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            announce(server.local_addr(), &mode);
+            announce(server.local_addr(), &mode, "async");
             match server.run_blocking() {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -220,11 +287,21 @@ fn main() -> ExitCode {
 }
 
 /// The listening line is the readiness signal (tests wait for it).
-fn announce(addr: std::net::SocketAddr, mode: &str) {
+fn announce(addr: std::net::SocketAddr, mode: &str, transport: &str) {
     println!(
-        "pinkdb-server v{} listening on {} ({mode})",
+        "pinkdb-server v{} listening on {} ({mode}, transport: {transport})",
         env!("CARGO_PKG_VERSION"),
         addr
     );
-    eprintln!("pinkdb-server: no authentication, no TLS — keep the bind address trusted");
+    if transport == "TLS" {
+        eprintln!(
+            "pinkdb-server: TLS encrypts the transport only — there is no authentication; \
+             keep the bind address trusted"
+        );
+    } else {
+        eprintln!(
+            "pinkdb-server: no authentication, no TLS on this transport — keep the bind \
+             address trusted"
+        );
+    }
 }

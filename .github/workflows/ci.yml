@@ -99,6 +99,16 @@ jobs:
       - name: cargo test -p pinkdb-cli --features client
         run: cargo test -p pinkdb-cli --features client
 
+      # TLS transport (46): the server and the remote CLI. Certificates are
+      # generated at test time (rcgen, a test-only dependency), so no
+      # openssl/system trust store is needed and the default build is
+      # unaffected.
+      - name: cargo test -p pinkdb-server --features tls
+        run: cargo test -p pinkdb-server --features tls
+
+      - name: cargo test -p pinkdb-cli --features client,tls
+        run: cargo test -p pinkdb-cli --features client,tls
+
       - name: cargo test -p pinkdb-cli --features repo
         run: cargo test -p pinkdb-cli --features repo
 
@@ -118,7 +128,9 @@ jobs:
           cargo clippy --all-targets -p pink-lake --features s3,vortexlake -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,encryption -- -D warnings
           cargo clippy --all-targets -p pink-lake --features s3,vortexlake,encryption -- -D warnings
-          cargo clippy --all-targets -p pinkdb-cli --features vortexlake,s3,repo,client,encryption -- -D warnings
+          cargo clippy --all-targets -p pinkdb-server --features tls -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features vortexlake,s3,repo,client,tls,encryption -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features client,tls -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features pinklake -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features async-server -- -D warnings

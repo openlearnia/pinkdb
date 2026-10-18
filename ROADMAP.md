@@ -79,7 +79,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 43 | Materialized views: `CREATE MATERIALIZED VIEW`, `REFRESH [MATERIALIZED VIEW]`, on-demand full refresh, per-database, persisted + WAL-logged (incremental/auto-refresh deferred) | done | landed (user, `2be5d3b`): stored as a queryable table + refresh query in the catalog, `REFRESH` fully recomputes, `IF [NOT] EXISTS`, per-database, WAL-logged, persisted; manual + scheduled refresh policies follow in wave 80 |
 | 44 | Stored procedures: SQL procedural language (parameters, variables, control flow) + **JavaScript procedures** (optional embedded engine; WAL-replay determinism must be solved — volatile calls refused or pinned at record time) | done | SQL language landed (bodies in `$$…$$`, DECLARE/SET/IF/WHILE/nested blocks/RETURN/RAISE, values-never-text binding, atomic `CALL`, WAL replay re-executes deterministically, `.pink` flags bit 4, protocol v8); JS: the `pinkdb-js` sandbox contract + clean refusal landed — **engine binding deferred to wave 81 (quickjs-ng)**; also fixed a pre-existing folded-NULL typing bug |
 | 45 | Performance tuning (recurring every 5th wave): bench-driven speed work against the committed query bench; profile-first, small measured wins (core) — *pulled forward after 40c* | done | 4b53844…(part 6) — 1M battery 416 → 245–250 ms (−41%): group_region 6.7 → 3.2, distinct_lowcard 19.4 → 3.8, windows 63 → 13.5, order_str 36 → 29, group_id/distinct_id 62/69 → 50/50, join_probe 21 → 5.3; @10M group_region 68–70 → 33–35 ms (≤60 target met; DuckLake 37–55), import 274 → 173 ms, `.lake save` 632–758 → 296–340 ms (lake format_version 3, 8,192-row blocks, agreed layout change), `.lake open` 618 → 100 ms, data 29.7 → 25 MB, teardown 93 → 16 ms; 516 tests, duckdiff 60/60 + 64/64 big, kill loops clean, clippy/fmt clean |
-| 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | in progress | `wt-tls`, dispatched on 83e44cd |
+| 46 | Network server TLS: rustls + certificate config, encrypted transport (optional pinkdb-server feature) | done | landed; `tls` feature = rustls transport (`Server::bind_tls*`, `--tls-cert/--tls-key`, CLI `--tls/--tls-ca-cert/--tls-insecure`), same protocol v8, cert validation before bind, handshake failures isolated under idle timeout, cap applies; no auth/authorization unchanged (documented); 22 tests (incl. runtime-generated certs); default graph byte-identical, server +1.18 MB only with the feature |
 | 47 | Async I/O at the I/O boundary: optional async storage layer (object stores / S3 for the lake) and/or an async server variant, feature-gated; requires a documented carve-out to the zero-async design rule for the I/O boundary only (core executor stays sync) | done | landed; `async-server` feature = tokio listener with one task per connection, engine calls on the blocking pool (`spawn_blocking`, 16 MiB stacks), shared protocol/result codecs via a `FrameSink` trait → **byte-identical frames** to the sync server (test), cap/idle-timeout/panic-isolation/EMFILE/shutdown tests, `--transport sync\|async`; documented carve-out; default graph tokio-free; server +0.38 MB with the feature |
 | 48 | RBAC: users + roles with Argon2id password hashes (reusing the encryption crate), `CREATE USER`/`CREATE ROLE`/`GRANT`/`REVOKE` on databases/tables, session login on the network server, per-connection enforcement (embedded API stays trusted), grants persisted in the catalog + WAL | queued | — |
 | 49 | Extensions on wasm: support loadable/pluggable extensions for wasm targets — either wasm dynamic-linking (pre-built WASI side modules, per-runtime `dlopen` support) or a host-function registration path (JS/wasm-bindgen scripting surface); native `dlopen` extensions are impossible in the wasm sandbox, so a distinct ABI/loading model is required | queued | — |
@@ -1459,3 +1459,28 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   equal per-request latency at low load. Overlap flagged with wave 46
   (TLS edits the same server files) — reconcile at 46's integration. Worktree
   removed.
+- 2026-10-18 — Wave 46 (server TLS): opt-in rustls transport — `Server::bind_tls`/
+  `bind_tls_with_max_connections` (same framed protocol v8), binary flags
+  `--tls-cert/--tls-key`, blocking-client `connect_tls(addr, server_name,
+  trust)` and CLI `--tls` / `--tls-ca-cert` / `--tls-insecure` behind a `tls`
+  feature (`= ["client", "pinkdb-server/tls"]`). Certificates load and validate
+  **before binding** (missing/non-PEM/empty/mismatch each refuse startup with
+  the file and reason); the handshake runs on the connection's own thread under
+  the socket idle timeout, so failures and stalls never touch the accept loop;
+  the connection cap applies (over-cap TLS connections are dropped pre-
+  handshake); plaintext↔TLS mismatches fail cleanly. **No authentication or
+  authorization was added** — TLS encrypts the transport and lets a client
+  verify *which* server it reached; the docs say so loudly. Trust anchors are
+  explicit PEM (system roots are the recorded next increment). Tests (22):
+  round-trip + prepared + multi-frame results over TLS, wrong anchor, expired
+  and not-yet-valid certs, both mismatch directions, 16-connection junk/stall
+  isolation, cap/idle under TLS, 8 startup refusals, CLI flag matrix, disabled-
+  build refusals — certificates are rcgen-generated per test (nothing checked
+  in). Gates on main: fmt/clippy (server ± tls ± async-server, CLI client ±
+  tls), server 59 default / 70 with `tls` / async suites green, CLI 68 client /
+  73 client,tls, pinkdb 564, workspace clean, duckdiff **171/171**. Sizes:
+  server 2,979,952 B default (unchanged graph), 4,217,408 B with `tls`.
+  Integration on top of wave 47: **6 hand-resolved conflicts** — the TLS bind
+  moved inside the async transport's `Sync` arm, `announce` gained a transport
+  label (TLS-aware security warning), feature/dep tables and the lock unified.
+  Worktree removed.

@@ -33,6 +33,8 @@ use rustyline::error::ReadlineError;
 
 #[cfg(feature = "client")]
 use pinkdb_server::Client;
+#[cfg(feature = "tls")]
+use pinkdb_server::ClientTrust;
 
 #[cfg(feature = "repo")]
 mod repo;
@@ -1075,6 +1077,12 @@ struct Opts {
     host: Option<String>,
     /// `-c` arguments, run in order instead of reading stdin.
     commands: Vec<String>,
+    /// `--tls`: encrypt the remote connection (requires a trust source).
+    tls: bool,
+    /// `--tls-ca-cert PATH`: PEM trust anchor for the server certificate.
+    tls_ca_cert: Option<String>,
+    /// `--tls-insecure`: skip certificate verification (local tests only).
+    tls_insecure: bool,
 }
 
 fn print_usage() {
@@ -1087,11 +1095,24 @@ fn print_usage() {
     } else {
         println!("                     [client feature: disabled in this build]");
     }
+    if cfg!(feature = "tls") {
+        println!("  --tls              encrypt the remote connection (TLS)");
+        println!("  --tls-ca-cert PATH PEM certificate to trust for the server (a CA, or the");
+        println!("                     self-signed server certificate); implies --tls");
+        println!("  --tls-insecure     DANGER: skip certificate verification; local tests only");
+    } else {
+        println!("  --tls …            [tls feature: disabled in this build]");
+    }
 }
 
 fn parse_args() -> Result<Opts, String> {
-    let mut host = None;
-    let mut commands = Vec::new();
+    let mut opts = Opts {
+        host: None,
+        commands: Vec::new(),
+        tls: false,
+        tls_ca_cert: None,
+        tls_insecure: false,
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1101,27 +1122,95 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--host" => {
                 let value = args.next().ok_or("--host requires HOST:PORT")?;
-                host = Some(value);
+                opts.host = Some(value);
             }
             other if other.starts_with("--host=") => {
-                host = Some(other["--host=".len()..].to_string());
+                opts.host = Some(other["--host=".len()..].to_string());
+            }
+            "--tls" => opts.tls = true,
+            "--tls-insecure" => opts.tls_insecure = true,
+            "--tls-ca-cert" => {
+                let value = args.next().ok_or("--tls-ca-cert requires a path")?;
+                opts.tls_ca_cert = Some(value);
+            }
+            other if other.starts_with("--tls-ca-cert=") => {
+                opts.tls_ca_cert = Some(other["--tls-ca-cert=".len()..].to_string());
             }
             "-c" => {
                 let value = args.next().ok_or("-c requires a command")?;
-                commands.push(value);
+                opts.commands.push(value);
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
-    Ok(Opts { host, commands })
+    validate_tls_args(&opts)?;
+    Ok(opts)
+}
+
+/// Reject TLS flag combinations the client cannot honor, with a precise
+/// message naming what is missing. `--tls-ca-cert` and `--tls-insecure` imply
+/// `--tls`; TLS itself needs `--host` (there is nothing to encrypt locally).
+fn validate_tls_args(opts: &Opts) -> Result<(), String> {
+    let requested = opts.tls || opts.tls_ca_cert.is_some() || opts.tls_insecure;
+    if !requested {
+        return Ok(());
+    }
+    // The build's capabilities come first: a binary without the feature
+    // cannot honor any TLS request, whatever the flags say.
+    if !cfg!(feature = "tls") {
+        return Err(
+            "TLS was requested, but this pinkdb binary was built without the tls feature;\n       \
+             rebuild with `cargo build -p pinkdb-cli --features client,tls`."
+                .to_string(),
+        );
+    }
+    if opts.host.is_none() {
+        return Err(
+            "TLS flags (--tls / --tls-ca-cert / --tls-insecure) require --host".to_string(),
+        );
+    }
+    if opts.tls_ca_cert.is_some() && opts.tls_insecure {
+        return Err(
+            "--tls-ca-cert and --tls-insecure are mutually exclusive: pick one trust source"
+                .to_string(),
+        );
+    }
+    if opts.tls_ca_cert.is_none() && !opts.tls_insecure {
+        return Err(
+            "--tls needs a trust source: pass --tls-ca-cert PATH (PEM), or --tls-insecure \
+             (local testing only)"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The name verified against the server certificate: the host part of
+/// `--host HOST:PORT`, with `[::1]` brackets stripped.
+#[cfg(feature = "tls")]
+fn tls_server_name(host: &str) -> String {
+    if let Some(rest) = host.strip_prefix('[')
+        && let Some((inside, _)) = rest.split_once(']')
+    {
+        return inside.to_string();
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return host.to_string();
+    }
+    match host.rsplit_once(':') {
+        Some((name, _)) if !name.is_empty() && !name.contains(':') => name.to_string(),
+        _ => host.to_string(),
+    }
 }
 
 /// Build the REPL session: local by default, remote when `--host` is given
-/// (the `client` feature; without it, `--host` is rejected). The `PINKDB_KEY`
+/// (the `client` feature; without it, `--host` is rejected). Over TLS when
+/// the `tls` feature is built and the TLS flags ask for it. The `PINKDB_KEY`
 /// passphrase, when set, becomes the store's at-rest key in local mode; in
 /// remote mode the variable is inert (the server's own at-rest configuration
 /// applies), so a set key is called out instead of being silently ignored.
-fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
+fn build_session(opts: &Opts, key: Option<EncryptionKey>) -> Session {
+    let host = opts.host.clone();
     if host.is_some() && key.is_some() {
         eprintln!(
             "warning: PINKDB_KEY is set but is not used in remote mode; \
@@ -1135,13 +1224,18 @@ fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
             Session::Local(LocalSession::new(db))
         }
         #[cfg(feature = "client")]
-        Some(host) => match Client::connect(&host) {
-            Ok(client) => Session::Remote(client),
-            Err(e) => {
-                eprintln!("Error: cannot connect to {host}: {e}");
-                std::process::exit(1);
+        Some(host) => {
+            if let Some(session) = open_tls_session(&host, opts) {
+                return session;
             }
-        },
+            match Client::connect(&host) {
+                Ok(client) => Session::Remote(client),
+                Err(e) => {
+                    eprintln!("Error: cannot connect to {host}: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         #[cfg(not(feature = "client"))]
         Some(_) => {
             eprintln!(
@@ -1151,6 +1245,40 @@ fn build_session(host: Option<String>, key: Option<EncryptionKey>) -> Session {
             std::process::exit(2);
         }
     }
+}
+
+/// The TLS remote session when the flags asked for one (crate feature `tls`);
+/// `None` = plaintext. Startup validation has already vetted the flag
+/// combination and feature availability, so a TLS request that reaches here
+/// always has exactly one trust source.
+#[cfg(feature = "tls")]
+fn open_tls_session(host: &str, opts: &Opts) -> Option<Session> {
+    if !(opts.tls || opts.tls_ca_cert.is_some() || opts.tls_insecure) {
+        return None;
+    }
+    if opts.tls_insecure {
+        eprintln!(
+            "warning: --tls-insecure skips server certificate verification; \
+             use it only for local testing"
+        );
+    }
+    let trust = match &opts.tls_ca_cert {
+        Some(path) => ClientTrust::CaFile(std::path::PathBuf::from(path)),
+        None => ClientTrust::Insecure,
+    };
+    match Client::connect_tls(host, &tls_server_name(host), trust) {
+        Ok(client) => Some(Session::Remote(client)),
+        Err(e) => {
+            eprintln!("Error: cannot connect to {host} over TLS: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(all(feature = "client", not(feature = "tls")))]
+fn open_tls_session(_host: &str, _opts: &Opts) -> Option<Session> {
+    // `validate_tls_args` rejects TLS flags in this build.
+    None
 }
 
 /// Durable-open options from the environment: `PINKDB_BUSY_TIMEOUT_MS`
@@ -1175,9 +1303,11 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let host = opts.host;
+    // Only the remote banner (client feature) needs the host string.
+    #[cfg(feature = "client")]
+    let host = opts.host.clone();
     let mut session = build_session(
-        host.clone(),
+        &opts,
         match EncryptionKey::from_env() {
             Ok(key) => key,
             Err(e) => {

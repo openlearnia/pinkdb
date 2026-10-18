@@ -11,6 +11,10 @@ path = "src/main.rs"
 [features]
 # Opt-in remote mode: `pinkdb --host HOST:PORT` talks to a pinkdb-server.
 client = ["dep:pinkdb-server"]
+# Opt-in TLS for remote mode: `--tls`, `--tls-ca-cert PATH` and
+# `--tls-insecure` work and the transport is rustls-encrypted. Implies
+# `client` and forwards to `pinkdb-server/tls`.
+tls = ["client", "pinkdb-server/tls"]
 # Opt-in at-rest encryption: forwards to `pinkdb/encryption`; `PINKDB_KEY`
 # then encrypts `.save` and decrypts `.open`. When a lake feature is built
 # too, the same key encrypts the lake at rest (pink-lake's `encryption`
@@ -52,3 +56,7 @@ serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
 # Lake layer (vortexlake/pinklake features): catalog + immutable data files.
 pink-lake = { path = "../pink-lake", optional = true }
+
+[dev-dependencies]
+# Test-only self-signed certificate generation for the TLS remote-mode tests.
+rcgen = "0.14"

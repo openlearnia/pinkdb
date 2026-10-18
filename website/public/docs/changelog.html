@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
+<h3>Wave 46 — network server TLS ✅</h3>
+<ul>
+<li>Opt-in <code>tls</code> feature: the server serves the same protocol over <strong>rustls</strong>-encrypted TCP (<code>--tls-cert/--tls-key</code>), and the CLI's remote mode gained <code>--tls</code>, <code>--tls-ca-cert</code> and <code>--tls-insecure</code>. Certificate problems refuse startup with precise messages; handshake failures never disturb the accept loop; the default build and dependency graph are unchanged.</li>
+<li>Still <strong>no authentication</strong> — TLS encrypts the transport only, which the docs and startup warning state explicitly.</li>
+</ul>
 <h3>Wave 47 — async I/O at the boundary ✅</h3>
 <ul>
 <li><code>pinkdb-server</code> gains an opt-in <strong><code>async-server</code></strong> transport: a tokio listener with one task per connection, engine calls on the blocking pool, and <strong>byte-identical protocol frames</strong> to the synchronous server (same client works unchanged). <code>--transport sync|async</code>.</li>

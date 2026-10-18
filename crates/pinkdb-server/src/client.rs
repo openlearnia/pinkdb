@@ -14,7 +14,7 @@
 //! # Ok::<(), pinkdb_server::ClientError>(())
 //! ```
 
-use std::io::BufReader;
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 
 use pinkdb::{DataType, QueryResult, Value};
@@ -29,6 +29,10 @@ pub enum ClientError {
     /// The connection is unusable after an earlier decode or transport error:
     /// no further frames may be read from it. Reconnect.
     Broken(String),
+    /// TLS could not be set up (bad certificate file, bad server name, ...)
+    /// or the TLS handshake failed before the pinkdb handshake.
+    #[cfg(feature = "tls")]
+    Tls(String),
 }
 
 impl std::fmt::Display for ClientError {
@@ -36,6 +40,8 @@ impl std::fmt::Display for ClientError {
         match self {
             ClientError::Protocol(e) => write!(f, "{e}"),
             ClientError::Broken(msg) => write!(f, "client connection is broken: {msg}"),
+            #[cfg(feature = "tls")]
+            ClientError::Tls(msg) => write!(f, "{msg}"),
         }
     }
 }
@@ -45,6 +51,8 @@ impl std::error::Error for ClientError {
         match self {
             ClientError::Protocol(e) => Some(e),
             ClientError::Broken(_) => None,
+            #[cfg(feature = "tls")]
+            ClientError::Tls(_) => None,
         }
     }
 }
@@ -61,11 +69,52 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 /// One result set being assembled from frames: names, types, rows so far.
 type PendingResult = Option<(Vec<String>, Vec<DataType>, Vec<Vec<Value>>)>;
 
+/// The byte stream under a client connection: plain TCP, or TLS over TCP
+/// (crate feature `tls`).
+///
+/// The pinkdb protocol runs over one owned stream that is both readable and
+/// writable; the client reads through its `BufReader` and writes through the
+/// same stream (`BufReader::get_mut`), which is exactly what rustls'
+/// `StreamOwned` requires.
+#[derive(Debug)]
+enum Transport {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+}
+
+impl Read for Transport {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Plain(stream) => stream.read(buf),
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Transport {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Transport::Plain(stream) => stream.write(buf),
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Transport::Plain(stream) => stream.flush(),
+            #[cfg(feature = "tls")]
+            Transport::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
 /// A blocking client connection. One client = one server-side session.
 #[derive(Debug)]
 pub struct Client {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    reader: BufReader<Transport>,
     server_version: String,
     protocol_version: u32,
     /// Set after a decode/transport failure: the stream is out of sync, so
@@ -83,35 +132,55 @@ impl Client {
     /// version the server agrees on.
     pub fn connect(addr: impl ToSocketAddrs) -> Result<Client> {
         let stream = TcpStream::connect(addr).map_err(ProtocolError::Io)?;
-        if let Err(e) = stream.set_nodelay(true) {
-            eprintln!("pinkdb: cannot set TCP_NODELAY on the client socket: {e}");
-        }
-        // Never hang forever on a stalling server. A generous idle timeout
-        // (override with PINKDB_CLIENT_TIMEOUT_MS; 0 disables) leaves
-        // long-running queries room while bounding a dead peer.
-        let timeout_ms = std::env::var("PINKDB_CLIENT_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(300_000);
-        if timeout_ms > 0 {
-            let timeout = Some(std::time::Duration::from_millis(timeout_ms));
-            if let Err(e) = stream.set_read_timeout(timeout) {
-                eprintln!("pinkdb: cannot set the client read timeout: {e}");
-            }
-            if let Err(e) = stream.set_write_timeout(timeout) {
-                eprintln!("pinkdb: cannot set the client write timeout: {e}");
-            }
-        }
-        let writer = stream.try_clone().map_err(ProtocolError::Io)?;
+        configure_client_socket(&stream);
+        Self::handshake(Transport::Plain(stream))
+    }
+
+    /// Connect over TLS and perform the `Hello` handshake (crate feature
+    /// `tls`).
+    ///
+    /// `server_name` is what the server certificate is verified against: a
+    /// DNS name (`db.example.com`) or an IP-address literal (`127.0.0.1`).
+    /// `trust` selects the trust anchor, or the loudly unsafe
+    /// [`crate::ClientTrust::Insecure`] escape hatch for local tests.
+    ///
+    /// A TLS client pointed at a *plaintext* server cannot tell the stall
+    /// apart from a slow peer: the ClientHello reads as a plausible frame
+    /// length, so the failure surfaces only when the server's idle timeout
+    /// (or `PINKDB_CLIENT_TIMEOUT_MS` on this side) expires — always an
+    /// error, never a served connection.
+    #[cfg(feature = "tls")]
+    pub fn connect_tls(
+        addr: impl ToSocketAddrs,
+        server_name: &str,
+        trust: crate::tls::ClientTrust,
+    ) -> Result<Client> {
+        let config = crate::tls::client_config(trust)
+            .map_err(|e| ClientError::Tls(format!("TLS configuration failed: {e}")))?;
+        let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
+            .map_err(|e| ClientError::Tls(format!("invalid TLS server name: {e}")))?;
+        let stream = TcpStream::connect(addr).map_err(ProtocolError::Io)?;
+        configure_client_socket(&stream);
+        let session = rustls::ClientConnection::new(config, server_name)
+            .map_err(|e| ClientError::Tls(format!("cannot start the TLS session: {e}")))?;
+        // The TLS handshake runs lazily on the first read/write below; a
+        // certificate or protocol failure surfaces as the IO error of the
+        // `Hello` write or response read.
+        Self::handshake(Transport::Tls(Box::new(rustls::StreamOwned::new(
+            session, stream,
+        ))))
+    }
+
+    /// Configure the transport, then speak the `Hello` handshake.
+    fn handshake(transport: Transport) -> Result<Client> {
         let mut client = Client {
-            reader: BufReader::new(stream),
-            writer,
+            reader: BufReader::new(transport),
             server_version: String::new(),
             protocol_version: PROTOCOL_VERSION,
             broken: false,
         };
         protocol::write_request(
-            &mut client.writer,
+            client.reader.get_mut(),
             &Request::Hello {
                 protocol_version: PROTOCOL_VERSION,
             },
@@ -155,7 +224,7 @@ impl Client {
     pub fn ping(&mut self) -> Result<()> {
         self.check_usable()?;
         let result = (|| {
-            protocol::write_request(&mut self.writer, &Request::Ping)?;
+            protocol::write_request(self.reader.get_mut(), &Request::Ping)?;
             match protocol::read_response(&mut self.reader)? {
                 Response::Pong => Ok(()),
                 Response::Error { message } => Err(ProtocolError::Server(message).into()),
@@ -186,7 +255,7 @@ impl Client {
 
     fn execute_inner(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
         protocol::write_request(
-            &mut self.writer,
+            self.reader.get_mut(),
             &Request::Execute {
                 sql: sql.to_string(),
             },
@@ -200,7 +269,7 @@ impl Client {
         self.check_usable()?;
         let result = (|| {
             protocol::write_request(
-                &mut self.writer,
+                self.reader.get_mut(),
                 &Request::Prepare {
                     sql: sql.to_string(),
                 },
@@ -236,7 +305,7 @@ impl Client {
         values: &[Value],
     ) -> Result<Vec<QueryResult>> {
         protocol::write_request(
-            &mut self.writer,
+            self.reader.get_mut(),
             &Request::ExecutePrepared {
                 handle,
                 values: values.to_vec(),
@@ -351,6 +420,29 @@ impl Client {
             self.broken = true;
         }
         result
+    }
+}
+
+/// Socket options every client connection gets: `TCP_NODELAY`, and a bounded
+/// read/write timeout (override with `PINKDB_CLIENT_TIMEOUT_MS`; 0 disables)
+/// so a stalling server cannot hang the client forever. With TLS, the same
+/// socket timeouts bound the handshake and every encrypted read/write.
+fn configure_client_socket(stream: &TcpStream) {
+    if let Err(e) = stream.set_nodelay(true) {
+        eprintln!("pinkdb: cannot set TCP_NODELAY on the client socket: {e}");
+    }
+    let timeout_ms = std::env::var("PINKDB_CLIENT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300_000);
+    if timeout_ms > 0 {
+        let timeout = Some(std::time::Duration::from_millis(timeout_ms));
+        if let Err(e) = stream.set_read_timeout(timeout) {
+            eprintln!("pinkdb: cannot set the client read timeout: {e}");
+        }
+        if let Err(e) = stream.set_write_timeout(timeout) {
+            eprintln!("pinkdb: cannot set the client write timeout: {e}");
+        }
     }
 }
 
