@@ -1249,3 +1249,20 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   COUNT+MIN+MAX = **0 decodes**. Multi-writer (4 processes, txn-read):
   serial 0.344 s vs concurrent 0.143 s → **2.41×**, verify ok (previous
   record 2.55×).
+- 2026-10-17 — **Bug-review remediation** (branch `hardening-review-fixes`;
+  source [docs/bug-review-2026-10-17-1827.md](docs/bug-review-2026-10-17-1827.md),
+  status [docs/bug-review-remediation-2026-10-17.md](docs/bug-review-remediation-2026-10-17.md)):
+  all **12 P1** findings fixed with regression tests verified to fail on the
+  pre-fix code — Window filter pushdown, mixed-operand JOIN keys, `ALTER …
+  DEFAULT` guards, JOIN/UNION plan depth, RANGE-frame NULL keys, plaintext WAL
+  mid-file CRC, atomic/guarded `save`, legacy-head lake commits, delete-file
+  count overflow, private staging copies, server `ExecutePrepared`/`Rows` caps
+  — plus the P2 engine/lake/S3/CLI/server/bindings edges (concat operand,
+  alias shadowing, set-op NULL, checked overflow, INTERVAL hashing, lazy
+  CASE/COALESCE, WAL fsync/LSN/decoders, conflict set, container versions,
+  schema-counter monotonicity, conditional retry, SigV4, CLI guards, bindings
+  DECIMAL/INTERVAL/`ALTERED_TABLE`, client caps/timeouts, FFI unwind, docs).
+  Deferred: `.pink` string-offset `u32` plumbing; attach `COUNT` with
+  overlapping delete files. Gates: workspace test/clippy green, duckdiff
+  171/171 (175/175 big), feature matrices (encryption, lake s3/vortex, CLI
+  lake,s3/client/repo, Python 37, Go) green.

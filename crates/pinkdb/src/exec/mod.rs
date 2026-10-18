@@ -96,11 +96,12 @@ pub(crate) struct Output {
 
 /// Per-statement execution context: the database, visible CTE outputs
 /// (CTEs shadow catalog tables), memoised subquery results keyed by
-/// plan-node address (the tree is immutable during execution, so each
-/// uncorrelated subquery evaluates once even when probed per chunk), and the
-/// per-statement scan projections (which columns each scan's consumers
-/// read — the attached-lake read path decodes only those, and a store scan
-/// materializes only those).
+/// plan-node address (the tree is immutable during execution, so a memo hit
+/// skips the work; under `par_iter` two chunks racing on the same first probe
+/// may both evaluate one uncorrelated subquery — redundant, but the result is
+/// still correct), and the per-statement scan projections (which columns each
+/// scan's consumers read — the attached-lake read path decodes only those, and
+/// a store scan materializes only those).
 pub(crate) struct Cx<'a> {
     pub(crate) db: &'a PinkDb,
     pub(crate) ctes: HashMap<String, Output>,

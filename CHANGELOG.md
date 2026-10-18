@@ -10,6 +10,28 @@ one-liners below.
 
 ## 2026-10-17
 
+### Bug-review remediation — P1 + P2 ✅
+- **P1 (12)** — Window filter pushdown (wrong ranks), mixed-operand JOIN keys
+  (panic), `ALTER … DEFAULT` depth/parameter guards, JOIN/UNION plan depth,
+  RANGE-frame NULL keys, plaintext WAL mid-file corruption (silent data loss),
+  atomic + guarded `save`, legacy-head lake commits (unreadable catalog),
+  delete-file count overflow, plaintext staging copies, and the server's
+  `ExecutePrepared` / `Rows` allocation caps.
+- **P2 (engine)** — `||` on the right of `=`/`LIKE`/`BETWEEN`, SELECT-alias
+  shadowing within one list, set-op `NULL` arms, checked decimal/temporal
+  overflow, an optimizer index guard, INTERVAL hashing, lazy CASE/COALESCE,
+  WAL directory fsync + checked LSN/decoders, the COMMIT conflict set, and
+  unsupported WAL container versions.
+- **P2 (lake/S3/CLI/server/bindings)** — monotonic lake `schema_version`,
+  partition error names, container-version classification, conditional-retry
+  guard, SigV4 whitespace, CLI fail-closed key/backoff/partition guards,
+  loopback parsing, atomic + Windows-safe repo files, terminal-escape output
+  escaping, checked prepared handles, an FFI unwind guard, DECIMAL/INTERVAL/
+  `ALTERED_TABLE` in the Python and Go bindings, a client batch cap + socket
+  timeouts, off-thread over-limit rejection, and documentation drift.
+- Deferred (documented): `.pink` string-offset `u32` plumbing; attach `COUNT`
+  with overlapping delete files.
+
 ### Wave 67 — lake maintenance ✅
 - **Compaction**: `merge_adjacent_files` publishes one new version referencing
   consolidated files — groups of delete-free files sharing partition values and
