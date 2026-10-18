@@ -667,6 +667,8 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
         QueryResult::LoadedExtension { name } => done(w, DoneKind::LoadedExtension, 0, name),
         QueryResult::Checkpointed => done(w, DoneKind::Checkpointed, 0, ""),
         QueryResult::AlteredTable { name } => done(w, DoneKind::AlteredTable, 0, name),
+        QueryResult::CreatedIndex { name } => done(w, DoneKind::Created, 0, name),
+        QueryResult::DroppedIndex { name } => done(w, DoneKind::DroppedTable, 0, name),
     }
 }
 

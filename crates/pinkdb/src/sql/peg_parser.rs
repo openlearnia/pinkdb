@@ -945,6 +945,9 @@ peg::parser! {
             = kw(Keyword::Create) kw(Keyword::Database) ifne:if_not_exists() name:ident() {
                   Statement::CreateDatabase { name, if_not_exists: ifne }
               }
+            / kw(Keyword::Create) kw(Keyword::Index) ifne:if_not_exists() name:ident() kw(Keyword::On) t:table_ref() lparen() col:ident() rparen() {
+                  Statement::CreateIndex { db: t.0, name, table: t.1, column: col, if_not_exists: ifne }
+              }
             / kw(Keyword::Create) kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
                   Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query) }
               }
@@ -1110,8 +1113,8 @@ peg::parser! {
             / kw(Keyword::Drop) kw(Keyword::Table) ife:if_exists() t:table_ref() {
                   Statement::DropTable { db: t.0, name: t.1, if_exists: ife }
               }
+            / kw(Keyword::Drop) kw(Keyword::Index) ife:if_exists() t:table_ref() { Statement::DropIndex { db: t.0, name: t.1, if_exists: ife } }
             / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
-
         /// `ALTER TABLE` (wave 65). `alter`, `add`, `column`, `rename` and
         /// `default` are matched as words, not reserved keywords, so they stay
         /// usable as table/column names (`to` too: `RENAME COLUMN a TO to`).

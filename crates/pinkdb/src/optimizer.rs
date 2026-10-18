@@ -31,7 +31,135 @@ pub fn optimize(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     let plan = pushdown(fold_plan(db, plan));
     let plan = eliminate_fk_joins(db, plan);
     let plan = drop_count_star_projections(plan);
+    let plan = apply_indexes(db, plan);
     fold_plan(db, plan)
+}
+
+/// Rewrite `Filter { input: Scan, predicate: col = literal }` into an
+/// `IndexScan` when a hash index exists on that column. Only simple equality
+/// against a literal is supported; everything else keeps the scan.
+fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
+    match plan {
+        LogicalPlan::Filter { input, predicate } => {
+            let input = apply_indexes(db, *input);
+            // Try to match input: Scan + predicate: col = literal.
+            if let LogicalPlan::Scan { db: qdb, table, .. } = &input {
+                if let BoundExpr::Binary {
+                    op: crate::sql::ast::BinaryOp::Eq,
+                    left,
+                    right,
+                    ..
+                } = &predicate
+                {
+                    // col = literal or literal = col
+                    let (col_idx, lit) = match (&**left, &**right) {
+                        (BoundExpr::Column { index, .. }, BoundExpr::Literal(_)) => {
+                            (*index, right.clone())
+                        }
+                        (BoundExpr::Literal(_), BoundExpr::Column { index, .. }) => {
+                            (*index, left.clone())
+                        }
+                        _ => return LogicalPlan::Filter {
+                            input: Box::new(input),
+                            predicate,
+                        },
+                    };
+                    let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
+                    if let Ok(t) = db.table_in(lookup, table) {
+                        if let Some(idx) = t.indexes.iter().find(|i| i.column == col_idx) {
+                            return LogicalPlan::IndexScan {
+                                db: qdb.clone(),
+                                table: table.clone(),
+                                index: idx.name.clone(),
+                                value: *lit,
+                            };
+                        }
+                    }
+                }
+            }
+            LogicalPlan::Filter {
+                input: Box::new(input),
+                predicate,
+            }
+        }
+        LogicalPlan::Project { input, exprs, names } => LogicalPlan::Project {
+            input: Box::new(apply_indexes(db, *input)),
+            exprs,
+            names,
+        },
+        LogicalPlan::Sort { input, keys } => LogicalPlan::Sort {
+            input: Box::new(apply_indexes(db, *input)),
+            keys,
+        },
+        LogicalPlan::Limit { input, limit } => LogicalPlan::Limit {
+            input: Box::new(apply_indexes(db, *input)),
+            limit,
+        },
+        LogicalPlan::Offset { input, offset } => LogicalPlan::Offset {
+            input: Box::new(apply_indexes(db, *input)),
+            offset,
+        },
+        LogicalPlan::Distinct { input } => LogicalPlan::Distinct {
+            input: Box::new(apply_indexes(db, *input)),
+        },
+        LogicalPlan::Window {
+            input,
+            windows,
+            input_cols,
+        } => LogicalPlan::Window {
+            input: Box::new(apply_indexes(db, *input)),
+            windows,
+            input_cols,
+        },
+        LogicalPlan::Aggregate { input, keys, aggs } => LogicalPlan::Aggregate {
+            input: Box::new(apply_indexes(db, *input)),
+            keys,
+            aggs,
+        },
+        LogicalPlan::Join {
+            kind,
+            left,
+            right,
+            left_keys,
+            right_keys,
+            left_cols,
+        } => LogicalPlan::Join {
+            kind,
+            left: Box::new(apply_indexes(db, *left)),
+            right: Box::new(apply_indexes(db, *right)),
+            left_keys,
+            right_keys,
+            left_cols,
+        },
+        LogicalPlan::NestedLoopJoin {
+            kind,
+            left,
+            right,
+            on,
+            left_cols,
+        } => LogicalPlan::NestedLoopJoin {
+            kind,
+            left: Box::new(apply_indexes(db, *left)),
+            right: Box::new(apply_indexes(db, *right)),
+            on,
+            left_cols,
+        },
+        LogicalPlan::SetOp { op, left, right, types } => LogicalPlan::SetOp {
+            op,
+            left: Box::new(apply_indexes(db, *left)),
+            right: Box::new(apply_indexes(db, *right)),
+            types,
+        },
+        LogicalPlan::Cte { name, query, body } => LogicalPlan::Cte {
+            name,
+            query: Box::new(apply_indexes(db, *query)),
+            body: Box::new(apply_indexes(db, *body)),
+        },
+        LogicalPlan::Explain { plan } => LogicalPlan::Explain {
+            plan: Box::new(apply_indexes(db, *plan)),
+        },
+        other => other,
+    }
 }
 
 /// Drop a `Project` that feeds an aggregate that only counts rows

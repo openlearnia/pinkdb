@@ -16,7 +16,7 @@ use crate::types::{decimal_fits, DataType, PinkDbError, Result, Value};
 use crate::vector::{DataChunk, Vector, VectorData, CHUNK_SIZE};
 use rayon::prelude::*;
 
-fn encode_value(buf: &mut Vec<u8>, v: &Value) {
+pub(crate) fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
         Value::Null => buf.push(0),
         Value::Boolean(b) => {

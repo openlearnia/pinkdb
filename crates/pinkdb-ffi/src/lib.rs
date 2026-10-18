@@ -309,6 +309,8 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::LoadedExtension { .. } => PINKDB_STMT_LOADED_EXTENSION,
         QueryResult::Checkpointed => PINKDB_STMT_CHECKPOINTED,
         QueryResult::AlteredTable { .. } => PINKDB_STMT_ALTERED_TABLE,
+        QueryResult::CreatedIndex { .. } => PINKDB_STMT_CREATED,
+        QueryResult::DroppedIndex { .. } => PINKDB_STMT_DROPPED_TABLE,
     }
 }
 

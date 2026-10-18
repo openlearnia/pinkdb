@@ -78,6 +78,7 @@ pub(crate) enum Keyword {
     Database,
     Load,
     Extension,
+    Index,
 }
 
 impl Keyword {
@@ -154,6 +155,7 @@ impl Keyword {
             "DATABASE" => Keyword::Database,
             "LOAD" => Keyword::Load,
             "EXTENSION" => Keyword::Extension,
+            "INDEX" => Keyword::Index,
             _ => return None,
         })
     }

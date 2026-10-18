@@ -98,6 +98,20 @@ pub enum Statement {
     ShowTables,
     /// `SHOW DATABASES`: every database in the store, sorted by name.
     ShowDatabases,
+    /// `CREATE INDEX [IF NOT EXISTS] <name> ON <table>(<col>)`.
+    CreateIndex {
+        db: Option<String>,
+        name: String,
+        table: String,
+        column: String,
+        if_not_exists: bool,
+    },
+    /// `DROP INDEX [IF EXISTS] <name>`.
+    DropIndex {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
     /// `DESCRIBE <table>`: DuckDB-shaped column metadata.
     Describe {
         db: Option<String>,

@@ -985,6 +985,8 @@ fn render_results(results: &[QueryResult]) {
             QueryResult::RolledBack => println!("Transaction rolled back."),
             QueryResult::CreatedView { name } => println!("View {name} created."),
             QueryResult::DroppedTable { name } => println!("Table {name} dropped."),
+            QueryResult::CreatedIndex { name } => println!("Index {name} created."),
+            QueryResult::DroppedIndex { name } => println!("Index {name} dropped."),
             QueryResult::DroppedView { name } => println!("View {name} dropped."),
             QueryResult::CreatedDatabase { name } => {
                 println!("Database {name} created.")

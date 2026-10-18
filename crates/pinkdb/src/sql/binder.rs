@@ -3023,6 +3023,47 @@ pub(crate) fn bind_tracked_with(
             name: name.clone(),
             if_exists: *if_exists,
         }),
+        Statement::CreateIndex {
+            db: qdb,
+            name,
+            table,
+            column,
+            if_not_exists,
+        } => {
+            // Validate table + column exist.
+            let target_db = Binder::new(db, default_db).resolve_db(qdb)?;
+            let col_idx = if let Ok(t) = db.table_in(&target_db, table) {
+                t.columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(column))
+                    .ok_or_else(|| {
+                        PinkDbError::Catalog(format!(
+                            "column \"{column}\" not found in table \"{table}\""
+                        ))
+                    })?
+            } else {
+                if !*if_not_exists {
+                    return Err(PinkDbError::Catalog(format!("table \"{table}\" not found")));
+                }
+                0
+            };
+            empty(LogicalPlan::CreateIndex {
+                db: Some(target_db),
+                name: name.clone(),
+                table: table.clone(),
+                column: col_idx,
+                if_not_exists: *if_not_exists,
+            })
+        }
+        Statement::DropIndex {
+            db: qdb,
+            name,
+            if_exists,
+        } => empty(LogicalPlan::DropIndex {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         Statement::AlterTable { db: qdb, name, op } => {
             bind_alter_table(db, default_db, qdb.as_deref(), name, op, params.clone())
         }
@@ -4289,7 +4330,13 @@ pub(crate) fn plan_schema(
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::Checkpoint
-        | LogicalPlan::Use { .. } => Ok(Vec::new()),
+        | LogicalPlan::Use { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. } => Ok(Vec::new()),
+        LogicalPlan::IndexScan { db: qdb, table, .. } => {
+            let lookup = qdb.as_deref().unwrap_or(default_db);
+            db.visible_table_schema(lookup, table)
+        }
         // DESCRIBE/EXPLAIN produce fixed shapes (their schema is built by the
         // executor); they never appear as a query scope.
         LogicalPlan::Describe { .. } | LogicalPlan::Explain { .. } => Ok(Vec::new()),

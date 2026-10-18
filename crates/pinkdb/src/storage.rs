@@ -81,6 +81,8 @@ pub struct DataTable {
     /// `DESCRIBE` reports them and the optimizer may trust them (see
     /// [`crate::optimizer`]).
     pub constraints: TableConstraints,
+    /// In-memory hash indexes for equality lookups.
+    pub indexes: Vec<Index>,
     /// Mutation stamp for optimistic-concurrency conflict detection. Drawn
     /// from a process-wide counter on creation and on every
     /// append/update/delete batch, so it is unique across tables: a table
@@ -88,6 +90,16 @@ pub struct DataTable {
     /// stamp (a transaction based on the old table must conflict).
     /// Process-lifetime only (not persisted — save/load draws fresh stamps).
     pub version: u64,
+}
+
+/// A single-column hash index: maps a key value to the global row indices
+/// (flattened across chunks) where it occurs. NULL keys are not stored
+/// (NULL never matches `=`).
+#[derive(Debug, Clone)]
+pub struct Index {
+    pub name: String,
+    pub column: usize,
+    pub map: std::collections::HashMap<Vec<u8>, Vec<usize>>,
 }
 
 /// The kind of a declarative key constraint.
@@ -231,6 +243,7 @@ impl DataTable {
                 .collect(),
             num_rows: 0,
             constraints,
+            indexes: Vec::new(),
             version: next_table_version(),
         })
     }
@@ -266,6 +279,7 @@ impl DataTable {
             columns,
             num_rows,
             constraints: TableConstraints::default(),
+            indexes: Vec::new(),
             version: next_table_version(),
         }
     }
@@ -1511,6 +1525,46 @@ impl PinkDb {
             .remove(&Self::key(name))
             .map(|_| ())
             .ok_or_else(|| PinkDbError::Catalog(format!("table \"{name}\" not found")))
+    }
+
+    /// Build a hash index on `table.column` (by index) and store it.
+    pub fn create_index_in(&mut self, db: &str, table: &str, name: &str, column: usize) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, table) {
+            return Err(err);
+        }
+        let t = self.table_mut_in(db, table)?;
+        // Build the index: map each non-NULL key value to global row indices.
+        let mut map = std::collections::HashMap::new();
+        let mut offset = 0usize;
+        for chunk in t.columns[column].chunks.iter() {
+            for row in 0..chunk.len() {
+                let v = chunk.get(row);
+                if matches!(v, crate::types::Value::Null) {
+                    continue;
+                }
+                let mut buf = Vec::new();
+                crate::exec::aggregate::encode_value(&mut buf, &v);
+                let global = offset + row;
+                map.entry(buf).or_insert_with(Vec::new).push(global);
+            }
+            offset += chunk.len();
+        }
+        t.indexes.push(Index {
+            name: name.to_string(),
+            column,
+            map,
+        });
+        Ok(())
+    }
+
+    pub fn drop_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
+        let t = self.table_mut_in(db, table)?;
+        let before = t.indexes.len();
+        t.indexes.retain(|i| i.name != name);
+        if t.indexes.len() == before {
+            return Err(PinkDbError::Catalog(format!("index \"{name}\" not found")));
+        }
+        Ok(())
     }
 
     /// `ALTER TABLE … RENAME TO` (wave 65): move the table to a new

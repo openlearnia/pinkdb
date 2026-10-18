@@ -81,6 +81,24 @@ pub enum LogicalPlan {
         /// `IF EXISTS`: a missing table makes this a no-op.
         if_exists: bool,
     },
+    CreateIndex {
+        db: Option<String>,
+        name: String,
+        table: String,
+        column: usize,
+        if_not_exists: bool,
+    },
+    DropIndex {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
+    IndexScan {
+        db: Option<String>,
+        table: String,
+        index: String,
+        value: BoundExpr,
+    },
     DropView {
         db: Option<String>,
         name: String,
@@ -435,7 +453,12 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::Describe { .. }
-        | LogicalPlan::Checkpoint => {}
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. } => {}
+        LogicalPlan::IndexScan { db, table, .. } => {
+            out.insert(key(db, table));
+        }
         // `CREATE TABLE` reads the declared foreign-key targets: the binder
         // validated their keys against the catalog, so the statement depends
         // on them (a concurrent DROP/recreate that changes the key is a
@@ -750,7 +773,10 @@ fn walk_scan_filters(
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::AlterTable { .. }
-        | LogicalPlan::CreateTable { .. } => {}
+        | LogicalPlan::CreateTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::IndexScan { .. } => {}
         LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
         LogicalPlan::CreateTableAs { query, .. } | LogicalPlan::InsertSelect { query, .. } => {
             walk_scan_filters(query, &[], out)
@@ -1201,7 +1227,10 @@ fn walk_scan_projections(
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::Describe { .. }
-        | LogicalPlan::Checkpoint => {}
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::IndexScan { .. } => {}
     }
 }
 

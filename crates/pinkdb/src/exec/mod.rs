@@ -55,6 +55,12 @@ pub enum QueryResult {
     DroppedTable {
         name: String,
     },
+    CreatedIndex {
+        name: String,
+    },
+    DroppedIndex {
+        name: String,
+    },
     DroppedView {
         name: String,
     },
@@ -437,6 +443,55 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             db.drop_table_in(&target, name)?;
             Ok(QueryResult::DroppedTable { name: name.clone() })
         }
+        LogicalPlan::CreateIndex {
+            db: qdb,
+            name,
+            table,
+            column,
+            if_not_exists,
+        } => {
+            let target = resolve_db(db, qdb);
+            if db.table_in(&target, table).is_err() {
+                if *if_not_exists {
+                    return Ok(QueryResult::CreatedIndex { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!("table \"{table}\" not found")));
+            }
+            // Check if index already exists.
+            let t = db.table_in(&target, table)?;
+            if t.indexes.iter().any(|i| i.name == *name) {
+                if *if_not_exists {
+                    return Ok(QueryResult::CreatedIndex { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!("index \"{name}\" already exists")));
+            }
+            // Build index.
+            db.create_index_in(&target, table, name, *column)?;
+            Ok(QueryResult::CreatedIndex { name: name.clone() })
+        }
+        LogicalPlan::DropIndex {
+            db: qdb,
+            name,
+            if_exists,
+        } => {
+            let target = resolve_db(db, qdb);
+            // Find which table has this index.
+            let tables = db.list_tables_in(&target);
+            let mut found = false;
+            for tbl in &tables {
+                if let Ok(t) = db.table_in(&target, tbl) {
+                    if t.indexes.iter().any(|i| i.name == *name) {
+                        db.drop_index_in(&target, tbl, name)?;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found && !*if_exists {
+                return Err(PinkDbError::Catalog(format!("index \"{name}\" not found")));
+            }
+            Ok(QueryResult::DroppedIndex { name: name.clone() })
+        }
         LogicalPlan::AlterTable { db: qdb, name, op } => {
             let target = resolve_db(db, qdb);
             // An attached (read-only) name is refused before anything runs:
@@ -737,6 +792,45 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     })
 }
 
+/// Gather output for an index scan: produce chunks containing only the rows
+/// whose global indices are in `row_indices`, with the table's full column set.
+fn index_scan_output(
+    cx: &Cx,
+    db_name: &str,
+    table: &str,
+    _col: usize,
+    row_indices: &[usize],
+) -> Result<Output> {
+    let t = cx.db.table_in(db_name, table)?;
+    let (names, types): (Vec<String>, Vec<DataType>) = t.schema().into_iter().unzip();
+    let mut out_chunks = Vec::new();
+    let mut cur_cols: Vec<Vector> = types.iter().map(|ty| Vector::new_empty(*ty)).collect();
+    let mut cur_rows = 0usize;
+    for &ri in row_indices {
+        if cur_rows >= CHUNK_SIZE {
+            let cols = std::mem::take(&mut cur_cols);
+            out_chunks.push(DataChunk::new(cols)?);
+            cur_cols = types.iter().map(|ty| Vector::new_empty(*ty)).collect();
+            cur_rows = 0;
+        }
+        let chunk_idx = ri / CHUNK_SIZE;
+        let row_in_chunk = ri % CHUNK_SIZE;
+        for (ci, col) in t.columns.iter().enumerate() {
+            let v = col.chunks[chunk_idx].get(row_in_chunk);
+            cur_cols[ci].push_value(v)?;
+        }
+        cur_rows += 1;
+    }
+    if cur_rows > 0 || out_chunks.is_empty() {
+        out_chunks.push(DataChunk::new(cur_cols)?);
+    }
+    Ok(Output {
+        chunks: out_chunks,
+        names,
+        types,
+    })
+}
+
 /// The chunks of a store table restricted to `cols` — the in-memory twin of
 /// the attached-lake projected decode. Present columns are shared (`Arc`)
 /// with the stored chunk; a column outside `cols` is a shared zero-length
@@ -967,10 +1061,29 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::DropDatabase { .. }
         | LogicalPlan::LoadExtension { .. }
         | LogicalPlan::Checkpoint
-        | LogicalPlan::Use { .. } => Err(PinkDbError::Execution(
+        | LogicalPlan::Use { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. } => Err(PinkDbError::Execution(
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { .. } => scan_output(cx, plan),
+        LogicalPlan::IndexScan { db, table, index, value } => {
+            // Use the index to get matching row indices, then gather columns.
+            let target = resolve_db(cx.db, db);
+            let t = cx.db.table_in(&target, table)?;
+            let idx = t.indexes.iter().find(|i| i.name == *index).ok_or_else(|| {
+                PinkDbError::Catalog(format!("index \"{index}\" not found"))
+            })?;
+            // value is a BoundExpr literal.
+            let key_val = match value {
+                BoundExpr::Literal(v) => v.clone(),
+                _ => return Err(PinkDbError::Execution("index scan requires a literal".to_string())),
+            };
+            let mut key_buf = Vec::new();
+            crate::exec::aggregate::encode_value(&mut key_buf, &key_val);
+            let row_indices = idx.map.get(&key_buf).cloned().unwrap_or_default();
+            index_scan_output(cx, &target, table, idx.column, &row_indices)
+        }
         LogicalPlan::ShowTables { db } => {
             // DuckDB lists tables and views together, sorted by name.
             let mut names = cx.db.list_tables_in(db);
@@ -3702,6 +3815,9 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::Rollback => "Rollback".to_string(),
         LogicalPlan::CreateView { db, name, .. } => format!("CreateView {}", qualify(db, name)),
         LogicalPlan::DropTable { db, name, .. } => format!("DropTable {}", qualify(db, name)),
+        LogicalPlan::CreateIndex { db, name, table, .. } => format!("CreateIndex {} ON {}", name, qualify(db, table)),
+        LogicalPlan::DropIndex { db, name, .. } => format!("DropIndex {}", qualify(db, name)),
+        LogicalPlan::IndexScan { db, table, index, .. } => format!("IndexScan {} using {}", qualify(db, table), index),
         LogicalPlan::DropView { db, name } => format!("DropView {}", qualify(db, name)),
         LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
