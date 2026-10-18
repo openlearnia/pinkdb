@@ -13,16 +13,16 @@
 use std::time::{Duration, Instant};
 
 use pinkdb::Database;
-use pinkdb_server::client::Client;
 use pinkdb_server::Server;
+use pinkdb_server::client::Client;
 
 fn arg(name: &str, default: usize) -> usize {
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
-        if a == name {
-            if let Some(v) = it.next() {
-                return v.parse().unwrap_or(default);
-            }
+        if a == name
+            && let Some(v) = it.next()
+        {
+            return v.parse().unwrap_or(default);
         }
     }
     default
