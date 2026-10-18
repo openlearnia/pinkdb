@@ -76,7 +76,6 @@ pub use protocol::{
 };
 pub use server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server, ServerHandle};
 
-
 #[cfg(feature = "async-server")]
 pub use async_server::{AsyncServer, AsyncServerHandle};
 #[cfg(feature = "tls")]
