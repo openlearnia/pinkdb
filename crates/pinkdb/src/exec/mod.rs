@@ -472,7 +472,9 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                 if *if_not_exists {
                     return Ok(QueryResult::CreatedIndex { name: name.clone() });
                 }
-                return Err(PinkDbError::Catalog(format!("index \"{name}\" already exists")));
+                return Err(PinkDbError::Catalog(format!(
+                    "index \"{name}\" already exists"
+                )));
             }
             // Build index.
             db.create_index_in(&target, table, name, *column)?;
@@ -740,9 +742,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let target = resolve_db(db, qdb);
             if db.table_in(&target, name).is_err() {
                 if *if_exists {
-                    return Ok(QueryResult::DroppedMaterializedView {
-                        name: name.clone(),
-                    });
+                    return Ok(QueryResult::DroppedMaterializedView { name: name.clone() });
                 }
                 return Err(PinkDbError::Catalog(format!(
                     "materialized view \"{name}\" not found"
@@ -1192,17 +1192,28 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { .. } => scan_output(cx, plan),
-        LogicalPlan::IndexScan { db, table, index, value } => {
+        LogicalPlan::IndexScan {
+            db,
+            table,
+            index,
+            value,
+        } => {
             // Use the index to get matching row indices, then gather columns.
             let target = resolve_db(cx.db, db);
             let t = cx.db.table_in(&target, table)?;
-            let idx = t.indexes.iter().find(|i| i.name == *index).ok_or_else(|| {
-                PinkDbError::Catalog(format!("index \"{index}\" not found"))
-            })?;
+            let idx = t
+                .indexes
+                .iter()
+                .find(|i| i.name == *index)
+                .ok_or_else(|| PinkDbError::Catalog(format!("index \"{index}\" not found")))?;
             // value is a BoundExpr literal.
             let key_val = match value {
                 BoundExpr::Literal(v) => v.clone(),
-                _ => return Err(PinkDbError::Execution("index scan requires a literal".to_string())),
+                _ => {
+                    return Err(PinkDbError::Execution(
+                        "index scan requires a literal".to_string(),
+                    ))
+                }
             };
             let mut key_buf = Vec::new();
             crate::exec::aggregate::encode_value(&mut key_buf, &key_val);
@@ -3940,12 +3951,22 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::Rollback => "Rollback".to_string(),
         LogicalPlan::CreateView { db, name, .. } => format!("CreateView {}", qualify(db, name)),
         LogicalPlan::DropTable { db, name, .. } => format!("DropTable {}", qualify(db, name)),
-        LogicalPlan::CreateIndex { db, name, table, .. } => format!("CreateIndex {} ON {}", name, qualify(db, table)),
+        LogicalPlan::CreateIndex {
+            db, name, table, ..
+        } => format!("CreateIndex {} ON {}", name, qualify(db, table)),
         LogicalPlan::DropIndex { db, name, .. } => format!("DropIndex {}", qualify(db, name)),
-        LogicalPlan::CreateMaterializedView { db, name, .. } => format!("CreateMaterializedView {}", qualify(db, name)),
-        LogicalPlan::RefreshMaterializedView { db, name } => format!("RefreshMaterializedView {}", qualify(db, name)),
-        LogicalPlan::DropMaterializedView { db, name, .. } => format!("DropMaterializedView {}", qualify(db, name)),
-        LogicalPlan::IndexScan { db, table, index, .. } => format!("IndexScan {} using {}", qualify(db, table), index),
+        LogicalPlan::CreateMaterializedView { db, name, .. } => {
+            format!("CreateMaterializedView {}", qualify(db, name))
+        }
+        LogicalPlan::RefreshMaterializedView { db, name } => {
+            format!("RefreshMaterializedView {}", qualify(db, name))
+        }
+        LogicalPlan::DropMaterializedView { db, name, .. } => {
+            format!("DropMaterializedView {}", qualify(db, name))
+        }
+        LogicalPlan::IndexScan {
+            db, table, index, ..
+        } => format!("IndexScan {} using {}", qualify(db, table), index),
         LogicalPlan::DropView { db, name } => format!("DropView {}", qualify(db, name)),
         LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),

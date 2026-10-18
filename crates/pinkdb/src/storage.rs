@@ -1135,11 +1135,23 @@ impl PinkDb {
         Ok(())
     }
 
-    pub(crate) fn materialized_views_remove_in(&mut self, db: &str, key: &str) -> Option<MaterializedViewDef> {
-        self.databases.get_mut(&Self::db_key(db))?.materialized_views.remove(key)
+    pub(crate) fn materialized_views_remove_in(
+        &mut self,
+        db: &str,
+        key: &str,
+    ) -> Option<MaterializedViewDef> {
+        self.databases
+            .get_mut(&Self::db_key(db))?
+            .materialized_views
+            .remove(key)
     }
 
-    pub(crate) fn materialized_views_insert_in(&mut self, db: &str, key: String, view: MaterializedViewDef) -> Result<()> {
+    pub(crate) fn materialized_views_insert_in(
+        &mut self,
+        db: &str,
+        key: String,
+        view: MaterializedViewDef,
+    ) -> Result<()> {
         self.catalog_mut(db)?.materialized_views.insert(key, view);
         Ok(())
     }
@@ -1553,7 +1565,13 @@ impl PinkDb {
     }
 
     /// Build a hash index on `table.column` (by index) and store it.
-    pub fn create_index_in(&mut self, db: &str, table: &str, name: &str, column: usize) -> Result<()> {
+    pub fn create_index_in(
+        &mut self,
+        db: &str,
+        table: &str,
+        name: &str,
+        column: usize,
+    ) -> Result<()> {
         if let Some(err) = self.attached_read_only(db, table) {
             return Err(err);
         }

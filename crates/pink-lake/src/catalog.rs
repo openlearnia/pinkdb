@@ -79,6 +79,50 @@
 //! every file partition key must be a parseable key, and a file partition
 //! value must decode under its column's type at attach time, where the schema
 //! is known).
+//!
+//! Wave 68 adds **inlined rows** — small commits whose appended rows are
+//! stored in the manifest instead of a data file (DuckLake's
+//! `data_inlining_row_limit`, whose default is 10 rows per table):
+//!
+//! ```json
+//! "main.t": {
+//!   "files": [ … ],
+//!   "rows": 3,
+//!   "format": "vortex",
+//!   "schema_version": 1,
+//!   "columns": [ … ],
+//!   "inlined": [
+//!     { "row_id": 0, "begin": 2, "schema_version": 1,
+//!       "columns": ["a", "b"], "values": ["1", "x"] },
+//!     { "row_id": 3, "begin": 3, "end": 4, "flushed": true,
+//!       "schema_version": 1, "columns": ["a", "b"], "values": ["2", "y"] }
+//!   ],
+//!   "inlined_limit": 5,
+//!   "next_row_id": 4
+//! }
+//! ```
+//!
+//! The list is the table's **inlined row history**: `begin` is the version
+//! that added the row version, `end` (optional) the version that deleted or
+//! superseded it (an update is an end plus a new row version with the same
+//! `row_id`, DuckLake's `_ducklake_begin_snapshot`/`_ducklake_end_snapshot`
+//! pair), and a row is **live** exactly while `end` is absent. `flushed`
+//! marks an `end` written by `.lake flush` — the row was *materialized into a
+//! data file*, not deleted; the record stays as the change log. `values` are
+//! canonically encoded like the statistics block ([`crate::stats`]), `null`
+//! for SQL NULL, positional against `columns` — the column names **as the row
+//! was written** (they decode through the schema record's rename map, like
+//! per-file schemas; a column added later reads its DEFAULT and a dropped one
+//! is skipped). `inlined_limit` is the table's `data_inlining_row_limit`
+//! (absent = the lake handle's default), and `next_row_id` is the per-table
+//! row-id counter shared by inlined rows and data-file row ranges
+//! ([`FileRef`]'s `row_id_start`).
+//!
+//! Every field is optional and additive: a table without inlined rows keeps
+//! the pre-wave-68 shape. `rows` stays the table's **logical** row count —
+//! `sum(files.rows) - sum(deletes.count) + live inlined rows` — and the
+//! manifest reader enforces exactly that invariant, so a stats-only
+//! `COUNT(*)` stays exact with inlined rows present.
 
 use std::collections::BTreeMap;
 
@@ -235,6 +279,14 @@ pub(crate) enum FileFormat {
 /// statistics), and `partition` is the file's partition value map (one entry
 /// per partition key, keyed by [`PartitionKey::key_text`]; `None` is a SQL
 /// NULL). Both are additive: a manifest without them keeps its old shape.
+///
+/// Wave 68 adds `row_id_start`: the first row id of the file's rows, assigned
+/// by the commit that published it (the per-table [`TableEntry::next_row_id`]
+/// counter; DuckLake's `ducklake_data_file.row_id_start`). Change-data reads
+/// address a file row as `row_id_start + position`. Absent on a file published
+/// by a full save, a maintenance output (merge/rewrite), or a pre-wave-68
+/// file — its rows then have no recorded row id (`NULL` in a change row); the
+/// values stay exact either way.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub(crate) enum FileRef {
@@ -260,6 +312,10 @@ pub(crate) enum FileRef {
         /// file written before the table's spec was set.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         partition: Option<BTreeMap<String, Option<String>>>,
+        /// Wave 68: the row id of the file's first row (`None` = not
+        /// recorded; see the struct docs).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        row_id_start: Option<u64>,
     },
 }
 
@@ -282,6 +338,7 @@ impl<'de> Deserialize<'de> for FileRef {
                 schema_version: Option<u64>,
                 stats: Option<crate::stats::StatsBlock>,
                 partition: Option<BTreeMap<String, Option<String>>>,
+                row_id_start: Option<u64>,
             },
         }
         match Repr::deserialize(deserializer)? {
@@ -292,6 +349,7 @@ impl<'de> Deserialize<'de> for FileRef {
                 schema_version,
                 stats,
                 partition,
+                row_id_start,
             } => {
                 let Some(rows) = rows else {
                     return Err(D::Error::custom(format!(
@@ -306,6 +364,7 @@ impl<'de> Deserialize<'de> for FileRef {
                     schema_version,
                     stats,
                     partition,
+                    row_id_start,
                 })
             }
         }
@@ -350,6 +409,38 @@ impl FileRef {
         }
     }
 
+    /// Wave 68: the row id of the file's first row, when the file's row ids
+    /// were recorded (`row_id_start + position` addresses one of its rows).
+    pub(crate) fn row_id_start(&self) -> Option<u64> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry { row_id_start, .. } => *row_id_start,
+        }
+    }
+
+    /// [`FileRef::row_id_start`] set to a new value (a no-op on a v1–v3
+    /// [`FileRef::Path`], which never carries one).
+    pub(crate) fn with_row_id_start(&self, start: Option<u64>) -> FileRef {
+        match self {
+            FileRef::Path(path) => FileRef::Path(path.clone()),
+            FileRef::Entry {
+                path,
+                rows,
+                schema_version,
+                stats,
+                partition,
+                ..
+            } => FileRef::Entry {
+                path: path.clone(),
+                rows: *rows,
+                schema_version: *schema_version,
+                stats: stats.clone(),
+                partition: partition.clone(),
+                row_id_start: start,
+            },
+        }
+    }
+
     /// Set this file's partition value map (a no-op on a v1–v3 [`FileRef::Path`],
     /// which never carries one).
     pub(crate) fn with_partition(mut self, partition: BTreeMap<String, Option<String>>) -> Self {
@@ -369,7 +460,8 @@ impl FileRef {
     }
 
     /// [`FileRef::schema_version`] set to a new value (verbatim variant kept;
-    /// an entry's partition values are carried through unchanged).
+    /// an entry's partition values and row-id start are carried through
+    /// unchanged).
     pub(crate) fn with_schema_version(&self, version: Option<u64>) -> FileRef {
         match self {
             FileRef::Path(path) => FileRef::Path(path.clone()),
@@ -378,6 +470,7 @@ impl FileRef {
                 rows,
                 stats,
                 partition,
+                row_id_start,
                 ..
             } => FileRef::Entry {
                 path: path.clone(),
@@ -385,6 +478,7 @@ impl FileRef {
                 schema_version: version,
                 stats: stats.clone(),
                 partition: partition.clone(),
+                row_id_start: *row_id_start,
             },
         }
     }
@@ -517,9 +611,54 @@ pub(crate) struct Catalog {
     pub(crate) schema_version: u64,
 }
 
+/// One inlined row version (wave 68): a row stored in the manifest instead of
+/// a data file (see the module docs). See [`InlinedRow::live`],
+/// [`TableEntry::live_inlined`] and the `crate::inlined` module for the
+/// decode/materialize rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InlinedRow {
+    /// The table's per-row identity (`ducklake_inlined_data`'s
+    /// `_ducklake_row_id`): unique within the table, never reused, monotonic
+    /// in `begin` order. An update ends the old version and inserts the new
+    /// one under the same id.
+    pub(crate) row_id: u64,
+    /// The version that added this row version (`_ducklake_begin_snapshot`).
+    pub(crate) begin: u64,
+    /// The version that deleted or superseded this row version; absent while
+    /// the row is live (`_ducklake_end_snapshot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) end: Option<u64>,
+    /// True when `end` was written by `.lake flush` (the row was materialized
+    /// into a data file, not deleted). Absent (false) on a real deletion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) flushed: bool,
+    /// The table schema epoch the row was written under (like
+    /// [`FileRef`]'s `schema_version`; used for the rename/default mapping).
+    pub(crate) schema_version: u64,
+    /// The column names as written, in write order (positional against
+    /// `values`).
+    pub(crate) columns: Vec<String>,
+    /// The row's values, canonically encoded ([`crate::stats::encode_value`]),
+    /// positional against `columns`; `null` is a SQL NULL.
+    pub(crate) values: Vec<Option<String>>,
+}
+
+impl InlinedRow {
+    /// True while this row version has not been deleted or superseded
+    /// (`end` is absent): exactly the rows a scan unions with the data files.
+    pub(crate) fn live(&self) -> bool {
+        self.end.is_none()
+    }
+}
+
+/// Zero-check for `skip_serializing_if` on a counter.
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 /// One table of one version: the immutable data files it is made of, the
-/// positional delete files applied on top of them, and the logical row count
-/// (checked on load).
+/// positional delete files applied on top of them, the inlined row history,
+/// and the logical row count (checked on load).
 ///
 /// A v4 writer appends: a table's entry grows by new data files (and delete
 /// files) from commit to commit, and never rewrites a file it published
@@ -562,6 +701,22 @@ pub(crate) struct TableEntry {
     /// ordered by version.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) renames: Vec<RenameEntry>,
+    /// Wave 68: the table's inlined row history (see [`InlinedRow`]) — live
+    /// rows and every ended/superseded version this table ever inlined.
+    /// Absent (empty) for a table that never inlined.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) inlined: Vec<InlinedRow>,
+    /// Wave 68: the table's `data_inlining_row_limit` (0 disables inlining);
+    /// absent = the lake handle's default. Persisted like DuckLake's
+    /// per-table option of the same name (`ducklake_metadata` scope `table`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) inlined_limit: Option<u64>,
+    /// Wave 68: the next per-table row id to assign — shared by inlined rows
+    /// and the `row_id_start` of every file an incremental commit adds
+    /// (DuckLake's row-id counter). Absent (0) on a table that predates wave
+    /// 68.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) next_row_id: u64,
 }
 
 impl TableEntry {
@@ -592,6 +747,37 @@ impl TableEntry {
             total = total.checked_add(d.count)?;
         }
         Some(total)
+    }
+
+    /// The live inlined row versions (`end` absent), in row-id order — the
+    /// rows a scan unions with the data files, after every file.
+    pub(crate) fn live_inlined(&self) -> Vec<&InlinedRow> {
+        let mut live: Vec<&InlinedRow> = self.inlined.iter().filter(|r| r.live()).collect();
+        live.sort_by_key(|r| r.row_id);
+        live
+    }
+
+    /// The number of live inlined row versions.
+    pub(crate) fn live_inlined_rows(&self) -> u64 {
+        self.inlined.iter().filter(|r| r.live()).count() as u64
+    }
+
+    /// The highest row id the table ever assigned (`None` when it never
+    /// assigned one): the floor a writer's next `next_row_id` must exceed.
+    pub(crate) fn max_row_id(&self) -> Option<u64> {
+        self.inlined
+            .iter()
+            .map(|r| r.row_id)
+            .max()
+            .into_iter()
+            .chain(
+                self.files
+                    .iter()
+                    .filter_map(|f| f.row_id_start().zip(f.rows()))
+                    .filter(|(_, rows)| *rows > 0)
+                    .map(|(start, rows)| start.saturating_add(rows - 1)),
+            )
+            .max()
     }
 }
 
@@ -652,4 +838,29 @@ pub(crate) struct TableDelta {
     /// the rewritten data files. Absent on ordinary commits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) removed_delete_files: Vec<String>,
+    /// Wave 68: rows this commit **inlined** into the manifest instead of
+    /// writing a data file. The rows themselves live in the version's
+    /// `inlined` list (`begin == commit version`); this count is the audit
+    /// marker a change-data read uses to tell an inlined append from a plain
+    /// one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) rows_inlined: u64,
+    /// Wave 68: inlined row versions this commit ended (deleted or
+    /// superseded). Their `end` is the commit's version.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) inlined_ended: u64,
+    /// Wave 68: inlined rows this commit **materialized into data files**
+    /// (`.lake flush`). The listed `data_files` hold the flushed rows, whose
+    /// change history stays in the version's `inlined` list; a change-data
+    /// read must not report those files' rows as insertions.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub(crate) inlined_flushed: u64,
+    /// Wave 68: the table's `data_inlining_row_limit` after this commit when
+    /// the commit changed it (a clear — back to the default — carries only
+    /// `inlining_changed`). Absent when the commit did not change it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) inlined_limit: Option<u64>,
+    /// True when this commit set or cleared the table's inlining limit.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) inlining_changed: bool,
 }

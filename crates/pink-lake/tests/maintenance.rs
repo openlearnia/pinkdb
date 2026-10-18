@@ -146,6 +146,7 @@ fn store(rows: &[(i32, &str)]) -> PinkDb {
 /// (the first append creates the table).
 fn appended_lake(dir: &Path, chunks: &[&[(i32, &str)]]) -> Lake {
     let mut lake = Lake::open_or_create(dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     for chunk in chunks {
         let mut commit = Commit::new();
         commit.append("main.t", sub_table(chunk));
@@ -456,6 +457,7 @@ fn merge_never_mixes_partition_values() {
     let dir = scratch("merge-partitions");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     // Partitioned table: one file per value set per commit; two commits per
     // value gives each value a two-file group.
     let mut commit = Commit::new();
@@ -518,15 +520,20 @@ fn merge_skips_across_schema_epochs() {
     pink_lake::save_store(&store(&[(1, "a")]), &lake_dir).unwrap();
 
     // A writable attach runs `ALTER TABLE … ADD COLUMN n` (epoch 2); an
-    // append right after carries epoch 2.
+    // append right after carries epoch 2. Wave 68: inlining is on by
+    // default; this fixture pins file epochs, so every handle opts out.
     {
         let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+        wa.set_data_inlining_row_limit(0);
+        wa.set_data_inlining_row_limit(0);
         let mut db = materialize(&wa);
         db.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 0;")
             .unwrap();
         wa.commit(&db, &CommitSettings::default()).unwrap();
     }
     let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    lake.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
     commit.append("main.t", three_col_table(2, "b"));
     lake.commit(&commit).unwrap();
@@ -534,12 +541,16 @@ fn merge_skips_across_schema_epochs() {
     // Another ALTER (epoch 3) and two appends under it.
     {
         let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+        wa.set_data_inlining_row_limit(0);
+        wa.set_data_inlining_row_limit(0);
         let mut db = materialize(&wa);
         db.execute("ALTER TABLE t ADD COLUMN m INTEGER DEFAULT 7;")
             .unwrap();
         wa.commit(&db, &CommitSettings::default()).unwrap();
     }
     let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
+    lake.set_data_inlining_row_limit(0);
     for (id, s) in [(3, "c"), (4, "d")] {
         let mut commit = Commit::new();
         commit.append("main.t", four_col_table(id, s));
@@ -713,6 +724,7 @@ fn merge_respects_size_filters_and_max_compacted_files() {
     let dir2 = scratch("merge-cap");
     let lake_dir2 = dir2.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir2).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
     commit.set_partition("main.t", &["s"]).unwrap();
     commit.append("main.t", sub_table(&[(1, "east"), (2, "west")]));
@@ -749,6 +761,7 @@ fn merge_on_a_legacy_v1_lake_is_skipped_or_refused() {
         &lake_dir,
     );
     let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     // A scan skips every v1 entry (one path-only file, no per-file counts).
     let report = lake
         .merge_adjacent_files(None, &MergeSettings::default())
@@ -1302,6 +1315,7 @@ fn table_info_options_and_settings_report_exact_facts() {
     let dir = scratch("info");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let mut commit = Commit::new();
     commit.set_partition("main.t", &["s"]).unwrap();
     commit.append("main.t", sub_table(&[(1, "east"), (2, "west")]));

@@ -59,10 +59,12 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
                         (BoundExpr::Literal(_), BoundExpr::Column { index, .. }) => {
                             (*index, left.clone())
                         }
-                        _ => return LogicalPlan::Filter {
-                            input: Box::new(input),
-                            predicate,
-                        },
+                        _ => {
+                            return LogicalPlan::Filter {
+                                input: Box::new(input),
+                                predicate,
+                            }
+                        }
                     };
                     let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
                     if let Ok(t) = db.table_in(lookup, table) {
@@ -82,7 +84,11 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
                 predicate,
             }
         }
-        LogicalPlan::Project { input, exprs, names } => LogicalPlan::Project {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            names,
+        } => LogicalPlan::Project {
             input: Box::new(apply_indexes(db, *input)),
             exprs,
             names,
@@ -144,7 +150,12 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             on,
             left_cols,
         },
-        LogicalPlan::SetOp { op, left, right, types } => LogicalPlan::SetOp {
+        LogicalPlan::SetOp {
+            op,
+            left,
+            right,
+            types,
+        } => LogicalPlan::SetOp {
             op,
             left: Box::new(apply_indexes(db, *left)),
             right: Box::new(apply_indexes(db, *right)),
@@ -169,11 +180,7 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
 /// nested shapes are covered.
 fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
     match plan {
-        LogicalPlan::Aggregate {
-            input,
-            keys,
-            aggs,
-        } => {
+        LogicalPlan::Aggregate { input, keys, aggs } => {
             let input = *input;
             let is_count_star_only = keys.is_empty()
                 && !aggs.is_empty()
@@ -189,8 +196,8 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
                 // stay.) Peel them all.
                 let mut cur = input;
                 while let LogicalPlan::Project { input: inner, .. }
-                    | LogicalPlan::Sort { input: inner, .. }
-                    | LogicalPlan::Window { input: inner, .. } = cur
+                | LogicalPlan::Sort { input: inner, .. }
+                | LogicalPlan::Window { input: inner, .. } = cur
                 {
                     cur = *inner;
                 }
@@ -274,7 +281,12 @@ fn drop_count_star_projections(plan: LogicalPlan) -> LogicalPlan {
             query: Box::new(drop_count_star_projections(*query)),
             body: Box::new(drop_count_star_projections(*body)),
         },
-        LogicalPlan::SetOp { op, left, right, types } => LogicalPlan::SetOp {
+        LogicalPlan::SetOp {
+            op,
+            left,
+            right,
+            types,
+        } => LogicalPlan::SetOp {
             op,
             left: Box::new(drop_count_star_projections(*left)),
             right: Box::new(drop_count_star_projections(*right)),

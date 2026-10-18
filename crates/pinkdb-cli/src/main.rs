@@ -75,6 +75,19 @@ fn print_help() {
         println!("  .lake partition {LAKE} <t> by (<key>, ...) | clear");
         println!("                                set/clear a table's partition spec (identity or");
         println!("                                bucket(N, col)); new writes split per value set");
+        println!("  .lake inlining {LAKE} <t> <limit|default>");
+        println!("                                set/clear the per-table data_inlining_row_limit");
+        println!(
+            "                                (0 disables; commits at most `limit` rows inline)"
+        );
+        println!("  .lake flush {LAKE} [t]");
+        println!("                                materialize inlined rows into data files");
+        println!("  .lake changes {LAKE} [t] [from] [to]");
+        println!(
+            "                                row-level changes of a version range (inclusive)"
+        );
+        println!("  .lake add_data_files {LAKE} <t> <path> [path ...]");
+        println!("                                register existing data/ files as table rows");
         println!(
             "  .lake merge {LAKE} [t] [min_file_size=N] [max_file_size=N] [max_compacted_files=N]"
         );

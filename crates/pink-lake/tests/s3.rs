@@ -146,7 +146,8 @@ fn full_cycle_create_save_open_versions_tables() {
     );
 
     // open a fresh handle and rebuild: value- and byte-exact.
-    let lake = Lake::open_s3(mock_config(&mock, "test-bucket", "lakes/mine")).unwrap();
+    let mut lake = Lake::open_s3(mock_config(&mock, "test-bucket", "lakes/mine")).unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.current_version(), 2);
     let loaded = lake.load(None).unwrap();
     assert_eq!(
@@ -301,6 +302,7 @@ fn resaving_a_published_snapshot_is_refused() {
     // never replace it.
     mock.put_object("lake/catalog.json", &v2_catalog);
     let mut lake = Lake::open_s3(mock_config(&mock, bucket, "lake")).unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.current_version(), 2);
     let err = lake.write_from_store(&db).unwrap_err();
     assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
@@ -424,7 +426,8 @@ fn error_mapping_not_found_auth_and_missing_data() {
     assert!(matches!(err, LakeError::NotALake { .. }), "{err:?}");
 
     // A missing snapshot is a clean version-not-found.
-    let lake = Lake::open_s3(mock_config(&mock, bucket, "lake")).unwrap();
+    let mut lake = Lake::open_s3(mock_config(&mock, bucket, "lake")).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let err = lake.load(Some(99)).unwrap_err();
     assert!(matches!(err, LakeError::VersionNotFound { .. }), "{err:?}");
     assert!(
@@ -502,7 +505,8 @@ fn open_url_reads_the_environment_and_saves_the_full_cycle() {
         pink_lake::save_store_url(&db, "s3://url-bucket/from/env").unwrap(),
         3
     );
-    let lake = Lake::open_url("s3://url-bucket/from/env").unwrap();
+    let mut lake = Lake::open_url("s3://url-bucket/from/env").unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.versions().unwrap(), vec![1, 2, 3]);
     assert_eq!(lake.tables().unwrap().len(), 3);
 
@@ -548,6 +552,7 @@ fn paginated_listings_and_delete_work() {
     let mut lake = Lake::create_s3(mock_config(&mock, bucket, "lake")).unwrap();
     lake.write_from_store(&db).unwrap();
     let mut lake = Lake::open_s3(mock_config(&mock, bucket, "lake")).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&db).unwrap();
     lake.write_from_store(&db).unwrap();
     assert_eq!(lake.versions().unwrap(), vec![1, 2, 3, 4]);
@@ -925,7 +930,8 @@ fn save_store_helpers_work_for_local_and_s3() {
         pink_lake::save_store_s3(&db, mock_config(&mock, "helpers-bucket", "h")).unwrap(),
         2
     );
-    let lake = Lake::open_s3(mock_config(&mock, "helpers-bucket", "h")).unwrap();
+    let mut lake = Lake::open_s3(mock_config(&mock, "helpers-bucket", "h")).unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);
     assert_eq!(lake.load(None).unwrap().table("t").unwrap().num_rows(), 2);
     // A rejected store leaves nothing behind (same pre-validation as local).
@@ -1059,7 +1065,8 @@ fn v1_pink_data_files_load_over_s3() {
         &pink_bytes,
     );
 
-    let lake = Lake::open_s3(mock_config(&mock, "v1-bucket", "v1")).unwrap();
+    let mut lake = Lake::open_s3(mock_config(&mock, "v1-bucket", "v1")).unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.format_version(), 1);
     assert_eq!(lake.current_version(), 1);
     assert_eq!(lake.tables().unwrap(), vec![("main.t".to_string(), 3)]);
@@ -1097,12 +1104,13 @@ fn s3_error_taxonomy_slowdown_redirect_and_missing_bucket() {
     let mut lake = Lake::create_s3(mock_config(&mock, bucket, "lake")).unwrap();
     lake.write_from_store(&db).unwrap(); // v2
 
-    // A transient 503 SlowDown is retried with backoff (S3 returns it before
-    // applying the request, so even the create-only snapshot PUT is safe to
-    // repeat) and the save goes through.
+    // A transient 503 SlowDown is retried with backoff on an *unconditional*
+    // PUT (a fresh data object — safe to repeat) and the save goes through.
+    // (A 503 on a conditional write is deliberately not retried: the request
+    // may have committed; the second half pins that.)
     mock.inject_error(
         "PUT",
-        "lake/snapshots/3.json",
+        "lake/data/main.t/",
         503,
         "SlowDown",
         "Please reduce your request rate.",
@@ -1111,8 +1119,8 @@ fn s3_error_taxonomy_slowdown_redirect_and_missing_bucket() {
     lake.write_from_store(&db).unwrap();
     assert_eq!(lake.current_version(), 3);
 
-    // A persistent 503 outlasts the retries: an I/O error naming the code
-    // (the caller retries the save after reopening).
+    // A 503 on the conditional snapshot PUT surfaces as an I/O error naming
+    // the code, with no retry (the caller retries the save after reopening).
     mock.inject_error(
         "PUT",
         "lake/snapshots/4.json",
@@ -1198,7 +1206,8 @@ fn virtual_hosted_addressing_round_trips_end_to_end() {
     // signed and the signature recomputed by the mock.
     assert_eq!(mock.verified_requests(), requests.len());
 
-    let lake = Lake::open_s3(config()).unwrap();
+    let mut lake = Lake::open_s3(config()).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let loaded = lake.load(None).unwrap();
     assert_eq!(
         store_bytes(&loaded, &scratch, "vhost-loaded"),
@@ -1234,7 +1243,8 @@ fn live_s3_roundtrip_is_opt_in() {
 
     let mut lake = Lake::create_s3(config.clone()).unwrap();
     assert_eq!(lake.write_from_store(&db).unwrap(), 2);
-    let lake = Lake::open_s3(config).unwrap();
+    let mut lake = Lake::open_s3(config).unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);
     assert_eq!(lake.tables().unwrap().len(), 3);
     assert!(lake.missing_data_files().unwrap().is_empty());
@@ -1319,7 +1329,8 @@ fn attach_over_s3_is_footer_only_and_matches_load() {
     lake.write_from_store(&db).unwrap();
 
     // Attach a fresh handle and check the descriptors against the eager load.
-    let lake = Lake::open_s3(mock_config(&mock, "test-bucket", "attach")).unwrap();
+    let mut lake = Lake::open_s3(mock_config(&mock, "test-bucket", "attach")).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let report = lake.attach(None).unwrap();
     assert!(report.remote, "object storage has no ranged reads here");
     assert_eq!(report.tables, 3);
@@ -1378,6 +1389,9 @@ fn attach_over_s3_is_footer_only_and_matches_load() {
 /// An S3 lake whose `main.t` is built from one appended file per chunk.
 fn s3_appended_lake(mock: &MockS3, prefix: &str, chunks: &[&[(i32, &str)]]) -> Lake {
     let mut lake = Lake::create_s3(mock_config(mock, "test-bucket", prefix)).unwrap();
+    // Wave 68: inlining is on by default; this helper pins one data file per
+    // chunk, so it opts out.
+    lake.set_data_inlining_row_limit(0);
     for chunk in chunks {
         let mut table = pinkdb::DataTable::new(
             "t".to_string(),

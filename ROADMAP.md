@@ -101,7 +101,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 65 | Lake schema evolution, DuckLake parity: ALTER TABLE on lake tables (ADD COLUMN with DEFAULT, RENAME, DROP), catalog schema versions, old data files read through the schema mapping | done | landed; catalog **format 5** schema records (per-column defaults/added-epochs/renames), metadata-only commits, per-version schemas under time travel, engine-wide ALTER + `.pink` FLAG_DEFAULTS; reconciled with 66 by hand (21 conflicts — `record` field split, zone-map vs merge gating, format-5 pins) |
 | 66 | Lake partitioning & pruning, DuckLake parity: `PARTITIONED BY` file splitting, per-file column statistics/zone maps (absorbs the queued lake-scan stage 3), filter pruning on attached scans | done | landed; identity + `bucket(N)` specs recorded in the catalog (additive to v4), one data file per partition value per commit, per-file zone maps (Vortex via `persist::table_stats`), planner-extracted conjunct pruning with decode counters; bucket labels are pinkdb's own FNV-1a (no bucket-value pruning; documented); duckdiff 171/171 |
 | 67 | Lake maintenance, DuckLake parity: `merge_adjacent_files`, `rewrite_data_files`, `expire_snapshots`, `cleanup_old_files`, `delete_orphaned_files`, `list_files`, `table_info`/`options`/`settings` introspection as `.lake` commands | done | landed; compaction merged-away sources never touched (bytes+mtimes pinned), groups by partition+epoch with ≥2 delete-free files; rewrite materializes deletes; expire (versions/older-than/keep, never current); cleanup/orphans share the unreferenced scan (no scheduled-deletion queue — documented) with dry-run + age gate; S3 `stat`/`list_recursive`; duckdiff 171/171 |
-| 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | in progress | `wt-lake-inline`, dispatched on 7bae38c (**last lake-block wave**) |
+| 68 | Lake inlined small writes & CDC, DuckLake parity: inline tiny commits into the metadata (`data_inlining_row_limit`-style, flush to files later), change summaries rendered as CDC queries (`insertions`/`deletions`/`changes`), `add_data_files` (register existing files); depends on 63 | done | landed; inlined rows in the catalog (default limit 10, α-pinned; `.lake flush` materializes, history kept), CDC via `table_insertions`/`deletions`/`changes` + `.lake changes` (updates = delete+insert, documented), `add_data_files` with exact-schema checks (+ encrypted path binding); duckdiff 171/171 |
 | 69 | Prepared statements in the Python and Go bindings: wrapper ergonomics + tests over the FFI entry points landed in 59 | queued | follows 59 |
 | 70 | Core extension: **parquet** — read: `read_parquet` / `parquet_scan` (globs, multi-file, `union_by_name`, hive-partition + `filename` columns, column subset), projection + filter pushdown via row-group statistics (min/max/null counts), introspection (`parquet_schema`, `parquet_metadata`, `parquet_file_metadata`, `parquet_kv_metadata`), direct `FROM 'file.parquet'` replacement scan; write: `COPY … (FORMAT parquet)` (snappy default; zstd/gzip/uncompressed; `row_group_size`; per-column stats) with the α-probed physical mapping (DECIMAL→INT32 or FIXED_LEN_BYTE_ARRAY, TIMESTAMP→INT64 micros, DATE→INT32 days, INTERVAL→FIXED_LEN_BYTE_ARRAY) | queued | crate `pinkdb-parquet` (wasm-compatible); nested types + parquet encryption deferred |
 | 71 | Core extension: **arrow** — Arrow IPC (Feather v2) file read/write (`read_arrow` + `FROM 'file.arrow'`, `COPY … (FORMAT arrow)`) over the arrow-rs crates; Arrow **C Data Interface** in the FFI (query-result export + Arrow-array scan input, zero-copy where the layout allows) for pyarrow/Polars/DuckDB/ADBC hosts; DuckDB α ships no loadable `arrow` extension on this platform (probed: HTTP 404), so parity is pinned at the file level (arrow-rs/pyarrow round-trips; pyarrow pip-installable) and at the C ABI level, not via SQL | queued | crate `pinkdb-arrow` (wasm-compatible); Python/Go wrapper ergonomics follow-up |
@@ -1253,6 +1253,31 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   table plus its refresh query in the catalog, per-database, WAL-logged,
   persisted. Tracker synced (42/43 → done; 79 queued); the wave-42 dispatch
   agent was cancelled (redundant) with nothing written.
+- 2026-10-18 — Wave 68 (inlined small writes + CDC; **closes the lake-parity
+  block**): commits appending ≤ `data_inlining_row_limit` rows (default **10**,
+  α-pinned; 0 disables; per-table persisted limits + `PINKDB_LAKE_INLINING_ROW_LIMIT`)
+  store them **in the catalog** as versioned rows (`row_id`/`begin`/`end`,
+  schema-mapped values via renames/defaults; additive fields — pre-68 manifests
+  unchanged); scans read data files in manifest order then live inlined rows;
+  stats fold exact inlined facts with the shared DOUBLE gate; deletes/updates
+  of inlined rows are version-ends (no row-id pairing — documented).
+  `flush_inlined_data` + `.lake flush` materialize rows into partition-split
+  files and keep the history (`flushed: true`). CDC reads:
+  `Lake::{table_insertions, table_deletions, table_changes}` + `.lake changes`
+  derive rows from commit deltas + inlined records with
+  `snapshot_id`/`rowid`/`change_type` (inclusive ranges α-pinned; a full-save
+  version in range is refused by name; updates surface as delete+insert).
+  `add_data_files` + `.lake add_data_files` register lake-relative files with
+  exact-schema/row-count/statistics checks (encrypted lakes verify the
+  container's path binding). Maintenance interplay handled (merge carries
+  untouched inlined rows; `table_info` reports them). Also fixed two
+  pre-existing base issues: the s3 error-taxonomy test now targets a
+  data-file PUT (matching the bug-review no-retry semantics) and rustfmt
+  drift in five `pinkdb` files (wave 42/43 leftovers) — fmt gate green again.
+  Gates on main: fmt/clippy (all lake combos), pink-lake default **117**,
+  vortex **174**, +encryption **195**, s3+vortex+encryption **258**, CLI
+  matrix incl. `lake,s3` **103** (multiprocess 27/27), workspace clean,
+  `bench/duckdiff.py` **171/171**. Clean apply; worktree removed.
 - 2026-10-17 — Post-freeze benchmark session (final tree `b3154e7`, Apple
   Silicon, best-of-N, DuckDB α46057 reference): standing battery **250.8 ms**
   (per-query: count 0.03, filter_num 2.25, filter_str 1.60, proj_func 18.2,

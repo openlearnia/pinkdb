@@ -60,13 +60,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use pinkdb::{AttachedLake, DataTable, PinkDb, Value};
 
-use crate::catalog::{CommitManifest, DeleteRef, FileRef, PartitionKey, TableDelta, TableEntry};
+use crate::catalog::{
+    Catalog, CommitManifest, DeleteRef, FileRef, PartitionKey, TableDelta, TableEntry,
+};
 use crate::local::CATALOG_FILE;
-use crate::{delete_file, split_key, Lake, LakeError, Result};
+use crate::storage::Head;
+use crate::{
+    delete_file, manifest_for, only_table, split_key, validate_rel_path, Lake, LakeError, Result,
+    FORMAT_VERSION,
+};
 
 /// DuckLake-compatible retry controls for a lake commit (`ducklake_max_retry_count`,
 /// `ducklake_retry_backoff`, `ducklake_retry_wait_ms`).
@@ -114,23 +120,34 @@ impl CommitSettings {
     }
 }
 
-/// One incremental commit: appended rows and/or positional deletes per
-/// `db.table` key, plus whole-table drops.
+/// One incremental commit: appended rows, positional deletes and/or inlined
+/// row deletes per `db.table` key, plus whole-table drops.
 ///
 /// Build one with [`Commit::append`]/[`Commit::delete_positions`]/
-/// [`Commit::drop_table`] and publish it with [`Lake::commit`]. The files
-/// themselves are written by the commit (that is what makes the
-/// data-files-first publication order possible); the caller only describes
-/// the change.
+/// [`Commit::delete_inlined_rows`]/[`Commit::drop_table`] and publish it with
+/// [`Lake::commit`]. The files (or inlined records) themselves are written by
+/// the commit (that is what makes the data-files-first publication order
+/// possible); the caller only describes the change. An append whose row count
+/// fits the table's inlining limit lands in the manifest instead of a file —
+/// the decision is the commit's, and [`CommitReport::rows_inlined`] reports
+/// it.
 #[derive(Debug, Clone, Default)]
 pub struct Commit {
     appends: BTreeMap<String, Arc<DataTable>>,
     deletes: BTreeMap<String, BTreeMap<String, Vec<u64>>>,
+    /// Inlined row versions this commit ends (`db.table` → row ids, wave 68).
+    /// An id naming a row the head does not hold live is a conflict, never a
+    /// silent no-op.
+    inlined_deletes: BTreeMap<String, Vec<u64>>,
     drops: BTreeSet<String>,
     /// Per-table partition specification changes (wave 66): `Some(keys)` sets
     /// the spec, `None` clears it. Applied to the table's catalog entry when
     /// the commit publishes; the table must exist.
     partition_changes: BTreeMap<String, Option<Vec<PartitionKey>>>,
+    /// Per-table `data_inlining_row_limit` changes (wave 68): `Some(limit)`
+    /// sets the persisted limit (0 disables inlining), `None` clears it back
+    /// to the lake handle's default. Metadata-only, like a partition change.
+    inlining_changes: BTreeMap<String, Option<u64>>,
     /// Schema records this commit publishes (wave 65), per `db.table`: an
     /// added/dropped/renamed column's new [`TableSchema`](crate::schema::TableSchema).
     /// Set by [`Lake::commit_from_tables`]; a hand-built commit leaves it
@@ -186,6 +203,46 @@ impl Commit {
     /// Drop the whole table from the catalog (its old files stay on disk).
     pub fn drop_table(&mut self, table: &str) -> &mut Self {
         self.drops.insert(table.to_string());
+        self
+    }
+
+    /// End the given **inlined** row versions of `table` (wave 68): each id
+    /// must name a row the head holds live, and the published version marks
+    /// its `end` (a deletion; an update is this plus an
+    /// [`Commit::append`]). Row ids come from a change-data read
+    /// ([`Lake::table_changes`]) or one of the `crate::inlined` readers.
+    /// Ids are sorted and deduplicated; an empty list is a no-op.
+    pub fn delete_inlined_rows(&mut self, table: &str, row_ids: &[u64]) -> &mut Self {
+        let mut ids: Vec<u64> = row_ids.to_vec();
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            if let Some(rows) = self.inlined_deletes.get_mut(table) {
+                rows.clear();
+                self.inlined_deletes.remove(table);
+            }
+            return self;
+        }
+        self.inlined_deletes
+            .entry(table.to_string())
+            .or_default()
+            .extend(ids);
+        self
+    }
+
+    /// Set `table`'s persisted `data_inlining_row_limit` (wave 68; 0
+    /// disables inlining for the table): appended rows at most this many are
+    /// stored in the manifest instead of a data file. Metadata-only — the
+    /// table must exist in the head when the commit publishes.
+    pub fn set_inlining_limit(&mut self, table: &str, limit: u64) -> &mut Self {
+        self.inlining_changes.insert(table.to_string(), Some(limit));
+        self
+    }
+
+    /// Clear `table`'s persisted `data_inlining_row_limit`: the lake handle's
+    /// default ([`Lake::data_inlining_row_limit`]) applies again.
+    pub fn clear_inlining_limit(&mut self, table: &str) -> &mut Self {
+        self.inlining_changes.insert(table.to_string(), None);
         self
     }
 
@@ -245,8 +302,10 @@ impl Commit {
     pub fn is_empty(&self) -> bool {
         self.appends.is_empty()
             && self.deletes.is_empty()
+            && self.inlined_deletes.is_empty()
             && self.drops.is_empty()
             && self.partition_changes.is_empty()
+            && self.inlining_changes.is_empty()
             && self.schemas.is_empty()
     }
 
@@ -275,6 +334,17 @@ impl Commit {
             .get(table)
             .and_then(|f| f.get(file))
             .map(Vec::as_slice)
+    }
+
+    /// The inlined row ids this commit ends for `table`, if any.
+    pub fn deleted_inlined_rows(&self, table: &str) -> Option<&[u64]> {
+        self.inlined_deletes.get(table).map(Vec::as_slice)
+    }
+
+    /// The `data_inlining_row_limit` this commit sets (`Some(limit)`) or
+    /// clears (`Some(None)`) for `table`, if any.
+    pub fn inlining_limit_change(&self, table: &str) -> Option<&Option<u64>> {
+        self.inlining_changes.get(table)
     }
 }
 
@@ -311,6 +381,12 @@ pub struct CommitReport {
     pub rows_added: u64,
     /// Rows deleted by position.
     pub rows_deleted: u64,
+    /// Wave 68: appended rows stored in the manifest instead of a data file
+    /// (a subset of `rows_added`).
+    pub rows_inlined: u64,
+    /// Wave 68: inlined row versions this commit ended (deleted or
+    /// superseded).
+    pub inlined_deleted: u64,
 }
 
 impl CommitReport {
@@ -330,8 +406,77 @@ impl CommitReport {
             bytes_written: 0,
             rows_added: 0,
             rows_deleted: 0,
+            rows_inlined: 0,
+            inlined_deleted: 0,
         }
     }
+}
+
+/// What one [`Lake::flush_inlined_data`] published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlushReport {
+    /// The published version; the unchanged head when there was nothing to
+    /// flush.
+    pub version: u64,
+    /// True when a version was published.
+    pub committed: bool,
+    /// Conflicting publishes retried.
+    pub retries: u32,
+    /// `(db.table, rows materialized)` per flushed table, sorted by key.
+    pub tables: Vec<(String, u64)>,
+    /// Data files written.
+    pub data_files: usize,
+    /// Bytes written: data files + commit manifest + snapshot + catalog.
+    pub bytes_written: u64,
+}
+
+/// What one [`Lake::add_data_files`] published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddFilesReport {
+    /// The published version.
+    pub version: u64,
+    /// True when a version was published.
+    pub committed: bool,
+    /// Conflicting publishes retried.
+    pub retries: u32,
+    /// `(db.table, path, rows)` per registered file, in registration order.
+    pub files: Vec<(String, String, u64)>,
+    /// Bytes written: commit manifest + snapshot + catalog (the data files
+    /// themselves were not rewritten).
+    pub bytes_written: u64,
+}
+
+/// The base version's physical layout of one table: its data files (in
+/// manifest order, with the positions their delete files drop) followed by
+/// its **live inlined row ids** (row-id order) — exactly the documented
+/// wave-68 scan order, so a diff's row → physical mapping is positionally
+/// sound.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BaseLayout {
+    /// `(data file, rows, deleted positions)` per file, manifest order.
+    pub(crate) files: Vec<(String, u64, Vec<u64>)>,
+    /// The live inlined row ids, ascending (row-id order).
+    pub(crate) inlined: Vec<u64>,
+}
+
+impl BaseLayout {
+    /// The number of logical rows the data files contribute (files minus
+    /// their deleted positions): the split point of the two parts.
+    pub(crate) fn file_rows(&self) -> usize {
+        self.files
+            .iter()
+            .map(|(_, rows, deleted)| (*rows as usize).saturating_sub(deleted.len()))
+            .sum()
+    }
+}
+
+/// Where one base row physically lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaseRow {
+    /// `(file index into `BaseLayout::files`, 0-based position in the file)`.
+    File(usize, u64),
+    /// The live inlined row version with this row id.
+    Inlined(u64),
 }
 
 /// The row-level difference between a base table and its current content.
@@ -339,13 +484,17 @@ impl CommitReport {
 pub(crate) struct TableDiff {
     /// `(data file, physical positions to delete)` pairs, in file order.
     pub(crate) deletes: Vec<(String, Vec<u64>)>,
+    /// Live inlined row ids to end (ascending).
+    pub(crate) inlined_deletes: Vec<u64>,
     /// Indices of current rows to append (ascending, disjoint).
     pub(crate) appended: Vec<usize>,
 }
 
 impl TableDiff {
     pub(crate) fn is_empty(&self) -> bool {
-        self.deletes.iter().all(|(_, p)| p.is_empty()) && self.appended.is_empty()
+        self.deletes.iter().all(|(_, p)| p.is_empty())
+            && self.inlined_deletes.is_empty()
+            && self.appended.is_empty()
     }
 }
 
@@ -462,29 +611,33 @@ fn rows_identical_view(
 /// identity view (`DiffCol::Base(i)` per column) is the no-schema-change
 /// case.
 pub(crate) fn diff_table(
-    base_files: &[(String, u64, Vec<u64>)],
+    layout: &BaseLayout,
     base: &DataTable,
     current: &DataTable,
     view: &[DiffCol],
 ) -> Result<TableDiff> {
-    // Logical base row → (file index, physical position).
-    let mut layout: Vec<(usize, u64)> = Vec::with_capacity(base.num_rows());
-    for (fi, (_rel, rows, deleted)) in base_files.iter().enumerate() {
+    // Logical base row → where it physically lives: the file rows first
+    // (manifest order, minus their deleted positions), then the live inlined
+    // rows in row-id order.
+    let mut base_rows: Vec<BaseRow> = Vec::with_capacity(base.num_rows());
+    for (fi, (_rel, rows, deleted)) in layout.files.iter().enumerate() {
         let mut d = 0usize;
         for pos in 0..*rows {
             if d < deleted.len() && deleted[d] == pos {
                 d += 1;
                 continue;
             }
-            layout.push((fi, pos));
+            base_rows.push(BaseRow::File(fi, pos));
         }
     }
-    if layout.len() != base.num_rows() {
+    base_rows.extend(layout.inlined.iter().map(|id| BaseRow::Inlined(*id)));
+    if base_rows.len() != base.num_rows() {
         return Err(LakeError::Internal {
             message: format!(
-                "diff base disagrees with the version's file layout: {} rows vs {} logical rows",
+                "diff base disagrees with the version's physical layout: {} rows vs {} \
+                 logical rows",
                 base.num_rows(),
-                layout.len()
+                base_rows.len()
             ),
         });
     }
@@ -508,7 +661,8 @@ pub(crate) fn diff_table(
     }
     let mut cursors: HashMap<u64, usize> = HashMap::new();
     let mut taken = vec![false; current.num_rows()];
-    let mut deleted: Vec<Vec<u64>> = vec![Vec::new(); base_files.len()];
+    let mut deleted: Vec<Vec<u64>> = vec![Vec::new(); layout.files.len()];
+    let mut inlined_deletes: Vec<u64> = Vec::new();
 
     let mut p = 0usize;
     for bc in 0..base.num_chunks() {
@@ -532,23 +686,29 @@ pub(crate) fn diff_table(
             }
             match found {
                 Some((cand_c, cand_r)) => taken[flat_of[cand_c] + cand_r] = true,
-                None => {
-                    let (fi, pos) = layout[p];
-                    deleted[fi].push(pos);
-                }
+                None => match base_rows[p] {
+                    BaseRow::File(fi, pos) => deleted[fi].push(pos),
+                    BaseRow::Inlined(row_id) => inlined_deletes.push(row_id),
+                },
             }
             p += 1;
         }
     }
-    debug_assert_eq!(p, layout.len());
+    debug_assert_eq!(p, base_rows.len());
 
     let appended: Vec<usize> = (0..current.num_rows()).filter(|&r| !taken[r]).collect();
-    let deletes = base_files
+    let deletes = layout
+        .files
         .iter()
         .enumerate()
         .map(|(fi, (rel, _, _))| (rel.clone(), std::mem::take(&mut deleted[fi])))
         .collect();
-    Ok(TableDiff { deletes, appended })
+    inlined_deletes.sort_unstable();
+    Ok(TableDiff {
+        deletes,
+        inlined_deletes,
+        appended,
+    })
 }
 
 /// Build the sub-table of `src` holding the rows at `indices` (ascending),
@@ -633,71 +793,81 @@ fn project_base_table(
     ))
 }
 
-/// The base table's logical content after a diff lands: base rows minus the
-/// deleted positions, plus the appended rows, in merge-on-read order (the
-/// exact order the lake's readers produce), **in the current schema** (the
-/// view projects renamed columns and materializes added columns' defaults).
-/// Chunks are shared where possible: this is the reference a writable
-/// attachment diffs against next, not a persisted artifact.
+/// The base table's logical content after a diff lands: the data files' rows
+/// minus their deleted positions, plus the live inlined rows minus the ended
+/// ones, plus the appended rows — assembled in exactly the reader's order
+/// (files first, then live inlined rows in row-id order; an append written to
+/// a new data file sits at the end of the file part, an inlined append after
+/// every live inlined row) — **in the current schema** (the view projects
+/// renamed columns and materializes added columns' defaults). Chunks are
+/// shared where possible: this is the reference a writable attachment diffs
+/// against next, not a persisted artifact.
 fn rebuild_logical(
     base: &DataTable,
     current: &DataTable,
     view: &[DiffCol],
-    layout: &[(String, u64, Vec<u64>)],
+    layout: &BaseLayout,
     diff: &TableDiff,
+    appended_inlined: bool,
 ) -> Result<DataTable> {
     let base = project_base_table(base, current, view)?;
-    // Physical (file, position) → logical index, and the deleted logical
-    // indices.
+    let file_rows = layout.file_rows();
+    // The file part: positions kept, mapped to their logical indices. The
+    // physical walk mirrors `diff_table`, so the two index spaces agree.
     let deleted: BTreeSet<(usize, u64)> = diff
         .deletes
         .iter()
         .enumerate()
         .flat_map(|(fi, (_, positions))| positions.iter().map(move |&p| (fi, p)))
         .collect();
-    let mut deleted_logical: BTreeSet<usize> = BTreeSet::new();
+    let mut kept_files: Vec<usize> = Vec::with_capacity(file_rows);
     let mut index = 0usize;
-    for (fi, (_rel, rows, base_deleted)) in layout.iter().enumerate() {
+    for (fi, (_rel, rows, base_deleted)) in layout.files.iter().enumerate() {
         let mut d = 0usize;
         for pos in 0..*rows {
             if d < base_deleted.len() && base_deleted[d] == pos {
                 d += 1;
                 continue;
             }
-            if deleted.contains(&(fi, pos)) {
-                deleted_logical.insert(index);
+            if !deleted.contains(&(fi, pos)) {
+                kept_files.push(index);
             }
             index += 1;
         }
     }
+    debug_assert_eq!(index, file_rows);
+    // The live inlined part: the rows whose ids this diff did not end.
+    let ended: BTreeSet<u64> = diff.inlined_deletes.iter().copied().collect();
+    let kept_inlined: Vec<usize> = layout
+        .inlined
+        .iter()
+        .enumerate()
+        .filter(|(_, row_id)| !ended.contains(row_id))
+        .map(|(k, _)| file_rows + k)
+        .collect();
     let mut out =
         DataTable::new(base.name.clone(), base.schema()).map_err(|e| LakeError::Engine {
             context: format!("rebuilding the writable base of \"{}\"", base.name),
             source: e,
         })?;
-    let mut start = 0usize;
-    for c in 0..base.num_chunks() {
-        let chunk = base.scan_chunk(c).ok_or_else(|| LakeError::Internal {
-            message: format!("chunk {c} of \"{}\" disappeared", base.name),
-        })?;
-        let end = start + chunk.num_rows;
-        let keep: Vec<usize> = (start..end)
-            .filter(|r| !deleted_logical.contains(r))
-            .map(|r| r - start)
-            .collect();
-        if !keep.is_empty() {
-            let gathered = chunk.gather(&keep);
-            out.append_shared_chunk(&gathered.columns)
-                .map_err(|e| LakeError::Engine {
-                    context: format!("rebuilding the writable base of \"{}\"", base.name),
-                    source: e,
-                })?;
+    let file_part = sub_table(&base, &kept_files)?;
+    crate::copy_chunks(&file_part, &mut out, "the data files")?;
+    let appended = if diff.appended.is_empty() {
+        None
+    } else {
+        Some(sub_table(current, &diff.appended)?)
+    };
+    if !appended_inlined {
+        if let Some(rows) = &appended {
+            crate::copy_chunks(rows, &mut out, "the appended rows")?;
         }
-        start = end;
     }
-    if !diff.appended.is_empty() {
-        let sub = sub_table(current, &diff.appended)?;
-        crate::copy_chunks(&sub, &mut out, "the appended rows")?;
+    let inlined_part = sub_table(&base, &kept_inlined)?;
+    crate::copy_chunks(&inlined_part, &mut out, "the inlined rows")?;
+    if appended_inlined {
+        if let Some(rows) = &appended {
+            crate::copy_chunks(rows, &mut out, "the appended rows")?;
+        }
     }
     Ok(out)
 }
@@ -776,6 +946,33 @@ impl WritableAttachment {
         })
     }
 
+    /// The attachment's default `data_inlining_row_limit` (the inner lake
+    /// handle's; see [`Lake::data_inlining_row_limit`] — a commit whose
+    /// appended rows fit it inlines them into the manifest instead of writing
+    /// a data file).
+    pub fn data_inlining_row_limit(&self) -> u64 {
+        self.lake.data_inlining_row_limit()
+    }
+
+    /// Set the attachment's default `data_inlining_row_limit` (0 disables
+    /// inlining, so every commit writes data files — the pre-wave-68 shape).
+    pub fn set_data_inlining_row_limit(&mut self, limit: u64) {
+        self.lake.set_data_inlining_row_limit(limit);
+    }
+
+    /// The inner [`Lake`] handle (read access: `current_version`,
+    /// `table_changes`, `attach`, …). Committing through the handle would
+    /// bypass the attachment's pinned base — use
+    /// [`WritableAttachment::commit`] for that.
+    pub fn lake(&self) -> &Lake {
+        &self.lake
+    }
+
+    /// The inner [`Lake`] handle, mutable (see [`WritableAttachment::lake`]).
+    pub fn lake_mut(&mut self) -> &mut Lake {
+        &mut self.lake
+    }
+
     /// The lake location (as opened).
     pub fn location(&self) -> &std::path::Path {
         self.lake.path()
@@ -813,10 +1010,10 @@ impl WritableAttachment {
             let (dbname, table) = split_key(key, self.location())?;
             let changed = match db.table_in(dbname, table) {
                 Ok(current) => {
-                    let files = self.base_layout(key)?;
+                    let layout = self.base_layout(key)?;
                     let entry = self.base_entry(key)?;
                     let delta = crate::schema::plan_schema_delta(key, &entry, base_table, current)?;
-                    !diff_table(&files, base_table, current, &delta.view)?.is_empty()
+                    !diff_table(&layout, base_table, current, &delta.view)?.is_empty()
                         || delta.record.is_some()
                 }
                 Err(_) => true,
@@ -924,9 +1121,10 @@ impl WritableAttachment {
         Ok(())
     }
 
-    /// The base version's physical layout of one table: `(file, rows,
-    /// existing delete positions)` for every data file, in manifest order.
-    fn base_layout(&self, key: &str) -> Result<Vec<(String, u64, Vec<u64>)>> {
+    /// The base version's physical layout of one table (wave 68): the data
+    /// files with their deleted positions, plus the live inlined row ids in
+    /// row-id order — what [`diff_table`] addresses.
+    fn base_layout(&self, key: &str) -> Result<BaseLayout> {
         let (manifest, manifest_path) = self.lake.manifest(Some(self.base_version))?;
         let entry = manifest.tables.get(key).ok_or_else(|| LakeError::Corrupt {
             path: manifest_path.clone(),
@@ -935,7 +1133,10 @@ impl WritableAttachment {
                 self.base_version
             ),
         })?;
-        self.lake.entry_layout(entry, key, &manifest_path)
+        Ok(BaseLayout {
+            files: self.lake.entry_layout(entry, key, &manifest_path)?,
+            inlined: entry.live_inlined().iter().map(|r| r.row_id).collect(),
+        })
     }
 
     /// The base version's catalog entry of one table (for schema deltas).
@@ -1301,7 +1502,10 @@ impl Lake {
                     if let Some(record) = &delta.record {
                         commit.set_schema(key, record.clone());
                     }
-                    let layout = self.entry_layout(&entry, key, &manifest_path)?;
+                    let layout = BaseLayout {
+                        files: self.entry_layout(&entry, key, &manifest_path)?,
+                        inlined: entry.live_inlined().iter().map(|r| r.row_id).collect(),
+                    };
                     let diff = diff_table(&layout, base_table, table, &delta.view)?;
                     if diff.is_empty() && delta.record.is_none() {
                         after.insert((*key).to_string(), Arc::clone(table));
@@ -1312,8 +1516,20 @@ impl Lake {
                             commit.delete_positions(key, file, positions);
                         }
                     }
+                    if !diff.inlined_deletes.is_empty() {
+                        commit.delete_inlined_rows(key, &diff.inlined_deletes);
+                    }
+                    let mut appended_inlined = false;
                     if !diff.appended.is_empty() {
                         let sub = sub_table(table, &diff.appended)?;
+                        // The same decision the publish makes (see
+                        // `Lake::inlines_appends`), so the rebuilt base lands
+                        // the appended rows exactly where the reader will.
+                        appended_inlined = self.inlines_appends(
+                            Some(&entry),
+                            delta.record.is_some(),
+                            sub.num_rows() as u64,
+                        );
                         commit.append(key, Arc::new(sub));
                     }
                     after.insert(
@@ -1324,6 +1540,7 @@ impl Lake {
                             &delta.view,
                             &layout,
                             &diff,
+                            appended_inlined,
                         )?),
                     );
                 }
@@ -1335,21 +1552,7 @@ impl Lake {
                     // the start (epoch 1).
                     commit.expect_table(key, None);
                     commit.append(key, Arc::clone(table));
-                    let record = crate::schema::TableSchema {
-                        version: 1,
-                        columns: table
-                            .columns
-                            .iter()
-                            .map(|c| crate::schema::SchemaColumn {
-                                name: c.name.clone(),
-                                dtype: c.dtype,
-                                default: c.default.clone().filter(|v| !v.is_null()),
-                                added: 1,
-                            })
-                            .collect(),
-                        renames: Vec::new(),
-                    };
-                    commit.set_schema(key, record);
+                    commit.set_schema(key, crate::schema::TableSchema::initial(table));
                     after.insert((*key).to_string(), Arc::clone(table));
                 }
             }
@@ -1361,6 +1564,529 @@ impl Lake {
             }
         }
         Ok((commit, after))
+    }
+
+    /// Set (or with `None` clear) one table's persisted
+    /// `data_inlining_row_limit`, publishing exactly one metadata-only
+    /// version — the parity surface DuckLake exposes as
+    /// `ducklake_set_option('catalog', 'data_inlining_row_limit', n,
+    /// table_name => 't')` (its per-table option of the same name). `0`
+    /// disables inlining for the table; a cleared limit falls back to the
+    /// handle's [`Lake::data_inlining_row_limit`]. Setting the identical
+    /// value is a no-op.
+    pub fn set_inlining_limit(
+        &mut self,
+        table: &str,
+        limit: Option<u64>,
+        settings: &CommitSettings,
+    ) -> Result<CommitReport> {
+        split_key(table, &self.root)?;
+        let (manifest, manifest_path) = self.manifest(None)?;
+        let entry = manifest
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| LakeError::Corrupt {
+                path: manifest_path.clone(),
+                message: format!("table \"{table}\" does not exist in the lake"),
+            })?;
+        if entry.inlined_limit == limit {
+            return Ok(CommitReport::noop(self.version));
+        }
+        let mut commit = Commit::new();
+        match limit {
+            Some(limit) => commit.set_inlining_limit(table, limit),
+            None => commit.clear_inlining_limit(table),
+        };
+        commit.expect_table(table, Some(entry));
+        self.commit_with_settings(&commit, settings)
+    }
+
+    /// Flush inlined rows to data files, DuckLake's
+    /// `ducklake_flush_inlined_data`: every **live** inlined row version of
+    /// `table` (or of every table, with `None`) is materialized into the
+    /// normal data-file layout — the table's partition spec splits it exactly
+    /// like any other write — and one version is published. The flushed rows'
+    /// records stay in the manifest as the change log, with their `end` set
+    /// to the flush version and `flushed` marking that the end is a
+    /// materialization, not a deletion; a later change-data read therefore
+    /// still reports the rows as insertions (at their begin version) and
+    /// never as deletions. Rows already ended or superseded before the flush
+    /// are history and are untouched.
+    ///
+    /// The flush is a writer transaction: a conflicting publish retries
+    /// (re-reading the head and re-materializing, discarding the unpublished
+    /// files), and the returned [`FlushReport`] is a no-op when there is
+    /// nothing to flush.
+    pub fn flush_inlined_data(&mut self, table: Option<&str>) -> Result<FlushReport> {
+        self.flush_inlined_data_with_settings(table, &CommitSettings::default())
+    }
+
+    /// [`Lake::flush_inlined_data`] with explicit retry settings.
+    pub fn flush_inlined_data_with_settings(
+        &mut self,
+        table: Option<&str>,
+        settings: &CommitSettings,
+    ) -> Result<FlushReport> {
+        if self.format_version < 4 {
+            return Err(pre_incremental_head(self.format_version));
+        }
+        if let Some(table) = table {
+            split_key(table, &self.root)?;
+        }
+        let mut attempt: u32 = 0;
+        loop {
+            if attempt > 0 {
+                std::thread::sleep(settings.backoff_for(attempt));
+                self.rebase_catalog()?;
+            } else {
+                self.ensure_catalog_unchanged()?;
+            }
+            let head = self.read_catalog_for_commit()?;
+            let manifest_path = self.storage.abs(CATALOG_FILE);
+            let version = head
+                .version
+                .checked_add(1)
+                .filter(|v| *v <= crate::MAX_VERSION)
+                .ok_or_else(|| LakeError::Overflow {
+                    path: self.root.clone(),
+                    version: head.version,
+                })?;
+            let keys: Vec<String> = match table {
+                Some(table) => {
+                    if !head.tables.contains_key(table) {
+                        return Err(LakeError::Corrupt {
+                            path: manifest_path.clone(),
+                            message: format!(
+                                "table \"{table}\" does not exist in version {}",
+                                head.version
+                            ),
+                        });
+                    }
+                    vec![table.to_string()]
+                }
+                None => head.tables.keys().cloned().collect(),
+            };
+            let mut tables = head.tables.clone();
+            let mut deltas: BTreeMap<String, TableDelta> = BTreeMap::new();
+            let mut written: Vec<String> = Vec::new();
+            let mut report_tables: Vec<(String, u64)> = Vec::new();
+            let mut file_bytes = 0u64;
+            let mut data_files = 0usize;
+            for key in keys {
+                let entry = tables.get(&key).cloned().expect("checked above");
+                let live = entry.live_inlined();
+                if live.is_empty() {
+                    continue;
+                }
+                let record = crate::schema::TableSchema::from_entry(&key, &entry, &manifest_path)?
+                    .ok_or_else(|| LakeError::NotRepresentable {
+                        message: format!(
+                            "table \"{key}\" inlines rows but has no schema record; this \
+                                 lake was written by an older build — re-save it before flushing"
+                        ),
+                    })?;
+                let (_, table_name) = split_key(&key, &manifest_path)?;
+                let live: Vec<crate::catalog::InlinedRow> = live.into_iter().cloned().collect();
+                let (rows, _) = crate::inlined::materialize_live(
+                    &live,
+                    &record,
+                    &key,
+                    table_name,
+                    None,
+                    &manifest_path,
+                )?;
+                let (files, bytes) =
+                    self.write_data_files(&key, None, entry.partition_keys(), &rows)?;
+                file_bytes += bytes;
+                data_files += files.len();
+                written.extend(files.iter().map(|f| f.path().to_string()));
+                let mut next_row_id = entry
+                    .next_row_id
+                    .max(entry.max_row_id().map_or(0, |m| m.saturating_add(1)));
+                let files = stamp_file_row_ids(&files, &mut next_row_id);
+                let count = live.len() as u64;
+                let mut new_entry = entry.clone();
+                new_entry.files.extend(files.iter().cloned());
+                new_entry.next_row_id = next_row_id;
+                for row in new_entry.inlined.iter_mut() {
+                    if row.end.is_none() {
+                        row.end = Some(version);
+                        row.flushed = true;
+                    }
+                }
+                deltas.insert(
+                    key.clone(),
+                    TableDelta {
+                        data_files: files,
+                        delete_files: Vec::new(),
+                        rows_added: 0,
+                        rows_deleted: 0,
+                        replaced: false,
+                        partition_changed: false,
+                        partition_by: None,
+                        compacted_files: Vec::new(),
+                        removed_delete_files: Vec::new(),
+                        rows_inlined: 0,
+                        inlined_ended: 0,
+                        inlined_flushed: count,
+                        inlined_limit: None,
+                        inlining_changed: false,
+                    },
+                );
+                report_tables.push((key.clone(), count));
+                tables.insert(key, new_entry);
+            }
+            report_tables.sort_by(|a, b| a.0.cmp(&b.0));
+            if report_tables.is_empty() {
+                return Ok(FlushReport {
+                    version: head.version,
+                    committed: false,
+                    retries: attempt,
+                    tables: Vec::new(),
+                    data_files: 0,
+                    bytes_written: 0,
+                });
+            }
+            let (author, commit_message) = match &self.pending_commit {
+                Some((author, message)) => (author.clone(), message.clone()),
+                None => (None, None),
+            };
+            let changes = manifest_for(&*self.storage, &self.root, Some(head.version))
+                .ok()
+                .map(|(previous, _)| {
+                    crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
+                });
+            let schema_version = crate::next_schema_version(Some(&head), &tables);
+            let new_catalog = Catalog {
+                format_version: FORMAT_VERSION,
+                updated: crate::time::iso8601_utc(SystemTime::now()),
+                version,
+                tables,
+                author,
+                commit_message,
+                changes,
+                schema_version,
+            };
+            let snapshot_plain = crate::manifest_json(&new_catalog, &self.root)?;
+            let commit_manifest = CommitManifest {
+                format_version: FORMAT_VERSION,
+                version,
+                base_version: head.version,
+                updated: crate::time::iso8601_utc(SystemTime::now()),
+                tables: deltas,
+            };
+            let commit_bytes = crate::commit_manifest_json(&commit_manifest)?;
+            let report = FlushReport {
+                version,
+                committed: true,
+                retries: attempt,
+                tables: report_tables,
+                data_files,
+                bytes_written: file_bytes
+                    + commit_bytes.len() as u64
+                    + 2 * snapshot_plain.len() as u64,
+            };
+            match self.publish_commit_version(version, &commit_bytes, &snapshot_plain) {
+                Ok(()) => {
+                    self.pending_commit = None;
+                    return Ok(report);
+                }
+                Err(LakeError::Conflict { .. }) if attempt < settings.max_retry_count => {
+                    discard_unpublished(&*self.storage, &written);
+                    attempt += 1;
+                }
+                Err(e) => {
+                    discard_unpublished(&*self.storage, &written);
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Register existing data files as rows of `table`, DuckLake's
+    /// `ducklake_add_data_files`: the files are **not** rewritten or copied —
+    /// one version is published whose entry lists them (with their exact row
+    /// counts, statistics and row-id ranges), so their rows become queryable.
+    ///
+    /// The checks mirror the reference's rules with pinkdb's stricter path
+    /// model: the path must be lake-relative and under `data/` (DuckLake
+    /// accepts arbitrary local paths; a pinkdb lake may live on object
+    /// storage, where an outside path does not exist), the file must exist
+    /// and decode under the table's format, its declaring `db.table` must
+    /// match, its row count must be readable from the file itself, and its
+    /// schema must match the table's recorded schema exactly — a missing or
+    /// extra column is a clean refusal (DuckLake's `allow_missing` /
+    /// `ignore_extra_columns` opt-outs are not implemented; document them as
+    /// the way out of a whole-store re-save instead). A file that cannot be
+    /// validated (unreadable, wrong format, wrong table, no schema record on
+    /// the table, plaintext in an encrypted lake) is refused before anything
+    /// is published.
+    pub fn add_data_files(&mut self, table: &str, paths: &[String]) -> Result<AddFilesReport> {
+        self.add_data_files_with_settings(table, paths, &CommitSettings::default())
+    }
+
+    /// [`Lake::add_data_files`] with explicit retry settings.
+    pub fn add_data_files_with_settings(
+        &mut self,
+        table: &str,
+        paths: &[String],
+        settings: &CommitSettings,
+    ) -> Result<AddFilesReport> {
+        if self.format_version < 4 {
+            return Err(pre_incremental_head(self.format_version));
+        }
+        split_key(table, &self.root)?;
+        if paths.is_empty() {
+            return Err(LakeError::InvalidOption {
+                message: "ducklake_add_data_files needs at least one path".to_string(),
+            });
+        }
+        if self.format_version < 5 {
+            return Err(LakeError::NotRepresentable {
+                message: format!(
+                    "table \"{table}\": registering files needs a format_version 5 table (the \
+                     schema record the file is validated against); re-save the lake to migrate \
+                     it"
+                ),
+            });
+        }
+        let mut attempt: u32 = 0;
+        loop {
+            if attempt > 0 {
+                std::thread::sleep(settings.backoff_for(attempt));
+                self.rebase_catalog()?;
+            } else {
+                self.ensure_catalog_unchanged()?;
+            }
+            let head = self.read_catalog_for_commit()?;
+            let manifest_path = self.storage.abs(CATALOG_FILE);
+            let version = head
+                .version
+                .checked_add(1)
+                .filter(|v| *v <= crate::MAX_VERSION)
+                .ok_or_else(|| LakeError::Overflow {
+                    path: self.root.clone(),
+                    version: head.version,
+                })?;
+            let entry = head
+                .tables
+                .get(table)
+                .cloned()
+                .ok_or_else(|| LakeError::Corrupt {
+                    path: manifest_path.clone(),
+                    message: format!(
+                        "table \"{table}\" does not exist in version {}",
+                        head.version
+                    ),
+                })?;
+            let record = crate::schema::TableSchema::from_entry(table, &entry, &manifest_path)?
+                .ok_or_else(|| LakeError::NotRepresentable {
+                    message: format!(
+                        "table \"{table}\" has no schema record (a legacy entry); registering \
+                         files needs the format_version 5 schema the file is validated against \
+                         — save the store again to publish one"
+                    ),
+                })?;
+            let format = entry.format();
+            let mut new_entry = entry.clone();
+            let mut registered: Vec<(String, String, u64)> = Vec::new();
+            let mut delta = TableDelta::default();
+            for path in paths {
+                let rel = path.trim();
+                if let Err(e) = validate_rel_path(rel) {
+                    return Err(LakeError::NotRepresentable {
+                        message: format!(
+                            "ducklake_add_data_files: \"{rel}\" is not a lake-relative `data/…` \
+                             path (a pinkdb lake registers files under its data/ prefix — the \
+                             reference accepts arbitrary local paths, which do not exist for \
+                             an object-storage lake): {e}"
+                        ),
+                    });
+                }
+                match self.storage.head(rel)? {
+                    Head::File => {}
+                    Head::Missing => {
+                        return Err(LakeError::Io {
+                            context: format!("registering data file \"{rel}\""),
+                            source: std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                format!(
+                                    "no files found that match the pattern \"{rel}\" under {}",
+                                    self.storage.abs("").display()
+                                ),
+                            ),
+                        })
+                    }
+                    Head::NotAFile => {
+                        return Err(LakeError::Corrupt {
+                            path: self.storage.abs(rel),
+                            message: "the registered path is not a regular file".to_string(),
+                        })
+                    }
+                }
+                let mini =
+                    self.open_data_file(rel, format)
+                        .map_err(|e| LakeError::NotRepresentable {
+                            message: format!(
+                                "ducklake_add_data_files: \"{rel}\" cannot be read as a {:?} data \
+                             file of a pinkdb lake ({e}); the file must be a data file this \
+                             lake's format and schema describe",
+                                format
+                            ),
+                        })?;
+                let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
+                let (dbname, table_name) = split_key(table, &manifest_path)?;
+                if !file_db.eq_ignore_ascii_case(dbname)
+                    || !file_table.name.eq_ignore_ascii_case(table_name)
+                {
+                    return Err(LakeError::Corrupt {
+                        path: self.storage.abs(rel),
+                        message: format!(
+                            "data file holds {file_db}.{}, but the catalog says \"{table}\"",
+                            file_table.name
+                        ),
+                    });
+                }
+                // The exact-schema gate: every recorded logical column must
+                // be present with its type (through the rename map), and no
+                // extra column may ride along — a missing or extra column
+                // would silently change what a scan returns.
+                let physical = file_table.schema();
+                let mut used = vec![false; physical.len()];
+                for (i, col) in record.columns.iter().enumerate() {
+                    let Some(want) = record.physical_name(i, entry.schema_version) else {
+                        return Err(LakeError::NotRepresentable {
+                            message: format!(
+                                "ducklake_add_data_files: table \"{table}\" column \"{}\" \
+                                 appeared after schema version {}; a registered file is read \
+                                 under the table's current schema",
+                                col.name, entry.schema_version
+                            ),
+                        });
+                    };
+                    let found = physical
+                        .iter()
+                        .position(|(name, _)| name.eq_ignore_ascii_case(want));
+                    match found {
+                        Some(idx) if physical[idx].1 == col.dtype => used[idx] = true,
+                        Some(idx) => {
+                            return Err(LakeError::NotRepresentable {
+                                message: format!(
+                                    "ducklake_add_data_files: \"{rel}\" holds column \"{want}\" \
+                                     as {:?}, but table \"{table}\" records {:?}",
+                                    physical[idx].1, col.dtype
+                                ),
+                            })
+                        }
+                        None => {
+                            return Err(LakeError::NotRepresentable {
+                                message: format!(
+                                    "ducklake_add_data_files: column \"{}\" exists in table \
+                                     \"{table}\" but was not found in file \"{rel}\" (the \
+                                     reference's allow_missing opt-out is not implemented here \
+                                     — re-save the store to publish a complete file)",
+                                    col.name
+                                ),
+                            })
+                        }
+                    }
+                }
+                if let Some(idx) = used.iter().position(|u| !*u) {
+                    return Err(LakeError::NotRepresentable {
+                        message: format!(
+                            "ducklake_add_data_files: column \"{}\" exists in file \"{rel}\" but \
+                             was not found in table \"{table}\" (the reference's \
+                             ignore_extra_columns opt-out is not implemented here)",
+                            physical[idx].0
+                        ),
+                    });
+                }
+                let rows = file_table.num_rows() as u64;
+                let start = new_entry
+                    .next_row_id
+                    .max(new_entry.max_row_id().map_or(0, |m| m.saturating_add(1)));
+                let Some(next) = start.checked_add(rows) else {
+                    return Err(LakeError::Corrupt {
+                        path: manifest_path.clone(),
+                        message: format!("table \"{table}\": row ids overflow u64"),
+                    });
+                };
+                let saved = pinkdb::persist::table_stats(dbname, table_name, file_table);
+                let stats = crate::stats::StatsBlock::from_saved(table, rel, &saved)?;
+                let file = FileRef::Entry {
+                    path: rel.to_string(),
+                    rows,
+                    schema_version: Some(entry.schema_version.max(1)),
+                    stats: Some(stats),
+                    partition: None,
+                    row_id_start: Some(start),
+                };
+                new_entry.files.push(file.clone());
+                new_entry.rows =
+                    new_entry
+                        .rows
+                        .checked_add(rows)
+                        .ok_or_else(|| LakeError::Corrupt {
+                            path: manifest_path.clone(),
+                            message: format!("table \"{table}\" overflows u64 rows"),
+                        })?;
+                new_entry.next_row_id = next;
+                delta.data_files.push(file);
+                delta.rows_added += rows;
+                registered.push((table.to_string(), rel.to_string(), rows));
+            }
+            let mut tables = head.tables.clone();
+            tables.insert(table.to_string(), new_entry);
+            let mut deltas: BTreeMap<String, TableDelta> = BTreeMap::new();
+            deltas.insert(table.to_string(), delta);
+            let (author, commit_message) = match &self.pending_commit {
+                Some((author, message)) => (author.clone(), message.clone()),
+                None => (None, None),
+            };
+            let changes = manifest_for(&*self.storage, &self.root, Some(head.version))
+                .ok()
+                .map(|(previous, _)| {
+                    crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
+                });
+            let schema_version = crate::next_schema_version(Some(&head), &tables);
+            let new_catalog = Catalog {
+                format_version: FORMAT_VERSION,
+                updated: crate::time::iso8601_utc(SystemTime::now()),
+                version,
+                tables,
+                author,
+                commit_message,
+                changes,
+                schema_version,
+            };
+            let snapshot_plain = crate::manifest_json(&new_catalog, &self.root)?;
+            let commit_manifest = CommitManifest {
+                format_version: FORMAT_VERSION,
+                version,
+                base_version: head.version,
+                updated: crate::time::iso8601_utc(SystemTime::now()),
+                tables: deltas,
+            };
+            let commit_bytes = crate::commit_manifest_json(&commit_manifest)?;
+            let report = AddFilesReport {
+                version,
+                committed: true,
+                retries: attempt,
+                files: registered,
+                bytes_written: commit_bytes.len() as u64 + 2 * snapshot_plain.len() as u64,
+            };
+            match self.publish_commit_version(version, &commit_bytes, &snapshot_plain) {
+                Ok(()) => {
+                    self.pending_commit = None;
+                    return Ok(report);
+                }
+                Err(LakeError::Conflict { .. }) if attempt < settings.max_retry_count => {
+                    attempt += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// The physical layout of one entry: `(data file, rows, the positions its
@@ -1383,13 +2109,29 @@ impl Lake {
     /// follow the head's partition specification (or the spec this same
     /// commit sets for a table it creates): each distinct partition value set
     /// becomes its own data file carrying those values.
+    ///
+    /// Wave 68: an append whose row count the table's `data_inlining_row_limit`
+    /// admits (see [`Lake::inlines_appends`]) is **not** written at all — the
+    /// rows ride in [`UploadedCommit::inlined`] and the publish stores them in
+    /// the manifest. The decision is kept across retries: the uploaded rows
+    /// are what a rebased publish records.
     fn upload_commit(
         &self,
         commit: &Commit,
         specs: &BTreeMap<String, Vec<PartitionKey>>,
     ) -> Result<UploadedCommit> {
+        let head = crate::read_catalog(&*self.storage, &self.root)?;
         let mut uploaded = UploadedCommit::default();
         for (key, rows) in &commit.appends {
+            let entry = head.tables.get(key);
+            if self.inlines_appends(
+                entry,
+                commit.schemas.contains_key(key),
+                rows.num_rows() as u64,
+            ) {
+                uploaded.inlined.insert(key.clone(), Arc::clone(rows));
+                continue;
+            }
             let keys = specs.get(key).map(Vec::as_slice).unwrap_or(&[]);
             let (files, bytes) = self.write_data_files(key, None, keys, rows)?;
             uploaded.bytes += bytes;
@@ -1431,6 +2173,35 @@ impl Lake {
             }
         }
         Ok(out)
+    }
+
+    /// Whether an append of `rows` rows to `entry` (the head entry; `None`
+    /// when this commit creates the table) lands as **inlined records**
+    /// instead of a data file: a positive count within the table's effective
+    /// `data_inlining_row_limit` (the entry's own, else this handle's
+    /// default; 0 disables), and a schema record available — the commit
+    /// publishes one (`publishes_record`) or the entry already has one, since
+    /// inlined rows decode through the v5 `columns`/`renames` mapping. The
+    /// same helper drives the writable attachment's rebuilt base, so a diff
+    /// always agrees with the reader on where the appended rows land.
+    pub(crate) fn inlines_appends(
+        &self,
+        entry: Option<&TableEntry>,
+        publishes_record: bool,
+        rows: u64,
+    ) -> bool {
+        if rows == 0 {
+            return false;
+        }
+        let limit = entry
+            .and_then(|e| e.inlined_limit)
+            .unwrap_or(self.inline_row_limit);
+        // A table this commit creates mints its initial schema record together
+        // with the inlined rows (the record is what decodes them); an existing
+        // table needs one already, or this commit publishing one.
+        let recorded =
+            entry.is_none() || publishes_record || entry.is_some_and(|e| e.columns.is_some());
+        limit > 0 && rows <= limit && recorded
     }
 
     /// One publish attempt: build the new catalog from the current head plus
@@ -1492,73 +2263,258 @@ impl Lake {
                 deltas.insert(key.clone(), TableDelta::default());
             }
         }
-        for (key, files) in &uploaded.appends {
-            let appended = commit.appends.get(key).expect("uploaded append has rows");
+        for key in commit.appends.keys() {
+            let appended = commit.appends.get(key).expect("iterated from appends");
             let added = appended.num_rows() as u64;
             rows_added += added;
-            // A new file's schema epoch: the record the commit publishes for
-            // this table, else the entry's current epoch (a recorded entry's
-            // files always carry one), else none (legacy entry).
+            // The schema epoch new rows are written under: the record the
+            // commit publishes for this table, else the entry's current epoch
+            // (a recorded entry's files always carry one), else none (legacy
+            // entry).
             let file_version = commit
                 .schemas
                 .get(key)
                 .map(|s| s.version)
                 .or_else(|| tables.get(key).map(|e| e.schema_version).filter(|v| *v > 0));
-            let files: Vec<crate::catalog::FileRef> = files
+            let inlined = uploaded.inlined.contains_key(key);
+            let records = if inlined {
+                // The epoch the rows are written under: the record this
+                // commit publishes, the entry's current record, or — for a
+                // table this commit creates — epoch 1 (the record the publish
+                // mints with the rows).
+                let record = match tables.get(key) {
+                    Some(entry) => commit
+                        .schemas
+                        .get(key)
+                        .map(|s| s.version)
+                        .or_else(|| Some(entry.schema_version).filter(|v| *v > 0)),
+                    None => Some(commit.schemas.get(key).map_or(1, |record| record.version)),
+                }
+                .ok_or_else(|| {
+                    PublishFailure::Fatal(LakeError::NotRepresentable {
+                        message: format!(
+                            "table \"{key}\": inlined rows need a schema record (the version \
+                             the rows were written under) — this commit's rows were inlined \
+                             against a base that had one, but the head no longer does; re-run \
+                             the commit from a fresh base"
+                        ),
+                    })
+                })?;
+                let schema = appended.schema();
+                let names: Vec<String> = schema.iter().map(|(n, _)| n.clone()).collect();
+                let dtypes: Vec<pinkdb::DataType> = schema.iter().map(|(_, d)| *d).collect();
+                Some((record, names, dtypes))
+            } else {
+                None
+            };
+            let Some(entry) = tables.get_mut(key) else {
+                if commit.deletes.contains_key(key)
+                    || commit.drops.contains(key)
+                    || commit.inlined_deletes.contains_key(key)
+                    || commit.inlining_changes.contains_key(key)
+                {
+                    return Err(PublishFailure::Fatal(LakeError::Corrupt {
+                        path: self.storage.abs(CATALOG_FILE),
+                        message: format!(
+                            "table \"{key}\" does not exist; a commit cannot delete from or \
+                             drop it"
+                        ),
+                    }));
+                }
+                // A table this commit creates takes the partition spec the
+                // same commit sets for it, if any (its appends were already
+                // split by that spec — see `upload_partition_specs`), and its
+                // row-id counter starts at 0. Its schema record is minted
+                // here (epoch 1) unless the commit carries one, so its files
+                // are stamped with that epoch.
+                let spec = commit.partition_changes.get(key).cloned().flatten();
+                let created_version = commit.schemas.get(key).map_or(1, |s| s.version);
+                let mut next_row_id = 0u64;
+                let mut entry = TableEntry {
+                    files: Vec::new(),
+                    rows: added,
+                    format: Some(self.write_format()),
+                    stats: None,
+                    deletes: Vec::new(),
+                    partition_by: spec.clone(),
+                    schema_version: 0,
+                    columns: None,
+                    renames: Vec::new(),
+                    inlined: Vec::new(),
+                    inlined_limit: None,
+                    next_row_id: 0,
+                };
+                let mut files_for_delta: Vec<FileRef> = Vec::new();
+                if let Some((record, names, dtypes)) = &records {
+                    let new = crate::inlined::records_for_append(
+                        appended,
+                        names,
+                        dtypes,
+                        next_row_id,
+                        version,
+                        *record,
+                        key,
+                    )
+                    .map_err(PublishFailure::Fatal)?;
+                    next_row_id += new.len() as u64;
+                    entry.inlined = new;
+                } else {
+                    let files = uploaded
+                        .appends
+                        .get(key)
+                        .expect("uploaded append has files");
+                    let files: Vec<FileRef> = files
+                        .iter()
+                        .map(|f| f.with_schema_version(Some(created_version)))
+                        .collect();
+                    let files = stamp_file_row_ids(&files, &mut next_row_id);
+                    entry.files = files.clone();
+                    files_for_delta = files;
+                }
+                // A table this commit creates mints its initial schema record
+                // (epoch 1). The record publish loop below overrides it when
+                // the commit carries one (a `commit_from_tables` create); a
+                // hand-built commit has none, and the record is what decodes
+                // inlined rows and what wave-65 evolution continues from.
+                if !commit.schemas.contains_key(key) {
+                    let record = crate::schema::TableSchema::initial(appended);
+                    let (record_version, columns, renames) =
+                        record.to_entry_fields().map_err(PublishFailure::Fatal)?;
+                    entry.schema_version = record_version;
+                    entry.columns = Some(columns);
+                    entry.renames = renames;
+                }
+                entry.next_row_id = next_row_id;
+                tables.insert(key.clone(), entry);
+                let delta = deltas.entry(key.clone()).or_default();
+                delta.rows_added += added;
+                if inlined {
+                    delta.rows_inlined += added;
+                } else {
+                    delta.data_files.extend(files_for_delta);
+                }
+                if spec.is_some() {
+                    delta.partition_changed = true;
+                    delta.partition_by = spec;
+                }
+                continue;
+            };
+            if let Some((record, names, dtypes)) = &records {
+                // Wave 68: store the appended rows in the manifest. Row ids
+                // continue the table's counter (never backwards, whatever a
+                // tampered counter says).
+                let base = entry
+                    .next_row_id
+                    .max(entry.max_row_id().map_or(0, |m| m.saturating_add(1)));
+                let new = crate::inlined::records_for_append(
+                    appended, names, dtypes, base, version, *record, key,
+                )
+                .map_err(PublishFailure::Fatal)?;
+                let count = new.len() as u64;
+                let Some(next) = base.checked_add(count) else {
+                    return Err(PublishFailure::Fatal(LakeError::Corrupt {
+                        path: self.storage.abs(CATALOG_FILE),
+                        message: format!("table \"{key}\": row ids overflow u64"),
+                    }));
+                };
+                entry.inlined.extend(new);
+                entry.next_row_id = next;
+                entry.rows = entry.rows.checked_add(added).ok_or_else(|| {
+                    PublishFailure::Fatal(LakeError::Corrupt {
+                        path: self.storage.abs(CATALOG_FILE),
+                        message: format!("table \"{key}\" overflows u64 rows"),
+                    })
+                })?;
+                let delta = deltas.entry(key.clone()).or_default();
+                delta.rows_added += added;
+                delta.rows_inlined += added;
+                continue;
+            }
+            let files = uploaded
+                .appends
+                .get(key)
+                .expect("uploaded append has files");
+            let files: Vec<FileRef> = files
                 .iter()
                 .map(|f| f.with_schema_version(file_version))
                 .collect();
-            match tables.get_mut(key) {
-                Some(entry) => {
-                    entry.files.extend(files.iter().cloned());
-                    entry.rows = entry.rows.checked_add(added).ok_or_else(|| {
-                        PublishFailure::Fatal(LakeError::Corrupt {
-                            path: self.storage.abs(CATALOG_FILE),
-                            message: format!("table \"{key}\" overflows u64 rows"),
-                        })
-                    })?;
-                    let delta = deltas.entry(key.clone()).or_default();
-                    delta.data_files.extend(files.iter().cloned());
-                    delta.rows_added += added;
-                }
-                None => {
-                    if commit.deletes.contains_key(key) || commit.drops.contains(key) {
-                        return Err(PublishFailure::Fatal(LakeError::Corrupt {
-                            path: self.storage.abs(CATALOG_FILE),
-                            message: format!(
-                                "table \"{key}\" does not exist; a commit cannot delete from or \
-                                 drop it"
-                            ),
-                        }));
-                    }
-                    // A table this commit creates takes the partition spec the
-                    // same commit sets for it, if any (its appends were
-                    // already split by that spec — see
-                    // `upload_partition_specs`).
-                    let spec = commit.partition_changes.get(key).cloned().flatten();
-                    tables.insert(
-                        key.clone(),
-                        TableEntry {
-                            files: files.clone(),
-                            rows: added,
-                            format: Some(self.write_format()),
-                            stats: None,
-                            deletes: Vec::new(),
-                            partition_by: spec.clone(),
-                            schema_version: 0,
-                            columns: None,
-                            renames: Vec::new(),
-                        },
-                    );
-                    let delta = deltas.entry(key.clone()).or_default();
-                    delta.data_files.extend(files.iter().cloned());
-                    delta.rows_added += added;
-                    if spec.is_some() {
-                        delta.partition_changed = true;
-                        delta.partition_by = spec;
-                    }
-                }
+            let mut next_row_id = entry
+                .next_row_id
+                .max(entry.max_row_id().map_or(0, |m| m.saturating_add(1)));
+            let files = stamp_file_row_ids(&files, &mut next_row_id);
+            entry.files.extend(files.iter().cloned());
+            entry.next_row_id = next_row_id;
+            entry.rows = entry.rows.checked_add(added).ok_or_else(|| {
+                PublishFailure::Fatal(LakeError::Corrupt {
+                    path: self.storage.abs(CATALOG_FILE),
+                    message: format!("table \"{key}\" overflows u64 rows"),
+                })
+            })?;
+            let delta = deltas.entry(key.clone()).or_default();
+            delta.data_files.extend(files.iter().cloned());
+            delta.rows_added += added;
+        }
+        // Wave 68: end the inlined row versions this commit deletes or
+        // supersedes. Every id must name a row the head holds live: an id
+        // from a stale base is a conflict, never a silent miss.
+        for (key, ids) in &commit.inlined_deletes {
+            let entry = tables.get_mut(key).ok_or_else(|| {
+                PublishFailure::Fatal(LakeError::Corrupt {
+                    path: self.storage.abs(CATALOG_FILE),
+                    message: format!("table \"{key}\" does not exist in the head version"),
+                })
+            })?;
+            for id in ids {
+                let Some(row) = entry
+                    .inlined
+                    .iter_mut()
+                    .find(|r| r.row_id == *id && r.end.is_none())
+                else {
+                    return Err(PublishFailure::Fatal(LakeError::Conflict {
+                        path: self.storage.abs(CATALOG_FILE),
+                        message: format!(
+                            "table \"{key}\": inlined row {id} is not live at version {} \
+                             (already deleted, superseded, or never inlined); recompute the \
+                             change against the current version",
+                            self.version
+                        ),
+                    }));
+                };
+                row.end = Some(version);
+                row.flushed = false;
+                entry.rows = entry.rows.checked_sub(1).ok_or_else(|| {
+                    PublishFailure::Fatal(LakeError::Corrupt {
+                        path: self.storage.abs(CATALOG_FILE),
+                        message: format!(
+                            "table \"{key}\": ending inlined row {id} underflows its row count"
+                        ),
+                    })
+                })?;
+                rows_deleted += 1;
+                let delta = deltas.entry(key.clone()).or_default();
+                delta.rows_deleted += 1;
+                delta.inlined_ended += 1;
             }
+        }
+        // Wave 68: per-table `data_inlining_row_limit` changes (metadata
+        // only, like a partition change): the table must exist.
+        for (key, limit) in &commit.inlining_changes {
+            let entry = tables.get_mut(key).ok_or_else(|| {
+                PublishFailure::Fatal(LakeError::Corrupt {
+                    path: self.storage.abs(CATALOG_FILE),
+                    message: format!(
+                        "table \"{key}\" does not exist; a commit cannot set or clear its \
+                         data_inlining_row_limit"
+                    ),
+                })
+            })?;
+            if entry.inlined_limit == *limit {
+                continue;
+            }
+            entry.inlined_limit = *limit;
+            let delta = deltas.entry(key.clone()).or_default();
+            delta.inlining_changed = true;
+            delta.inlined_limit = *limit;
         }
         // The schema records this commit publishes (wave 65): the new epoch
         // and columns; every file that predates the record (or predates this
@@ -1712,6 +2668,8 @@ impl Lake {
         };
         let snapshot_bytes =
             crate::manifest_json(&new_catalog, &self.root).map_err(PublishFailure::Fatal)?;
+        let rows_inlined: u64 = deltas.values().map(|d| d.rows_inlined).sum();
+        let inlined_deleted: u64 = deltas.values().map(|d| d.inlined_ended).sum();
         let commit_manifest = CommitManifest {
             format_version: crate::FORMAT_VERSION,
             version,
@@ -1725,7 +2683,9 @@ impl Lake {
             .appends
             .keys()
             .chain(commit.deletes.keys())
+            .chain(commit.inlined_deletes.keys())
             .chain(commit.partition_changes.keys())
+            .chain(commit.inlining_changes.keys())
             .collect();
         let report = CommitReport {
             version,
@@ -1755,6 +2715,8 @@ impl Lake {
                 + 2 * snapshot_bytes.len() as u64,
             rows_added,
             rows_deleted,
+            rows_inlined,
+            inlined_deleted,
         };
         self.publish_commit_version(version, &commit_bytes, &snapshot_bytes)
             .map_err(PublishFailure::Retry)?;
@@ -1820,7 +2782,7 @@ impl Lake {
     }
 }
 
-/// The files one commit uploads before publishing.
+/// The files (and inlined rows) one commit uploads before publishing.
 #[derive(Debug, Default)]
 struct UploadedCommit {
     /// `db.table` → the appended data files, one per partition value set
@@ -1828,7 +2790,27 @@ struct UploadedCommit {
     appends: BTreeMap<String, Vec<FileRef>>,
     /// `db.table` → data file → the delete file to add.
     deletes: BTreeMap<String, BTreeMap<String, DeleteRef>>,
+    /// Wave 68: `db.table` → the appended rows that inline (no data file was
+    /// written; the publish stores them in the manifest).
+    inlined: BTreeMap<String, Arc<DataTable>>,
     bytes: u64,
+}
+
+/// Assign `row_id_start` ranges to the commit's new data files, continuing
+/// `next` (the table's row-id counter) in file order. A zero-row file gets no
+/// range. Backdating is not possible: the counter never moves backwards.
+fn stamp_file_row_ids(files: &[FileRef], next: &mut u64) -> Vec<FileRef> {
+    files
+        .iter()
+        .map(|f| {
+            let start = f.rows().filter(|r| *r > 0).map(|rows| {
+                let start = *next;
+                *next = next.saturating_add(rows);
+                start
+            });
+            f.with_row_id_start(start)
+        })
+        .collect()
 }
 
 /// Why one publish attempt failed: `Retry` rebases (a conflicting writer);
@@ -1857,5 +2839,14 @@ fn conflict_message(e: &LakeError) -> String {
     match e {
         LakeError::Conflict { message, .. } => message.clone(),
         other => other.to_string(),
+    }
+}
+
+/// Best-effort removal of a flush attempt's unpublished data files (a retry
+/// or a failure before publication). Nothing ever references them; a crash
+/// here leaves them for `cleanup_old_files`.
+fn discard_unpublished(storage: &dyn crate::storage::Storage, written: &[String]) {
+    for rel in written {
+        let _ = storage.delete(rel);
     }
 }

@@ -215,6 +215,10 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "attach" => cmd_attach(db, rest),
         "commit" => cmd_commit(db, rest),
         "partition" => cmd_partition(db, rest),
+        "inlining" => cmd_inlining(rest),
+        "flush" => cmd_flush(rest),
+        "changes" => cmd_changes(rest),
+        "add_data_files" | "add_files" => cmd_add_data_files(rest),
         "merge" => cmd_merge(rest),
         "rewrite" => cmd_rewrite(rest),
         "expire" => cmd_expire(rest),
@@ -231,9 +235,9 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!(
-            "Usage: .lake <save|open|attach|commit|partition|merge|rewrite|expire|cleanup|\
-             orphans|files|table_info|options|settings|detach|attached|versions|snapshots|\
-             tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|partition|inlining|flush|changes|\
+             add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
+             settings|detach|attached|versions|snapshots|tables|info> ..."
         ),
         other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
     }
@@ -628,6 +632,26 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
 /// `.lake attach <dir> write`: the writable (incremental) attach. Materializes
 /// the pinned version's tables into the session store and remembers the base
 /// version; `.lake commit <dir>` publishes the difference.
+/// The writable attach's default `data_inlining_row_limit`, from
+/// `PINKDB_LAKE_INLINING_ROW_LIMIT` (DuckLake's session setting
+/// `ducklake_default_data_inlining_row_limit`; 0 disables inlining so every
+/// commit writes data files). Unset keeps the handle default (10); an
+/// unparseable value is reported and the default is used. A table's persisted
+/// `.lake inlining` limit always wins.
+fn attach_inlining_limit() -> Option<u64> {
+    let raw = std::env::var("PINKDB_LAKE_INLINING_ROW_LIMIT").ok()?;
+    match raw.trim().parse::<u64>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            eprintln!(
+                "warning: PINKDB_LAKE_INLINING_ROW_LIMIT={raw:?} is not a count; using the \
+                 default"
+            );
+            None
+        }
+    }
+}
+
 fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
     if db.in_transaction() {
         cli_error!(".lake attach is not allowed inside a transaction; COMMIT or ROLLBACK first");
@@ -638,13 +662,16 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
         Some(key) => WritableAttachment::open_with_key(dir, version, key),
         None => WritableAttachment::open(dir, version),
     };
-    let wa = match wa {
+    let mut wa = match wa {
         Ok(wa) => wa,
         Err(e) => {
             cli_error!("{e}");
             return;
         }
     };
+    if let Some(limit) = attach_inlining_limit() {
+        wa.set_data_inlining_row_limit(limit);
+    }
     let key = wa.location().display().to_string();
     if writables().contains_key(&key) {
         cli_error!(
@@ -821,13 +848,22 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
             set_baseline_version_only(&dir, report.version);
             println!(
                 "Committed lake version {} onto {dir} in {:.3}s ({} file{}: {} data, {} \
-                 delete;{} +{} row{}, -{} row{}; {} bytes; {} retr{})",
+                 delete{};{} +{} row{}, -{} row{}; {} bytes; {} retr{})",
                 report.version,
                 t0.elapsed().as_secs_f64(),
                 report.data_files + report.delete_files,
                 plural(report.data_files + report.delete_files),
                 report.data_files,
                 report.delete_files,
+                if report.rows_inlined > 0 {
+                    format!(
+                        " ({} row{} inlined)",
+                        report.rows_inlined,
+                        plural(report.rows_inlined as usize)
+                    )
+                } else {
+                    String::new()
+                },
                 if report.schema_changes > 0 {
                     format!(
                         " {} schema change{};",
@@ -1010,6 +1046,304 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
                     } else {
                         "partition-value set"
                     },
+                );
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake inlining <dir> <table> <limit|default>`: set (or clear) one
+/// table's persisted `data_inlining_row_limit` — DuckLake's per-table option
+/// of the same name, set through `ducklake_set_option(..., table_name =>
+/// 't')`. `0` disables inlining for the table; `default` clears the limit so
+/// the handle's default applies again. Published as one metadata-only
+/// version.
+fn cmd_inlining(arg: &str) {
+    let usage = "Usage: .lake inlining <dir> <table> <limit|default>{HINT}";
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return;
+    };
+    let Some((table, rest)) = take_token(rest) else {
+        println!("{usage}");
+        return;
+    };
+    let value = rest.trim();
+    if value.is_empty() || value.split_whitespace().count() != 1 {
+        println!("{usage}");
+        return;
+    }
+    let dir = unquote(&dir);
+    let table = flat_table_key(&unquote(&table));
+    let limit: Option<u64> = if value.eq_ignore_ascii_case("default") {
+        None
+    } else {
+        match value.parse::<u64>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                cli_error!("invalid inlining limit {value:?}: expected a count or `default`");
+                return;
+            }
+        }
+    };
+    {
+        let writables = writables();
+        if writables.contains_key(&dir) {
+            cli_error!(
+                "{dir} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir}) it before changing its inlining setting"
+            );
+            return;
+        }
+    }
+    let mut lake = match Lake::open_url(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let settings = commit_settings();
+    match lake.set_inlining_limit(&table, limit, &settings) {
+        Ok(report) if !report.committed => {
+            println!("Table {table} in {dir} already has that inlining limit; nothing published");
+        }
+        Ok(report) => {
+            set_baseline_version_only(&dir, report.version);
+            match limit {
+                Some(limit) => println!(
+                    "Table {table} in {dir}: commits appending at most {limit} row{} are stored \
+                     in the catalog metadata (version {}); 0 disables inlining",
+                    if limit == 1 { "" } else { "s" },
+                    report.version,
+                ),
+                None => println!(
+                    "Cleared the inlining limit of {table} in {dir} (version {}); the \
+                     handle's data_inlining_row_limit default applies",
+                    report.version,
+                ),
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake flush <dir> [table]`: materialize inlined rows into data files,
+/// DuckLake's `ducklake_flush_inlined_data`. Without a table, every table of
+/// the lake is flushed in one version.
+fn cmd_flush(arg: &str) {
+    let usage = "Usage: .lake flush <dir> [table]{HINT}";
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return;
+    };
+    let dir = unquote(&dir);
+    let rest = rest.trim();
+    let table = if rest.is_empty() {
+        None
+    } else if rest.split_whitespace().count() == 1 {
+        Some(flat_table_key(&unquote(rest)))
+    } else {
+        println!("{usage}");
+        return;
+    };
+    {
+        let writables = writables();
+        if writables.contains_key(&dir) {
+            cli_error!(
+                "{dir} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir}) it before flushing its inlined rows"
+            );
+            return;
+        }
+    }
+    let mut lake = match Lake::open_url(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let t0 = Instant::now();
+    match lake.flush_inlined_data(table.as_deref()) {
+        Ok(report) if !report.committed => match table {
+            Some(table) => println!("Table {table} in {dir} has no live inlined rows to flush"),
+            None => println!("{dir} has no live inlined rows to flush"),
+        },
+        Ok(report) => {
+            set_baseline_version_only(&dir, report.version);
+            for (key, rows) in &report.tables {
+                println!(
+                    "Flushed {rows} inlined row{} of {key} into {dir} data files (version {})",
+                    plural(*rows as usize),
+                    report.version,
+                );
+            }
+            println!(
+                "{} data file{} written in {:.3}s; the flushed rows' records stay as the \
+                 change log",
+                report.data_files,
+                plural(report.data_files),
+                t0.elapsed().as_secs_f64(),
+            );
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake changes <dir> [table] [from] [to]`: render a version range's
+/// row-level changes — the `ducklake_table_changes` shape (`snapshot_id`,
+/// `rowid`, `change_type`, the table's columns), inclusive on both ends.
+/// `from` defaults to version 1 and `to` to the current version; without a
+/// table every table of the range is listed.
+fn cmd_changes(arg: &str) {
+    let usage = "Usage: .lake changes <dir> [table] [from] [to]{HINT}";
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return;
+    };
+    let dir = unquote(&dir);
+    let mut table: Option<String> = None;
+    let mut from: Option<u64> = None;
+    let mut to: Option<u64> = None;
+    for token in rest.split_whitespace() {
+        match token.parse::<u64>() {
+            Ok(n) if from.is_none() => from = Some(n),
+            Ok(n) if to.is_none() => to = Some(n),
+            Ok(_) => {
+                println!("{usage}");
+                return;
+            }
+            Err(_) if table.is_none() => table = Some(flat_table_key(&unquote(token))),
+            Err(_) => {
+                println!("{usage}");
+                return;
+            }
+        }
+    }
+    let lake = match open_lake(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let current = lake.current_version();
+    let from = from.unwrap_or(1);
+    let to = to.unwrap_or(current);
+    let keys: Vec<String> = match &table {
+        Some(table) => vec![table.clone()],
+        None => match lake.tables() {
+            Ok(tables) => tables.into_iter().map(|(key, _)| key).collect(),
+            Err(e) => {
+                cli_error!("{e}");
+                return;
+            }
+        },
+    };
+    if keys.is_empty() {
+        println!("(no tables)");
+        return;
+    }
+    let mut any = false;
+    for key in keys {
+        let rows = match lake.table_changes(&key, from, Some(to)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                cli_error!("{e}");
+                return;
+            }
+        };
+        for row in rows {
+            any = true;
+            let rowid = match row.row_id {
+                Some(id) => id.to_string(),
+                None => "NULL".to_string(),
+            };
+            let values = if row.values.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "  {}",
+                    row.values
+                        .iter()
+                        .map(render_change_value)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+            println!(
+                "{key}  version {}  rowid {rowid}  {}{values}",
+                row.version, row.change_type
+            );
+        }
+    }
+    if !any {
+        println!("(no changes in versions {from}..={to})");
+    }
+}
+
+/// One change-row value: VARCHARs quoted (so NULL is unambiguous), everything
+/// else in its canonical display.
+fn render_change_value(value: &pinkdb::Value) -> String {
+    match value {
+        pinkdb::Value::Varchar(s) => format!("'{}'", s.replace('\'', "''")),
+        other => other.to_string(),
+    }
+}
+
+/// `.lake add_data_files <dir> <table> <path> [path ...]`: register existing
+/// data files of the lake as rows of a table, DuckLake's
+/// `ducklake_add_data_files`. The paths are lake-relative `data/…` paths;
+/// every file is validated (format, table identity, exact schema, readable
+/// row count) before the version is published.
+fn cmd_add_data_files(arg: &str) {
+    let usage = "Usage: .lake add_data_files <dir> <table> <path> [path ...]{HINT}";
+    let Some((dir, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return;
+    };
+    let Some((table, rest)) = take_token(rest) else {
+        println!("{usage}");
+        return;
+    };
+    let paths: Vec<String> = rest
+        .split_whitespace()
+        .map(|p| unquote(p).to_string())
+        .collect();
+    if paths.is_empty() {
+        println!("{usage}");
+        return;
+    }
+    let dir = unquote(&dir);
+    let table = flat_table_key(&unquote(&table));
+    {
+        let writables = writables();
+        if writables.contains_key(&dir) {
+            cli_error!(
+                "{dir} is attached writable in this session; .lake commit (or .lake detach \
+                 {dir}) it before registering files"
+            );
+            return;
+        }
+    }
+    let mut lake = match Lake::open_url(&dir) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let settings = commit_settings();
+    match lake.add_data_files_with_settings(&table, &paths, &settings) {
+        Ok(report) => {
+            set_baseline_version_only(&dir, report.version);
+            for (_, path, rows) in &report.files {
+                println!(
+                    "Registered {path} ({rows} row{}) as {table} in {dir} (version {})",
+                    plural(*rows as usize),
+                    report.version,
                 );
             }
         }
@@ -1941,8 +2275,22 @@ fn cmd_table_info(arg: &str) {
                 } else {
                     format!(", partitioned by ({})", info.partition_by.join(", "))
                 };
+                let inlining = if info.inlined_history > 0 {
+                    format!(
+                        ", {} inlined row{} ({} recorded{})",
+                        info.inlined_rows,
+                        plural(info.inlined_rows as usize),
+                        info.inlined_history,
+                        match info.inlined_limit {
+                            Some(limit) => format!(", limit {limit}"),
+                            None => String::new(),
+                        }
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{}: {} file{}, {}, {} delete file{}, {}, {} row{}, schema version {}{}",
+                    "{}: {} file{}, {}, {} delete file{}, {}, {} row{}, schema version {}{}{}",
                     info.table,
                     info.file_count,
                     plural(info.file_count as usize),
@@ -1954,6 +2302,7 @@ fn cmd_table_info(arg: &str) {
                     plural(info.rows as usize),
                     info.schema_version,
                     partition,
+                    inlining,
                 );
             }
         }

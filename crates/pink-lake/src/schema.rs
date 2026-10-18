@@ -99,6 +99,26 @@ pub(crate) struct FileMapping {
 }
 
 impl TableSchema {
+    /// The initial record (epoch 1) of a table whose schema is `table`'s:
+    /// every live column at `added: 1`, no rename history — what a commit
+    /// publishes for a table it creates.
+    pub(crate) fn initial(table: &pinkdb::DataTable) -> Self {
+        Self {
+            version: 1,
+            columns: table
+                .columns
+                .iter()
+                .map(|c| SchemaColumn {
+                    name: c.name.clone(),
+                    dtype: c.dtype,
+                    default: c.default.clone().filter(|v| !v.is_null()),
+                    added: 1,
+                })
+                .collect(),
+            renames: Vec::new(),
+        }
+    }
+
     /// Parse a v5 table entry's record. `None` for a legacy entry (no
     /// `columns`); every parse failure is a [`LakeError::Corrupt`] naming the
     /// manifest.

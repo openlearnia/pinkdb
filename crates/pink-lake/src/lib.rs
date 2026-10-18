@@ -340,9 +340,11 @@ use pinkdb::{DataTable, DataType, PinkDb};
 
 mod attach;
 mod catalog;
+mod cdc;
 mod crypto;
 mod delete_file;
 mod incremental;
+mod inlined;
 mod local;
 mod maintenance;
 #[cfg(test)]
@@ -360,8 +362,11 @@ mod zone;
 
 pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
+pub use cdc::{ChangeKind, ChangeRow};
 pub use crypto::EncryptionKey;
-pub use incremental::{Commit, CommitReport, CommitSettings, WritableAttachment};
+pub use incremental::{
+    AddFilesReport, Commit, CommitReport, CommitSettings, FlushReport, WritableAttachment,
+};
 use local::{LocalStorage, CATALOG_FILE};
 pub use maintenance::{
     CleanupReport, CleanupSettings, CompactionReport, ExpireReport, ExpireSettings, LakeFileInfo,
@@ -397,6 +402,14 @@ pub use s3::{S3Config, DEFAULT_RETRIES};
 /// zone map (`stats`) in every format; an older v4 reader ignores the fields
 /// and reads the same files (it just cannot prune or interpret partitions).
 ///
+/// Wave 68 extends v4/v5 additively as well: a table may carry **inlined
+/// rows** (small commits stored in the manifest) with their change history
+/// and a row-id counter, a data file may record its `row_id_start`, and the
+/// per-commit delta gains the inlining audit fields. A wave-67 reader ignores
+/// all of them except the row-count invariant (which already includes live
+/// inlined rows in `rows`); this build refuses nothing a wave-67 writer
+/// published.
+///
 /// Versions 1–3 stay readable and are never written any more. Version 3
 /// (wave 45): Vortex data files with 8,192-row / ~1 MiB row blocks. Version
 /// 2: Vortex data files with one block per engine chunk. Both list one
@@ -425,6 +438,12 @@ pub const MAX_FORMAT_VERSION: u32 = 5;
 /// publish loadable forever. A manifest above the cap (a tampered or
 /// truncated `version: u64::MAX`) is [`LakeError::Corrupt`], not a wrap.
 pub const MAX_VERSION: u64 = u64::MAX - 1;
+
+/// DuckLake's `ducklake_default_data_inlining_row_limit`: a commit's appended
+/// rows are stored in the manifest instead of a data file when the table's
+/// limit admits them (at most this many rows, and more than zero), unless the
+/// table records its own `data_inlining_row_limit`. 0 disables inlining.
+pub const DEFAULT_INLINING_ROW_LIMIT: u64 = 10;
 
 /// Result alias for lake operations.
 pub type Result<T> = std::result::Result<T, LakeError>;
@@ -675,6 +694,13 @@ pub struct Lake {
     /// transaction metadata). Kept across a failed save, cleared by a
     /// successful one.
     pending_commit: Option<(Option<String>, Option<String>)>,
+    /// The handle's `data_inlining_row_limit` default, applied to a table
+    /// that does not record its own (DuckLake's session setting
+    /// `ducklake_default_data_inlining_row_limit`; this handle is the
+    /// analogue of a session). Not persisted: every handle starts at
+    /// [`DEFAULT_INLINING_ROW_LIMIT`] and a table's persisted
+    /// [`TableEntry::inlined_limit`] wins over it.
+    inline_row_limit: u64,
 }
 
 impl Lake {
@@ -784,6 +810,7 @@ impl Lake {
             format_version: FORMAT_VERSION,
             version: 1,
             pending_commit: None,
+            inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
         })
     }
 
@@ -825,6 +852,7 @@ impl Lake {
             format_version: manifest.format_version,
             version: manifest.version,
             pending_commit: None,
+            inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
         })
     }
 
@@ -980,6 +1008,23 @@ impl Lake {
     /// fails, so a retry still carries it.
     pub fn set_commit_message(&mut self, author: Option<String>, message: Option<String>) {
         self.pending_commit = Some((author, message));
+    }
+
+    /// This handle's default `data_inlining_row_limit` (DuckLake's session
+    /// setting `ducklake_default_data_inlining_row_limit`, 10 by default; 0
+    /// disables inlining). Applied to a table that does not record its own
+    /// limit ([`TableEntry::inlined_limit`], set through
+    /// [`Lake::set_inlining_limit`]).
+    pub fn data_inlining_row_limit(&self) -> u64 {
+        self.inline_row_limit
+    }
+
+    /// Set this handle's default `data_inlining_row_limit` (in memory only,
+    /// like DuckLake's per-session setting). A table that records its own
+    /// limit is unaffected; a per-table limit is published by
+    /// [`Lake::set_inlining_limit`].
+    pub fn set_data_inlining_row_limit(&mut self, limit: u64) {
+        self.inline_row_limit = limit;
     }
 
     /// The per-version records of every published version, ascending: the
@@ -1174,9 +1219,8 @@ impl Lake {
             for name in db.list_tables_in(&dbname) {
                 let src = table_in(db, &dbname, &name)?;
                 let key = format!("{dbname}.{name}");
-                let keys: Vec<PartitionKey> = previous
-                    .as_ref()
-                    .and_then(|p| p.tables.get(&key))
+                let previous_entry = previous.as_ref().and_then(|p| p.tables.get(&key));
+                let keys: Vec<PartitionKey> = previous_entry
                     .and_then(|e| e.partition_by.clone())
                     .unwrap_or_default();
                 // One data file per partition value set (exactly one for an
@@ -1188,6 +1232,31 @@ impl Lake {
                 let (files, written) = self.write_data_files(&key, Some(format), &keys, src)?;
                 bytes_written += written;
                 rows += src.num_rows() as u64;
+                // Wave 68: the save folds every live inlined row into the new
+                // data files (the store's tables already contain them), so it
+                // publishes fresh row ids for them — the counter continues
+                // from the table's recorded one, never backwards. The inlined
+                // *history* is dropped: the rows are file-backed from this
+                // version on, and a change-data read of a range that includes
+                // this full-save version is refused anyway (the delta marks
+                // the table replaced).
+                let mut next_row_id = previous_entry
+                    .map(|e| {
+                        e.next_row_id
+                            .max(e.max_row_id().map_or(0, |m| m.saturating_add(1)))
+                    })
+                    .unwrap_or(0);
+                let files: Vec<crate::catalog::FileRef> = files
+                    .into_iter()
+                    .map(|f| {
+                        let start = f.rows().filter(|r| *r > 0).map(|r| {
+                            let start = next_row_id;
+                            next_row_id = next_row_id.saturating_add(r);
+                            start
+                        });
+                        f.with_schema_version(Some(1)).with_row_id_start(start)
+                    })
+                    .collect();
                 // The v5 schema record: the store table's live columns, with
                 // their defaults, all at epoch 1 — a full save rewrites every
                 // data file under the current schema, so no history is needed.
@@ -1198,10 +1267,6 @@ impl Lake {
                         crate::catalog::ColumnEntry::new(&c.name, c.dtype, c.default.as_ref(), 1)
                     })
                     .collect::<Result<Vec<_>>>()?;
-                let files: Vec<crate::catalog::FileRef> = files
-                    .into_iter()
-                    .map(|f| f.with_schema_version(Some(1)))
-                    .collect();
                 deltas.insert(
                     key.clone(),
                     catalog::TableDelta {
@@ -1214,6 +1279,11 @@ impl Lake {
                         partition_by: None,
                         compacted_files: Vec::new(),
                         removed_delete_files: Vec::new(),
+                        rows_inlined: 0,
+                        inlined_ended: 0,
+                        inlined_flushed: 0,
+                        inlined_limit: None,
+                        inlining_changed: false,
                     },
                 );
                 tables.insert(
@@ -1228,6 +1298,11 @@ impl Lake {
                         schema_version: 1,
                         columns: Some(columns),
                         renames: Vec::new(),
+                        inlined: Vec::new(),
+                        // A table's inlining setting survives a save; the
+                        // counter continues (see above).
+                        inlined_limit: previous_entry.and_then(|e| e.inlined_limit),
+                        next_row_id,
                     },
                 );
             }
@@ -1360,6 +1435,7 @@ impl Lake {
                             schema_version: None,
                             stats: Some(block),
                             partition: None,
+                            row_id_start: None,
                         },
                         written,
                     ))
@@ -1400,6 +1476,7 @@ impl Lake {
                         schema_version: None,
                         stats: Some(block),
                         partition: None,
+                        row_id_start: None,
                     },
                     bytes.len() as u64,
                 ))
@@ -1680,17 +1757,37 @@ impl Lake {
                     source: e,
                 })?;
             }
-            if entry.files.is_empty() {
-                return Err(LakeError::Corrupt {
-                    path: manifest_path.to_path_buf(),
-                    message: format!("table \"{key}\" has no data files"),
-                });
-            }
             let format = entry.format();
             let layout = self.entry_layout(entry, key, manifest_path)?;
             // The v5 schema record (wave 65), when this entry has one.
             let schema = crate::schema::TableSchema::from_entry(key, entry, manifest_path)?;
             let mut created = false;
+            // A table whose rows are all inlined (or an empty committed
+            // table) lists no data file: the schema record is the authority.
+            if entry.files.is_empty() {
+                let record = schema.as_ref().ok_or_else(|| LakeError::Corrupt {
+                    path: manifest_path.to_path_buf(),
+                    message: format!(
+                        "table \"{key}\" has no data files and no schema record; its schema is \
+                         not recorded anywhere"
+                    ),
+                })?;
+                db.create_table_in(dbname, table, record.schema_pairs())
+                    .map_err(|e| LakeError::Engine {
+                        context: format!("recreating table \"{key}\""),
+                        source: e,
+                    })?;
+                let t = db
+                    .table_mut_in(dbname, table)
+                    .map_err(|e| LakeError::Engine {
+                        context: format!("recreating table \"{key}\""),
+                        source: e,
+                    })?;
+                for (col, record) in t.columns.iter_mut().zip(&record.columns) {
+                    col.default = record.default.clone();
+                }
+                created = true;
+            }
             for (i, (rel, file_rows, deleted)) in layout.iter().enumerate() {
                 validate_rel_path(rel)?;
                 let mini = self.open_data_file(rel, format)?;
@@ -1768,6 +1865,40 @@ impl Lake {
                     });
                 }
                 copy_chunks(&file_table, dst, rel)?;
+            }
+            // The live inlined rows union after every data file (the
+            // documented wave-68 scan order; see `crate::inlined`).
+            if !entry.inlined.is_empty() {
+                let record = schema.as_ref().ok_or_else(|| LakeError::Corrupt {
+                    path: manifest_path.to_path_buf(),
+                    message: format!("table \"{key}\" carries inlined rows but no schema record"),
+                })?;
+                let live: Vec<crate::catalog::InlinedRow> =
+                    entry.live_inlined().into_iter().cloned().collect();
+                let (inlined, _) = crate::inlined::materialize_live(
+                    &live,
+                    record,
+                    key,
+                    table,
+                    None,
+                    manifest_path,
+                )?;
+                let dst = db
+                    .table_mut_in(dbname, table)
+                    .map_err(|e| LakeError::Engine {
+                        context: format!("loading table \"{key}\""),
+                        source: e,
+                    })?;
+                if dst.schema() != inlined.schema() {
+                    return Err(LakeError::Corrupt {
+                        path: manifest_path.to_path_buf(),
+                        message: format!(
+                            "table \"{key}\": the inlined rows materialize under a different \
+                             schema than the table's data files"
+                        ),
+                    });
+                }
+                copy_chunks(&inlined, dst, "inlined rows")?;
             }
             let loaded = table_in(&db, dbname, table)?;
             if loaded.num_rows() as u64 != entry.rows {
@@ -2142,6 +2273,18 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                  manifest (partitioning is part of the v4 incremental format)"
             )));
         }
+        if v < 4 && (!entry.inlined.is_empty() || entry.inlined_limit.is_some()) {
+            return Err(corrupt(format!(
+                "table \"{key}\" declares inlined rows in a format_version {v} manifest \
+                 (inlining is part of the v4 incremental format)"
+            )));
+        }
+        if !entry.inlined.is_empty() && entry.columns.is_none() {
+            return Err(corrupt(format!(
+                "table \"{key}\" carries inlined rows but no schema record (inlined rows are \
+                 read through the v5 `columns`/`renames` mapping)"
+            )));
+        }
         if let Some(keys) = &entry.partition_by {
             if keys.is_empty() {
                 return Err(corrupt(format!(
@@ -2263,11 +2406,77 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
             }
         }
         if v >= 4 {
-            if entry.files.is_empty() {
+            if entry.files.is_empty() && entry.inlined.is_empty() {
                 return Err(corrupt(format!(
                     "table \"{key}\" has no data files (a format_version {v} table always lists \
-                     at least one)"
+                     at least one, unless it holds inlined rows)"
                 )));
+            }
+            // Wave 68: the inlined row history, validated structurally. Row
+            // ids are unique and below the counter; every record carries the
+            // version pair a change-data read consumes; values are positional
+            // against the row's own column list. The value encoding itself is
+            // decoded lazily, where a failure names the exact row.
+            let mut seen_rows: BTreeMap<u64, u64> = BTreeMap::new();
+            for row in &entry.inlined {
+                if row.values.len() != row.columns.len() {
+                    return Err(corrupt(format!(
+                        "table \"{key}\": inlined row {} holds {} values for {} columns",
+                        row.row_id,
+                        row.values.len(),
+                        row.columns.len()
+                    )));
+                }
+                if row.schema_version < 1 {
+                    return Err(corrupt(format!(
+                        "table \"{key}\": inlined row {} declares schema version 0 (a recorded \
+                         row is written under a schema epoch of at least 1)",
+                        row.row_id
+                    )));
+                }
+                if row.begin < 1 || row.begin > manifest.version {
+                    return Err(corrupt(format!(
+                        "table \"{key}\": inlined row {} begins at version {}, outside \
+                         1..={}",
+                        row.row_id, row.begin, manifest.version
+                    )));
+                }
+                if let Some(end) = row.end {
+                    if end < row.begin || end > manifest.version {
+                        return Err(corrupt(format!(
+                            "table \"{key}\": inlined row {} ends at version {end}, outside \
+                             {}..={}",
+                            row.row_id, row.begin, manifest.version
+                        )));
+                    }
+                }
+                if row.flushed && row.end.is_none() {
+                    return Err(corrupt(format!(
+                        "table \"{key}\": inlined row {} is marked flushed but has no end \
+                         version (a flush writes the end that materialized it)",
+                        row.row_id
+                    )));
+                }
+                if let Some(begin) = seen_rows.get(&row.row_id) {
+                    if *begin == row.begin {
+                        return Err(corrupt(format!(
+                            "table \"{key}\": inlined row {} appears twice for version {}",
+                            row.row_id, row.begin
+                        )));
+                    }
+                }
+                seen_rows.insert(row.row_id, row.begin);
+            }
+            if entry.next_row_id > 0 {
+                for row in &entry.inlined {
+                    if row.row_id >= entry.next_row_id {
+                        return Err(corrupt(format!(
+                            "table \"{key}\": inlined row id {} is at or beyond the table's \
+                             next_row_id {}",
+                            row.row_id, entry.next_row_id
+                        )));
+                    }
+                }
             }
             let data_rows = entry.data_rows().ok_or_else(|| {
                 corrupt(format!(
@@ -2279,12 +2488,32 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                     "table \"{key}\" overflows u64 rows across its delete files"
                 ))
             })?;
-            if data_rows < deleted || data_rows - deleted != entry.rows {
+            let live_inlined = entry.live_inlined_rows();
+            if data_rows < deleted {
                 return Err(corrupt(format!(
                     "table \"{key}\" declares {} rows, but its files hold {data_rows} rows and \
                      its delete files drop {deleted} (the manifest disagrees with itself)",
                     entry.rows
                 )));
+            }
+            let implied = (data_rows - deleted).checked_add(live_inlined);
+            if implied != Some(entry.rows) {
+                return Err(if live_inlined == 0 {
+                    corrupt(format!(
+                        "table \"{key}\" declares {} rows, but its files hold {data_rows} rows \
+                         and its delete files drop {deleted} (the manifest disagrees with \
+                         itself)",
+                        entry.rows
+                    ))
+                } else {
+                    corrupt(format!(
+                        "table \"{key}\" declares {} rows, but its files hold {data_rows} rows, \
+                         its delete files drop {deleted} and {live_inlined} inlined row{} live \
+                         (the manifest disagrees with itself)",
+                        entry.rows,
+                        if live_inlined == 1 { "" } else { "s" }
+                    ))
+                });
             }
             for d in &entry.deletes {
                 validate_rel_path(&d.path)?;

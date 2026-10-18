@@ -101,6 +101,7 @@ use pinkdb::{
 
 use crate::catalog::{DeleteRef, FileFormat, PartitionKey, TableEntry};
 use crate::incremental::entry_layout;
+use crate::inlined::InlinedFact;
 use crate::storage::{Head, Storage};
 #[cfg(feature = "vortex-format")]
 use crate::vortex_file;
@@ -202,6 +203,10 @@ struct AttachedEntry {
     /// The v5 schema record of this version's entry (wave 65); `None` for a
     /// legacy entry, whose files carry the schema themselves and must agree.
     record: Option<crate::schema::TableSchema>,
+    /// Wave 68: the **live** inlined row versions, in row-id order — unioned
+    /// after every data file (see `crate::inlined` for the scan-order and
+    /// decode rules). Empty for a table that never inlined.
+    inlined: Vec<crate::catalog::InlinedRow>,
 }
 
 impl AttachedEntry {
@@ -664,23 +669,21 @@ impl LakeAttachment {
     }
 
     /// [`LakeAttachment::load_entry`] over a chosen subset of the entry's
-    /// files (the survivors of file pruning). An empty subset decodes
-    /// nothing and yields an empty table with the entry's full schema.
+    /// files (the survivors of file pruning). An empty subset decodes no data
+    /// file and yields the live inlined rows (or an empty table with the
+    /// entry's full schema when there are none): inlined rows are **never**
+    /// pruned — file pruning only skips files.
+    ///
+    /// The inlined contribution's `present` mask always equals the files'
+    /// (a `.pink` decode is all-present, a projected Vortex decode marks only
+    /// the requested columns), so the chunks merge cleanly; a column the
+    /// files did not decode is a NULL placeholder in the inlined block too.
     fn load_some(
         &self,
         entry: &AttachedEntry,
         files: &[AttachedFile],
         columns: Option<&[usize]>,
     ) -> Result<(DataTable, Vec<bool>)> {
-        if files.is_empty() {
-            let table = DataTable::new(entry.table.clone(), entry.schema.clone()).map_err(|e| {
-                LakeError::Engine {
-                    context: format!("preparing the empty pruned scan of \"{}\"", entry.key()),
-                    source: e,
-                }
-            })?;
-            return Ok((table, vec![true; entry.schema.len()]));
-        }
         let mut union: Option<(DataTable, Vec<bool>)> = None;
         for (i, file) in files.iter().enumerate() {
             let (table, present) = load_file(&*self.storage, &self.root, entry, file, columns)?;
@@ -699,11 +702,78 @@ impl LakeAttachment {
                 }
             }
         }
-        union.ok_or_else(|| LakeError::Corrupt {
-            path: self.root.join("catalog.json"),
-            message: format!("table \"{}\" has no data files", entry.key()),
-        })
+        if !entry.inlined.is_empty() {
+            let record = entry.record.as_ref().ok_or_else(|| LakeError::Corrupt {
+                path: self.root.join("catalog.json"),
+                message: format!(
+                    "table \"{}\" carries inlined rows but no schema record",
+                    entry.key()
+                ),
+            })?;
+            let wanted: Vec<bool> = match &union {
+                Some((_, present)) => present.clone(),
+                None => requested_mask(entry.schema.len(), columns),
+            };
+            let (table, present) = crate::inlined::materialize_live(
+                &entry.inlined,
+                record,
+                &entry.key(),
+                &entry.table,
+                Some(&wanted),
+                &self.root.join("catalog.json"),
+            )?;
+            match &mut union {
+                None => union = Some((table, present)),
+                Some((dst, first_present)) => {
+                    if *first_present != present {
+                        return Err(LakeError::Internal {
+                            message: format!(
+                                "attached inlined rows of \"{}\" disagree with the files on the \
+                                 decoded columns",
+                                entry.key()
+                            ),
+                        });
+                    }
+                    copy_chunks(&table, dst, "inlined rows")?;
+                }
+            }
+        }
+        match union {
+            Some(union) => Ok(union),
+            None => {
+                let table =
+                    DataTable::new(entry.table.clone(), entry.schema.clone()).map_err(|e| {
+                        LakeError::Engine {
+                            context: format!("preparing the empty scan of \"{}\"", entry.key()),
+                            source: e,
+                        }
+                    })?;
+                Ok((table, vec![true; entry.schema.len()]))
+            }
+        }
     }
+}
+
+/// The requested-column mask of one table load: `None`/unprovable = every
+/// column; a projection marks exactly its indices (an empty one marks column
+/// 0, the table's chunk shape). The same rule `requested_columns` applies.
+fn requested_mask(n_cols: usize, columns: Option<&[usize]>) -> Vec<bool> {
+    let mut wanted = match columns {
+        Some(cols) if cols.iter().all(|&i| i < n_cols) => {
+            let mut wanted = vec![false; n_cols];
+            for &i in cols {
+                wanted[i] = true;
+            }
+            wanted
+        }
+        _ => vec![true; n_cols],
+    };
+    if wanted.iter().all(|&w| !w) {
+        if let Some(first) = wanted.first_mut() {
+            *first = true;
+        }
+    }
+    wanted
 }
 
 /// Decode one data file of `entry` and apply its positional deletes.
@@ -1140,8 +1210,14 @@ fn zone_stats_compatible(block: &ColumnStats, footer: &ColumnStats) -> bool {
 /// approximation. `files` is `(surviving rows, stats)` per data file in
 /// manifest order, already mapped onto the logical schema and gated (a
 /// default-filled column's constant facts are exact even under deletes).
-fn merge_file_stats(files: &[(u64, Vec<ColumnStats>)]) -> Vec<ColumnStats> {
-    let ncols = files.first().map(|(_, s)| s.len()).unwrap_or(0);
+///
+/// Wave 68: the live inlined rows ride along as `facts` (exact — the values
+/// are stored with the row) and fold into the same result; an all-NULL
+/// inlined contribution adds only NULL counts, and an inlined DOUBLE extreme
+/// the gate refuses (`NaN`/zero) clears the fold to unknown, exactly like an
+/// unproven file.
+fn merge_file_stats(files: &[(u64, Vec<ColumnStats>)], facts: &[InlinedFact]) -> Vec<ColumnStats> {
+    let ncols = files.first().map(|(_, s)| s.len()).unwrap_or(facts.len());
     let mut out = Vec::with_capacity(ncols);
     for col in 0..ncols {
         let mut nulls = Some(0u64);
@@ -1188,9 +1264,21 @@ fn merge_file_stats(files: &[(u64, Vec<ColumnStats>)]) -> Vec<ColumnStats> {
                 None => max_known = false,
             }
         }
+        if let Some(fact) = facts.get(col) {
+            any_rows |= fact.rows > 0;
+            crate::inlined::apply_fact(
+                fact,
+                &mut nulls,
+                &mut min,
+                &mut min_known,
+                &mut max,
+                &mut max_known,
+            );
+        }
         if !any_rows {
-            // All files empty: the executor derives NULL min/max from the row
-            // count; the exact 0-NULL count is still provable.
+            // No file and no inlined row holds a value: the executor derives
+            // NULL min/max from the row count; the exact 0-NULL count is
+            // still provable.
             out.push(ColumnStats {
                 null_count: nulls,
                 min: None,
@@ -1242,20 +1330,26 @@ pub(crate) fn build_from(
         // read from it; the layout read decodes and validates every delete
         // file against the entry.
         let layout = entry_layout(&**storage, entry, key, &manifest_path)?;
-        // `entry.rows` backs the statistics-only `COUNT(*)`. The deduped layout
-        // is the truth: if two delete files target the same data file with
-        // overlapping positions, the manifest's `sum(count)` overstates the
-        // deletion and `entry.rows` would be wrong. Reject the mismatch (as
-        // `Lake::load` does) instead of answering with a wrong count.
-        let decoded_rows: Option<u64> = layout.iter().try_fold(0u64, |acc, (_, rows, deleted)| {
-            let live = rows.checked_sub(deleted.len() as u64)?;
-            acc.checked_add(live)
-        });
+        // `entry.rows` backs the statistics-only `COUNT(*)`. The deduped
+        // layout plus the live inlined rows is the truth: if two delete files
+        // target the same data file with overlapping positions, the manifest's
+        // `sum(count)` overstates the deletion and `entry.rows` would be
+        // wrong. Reject the mismatch (as `Lake::load` does) instead of
+        // answering with a wrong count.
+        let live_inlined = entry.live_inlined_rows();
+        let decoded_rows: Option<u64> =
+            layout
+                .iter()
+                .try_fold(live_inlined, |acc, (_, rows, deleted)| {
+                    let live = rows.checked_sub(deleted.len() as u64)?;
+                    acc.checked_add(live)
+                });
         if decoded_rows != Some(entry.rows) {
             return Err(LakeError::Corrupt {
                 path: manifest_path.clone(),
                 message: format!(
-                    "table \"{key}\" declares {} rows, but its deduplicated file layout holds {}",
+                    "table \"{key}\" declares {} rows, but its deduplicated file layout and \
+                     live inlined rows hold {}",
                     entry.rows,
                     decoded_rows
                         .map_or_else(|| "an overflowing count".to_string(), |r| r.to_string())
@@ -1481,10 +1575,30 @@ pub(crate) fn build_from(
             per_file.push((surviving, stats));
             zones.push(zone_stats);
         }
-        let schema = schema.ok_or_else(|| LakeError::Corrupt {
-            path: manifest_path.clone(),
-            message: format!("table \"{key}\" has no data files"),
-        })?;
+        let schema = match schema {
+            Some(schema) => schema,
+            // A table whose rows are all inlined (or an empty committed
+            // table) lists no data file: the schema record is the authority,
+            // exactly as `Lake::rebuild` reads it.
+            None if entry.files.is_empty() => match &record {
+                Some(record) => record.schema_pairs(),
+                None => {
+                    return Err(LakeError::Corrupt {
+                        path: manifest_path.clone(),
+                        message: format!(
+                            "table \"{key}\" has no data files and no schema record; its \
+                             schema is not recorded anywhere"
+                        ),
+                    })
+                }
+            },
+            None => {
+                return Err(LakeError::Corrupt {
+                    path: manifest_path.clone(),
+                    message: format!("table \"{key}\" has no data files"),
+                })
+            }
+        };
         // The partition spec: every key column must exist, and every file's
         // recorded partition value must decode under that column's type and
         // agree with the file's zone map (a misplaced or tampered value must
@@ -1556,7 +1670,20 @@ pub(crate) fn build_from(
                 }
             }
         }
-        let stats = merge_file_stats(&per_file);
+        let stats = {
+            // Wave 68: the live inlined rows contribute exact facts (they are
+            // fully known); see `crate::inlined::apply_fact` for the fold and
+            // the DOUBLE gate.
+            let live_inlined: Vec<crate::catalog::InlinedRow> =
+                entry.live_inlined().into_iter().cloned().collect();
+            let facts = match &record {
+                Some(record) if !live_inlined.is_empty() => {
+                    crate::inlined::live_facts(&live_inlined, record, key, &manifest_path)?
+                }
+                _ => Vec::new(),
+            };
+            merge_file_stats(&per_file, &facts)
+        };
         let attached = AttachedTable {
             db: dbname.to_string(),
             table: table.to_string(),
@@ -1603,6 +1730,7 @@ pub(crate) fn build_from(
                     AttachedFormat::Vortex
                 },
                 record,
+                inlined: entry.live_inlined().into_iter().cloned().collect(),
             },
         );
         tables.push(attached);
@@ -1890,6 +2018,7 @@ mod tests {
                 schema_version: None,
                 stats: block,
                 partition: None,
+                row_id_start: None,
             }],
             rows: 3,
             format: Some(FileFormat::Pink),
@@ -1899,6 +2028,9 @@ mod tests {
             schema_version: 0,
             columns: None,
             renames: Vec::new(),
+            inlined: Vec::new(),
+            inlined_limit: None,
+            next_row_id: 0,
         };
         let path = std::path::Path::new("snapshots/2.json");
         let key = "main.t";
@@ -1964,6 +2096,9 @@ mod tests {
             schema_version: 0,
             columns: None,
             renames: Vec::new(),
+            inlined: Vec::new(),
+            inlined_limit: None,
+            next_row_id: 0,
         };
         let (schema, stats) = pink_file_stats(key, &v1, &v1.files[0], path).unwrap();
         assert_eq!(schema[0].0, "i");

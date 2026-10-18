@@ -208,7 +208,8 @@ fn keyed_roundtrip_is_ciphertext_and_fails_closed_without_the_key() {
     assert!(err.to_string().contains("wrong key"), "{err}");
 
     // The right key reads the store back bit-exactly and reports encryption.
-    let lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    let mut lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert!(lake.is_encrypted());
     assert_eq!(lake.current_version(), 2);
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);
@@ -323,6 +324,8 @@ fn commits_deletes_and_time_travel_read_through_the_decorator() {
 
     let mut wa =
         WritableAttachment::open_with_key(lake_dir.to_str().unwrap(), None, key()).unwrap();
+    // Wave 68: inlining is on by default; this test pins the file artifacts.
+    wa.set_data_inlining_row_limit(0);
     let mut session = Lake::open_with_key(&lake_dir, key())
         .unwrap()
         .load(None)
@@ -356,7 +359,8 @@ fn commits_deletes_and_time_travel_read_through_the_decorator() {
     assert!(std::fs::read(&delete_files[0]).unwrap().starts_with(MAGIC));
 
     // The current version has the merged content; the old version is intact.
-    let lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    let mut lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let mut loaded = lake.load(None).unwrap();
     assert_eq!(
         rows(&mut loaded, "SELECT COUNT(*) FROM t;"),
@@ -508,7 +512,8 @@ fn an_unreadable_snapshot_is_reported_not_skipped() {
     bytes[last] ^= 0x01;
     std::fs::write(&snapshot, &bytes).unwrap();
 
-    let lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    let mut lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let err = lake.versions().unwrap_err();
     assert!(matches!(err, LakeError::Tampered { .. }), "{err:?}");
     let err = lake.snapshots().unwrap_err();
@@ -571,7 +576,8 @@ fn plaintext_lakes_are_unaffected() {
 
     let catalog = std::fs::read(lake_dir.join("catalog.json")).unwrap();
     assert!(catalog.starts_with(b"{"), "a plaintext catalog is JSON");
-    let lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     assert!(!lake.is_encrypted());
     assert_same_store(&db, &lake.load(None).unwrap());
     assert_eq!(lake.versions().unwrap(), vec![1, 2]);
@@ -751,6 +757,7 @@ fn s3_degraded_fallback_reconciles_the_encrypted_pair_from_stored_bytes() {
             let config = config();
             move || {
                 let mut lake = Lake::open_s3_with_key(config, key()).unwrap();
+                lake.set_data_inlining_row_limit(0);
                 lake.write_from_store(&db)
             }
         });
@@ -794,6 +801,8 @@ fn encrypted_lake_maintenance_round_trip() {
     let lake_dir = dir.join("lake");
     // Three commits → three encrypted data-file objects.
     let mut lake = Lake::create_with_key(&lake_dir, key()).unwrap();
+    // Wave 68: inlining is on by default; this test pins file artifacts.
+    lake.set_data_inlining_row_limit(0);
     let sub = |rows: &[(i32, &str)]| {
         let mut t = pinkdb::DataTable::new(
             "t".to_string(),
@@ -853,6 +862,7 @@ fn encrypted_lake_maintenance_round_trip() {
     // clean the unreferenced sources: dry run deletes nothing, confirm
     // deletes the ciphertext containers.
     let mut lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.expire_snapshots(&ExpireSettings {
         retain_last: Some(1),
         ..ExpireSettings::default()
@@ -882,7 +892,8 @@ fn encrypted_lake_maintenance_round_trip() {
         assert!(!lake_dir.join(path).exists(), "{path} survived");
     }
     // The keyed lake still opens and reads; a keyless open still refuses.
-    let lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    let mut lake = Lake::open_with_key(&lake_dir, key()).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let loaded = lake.load(None).unwrap();
     assert_eq!(loaded.table("t").unwrap().num_rows(), 4);
     let err = Lake::open(&lake_dir).unwrap_err();

@@ -3035,10 +3035,12 @@ pub(crate) fn bind_tracked_with(
                 dynamic,
             ))
         }
-        Statement::RefreshMaterializedView { db: qdb, name } => empty(LogicalPlan::RefreshMaterializedView {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
-            name: name.clone(),
-        }),
+        Statement::RefreshMaterializedView { db: qdb, name } => {
+            empty(LogicalPlan::RefreshMaterializedView {
+                db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+                name: name.clone(),
+            })
+        }
         Statement::DropMaterializedView {
             db: qdb,
             name,

@@ -366,6 +366,15 @@ pub struct TableInfo {
     /// The partition keys as their canonical texts (`region`,
     /// `bucket(4, id)`); empty when unpartitioned.
     pub partition_by: Vec<String>,
+    /// Wave 68: live inlined row versions in the head version (rows stored in
+    /// the manifest instead of a data file).
+    pub inlined_rows: u64,
+    /// Wave 68: the table's full inlined history — every live, ended and
+    /// flushed record (the change-data log `.lake flush` keeps).
+    pub inlined_history: u64,
+    /// Wave 68: the table's persisted `data_inlining_row_limit` (`None` =
+    /// the handle default applies).
+    pub inlined_limit: Option<u64>,
 }
 
 /// One catalog fact, as [`Lake::options`] lists it (`ducklake_options`'s
@@ -586,6 +595,11 @@ impl Lake {
                         partition_by: None,
                         compacted_files: planned.compacted_files.clone(),
                         removed_delete_files: planned.removed_delete_files.clone(),
+                        rows_inlined: 0,
+                        inlined_ended: 0,
+                        inlined_flushed: 0,
+                        inlined_limit: None,
+                        inlining_changed: false,
                     },
                 );
                 report_tables.push(TableCompaction {
@@ -879,7 +893,9 @@ impl Lake {
             let mut new_entry = entry.clone();
             new_entry.files = new_files;
             new_entry.deletes = new_deletes;
-            // The manifest's own rows invariant must survive compaction.
+            // The manifest's own rows invariant must survive compaction; the
+            // live inlined rows are untouched by a merge or rewrite and stay
+            // part of the logical count (wave 68).
             let data_rows = new_entry.data_rows().ok_or_else(|| LakeError::Corrupt {
                 path: manifest_path.clone(),
                 message: format!("table \"{key}\" overflows u64 rows across its data files"),
@@ -888,13 +904,14 @@ impl Lake {
                 path: manifest_path.clone(),
                 message: format!("table \"{key}\" overflows u64 rows across its delete files"),
             })?;
-            if data_rows < deleted_rows || data_rows - deleted_rows != entry.rows {
+            let live_inlined = new_entry.live_inlined_rows();
+            if data_rows < deleted_rows || data_rows - deleted_rows + live_inlined != entry.rows {
                 return Err(LakeError::Corrupt {
                     path: manifest_path.clone(),
                     message: format!(
                         "table \"{key}\": compaction would leave {data_rows} data rows minus \
-                         {deleted_rows} deleted positions, but the table declares {} rows; \
-                         refusing to publish",
+                         {deleted_rows} deleted positions plus {live_inlined} live inlined \
+                         row(s), but the table declares {} rows; refusing to publish",
                         entry.rows
                     ),
                 });
@@ -1273,6 +1290,9 @@ impl Lake {
                     .iter()
                     .map(|key| key.key_text())
                     .collect(),
+                inlined_rows: entry.live_inlined_rows(),
+                inlined_history: entry.inlined.len() as u64,
+                inlined_limit: entry.inlined_limit,
             });
         }
         Ok(out)

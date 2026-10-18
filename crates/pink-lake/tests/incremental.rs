@@ -193,7 +193,10 @@ fn commit_appends_without_rewriting_and_the_manifest_records_the_ranges() {
         .into_owned();
 
     // Append 5 rows as one new data file.
+    // Wave 68: inlining is on by default (DuckLake's 10-row limit); this
+    // test pins the file-append shape, so it opts out.
     let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let appended = sub_table(&[
         (1100, "a"),
         (1101, "b"),
@@ -362,8 +365,10 @@ fn commit_from_tables_diffs_inserts_updates_and_deletes_exactly() {
     let before = files_with_meta(&lake_dir);
 
     // A writable attachment materializes the base; mutate the store as any
-    // DML would and commit the difference.
+    // DML would and commit the difference. Wave 68: inlining is on by
+    // default, so this test opts out to pin the file-based diff shape.
     let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    wa.set_data_inlining_row_limit(0);
     assert_eq!(wa.base_version(), 2);
     let mut db = base;
     // INSERT (append), UPDATE a middle row, DELETE the first row.
@@ -386,7 +391,8 @@ fn commit_from_tables_diffs_inserts_updates_and_deletes_exactly() {
     assert_eq!(report.rows_deleted, 2, "1 deleted + 1 updated-away row");
     assert!(report.committed);
 
-    let lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let loaded = rows_of(&lake.load(None).unwrap());
     let want = expected_rows(&db);
     assert_eq!(loaded.len(), want.len(), "row count");
@@ -547,9 +553,13 @@ fn racing_commits_retry_and_rebase() {
     let lake_dir = dir.join("lake");
     save_store(&store(3), &lake_dir).unwrap();
 
-    // Two handles opened at the same version.
+    // Two handles opened at the same version. Wave 68: inlining is on by
+    // default; this test pins file appends and rebase behavior, so both
+    // handles opt out.
     let mut a = Lake::open(&lake_dir).unwrap();
     let mut b = Lake::open(&lake_dir).unwrap();
+    a.set_data_inlining_row_limit(0);
+    b.set_data_inlining_row_limit(0);
     let fast = CommitSettings {
         max_retry_count: 10,
         retry_backoff: 1.0,
@@ -572,7 +582,8 @@ fn racing_commits_retry_and_rebase() {
         "the origin the change was computed on"
     );
 
-    let lake = Lake::open(&lake_dir).unwrap();
+    let mut lake = Lake::open(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     let rows = rows_of(&lake.load(None).unwrap());
     assert_eq!(rows.len(), 5);
     assert_eq!(rows[3], (200, "a".to_string()));
@@ -921,6 +932,8 @@ fn writable_attachment_drops_tables_and_publishes_schema_changes() {
     save_store(&db, &lake_dir).unwrap();
 
     let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    // Wave 68: inlining is on by default; this test pins file writes.
+    wa.set_data_inlining_row_limit(0);
     assert_eq!(wa.tables().len(), 2);
     assert!(wa.contains("main.t") && wa.contains("main.u"));
 
@@ -947,6 +960,8 @@ fn writable_attachment_drops_tables_and_publishes_schema_changes() {
     // being refused. `ADD COLUMN … DEFAULT` is metadata-only for the old
     // files: they stay untouched and their rows read the default.
     let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
+    // Wave 68: the schema-change part pins file writes too.
+    wa.set_data_inlining_row_limit(0);
     let mut db = lake.load(None).unwrap();
     let files_before = file_list(&lake_dir, "main.t");
     db.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 7;")

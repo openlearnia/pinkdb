@@ -261,9 +261,9 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|attach|commit|partition|merge|rewrite|expire|cleanup|\
-             orphans|files|table_info|options|settings|detach|attached|versions|snapshots|\
-             tables|info> ..."
+            "Usage: .lake <save|open|attach|commit|partition|inlining|flush|changes|\
+             add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
+             settings|detach|attached|versions|snapshots|tables|info> ..."
         ),
         "{out}"
     );
@@ -1755,9 +1755,12 @@ fn writable_attach_commit_appends_without_rewriting() {
         .collect();
     assert_eq!(before.len(), 1, "one file per table per save");
 
-    // Materialize writable, mutate through DML, commit.
-    let out = run(&format!(
-        ".lake attach {lake} write\n\
+    // Materialize writable, mutate through DML, commit. (Wave 68: inlining
+    // is on by default; this test pins the file/delete-file shape via the
+    // handle-default env knob.)
+    let out = run_with_env(
+        &format!(
+            ".lake attach {lake} write\n\
          INSERT INTO t VALUES (999, 'late');\n\
          UPDATE t SET s = 'up' WHERE a = 0;\n\
          DELETE FROM t WHERE a = 1;\n\
@@ -1765,8 +1768,10 @@ fn writable_attach_commit_appends_without_rewriting() {
          SELECT COUNT(*), MIN(a), MAX(a), COUNT(s) FROM t;\n\
          .lake attached\n\
          .quit\n",
-        lake = lake.display()
-    ));
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
     assert!(
         out.contains("Attached") && out.contains("writable"),
         "the writable attach must report itself:\n{out}"
@@ -1862,8 +1867,9 @@ fn writable_attach_schema_evolution_publishes_and_time_travels() {
     let files_before = data_files(&lake.join("data")).len();
     assert_eq!(files_before, 1);
 
-    let out = run(&format!(
-        ".lake attach {lake} write\n\
+    let out = run_with_env(
+        &format!(
+            ".lake attach {lake} write\n\
          ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 42;\n\
          ALTER TABLE t ADD COLUMN tmp INTEGER;\n\
          UPDATE t SET n = 9 WHERE i = 2;\n\
@@ -1873,8 +1879,10 @@ fn writable_attach_schema_evolution_publishes_and_time_travels() {
          .lake commit {lake}\n\
          SELECT i, n FROM t ORDER BY i;\n\
          .quit\n",
-        lake = lake.display()
-    ));
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
     assert!(out.contains("Table t altered."), "{out}");
     assert!(
         out.contains("1 schema change"),
@@ -2127,17 +2135,20 @@ fn partition_spec_splits_commits_prunes_and_clears() {
     let lake = dir.join("lake");
 
     // Session 1: create, save, partition, commit appended rows.
-    let out = run(&format!(
-        "CREATE TABLE t (id INTEGER, region VARCHAR);\n\
-         INSERT INTO t VALUES (1, 'east'), (2, 'west');\n\
-         .lake save {lake}\n\
-         .lake partition {lake} t by (region)\n\
-         .lake attach {lake} write\n\
-         INSERT INTO t VALUES (3, 'south'), (4, 'south'), (5, 'north');\n\
-         .lake commit {lake}\n\
-         .quit\n",
-        lake = lake.display()
-    ));
+    let out = run_with_env(
+        &format!(
+            "CREATE TABLE t (id INTEGER, region VARCHAR);\n\
+             INSERT INTO t VALUES (1, 'east'), (2, 'west');\n\
+             .lake save {lake}\n\
+             .lake partition {lake} t by (region)\n\
+             .lake attach {lake} write\n\
+             INSERT INTO t VALUES (3, 'south'), (4, 'south'), (5, 'north');\n\
+             .lake commit {lake}\n\
+             .quit\n",
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
     assert!(out.contains("Partitioned main.t by (region)"), "{out}");
     // The three appended rows split into two files (south ×2, north ×1).
     assert!(out.contains("2 files: 2 data, 0 delete"), "{out}");
@@ -2183,16 +2194,20 @@ fn partition_spec_splits_commits_prunes_and_clears() {
     assert!(out.contains("│ 5 "), "{out}"); // the north row
     assert!(out.contains("│ 3 ") && out.contains("│ 4 "), "{out}");
 
-    // Session 3: clear the spec, then a new commit is one unpartitioned file.
-    let out = run(&format!(
-        ".lake partition {lake} t clear\n\
+    // Session 3: clear the spec, then a new commit is one unpartitioned file
+    // (inlining off: this pins the file shape).
+    let out = run_with_env(
+        &format!(
+            ".lake partition {lake} t clear\n\
          .lake partition {lake} t clear\n\
          .lake attach {lake} write\n\
          INSERT INTO t VALUES (6, 'east');\n\
          .lake commit {lake}\n\
          .quit\n",
-        lake = lake.display()
-    ));
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
     assert!(out.contains("Cleared the partition specification"), "{out}");
     assert!(out.contains("has no partition specification"), "{out}");
     assert!(out.contains("1 file: 1 data, 0 delete"), "{out}");
@@ -2252,19 +2267,24 @@ fn maintenance_commands_merge_expire_and_cleanup() {
     let dir = scratch("maint");
     let lake = dir.join("lake");
     // v2 saves one file; two writable-attach commits append two more.
-    run(&format!(
-        "CREATE TABLE t (id INTEGER, s VARCHAR);\n\
-         INSERT INTO t VALUES (1, 'a'), (2, 'b');\n\
-         .lake save {lake}\n\
-         .lake attach {lake} write\n\
-         INSERT INTO t VALUES (3, 'c');\n\
-         .lake commit {lake}\n\
-         INSERT INTO t VALUES (4, 'd');\n\
-         .lake commit {lake}\n\
-         .lake detach {lake}\n\
-         .quit\n",
-        lake = lake.display()
-    ));
+    // (Wave 68: inlining is on by default; this test pins file writes via the
+    // handle-default env knob, which publishes no version of its own.)
+    run_with_env(
+        &format!(
+            "CREATE TABLE t (id INTEGER, s VARCHAR);\n\
+             INSERT INTO t VALUES (1, 'a'), (2, 'b');\n\
+             .lake save {lake}\n\
+             .lake attach {lake} write\n\
+             INSERT INTO t VALUES (3, 'c');\n\
+             .lake commit {lake}\n\
+             INSERT INTO t VALUES (4, 'd');\n\
+             .lake commit {lake}\n\
+             .lake detach {lake}\n\
+             .quit\n",
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
     let data_dir = lake.join("data/main.t");
     let before: Vec<(PathBuf, Vec<u8>)> = std::fs::read_dir(&data_dir)
         .unwrap()
@@ -2356,5 +2376,105 @@ fn maintenance_commands_merge_expire_and_cleanup() {
     assert!(!out.contains("Error: corrupt"), "{out}");
     // Only the consolidated head file remains.
     assert_eq!(std::fs::read_dir(&data_dir).unwrap().count(), 1);
+    cleanup(&dir);
+}
+
+/// Wave 68: a small writable-attach commit inlines its rows into the catalog
+/// (no data file, reported by `.lake commit`), `.lake flush` materializes
+/// them into a data file, `.lake changes` renders the version range's
+/// insertions/deletions, and `.lake inlining` persists a per-table limit.
+#[test]
+fn inlining_flush_changes_and_inlining_limit_round_trip() {
+    let dir = scratch("inlining");
+    let lake = dir.join("lake");
+    let script = format!(
+        "CREATE TABLE t (i INTEGER, s VARCHAR);\n\
+         INSERT INTO t VALUES (1, 'a');\n\
+         .lake save {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    );
+    let out = run(&script);
+    assert!(out.contains("Saved lake version 2"), "{out}");
+
+    // A one-row append inlines: no data file, the report says so.
+    let out = run(&format!(
+        ".lake attach {lake} write\n\
+         INSERT INTO t VALUES (2, 'b');\n\
+         .lake commit {lake}\n\
+         SELECT COUNT(*) FROM t;\n\
+         .lake detach {lake}\n\
+         .lake flush {lake}\n\
+         .lake changes {lake} main.t 2 3\n\
+         .lake inlining {lake} main.t 0\n\
+         .lake inlining {lake} main.t default\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("0 files: 0 data, 0 delete"), "{out}");
+    assert!(out.contains("(1 row inlined)"), "{out}");
+    assert!(out.contains("│ 2 "), "the inlined row is visible: {out}");
+    assert!(
+        out.contains("Flushed 1 inlined row of main.t"),
+        "the flush materializes it: {out}"
+    );
+    // `.lake changes`: the v2 save's row and the v3 inlined row, inclusive.
+    assert!(out.contains("version 2  rowid 0  insert  1 'a'"), "{out}");
+    assert!(out.contains("version 3  rowid 1  insert  2 'b'"), "{out}");
+    assert!(
+        out.contains("commits appending at most 0 rows are stored in the catalog metadata"),
+        "{out}"
+    );
+    assert!(
+        out.contains("Cleared the inlining limit of main.t"),
+        "{out}"
+    );
+    // The flush published a real data file.
+    assert_eq!(data_files(&lake.join("data")).len(), 2, "save + flush");
+    cleanup(&dir);
+}
+
+/// Wave 68: `.lake add_data_files` registers an existing in-lake data file as
+/// rows of a table, `.lake files` names it, and the rows read back; a path
+/// outside `data/` is refused with the documented message.
+#[test]
+fn add_data_files_registers_through_the_cli() {
+    let dir = scratch("register");
+    let lake = dir.join("lake");
+    let values: Vec<String> = (0..12).map(|i| format!("({i})")).collect();
+    let out = run(&format!(
+        "CREATE TABLE t (a INTEGER);\n\
+         INSERT INTO t VALUES {};\n\
+         .lake save {lake}\n\
+         .lake files {lake}\n\
+         .lake add_data_files {lake} main.t data/main.t/nope.vortex\n\
+         .lake add_data_files {lake} main.t elsewhere/x.vortex\n\
+         .quit\n",
+        values.join(", "),
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    assert!(out.contains("no files found that match"), "{out}");
+    assert!(out.contains("is not a lake-relative"), "{out}");
+
+    // Register the saved file itself (its rows appear a second time).
+    let files_line = out
+        .lines()
+        .find(|l| l.starts_with("data/main.t/"))
+        .expect("`.lake files` lists the data file")
+        .to_string();
+    let path = files_line.split(':').next().unwrap().to_string();
+    let out = run(&format!(
+        ".lake add_data_files {lake} main.t {path}\n\
+         .lake open {lake}\n\
+         SELECT COUNT(*) FROM t;\n\
+         .lake changes {lake} main.t\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains(&format!("Registered {path}")), "{out}");
+    assert!(out.contains("Opened lake version 3"), "{out}");
+    assert!(out.contains("│ 24 "), "12 saved + 12 registered: {out}");
+    assert!(out.contains("version 3  rowid"), "{out}");
     cleanup(&dir);
 }

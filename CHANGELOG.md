@@ -10,6 +10,18 @@ one-liners below.
 
 ## 2026-10-18
 
+### Wave 68 — inlined small writes & CDC ✅
+- Tiny commits (≤ 10 rows by default; per-table limits, `PINKDB_LAKE_INLINING_ROW_LIMIT`)
+  live **in the catalog metadata** instead of new data files — scans, stats,
+  time travel, partitions and encryption all see them correctly. `.lake flush`
+  materializes them into real files and keeps the history.
+- **CDC reads**: `.lake changes` (and the library's
+  `table_insertions`/`table_deletions`/`table_changes`) replay each version's
+  deltas as `snapshot_id`/`rowid`/`change_type` rows. Updates read as
+  delete + insert (documented).
+- `.lake add_data_files` registers existing lake files into a version with
+  exact schema and statistics checks — encrypted lakes included.
+
 ### Wave 42 — hash indexes ✅
 - `CREATE INDEX [IF NOT EXISTS] name ON t (col)` and
   `DROP INDEX [IF EXISTS] name` (per-database): a single-column **hash index**

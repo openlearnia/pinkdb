@@ -186,6 +186,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
+<h3>Wave 68 — inlined small writes &amp; CDC ✅</h3>
+<ul>
+<li>Tiny commits (≤ 10 rows by default; per-table limits, <code>PINKDB_LAKE_INLINING_ROW_LIMIT</code>) live <strong>in the catalog metadata</strong> instead of new data files — scans, stats, time travel, partitions and encryption all see them correctly. <code>.lake flush</code> materializes them into real files and keeps the history.</li>
+<li><strong>CDC reads</strong>: <code>.lake changes</code> (and the library's <code>table_insertions</code>/<code>table_deletions</code>/<code>table_changes</code>) replay each version's deltas as <code>snapshot_id</code>/<code>rowid</code>/<code>change_type</code> rows. Updates read as delete + insert (documented).</li>
+<li><code>.lake add_data_files</code> registers existing lake files into a version with exact schema and statistics checks — encrypted lakes included.</li>
+</ul>
 <h3>Wave 42 — hash indexes ✅</h3>
 <ul>
 <li><code>CREATE INDEX [IF NOT EXISTS] name ON t (col)</code> and <code>DROP INDEX [IF EXISTS] name</code> (per-database): a single-column <strong>hash index</strong> turns <code>col = literal</code> lookups into an <code>IndexScan</code> instead of a full scan — results are identical either way. <code>.pink</code> persistence is queued as the follow-up (wave 79).</li>

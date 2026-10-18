@@ -921,10 +921,7 @@ pub(crate) fn aggregate(
             let idx = *index;
             let is_int_key = matches!(
                 dtype,
-                DataType::Integer
-                    | DataType::Bigint
-                    | DataType::Date
-                    | DataType::Timestamp
+                DataType::Integer | DataType::Bigint | DataType::Date | DataType::Timestamp
             );
             if is_int_key {
                 return fast_distinct_int(cx, inputs, idx, *dtype);

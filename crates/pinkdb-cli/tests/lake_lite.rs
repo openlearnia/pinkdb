@@ -442,8 +442,11 @@ fn lean_s3_save_open_roundtrip() {
 fn lean_partition_splits_commits_and_prunes() {
     let dir = scratch("partition");
     let lake = dir.join("lake");
-    let out = run(&format!(
-        "CREATE TABLE t (id INTEGER, region VARCHAR);\n\
+    // Wave 68: inlining is on by default; this test pins the file shape via
+    // the handle-default env knob (which publishes no version of its own).
+    let out = run_with_env(
+        &format!(
+            "CREATE TABLE t (id INTEGER, region VARCHAR);\n\
          INSERT INTO t VALUES (1, 'east'), (2, 'west');\n\
          .lake save {lake}\n\
          .lake partition {lake} t by (region)\n\
@@ -451,8 +454,10 @@ fn lean_partition_splits_commits_and_prunes() {
          INSERT INTO t VALUES (3, 'south'), (4, 'south'), (5, 'north');\n\
          .lake commit {lake}\n\
          .quit\n",
-        lake = lake.display()
-    ));
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
     assert!(out.contains("Partitioned main.t by (region)"), "{out}");
     assert!(out.contains("2 files: 2 data, 0 delete"), "{out}");
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
@@ -482,8 +487,10 @@ fn lean_partition_splits_commits_and_prunes() {
 fn lean_maintenance_merge_expire_cleanup() {
     let dir = scratch("maint");
     let lake = dir.join("lake");
-    run(&format!(
-        "CREATE TABLE t (id INTEGER);\n\
+    // Wave 68: inlining is on by default; this test pins the file shape.
+    run_with_env(
+        &format!(
+            "CREATE TABLE t (id INTEGER);\n\
          INSERT INTO t VALUES (1), (2);\n\
          .lake save {lake}\n\
          .lake attach {lake} write\n\
@@ -491,8 +498,10 @@ fn lean_maintenance_merge_expire_cleanup() {
          .lake commit {lake}\n\
          .lake detach {lake}\n\
          .quit\n",
-        lake = lake.display()
-    ));
+            lake = lake.display()
+        ),
+        &[("PINKDB_LAKE_INLINING_ROW_LIMIT", "0")],
+    );
     let out = run(&format!(
         ".lake merge {lake}\n\
          .lake files {lake}\n\

@@ -149,6 +149,7 @@ fn partitioned_commits_split_one_file_per_value_set() {
     let dir = scratch("split");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[
         (1, Some("east")),
         (2, Some("west")),
@@ -279,6 +280,7 @@ fn zone_map_pruning_decodes_only_matching_files() {
     let dir = scratch("prune");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     // Three files with disjoint id and region ranges.
     lake.write_from_store(&store(&[(1, Some("a1")), (2, Some("a2")), (3, Some("a3"))]))
         .unwrap();
@@ -358,6 +360,7 @@ fn partition_values_prune_and_nulls_stay_exact() {
     let dir = scratch("partition_prune");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     // Save first (one file), then partition, then save again: every file of
     // the partitioned version carries its value.
     lake.write_from_store(&store(&[(1, Some("east"))])).unwrap();
@@ -417,6 +420,7 @@ fn pruning_with_positional_deletes_is_correct_and_honest() {
     let dir = scratch("prune_deletes");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a1")), (2, Some("a2"))]))
         .unwrap();
     let mut commit = Commit::new();
@@ -485,6 +489,7 @@ fn pruning_across_time_travel_uses_version_zone_maps() {
     let dir = scratch("prune_tt");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a")), (2, Some("b")), (3, Some("c"))]))
         .unwrap();
     let mut commit = Commit::new();
@@ -523,6 +528,7 @@ fn time_travel_pruning_leaves_the_pinned_version_alone() {
     let dir = scratch("prune_tt_pin");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     lake.set_partition_spec(
         "main.t",
@@ -560,6 +566,7 @@ fn bucket_partitioning_splits_and_stays_correct() {
     let dir = scratch("bucket");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     let report = lake
         .set_partition_spec(
@@ -617,6 +624,7 @@ fn clearing_the_spec_keeps_files_and_reads_exact() {
     let dir = scratch("clear");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     lake.set_partition_spec(
         "main.t",
@@ -659,6 +667,7 @@ fn partition_ddl_errors_match_ducklake() {
     let dir = scratch("ddl_errors");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
 
     // DuckLake: "Unsupported partition function truncate - only year, month,
@@ -729,6 +738,7 @@ fn tampered_partition_values_and_zone_maps_are_refused() {
     let dir = scratch("tamper");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     lake.set_partition_spec(
         "main.t",
@@ -806,6 +816,7 @@ fn vortex_zone_maps_cross_check_against_the_footer() {
     let dir = scratch("vortex_cross");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a")), (2, Some("b"))]))
         .unwrap();
 
@@ -837,6 +848,7 @@ fn partition_changes_are_recorded_in_the_commit_manifest() {
     let dir = scratch("delta");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     let report = lake
         .set_partition_spec(
@@ -865,6 +877,7 @@ fn partition_errors_are_not_representable() {
     let dir = scratch("err_class");
     let lake_dir = dir.join("lake");
     let mut lake = Lake::open_or_create(&lake_dir).unwrap();
+    lake.set_data_inlining_row_limit(0);
     lake.write_from_store(&store(&[(1, Some("a"))])).unwrap();
     let err = lake
         .set_partition_spec(
