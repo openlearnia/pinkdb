@@ -874,6 +874,7 @@ peg::parser! {
             / load_extension()
             / alter_stmt()
             / drop()
+            / refresh_stmt()
             / checkpoint()
             / show_stmt()
             / describe_stmt()
@@ -924,6 +925,11 @@ peg::parser! {
                   }
               }
 
+              rule refresh_stmt() -> Statement
+              = word("refresh") word("materialized") kw(Keyword::View) t:table_ref() {
+                 Statement::RefreshMaterializedView { db: t.0, name: t.1 }
+              }
+
         /// `LOAD EXTENSION '<path>'` — the path must be a string literal.
         rule load_extension() -> Statement
             = kw(Keyword::Load) kw(Keyword::Extension) path:string_lit() {
@@ -947,6 +953,9 @@ peg::parser! {
               }
             / kw(Keyword::Create) kw(Keyword::Index) ifne:if_not_exists() name:ident() kw(Keyword::On) t:table_ref() lparen() col:ident() rparen() {
                   Statement::CreateIndex { db: t.0, name, table: t.1, column: col, if_not_exists: ifne }
+              }
+            / kw(Keyword::Create) word("materialized") kw(Keyword::View) ifne:if_not_exists() t:table_ref() kw(Keyword::As) query:select() {
+                  Statement::CreateMaterializedView { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne }
               }
             / kw(Keyword::Create) kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
                   Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query) }
@@ -1114,6 +1123,7 @@ peg::parser! {
                   Statement::DropTable { db: t.0, name: t.1, if_exists: ife }
               }
             / kw(Keyword::Drop) kw(Keyword::Index) ife:if_exists() t:table_ref() { Statement::DropIndex { db: t.0, name: t.1, if_exists: ife } }
+            / kw(Keyword::Drop) word("materialized") kw(Keyword::View) ife:if_exists() t:table_ref() { Statement::DropMaterializedView { db: t.0, name: t.1, if_exists: ife } }
             / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
         /// `ALTER TABLE` (wave 65). `alter`, `add`, `column`, `rename` and
         /// `default` are matched as words, not reserved keywords, so they stay

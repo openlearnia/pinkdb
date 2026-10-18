@@ -3014,6 +3014,40 @@ pub(crate) fn bind_tracked_with(
             cols,
             query,
         } => bind_create_view(db, default_db, qdb, name, cols, query),
+        Statement::CreateMaterializedView {
+            db: qdb,
+            name,
+            query,
+            if_not_exists,
+        } => {
+            let target = Binder::new(db, default_db).resolve_db(qdb)?;
+            // Bind the inner query.
+            let mut binder = Binder::new(db, default_db).with_params(params.clone());
+            let plan = bind_select_in(db, &mut binder, query)?;
+            let dynamic = binder.dynamic_functions_used();
+            Ok((
+                LogicalPlan::CreateMaterializedView {
+                    db: Some(target),
+                    name: name.clone(),
+                    query: Box::new(plan),
+                    if_not_exists: *if_not_exists,
+                },
+                dynamic,
+            ))
+        }
+        Statement::RefreshMaterializedView { db: qdb, name } => empty(LogicalPlan::RefreshMaterializedView {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+        }),
+        Statement::DropMaterializedView {
+            db: qdb,
+            name,
+            if_exists,
+        } => empty(LogicalPlan::DropMaterializedView {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
         Statement::DropTable {
             db: qdb,
             name,
@@ -4332,7 +4366,10 @@ pub(crate) fn plan_schema(
         | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. }
         | LogicalPlan::CreateIndex { .. }
-        | LogicalPlan::DropIndex { .. } => Ok(Vec::new()),
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::DropMaterializedView { .. } => Ok(Vec::new()),
         LogicalPlan::IndexScan { db: qdb, table, .. } => {
             let lookup = qdb.as_deref().unwrap_or(default_db);
             db.visible_table_schema(lookup, table)

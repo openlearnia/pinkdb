@@ -987,6 +987,15 @@ fn render_results(results: &[QueryResult]) {
             QueryResult::DroppedTable { name } => println!("Table {name} dropped."),
             QueryResult::CreatedIndex { name } => println!("Index {name} created."),
             QueryResult::DroppedIndex { name } => println!("Index {name} dropped."),
+            QueryResult::CreatedMaterializedView { name } => {
+                println!("Materialized view {name} created.")
+            }
+            QueryResult::RefreshedMaterializedView { name } => {
+                println!("Materialized view {name} refreshed.")
+            }
+            QueryResult::DroppedMaterializedView { name } => {
+                println!("Materialized view {name} dropped.")
+            }
             QueryResult::DroppedView { name } => println!("View {name} dropped."),
             QueryResult::CreatedDatabase { name } => {
                 println!("Database {name} created.")

@@ -75,6 +75,21 @@ pub enum LogicalPlan {
         cols: Option<Vec<String>>,
         query: Box<Select>,
     },
+    CreateMaterializedView {
+        db: Option<String>,
+        name: String,
+        query: Box<LogicalPlan>,
+        if_not_exists: bool,
+    },
+    RefreshMaterializedView {
+        db: Option<String>,
+        name: String,
+    },
+    DropMaterializedView {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
     DropTable {
         db: Option<String>,
         name: String,
@@ -455,7 +470,10 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::Describe { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::CreateIndex { .. }
-        | LogicalPlan::DropIndex { .. } => {}
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::DropMaterializedView { .. } => {}
         LogicalPlan::IndexScan { db, table, .. } => {
             out.insert(key(db, table));
         }
@@ -776,7 +794,10 @@ fn walk_scan_filters(
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
-        | LogicalPlan::IndexScan { .. } => {}
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::DropMaterializedView { .. } => {}
         LogicalPlan::Explain { plan } => walk_scan_filters(plan, &[], out),
         LogicalPlan::CreateTableAs { query, .. } | LogicalPlan::InsertSelect { query, .. } => {
             walk_scan_filters(query, &[], out)
@@ -1230,7 +1251,10 @@ fn walk_scan_projections(
         | LogicalPlan::Checkpoint
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
-        | LogicalPlan::IndexScan { .. } => {}
+        | LogicalPlan::IndexScan { .. }
+        | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::DropMaterializedView { .. } => {}
     }
 }
 

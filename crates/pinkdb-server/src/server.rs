@@ -669,6 +669,9 @@ fn send_result<W: Write>(w: &mut W, result: &QueryResult) -> Result<(), Protocol
         QueryResult::AlteredTable { name } => done(w, DoneKind::AlteredTable, 0, name),
         QueryResult::CreatedIndex { name } => done(w, DoneKind::Created, 0, name),
         QueryResult::DroppedIndex { name } => done(w, DoneKind::DroppedTable, 0, name),
+        QueryResult::CreatedMaterializedView { name } => done(w, DoneKind::Created, 0, name),
+        QueryResult::RefreshedMaterializedView { name } => done(w, DoneKind::Created, 0, name),
+        QueryResult::DroppedMaterializedView { name } => done(w, DoneKind::DroppedTable, 0, name),
     }
 }
 

@@ -98,6 +98,24 @@ pub enum Statement {
     ShowTables,
     /// `SHOW DATABASES`: every database in the store, sorted by name.
     ShowDatabases,
+    /// `CREATE MATERIALIZED VIEW [IF NOT EXISTS] name AS SELECT ...`.
+    CreateMaterializedView {
+        db: Option<String>,
+        name: String,
+        query: Box<Select>,
+        if_not_exists: bool,
+    },
+    /// `REFRESH MATERIALIZED VIEW name`.
+    RefreshMaterializedView {
+        db: Option<String>,
+        name: String,
+    },
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] name`.
+    DropMaterializedView {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
     /// `CREATE INDEX [IF NOT EXISTS] <name> ON <table>(<col>)`.
     CreateIndex {
         db: Option<String>,

@@ -757,6 +757,14 @@ pub struct ViewDef {
     pub cols: Option<Vec<String>>,
 }
 
+/// A materialized view: a cached query result stored as a table, plus the
+/// refresh query used by `REFRESH MATERIALIZED VIEW`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaterializedViewDef {
+    pub name: String,
+    pub query: crate::plan::LogicalPlan,
+}
+
 /// One database's catalog: its tables and its session-local views.
 #[derive(Debug, Default, Clone)]
 pub struct DbCatalog {
@@ -764,6 +772,7 @@ pub struct DbCatalog {
     pub(crate) name: String,
     pub(crate) tables: HashMap<String, DataTable>,
     pub(crate) views: HashMap<String, ViewDef>,
+    pub(crate) materialized_views: HashMap<String, MaterializedViewDef>,
 }
 
 /// A store of databases.
@@ -1124,6 +1133,22 @@ impl PinkDb {
     pub(crate) fn views_insert_in(&mut self, db: &str, key: String, view: ViewDef) -> Result<()> {
         self.catalog_mut(db)?.views.insert(key, view);
         Ok(())
+    }
+
+    pub(crate) fn materialized_views_remove_in(&mut self, db: &str, key: &str) -> Option<MaterializedViewDef> {
+        self.databases.get_mut(&Self::db_key(db))?.materialized_views.remove(key)
+    }
+
+    pub(crate) fn materialized_views_insert_in(&mut self, db: &str, key: String, view: MaterializedViewDef) -> Result<()> {
+        self.catalog_mut(db)?.materialized_views.insert(key, view);
+        Ok(())
+    }
+
+    pub fn materialized_view_in(&self, db: &str, name: &str) -> Result<&MaterializedViewDef> {
+        self.catalog(db)?
+            .materialized_views
+            .get(&name.to_ascii_lowercase())
+            .ok_or_else(|| PinkDbError::Catalog(format!("materialized view \"{name}\" not found")))
     }
 
     /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.
