@@ -73,6 +73,11 @@ pub struct Client {
     broken: bool,
 }
 
+/// The most rows one result batch may materialize on the client. Generous for
+/// legitimate results (the client materializes anyway), bounded so a hostile
+/// server cannot force unbounded growth.
+const MAX_BATCH_ROWS: usize = 10_000_000;
+
 impl Client {
     /// Connect and perform the `Hello` handshake, checking the protocol
     /// version the server agrees on.
@@ -80,6 +85,22 @@ impl Client {
         let stream = TcpStream::connect(addr).map_err(ProtocolError::Io)?;
         if let Err(e) = stream.set_nodelay(true) {
             eprintln!("pinkdb: cannot set TCP_NODELAY on the client socket: {e}");
+        }
+        // Never hang forever on a stalling server. A generous idle timeout
+        // (override with PINKDB_CLIENT_TIMEOUT_MS; 0 disables) leaves
+        // long-running queries room while bounding a dead peer.
+        let timeout_ms = std::env::var("PINKDB_CLIENT_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(300_000);
+        if timeout_ms > 0 {
+            let timeout = Some(std::time::Duration::from_millis(timeout_ms));
+            if let Err(e) = stream.set_read_timeout(timeout) {
+                eprintln!("pinkdb: cannot set the client read timeout: {e}");
+            }
+            if let Err(e) = stream.set_write_timeout(timeout) {
+                eprintln!("pinkdb: cannot set the client write timeout: {e}");
+            }
         }
         let writer = stream.try_clone().map_err(ProtocolError::Io)?;
         let mut client = Client {
@@ -266,6 +287,15 @@ impl Client {
                         }
                     }
                     accumulated.extend(rows);
+                    // A hostile/compromised server could stream unbounded rows;
+                    // the client materializes them, so cap the batch.
+                    if accumulated.len() > MAX_BATCH_ROWS {
+                        return Err(ProtocolError::Malformed(format!(
+                            "result batch exceeds {MAX_BATCH_ROWS} rows; refusing to \
+                             materialize it"
+                        ))
+                        .into());
+                    }
                 }
                 Response::Done { kind, count, name } => {
                     results.push(build_result(kind, count, name, current.take())?);

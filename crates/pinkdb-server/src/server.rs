@@ -261,12 +261,15 @@ impl Server {
 }
 
 /// Best-effort `Error` frame for a connection refused by the cap, then close.
+/// Runs on its own thread (with a bounded write) so a client that never reads
+/// cannot block the accept loop.
 fn reject_over_limit(mut stream: TcpStream, max: usize) {
-    if let Err(e) = stream.set_nonblocking(false) {
-        eprintln!("pinkdb-server: cannot switch a rejected socket to blocking mode: {e}");
-    }
-    let message = format!("connection limit reached (max {max}); try again later");
-    let _ = protocol::write_response(&mut stream, &Response::Error { message });
+    std::thread::spawn(move || {
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+        let message = format!("connection limit reached (max {max}); try again later");
+        let _ = protocol::write_response(&mut stream, &Response::Error { message });
+    });
 }
 
 /// A running server's handle (see [`Server::spawn`]).

@@ -119,15 +119,35 @@ fn string_field(value: &serde_json::Value, key: &str) -> Result<String, String> 
 }
 
 fn is_safe_component(v: &str) -> bool {
-    !v.is_empty() && v != "." && v != ".." && !v.contains(['/', '\\', '\0'])
+    if v.is_empty()
+        || v == "."
+        || v == ".."
+        || v.contains(['/', '\\', '\0', ':'])
+        || v.ends_with('.')
+        || v.ends_with(' ')
+    {
+        return false;
+    }
+    // Windows reserved device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`,
+    // `LPT1..9`), reserving also the stem before the first dot.
+    let upper = v.to_ascii_uppercase();
+    let stem = upper.split('.').next().unwrap_or("");
+    if matches!(stem, "CON" | "PRN" | "AUX" | "NUL") {
+        return false;
+    }
+    if let Some(digit) = stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    {
+        if matches!(digit, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9") {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_safe_relative_path(v: &str) -> bool {
-    !v.is_empty()
-        && !v.starts_with('/')
-        && !v.contains(['\\', '\0'])
-        && v.split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
+    !v.is_empty() && !v.starts_with('/') && v.split('/').all(is_safe_component)
 }
 
 /// The result of resolving `name[@version]` in one catalog.
