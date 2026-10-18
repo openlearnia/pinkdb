@@ -49,7 +49,7 @@ and Go suites green.
 
 | Finding | Status |
 |---|---|
-| `is_container` heuristic can skip encryption | documented (not reachable with current writers) |
+| `is_container` heuristic can skip encryption | documented (not reachable with current writers); a test now pins the already-sealed marker behavior |
 | Attach `COUNT` with overlapping delete files | **deferred** — the suggested `read_manifest` refusal breaks legitimate disjoint deletes from separate commits; needs attach-side handling |
 | Full save resets `schema_version` on an unreadable predecessor | fixed (falls back to the catalog head) |
 | Partition error names the partition key, not the table | fixed |
@@ -63,6 +63,7 @@ and Go suites green.
 | `PINKDB_LAKE_RETRY_BACKOFF=inf` | fixed (finite check) |
 | `.lake partition` lacks the transaction guard | fixed |
 | `S3Config` `Debug` prints the access-key id | **verified deliberate** (non-secret, test-pinned) |
+| Server-provided ETags echoed into `If-Match` unvalidated | fixed (conservative `valid_etag` guard) |
 
 ## P2 — server / FFI / bindings / CLI
 
@@ -71,7 +72,7 @@ and Go suites green.
 | Client `read_batch` unbounded | fixed (10M-row cap) |
 | Client has no socket timeouts | fixed (`PINKDB_CLIENT_TIMEOUT_MS`, default 5 min) |
 | `reject_over_limit` writes on the accept thread | fixed (own thread + 1 s write timeout) |
-| `pinkdb_open_memory` not under `catch_unwind` | fixed |
+| `pinkdb_open_memory` not under `catch_unwind` | fixed (open_memory + both `build_result` paths) |
 | `is_loopback_host` mis-parses IPv6 brackets | fixed |
 | Repo temp file `fs::write` (predictable, follows symlinks) | fixed (`create_new`, unique name) |
 | Bindings miss DECIMAL/INTERVAL/`ALTERED_TABLE` | fixed (Python + Go) |

@@ -439,7 +439,14 @@ pub extern "C" fn pinkdb_execute(
     // contract; no other reference exists during the call.
     let h = unsafe { &mut *handle };
     match catch_unwind(AssertUnwindSafe(|| h.db.execute(text))) {
-        Ok(Ok(results)) => Box::into_raw(Box::new(build_result(results))),
+        Ok(Ok(results)) => match catch_unwind(AssertUnwindSafe(|| Box::new(build_result(results))))
+        {
+            Ok(result) => Box::into_raw(result),
+            Err(_) => {
+                set_error("internal error: building the result panicked");
+                ptr::null_mut()
+            }
+        },
         Ok(Err(e)) => {
             set_error(&e.to_string());
             ptr::null_mut()
@@ -590,7 +597,15 @@ pub extern "C" fn pinkdb_execute_prepared(
     match catch_unwind(AssertUnwindSafe(|| {
         h.db.execute_prepared(&stmt.stmt, &bound)
     })) {
-        Ok(Ok(result)) => Box::into_raw(Box::new(build_result(vec![result]))),
+        Ok(Ok(result)) => {
+            match catch_unwind(AssertUnwindSafe(|| Box::new(build_result(vec![result])))) {
+                Ok(result) => Box::into_raw(result),
+                Err(_) => {
+                    set_error("internal error: building the result panicked");
+                    ptr::null_mut()
+                }
+            }
+        }
         Ok(Err(e)) => {
             set_error(&e.to_string());
             ptr::null_mut()

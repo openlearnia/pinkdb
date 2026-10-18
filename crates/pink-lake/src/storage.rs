@@ -870,6 +870,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Bytes that merely start with the container magic are the explicit
+    /// "already sealed" marker: stored as-is (not double-sealed) and then
+    /// refused by a keyed read (never guessed at).
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn a_pnklake1_object_is_stored_as_is_and_then_fails_closed() {
+        use crate::crypto::EncryptionKey;
+        let dir = std::env::temp_dir().join(format!(
+            "pink_lake_sealed_marker_{}_{}",
+            std::process::id(),
+            crate::fresh_id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
+        let storage = CryptoStorage::new(inner, Some(EncryptionKey::from_raw([3u8; 32]))).unwrap();
+        let mut fake = crate::crypto::ENC_MAGIC.to_vec();
+        fake.extend_from_slice(b"not a real container");
+        storage.put("data/t/x.pink", &fake).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("data/t/x.pink")).unwrap(),
+            fake,
+            "the marker must pass through unsealed"
+        );
+        let err = storage.read("data/t/x.pink", "reading").unwrap_err();
+        assert!(
+            matches!(err, LakeError::WrongKey { .. } | LakeError::Tampered { .. }),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A staging copy of decrypted (or downloaded) plaintext lives in a private
     /// 0700 directory as a 0600 file, and the whole directory is removed when
     /// the `LocalCopy` drops.

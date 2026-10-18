@@ -1233,6 +1233,17 @@ impl Condition<'_> {
     }
 }
 
+/// A conservative ETag: a short token of quoted/unquoted hex-ish characters.
+/// Rejects control characters (notably CR/LF) and anything that could not be a
+/// safe header value — the value is echoed back in an `If-Match`.
+fn valid_etag(v: &str) -> bool {
+    !v.is_empty()
+        && v.len() <= 256
+        && v.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'"' | b'-' | b'_' | b'.' | b'/' | b'+' | b'=')
+        })
+}
+
 /// The result of a conditional `PutObject`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Put {
@@ -1451,10 +1462,14 @@ impl S3Client {
                 }
             }
         }
+        // Server-provided ETags are echoed into an `If-Match` header; accept
+        // only a conservative value so a hostile/broken server cannot inject
+        // header syntax (CR/LF) or arbitrary bytes.
         let etag = response
             .headers()
             .get("etag")
             .and_then(|v| v.to_str().ok())
+            .filter(|v| valid_etag(v))
             .map(str::to_string);
         let bytes = if method == "HEAD" {
             Vec::new()
@@ -2252,6 +2267,15 @@ mod tests {
             Condition::IfMatch("\"abc\"").headers(),
             vec![("if-match", "\"abc\"".to_string())]
         );
+    }
+
+    #[test]
+    fn etags_are_validated_before_being_echoed() {
+        assert!(valid_etag("\"abc123\""));
+        assert!(valid_etag("abc-1_2.3/4+5="));
+        assert!(!valid_etag(""));
+        assert!(!valid_etag("\"abc\r\nX-Evil: 1\""));
+        assert!(!valid_etag(&"a".repeat(257)));
     }
 
     #[test]
