@@ -6,10 +6,10 @@ optional <code>s3</code> feature.</p>
 
 <h2>1. Build with lake + S3</h2>
 
-<pre class="code" data-lang="sh"><code># pinklake over object storage (7.07 MB binary)
+<pre class="code" data-lang="sh"><code># pinklake over object storage (7.11 MB binary)
 cargo build --release -p pinkdb-cli --features pinklake,s3
 
-# vortexlake over object storage (~49.6 MB binary)
+# vortexlake over object storage (~49.7 MB binary)
 cargo build --release -p pinkdb-cli --features vortexlake,s3
 # `--features s3` alone adds the storage client but no `.lake` commands</code></pre>
 

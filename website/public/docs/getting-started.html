@@ -251,7 +251,7 @@ release builds on Apple Silicon (exact bytes from a recent measurement):</p>
       <td>vortexlake + S3/R2</td>
       <td><code>vortexlake,s3</code></td>
       <td>vortexlake on <code>s3://</code> locations</td>
-      <td class="num">≈49.6 MB<br><span class="doc-meta">49,637,312 B</span></td>
+      <td class="num">≈49.7 MB<br><span class="doc-meta">49,674,464 B</span></td>
     </tr>
     <tr>
       <td>s3 only</td>
@@ -264,7 +264,22 @@ release builds on Apple Silicon (exact bytes from a recent measurement):</p>
       <td><code>arrow</code></td>
       <td>file access: <code>FROM 'x.arrow'</code>, <code>read_arrow</code>,
       <code>COPY … (FORMAT arrow)</code> (Arrow IPC)</td>
-      <td class="num">6.91 MB<br><span class="doc-meta">6,911,024 B</span></td>
+      <td class="num">6.95 MB<br><span class="doc-meta">6,950,832 B</span></td>
+    </tr>
+    <tr>
+      <td>parquet</td>
+      <td><code>parquet</code></td>
+      <td>file access: <code>FROM 'x.parquet'</code>,
+      <code>read_parquet</code>/<code>parquet_scan</code>, the four
+      <code>parquet_*</code> metadata functions (read-only; add
+      <code>,parquet-zstd</code> for zstd)</td>
+      <td class="num">4.89 MB<br><span class="doc-meta">4,892,448 B</span></td>
+    </tr>
+    <tr>
+      <td>arrow + parquet</td>
+      <td><code>arrow,parquet</code></td>
+      <td>both file surfaces</td>
+      <td class="num">8.06 MB<br><span class="doc-meta">8,062,368 B</span></td>
     </tr>
   </tbody>
 </table>

@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use pinkdb::exec::QueryResult;
 use pinkdb::{DataType, PinkDb, Value};
-use pinkdb_arrow::ArrowFormat;
+use pinkdb_arrow::{ArrowSink, ArrowSource};
 
 fn scratch_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,22 +131,25 @@ fn parse_type(name: &str) -> DataType {
     })
 }
 
-/// The declared format doesn't match the file: a `.parquet`-suffixed source
-/// is refused by the extension lookup, and an explicitly named format that
-/// isn't registered is refused by the registry.
+/// The unified surface: a path no registered **source** claims is refused with
+/// the registered-source hint, and an explicitly named format that isn't
+/// registered is refused by the sink registry.
 #[test]
 fn unregistered_formats_are_refused_with_the_registered_list() {
     let mut db = PinkDb::new();
     pinkdb_arrow::register(&mut db);
+    assert_eq!(db.table_sources().len(), 1);
     db.execute("CREATE TABLE t (a INTEGER);").unwrap();
     db.execute("INSERT INTO t VALUES (1);").unwrap();
+    // `x.parquet` is not claimed by the arrow source; the parquet source is
+    // not built into this crate's tests, so the binder reports the table
+    // sources it has.
     let err = db
         .execute("SELECT * FROM 'x.parquet';")
         .unwrap_err()
         .to_string();
-    assert!(err.contains("no file format is registered"), "{err}");
-    // The registered list names what *is* available.
-    assert!(err.contains("arrow"), "{err}");
+    assert!(err.contains("cannot read"), "{err}");
+    assert!(err.contains("table source"), "{err}");
     let err = db
         .execute("COPY t TO 'x.arrow' (FORMAT parquet);")
         .unwrap_err()
@@ -165,11 +168,11 @@ fn unregistered_formats_are_refused_with_the_registered_list() {
 }
 
 /// A durable store replays a file-reading record by re-reading the file; the
-/// format must be registered **before** the store is constructed
+/// table source must be registered **before** the store is constructed
 /// (`ensure_registered`, the CLI's startup step), because recovery replays
 /// inside `open_durable`.
 #[test]
-fn durable_replay_resolves_the_process_global_format() {
+fn durable_replay_resolves_the_process_global_source() {
     let dir = scratch_dir("durable");
     let file = dir.join("src.arrow");
     let store = dir.join("store.pink");
@@ -206,10 +209,12 @@ fn durable_replay_resolves_the_process_global_format() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The format is a plain `FileFormat` impl; the engine's `Debug` bound on
-/// the trait is satisfied by `ArrowFormat`.
+/// Both halves are plain implementations of the engine traits, and their
+/// `Debug` bounds are satisfied.
 #[test]
-fn format_implements_the_engine_trait() {
-    let f: std::sync::Arc<dyn pinkdb::FileFormat> = std::sync::Arc::new(ArrowFormat::new());
-    assert_eq!(f.name(), "arrow");
+fn both_halves_implement_the_engine_traits() {
+    let read: std::sync::Arc<dyn pinkdb::TableSource> = std::sync::Arc::new(ArrowSource::new());
+    let write: std::sync::Arc<dyn pinkdb::FileFormat> = std::sync::Arc::new(ArrowSink::new());
+    assert_eq!(read.name(), "arrow");
+    assert_eq!(write.name(), "arrow");
 }

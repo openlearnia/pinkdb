@@ -897,6 +897,14 @@ pub struct PinkDb {
     /// the visible catalog for reads only — never part of the store's own
     /// tables and never touched by `.save`, `.lake save`, or the WAL.
     pub(crate) attached_lakes: Vec<Arc<dyn crate::attached::AttachedLake>>,
+    /// Host-registered table sources (wave 70; unified with the arrow
+    /// extension's reads in wave 71): every file read surface — `read_parquet`
+    /// / `read_arrow` / `FROM 'file.<ext>'`. Process-level like extensions and
+    /// attached lakes — never persisted, and **seedable from a process-global
+    /// registration** so a durable store's replay can resolve a file-reading
+    /// record (replay re-reads the file, DuckDB's rule; see
+    /// [`crate::table_source`]).
+    pub(crate) table_sources: Vec<Arc<dyn crate::table_source::TableSource>>,
     /// `(database, table)` pairs written by *committed* units (autocommit
     /// statements and COMMITs) since the last statement-boundary refresh pass
     /// (wave 80): the ON COMMIT trigger's dirty set. Process-local, never
@@ -922,12 +930,12 @@ pub struct PinkDb {
     /// RBAC section + replayed from the WAL; an empty catalog is the
     /// documented "no users: every connection is trusted" state.
     pub(crate) rbac: crate::rbac::RbacCatalog,
-    /// Registered file formats (wave 71): `FROM 'x.<ext>'`,
-    /// `read_<format>(…)` and `COPY … (FORMAT <format>)` resolve through
-    /// this list. Process/store-level like loadable extensions — never
-    /// persisted, shared by store clones, empty in a stock engine (every
-    /// file surface then fails with a clear "no file format registered"
-    /// error). See [`crate::filefmt`].
+    /// Registered `COPY … (FORMAT <name>)` write sinks (wave 71): a sink
+    /// resolves by name or by the target path's extension. Process/store-level
+    /// like loadable extensions — never persisted, shared by store clones,
+    /// empty in a stock engine (COPY then fails with a clear "no file format
+    /// …" error). Reads are the separate table-source registry above. See
+    /// [`crate::filefmt`].
     pub(crate) file_formats: Vec<Arc<dyn crate::filefmt::FileFormat>>,
 }
 
@@ -963,6 +971,7 @@ impl Clone for PinkDb {
             allow_sql_load_extension: self.allow_sql_load_extension,
             replaying: false,
             attached_lakes: self.attached_lakes.clone(),
+            table_sources: self.table_sources.clone(),
             mv_pending: self.mv_pending.clone(),
             txn_writes: HashSet::new(),
             // A clone is a snapshot for one statement/transaction: it keeps
@@ -1019,14 +1028,18 @@ impl PinkDb {
             allow_sql_load_extension: true,
             replaying: false,
             attached_lakes: Vec::new(),
+            // Process-global table sources (`table_source::
+            // register_global_table_source`) seed every store constructed
+            // after the registration; the store then owns its list (durable
+            // replay resolves through it).
+            table_sources: crate::table_source::seeded_global_table_sources(),
             mv_pending: HashSet::new(),
             txn_writes: HashSet::new(),
             proc_depth: 0,
             proc_frame: crate::procedure::ProcFrame::default(),
             rbac: crate::rbac::RbacCatalog::default(),
-            // Process-global formats (`filefmt::register_global_file_format`)
-            // seed every store constructed after the registration; the store
-            // then owns its list (durable replay resolves through it).
+            // Process-global sinks (`filefmt::register_global_file_format`)
+            // seed every store constructed after the registration.
             file_formats: crate::filefmt::seeded_global_formats(),
         }
     }

@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-19">2026-10-19<a class="anchor" href="#2026-10-19" aria-label="Permalink: 2026-10-19">#</a></h2>
+<h3>Wave 70 — core <code>parquet</code> extension (read-side) ✅</h3>
+<ul>
+<li>Parquet reads with the DuckDB surface: <code>read_parquet</code>/<code>parquet_scan</code> (globs, directories, multi-file, <code>union_by_name</code>, hive partitions, <code>filename</code>/<code>file_row_number</code>), four metadata functions, a replacement scan (<code>FROM 'x.parquet'</code>), projection pushdown and row-group-statistics filter pruning with visible counters.</li>
+<li>Landed with the <strong>unified file-format surface</strong>: one read path (<code>TableSource</code>) shared with arrow, one grammar (<code>Function</code> + <code>Path</code>), the COPY sink kept separate, and logged file reads replay by re-reading (DuckDB's rule). <code>parquet</code> is opt-in (+1.1 MiB); the default binary pays ~18 KB for the surface.</li>
+</ul>
 <h3>Wave 71 — core <code>arrow</code> extension (Arrow IPC) ✅</h3>
 <ul>
 <li>New engine <strong>file-format extension surface</strong> (<code>pinkdb::filefmt</code>): arrow files work through <code>FROM 'x.arrow'</code>, <code>read_arrow</code>/<code>read_ipc</code>/<code>read_feather</code> and <code>COPY … (FORMAT arrow)</code>, with durable replay re-reading files and lean builds refusing everything with a precise error.</li>

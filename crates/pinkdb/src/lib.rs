@@ -37,6 +37,9 @@ pub mod procedure;
 pub mod rbac;
 pub mod sql;
 pub mod storage;
+/// Host-registered table sources (wave 70): the engine-adjacent surface the
+/// `pinkdb-parquet` crate (`read_parquet`, `FROM 'file.parquet'`) plugs into.
+pub mod table_source;
 pub mod types;
 pub mod vector;
 pub mod wal;
@@ -47,7 +50,7 @@ pub use attached::{
 pub use crypto::EncryptionKey;
 pub use db::{Connection, Database};
 pub use exec::QueryResult;
-pub use filefmt::{FileFormat, FileSchema};
+pub use filefmt::FileFormat;
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};
 pub use rbac::{
@@ -55,7 +58,10 @@ pub use rbac::{
     hash_password, validate_password_hash, verify_password,
 };
 pub use storage::{DataTable, PinkDb, ViewDef};
-pub use types::{DataType, PinkDbError, Value};
+pub use table_source::{
+    TableFunctionArg, TableFunctionCall, TableScanOutput, TableSource, TableSourceStats,
+};
+pub use types::{DataType, PinkDbError, Result, Value};
 pub use vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 pub use wal::{
     DEFAULT_AUTO_CHECKPOINT_BYTES, DurableOpenOptions, LockMode, RecoveryInfo, SyncPolicy,

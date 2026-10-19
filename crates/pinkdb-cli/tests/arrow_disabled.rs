@@ -21,8 +21,13 @@ COPY t TO 'x.arrow' (FORMAT arrow);
     let (text, status) = common::run_merged(Command::new(env!("CARGO_BIN_EXE_pinkdb")), script);
     common::assert_script_exit(status);
     assert!(
-        text.contains("Error: no file format is registered for \"x.arrow\""),
-        "the replacement scan must name the missing format:\n{text}"
+        text.contains("Error: cannot read \"x.arrow\" by path"),
+        "the replacement scan must name the missing source:\n{text}"
+    );
+    assert!(
+        text.contains("no table source is registered")
+            || text.contains("table sources do not serve it"),
+        "the replacement scan must name the build option or the sources:\n{text}"
     );
     assert!(
         text.contains("unknown table function \"read_arrow\""),

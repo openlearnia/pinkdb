@@ -385,17 +385,25 @@ pub enum FromSource {
         db: Option<String>,
         name: String,
     },
-    /// A file source (wave 71): a string-literal replacement scan
-    /// (`FROM 'f.arrow'`, `format: None`: resolved by file extension) or a
-    /// `read_*` table-function call (`FROM read_arrow('f.arrow')`,
-    /// `format: Some("read_arrow")`: resolved by the registered reader name).
-    /// Both resolve through the store's registered file formats at bind time.
-    File {
-        path: String,
-        /// The lowercased `read_*` function name, when written.
-        function: Option<String>,
-    },
     Derived(Box<Select>),
+    /// A table-function call in FROM position (wave 70): the binder offers
+    /// it to every registered [`crate::table_source::TableSource`].
+    Function {
+        name: String,
+        args: Vec<TableFunctionCallArg>,
+    },
+    /// A bare string literal in FROM position — DuckDB's *replacement scan*
+    /// (`FROM 'file.parquet'`). The binder offers the path to every
+    /// registered source's `bind_path` hook.
+    Path(String),
+}
+
+/// One argument of a [`FromSource::Function`] call, as parsed: an expression
+/// the binder must evaluate to a literal, optionally named with `:=` or `=>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableFunctionCallArg {
+    pub name: Option<String>,
+    pub expr: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]

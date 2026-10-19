@@ -179,8 +179,22 @@ fn check_select_positions(sel: &Select) -> Result<()> {
 fn check_source_positions(source: &FromSource) -> Result<()> {
     match source {
         FromSource::Derived(query) => check_select_positions(query),
-        // A file source takes one string literal; no placeholder can appear.
-        FromSource::Table { .. } | FromSource::File { .. } => Ok(()),
+        FromSource::Function { args, .. } => {
+            // A table-function argument must be a literal (the binder refuses
+            // anything else), so a placeholder here is a clear error rather
+            // than a bind-time surprise.
+            for a in args {
+                if expr_contains_parameter(&a.expr) {
+                    return Err(PinkDbError::Parse(
+                        "a table-function argument must be a literal (placeholders are \
+                         not supported here)"
+                            .to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        FromSource::Table { .. } | FromSource::Path(_) => Ok(()),
     }
 }
 
@@ -308,18 +322,20 @@ fn select_contains_parameter(sel: &Select) -> bool {
 }
 
 fn from_contains_parameter(from: &FromClause) -> bool {
-    let source = match &from.source {
-        FromSource::Derived(query) => select_contains_parameter(query),
-        FromSource::Table { .. } | FromSource::File { .. } => false,
-    };
+    let source = source_contains_parameter(&from.source);
     source
         || from.joins.iter().any(|join| {
-            let s = match &join.source {
-                FromSource::Derived(query) => select_contains_parameter(query),
-                FromSource::Table { .. } | FromSource::File { .. } => false,
-            };
-            s || join.on.as_ref().is_some_and(expr_contains_parameter)
+            source_contains_parameter(&join.source)
+                || join.on.as_ref().is_some_and(expr_contains_parameter)
         })
+}
+
+fn source_contains_parameter(source: &FromSource) -> bool {
+    match source {
+        FromSource::Derived(query) => select_contains_parameter(query),
+        FromSource::Function { args, .. } => args.iter().any(|a| expr_contains_parameter(&a.expr)),
+        FromSource::Table { .. } | FromSource::Path(_) => false,
+    }
 }
 
 // ---------- placeholder collection / renumbering ----------
@@ -405,8 +421,14 @@ fn collect_select_offsets(sel: &Select, out: &mut Vec<usize>) {
 }
 
 fn collect_source_offsets(source: &FromSource, out: &mut Vec<usize>) {
-    if let FromSource::Derived(query) = source {
-        collect_select_offsets(query, out);
+    match source {
+        FromSource::Derived(query) => collect_select_offsets(query, out),
+        FromSource::Function { args, .. } => {
+            for a in args {
+                collect_expr_offsets(&a.expr, out);
+            }
+        }
+        FromSource::Table { .. } | FromSource::Path(_) => {}
     }
 }
 
@@ -544,8 +566,14 @@ fn apply_select_ranks(sel: &mut Select, offsets: &[usize]) {
 }
 
 fn apply_source_ranks(source: &mut FromSource, offsets: &[usize]) {
-    if let FromSource::Derived(query) = source {
-        apply_select_ranks(query, offsets);
+    match source {
+        FromSource::Derived(query) => apply_select_ranks(query, offsets),
+        FromSource::Function { args, .. } => {
+            for a in args.iter_mut() {
+                apply_expr_ranks(&mut a.expr, offsets);
+            }
+        }
+        FromSource::Table { .. } | FromSource::Path(_) => {}
     }
 }
 
@@ -1488,9 +1516,7 @@ peg::parser! {
                   let (alias, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
-                  } else if at.is_some()
-                      && matches!(&source, FromSource::Derived(_) | FromSource::File { .. })
-                  {
+                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(FromClause { source, alias, at, joins })
@@ -1499,26 +1525,36 @@ peg::parser! {
 
         rule from_source() -> FromSource
             = lparen() q:select() rparen() { FromSource::Derived(Box::new(q)) }
-            / p:string_lit() { FromSource::File { path: p, function: None } }
-            / n:read_function() lparen() p:string_lit() rparen() {
-                  FromSource::File { path: p, function: Some(n) }
+            / name:ident() lparen() args:table_function_args() rparen() {
+                  FromSource::Function { name, args }
               }
+            / s:string_lit() { FromSource::Path(s) }
             / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
 
-        /// The `read_*('path')` table-function source (wave 71): the word
-        /// must start with `read_` and be followed by `('literal')`, so a
-        /// plain table reference (which `table_ref()` below still parses)
-        /// can never be captured by this alternative. The name is kept
-        /// lowercased; whether any format answers to it is a bind-time
-        /// question (an unregistered name is a clean bind error).
-        rule read_function() -> String
-            = s:ident_raw() ws() {?
-                  if s.len() > 5 && s[..5].eq_ignore_ascii_case("read_") {
-                      Ok(s.to_ascii_lowercase())
-                  } else {
-                      Err("a read_* table-function name")
-                  }
+        /// The argument list of a table-function FROM source: literals only
+        /// (the binder evaluates them), optionally named with `:=` or `=>`.
+        /// An empty argument list is legal and the source's to refuse.
+        rule table_function_args() -> Vec<crate::sql::ast::TableFunctionCallArg>
+            = first:table_function_arg() rest:(comma() a:table_function_arg() { a })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
               }
+            / { Vec::new() }
+
+        /// `expr` or `name := expr` / `name => expr`.
+        rule table_function_arg() -> crate::sql::ast::TableFunctionCallArg
+            = name:ident() named_arg_arrow() e:expr() {
+                  crate::sql::ast::TableFunctionCallArg { name: Some(name), expr: e }
+              }
+            / e:expr() {
+                  crate::sql::ast::TableFunctionCallArg { name: None, expr: e }
+              }
+
+        /// `:=` (DuckDB's named-argument form) or `=>` (accepted too).
+        rule named_arg_arrow()
+            = ":" ws() "=" ws()
+            / "=" ws() ">" ws()
 
         /// A from/join source's `[alias] [AT (...)]` suffix, in either legal
         /// order of appearance: `t AT (...)` (no alias) or `t [AS] alias
@@ -1571,7 +1607,7 @@ peg::parser! {
                   let (alias, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
-                  } else if matches!(&source, FromSource::Derived(_)) && at.is_some() {
+                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind: JoinKind::Cross, source, alias, at, on: None })
@@ -1581,7 +1617,7 @@ peg::parser! {
                   let (alias, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
-                  } else if matches!(&source, FromSource::Derived(_)) && at.is_some() {
+                  } else if at.is_some() && !matches!(&source, FromSource::Table { .. }) {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(JoinClause { kind, source, alias, at, on: Some(on) })

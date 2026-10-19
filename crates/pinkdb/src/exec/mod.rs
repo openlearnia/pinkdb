@@ -23,7 +23,7 @@ use expr::{coerce_to, count_true, eval_expr, select_true};
 use rayon::prelude::*;
 use window::eval_window;
 
-use crate::attached::AttachedTable;
+use crate::attached::{AttachedTable, PruneOp};
 use crate::plan::{
     AlterTablePlan, LogicalPlan, agg_output_schema, compare_values, win_output_schema,
 };
@@ -1212,43 +1212,6 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
     })
 }
 
-/// Evaluate one `FileScan` plan node (wave 71): read the registered file
-/// format's whole file, then scan it like any other table.
-///
-/// The plan carries the schema the binder read at planning time; the fresh
-/// read is validated against it, so a file replaced (or truncated) between
-/// planning and execution fails loudly instead of returning shifted columns.
-/// Every column is read (no projection pushdown into files yet).
-fn file_scan_output(
-    cx: &Cx,
-    format: &str,
-    path: &str,
-    schema: &[(String, DataType)],
-) -> Result<Output> {
-    let fmt = cx.db.file_format(format).ok_or_else(|| {
-        PinkDbError::Catalog(format!(
-            "no file format \"{format}\" is registered (registered formats: {})",
-            cx.db.file_format_names()
-        ))
-    })?;
-    let t = fmt.read(std::path::Path::new(path))?;
-    let actual = t.schema();
-    if actual != schema {
-        return Err(PinkDbError::Execution(format!(
-            "the file \"{path}\" changed between planning and execution \
-             (planned {} column(s), found {})",
-            schema.len(),
-            actual.len()
-        )));
-    }
-    let (names, types) = actual.into_iter().unzip();
-    Ok(Output {
-        chunks: scan_chunks(&t),
-        names,
-        types,
-    })
-}
-
 /// Every stored chunk of `t`, in order (columns shared by `Arc`, never
 /// copied).
 fn scan_chunks(t: &DataTable) -> Vec<DataChunk> {
@@ -1310,8 +1273,58 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
     })
 }
 
-/// Gather output for an index scan: produce chunks containing only the rows
-/// whose global indices are in `row_indices`, with the table's full column set.
+/// Evaluate one `TableFunction` plan node (wave 70): resolve the source by
+/// registry name, hand it the bound call, the projection bound and the
+/// pushable predicates, and validate the chunks it returns against the
+/// schema bind produced.
+fn table_function_output(
+    cx: &Cx,
+    plan: &LogicalPlan,
+    source: &str,
+    call: &crate::table_source::TableFunctionCall,
+    schema: &[(String, DataType)],
+) -> Result<Output> {
+    let Some(src) = cx.db.table_source(source) else {
+        return Err(PinkDbError::Execution(format!(
+            "the table source \"{source}\" is not registered in this session (it was \
+             unregistered after the statement was bound); re-register it and run the \
+             statement again"
+        )));
+    };
+    let projection = cx.projections.for_scan(plan);
+    let prunes = cx.prunes.for_scan(plan);
+    let scan = src.scan(call, projection, prunes)?;
+    let mut chunks = Vec::with_capacity(scan.chunks.len());
+    for chunk in scan.chunks {
+        if chunk.columns.len() != schema.len() {
+            return Err(PinkDbError::Execution(format!(
+                "table source \"{source}\" returned a chunk with {} columns but its \
+                 bound schema has {}",
+                chunk.columns.len(),
+                schema.len()
+            )));
+        }
+        for (i, col) in chunk.columns.iter().enumerate() {
+            if !col.is_empty() && col.dtype() != schema[i].1 {
+                return Err(PinkDbError::Execution(format!(
+                    "table source \"{source}\" returned column {i} as {} but its bound \
+                     schema says {}",
+                    col.dtype().name(),
+                    schema[i].1.name()
+                )));
+            }
+        }
+        chunks.push(chunk);
+    }
+    let (names, types) = schema.iter().cloned().unzip();
+    Ok(Output {
+        chunks,
+        names,
+        types,
+    })
+}
+
+/// Gather output for an index scan: produce chunks containing only the rows/// whose global indices are in `row_indices`, with the table's full column set.
 fn index_scan_output(
     cx: &Cx,
     db_name: &str,
@@ -1603,11 +1616,11 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { .. } => scan_output(cx, plan),
-        LogicalPlan::FileScan {
-            format,
-            path,
+        LogicalPlan::TableFunction {
+            source,
+            call,
             schema,
-        } => file_scan_output(cx, format, path, schema),
+        } => table_function_output(cx, plan, source, call, schema),
         LogicalPlan::CopyTo { .. } => Err(PinkDbError::Execution(
             "COPY does not produce rows".to_string(),
         )),
@@ -1771,7 +1784,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         }
         LogicalPlan::Explain { plan } => {
             let mut chunk = Vector::with_capacity(DataType::Varchar, 0);
-            for line in explain_lines(plan) {
+            for line in explain_lines(plan, Some(&cx.prunes)) {
                 chunk.push_valid(Value::Varchar(line))?;
             }
             let chunks = if chunk.is_empty() {
@@ -4328,19 +4341,35 @@ impl JoinedChunks {
 
 /// One line per plan node, root first, indented by depth; the format is
 /// pinkdb's own (stable and printable, not DuckDB-compatible).
-fn explain_lines(plan: &LogicalPlan) -> Vec<String> {
+/// The SQL spelling of a [`PruneOp`] for `EXPLAIN`'s pushed-filter line.
+fn prune_op_symbol(op: PruneOp) -> &'static str {
+    match op {
+        PruneOp::Eq => "=",
+        PruneOp::NotEq => "<>",
+        PruneOp::Lt => "<",
+        PruneOp::LtEq => "<=",
+        PruneOp::Gt => ">",
+        PruneOp::GtEq => ">=",
+        PruneOp::IsNull => "IS NULL",
+        PruneOp::IsNotNull => "IS NOT NULL",
+    }
+}
+
+fn explain_lines(plan: &LogicalPlan, prunes: Option<&crate::plan::ScanFilters>) -> Vec<String> {
     let mut out = Vec::new();
-    explain_into(plan, 0, &mut out);
+    explain_into(plan, 0, prunes, &mut out);
     out
 }
 
-fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
+fn explain_into(
+    plan: &LogicalPlan,
+    depth: usize,
+    prunes: Option<&crate::plan::ScanFilters>,
+    out: &mut Vec<String>,
+) {
     let pad = "  ".repeat(depth);
     let mut children: Vec<&LogicalPlan> = Vec::new();
     let head = match plan {
-        LogicalPlan::FileScan { format, path, .. } => {
-            format!("FileScan {format} '{path}'")
-        }
         LogicalPlan::CopyTo {
             db,
             table,
@@ -4459,6 +4488,57 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         LogicalPlan::IndexScan {
             db, table, index, ..
         } => format!("IndexScan {} using {}", qualify(db, table), index),
+        LogicalPlan::TableFunction {
+            source,
+            call,
+            schema,
+        } => {
+            let mut line = format!("TableFunction {source}: ");
+            match call {
+                crate::table_source::TableFunctionCall::Function { name, args } => {
+                    line.push_str(name);
+                    line.push('(');
+                    line.push_str(
+                        &args
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                    line.push(')');
+                }
+                crate::table_source::TableFunctionCall::Path(path) => {
+                    line.push('\'');
+                    line.push_str(path);
+                    line.push('\'');
+                }
+            }
+            line.push_str(&format!(" ({} columns)", schema.len()));
+            // DuckDB's `Filters:` line: the conjuncts the planner pushed into
+            // this scan (they prune row groups and files; the engine still
+            // re-applies them above the scan).
+            if let Some(filters) = prunes.map(|f| f.for_scan(plan)).filter(|f| !f.is_empty()) {
+                let rendered: Vec<String> = filters
+                    .iter()
+                    .map(|filter| {
+                        let name = schema
+                            .get(filter.column)
+                            .map(|(name, _)| name.clone())
+                            .unwrap_or_else(|| format!("#{}", filter.column));
+                        match (&filter.op, &filter.value) {
+                            (PruneOp::IsNull, _) => format!("{name} IS NULL"),
+                            (PruneOp::IsNotNull, _) => format!("{name} IS NOT NULL"),
+                            (op, Some(value)) => {
+                                format!("{name} {} {value}", prune_op_symbol(*op))
+                            }
+                            (op, None) => format!("{name} {op:?}"),
+                        }
+                    })
+                    .collect();
+                line.push_str(&format!("; filters=[{}]", rendered.join(", ")));
+            }
+            line
+        }
         LogicalPlan::DropView { db, name } => format!("DropView {}", qualify(db, name)),
         LogicalPlan::CreateDatabase { name, .. } => format!("CreateDatabase {name}"),
         LogicalPlan::DropDatabase { name, .. } => format!("DropDatabase {name}"),
@@ -4508,8 +4588,8 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
         }
         LogicalPlan::Cte { name, query, body } => {
             out.push(format!("{pad}Cte {name}"));
-            explain_into(query, depth + 1, out);
-            explain_into(body, depth + 1, out);
+            explain_into(query, depth + 1, prunes, out);
+            explain_into(body, depth + 1, prunes, out);
             return;
         }
         LogicalPlan::Join {
@@ -4600,7 +4680,7 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
     };
     out.push(format!("{pad}{head}"));
     for c in children {
-        explain_into(c, depth + 1, out);
+        explain_into(c, depth + 1, prunes, out);
     }
 }
 
@@ -4749,7 +4829,7 @@ impl<'p> Stream<'p> {
     /// predicate evaluated until the first pull.
     fn build(cx: &Cx, plan: &'p LogicalPlan) -> Result<Option<Stream<'p>>> {
         let (kind, names, types) = match plan {
-            LogicalPlan::Scan { .. } => {
+            LogicalPlan::Scan { .. } | LogicalPlan::TableFunction { .. } => {
                 let (names, types) = plan_schema_of(cx, plan)?;
                 (StreamKind::Scan { plan, chunks: None }, names, types)
             }
@@ -4843,7 +4923,9 @@ impl<'p> Stream<'p> {
             match kind {
                 StreamKind::Scan { plan, chunks } => {
                     if chunks.is_none() {
-                        *chunks = Some(scan_output(cx, plan)?.chunks.into_iter());
+                        // `eval` dispatches a plain scan to `scan_output` and
+                        // a table-function scan to `table_function_output`.
+                        *chunks = Some(eval(cx, plan)?.chunks.into_iter());
                     }
                     return Ok(chunks.as_mut().and_then(|it| it.next()));
                 }

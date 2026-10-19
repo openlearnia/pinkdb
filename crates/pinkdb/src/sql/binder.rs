@@ -13,7 +13,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
 use std::rc::Rc;
 
 use super::ast::*;
@@ -22,6 +21,7 @@ use crate::plan::{AlterTablePlan, LogicalPlan};
 use crate::storage::{
     DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
 };
+use crate::table_source::{TableFunctionArg, TableFunctionCall};
 use crate::types::{
     DECIMAL_MAX_PRECISION, DataType, ExtractField, PinkDbError, Result, Value, extract_field,
 };
@@ -5026,7 +5026,6 @@ pub(crate) fn plan_schema(
         LogicalPlan::SingleRow => Ok(Vec::new()),
         // A file source's schema is the schema the binder read from the
         // file at bind time — carried in the plan, so no second read.
-        LogicalPlan::FileScan { schema, .. } => Ok(schema.clone()),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
@@ -5081,6 +5080,7 @@ pub(crate) fn plan_schema(
         // DESCRIBE/EXPLAIN produce fixed shapes (their schema is built by the
         // executor); they never appear as a query scope.
         LogicalPlan::Describe { .. } | LogicalPlan::Explain { .. } => Ok(Vec::new()),
+        LogicalPlan::TableFunction { schema, .. } => Ok(schema.clone()),
         LogicalPlan::Project { exprs, names, .. } => Ok(names
             .iter()
             .cloned()
@@ -5118,17 +5118,112 @@ pub(crate) fn plan_schema(
     }
 }
 
-/// The default scope name of a file source without an alias: the file
-/// stem (`sales` for `data/sales.arrow`, like `.import`'s default table
-/// name), or the path itself when it has no stem — the scope name is only
-/// ever used for qualified column references, so a path-shaped fallback is
-/// harmless (it simply cannot be written as an identifier).
-fn file_source_name(path: &str) -> &str {
-    Path::new(path)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(path)
+/// Evaluate a table-function call's parsed arguments to literals.
+///
+/// Only literals bind: the call is resolved against the filesystem at bind
+/// time (the schema comes from the files), so an argument that is not a
+/// constant (`?`, a column, an expression) has no defined bind-time value.
+/// A single unary minus over a numeric literal folds (`-3`), which is the one
+/// expression shape worth special-casing.
+fn bind_table_function_args(
+    args: &[crate::sql::ast::TableFunctionCallArg],
+) -> Result<Vec<TableFunctionArg>> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        let value = literal_arg_value(&arg.expr).ok_or_else(|| {
+            PinkDbError::Type(
+                "a table-function argument must be a literal (got an expression); \
+                 write the value directly, e.g. read_parquet('file.parquet', \
+                 union_by_name := TRUE)"
+                    .to_string(),
+            )
+        })?;
+        out.push(TableFunctionArg {
+            name: arg.name.clone(),
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/// The literal value of a table-function argument expression, if it is one.
+fn literal_arg_value(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Literal(v) => Some(v.clone()),
+        Expr::Unary {
+            op: crate::sql::ast::UnaryOp::Negate,
+            expr,
+        } => match literal_arg_value(expr)? {
+            Value::Integer(n) => Some(Value::Integer(-n)),
+            Value::Bigint(n) => Some(Value::Bigint(-n)),
+            Value::Double(d) => Some(Value::Double(-d)),
+            Value::Decimal(v, s) => Some(Value::Decimal(-v, s)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Bind a table-function FROM source against the registered table sources.
+fn bind_table_function(
+    db: &PinkDb,
+    name: &str,
+    args: &[TableFunctionArg],
+    alias: &Option<String>,
+) -> Result<(ScopeTable, LogicalPlan)> {
+    let call = TableFunctionCall::Function {
+        name: name.to_string(),
+        args: args.to_vec(),
+    };
+    for source in db.table_sources() {
+        if let Some(schema) = source.bind(&call)? {
+            let eff = alias.clone().unwrap_or_else(|| name.to_string());
+            return Ok((
+                ScopeTable {
+                    name: eff.to_ascii_lowercase(),
+                    columns: schema.clone(),
+                },
+                LogicalPlan::TableFunction {
+                    source: source.name().to_ascii_lowercase(),
+                    call,
+                    schema,
+                },
+            ));
+        }
+    }
+    Err(PinkDbError::Catalog(format!(
+        "unknown table function \"{name}\": {}",
+        no_file_source_hint(db)
+    )))
+}
+
+/// The hint appended to "unknown table function" / "cannot read by path"
+/// errors: whether any source is registered at all changes what the user
+/// should do about it.
+fn no_file_source_hint(db: &PinkDb) -> String {
+    if db.table_sources().is_empty() {
+        "no table source is registered in this session (a build with the matching \
+         first-party extension — e.g. `arrow` or `parquet` — registers it, or \
+         register one with PinkDb::register_table_source)"
+            .to_string()
+    } else {
+        "the registered table sources do not serve it".to_string()
+    }
+}
+
+/// The scope name of a replacement scan: the file name's stem
+/// (`FROM 'dir/u.parquet'` binds as `u`, DuckDB's rule), lowercased. A path
+/// whose last component has no usable stem (a glob like `data/*.parquet`)
+/// keeps the raw stem text; qualified references to it are unusual, and
+/// unqualified column references are unaffected.
+fn replacement_scan_name(path: &str) -> String {
+    let last = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = last.split('.').next().unwrap_or(last);
+    if stem.is_empty() {
+        last.to_string()
+    } else {
+        stem.to_string()
+    }
 }
 
 /// Bind one FROM/JOIN source: returns its scope entry + executable plan.
@@ -5249,43 +5344,48 @@ fn bind_source(
                 },
             ))
         }
-        FromSource::File { path, function } => {
+        FromSource::Function { name, args } => {
             if let Some(at) = at {
-                return Err(PinkDbError::Catalog(format!(
-                    "time travel is not available on the file source \"{path}\" \
-                     (AT ({at}) works on lake tables)"
-                )));
+                // The parser refuses `AT` after a function source; a
+                // hand-built AST gets the same clean error.
+                let _ = at;
+                return Err(PinkDbError::Parse(
+                    "AT is only valid after a table name".to_string(),
+                ));
             }
-            // The format comes from the registered file formats: by the
-            // `read_*` function's registered name, or by the path's
-            // extension. The file's schema is read from its metadata only.
-            let format = match function {
-                Some(f) => db.file_format_for_function(f).ok_or_else(|| {
-                    PinkDbError::Catalog(format!(
-                        "unknown table function \"{f}\": no registered file format \
-                         answers to it (registered formats: {})",
-                        db.file_format_names()
-                    ))
-                })?,
-                None => db.file_format_for_path(path)?,
-            };
-            let schema = format.schema(Path::new(path)).map_err(|e| {
-                PinkDbError::Catalog(format!("cannot read {path} as {}: {e}", format.name()))
-            })?;
-            let eff = alias
-                .clone()
-                .unwrap_or_else(|| file_source_name(path).to_string());
-            Ok((
-                ScopeTable {
-                    name: eff.to_ascii_lowercase(),
-                    columns: schema.clone(),
-                },
-                LogicalPlan::FileScan {
-                    format: format.name().to_string(),
-                    path: path.clone(),
-                    schema,
-                },
-            ))
+            let args = bind_table_function_args(args)?;
+            bind_table_function(db, name, &args, alias)
+        }
+        FromSource::Path(path) => {
+            if let Some(at) = at {
+                let _ = at;
+                return Err(PinkDbError::Parse(
+                    "AT is only valid after a table name".to_string(),
+                ));
+            }
+            // DuckDB's replacement scan: the first registered source that
+            // claims the path owns it.
+            let call = TableFunctionCall::Path(path.clone());
+            for source in db.table_sources() {
+                if let Some(schema) = source.bind(&call)? {
+                    let eff = alias.clone().unwrap_or_else(|| replacement_scan_name(path));
+                    return Ok((
+                        ScopeTable {
+                            name: eff.to_ascii_lowercase(),
+                            columns: schema.clone(),
+                        },
+                        LogicalPlan::TableFunction {
+                            source: source.name().to_ascii_lowercase(),
+                            call,
+                            schema,
+                        },
+                    ));
+                }
+            }
+            Err(PinkDbError::Catalog(format!(
+                "cannot read \"{path}\" by path: {}",
+                no_file_source_hint(db)
+            )))
         }
         FromSource::Derived(q) => {
             if let Some(at) = at {

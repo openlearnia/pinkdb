@@ -1,0 +1,34 @@
+[package]
+name = "pinkdb-parquet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb core extension: read-side Parquet (read_parquet / parquet_scan / FROM 'file.parquet')"
+license = "MIT"
+
+[dependencies]
+# The engine, for the `TableSource` surface, `Value`/`DataType`/`Vector` and
+# `PrunePredicate`. The dependency direction matches pink-lake's: the reader
+# depends on the engine, never the other way around.
+pinkdb = { path = "../../crates/pinkdb" }
+# The Apache Arrow `parquet` crate (arrow-rs), pinned to the 59.x family the
+# workspace's Cargo.lock already carries (vortex-* pull arrow-* 59.3.0), so a
+# build that also enables a lake consumes one arrow generation. Only the
+# low-level reader/writer half is used: the `arrow` feature stays **off** (no
+# arrow-array dependency, no duplicate compile units).
+parquet = { version = "59.3", default-features = false }
+
+[features]
+# Default codecs: snappy (DuckDB's parquet default) and gzip via flate2's pure
+# Rust backend (miniz_oxide). Both are wasm-clean.
+default = ["snap", "gzip"]
+snap = ["parquet/snap"]
+gzip = ["parquet/flate2", "parquet/flate2-rust_backend"]
+# Opt-in codecs. `zstd` compiles the C zstd library through `zstd-sys`, so it
+# needs a C toolchain that can target the build's target (it built for
+# wasm32-unknown-unknown here with the system clang, but that is not
+# guaranteed everywhere — which is why it stays out of the default set).
+# `brotli` and `lz4` are pure Rust.
+zstd = ["parquet/zstd"]
+brotli = ["parquet/brotli"]
+lz4 = ["parquet/lz4"]

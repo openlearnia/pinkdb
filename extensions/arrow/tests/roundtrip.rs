@@ -18,11 +18,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pinkdb::filefmt::FileFormat;
+use pinkdb::FileFormat as _;
 use pinkdb::types::Interval;
 use pinkdb::vector::{CHUNK_SIZE, Vector, VectorData};
 use pinkdb::{DataTable, DataType, Value};
-use pinkdb_arrow::{ArrowFormat, EXTENSION_NAME};
+use pinkdb_arrow::{ArrowSink, ArrowSource, EXTENSION_NAME, READ_FUNCTIONS};
 
 /// A unique scratch path per test (tests run in parallel).
 fn scratch(name: &str) -> PathBuf {
@@ -211,13 +211,12 @@ fn assert_tables_equal(got: &DataTable, want: &DataTable) {
 fn roundtrip_all_supported_types_nulls_and_chunks() {
     let table = all_types_table("t");
     let path = scratch("all-types.arrow");
-    let format = ArrowFormat::new();
-    format.write(&path, &table).expect("write");
+    ArrowSink::new().write(&path, &table).expect("write");
 
     // The schema-only read agrees with the full read.
-    assert_eq!(format.schema(&path).unwrap(), table.schema());
+    assert_eq!(pinkdb_arrow::read::schema(&path).unwrap(), table.schema());
 
-    let back = format.read(&path).expect("read");
+    let back = pinkdb_arrow::read::read(&path).expect("read");
     assert_tables_equal(&back, &table);
     // 5 rows land in one engine chunk on read (< CHUNK_SIZE).
     assert_eq!(back.num_chunks(), 1);
@@ -236,12 +235,11 @@ fn empty_table_roundtrips() {
     .unwrap();
     assert_eq!(table.num_rows, 0);
     let path = scratch("empty.arrow");
-    let format = ArrowFormat::new();
-    format.write(&path, &table).expect("write");
-    let back = format.read(&path).expect("read");
+    ArrowSink::new().write(&path, &table).expect("write");
+    let back = pinkdb_arrow::read::read(&path).expect("read");
     assert_eq!(back.schema(), table.schema());
     assert_eq!(back.num_rows, 0);
-    assert_eq!(format.schema(&path).unwrap(), table.schema());
+    assert_eq!(pinkdb_arrow::read::schema(&path).unwrap(), table.schema());
     std::fs::remove_file(&path).ok();
 }
 
@@ -270,10 +268,10 @@ fn writer_emits_one_batch_per_engine_chunk() {
         .unwrap();
 
     let path = scratch("batches.arrow");
-    ArrowFormat::new().write(&path, &table).unwrap();
+    ArrowSink::new().write(&path, &table).unwrap();
     let reader = FileReader::try_new_buffered(std::fs::File::open(&path).unwrap(), None).unwrap();
     assert_eq!(reader.num_batches(), 3);
-    let back = ArrowFormat::new().read(&path).unwrap();
+    let back = pinkdb_arrow::read::read(&path).unwrap();
     assert_eq!(back.num_rows, rows);
     assert_eq!(back.num_chunks(), 3);
     assert_tables_equal(&back, &table);
@@ -284,9 +282,8 @@ fn writer_emits_one_batch_per_engine_chunk() {
 fn nulls_in_every_column_survive() {
     let table = all_types_table("n");
     let path = scratch("nulls.arrow");
-    let format = ArrowFormat::new();
-    format.write(&path, &table).unwrap();
-    let back = format.read(&path).unwrap();
+    ArrowSink::new().write(&path, &table).unwrap();
+    let back = pinkdb_arrow::read::read(&path).unwrap();
     // Row 1 is all-NULL in every column.
     for col in 0..back.num_cols() {
         assert_eq!(back.get(1, col), Some(Value::Null), "column {col}");
@@ -296,14 +293,13 @@ fn nulls_in_every_column_survive() {
 
 #[test]
 fn missing_file_and_non_arrow_files_are_clean_errors() {
-    let format = ArrowFormat::new();
     let missing = scratch("missing.arrow");
-    let err = format.read(&missing).unwrap_err().to_string();
+    let err = pinkdb_arrow::read::read(&missing).unwrap_err().to_string();
     assert!(err.contains("cannot open"), "{err}");
 
     let text = scratch("not-arrow.arrow");
     std::fs::write(&text, b"hello, this is not arrow").unwrap();
-    let err = format.schema(&text).unwrap_err().to_string();
+    let err = pinkdb_arrow::read::schema(&text).unwrap_err().to_string();
     assert!(err.contains("not an Arrow IPC file"), "{err}");
     std::fs::remove_file(&text).ok();
 }
@@ -311,8 +307,7 @@ fn missing_file_and_non_arrow_files_are_clean_errors() {
 #[test]
 fn reads_pyarrow_golden_types() {
     let path = fixtures("golden_types.arrow");
-    let format = ArrowFormat::new();
-    let schema = format.schema(&path).expect("schema");
+    let schema = pinkdb_arrow::read::schema(&path).expect("schema");
     // The widening legs are pinned by the engine schema itself.
     let dtypes: Vec<(&str, DataType)> = schema.iter().map(|(n, t)| (n.as_str(), *t)).collect();
     assert_eq!(
@@ -347,7 +342,7 @@ fn reads_pyarrow_golden_types() {
             ("iv", DataType::Interval),
         ]
     );
-    let t = format.read(&path).expect("read");
+    let t = pinkdb_arrow::read::read(&path).expect("read");
     assert_eq!(t.num_rows, 5);
     let col = |name: &str| t.columns[t.column_index(name).unwrap()].dtype;
     assert_eq!(col("i8"), DataType::Integer);
@@ -398,9 +393,7 @@ fn reads_pyarrow_golden_types() {
 
 #[test]
 fn reads_multi_batch_files_and_rechunks_at_chunk_size() {
-    let t = ArrowFormat::new()
-        .read(&fixtures("golden_bulk.arrow"))
-        .expect("read");
+    let t = pinkdb_arrow::read::read(&fixtures("golden_bulk.arrow")).expect("read");
     assert_eq!(t.num_rows, 2050);
     // Two source batches (1234 + 816) re-chunk into 2048 + 2.
     assert_eq!(t.num_chunks(), 2);
@@ -415,9 +408,7 @@ fn reads_multi_batch_files_and_rechunks_at_chunk_size() {
 #[test]
 fn reads_compressed_ipc_files() {
     for file in ["golden_lz4.arrow", "golden_zstd.arrow"] {
-        let t = ArrowFormat::new()
-            .read(&fixtures(file))
-            .unwrap_or_else(|e| panic!("{file}: {e}"));
+        let t = pinkdb_arrow::read::read(&fixtures(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
         assert_eq!(t.num_rows, 3, "{file}");
         assert_eq!(t.get(0, 0), Some(Value::Integer(1)), "{file}");
         // Same payload in both files — the compression wrapper is the only
@@ -434,8 +425,7 @@ fn reads_compressed_ipc_files() {
 
 #[test]
 fn stream_files_are_refused_with_the_format_difference() {
-    let err = ArrowFormat::new()
-        .read(&fixtures("golden_stream.arrows"))
+    let err = pinkdb_arrow::read::read(&fixtures("golden_stream.arrows"))
         .unwrap_err()
         .to_string();
     assert!(err.contains("Arrow IPC stream"), "{err}");
@@ -444,32 +434,33 @@ fn stream_files_are_refused_with_the_format_difference() {
 
 #[test]
 fn unsupported_columns_are_refused_at_schema_time() {
-    let err = ArrowFormat::new()
-        .schema(&fixtures("golden_unsupported.arrow"))
+    let err = pinkdb_arrow::read::schema(&fixtures("golden_unsupported.arrow"))
         .unwrap_err()
         .to_string();
     assert!(err.contains("blob"), "{err}");
     assert!(err.contains("Binary"), "{err}");
     // The refusal happens before any row is produced; the reader never
     // half-decodes a file.
-    let err = ArrowFormat::new()
-        .read(&fixtures("golden_unsupported.arrow"))
+    let err = pinkdb_arrow::read::read(&fixtures("golden_unsupported.arrow"))
         .unwrap_err()
         .to_string();
     assert!(err.contains("cannot be read exactly"), "{err}");
 }
 
 /// The registered name/extension/function surface the engine resolves
-/// through (kept here so the constants and the trait impl cannot drift).
+/// through (kept here so the constants and the trait impls cannot drift).
 #[test]
 fn format_identity_is_stable() {
-    let f = ArrowFormat::new();
-    assert_eq!(f.name(), EXTENSION_NAME);
-    assert_eq!(f.name(), "arrow");
-    assert!(f.extensions().contains(&"feather"));
-    assert!(f.read_functions().contains(&"read_arrow"));
-    // `Debug` is required by the engine registry.
-    let _ = format!("{:?}", Arc::new(f));
+    use pinkdb::{FileFormat, TableSource};
+    let read: Arc<dyn TableSource> = Arc::new(ArrowSource::new());
+    let write: Arc<dyn FileFormat> = Arc::new(ArrowSink::new());
+    assert_eq!(read.name(), EXTENSION_NAME);
+    assert_eq!(write.name(), EXTENSION_NAME);
+    assert_eq!(write.name(), "arrow");
+    assert!(write.extensions().contains(&"feather"));
+    assert!(READ_FUNCTIONS.contains(&"read_arrow"));
+    // `Debug` is required by both engine registries.
+    let _ = format!("{read:?} {write:?}");
 }
 
 /// A hand-built vector with an explicit validity mask: the writer must
@@ -485,9 +476,8 @@ fn explicit_validity_masks_survive_the_roundtrip() {
     .unwrap();
     t.append_chunk(vec![v]).unwrap();
     let path = scratch("mask.arrow");
-    let f = ArrowFormat::new();
-    f.write(&path, &t).unwrap();
-    let back = f.read(&path).unwrap();
+    ArrowSink::new().write(&path, &t).unwrap();
+    let back = pinkdb_arrow::read::read(&path).unwrap();
     // 0b1011: rows 0, 1 and 3 valid, row 2 NULL.
     assert_eq!(back.get(0, 0), Some(Value::Integer(7)));
     assert_eq!(back.get(1, 0), Some(Value::Integer(9)));
@@ -515,7 +505,7 @@ fn interval_overflow_is_a_clean_error() {
     )])
     .unwrap();
     let path = scratch("iv-overflow.arrow");
-    let err = ArrowFormat::new().write(&path, &t).unwrap_err().to_string();
+    let err = ArrowSink::new().write(&path, &t).unwrap_err().to_string();
     assert!(err.contains("nanosecond interval"), "{err}");
     // The failed write must not leave a half-written file behind as a valid
     // arrow file: the header bytes are already there, so the file is

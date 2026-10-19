@@ -71,11 +71,14 @@ fn register_builtin_extensions() {
     if let Err(e) = pinkdb_math::ensure_registered() {
         eprintln!("warning: the math extension could not be registered: {e}");
     }
-    // The arrow extension is engine-adjacent, not a scalar extension: it
-    // registers a *file format* process-wide, before any store is created,
-    // so a durable `.open` can resolve file sources while it replays.
+    // The arrow and parquet extensions are engine-adjacent, not scalar
+    // extensions: they register their file surfaces process-wide, before any
+    // store is created, so a durable `.open` can resolve file sources while
+    // it replays (a replay re-reads the file, DuckDB's rule).
     #[cfg(feature = "arrow")]
     pinkdb_arrow::ensure_registered();
+    #[cfg(feature = "parquet")]
+    pinkdb_parquet::ensure_registered();
 }
 
 /// Load the CLI's built-in extensions into a store it just created or
@@ -85,6 +88,11 @@ fn register_builtin_extensions() {
 /// prefixed with `LOAD EXTENSION '<name>'` — keeps it:
 /// [`PinkDb::is_extension_loaded`] is consulted first, because a second load
 /// is a documented error.
+///
+/// The built-in **file sources** are registered process-wide at startup
+/// (`register_builtin_extensions`), before any store exists, so every store
+/// this session opens — including a durable `.open` that replays a
+/// file-reading record — starts with them.
 fn load_builtin_extensions(#[allow(unused_variables)] db: &mut PinkDb) {
     #[cfg(feature = "json")]
     load_builtin_extension(db, pinkdb_json::EXTENSION_NAME);
@@ -106,6 +114,47 @@ fn load_builtin_extension(db: &mut PinkDb, name: &str) {
     }
 }
 
+/// The `.parquet` message when the binary was built without the feature.
+#[cfg(not(feature = "parquet"))]
+fn parquet_unavailable(cmd: &str) {
+    cli_error!("{cmd} is not available: this pinkdb binary was built without the parquet feature;");
+    eprintln!("       rebuild with `cargo build -p pinkdb-cli --features parquet`.");
+}
+
+/// `.parquet [reset]`: the parquet reader's pushdown counters — files read,
+/// row groups visited and pruned by statistics, columns decoded, rows
+/// returned. `reset` zeroes them.
+#[cfg(feature = "parquet")]
+fn cmd_parquet(db: &PinkDb, arg: &str) {
+    match arg {
+        "" | "stats" => {
+            let stats = db.table_source_stats();
+            if stats.is_empty() {
+                println!("(no table sources registered)");
+                return;
+            }
+            for s in stats {
+                println!("{}", s.name);
+                println!(
+                    "  scans: {}, rows: {}, files: {}, row groups: {} ({} pruned by statistics), columns decoded: {}",
+                    s.scans, s.rows, s.files, s.row_groups, s.row_groups_pruned, s.columns_decoded
+                );
+            }
+            println!(
+                "  read_parquet('…') / parquet_scan('…') / FROM 'file.parquet'; projections and \
+                 WHERE conjuncts are pushed into the scan"
+            );
+        }
+        "reset" => {
+            for source in db.table_sources() {
+                source.reset_stats();
+            }
+            println!("parquet counters reset");
+        }
+        _ => println!("Usage: .parquet [stats|reset]"),
+    }
+}
+
 fn print_help() {
     println!("Dot-commands:");
     println!("  .help                  show this help");
@@ -117,6 +166,9 @@ fn print_help() {
     println!("  .schema <table|view>   show a schema (accepts db.table; quoting honored)");
     println!("  .import <file.csv> [table]  import CSV (table defaults to file stem;");
     println!("                         db.table targets another database)");
+    if cfg!(feature = "parquet") {
+        println!("  .parquet [stats|reset] parquet reader counters (pushdown evidence)");
+    }
     println!("  .save <file.pink>      checkpoint the bound file; snapshot elsewhere");
     println!("  .open <file.pink>      open durable: loads the file, replays <file.pink.wal>");
     if cfg!(any(feature = "pinklake", feature = "vortexlake")) {
@@ -812,6 +864,12 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
         ".tables" => cmd_tables(db),
         ".schema" => cmd_schema(db, rest),
         ".import" => cmd_import(db, rest),
+        ".parquet" => {
+            #[cfg(feature = "parquet")]
+            cmd_parquet(db, rest);
+            #[cfg(not(feature = "parquet"))]
+            parquet_unavailable(".parquet");
+        }
         ".install" => {
             #[cfg(feature = "repo")]
             cmd_install(db, rest);

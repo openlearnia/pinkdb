@@ -91,7 +91,8 @@ SELECT * FROM read_nope('{dir}/inferred.arrow');
         "FORMAT wins for unknown names:\n{text}"
     );
     assert!(
-        f.contains("Error:cannotread") && f.contains("missing.arrow"),
+        (f.contains("Error:cannotread") || f.contains("Error:cannotopen"))
+            && f.contains("missing.arrow"),
         "{text}"
     );
     assert!(f.contains("unknowntablefunction\"read_nope\""), "{text}");
@@ -157,7 +158,8 @@ SELECT a FROM dst;
     common::assert_script_exit(status);
     assert!(text.contains("Error:"), "{text}");
     assert!(
-        flat(&text).contains("cannotread") && text.contains("src.arrow"),
+        (flat(&text).contains("cannotread") || flat(&text).contains("cannotopen"))
+            && text.contains("src.arrow"),
         "the recovery error must name the missing file:\n{text}"
     );
     std::fs::remove_dir_all(&dir).ok();

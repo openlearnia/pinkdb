@@ -772,10 +772,15 @@ impl DataChunk {
     /// placeholder (`len() == 0`) for a column a projection pushdown did not
     /// decode; `num_rows` is authoritative here. The projection-aware shapes
     /// only (`Filter`/`Sort`/`Limit` rebuilds and a projected scan — an
-    /// attached lake's decode or an in-memory table's `exec::project_scan_chunks`)
-    /// create these; operators that read columns use
-    /// [`DataChunk::expect_column`].
-    pub(crate) fn projected(columns: Vec<Arc<Vector>>, num_rows: usize) -> Self {
+    /// attached lake's decode, a host table source's scan, or an in-memory
+    /// table's `exec::project_scan_chunks`) create these; operators that read
+    /// columns use `expect_column`.
+    ///
+    /// Public because it is the scan contract a
+    /// [`TableSource`](crate::table_source::TableSource) returns: full-width
+    /// columns in the bound schema's order, with the columns its projection
+    /// did not decode as placeholders.
+    pub fn projected(columns: Vec<Arc<Vector>>, num_rows: usize) -> Self {
         debug_assert!(
             columns.iter().all(|c| c.len() == num_rows || c.is_empty()),
             "projected chunks hold present columns (num_rows long) and \

@@ -6,7 +6,14 @@ mutations never leak between cases. Results compare at value level:
 ints exact, floats within tolerance, NULLs, dates/timestamps normalized
 to microseconds. Column names are ignored (header formats differ).
 
-Batteries: small relational set (in-SQL setup) + 1M-row CSV set.
+Batteries: small relational set (in-SQL setup) + 1M-row CSV set + the two
+file-format batteries (Arrow IPC and Parquet), which need a pinkdb CLI built
+with both opt-in extensions:
+
+    cargo build --release -p pinkdb-cli --features arrow,parquet
+
+A binary without one of the features skips that battery with a note (and the
+build command above); the other batteries still run.
 
 Usage: python3 bench/duckdiff.py [--verbose]
 Exit code: 0 iff every query matches.
@@ -566,6 +573,18 @@ STRING_EXT_QUERIES = [
 ]
 
 
+def run_parquet():
+    print("== parquet battery ==")
+    if not parquet_enabled():
+        print(
+            "parquet reader not built into the pinkdb binary under test; skipping "
+            "(build with `cargo build --release -p pinkdb-cli --features arrow,parquet`)"
+        )
+        return
+    for label, sql, ordered, expect_error in PARQUET_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETUP)
+
+
 def run_small():
     print("== small battery ==")
     try:
@@ -588,6 +607,7 @@ def run_small():
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + STRING_EXT_SETUP)
     run_arrow()
+    run_parquet()
 
 
 # ---- wave 71: the core arrow extension (`extensions/arrow`) ----
@@ -703,26 +723,20 @@ ARROW_BULK_QUERIES = [
 
 def run_arrow():
     print("== arrow battery (wave 71) ==")
-    # The feature check mirrors `arrow_disabled.rs`: a lean CLI registers no
-    # file format at all (the `read_arrow` name is unknown and a bare
-    # `'x.arrow'` source has no format), so the battery fails loudly with the
-    # build command instead of skipping.
+    # The feature check mirrors `arrow_disabled.rs`: a CLI without the feature
+    # has no `read_arrow` source (the binder reports the registered table
+    # sources), so skip with the build command instead of failing every probe.
     got = pink_query("", "SELECT COUNT(*) FROM read_arrow('x.arrow');")
-    registered = got[0] == "error" and (
-        "as arrow" in got[1] or "cannot read" in got[1]
+    skipped = got[0] == "error" and (
+        "unknown table function" in got[1]
+        or "no table source is registered" in got[1]
+        or "do not serve" in got[1]
     )
-    if not registered:
-        # Not a skip: every arrow probe fails, loudly, with the fix — the
-        # other batteries still run and report their own results (CI's
-        # duckdiff job must build the CLI with `--features arrow`).
-        hint = (
-            "arrow probes need a pinkdb CLI built with the arrow feature: "
-            f"cargo build --release -p pinkdb-cli --features arrow "
-            f"(PINKDB_CLI={PINKDB[0]!r})"
+    if skipped:
+        print(
+            "arrow reader not built into the pinkdb binary under test; skipping "
+            "(build with `cargo build --release -p pinkdb-cli --features arrow,parquet`)"
         )
-        print(hint)
-        for label, _, _, _ in ARROW_BULK_QUERIES + ARROW_QUERIES:
-            check(label, False, hint)
         return
     os.makedirs(ARROW_DIR, exist_ok=True)
     round_file = os.path.join(ARROW_DIR, "av.arrow")
@@ -790,6 +804,73 @@ def run_case(label, sql, ordered, expect_error, setup):
             print(f"    rows={len(prows_n)}")
     else:
         check(label, False, f"\npink={prows_n}\nduck={drows}")
+
+
+# ---- wave 70: the core parquet extension (`pinkdb-parquet`) ----
+#
+# Both engines read the SAME committed fixtures under
+# `bench/parquet_fixtures/` (tiny DuckDB-written files; regenerate with the SQL
+# in `bench/parquet_fixtures/gen_parquet_fixtures.sql`). The pinkdb side needs
+# a CLI built with the `parquet` feature:
+#
+#   cargo build --release -p pinkdb-cli --features parquet
+#
+# When the binary under test has no parquet reader, the battery is skipped with
+# a note instead of failing (a deliberate opt-in feature, like the lake
+# batteries). Probes avoid the surfaces where the two engines legitimately
+# differ (pinkdb's TIMESTAMP-only temporal types, TINYINT/SMALLINT widening,
+# BLOB) and project the introspection columns α and pinkdb share.
+PARQUET_FIX = "bench/parquet_fixtures"
+PARQUET_QUERIES = [
+    # core read path: values, NULLs, DECIMAL, DATE, BOOLEAN, DOUBLE
+    ("pq-people-scan", f"SELECT id, name, score, hired, flag, dec FROM read_parquet('{PARQUET_FIX}/people.parquet') ORDER BY id;", True, False),
+    ("pq-people-projection", f"SELECT name FROM read_parquet('{PARQUET_FIX}/people.parquet') WHERE id >= 6 ORDER BY name;", True, False),
+    ("pq-people-agg", f"SELECT count(*), count(name), min(id), max(id), min(dec), max(dec), sum(id) FROM read_parquet('{PARQUET_FIX}/people.parquet');", True, False),
+    ("pq-null-filters", f"SELECT id FROM read_parquet('{PARQUET_FIX}/people.parquet') WHERE score IS NULL OR name IS NULL ORDER BY id;", True, False),
+    # multi-file reads: globs, union_by_name, extra/missing columns
+    ("pq-glob-count", f"SELECT count(*) FROM read_parquet('{PARQUET_FIX}/multi/*.parquet', union_by_name := TRUE);", True, False),
+    ("pq-union-missing", f"SELECT id, name, extra FROM read_parquet('{PARQUET_FIX}/multi/*.parquet', union_by_name := TRUE) ORDER BY id;", True, False),
+    ("pq-union-type-fallback", f"SELECT id, score FROM read_parquet('{PARQUET_FIX}/conflict/*.parquet', union_by_name := TRUE) ORDER BY id;", True, False),
+    ("pq-no-union-extra-col", f"SELECT id, name FROM read_parquet('{PARQUET_FIX}/multi/*.parquet') ORDER BY id;", True, False),
+    ("pq-no-union-mismatch", f"SELECT * FROM read_parquet('{PARQUET_FIX}/badglob/*.parquet');", False, True),
+    # hive partitions, filename, and the option that turns them off
+    ("pq-hive", f"SELECT id, region FROM read_parquet('{PARQUET_FIX}/hive/**/*.parquet') ORDER BY id;", True, False),
+    ("pq-hive-filename", f"SELECT filename, count(*) FROM read_parquet('{PARQUET_FIX}/hive/**/*.parquet', filename := TRUE) GROUP BY filename ORDER BY filename;", True, False),
+    ("pq-hive-off", f"SELECT count(*) FROM read_parquet('{PARQUET_FIX}/hive/**/*.parquet', hive_partitioning := FALSE);", True, False),
+    ("pq-hive-where", f"SELECT id FROM read_parquet('{PARQUET_FIX}/hive/**/*.parquet') WHERE region = 'us' ORDER BY id;", True, False),
+    # row-group statistics pruning: the same answers as a full scan
+    ("pq-rg-range", f"SELECT count(*) FROM read_parquet('{PARQUET_FIX}/rg_stats.parquet') WHERE id >= 7000;", True, False),
+    ("pq-rg-between", f"SELECT id FROM read_parquet('{PARQUET_FIX}/rg_stats.parquet') WHERE id >= 2047 AND id <= 2049 ORDER BY id;", True, False),
+    ("pq-rg-is-null", f"SELECT count(*) FROM read_parquet('{PARQUET_FIX}/rg_stats.parquet') WHERE id IS NULL;", True, False),
+    ("pq-rg-not-eq", f"SELECT count(*) FROM read_parquet('{PARQUET_FIX}/rg_stats.parquet') WHERE id <> 5;", True, False),
+    # replacement scans and the gzip codec
+    ("pq-replacement", f"SELECT count(*), sum(id) FROM '{PARQUET_FIX}/people.parquet';", True, False),
+    ("pq-gzip", f"SELECT count(*), sum(id), min(dec) FROM '{PARQUET_FIX}/gzip.parquet';", True, False),
+    # introspection (the columns both engines share, α's order)
+    ("pq-schema", f"SELECT name, type, repetition_type, converted_type, scale, precision, duckdb_type FROM parquet_schema('{PARQUET_FIX}/people.parquet') ORDER BY column_id;", True, False),
+    ("pq-metadata", f"SELECT row_group_id, path_in_schema, type, stats_min, stats_max, stats_null_count, compression, encodings FROM parquet_metadata('{PARQUET_FIX}/people.parquet') ORDER BY path_in_schema;", True, False),
+    ("pq-file-metadata", f"SELECT num_rows, num_row_groups, format_version, file_size_bytes, footer_size FROM parquet_file_metadata('{PARQUET_FIX}/people.parquet');", True, False),
+    ("pq-kv-metadata", f"SELECT key::VARCHAR, value::VARCHAR FROM parquet_kv_metadata('{PARQUET_FIX}/kv.parquet') ORDER BY 1;", True, False),
+    ("pq-kv-empty", f"SELECT count(*) FROM parquet_kv_metadata('{PARQUET_FIX}/people.parquet');", True, False),
+    # errors both engines must refuse
+    ("pq-missing-file", f"SELECT * FROM read_parquet('{PARQUET_FIX}/nope.parquet');", False, True),
+    ("pq-empty-glob", f"SELECT * FROM read_parquet('{PARQUET_FIX}/nope*.parquet');", False, True),
+    ("pq-unsupported-option", f"SELECT * FROM read_parquet('{PARQUET_FIX}/people.parquet', schema := 'x');", False, True),
+    ("pq-bad-arg", "SELECT * FROM read_parquet(1);", False, True),
+]
+
+
+def parquet_enabled():
+    """Probe once: does the pinkdb binary under test read parquet?"""
+    got = pink_query("", f"SELECT count(*) FROM read_parquet('{PARQUET_FIX}/people.parquet');")
+    if got[0] == "rows":
+        return True
+    # Distinguish "no parquet support" from a real failure: the binder's
+    # unknown-function error names the function and mentions parquet.
+    msg = got[1] if got[0] == "error" else ""
+    if "read_parquet" in msg or "parquet" in msg.lower():
+        return False
+    raise SystemExit(f"parquet pre-check failed unexpectedly: {got}")
 
 
 BIG_QUERIES = [

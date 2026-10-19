@@ -27,13 +27,25 @@ datetime = ["dep:pinkdb-datetime"]
 math = ["dep:pinkdb-math"]
 # Opt-in core arrow extension (wave 71): Arrow IPC (Feather v2) file
 # read/write over arrow-rs — `FROM 'f.arrow'`, `read_arrow('f.arrow')` and
-# `COPY t TO 'f.arrow' (FORMAT arrow)`. Registers the format process-wide at
-# startup (`pinkdb_arrow::ensure_registered`), so every store this build
-# creates or opens — including a durable reopen that replays a logged
-# `INSERT … SELECT … FROM 'f.arrow'` — resolves it and a lean build refuses
-# such a replay with a clear "no file format registered" error. Never a
-# default feature: it links the arrow-rs crates.
+# `COPY t TO 'f.arrow' (FORMAT arrow)`. Registers the table source and the
+# COPY sink process-wide at startup (`pinkdb_arrow::ensure_registered`), so
+# every store this build creates or opens — including a durable reopen that
+# replays a logged `INSERT … SELECT … FROM 'f.arrow'` (replay re-reads the
+# file, DuckDB's rule) — resolves them; a lean build fails such a replay with
+# a clear error at bind instead. Never a default feature: it links the
+# arrow-rs crates.
 arrow = ["dep:pinkdb-arrow"]
+# Opt-in parquet reader (wave 70): `read_parquet`/`parquet_scan`, the
+# `parquet_schema`/`parquet_metadata`/`parquet_file_metadata`/
+# `parquet_kv_metadata` introspection functions, and DuckDB's replacement
+# scan (`FROM 'file.parquet'`). Not a default feature: the arrow-rs
+# `parquet` crate and its codec dependencies are the largest dependency any
+# extension brings, and the default CLI stays lean.
+parquet = ["dep:pinkdb-parquet"]
+# Opt-in zstd parquet codec: forwards to pinkdb-parquet's `zstd` feature
+# (which compiles the C zstd library through `zstd-sys`, so a C toolchain for
+# the target is required).
+parquet-zstd = ["parquet", "pinkdb-parquet/zstd"]
 # Opt-in remote mode: `pinkdb --host HOST:PORT` talks to a pinkdb-server.
 client = ["dep:pinkdb-server"]
 # Opt-in TLS for remote mode: `--tls`, `--tls-ca-cert PATH` and
@@ -91,6 +103,10 @@ pinkdb-math = { path = "../../extensions/math", optional = true }
 # 59.x line the workspace lock already carries for vortex).
 pinkdb-arrow = { path = "../../extensions/arrow", optional = true }
 pinkdb-server = { path = "../pinkdb-server", optional = true }
+# Parquet reader (parquet feature): the engine-adjacent table source. Links
+# the arrow-rs `parquet` crate; opt-in only, so the default binary is
+# byte-for-byte unaffected.
+pinkdb-parquet = { path = "../../extensions/parquet", optional = true }
 # Repository client (repo feature): blocking HTTP over rustls (no gzip: the
 # repository serves raw artifacts), catalog JSON, and SHA-256 verification.
 ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }

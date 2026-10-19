@@ -15,14 +15,17 @@
 //!
 //! The scalar extension ABI (waves 29A/49) registers scalar functions only —
 //! it has no way to express a replacement scan, a table function, or a COPY
-//! format. The engine therefore grew a second, minimal extension surface in
-//! wave 71 ([`pinkdb::filefmt::FileFormat`]): the *engine* owns the trait and
-//! the per-store registry, an engine-adjacent first-party crate implements it
-//! (this one — depending on `pinkdb`, never the other way around, exactly
-//! like `pink-lake` implements `AttachedLake`), and the host registers the
-//! implementation when it creates the store. The CLI wires it behind the
-//! opt-in `arrow` cargo feature, so the default binary stays lean — the same
-//! model as the `vortexlake` lake build.
+//! format. The engine therefore exposes two host traits: the **table source**
+//! ([`pinkdb::table_source::TableSource`]) for every file *read* surface, and
+//! the **write sink** ([`pinkdb::FileFormat`]) for `COPY … (FORMAT <name>)`.
+//! This crate implements both (depending on `pinkdb`, never the other way
+//! around, exactly like `pink-lake` implements `AttachedLake`), and the host
+//! registers them when it creates the store — or process-wide via
+//! [`ensure_registered`], the bootstrap a durable store needs. The CLI wires
+//! it behind the opt-in `arrow` cargo feature, so the default binary stays
+//! lean — the same model as the `vortexlake` lake build. (Wave 70/71
+//! unification: both file-format crates now share this one read surface; see
+//! `extensions/parquet`.)
 //!
 //! Alternatives considered and rejected:
 //!
@@ -33,8 +36,7 @@
 //!   read-only catalog extension): it would have bent lake semantics around
 //!   plain files (session-scoped registration, lake-specific refusal rules in
 //!   durable stores, statistics descriptors, `.lake detach`) for no gain —
-//!   the file surfaces needed their own AST nodes and a COPY plan anyway, and
-//!   `FileFormat` is the smaller trait;
+//!   the file surfaces needed their own AST nodes and a COPY plan anyway;
 //! - **a `pinkdb`-internal arrow dependency**: would put arrow-rs in the core
 //!   engine's dependency tree and violate the "default CLI stays lean"
 //!   requirement.
@@ -69,9 +71,10 @@
 //!
 //! File access is not session-local state: a WAL-logged statement that reads
 //! a file (`INSERT INTO t SELECT * FROM 'f.arrow'`) replays by re-reading
-//! that file (DuckDB's behavior — see [`pinkdb::filefmt`]). `COPY … TO` has
-//! no store effect and is never WAL-logged; like DuckDB, a `COPY` inside a
-//! transaction is not rolled back (the file is external).
+//! that file (DuckDB's behavior — see [`pinkdb::table_source`]); a deleted
+//! file is a hard recovery error, a changed file replays its new content.
+//! `COPY … TO` has no store effect and is never WAL-logged; like DuckDB, a
+//! `COPY` inside a transaction is not rolled back (the file is external).
 
 pub mod read;
 pub mod types;
@@ -80,9 +83,9 @@ pub mod write;
 use std::path::Path;
 use std::sync::Arc;
 
-use pinkdb::filefmt::{FileFormat, FileSchema};
+use pinkdb::table_source::{TableFunctionCall, TableScanOutput, TableSource, TableSourceStats};
 use pinkdb::types::Result;
-use pinkdb::{DataTable, PinkDb};
+use pinkdb::{AttachedScan, DataTable, DataType, FileFormat, PinkDb, PrunePredicate};
 
 /// The registered format's name: `FORMAT arrow`.
 pub const EXTENSION_NAME: &str = "arrow";
@@ -93,21 +96,114 @@ pub const EXTENSION_NAME: &str = "arrow";
 /// "this is an IPC stream" message instead of "no file format registered".
 pub const EXTENSIONS: &[&str] = &["arrow", "ipc", "feather", "arrows"];
 
-/// The `read_*` table functions this format answers to.
+/// The `read_*` table functions this source answers to.
 pub const READ_FUNCTIONS: &[&str] = &["read_arrow", "read_ipc", "read_feather"];
 
-/// The Arrow IPC (Feather v2) file format, as the engine's
-/// [`FileFormat`] hook.
+/// The Arrow IPC (Feather v2) file **read** surface: a
+/// [`pinkdb::TableSource`].
+///
+/// Reads are full-file: a scan materializes the whole IPC file and returns it
+/// in engine chunks (IPC has no row-group statistics, so the projection and
+/// filter hints are ignored; every column decodes). The counters report one
+/// file and its column count.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct ArrowFormat;
+pub struct ArrowSource;
 
-impl ArrowFormat {
+impl ArrowSource {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl FileFormat for ArrowFormat {
+impl TableSource for ArrowSource {
+    fn name(&self) -> &str {
+        EXTENSION_NAME
+    }
+
+    fn bind(&self, call: &TableFunctionCall) -> Result<Option<Vec<(String, DataType)>>> {
+        let Some(path) = self.claim(call)? else {
+            return Ok(None);
+        };
+        Ok(Some(read::schema(Path::new(&path))?))
+    }
+
+    fn scan(
+        &self,
+        call: &TableFunctionCall,
+        _projection: Option<&[usize]>,
+        _filters: &[PrunePredicate],
+    ) -> Result<TableScanOutput> {
+        let path = self.claim(call)?.ok_or_else(|| {
+            pinkdb::PinkDbError::Execution(format!("the arrow source does not serve {call:?}"))
+        })?;
+        let table = read::read(Path::new(&path))?;
+        let columns = table.num_cols() as u64;
+        let chunks = AttachedScan::complete(Arc::new(table)).chunks();
+        Ok(TableScanOutput {
+            chunks,
+            files: 1,
+            // The IPC file format has no row groups.
+            row_groups: 0,
+            row_groups_pruned: 0,
+            columns_decoded: columns,
+        })
+    }
+
+    fn stats(&self) -> TableSourceStats {
+        TableSourceStats {
+            name: EXTENSION_NAME.to_string(),
+            ..TableSourceStats::default()
+        }
+    }
+}
+
+impl ArrowSource {
+    /// The path a call names when this source owns it, else `None`: a
+    /// `read_arrow`/`read_ipc`/`read_feather(path)` call whose single
+    /// argument is a string literal, or a bare path with one of
+    /// [`EXTENSIONS`].
+    fn claim(&self, call: &TableFunctionCall) -> Result<Option<String>> {
+        match call {
+            TableFunctionCall::Function { name, args } => {
+                if !READ_FUNCTIONS.iter().any(|f| f.eq_ignore_ascii_case(name)) {
+                    return Ok(None);
+                }
+                match args.as_slice() {
+                    [arg] => match &arg.value {
+                        pinkdb::Value::Varchar(path) => Ok(Some(path.clone())),
+                        other => Err(pinkdb::PinkDbError::Type(format!(
+                            "{name}: the path must be a string literal (got {other})"
+                        ))),
+                    },
+                    _ => Err(pinkdb::PinkDbError::Type(format!(
+                        "{name} takes exactly one path argument"
+                    ))),
+                }
+            }
+            TableFunctionCall::Path(path) => {
+                let ext = Path::new(path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase());
+                Ok(ext
+                    .filter(|e| EXTENSIONS.contains(&e.as_str()))
+                    .map(|_| path.clone()))
+            }
+        }
+    }
+}
+
+/// The Arrow IPC **write** sink: `COPY … (FORMAT arrow)`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArrowSink;
+
+impl ArrowSink {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl FileFormat for ArrowSink {
     fn name(&self) -> &str {
         EXTENSION_NAME
     }
@@ -116,79 +212,117 @@ impl FileFormat for ArrowFormat {
         EXTENSIONS
     }
 
-    fn read_functions(&self) -> &[&str] {
-        READ_FUNCTIONS
-    }
-
-    fn schema(&self, path: &Path) -> Result<FileSchema> {
-        read::schema(path)
-    }
-
-    fn read(&self, path: &Path) -> Result<DataTable> {
-        read::read(path)
-    }
-
     fn write(&self, path: &Path, table: &DataTable) -> Result<()> {
         write::write(path, table)
     }
 }
 
-/// Register the Arrow IPC format on one store (embedder path). Idempotent:
-/// registering again replaces the previous instance.
+/// Register the Arrow IPC read source and write sink on one store (embedder
+/// path). Idempotent: registering again replaces the previous instances.
 pub fn register(db: &mut PinkDb) {
-    db.register_file_format(Arc::new(ArrowFormat));
+    db.register_table_source(Arc::new(ArrowSource));
+    db.register_file_format(Arc::new(ArrowSink));
 }
 
-/// Register the Arrow IPC format **process-wide**, for every store created
-/// afterwards — the host-bootstrap step a durable store needs: recovery
-/// replays inside `open_durable`, before the caller holds the store, so a
-/// WAL record that reads a file (`INSERT … SELECT * FROM 'f.arrow'`) can only
-/// resolve if the format was registered *before* the store was constructed.
-/// The CLI (built with the `arrow` feature) calls this once at startup; an
-/// embedder that opens stores before calling it must use
-/// [`register`] per store instead. Idempotent.
+/// Register both halves **process-wide**, for every store created afterwards
+/// — the host-bootstrap step a durable store needs: recovery replays inside
+/// `open_durable`, before the caller holds the store, so a WAL record that
+/// reads a file (`INSERT … SELECT * FROM 'f.arrow'`) can only resolve if the
+/// source was registered *before* the store was constructed. The CLI (built
+/// with the `arrow` feature) calls this once at startup; an embedder that
+/// opens stores before calling it must use [`register`] per store instead.
+/// Idempotent.
 pub fn ensure_registered() {
-    pinkdb::filefmt::register_global_file_format(Arc::new(ArrowFormat));
+    pinkdb::table_source::register_global_table_source(Arc::new(ArrowSource));
+    pinkdb::filefmt::register_global_file_format(Arc::new(ArrowSink));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The read source claims the arrow/ipc/feather extensions and the three
+    /// `read_*` spellings, and nothing else.
     #[test]
-    fn registration_exposes_name_extension_and_reader() {
+    fn registration_exposes_the_read_and_write_surfaces() {
         let mut db = PinkDb::new();
+        assert!(db.table_source("arrow").is_none());
         assert!(db.file_format("arrow").is_none());
-        assert!(db.file_format_names().contains("none"));
         register(&mut db);
-        let f = db.file_format("ARROW").expect("case-insensitive lookup");
-        assert_eq!(f.name(), "arrow");
+        let source = db.table_source("ARROW").expect("case-insensitive lookup");
+        assert_eq!(source.name(), "arrow");
+        let sink = db.file_format("ARROW").expect("case-insensitive lookup");
+        assert_eq!(sink.name(), "arrow");
+        assert!(db.file_format_names().contains("arrow"));
+
+        // The replacement scan claims every registered extension.
+        for path in ["x.arrow", "x.IPC", "dir/x.feather", "x.arrows"] {
+            let claimed = source
+                .bind(&TableFunctionCall::Path(path.to_string()))
+                .map_err(|e| e.to_string());
+            assert!(
+                matches!(claimed, Err(ref e) if e.contains("cannot open")),
+                "{path}: {claimed:?}"
+            );
+        }
+        // …and not another format's.
         assert_eq!(
-            db.file_format_for_extension("feather").map(|f| f.name()),
-            Some("arrow")
-        );
-        assert_eq!(
-            db.file_format_for_function("read_arrow").map(|f| f.name()),
-            Some("arrow")
+            source
+                .bind(&TableFunctionCall::Path("x.parquet".to_string()))
+                .unwrap(),
+            None
         );
         // Re-registration replaces instead of duplicating.
         register(&mut db);
         assert_eq!(db.file_format_names(), "arrow");
     }
 
-    /// The engine's path resolution: known extension → format, unknown →
-    /// clean error naming the registered formats.
+    /// `read_*` name resolution, arity and argument-type refusals.
     #[test]
-    fn path_resolution_is_extension_driven() {
-        let mut db = PinkDb::new();
-        register(&mut db);
-        assert!(db.file_format_for_path("x.arrow").is_ok());
-        assert!(db.file_format_for_path("x.FEATHER").is_ok());
-        let err = db
-            .file_format_for_path("x.parquet")
+    fn read_functions_are_named_and_checked() {
+        let source = ArrowSource::new();
+        for name in READ_FUNCTIONS {
+            let err = source
+                .bind(&pinkdb::TableFunctionCall::Function {
+                    name: name.to_string(),
+                    args: vec![pinkdb::TableFunctionArg {
+                        name: None,
+                        value: pinkdb::Value::Varchar("x.arrow".to_string()),
+                    }],
+                })
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("cannot open"), "{name}: {err}");
+        }
+        // Not this source's name.
+        assert_eq!(
+            source
+                .bind(&pinkdb::TableFunctionCall::Function {
+                    name: "read_parquet".to_string(),
+                    args: vec![],
+                })
+                .unwrap(),
+            None
+        );
+        // Arity / argument type are this source's clean errors.
+        let err = source
+            .bind(&pinkdb::TableFunctionCall::Function {
+                name: "read_arrow".to_string(),
+                args: vec![],
+            })
             .unwrap_err()
             .to_string();
-        assert!(err.contains("no file format is registered"), "{err}");
-        assert!(err.contains("arrow"), "{err}");
+        assert!(err.contains("exactly one path"), "{err}");
+        let err = source
+            .bind(&pinkdb::TableFunctionCall::Function {
+                name: "read_arrow".to_string(),
+                args: vec![pinkdb::TableFunctionArg {
+                    name: None,
+                    value: pinkdb::Value::Integer(1),
+                }],
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("string literal"), "{err}");
     }
 }

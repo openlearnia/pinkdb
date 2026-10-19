@@ -272,21 +272,26 @@ pub enum LogicalPlan {
         table: String,
         at: Option<AtSpec>,
     },
-    /// Full read of a registered file format (wave 71): `FROM 'f.arrow'` /
-    /// `FROM read_arrow('f.arrow')`. `format` names the registered format,
-    /// `path` is the source path exactly as written, and `schema` is what the
-    /// binder read from the file's metadata — the executor re-reads the file
-    /// and validates the schema against it, so a file that changed between
-    /// bind and execution fails loudly instead of returning shifted columns.
-    /// Never a write; never WAL-logged by itself (a logged statement that
-    /// reads one replays by re-reading the file — see [`crate::filefmt`]).
-    FileScan {
-        format: String,
-        path: String,
-        schema: Vec<(String, DataType)>,
-    },
     /// One empty row — `SELECT` without `FROM`.
     SingleRow,
+    /// A leaf scan served by a host-registered
+    /// [`crate::table_source::TableSource`] (wave 70): `read_parquet('…')`,
+    /// `parquet_scan('…')`, the introspection functions, and DuckDB's
+    /// replacement scan `FROM 'file.parquet'`.
+    ///
+    /// The node names the source by its registry name and carries the call
+    /// (function + literal arguments, or the path) plus the schema `bind`
+    /// returned. It holds no trait object, so plans stay `Clone + PartialEq +
+    /// Debug`; the executor resolves the name again through
+    /// [`PinkDb::table_source`](crate::PinkDb::table_source) and re-derives
+    /// the same schema (checked against `schema`).
+    TableFunction {
+        /// Registry name of the source, lowercased.
+        source: String,
+        call: crate::table_source::TableFunctionCall,
+        /// The bound output schema, in output order.
+        schema: Vec<(String, DataType)>,
+    },
     Filter {
         input: Box<LogicalPlan>,
         predicate: BoundExpr,
@@ -420,7 +425,6 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
     matches!(
         plan,
         LogicalPlan::Scan { .. }
-            | LogicalPlan::FileScan { .. }
             // COPY writes an external file, never the store: it can run under
             // a read lock (and is never WAL-logged).
             | LogicalPlan::CopyTo { .. }
@@ -666,7 +670,6 @@ pub(crate) fn collect_tables_read(
             out.insert((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
         }
         // A file source reads no store table; `COPY` reads its source table.
-        LogicalPlan::FileScan { .. } => {}
         LogicalPlan::CopyTo { db, table, .. } => {
             out.insert(key(db, table));
         }
@@ -716,6 +719,10 @@ pub(crate) fn collect_tables_read(
         LogicalPlan::IndexScan { db, table, .. } => {
             out.insert(key(db, table));
         }
+        // A table-function scan (wave 70) reads external state, not a catalog
+        // table: the multi-writer touched set stays empty (a logged statement
+        // that reads one replays by re-reading the file).
+        LogicalPlan::TableFunction { .. } => {}
         // A call's own arguments may hold subqueries (they bind in an empty
         // scope); the tables its *body* touches are only known after
         // execution and are reported through `PinkDb::proc_frame`.
@@ -934,10 +941,14 @@ impl ScanProjections {
         projections
     }
 
-    /// The columns of `scan` (a [`LogicalPlan::Scan`]) this plan reads, or
-    /// `None` when the analysis could not bound it (read every column).
+    /// The columns of a leaf scan ([`LogicalPlan::Scan`] or
+    /// [`LogicalPlan::TableFunction`]) this plan reads, or `None` when the
+    /// analysis could not bound it (read every column).
     pub(crate) fn for_scan(&self, scan: &LogicalPlan) -> Option<&[usize]> {
-        debug_assert!(matches!(scan, LogicalPlan::Scan { .. }));
+        debug_assert!(matches!(
+            scan,
+            LogicalPlan::Scan { .. } | LogicalPlan::TableFunction { .. }
+        ));
         self.map.get(&node_addr(scan)).map(Vec::as_slice)
     }
 }
@@ -978,9 +989,13 @@ impl ScanFilters {
         filters
     }
 
-    /// The predicates `scan` (a [`LogicalPlan::Scan`]) may be pruned by.
+    /// The predicates a leaf scan ([`LogicalPlan::Scan`] or
+    /// [`LogicalPlan::TableFunction`]) may be pruned by.
     pub(crate) fn for_scan(&self, scan: &LogicalPlan) -> &[crate::attached::PrunePredicate] {
-        debug_assert!(matches!(scan, LogicalPlan::Scan { .. }));
+        debug_assert!(matches!(
+            scan,
+            LogicalPlan::Scan { .. } | LogicalPlan::TableFunction { .. }
+        ));
         self.map
             .get(&node_addr(scan))
             .map(Vec::as_slice)
@@ -1007,7 +1022,7 @@ fn walk_scan_filters(
         LogicalPlan::Limit { input, .. } | LogicalPlan::Offset { input, .. } => {
             walk_scan_filters(input, inherited, out);
         }
-        LogicalPlan::Scan { db: Some(_), .. } => {
+        LogicalPlan::Scan { db: Some(_), .. } | LogicalPlan::TableFunction { .. } => {
             if !inherited.is_empty() {
                 out.entry(node_addr(plan))
                     // The same node reached through two parents may only use
@@ -1059,7 +1074,6 @@ fn walk_scan_filters(
         | LogicalPlan::Revoke { .. }
         // Wave 71: a file source is not an attached table (no zone maps to
         // prune by), and COPY has no predicate to push into its source.
-        | LogicalPlan::FileScan { .. }
         | LogicalPlan::CopyTo { .. } => {}
         LogicalPlan::Call { args, .. } => {
             for a in args {
@@ -1344,6 +1358,9 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
     let mut children: Vec<&LogicalPlan> = Vec::new();
     match plan {
         LogicalPlan::Scan { .. }
+        // A table-function call carries literal arguments only: no bound
+        // expression can hide a dynamic scalar in it.
+        | LogicalPlan::TableFunction { .. }
         | LogicalPlan::SingleRow
         | LogicalPlan::Begin
         | LogicalPlan::Commit
@@ -1377,7 +1394,6 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         | LogicalPlan::Revoke { .. }
         // Wave 71: a file scan and a COPY carry no expression (the format
         // callback is engine-side, not a dynamic scalar).
-        | LogicalPlan::FileScan { .. }
         | LogicalPlan::CopyTo { .. }
         => {}
         LogicalPlan::IndexScan { value, .. } => exprs.push(value),
@@ -1562,7 +1578,7 @@ fn walk_scan_projections(
     out: &mut HashMap<usize, Vec<usize>>,
 ) {
     match plan {
-        LogicalPlan::Scan { db: Some(_), .. } => {
+        LogicalPlan::Scan { db: Some(_), .. } | LogicalPlan::TableFunction { .. } => {
             if let Needed::Cols(set) = needed {
                 out.insert(
                     node_addr(plan),
@@ -1579,7 +1595,7 @@ fn walk_scan_projections(
         LogicalPlan::Scan { db: None, .. } | LogicalPlan::SingleRow => {}
         // Wave 71: a file scan always decodes every column (no projection
         // pushdown into an IPC file yet), and COPY reads its whole table.
-        LogicalPlan::FileScan { .. } | LogicalPlan::CopyTo { .. } => {}
+        LogicalPlan::CopyTo { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             let mut need = needed.clone();
             collect_expr_projections(predicate, &mut need, out);

@@ -21,11 +21,13 @@ members = [
     # Core math extension (wave 54): the DuckDB math surface the engine does
     # not already provide, authored with the SDK's linked registration.
     "extensions/math",
-    # Core arrow extension (wave 71): Arrow IPC file read/write. Unlike the
-    # scalar extensions above this one is an *engine-adjacent* crate (it
-    # depends on `pinkdb` and implements the `pinkdb::filefmt::FileFormat`
-    # hook); the CLI wires it behind the opt-in `arrow` feature.
+    # Core arrow extension (wave 71): Arrow IPC file read/write. Engine-adjacent
+    # (it depends on `pinkdb` and implements the host table-source and COPY-sink
+    # hooks); the CLI wires it behind the opt-in `arrow` feature.
     "extensions/arrow",
+    # Core parquet extension (wave 70): read-side Parquet, the same
+    # engine-adjacent shape, wired behind the CLI's opt-in `parquet` feature.
+    "extensions/parquet",
 ]
 resolver = "2"
 

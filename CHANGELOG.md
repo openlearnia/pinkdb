@@ -10,6 +10,18 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 70 — core `parquet` extension (read-side) ✅
+- Parquet reads with the DuckDB surface: `read_parquet`/`parquet_scan`
+  (globs, directories, multi-file, `union_by_name`, hive partitions,
+  `filename`/`file_row_number`), four metadata functions, a replacement scan
+  (`FROM 'x.parquet'`), projection pushdown and row-group-statistics filter
+  pruning with visible counters.
+- Landed with the **unified file-format surface**: one read path
+  (`TableSource`) shared with arrow, one grammar (`Function` + `Path`), the
+  COPY sink kept separate, and logged file reads replay by re-reading
+  (DuckDB's rule). `parquet` is opt-in (+1.1 MiB); the default binary pays
+  ~18 KB for the surface.
+
 ### Wave 71 — core `arrow` extension (Arrow IPC) ✅
 - New engine **file-format extension surface** (`pinkdb::filefmt`): arrow
   files work through `FROM 'x.arrow'`, `read_arrow`/`read_ipc`/`read_feather`

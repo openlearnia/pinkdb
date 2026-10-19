@@ -70,6 +70,8 @@ SQL text
 | `pinkdb-js` | Optional (`js` feature) JavaScript procedure sandbox: the deterministic host contract; the engine binding is the recorded follow-up |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
+| `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed |
+| `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name |
 | `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` v4 with the `pinklake` feature; v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
 
 Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
@@ -1048,24 +1050,24 @@ REPL builds (`.lake` commands are opt-in; `vortexlake` is the Vortex build,
 implies neither lake build**; combine them explicitly, `pinklake,s3` or
 `vortexlake,s3`):
 
-| Build | CLI features | Lake | Data files | Release size |
+| Build | CLI features | Adds | Data files | Release size |
 |---|---|---|---|---|
-| default | — | no `.lake` commands | — | 3,741,504 B |
-| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 5,071,072 B (+1.27 MiB over default, −40.6 MiB vs vortexlake) |
-| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 7,074,064 B |
-| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,656,976 B |
-| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.6 MB (vortexlake + the same ≈2 MB S3 client) |
-| s3 only | `s3` | no `.lake` commands (the client only takes effect with a lake feature) | — | same bytes as default |
-| arrow | `arrow` | file access only (`FROM 'x.arrow'`, `read_arrow`, `COPY … (FORMAT arrow)`) | Arrow IPC (read/write) | 6,911,024 B (≈+3.0 MiB over default) |
+| default | — | no `.lake` commands, no file formats | — | 3,761,936 B |
+| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 5,091,776 B (+1.27 MiB over default, −40.6 MiB vs vortexlake) |
+| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 7,111,568 B |
+| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,677,664 B |
+| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.7 MB (vortexlake + the same ≈2 MB S3 client) |
+| s3 only | `s3` | no `.lake` commands (the client only takes effect with a lake feature) | — | ≈default (3,761,952 B) |
+| arrow | `arrow` | `FROM 'f.arrow'` / `read_arrow` (read) + `COPY … (FORMAT arrow)` (write) | Arrow IPC | 6,950,832 B (+3.04 MiB over default) |
+| parquet | `parquet` | `read_parquet` / `parquet_scan` / `FROM 'f.parquet'`, the four `parquet_*` metadata functions (read-only; add `,parquet-zstd` for zstd) | Parquet | 4,892,448 B (+1.08 MiB over default) |
+| arrow + parquet | `arrow,parquet` | both file surfaces (they share the engine's table-source surface and part of the arrow-rs tree) | Arrow IPC + Parquet | 8,062,368 B (+4.10 MiB over default) |
 
-The opt-in `arrow` feature is orthogonal to the lake builds (it is a file
-format, not a lake): `--features arrow` adds Arrow IPC file read/write to
-*any* of the builds above.
-
-| Build | CLI features | Adds | Release size |
-|---|---|---|---|
-| default + arrow | `arrow` | `FROM 'f.arrow'`, `read_arrow`, `COPY … (FORMAT arrow)` | 6,911,024 B (+3.02 MiB over default) |
-| lean + arrow | `--no-default-features --features arrow` | as above, without json/datetime/math | 6,753,456 B (lean alone: 3,600,288 B) |
+The file-format extensions are orthogonal to the lake builds and to each
+other: either composes with `pinklake`/`vortexlake`/`s3` and with the
+`--no-default-features` lean build, and each pays for its own linked codecs.
+All sizes above are `cargo build --release -p pinkdb-cli` on the same tree
+(the lake rows are re-measured at integration; measurement drift is noted as
+a follow-up).
 
 ```sh
 cargo build -p pinkdb-cli --features vortexlake        # Vortex data files, local directories
@@ -1073,6 +1075,10 @@ cargo build -p pinkdb-cli --features vortexlake,s3     # Vortex data files + S3/
 cargo build -p pinkdb-cli --features pinklake          # lean `.pink` data files (no Vortex), local
 cargo build -p pinkdb-cli --features pinklake,s3       # lean `.pink` data files + S3/R2
 cargo build -p pinkdb-cli --features s3                # storage client only (no .lake commands)
+cargo build -p pinkdb-cli --features arrow             # Arrow IPC read/write (`FROM 'f.arrow'`, COPY)
+cargo build -p pinkdb-cli --features parquet           # read_parquet / FROM 'file.parquet' (snappy + gzip)
+cargo build -p pinkdb-cli --features arrow,parquet     # both file surfaces
+cargo build -p pinkdb-cli --features parquet-zstd      # …plus zstd-compressed files (needs a C toolchain)
 ```
 
 ```text
@@ -1159,7 +1165,7 @@ The same lake layer without the Vortex dependency: a `pinklake` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
 single-table persistence bytes) under `format_version` 4 catalogs (each file
 object carries its own statistics block) — no `vortex` crate and none of its
-~218 transitive crates, a 5.07 MB binary instead of 47.66 MB. It enables every
+~218 transitive crates, a 5.09 MB binary instead of 47.68 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
 (add `,s3`; the storage client alone provides no commands), with the same
 layout, incremental commits, atomic
@@ -1654,36 +1660,58 @@ binary lean. `string` ships as an in-repo loadable extension
 (`extensions/string`: `make -C extensions/string`, then
 `LOAD EXTENSION '<path>'`).
 
-`arrow` (wave 71) is a core extension of a different shape: a *file format*,
-not a scalar function — the scalar ABI cannot express replacement scans,
-table functions or COPY formats, so the engine owns a second, tiny extension
-surface (`pinkdb::filefmt::FileFormat`: engine-side trait + per-store
-registry, seeded from a process-global registration at host bootstrap) and
-`extensions/arrow` = `pinkdb-arrow` implements it over the arrow-rs crates —
-the same engine-adjacent shape as `pink-lake` implementing `AttachedLake`:
+Two core extensions are **file formats** rather than scalar functions: the
+scalar ABI (one callback per row) cannot express a replacement scan, a table
+function, or a COPY format. The engine therefore owns one **table-source**
+read surface (`pinkdb::table_source::TableSource`: a bind-time schema, chunk
+scans that receive a projection and pushdown predicates, and the
+process-global registration a durable replay needs) and one **COPY sink**
+surface (`pinkdb::filefmt::FileFormat`). Both extensions are engine-adjacent
+crates implementing those traits over the arrow-rs crates — the same shape as
+`pink-lake` implementing `AttachedLake`:
+
+| Extension | Crate | Read | Write |
+|---|---|---|---|
+| `arrow` | `extensions/arrow` (`pinkdb-arrow`) | `FROM 'f.arrow'` / `read_arrow('f.arrow')` (`read_ipc`/`read_feather`; `.arrow`/`.ipc`/`.feather`/`.arrows`) | `COPY t TO 'f.arrow' (FORMAT arrow)` |
+| `parquet` | `extensions/parquet` (`pinkdb-parquet`) | `read_parquet('glob')` / `parquet_scan`, `FROM 'f.parquet'`, `parquet_schema`/`parquet_metadata`/`parquet_file_metadata`/`parquet_kv_metadata`; globs + `union_by_name`, hive partitions, `filename`, projection + row-group-statistics pushdown | — (follow-up) |
 
 ```sql
 SELECT * FROM 'data.arrow';                        -- replacement scan (.arrow/.ipc/.feather)
 SELECT * FROM read_arrow('data.arrow');            -- table function (read_ipc / read_feather)
 COPY t TO 'out.arrow' (FORMAT arrow);              -- write (FORMAT inferred from the extension)
+SELECT * FROM read_parquet('data/*.parquet') WHERE id > 10;
+SELECT * FROM 'data/people.parquet';
+SELECT * FROM parquet_metadata('data/people.parquet');
 ```
 
-Arrow IPC **file** format (Feather v2) only: the IPC *stream* format is
-detected by its magic and refused with a message naming the difference;
-reads accept uncompressed/LZ4/ZSTD files, writes are uncompressed; one
-record batch per engine chunk (≤2048 rows) on write, any batch layout on
-read; a scan materializes the whole file (no projection/streaming yet);
-every type without an exact engine counterpart (BLOB, TIME, nested types,
-`UInt64`, `Decimal256`, …) is refused at bind time naming the column. It is
-an **opt-in** CLI feature (`cargo build -p pinkdb-cli --features arrow`;
-3,741,504 → 6,911,024 B release, +3.02 MiB) — the default binary stays lean
-and refuses every file surface with a clear error. A durable store replays
-a logged `INSERT … SELECT … FROM 'f.arrow'` by re-reading the file (DuckDB's
-rule; the format must be registered before the store is opened, which the
-CLI does at startup), and a file that vanished before replay is a hard
-recovery error, never a silent drop. The Arrow **C Data Interface** in
-`pinkdb-ffi` is a documented follow-up with a precise pin in
-`extensions/arrow/README.md` (not half-implemented).
+Arrow: IPC **file** format (Feather v2) only — the IPC *stream* format is
+detected by its magic and refused with a message naming the difference; reads
+accept uncompressed/LZ4/ZSTD files, writes are uncompressed; one record batch
+per engine chunk (≤2048 rows) on write, any batch layout on read; a scan
+materializes the whole file (no projection/streaming yet); every type without
+an exact engine counterpart (BLOB, TIME, nested types, `UInt64`,
+`Decimal256`, …) is refused at bind time naming the column. The Arrow **C
+Data Interface** in `pinkdb-ffi` is a documented follow-up with a precise pin
+in `extensions/arrow/README.md` (not half-implemented).
+
+Parquet: read-only for now (`COPY … (FORMAT parquet)` is a follow-up);
+DuckDB-α-pinned semantics for globs and directories, multi-file reads,
+`union_by_name`, hive-partition columns, `filename`, `file_row_number`,
+`allow_empty` and `hive_types_autocast`; min/max/NULL-count row-group
+statistics prune scans (visible in `EXPLAIN`'s `filters=[…]` and
+`.parquet`'s counters); flat schemas only, and TIMESTAMP(nanos)/TIME/UUID/
+FLOAT16/BSON/VARIANT/geo/nested columns are refused by name. Add
+`,parquet-zstd` for zstd-compressed files (compiles the C zstd library).
+
+Both are **opt-in** CLI features (`cargo build -p pinkdb-cli --features
+arrow,parquet`; sizes in the builds table above): the default binary stays
+lean and refuses every file surface with a clear error. A durable store
+replays a logged statement that reads a file by **re-reading** the file
+(DuckDB's rule; the host registers the sources process-wide before any store
+is opened, which is what makes that replay resolvable). A file deleted
+before replay is a hard recovery error, never a silent drop; a file
+*changed* before replay replays its new content — the documented caveat of
+the re-read policy, matching DuckDB.
 
 A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
 
@@ -2349,7 +2377,7 @@ and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
 `pinklake` build (`.pink` v4 lake data files, no `vortex` dependency,
-5.07 MB vs 47.66 MB CLI) shipped in wave 45i, and wave 45k gave it exact
+5.09 MB vs 47.68 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for
