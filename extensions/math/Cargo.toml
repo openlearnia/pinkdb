@@ -1,0 +1,23 @@
+[package]
+name = "pinkdb-math"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb core math extension: exp/ln/log/log2/log10, the trigonometric family, degrees/radians/pi and the volatile random()"
+license = "MIT"
+
+[dependencies]
+# The Rust extension SDK (wave 51): one `pinkdb_extension!` declaration, safe
+# typed callbacks, and the linked (wave-49) registration the CLI publishes at
+# startup. Zero other dependencies — the functions are `std`'s `f64` math and
+# a hand-rolled PRNG, so the default binary grows by a few KB only. The
+# declaration uses the SDK's wave-54 ranged arities (`optional`), which the
+# linked model registers; the native ABI v1 cannot express them, so this crate
+# is linked-only by construction (see the crate docs).
+pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
+
+[dev-dependencies]
+# End-to-end SQL tests (tests/engine.rs) drive the extension through the
+# engine: binder, executor, WAL. A dev-dependency cannot cycle — the engine
+# never depends on this crate.
+pinkdb = { path = "../../crates/pinkdb" }

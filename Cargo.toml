@@ -18,6 +18,9 @@ members = [
     "extensions/json",
     "extensions/string",
     "extensions/datetime",
+    # Core math extension (wave 54): the DuckDB math surface the engine does
+    # not already provide, authored with the SDK's linked registration.
+    "extensions/math",
 ]
 resolver = "2"
 

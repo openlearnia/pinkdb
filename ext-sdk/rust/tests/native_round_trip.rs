@@ -294,3 +294,78 @@ fn deterministic_extension_statements_wal_log_and_replay() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Wave 54: a declaration that uses a ranged arity (`optional`/`variadic`)
+/// cannot be registered by the native ABI v1, which carries a fixed argument
+/// count and no lower bound. The SDK must fail the load with a clear
+/// diagnostic instead of silently registering the function as fixed-arity at
+/// its maximum (which would refuse the shorter calls the declaration
+/// promises). The same source loads fine through the linked model — see
+/// `linked_round_trip.rs`.
+#[test]
+fn a_ranged_declaration_is_refused_by_the_native_load() {
+    /// A declaration whose only function is `optional(1)`.
+    const SOURCE: &str = r#"
+use pinkdb_ext_sdk::{Optional, pinkdb_extension};
+
+pinkdb_extension! {
+    name = "wave54_ranged_native",
+    functions = [
+        /// 1 or 2 arguments (a ranged arity: linked-only by design).
+        optional(1) fn ext_ranged_tail(a: f64, b: Optional<f64>) -> f64 {
+            b.value().copied().unwrap_or(a)
+        },
+    ],
+}
+"#;
+
+    let exe = std::env::current_exe().expect("current test binary path");
+    let deps = exe.parent().expect("the test binary lives in deps/");
+    let rlib = newest_sdk_rlib(deps)
+        .unwrap_or_else(|| panic!("no libpinkdb_ext_sdk-*.rlib in {}", deps.display()));
+    let out_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("rust_sdk_ranged_{}", std::process::id()));
+    std::fs::create_dir_all(&out_dir).expect("create fixture directory");
+    let source = out_dir.join("ranged_ext.rs");
+    std::fs::write(&source, SOURCE).expect("write the ranged fixture source");
+    let library = out_dir.join(format!("libranged_ext{}", std::env::consts::DLL_SUFFIX));
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = Command::new(&rustc)
+        .arg("--edition")
+        .arg("2024")
+        .arg("--crate-name")
+        .arg("ranged_ext")
+        .arg("--crate-type")
+        .arg("cdylib")
+        .arg("-L")
+        .arg(format!("dependency={}", deps.display()))
+        .arg("--extern")
+        .arg(format!("pinkdb_ext_sdk={}", rlib.display()))
+        .arg("-o")
+        .arg(&library)
+        .arg(&source)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run `{rustc}`: {e} (set RUSTC?)"));
+    assert!(
+        output.status.success(),
+        "compiling the ranged fixture failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut db = PinkDb::new();
+    let message = db
+        .load_extension(library.to_str().expect("UTF-8 fixture path"))
+        .expect_err("a ranged declaration must not load natively")
+        .to_string();
+    // The loader reports the init code; the SDK's stderr diagnostic names the
+    // function and the linked alternative.
+    assert!(
+        message.contains("failed to initialize") && message.contains("returned 5"),
+        "{message}"
+    );
+    // Nothing was registered: a failed load is atomic.
+    let message = error(&mut db, "SELECT ext_ranged_tail(1.0);");
+    assert!(message.contains("unknown function"), "{message}");
+    let _ = std::fs::remove_dir_all(&out_dir);
+}

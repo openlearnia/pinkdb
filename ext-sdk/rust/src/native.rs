@@ -48,6 +48,13 @@ const INIT_ABI_VERSION: i32 = 3;
 /// function but the host predates the flag (an older host would silently
 /// register it as deterministic, so the load must fail instead).
 const INIT_NO_FLAGS_SUPPORT: i32 = 4;
+/// `pinkdb_extension_init`'s code when the extension declares a
+/// ranged-arity function (`optional(min)` / `variadic(min)`): the native ABI
+/// v1 registers fixed-arity functions only, and registering a ranged one at
+/// its maximum arity would silently refuse the shorter calls the declaration
+/// promises. A diagnostic on stderr names the function and the linked
+/// alternative.
+const INIT_RANGED_ARITY: i32 = 5;
 
 /// The end offset of the `register_scalar_flags` field in the host's struct,
 /// as known to this build. An extension calls the field only when the host's
@@ -262,11 +269,12 @@ unsafe extern "C" fn trampoline(
         return CODE_INTERNAL_ERROR;
     };
     *out = null_value(spec.ret.tag());
-    if n_args != spec.args.len() {
+    if n_args < spec.min_args || n_args > spec.max_args() {
         eprintln!(
-            "pinkdb extension {}: host passed {n_args} argument(s), {} registered",
+            "pinkdb extension {}: host passed {n_args} argument(s), this function accepts {}..{}",
             spec.name,
-            spec.args.len()
+            spec.min_args,
+            spec.max_args()
         );
         return CODE_INTERNAL_ERROR;
     }
@@ -293,11 +301,11 @@ unsafe extern "C" fn trampoline(
             return CODE_INTERNAL_ERROR;
         }
     };
-    if decoded.len() != spec.args.len()
+    if decoded.len() != n_args
         || decoded
             .iter()
-            .zip(spec.args)
-            .any(|(arg, want)| arg.ext_type() != *want)
+            .enumerate()
+            .any(|(i, arg)| arg.ext_type() != spec.arg_type_at(i))
     {
         eprintln!(
             "pinkdb extension {}: host passed unsupported argument values",
@@ -392,6 +400,23 @@ fn init_inner(
     }
 
     for spec in specs {
+        // The native ABI v1 carries a fixed `n_args`, with no way to express
+        // "at least n": registering a ranged declaration at its maximum arity
+        // would silently refuse the shorter calls it promises, so the whole
+        // load fails instead (atomically) with a diagnostic pointing at the
+        // linked model.
+        if spec.is_ranged() {
+            eprintln!(
+                "pinkdb extension {extension_name}: function {} declares a ranged arity \
+                 ({}..={} arguments); the native ABI v1 registers fixed-arity functions only — \
+                 publish this extension through the linked registry instead \
+                 (pinkdb_register_linked(), then LOAD EXTENSION '{extension_name}')",
+                spec.name,
+                spec.min_args,
+                spec.max_args()
+            );
+            return INIT_RANGED_ARITY;
+        }
         // The host copies the name during the call, so a temporary C string is
         // enough (and keeps the spec free of a duplicate NUL-terminated
         // spelling).

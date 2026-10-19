@@ -341,8 +341,10 @@ pub enum BoundExpr {
     /// Call into a scalar function registered by a loaded extension — a
     /// native `dlopen` callback or a linked registry function
     /// (`PinkDb::load_extension` / `PinkDb::load_linked_extension`). `name` is
-    /// the canonical lowercased registry key; args and result are typed
-    /// exactly as registered (no implicit casts in ABI v1). Never
+    /// the canonical lowercased registry key; args and result are typed as
+    /// registered (ABI v1 inserts no implicit casts, except that a numeric
+    /// argument widens into a `DOUBLE` parameter — see
+    /// [`Binder::bind_dynamic_function`]). Never
     /// constant-folded (an extension callback is opaque: it may be impure and
     /// may fail).
     ///
@@ -1849,10 +1851,12 @@ impl<'a> Binder<'a> {
     /// ABI v1 is strictly typed: every argument's bound type must equal the
     /// registered argument type (a bare `NULL` literal is typeless and is
     /// passed as a NULL of the registered type), and the result type is the
-    /// registered return type. Both loading models register through the same
-    /// registry, so this is the one binder path for either. A linked function
-    /// may declare a ranged or variadic arity (`new_optional` /
-    /// `new_variadic`); `dlopen` functions and plain linked ones are fixed.
+    /// registered return type. The one implicit conversion is the numeric
+    /// widening into a `DOUBLE` parameter (see below). Both loading models
+    /// register through the same registry, so this is the one binder path for
+    /// either. A linked function may declare a ranged or variadic arity
+    /// (`new_optional` / `new_variadic`); `dlopen` functions and plain linked
+    /// ones are fixed.
     fn bind_dynamic_function(
         &mut self,
         name: &str,
@@ -1912,17 +1916,34 @@ impl<'a> Binder<'a> {
                 None => *want_args.last().expect("a variadic function has a type"),
             };
             // A bare NULL literal is typeless: the executor hands the
-            // callback `is_null` with the registered type tag. Everything
-            // else must match the registered argument type exactly — ABI v1
-            // inserts no implicit casts.
+            // callback `is_null` with the registered type tag.
+            //
+            // Everything else must equal the registered argument type — ABI
+            // v1 inserts no implicit casts — with one documented widening
+            // rule: a **DOUBLE parameter accepts any numeric argument**
+            // (INTEGER, BIGINT, DECIMAL) and the engine inserts the CAST to
+            // DOUBLE that DuckDB applies implicitly, so `exp(1)`, `log(100)`
+            // and an integer or DECIMAL column all work like DuckDB. Every
+            // other declared type stays exact and keeps the CAST hint —
+            // VARCHAR included (`json_array(1)` and `ext_repeat('x', 1)`
+            // keep their documented errors): a string is not a number, and
+            // parsing one is not this ABI's job.
+            let mut b = b;
             if !matches!(b, BoundExpr::Literal(Value::Null))
                 && crate::ext::ext_type_of(b.dtype()) != Some(want)
             {
-                return Err(PinkDbError::Type(format!(
-                    "{func_name} argument {} must be {want}, got {} (use CAST)",
-                    i + 1,
-                    b.dtype()
-                )));
+                if want == crate::ext::ExtType::Double && b.dtype().is_numeric() {
+                    b = BoundExpr::Cast {
+                        expr: Box::new(b),
+                        dtype: DataType::Double,
+                    };
+                } else {
+                    return Err(PinkDbError::Type(format!(
+                        "{func_name} argument {} must be {want}, got {} (use CAST)",
+                        i + 1,
+                        b.dtype()
+                    )));
+                }
             }
             bound.push(b);
         }

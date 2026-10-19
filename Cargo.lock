@@ -2183,6 +2183,7 @@ dependencies = [
  "pinkdb",
  "pinkdb-datetime",
  "pinkdb-json",
+ "pinkdb-math",
  "pinkdb-server",
  "rcgen",
  "rustyline",
@@ -2248,6 +2249,14 @@ version = "0.1.0"
 dependencies = [
  "pinkdb",
  "pinkdb-ext-loader",
+]
+
+[[package]]
+name = "pinkdb-math"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "pinkdb-ext-sdk",
 ]
 
 [[package]]

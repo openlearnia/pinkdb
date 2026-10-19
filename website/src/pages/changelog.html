@@ -9,6 +9,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-19</h2>
+<h3>Wave 54 — core <code>math</code> extension ✅</h3>
+<ul>
+<li>Seventeen functions via the Rust SDK: <code>exp</code>/<code>ln</code>/<code>log</code>/<code>log2</code>/<code>log10</code>, the trigonometric family, <code>degrees</code>/<code>radians</code>/<code>pi</code>, and the first <strong>volatile</strong> function — <code>random()</code> refuses to run in any WAL-logged statement (replay could diverge), while reads work normally. <code>sqrt</code>/<code>pow</code>/<code>floor</code>/<code>ceil</code>/ <code>sign</code>/<code>greatest</code>/<code>least</code> remain core built-ins.</li>
+<li>SDK gained ranged arity (optional/variadic — linked-only by construction), and integer/DECIMAL arguments now widen into DOUBLE parameters like DuckDB. <code>math</code> joins json+datetime as a <strong>default feature</strong>; +25 KB default.</li>
+</ul>
 <h3>Wave 69 — prepared statements in the Python and Go bindings ✅</h3>
 <ul>
 <li>Both bindings gained idiomatic prepared-statement APIs over the FFI: Python <code>db.prepare(sql)</code> → <code>Statement.execute(*params)</code>, Go <code>db.Prepare(sql)</code> → <code>Stmt.Execute(args...)</code> — typed parameters, NULLs, reuse and clean close semantics, with native error strings passed through unchanged.</li>

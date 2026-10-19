@@ -115,9 +115,14 @@ registered argument/return types are *derived from the Rust types you write* —
 there is no separate metadata table to keep in sync.
 
 ABI v1 is strictly typed: the engine inserts **no implicit casts** for
-extension arguments. `ext_rs_repeat('ab', 3)` is an error (`argument 2 must be
-BIGINT, got INTEGER (use CAST)`) because the literal is INTEGER — write
-`CAST(3 AS BIGINT)`, or declare the parameter `i32`.
+extension arguments, with one documented exception — a **numeric** argument
+(INTEGER, BIGINT, DECIMAL) widens into a `DOUBLE` parameter, the implicit
+cast DuckDB applies to its math functions (`exp(1)`, `sqrt(4)`).
+`ext_rs_repeat('ab', 3)` is an error (`argument 2 must be BIGINT, got
+INTEGER (use CAST)`) because the literal is INTEGER and the parameter is
+BIGINT — write `CAST(3 AS BIGINT)`, or declare the parameter `i32`. A
+VARCHAR stays strict even for a `DOUBLE` parameter (`exp('1')` is an error;
+DuckDB parses the string — a documented divergence).
 
 ### NULL handling is explicit
 
@@ -134,6 +139,63 @@ Every registered argument type accepts a bare `NULL` at bind time; the
 `NULL` literals are typeless and pass through for any declared type; a
 *typed* NULL column of the wrong type is a bind-time error like any other
 mismatch.
+
+### Ranged arity: `optional(min)` and `variadic(min)`
+
+A function is fixed-arity unless it says otherwise. Two leading modifiers
+declare the arity ranges the wave-52 linked model supports:
+
+```rust
+pinkdb_extension! {
+    name = "my_extension",
+    functions = [
+        /// 1 or 2 arguments: `my_log(100)` or `my_log(2, 8)`.
+        optional(1) fn my_log(b: Option<f64>, x: Optional<f64>) -> Option<f64> {
+            let b = b?;
+            Some(match x {
+                Optional::Absent => b.log10(),
+                Optional::Null => return None,
+                Optional::Value(x) => x.log10() / b.log10(),
+            })
+        },
+        /// Any number of NULL-able arguments, at least one.
+        variadic(1) fn my_sum(values: Vec<Option<i64>>) -> Option<i64> {
+            let mut total = 0i64;
+            for value in values.into_iter().flatten() {
+                total = total.wrapping_add(value);
+            }
+            Some(total)
+        },
+    ]
+}
+```
+
+- `optional(min)`: the declared parameters, but a call may stop after `min`
+  of them. Positions from `min` on must be written [`Optional<T>`], whose
+  three states are `Absent` (not passed), `Null` and `Value(T)` — a bare
+  `Option<T>` conflates the first two, and `my_log(10)` (base-10) really is
+  not `my_log(2, NULL)` (SQL NULL). Positions below `min` are always
+  `Value(_)`; write a plain type there to say so in the signature.
+- `variadic(min)`: exactly one parameter, `Vec<T>`, and a call passes `min`
+  to 64 arguments of the declared `T` type. `T` is usually `Option<_>` so
+  NULL stays representable; `decode_arguments` (what the generated glue
+  calls) copies each argument, borrowing VARCHAR bytes for the call.
+
+Both forms register through the linked model
+(`LinkedFunction::new_optional` / `new_variadic`). **The native ABI v1 has no
+ranged-arity descriptor**: `pinkdb_extension_init` refuses a declaration that
+uses either modifier (a diagnostic on stderr names the function) instead of
+silently registering it as fixed-arity at its maximum — which would refuse
+the shorter calls the declaration promises. Publish such an extension with
+`pinkdb_register_linked()` (wasm's only model, and the native fallback):
+
+```rust
+my_extension::pinkdb_register_linked()?;
+// then, from SQL: LOAD EXTENSION 'my_extension'; SELECT my_log(100);
+```
+
+Fixed-arity declarations are untouched by all of this: they never take this
+path, and their generated code is the same as before wave 54.
 
 ### Deterministic by default — `volatile` for everything else
 

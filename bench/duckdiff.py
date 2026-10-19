@@ -517,6 +517,43 @@ STRING_EXT_QUERIES = [
     ("str-where", "SELECT name FROM emp WHERE starts_with(name, 'a') OR strpos(name, 'ev') > 0 ORDER BY name;", True, False),
     ("str-group", "SELECT left(name, CAST(1 AS BIGINT)) AS initial, COUNT(*) FROM emp GROUP BY initial ORDER BY initial;", True, False),
     ("str-compose", "SELECT upper(reverse(name)) FROM emp ORDER BY 1;", True, False),
+    # ---- wave 54: core math extension (`extensions/math`) ----
+    # The CLI's default `math` feature loads the extension into every store, so
+    # `exp`/`ln`/`log`/... need no LOAD; `sqrt`/`pow`/`floor`/`ceil`/`sign`/
+    # `greatest`/`least` are engine built-ins (an extension cannot shadow one),
+    # and the same probes pin them. Integer/DECIMAL arguments widen into a
+    # DOUBLE parameter — DuckDB's implicit cast — while a VARCHAR stays a bind
+    # error (a documented divergence; not probed here because DuckDB accepts it).
+    ("math-exp-log", "SELECT exp(0.0), exp(1.0), ln(1.0), ln(exp(1.0)), log(100.0), log2(8.0), log10(1000.0);", False, False),
+    ("math-log-two-arg", "SELECT log(2.0, 8.0), log(8.0, 2.0), log(10.0, 0.5), log(1.5, 2.5), log(100.0, 2.0);", False, False),
+    ("math-log-one-arg", "SELECT log(100.0), log(1.0), log(0.5), log(2.0);", False, False),
+    # ±infinity is compared through predicates: the harness treats float(x - x)
+    # as unordered, exactly like NaN, so a raw `inf` cell could not pass.
+    ("math-infinities", "SELECT exp(1000.0) > 1e308, exp(-1000.0) = 0.0, ln(0.0) < -1e308, log(0.0) < -1e308, log(2.0, 0.0) < -1e308, cot(0.0) > 1e308;", False, False),
+    # NaN values are probed through ordered comparisons only: pinkdb's float
+    # comparison maps an unordered pair to *equal* (a pre-existing divergence
+    # from DuckDB's NaN = NaN, out of this wave's scope), so `NaN = 0` would
+    # differ while `NaN < 0` agrees (false both sides).
+    ("math-nan-predicates", "SELECT ln(-1.0) < 0.0, sqrt(-1.0) < 0.0, asin(2.0) < 0.0, acos(2.0) < 0.0, log(-1.0) < 0.0, tan(pi() / 2.0) > 1e15;", False, False),
+    ("math-trig", "SELECT sin(0.0), cos(0.0), tan(0.0), sin(pi() / 2.0), cos(pi()), sin(pi() / 6.0), tan(pi() / 4.0);", False, False),
+    ("math-trig-inverses", "SELECT asin(1.0), acos(1.0), acos(0.0), atan(1.0), atan2(0.0, 0.0), atan2(1.0, 0.0), atan2(0.0, -1.0), atan2(-1.0, 0.0);", False, False),
+    ("math-cot", "SELECT cot(1.0), cot(pi() / 4.0), cot(pi() / 2.0), cot(0.0) > 1e308;", False, False),
+    ("math-pi-conversions", "SELECT pi(), degrees(pi()), radians(180.0), degrees(1.0), radians(1.0), degrees(0.0);", False, False),
+    ("math-null", "SELECT exp(NULL) IS NULL, ln(NULL) IS NULL, log(NULL) IS NULL, log(2.0, NULL) IS NULL, log(NULL, 2.0) IS NULL, sin(NULL) IS NULL, atan2(NULL, 1.0) IS NULL, pi() IS NOT NULL;", False, False),
+    ("math-coercion-literals", "SELECT exp(1), log(100), log(2, 8), log2(8), log10(1000), sin(0), cos(0), atan2(1, 1);", False, False),
+    ("math-columns", "SELECT id, exp(id), log(id), sqrt(id), pow(id, 2) FROM emp ORDER BY id;", True, False),
+    ("math-columns-double", "SELECT id, ln(salary), sin(salary), floor(salary), ceil(salary), sign(salary) FROM emp ORDER BY id;", True, False),
+    ("math-decimal", "SELECT x, exp(x), log10(x) FROM dt ORDER BY x NULLS LAST;", True, False),
+    ("math-where", "SELECT id FROM emp WHERE log2(id) > 1.0 AND sqrt(id) < 3.0 ORDER BY id;", True, False),
+    ("math-group", "SELECT floor(salary / 100.0) AS b, COUNT(*), SUM(exp(id)) FROM emp WHERE salary IS NOT NULL GROUP BY b ORDER BY b;", True, False),
+    ("math-greatest-least", "SELECT id, greatest(id, did, 3), least(id, did, 3), greatest(salary, 100.0), least(salary, 100.0) FROM emp ORDER BY id;", True, False),
+    ("math-greatest-nan", "SELECT least(0.0 / 0.0, 5.0), least(5.0, 0.0 / 0.0), greatest(1, 2.5), least(1, 2.5), greatest(-1, -2.5);", False, False),
+    ("math-sign", "SELECT sign(-5), sign(0), sign(3.5), sign(-1.5), sign(salary), sign(id - 3) FROM emp ORDER BY id;", True, False),
+    ("math-floor-ceil", "SELECT floor(1.7), floor(-1.5), ceil(1.2), ceil(-1.2), floor(id), ceil(salary) FROM emp ORDER BY id;", True, False),
+    ("math-pow-sqrt", "SELECT sqrt(4), sqrt(2.0), pow(2, 10), power(2.0, 0.5), sqrt(salary) FROM emp ORDER BY id;", True, False),
+    ("math-random-shape", "SELECT random() >= 0.0 AND random() < 1.0;", False, False),
+    ("math-log-arity", "SELECT log();", False, True),
+    ("math-log-too-many", "SELECT log(1.0, 2.0, 3.0);", False, True),
 ]
 
 

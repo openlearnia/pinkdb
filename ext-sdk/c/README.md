@@ -91,7 +91,7 @@ One tagged scalar, `pinkdb_ext_value`, crosses the ABI by value:
 
 | field | meaning |
 |---|---|
-| `type_tag` | `PINKDB_EXT_TYPE_*` — the *declared* type (the binder inserts no implicit casts; callers write `CAST(...)`) |
+| `type_tag` | `PINKDB_EXT_TYPE_*` — the *declared* type (the binder inserts no implicit casts, except numeric arguments widening into a `DOUBLE` parameter; callers write `CAST(...)` otherwise) |
 | `is_null` | non-zero ⇒ NULL; only `type_tag` is then meaningful |
 | `int64` | BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since epoch), TIMESTAMP (µs since epoch UTC), INTERVAL (µs part) |
 | `double_` | DOUBLE (same layout as the Rust field named `double`); for INTERVAL it carries the `(months << 32) \| days` bit pattern |

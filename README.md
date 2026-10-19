@@ -1050,11 +1050,11 @@ implies neither lake build**; combine them explicitly, `pinklake,s3` or
 
 | Build | CLI features | Lake | Data files | Release size |
 |---|---|---|---|---|
-| default | — | no `.lake` commands | — | 3,637,664 B |
-| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 4,950,400 B (+1.25 MiB over default, −40.6 MiB vs vortexlake) |
-| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 6,970,192 B |
-| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,553,136 B |
-| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.5 MB (vortexlake + the same ≈2 MB S3 client) |
+| default | — | no `.lake` commands | — | 3,719,664 B |
+| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 5,048,832 B (+1.27 MiB over default, −40.6 MiB vs vortexlake) |
+| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 7,052,176 B |
+| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,634,992 B |
+| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.6 MB (vortexlake + the same ≈2 MB S3 client) |
 | s3 only | `s3` | no `.lake` commands (the client only takes effect with a lake feature) | — | same bytes as default |
 
 ```sh
@@ -1149,7 +1149,7 @@ The same lake layer without the Vortex dependency: a `pinklake` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
 single-table persistence bytes) under `format_version` 4 catalogs (each file
 object carries its own statistics block) — no `vortex` crate and none of its
-~218 transitive crates, a 4.95 MB binary instead of 47.55 MB. It enables every
+~218 transitive crates, a 5.05 MB binary instead of 47.63 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
 (add `,s3`; the storage client alone provides no commands), with the same
 layout, incremental commits, atomic
@@ -1633,14 +1633,16 @@ host→foreign-binding); an extension is a foreign library→host callback ABI.
 
 First-party **core extensions** register through the same registry (linked
 registration, no `dlopen`). `json` (`json_extract`, `json_value`, `json_valid`,
-`json_array_length`, `json_object`, `json_array` over JSON text in `VARCHAR`)
-and `datetime` (`strftime`, `strptime`, `epoch`, `epoch_ms`, `dayofweek`,
+`json_array_length`, `json_object`, `json_array` over JSON text in `VARCHAR`),
+`datetime` (`strftime`, `strptime`, `epoch`, `epoch_ms`, `dayofweek`,
 `dayofyear`, `week`, `last_day`, `age`, `make_date` over naive
 `DATE`/`TIMESTAMP`, pinned to DuckDB 2.0 α semantics — `extensions/datetime`
-carries the full matrix and divergences) are CLI **default features**;
-`--no-default-features` keeps the binary lean. `string` ships as an in-repo
-loadable extension (`extensions/string`: `make -C extensions/string`, then
-`LOAD EXTENSION '<path>'`), with `math` landing in the same series.
+carries the full matrix and divergences) and `math` (`exp`/`ln`/`log`/`log2`/
+`log10`, the trigonometric family, `degrees`/`radians`, `pi` and the volatile
+`random()`) are CLI **default features**; `--no-default-features` keeps the
+binary lean. `string` ships as an in-repo loadable extension
+(`extensions/string`: `make -C extensions/string`, then
+`LOAD EXTENSION '<path>'`).
 
 A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
 
@@ -2306,7 +2308,7 @@ and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
 `pinklake` build (`.pink` v4 lake data files, no `vortex` dependency,
-4.95 MB vs 47.55 MB CLI) shipped in wave 45i, and wave 45k gave it exact
+5.05 MB vs 47.63 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for

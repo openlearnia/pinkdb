@@ -208,7 +208,7 @@ fn arity_and_argument_type_mismatches_are_clear_errors() {
     let e = error(&mut db, "SELECT ext_concat2('a');");
     assert!(e.contains("ext_concat2 takes 2 argument(s)"), "{e}");
 
-    // ABI v1 is strictly typed: no implicit casts (use CAST).
+    // ABI v1 is strictly typed: no implicit casts (use CAST)…
     let e = error(&mut db, "SELECT ext_double_it('x');");
     assert!(
         e.contains("ext_double_it argument 1 must be INTEGER, got VARCHAR"),
@@ -219,12 +219,28 @@ fn arity_and_argument_type_mismatches_are_clear_errors() {
         e.contains("ext_shout argument 1 must be VARCHAR, got INTEGER"),
         "{e}"
     );
-    let e = error(&mut db, "SELECT ext_halve(1);");
+    let e = error(&mut db, "SELECT ext_halve('x');");
     assert!(
-        e.contains("ext_halve argument 1 must be DOUBLE, got INTEGER"),
+        e.contains("ext_halve argument 1 must be DOUBLE, got VARCHAR"),
         "{e}"
     );
-    // The fix is an explicit cast.
+    // …with the wave-54 numeric widening: a DOUBLE parameter takes any
+    // numeric argument, and the engine inserts the CAST to DOUBLE DuckDB
+    // applies implicitly — `exp(1)`, `sqrt(4)` and an integer column all
+    // work. Other declared types stay exact (`ext_double_it` above).
+    assert_eq!(
+        rows(&mut db, "SELECT ext_halve(1);"),
+        vec![vec![Value::Double(0.5)]]
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT ext_halve(CAST(1 AS BIGINT));"),
+        vec![vec![Value::Double(0.5)]]
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT ext_halve(CAST(1 AS DECIMAL(4,2)));"),
+        vec![vec![Value::Double(0.5)]]
+    );
+    // The explicit cast still works (it is what the engine inserts).
     assert_eq!(
         rows(&mut db, "SELECT ext_halve(CAST(1 AS DOUBLE));"),
         vec![vec![Value::Double(0.5)]]

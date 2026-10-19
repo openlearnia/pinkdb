@@ -49,9 +49,10 @@ const DISPLAY_CAP: usize = 10_000;
 
 /// Publish the linked extensions the CLI ships in the process-global
 /// registry — the host-bootstrap step `LOAD EXTENSION '<name>'` resolves
-/// against, on every target. With the default features that is `pinkdb-json`
-/// and `pinkdb-datetime`; a host that uses the library instead does the same
-/// explicitly (`pinkdb_json::ensure_registered()`).
+/// against, on every target. With the default features those are
+/// `pinkdb-json`, `pinkdb-datetime` and `pinkdb-math`; a host that uses the
+/// library instead does the same explicitly (`pinkdb_json::ensure_registered()`,
+/// `pinkdb_datetime::ensure_registered()`, `pinkdb_math::ensure_registered()`).
 fn register_builtin_extensions() {
     #[cfg(feature = "json")]
     if let Err(e) = pinkdb_json::ensure_registered() {
@@ -61,31 +62,37 @@ fn register_builtin_extensions() {
     if let Err(e) = pinkdb_datetime::ensure_registered() {
         eprintln!("warning: the datetime extension could not be registered: {e}");
     }
+    #[cfg(feature = "math")]
+    if let Err(e) = pinkdb_math::ensure_registered() {
+        eprintln!("warning: the math extension could not be registered: {e}");
+    }
 }
 
 /// Load the CLI's built-in extensions into a store it just created or
-/// opened, so `json_*` and the datetime functions work without a
-/// `LOAD EXTENSION` statement (the DuckDB behavior). A store whose WAL
-/// replay already loaded one — a replayed record that calls such a function
-/// is prefixed with `LOAD EXTENSION '<name>'` — keeps it:
+/// opened, so `json_*`, the datetime functions and `exp(...)`/`random()` work
+/// without a `LOAD EXTENSION` statement (the DuckDB behavior). A store whose
+/// WAL replay already loaded one — a replayed record that calls a function is
+/// prefixed with `LOAD EXTENSION '<name>'` — keeps it:
 /// [`PinkDb::is_extension_loaded`] is consulted first, because a second load
 /// is a documented error.
-fn load_builtin_extensions(db: &mut PinkDb) {
-    // A feature-less build has nothing to load; keep the parameter used so
-    // the lean configuration stays warning-free (the sibling core-extension
-    // waves extend the cfg blocks above).
-    let _ = &db;
+fn load_builtin_extensions(#[allow(unused_variables)] db: &mut PinkDb) {
     #[cfg(feature = "json")]
-    if !db.is_extension_loaded(pinkdb_json::EXTENSION_NAME)
-        && let Err(e) = db.load_linked_extension(pinkdb_json::EXTENSION_NAME)
-    {
-        eprintln!("warning: the json extension could not be loaded: {e}");
-    }
+    load_builtin_extension(db, pinkdb_json::EXTENSION_NAME);
     #[cfg(feature = "datetime")]
-    if !db.is_extension_loaded(pinkdb_datetime::EXTENSION_NAME)
-        && let Err(e) = db.load_linked_extension(pinkdb_datetime::EXTENSION_NAME)
-    {
-        eprintln!("warning: the datetime extension could not be loaded: {e}");
+    load_builtin_extension(db, pinkdb_datetime::EXTENSION_NAME);
+    #[cfg(feature = "math")]
+    load_builtin_extension(db, pinkdb_math::EXTENSION_NAME);
+}
+
+/// Load one built-in extension by its registry name (shared by the feature
+/// blocks above; absent when no core-extension feature is built).
+#[cfg(any(feature = "json", feature = "datetime", feature = "math"))]
+fn load_builtin_extension(db: &mut PinkDb, name: &str) {
+    if db.is_extension_loaded(name) {
+        return;
+    }
+    if let Err(e) = db.load_linked_extension(name) {
+        eprintln!("warning: the {name} extension could not be loaded: {e}");
     }
 }
 
@@ -206,6 +213,19 @@ fn print_help() {
     } else {
         println!("DATETIME: the datetime functions are not built (rebuild with the `datetime`");
         println!("      feature, or link `pinkdb-datetime` and register it).");
+    }
+    if cfg!(feature = "math") {
+        println!("MATH: exp, ln, log, log2, log10, sin, cos, tan, cot, asin, acos, atan, atan2,");
+        println!("      degrees, radians, pi and the volatile random() are built in and loaded");
+        println!("      into every store (`math` feature); sqrt, pow, floor, ceil, sign, greatest");
+        println!(
+            "      and least are core functions. `LOAD EXTENSION 'math'` would be a duplicate."
+        );
+    } else {
+        println!(
+            "MATH: the math functions (exp, log, sin, ..., random) are not built (rebuild with"
+        );
+        println!("      the `math` feature, or link `pinkdb-math` and register it).");
     }
 }
 

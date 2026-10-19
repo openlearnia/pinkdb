@@ -81,7 +81,11 @@
  *   read-only. Read-only means "do not modify"; the array itself lives on the
  *   host's stack for the duration of the call.
  * - A registered argument type is fixed: no implicit casts are inserted by
- *   the binder, and a zero-argument function receives `args == NULL`.
+ *   the binder, with one documented exception — a numeric argument
+ *   (INTEGER, BIGINT, DECIMAL) widens into a `DOUBLE` parameter, which is
+ *   DuckDB's implicit cast for the math functions (`exp(1)`, `sqrt(4)`);
+ *   everything else needs an explicit `CAST`. A zero-argument function
+ *   receives `args == NULL`.
  * - `out` points at host-owned, writable storage pre-filled with NULL. Set
  *   `out->type_tag` (and, for VARCHAR results, text_ptr/text_len), then
  *   return 0. If `is_null` stays non-zero the result is NULL.

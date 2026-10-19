@@ -265,8 +265,10 @@ fn invalidity_and_nulls_follow_the_documented_matrix() {
     assert_eq!(text(&mut db, "SELECT json_extract(NULL, NULL);"), None);
 }
 
-/// ABI v1 is strictly typed: no implicit casts, so `json_array(1)` is a bind
-/// error telling the user to CAST — the documented divergence from DuckDB.
+/// ABI v1 is strictly typed: no implicit casts (the wave-54 numeric→DOUBLE
+/// widening covers `DOUBLE` parameters only, so it does not apply here), so
+/// `json_array(1)` is a bind error telling the user to CAST — the documented
+/// divergence from DuckDB.
 #[test]
 fn typed_arguments_are_refused_with_a_cast_hint() {
     let mut db = db_with_json();

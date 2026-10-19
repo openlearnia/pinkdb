@@ -47,6 +47,65 @@
 //! reaches a non-`Option` parameter is a clear error (per the header, the
 //! callback decides what NULL means — the SDK makes that decision explicit).
 //!
+//! # Ranged arity: `optional(min)` and `variadic(min)`
+//!
+//! A function is fixed-arity by default. Two modifiers declare the arity
+//! ranges the linked loading model supports (wave 52's
+//! `LinkedFunction::new_optional` / `new_variadic`):
+//!
+//! ```no_run
+//! # use pinkdb_ext_sdk::{Optional, pinkdb_extension};
+//! pinkdb_extension! {
+//!     name = "my_extension",
+//!     functions = [
+//!         /// 1 or 2 arguments: `my_log(100)` or `my_log(2, 8)`.
+//!         optional(1) fn my_log(b: Option<f64>, x: Optional<f64>) -> Option<f64> {
+//!             let b = b?;
+//!             Some(match x {
+//!                 Optional::Absent => b.log10(),
+//!                 Optional::Null => return None,
+//!                 Optional::Value(x) => x.ln() / b.ln(),
+//!             })
+//!         },
+//!         /// Any number of arguments (at least one), NULL-able.
+//!         variadic(1) fn my_sum(values: Vec<Option<i64>>) -> Option<i64> {
+//!             Some(values.into_iter().flatten().sum())
+//!         },
+//!     ]
+//! }
+//! ```
+//!
+//! [`Optional<T>`] is the three-state argument a ranged call needs: the
+//! position may be `Absent` (the call stopped before it), `Null`, or a
+//! `Value(T)` — `log(10)` and `log(2, NULL)` differ, so a bare `Option<T>`
+//! (which conflates the first two) is not enough. A variadic declaration has
+//! exactly one parameter, `Vec<T>`, and repeats `T`'s declared type for every
+//! argument from `min` up to the ABI's 64-argument limit; `T` is usually
+//! `Option<_>` so NULL stays representable. The declared amount is what the
+//! engine binds: a call outside `min..=max` is refused before the callback
+//! runs.
+//!
+//! **Ranged declarations are linked-only.** The native ABI v1 registration
+//! carries a fixed argument count with no lower bound, so
+//! `pinkdb_extension_init` refuses a declaration that uses `optional` /
+//! `variadic` (a diagnostic on stderr names the function) instead of
+//! silently registering it as fixed-arity. Publish such an extension through
+//! the linked registry — wasm's only model, and the native fallback:
+//!
+//! ```no_run
+//! # mod my_extension { pinkdb_ext_sdk::pinkdb_extension! {
+//! #     name = "my_extension",
+//! #     functions = [ optional(1) fn f(a: f64, b: pinkdb_ext_sdk::Optional<f64>) -> f64 { a } ],
+//! # } }
+//! # fn main() -> Result<(), pinkdb_ext_sdk::ExtError> {
+//! my_extension::pinkdb_register_linked()?;
+//! // then, from SQL: LOAD EXTENSION 'my_extension';
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Fixed-arity declarations are unaffected: they never took this path.
+//!
 //! # Deterministic by default; volatile functions are declared separately
 //!
 //! **A function listed under `functions` is assumed deterministic.** A
@@ -113,7 +172,10 @@ pub use pinkdb_ext_loader::{
     ExtArg, ExtError, ExtType, ExtValue, LinkedExtension, LinkedFunction, linked,
 };
 pub use spec::ScalarSpec;
-pub use value::{Date, ExtArgType, FromExtArg, Interval, IntoExtValue, Timestamp};
+pub use value::{
+    Date, ExtArgType, FromExtArg, FromExtArgAt, Interval, IntoExtValue, Optional, Timestamp,
+    decode_arguments,
+};
 
 /// Publish a linked extension in the process-global registry (wave 49);
 /// the generated [`pinkdb_register_linked`](crate::pinkdb_extension) wraps
@@ -127,6 +189,9 @@ pub fn register_linked_extension(ext: LinkedExtension) -> Result<(), ExtError> {
 pub mod __private {
     #[cfg(not(target_arch = "wasm32"))]
     pub use crate::native::native_init;
+    /// The argument tag type, so a generated `min_args` can borrow a slice of
+    /// declared types.
+    pub use pinkdb_ext_loader::ExtType;
     #[cfg(not(target_arch = "wasm32"))]
     pub use pinkdb_ext_loader::PinkdbHostApi as HostApi;
 
@@ -134,4 +199,10 @@ pub mod __private {
     /// `pinkdb_extension_abi_version` returns.
     #[cfg(not(target_arch = "wasm32"))]
     pub const ABI_VERSION: u32 = pinkdb_ext_loader::PINKDB_EXT_ABI_VERSION;
+
+    /// The number of declared argument types, as a `const` expression (an
+    /// empty array literal's `.len()` has no inferred element type).
+    pub const fn arg_count(tags: &[ExtType]) -> usize {
+        tags.len()
+    }
 }

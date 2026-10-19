@@ -51,6 +51,67 @@ impl ExtArgType for Interval {
 impl<T: ExtArgType> ExtArgType for Option<T> {
     const EXT_TYPE: ExtType = T::EXT_TYPE;
 }
+/// A possibly-absent argument keeps its inner type's tag.
+impl<T: ExtArgType> ExtArgType for Optional<T> {
+    const EXT_TYPE: ExtType = T::EXT_TYPE;
+}
+
+/// One argument of a function declared with `optional(min)`: it may not have
+/// been passed at all.
+///
+/// The three states are the three things a ranged-arity call can say about a
+/// position, and they are deliberately distinct — `log(10)` (absent) is a
+/// base-10 logarithm while `log(2, NULL)` is SQL NULL:
+///
+/// - [`Optional::Absent`]: the caller stopped before this position;
+/// - [`Optional::Null`]: the caller passed SQL NULL;
+/// - [`Optional::Value`]: the caller passed a value.
+///
+/// A parameter *below* the declared minimum is always `Value` (the binder and
+/// the loader both refuse a shorter call); decode such a position with a
+/// plain type to say so in the signature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Optional<T> {
+    /// The argument was not passed.
+    Absent,
+    /// The argument was SQL NULL.
+    Null,
+    /// The argument was a value of the declared type.
+    Value(T),
+}
+
+impl<T> Optional<T> {
+    /// Whether the argument was not passed at all.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Optional::Absent)
+    }
+
+    /// Whether the argument was SQL NULL.
+    pub fn is_null(&self) -> bool {
+        matches!(self, Optional::Null)
+    }
+
+    /// The value, if a value was passed (`None` for absent *and* NULL).
+    pub fn value(&self) -> Option<&T> {
+        match self {
+            Optional::Value(value) => Some(value),
+            Optional::Absent | Optional::Null => None,
+        }
+    }
+
+    /// Consume the argument, yielding the value if a value was passed.
+    pub fn into_value(self) -> Option<T> {
+        match self {
+            Optional::Value(value) => Some(value),
+            Optional::Absent | Optional::Null => None,
+        }
+    }
+
+    /// The value, or `default` for absent *and* NULL.
+    pub fn value_or(self, default: T) -> T {
+        self.into_value().unwrap_or(default)
+    }
+}
 
 /// Decode one ABI argument into the Rust type an author wrote.
 ///
@@ -179,6 +240,82 @@ impl<'a, T: FromExtArg<'a>> FromExtArg<'a> for Option<T> {
             other => T::from_ext_arg(other).map(Some),
         }
     }
+}
+
+/// Decode argument `index` of a call whose arity may be **short** (a function
+/// declared with `optional(min)`).
+///
+/// Implemented for the ABI v1 types and for [`Optional<T>`]. The two families
+/// differ in exactly one way: an index past the end of the call is
+///
+/// - an error for a plain type — the parameter is required (the loader and
+///   the engine both refuse a call below the declared minimum, so this arm is
+///   a defensive one);
+/// - [`Optional::Absent`] for [`Optional<T>`], which is the whole point.
+///
+/// The generated glue uses this trait for every parameter of an
+/// `optional(min)` declaration; a fixed-arity declaration keeps using
+/// [`FromExtArg`] (and never sees a short call).
+pub trait FromExtArgAt<'a>: Sized {
+    /// Decode the argument at `index`, distinguishing "not passed".
+    fn from_ext_arg_at(args: &'a [ExtArg<'a>], index: usize) -> Result<Self, String>;
+}
+
+/// The plain types are decoded exactly like [`FromExtArg`]; a missing
+/// argument is an error naming the parameter (never a silent NULL).
+macro_rules! required_at {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl<'a> FromExtArgAt<'a> for $ty {
+                fn from_ext_arg_at(args: &'a [ExtArg<'a>], index: usize) -> Result<Self, String> {
+                    match args.get(index) {
+                        Some(arg) => <$ty as FromExtArg<'a>>::from_ext_arg(arg),
+                        None => Err(format!(
+                            "argument {} was not passed (this parameter is required)",
+                            index + 1
+                        )),
+                    }
+                }
+            }
+        )*
+    };
+}
+
+required_at!(bool, i32, i64, f64, String, &'a str, Date, Timestamp);
+
+impl<'a, T: FromExtArg<'a>> FromExtArgAt<'a> for Option<T> {
+    fn from_ext_arg_at(args: &'a [ExtArg<'a>], index: usize) -> Result<Self, String> {
+        match args.get(index) {
+            Some(arg) => <Option<T> as FromExtArg<'a>>::from_ext_arg(arg),
+            None => Err(format!(
+                "argument {} was not passed (this parameter is required)",
+                index + 1
+            )),
+        }
+    }
+}
+
+impl<'a, T: FromExtArg<'a>> FromExtArgAt<'a> for Optional<T> {
+    fn from_ext_arg_at(args: &'a [ExtArg<'a>], index: usize) -> Result<Self, String> {
+        match args.get(index) {
+            None => Ok(Optional::Absent),
+            Some(ExtArg::Null(_)) => Ok(Optional::Null),
+            Some(arg) => T::from_ext_arg(arg).map(Optional::Value),
+        }
+    }
+}
+
+/// Decode a whole argument list into `Vec<T>` — the tail of a function
+/// declared with `variadic(min)` (`Vec<Option<i64>>` for a NULL-able tail).
+///
+/// The borrow is tied to `args`, so `Vec<&str>` borrows the host's VARCHAR
+/// bytes for the duration of the call (copy to `String` to keep them).
+/// Errors name the 1-based argument, like every other decode path.
+pub fn decode_arguments<'a, T: FromExtArg<'a>>(args: &'a [ExtArg<'a>]) -> Result<Vec<T>, String> {
+    args.iter()
+        .enumerate()
+        .map(|(i, arg)| T::from_ext_arg(arg).map_err(|e| format!("argument {}: {e}", i + 1)))
+        .collect()
 }
 
 /// Encode a Rust return value into an ABI result.
@@ -439,5 +576,85 @@ mod tests {
             ok.into_ext_value().unwrap(),
             ExtValue::Varchar(b"x".to_vec())
         );
+    }
+
+    /// Wave 54: `Optional<T>` carries the three states a ranged-arity call
+    /// can say about a position, and its type tag is its inner type's.
+    #[test]
+    fn optional_keeps_absent_null_and_value_apart() {
+        let absent = Optional::<i64>::Absent;
+        let null = Optional::<i64>::Null;
+        let value = Optional::Value(7i64);
+        assert!(absent.is_absent() && !absent.is_null());
+        assert!(null.is_null() && !null.is_absent());
+        assert_eq!(value.value(), Some(&7));
+        assert_eq!(value.into_value(), Some(7));
+        assert_eq!(absent.value(), None);
+        assert_eq!(null.value(), None);
+        assert_eq!(absent.into_value(), None);
+        assert_eq!(null.into_value(), None);
+        assert_eq!(Optional::Value(3i64).value_or(9), 3);
+        assert_eq!(absent.value_or(9), 9);
+        assert_eq!(null.value_or(9), 9);
+        assert_eq!(Optional::<i64>::EXT_TYPE, ExtType::Bigint);
+        assert_eq!(Optional::<f64>::EXT_TYPE, ExtType::Double);
+        assert_eq!(Optional::<&str>::EXT_TYPE, ExtType::Varchar);
+    }
+
+    /// Wave 54: the ranged-arity decode — a plain parameter is an error when
+    /// absent (defensive: the engine refuses a short call first), while
+    /// `Optional<T>` reports `Absent`; NULL and values decode alike.
+    #[test]
+    fn from_ext_arg_at_decodes_short_calls() {
+        let args = [ExtArg::Bigint(7), ExtArg::Null(ExtType::Bigint)];
+        assert_eq!(
+            <Optional<i64> as FromExtArgAt>::from_ext_arg_at(&args, 0).unwrap(),
+            Optional::Value(7)
+        );
+        assert_eq!(
+            <Optional<i64> as FromExtArgAt>::from_ext_arg_at(&args, 1).unwrap(),
+            Optional::Null
+        );
+        assert_eq!(
+            <Optional<i64> as FromExtArgAt>::from_ext_arg_at(&args, 2).unwrap(),
+            Optional::Absent
+        );
+        assert!(<i64 as FromExtArgAt>::from_ext_arg_at(&args, 2).is_err());
+        assert!(<Option<i64> as FromExtArgAt>::from_ext_arg_at(&args, 2).is_err());
+        assert_eq!(<i64 as FromExtArgAt>::from_ext_arg_at(&args, 0).unwrap(), 7);
+        // Absent is not an error for the wrapper; a *wrong* type still is.
+        assert!(
+            <Optional<i64> as FromExtArgAt>::from_ext_arg_at(&[ExtArg::Varchar(b"x")], 0).is_err()
+        );
+    }
+
+    /// Wave 54: the variadic tail decodes every argument, with 1-based
+    /// error positions, and borrowed elements keep the caller's lifetime.
+    #[test]
+    fn decode_arguments_covers_a_variadic_tail() {
+        let args = [
+            ExtArg::Bigint(1),
+            ExtArg::Null(ExtType::Bigint),
+            ExtArg::Bigint(3),
+        ];
+        assert_eq!(
+            decode_arguments::<Option<i64>>(&args).unwrap(),
+            vec![Some(1), None, Some(3)]
+        );
+        assert!(decode_arguments::<i64>(&args).is_err());
+        let message = decode_arguments::<i64>(&args).unwrap_err();
+        assert!(
+            message.contains("argument 2") && message.contains("Option<i64>"),
+            "{message}"
+        );
+        assert_eq!(decode_arguments::<i64>(&[]).unwrap(), Vec::<i64>::new());
+
+        let text = [ExtArg::Varchar(b"hi"), ExtArg::Varchar(b"yo")];
+        let borrowed: Vec<&str> = decode_arguments(&text).unwrap();
+        assert_eq!(borrowed, vec!["hi", "yo"]);
+        // The error names the 1-based position.
+        let bad = [ExtArg::Varchar(b"hi"), ExtArg::Bigint(2)];
+        let message = decode_arguments::<&str>(&bad).unwrap_err();
+        assert!(message.contains("argument 2"), "{message}");
     }
 }

@@ -39,6 +39,10 @@
 //!     boundary, but they still fail the statement — return `Err` instead.
 //!  5. One declaration per crate: the macro defines the extension's exported
 //!     symbols. Use one module per extension if you need to organize code.
+//!  6. Ranged arities (`optional(min)` / `variadic(min)`, documented in the
+//!     SDK README) are **linked-only**: the native ABI v1 registers a fixed
+//!     argument count, so a declaration that uses one fails a native load.
+//!     This skeleton stays fixed-arity so it builds a loadable cdylib.
 
 use pinkdb_ext_sdk::pinkdb_extension;
 

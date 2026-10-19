@@ -207,7 +207,10 @@ jobs:
               for sub in ("build", "dist"):
                   libs += sorted(glob.glob(os.path.join(directory, sub, f"*{lib_ext}")))
               if not libs:
-                  sys.exit(f"error: extensions/{name}/ has no {lib_ext} under build/ or dist/")
+                  # Cargo-built workspace extensions (json/math/datetime) have
+                  # no Makefile artifact yet; skip them rather than failing
+                  # discovery.
+                  continue
               if len(libs) > 1:
                   sys.exit(
                       f"error: extensions/{name}/ has {len(libs)} {lib_ext} files under "
