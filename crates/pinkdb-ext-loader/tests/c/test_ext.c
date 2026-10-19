@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Copied out of init: the header documents the struct as init-scoped. */
@@ -288,6 +289,63 @@ static int32_t ext_micros(void *user_data, const pinkdb_ext_value *args,
     return 0;
 }
 
+/* ext_interval_pack(months INTEGER, days INTEGER, micros BIGINT) -> INTERVAL.
+ *
+ * The header's INTERVAL payload: micros in `int64`, months/days in the bits
+ * of `double_`. This is exactly how a third-party C extension is meant to
+ * build the value. */
+static int32_t ext_interval_pack(void *user_data,
+                                 const pinkdb_ext_value *args, size_t n_args,
+                                 pinkdb_ext_value *out) {
+    (void)user_data;
+    (void)n_args;
+    if (args[0].is_null || args[1].is_null || args[2].is_null) {
+        out->is_null = 1;
+        return 0;
+    }
+    uint64_t bits = ((uint64_t)(uint32_t)args[0].int64 << 32) |
+                    (uint32_t)args[1].int64;
+    double packed;
+    memcpy(&packed, &bits, sizeof(bits));
+    out->type_tag = PINKDB_EXT_TYPE_INTERVAL;
+    out->is_null = 0;
+    out->int64 = args[2].int64;
+    out->double_ = packed;
+    return 0;
+}
+
+/* ext_interval_fields(iv INTERVAL) -> VARCHAR "months|days|micros". */
+static int32_t ext_interval_fields(void *user_data,
+                                   const pinkdb_ext_value *args, size_t n_args,
+                                   pinkdb_ext_value *out) {
+    (void)user_data;
+    (void)n_args;
+    if (args[0].is_null) {
+        out->is_null = 1;
+        return 0;
+    }
+    uint64_t bits;
+    memcpy(&bits, &args[0].double_, sizeof(bits));
+    long long months = (int32_t)(uint32_t)(bits >> 32);
+    long long days = (int32_t)(uint32_t)bits;
+    long long micros = args[0].int64;
+    char buf[96];
+    int len = snprintf(buf, sizeof(buf), "%lld|%lld|%lld", months, days, micros);
+    if (len < 0 || (size_t)len >= sizeof(buf)) {
+        return 1;
+    }
+    char *text = (char *)g_api.alloc((size_t)len);
+    if (text == NULL) {
+        return 1;
+    }
+    memcpy(text, buf, (size_t)len);
+    out->type_tag = PINKDB_EXT_TYPE_VARCHAR;
+    out->is_null = 0;
+    out->text_ptr = text;
+    out->text_len = (size_t)len;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* ABI entry points.                                                   */
 /* ------------------------------------------------------------------ */
@@ -317,6 +375,9 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     const int32_t t_double[1] = {PINKDB_EXT_TYPE_DOUBLE};
     const int32_t t_date[1] = {PINKDB_EXT_TYPE_DATE};
     const int32_t t_ts[1] = {PINKDB_EXT_TYPE_TIMESTAMP};
+    const int32_t t_pack[3] = {PINKDB_EXT_TYPE_INTEGER, PINKDB_EXT_TYPE_INTEGER,
+                               PINKDB_EXT_TYPE_BIGINT};
+    const int32_t t_iv[1] = {PINKDB_EXT_TYPE_INTERVAL};
 
     if (api->register_scalar(host_ctx, "ext_double_it", 1, t_int,
                              PINKDB_EXT_TYPE_INTEGER, ext_double_it, NULL) != 0) {
@@ -362,6 +423,16 @@ int32_t pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx) {
     if (api->register_scalar(host_ctx, "ext_micros", 1, t_ts,
                              PINKDB_EXT_TYPE_BIGINT, ext_micros, NULL) != 0) {
         return 19;
+    }
+    if (api->register_scalar(host_ctx, "ext_interval_pack", 3, t_pack,
+                             PINKDB_EXT_TYPE_INTERVAL, ext_interval_pack,
+                             NULL) != 0) {
+        return 21;
+    }
+    if (api->register_scalar(host_ctx, "ext_interval_fields", 1, t_iv,
+                             PINKDB_EXT_TYPE_VARCHAR, ext_interval_fields,
+                             NULL) != 0) {
+        return 22;
     }
     return 0;
 }

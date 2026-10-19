@@ -2181,6 +2181,7 @@ version = "0.1.0"
 dependencies = [
  "pink-lake",
  "pinkdb",
+ "pinkdb-datetime",
  "pinkdb-json",
  "pinkdb-server",
  "rcgen",
@@ -2188,6 +2189,14 @@ dependencies = [
  "serde_json",
  "sha2",
  "ureq",
+]
+
+[[package]]
+name = "pinkdb-datetime"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "pinkdb-ext-sdk",
 ]
 
 [[package]]

@@ -106,6 +106,7 @@ author prefers:
 | `VARCHAR` | `&str` (borrowed for the call) or `String` (copied) | `String`, `&'static str` |
 | `DATE` | `Date` (days since 1970-01-01) | `Date` |
 | `TIMESTAMP` | `Timestamp` (microseconds since 1970-01-01 UTC) | `Timestamp` |
+| `INTERVAL` | `Interval` (`months`/`days`/`micros`) | `Interval` |
 
 `Option<T>` around any of them makes NULL a normal value; `Result<T, String>`
 around a return type makes errors returnable. All combinations are accepted:

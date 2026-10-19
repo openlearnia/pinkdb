@@ -102,6 +102,35 @@ fn loads_and_runs_typed_scalar_functions() {
         vec![vec![Value::Boolean(true)]]
     );
 
+    // INTERVAL crosses the C ABI in both directions: the extension builds
+    // one from three scalars (the header's double-bit payload) and reads one
+    // the engine produced back field by field.
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT ext_interval_pack(1, -2, CAST(3000000 AS BIGINT));"
+        ),
+        vec![vec![Value::Interval {
+            months: 1,
+            days: -2,
+            micros: 3_000_000,
+        }]]
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT ext_interval_fields(ext_interval_pack(13, 17, CAST(0 AS BIGINT)));"
+        ),
+        vec![vec![Value::Varchar("13|17|0".to_string())]]
+    );
+    assert_eq!(
+        rows(
+            &mut db,
+            "SELECT ext_interval_fields(CAST('1 year 2 days 03:00:00' AS INTERVAL));"
+        ),
+        vec![vec![Value::Varchar("12|2|10800000000".to_string())]]
+    );
+
     // The engine's own functions are untouched and extensions compose with
     // them like any other expression.
     assert_eq!(

@@ -118,6 +118,15 @@ unsafe fn collect_args<'a>(
             }
             Some(ExtType::Date) => ExtArg::Date(value.int64 as i32),
             Some(ExtType::Timestamp) => ExtArg::Timestamp(value.int64),
+            Some(ExtType::Interval) => {
+                let (months, days, micros) =
+                    pinkdb_ext_loader::unpack_interval(value.int64, value.double);
+                ExtArg::Interval {
+                    months,
+                    days,
+                    micros,
+                }
+            }
             // The host only passes declared, non-NULL tags (it rejects
             // PINKDB_EXT_TYPE_NULL at registration and bad results at call
             // time), so this is a contract violation, not something to
@@ -170,6 +179,17 @@ fn write_result(value: ExtValue, out: &mut PinkdbExtValue) -> Result<(), String>
         ExtValue::Timestamp(micros) => {
             out.is_null = 0;
             out.int64 = micros;
+            Ok(())
+        }
+        ExtValue::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            out.is_null = 0;
+            let (int64, double) = pinkdb_ext_loader::pack_interval(months, days, micros);
+            out.int64 = int64;
+            out.double = double;
             Ok(())
         }
         ExtValue::Varchar(bytes) => {
@@ -522,6 +542,20 @@ mod tests {
         assert_eq!(out.int64, 9);
         write_result(ExtValue::Timestamp(-1), &mut out).unwrap();
         assert_eq!(out.int64, -1);
+        write_result(
+            ExtValue::Interval {
+                months: 13,
+                days: -2,
+                micros: 7,
+            },
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            pinkdb_ext_loader::unpack_interval(out.int64, out.double),
+            (13, -2, 7)
+        );
+        assert!(out.text_ptr.is_null());
 
         write_result(ExtValue::Varchar(Vec::new()), &mut out).unwrap();
         assert_eq!(out.is_null, 0);
@@ -573,14 +607,33 @@ mod tests {
                 text_ptr: b"hi".as_ptr() as *const c_char,
                 text_len: 2,
             },
+            {
+                let (int64, double) = pinkdb_ext_loader::pack_interval(1, 2, -3);
+                PinkdbExtValue {
+                    type_tag: ExtType::Interval.tag(),
+                    is_null: 0,
+                    int64,
+                    double,
+                    text_ptr: std::ptr::null(),
+                    text_len: 0,
+                }
+            },
         ];
-        // SAFETY: the array holds four valid structs whose text borrows live
+        // SAFETY: the array holds five valid structs whose text borrows live
         // for this scope.
         let decoded = unsafe { collect_args(values.as_ptr(), values.len()) }.unwrap();
         assert_eq!(decoded[0], ExtArg::Boolean(true));
         assert_eq!(decoded[1], ExtArg::Bigint(-7));
         assert_eq!(decoded[2], ExtArg::Null(ExtType::Varchar));
         assert_eq!(decoded[3], ExtArg::Varchar(b"hi"));
+        assert_eq!(
+            decoded[4],
+            ExtArg::Interval {
+                months: 1,
+                days: 2,
+                micros: -3
+            }
+        );
         // SAFETY: as above, with a NULL array (the zero-argument case).
         assert!(
             unsafe { collect_args(std::ptr::null(), 0) }

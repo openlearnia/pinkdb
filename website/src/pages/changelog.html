@@ -9,6 +9,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-19</h2>
+<h3>Wave 56 — core <code>datetime</code> extension ✅</h3>
+<ul>
+<li>Ten DuckDB-pinned datetime functions over naive <code>DATE</code>/<code>TIMESTAMP</code>: <code>strftime</code>, <code>strptime</code>, <code>epoch</code>/<code>epoch_ms</code>, <code>dayofweek</code>/<code>dayofyear</code>/<code>week</code>, <code>last_day</code>, <code>age</code>, <code>make_date</code> — hand-rolled civil-date and format engines, zero new dependencies.</li>
+<li>The extension ABI gained an additive <strong>INTERVAL</strong> value type so <code>age</code> returns a real interval; <code>datetime</code> joins <code>json</code> as a <strong>default CLI feature</strong> (<code>--no-default-features</code> for lean). +40 KB on the default binary.</li>
+</ul>
 <h3>Wave 53 — core <code>string</code> extension ✅</h3>
 <ul>
 <li>Ten DuckDB-pinned string functions built with the Rust SDK: <code>split_part</code>, <code>reverse</code>, <code>left</code>/<code>right</code> (now parse unquoted), <code>strpos</code>, <code>starts_with</code>/<code>ends_with</code>, <code>regexp_extract</code>, <code>regexp_matches</code>, plus pinkdb's <code>regexp_match</code> (a pinned divergence — DuckDB has no such function) with DuckDB's full option surface.</li>

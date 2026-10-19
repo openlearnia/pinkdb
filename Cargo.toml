@@ -17,6 +17,7 @@ members = [
     # registration).
     "extensions/json",
     "extensions/string",
+    "extensions/datetime",
 ]
 resolver = "2"
 

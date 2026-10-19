@@ -49,37 +49,45 @@ const DISPLAY_CAP: usize = 10_000;
 
 /// Publish the linked extensions the CLI ships in the process-global
 /// registry — the host-bootstrap step `LOAD EXTENSION '<name>'` resolves
-/// against, on every target. With the default `json` feature that is
-/// `pinkdb-json`; a host that uses the library instead does the same
+/// against, on every target. With the default features that is `pinkdb-json`
+/// and `pinkdb-datetime`; a host that uses the library instead does the same
 /// explicitly (`pinkdb_json::ensure_registered()`).
-#[cfg(feature = "json")]
 fn register_builtin_extensions() {
+    #[cfg(feature = "json")]
     if let Err(e) = pinkdb_json::ensure_registered() {
         eprintln!("warning: the json extension could not be registered: {e}");
     }
+    #[cfg(feature = "datetime")]
+    if let Err(e) = pinkdb_datetime::ensure_registered() {
+        eprintln!("warning: the datetime extension could not be registered: {e}");
+    }
 }
-
-#[cfg(not(feature = "json"))]
-fn register_builtin_extensions() {}
 
 /// Load the CLI's built-in extensions into a store it just created or
-/// opened, so `json_*` works without a `LOAD EXTENSION` statement (the
-/// DuckDB behavior). A store whose WAL replay already loaded one — a
-/// replayed record that calls a json function is prefixed with
-/// `LOAD EXTENSION 'json'` — keeps it: [`PinkDb::is_extension_loaded`] is
-/// consulted first, because a second load is a documented error.
-#[cfg(feature = "json")]
+/// opened, so `json_*` and the datetime functions work without a
+/// `LOAD EXTENSION` statement (the DuckDB behavior). A store whose WAL
+/// replay already loaded one — a replayed record that calls such a function
+/// is prefixed with `LOAD EXTENSION '<name>'` — keeps it:
+/// [`PinkDb::is_extension_loaded`] is consulted first, because a second load
+/// is a documented error.
 fn load_builtin_extensions(db: &mut PinkDb) {
-    if db.is_extension_loaded(pinkdb_json::EXTENSION_NAME) {
-        return;
-    }
-    if let Err(e) = db.load_linked_extension(pinkdb_json::EXTENSION_NAME) {
+    // A feature-less build has nothing to load; keep the parameter used so
+    // the lean configuration stays warning-free (the sibling core-extension
+    // waves extend the cfg blocks above).
+    let _ = &db;
+    #[cfg(feature = "json")]
+    if !db.is_extension_loaded(pinkdb_json::EXTENSION_NAME)
+        && let Err(e) = db.load_linked_extension(pinkdb_json::EXTENSION_NAME)
+    {
         eprintln!("warning: the json extension could not be loaded: {e}");
     }
+    #[cfg(feature = "datetime")]
+    if !db.is_extension_loaded(pinkdb_datetime::EXTENSION_NAME)
+        && let Err(e) = db.load_linked_extension(pinkdb_datetime::EXTENSION_NAME)
+    {
+        eprintln!("warning: the datetime extension could not be loaded: {e}");
+    }
 }
-
-#[cfg(not(feature = "json"))]
-fn load_builtin_extensions(_db: &mut PinkDb) {}
 
 fn print_help() {
     println!("Dot-commands:");
@@ -190,6 +198,14 @@ fn print_help() {
     } else {
         println!("JSON: json_* functions are not built (rebuild with the `json` feature, or link");
         println!("      `pinkdb-json` and register it).");
+    }
+    if cfg!(feature = "datetime") {
+        println!("DATETIME: strftime, strptime, epoch, epoch_ms, dayofweek, dayofyear, week,");
+        println!("      last_day, age, make_date are built in and loaded into every store");
+        println!("      (`datetime` feature); DATE arguments take `::TIMESTAMP`.");
+    } else {
+        println!("DATETIME: the datetime functions are not built (rebuild with the `datetime`");
+        println!("      feature, or link `pinkdb-datetime` and register it).");
     }
 }
 

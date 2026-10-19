@@ -45,12 +45,30 @@
  *             results the host ignores every other field, including text_ptr
  *             — but still frees a non-NULL text_ptr, see ownership below);
  *   int64     BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since 1970-01-01),
- *             TIMESTAMP (microseconds since 1970-01-01 UTC);
+ *             TIMESTAMP (microseconds since 1970-01-01 UTC), and INTERVAL
+ *             (microseconds — see the INTERVAL note below);
  *   double_   DOUBLE (the Rust struct field is named `double`; `double_` is
- *             the C spelling — offsets and layout are identical);
+ *             the C spelling — offsets and layout are identical); for
+ *             INTERVAL it carries no numeric meaning and is read as a bit
+ *             pattern (see below);
  *   text_ptr  VARCHAR bytes; NULL when absent;
  *   text_len  byte length of text_ptr (embedded NUL bytes are allowed; a
  *             trailing NUL is neither required nor read).
+ *
+ * INTERVAL (type tag 9, same number as the pinkdb C ABI's
+ * PINKDB_TYPE_INTERVAL) is a calendar interval with DuckDB's three fields:
+ * months, days and micros. The by-value struct cannot grow a field without
+ * breaking ABI v1, so the payload rides in the two existing scalars:
+ *
+ *     int64      int64   = micros (can be any int64)
+ *     double_    bits    = ((uint32)months << 32) | (uint32)days
+ *
+ * i.e. read/write `months` and `days` through the 64-bit pattern of
+ * `double_` (C: memcpy the double to a uint64_t; C++: std::bit_cast; Rust:
+ * `f64::to_bits` / `f64::from_bits`) — never through the float value itself.
+ * The three fields round-trip exactly; a NULL interval ignores the payload.
+ * Argument and result marshalling is identical. (Type tags 8 — the pinkdb C
+ * ABI's DECIMAL — is deliberately not supported by extension ABI v1.)
  *
  * ---------------------------------------------------------------------------
  * Scalar callbacks
@@ -212,7 +230,9 @@ extern "C" {
  * above). The only bit defined today; unknown bits are rejected. */
 #define PINKDB_EXT_FLAG_VOLATILE 0x1u
 
-/* Value / argument type tags (same numbering as the pinkdb C ABI). */
+/* Value / argument type tags (same numbering as the pinkdb C ABI). 8 is that
+ * ABI's DECIMAL, which extension ABI v1 does not support; 9 is INTERVAL (see
+ * the payload note at the top of this header). */
 enum {
     PINKDB_EXT_TYPE_NULL = 0,
     PINKDB_EXT_TYPE_BOOLEAN = 1,
@@ -221,7 +241,8 @@ enum {
     PINKDB_EXT_TYPE_DOUBLE = 4,
     PINKDB_EXT_TYPE_VARCHAR = 5,
     PINKDB_EXT_TYPE_DATE = 6,
-    PINKDB_EXT_TYPE_TIMESTAMP = 7
+    PINKDB_EXT_TYPE_TIMESTAMP = 7,
+    PINKDB_EXT_TYPE_INTERVAL = 9
 };
 
 /* One tagged scalar value; see the layout notes at the top of this header. */

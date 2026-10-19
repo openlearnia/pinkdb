@@ -45,6 +45,27 @@ pub const PINKDB_EXT_TYPE_DOUBLE: i32 = 4;
 pub const PINKDB_EXT_TYPE_VARCHAR: i32 = 5;
 pub const PINKDB_EXT_TYPE_DATE: i32 = 6;
 pub const PINKDB_EXT_TYPE_TIMESTAMP: i32 = 7;
+/// Calendar interval, three DuckDB fields (`months`, `days`, `micros`). The
+/// tag number matches `pinkdb.h`'s `PINKDB_TYPE_INTERVAL`; 8 is that header's
+/// DECIMAL, which extension ABI v1 deliberately does not support. The
+/// by-value payload packing is [`pack_interval`] / [`unpack_interval`].
+pub const PINKDB_EXT_TYPE_INTERVAL: i32 = 9;
+
+/// Pack an interval's three fields into the by-value ABI payload: `micros`
+/// goes in the `int64` field, `months`/`days` ride in the bits of the
+/// `double` field (high 32 / low 32). `double` carries no numeric meaning for
+/// an INTERVAL value — use [`unpack_interval`], never the float itself.
+pub const fn pack_interval(months: i32, days: i32, micros: i64) -> (i64, f64) {
+    let bits = ((months as u32 as u64) << 32) | (days as u32 as u64);
+    (micros, f64::from_bits(bits))
+}
+
+/// Unpack the payload written by [`pack_interval`] (or by an extension built
+/// against the header's description of it) back into `(months, days, micros)`.
+pub const fn unpack_interval(int64: i64, double: f64) -> (i32, i32, i64) {
+    let bits = double.to_bits();
+    ((bits >> 32) as u32 as i32, bits as u32 as i32, int64)
+}
 
 /// One tagged scalar, by value. Same layout family as `pinkdb-ffi`'s
 /// `PinkValue`; for VARCHAR, `text_ptr`/`text_len` carry raw bytes (embedded
@@ -188,6 +209,9 @@ pub enum ExtType {
     Varchar,
     Date,
     Timestamp,
+    /// Calendar interval (`months`, `days`, `micros`), carried by value as
+    /// [`pack_interval`] describes.
+    Interval,
 }
 
 impl ExtType {
@@ -201,6 +225,7 @@ impl ExtType {
             ExtType::Varchar => PINKDB_EXT_TYPE_VARCHAR,
             ExtType::Date => PINKDB_EXT_TYPE_DATE,
             ExtType::Timestamp => PINKDB_EXT_TYPE_TIMESTAMP,
+            ExtType::Interval => PINKDB_EXT_TYPE_INTERVAL,
         }
     }
 
@@ -214,6 +239,7 @@ impl ExtType {
             PINKDB_EXT_TYPE_VARCHAR => Some(ExtType::Varchar),
             PINKDB_EXT_TYPE_DATE => Some(ExtType::Date),
             PINKDB_EXT_TYPE_TIMESTAMP => Some(ExtType::Timestamp),
+            PINKDB_EXT_TYPE_INTERVAL => Some(ExtType::Interval),
             _ => None,
         }
     }
@@ -228,6 +254,7 @@ impl ExtType {
             ExtType::Varchar => "VARCHAR",
             ExtType::Date => "DATE",
             ExtType::Timestamp => "TIMESTAMP",
+            ExtType::Interval => "INTERVAL",
         }
     }
 }
@@ -250,6 +277,12 @@ pub enum ExtArg<'a> {
     Varchar(&'a [u8]),
     Date(i32),
     Timestamp(i64),
+    /// A calendar interval, by value.
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
 }
 
 impl ExtArg<'_> {
@@ -264,6 +297,7 @@ impl ExtArg<'_> {
             ExtArg::Varchar(_) => ExtType::Varchar,
             ExtArg::Date(_) => ExtType::Date,
             ExtArg::Timestamp(_) => ExtType::Timestamp,
+            ExtArg::Interval { .. } => ExtType::Interval,
         }
     }
 
@@ -304,6 +338,21 @@ impl ExtArg<'_> {
             ),
             ExtArg::Date(d) => (PINKDB_EXT_TYPE_DATE, 0, d as i64, 0.0, std::ptr::null(), 0),
             ExtArg::Timestamp(us) => (PINKDB_EXT_TYPE_TIMESTAMP, 0, us, 0.0, std::ptr::null(), 0),
+            ExtArg::Interval {
+                months,
+                days,
+                micros,
+            } => {
+                let (int64, double) = pack_interval(months, days, micros);
+                (
+                    PINKDB_EXT_TYPE_INTERVAL,
+                    0,
+                    int64,
+                    double,
+                    std::ptr::null(),
+                    0,
+                )
+            }
         };
         PinkdbExtValue {
             type_tag,
@@ -328,6 +377,12 @@ pub enum ExtValue {
     Varchar(Vec<u8>),
     Date(i32),
     Timestamp(i64),
+    /// A calendar interval, by value.
+    Interval {
+        months: i32,
+        days: i32,
+        micros: i64,
+    },
 }
 
 impl ExtValue {
@@ -342,6 +397,7 @@ impl ExtValue {
             ExtValue::Varchar(_) => ExtType::Varchar,
             ExtValue::Date(_) => ExtType::Date,
             ExtValue::Timestamp(_) => ExtType::Timestamp,
+            ExtValue::Interval { .. } => ExtType::Interval,
         })
     }
 }
@@ -360,6 +416,7 @@ mod tests {
             ExtType::Varchar,
             ExtType::Date,
             ExtType::Timestamp,
+            ExtType::Interval,
         ];
         let mut tags: Vec<i32> = all.iter().map(|t| t.tag()).collect();
         tags.sort_unstable();
@@ -390,6 +447,40 @@ mod tests {
         assert_eq!(d.type_tag, PINKDB_EXT_TYPE_DOUBLE);
         assert_eq!(d.double, 2.5);
         assert_eq!(d.int64, 0);
+    }
+
+    /// The interval payload survives the by-value round trip in every field,
+    /// including negative months/days/micros.
+    #[test]
+    fn interval_payload_round_trips() {
+        for (months, days, micros) in [
+            (0, 0, 0),
+            (13, 17, 0),
+            (-1, -1, -432_000_000),
+            (i32::MAX, i32::MIN, i64::MIN),
+            (i32::MIN, i32::MAX, i64::MAX),
+        ] {
+            let (int64, double) = pack_interval(months, days, micros);
+            assert_eq!(unpack_interval(int64, double), (months, days, micros));
+
+            let abi = ExtArg::Interval {
+                months,
+                days,
+                micros,
+            }
+            .to_abi();
+            assert_eq!(abi.type_tag, PINKDB_EXT_TYPE_INTERVAL);
+            assert_eq!(abi.is_null, 0);
+            assert_eq!(
+                unpack_interval(abi.int64, abi.double),
+                (months, days, micros)
+            );
+        }
+        // A NULL interval carries the tag, not a payload.
+        assert_eq!(
+            ExtArg::Null(ExtType::Interval).to_abi().type_tag,
+            PINKDB_EXT_TYPE_INTERVAL
+        );
     }
 
     #[test]

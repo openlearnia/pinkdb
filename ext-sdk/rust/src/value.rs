@@ -44,6 +44,9 @@ impl ExtArgType for Date {
 impl ExtArgType for Timestamp {
     const EXT_TYPE: ExtType = ExtType::Timestamp;
 }
+impl ExtArgType for Interval {
+    const EXT_TYPE: ExtType = ExtType::Interval;
+}
 /// An optional argument keeps its inner type's tag and accepts NULL.
 impl<T: ExtArgType> ExtArgType for Option<T> {
     const EXT_TYPE: ExtType = T::EXT_TYPE;
@@ -152,6 +155,23 @@ impl FromExtArg<'_> for Timestamp {
     }
 }
 
+impl FromExtArg<'_> for Interval {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<Interval, String> {
+        match arg {
+            ExtArg::Interval {
+                months,
+                days,
+                micros,
+            } => Ok(Interval {
+                months: *months,
+                days: *days,
+                micros: *micros,
+            }),
+            other => Err(type_message("INTERVAL", "Interval", other)),
+        }
+    }
+}
+
 impl<'a, T: FromExtArg<'a>> FromExtArg<'a> for Option<T> {
     fn from_ext_arg(arg: &'a ExtArg<'a>) -> Result<Option<T>, String> {
         match arg {
@@ -231,6 +251,17 @@ impl IntoExtValue for Timestamp {
     }
 }
 
+impl IntoExtValue for Interval {
+    const RET_TYPE: ExtType = ExtType::Interval;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Interval {
+            months: self.months,
+            days: self.days,
+            micros: self.micros,
+        })
+    }
+}
+
 impl<T: IntoExtValue> IntoExtValue for Option<T> {
     const RET_TYPE: ExtType = T::RET_TYPE;
     fn into_ext_value(self) -> Result<ExtValue, String> {
@@ -261,6 +292,25 @@ pub struct Date(pub i32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timestamp(pub i64);
 
+/// A SQL `INTERVAL`: DuckDB's three-field calendar interval — whole `months`,
+/// whole `days`, and a `micros` time part.
+///
+/// The fields are independent and signed; the engine normalizes nothing
+/// (`age(TIMESTAMP '2024-03-01', TIMESTAMP '2023-01-15')` returns exactly the
+/// `1 year 1 month 17 days` decomposition as `months = 13, days = 17,
+/// micros = 0`). The by-value ABI payload is produced by the loader's
+/// `pack_interval` (micros in `int64`, months/days in the bits of `double`);
+/// this SDK does that marshalling, so authors just construct the struct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Interval {
+    /// Whole calendar months (12 per year when displayed).
+    pub months: i32,
+    /// Whole days.
+    pub days: i32,
+    /// Time part in microseconds.
+    pub micros: i64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,12 +325,14 @@ mod tests {
         assert_eq!(<&str as ExtArgType>::EXT_TYPE, ExtType::Varchar);
         assert_eq!(Date::EXT_TYPE, ExtType::Date);
         assert_eq!(Timestamp::EXT_TYPE, ExtType::Timestamp);
+        assert_eq!(Interval::EXT_TYPE, ExtType::Interval);
         assert_eq!(Option::<i64>::EXT_TYPE, ExtType::Bigint);
         assert_eq!(Option::<String>::EXT_TYPE, ExtType::Varchar);
 
         assert_eq!(i32::RET_TYPE, ExtType::Integer);
         assert_eq!(<&'static str as IntoExtValue>::RET_TYPE, ExtType::Varchar);
         assert_eq!(<Option<i64> as IntoExtValue>::RET_TYPE, ExtType::Bigint);
+        assert_eq!(Interval::RET_TYPE, ExtType::Interval);
         assert_eq!(
             <Result<Option<String>, String> as IntoExtValue>::RET_TYPE,
             ExtType::Varchar
@@ -317,6 +369,24 @@ mod tests {
             Timestamp::from_ext_arg(&ExtArg::Timestamp(5)).unwrap(),
             Timestamp(5)
         );
+        let iv = ExtArg::Interval {
+            months: 13,
+            days: -2,
+            micros: 7,
+        };
+        assert_eq!(
+            Interval::from_ext_arg(&iv).unwrap(),
+            Interval {
+                months: 13,
+                days: -2,
+                micros: 7
+            }
+        );
+        assert!(
+            Interval::from_ext_arg(&ExtArg::Null(ExtType::Interval))
+                .unwrap_err()
+                .contains("Option<Interval>")
+        );
         // A wrong runtime tag is a clear error, never a reinterpretation.
         let message = i64::from_ext_arg(&ExtArg::Varchar(b"x")).unwrap_err();
         assert_eq!(message, "expected BIGINT, got VARCHAR");
@@ -340,6 +410,20 @@ mod tests {
         assert_eq!(
             Timestamp(2).into_ext_value().unwrap(),
             ExtValue::Timestamp(2)
+        );
+        assert_eq!(
+            Interval {
+                months: 1,
+                days: 2,
+                micros: 3
+            }
+            .into_ext_value()
+            .unwrap(),
+            ExtValue::Interval {
+                months: 1,
+                days: 2,
+                micros: 3
+            }
         );
         assert_eq!(
             Option::<i64>::None.into_ext_value().unwrap(),

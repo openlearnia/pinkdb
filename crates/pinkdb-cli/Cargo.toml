@@ -9,16 +9,20 @@ name = "pinkdb"
 path = "src/main.rs"
 
 [features]
-# Default build: the first-party **json** extension (wave 52) is linked and
-# published in the linked registry at startup, then loaded into every store
-# the session opens, so the six `json_*` functions work out of the box (the
-# DuckDB behavior). `--no-default-features` produces the lean binary without
-# it. Like every extension it costs a `LOAD EXTENSION` prefix in the WAL of
-# the statements that call it, and a durable store replayed by a build
-# without the feature refuses those records instead of dropping them.
-default = ["json"]
+# Default build: the first-party **json** (wave 52) and **datetime** (wave 56)
+# extensions are linked and published in the linked registry at startup, then
+# loaded into every store the session opens, so the `json_*` and datetime
+# functions work out of the box (the DuckDB behavior). `--no-default-features`
+# produces the lean binary without them. Like every extension each costs a
+# `LOAD EXTENSION` prefix in the WAL of the statements that call it, and a
+# durable store replayed by a build without the feature refuses those records
+# instead of dropping them.
+default = ["json", "datetime"]
 # Core json extension: `pinkdb-json` (JSON as VARCHAR in v1).
 json = ["dep:pinkdb-json"]
+# Core datetime extension: `pinkdb-datetime` (strftime, strptime, epoch,
+# epoch_ms, dayofweek, dayofyear, week, last_day, age, make_date).
+datetime = ["dep:pinkdb-datetime"]
 # Opt-in remote mode: `pinkdb --host HOST:PORT` talks to a pinkdb-server.
 client = ["dep:pinkdb-server"]
 # Opt-in TLS for remote mode: `--tls`, `--tls-ca-cert PATH` and
@@ -62,6 +66,10 @@ rustyline = "14"
 # VARCHAR (v1 has no JSON type). Links no external crates — parsing and
 # rendering are hand rolled — so the default binary grows by a few KB only.
 pinkdb-json = { path = "../../extensions/json", optional = true }
+# Core datetime extension (default feature): ten DuckDB date/time functions
+# over naive DATE/TIMESTAMP. Links only the Rust extension SDK (calendar math
+# and the format engine are hand rolled), so it is a few KB, too.
+pinkdb-datetime = { path = "../../extensions/datetime", optional = true }
 pinkdb-server = { path = "../pinkdb-server", optional = true }
 # Repository client (repo feature): blocking HTTP over rustls (no gzip: the
 # repository serves raw artifacts), catalog JSON, and SHA-256 verification.

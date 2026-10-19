@@ -1,0 +1,20 @@
+[package]
+name = "pinkdb-datetime"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb core datetime extension: strftime, strptime, epoch, epoch_ms, dayofweek, dayofyear, week, last_day, age, make_date (naive timestamps)"
+license = "MIT"
+
+[dependencies]
+# The wave-51 Rust SDK: one `pinkdb_extension!` declaration generates the ABI
+# v1 exports (native cdylib) and the linked/wasm registration. The SDK depends
+# on the loader, never the other way around; this crate adds no other
+# dependency (calendar math and the format engine are hand rolled below).
+pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
+
+[dev-dependencies]
+# End-to-end SQL tests (tests/engine.rs) drive the extension through the
+# engine: binder, executor, WAL. A dev-dependency cannot cycle — the engine
+# never depends on this crate.
+pinkdb = { path = "../../crates/pinkdb" }

@@ -40,6 +40,7 @@
 //! | `VARCHAR` | `&str` (borrowed) or `String` (owned) | `String`, `&'static str`, or `Option<_>` of those |
 //! | `DATE` | [`Date`] | [`Date`] |
 //! | `TIMESTAMP` | [`Timestamp`] | [`Timestamp`] |
+//! | `INTERVAL` | [`Interval`] | [`Interval`] |
 //!
 //! `Option<T>` around any of them means "NULL is a normal value": a NULL
 //! argument decodes to `None`, and `None` encodes to SQL NULL. A NULL that
@@ -112,7 +113,7 @@ pub use pinkdb_ext_loader::{
     ExtArg, ExtError, ExtType, ExtValue, LinkedExtension, LinkedFunction, linked,
 };
 pub use spec::ScalarSpec;
-pub use value::{Date, ExtArgType, FromExtArg, IntoExtValue, Timestamp};
+pub use value::{Date, ExtArgType, FromExtArg, Interval, IntoExtValue, Timestamp};
 
 /// Publish a linked extension in the process-global registry (wave 49);
 /// the generated [`pinkdb_register_linked`](crate::pinkdb_extension) wraps

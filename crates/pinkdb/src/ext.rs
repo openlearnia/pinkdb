@@ -76,9 +76,12 @@ pub(crate) fn ext_type_of(dtype: DataType) -> Option<ExtType> {
         DataType::Varchar => Some(ExtType::Varchar),
         DataType::Date => Some(ExtType::Date),
         DataType::Timestamp => Some(ExtType::Timestamp),
-        // ABI v1 has no DECIMAL/INTERVAL argument types; the binder's
-        // exact-type check rejects such arguments with its usual message.
-        DataType::Decimal { .. } | DataType::Interval => None,
+        // INTERVAL is an additive ABI v1 type (tag 9, the pinkdb C ABI's
+        // number): a function may declare it as an argument or return type.
+        // DECIMAL still has no ABI type; the binder's exact-type check
+        // rejects such arguments with its usual message.
+        DataType::Interval => Some(ExtType::Interval),
+        DataType::Decimal { .. } => None,
     }
 }
 
@@ -92,6 +95,7 @@ pub(crate) fn dtype_of_ext(dtype: ExtType) -> DataType {
         ExtType::Varchar => DataType::Varchar,
         ExtType::Date => DataType::Date,
         ExtType::Timestamp => DataType::Timestamp,
+        ExtType::Interval => DataType::Interval,
     }
 }
 
@@ -332,10 +336,15 @@ pub(crate) fn push_ext_arg<'a>(
         VectorData::VarChar(v) => ExtArg::Varchar(v[row].as_bytes()),
         VectorData::Date32(v) => ExtArg::Date(v[row]),
         VectorData::TimestampMicros(v) => ExtArg::Timestamp(v[row]),
-        // Unreachable: `ext_type_of` rejects these in the binder's exact-type
-        // check before any callback can run.
-        VectorData::Decimal { .. } | VectorData::Interval(_) => {
-            unreachable!("extensions v1 do not accept DECIMAL/INTERVAL arguments")
+        VectorData::Interval(v) => ExtArg::Interval {
+            months: v[row].months,
+            days: v[row].days,
+            micros: v[row].micros,
+        },
+        // Unreachable: `ext_type_of` rejects DECIMAL in the binder's
+        // exact-type check before any callback can run.
+        VectorData::Decimal { .. } => {
+            unreachable!("extensions v1 do not accept DECIMAL arguments")
         }
     });
 }
@@ -403,6 +412,20 @@ pub(crate) fn ext_value_to_value(
             }
             Value::Timestamp(us)
         }
+        ExtValue::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            if dtype != DataType::Interval {
+                return Err(mismatch(ExtType::Interval));
+            }
+            Value::Interval {
+                months,
+                days,
+                micros,
+            }
+        }
     })
 }
 
@@ -420,6 +443,7 @@ mod tests {
             DataType::Varchar,
             DataType::Date,
             DataType::Timestamp,
+            DataType::Interval,
         ] {
             assert_eq!(dtype_of_ext(ext_type_of(dtype).unwrap()), dtype);
         }
@@ -430,7 +454,43 @@ mod tests {
             }),
             None
         );
-        assert_eq!(ext_type_of(DataType::Interval), None);
+    }
+
+    #[test]
+    fn result_conversion_accepts_an_interval_only_for_an_interval() {
+        let ok = ext_value_to_value(
+            "f",
+            DataType::Interval,
+            ExtValue::Interval {
+                months: 1,
+                days: 2,
+                micros: 3,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            ok,
+            Value::Interval {
+                months: 1,
+                days: 2,
+                micros: 3
+            }
+        );
+        let err = ext_value_to_value(
+            "f",
+            DataType::Varchar,
+            ExtValue::Interval {
+                months: 0,
+                days: 0,
+                micros: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("returned INTERVAL, expected VARCHAR"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -93,9 +93,17 @@ One tagged scalar, `pinkdb_ext_value`, crosses the ABI by value:
 |---|---|
 | `type_tag` | `PINKDB_EXT_TYPE_*` — the *declared* type (the binder inserts no implicit casts; callers write `CAST(...)`) |
 | `is_null` | non-zero ⇒ NULL; only `type_tag` is then meaningful |
-| `int64` | BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since epoch), TIMESTAMP (µs since epoch UTC) |
-| `double_` | DOUBLE (same layout as the Rust field named `double`) |
+| `int64` | BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since epoch), TIMESTAMP (µs since epoch UTC), INTERVAL (µs part) |
+| `double_` | DOUBLE (same layout as the Rust field named `double`); for INTERVAL it carries the `(months << 32) \| days` bit pattern |
 | `text_ptr`/`text_len` | VARCHAR bytes; embedded NULs allowed, no trailing NUL required |
+
+`PINKDB_EXT_TYPE_INTERVAL` (tag 9) is DuckDB's three-field calendar
+interval. The by-value struct cannot grow a field without breaking ABI v1,
+so `months` and `days` ride in the `double_` bit pattern: memcpy the double
+to a `uint64_t` and read `months = (uint32_t)(bits >> 32)`,
+`days = (uint32_t)bits`; `int64` carries `micros`. All three fields
+round-trip exactly; a NULL interval ignores the payload. The header
+documents the same layout.
 
 - The host always calls the callback, even for NULL arguments, with `args[i].is_null` set — the extension decides what NULL means (DuckDB calls this "special NULL handling"). A zero-argument callback receives `args == NULL`.
 - `out` points at host-owned writable storage pre-filled with NULL. Set `out->type_tag` (and text fields for VARCHAR), then return 0. Leaving `is_null` set yields NULL.

@@ -437,6 +437,36 @@ QUERIES = [
     ("json-extract-bad-path", "SELECT json_extract('{\"a\":1}', '$.a.');", False, True),
     ("json-object-odd-args", "SELECT json_object('a');", False, True),
     ("json-object-null-key", "SELECT json_object(CAST(NULL AS VARCHAR), 'v');", False, True),
+    # ---- wave 56: the core datetime extension ----
+    # DATE arguments take `::TIMESTAMP` in pinkdb (the strict extension ABI
+    # inserts no implicit casts); DuckDB accepts the same cast, so every
+    # probe is one SQL text for both engines.
+    ("dt-epoch", "SELECT epoch(TIMESTAMP '2024-01-01 12:00:00'), epoch(TIMESTAMP '1969-12-31 23:59:59.5'), epoch(DATE '1970-01-01'::TIMESTAMP), epoch(TIMESTAMP '1969-12-31 23:59:59.999999'), epoch(TIMESTAMP '1969-12-31 23:59:59.000001'), epoch(TIMESTAMP '1969-12-31 23:59:59.000000');", False, False),
+    ("dt-epoch-ms", "SELECT epoch_ms(TIMESTAMP '2024-01-01 00:00:00.000001'), epoch_ms(TIMESTAMP '1969-12-31 23:59:59.999999'), epoch_ms(TIMESTAMP '1969-12-31 23:59:59.9995'), epoch_ms(TIMESTAMP '1970-01-01 00:00:00.0005'), epoch_ms(DATE '1970-01-01'::TIMESTAMP);", False, False),
+    ("dt-dayofweek", "SELECT dayofweek(DATE '2024-01-07'::TIMESTAMP), dayofweek(DATE '2024-01-08'::TIMESTAMP), dayofweek(TIMESTAMP '2023-01-01 12:00:00'), dayofweek(TIMESTAMP '1969-12-31 23:59:59');", False, False),
+    ("dt-dayofyear", "SELECT dayofyear(DATE '2024-03-01'::TIMESTAMP), dayofyear(DATE '2023-03-01'::TIMESTAMP), dayofyear(DATE '2024-12-31'::TIMESTAMP), dayofyear(DATE '2000-02-29'::TIMESTAMP);", False, False),
+    ("dt-week-iso", "SELECT week(DATE '2021-01-01'::TIMESTAMP), week(DATE '2021-01-04'::TIMESTAMP), week(DATE '2020-12-31'::TIMESTAMP), week(DATE '2024-01-01'::TIMESTAMP), week(DATE '2023-01-01'::TIMESTAMP), week(DATE '2024-12-31'::TIMESTAMP);", False, False),
+    ("dt-last-day", "SELECT last_day(DATE '2024-02-01'::TIMESTAMP), last_day(DATE '2023-02-01'::TIMESTAMP), last_day(DATE '2024-01-15'::TIMESTAMP), last_day(DATE '2024-12-01'::TIMESTAMP), last_day(TIMESTAMP '2000-02-29 13:14:15');", False, False),
+    ("dt-make-date", "SELECT make_date(2024, 2, 29), make_date(2023, 12, 31), make_date(1970, 1, 1), make_date(1, 1, 1), make_date(9999, 12, 31);", False, False),
+    ("dt-strftime-date", "SELECT strftime(TIMESTAMP '2024-03-05 14:07:09', '%Y-%m-%d %H:%M:%S'), strftime(DATE '2024-03-05'::TIMESTAMP, '%c'), strftime(DATE '2024-03-05'::TIMESTAMP, '%x %X %T'), strftime(TIMESTAMP '2024-03-05 14:07:09', 'plain 100%% text'), strftime(TIMESTAMP '2024-03-05 14:07:09', '%%Y');", False, False),
+    ("dt-strftime-fields", "SELECT strftime(TIMESTAMP '2024-03-05 14:07:09.123456', '%f'), strftime(TIMESTAMP '2024-03-05 14:07:09', '%a|%A|%b|%B|%h'), strftime(TIMESTAMP '2024-03-05 14:07:09', '%j|%u|%w|%U|%W|%V|%G'), strftime(TIMESTAMP '2024-03-05 09:07:09', '%I|%p'), strftime(TIMESTAMP '2024-03-05 00:00:00', '%I|%p');", False, False),
+    ("dt-strftime-boundaries", "SELECT strftime(TIMESTAMP '1969-12-31 23:59:59', '%G %V %Y %j'), strftime(TIMESTAMP '2023-01-01 00:00:00', '%G %V %U %W'), strftime(TIMESTAMP '2024-12-31 00:00:00', '%G %V'), strftime(TIMESTAMP '0001-01-01 00:00:00', '%Y|%y');", False, False),
+    ("dt-strptime", "SELECT strptime('2024-03-05 14:07:09.123456', '%Y-%m-%d %H:%M:%S.%f'), strptime('2024-3-5 4:5:6', '%Y-%m-%d %H:%M:%S'), strptime('Mar 05 2024', '%b %d %Y'), strptime('2024-065', '%Y-%j'), strptime(strftime(TIMESTAMP '2024-03-05 14:07:09.123456', '%Y-%m-%d %H:%M:%S.%f'), '%Y-%m-%d %H:%M:%S.%f') = TIMESTAMP '2024-03-05 14:07:09.123456';", False, False),
+    ("dt-strptime-defaults", "SELECT strptime('14:07:09', '%H:%M:%S'), strptime('07', '%d'), strptime('2024', '%Y'), strptime('69-01-01', '%y-%m-%d'), strptime('68-01-01', '%y-%m-%d');", False, False),
+    ("dt-strptime-composite", "SELECT strptime('2024-03-05 14:07:09', '%c'), strptime('2024-03-05', '%x'), strptime('4:05 PM', '%I:%M %p'), strptime('12:05 AM', '%I:%M %p');", False, False),
+    ("dt-strptime-rollover", "SELECT strptime('2023-366', '%Y-%j'), strptime('366', '%j'), strptime('2024-366', '%Y-%j');", False, False),
+    ("dt-age", "SELECT age(DATE '2024-03-01'::TIMESTAMP, DATE '2023-01-15'::TIMESTAMP), age(DATE '2023-01-15'::TIMESTAMP, DATE '2024-03-01'::TIMESTAMP), age(DATE '2024-03-01'::TIMESTAMP, DATE '2024-01-31'::TIMESTAMP), age(TIMESTAMP '2024-01-01 00:00:00', TIMESTAMP '2024-01-01 00:00:00');", False, False),
+    ("dt-age-boundaries", "SELECT age(DATE '2024-02-29'::TIMESTAMP, DATE '2023-12-31'::TIMESTAMP), age(DATE '2024-02-29'::TIMESTAMP, DATE '2023-03-01'::TIMESTAMP), age(DATE '2024-12-31'::TIMESTAMP, DATE '2024-01-01'::TIMESTAMP), age(DATE '2000-02-29'::TIMESTAMP, DATE '1999-02-28'::TIMESTAMP);", False, False),
+    ("dt-age-times", "SELECT age(TIMESTAMP '2024-03-01 06:00:00', TIMESTAMP '2023-01-15 18:30:00'), age(TIMESTAMP '2024-03-01 06:00:00', TIMESTAMP '2024-01-31 18:00:00'), age(TIMESTAMP '2024-03-01 00:00:00', TIMESTAMP '2024-03-01 00:00:01'), age(TIMESTAMP '1970-01-01 01:00:00', TIMESTAMP '1969-12-31 23:00:00');", False, False),
+    ("dt-null-matrix", "SELECT epoch(hired::TIMESTAMP), epoch_ms(hired::TIMESTAMP), dayofweek(hired::TIMESTAMP), dayofyear(hired::TIMESTAMP), week(hired::TIMESTAMP), last_day(hired::TIMESTAMP), strftime(hired::TIMESTAMP, '%Y'), strptime(NULL, '%Y'), strptime('2024', NULL), age(hired::TIMESTAMP, DATE '2024-01-01'::TIMESTAMP), make_date(NULL, 1, 1) FROM emp WHERE id = 5;", False, False),
+    ("dt-columns", "SELECT id, dayofyear(hired::TIMESTAMP), week(hired::TIMESTAMP), last_day(hired::TIMESTAMP) FROM emp ORDER BY id;", True, False),
+    ("dt-where-group", "SELECT strftime(hired::TIMESTAMP, '%Y-%m') AS m, COUNT(*) FROM emp WHERE week(hired::TIMESTAMP) >= 1 GROUP BY m ORDER BY m;", True, False),
+    # error cases: both engines must refuse.
+    ("dt-strftime-unsupported", "SELECT strftime(TIMESTAMP '2024-03-05 14:07:09', '%e');", False, True),
+    ("dt-strftime-trailing-percent", "SELECT strftime(TIMESTAMP '2024-03-05 14:07:09', 'x%');", False, True),
+    ("dt-strptime-bad-month", "SELECT strptime('2024-13-05', '%Y-%m-%d');", False, True),
+    ("dt-strptime-bad-date", "SELECT strptime('2023-02-29', '%Y-%m-%d');", False, True),
+    ("dt-make-date-invalid", "SELECT make_date(2023, 2, 29);", False, True),
 ]
 
 # ---- wave 53: core string extension (`extensions/string`) ----

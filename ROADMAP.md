@@ -89,7 +89,7 @@ Status: `done` / `in progress` / `queued`. A wave is `done` only when `cargo bui
 | 53 | Core extension: **string** — `split_part`, trim variants, `replace`, `reverse`, `left`/`right`, `strpos`, `starts_with`/`ends_with`, `regexp_match`/`regexp_extract` landed; new `extensions/string` = **`pinkdb-ext-string`** (workspace member; **no new crates** — `regex` was already locked) authored with the wave-51 SDK: `split_part`, `reverse`, `left`, `right`, `strpos`, `starts_with`, `ends_with` (exact DuckDB α semantics incl. negative/1-based indexes, Unicode scalars, NULL propagation) + the regexp surface: `regexp_extract` (4-arg full shape), **`regexp_matches`** (3-arg BOOLEAN — DuckDB's real function; the brief's `regexp_match` does not exist in DuckDB — verified — pinned as pinkdb's first-match VARCHAR, documented loudly), option surface `i/c/l/m/n/p/s` with DuckDB's left-to-right precedence (`g` refused exactly like DuckDB); `trim`/`replace` families deliberately NOT re-registered (core built-ins; extensions cannot shadow — proven by a test that pins the refusal); one minimal engine grammar relaxation so unquoted `left(`/`right(` parse (LEFT/RIGHT are join keywords; `LEFT OUTER JOIN`, bare keywords, `CAST(x)` unchanged); tests ext-string **19**, pinkdb 597 → **598**, workspace **1010**, duckdiff 196 → **223** (+27 probes), smoke **15/15**, wasm green; CLI default **+0 B** (runtime-loaded dylib: 1.70 MB unstripped / 1.43 MB stripped, regex chain ≈1.22 MiB of it) | |
 | 54 | Core extension: **math** — `sqrt`, `pow`, `log`/`ln`/`exp`, trig, `floor`/`ceil`, `sign`, `greatest`/`least`, `random` (volatile-flagged) | queued | `extensions/math` |
 | 55 | Performance tuning (recurring every 5th wave): bench-driven speed work (core) — done: column-vs-literal comparison fast path (`filter_str` 5.39 → 1.60 ms, battery 235.5 ms best-ever); audit deltas attributed (per-chunk literal Vectors + codegen/thermal noise), fused-path choice validated | done | core |
-| 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) | queued | `extensions/datetime` |
+| 56 | Core extension: **datetime** — `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`, `last_day`, `age`, `make_date` (naive timestamps only) landed; new `extensions/datetime` = **`pinkdb-datetime`** (workspace member, **zero new deps** — hand-rolled civil-date + format engine) with the wave-51 SDK: `strftime`, `strptime`, `epoch`, `epoch_ms`, `dayofweek`, `dayofyear`, `week`, `last_day`, `age`, `make_date` over **naive** DATE/TIMESTAMP; **additive ABI v1 INTERVAL value type** (tag 9, matching `pinkdb.h`; months/days ride the bits of `double`, µs in `int64`; loader + engine + SDK + all four header copies via `header_sync`) so `age` returns a real INTERVAL; semantics pinned against α46057 (epoch is fractional **DOUBLE** — the brief's BIGINT is the 1.x shape; `epoch_ms` ties-away rounding; ISO-8601 `week`; `age` decomposition borrows from the start month; `make_date` errors like DuckDB; strftime/strptime specifier set = α's minus deliberate refusals `%z %Z %n %N %g` (+strptime `%U %W %V %G`) — full matrix + divergences in the crate docs); `datetime` joins `json` as a CLI **default feature** (auto-loaded; `--no-default-features` lean); tests datetime **35**, ext-loader 73 → **74** (+C-ABI interval round-trip), pinkdb 598 → **599**, workspace **1047**, duckdiff 223 → **248** (+25 probes), smokes green, wasm green; sizes **+40,304 B** default / **+56,832 B** lake (exact) | |
 | 57 | Pink-lake data encryption/decryption at rest (feature-gated): one Argon2id KDF per lake session (salt recorded in the catalog), AEAD containers for the catalog + snapshots (the `catalog == snapshot` byte invariant preserved) and the data files — stage 1 `.pink` v1/v4, stage 2 Vortex v2/v3 (whole-file container first; attach keeps working via the encrypted manifest statistics, footer-only/segment-level as the follow-up); `PINKDB_KEY` UX consistent with the engine; plaintext lakes keep working; a missing/wrong key fails closed with an authenticated error; S3 ciphertext CAS unchanged; encrypted soak + strict S3 harness coverage | done | landed; `PNKLAKE1` AES-256-GCM containers over every object via a `Storage` decorator (manifests sealed once → invariant holds; commits/deletes/time-travel inherited), stats-fast attach preserved, wrong/missing key fails closed with feature-off rebuild hints, encrypted CI matrix + Docker harness section; Vortex stage-1 whole-file reads documented |
 | 58 | SQL completeness (worktree `wt-sql-completeness`): multi-way/composite/non-equi joins, CROSS/FULL joins, INTERSECT/EXCEPT, INSERT…SELECT, CTAS, IF [NOT] EXISTS, OFFSET, NULLS FIRST/LAST, COUNT(DISTINCT), RANGE window frames + the DuckDB RANGE-default peer fix, EXPLAIN, SHOW/DESCRIBE | done | landed; duckdiff 88 → 155 probes |
 | 59 | Prepared statements and parameters: placeholders, a bind API, and protocol/FFI/Python/Go front-end support | done | landed (engine + protocol v5 + FFI + client); Python/Go wrappers follow in wave 69 |
@@ -1640,4 +1640,26 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   clippy predates it; **both toolchains now gate clippy**) and the server
   `--help` duplicate `--allow-load-extension` line removed (46↔47 merge
   leftover). Integration on main: one conflict (workspace members union).
+  Worktree removed.
+
+- 2026-10-19 — Wave 56 (datetime core extension; worktree `wt-datetime`): ten
+  DuckDB-pinned functions over naive DATE/TIMESTAMP, authored with the SDK. The
+  headline ABI change is **additive INTERVAL** (tag 9): `age` needs a real
+  interval result and the ABI could not express one, so months/days ride the
+  bits of `double` (lossless, zero-allocation, documented) and µs in `int64`;
+  the C dlopen path round-trips it in `extensions.rs` and `header_sync` keeps
+  all four vendored headers byte-identical. Semantics were pinned live: α's
+  `epoch` is fractional **DOUBLE** (the brief's "BIGINT seconds" is the 1.x
+  shape — divergence documented), `epoch_ms` rounds ties away from zero,
+  `week` is ISO-8601, `age` decomposes month→days with the start month's
+  length and swap-negates, `make_date` errors on invalid fields, and the
+  strftime/strptime set is α's minus deliberate refusals (`%z %Z %n %N %g`; plus
+  `%U %W %V %G` for strptime). `datetime` joins `json` in the CLI's default
+  features (auto-loaded; `--no-default-features` stays lean). Gates: datetime
+  **35**, ext-loader 73 → **74**, pinkdb 598 → **599**, workspace **1047**,
+  duckdiff 223 → **248** (+25 probes), fmt/clippy on both toolchains, wasm
+  green, C/Go/Rust smokes green. Sizes (exact): **+40,304 B** on the default
+  CLI (3,637,696 → 3,678,000), **+56,832 B** with vortexlake,s3 (49,533,392 →
+  49,590,224). Integration on main: two conflicts resolved (workspace members
+  union; the README core-extensions paragraph merged with wave 53's wording).
   Worktree removed.

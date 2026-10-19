@@ -296,6 +296,14 @@ impl DynamicFunction {
             }
             ExtType::Date => ExtValue::Date(out.int64 as i32),
             ExtType::Timestamp => ExtValue::Timestamp(out.int64),
+            ExtType::Interval => {
+                let (months, days, micros) = crate::abi::unpack_interval(out.int64, out.double);
+                ExtValue::Interval {
+                    months,
+                    days,
+                    micros,
+                }
+            }
         })
     }
 }

@@ -10,6 +10,15 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 56 — core `datetime` extension ✅
+- Ten DuckDB-pinned datetime functions over naive `DATE`/`TIMESTAMP`:
+  `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`,
+  `last_day`, `age`, `make_date` — hand-rolled civil-date and format engines,
+  zero new dependencies.
+- The extension ABI gained an additive **INTERVAL** value type so `age` returns
+  a real interval; `datetime` joins `json` as a **default CLI feature**
+  (`--no-default-features` for lean). +40 KB on the default binary.
+
 ### Wave 53 — core `string` extension ✅
 - Ten DuckDB-pinned string functions built with the Rust SDK: `split_part`,
   `reverse`, `left`/`right` (now parse unquoted), `strpos`,
