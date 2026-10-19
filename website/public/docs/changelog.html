@@ -185,6 +185,13 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2 id="2026-10-19">2026-10-19<a class="anchor" href="#2026-10-19" aria-label="Permalink: 2026-10-19">#</a></h2>
+<h3>Wave 50 — performance pass ✅</h3>
+<ul>
+<li>High-cardinality <code>GROUP BY</code> / <code>COUNT(DISTINCT)</code> got a typed fast path (no per-row values, chunked output, adaptive one-shot reserve): <code>group_id</code> 15.8 → 4.4 ms and <code>distinct_id</code> 15.6 → 4.6 ms — both now ahead of the DuckDB reference on the same corpus.</li>
+<li>Byte-slice hashing went word-wise: <code>distinct_lowcard</code> 3.8 → 3.1 ms and <code>join_probe</code> 5.3 → 4.6 ms.</li>
+<li>Standing battery total <strong>101.5 → 75.7 ms (−25%)</strong>; all correctness gates unchanged.</li>
+</ul>
 <h2 id="2026-10-18">2026-10-18<a class="anchor" href="#2026-10-18" aria-label="Permalink: 2026-10-18">#</a></h2>
 <h3>Wave 48 — RBAC: users, roles and enforced grants ✅</h3>
 <ul>
@@ -399,6 +406,7 @@ progress log</a>.</p>
 <nav class="toc" aria-label="On this page">
 <p class="toc-title">On this page</p>
 <ul>
+  <li><a href="#2026-10-19">2026-10-19</a></li>
   <li><a href="#2026-10-18">2026-10-18</a></li>
   <li><a href="#2026-10-17">2026-10-17</a></li>
   <li><a href="#2026-10-16">2026-10-16</a></li>

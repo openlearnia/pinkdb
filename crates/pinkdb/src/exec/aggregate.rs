@@ -848,65 +848,152 @@ pub(crate) struct Partial {
     pub(crate) index: FastMap<Vec<u8>, usize>,
 }
 
-/// Run hash aggregation over `inputs`. Output columns are
-/// `[keys..., aggs...]`, chunked at [`CHUNK_SIZE`].
-///
-/// Chunks aggregate in parallel (rayon) into per-chunk partials, which merge
-/// in chunk order — group order is deterministic (first-seen row wins).
+/// Output buffer of the integer-DISTINCT fast path: the current vector's
+/// payload in the key's own layout (narrowed on flush for INTEGER/DATE) plus
+/// the slot of the (at most one) NULL key. Buffers flush as `CHUNK_SIZE`-row
+/// vectors, so no `Value` is ever built for a row.
+struct DistinctOut {
+    dtype: DataType,
+    payload: Vec<i64>,
+    null_at: Option<usize>,
+    chunks: Vec<DataChunk>,
+}
+
+impl DistinctOut {
+    fn new(dtype: DataType) -> DistinctOut {
+        DistinctOut {
+            dtype,
+            payload: Vec::with_capacity(CHUNK_SIZE),
+            null_at: None,
+            chunks: Vec::new(),
+        }
+    }
+
+    /// Record key `x` as the next output row; a full buffer flushes.
+    fn push(&mut self, x: i64) -> Result<()> {
+        self.payload.push(x);
+        if self.payload.len() >= CHUNK_SIZE {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Record the NULL key's output row (the caller de-duplicates it).
+    fn push_null(&mut self) -> Result<()> {
+        debug_assert!(self.null_at.is_none());
+        self.null_at = Some(self.payload.len());
+        self.push(0)
+    }
+
+    /// Move the buffered payload into one vector. Only the NULL slot is
+    /// invalid, so the mask is all-ones with that one bit cleared
+    /// (`from_raw` clears the bits past the length).
+    fn flush(&mut self) -> Result<()> {
+        let rows = self.payload.len();
+        if rows == 0 {
+            return Ok(());
+        }
+        let payload = std::mem::take(&mut self.payload);
+        let data = match self.dtype {
+            DataType::Integer => VectorData::Int32(payload.iter().map(|&x| x as i32).collect()),
+            DataType::Date => VectorData::Date32(payload.iter().map(|&x| x as i32).collect()),
+            DataType::Bigint => VectorData::Int64(payload),
+            DataType::Timestamp => VectorData::TimestampMicros(payload),
+            // `aggregate` only routes the integer layouts here.
+            _ => unreachable!("integer DISTINCT over a non-integer key"),
+        };
+        let mut validity = vec![u64::MAX; rows.div_ceil(64)];
+        if let Some(at) = self.null_at.take() {
+            validity[at / 64] &= !(1u64 << (at % 64));
+        }
+        self.payload = Vec::with_capacity(CHUNK_SIZE);
+        self.chunks
+            .push(DataChunk::new(vec![Vector::from_raw(data, validity)])?);
+        Ok(())
+    }
+}
+
 /// Fast path for DISTINCT over a single integer/date/timestamp column: avoids
-/// the full group machinery (no per-group allocations, no encode/clone).
+/// the full group machinery (no per-group allocations, no encode/clone) and
+/// writes distinct keys straight into typed output payloads.
 fn fast_distinct_int(
     _cx: &Cx,
     inputs: &[DataChunk],
     idx: usize,
     dtype: DataType,
 ) -> Result<Vec<DataChunk>> {
-    use crate::types::FastSet;
+    let total_rows: usize = inputs.iter().map(|c| c.num_rows()).sum();
     let mut seen: FastSet<i64> = FastSet::default();
+    let mut reserved = false;
     let mut seen_null = false;
-    let mut out_values: Vec<Value> = Vec::new();
-    for chunk in inputs {
-        let col = &chunk.columns[idx];
-        for i in 0..chunk.num_rows() {
-            if col.is_null(i) {
+    let mut out = DistinctOut::new(dtype);
+    // One row at a time: `Some(key)` inserts a key (emitting it on first
+    // sight), `None` is the single NULL key.
+    let mut feed = |x: Option<i64>| -> Result<()> {
+        match x {
+            Some(v) => {
+                if seen.insert(v) {
+                    // Like the general path: a set that proves high
+                    // cardinality reserves the rest of the input in one
+                    // rehash instead of growing by doubling.
+                    if !reserved && seen.len() >= HIGH_CARDINALITY_KEYS {
+                        seen.reserve(total_rows.saturating_sub(seen.len()).min(1 << 20));
+                        reserved = true;
+                    }
+                    out.push(v)?;
+                }
+            }
+            None => {
                 if !seen_null {
                     seen_null = true;
-                    out_values.push(Value::Null);
-                }
-            } else {
-                let v = col.get(i);
-                let key = match v {
-                    Value::Integer(x) => x as i64,
-                    Value::Bigint(x) => x,
-                    Value::Date(x) => x as i64,
-                    Value::Timestamp(x) => x,
-                    _ => unreachable!(),
-                };
-                if seen.insert(key) {
-                    out_values.push(v);
+                    out.push_null()?;
                 }
             }
         }
-    }
-    // Emit as chunks.
-    let mut out_chunks = Vec::new();
-    let mut cur = Vector::with_capacity(dtype, CHUNK_SIZE);
-    let mut cur_rows = 0;
-    for v in out_values {
-        if cur_rows >= CHUNK_SIZE {
-            out_chunks.push(DataChunk::new(vec![cur])?);
-            cur = Vector::with_capacity(dtype, CHUNK_SIZE);
-            cur_rows = 0;
+        Ok(())
+    };
+    for chunk in inputs {
+        let rows = chunk.num_rows();
+        let col = &chunk.columns[idx];
+        // INTEGER/DATE payloads are i32, BIGINT/TIMESTAMP i64.
+        match col.data() {
+            VectorData::Int32(d) | VectorData::Date32(d) => {
+                for (i, &x) in d.iter().enumerate().take(rows) {
+                    feed(if col.is_valid(i) {
+                        Some(x as i64)
+                    } else {
+                        None
+                    })?;
+                }
+            }
+            VectorData::Int64(d) | VectorData::TimestampMicros(d) => {
+                for (i, &x) in d.iter().enumerate().take(rows) {
+                    feed(if col.is_valid(i) { Some(x) } else { None })?;
+                }
+            }
+            other => {
+                return Err(PinkDbError::Execution(format!(
+                    "internal: integer DISTINCT over a {:?} column",
+                    other.dtype()
+                )));
+            }
         }
-        cur.push_value(v)?;
-        cur_rows += 1;
     }
-    if cur_rows > 0 || out_chunks.is_empty() {
-        out_chunks.push(DataChunk::new(vec![cur])?);
+    out.flush()?;
+    if out.chunks.is_empty() {
+        // No input rows: one empty chunk carries the output schema, exactly
+        // as the materialized emit did.
+        out.chunks
+            .push(DataChunk::new(vec![Vector::with_capacity(dtype, 0)])?);
     }
-    Ok(out_chunks)
+    Ok(out.chunks)
 }
 
+/// Run hash aggregation over `inputs`. Output columns are
+/// `[keys..., aggs...]`, chunked at [`CHUNK_SIZE`].
+///
+/// Chunks aggregate in parallel (rayon) into per-chunk partials, which merge
+/// in chunk order — group order is deterministic (first-seen row wins).
 pub(crate) fn aggregate(
     cx: &Cx,
     inputs: &[DataChunk],

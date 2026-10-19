@@ -8,6 +8,18 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-19
+
+### Wave 50 — performance pass ✅
+- High-cardinality `GROUP BY` / `COUNT(DISTINCT)` got a typed fast path (no
+  per-row values, chunked output, adaptive one-shot reserve): `group_id`
+  15.8 → 4.4 ms and `distinct_id` 15.6 → 4.6 ms — both now ahead of the DuckDB
+  reference on the same corpus.
+- Byte-slice hashing went word-wise: `distinct_lowcard` 3.8 → 3.1 ms and
+  `join_probe` 5.3 → 4.6 ms.
+- Standing battery total **101.5 → 75.7 ms (−25%)**; all correctness gates
+  unchanged.
+
 ## 2026-10-18
 
 ### Wave 48 — RBAC: users, roles and enforced grants ✅

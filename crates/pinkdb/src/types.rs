@@ -25,18 +25,30 @@ impl std::hash::BuildHasher for FnvBuild {
 }
 
 impl std::hash::Hasher for FnvHash {
+    /// Byte-slice keys (encoded group/join keys, composite row keys) mix one
+    /// whole 8-byte word per step, with the ≤ 7-byte tail folded in as one
+    /// partially-filled word — the same single-step mix `write_u64` uses.
+    /// Every byte still feeds the hash; this is just as deterministic (no
+    /// per-run seed), so results never depend on hash order.
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.0 ^= u64::from_le_bytes(word.try_into().expect("chunks_exact(8)"));
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+        let tail = words.remainder();
+        if !tail.is_empty() {
+            let mut word = 0u64;
+            for (i, &b) in tail.iter().enumerate() {
+                word |= (b as u64) << (8 * i);
+            }
+            self.0 ^= word;
             self.0 = self.0.wrapping_mul(0x100000001b3);
         }
     }
 
     /// One FNV step over the whole word instead of the default 8-iteration
     /// byte loop: integer-keyed maps (i64 join keys) hash through here.
-    /// Byte-slice hashing keeps the exact FNV-1a loop above, and this is just
-    /// as deterministic (no per-run seed), so results never depend on hash
-    /// order.
     fn write_u64(&mut self, x: u64) {
         self.0 ^= x;
         self.0 = self.0.wrapping_mul(0x100000001b3);
