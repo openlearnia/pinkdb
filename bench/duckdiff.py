@@ -483,6 +483,18 @@ QUERIES = [
     ("dt-strptime-bad-month", "SELECT strptime('2024-13-05', '%Y-%m-%d');", False, True),
     ("dt-strptime-bad-date", "SELECT strptime('2023-02-29', '%Y-%m-%d');", False, True),
     ("dt-make-date-invalid", "SELECT make_date(2023, 2, 29);", False, True),
+    # ---- wave 77: SQL macros ----
+    ("macro-scalar", "CREATE MACRO m_add(a, b) AS a + b; SELECT m_add(id, 10) FROM emp ORDER BY id;", True, False),
+    ("macro-default", "CREATE MACRO m_def(a, b := 10) AS a + b; SELECT m_def(1), m_def(1, 2), m_def(b := 5, a := 2);", False, False),
+    ("macro-where-group", "CREATE MACRO m_bump(x) AS x + 1; SELECT m_bump(did) AS d, COUNT(*) FROM emp WHERE m_bump(id) > 1 GROUP BY m_bump(did) ORDER BY d;", True, False),
+    ("macro-nested", "CREATE MACRO m_inc(x) AS x + 1; CREATE MACRO m_inc2(x) AS m_inc(m_inc(x)); SELECT m_inc2(id) FROM emp ORDER BY id;", True, False),
+    ("macro-table", "CREATE MACRO m_high(s) AS TABLE SELECT id, name FROM emp WHERE salary > s; SELECT name FROM m_high(60) ORDER BY name;", True, False),
+    ("macro-table-nested-default", "CREATE MACRO m_base() AS TABLE SELECT * FROM emp; CREATE MACRO m_top(n := 1) AS TABLE SELECT name FROM m_base() WHERE salary >= n; SELECT COUNT(*), MIN(name) FROM m_top(100);", False, False),
+    ("macro-in-view", "CREATE MACRO m_twice(x) AS x * 2; CREATE VIEW m_v AS SELECT m_twice(id) AS y FROM emp; SELECT SUM(y) FROM m_v;", False, False),
+    ("macro-or-replace", "CREATE MACRO m_swap(a, b) AS a - b; CREATE OR REPLACE MACRO m_swap(a, b) AS b - a; CREATE MACRO IF NOT EXISTS m_swap(a, b) AS a * b; SELECT m_swap(3, 2);", False, False),
+    ("macro-drop", "CREATE MACRO m_gone(x) AS x; DROP MACRO m_gone; DROP MACRO IF EXISTS m_gone; SELECT 7;", False, False),
+    ("macro-self-recursion", "CREATE MACRO m_fact(n) AS n * m_fact(n - 1); SELECT m_fact(3);", False, True),
+    ("macro-table-as-scalar", "CREATE MACRO m_t(x) AS TABLE SELECT x AS v; SELECT m_t(1);", False, True),
 ]
 
 # ---- wave 53: core string extension (`extensions/string`) ----

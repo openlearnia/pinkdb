@@ -799,6 +799,10 @@ pub struct DbCatalog {
     pub(crate) materialized_views: HashMap<String, MaterializedViewDef>,
     /// Stored procedures, keyed by lowercased name.
     pub(crate) procedures: HashMap<String, crate::procedure::ProcedureDef>,
+    /// SQL macros (wave 77), keyed by lowercased name. Macros live in their
+    /// own namespace: a macro may share a name with a table or view, exactly
+    /// like DuckDB (a scalar/table macro name is one namespace).
+    pub(crate) macros: HashMap<String, crate::macros::MacroDef>,
 }
 
 /// A store of databases.
@@ -1306,6 +1310,60 @@ impl PinkDb {
     /// flags word.)
     pub(crate) fn has_procedures(&self) -> bool {
         self.databases.values().any(|c| !c.procedures.is_empty())
+    }
+
+    /// A stored macro of `db` by name (case-insensitive).
+    pub fn macro_in(&self, db: &str, name: &str) -> Result<&crate::macros::MacroDef> {
+        self.catalog(db)?
+            .macros
+            .get(&name.to_ascii_lowercase())
+            .ok_or_else(|| {
+                PinkDbError::Catalog(format!("macro \"{name}\" not found in database \"{db}\""))
+            })
+    }
+
+    /// Install (or replace) one macro definition.
+    pub(crate) fn macros_insert_in(
+        &mut self,
+        db: &str,
+        key: String,
+        def: crate::macros::MacroDef,
+    ) -> Result<()> {
+        self.catalog_mut(db)?.macros.insert(key, def);
+        Ok(())
+    }
+
+    /// Remove one macro (the caller checks existence for `IF EXISTS`).
+    pub(crate) fn macros_remove_in(
+        &mut self,
+        db: &str,
+        key: &str,
+    ) -> Option<crate::macros::MacroDef> {
+        self.databases
+            .get_mut(&Self::db_key(db))?
+            .macros
+            .remove(key)
+    }
+
+    /// Every macro of `db`, as `(lowercased key, definition)` pairs sorted by
+    /// key — the deterministic order `.pink` writes them in.
+    pub(crate) fn macros_in(&self, db: &str) -> Vec<(String, crate::macros::MacroDef)> {
+        let Some(cat) = self.databases.get(&Self::db_key(db)) else {
+            return Vec::new();
+        };
+        let mut out: Vec<(String, crate::macros::MacroDef)> = cat
+            .macros
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Does any database hold a macro? (Cheap gate for the `.pink` flags
+    /// word.)
+    pub(crate) fn has_macros(&self) -> bool {
+        self.databases.values().any(|c| !c.macros.is_empty())
     }
 
     /// Does the store hold any RBAC data (a user, a role, a membership, a

@@ -211,6 +211,33 @@ pub enum LogicalPlan {
         name: String,
         args: Vec<BoundExpr>,
     },
+    /// `CREATE [OR REPLACE] MACRO ...` (wave 77): store the parsed template
+    /// in the target database's catalog. `source` is the statement text the
+    /// runner attached (persisted in `.pink`, like a materialized view's
+    /// defining SQL); the executor refuses an empty one.
+    CreateMacro {
+        db: Option<String>,
+        name: String,
+        def: crate::macros::MacroDef,
+        or_replace: bool,
+        if_not_exists: bool,
+        source: String,
+    },
+    /// `DROP MACRO [IF EXISTS] name`.
+    DropMacro {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
+    /// `SHOW MACROS`: the database's macros, sorted by name.
+    ShowMacros {
+        db: String,
+    },
+    /// `DESCRIBE MACRO name`: one macro's DuckDB-shaped function metadata.
+    DescribeMacro {
+        db: String,
+        name: String,
+    },
     /// `CREATE USER [IF NOT EXISTS] name PASSWORD '<plaintext>'` (wave 48).
     /// The binder hashed the password; only the Argon2id PHC string is in
     /// the plan, the catalog and the WAL (`crate::rbac::wal_statement_text`
@@ -445,7 +472,9 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
             | LogicalPlan::ShowTables { .. }
             | LogicalPlan::ShowDatabases
             | LogicalPlan::ShowMaterializedViews { .. }
+            | LogicalPlan::ShowMacros { .. }
             | LogicalPlan::Describe { .. }
+            | LogicalPlan::DescribeMacro { .. }
             | LogicalPlan::Explain { .. }
     )
 }
@@ -470,6 +499,24 @@ pub(crate) fn with_mv_source(plan: LogicalPlan, source: Option<&str>) -> Logical
             query,
             if_not_exists,
             policy,
+            source: source.unwrap_or_default().to_string(),
+        },
+        // Wave 77: a macro's definition is persisted as its defining statement
+        // text (a bound template cannot be rendered back to SQL), so the
+        // runner's per-statement source rides along exactly like an MV's.
+        LogicalPlan::CreateMacro {
+            db,
+            name,
+            def,
+            or_replace,
+            if_not_exists,
+            ..
+        } => LogicalPlan::CreateMacro {
+            db,
+            name,
+            def,
+            or_replace,
+            if_not_exists,
             source: source.unwrap_or_default().to_string(),
         },
         other => other,
@@ -525,6 +572,12 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::CreateProcedure { .. }
             | LogicalPlan::DropProcedure { .. }
             | LogicalPlan::Call { .. }
+            // Wave 77: macro DDL mutates the catalog and must replay; a
+            // statement that *uses* a macro logs its own text unchanged, and
+            // replay re-expands it against the definitions present in WAL
+            // order.
+            | LogicalPlan::CreateMacro { .. }
+            | LogicalPlan::DropMacro { .. }
             // Wave 48: user/role DDL and grants mutate the store's RBAC
             // catalog, so a durable store logs and replays them. A
             // `CREATE/ALTER USER` is logged in its `PASSWORD_HASH` form —
@@ -563,6 +616,10 @@ pub(crate) fn refused_in_transaction(plan: &LogicalPlan) -> Option<&'static str>
         // there like hand-written statements.
         LogicalPlan::CreateProcedure { .. } => "CREATE PROCEDURE",
         LogicalPlan::DropProcedure { .. } => "DROP PROCEDURE",
+        // Wave 77: macro definitions are catalog metadata the per-table
+        // transaction merge does not carry, exactly like a procedure's.
+        LogicalPlan::CreateMacro { .. } => "CREATE MACRO",
+        LogicalPlan::DropMacro { .. } => "DROP MACRO",
         // Wave 48: RBAC objects live in the store's catalog, which the
         // per-table transaction merge does not carry (exactly like a
         // procedure definition or a database). Refusing them inside a
@@ -689,7 +746,9 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
+        | LogicalPlan::ShowMacros { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
@@ -697,7 +756,9 @@ pub(crate) fn collect_tables_read(
         | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. }
         | LogicalPlan::CreateProcedure { .. }
-        | LogicalPlan::DropProcedure { .. } => {}
+        | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::CreateMacro { .. }
+        | LogicalPlan::DropMacro { .. } => {}
         // A materialized view's defining query is part of the statement: the
         // backing table is computed from exactly these reads.
         LogicalPlan::CreateMaterializedView { query, .. } => {
@@ -1051,7 +1112,9 @@ fn walk_scan_filters(
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
+        | LogicalPlan::ShowMacros { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::AlterTable { .. }
         | LogicalPlan::CreateTable { .. }
@@ -1059,6 +1122,8 @@ fn walk_scan_filters(
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::IndexScan { .. }
         | LogicalPlan::CreateMaterializedView { .. }
+        | LogicalPlan::CreateMacro { .. }
+        | LogicalPlan::DropMacro { .. }
         | LogicalPlan::RefreshMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
         | LogicalPlan::DropMaterializedView { .. }
@@ -1375,12 +1440,16 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
+        | LogicalPlan::ShowMacros { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::CreateMacro { .. }
+        | LogicalPlan::DropMacro { .. }
         | LogicalPlan::CreateTable { .. }
         | LogicalPlan::DropMaterializedView { .. }
         | LogicalPlan::RefreshMaterializedViews { .. }
@@ -1754,7 +1823,9 @@ fn walk_scan_projections(
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
+        | LogicalPlan::ShowMacros { .. }
         | LogicalPlan::Describe { .. }
+        | LogicalPlan::DescribeMacro { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::CreateIndex { .. }
         | LogicalPlan::DropIndex { .. }
@@ -1765,6 +1836,8 @@ fn walk_scan_projections(
         | LogicalPlan::DropMaterializedView { .. }
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::CreateMacro { .. }
+        | LogicalPlan::DropMacro { .. }
         // Wave 48: RBAC statements scan no table.
         | LogicalPlan::CreateUser { .. }
         | LogicalPlan::AlterUser { .. }

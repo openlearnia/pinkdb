@@ -332,6 +332,8 @@ fn kind_of(r: &QueryResult) -> i32 {
         QueryResult::DroppedMaterializedView { .. } => PINKDB_STMT_DROPPED_TABLE,
         QueryResult::CreatedProcedure { .. } => PINKDB_STMT_CREATED,
         QueryResult::DroppedProcedure { .. } => PINKDB_STMT_DROPPED_TABLE,
+        QueryResult::CreatedMacro { .. } => PINKDB_STMT_CREATED,
+        QueryResult::DroppedMacro { .. } => PINKDB_STMT_DROPPED_TABLE,
         QueryResult::Called { .. } => PINKDB_STMT_CREATED,
         QueryResult::CreatedUser { .. } => PINKDB_STMT_CREATED_USER,
         QueryResult::AlteredUser { .. } => PINKDB_STMT_ALTERED_USER,
@@ -395,6 +397,8 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
                     | QueryResult::AlteredTable { name }
                     | QueryResult::CreatedProcedure { name }
                     | QueryResult::DroppedProcedure { name }
+                    | QueryResult::CreatedMacro { name }
+                    | QueryResult::DroppedMacro { name }
                     | QueryResult::CreatedUser { name }
                     | QueryResult::AlteredUser { name }
                     | QueryResult::DroppedUser { name }

@@ -90,6 +90,22 @@ fn reject_parameter_positions(stmts: &[Statement]) -> Result<()> {
                     ));
                 }
             }
+            // A macro definition is a stored template: it has no bind call to
+            // take a value from, exactly like a view definition.
+            Statement::CreateMacro { params, body, .. } => {
+                if params
+                    .iter()
+                    .any(|p| p.default.as_ref().is_some_and(expr_contains_parameter))
+                    || match body {
+                        MacroBody::Scalar(e) => expr_contains_parameter(e),
+                        MacroBody::Table(q) => select_contains_parameter(q),
+                    }
+                {
+                    return Err(PinkDbError::Parameter(
+                        "parameters are not supported in CREATE MACRO".to_string(),
+                    ));
+                }
+            }
             Statement::CreateTableAs { query, .. } => check_select_positions(query)?,
             Statement::Insert { source, .. } => match source {
                 InsertSource::Values(rows) => {
@@ -225,6 +241,7 @@ fn check_expr_positions(expr: &Expr) -> Result<()> {
             }
             Ok(())
         }
+        Expr::NamedArg { expr, .. } => check_expr_positions(expr),
         Expr::Window { args, over, .. } => {
             for a in args {
                 check_expr_positions(a)?;
@@ -276,6 +293,7 @@ fn expr_contains_parameter(expr: &Expr) -> bool {
         Expr::Function { args, .. } | Expr::Coalesce(args) => {
             args.iter().any(expr_contains_parameter)
         }
+        Expr::NamedArg { expr, .. } => expr_contains_parameter(expr),
         Expr::Window { args, over, .. } => {
             args.iter().any(expr_contains_parameter)
                 || over.partition.iter().any(expr_contains_parameter)
@@ -375,6 +393,19 @@ fn collect_parameter_offsets(stmt: &Statement, out: &mut Vec<usize>) {
                 collect_expr_offsets(e, out);
             }
         }
+        // A macro definition never holds `?` (rejected before renumbering);
+        // its defaults/bodies still walk so a future relaxation is covered.
+        Statement::CreateMacro { params, body, .. } => {
+            for p in params {
+                if let Some(e) = &p.default {
+                    collect_expr_offsets(e, out);
+                }
+            }
+            match body {
+                MacroBody::Scalar(e) => collect_expr_offsets(e, out),
+                MacroBody::Table(q) => collect_select_offsets(q, out),
+            }
+        }
         Statement::AlterTable {
             op: AlterTableOp::AddColumn {
                 default: Some(e), ..
@@ -455,6 +486,7 @@ fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
                 collect_expr_offsets(a, out);
             }
         }
+        Expr::NamedArg { expr, .. } => collect_expr_offsets(expr, out),
         Expr::Window { args, over, .. } => {
             for a in args {
                 collect_expr_offsets(a, out);
@@ -518,6 +550,17 @@ fn apply_parameter_ranks(stmt: &mut Statement, offsets: &[usize]) {
         Statement::Call { args, .. } => {
             for e in args {
                 apply_expr_ranks(e, offsets);
+            }
+        }
+        Statement::CreateMacro { params, body, .. } => {
+            for p in params {
+                if let Some(e) = p.default.as_mut() {
+                    apply_expr_ranks(e, offsets);
+                }
+            }
+            match body {
+                MacroBody::Scalar(e) => apply_expr_ranks(e, offsets),
+                MacroBody::Table(q) => apply_select_ranks(q, offsets),
             }
         }
         Statement::AlterTable {
@@ -603,6 +646,7 @@ fn apply_expr_ranks(expr: &mut Expr, offsets: &[usize]) {
                 apply_expr_ranks(a, offsets);
             }
         }
+        Expr::NamedArg { expr, .. } => apply_expr_ranks(expr, offsets),
         Expr::Window { args, over, .. } => {
             for a in args {
                 apply_expr_ranks(a, offsets);
@@ -990,10 +1034,15 @@ peg::parser! {
             = word("show") word("tables") { Statement::ShowTables }
             / word("show") word("databases") { Statement::ShowDatabases }
             / word("show") word("materialized") word("views") { Statement::ShowMaterializedViews }
+            / word("show") word("macros") { Statement::ShowMacros }
 
-        /// `DESCRIBE <table>`: DuckDB-shaped column metadata.
+        /// `DESCRIBE <table>`: DuckDB-shaped column metadata. `DESCRIBE MACRO
+        /// <name>` (wave 77) reports one macro's function metadata.
         rule describe_stmt() -> Statement
-            = word("describe") t:table_ref() { Statement::Describe { db: t.0, name: t.1 } }
+            = word("describe") word("macro") t:table_ref() {
+                  Statement::DescribeMacro { db: t.0, name: t.1 }
+              }
+            / word("describe") t:table_ref() { Statement::Describe { db: t.0, name: t.1 } }
 
         /// `EXPLAIN <select>` — the plain (optimized) plan text.
         rule explain_stmt() -> Statement
@@ -1128,6 +1177,17 @@ peg::parser! {
             / kw(Keyword::Create) word("materialized") kw(Keyword::View) ifne:if_not_exists() t:table_ref() policy:refresh_policy() kw(Keyword::As) query:select() {
                   Statement::CreateMaterializedView { db: t.0, name: t.1, query: Box::new(query), if_not_exists: ifne, policy }
               }
+            / kw(Keyword::Create) orr:or_replace() word("macro") ifne:if_not_exists() t:table_ref()
+              params:macro_params() kw(Keyword::As) body:macro_body() {
+                  Statement::CreateMacro {
+                      db: t.0,
+                      name: t.1,
+                      params,
+                      body,
+                      or_replace: orr,
+                      if_not_exists: ifne,
+                  }
+              }
             / kw(Keyword::Create) kw(Keyword::View) t:table_ref() cols:col_name_list()? kw(Keyword::As) query:select() {
                   Statement::CreateView { db: t.0, name: t.1, cols, query: Box::new(query) }
               }
@@ -1167,6 +1227,44 @@ peg::parser! {
                   out.extend(rest);
                   out
               }
+
+        /// A macro's parameter list (wave 77): `(a, b := 10)` or `()`.
+        /// Parameters are untyped, like DuckDB's; a declared type is parsed
+        /// and refused here with a definition-shaped error (the call site
+        /// states the type by the argument it passes). Defaults are constant
+        /// expressions and must follow every non-default parameter.
+        rule macro_params() -> Vec<MacroParam>
+            = lparen() rparen() { Vec::new() }
+            / lparen() first:macro_param() rest:(comma() p:macro_param() { p })* rparen() {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        rule macro_param() -> MacroParam
+            = name:ident() ty:macro_param_type()? default:macro_param_default()? {?
+                  if ty.is_some() {
+                      return Err(
+                          "untyped macro parameters (typed parameters are not supported)"
+                      );
+                  }
+                  Ok(MacroParam { name, default })
+              }
+
+        /// An optional type after a macro parameter name. Matched (and then
+        /// refused) so the error names the real limitation, not a stray
+        /// token.
+        rule macro_param_type() -> crate::types::DataType
+            = ty:type_name() { ty }
+
+        rule macro_param_default() -> Expr
+            = named_arg_arrow() e:expr() { e }
+
+        /// `AS expr` (scalar) or `AS TABLE SELECT ...` (table).
+        rule macro_body() -> MacroBody
+            = word("table") lparen() q:select() rparen() { MacroBody::Table(Box::new(q)) }
+            / word("table") q:select() { MacroBody::Table(Box::new(q)) }
+            / e:expr() { MacroBody::Scalar(e) }
 
         /// `LANGUAGE SQL` / `LANGUAGE JAVASCRIPT` (optional; SQL is the
         /// default). Accepted before or after `AS <body>`.
@@ -1384,6 +1482,7 @@ peg::parser! {
             / kw(Keyword::Drop) word("materialized") kw(Keyword::View) ife:if_exists() t:table_ref() { Statement::DropMaterializedView { db: t.0, name: t.1, if_exists: ife } }
             / kw(Keyword::Drop) kw(Keyword::View) t:table_ref() { Statement::DropView { db: t.0, name: t.1 } }
             / kw(Keyword::Drop) word("procedure") ife:if_exists() t:table_ref() { Statement::DropProcedure { db: t.0, name: t.1, if_exists: ife } }
+            / kw(Keyword::Drop) word("macro") ife:if_exists() t:table_ref() { Statement::DropMacro { db: t.0, name: t.1, if_exists: ife } }
         /// `ALTER TABLE` (wave 65). `alter`, `add`, `column`, `rename` and
         /// `default` are matched as words, not reserved keywords, so they stay
         /// usable as table/column names (`to` too: `RENAME COLUMN a TO to`).
@@ -1968,8 +2067,24 @@ peg::parser! {
         /// `f(*)`, `f(a, b)` or `f()`; a leading `*` is the whole argument list.
         rule fn_args() -> Vec<Expr>
             = star() { vec![Expr::Star] }
-            / args:expr_list() { args }
+            / args:fn_arg_list() { args }
             / { vec![] }
+
+        rule fn_arg_list() -> Vec<Expr>
+            = first:fn_arg() rest:(comma() a:fn_arg() { a })* {
+                  let mut out = vec![first];
+                  out.extend(rest);
+                  out
+              }
+
+        /// One call argument: `expr`, or `name := expr` / `name => expr`
+        /// (named arguments are consumed by macro calls only; the binder
+        /// refuses them in every other call).
+        rule fn_arg() -> Expr
+            = name:ident() named_arg_arrow() e:expr() {
+                  Expr::NamedArg { name, expr: Box::new(e) }
+              }
+            / e:expr() { e }
 
         // ---------- window clauses ----------
 
@@ -4529,6 +4644,103 @@ mod tests {
             assert!(
                 matches!(parse(bad), Err(PinkDbError::Parse(_))),
                 "{bad} must be a parse error"
+            );
+        }
+    }
+
+    // ---------- SQL macros (wave 77) ----------
+
+    #[test]
+    fn macro_statements_parse() {
+        let Statement::CreateMacro {
+            name,
+            params,
+            body,
+            or_replace,
+            if_not_exists,
+            ..
+        } = parse_one("CREATE OR REPLACE MACRO add(a, b := 10) AS a + b;")
+        else {
+            panic!()
+        };
+        assert_eq!(name, "add");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, "a");
+        assert!(params[0].default.is_none());
+        assert_eq!(params[1].name, "b");
+        assert_eq!(params[1].default, Some(Expr::Literal(Value::Integer(10))));
+        assert!(matches!(body, MacroBody::Scalar(Expr::Binary { .. })));
+        assert!(or_replace);
+        assert!(!if_not_exists);
+
+        // A table macro body, with `IF NOT EXISTS` after the name.
+        let Statement::CreateMacro {
+            body,
+            if_not_exists,
+            ..
+        } = parse_one("CREATE MACRO pick(x) AS TABLE SELECT x AS v;")
+        else {
+            panic!()
+        };
+        assert!(matches!(body, MacroBody::Table(_)));
+        assert!(!if_not_exists);
+        assert!(matches!(
+            parse_one("CREATE MACRO IF NOT EXISTS zip() AS 1;"),
+            Statement::CreateMacro {
+                if_not_exists: true,
+                ..
+            }
+        ));
+        // `AS TABLE (SELECT ...)` is accepted too.
+        assert!(matches!(
+            parse_one("CREATE MACRO q(x) AS TABLE (SELECT x AS v);"),
+            Statement::CreateMacro {
+                body: MacroBody::Table(_),
+                ..
+            }
+        ));
+        // Drop / show / describe.
+        assert!(matches!(
+            parse_one("DROP MACRO IF EXISTS gone;"),
+            Statement::DropMacro {
+                if_exists: true,
+                ..
+            }
+        ));
+        assert!(matches!(parse_one("SHOW MACROS;"), Statement::ShowMacros));
+        assert!(matches!(
+            parse_one("DESCRIBE MACRO other.add;"),
+            Statement::DescribeMacro { .. }
+        ));
+        // Named arguments are parsed as a call argument node.
+        let Statement::Select(sel) = parse_one("SELECT add(b := 2, a := 1);") else {
+            panic!()
+        };
+        let Projection::Expr { expr, .. } = &sel.projections[0] else {
+            panic!()
+        };
+        let Expr::Function { args, .. } = expr else {
+            panic!()
+        };
+        assert!(matches!(&args[0], Expr::NamedArg { name, .. } if name == "b"));
+    }
+
+    #[test]
+    fn macro_syntax_errors_are_clean() {
+        for bad in [
+            "CREATE MACRO f(x INTEGER) AS x;",
+            "CREATE MACRO f(x) AS SELECT 1;",
+            "CREATE MACRO f(x) AS (SELECT ?);",
+            "CREATE MACRO f(x) AS TABLE SELECT ?;",
+            "CREATE MACRO f(x := ?) AS x;",
+            "DROP MACRO;",
+        ] {
+            assert!(
+                matches!(
+                    parse(bad),
+                    Err(PinkDbError::Parse(_) | PinkDbError::Parameter(_))
+                ),
+                "{bad} must be a clean parse/parameter error"
             );
         }
     }

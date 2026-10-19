@@ -190,6 +190,36 @@ pub enum Statement {
         name: String,
         args: Vec<Expr>,
     },
+    /// `CREATE MACRO name(params) AS <body>` (wave 77): a stored SQL macro.
+    ///
+    /// The body is a template, not a query: `AS expr` is a scalar macro and
+    /// `AS TABLE SELECT ...` a table macro. Parameters are untyped (DuckDB
+    /// macros are too) and may carry a constant `:=` default. The binder
+    /// splices argument ASTs into the body at every use — no SQL text is ever
+    /// generated from them, and nested macro calls resolve at the same bind.
+    CreateMacro {
+        db: Option<String>,
+        name: String,
+        params: Vec<MacroParam>,
+        body: MacroBody,
+        /// `OR REPLACE`: an existing macro of that name is replaced.
+        or_replace: bool,
+        /// `IF NOT EXISTS`: an existing macro makes this a no-op.
+        if_not_exists: bool,
+    },
+    /// `DROP MACRO [IF EXISTS] name`.
+    DropMacro {
+        db: Option<String>,
+        name: String,
+        if_exists: bool,
+    },
+    /// `SHOW MACROS`: the session database's macros.
+    ShowMacros,
+    /// `DESCRIBE MACRO name`: one macro's DuckDB-shaped function metadata.
+    DescribeMacro {
+        db: Option<String>,
+        name: String,
+    },
     /// `CREATE USER [IF NOT EXISTS] name PASSWORD '<plaintext>'` (wave 48).
     /// `PASSWORD_HASH '<phc>'` is the pre-hashed form the WAL replay uses.
     CreateUser {
@@ -253,6 +283,25 @@ pub enum AlterTableOp {
     RenameColumn { from: String, to: String },
     /// `RENAME TO <to>`: rename the whole table.
     RenameTable { to: String },
+}
+
+/// One macro parameter declaration (wave 77): `name [:= default]`.
+///
+/// A default is a constant expression (DuckDB's rule: no columns, aggregates
+/// or subqueries). It is spliced into the body exactly like an argument when
+/// the call omits the parameter, so it may refer to functions but never to the
+/// caller's table scope.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MacroParam {
+    pub name: String,
+    pub default: Option<Expr>,
+}
+
+/// A macro body template: `AS expr` (scalar) or `AS TABLE SELECT ...` (table).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MacroBody {
+    Scalar(Expr),
+    Table(Box<Select>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -554,6 +603,13 @@ pub enum Expr {
         /// `f(DISTINCT x)` — only `COUNT(DISTINCT x)` is supported (checked
         /// in the binder).
         distinct: bool,
+    },
+    /// `name := expr` (also `name => expr`) inside a function call's argument
+    /// list (wave 77). Only macro calls consume these; the binder refuses one
+    /// in a built-in, aggregate, window or extension call.
+    NamedArg {
+        name: String,
+        expr: Box<Expr>,
     },
     /// `f(...) OVER ([PARTITION BY ...] [ORDER BY ...] [ROWS/RANGE ...])`.
     Window {

@@ -8,7 +8,8 @@
 //!                            section, bit 2 = each database carries a
 //!                            materialized-view section, bit 4 = a
 //!                            stored-procedure section, bit 5 = a
-//!                            store-level RBAC section; unknown bits are a
+//!                            store-level RBAC section, bit 6 = a
+//!                            SQL-macro section; unknown bits are a
 //!                            hard error; bit 3 is reserved for index
 //!                            persistence)
 //! db_count u32
@@ -156,9 +157,21 @@ const FLAG_PROCEDURES: u32 = 0x10;
 /// after every database. Set iff the store has any RBAC data, so stores
 /// without users keep their exact previous bytes. An older v5 build refuses
 /// the file cleanly through the unknown-flags check (the RBAC section is
-/// unknown to it either way); the next format-gated section takes bit 6
-/// (`0x40`).
+/// unknown to it either way); the next format-gated section starts at bit 7
+/// (`0x80`) — bit 6 is the SQL-macro section ([`FLAG_MACROS`]).
 const FLAG_RBAC: u32 = 0x20;
+
+/// Flags bit 6 (v5+): every database carries the SQL-macro section (wave 77:
+/// name + the full `CREATE MACRO` statement text) after its tables and before
+/// its materialized-view section. Set iff at least one database has a macro,
+/// so stores without them keep their exact previous bytes. An older v5 build
+/// refuses the file cleanly through the unknown-flags check; the next
+/// format-gated section takes bit 7 (`0x80`).
+///
+/// Macros are written **before** materialized views on purpose: an MV's
+/// defining SQL may call a macro and is rebound at load, so the macro must
+/// already be in the catalog when that rebind runs.
+const FLAG_MACROS: u32 = 0x40;
 
 /// Column-default value tags (one byte per non-NULL default).
 const VD_BOOL: u8 = 0;
@@ -2228,6 +2241,7 @@ impl PinkDb {
         });
         let with_mvs = self.has_materialized_views();
         let with_procedures = self.has_procedures();
+        let with_macros = self.has_macros();
         let with_rbac = self.has_rbac_data();
         w.u32(
             if with_constraints {
@@ -2237,6 +2251,7 @@ impl PinkDb {
             } | if with_defaults { FLAG_DEFAULTS } else { 0 }
                 | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
                 | if with_procedures { FLAG_PROCEDURES } else { 0 }
+                | if with_macros { FLAG_MACROS } else { 0 }
                 | if with_rbac { FLAG_RBAC } else { 0 },
         );
         let mut saved: Vec<SavedTableStats> = Vec::new();
@@ -2346,6 +2361,9 @@ impl PinkDb {
                         w.bytes(&col.payload);
                     }
                 }
+            }
+            if with_macros {
+                write_macros(&mut w, self, dbname);
             }
             if with_mvs {
                 write_materialized_views(&mut w, self, dbname);
@@ -2578,6 +2596,7 @@ impl PinkDb {
         let mut defaults = false;
         let mut mvs = false;
         let mut procedures = false;
+        let mut macros = false;
         let mut rbac = false;
         if flags {
             let f = r.u32()?;
@@ -2586,6 +2605,7 @@ impl PinkDb {
                     | FLAG_DEFAULTS
                     | FLAG_MATERIALIZED_VIEWS
                     | FLAG_PROCEDURES
+                    | FLAG_MACROS
                     | FLAG_RBAC)
                     != 0
                 {
@@ -2597,6 +2617,7 @@ impl PinkDb {
                 defaults = f & FLAG_DEFAULTS != 0;
                 mvs = f & FLAG_MATERIALIZED_VIEWS != 0;
                 procedures = f & FLAG_PROCEDURES != 0;
+                macros = f & FLAG_MACROS != 0;
                 rbac = f & FLAG_RBAC != 0;
             } else if f != 0 {
                 return Err(PinkDbError::Execution(format!(
@@ -2615,6 +2636,9 @@ impl PinkDb {
                 let n_tables = r.u32()?;
                 for _ in 0..n_tables {
                     load_table(&mut r, &mut db, &dbname, v5, constraints, defaults)?;
+                }
+                if v5 && macros {
+                    load_macros(&mut r, &mut db, &dbname)?;
                 }
                 if v5 && mvs {
                     load_materialized_views(&mut r, &mut db, &dbname)?;
@@ -2693,6 +2717,81 @@ fn write_constraints(w: &mut Writer, c: &TableConstraints) {
 const MV_MANUAL: u8 = 0;
 const MV_EVERY: u8 = 1;
 const MV_ON_COMMIT: u8 = 2;
+
+/// One database's macro section (`FLAG_MACROS`, wave 77): the count, then per
+/// macro, sorted by lowercased name, `name, source` where `source` is the
+/// full `CREATE MACRO ...` statement text. The **parsed template is not
+/// stored**: the loader re-parses the statement, exactly like a procedure
+/// body or an MV definition (a template cannot be rendered back to SQL). The
+/// section is written before the materialized-view section so an MV's
+/// load-time rebind can expand a macro it calls.
+fn write_macros(w: &mut Writer, db: &PinkDb, dbname: &str) {
+    let macros = db.macros_in(dbname);
+    w.u32(macros.len() as u32);
+    for (_, def) in &macros {
+        w.str(&def.name);
+        w.str(&def.source);
+    }
+}
+
+/// Decode one database's macro section and install the definitions. A source
+/// text that is not exactly one `CREATE MACRO` statement is a corrupt file
+/// (the executor refuses to store a definition without its statement text).
+fn load_macros(r: &mut Reader, db: &mut PinkDb, dbname: &str) -> Result<()> {
+    let n = r.u32()? as usize;
+    // Each macro costs at least 8 bytes (two empty string length prefixes);
+    // never size an allocation from the unvalidated count.
+    if n > r.remaining() / 8 + 1 {
+        return r.err("macro count exceeds the remaining file");
+    }
+    for _ in 0..n {
+        let name = r.str()?;
+        let source = r.str()?;
+        let mut stmts = crate::sql::parse_statements(&source).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "corrupt file: macro \"{name}\" (database \"{dbname}\") does not parse: {e}"
+            ))
+        })?;
+        if stmts.len() != 1 {
+            return r.err(&format!(
+                "macro \"{name}\" definition is not exactly one statement"
+            ));
+        }
+        let Some(crate::sql::ast::Statement::CreateMacro {
+            name: parsed_name,
+            params,
+            body,
+            ..
+        }) = stmts.pop()
+        else {
+            return r.err(&format!(
+                "macro \"{name}\" definition is not a CREATE MACRO statement"
+            ));
+        };
+        if !parsed_name.eq_ignore_ascii_case(&name) {
+            return r.err(&format!(
+                "macro section names \"{name}\" but its definition creates \"{parsed_name}\""
+            ));
+        }
+        if db.macro_in(dbname, &name).is_ok() {
+            return r.err(&format!("macro \"{name}\" is defined twice"));
+        }
+        let def = crate::macros::MacroDef {
+            name: parsed_name,
+            params: params
+                .into_iter()
+                .map(|p| crate::macros::MacroParamDef {
+                    name: p.name,
+                    default: p.default,
+                })
+                .collect(),
+            body,
+            source,
+        };
+        db.macros_insert_in(dbname, name.to_ascii_lowercase(), def)?;
+    }
+    Ok(())
+}
 
 /// One database's materialized-view section (`FLAG_MATERIALIZED_VIEWS`): the
 /// count, then per view, sorted by lowercased name,

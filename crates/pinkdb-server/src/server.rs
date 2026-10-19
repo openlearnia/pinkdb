@@ -841,6 +841,8 @@ pub(crate) fn send_result<S: FrameSink + ?Sized>(
         }
         QueryResult::CreatedProcedure { name } => done(w, DoneKind::Created, 0, name),
         QueryResult::DroppedProcedure { name } => done(w, DoneKind::DroppedTable, 0, name),
+        QueryResult::CreatedMacro { name } => done(w, DoneKind::Created, 0, name),
+        QueryResult::DroppedMacro { name } => done(w, DoneKind::DroppedTable, 0, name),
         QueryResult::Called {
             name,
             statements,

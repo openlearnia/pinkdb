@@ -1184,6 +1184,8 @@ fn render_results(results: &[QueryResult]) {
             QueryResult::AlteredTable { name } => println!("Table {name} altered."),
             QueryResult::CreatedProcedure { name } => println!("Procedure {name} created."),
             QueryResult::DroppedProcedure { name } => println!("Procedure {name} dropped."),
+            QueryResult::CreatedMacro { name } => println!("Macro {name} created."),
+            QueryResult::DroppedMacro { name } => println!("Macro {name} dropped."),
             QueryResult::CreatedUser { name } => println!("User {name} created."),
             QueryResult::AlteredUser { name } => println!("User {name} altered."),
             QueryResult::DroppedUser { name } => println!("User {name} dropped."),

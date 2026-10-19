@@ -1474,6 +1474,11 @@ fn refused_in_body(stmt: &Statement) -> Option<&'static str> {
         Statement::DropDatabase { .. } => "DROP DATABASE",
         Statement::CreateProcedure { .. } => "CREATE PROCEDURE",
         Statement::DropProcedure { .. } => "DROP PROCEDURE",
+        // Wave 77: a macro definition is catalog metadata the call's snapshot
+        // undo would not carry, exactly like a procedure definition. Macro
+        // *use* inside a body is ordinary SQL and is allowed.
+        Statement::CreateMacro { .. } => "CREATE MACRO",
+        Statement::DropMacro { .. } => "DROP MACRO",
         Statement::CreateMaterializedView { .. } => "CREATE MATERIALIZED VIEW",
         Statement::DropMaterializedView { .. } => "DROP MATERIALIZED VIEW",
         Statement::RefreshMaterializedView { .. } => "REFRESH MATERIALIZED VIEW",

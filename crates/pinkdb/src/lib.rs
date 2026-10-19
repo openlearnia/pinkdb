@@ -26,6 +26,8 @@ pub mod filefmt;
 /// to `pinkdb-js`, which refuses cleanly when no engine is bound.
 #[cfg(feature = "js")]
 pub(crate) mod js;
+/// SQL macros (wave 77): scalar/table templates expanded at bind time.
+pub mod macros;
 pub(crate) mod mv;
 pub mod optimizer;
 pub mod persist;
@@ -51,6 +53,7 @@ pub use crypto::EncryptionKey;
 pub use db::{Connection, Database};
 pub use exec::QueryResult;
 pub use filefmt::FileFormat;
+pub use macros::{MacroDef, MacroParamDef};
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};
 pub use rbac::{

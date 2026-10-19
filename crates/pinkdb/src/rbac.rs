@@ -1136,6 +1136,12 @@ pub(crate) fn check_statement(
         | LogicalPlan::DropIndex { db, .. }
         | LogicalPlan::CreateProcedure { db, .. }
         | LogicalPlan::DropProcedure { db, .. }
+        // Wave 77: a macro is database metadata like a procedure: defining or
+        // dropping one needs CREATE on the database. Invoking one needs no
+        // macro privilege — its expansion runs under the invoker's ordinary
+        // table privileges (see `check_statement`'s read pass).
+        | LogicalPlan::CreateMacro { db, .. }
+        | LogicalPlan::DropMacro { db, .. }
         | LogicalPlan::CreateTableAs { db, .. }
         | LogicalPlan::CreateMaterializedView { db, .. }
         | LogicalPlan::RefreshMaterializedView { db, .. }

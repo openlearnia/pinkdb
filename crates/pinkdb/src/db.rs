@@ -1109,6 +1109,9 @@ fn refused_in_txn(stmt: &crate::sql::ast::Statement) -> Option<&'static str> {
         // transaction: its statements run there like hand-written ones.
         Statement::CreateProcedure { .. } => "CREATE PROCEDURE",
         Statement::DropProcedure { .. } => "DROP PROCEDURE",
+        // Wave 77: macro definitions are catalog metadata too.
+        Statement::CreateMacro { .. } => "CREATE MACRO",
+        Statement::DropMacro { .. } => "DROP MACRO",
         // Wave 48: the RBAC catalog is store metadata the per-table
         // transaction merge does not carry (exactly like a procedure
         // definition), so these are refused inside a transaction.

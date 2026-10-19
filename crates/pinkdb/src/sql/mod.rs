@@ -265,6 +265,17 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                 ast::Statement::Select(select) => {
                     work.push((NodeRef::Select(select), child));
                 }
+                ast::Statement::CreateMacro { params, body, .. } => {
+                    for p in params {
+                        if let Some(e) = &p.default {
+                            work.push((NodeRef::Expr(e), child));
+                        }
+                    }
+                    match body {
+                        ast::MacroBody::Scalar(e) => work.push((NodeRef::Expr(e), child)),
+                        ast::MacroBody::Table(q) => work.push((NodeRef::Select(q), child)),
+                    }
+                }
                 ast::Statement::AlterTable {
                     op:
                         ast::AlterTableOp::AddColumn {
@@ -327,6 +338,9 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                     for arg in args {
                         work.push((NodeRef::Expr(arg), child));
                     }
+                }
+                ast::Expr::NamedArg { expr, .. } => {
+                    work.push((NodeRef::Expr(expr), child));
                 }
                 ast::Expr::Window { args, over, .. } => {
                     for arg in args {
@@ -489,6 +503,17 @@ fn take_statement_children(
         ast::Statement::Select(select) => {
             selects.push(std::mem::replace(select, empty_select()));
         }
+        ast::Statement::CreateMacro { params, body, .. } => {
+            for p in params.drain(..) {
+                if let Some(e) = p.default {
+                    exprs.push(e);
+                }
+            }
+            match std::mem::replace(body, ast::MacroBody::Scalar(null_expr())) {
+                ast::MacroBody::Scalar(e) => exprs.push(e),
+                ast::MacroBody::Table(q) => selects.push(*q),
+            }
+        }
         ast::Statement::AlterTable {
             op: ast::AlterTableOp::AddColumn { default, .. },
             ..
@@ -575,6 +600,9 @@ fn take_expr_children(
             exprs.push(std::mem::replace(&mut **high, null_expr()));
         }
         ast::Expr::Function { args, .. } => exprs.append(args),
+        ast::Expr::NamedArg { expr, .. } => {
+            exprs.push(std::mem::replace(&mut **expr, null_expr()));
+        }
         ast::Expr::Window { args, over, .. } => {
             exprs.append(args);
             exprs.append(&mut over.partition);

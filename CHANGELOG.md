@@ -10,6 +10,17 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 77 — SQL macros ✅
+- `CREATE [OR REPLACE] MACRO … AS expr` and `AS TABLE SELECT …`, with
+  `DROP MACRO [IF EXISTS]`, parameter defaults and named arguments, expanded
+  by **bind-time AST substitution** (no dynamic SQL — call-site typing,
+  invoker rights and injection safety hold). Usable in expressions, FROM,
+  aggregates, windows, CTEs, prepared statements, views and other macros;
+  recursion is refused cleanly.
+- `SHOW MACROS` / `DESCRIBE MACRO`; macros persist in `.pink` (flag bit 6,
+  loaded before MVs) and are WAL-logged DDL; invocation keeps table grants
+  enforced. +98 KB on the default binary.
+
 ### Wave 70 — core `parquet` extension (read-side) ✅
 - Parquet reads with the DuckDB surface: `read_parquet`/`parquet_scan`
   (globs, directories, multi-file, `union_by_name`, hive partitions,

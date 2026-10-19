@@ -11,7 +11,7 @@
 //! - Numeric widening: INTEGER → BIGINT → DOUBLE. `int / int` → DOUBLE.
 //! - Comparisons need both-numeric, both-VARCHAR, or both-BOOLEAN (equality).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -1001,6 +1001,12 @@ struct Binder<'a> {
     /// `?` slots when binding a parameterized statement (shared with child
     /// scopes); `None` binds a plain statement, where a `?` is an error.
     params: Option<ParamSlots>,
+    /// Current nested macro expansion depth (wave 77), shared with every
+    /// child scope so a cycle that crosses a view/subquery still counts.
+    macro_depth: Rc<Cell<usize>>,
+    /// Substitution work used by this statement's macro expansions, shared
+    /// like the depth. Bounds a body that duplicates its arguments.
+    macro_nodes: Rc<Cell<usize>>,
 }
 
 impl<'a> Binder<'a> {
@@ -1019,6 +1025,8 @@ impl<'a> Binder<'a> {
             views_used: Rc::new(RefCell::new(Vec::new())),
             dynamic_functions_used: Rc::new(RefCell::new(Vec::new())),
             params: None,
+            macro_depth: Rc::new(Cell::new(0)),
+            macro_nodes: Rc::new(Cell::new(0)),
         }
     }
 
@@ -1046,6 +1054,8 @@ impl<'a> Binder<'a> {
             views_used: Rc::clone(&self.views_used),
             dynamic_functions_used: Rc::clone(&self.dynamic_functions_used),
             params: self.params.clone(),
+            macro_depth: Rc::clone(&self.macro_depth),
+            macro_nodes: Rc::clone(&self.macro_nodes),
         }
     }
 
@@ -1350,6 +1360,9 @@ impl<'a> Binder<'a> {
                 args,
                 distinct,
             } => self.bind_function(name, args, *distinct, aggs, allow_agg),
+            Expr::NamedArg { .. } => Err(PinkDbError::Parse(
+                "named arguments are only supported in a macro call".to_string(),
+            )),
             Expr::Window {
                 name,
                 args,
@@ -1756,6 +1769,61 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Bind a call through a stored scalar macro (wave 77): normalize the
+    /// arguments (positional/named/defaults), splice them into a clone of the
+    /// body, and bind the expanded expression in the caller's scope.
+    ///
+    /// `Ok(None)` means "no macro of this name": the ordinary built-in /
+    /// extension path runs. A table macro used as a scalar function is a
+    /// clear error, matching DuckDB.
+    fn bind_scalar_macro(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        distinct: bool,
+        aggs: &mut Vec<BoundAgg>,
+        allow_agg: bool,
+    ) -> Result<Option<BoundExpr>> {
+        let def = match self.db.macro_in(&self.default_db, name) {
+            Ok(def) => def.clone(),
+            Err(_) => return Ok(None),
+        };
+        if def.is_table() {
+            return Err(PinkDbError::Catalog(format!(
+                "macro \"{name}\" is a table macro; call it in a FROM clause"
+            )));
+        }
+        if distinct {
+            return Err(PinkDbError::Execution(
+                "DISTINCT is not supported in a macro call".to_string(),
+            ));
+        }
+        let normalized: Vec<(Option<String>, Expr)> = args
+            .iter()
+            .map(|a| match a {
+                Expr::NamedArg { name, expr } => (Some(name.clone()), (**expr).clone()),
+                other => (None, other.clone()),
+            })
+            .collect();
+        let map = crate::macros::bind_arguments(&def, &normalized)?;
+        let MacroBody::Scalar(body) = &def.body else {
+            unreachable!("a non-table macro has a scalar body")
+        };
+        let expanded = crate::macros::substitute_expr(body, &map, &self.macro_nodes)?;
+        let depth = self.macro_depth.get() + 1;
+        if depth > crate::macros::MAX_MACRO_EXPANSION_DEPTH {
+            return Err(PinkDbError::Execution(format!(
+                "macro expansion depth limit ({}) exceeded while expanding \"{name}\": \
+                 the macro definitions are recursive",
+                crate::macros::MAX_MACRO_EXPANSION_DEPTH
+            )));
+        }
+        self.macro_depth.set(depth);
+        let result = self.bind_expr(&expanded, aggs, allow_agg);
+        self.macro_depth.set(depth - 1);
+        result.map(Some)
+    }
+
     fn bind_function(
         &mut self,
         name: &str,
@@ -1764,6 +1832,18 @@ impl<'a> Binder<'a> {
         aggs: &mut Vec<BoundAgg>,
         allow_agg: bool,
     ) -> Result<BoundExpr> {
+        // Wave 77: a stored macro shadows every built-in of the same name
+        // (DuckDB's rule: `CREATE MACRO abs(x) AS 42` wins). Expansion is a
+        // pure AST splice into the caller's bind — invoker rights, call-site
+        // types, and no generated SQL.
+        if let Some(bound) = self.bind_scalar_macro(name, args, distinct, aggs, allow_agg)? {
+            return Ok(bound);
+        }
+        if args.iter().any(|a| matches!(a, Expr::NamedArg { .. })) {
+            return Err(PinkDbError::Parse(format!(
+                "named arguments are only supported in macro calls (in \"{name}\")"
+            )));
+        }
         if let Some(func) = AggFunc::from_name(name) {
             if !allow_agg {
                 return Err(PinkDbError::Execution(
@@ -2460,6 +2540,7 @@ fn default_name(expr: &Expr) -> String {
             format!("coalesce({})", inner.join(", "))
         }
         Expr::Cast { expr, dtype } => format!("cast({} as {dtype})", default_name(expr)),
+        Expr::NamedArg { name, expr } => format!("{name} := {}", default_name(expr)),
         Expr::Case {
             branches, else_, ..
         } => {
@@ -3309,6 +3390,45 @@ fn bind_tracked_plan(
             name,
             args,
         } => bind_call(db, default_db, qdb.as_deref(), name, args, params.clone()),
+        Statement::CreateMacro {
+            db: qdb,
+            name,
+            params: macro_params,
+            body,
+            or_replace,
+            if_not_exists,
+        } => bind_create_macro(
+            db,
+            default_db,
+            qdb.as_deref(),
+            CreateMacroArgs {
+                name,
+                params: macro_params,
+                body,
+                or_replace: *or_replace,
+                if_not_exists: *if_not_exists,
+            },
+        ),
+        Statement::DropMacro {
+            db: qdb,
+            name,
+            if_exists,
+        } => empty(LogicalPlan::DropMacro {
+            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
+            name: name.clone(),
+            if_exists: *if_exists,
+        }),
+        Statement::ShowMacros => empty(LogicalPlan::ShowMacros {
+            db: default_db.to_ascii_lowercase(),
+        }),
+        Statement::DescribeMacro { db: qdb, name } => {
+            let target = Binder::new(db, default_db).resolve_db(qdb)?;
+            db.macro_in(&target, name)?;
+            empty(LogicalPlan::DescribeMacro {
+                db: target,
+                name: name.clone(),
+            })
+        }
         Statement::CreateUser {
             name,
             password,
@@ -3393,6 +3513,193 @@ fn bind_create_procedure(
         },
         Vec::new(),
     ))
+}
+
+/// The parsed `CREATE [OR REPLACE] MACRO` header the binder validates (a
+/// struct so the helper stays under the argument-count lint).
+struct CreateMacroArgs<'a> {
+    name: &'a str,
+    params: &'a [MacroParam],
+    body: &'a MacroBody,
+    or_replace: bool,
+    if_not_exists: bool,
+}
+
+/// Bind `CREATE [OR REPLACE] MACRO` (wave 77): validate the parameter list and
+/// defaults, refuse recursion, and carry the template into the plan.
+///
+/// The body is **not** bound here: it is a template whose parameter types (and
+/// even the columns an argument may name) are only known at each call site, so
+/// binding it once would reject valid generic definitions. What is checked is
+/// everything that must hold forever: duplicate parameters, default ordering,
+/// defaults being constant expressions, and the recursion rules. A bad body
+/// surfaces as a clean bind error at the first use, with the call's own scope
+/// (DuckDB binds the body at `CREATE`; this is the one documented divergence
+/// of this wave).
+fn bind_create_macro(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: Option<&str>,
+    args: CreateMacroArgs<'_>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let CreateMacroArgs {
+        name,
+        params,
+        body,
+        or_replace,
+        if_not_exists,
+    } = args;
+    let target = Binder::new(db, default_db).resolve_db(&qdb.map(str::to_string))?;
+    let key = name.to_ascii_lowercase();
+    let mut defs: Vec<crate::macros::MacroParamDef> = Vec::with_capacity(params.len());
+    let mut seen_default = false;
+    for p in params {
+        if defs
+            .iter()
+            .any(|d: &crate::macros::MacroParamDef| d.name.eq_ignore_ascii_case(&p.name))
+        {
+            return Err(PinkDbError::Catalog(format!(
+                "macro \"{name}\": parameter \"{}\" is declared twice",
+                p.name
+            )));
+        }
+        match &p.default {
+            Some(default) => {
+                seen_default = true;
+                validate_macro_default(db, &target, name, &p.name, default)?;
+                defs.push(crate::macros::MacroParamDef {
+                    name: p.name.clone(),
+                    default: Some(default.clone()),
+                });
+            }
+            None => {
+                if seen_default {
+                    return Err(PinkDbError::Parse(format!(
+                        "macro \"{name}\": parameter \"{}\" without a default follows one with \
+                         a default",
+                        p.name
+                    )));
+                }
+                defs.push(crate::macros::MacroParamDef {
+                    name: p.name.clone(),
+                    default: None,
+                });
+            }
+        }
+    }
+    // Direct and mutual recursion is refused here, at definition time. The
+    // check runs in both directions: the new body may call an existing macro,
+    // and an existing macro may already call this (forward-referenced) name.
+    // A cycle that crosses a view cannot be seen from the definition and is
+    // caught by the expansion-depth limit at bind.
+    if crate::macros::body_reaches(db, &target, body, &key) {
+        return Err(recursive_macro(name));
+    }
+    for (existing, _) in db.macros_in(&target) {
+        if existing == key {
+            continue;
+        }
+        let mut seen = std::collections::HashSet::new();
+        let existing_calls_new = crate::macros::reaches(db, &target, &existing, &key, &mut seen);
+        if existing_calls_new && crate::macros::body_reaches(db, &target, body, &existing) {
+            return Err(recursive_macro(name));
+        }
+    }
+    Ok((
+        LogicalPlan::CreateMacro {
+            db: Some(target),
+            name: name.to_string(),
+            def: crate::macros::MacroDef {
+                name: name.to_string(),
+                params: defs,
+                body: body.clone(),
+                // The runner attaches the statement text; the template alone
+                // cannot be rendered back to SQL.
+                source: String::new(),
+            },
+            or_replace,
+            if_not_exists,
+            source: String::new(),
+        },
+        Vec::new(),
+    ))
+}
+
+fn recursive_macro(name: &str) -> PinkDbError {
+    PinkDbError::Catalog(format!(
+        "macro \"{name}\" is recursive (directly or through another macro); recursive macro \
+         definitions are not supported"
+    ))
+}
+
+/// A macro default must be a constant expression: no columns, aggregates or
+/// subqueries (DuckDB's rule). It is bound once here in an empty scope so the
+/// error names the parameter, and re-spliced at every call.
+fn validate_macro_default(
+    db: &PinkDb,
+    target_db: &str,
+    macro_name: &str,
+    param: &str,
+    default: &Expr,
+) -> Result<()> {
+    if expr_has_subquery(default) {
+        return Err(PinkDbError::Type(format!(
+            "macro \"{macro_name}\": default value for parameter \"{param}\" cannot contain \
+             subqueries"
+        )));
+    }
+    let mut binder = Binder::new(db, target_db);
+    let mut aggs = Vec::new();
+    let bound = binder.bind_expr(default, &mut aggs, true).map_err(|e| {
+        PinkDbError::Type(format!(
+            "macro \"{macro_name}\": default value for parameter \"{param}\" is not a constant \
+             expression: {e}"
+        ))
+    })?;
+    if !aggs.is_empty() {
+        return Err(PinkDbError::Type(format!(
+            "macro \"{macro_name}\": default value for parameter \"{param}\" cannot contain \
+             aggregate functions"
+        )));
+    }
+    if bound.has_column_ref() {
+        return Err(PinkDbError::Type(format!(
+            "macro \"{macro_name}\": default value for parameter \"{param}\" cannot contain \
+             column names"
+        )));
+    }
+    Ok(())
+}
+
+fn expr_has_subquery(expr: &Expr) -> bool {
+    match expr {
+        Expr::ScalarSubquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => true,
+        Expr::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::Unary { expr, .. }
+        | Expr::IsNull { expr, .. }
+        | Expr::Cast { expr, .. }
+        | Expr::NamedArg { expr, .. } => expr_has_subquery(expr),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::Function { args, .. } | Expr::Coalesce(args) => args.iter().any(expr_has_subquery),
+        Expr::Window { args, over, .. } => {
+            args.iter().any(expr_has_subquery)
+                || over.partition.iter().any(expr_has_subquery)
+                || over.order.iter().any(|i| expr_has_subquery(&i.expr))
+        }
+        Expr::Case { branches, else_ } => {
+            branches
+                .iter()
+                .any(|(c, v)| expr_has_subquery(c) || expr_has_subquery(v))
+                || else_.as_ref().is_some_and(|e| expr_has_subquery(e))
+        }
+        Expr::Literal(_)
+        | Expr::Parameter(_)
+        | Expr::Star
+        | Expr::QualifiedStar(_)
+        | Expr::Column { .. } => false,
+    }
 }
 
 /// Bind `CALL name(args...)`: resolve the procedure, check arity, and bind
@@ -5053,6 +5360,7 @@ pub(crate) fn plan_schema(
         | LogicalPlan::ShowTables { .. }
         | LogicalPlan::ShowDatabases
         | LogicalPlan::ShowMaterializedViews { .. }
+        | LogicalPlan::ShowMacros { .. }
         | LogicalPlan::Checkpoint
         | LogicalPlan::Use { .. }
         | LogicalPlan::CreateIndex { .. }
@@ -5065,6 +5373,11 @@ pub(crate) fn plan_schema(
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
         | LogicalPlan::Call { .. }
+        // Wave 77: macro DDL is catalog metadata, never a query scope; the
+        // macro's *expansion* is what produced this plan.
+        | LogicalPlan::CreateMacro { .. }
+        | LogicalPlan::DropMacro { .. }
+        | LogicalPlan::DescribeMacro { .. }
         // Wave 48: neither do RBAC statements.
         | LogicalPlan::CreateUser { .. }
         | LogicalPlan::AlterUser { .. }
@@ -5351,6 +5664,50 @@ fn bind_source(
                 let _ = at;
                 return Err(PinkDbError::Parse(
                     "AT is only valid after a table name".to_string(),
+                ));
+            }
+            // Wave 77: a stored table macro expands into the FROM clause.
+            // Its body is a self-contained SELECT: the caller's CTEs do not
+            // leak in (like a view body), and the substituted arguments see
+            // the current database's catalog.
+            if let Ok(def) = binder.db.macro_in(&binder.default_db, name) {
+                let def = def.clone();
+                if !def.is_table() {
+                    return Err(PinkDbError::Catalog(format!(
+                        "macro \"{name}\" is a scalar macro; call it in an expression"
+                    )));
+                }
+                let normalized: Vec<(Option<String>, Expr)> = args
+                    .iter()
+                    .map(|a| (a.name.clone(), a.expr.clone()))
+                    .collect();
+                let map = crate::macros::bind_arguments(&def, &normalized)?;
+                let MacroBody::Table(body) = &def.body else {
+                    unreachable!("a table macro has a table body")
+                };
+                let expanded = crate::macros::substitute_select(body, &map, &binder.macro_nodes)?;
+                let depth = binder.macro_depth.get() + 1;
+                if depth > crate::macros::MAX_MACRO_EXPANSION_DEPTH {
+                    return Err(PinkDbError::Execution(format!(
+                        "macro expansion depth limit ({}) exceeded while expanding \"{name}\": \
+                         the macro definitions are recursive",
+                        crate::macros::MAX_MACRO_EXPANSION_DEPTH
+                    )));
+                }
+                binder.macro_depth.set(depth);
+                let mut child = binder.child();
+                child.ctes.clear();
+                let sub = bind_select_in(db, &mut child, &expanded);
+                binder.macro_depth.set(depth - 1);
+                let sub = sub?;
+                let schema = plan_schema(db, &child.default_db, &child.ctes, &sub)?;
+                let eff = alias.clone().unwrap_or_else(|| def.name.clone());
+                return Ok((
+                    ScopeTable {
+                        name: eff.to_ascii_lowercase(),
+                        columns: schema,
+                    },
+                    sub,
                 ));
             }
             let args = bind_table_function_args(args)?;

@@ -9,6 +9,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-19</h2>
+<h3>Wave 77 — SQL macros ✅</h3>
+<ul>
+<li><code>CREATE [OR REPLACE] MACRO … AS expr</code> and <code>AS TABLE SELECT …</code>, with <code>DROP MACRO [IF EXISTS]</code>, parameter defaults and named arguments, expanded by <strong>bind-time AST substitution</strong> (no dynamic SQL — call-site typing, invoker rights and injection safety hold). Usable in expressions, FROM, aggregates, windows, CTEs, prepared statements, views and other macros; recursion is refused cleanly.</li>
+<li><code>SHOW MACROS</code> / <code>DESCRIBE MACRO</code>; macros persist in <code>.pink</code> (flag bit 6, loaded before MVs) and are WAL-logged DDL; invocation keeps table grants enforced. +98 KB on the default binary.</li>
+</ul>
 <h3>Wave 70 — core <code>parquet</code> extension (read-side) ✅</h3>
 <ul>
 <li>Parquet reads with the DuckDB surface: <code>read_parquet</code>/<code>parquet_scan</code> (globs, directories, multi-file, <code>union_by_name</code>, hive partitions, <code>filename</code>/<code>file_row_number</code>), four metadata functions, a replacement scan (<code>FROM 'x.parquet'</code>), projection pushdown and row-group-statistics filter pruning with visible counters.</li>

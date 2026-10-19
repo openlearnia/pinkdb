@@ -108,6 +108,14 @@ pub enum QueryResult {
     DroppedProcedure {
         name: String,
     },
+    /// `CREATE MACRO` (wave 77).
+    CreatedMacro {
+        name: String,
+    },
+    /// `DROP MACRO` (wave 77).
+    DroppedMacro {
+        name: String,
+    },
     /// `CALL name(args...)` (wave 44): the procedure ran `statements` body
     /// statements, and `result` is what it returned — the last statement's
     /// result, or the `RETURN <expr>` value (a one-row, one-column
@@ -1121,6 +1129,59 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let def = db.procedure_in(&target, name)?.clone();
             crate::procedure::execute_call(db, &target, &def, values)
         }
+        LogicalPlan::CreateMacro {
+            db: qdb,
+            name,
+            def,
+            or_replace,
+            if_not_exists,
+            source,
+        } => {
+            let target = resolve_db(db, qdb);
+            // The definition is persisted as its statement text; a plan that
+            // reached the executor without one (a host calling the raw
+            // bind/run API) could never be saved, so refuse loudly instead of
+            // writing a corrupt `.pink`.
+            if source.trim().is_empty() {
+                return Err(PinkDbError::Execution(
+                    "internal error: CREATE MACRO reached the executor without its statement \
+                     text (bind and run through PinkDb::execute / Connection::execute)"
+                        .to_string(),
+                ));
+            }
+            if db.macro_in(&target, name).is_ok() {
+                if *if_not_exists {
+                    return Ok(QueryResult::CreatedMacro { name: name.clone() });
+                }
+                if !*or_replace {
+                    return Err(PinkDbError::Catalog(format!(
+                        "macro \"{name}\" already exists in database \"{target}\" \
+                         (use CREATE OR REPLACE MACRO to replace it)"
+                    )));
+                }
+            }
+            let mut def = def.clone();
+            def.source = source.clone();
+            db.macros_insert_in(&target, name.to_ascii_lowercase(), def)?;
+            Ok(QueryResult::CreatedMacro { name: name.clone() })
+        }
+        LogicalPlan::DropMacro {
+            db: qdb,
+            name,
+            if_exists,
+        } => {
+            let target = resolve_db(db, qdb);
+            if db.macro_in(&target, name).is_err() {
+                if *if_exists {
+                    return Ok(QueryResult::DroppedMacro { name: name.clone() });
+                }
+                return Err(PinkDbError::Catalog(format!(
+                    "macro \"{name}\" not found in database \"{target}\""
+                )));
+            }
+            db.macros_remove_in(&target, &name.to_ascii_lowercase());
+            Ok(QueryResult::DroppedMacro { name: name.clone() })
+        }
         _ => {
             let cx = Cx::new(db).with_projections(plan);
             run_read_with(&cx, plan)
@@ -1604,6 +1665,9 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         | LogicalPlan::CreateProcedure { .. }
         | LogicalPlan::DropProcedure { .. }
         | LogicalPlan::Call { .. }
+        // Wave 77: macro DDL is handled by `run`.
+        | LogicalPlan::CreateMacro { .. }
+        | LogicalPlan::DropMacro { .. }
         // Wave 48: RBAC statements are handled by `run` like every other
         // catalog mutation.
         | LogicalPlan::CreateUser { .. }
@@ -1673,6 +1737,62 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 chunks: vec![DataChunk::new(vec![string_vector(&names)?])?],
                 names: vec!["database_name".to_string()],
                 types: vec![DataType::Varchar],
+            })
+        }
+        LogicalPlan::ShowMacros { db: qdb } => {
+            let target = resolve_db(cx.db, &Some(qdb.clone()));
+            let defs = cx.db.macros_in(&target);
+            let mut name = Vector::with_capacity(DataType::Varchar, defs.len());
+            let mut kind = Vector::with_capacity(DataType::Varchar, defs.len());
+            let mut params = Vector::with_capacity(DataType::Varchar, defs.len());
+            for (_, def) in &defs {
+                name.push_valid(Value::Varchar(def.name.clone()))?;
+                kind.push_valid(Value::Varchar(def.kind().to_string()))?;
+                params.push_valid(Value::Varchar(def.parameter_names()))?;
+            }
+            Ok(Output {
+                chunks: vec![DataChunk::new(vec![name, kind, params])?],
+                names: vec![
+                    "name".to_string(),
+                    "kind".to_string(),
+                    "parameters".to_string(),
+                ],
+                types: vec![DataType::Varchar, DataType::Varchar, DataType::Varchar],
+            })
+        }
+        LogicalPlan::DescribeMacro { db: qdb, name } => {
+            let def = cx.db.macro_in(qdb, name)?.clone();
+            // DuckDB-shaped macro metadata (`duckdb_functions()`' columns for
+            // a `function_type = 'macro'` row). `return_type` is NULL for an
+            // untyped macro, exactly like DuckDB's.
+            let macro_definition = def.source.trim().to_string();
+            let mut return_type = Vector::with_capacity(DataType::Varchar, 1);
+            return_type.push_null()?;
+            Ok(Output {
+                chunks: vec![DataChunk::new(vec![
+                    string_vector(std::slice::from_ref(&def.name))?,
+                    string_vector(&["macro".to_string()])?,
+                    string_vector(&[def.parameter_names()])?,
+                    string_vector(&["".to_string()])?,
+                    return_type,
+                    string_vector(&[macro_definition])?,
+                ])?],
+                names: vec![
+                    "function_name".to_string(),
+                    "function_type".to_string(),
+                    "parameters".to_string(),
+                    "parameter_types".to_string(),
+                    "return_type".to_string(),
+                    "macro_definition".to_string(),
+                ],
+                types: vec![
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                    DataType::Varchar,
+                ],
             })
         }
         LogicalPlan::ShowMaterializedViews { db: qdb } => {
@@ -4467,6 +4587,14 @@ fn explain_into(
         }
         LogicalPlan::CreateProcedure { name, .. } => format!("CreateProcedure {name}"),
         LogicalPlan::DropProcedure { name, .. } => format!("DropProcedure {name}"),
+        LogicalPlan::CreateMacro { db, name, .. } => {
+            format!("CreateMacro {}", qualify(db, name))
+        }
+        LogicalPlan::DropMacro { db, name, .. } => format!("DropMacro {}", qualify(db, name)),
+        LogicalPlan::ShowMacros { db } => format!("ShowMacros {db}"),
+        LogicalPlan::DescribeMacro { db, name } => {
+            format!("DescribeMacro {}", qualify(&Some(db.clone()), name))
+        }
         LogicalPlan::Call { name, .. } => format!("Call {name}"),
         LogicalPlan::CreateUser { name, .. } => format!("CreateUser {name}"),
         LogicalPlan::AlterUser { name, .. } => format!("AlterUser {name}"),
