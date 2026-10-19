@@ -78,6 +78,24 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
   threads is safe; opening the same file from several threads is not needed.</li>
 </ul>
 
+<h2><code>Statement</code></h2>
+
+<ul>
+  <li><code>Database.prepare(sql)</code> — prepare a single statement; returns a
+  <code>Statement</code> with <code>parameter_count</code> and <code>sql</code>
+  metadata. Prepare errors raise <code>Error</code>.</li>
+  <li><code>Statement.execute(*params)</code> — bind the parameters and run the
+  statement, returning one <code>Result</code>. Parameters map
+  <code>None</code>&#8594;NULL, <code>bool</code>, <code>int</code>
+  (INTEGER/BIGINT), <code>float</code>, <code>str</code>,
+  <code>datetime.date</code>, <code>datetime.datetime</code> (aware&#8594;UTC);
+  <code>bytes</code>/<code>Decimal</code> are refused with guidance. Native
+  error strings pass through and the statement stays usable.</li>
+  <li><code>close()</code> — free the native prepared statement; idempotent. The
+  class is a context manager and <code>__del__</code> is safe; copy/pickle are
+  refused.</li>
+</ul>
+
 <h2><code>Result</code></h2>
 
 <div class="table-wrap">
@@ -86,13 +104,7 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
   <tbody>
     <tr>
       <td><code>kind</code></td>
-      <td>one of <code>selected</code>, <code>created</code>, <code>inserted</code>,
-      <code>updated</code>, <code>deleted</code>, <code>began</code>,
-      <code>committed</code>, <code>rolledback</code>, <code>created_view</code>,
-      <code>dropped_table</code>, <code>dropped_view</code>,
-      <code>created_database</code>, <code>dropped_database</code>,
-      <code>used</code>, <code>loaded_extension</code>,
-      <code>checkpointed</code></td>
+      <td>one of <code>selected</code>, <code>created</code>, <code>inserted</code>, <code>updated</code>, <code>deleted</code>, <code>began</code>, <code>committed</code>, <code>rolledback</code>, <code>created_view</code>, <code>dropped_table</code>, <code>dropped_view</code>, <code>created_database</code>, <code>dropped_database</code>, <code>used</code>, <code>loaded_extension</code>, <code>checkpointed</code>, <code>altered_table</code>, <code>created_user</code>, <code>altered_user</code>, <code>dropped_user</code>, <code>created_role</code>, <code>dropped_role</code>, <code>granted</code>, <code>revoked</code></td>
     </tr>
     <tr>
       <td><code>columns</code> / <code>column_types</code></td>

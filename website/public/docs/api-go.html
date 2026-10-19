@@ -245,16 +245,28 @@ empty path or one containing a NUL byte before any native call. SQL that is not 
 UTF-8 fails with <code>SQL is not valid UTF-8</code> and leaves the handle
 usable.</p>
 
+<h2 id="prepared-statements">Prepared statements<a class="anchor" href="#prepared-statements" aria-label="Permalink: Prepared statements">#</a></h2>
+
+<ul>
+  <li><code>(*DB).Prepare(sql) (*Stmt, error)</code> — prepare a single statement;
+  errors are returned, never panics.</li>
+  <li><code>(*Stmt).Execute(args ...any) (Result, error)</code> — bind and run;
+  one <code>Result</code> per execution. Parameters map <code>nil</code>&#8594;NULL,
+  <code>bool</code>, integer kinds (INTEGER/BIGINT), <code>float32/64</code>,
+  <code>string</code>, <code>time.Time</code> (TIMESTAMP, &#181;s), and
+  <code>pinkdb.Date</code> (DATE). <code>[]byte</code> is refused (no BLOB in ABI
+  v1); native error strings are returned verbatim and the statement stays
+  usable.</li>
+  <li><code>ParameterCount()</code> / <code>SQL()</code> metadata;
+  <code>Close()</code> is idempotent — later use returns
+  <code>ErrStmtClosed</code>. A <code>Stmt</code> is safe for concurrent use
+  (calls are serialized) and has no finalizer: call <code>Close</code>.</li>
+</ul>
+
 <h2 id="result"><code>Result</code><a class="anchor" href="#result" aria-label="Permalink: Result">#</a></h2>
 
 <ul>
-  <li><code>Kind</code>: <code>selected</code>, <code>created</code>,
-  <code>inserted</code>, <code>updated</code>, <code>deleted</code>,
-  <code>began</code>, <code>committed</code>, <code>rolledback</code>,
-  <code>created_view</code>, <code>dropped_table</code>,
-  <code>dropped_view</code>, <code>created_database</code>,
-  <code>dropped_database</code>, <code>used</code>,
-  <code>loaded_extension</code>.</li>
+  <li><code>Kind</code>: <code>selected</code>, <code>created</code>, <code>inserted</code>, <code>updated</code>, <code>deleted</code>, <code>began</code>, <code>committed</code>, <code>rolledback</code>, <code>created_view</code>, <code>dropped_table</code>, <code>dropped_view</code>, <code>created_database</code>, <code>dropped_database</code>, <code>used</code>, <code>loaded_extension</code>, <code>checkpointed</code>, <code>altered_table</code>, <code>created_user</code>, <code>altered_user</code>, <code>dropped_user</code>, <code>created_role</code>, <code>dropped_role</code>, <code>granted</code>, <code>revoked</code>.</li>
   <li><code>Columns</code> / <code>ColumnTypes</code> (SELECT only; types
   <code>boolean</code>, <code>integer</code>, <code>bigint</code>,
   <code>double</code>, <code>varchar</code>, <code>date</code>,
@@ -326,6 +338,7 @@ Avoid NUL bytes in identifiers until the engine-level fix lands.</p>
 <ul>
   <li><a href="#setup">Setup</a></li>
   <li><a href="#functions">Functions</a></li>
+  <li><a href="#prepared-statements">Prepared statements</a></li>
   <li><a href="#result">Result</a></li>
   <li><a href="#errors-and-thread-safety">Errors and thread safety</a></li>
   <li><a href="#testing">Testing</a></li>

@@ -1072,3 +1072,525 @@ func TestThreadLocalErrorIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// ----- prepared statements (wave 69) -----
+
+func mustPrepare(t *testing.T, db *DB, sql string) *Stmt {
+	t.Helper()
+	stmt, err := db.Prepare(sql)
+	if err != nil {
+		t.Fatalf("Prepare(%q): %v", sql, err)
+	}
+	return stmt
+}
+
+func mustStmtExecute(t *testing.T, stmt *Stmt, args ...any) Result {
+	t.Helper()
+	result, err := stmt.Execute(args...)
+	if err != nil {
+		t.Fatalf("Execute(%v): %v", args, err)
+	}
+	return result
+}
+
+func TestPrepareMetadataAndErrors(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+
+	stmt := mustPrepare(t, db, "INSERT INTO t (a, b) VALUES (?, ?)")
+	defer stmt.Close()
+	if got := stmt.ParameterCount(); got != 2 {
+		t.Fatalf("ParameterCount() = %d, want 2", got)
+	}
+	if got, want := stmt.SQL(), "INSERT INTO t (a, b) VALUES (?, ?)"; got != want {
+		t.Fatalf("SQL() = %q, want %q", got, want)
+	}
+	zero := mustPrepare(t, db, "SELECT 1")
+	defer zero.Close()
+	if got := zero.ParameterCount(); got != 0 {
+		t.Fatalf("zero-parameter ParameterCount() = %d, want 0", got)
+	}
+
+	for _, tc := range []struct {
+		name string
+		sql  string
+		want string
+	}{
+		{"multi statement", "SELECT ?; SELECT ?", "exactly one statement"},
+		{"empty", "", "exactly one statement"},
+		{"comment only", "-- nothing\n", "exactly one statement"},
+		{"order by parameter", "SELECT 1 ORDER BY ?", "not supported in ORDER BY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := db.Prepare(tc.sql)
+			if err == nil {
+				t.Fatalf("Prepare(%q) = nil error, want %q", tc.sql, tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Prepare(%q) error = %q, want it to contain %q", tc.sql, err, tc.want)
+			}
+			// A failed prepare leaves the database usable.
+			mustExecute(t, db, "SELECT 1;")
+		})
+	}
+}
+
+func TestStmtAllTypesRoundTrip(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db,
+		"CREATE TABLE types (b BOOLEAN, i INTEGER, bi BIGINT, d DOUBLE, "+
+			"s VARCHAR, dt DATE, ts TIMESTAMP);")
+
+	insert := mustPrepare(t, db, "INSERT INTO types VALUES (?, ?, ?, ?, ?, ?, ?)")
+	defer insert.Close()
+	date := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	timestamp := time.Date(2024, 1, 15, 10, 0, 0, 123456000, time.UTC)
+
+	result := mustStmtExecute(t, insert,
+		true, int(-2147483648), int64(math.MaxInt64), float64(math.Copysign(0, -1)),
+		"héllo 🌍\x00", Date(date), timestamp)
+	if result.Kind != "inserted" {
+		t.Fatalf("insert kind = %q, want inserted", result.Kind)
+	}
+	if result.Affected != 1 {
+		t.Fatalf("insert affected = %d, want 1", result.Affected)
+	}
+	mustStmtExecute(t, insert, nil, nil, nil, nil, nil, nil, nil)
+
+	// A prepared SELECT with a bound WHERE value, executed twice.
+	byI := mustPrepare(t, db, "SELECT b, i, bi, d, s, dt, ts FROM types WHERE i = ?")
+	defer byI.Close()
+	selected := mustStmtExecute(t, byI, int32(math.MinInt32))
+	checkStrings(t, "columns", selected.Columns, []string{"b", "i", "bi", "d", "s", "dt", "ts"})
+	checkStrings(t, "column types", selected.ColumnTypes,
+		[]string{"boolean", "integer", "bigint", "double", "varchar", "date", "timestamp"})
+	row := selected.Rows[0]
+	if got := boolAt(t, row, 0); !got {
+		t.Fatalf("b = %v, want true", got)
+	}
+	if got := intAt(t, row, 1); got != math.MinInt32 {
+		t.Fatalf("i = %d, want %d", got, math.MinInt32)
+	}
+	if got := intAt(t, row, 2); got != math.MaxInt64 {
+		t.Fatalf("bi = %d, want %d", got, math.MaxInt64)
+	}
+	if got := floatAt(t, row, 3); got != 0 || !math.Signbit(got) {
+		t.Fatalf("d = %v (signbit %v), want -0.0", got, math.Signbit(got))
+	}
+	if got := stringAt(t, row, 4); got != "héllo 🌍\x00" {
+		t.Fatalf("s = %q, want %q", got, "héllo 🌍\x00")
+	}
+	if got := timeAt(t, row, 5); !got.Equal(date) {
+		t.Fatalf("dt = %v, want %v", got, date)
+	}
+	if got := timeAt(t, row, 6); !got.Equal(timestamp) {
+		t.Fatalf("ts = %v, want %v", got, timestamp)
+	}
+
+	// The NULL row: every column is nil, and the second execution did not
+	// disturb the first one's result.
+	isNull := mustStmtExecute(t, byI, nil)
+	if len(isNull.Rows) != 0 {
+		t.Fatalf("SELECT i = NULL returned %d rows, want 0", len(isNull.Rows))
+	}
+	nullsStmt := mustPrepare(t, db, "SELECT b, i, bi, d, s, dt, ts FROM types WHERE i IS NULL")
+	defer nullsStmt.Close()
+	nulls := mustStmtExecute(t, nullsStmt)
+	if len(nulls.Rows) != 1 {
+		t.Fatalf("NULL row count = %d, want 1", len(nulls.Rows))
+	}
+	for i := range nulls.Rows[0] {
+		nilAt(t, nulls.Rows[0], i)
+	}
+}
+
+func TestStmtIntegerAndFloatWidths(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	stmt := mustPrepare(t, db, "SELECT ?")
+	defer stmt.Close()
+
+	cases := []struct {
+		arg      any
+		want     int64
+		wantType string
+	}{
+		{int8(-5), -5, "integer"},
+		{int16(-300), -300, "integer"},
+		{int32(math.MaxInt32), math.MaxInt32, "integer"},
+		{int(-7), -7, "integer"},
+		{int64(math.MinInt64), math.MinInt64, "bigint"},
+		{uint8(5), 5, "integer"},
+		{uint16(300), 300, "integer"},
+		{uint32(math.MaxUint32), math.MaxUint32, "bigint"},
+		{uint64(math.MaxInt64), math.MaxInt64, "bigint"},
+	}
+	for _, tc := range cases {
+		selected := mustStmtExecute(t, stmt, tc.arg)
+		checkStrings(t, "column types", selected.ColumnTypes, []string{tc.wantType})
+		if got := intAt(t, selected.Rows[0], 0); got != tc.want {
+			t.Fatalf("Execute(%v) = %d, want %d", tc.arg, got, tc.want)
+		}
+	}
+	selected := mustStmtExecute(t, stmt, float32(1.5))
+	checkStrings(t, "column types", selected.ColumnTypes, []string{"double"})
+	if got := floatAt(t, selected.Rows[0], 0); got != 1.5 {
+		t.Fatalf("float32(1.5) = %v", got)
+	}
+}
+
+func TestStmtRepeatedExecution(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (i BIGINT, s VARCHAR);")
+
+	insert := mustPrepare(t, db, "INSERT INTO t (i, s) VALUES (?, ?)")
+	defer insert.Close()
+	selectByI := mustPrepare(t, db, "SELECT s FROM t WHERE i = ?")
+	defer selectByI.Close()
+
+	for i := 0; i < 200; i++ {
+		if got := mustStmtExecute(t, insert, i, fmt.Sprintf("v%d", i)).Affected; got != 1 {
+			t.Fatalf("iteration %d: affected = %d, want 1", i, got)
+		}
+		selected := mustStmtExecute(t, selectByI, i)
+		if len(selected.Rows) != 1 || stringAt(t, selected.Rows[0], 0) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("iteration %d: rows = %v", i, selected.Rows)
+		}
+	}
+	// Both statements still work after hundreds of rebinds.
+	countStmt := mustPrepare(t, db, "SELECT COUNT(*) FROM t")
+	defer countStmt.Close()
+	count := mustStmtExecute(t, countStmt)
+	if got := intAt(t, count.Rows[0], 0); got != 200 {
+		t.Fatalf("COUNT(*) = %d, want 200", got)
+	}
+}
+
+func TestStmtNullHandling(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (i INTEGER, s VARCHAR);")
+	insert := mustPrepare(t, db, "INSERT INTO t VALUES (?, ?)")
+	defer insert.Close()
+
+	mustStmtExecute(t, insert, nil, nil)
+	mustStmtExecute(t, insert, 1, "x")
+	nullStmt := mustPrepare(t, db, "SELECT i, s FROM t WHERE i IS NULL")
+	defer nullStmt.Close()
+	selected := mustStmtExecute(t, nullStmt)
+	if len(selected.Rows) != 1 {
+		t.Fatalf("NULL row count = %d, want 1", len(selected.Rows))
+	}
+	nilAt(t, selected.Rows[0], 0)
+	nilAt(t, selected.Rows[0], 1)
+
+	// A NULL with no column context and no CAST cannot be typed: the native
+	// bind step says so, and the statement remains usable.
+	untyped := mustPrepare(t, db, "SELECT ?")
+	defer untyped.Close()
+	_, err := untyped.Execute(nil)
+	if err == nil || !strings.Contains(err.Error(), "could not determine data type of parameter 1") {
+		t.Fatalf("SELECT ? with NULL = %v, want the untypable-NULL error", err)
+	}
+	cast := mustPrepare(t, db, "SELECT CAST(? AS INTEGER)")
+	defer cast.Close()
+	selected = mustStmtExecute(t, cast, nil)
+	nilAt(t, selected.Rows[0], 0)
+	if _, err := untyped.Execute(7); err != nil {
+		t.Fatalf("statement unusable after a bind error: %v", err)
+	}
+}
+
+func TestStmtErrorSurfaces(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (i INTEGER, s VARCHAR);")
+
+	one := mustPrepare(t, db, "SELECT ?")
+	defer one.Close()
+
+	_, err := one.Execute()
+	if err == nil || err.Error() != "values were not provided for prepared statement parameters: 1" {
+		t.Fatalf("too few values error = %v, want the exact native message", err)
+	}
+	_, err = one.Execute(1, 2)
+	want := "parameter count mismatch: the prepared statement takes 1, but values were provided for: 2"
+	if err == nil || err.Error() != want {
+		t.Fatalf("too many values error = %v, want exactly %q", err, want)
+	}
+
+	cast := mustPrepare(t, db, "SELECT CAST(? AS INTEGER)")
+	defer cast.Close()
+	_, err = cast.Execute("abc")
+	if err == nil || err.Error() != `cannot bind parameter 1 as INTEGER: cannot CAST "abc" AS INTEGER` {
+		t.Fatalf("type error = %v, want the exact native message", err)
+	}
+
+	// Client-side rejections name the 1-based parameter position.
+	for _, tc := range []struct {
+		name string
+		arg  any
+		want string
+	}{
+		{"bytes", []byte{1, 2}, "no BLOB type"},
+		{"uint64 overflow", uint64(math.MaxUint64), "does not fit in BIGINT"},
+		{"unsupported", struct{}{}, "unsupported Go type struct {}"},
+		{"date range", Date(time.Date(6_000_000, 1, 1, 0, 0, 0, 0, time.UTC)), "does not fit in i32"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := one.Execute(tc.arg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Execute(%v) error = %v, want it to contain %q", tc.arg, err, tc.want)
+			}
+		})
+	}
+
+	// Every failure above left both statements usable.
+	if selected := mustStmtExecute(t, one, 42); intAt(t, selected.Rows[0], 0) != 42 {
+		t.Fatalf("statement unusable after errors")
+	}
+}
+
+func TestStmtCloseSemantics(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+
+	stmt := mustPrepare(t, db, "SELECT 1")
+	stmt.Close()
+	stmt.Close() // idempotent
+	if _, err := stmt.Execute(); !errors.Is(err, ErrStmtClosed) {
+		t.Fatalf("Execute after Stmt.Close = %v, want ErrStmtClosed", err)
+	}
+	if _, err := db.Prepare("SELECT 1"); err != nil {
+		t.Fatalf("Prepare after Stmt.Close: %v", err)
+	}
+
+	other := mustPrepare(t, db, "SELECT 2")
+	db.Close()
+	if _, err := other.Execute(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Execute after DB.Close = %v, want ErrClosed", err)
+	}
+	if _, err := db.Prepare("SELECT 3"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Prepare after DB.Close = %v, want ErrClosed", err)
+	}
+	// Freeing a prepared statement does not touch the (already closed) handle.
+	other.Close()
+	other.Close()
+}
+
+func TestStmtDurableRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prepared.pink")
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	mustExecute(t, db, "CREATE TABLE t (i INTEGER, s VARCHAR);")
+	insert := mustPrepare(t, db, "INSERT INTO t VALUES (?, ?)")
+	for i, s := range []string{"héllo", "wörld"} {
+		mustStmtExecute(t, insert, i, s)
+	}
+	insert.Close()
+	db.Close()
+
+	// Reopen: the WAL logged the fully substituted SQL, so both rows replay.
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer reopened.Close()
+	selectStmt := mustPrepare(t, reopened, "SELECT i, s FROM t ORDER BY i")
+	defer selectStmt.Close()
+	selected := mustStmtExecute(t, selectStmt)
+	if len(selected.Rows) != 2 {
+		t.Fatalf("got %d rows, want 2", len(selected.Rows))
+	}
+	if got := stringAt(t, selected.Rows[0], 1); got != "héllo" {
+		t.Fatalf("row 0 s = %q", got)
+	}
+	if got := stringAt(t, selected.Rows[1], 1); got != "wörld" {
+		t.Fatalf("row 1 s = %q", got)
+	}
+
+	// A second handle sees a prepared write from the first, and a prepared
+	// statement resolves the current catalog on every execution.
+	insert2 := mustPrepare(t, reopened, "INSERT INTO t VALUES (?, ?)")
+	defer insert2.Close()
+	mustStmtExecute(t, insert2, 2, "third")
+	countStmt := mustPrepare(t, reopened, "SELECT COUNT(*) FROM t")
+	defer countStmt.Close()
+	count := mustStmtExecute(t, countStmt)
+	if got := intAt(t, count.Rows[0], 0); got != 3 {
+		t.Fatalf("COUNT(*) after reuse = %d, want 3", got)
+	}
+}
+
+func TestStmtTransactionRollback(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (i INTEGER);")
+	insert := mustPrepare(t, db, "INSERT INTO t VALUES (?)")
+	defer insert.Close()
+
+	mustExecute(t, db, "BEGIN;")
+	mustStmtExecute(t, insert, 1)
+	mustExecute(t, db, "ROLLBACK;")
+	countStmt := mustPrepare(t, db, "SELECT COUNT(*) FROM t")
+	defer countStmt.Close()
+	count := mustStmtExecute(t, countStmt)
+	if got := intAt(t, count.Rows[0], 0); got != 0 {
+		t.Fatalf("COUNT(*) after ROLLBACK = %d, want 0", got)
+	}
+
+	mustExecute(t, db, "BEGIN;")
+	mustStmtExecute(t, insert, 2)
+	mustExecute(t, db, "COMMIT;")
+	count = mustStmtExecute(t, countStmt)
+	if got := intAt(t, count.Rows[0], 0); got != 1 {
+		t.Fatalf("COUNT(*) after COMMIT = %d, want 1", got)
+	}
+}
+
+func TestStmtConcurrentReuse(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (i INTEGER);")
+	insert := mustPrepare(t, db, "INSERT INTO t VALUES (?)")
+	defer insert.Close()
+
+	const (
+		goroutines = 8
+		perRoutine = 100
+	)
+	var wg sync.WaitGroup
+	problems := make(chan error, goroutines)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perRoutine; i++ {
+				if _, err := insert.Execute(g*perRoutine + i); err != nil {
+					problems <- fmt.Errorf("goroutine %d iteration %d: %w", g, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(problems)
+	for err := range problems {
+		t.Fatal(err)
+	}
+	countStmt := mustPrepare(t, db, "SELECT COUNT(*) FROM t")
+	defer countStmt.Close()
+	count := mustStmtExecute(t, countStmt)
+	if got := intAt(t, count.Rows[0], 0); got != goroutines*perRoutine {
+		t.Fatalf("COUNT(*) = %d, want %d", got, goroutines*perRoutine)
+	}
+}
+
+// TestStmtValueIsNotParsedAsSQL binds a string that would be dangerous if the
+// wrapper interpolated values into the statement text.
+func TestStmtValueIsNotParsedAsSQL(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (s VARCHAR);")
+	insert := mustPrepare(t, db, "INSERT INTO t VALUES (?)")
+	defer insert.Close()
+
+	payload := "'; DROP TABLE t; -- ?"
+	mustStmtExecute(t, insert, payload)
+	selectStmt := mustPrepare(t, db, "SELECT s FROM t WHERE s = ?")
+	defer selectStmt.Close()
+	selected := mustStmtExecute(t, selectStmt, payload)
+	if len(selected.Rows) != 1 || stringAt(t, selected.Rows[0], 0) != payload {
+		t.Fatalf("payload round-trip = %v", selected.Rows)
+	}
+	mustExecute(t, db, "SELECT COUNT(*) FROM t;") // still exists
+}
+
+// TestStmtRBACKinds exercises the wave 48 statement kinds (17-23) through a
+// zero-parameter prepared statement: the binding must name them rather than
+// reporting an unknown kind.
+func TestStmtRBACKinds(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (i INTEGER);")
+
+	cases := []struct {
+		sql  string
+		kind string
+		name string
+	}{
+		{"CREATE USER alice PASSWORD 'secret'", "created_user", "alice"},
+		{"CREATE ROLE analyst", "created_role", "analyst"},
+		{"GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.t TO alice"},
+		{"REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.t TO alice"},
+		{"ALTER USER alice PASSWORD 'rotated'", "altered_user", "alice"},
+		{"DROP ROLE analyst", "dropped_role", "analyst"},
+		{"DROP USER alice", "dropped_user", "alice"},
+	}
+	for _, tc := range cases {
+		stmt := mustPrepare(t, db, tc.sql)
+		result := mustStmtExecute(t, stmt)
+		stmt.Close()
+		if result.Kind != tc.kind {
+			t.Fatalf("%s kind = %q, want %q", tc.sql, result.Kind, tc.kind)
+		}
+		if result.Name != tc.name {
+			t.Fatalf("%s name = %q, want %q", tc.sql, result.Name, tc.name)
+		}
+	}
+}
+
+// TestBoundedRSSAcrossPreparedLoops mirrors the Execute-loop leak pin for the
+// prepared path: alternating successful and failing Stmt.Execute calls on one
+// reused statement must not grow peak RSS or the Go heap.
+func TestBoundedRSSAcrossPreparedLoops(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+	mustExecute(t, db, "CREATE TABLE t (a INTEGER, s VARCHAR);")
+	mustExecute(t, db, "INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');")
+
+	stmt := mustPrepare(t, db, "SELECT a, s FROM t WHERE a = ?")
+	defer stmt.Close()
+
+	run := func(iterations int) {
+		for i := 0; i < iterations; i++ {
+			result, err := stmt.Execute(1)
+			if err != nil {
+				t.Fatalf("iteration %d: success path: %v", i, err)
+			}
+			if len(result.Rows) != 1 {
+				t.Fatalf("iteration %d: got %d rows", i, len(result.Rows))
+			}
+			if _, err := stmt.Execute(); err == nil {
+				t.Fatalf("iteration %d: arity error path succeeded", i)
+			}
+		}
+	}
+
+	run(500) // warm every allocator path before measuring
+	runtime.GC()
+	rssBefore := maxRSSBytes(t)
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	heapBefore := ms.HeapAlloc
+
+	const iterations = 5000
+	run(iterations)
+
+	runtime.GC()
+	rssAfter := maxRSSBytes(t)
+	runtime.ReadMemStats(&ms)
+	const rssLimit = 128 << 20
+	const heapLimit = 32 << 20
+	if growth := int64(rssAfter) - int64(rssBefore); growth > rssLimit {
+		t.Fatalf("peak RSS grew %d bytes over %d prepared iterations (limit %d)", growth, iterations, rssLimit)
+	}
+	if growth := int64(ms.HeapAlloc) - int64(heapBefore); growth > heapLimit {
+		t.Fatalf("Go heap grew %d bytes over %d prepared iterations (limit %d)", growth, iterations, heapLimit)
+	}
+}

@@ -419,7 +419,14 @@ class OwnershipTests(unittest.TestCase):
 class FreeInstrumentationTests(unittest.TestCase):
     """Shadow ``pinkdb._LIB`` symbols to prove native frees happen exactly once."""
 
-    _NAMES = ("pinkdb_execute", "pinkdb_result_free", "pinkdb_close")
+    _NAMES = (
+        "pinkdb_execute",
+        "pinkdb_execute_prepared",
+        "pinkdb_prepare",
+        "pinkdb_result_free",
+        "pinkdb_prepared_free",
+        "pinkdb_close",
+    )
 
     def setUp(self):
         self._originals = {
@@ -433,16 +440,42 @@ class FreeInstrumentationTests(unittest.TestCase):
         self.result_allocations = 0
         self.result_frees = 0
         self.double_frees = []
+        self.outstanding_prepared = set()
+        self.prepared_allocations = 0
+        self.prepared_frees = 0
+        self.double_prepared_frees = []
         self.closed_pointers = []
 
         def counting_execute(handle, sql, sql_len):
-            pointer = self._originals["pinkdb_execute"](handle, sql, sql_len)
+            return track_result(
+                self._originals["pinkdb_execute"](handle, sql, sql_len)
+            )
+
+        def counting_prepare(handle, sql, sql_len):
+            pointer = self._originals["pinkdb_prepare"](handle, sql, sql_len)
+            if pointer:
+                if pointer in self.outstanding_prepared:
+                    raise AssertionError(
+                        f"prepared pointer still live: {pointer!r}"
+                    )
+                self.prepared_allocations += 1
+                self.outstanding_prepared.add(pointer)
+            return pointer
+
+        def track_result(pointer):
             if pointer:
                 if pointer in self.outstanding_results:
                     raise AssertionError(f"result pointer still live: {pointer!r}")
                 self.result_allocations += 1
                 self.outstanding_results.add(pointer)
             return pointer
+
+        def counting_execute_prepared(handle, prepared, values, count):
+            return track_result(
+                self._originals["pinkdb_execute_prepared"](
+                    handle, prepared, values, count
+                )
+            )
 
         def counting_result_free(pointer):
             if pointer not in self.outstanding_results:
@@ -452,12 +485,25 @@ class FreeInstrumentationTests(unittest.TestCase):
             self.result_frees += 1
             return self._originals["pinkdb_result_free"](pointer)
 
+        def counting_prepared_free(pointer):
+            if pointer not in self.outstanding_prepared:
+                self.double_prepared_frees.append(pointer)
+                raise AssertionError(
+                    f"free of a not-outstanding prepared statement: {pointer!r}"
+                )
+            self.outstanding_prepared.discard(pointer)
+            self.prepared_frees += 1
+            return self._originals["pinkdb_prepared_free"](pointer)
+
         def counting_close(pointer):
             self.closed_pointers.append(pointer)
             return self._originals["pinkdb_close"](pointer)
 
         pinkdb._LIB.pinkdb_execute = counting_execute
+        pinkdb._LIB.pinkdb_execute_prepared = counting_execute_prepared
+        pinkdb._LIB.pinkdb_prepare = counting_prepare
         pinkdb._LIB.pinkdb_result_free = counting_result_free
+        pinkdb._LIB.pinkdb_prepared_free = counting_prepared_free
         pinkdb._LIB.pinkdb_close = counting_close
 
     def _restore_instrumentation(self):
@@ -474,6 +520,32 @@ class FreeInstrumentationTests(unittest.TestCase):
         self.assertEqual(self.result_allocations, executes + 1)
         self.assertEqual(self.result_frees, executes + 1)
         self.assertEqual(self.double_frees, [])
+        self.assertEqual(self.outstanding_results, set())
+
+    def test_every_prepared_statement_is_freed_exactly_once(self):
+        db = pinkdb.connect_memory()
+        statements = [db.prepare("SELECT ?") for _ in range(20)]
+        # Executing allocates results too; close frees only the statement.
+        for i, stmt in enumerate(statements):
+            pointer = stmt._prepared
+            self.assertIn(pointer, self.outstanding_prepared)
+            stmt.execute(i)
+            stmt.close()
+            stmt.close()  # idempotent: must not reach the library again
+            self.assertNotIn(pointer, self.outstanding_prepared)
+        # The last one is released by the garbage collector instead.
+        collected = db.prepare("SELECT 1")
+        collected.execute()
+        del collected
+        gc.collect()
+        db.close()
+
+        self.assertEqual(self.prepared_allocations, 21)
+        self.assertEqual(self.prepared_frees, 21)
+        self.assertEqual(self.double_prepared_frees, [])
+        self.assertEqual(self.outstanding_prepared, set())
+        self.assertEqual(self.result_allocations, 21)
+        self.assertEqual(self.result_frees, 21)
         self.assertEqual(self.outstanding_results, set())
 
     def test_every_handle_is_closed_exactly_once(self):
@@ -618,6 +690,386 @@ class SharedHandleTests(unittest.TestCase):
                 self.assertEqual(
                     second.execute("SELECT COUNT(*) FROM t;")[0].rows, [[2]]
                 )
+            finally:
+                first.close()
+                second.close()
+
+
+class PreparedStatementTests(unittest.TestCase):
+    def setUp(self):
+        self.db = pinkdb.connect_memory()
+        self.addCleanup(self.db.close)
+
+    def test_prepare_metadata_and_parse_only(self):
+        stmt = self.db.prepare("INSERT INTO t (a, b) VALUES (?, ?)")
+        self.addCleanup(stmt.close)
+        self.assertEqual(stmt.sql, "INSERT INTO t (a, b) VALUES (?, ?)")
+        self.assertEqual(stmt.parameter_count, 2)
+        self.assertIn("open, 2 parameters", repr(stmt))
+
+        zero = self.db.prepare("SELECT 1")
+        self.addCleanup(zero.close)
+        self.assertEqual(zero.parameter_count, 0)
+        self.assertEqual(zero.execute().rows, [[1]])
+
+        # Prepare parses only: the table may not exist yet, and the statement
+        # binds against the catalog current at each execution.
+        stmt2 = self.db.prepare("INSERT INTO t (a) VALUES (?)")
+        self.addCleanup(stmt2.close)
+        self.db.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+        self.assertEqual(stmt2.execute(5).affected, 1)
+        self.assertEqual(self.db.execute("SELECT a FROM t;")[0].rows, [[5]])
+
+    def test_parameter_type_mapping(self):
+        stmt = self.db.prepare("SELECT ?;".rstrip(";"))
+        self.addCleanup(stmt.close)
+        cases = [
+            (True, "boolean", True),
+            (False, "boolean", False),
+            (0, "integer", 0),
+            (-(2**31), "integer", -(2**31)),
+            (2**31 - 1, "integer", 2**31 - 1),
+            (2**31, "bigint", 2**31),
+            (-(2**31) - 1, "bigint", -(2**31) - 1),
+            (2**63 - 1, "bigint", 2**63 - 1),
+            (1.5, "double", 1.5),
+            (-0.0, "double", -0.0),
+            ("héllo 🌍", "varchar", "héllo 🌍"),
+            ("", "varchar", ""),
+            ("a\x00b", "varchar", "a\x00b"),
+            (datetime.date(2024, 1, 15), "date", datetime.date(2024, 1, 15)),
+            (datetime.date.min, "date", datetime.date.min),
+            (datetime.date.max, "date", datetime.date.max),
+            (
+                datetime.datetime(2024, 1, 15, 10, 0, 0, 123456),
+                "timestamp",
+                datetime.datetime(2024, 1, 15, 10, 0, 0, 123456),
+            ),
+            (
+                datetime.datetime(1969, 12, 31, 23, 59, 59, 999999),
+                "timestamp",
+                datetime.datetime(1969, 12, 31, 23, 59, 59, 999999),
+            ),
+        ]
+        for value, want_type, want in cases:
+            with self.subTest(value=value):
+                result = stmt.execute(value)
+                self.assertEqual(result.column_types, [want_type])
+                self.assertEqual(result.rows, [[want]])
+                self.assertEqual(result.kind, "selected")
+        # -0.0 must survive bit-for-bit.
+        negative_zero = stmt.execute(-0.0).rows[0][0]
+        self.assertEqual(math.copysign(1.0, negative_zero), -1.0)
+
+    def test_datetime_with_timezone_is_converted_to_utc(self):
+        aware = datetime.datetime(
+            2024, 1, 15, 12, 0,
+            tzinfo=datetime.timezone(datetime.timedelta(hours=5, minutes=30)),
+        )
+        selected = self.db.prepare("SELECT ?").execute(aware)
+        self.assertEqual(selected.rows, [[datetime.datetime(2024, 1, 15, 6, 30)]])
+
+    def test_all_types_roundtrip(self):
+        self.db.execute(
+            "CREATE TABLE types (b BOOLEAN, i INTEGER, bi BIGINT, d DOUBLE, "
+            "s VARCHAR, dt DATE, ts TIMESTAMP);"
+        )
+        insert = self.db.prepare("INSERT INTO types VALUES (?, ?, ?, ?, ?, ?, ?)")
+        self.addCleanup(insert.close)
+        result = insert.execute(
+            True,
+            -(2**31),
+            2**63 - 1,
+            -0.0,
+            "héllo 🌍\x00",
+            datetime.date(2024, 1, 15),
+            datetime.datetime(2024, 1, 15, 10, 0, 0, 123456),
+        )
+        self.assertEqual(result.kind, "inserted")
+        self.assertEqual(result.affected, 1)
+        self.assertEqual(insert.execute(None, None, None, None, None, None, None).affected, 1)
+
+        select = self.db.prepare("SELECT * FROM types WHERE i = ?")
+        self.addCleanup(select.close)
+        selected = select.execute(-(2**31))
+        self.assertEqual(
+            selected.column_types,
+            ["boolean", "integer", "bigint", "double", "varchar", "date", "timestamp"],
+        )
+        self.assertEqual(
+            selected.rows,
+            [[
+                True,
+                -(2**31),
+                2**63 - 1,
+                -0.0,
+                "héllo 🌍\x00",
+                datetime.date(2024, 1, 15),
+                datetime.datetime(2024, 1, 15, 10, 0, 0, 123456),
+            ]],
+        )
+        # A NULL bound into the same typed slot, then a miss in the same
+        # statement.
+        self.assertEqual(select.execute(None).rows, [])
+        nulls = self.db.execute("SELECT * FROM types WHERE i IS NULL;")[0]
+        self.assertEqual(nulls.rows, [[None] * 7])
+
+    def test_repeated_execution_rebinds(self):
+        stmt = self.db.prepare("SELECT ?;".rstrip(";"))
+        self.addCleanup(stmt.close)
+        # The same statement binds different values and even different types
+        # on each execution (auto-commit per execute, fresh bind each time).
+        self.assertEqual(stmt.execute(1).rows, [[1]])
+        self.assertEqual(stmt.execute("one").rows, [["one"]])
+        self.assertEqual(stmt.execute(True).rows, [[True]])
+        for i in range(5):
+            self.assertEqual(stmt.execute(i * 10).rows, [[i * 10]])
+
+    def test_reuse_resolves_the_current_catalog(self):
+        stmt = self.db.prepare("SELECT x FROM t")
+        self.addCleanup(stmt.close)
+        self.db.execute("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (7);")
+        self.assertEqual(stmt.execute().rows, [[7]])
+        self.db.execute(
+            "DROP TABLE t; CREATE TABLE t (x VARCHAR); INSERT INTO t VALUES ('reborn');"
+        )
+        selected = stmt.execute()
+        self.assertEqual(selected.column_types, ["varchar"])
+        self.assertEqual(selected.rows, [["reborn"]])
+
+    def test_null_handling(self):
+        self.db.execute("CREATE TABLE t (i INTEGER, s VARCHAR);")
+        insert = self.db.prepare("INSERT INTO t VALUES (?, ?)")
+        self.addCleanup(insert.close)
+        insert.execute(None, None)
+        insert.execute(1, "x")
+        selected = self.db.execute("SELECT i, s FROM t WHERE i IS NULL;")[0]
+        self.assertEqual(selected.rows, [[None, None]])
+
+        # NULL with no context and no CAST cannot be typed: the native bind
+        # error names the position and the statement stays usable.
+        untyped = self.db.prepare("SELECT ?")
+        self.addCleanup(untyped.close)
+        with self.assertRaises(pinkdb.Error) as ctx:
+            untyped.execute(None)
+        self.assertEqual(
+            str(ctx.exception),
+            "could not determine data type of parameter 1: bind a non-NULL "
+            "value or add an explicit CAST(? AS <type>)",
+        )
+        cast = self.db.prepare("SELECT CAST(? AS INTEGER)")
+        self.addCleanup(cast.close)
+        self.assertEqual(cast.execute(None).rows, [[None]])
+        self.assertEqual(untyped.execute(7).rows, [[7]])
+
+    def test_wrong_arity_is_a_native_error(self):
+        one = self.db.prepare("SELECT ?")
+        self.addCleanup(one.close)
+        with self.assertRaises(pinkdb.Error) as ctx:
+            one.execute()
+        self.assertEqual(
+            str(ctx.exception),
+            "values were not provided for prepared statement parameters: 1",
+        )
+        with self.assertRaises(pinkdb.Error) as ctx:
+            one.execute(1, 2)
+        self.assertEqual(
+            str(ctx.exception),
+            "parameter count mismatch: the prepared statement takes 1, "
+            "but values were provided for: 2",
+        )
+        two = self.db.prepare("SELECT ?, ?")
+        self.addCleanup(two.close)
+        with self.assertRaises(pinkdb.Error) as ctx:
+            two.execute(1)
+        self.assertEqual(
+            str(ctx.exception),
+            "values were not provided for prepared statement parameters: 2",
+        )
+        # The failures left both statements usable.
+        self.assertEqual(one.execute(9).rows, [[9]])
+        self.assertEqual(two.execute(1, 2).rows, [[1, 2]])
+
+    def test_conversion_and_range_errors(self):
+        cast = self.db.prepare("SELECT CAST(? AS INTEGER)")
+        self.addCleanup(cast.close)
+        with self.assertRaises(pinkdb.Error) as ctx:
+            cast.execute("abc")
+        self.assertEqual(
+            str(ctx.exception),
+            'cannot bind parameter 1 as INTEGER: cannot CAST "abc" AS INTEGER',
+        )
+        self.assertEqual(cast.execute("42").rows, [[42]])
+
+        stmt = self.db.prepare("SELECT ?")
+        self.addCleanup(stmt.close)
+        with self.assertRaises(pinkdb.Error) as ctx:
+            stmt.execute(2**63)
+        self.assertIn("does not fit in INTEGER or BIGINT", str(ctx.exception))
+        with self.assertRaises(pinkdb.Error) as ctx:
+            stmt.execute(-(2**63) - 1)
+        self.assertIn("does not fit in INTEGER or BIGINT", str(ctx.exception))
+        with self.assertRaises(pinkdb.Error) as ctx:
+            stmt.execute("\ud800")
+        self.assertIn("not encodable as UTF-8", str(ctx.exception))
+        self.assertEqual(stmt.execute("ok").rows, [["ok"]])
+
+    def test_unbindable_types_raise_type_error(self):
+        stmt = self.db.prepare("SELECT ?")
+        self.addCleanup(stmt.close)
+        for bad in (b"bytes", bytearray(b"x"), memoryview(b"x"), decimal.Decimal("1.5"), object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    stmt.execute(bad)
+        with self.assertRaises(TypeError) as ctx:
+            stmt.execute(decimal.Decimal("1.5"))
+        self.assertIn("cannot bind DECIMAL parameters", str(ctx.exception))
+        with self.assertRaises(TypeError) as ctx:
+            stmt.execute(b"raw")
+        self.assertIn("no BLOB type", str(ctx.exception))
+        self.assertEqual(stmt.execute(1).rows, [[1]])
+
+    def test_prepare_errors(self):
+        with self.assertRaises(TypeError):
+            self.db.prepare(b"SELECT 1")
+        with self.assertRaises(pinkdb.Error) as ctx:
+            self.db.prepare("SELECT ?; SELECT ?")
+        self.assertIn("exactly one statement", str(ctx.exception))
+        for empty in ("", "-- comment only\n", "  ;  "):
+            with self.subTest(sql=empty):
+                with self.assertRaises(pinkdb.Error) as ctx:
+                    self.db.prepare(empty)
+                self.assertIn("exactly one statement", str(ctx.exception))
+        with self.assertRaises(pinkdb.Error) as ctx:
+            self.db.prepare("SELECT 1 ORDER BY ?")
+        self.assertIn("not supported in ORDER BY", str(ctx.exception))
+        with self.assertRaises(pinkdb.Error) as ctx:
+            self.db.prepare("SELECT '\ud800';")
+        self.assertIn("not encodable as UTF-8", str(ctx.exception))
+        # A failed prepare leaves the database usable.
+        self.assertEqual(self.db.execute("SELECT 1;")[0].rows, [[1]])
+
+    def test_close_and_database_close_semantics(self):
+        stmt = self.db.prepare("SELECT ?")
+        stmt.close()
+        stmt.close()  # idempotent
+        with self.assertRaises(pinkdb.Error) as ctx:
+            stmt.execute(1)
+        self.assertEqual(str(ctx.exception), "statement is closed")
+        self.assertEqual(stmt.parameter_count, 1)  # metadata stays readable
+
+        db = pinkdb.connect_memory()
+        with db.prepare("SELECT 1") as scoped:
+            self.assertEqual(scoped.execute().rows, [[1]])
+        with self.assertRaises(pinkdb.Error) as ctx:
+            scoped.execute()
+        self.assertEqual(str(ctx.exception), "statement is closed")
+
+        orphan = db.prepare("SELECT 2")
+        db.close()
+        with self.assertRaises(pinkdb.Error) as ctx:
+            orphan.execute()
+        self.assertEqual(str(ctx.exception), "database is closed")
+        orphan.close()  # freeing does not touch the closed handle
+        with self.assertRaises(pinkdb.Error) as ctx:
+            db.prepare("SELECT 3")
+        self.assertEqual(str(ctx.exception), "database is closed")
+
+    def test_copy_and_pickle_fail_safely(self):
+        with self.db.prepare("SELECT ?") as stmt:
+            for copier in (copy.copy, copy.deepcopy):
+                with self.subTest(copier=copier.__name__):
+                    with self.assertRaises(TypeError) as ctx:
+                        copier(stmt)
+                    self.assertIn("cannot copy a Statement handle", str(ctx.exception))
+            with self.assertRaises((pickle.PicklingError, TypeError, AttributeError)):
+                pickle.dumps(stmt)
+            # The original still owns the only native statement.
+            self.assertEqual(stmt.execute(1).rows, [[1]])
+
+    def test_values_are_never_parsed_as_sql(self):
+        self.db.execute("CREATE TABLE t (s VARCHAR);")
+        insert = self.db.prepare("INSERT INTO t VALUES (?)")
+        self.addCleanup(insert.close)
+        payload = "'; DROP TABLE t; -- ?"
+        insert.execute(payload)
+        selected = self.db.prepare("SELECT s FROM t WHERE s = ?")
+        self.addCleanup(selected.close)
+        self.assertEqual(selected.execute(payload).rows, [[payload]])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM t;")[0].rows, [[1]])
+
+    def test_transaction_rollback_and_commit(self):
+        self.db.execute("CREATE TABLE t (i INTEGER);")
+        insert = self.db.prepare("INSERT INTO t VALUES (?)")
+        self.addCleanup(insert.close)
+        self.db.execute("BEGIN;")
+        insert.execute(1)
+        self.db.execute("ROLLBACK;")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM t;")[0].rows, [[0]])
+        self.db.execute("BEGIN;")
+        insert.execute(2)
+        self.db.execute("COMMIT;")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM t;")[0].rows, [[1]])
+
+    def test_rbac_kinds_through_prepared_statements(self):
+        # Wave 48 statements (kinds 17-23) surface with their names when run
+        # as zero-parameter prepared statements.
+        self.db.execute("CREATE TABLE t (i INTEGER);")
+        cases = [
+            ("CREATE USER alice PASSWORD 'secret'", "created_user", "alice"),
+            ("CREATE ROLE analyst", "created_role", "analyst"),
+            ("GRANT SELECT ON TABLE t TO alice", "granted", "SELECT ON TABLE main.t TO alice"),
+            ("REVOKE SELECT ON TABLE t FROM alice", "revoked", "SELECT ON TABLE main.t TO alice"),
+            ("ALTER USER alice PASSWORD 'rotated'", "altered_user", "alice"),
+            ("DROP ROLE analyst", "dropped_role", "analyst"),
+            ("DROP USER alice", "dropped_user", "alice"),
+        ]
+        for sql, kind, name in cases:
+            with self.subTest(sql=sql):
+                with self.db.prepare(sql) as stmt:
+                    result = stmt.execute()
+                self.assertEqual(result.kind, kind)
+                self.assertEqual(result.name, name)
+
+
+class PreparedDurableTests(unittest.TestCase):
+    def test_prepared_writes_replay_after_reopen(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "prepared.pink"
+            db = pinkdb.connect(path)
+            db.execute("CREATE TABLE t (i INTEGER, s VARCHAR);")
+            insert = db.prepare("INSERT INTO t VALUES (?, ?)")
+            insert.execute(0, "héllo")
+            insert.execute(1, "wörld")
+            insert.close()
+            db.close()
+
+            # The WAL logged the fully substituted SQL: replayed verbatim.
+            reopened = pinkdb.connect(path)
+            try:
+                rows = reopened.execute("SELECT i, s FROM t ORDER BY i;")[0].rows
+                self.assertEqual(rows, [[0, "héllo"], [1, "wörld"]])
+            finally:
+                reopened.close()
+
+    def test_prepared_statements_span_handles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "shared.pink"
+            first = pinkdb.connect(path)
+            second = pinkdb.connect(path)
+            try:
+                first.execute("CREATE TABLE t (i INTEGER, s VARCHAR);")
+                # A handle refreshes its catalog at a statement boundary; a
+                # prepared bind alone does not refresh it, so touch the
+                # second handle once before preparing against the new DDL.
+                second.execute("SELECT 1;")
+                insert = second.prepare("INSERT INTO t VALUES (?, ?)")
+                insert.execute(7, "from-second")
+                insert.close()
+                # The first handle refreshes at its statement boundary.
+                selected = first.prepare("SELECT s FROM t WHERE i = ?")
+                self.assertEqual(selected.execute(7).rows, [["from-second"]])
+                selected.close()
             finally:
                 first.close()
                 second.close()

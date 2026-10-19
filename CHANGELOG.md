@@ -10,6 +10,14 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 69 — prepared statements in the Python and Go bindings ✅
+- Both bindings gained idiomatic prepared-statement APIs over the FFI: Python
+  `db.prepare(sql)` → `Statement.execute(*params)`, Go `db.Prepare(sql)` →
+  `Stmt.Execute(args...)` — typed parameters, NULLs, reuse and clean close
+  semantics, with native error strings passed through unchanged.
+- No C-ABI changes; the bindings also caught up on the RBAC result kinds
+  (17–23). Python 56 tests, Go 38 (with `-race`).
+
 ### Wave 56 — core `datetime` extension ✅
 - Ten DuckDB-pinned datetime functions over naive `DATE`/`TIMESTAMP`:
   `strftime`, `strptime`, `epoch`/`epoch_ms`, `dayofweek`/`dayofyear`/`week`,

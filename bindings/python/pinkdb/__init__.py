@@ -16,6 +16,17 @@ Usage::
     >>> rows
     [[42]]
 
+Prepared statements (``?`` placeholders) reuse one parsed statement and bind
+values per execution::
+
+    >>> with pinkdb.connect_memory() as db:
+    ...     db.execute("CREATE TABLE t (x INTEGER, s VARCHAR);")
+    ...     with db.prepare("INSERT INTO t VALUES (?, ?);") as stmt:
+    ...         stmt.execute(1, "one")
+    ...         stmt.execute(2, None)
+    ...     db.execute("SELECT x, s FROM t ORDER BY x;")[0].rows
+    [[1, 'one'], [2, None]]
+
 Like the C ABI underneath, :class:`Database` handles are **not thread-safe**:
 use one database per thread.
 
@@ -46,6 +57,7 @@ __all__ = [
     "Error",
     "Database",
     "Result",
+    "Statement",
     "abi_version",
     "connect",
     "connect_memory",
@@ -74,6 +86,14 @@ _STMT_KINDS = {
     14: "loaded_extension",
     15: "checkpointed",
     16: "altered_table",
+    # Wave 48 RBAC statements.
+    17: "created_user",
+    18: "altered_user",
+    19: "dropped_user",
+    20: "created_role",
+    21: "dropped_role",
+    22: "granted",
+    23: "revoked",
 }
 
 # ----- value / column type tags (PINKDB_TYPE_*) -----
@@ -187,6 +207,23 @@ def _bind(lib: ctypes.CDLL, path: str) -> None:
     declare(
         "pinkdb_execute",
         [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t],
+        ctypes.c_void_p,
+    )
+    declare(
+        "pinkdb_prepare",
+        [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t],
+        ctypes.c_void_p,
+    )
+    declare("pinkdb_prepared_parameter_count", [ctypes.c_void_p], ctypes.c_size_t)
+    declare("pinkdb_prepared_free", [ctypes.c_void_p], None)
+    declare(
+        "pinkdb_execute_prepared",
+        [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(_PinkValue),
+            ctypes.c_size_t,
+        ],
         ctypes.c_void_p,
     )
     declare("pinkdb_result_free", [ctypes.c_void_p], None)
@@ -306,6 +343,123 @@ def _value_to_python(v: _PinkValue):
     raise Error(f"unknown value type tag {tag} from the native library")
 
 
+#: Python types that bind by value to a ``?`` placeholder, for error messages.
+_BINDABLE_TYPES = (
+    "None, bool, int, float, str, datetime.date or datetime.datetime"
+)
+
+
+def _bind_one(index: int, value):
+    """Map one Python parameter to ``(pink_value, keepalive)``.
+
+    ``index`` is the 1-based parameter position, used in error messages.
+    ``keepalive`` is the buffer backing a VARCHAR payload (or ``None``); the
+    caller must keep it alive until the native call has returned.
+
+    Type mapping: ``None`` -> NULL, ``bool`` -> BOOLEAN, ``int`` -> INTEGER or
+    BIGINT (whichever the value fits), ``float`` -> DOUBLE, ``str`` ->
+    VARCHAR, ``datetime.date`` -> DATE, ``datetime.datetime`` -> TIMESTAMP
+    (aware datetimes convert to UTC; naive ones are taken as UTC). ``bytes``,
+    ``bytearray``, ``memoryview`` and ``decimal.Decimal`` are refused: ABI v1
+    has no BLOB type and cannot bind DECIMAL/INTERVAL parameters.
+    """
+    pink = _PinkValue()
+    pink.type_tag = _TYPE_NULL
+    pink.is_null = 0
+    pink.int64 = 0
+    pink.double_ = 0.0
+    pink.text_ptr = None
+    pink.text_len = 0
+
+    if value is None:
+        pink.is_null = 1
+        return pink, None
+    if isinstance(value, bool):  # before int: bool is an int subclass
+        pink.type_tag = _TYPE_BOOLEAN
+        pink.int64 = 1 if value else 0
+        return pink, None
+    if isinstance(value, int):
+        if -(2**31) <= value < 2**31:
+            pink.type_tag = _TYPE_INTEGER
+        elif -(2**63) <= value < 2**63:
+            pink.type_tag = _TYPE_BIGINT
+        else:
+            raise Error(
+                f"parameter {index}: integer {value} does not fit in INTEGER "
+                "or BIGINT"
+            )
+        pink.int64 = value
+        return pink, None
+    if isinstance(value, float):
+        pink.type_tag = _TYPE_DOUBLE
+        pink.double_ = value
+        return pink, None
+    if isinstance(value, str):
+        try:
+            data = value.encode("utf-8")
+        except UnicodeEncodeError as exc:  # e.g. a lone surrogate
+            raise Error(
+                f"parameter {index} is not encodable as UTF-8: {exc}"
+            ) from exc
+        pink.type_tag = _TYPE_VARCHAR
+        if data:
+            # Keep text_len authoritative: the payload may contain embedded
+            # NULs, so the buffer (not the C string) is the value.
+            buffer = ctypes.create_string_buffer(data, len(data))
+            pink.text_ptr = ctypes.addressof(buffer)
+            pink.text_len = len(data)
+            return pink, buffer
+        return pink, None  # empty string: NULL pointer, zero length
+    if isinstance(value, _datetime.datetime):  # before date: a datetime is a date
+        moment = value
+        if moment.tzinfo is not None:
+            moment = moment.astimezone(_datetime.timezone.utc).replace(tzinfo=None)
+        delta = moment - _EPOCH_DATETIME
+        # timedelta normalizes negative spans as (negative days, positive
+        # seconds), so this reconstructs microseconds since the epoch exactly.
+        pink.type_tag = _TYPE_TIMESTAMP
+        pink.int64 = (
+            (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+        )
+        return pink, None
+    if isinstance(value, _datetime.date):
+        pink.type_tag = _TYPE_DATE
+        pink.int64 = (value - _EPOCH_DATE).days
+        return pink, None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"parameter {index}: ABI v1 has no BLOB type and cannot bind "
+            f"{type(value).__name__}; decode it to str (e.g. .decode('utf-8')) "
+            "or embed it in SQL"
+        )
+    if isinstance(value, _decimal.Decimal):
+        raise TypeError(
+            f"parameter {index}: ABI v1 cannot bind DECIMAL parameters; pass "
+            "the canonical text and CAST it in SQL, e.g. "
+            "CAST(? AS DECIMAL(18,3))"
+        )
+    raise TypeError(
+        f"parameter {index}: unsupported Python type {type(value).__name__!r}; "
+        f"bind {_BINDABLE_TYPES}"
+    )
+
+
+def _bind_parameters(params) -> tuple:
+    """Convert ``params`` to a ``pink_value`` array plus its keepalive buffers.
+
+    The same native error surface as ``Database.execute`` applies: a wrong
+    count is reported by the native bind step, not re-checked here.
+    """
+    values = []
+    keepalive = []
+    for index, param in enumerate(params, start=1):
+        pink, buffer = _bind_one(index, param)
+        values.append(pink)
+        if buffer is not None:
+            keepalive.append(buffer)
+    return values, keepalive
+
+
 class Result:
     """One statement's outcome, materialized as Python values.
 
@@ -316,11 +470,14 @@ class Result:
         ``deleted``, ``began``, ``committed``, ``rolledback``,
         ``created_view``, ``dropped_table``, ``dropped_view``,
         ``created_database``, ``dropped_database``, ``used``,
-        ``loaded_extension``, ``checkpointed``.
+        ``loaded_extension``, ``checkpointed``, ``altered_table``,
+        ``created_user``, ``altered_user``, ``dropped_user``,
+        ``created_role``, ``dropped_role``, ``granted``, ``revoked``.
     columns / column_types:
         For ``selected``: column names and type names (``boolean``,
         ``integer``, ``bigint``, ``double``, ``varchar``, ``date``,
-        ``timestamp``); empty for every other kind.
+        ``timestamp``, ``decimal``, ``interval``); empty for every other
+        kind.
     rows:
         For ``selected``: ``list`` of rows, each a ``list`` of Python values
         (NULL -> ``None``, BOOLEAN -> ``bool``, INTEGER/BIGINT -> ``int``,
@@ -447,6 +604,37 @@ class Database:
             finally:
                 self._lib.pinkdb_result_free(result_ptr)
 
+    def prepare(self, sql: str) -> "Statement":
+        """Parse one SQL statement with ``?`` placeholders into a reusable
+        :class:`Statement`.
+
+        Prepared statements take typed Python values (positional, one per
+        ``?``) and can be executed repeatedly; see :class:`Statement` for the
+        value mapping. Raises :class:`Error` for a multi-statement string,
+        one with no statement, or any parse error (the message comes from
+        ``pinkdb_last_error``), and :class:`TypeError` for non-``str`` SQL.
+        """
+        if not isinstance(sql, str):
+            raise TypeError("sql must be a str")
+        try:
+            data = sql.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise Error(f"sql is not encodable as UTF-8: {exc}") from exc
+        with self._lock:
+            if self._handle is None:
+                raise Error("database is closed")
+            prepared = self._lib.pinkdb_prepare(self._handle, data, len(data))
+            if not prepared:
+                raise Error(_last_error(self._lib))
+            try:
+                parameter_count = int(
+                    self._lib.pinkdb_prepared_parameter_count(prepared)
+                )
+            except BaseException:
+                self._lib.pinkdb_prepared_free(prepared)
+                raise
+            return Statement(self, prepared, sql, parameter_count)
+
     def close(self) -> None:
         """Close the handle. Idempotent and safe to call more than once."""
         with self._lock:
@@ -471,6 +659,117 @@ class Database:
     def __repr__(self) -> str:
         state = "closed" if self._handle is None else "open"
         return f"<pinkdb.Database ({state})>"
+
+
+class Statement:
+    """A parsed, reusable SQL statement with ``?`` placeholders.
+
+    Create it with :meth:`Database.prepare`; the statement is one SQL
+    statement (multi-statement strings are refused) and stays valid for any
+    number of :meth:`execute` calls, binding fresh values each time. Types are
+    resolved by the native bind step against the current catalog, so reuse
+    sees catalog changes (new columns, dropped tables).
+
+    Parameters bind by Python type: ``None`` -> NULL, ``bool`` -> BOOLEAN,
+    ``int`` -> INTEGER/BIGINT, ``float`` -> DOUBLE, ``str`` -> VARCHAR,
+    ``datetime.date`` -> DATE, ``datetime.datetime`` -> TIMESTAMP (naive
+    datetimes are UTC; aware ones are converted). A wrong parameter count or
+    a value the statement cannot convert raises :class:`Error` with the
+    native message and leaves both the statement and the database usable.
+
+    Release the native statement with :meth:`close` (idempotent); the object
+    is also a context manager. Executing after ``close`` raises
+    :class:`Error`, as does executing after the owning :class:`Database` was
+    closed. A ``Statement`` cannot be copied (both copies would own the same
+    native pointer).
+    """
+
+    __slots__ = ("_db", "_prepared", "_sql", "_parameter_count", "_closed")
+
+    def __init__(self, db: Database, prepared, sql: str, parameter_count: int):
+        self._db = db
+        self._prepared = prepared
+        self._sql = sql
+        self._parameter_count = parameter_count
+        self._closed = False
+
+    @property
+    def sql(self) -> str:
+        """The original SQL text, ``?`` placeholders included."""
+        return self._sql
+
+    @property
+    def parameter_count(self) -> int:
+        """Number of ``?`` placeholders: how many values ``execute`` takes."""
+        return self._parameter_count
+
+    def __copy__(self):
+        raise TypeError("cannot copy a Statement handle")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("cannot copy a Statement handle")
+
+    def execute(self, *params) -> Result:
+        """Bind ``params`` (one per ``?``, in textual order) and run the
+        statement once, returning its single :class:`Result`.
+
+        Raises :class:`TypeError` for an unbindable Python type and
+        :class:`Error` for a wrong parameter count, a value the statement
+        cannot convert, or a native execution error.
+        """
+        with self._db._lock:
+            if self._closed:
+                raise Error("statement is closed")
+            if self._db._handle is None:
+                raise Error("database is closed")
+            values, keepalive = _bind_parameters(params)
+            # ``keepalive`` holds the buffers behind VARCHAR text_ptr values;
+            # both it and ``values`` live until this call returns.
+            array = (_PinkValue * len(values))(*values) if values else None
+            result_ptr = self._db._lib.pinkdb_execute_prepared(
+                self._db._handle, self._prepared, array, len(values)
+            )
+            if not result_ptr:
+                raise Error(_last_error(self._db._lib))
+            try:
+                results = _snapshot(self._db._lib, result_ptr)
+            finally:
+                self._db._lib.pinkdb_result_free(result_ptr)
+            if len(results) != 1:  # pragma: no cover - FFI invariant
+                raise Error(
+                    "internal error: prepared statement produced "
+                    f"{len(results)} results"
+                )
+            return results[0]
+
+    def close(self) -> None:
+        """Free the native prepared statement. Idempotent; also safe after
+        the owning database has been closed (it does not touch the handle)."""
+        with self._db._lock:
+            prepared = self._prepared
+            if prepared is not None:
+                self._prepared = None
+                self._closed = True
+                self._db._lib.pinkdb_prepared_free(prepared)
+
+    def __enter__(self) -> "Statement":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # pragma: no cover - interpreter shutdown races
+            pass
+
+    def __repr__(self) -> str:
+        state = "closed" if self._closed else "open"
+        return (
+            f"<pinkdb.Statement ({state}, {self._parameter_count} parameters)>"
+        )
 
 
 def _encode_path(path) -> bytes:

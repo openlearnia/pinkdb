@@ -15,8 +15,8 @@
 // this package serializes every native call with a per-DB mutex, so a single
 // *DB may be shared between goroutines. Close frees the native handle and is
 // idempotent: once closed, further Close calls are a no-op and ABI() stays
-// callable (it is library-wide and does not touch the handle). Execute is the
-// only method that reports a closed database, returning ErrClosed instead of
+// callable (it is library-wide and does not touch the handle). Execute,
+// Prepare and Stmt.Execute report a closed database with ErrClosed instead of
 // touching freed memory.
 package pinkdb
 
@@ -46,10 +46,14 @@ const SupportedABI = 1
 // Errors returned by this package in addition to the native error messages
 // from pinkdb_last_error.
 var (
-	// ErrClosed is returned by DB.Execute after the database has been closed.
-	// Close itself is a no-op on an already-closed DB, and ABI() remains
-	// callable.
+	// ErrClosed is returned by DB.Execute, DB.Prepare and Stmt.Execute after
+	// the database has been closed. Close itself is a no-op on an
+	// already-closed DB, and ABI() remains callable.
 	ErrClosed = errors.New("pinkdb: database is closed")
+
+	// ErrStmtClosed is returned by Stmt.Execute after the statement has been
+	// closed with Stmt.Close. Stmt.Close itself is idempotent.
+	ErrStmtClosed = errors.New("pinkdb: statement is closed")
 
 	// ErrOutOfRange wraps DATE and TIMESTAMP payloads that cannot be
 	// represented by Go's time.Time. The guard is defensive-only: no current
@@ -82,6 +86,15 @@ const (
 	kindCheckpointed int32 = 15
 	// kindAlteredTable is `ALTER TABLE`.
 	kindAlteredTable int32 = 16
+	// Wave 48 RBAC statements; the *_USER / *_ROLE kinds carry the user or
+	// role name in Result.Name, GRANTED / REVOKED the grant description.
+	kindCreatedUser int32 = 17
+	kindAlteredUser int32 = 18
+	kindDroppedUser int32 = 19
+	kindCreatedRole int32 = 20
+	kindDroppedRole int32 = 21
+	kindGranted     int32 = 22
+	kindRevoked     int32 = 23
 )
 
 var kindNames = map[int32]string{
@@ -102,6 +115,13 @@ var kindNames = map[int32]string{
 	kindLoadedExtension: "loaded_extension",
 	kindCheckpointed:    "checkpointed",
 	kindAlteredTable:    "altered_table",
+	kindCreatedUser:     "created_user",
+	kindAlteredUser:     "altered_user",
+	kindDroppedUser:     "dropped_user",
+	kindCreatedRole:     "created_role",
+	kindDroppedRole:     "dropped_role",
+	kindGranted:         "granted",
+	kindRevoked:         "revoked",
 }
 
 // Value and column type tags; these mirror the PINKDB_TYPE_* values in
@@ -137,11 +157,14 @@ type Result struct {
 	// Kind is one of: "selected", "created", "inserted", "updated",
 	// "deleted", "began", "committed", "rolledback", "created_view",
 	// "dropped_table", "dropped_view", "created_database",
-	// "dropped_database", "used", "loaded_extension", "checkpointed".
+	// "dropped_database", "used", "loaded_extension", "checkpointed",
+	// "altered_table", "created_user", "altered_user", "dropped_user",
+	// "created_role", "dropped_role", "granted", "revoked".
 	Kind string
 	// Columns and ColumnTypes describe a "selected" result (column names and
 	// one of "null", "boolean", "integer", "bigint", "double", "varchar",
-	// "date", "timestamp"); both are empty for every other kind.
+	// "date", "timestamp", "decimal", "interval"); both are empty for every
+	// other kind.
 	Columns     []string
 	ColumnTypes []string
 	// Rows holds a "selected" result's rows as Go values: nil, bool, int64,
@@ -262,8 +285,10 @@ func (db *DB) executeNative(sqlPtr *C.char, sqlLen C.size_t) (*C.pinkdb_result, 
 }
 
 // Close frees the native handle. It is idempotent: after the first call,
-// further calls are a no-op (there is no handle left to free), and Execute
-// returns ErrClosed from then on. ABI() stays callable.
+// further calls are a no-op (there is no handle left to free), and Execute,
+// Prepare and Stmt.Execute return ErrClosed from then on. ABI() stays
+// callable. Prepared statements are owned by the caller: Stmt.Close still
+// frees them after the DB is closed (it does not touch the handle).
 func (db *DB) Close() {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -275,6 +300,270 @@ func (db *DB) Close() {
 		C.pinkdb_close(db.handle)
 		db.handle = nil
 	}
+}
+
+// Prepare parses exactly one SQL statement with `?` placeholders into a
+// reusable Stmt. A multi-statement string is refused, and so is a statement
+// with no statement in it; a statement with zero placeholders is allowed.
+//
+// SQL is passed as (pointer, length), so embedded NUL bytes are preserved.
+// Parse errors carry the message from pinkdb_last_error and leave the
+// database usable. After DB.Close, Prepare returns ErrClosed.
+func (db *DB) Prepare(sql string) (*Stmt, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return nil, ErrClosed
+	}
+
+	// CBytes + explicit length keeps embedded NULs; free the copy below.
+	var sqlPtr *C.char
+	if len(sql) > 0 {
+		sqlPtr = (*C.char)(C.CBytes([]byte(sql)))
+		defer C.free(unsafe.Pointer(sqlPtr))
+	}
+	prepared, err := db.prepareNative(sqlPtr, C.size_t(len(sql)))
+	if err != nil {
+		return nil, err
+	}
+	return &Stmt{
+		db:       db,
+		prepared: prepared,
+		sql:      sql,
+		nparams:  int(C.pinkdb_prepared_parameter_count(prepared)),
+	}, nil
+}
+
+// prepareNative runs pinkdb_prepare and, when it fails, reads the
+// thread-local pinkdb_last_error on the same OS thread. The caller must hold
+// db.mu and owns the returned prepared statement (freed with
+// pinkdb_prepared_free).
+func (db *DB) prepareNative(sqlPtr *C.char, sqlLen C.size_t) (*C.pinkdb_prepared, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	prepared := C.pinkdb_prepare(db.handle, sqlPtr, sqlLen)
+	if prepared == nil {
+		return nil, nativeError()
+	}
+	return prepared, nil
+}
+
+// Stmt is one parsed, reusable SQL statement with `?` placeholders, created
+// by DB.Prepare.
+//
+// Types are resolved by the native bind step against the current catalog, so
+// one Stmt can be executed repeatedly with different values (and sees catalog
+// changes between executions). Parameters bind by Go type: nil -> NULL, bool
+// -> BOOLEAN, an integer that fits int32 -> INTEGER (wider -> BIGINT), float32
+// / float64 -> DOUBLE, string -> VARCHAR, time.Time -> TIMESTAMP (UTC,
+// microsecond precision) and Date -> DATE. A wrong parameter count or a value
+// the statement cannot convert is a normal error; the statement and database
+// stay usable.
+//
+// Like DB, a *Stmt is goroutine-safe: every native call is serialized behind
+// the owning DB's mutex. Close frees the native prepared statement (it is
+// idempotent and remains safe after the DB is closed); Execute returns
+// ErrStmtClosed afterwards.
+type Stmt struct {
+	db       *DB
+	prepared *C.pinkdb_prepared
+	sql      string
+	nparams  int
+	closed   bool
+}
+
+// Date is a DATE parameter for a prepared statement. ABI v1 carries DATE as
+// days since the Unix epoch, so the instant is truncated to its UTC calendar
+// day (the same truncation as a TIMESTAMP -> DATE cast). A plain time.Time
+// binds as TIMESTAMP; use Date when a statement needs a DATE value with no
+// column context.
+type Date time.Time
+
+// SQL returns the original statement text, `?` placeholders included.
+func (stmt *Stmt) SQL() string { return stmt.sql }
+
+// ParameterCount reports how many values Execute takes: the number of `?`
+// placeholders in textual order. It is immutable after Prepare and safe to
+// call concurrently, including after Close.
+func (stmt *Stmt) ParameterCount() int { return stmt.nparams }
+
+// Execute binds args (one per `?` placeholder, in textual order) and runs the
+// statement once. It returns the statement's single Result.
+//
+// A wrong argument count or a value the statement cannot convert returns the
+// native error message; the statement and database stay usable. After
+// Stmt.Close it returns ErrStmtClosed, and after DB.Close ErrClosed.
+func (stmt *Stmt) Execute(args ...any) (Result, error) {
+	stmt.db.mu.Lock()
+	defer stmt.db.mu.Unlock()
+	if stmt.db.closed {
+		return Result{}, ErrClosed
+	}
+	if stmt.closed {
+		return Result{}, ErrStmtClosed
+	}
+
+	values, buffers, err := bindValues(args)
+	if err != nil {
+		return Result{}, err
+	}
+	defer func() {
+		// The native call copies every VARCHAR payload before returning.
+		for _, buffer := range buffers {
+			C.free(buffer)
+		}
+	}()
+	var valuesPtr *C.pink_value
+	if len(values) > 0 {
+		valuesPtr = &values[0]
+	}
+	result, err := stmt.executeNative(valuesPtr, C.size_t(len(values)))
+	if err != nil {
+		return Result{}, err
+	}
+	defer C.pinkdb_result_free(result)
+	results, err := materialize(result)
+	if err != nil {
+		return Result{}, err
+	}
+	if len(results) != 1 {
+		return Result{}, fmt.Errorf(
+			"pinkdb: prepared statement produced %d results, want 1", len(results))
+	}
+	return results[0], nil
+}
+
+// executeNative runs pinkdb_execute_prepared and, when it fails, reads the
+// thread-local pinkdb_last_error on the same OS thread. The caller must hold
+// the DB mutex and owns the returned result (freed with pinkdb_result_free).
+func (stmt *Stmt) executeNative(values *C.pink_value, count C.size_t) (*C.pinkdb_result, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	result := C.pinkdb_execute_prepared(stmt.db.handle, stmt.prepared, values, count)
+	if result == nil {
+		return nil, nativeError()
+	}
+	return result, nil
+}
+
+// Close frees the native prepared statement. It is idempotent: after the
+// first call, further calls are a no-op and Execute returns ErrStmtClosed.
+// Close is also safe after the owning DB has been closed.
+func (stmt *Stmt) Close() {
+	stmt.db.mu.Lock()
+	defer stmt.db.mu.Unlock()
+	if stmt.closed {
+		return
+	}
+	stmt.closed = true
+	if stmt.prepared != nil {
+		C.pinkdb_prepared_free(stmt.prepared)
+		stmt.prepared = nil
+	}
+}
+
+// bindValues converts Go parameters to pink_value structs. VARCHAR payloads
+// are copied into C memory and returned as buffers; the caller frees them
+// after the native call. On error every buffer allocated so far is freed.
+func bindValues(args []any) ([]C.pink_value, []unsafe.Pointer, error) {
+	values := make([]C.pink_value, len(args))
+	buffers := make([]unsafe.Pointer, 0, len(args))
+	fail := func(err error) ([]C.pink_value, []unsafe.Pointer, error) {
+		for _, buffer := range buffers {
+			C.free(buffer)
+		}
+		return nil, nil, err
+	}
+	for i, arg := range args {
+		v := &values[i]
+		switch value := arg.(type) {
+		case nil:
+			v.is_null = 1
+		case bool:
+			v.type_tag = C.int32_t(typeBoolean)
+			if value {
+				v.int64 = 1
+			}
+		case int:
+			bindInt(v, int64(value))
+		case int8:
+			bindInt(v, int64(value))
+		case int16:
+			bindInt(v, int64(value))
+		case int32:
+			bindInt(v, int64(value))
+		case int64:
+			bindInt(v, value)
+		case uint:
+			if uint64(value) > math.MaxInt64 {
+				return fail(integerRangeError(i, uint64(value)))
+			}
+			bindInt(v, int64(value))
+		case uint8:
+			bindInt(v, int64(value))
+		case uint16:
+			bindInt(v, int64(value))
+		case uint32:
+			bindInt(v, int64(value))
+		case uint64:
+			if value > math.MaxInt64 {
+				return fail(integerRangeError(i, value))
+			}
+			bindInt(v, int64(value))
+		case float32:
+			v.type_tag = C.int32_t(typeDouble)
+			v.double_ = C.double(value)
+		case float64:
+			v.type_tag = C.int32_t(typeDouble)
+			v.double_ = C.double(value)
+		case string:
+			v.type_tag = C.int32_t(typeVarchar)
+			if len(value) > 0 {
+				buffer := C.CBytes([]byte(value))
+				buffers = append(buffers, buffer)
+				v.text_ptr = (*C.char)(buffer)
+				v.text_len = C.size_t(len(value))
+			}
+		case []byte:
+			return fail(fmt.Errorf(
+				"pinkdb: parameter %d: []byte is not bindable; ABI v1 has no BLOB type "+
+					"(decode it to a string or embed it in SQL)", i+1))
+		case time.Time:
+			v.type_tag = C.int32_t(typeTimestamp)
+			v.int64 = C.int64_t(value.UnixMicro())
+		case Date:
+			// Floor-divide UTC seconds into days so pre-epoch instants keep
+			// their calendar day.
+			sec := time.Time(value).UTC().Unix()
+			days := sec / secondsPerDay
+			if sec%secondsPerDay < 0 {
+				days--
+			}
+			v.type_tag = C.int32_t(typeDate)
+			v.int64 = C.int64_t(days)
+		default:
+			return fail(fmt.Errorf(
+				"pinkdb: parameter %d: unsupported Go type %T; bind nil, bool, an integer, "+
+					"float32/float64, string, time.Time or pinkdb.Date", i+1, arg))
+		}
+	}
+	return values, buffers, nil
+}
+
+// bindInt tags n as INTEGER when it fits int32 and BIGINT otherwise. Every
+// int64 is representable, so no range error is possible here.
+func bindInt(v *C.pink_value, n int64) {
+	if n >= math.MinInt32 && n <= math.MaxInt32 {
+		v.type_tag = C.int32_t(typeInteger)
+	} else {
+		v.type_tag = C.int32_t(typeBigint)
+	}
+	v.int64 = C.int64_t(n)
+}
+
+func integerRangeError(index int, value uint64) error {
+	return fmt.Errorf(
+		"pinkdb: parameter %d: integer %d does not fit in BIGINT", index+1, value)
 }
 
 // checkABI fails when the linked library is not the ABI version this package
