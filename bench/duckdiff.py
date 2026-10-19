@@ -499,8 +499,14 @@ def run_small():
     except (OSError, IndexError):
         pass
     if not os.path.exists(STRING_EXT_PATH):
-        print(f"note: string extension not built at {STRING_EXT_PATH}; "
-              "run `make -C extensions/string` for the wave-53 probes")
+        # Self-sufficient: CI (and fresh checkouts) have no extension built.
+        print("string extension not built; building pinkdb-ext-string (release) ...")
+        subprocess.run(
+            ["cargo", "build", "--release", "-p", "pinkdb-ext-string"],
+            check=True,
+        )
+        if not os.path.exists(STRING_EXT_PATH):
+            raise SystemExit(f"string extension still missing at {STRING_EXT_PATH}")
     for label, sql, ordered, expect_error in QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
