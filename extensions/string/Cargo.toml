@@ -1,0 +1,30 @@
+[package]
+name = "pinkdb-ext-string"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb core string extension: split_part, reverse, left/right, strpos, starts_with/ends_with, regexp_extract/matches (Rust extension SDK)"
+license = "MIT"
+publish = false
+
+[lib]
+# A loadable extension is a shared library: `cargo build --release` writes
+# `target/release/libstring_ext.<dylib|so>`, which `LOAD EXTENSION '<path>'`
+# opens. The rlib half lets this crate's integration tests link the generated
+# `pinkdb_register_linked()` directly (the example crate ships cdylib-only
+# because its tests compile it with rustc instead).
+name = "string_ext"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
+# The regex engine. RE2-style / linear-time (no backtracking), the same
+# engine family DuckDB uses (RE2), and already in the workspace lock file via
+# vortex/bindgen — this adds a direct dependency edge, not a new crate.
+regex = "1.13"
+
+[dev-dependencies]
+# Deliberate dev-dependency cycle, like the SDK's own tests: the extension's
+# end-to-end tests drive a real engine through the linked registration.
+# Nothing in `pinkdb` depends on this crate.
+pinkdb = { path = "../../crates/pinkdb" }

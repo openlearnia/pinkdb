@@ -439,6 +439,56 @@ QUERIES = [
     ("json-object-null-key", "SELECT json_object(CAST(NULL AS VARCHAR), 'v');", False, True),
 ]
 
+# ---- wave 53: core string extension (`extensions/string`) ----
+#
+# These probes need the loadable extension on the pinkdb side only; DuckDB
+# has the same functions built in. Build it first (`make -C extensions/string`,
+# or `cargo build --release -p pinkdb-ext-string`), then the pinkdb side of
+# every probe is prefixed with `LOAD EXTENSION '<abs path>'` — engine-specific
+# setup outside the compared SQL, so both engines still run the SAME text.
+#
+# ABI v1 inserts no implicit casts for extension arguments, so BIGINT
+# parameters are spelled `CAST(n AS BIGINT)` (DuckDB accepts that too).
+STRING_EXT_SO = ".dylib" if sys.platform == "darwin" else ".so"
+STRING_EXT_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "target",
+    "release",
+    "libstring_ext" + STRING_EXT_SO,
+)
+STRING_EXT_SETUP = f"LOAD EXTENSION '{STRING_EXT_PATH}';"
+
+# (label, sql, ordered, expect_error) — same shape as QUERIES.
+STRING_EXT_QUERIES = [
+    ("str-split-part", "SELECT split_part('a,b,c', ',', CAST(1 AS BIGINT)), split_part('a,b,c', ',', CAST(3 AS BIGINT)), split_part('a,b,c', ',', CAST(4 AS BIGINT)), split_part('a,b,c', ',', CAST(0 AS BIGINT)), split_part('a,b,c', ',', CAST(-1 AS BIGINT)), split_part('a,b,c', ',', CAST(-3 AS BIGINT)), split_part('a,b,c', ',', CAST(-4 AS BIGINT)), split_part('abc', '', CAST(2 AS BIGINT)), split_part('héllo,world', ',', CAST(1 AS BIGINT));", False, False),
+    ("str-split-part-empty", "SELECT split_part('a', ',', CAST(1 AS BIGINT)), split_part('a', ',', CAST(2 AS BIGINT)), split_part('', ',', CAST(1 AS BIGINT)), split_part('', '', CAST(1 AS BIGINT));", False, False),
+    ("str-split-part-null", "SELECT split_part(NULL, ',', CAST(1 AS BIGINT)) IS NULL, split_part('a,b', NULL, CAST(1 AS BIGINT)) IS NULL, split_part('a,b', ',', NULL) IS NULL;", False, False),
+    ("str-reverse", "SELECT reverse('hello'), reverse('héllo'), reverse(''), reverse('日本');", False, False),
+    ("str-reverse-null", "SELECT reverse(NULL) IS NULL;", False, False),
+    ("str-left-right", "SELECT left('hello', CAST(2 AS BIGINT)), left('hello', CAST(0 AS BIGINT)), left('hello', CAST(-2 AS BIGINT)), left('hello', CAST(99 AS BIGINT)), right('hello', CAST(2 AS BIGINT)), right('hello', CAST(0 AS BIGINT)), right('hello', CAST(-2 AS BIGINT)), right('hello', CAST(99 AS BIGINT));", False, False),
+    ("str-left-right-unicode", "SELECT left('héllo', CAST(4 AS BIGINT)), right('héllo', CAST(4 AS BIGINT)), left('héllo', CAST(-1 AS BIGINT)), right('héllo', CAST(-1 AS BIGINT));", False, False),
+    ("str-left-right-null", "SELECT left(NULL, CAST(1 AS BIGINT)) IS NULL, left('x', NULL) IS NULL, right(NULL, CAST(1 AS BIGINT)) IS NULL, right('x', NULL) IS NULL;", False, False),
+    ("str-strpos", "SELECT strpos('hello', 'll'), strpos('hello', 'z'), strpos('hello', ''), strpos('', 'x'), strpos('héllo', 'llo'), strpos('aé b', 'b');", False, False),
+    ("str-strpos-null", "SELECT strpos(NULL, 'x') IS NULL, strpos('x', NULL) IS NULL;", False, False),
+    ("str-prefix", "SELECT starts_with('hello', 'he'), starts_with('hello', 'el'), starts_with('hello', ''), ends_with('hello', 'lo'), ends_with('hello', 'he'), ends_with('', ''), starts_with('héllo', 'hé');", False, False),
+    ("str-prefix-null", "SELECT starts_with(NULL, 'a') IS NULL, starts_with('a', NULL) IS NULL, ends_with(NULL, 'a') IS NULL, ends_with('a', NULL) IS NULL;", False, False),
+    ("str-regexp-extract", "SELECT regexp_extract('hello', 'l+', 0, ''), regexp_extract('hello', '(l+)', 1, ''), regexp_extract('abc-123', '([a-z]+)-([0-9]+)', 2, ''), regexp_extract('hello', 'z', 0, ''), regexp_extract('abc', 'a(b)c', 3, ''), regexp_extract('abc', '', 0, '');", False, False),
+    ("str-regexp-extract-options", "SELECT regexp_extract('HELLO world', 'hello', 0, 'i'), regexp_extract('HELLO', 'hello', 0, 'ic'), regexp_extract('HELLO', 'hello', 0, 'ci'), regexp_extract('a.b', 'a.b', 0, 'l'), regexp_extract('axb', 'a.b', 0, 'l'), regexp_extract('héllo', '(é)', 1, '');", False, False),
+    ("str-regexp-extract-null", "SELECT regexp_extract(NULL, 'a', 0, '') IS NULL, regexp_extract('a', NULL, 0, '') IS NULL, regexp_extract('abc', 'b', NULL, '') = '';", False, False),
+    ("str-regexp-matches", "SELECT regexp_matches('hello', 'l', ''), regexp_matches('hello', '^h', ''), regexp_matches('hello', '^e', ''), regexp_matches('hello', 'o$', ''), regexp_matches('abc', '^abc$', ''), regexp_matches('abc', '', ''), regexp_matches('HELLO', 'hello', 'i'), regexp_matches('HELLO', 'hello', 'c');", False, False),
+    ("str-regexp-matches-dotall", "SELECT regexp_matches('a\nb', 'a.b', ''), regexp_matches('a\nb', 'a.b', 's'), regexp_matches('a\nb', 'a.b', 'sm'), regexp_matches('a\nb', 'a.b', 'ms'), regexp_matches('a\nb', '(?s)a.b', ''), regexp_matches('a.b', 'a.b', 'l'), regexp_matches('axb', 'a.b', 'l');", False, False),
+    ("str-regexp-matches-null", "SELECT regexp_matches(NULL, 'a', '') IS NULL, regexp_matches('a', NULL, '') IS NULL;", False, False),
+    ("str-regexp-bad-group", "SELECT regexp_extract('abc', 'a(b)c', 10, '');", False, True),
+    ("str-regexp-bad-group-negative", "SELECT regexp_extract('abc', 'a(b)c', -1, '');", False, True),
+    ("str-regexp-g-option", "SELECT regexp_matches('a', 'a', 'g');", False, True),
+    ("str-regexp-bad-option", "SELECT regexp_matches('a', 'a', 'q');", False, True),
+    ("str-regexp-bad-pattern", "SELECT regexp_matches('a', '(', '');", False, True),
+    ("str-regexp-null-options", "SELECT regexp_matches('a', 'a', NULL);", False, True),
+    ("str-where", "SELECT name FROM emp WHERE starts_with(name, 'a') OR strpos(name, 'ev') > 0 ORDER BY name;", True, False),
+    ("str-group", "SELECT left(name, CAST(1 AS BIGINT)) AS initial, COUNT(*) FROM emp GROUP BY initial ORDER BY initial;", True, False),
+    ("str-compose", "SELECT upper(reverse(name)) FROM emp ORDER BY 1;", True, False),
+]
+
 
 def run_small():
     print("== small battery ==")
@@ -448,30 +498,39 @@ def run_small():
         print(f"reference: {version}")
     except (OSError, IndexError):
         pass
+    if not os.path.exists(STRING_EXT_PATH):
+        print(f"note: string extension not built at {STRING_EXT_PATH}; "
+              "run `make -C extensions/string` for the wave-53 probes")
     for label, sql, ordered, expect_error in QUERIES:
-        got = pink_query(SETUP, sql)
-        if expect_error:
-            d = duck_query(SETUP, sql)
-            check(label, got[0] == "error" and d[0] == "error",
-                  f"pink={got[0]} duck={d[0]}")
-            continue
-        if got[0] == "error":
-            check(label, False, f"pinkdb error: {got[1]}")
-            continue
-        _, types, prows = got
+        run_case(label, sql, ordered, expect_error, SETUP)
+    for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETUP + "\n" + STRING_EXT_SETUP)
+
+
+def run_case(label, sql, ordered, expect_error, setup):
+    got = pink_query(setup, sql)
+    if expect_error:
         d = duck_query(SETUP, sql)
-        if d[0] == "error":
-            check(label, False, f"duckdb error: {d[1]}")
-            continue
-        _, drows = d
-        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
-        ok = rows_equal(prows_n, drows, ordered)
-        if ok:
-            check(label, True)
-            if VERBOSE:
-                print(f"    rows={len(prows_n)}")
-        else:
-            check(label, False, f"\npink={prows_n}\nduck={drows}")
+        check(label, got[0] == "error" and d[0] == "error",
+              f"pink={got[0]} duck={d[0]}")
+        return
+    if got[0] == "error":
+        check(label, False, f"pinkdb error: {got[1]}")
+        return
+    _, types, prows = got
+    d = duck_query(SETUP, sql)
+    if d[0] == "error":
+        check(label, False, f"duckdb error: {d[1]}")
+        return
+    _, drows = d
+    prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+    ok = rows_equal(prows_n, drows, ordered)
+    if ok:
+        check(label, True)
+        if VERBOSE:
+            print(f"    rows={len(prows_n)}")
+    else:
+        check(label, False, f"\npink={prows_n}\nduck={drows}")
 
 
 BIG_QUERIES = [

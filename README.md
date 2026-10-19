@@ -1631,12 +1631,14 @@ host→foreign-binding); an extension is a foreign library→host callback ABI.
   `LOAD EXTENSION '<path>'` (string-literal path). Loaded functions resolve
   case-insensitively like built-ins and cannot shadow one.
 
-First-party **core extensions** ship inside the binary and register through the
-same registry (linked registration, no `dlopen`): the `json` pack is a CLI
-**default feature** — `json_extract`, `json_value`, `json_valid`,
-`json_array_length`, `json_object`, `json_array` over JSON text in `VARCHAR`
-(disable with `--no-default-features` for the lean binary). The remaining packs
-(`string`, `math`, `datetime`) land in the same series.
+First-party **core extensions** register through the same registry (linked
+registration, no `dlopen`): the `json` pack is a CLI **default feature** —
+`json_extract`, `json_value`, `json_valid`, `json_array_length`, `json_object`,
+`json_array` over JSON text in `VARCHAR` (disable with `--no-default-features`
+for the lean binary) — while `string` ships as an in-repo loadable extension
+(`extensions/string`: `make -C extensions/string`, then
+`LOAD EXTENSION '<path>'`), with `math` and `datetime` landing in the same
+series.
 
 A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
 

@@ -1840,8 +1840,25 @@ peg::parser! {
             = s:ident() {? if s.eq_ignore_ascii_case("coalesce") { Ok(s) } else { Err("COALESCE") } }
 
         /// Any function name but COALESCE.
+        ///
+        /// LEFT and RIGHT are reserved keywords (join keywords), but they are
+        /// also function names in the wave-53 string extension
+        /// (`left('ab', 2)`, `right('ab', 2)`). A keyword word directly
+        /// followed by `(` can only be a call in expression position, so
+        /// exactly those two parse as function names here; every other
+        /// reserved keyword keeps failing (`CAST(x)` stays a parse error),
+        /// bare keyword identifiers stay rejected (`SELECT 1 AS left`), and
+        /// `LEFT [OUTER] JOIN` is untouched — the FROM grammar consumes join
+        /// keywords before any expression is parsed.
         rule non_coalesce_name() -> String
-            = s:ident() {? if s.eq_ignore_ascii_case("coalesce") { Err("non-COALESCE function name") } else { Ok(s) } }
+            = s:ident_raw() ws() &lparen() {?
+                  if s.eq_ignore_ascii_case("left") || s.eq_ignore_ascii_case("right") {
+                      Ok(s.to_string())
+                  } else {
+                      Err("keyword function name")
+                  }
+              }
+            / s:ident() {? if s.eq_ignore_ascii_case("coalesce") { Err("non-COALESCE function name") } else { Ok(s) } }
 
         rule fn_call() -> Expr
             = name:non_coalesce_name() lparen() distinct:distinct_flag() args:fn_args() rparen() over:over_clause()? {
@@ -3089,6 +3106,58 @@ mod tests {
         ] {
             assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
         }
+    }
+
+    /// A reserved keyword directly followed by `(` is a **function call**,
+    /// never an identifier: `left(...)`/`right(...)` (the wave-53 string
+    /// extension) were parse errors before because LEFT/RIGHT are join
+    /// keywords. `LEFT JOIN` and bare keyword identifiers keep their old
+    /// behavior — the relaxation only adds previously-invalid syntax.
+    #[test]
+    fn reserved_keywords_parse_as_function_calls_only_with_a_paren() {
+        let Statement::Select(sel) = parse_one("SELECT left(name, 1), right(name, 2) FROM t;")
+        else {
+            panic!()
+        };
+        let names: Vec<(&str, usize)> = sel
+            .projections
+            .iter()
+            .map(|p| match p {
+                Projection::Expr {
+                    expr: Expr::Function { name, args, .. },
+                    ..
+                } => (name.as_str(), args.len()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(names, [("left", 2), ("right", 2)]);
+        // Whitespace before `(` and the quoted spelling still work.
+        let Statement::Select(sel) = parse_one("SELECT left ( 'ab' , 1 ), \"right\"(x, 2) FROM t;")
+        else {
+            panic!()
+        };
+        assert_eq!(sel.projections.len(), 2);
+        // Bare keyword identifiers stay rejected: the relaxation requires `(`.
+        for sql in [
+            "SELECT left FROM t;",
+            "SELECT left + 1 FROM t;",
+            "SELECT 1 AS right;",
+        ] {
+            assert!(matches!(parse(sql), Err(PinkDbError::Parse(_))), "{sql}");
+        }
+        // Join parsing is untouched.
+        let Statement::Select(sel) = parse_one("SELECT * FROM a LEFT OUTER JOIN b ON a.x = b.x;")
+        else {
+            panic!()
+        };
+        let joins = sel.from.unwrap().joins;
+        assert_eq!(joins.len(), 1);
+        assert_eq!(joins[0].kind, JoinKind::Left);
+        // COALESCE keeps its own rule (the guard is unchanged).
+        assert!(matches!(
+            parse_one("SELECT coalesce(a, b) FROM t;"),
+            Statement::Select(_)
+        ));
     }
 
     #[test]

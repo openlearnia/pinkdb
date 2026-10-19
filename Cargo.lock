@@ -2214,6 +2214,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-ext-string"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "pinkdb-ext-sdk",
+ "regex",
+]
+
+[[package]]
 name = "pinkdb-ffi"
 version = "0.1.0"
 dependencies = [

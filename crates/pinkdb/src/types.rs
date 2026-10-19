@@ -31,12 +31,11 @@ impl std::hash::Hasher for FnvHash {
     /// Every byte still feeds the hash; this is just as deterministic (no
     /// per-run seed), so results never depend on hash order.
     fn write(&mut self, bytes: &[u8]) {
-        let mut words = bytes.chunks_exact(8);
-        for word in &mut words {
-            self.0 ^= u64::from_le_bytes(word.try_into().expect("chunks_exact(8)"));
+        let (words, tail) = bytes.as_chunks::<8>();
+        for word in words {
+            self.0 ^= u64::from_le_bytes(*word);
             self.0 = self.0.wrapping_mul(0x100000001b3);
         }
-        let tail = words.remainder();
         if !tail.is_empty() {
             let mut word = 0u64;
             for (i, &b) in tail.iter().enumerate() {

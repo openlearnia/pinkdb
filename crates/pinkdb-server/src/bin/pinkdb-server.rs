@@ -4,7 +4,6 @@
 //! pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
 //!               [--max-connections N] [--idle-timeout SECS]
 //!               [--transport sync|async] [--allow-load-extension]
-//!               [--allow-load-extension]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
 //! ```
 //!
@@ -63,7 +62,6 @@ fn usage() -> &'static str {
     "Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]\n\
      \x20                    [--max-connections N] [--idle-timeout SECS]\n\
      \x20                    [--transport sync|async] [--allow-load-extension]\n\
-     \x20                    [--allow-load-extension]\n\
      \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\

@@ -10,6 +10,15 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 53 — core `string` extension ✅
+- Ten DuckDB-pinned string functions built with the Rust SDK: `split_part`,
+  `reverse`, `left`/`right` (now parse unquoted), `strpos`,
+  `starts_with`/`ends_with`, `regexp_extract`, `regexp_matches`, plus pinkdb's
+  `regexp_match` (a pinned divergence — DuckDB has no such function) with
+  DuckDB's full option surface.
+- `trim`/`ltrim`/`rtrim`/`replace` stay core built-ins (extensions can't shadow
+  them). Loaded at runtime; the default CLI binary grows **0 bytes**.
+
 ### Wave 52 — core `json` extension ✅
 - Six DuckDB-pinned JSON functions over `VARCHAR` — `json_extract`,
   `json_value`, `json_valid`, `json_array_length`, `json_object`,

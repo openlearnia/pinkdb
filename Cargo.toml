@@ -12,7 +12,11 @@ members = [
     # the other way around.
     "ext-sdk/rust",
     "ext-sdk/rust/example/string_ext",
+    # In-repo first-party extensions (waves 52–56): built as cdylibs loaded
+    # with `LOAD EXTENSION '<path>'` (and mirrored by the linked/wasm
+    # registration).
     "extensions/json",
+    "extensions/string",
 ]
 resolver = "2"
 

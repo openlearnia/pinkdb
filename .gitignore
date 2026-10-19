@@ -24,3 +24,7 @@ __pycache__/
 # Rust extension SDK build outputs (the skeleton is a standalone crate)
 /ext-sdk/rust/template/target/
 /ext-sdk/rust/template/Cargo.lock
+
+# In-repo extension build outputs (copied into build/ by extensions/*/Makefile
+# for the publish workflow; the canonical libraries live in target/)
+/extensions/*/build/
