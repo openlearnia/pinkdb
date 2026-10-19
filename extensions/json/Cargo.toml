@@ -1,0 +1,20 @@
+[package]
+name = "pinkdb-json"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb core json extension: json_extract, json_value, json_valid, json_array_length, json_object, json_array (JSON as VARCHAR in v1)"
+license = "MIT"
+
+[dependencies]
+# The linked-extension model (wave 49): metadata + safe-Rust callbacks. The
+# loader crate is dependency-free on wasm and links `libloading` natively
+# only, so this extension costs no new external crates on any target — JSON
+# parsing and rendering are hand rolled (see the crate docs).
+pinkdb-ext-loader = { path = "../../crates/pinkdb-ext-loader" }
+
+[dev-dependencies]
+# End-to-end SQL tests (tests/engine.rs) drive the extension through the
+# engine: binder, executor, WAL. A dev-dependency cannot cycle — the engine
+# never depends on this crate.
+pinkdb = { path = "../../crates/pinkdb" }

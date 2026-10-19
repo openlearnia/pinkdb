@@ -208,11 +208,12 @@ fn eval_dynamic_scalar(
     let mut out = Vector::new_empty(dtype);
     // Reused per row: no allocation once warm.
     let mut ext_args: Vec<ExtArg<'_>> = Vec::with_capacity(vecs.len());
-    let declared = function.arg_types();
     for row in 0..chunk.num_rows() {
         ext_args.clear();
         for (i, v) in vecs.iter().enumerate() {
-            crate::ext::push_ext_arg(&mut ext_args, v, row, declared[i]);
+            // Positional declared type; a variadic function repeats the last
+            // one for arguments past its declared list.
+            crate::ext::push_ext_arg(&mut ext_args, v, row, function.arg_type_at(i));
         }
         let value = function
             .call(&ext_args)

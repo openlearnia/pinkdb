@@ -233,6 +233,16 @@ impl PinkDb {
             .map(|ext| ext.name().to_string())
     }
 
+    /// Whether an extension is loaded in this store under `name` (the
+    /// extension's *declared* name, matched case-insensitively) — the
+    /// question a host that auto-loads its own first-party extensions asks
+    /// before running `LOAD EXTENSION '<name>'`, whose second load is a
+    /// documented error.
+    pub fn is_extension_loaded(&self, name: &str) -> bool {
+        self.loaded_extensions
+            .contains_key(&name.to_ascii_lowercase())
+    }
+
     /// Register one extension handle — the shared half of both loading
     /// models: validate everything, then insert everything.
     fn register_handle(&mut self, handle: ExtHandle) -> std::result::Result<(), ExtError> {

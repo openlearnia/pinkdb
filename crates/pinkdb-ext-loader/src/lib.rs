@@ -138,11 +138,56 @@ impl ExtFunction {
     }
 
     /// Declared argument types, in order.
+    ///
+    /// For a variadic linked function this is the declared prefix: arguments
+    /// past it repeat the last type (see [`Self::arg_type_at`]).
     pub fn arg_types(&self) -> &[ExtType] {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
             ExtFunction::Dynamic(f) => f.arg_types(),
             ExtFunction::Linked { func, .. } => func.arg_types(),
+        }
+    }
+
+    /// Smallest accepted argument count (the declared count for every
+    /// `dlopen` function and for a fixed linked function).
+    pub fn min_args(&self) -> usize {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.n_args(),
+            ExtFunction::Linked { func, .. } => func.min_args(),
+        }
+    }
+
+    /// Largest accepted argument count (`PINKDB_EXT_MAX_ARGS` for a variadic
+    /// linked function, the declared count otherwise).
+    pub fn max_args(&self) -> usize {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.n_args(),
+            ExtFunction::Linked { func, .. } => func.max_args(),
+        }
+    }
+
+    /// Whether arguments past the declared list repeat the last declared type
+    /// (`false` for every `dlopen` function).
+    pub fn is_variadic(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(_) => false,
+            ExtFunction::Linked { func, .. } => func.is_variadic(),
+        }
+    }
+
+    /// The declared type of argument `index` (0-based): the positional type,
+    /// or the repeated last type for a variadic argument past the declared
+    /// list. Clamped to the declared list, so it is defined for every index
+    /// of a function that declares at least one type.
+    pub fn arg_type_at(&self, index: usize) -> ExtType {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.arg_types()[index.min(f.n_args() - 1)],
+            ExtFunction::Linked { func, .. } => func.arg_type_at(index),
         }
     }
 
@@ -176,9 +221,11 @@ impl ExtFunction {
 
     /// Invoke the callback once (one row) and return its result.
     ///
-    /// `args` must have exactly [`Self::n_args`] entries of the declared
-    /// types; a violation is reported as [`ExtError::BadResult`] by both
-    /// models rather than being undefined.
+    /// `args` must match the registered arity — exactly [`Self::n_args`] for
+    /// a fixed function, within `min_args..=max_args` for a ranged or
+    /// variadic one — with each argument of [`Self::arg_type_at`]'s type; a
+    /// violation is reported as [`ExtError::BadResult`] by both models rather
+    /// than being undefined.
     pub fn call(&self, args: &[ExtArg<'_>]) -> Result<ExtValue, ExtError> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]

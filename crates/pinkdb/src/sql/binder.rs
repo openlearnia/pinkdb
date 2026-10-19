@@ -1850,7 +1850,9 @@ impl<'a> Binder<'a> {
     /// registered argument type (a bare `NULL` literal is typeless and is
     /// passed as a NULL of the registered type), and the result type is the
     /// registered return type. Both loading models register through the same
-    /// registry, so this is the one binder path for either.
+    /// registry, so this is the one binder path for either. A linked function
+    /// may declare a ranged or variadic arity (`new_optional` /
+    /// `new_variadic`); `dlopen` functions and plain linked ones are fixed.
     fn bind_dynamic_function(
         &mut self,
         name: &str,
@@ -1875,12 +1877,25 @@ impl<'a> Binder<'a> {
             }
         }
         let want_args: Vec<crate::ext::ExtType> = func.arg_types().to_vec();
+        let min_args = func.min_args();
+        let max_args = func.max_args();
         let dtype = crate::ext::dtype_of_ext(func.ret_type());
-        if args.len() != want_args.len() {
-            return Err(PinkDbError::Type(format!(
-                "{func_name} takes {} argument(s)",
-                want_args.len()
-            )));
+        if args.len() < min_args || args.len() > max_args {
+            // Fixed arity keeps the historical wording; the ranged arities
+            // (linked `new_optional` / `new_variadic`) say which bound was
+            // missed.
+            let message = if min_args == max_args {
+                format!("{func_name} takes {min_args} argument(s)")
+            } else if args.len() < min_args {
+                if func.is_variadic() {
+                    format!("{func_name} takes at least {min_args} argument(s)")
+                } else {
+                    format!("{func_name} takes between {min_args} and {max_args} argument(s)")
+                }
+            } else {
+                format!("{func_name} takes at most {max_args} argument(s)")
+            };
+            return Err(PinkDbError::Type(message));
         }
         let mut bound = Vec::with_capacity(args.len());
         for (i, a) in args.iter().enumerate() {
@@ -1890,7 +1905,12 @@ impl<'a> Binder<'a> {
                 ));
             }
             let b = self.bind_expr(a, aggs, allow_agg)?;
-            let want = want_args[i];
+            // The declared type of position `i`: positional, or the repeated
+            // last type of a variadic function.
+            let want = match want_args.get(i) {
+                Some(t) => *t,
+                None => *want_args.last().expect("a variadic function has a type"),
+            };
             // A bare NULL literal is typeless: the executor hands the
             // callback `is_null` with the registered type tag. Everything
             // else must match the registered argument type exactly — ABI v1

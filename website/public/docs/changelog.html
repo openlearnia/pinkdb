@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-19">2026-10-19<a class="anchor" href="#2026-10-19" aria-label="Permalink: 2026-10-19">#</a></h2>
+<h3>Wave 52 — core <code>json</code> extension ✅</h3>
+<ul>
+<li>Six DuckDB-pinned JSON functions over <code>VARCHAR</code> — <code>json_extract</code>, <code>json_value</code>, <code>json_valid</code>, <code>json_array_length</code>, <code>json_object</code>, <code>json_array</code> — with a hand-rolled parser (zero new dependencies) that matches DuckDB on the messy corners: trailing commas, <code>NaN</code>/<code>Infinity</code>, duplicate keys, canonical number rendering, escapes.</li>
+<li><code>json</code> is a <strong>default CLI feature</strong> (<code>--no-default-features</code> for the lean binary); the functions register through the linked registry, so durable replay resolves them automatically.</li>
+</ul>
 <h3>Wave 51 — Rust extension SDK + volatile flag ✅</h3>
 <ul>
 <li>New <code>ext-sdk/rust</code>: declare an extension once (<code>pinkdb_extension!</code>) and get both the native ABI v1 cdylib exports and the wasm/all-target linked registration from safe Rust — typed args, <code>Option</code> NULLs, <code>Result</code> errors, no <code>unsafe</code> in author code.</li>

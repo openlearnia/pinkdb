@@ -10,6 +10,16 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 52 — core `json` extension ✅
+- Six DuckDB-pinned JSON functions over `VARCHAR` — `json_extract`,
+  `json_value`, `json_valid`, `json_array_length`, `json_object`,
+  `json_array` — with a hand-rolled parser (zero new dependencies) that matches
+  DuckDB on the messy corners: trailing commas, `NaN`/`Infinity`, duplicate
+  keys, canonical number rendering, escapes.
+- `json` is a **default CLI feature** (`--no-default-features` for the lean
+  binary); the functions register through the linked registry, so durable
+  replay resolves them automatically.
+
 ### Wave 51 — Rust extension SDK + volatile flag ✅
 - New `ext-sdk/rust`: declare an extension once (`pinkdb_extension!`) and get
   both the native ABI v1 cdylib exports and the wasm/all-target linked

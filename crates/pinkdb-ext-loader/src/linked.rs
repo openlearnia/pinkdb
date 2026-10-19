@@ -167,6 +167,13 @@ pub struct LinkedFunction {
     name: String,
     /// Declared argument types, in order.
     arg_types: Vec<ExtType>,
+    /// Smallest accepted argument count. Equal to the declared count for a
+    /// fixed function; lower for [`LinkedFunction::new_optional`] and
+    /// [`LinkedFunction::new_variadic`].
+    min_args: usize,
+    /// Whether arguments past the declared list repeat the last declared
+    /// type (a variadic function, capped at [`PINKDB_EXT_MAX_ARGS`]).
+    repeats: bool,
     /// Declared return type.
     ret_type: ExtType,
     /// Volatile (nondeterministic) declaration: the engine refuses to run a
@@ -190,7 +197,7 @@ impl std::fmt::Debug for LinkedFunction {
 }
 
 impl LinkedFunction {
-    /// Declare one function.
+    /// Declare one function with a fixed argument list.
     ///
     /// Fails when `name` is empty or when the arity exceeds
     /// [`PINKDB_EXT_MAX_ARGS`] (the C ABI's limit, kept identical so the two
@@ -198,6 +205,53 @@ impl LinkedFunction {
     pub fn new(
         name: impl Into<String>,
         arg_types: Vec<ExtType>,
+        ret_type: ExtType,
+        callback: impl LinkedScalar,
+    ) -> Result<Self, ExtError> {
+        let min_args = arg_types.len();
+        Self::build(name, arg_types, min_args, false, ret_type, callback)
+    }
+
+    /// Declare one function whose arity is a **bounded range**: the declared
+    /// argument types, but a call may omit trailing arguments down to
+    /// `min_args` (`0..=arg_types.len()`). The declared types stay
+    /// positional — there is no repetition — so this is how
+    /// `json_array_length(json)` / `json_array_length(json, path)` is
+    /// declared. `min_args` must not exceed the declared count.
+    pub fn new_optional(
+        name: impl Into<String>,
+        arg_types: Vec<ExtType>,
+        min_args: usize,
+        ret_type: ExtType,
+        callback: impl LinkedScalar,
+    ) -> Result<Self, ExtError> {
+        Self::build(name, arg_types, min_args, false, ret_type, callback)
+    }
+
+    /// Declare one **variadic** function: it accepts at least `min_args`
+    /// arguments, and every argument past the declared list repeats the
+    /// *last* declared type — `json_array` (VARCHAR values, `min_args` 0) and
+    /// `json_object` (VARCHAR keys and values, `min_args` 0, checked for
+    /// parity by the callback) are declared this way. The declared list must
+    /// not be empty (it names the repeated type) and `min_args` must not
+    /// exceed it. A call is capped at [`PINKDB_EXT_MAX_ARGS`] arguments, the
+    /// ABI's arity limit.
+    pub fn new_variadic(
+        name: impl Into<String>,
+        arg_types: Vec<ExtType>,
+        min_args: usize,
+        ret_type: ExtType,
+        callback: impl LinkedScalar,
+    ) -> Result<Self, ExtError> {
+        Self::build(name, arg_types, min_args, true, ret_type, callback)
+    }
+
+    /// Shared validation and construction for all three arities.
+    fn build(
+        name: impl Into<String>,
+        arg_types: Vec<ExtType>,
+        min_args: usize,
+        repeats: bool,
         ret_type: ExtType,
         callback: impl LinkedScalar,
     ) -> Result<Self, ExtError> {
@@ -211,9 +265,22 @@ impl LinkedFunction {
                 arg_types.len()
             )));
         }
+        if repeats && arg_types.is_empty() {
+            return Err(ExtError::registration(format!(
+                "function \"{name}\" is variadic but declares no argument type to repeat"
+            )));
+        }
+        if min_args > arg_types.len() {
+            return Err(ExtError::registration(format!(
+                "function \"{name}\" declares {min_args} minimum argument(s) but only {} type(s)",
+                arg_types.len()
+            )));
+        }
         Ok(Self {
             name,
             arg_types,
+            min_args,
+            repeats,
             ret_type,
             volatile: false,
             callback: Arc::new(callback),
@@ -255,7 +322,9 @@ impl LinkedFunction {
         &self.name
     }
 
-    /// Declared argument count.
+    /// Declared argument count (the length of [`Self::arg_types`], which is
+    /// the *upper* bound of a bounded-range arity and the declared prefix of
+    /// a variadic one).
     pub fn n_args(&self) -> usize {
         self.arg_types.len()
     }
@@ -265,6 +334,37 @@ impl LinkedFunction {
         &self.arg_types
     }
 
+    /// Smallest accepted argument count (equal to [`Self::n_args`] for a
+    /// fixed function).
+    pub fn min_args(&self) -> usize {
+        self.min_args
+    }
+
+    /// Largest accepted argument count: the declared count, or
+    /// [`PINKDB_EXT_MAX_ARGS`] for a variadic function.
+    pub fn max_args(&self) -> usize {
+        if self.repeats {
+            PINKDB_EXT_MAX_ARGS as usize
+        } else {
+            self.arg_types.len()
+        }
+    }
+
+    /// Whether arguments past the declared list repeat the last declared
+    /// type (see [`Self::new_variadic`]).
+    pub fn is_variadic(&self) -> bool {
+        self.repeats
+    }
+
+    /// The declared type of argument `index` (0-based): the positional type,
+    /// or the last declared type for a variadic argument past the declared
+    /// list. The index is clamped to the declared list, so this is defined
+    /// for any index of a function that declares at least one type.
+    pub fn arg_type_at(&self, index: usize) -> ExtType {
+        let i = index.min(self.arg_types.len() - 1);
+        self.arg_types[i]
+    }
+
     /// Declared return type.
     pub fn ret_type(&self) -> ExtType {
         self.ret_type
@@ -272,32 +372,53 @@ impl LinkedFunction {
 
     /// Invoke the callback once (one row) and return its result.
     ///
-    /// The host guarantees at bind time that `args` has exactly
-    /// [`Self::n_args`] entries of the declared types; a mismatch reaching
-    /// here is reported as [`ExtError::BadResult`] rather than being
-    /// undefined. A NULL argument is passed through as [`ExtArg::Null`] — the
-    /// callback decides what NULL means. The result must be NULL or carry the
-    /// registered return type.
+    /// The host guarantees at bind time that `args` matches the declared
+    /// arity — exactly [`Self::n_args`] for a fixed function, within
+    /// `min_args..=max_args` for the ranged arities — with each argument of
+    /// [`Self::arg_type_at`]'s type; a mismatch reaching here is reported as
+    /// [`ExtError::BadResult`] rather than being undefined. A NULL argument
+    /// is passed through as [`ExtArg::Null`] — the callback decides what NULL
+    /// means. The result must be NULL or carry the registered return type.
     pub fn call(&self, args: &[ExtArg<'_>]) -> Result<ExtValue, ExtError> {
-        if args.len() != self.arg_types.len() {
+        if args.len() < self.min_args || args.len() > self.max_args() {
+            let message = if self.min_args == self.max_args() {
+                format!("expected {} argument(s), got {}", self.min_args, args.len())
+            } else if args.len() < self.min_args {
+                if self.repeats {
+                    format!(
+                        "expected at least {} argument(s), got {}",
+                        self.min_args,
+                        args.len()
+                    )
+                } else {
+                    format!(
+                        "expected between {} and {} argument(s), got {}",
+                        self.min_args,
+                        self.max_args(),
+                        args.len()
+                    )
+                }
+            } else {
+                format!(
+                    "expected at most {} argument(s), got {}",
+                    self.max_args(),
+                    args.len()
+                )
+            };
             return Err(ExtError::BadResult {
                 function: self.name.clone(),
-                message: format!(
-                    "expected {} argument(s), got {}",
-                    self.arg_types.len(),
-                    args.len()
-                ),
+                message,
             });
         }
         for (i, a) in args.iter().enumerate() {
-            if a.ext_type() != self.arg_types[i] {
+            if a.ext_type() != self.arg_type_at(i) {
                 return Err(ExtError::BadResult {
                     function: self.name.clone(),
                     message: format!(
                         "argument {} has type {}, registered as {}",
                         i + 1,
                         a.ext_type(),
-                        self.arg_types[i]
+                        self.arg_type_at(i)
                     ),
                 });
             }
@@ -716,6 +837,119 @@ mod tests {
             "a panic must be caught at the boundary: {err:?}"
         );
         assert!(err.to_string().contains("panicked: boom"), "{err}");
+    }
+
+    #[test]
+    fn ranged_and_variadic_arities_are_checked() {
+        // A bounded range (`new_optional`): 1 or 2 declared VARCHARs.
+        let optional = LinkedFunction::new_optional(
+            "maybe_two",
+            vec![ExtType::Varchar, ExtType::Varchar],
+            1,
+            ExtType::Integer,
+            |args: &[ExtArg<'_>]| Ok(ExtValue::Integer(args.len() as i32)),
+        )
+        .unwrap();
+        assert_eq!(optional.min_args(), 1);
+        assert_eq!(optional.max_args(), 2);
+        assert!(!optional.is_variadic());
+        assert_eq!(
+            optional.call(&[ExtArg::Varchar(b"a")]).unwrap(),
+            ExtValue::Integer(1)
+        );
+        assert_eq!(
+            optional
+                .call(&[ExtArg::Varchar(b"a"), ExtArg::Varchar(b"b")])
+                .unwrap(),
+            ExtValue::Integer(2)
+        );
+        let err = optional.call(&[]).unwrap_err().to_string();
+        assert!(
+            err.contains("expected between 1 and 2 argument(s), got 0"),
+            "{err}"
+        );
+        let err = optional
+            .call(&[
+                ExtArg::Varchar(b"a"),
+                ExtArg::Varchar(b"b"),
+                ExtArg::Varchar(b"c"),
+            ])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("expected at most 2 argument(s), got 3"),
+            "{err}"
+        );
+
+        // A variadic function (`new_variadic`): every argument past the
+        // declared list repeats the last declared type.
+        let variadic = LinkedFunction::new_variadic(
+            "many",
+            vec![ExtType::Integer, ExtType::Varchar],
+            0,
+            ExtType::Integer,
+            |args: &[ExtArg<'_>]| Ok(ExtValue::Integer(args.len() as i32)),
+        )
+        .unwrap();
+        assert_eq!(variadic.min_args(), 0);
+        assert_eq!(variadic.max_args(), PINKDB_EXT_MAX_ARGS as usize);
+        assert!(variadic.is_variadic());
+        assert_eq!(variadic.arg_type_at(0), ExtType::Integer);
+        assert_eq!(variadic.arg_type_at(1), ExtType::Varchar);
+        assert_eq!(variadic.arg_type_at(9), ExtType::Varchar);
+        assert_eq!(
+            variadic
+                .call(&[
+                    ExtArg::Integer(1),
+                    ExtArg::Varchar(b"x"),
+                    ExtArg::Varchar(b"y"),
+                    ExtArg::Varchar(b"z"),
+                ])
+                .unwrap(),
+            ExtValue::Integer(4)
+        );
+        // A variadic argument of the wrong type is refused…
+        let err = variadic
+            .call(&[ExtArg::Integer(1), ExtArg::Integer(2)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("argument 2 has type INTEGER, registered as VARCHAR"),
+            "{err}"
+        );
+        // …and the ABI's arity cap still applies.
+        let too_many = vec![ExtArg::Varchar(b"x"); PINKDB_EXT_MAX_ARGS as usize + 1];
+        let err = variadic.call(&too_many).unwrap_err().to_string();
+        assert!(
+            err.contains("expected at most 64 argument(s), got 65"),
+            "{err}"
+        );
+
+        // Metadata validation: a minimum above the declared list, or a
+        // variadic function with no type to repeat, is refused at build time.
+        let err = LinkedFunction::new_optional(
+            "bad_min",
+            vec![ExtType::Varchar],
+            2,
+            ExtType::Integer,
+            |_args: &[ExtArg<'_>]| Ok(ExtValue::Null),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("2 minimum argument(s) but only 1 type(s)"),
+            "{err}"
+        );
+        let err = LinkedFunction::new_variadic(
+            "bad_variadic",
+            vec![],
+            0,
+            ExtType::Integer,
+            |_args: &[ExtArg<'_>]| Ok(ExtValue::Null),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("declares no argument type to repeat"), "{err}");
     }
 
     #[test]

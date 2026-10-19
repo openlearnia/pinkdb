@@ -2181,6 +2181,7 @@ version = "0.1.0"
 dependencies = [
  "pink-lake",
  "pinkdb",
+ "pinkdb-json",
  "pinkdb-server",
  "rcgen",
  "rustyline",
@@ -2222,6 +2223,14 @@ dependencies = [
 [[package]]
 name = "pinkdb-js"
 version = "0.1.0"
+
+[[package]]
+name = "pinkdb-json"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "pinkdb-ext-loader",
+]
 
 [[package]]
 name = "pinkdb-server"

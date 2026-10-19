@@ -12,6 +12,7 @@ members = [
     # the other way around.
     "ext-sdk/rust",
     "ext-sdk/rust/example/string_ext",
+    "extensions/json",
 ]
 resolver = "2"
 

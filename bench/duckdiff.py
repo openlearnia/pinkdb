@@ -215,6 +215,12 @@ CREATE TABLE keys_c (cid INTEGER, pid INTEGER NOT NULL REFERENCES keys_p(id), no
 INSERT INTO keys_c VALUES (1, 1, 'x'), (2, 2, 'y');
 CREATE TABLE fk_null_c (cid INTEGER, pid INTEGER REFERENCES keys_p(id));
 INSERT INTO fk_null_c VALUES (1, 1), (2, NULL);
+-- wave 52: a document column for the core json extension probes.
+CREATE TABLE jdocs (id INTEGER, doc VARCHAR);
+INSERT INTO jdocs VALUES
+ (1, '{"t": ["a", "b"], "n": "ann"}'),
+ (2, '{"t": [], "n": "bob"}'),
+ (3, '{"t": ["c"], "n": "cat"}');
 """
 
 # (label, sql, ordered, expect_error)
@@ -398,6 +404,39 @@ QUERIES = [
     ("interval-date", "SELECT DATE '2024-01-31' + INTERVAL '1 month', TIMESTAMP '2024-03-31 10:00:00' + INTERVAL '2 days 3 hours';", False, False),
     ("interval-cast-agg", "SELECT CAST('1 day' AS INTERVAL), MIN(iv), MAX(iv) FROM dt;", False, False),
     ("interval-ident", "SELECT 7 AS interval;", False, False),
+    # --- wave 52: core json extension (JSON as VARCHAR in v1) ---
+    # The default CLI links `pinkdb-json` and loads it into every store, so no
+    # `LOAD EXTENSION` is needed; DuckDB has json built in, so both engines
+    # answer the same SQL. `json_extract` returns DuckDB's JSON type, which
+    # `-json` would render as nested JSON, so probes cast it — the cast's
+    # text is the same compact serialization pinkdb returns.
+    ("json-extract-nested", "SELECT json_extract('{\"a\": {\"b\" : [1,  2] }}', '$.a')::VARCHAR;", False, False),
+    ("json-extract-string-escapes", "SELECT json_extract('{\"a\":\"he said \\\"hi\\\"\"}', '$.a')::VARCHAR, json_extract('{\"a\":\"/\\b\\f\\r\\t\"}', '$.a')::VARCHAR;", False, False),
+    ("json-extract-unicode", "SELECT json_extract('{\"a\":\"\\u0041\\u00e9\\uD83D\\uDE00\"}', '$.a')::VARCHAR;", False, False),
+    ("json-extract-paths", "SELECT json_extract('[10,20,30]', '$[1]')::VARCHAR, json_extract('[1,2,3]', '$[-1]')::VARCHAR, json_extract('[1,2,3]', '$[-4]')::VARCHAR, json_extract('[1,2]', '$.a')::VARCHAR, json_extract('{\"a\":1}', '$[0]')::VARCHAR;", False, False),
+    ("json-extract-quoted-keys", "SELECT json_extract('{\"a b\": 3}', '$.\"a b\"')::VARCHAR, json_extract('{\"a.b\":1}', '$.\"a.b\"')::VARCHAR, json_extract('{\"a.b\":1}', '$.a.b')::VARCHAR;", False, False),
+    ("json-extract-duplicates", "SELECT json_extract('{\"a\":1,\"b\":2,\"a\":3}', '$')::VARCHAR, json_extract('{\"a\":1,\"a\":2}', '$.a')::VARCHAR;", False, False),
+    ("json-extract-root-whitespace", "SELECT json_extract('[true,false,null,1,\"s\"]', '$')::VARCHAR, json_extract(' {\"a\" : 1 } ', '$')::VARCHAR;", False, False),
+    ("json-extract-null-args", "SELECT json_extract(NULL, '$.a')::VARCHAR, json_extract('{\"a\":1}', NULL)::VARCHAR;", False, False),
+    ("json-extract-numbers", "SELECT json_extract('{\"a\": 1.50}', '$.a')::VARCHAR, json_extract('{\"a\": 1e2}', '$.a')::VARCHAR, json_extract('{\"a\":-0.0}', '$.a')::VARCHAR, json_extract('[-0, 1E+3, 0.0, 1.0]', '$')::VARCHAR, json_extract('[0.30000000000000004,9.9e20,1e-7,5e-324]', '$')::VARCHAR;", False, False),
+    ("json-extract-wide-numbers", "SELECT json_extract('{\"a\":18446744073709551615}', '$.a')::VARCHAR, json_extract('{\"a\":18446744073709551616}', '$.a')::VARCHAR, json_extract('{\"a\":1e400}', '$.a')::VARCHAR, json_extract('{\"a\":1e-400}', '$.a')::VARCHAR;", False, False),
+    ("json-extract-nested-arrays", "SELECT json_extract('{\"a\":[{\"b\":true}]}', '$.a[0].b')::VARCHAR, json_extract('{\"a\":[{\"b\":[1,2]}]}', '$.a[-1].b[-2]')::VARCHAR;", False, False),
+    ("json-value", "SELECT json_value('{\"a\":1}', '$.a'), json_value('{\"a\":1.5}', '$.a'), json_value('{\"a\":true}', '$.a'), json_value('{\"a\":\"x\"}', '$.a'), json_value('{\"a\":null}', '$.a'), json_value('{\"a\":[1]}', '$.a'), json_value('{\"a\":{\"b\":1}}', '$.a'), json_value('{\"a\":1}', '$.missing'), json_value(NULL, '$.a');", False, False),
+    ("json-valid", "SELECT json_valid('{\"a\":1}'), json_valid('  {\"a\":1}  '), json_valid('{\"a\":1,}'), json_valid('nan'), json_valid('Infinity'), json_valid('1e400'), json_valid('{'), json_valid(''), json_valid(NULL), json_valid('01'), json_valid('{\"a\":1} trailing');", False, False),
+    ("json-valid-escapes", "SELECT json_valid('\"a\\u0041b\"'), json_valid('\"a\\u12\"'), json_valid('\"a\\x41b\"'), json_valid('\"\\uD800\"');", False, False),
+    ("json-array-length", "SELECT json_array_length('[]'), json_array_length('[1,2,3]'), json_array_length('{\"a\":[1,2]}', '$.a'), json_array_length('{}'), json_array_length('1'), json_array_length('[]', '$.missing'), json_array_length(NULL), json_array_length('[]', NULL);", False, False),
+    ("json-object", "SELECT json_object('a','1','b','x')::VARCHAR, json_object()::VARCHAR, json_object('a',NULL,'b','1')::VARCHAR, json_object('a','1','a','2')::VARCHAR;", False, False),
+    ("json-array", "SELECT json_array('x','y')::VARCHAR, json_array()::VARCHAR, json_array(NULL,'1')::VARCHAR, json_array('{\"a\":1}')::VARCHAR;", False, False),
+    ("json-column-extract", "SELECT json_extract(doc, '$.t')::VARCHAR, json_value(doc, '$.n') FROM jdocs ORDER BY id;", True, False),
+    ("json-where-length", "SELECT id FROM jdocs WHERE json_array_length(doc, '$.t') > 1 ORDER BY id;", True, False),
+    ("json-group-length", "SELECT json_array_length(doc, '$.t') AS n, COUNT(*) FROM jdocs GROUP BY n ORDER BY n;", True, False),
+    ("json-compose-builders", "SELECT json_object('n', json_value(doc, '$.n'))::VARCHAR FROM jdocs WHERE id = 1;", True, False),
+    # error cases: both engines must refuse (DuckDB at bind time, pinkdb at
+    # execution time for the callback-driven ones — both are errors).
+    ("json-extract-invalid", "SELECT json_extract('{', '$');", False, True),
+    ("json-extract-bad-path", "SELECT json_extract('{\"a\":1}', '$.a.');", False, True),
+    ("json-object-odd-args", "SELECT json_object('a');", False, True),
+    ("json-object-null-key", "SELECT json_object(CAST(NULL AS VARCHAR), 'v');", False, True),
 ]
 
 

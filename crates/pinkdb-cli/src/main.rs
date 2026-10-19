@@ -47,6 +47,40 @@ const CONT_PROMPT: &str = "   ...> ";
 /// Rows shown before truncating with a "(N more rows)" note.
 const DISPLAY_CAP: usize = 10_000;
 
+/// Publish the linked extensions the CLI ships in the process-global
+/// registry — the host-bootstrap step `LOAD EXTENSION '<name>'` resolves
+/// against, on every target. With the default `json` feature that is
+/// `pinkdb-json`; a host that uses the library instead does the same
+/// explicitly (`pinkdb_json::ensure_registered()`).
+#[cfg(feature = "json")]
+fn register_builtin_extensions() {
+    if let Err(e) = pinkdb_json::ensure_registered() {
+        eprintln!("warning: the json extension could not be registered: {e}");
+    }
+}
+
+#[cfg(not(feature = "json"))]
+fn register_builtin_extensions() {}
+
+/// Load the CLI's built-in extensions into a store it just created or
+/// opened, so `json_*` works without a `LOAD EXTENSION` statement (the
+/// DuckDB behavior). A store whose WAL replay already loaded one — a
+/// replayed record that calls a json function is prefixed with
+/// `LOAD EXTENSION 'json'` — keeps it: [`PinkDb::is_extension_loaded`] is
+/// consulted first, because a second load is a documented error.
+#[cfg(feature = "json")]
+fn load_builtin_extensions(db: &mut PinkDb) {
+    if db.is_extension_loaded(pinkdb_json::EXTENSION_NAME) {
+        return;
+    }
+    if let Err(e) = db.load_linked_extension(pinkdb_json::EXTENSION_NAME) {
+        eprintln!("warning: the json extension could not be loaded: {e}");
+    }
+}
+
+#[cfg(not(feature = "json"))]
+fn load_builtin_extensions(_db: &mut PinkDb) {}
+
 fn print_help() {
     println!("Dot-commands:");
     println!("  .help                  show this help");
@@ -149,6 +183,14 @@ fn print_help() {
     println!("SQL: end statements with `;`. `USE <db>` switches the session database;");
     println!("     `CREATE DATABASE <db>` / `DROP DATABASE <db>` manage databases;");
     println!("     `LOAD EXTENSION '<path>'` loads a native extension (ABI v1).");
+    if cfg!(feature = "json") {
+        println!("JSON: json_extract, json_value, json_valid, json_array_length, json_object,");
+        println!("      json_array are built in and loaded into every store (`json` feature); a");
+        println!("      `LOAD EXTENSION 'json'` would be a duplicate load.");
+    } else {
+        println!("JSON: json_* functions are not built (rebuild with the `json` feature, or link");
+        println!("      `pinkdb-json` and register it).");
+    }
 }
 
 /// The `.install`/`.repositories`/`.installed` message when the binary was
@@ -793,6 +835,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                     let key = db.encryption_key().cloned();
                     *db = PinkDb::new();
                     db.set_encryption_key(key);
+                    load_builtin_extensions(db);
                 }
                 // `PINKDB_KEY` (if set) is already installed on the store, so
                 // both the checkpoint and the snapshot path encrypt.
@@ -819,6 +862,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                             );
                         }
                         *db = new_db;
+                        load_builtin_extensions(db);
                         println!("Opened {path}");
                     }
                     Err(e) => cli_error!("{e}"),
@@ -1294,6 +1338,7 @@ fn build_session(opts: &Opts, key: Option<EncryptionKey>) -> Session {
         None => {
             let mut db = PinkDb::new();
             db.set_encryption_key(key);
+            load_builtin_extensions(&mut db);
             Session::Local(LocalSession::new(db))
         }
         #[cfg(feature = "client")]
@@ -1397,6 +1442,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // The linked registry must know the CLI's built-in extensions before any
+    // store is created: a durable reopen whose WAL replays a json record
+    // resolves the name here during replay.
+    register_builtin_extensions();
     // Only the remote banner (client feature) needs the host string.
     #[cfg(feature = "client")]
     let host = opts.host.clone();
