@@ -13,7 +13,8 @@ license = "MIT"
 # a hand-rolled PRNG, so the default binary grows by a few KB only. The
 # declaration uses the SDK's wave-54 ranged arities (`optional`), which the
 # linked model registers; the native ABI v1 cannot express them, so this crate
-# is linked-only by construction (see the crate docs).
+# is linked-only by construction and emits no native ABI exports (see the
+# crate docs).
 pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
 
 [dev-dependencies]
@@ -21,3 +22,7 @@ pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
 # engine: binder, executor, WAL. A dev-dependency cannot cycle — the engine
 # never depends on this crate.
 pinkdb = { path = "../../crates/pinkdb" }
+# Link-level regression guard (tests/coexist.rs): two linked-only extension
+# rlibs plus a locally declared one must link into *one* test binary — the
+# wave-77 duplicate-`pinkdb_extension_*` failure shape on Linux.
+pinkdb-datetime = { path = "../datetime" }

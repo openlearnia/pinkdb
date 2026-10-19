@@ -1856,8 +1856,8 @@ header copy is pinned by the same `cargo test` check.
 Wave 51 adds a Rust SDK (`ext-sdk/rust/`, crate `pinkdb-ext-sdk`): one
 `pinkdb_extension!` declaration defines the extension's name and its
 functions, and the SDK generates the ABI glue — value marshalling, VARCHAR
-ownership, NULL handling, the three `pinkdb_extension_*` exports — from
-typed Rust bodies. Extension authors write no `unsafe` and no C:
+ownership, NULL handling — from typed Rust bodies. Extension authors write no
+`unsafe` and no C:
 
 ```rust
 use pinkdb_ext_sdk::pinkdb_extension;
@@ -1873,15 +1873,27 @@ pinkdb_extension! {
         fn my_ext_now_micros() -> Result<i64, String> { /* read a clock */ },
     ],
 }
+
+// Only a cdylib (a shared library loaded with LOAD EXTENSION '<path>') emits
+// the three ABI v1 symbols; a linked-only extension must not (see below).
+pinkdb_ext_sdk::pinkdb_abi_exports!();
 ```
 
 Parameters and returns are the ABI v1 types (`bool`, `i32`, `i64`, `f64`,
 `&str`/`String`, `Date`, `Timestamp`), `Option<T>` makes NULL explicit, and
 `Result<_, String>` returns errors. The same declaration drives both loading
-models: a native cdylib (`LOAD EXTENSION '<path>'`) and wave 49's linked
-registration (`pinkdb_register_linked()`, the only model on wasm), so one
-source covers every target. The SDK depends on the loader crate, never the
-other way around: no pinkdb binary grows because of it.
+models: wave 49's linked registration (`pinkdb_register_linked()`, the only
+model on wasm, and how the CLI's built-in `json`/`datetime`/`math` extensions
+reach the binary) and — for a cdylib — the native ABI v1 exports, emitted by
+the **separate, explicit** `pinkdb_abi_exports!()` call. The split is
+deliberate: a linked-only extension is an rlib the host links in, and two
+rlibs carrying `#[no_mangle]` `pinkdb_extension_*` symbols are a
+`duplicate symbol: pinkdb_extension_init` link error on Linux. A crate that
+builds both an rlib and a cdylib (like `extensions/string`) gates the call
+behind an `abi-exports` Cargo feature that only the shared-library build
+enables; `./ext-sdk/rust/check-native-exports.sh` asserts the linked-only
+rlibs carry none. The SDK depends on the loader crate, never the other way
+around: no pinkdb binary grows because of it.
 
 The `volatile` list is the additive ABI v1 deterministic/volatile flag
 surfaced safely: **functions are deterministic by default** — the engine may
@@ -1899,9 +1911,10 @@ today's semantics byte-for-byte); the linked model carries it as
 ```sh
 make -C ext-sdk/rust        # builds the example into target/release/
 ./ext-sdk/rust/smoke.sh     # builds it, loads it via the release CLI, greps 15 checks
+./ext-sdk/rust/check-native-exports.sh   # linked-only rlibs carry no ABI symbols
 ```
 
-`ext-sdk/rust/README.md` walks through the macro, the type/`Option`/`Result`
+`ext-sdk/rust/README.md` walks through the macros, the type/`Option`/`Result`
 rules, the volatility contract, the error-code mapping (the C ABI carries no
 error text) and the crate's own round-trip tests (native `LOAD EXTENSION`,
 linked registration, durable replay); its header copy is pinned by the same

@@ -2400,6 +2400,7 @@ name = "pinkdb-math"
 version = "0.1.0"
 dependencies = [
  "pinkdb",
+ "pinkdb-datetime",
  "pinkdb-ext-sdk",
 ]
 

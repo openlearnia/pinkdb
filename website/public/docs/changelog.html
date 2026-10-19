@@ -231,6 +231,9 @@ progress log</a>.</p>
 <li>New <code>ext-sdk/rust</code>: declare an extension once (<code>pinkdb_extension!</code>) and get both the native ABI v1 cdylib exports and the wasm/all-target linked registration from safe Rust — typed args, <code>Option</code> NULLs, <code>Result</code> errors, no <code>unsafe</code> in author code.</li>
 <li>Additive <strong>ABI v1 volatile flag</strong>: functions can declare themselves nondeterministic, and the engine refuses to call them in any statement it WAL-logs (replay could diverge) with an explicit error; deterministic extensions are unchanged.</li>
 </ul>
+<ul>
+<li><strong>Fixed:</strong> the SDK's ABI exports (<code>pinkdb_extension_abi_version</code> / <code>_name</code> / <code>_init</code>) are now <strong>opt-in</strong> — <code>pinkdb_abi_exports!()</code> (or the <code>abi-exports</code> feature for dual-artifact crates, as <code>extensions/string</code> does) — because emitting them from linked-only extensions caused duplicate symbols on Linux linkers. Cdylib authors add the macro; linked-only crates need nothing.</li>
+</ul>
 <h3>Wave 50 — performance pass ✅</h3>
 <ul>
 <li>High-cardinality <code>GROUP BY</code> / <code>COUNT(DISTINCT)</code> got a typed fast path (no per-row values, chunked output, adaptive one-shot reserve): <code>group_id</code> 15.8 → 4.4 ms and <code>distinct_id</code> 15.6 → 4.6 ms — both now ahead of the DuckDB reference on the same corpus.</li>

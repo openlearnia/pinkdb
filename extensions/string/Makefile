@@ -19,13 +19,13 @@ SO_EXT := so
 endif
 
 all:
-	$(CARGO) build --release -p pinkdb-ext-string
+	$(CARGO) build --release -p pinkdb-ext-string --features abi-exports
 	mkdir -p build
 	cp "$(ROOT)/target/release/libstring_ext.$(SO_EXT)" build/
 	@printf 'extension built: %s\n' "extensions/string/build/libstring_ext.$(SO_EXT)"
 
 debug:
-	$(CARGO) build -p pinkdb-ext-string
+	$(CARGO) build -p pinkdb-ext-string --features abi-exports
 	@printf 'debug library: %s\n' "$(ROOT)/target/debug/libstring_ext.$(SO_EXT)"
 
 clean:

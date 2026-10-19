@@ -23,10 +23,16 @@
 //!
 //! # Loading
 //!
-//! - native: `cargo build --release -p pinkdb-ext-string`, then
-//!   `LOAD EXTENSION '<repo>/target/release/libstring_ext.dylib';`
+//! - native: `make -C extensions/string` (or
+//!   `cargo build --release -p pinkdb-ext-string --features abi-exports`),
+//!   then `LOAD EXTENSION '<repo>/target/release/libstring_ext.dylib';`
 //! - linked (tests, wasm): `string_ext::pinkdb_register_linked()?`, then
 //!   `LOAD EXTENSION 'string';` — same declaration, same functions.
+//!
+//! The `abi-exports` feature is what emits the three `#[no_mangle]` ABI
+//! symbols. It is off by default because this crate also builds an rlib, and
+//! a linked-only extension must not carry them: two extension rlibs in one
+//! binary collide on Linux (`duplicate symbol: pinkdb_extension_init`).
 //!
 //! # ABI v1 strict typing
 //!
@@ -316,6 +322,15 @@ pinkdb_extension! {
         },
     ],
 }
+
+// The cdylib half of this crate opts in to the ABI v1 `#[no_mangle]` exports
+// (`LOAD EXTENSION '<path>'` looks them up). They stay out of the default
+// build because this crate also builds the rlib the tests (and any linked
+// host) use: two linked extension rlibs carrying the same globals fail to
+// link on Linux (`duplicate symbol: pinkdb_extension_init`). `make -C
+// extensions/string` builds the shared library with `--features abi-exports`.
+#[cfg(feature = "abi-exports")]
+pinkdb_ext_sdk::pinkdb_abi_exports!();
 
 #[cfg(test)]
 mod tests {

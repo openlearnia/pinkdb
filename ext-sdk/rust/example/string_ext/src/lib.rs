@@ -1,10 +1,10 @@
 //! `rust_string_ext` — the worked example for the pinkdb Rust extension SDK.
 //!
 //! One declaration defines the extension: its SQL name and four typed
-//! functions. The SDK generates the ABI v1 exports (this cdylib is loaded by
-//! `LOAD EXTENSION '<path>'`) and the linked registration
-//! (`pinkdb_register_linked()`), which is how the same source is published on
-//! targets without a dynamic linker — wasm included.
+//! functions. The SDK generates the linked registration
+//! (`pinkdb_register_linked()`), and the explicit `pinkdb_abi_exports!()`
+//! call below emits the ABI v1 exports this cdylib needs to be loaded by
+//! `LOAD EXTENSION '<path>'`.
 //!
 //! Build and try it:
 //!
@@ -23,7 +23,7 @@
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use pinkdb_ext_sdk::{Date, pinkdb_extension};
+use pinkdb_ext_sdk::{Date, pinkdb_abi_exports, pinkdb_extension};
 
 /// A process-local counter behind [`ext_rs_tick`]. Extension callbacks run
 /// concurrently on the host's rayon workers, so shared state must be
@@ -78,3 +78,9 @@ pinkdb_extension! {
         },
     ],
 }
+
+// This crate is cdylib-only, so it opts in to the ABI v1 `#[no_mangle]`
+// exports that `LOAD EXTENSION '<path>'` looks up. A linked-only (rlib)
+// extension must *not* emit them: two rlibs carrying the same globals in one
+// binary fail to link on Linux (`duplicate symbol: pinkdb_extension_init`).
+pinkdb_abi_exports!();

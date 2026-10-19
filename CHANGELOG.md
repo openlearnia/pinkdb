@@ -99,6 +99,13 @@ one-liners below.
   WAL-logs (replay could diverge) with an explicit error; deterministic
   extensions are unchanged.
 
+- **Fixed:** the SDK's ABI exports (`pinkdb_extension_abi_version` /
+  `_name` / `_init`) are now **opt-in** — `pinkdb_abi_exports!()` (or the
+  `abi-exports` feature for dual-artifact crates, as `extensions/string`
+  does) — because emitting them from linked-only extensions caused duplicate
+  symbols on Linux linkers. Cdylib authors add the macro; linked-only crates
+  need nothing.
+
 ### Wave 50 — performance pass ✅
 - High-cardinality `GROUP BY` / `COUNT(DISTINCT)` got a typed fast path (no
   per-row values, chunked output, adaptive one-shot reserve): `group_id`

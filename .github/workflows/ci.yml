@@ -279,10 +279,20 @@ jobs:
       - name: ./ext-sdk/go/smoke.sh
         run: ./ext-sdk/go/smoke.sh
 
+      # The link-level invariant behind the wave-77 Linux failure: only a
+      # cdylib may carry the `#[no_mangle]` ABI v1 symbols. This checks the
+      # linked-only extension rlibs contain none (and the example cdylib still
+      # exports all three), so a regression fails here instead of relying on
+      # rust-lld's duplicate-symbol error.
+      - name: linked-only extensions carry no native ABI exports
+        run: ./ext-sdk/rust/check-native-exports.sh
+
       # The Rust SDK smoke builds its example with cargo (a workspace member)
       # and drives the same CLI session, including the volatile-function
       # refusal. `cargo test -p pinkdb-ext-sdk` (the main build-test job) also
-      # covers the SDK's own native and linked round trips.
+      # covers the SDK's own native and linked round trips, and
+      # `cargo test -p pinkdb-math` links both core extensions plus a locally
+      # declared one into one binary (tests/coexist.rs).
       - name: ./ext-sdk/rust/smoke.sh
         run: ./ext-sdk/rust/smoke.sh
 

@@ -3,17 +3,20 @@
 # pinkdb Rust extension SDK smoke test.
 #
 # End-to-end proof that the SDK works against a real host:
-#   1. builds the release CLI (`cargo build --release -p pinkdb-cli`);
-#   2. builds the worked example with the SDK Makefile
+#   1. checks the native-export invariant (`check-native-exports.sh`):
+#      linked-only rlibs carry no `pinkdb_extension_*` globals, the example
+#      cdylib exports all three;
+#   2. builds the release CLI (`cargo build --release -p pinkdb-cli`);
+#   3. builds the worked example with the SDK Makefile
 #      (target/release/librust_string_ext.dylib — one `pinkdb_extension!`
-#      declaration, compiled by cargo);
-#   3. runs a deterministic SQL session in a scratch directory that loads the
+#      declaration plus the explicit `pinkdb_abi_exports!()` opt-in);
+#   4. runs a deterministic SQL session in a scratch directory that loads the
 #      extension via `LOAD EXTENSION '<abs path>'` and exercises the
 #      registered functions: VARCHAR results (borrowed `&str` in, owned
 #      `String` out), NULL handling through `Option`, bytes-vs-characters
 #      length, a DATE round trip, composition with built-ins, the error path,
 #      the volatile-function refusal, and a WAL-logged deterministic INSERT;
-#   4. greps the expected outputs and exits non-zero on any mismatch.
+#   5. greps the expected outputs and exits non-zero on any mismatch.
 #
 # `cargo test -p pinkdb-ext-sdk` covers the same example through the SDK's own
 # native round-trip test (compiled with rustc) plus the linked model and a
@@ -32,6 +35,13 @@ case "$(uname -s)" in
     Darwin) so_ext="dylib" ;;
     *)      so_ext="so" ;;
 esac
+
+# Linked-only extensions (the rlibs every in-repo core extension builds into
+# the host) must carry no `pinkdb_extension_*` globals; only a cdylib opts in.
+# This is a link-level invariant the macOS linker cannot prove (it tolerates
+# duplicates), so check the artifacts directly before the end-to-end session.
+echo "==> ./ext-sdk/rust/check-native-exports.sh"
+"$here/check-native-exports.sh"
 
 echo "==> cargo build --release -p pinkdb-cli"
 (cd "$repo" && cargo build --release -p pinkdb-cli)

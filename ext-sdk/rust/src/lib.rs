@@ -3,10 +3,17 @@
 //! An extension author writes plain Rust — typed parameters, typed return
 //! values, `Result<_, String>` for errors, no `unsafe` anywhere — and a
 //! single [`pinkdb_extension!`] declaration generates the boilerplate:
-//! value marshalling, text ownership, NULL handling, the ABI v1 exports, and
-//! the wave-49 **linked** registration (the wasm loading model, which native
-//! targets share). The same declaration therefore builds a native cdylib and
-//! a linked/wasm extension from one source.
+//! value marshalling, text ownership, NULL handling, and the wave-49
+//! **linked** registration (the wasm loading model, which native targets
+//! share). A crate that builds a **cdylib** adds one explicit
+//! [`pinkdb_abi_exports!`] call for the three ABI v1 exports, so the same
+//! declaration serves a linked/wasm extension and a native loadable library.
+//!
+//! The explicit split is deliberate: linked-only extensions (rlibs the host
+//! links in) must not carry `#[no_mangle]` ABI symbols, because two of them in
+//! one binary are a `duplicate symbol: pinkdb_extension_init` link error on
+//! Linux. Only a cdylib opts in — see
+//! [`pinkdb_abi_exports!`] for the direct and feature-gated patterns.
 //!
 //! ```no_run
 //! pinkdb_ext_sdk::pinkdb_extension! {
@@ -17,6 +24,10 @@
 //!         },
 //!     ]
 //! }
+//!
+//! // Only in a cdylib crate (or behind a `abi-exports` feature that the
+//! // shared-library build turns on): the ABI v1 `#[no_mangle]` exports.
+//! pinkdb_ext_sdk::pinkdb_abi_exports!();
 //!
 //! // Native: `cargo build --release` a cdylib, then
 //! //   LOAD EXTENSION '/path/to/libstring_ext.dylib';
@@ -158,9 +169,11 @@
 //! [`pinkdb_scalar_specs`](pinkdb_extension)`()` is the generated list both
 //! models consume; [`pinkdb_linked_extension`](pinkdb_extension)`()` and
 //! [`pinkdb_register_linked`](pinkdb_extension)`()` expose the wave-49
-//! registration, and the three `pinkdb_extension_*` exports (native only)
-//! are what `LOAD EXTENSION '<path>'` drives. See `ext-sdk/rust/README.md`
-//! for the layout, the template, and the sharp edges.
+//! registration. The three `pinkdb_extension_*` exports (native only) come
+//! from the explicit [`pinkdb_abi_exports!`] call and are what
+//! `LOAD EXTENSION '<path>'` drives; a crate that is only ever linked in
+//! must not call it. See `ext-sdk/rust/README.md` for the layout, the
+//! template, and the sharp edges.
 
 mod macros;
 #[cfg(not(target_arch = "wasm32"))]

@@ -16,6 +16,19 @@ publish = false
 name = "string_ext"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Emit the three ABI v1 `#[no_mangle] extern "C"` exports
+# (`pinkdb_extension_abi_version` / `_name` / `_init`) so the cdylib can be
+# loaded with `LOAD EXTENSION '<path>'`.
+#
+# Off by default because this crate also builds an **rlib**: a linked-only
+# extension must not carry those process-global symbols, or two extension
+# rlibs in one binary become a `duplicate symbol: pinkdb_extension_init` link
+# error on Linux (rust-lld/GNU ld). The shared-library build — `make`,
+# `extensions/string/smoke.sh`, the publish workflow — turns it on; tests and
+# any linked use keep the default (no exports).
+abi-exports = []
+
 [dependencies]
 pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
 # The regex engine. RE2-style / linear-time (no backtracking), the same

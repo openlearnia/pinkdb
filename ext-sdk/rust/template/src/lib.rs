@@ -37,14 +37,16 @@
 //!     any shared mutable state (atomics, locks) and never assume init and a
 //!     callback run on the same thread. The SDK catches panics at the ABI
 //!     boundary, but they still fail the statement — return `Err` instead.
-//!  5. One declaration per crate: the macro defines the extension's exported
-//!     symbols. Use one module per extension if you need to organize code.
+//!  5. One declaration per crate, and one module per extension. The
+//!     declaration generates the shared function list and the linked
+//!     registration; the ABI v1 exports are an explicit opt-in because only a
+//!     cdylib may carry them (see the `pinkdb_abi_exports!` call below).
 //!  6. Ranged arities (`optional(min)` / `variadic(min)`, documented in the
 //!     SDK README) are **linked-only**: the native ABI v1 registers a fixed
 //!     argument count, so a declaration that uses one fails a native load.
 //!     This skeleton stays fixed-arity so it builds a loadable cdylib.
 
-use pinkdb_ext_sdk::pinkdb_extension;
+use pinkdb_ext_sdk::{pinkdb_abi_exports, pinkdb_extension};
 
 pinkdb_extension! {
     name = "my_extension",
@@ -68,3 +70,11 @@ pinkdb_extension! {
     //     fn my_ext_now_micros() -> i64 { /* read a clock */ }
     // ],
 }
+
+// A skeleton that ships a shared library: opt in to the ABI v1
+// `#[no_mangle]` exports (`pinkdb_extension_abi_version`, `_name`, `_init`)
+// that `LOAD EXTENSION '<path>'` looks up. A crate that is only ever linked
+// into a host as an rlib must not call this — two linked extensions carrying
+// the same globals fail to link on Linux with
+// `duplicate symbol: pinkdb_extension_init`.
+pinkdb_abi_exports!();

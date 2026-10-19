@@ -7,10 +7,12 @@ description = "pinkdb core datetime extension: strftime, strptime, epoch, epoch_
 license = "MIT"
 
 [dependencies]
-# The wave-51 Rust SDK: one `pinkdb_extension!` declaration generates the ABI
-# v1 exports (native cdylib) and the linked/wasm registration. The SDK depends
-# on the loader, never the other way around; this crate adds no other
-# dependency (calendar math and the format engine are hand rolled below).
+# The wave-51 Rust SDK: one `pinkdb_extension!` declaration generates the
+# shared function list and the linked/wasm registration the CLI and embedders
+# publish at bootstrap. This crate is linked-only (an rlib inside the host
+# binary), so it does not emit the native ABI exports — see the crate docs.
+# The SDK depends on the loader, never the other way around; this crate adds no
+# other dependency (calendar math and the format engine are hand rolled below).
 pinkdb-ext-sdk = { path = "../../ext-sdk/rust" }
 
 [dev-dependencies]

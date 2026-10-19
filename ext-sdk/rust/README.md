@@ -3,17 +3,18 @@
 Everything needed to build a pinkdb extension in **safe Rust** against the
 extension ABI v1. One `pinkdb_extension!` declaration defines the extension —
 its name and its functions — and the SDK generates the ABI glue: value
-marshalling, VARCHAR ownership, NULL handling, the three `pinkdb_extension_*`
-exports a native cdylib needs, and the wave-49 **linked** registration that
-covers every target *including wasm*. Extension authors write no `unsafe` and
-no C.
+marshalling, VARCHAR ownership, NULL handling, the wave-49 **linked**
+registration that covers every target *including wasm*, and (for a cdylib,
+via a separate explicit `pinkdb_abi_exports!()` call) the three
+`pinkdb_extension_*` exports a native shared library needs. Extension authors
+write no `unsafe` and no C.
 
 ```
 ext-sdk/rust/
 ├── include/pinkdb_extension.h   # vendored ABI header (byte-identical to the loader crate's copy)
 ├── src/                         # the SDK crate (`pinkdb-ext-sdk`)
 │   ├── lib.rs                   # crate docs: types, volatility, errors, the macros
-│   ├── macros.rs                # `pinkdb_extension!`
+│   ├── macros.rs                # `pinkdb_extension!` (declaration) + `pinkdb_abi_exports!` (cdylib opt-in)
 │   ├── spec.rs                  # ScalarSpec: the one description both loading models consume
 │   ├── value.rs                 # the typed value model (ExtArgType / FromExtArg / IntoExtValue)
 │   └── native.rs                # the ABI v1 exports and the single extern "C" trampoline
@@ -22,6 +23,7 @@ ext-sdk/rust/
 ├── tests/                       # native (rustc-built cdylib) and linked round trips + a durable replay
 ├── Makefile                     # builds the example / the template
 ├── smoke.sh                     # end-to-end test against the release CLI
+├── check-native-exports.sh      # linked-only rlibs carry no ABI symbols; the cdylib does
 └── README.md
 ```
 
@@ -58,11 +60,11 @@ functions resolve case-insensitively like built-ins and cannot shadow one.
 
 ## Writing an extension
 
-A whole extension is one macro invocation. Start from `template/` and write
-plain Rust functions:
+A whole extension starts with one macro invocation. Start from `template/` and
+write plain Rust functions:
 
 ```rust
-use pinkdb_ext_sdk::pinkdb_extension;
+use pinkdb_ext_sdk::{pinkdb_abi_exports, pinkdb_extension};
 
 pinkdb_extension! {
     name = "my_extension",
@@ -75,22 +77,68 @@ pinkdb_extension! {
         },
     ],
 }
+
+// Only a cdylib calls this (see "Native cdylib: opting in to the ABI
+// exports" below). A linked-only extension must not.
+pinkdb_abi_exports!();
 ```
 
-The macro emits:
+`pinkdb_extension!` emits:
 
-- `pinkdb_extension_abi_version`, `pinkdb_extension_name`,
-  `pinkdb_extension_init` — the ABI v1 exports `LOAD EXTENSION '<path>'`
-  drives (native targets only: wasm has no dynamic linker);
 - `pinkdb_scalar_specs()` — the extension's functions as a `&'static
   [ScalarSpec]`, the one description both loading models consume;
 - `pinkdb_linked_extension()` / `pinkdb_register_linked()` — the wave-49
   linked registration (see [One source, two loading
-  models](#one-source-two-loading-models)).
+  models](#one-source-two-loading-models));
+- two hidden name constants used by `pinkdb_abi_exports!`.
 
-A declaration may appear **once per crate**: it defines the extension's
-exported symbols and a few plain functions. Use one module per extension, as
-the template does.
+`pinkdb_abi_exports!()` — a **separate, explicit** call, in the same module —
+emits the three ABI v1 exports (`pinkdb_extension_abi_version`,
+`pinkdb_extension_name`, `pinkdb_extension_init`) that `LOAD EXTENSION
+'<path>'` looks up (native targets only: wasm has no dynamic linker).
+
+A declaration may appear **once per crate**, and an extension has one module;
+use one module per extension, as the template does.
+
+> **Why the exports are a separate macro.** The symbols are process-global
+> `#[no_mangle] extern "C"` definitions. An rlib that the host **links in**
+> must not carry them: two linked-only extension rlibs in one binary then
+> define `pinkdb_extension_init` (and `_name`) twice, and GNU ld / rust-lld on
+> Linux fail with `duplicate symbol: pinkdb_extension_init`. The macOS linker
+> silently tolerates duplicates, so a local macOS build is not proof — every
+> in-repo core extension (math, datetime, …) is linked-only and emits no
+> exports; `./ext-sdk/rust/check-native-exports.sh` checks that directly.
+
+### Native cdylib: opting in to the ABI exports
+
+Call `pinkdb_abi_exports!()` when the crate's artifact is a shared library:
+
+- **cdylib-only crate** (`crate-type = ["cdylib"]`, like this SDK's example
+  and `template/`): call it unconditionally after the declaration;
+- **crate that builds both an rlib and a cdylib** (`crate-type = ["cdylib",
+  "rlib"]`, like `extensions/string`): gate the call behind a Cargo feature
+  that only the shared-library build enables, so the rlib stays free of the
+  globals:
+
+```toml
+[features]
+# The Makefile's shared-library build turns this on; tests and linked uses
+# keep the default (no exports).
+abi-exports = []
+```
+
+```rust
+# #[cfg(feature = "abi-exports")]
+pinkdb_ext_sdk::pinkdb_abi_exports!();
+```
+
+Then build the loadable library with the feature on
+(`cargo build --release -p my-ext --features abi-exports`, or via the
+Makefile) and load it with `LOAD EXTENSION '<path>'`. Building a cdylib
+*without* the feature produces a shared library with no ABI symbols: it
+will fail to load with "does not export pinkdb_extension_abi_version". A
+linked-only build (tests, a host that links the rlib) must **never** enable
+the feature — that is the duplicate-symbol failure again.
 
 ### Types
 
@@ -273,10 +321,13 @@ flow mechanism; return `Err`.
 
 The same declaration feeds both ways an extension can be loaded:
 
-- **native `dlopen`** (this is what a cdylib built from the declaration is):
+- **native `dlopen`** (what a cdylib that called `pinkdb_abi_exports!()` is):
   `LOAD EXTENSION '/path/to/libmy_extension.dylib'` runs
   `pinkdb_extension_init`, which registers every function through the host
-  API. The SDK's single `extern "C"` trampoline serves them all.
+  API. The SDK's single `extern "C"` trampoline serves them all. A crate that
+  is linked in rather than dlopen-ed omits `pinkdb_abi_exports!()` — see
+  [Native cdylib: opting in to the ABI
+  exports](#native-cdylib-opting-in-to-the-abi-exports).
 - **linked registration** (wave 49; the only model on wasm, where there is no
   dynamic linker): the embedder calls the generated
   `pinkdb_register_linked()` at host bootstrap, then `LOAD EXTENSION
@@ -290,15 +341,27 @@ my_extension::pinkdb_register_linked()?;
 ```
 
 Because this is a compile-time registration, an rlib of the extension can be
-linked into the host binary — that is exactly how a wasm build ships. The SDK
+linked into the host binary — that is exactly how a wasm build ships, and how
+every in-repo core extension (math, datetime, …) reaches the CLI. The SDK
 itself is never a dependency of pinkdb: the release binary does not grow with
-an extension SDK.
+an extension SDK. A linked-only crate must be export-free so several of them
+can coexist in one binary: `./ext-sdk/rust/check-native-exports.sh` asserts
+the rlibs carry no `pinkdb_extension_*` symbols (and that the example cdylib
+still exports all three).
 
 ## Sharp edges
 
 The ABI header documents the contract; these are the Rust-specific
 consequences, verified against the real host:
 
+- **A linked-only extension must not call `pinkdb_abi_exports!()`.** The three
+  exports are `#[no_mangle]` globals: an rlib that a host links in carries them
+  into that binary, and two such rlibs collide on Linux
+  (`duplicate symbol: pinkdb_extension_init` — the macOS linker tolerates it,
+  so only a Linux link or `./check-native-exports.sh` catches it). Emit them
+  only from a shared-library build; when one crate builds both an rlib and a
+  cdylib, gate the call behind the `abi-exports` feature (the
+  `extensions/string` pattern).
 - **A cdylib extension must not be loaded into a process that never unloads
   it and then rebuilt in place.** Like every native extension, the library
   stays mapped for the life of the host process; replacing the file on disk
@@ -345,7 +408,13 @@ functions. The SDK's own tests are the worked patterns:
   store whose deterministic extension statement WAL-logs and replays
   identically;
 - `./smoke.sh` — the CLI-visible end-to-end session (15 greps), including the
-  volatile refusal and the error paths.
+  volatile refusal and the error paths, preceded by
+  `./check-native-exports.sh` (the link-level invariant: linked-only rlibs
+  carry no `pinkdb_extension_*` symbols, the cdylib exports all three);
+- `extensions/math/tests/coexist.rs` — the link-level fixture: two linked-only
+  extensions (`pinkdb-math`, `pinkdb-datetime`) plus a locally declared one in
+  **one** binary, which is the shape that failed to link on Linux when the
+  declaration emitted the exports unconditionally.
 
 Tips: test NULL inputs explicitly (`... IS NULL`), exercise VARCHAR results
 through a built-in (`upper(...)`, `length(...)`) to prove the bytes survive,

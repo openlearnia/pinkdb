@@ -1,8 +1,16 @@
-//! The registration macro: one declaration generates the ABI v1 exports
-//! (native) and the linked registration (every target), both driven by the
-//! same [`ScalarSpec`](crate::ScalarSpec) list.
+//! The registration macros: one declaration generates the shared function
+//! list (and the linked registration) on every target; a **separate**,
+//! explicit macro emits the ABI v1 exports that only a cdylib wants.
 //!
-//! The macro is the only thing an extension author has to write besides the
+//! The split exists because a linked-only extension (an rlib the host links
+//! into its own binary — every in-repo core extension) must **not** carry
+//! `#[no_mangle]` ABI symbols: two such rlibs in one binary are a link error
+//! (`duplicate symbol: pinkdb_extension_init` on GNU ld/rust-lld; the macOS
+//! linker happens to tolerate it, which is why the failure only shows on
+//! Linux). Only a crate that builds a shared library calls
+//! [`pinkdb_abi_exports!`](crate::pinkdb_abi_exports).
+//!
+//! The macros are the only thing an extension author has to write besides the
 //! function bodies; see the crate docs for the accepted shapes and
 //! `ext-sdk/rust/README.md` for the guided tour.
 //!
@@ -126,12 +134,22 @@ macro_rules! __pinkdb_spec {
 /// Every function is written as a normal Rust item with typed parameters and
 /// a typed return value, and the macro generates:
 ///
-/// - the three ABI v1 exports (`pinkdb_extension_abi_version`,
-///   `pinkdb_extension_name`, `pinkdb_extension_init`) on native targets;
 /// - `pinkdb_scalar_specs()` — the shared description both loading models
 ///   consume;
 /// - `pinkdb_linked_extension()` / `pinkdb_register_linked()` — the wave-49
-///   linked registration, which is also how a wasm build is published.
+///   linked registration, the only loading model on wasm and the one every
+///   in-repo core extension uses.
+///
+/// It deliberately does **not** emit the ABI v1 `#[no_mangle]` exports: a
+/// linked-only crate (an rlib) must not carry them, or two extension rlibs in
+/// one binary become a duplicate-symbol link error. A crate that builds a
+/// **cdylib** opts in with [`pinkdb_abi_exports!`](crate::pinkdb_abi_exports)
+/// (directly when the crate is cdylib-only, or behind a Cargo feature when it
+/// also builds an rlib — see the crate docs and the README).
+///
+/// The two hidden constants `PINKDB_EXTENSION_NAME` /
+/// `PINKDB_EXTENSION_NAME_C` are generated for `pinkdb_abi_exports!`; both
+/// macros must be invoked in the same module.
 ///
 /// Accepted parameter/return types are the ABI v1 types (see the crate docs)
 /// and `Option<T>` around them; NULL handling is explicit through
@@ -286,6 +304,63 @@ macro_rules! pinkdb_extension {
             $crate::register_linked_extension(pinkdb_linked_extension()?)
         }
 
+        /// The declared extension name.
+        ///
+        /// Hidden plumbing for [`pinkdb_abi_exports!`](crate::pinkdb_abi_exports):
+        /// it lets the exports repeat the name without a second literal that
+        /// could drift from this declaration.
+        #[doc(hidden)]
+        pub const PINKDB_EXTENSION_NAME: &str = $name;
+
+        /// [`PINKDB_EXTENSION_NAME`], NUL-terminated for the C ABI.
+        #[doc(hidden)]
+        pub const PINKDB_EXTENSION_NAME_C: &str = ::core::concat!($name, "\0");
+    };
+}
+
+/// Emit the three ABI v1 `#[no_mangle] extern "C"` exports
+/// (`pinkdb_extension_abi_version`, `pinkdb_extension_name`,
+/// `pinkdb_extension_init`) for the extension declared by
+/// [`pinkdb_extension!`](crate::pinkdb_extension) in the same module.
+///
+/// # Only a cdylib calls this
+///
+/// The symbols are process-global once linked. A **linked-only** extension —
+/// an ordinary rlib the host links in, which is every in-repo core
+/// extension — must not emit them: when two such rlibs reach one binary, the
+/// linker sees two definitions of each symbol and fails with
+///
+/// ```text
+/// duplicate symbol: pinkdb_extension_init  (libpinkdb_math-….rlib and libpinkdb_datetime-….rlib)
+/// duplicate symbol: pinkdb_extension_name  (…)
+/// ```
+///
+/// GNU ld / rust-lld on Linux reject that outright. (The macOS linker can
+/// tolerate it, which is exactly why a local macOS build is not proof: the
+/// failure is a Linux link error, caught by CI and by the SDK's
+/// `check-native-exports.sh`.)
+///
+/// Call it directly from a crate whose only artifact is a cdylib:
+///
+/// ```ignore
+/// pinkdb_ext_sdk::pinkdb_extension! { name = "my_extension", functions = [ /* … */ ] }
+/// pinkdb_ext_sdk::pinkdb_abi_exports!();
+/// ```
+///
+/// A crate that builds **both** an rlib (tests, linked registration) and a
+/// cdylib gates the call behind a Cargo feature (the pattern
+/// `extensions/string` uses), so the rlib half stays free of the globals:
+///
+/// ```ignore
+/// # #[cfg(feature = "abi-exports")]
+/// pinkdb_ext_sdk::pinkdb_abi_exports!();
+/// ```
+///
+/// On wasm targets the exports are omitted: there is no dynamic linker, and
+/// the linked registration is the only loading model.
+#[macro_export]
+macro_rules! pinkdb_abi_exports {
+    () => {
         /// `pinkdb_extension_abi_version` (ABI v1): the loader compares this
         /// against its own version and refuses the library on a mismatch.
         #[cfg(not(target_arch = "wasm32"))]
@@ -299,8 +374,10 @@ macro_rules! pinkdb_extension {
         #[cfg(not(target_arch = "wasm32"))]
         #[unsafe(no_mangle)]
         pub extern "C" fn pinkdb_extension_name() -> *const ::core::ffi::c_char {
-            // The literal is NUL-terminated here, so the pointer is a C string.
-            ::core::concat!($name, "\0").as_ptr().cast::<::core::ffi::c_char>()
+            // The constant is NUL-terminated, so the pointer is a C string.
+            PINKDB_EXTENSION_NAME_C
+                .as_ptr()
+                .cast::<::core::ffi::c_char>()
         }
 
         /// `pinkdb_extension_init` (ABI v1): register every declared
@@ -314,7 +391,14 @@ macro_rules! pinkdb_extension {
         ) -> i32 {
             // SAFETY: the loader passes a valid, initialized host API and the
             // opaque context to hand back; `native_init` documents both.
-            unsafe { $crate::__private::native_init(api, host_ctx, $name, pinkdb_scalar_specs()) }
+            unsafe {
+                $crate::__private::native_init(
+                    api,
+                    host_ctx,
+                    PINKDB_EXTENSION_NAME,
+                    pinkdb_scalar_specs(),
+                )
+            }
         }
     };
 }

@@ -8,7 +8,8 @@ extension SDK (ABI v1) and pinned live against DuckDB
 
 ```sql
 -- native (this repo):
-cargo build --release -p pinkdb-ext-string
+--   make -C extensions/string
+--   (or: cargo build --release -p pinkdb-ext-string --features abi-exports)
 LOAD EXTENSION '/abs/path/to/target/release/libstring_ext.dylib';
 -- linked (tests, wasm embedders): register at bootstrap, then load by name
 LOAD EXTENSION 'string';
@@ -20,6 +21,15 @@ SELECT split_part('a,b,c', ',', CAST(2 AS BIGINT)), reverse('héllo');
 `extensions/string/build/` (the artifact `publish-extensions.yml` discovers
 for the `string` repo entry). `./extensions/string/smoke.sh` runs the
 CLI-visible end-to-end session.
+
+The `abi-exports` feature is what emits the three ABI v1 `#[no_mangle]`
+symbols `LOAD EXTENSION '<path>'` looks up. It is off by default because this
+crate also builds an rlib (the linked registration, used by the tests): a
+linked-only extension must not carry those globals, or two extension rlibs in
+one binary fail to link on Linux with
+`duplicate symbol: pinkdb_extension_init`. Plain
+`cargo build --release -p pinkdb-ext-string` therefore produces a dylib with
+no ABI symbols (not loadable natively); the Makefile passes the feature.
 
 ## Functions
 

@@ -306,7 +306,7 @@ fn deterministic_extension_statements_wal_log_and_replay() {
 fn a_ranged_declaration_is_refused_by_the_native_load() {
     /// A declaration whose only function is `optional(1)`.
     const SOURCE: &str = r#"
-use pinkdb_ext_sdk::{Optional, pinkdb_extension};
+use pinkdb_ext_sdk::{Optional, pinkdb_abi_exports, pinkdb_extension};
 
 pinkdb_extension! {
     name = "wave54_ranged_native",
@@ -317,6 +317,9 @@ pinkdb_extension! {
         },
     ],
 }
+
+// Compiled as a cdylib: opt in to the ABI v1 symbols `LOAD EXTENSION` looks up.
+pinkdb_abi_exports!();
 "#;
 
     let exe = std::env::current_exe().expect("current test binary path");

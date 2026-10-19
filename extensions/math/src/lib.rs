@@ -5,8 +5,12 @@
 //!
 //! One [`pinkdb_extension!`] declaration defines every function; the same
 //! declaration publishes the linked registration the CLI loads at startup
-//! (`pinkdb_math::ensure_registered()` + `load_linked_extension("math")`) and
-//! the specs a native cdylib would export.
+//! (`pinkdb_math::ensure_registered()` + `load_linked_extension("math")`).
+//! This crate is **linked-only**: it is an rlib the CLI links in, so it
+//! deliberately emits no native ABI exports (a native cdylib would call
+//! `pinkdb_abi_exports!()`; two linked extension rlibs carrying those
+//! `#[no_mangle]` globals are a `duplicate symbol: pinkdb_extension_init`
+//! link error on Linux).
 //!
 //! # What this extension provides, and what the engine already owns
 //!
@@ -105,7 +109,9 @@
 //! (1 or 2 arguments). That is a ranged arity, which only the linked loading
 //! model registers — and the linked model is how this crate is loaded
 //! (there is no cdylib build; the native ABI v1 has no ranged-arity
-//! descriptor).
+//! descriptor). For the same reason the crate is linked-only and emits no
+//! native ABI exports: it is an rlib in the host binary, not a shared
+//! library.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1796,3 +1796,28 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   **+97,728 B** (full size-table refresh deferred to the next landing, where
   httpfs also shifts the rows). Integration on main: clean apply (19 files).
   Worktree removed.
+
+- 2026-10-19 — Fix (wave-51 SDK follow-up; worktree `wt-sdkfix`): CI's
+  `cargo build` went red on Linux with duplicate `pinkdb_extension_init` /
+  `_name` symbols — `pinkdb_extension!` emitted the three ABI v1 exports
+  unconditionally, so **linked-only** extensions (`pinkdb-math`,
+  `pinkdb-datetime`) collided once wave 77's codegen shifted which archive
+  members got pulled; macOS's linker tolerates duplicate symbols, which is why
+  every local gate was green. Fix: `pinkdb_extension!` now generates only the
+  declaration (`pinkdb_scalar_specs`/`pinkdb_linked_extension`/
+  `pinkdb_register_linked` + hidden name constants) and a new explicit
+  `pinkdb_abi_exports!()` emits the three `#[no_mangle]` symbols —
+  **cdylib-only by construction**; the dual-artifact `extensions/string`
+  gates it behind an `abi-exports` feature enabled by its Makefile, while
+  math/datetime emit nothing and the SDK example/template call the macro
+  unconditionally. Regression coverage that doesn't need rust-lld:
+  `ext-sdk/rust/check-native-exports.sh` (`nm` proof that linked-only rlibs
+  carry no exports, with a positive control on the cdylib; wired into the
+  smoke and the `sdk-smokes` CI job) plus `extensions/math/tests/coexist.rs`,
+  which links math + datetime + a local declaration into one binary and
+  queries all three (on Linux, a regression is a link error there). Docs:
+  SDK README "Native cdylib: opting in to the ABI exports", crate/manifest
+  docs, bench builds string with the feature. Gates: `cargo build` green
+  (the failing step), SDK/loader/math/datetime/string suites green, pinkdb
+  **639**, workspace **1177**, fmt/clippy both toolchains, wasm green,
+  duckdiff **326/326**. Size: **0 B** (the linker already GC'd the wrappers).

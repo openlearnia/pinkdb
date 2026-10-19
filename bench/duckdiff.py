@@ -501,7 +501,9 @@ QUERIES = [
 #
 # These probes need the loadable extension on the pinkdb side only; DuckDB
 # has the same functions built in. Build it first (`make -C extensions/string`,
-# or `cargo build --release -p pinkdb-ext-string`), then the pinkdb side of
+# or `cargo build --release -p pinkdb-ext-string --features abi-exports` — the
+# feature emits the ABI v1 symbols a cdylib needs; the default build is the
+# export-free rlib half), then the pinkdb side of
 # every probe is prefixed with `LOAD EXTENSION '<abs path>'` — engine-specific
 # setup outside the compared SQL, so both engines still run the SAME text.
 #
@@ -605,15 +607,27 @@ def run_small():
         print(f"reference: {version}")
     except (OSError, IndexError):
         pass
+    # Self-sufficient: CI (and fresh checkouts) have no extension built, and a
+    # stale artifact can predate the `abi-exports` feature — a cdylib built
+    # without it carries no ABI v1 symbols and `LOAD EXTENSION` refuses it
+    # (that is the wave-78 fix: linked-only rlibs stay export-free, only the
+    # shared-library build opts in). Build unconditionally: cargo no-ops when
+    # it is up to date.
+    print("building pinkdb-ext-string (release, `abi-exports`) ...")
+    subprocess.run(
+        [
+            "cargo",
+            "build",
+            "--release",
+            "-p",
+            "pinkdb-ext-string",
+            "--features",
+            "abi-exports",
+        ],
+        check=True,
+    )
     if not os.path.exists(STRING_EXT_PATH):
-        # Self-sufficient: CI (and fresh checkouts) have no extension built.
-        print("string extension not built; building pinkdb-ext-string (release) ...")
-        subprocess.run(
-            ["cargo", "build", "--release", "-p", "pinkdb-ext-string"],
-            check=True,
-        )
-        if not os.path.exists(STRING_EXT_PATH):
-            raise SystemExit(f"string extension still missing at {STRING_EXT_PATH}")
+        raise SystemExit(f"string extension still missing at {STRING_EXT_PATH}")
     for label, sql, ordered, expect_error in QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
