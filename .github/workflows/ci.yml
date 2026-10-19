@@ -154,7 +154,9 @@ jobs:
           cargo build -p pinkdb --target wasm32-unknown-unknown
 
       - name: cargo build --release -p pinkdb-cli (duckdiff artifact)
-        run: cargo build --release -p pinkdb-cli
+        # The differential battery includes the opt-in file-format extension
+        # probes (arrow today; parquet joins this list when it lands).
+        run: cargo build --release -p pinkdb-cli --features arrow
 
       - name: upload the release CLI for the duckdiff job
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

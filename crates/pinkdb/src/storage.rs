@@ -922,6 +922,13 @@ pub struct PinkDb {
     /// RBAC section + replayed from the WAL; an empty catalog is the
     /// documented "no users: every connection is trusted" state.
     pub(crate) rbac: crate::rbac::RbacCatalog,
+    /// Registered file formats (wave 71): `FROM 'x.<ext>'`,
+    /// `read_<format>(…)` and `COPY … (FORMAT <format>)` resolve through
+    /// this list. Process/store-level like loadable extensions — never
+    /// persisted, shared by store clones, empty in a stock engine (every
+    /// file surface then fails with a clear "no file format registered"
+    /// error). See [`crate::filefmt`].
+    pub(crate) file_formats: Vec<Arc<dyn crate::filefmt::FileFormat>>,
 }
 
 impl Default for PinkDb {
@@ -966,6 +973,7 @@ impl Clone for PinkDb {
             proc_depth: self.proc_depth,
             proc_frame: self.proc_frame.clone(),
             rbac: self.rbac.clone(),
+            file_formats: self.file_formats.clone(),
         }
     }
 }
@@ -1016,6 +1024,10 @@ impl PinkDb {
             proc_depth: 0,
             proc_frame: crate::procedure::ProcFrame::default(),
             rbac: crate::rbac::RbacCatalog::default(),
+            // Process-global formats (`filefmt::register_global_file_format`)
+            // seed every store constructed after the registration; the store
+            // then owns its list (durable replay resolves through it).
+            file_formats: crate::filefmt::seeded_global_formats(),
         }
     }
 

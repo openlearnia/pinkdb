@@ -43,6 +43,16 @@ pub enum Statement {
         table: String,
         where_clause: Option<Expr>,
     },
+    /// `COPY <table> TO '<path>' [(FORMAT <format>)]` (wave 71): write one
+    /// catalog table to a registered file format. `format: None` infers the
+    /// format from the target path's extension (DuckDB's rule). External
+    /// side effect only: no store mutation, never WAL-logged.
+    CopyTo {
+        db: Option<String>,
+        table: String,
+        path: String,
+        format: Option<String>,
+    },
     Begin,
     Commit,
     Rollback,
@@ -374,6 +384,16 @@ pub enum FromSource {
     Table {
         db: Option<String>,
         name: String,
+    },
+    /// A file source (wave 71): a string-literal replacement scan
+    /// (`FROM 'f.arrow'`, `format: None`: resolved by file extension) or a
+    /// `read_*` table-function call (`FROM read_arrow('f.arrow')`,
+    /// `format: Some("read_arrow")`: resolved by the registered reader name).
+    /// Both resolve through the store's registered file formats at bind time.
+    File {
+        path: String,
+        /// The lowercased `read_*` function name, when written.
+        function: Option<String>,
     },
     Derived(Box<Select>),
 }

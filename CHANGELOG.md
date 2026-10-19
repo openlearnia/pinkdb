@@ -10,6 +10,16 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 71 — core `arrow` extension (Arrow IPC) ✅
+- New engine **file-format extension surface** (`pinkdb::filefmt`): arrow
+  files work through `FROM 'x.arrow'`, `read_arrow`/`read_ipc`/`read_feather`
+  and `COPY … (FORMAT arrow)`, with durable replay re-reading files and lean
+  builds refusing everything with a precise error.
+- `arrow` is an **opt-in CLI feature** (+≈3.0 MiB; the default binary grows
+  only 22 KB for the seam). Round-tripped against pyarrow in both directions;
+  DuckDB has no Arrow support to diff against (documented). The Arrow C Data
+  Interface is pinned as a follow-up. `.pink` remains the native format.
+
 ### Wave 54 — core `math` extension ✅
 - Seventeen functions via the Rust SDK: `exp`/`ln`/`log`/`log2`/`log10`, the
   trigonometric family, `degrees`/`radians`/`pi`, and the first **volatile**

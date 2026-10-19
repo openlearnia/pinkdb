@@ -1,0 +1,27 @@
+[package]
+name = "pinkdb-arrow"
+version = "0.1.0"
+edition = "2024"
+# The workspace MSRV (wave 82): the same floor as the engine and pink-lake.
+rust-version = "1.97"
+description = "pinkdb core extension: Arrow IPC (Feather v2) file read/write — `FROM 'f.arrow'`, `read_arrow`, `COPY … (FORMAT arrow)`"
+license = "MIT"
+
+# This is a *core extension* with an engine-adjacent integration, not a
+# scalar cdylib: the engine owns the `FileFormat` trait and the registry
+# (`pinkdb::filefmt`), this crate implements it over arrow-rs, and the host
+# (the CLI's `arrow` feature, or an embedder) registers it at store creation.
+# Arrow crates are pinned to the 59.x line already in the workspace lock
+# (vortex-array 0.88 depends on arrow-* 59.3.0), so a `vortexlake`-enabled
+# build shares those compile units instead of duplicating them.
+[dependencies]
+pinkdb = { path = "../../crates/pinkdb" }
+arrow-array = { version = "59", default-features = false }
+arrow-buffer = { version = "59", default-features = false }
+arrow-schema = { version = "59", default-features = false }
+# IPC file reader/writer. `default-features = false` (no compression) would
+# be leaner, but a reader that cannot open a zstd/lz4-compressed IPC file
+# written by another tool is a functional gap: both decompressors are opt-in
+# features of arrow-ipc and are enabled here. Writing is always uncompressed
+# (DuckDB's and pyarrow's default).
+arrow-ipc = { version = "59", default-features = false, features = ["lz4", "zstd"] }

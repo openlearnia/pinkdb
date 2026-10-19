@@ -1050,12 +1050,22 @@ implies neither lake build**; combine them explicitly, `pinklake,s3` or
 
 | Build | CLI features | Lake | Data files | Release size |
 |---|---|---|---|---|
-| default | — | no `.lake` commands | — | 3,719,664 B |
-| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 5,048,832 B (+1.27 MiB over default, −40.6 MiB vs vortexlake) |
-| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 7,052,176 B |
-| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,634,992 B |
+| default | — | no `.lake` commands | — | 3,741,504 B |
+| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 5,071,072 B (+1.27 MiB over default, −40.6 MiB vs vortexlake) |
+| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 7,074,064 B |
+| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,656,976 B |
 | vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.6 MB (vortexlake + the same ≈2 MB S3 client) |
 | s3 only | `s3` | no `.lake` commands (the client only takes effect with a lake feature) | — | same bytes as default |
+| arrow | `arrow` | file access only (`FROM 'x.arrow'`, `read_arrow`, `COPY … (FORMAT arrow)`) | Arrow IPC (read/write) | 6,911,024 B (≈+3.0 MiB over default) |
+
+The opt-in `arrow` feature is orthogonal to the lake builds (it is a file
+format, not a lake): `--features arrow` adds Arrow IPC file read/write to
+*any* of the builds above.
+
+| Build | CLI features | Adds | Release size |
+|---|---|---|---|
+| default + arrow | `arrow` | `FROM 'f.arrow'`, `read_arrow`, `COPY … (FORMAT arrow)` | 6,911,024 B (+3.02 MiB over default) |
+| lean + arrow | `--no-default-features --features arrow` | as above, without json/datetime/math | 6,753,456 B (lean alone: 3,600,288 B) |
 
 ```sh
 cargo build -p pinkdb-cli --features vortexlake        # Vortex data files, local directories
@@ -1149,7 +1159,7 @@ The same lake layer without the Vortex dependency: a `pinklake` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
 single-table persistence bytes) under `format_version` 4 catalogs (each file
 object carries its own statistics block) — no `vortex` crate and none of its
-~218 transitive crates, a 5.05 MB binary instead of 47.63 MB. It enables every
+~218 transitive crates, a 5.07 MB binary instead of 47.66 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
 (add `,s3`; the storage client alone provides no commands), with the same
 layout, incremental commits, atomic
@@ -1643,6 +1653,37 @@ carries the full matrix and divergences) and `math` (`exp`/`ln`/`log`/`log2`/
 binary lean. `string` ships as an in-repo loadable extension
 (`extensions/string`: `make -C extensions/string`, then
 `LOAD EXTENSION '<path>'`).
+
+`arrow` (wave 71) is a core extension of a different shape: a *file format*,
+not a scalar function — the scalar ABI cannot express replacement scans,
+table functions or COPY formats, so the engine owns a second, tiny extension
+surface (`pinkdb::filefmt::FileFormat`: engine-side trait + per-store
+registry, seeded from a process-global registration at host bootstrap) and
+`extensions/arrow` = `pinkdb-arrow` implements it over the arrow-rs crates —
+the same engine-adjacent shape as `pink-lake` implementing `AttachedLake`:
+
+```sql
+SELECT * FROM 'data.arrow';                        -- replacement scan (.arrow/.ipc/.feather)
+SELECT * FROM read_arrow('data.arrow');            -- table function (read_ipc / read_feather)
+COPY t TO 'out.arrow' (FORMAT arrow);              -- write (FORMAT inferred from the extension)
+```
+
+Arrow IPC **file** format (Feather v2) only: the IPC *stream* format is
+detected by its magic and refused with a message naming the difference;
+reads accept uncompressed/LZ4/ZSTD files, writes are uncompressed; one
+record batch per engine chunk (≤2048 rows) on write, any batch layout on
+read; a scan materializes the whole file (no projection/streaming yet);
+every type without an exact engine counterpart (BLOB, TIME, nested types,
+`UInt64`, `Decimal256`, …) is refused at bind time naming the column. It is
+an **opt-in** CLI feature (`cargo build -p pinkdb-cli --features arrow`;
+3,741,504 → 6,911,024 B release, +3.02 MiB) — the default binary stays lean
+and refuses every file surface with a clear error. A durable store replays
+a logged `INSERT … SELECT … FROM 'f.arrow'` by re-reading the file (DuckDB's
+rule; the format must be registered before the store is opened, which the
+CLI does at startup), and a file that vanished before replay is a hard
+recovery error, never a silent drop. The Arrow **C Data Interface** in
+`pinkdb-ffi` is a documented follow-up with a precise pin in
+`extensions/arrow/README.md` (not half-implemented).
 
 A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
 
@@ -2308,7 +2349,7 @@ and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
 `pinklake` build (`.pink` v4 lake data files, no `vortex` dependency,
-5.05 MB vs 47.63 MB CLI) shipped in wave 45i, and wave 45k gave it exact
+5.07 MB vs 47.66 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for

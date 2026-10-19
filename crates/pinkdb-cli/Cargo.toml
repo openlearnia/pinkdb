@@ -25,6 +25,15 @@ json = ["dep:pinkdb-json"]
 datetime = ["dep:pinkdb-datetime"]
 # Core math extension: `pinkdb-math` (exp/ln/log, trigonometry, random()).
 math = ["dep:pinkdb-math"]
+# Opt-in core arrow extension (wave 71): Arrow IPC (Feather v2) file
+# read/write over arrow-rs — `FROM 'f.arrow'`, `read_arrow('f.arrow')` and
+# `COPY t TO 'f.arrow' (FORMAT arrow)`. Registers the format process-wide at
+# startup (`pinkdb_arrow::ensure_registered`), so every store this build
+# creates or opens — including a durable reopen that replays a logged
+# `INSERT … SELECT … FROM 'f.arrow'` — resolves it and a lean build refuses
+# such a replay with a clear "no file format registered" error. Never a
+# default feature: it links the arrow-rs crates.
+arrow = ["dep:pinkdb-arrow"]
 # Opt-in remote mode: `pinkdb --host HOST:PORT` talks to a pinkdb-server.
 client = ["dep:pinkdb-server"]
 # Opt-in TLS for remote mode: `--tls`, `--tls-ca-cert PATH` and
@@ -76,6 +85,11 @@ pinkdb-datetime = { path = "../../extensions/datetime", optional = true }
 # and the volatile random(), through the Rust extension SDK. Zero external
 # crates — `std`'s `f64` math and a hand-rolled PRNG.
 pinkdb-math = { path = "../../extensions/math", optional = true }
+# Core arrow extension (opt-in `arrow` feature): Arrow IPC file read/write —
+# the engine-adjacent crate that implements `pinkdb::FileFormat` over the
+# arrow-rs crates (`arrow-array`/`arrow-ipc`/`arrow-schema`, pinned to the
+# 59.x line the workspace lock already carries for vortex).
+pinkdb-arrow = { path = "../../extensions/arrow", optional = true }
 pinkdb-server = { path = "../pinkdb-server", optional = true }
 # Repository client (repo feature): blocking HTTP over rustls (no gzip: the
 # repository serves raw artifacts), catalog JSON, and SHA-256 verification.

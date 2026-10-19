@@ -66,6 +66,16 @@ pub enum LogicalPlan {
         table: String,
         predicate: Option<BoundExpr>,
     },
+    /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71): write one
+    /// store table to a registered file format. External side effect only —
+    /// the store and the WAL are untouched, so the statement is never logged
+    /// and needs no lease; the result is DuckDB's `Count` shape.
+    CopyTo {
+        db: Option<String>,
+        table: String,
+        format: String,
+        path: String,
+    },
     Begin,
     Commit,
     Rollback,
@@ -262,6 +272,19 @@ pub enum LogicalPlan {
         table: String,
         at: Option<AtSpec>,
     },
+    /// Full read of a registered file format (wave 71): `FROM 'f.arrow'` /
+    /// `FROM read_arrow('f.arrow')`. `format` names the registered format,
+    /// `path` is the source path exactly as written, and `schema` is what the
+    /// binder read from the file's metadata — the executor re-reads the file
+    /// and validates the schema against it, so a file that changed between
+    /// bind and execution fails loudly instead of returning shifted columns.
+    /// Never a write; never WAL-logged by itself (a logged statement that
+    /// reads one replays by re-reading the file — see [`crate::filefmt`]).
+    FileScan {
+        format: String,
+        path: String,
+        schema: Vec<(String, DataType)>,
+    },
     /// One empty row — `SELECT` without `FROM`.
     SingleRow,
     Filter {
@@ -397,6 +420,10 @@ pub fn is_read_only(plan: &LogicalPlan) -> bool {
     matches!(
         plan,
         LogicalPlan::Scan { .. }
+            | LogicalPlan::FileScan { .. }
+            // COPY writes an external file, never the store: it can run under
+            // a read lock (and is never WAL-logged).
+            | LogicalPlan::CopyTo { .. }
             | LogicalPlan::SingleRow
             | LogicalPlan::Filter { .. }
             | LogicalPlan::Join { .. }
@@ -637,6 +664,11 @@ pub(crate) fn collect_tables_read(
             ..
         } => {
             out.insert((db.to_ascii_lowercase(), table.to_ascii_lowercase()));
+        }
+        // A file source reads no store table; `COPY` reads its source table.
+        LogicalPlan::FileScan { .. } => {}
+        LogicalPlan::CopyTo { db, table, .. } => {
+            out.insert(key(db, table));
         }
         LogicalPlan::Scan { db: None, .. }
         | LogicalPlan::SingleRow
@@ -1024,7 +1056,11 @@ fn walk_scan_filters(
         | LogicalPlan::CreateRole { .. }
         | LogicalPlan::DropRole { .. }
         | LogicalPlan::Grant { .. }
-        | LogicalPlan::Revoke { .. } => {}
+        | LogicalPlan::Revoke { .. }
+        // Wave 71: a file source is not an attached table (no zone maps to
+        // prune by), and COPY has no predicate to push into its source.
+        | LogicalPlan::FileScan { .. }
+        | LogicalPlan::CopyTo { .. } => {}
         LogicalPlan::Call { args, .. } => {
             for a in args {
                 walk_expr_subquery_filters(a, out);
@@ -1339,6 +1375,10 @@ fn walk_dynamic_scalars(plan: &LogicalPlan, found: &mut bool) {
         | LogicalPlan::DropRole { .. }
         | LogicalPlan::Grant { .. }
         | LogicalPlan::Revoke { .. }
+        // Wave 71: a file scan and a COPY carry no expression (the format
+        // callback is engine-side, not a dynamic scalar).
+        | LogicalPlan::FileScan { .. }
+        | LogicalPlan::CopyTo { .. }
         => {}
         LogicalPlan::IndexScan { value, .. } => exprs.push(value),
         LogicalPlan::Call { args, .. } => exprs.extend(args.iter()),
@@ -1537,6 +1577,9 @@ fn walk_scan_projections(
         // Unqualified scans name CTE outputs (binder-resolved), not tables;
         // the CTE's own query is walked through `LogicalPlan::Cte`.
         LogicalPlan::Scan { db: None, .. } | LogicalPlan::SingleRow => {}
+        // Wave 71: a file scan always decodes every column (no projection
+        // pushdown into an IPC file yet), and COPY reads its whole table.
+        LogicalPlan::FileScan { .. } | LogicalPlan::CopyTo { .. } => {}
         LogicalPlan::Filter { input, predicate } => {
             let mut need = needed.clone();
             collect_expr_projections(predicate, &mut need, out);

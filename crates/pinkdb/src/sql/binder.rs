@@ -13,6 +13,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use super::ast::*;
@@ -3109,6 +3110,12 @@ fn bind_tracked_plan(
             table,
             where_clause,
         } => bind_delete(db, default_db, qdb, table, where_clause, params.clone()),
+        Statement::CopyTo {
+            db: qdb,
+            table,
+            path,
+            format,
+        } => bind_copy_to(db, default_db, qdb, table, path, format.as_deref()),
         Statement::Begin => empty(LogicalPlan::Begin),
         Statement::Commit => empty(LogicalPlan::Commit),
         Statement::Rollback => empty(LogicalPlan::Rollback),
@@ -3940,6 +3947,52 @@ fn bind_delete(
             predicate,
         },
         dynamic_functions,
+    ))
+}
+
+/// Bind `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71): resolve the
+/// source table and the target file format at bind time, so a missing table
+/// or an unregistered format is a clean plan-time error (never a partial
+/// file written by a half-bound statement).
+///
+/// The source must be a catalog table of the store: views are not tables and
+/// attached lake tables live outside the store, so both are refused with a
+/// message saying what to do instead.
+fn bind_copy_to(
+    db: &PinkDb,
+    default_db: &str,
+    qdb: &Option<String>,
+    table: &str,
+    path: &str,
+    format: Option<&str>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let table_db = Binder::new(db, default_db).resolve_db(qdb)?;
+    let t = db.table_in(&table_db, table).map_err(|_| {
+        PinkDbError::Catalog(format!(
+            "COPY source table \"{table}\" does not exist in database \"{table_db}\" \
+             (COPY writes plain catalog tables; views and attached lake tables are \
+             not supported — materialize the query into a table first)"
+        ))
+    })?;
+    let fmt = match format {
+        Some(name) => db.file_format(name).ok_or_else(|| {
+            PinkDbError::Catalog(format!(
+                "no file format \"{name}\" is registered (registered formats: {}); \
+                 a build with the matching first-party extension (e.g. `arrow`) \
+                 registers it",
+                db.file_format_names()
+            ))
+        })?,
+        None => db.file_format_for_path(path)?,
+    };
+    Ok((
+        LogicalPlan::CopyTo {
+            db: Some(table_db),
+            table: t.name.clone(),
+            format: fmt.name().to_string(),
+            path: path.to_string(),
+        },
+        Vec::new(),
     ))
 }
 
@@ -4971,6 +5024,9 @@ pub(crate) fn plan_schema(
             }
         }
         LogicalPlan::SingleRow => Ok(Vec::new()),
+        // A file source's schema is the schema the binder read from the
+        // file at bind time — carried in the plan, so no second read.
+        LogicalPlan::FileScan { schema, .. } => Ok(schema.clone()),
         LogicalPlan::Filter { input, .. }
         | LogicalPlan::Distinct { input }
         | LogicalPlan::Sort { input, .. }
@@ -4982,6 +5038,9 @@ pub(crate) fn plan_schema(
         | LogicalPlan::InsertSelect { .. }
         | LogicalPlan::Update { .. }
         | LogicalPlan::Delete { .. }
+        // COPY's result shape is built by the executor (a one-row Count),
+        // like DESCRIBE/EXPLAIN's.
+        | LogicalPlan::CopyTo { .. }
         | LogicalPlan::Begin
         | LogicalPlan::Commit
         | LogicalPlan::Rollback
@@ -5057,6 +5116,19 @@ pub(crate) fn plan_schema(
             Ok(out)
         }
     }
+}
+
+/// The default scope name of a file source without an alias: the file
+/// stem (`sales` for `data/sales.arrow`, like `.import`'s default table
+/// name), or the path itself when it has no stem — the scope name is only
+/// ever used for qualified column references, so a path-shaped fallback is
+/// harmless (it simply cannot be written as an identifier).
+fn file_source_name(path: &str) -> &str {
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
 }
 
 /// Bind one FROM/JOIN source: returns its scope entry + executable plan.
@@ -5174,6 +5246,44 @@ fn bind_source(
                     db: Some(lookup_db),
                     table: name.clone(),
                     at,
+                },
+            ))
+        }
+        FromSource::File { path, function } => {
+            if let Some(at) = at {
+                return Err(PinkDbError::Catalog(format!(
+                    "time travel is not available on the file source \"{path}\" \
+                     (AT ({at}) works on lake tables)"
+                )));
+            }
+            // The format comes from the registered file formats: by the
+            // `read_*` function's registered name, or by the path's
+            // extension. The file's schema is read from its metadata only.
+            let format = match function {
+                Some(f) => db.file_format_for_function(f).ok_or_else(|| {
+                    PinkDbError::Catalog(format!(
+                        "unknown table function \"{f}\": no registered file format \
+                         answers to it (registered formats: {})",
+                        db.file_format_names()
+                    ))
+                })?,
+                None => db.file_format_for_path(path)?,
+            };
+            let schema = format.schema(Path::new(path)).map_err(|e| {
+                PinkDbError::Catalog(format!("cannot read {path} as {}: {e}", format.name()))
+            })?;
+            let eff = alias
+                .clone()
+                .unwrap_or_else(|| file_source_name(path).to_string());
+            Ok((
+                ScopeTable {
+                    name: eff.to_ascii_lowercase(),
+                    columns: schema.clone(),
+                },
+                LogicalPlan::FileScan {
+                    format: format.name().to_string(),
+                    path: path.clone(),
+                    schema,
                 },
             ))
         }

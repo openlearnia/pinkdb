@@ -179,7 +179,8 @@ fn check_select_positions(sel: &Select) -> Result<()> {
 fn check_source_positions(source: &FromSource) -> Result<()> {
     match source {
         FromSource::Derived(query) => check_select_positions(query),
-        FromSource::Table { .. } => Ok(()),
+        // A file source takes one string literal; no placeholder can appear.
+        FromSource::Table { .. } | FromSource::File { .. } => Ok(()),
     }
 }
 
@@ -309,13 +310,13 @@ fn select_contains_parameter(sel: &Select) -> bool {
 fn from_contains_parameter(from: &FromClause) -> bool {
     let source = match &from.source {
         FromSource::Derived(query) => select_contains_parameter(query),
-        FromSource::Table { .. } => false,
+        FromSource::Table { .. } | FromSource::File { .. } => false,
     };
     source
         || from.joins.iter().any(|join| {
             let s = match &join.source {
                 FromSource::Derived(query) => select_contains_parameter(query),
-                FromSource::Table { .. } => false,
+                FromSource::Table { .. } | FromSource::File { .. } => false,
             };
             s || join.on.as_ref().is_some_and(expr_contains_parameter)
         })
@@ -900,6 +901,7 @@ peg::parser! {
         rule statement() -> Statement
             = create()
             / insert()
+            / copy_stmt()
             / update()
             / delete()
             / txn()
@@ -1310,6 +1312,33 @@ peg::parser! {
                   Statement::Delete { db: t.0, table: t.1, where_clause: where_ }
               }
 
+        /// `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71).
+        ///
+        /// `COPY`, `TO` and `FORMAT` are matched as words, not reserved
+        /// keywords, so they stay usable as names elsewhere (`TO` is already
+        /// used that way by `ALTER … RENAME … TO`). The parenthesized option
+        /// list accepts exactly the one option v1 defines — `FORMAT <name>`
+        /// (an identifier or keyword-shaped word like `arrow`), optionally
+        /// with `=`, DuckDB's spelling — and rejects anything else with a
+        /// parse error naming what is supported. `FORMAT` may be omitted: the
+        /// format is then inferred from the target path's extension at bind
+        /// time, DuckDB's rule.
+        rule copy_stmt() -> Statement
+            = word("copy") t:table_ref() word("to") p:string_lit() fmt:copy_format() {
+                  Statement::CopyTo { db: t.0, table: t.1, path: p, format: fmt }
+              }
+
+        rule copy_format() -> Option<String>
+            = lparen() word("format") eq()? f:copy_format_name() rparen() { Some(f) }
+            / { None }
+
+        /// A format name in the option list: a single identifier-shaped word
+        /// (`arrow`, `parquet` — `parquet` lexes as an identifier, and any
+        /// future keyword spelling is accepted too since this rule only
+        /// requires the word's shape).
+        rule copy_format_name() -> String
+            = s:ident_raw() ws() { s.to_ascii_lowercase() }
+
         rule drop() -> Statement
             = kw(Keyword::Drop) kw(Keyword::Database) ife:if_exists() name:ident() {
                   Statement::DropDatabase { name, if_exists: ife }
@@ -1459,7 +1488,9 @@ peg::parser! {
                   let (alias, at) = suffix;
                   if matches!(&source, FromSource::Derived(_)) && alias.is_none() {
                       Err("derived table needs an alias")
-                  } else if matches!(&source, FromSource::Derived(_)) && at.is_some() {
+                  } else if at.is_some()
+                      && matches!(&source, FromSource::Derived(_) | FromSource::File { .. })
+                  {
                       Err("AT is only valid after a table name")
                   } else {
                       Ok(FromClause { source, alias, at, joins })
@@ -1468,7 +1499,26 @@ peg::parser! {
 
         rule from_source() -> FromSource
             = lparen() q:select() rparen() { FromSource::Derived(Box::new(q)) }
+            / p:string_lit() { FromSource::File { path: p, function: None } }
+            / n:read_function() lparen() p:string_lit() rparen() {
+                  FromSource::File { path: p, function: Some(n) }
+              }
             / t:table_ref() { FromSource::Table { db: t.0, name: t.1 } }
+
+        /// The `read_*('path')` table-function source (wave 71): the word
+        /// must start with `read_` and be followed by `('literal')`, so a
+        /// plain table reference (which `table_ref()` below still parses)
+        /// can never be captured by this alternative. The name is kept
+        /// lowercased; whether any format answers to it is a bind-time
+        /// question (an unregistered name is a clean bind error).
+        rule read_function() -> String
+            = s:ident_raw() ws() {?
+                  if s.len() > 5 && s[..5].eq_ignore_ascii_case("read_") {
+                      Ok(s.to_ascii_lowercase())
+                  } else {
+                      Err("a read_* table-function name")
+                  }
+              }
 
         /// A from/join source's `[alias] [AT (...)]` suffix, in either legal
         /// order of appearance: `t AT (...)` (no alias) or `t [AS] alias

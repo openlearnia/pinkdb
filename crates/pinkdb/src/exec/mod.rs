@@ -1145,6 +1145,12 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     if let LogicalPlan::Use { name } = plan {
         return use_result(cx.db, name);
     }
+    // `COPY … TO …` (wave 71) is read-only for the store (only an external
+    // file is written) but produces DuckDB's `Count` result, not a row set —
+    // handle it before the row evaluator.
+    if let LogicalPlan::CopyTo { .. } = plan {
+        return execute_copy_to(cx.db, plan);
+    }
     let out = eval(cx, plan)?;
     let mut rows = Vec::new();
     for chunk in &out.chunks {
@@ -1167,6 +1173,79 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
         names: out.names,
         types: out.types,
         rows,
+    })
+}
+
+/// Execute `COPY <table> TO '<path>' [(FORMAT <name>)]` (wave 71): materialize
+/// the source table's already-stored columns (no expression evaluation) and
+/// hand them to the registered format's writer.
+///
+/// The format and the table were resolved at bind time; they are re-resolved
+/// here against the current catalog (a refresh between bind and execution
+/// must never write the wrong table), and the writer's schema check is the
+/// table's own schema. The result is DuckDB's `Count` shape: one row, one
+/// `BIGINT` column naming the rows written.
+fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
+    let LogicalPlan::CopyTo {
+        db: qdb,
+        table,
+        format,
+        path,
+    } = plan
+    else {
+        unreachable!("execute_copy_to needs a CopyTo node");
+    };
+    let target = resolve_db(db, qdb);
+    let format = db.file_format(format).ok_or_else(|| {
+        PinkDbError::Catalog(format!(
+            "no file format \"{format}\" is registered (registered formats: {})",
+            db.file_format_names()
+        ))
+    })?;
+    let t = db.table_in(&target, table)?;
+    format.write(std::path::Path::new(path), t)?;
+    let rows = i64::try_from(t.num_rows).unwrap_or(i64::MAX);
+    Ok(QueryResult::Selected {
+        names: vec!["Count".to_string()],
+        types: vec![DataType::Bigint],
+        rows: vec![vec![Value::Bigint(rows)]],
+    })
+}
+
+/// Evaluate one `FileScan` plan node (wave 71): read the registered file
+/// format's whole file, then scan it like any other table.
+///
+/// The plan carries the schema the binder read at planning time; the fresh
+/// read is validated against it, so a file replaced (or truncated) between
+/// planning and execution fails loudly instead of returning shifted columns.
+/// Every column is read (no projection pushdown into files yet).
+fn file_scan_output(
+    cx: &Cx,
+    format: &str,
+    path: &str,
+    schema: &[(String, DataType)],
+) -> Result<Output> {
+    let fmt = cx.db.file_format(format).ok_or_else(|| {
+        PinkDbError::Catalog(format!(
+            "no file format \"{format}\" is registered (registered formats: {})",
+            cx.db.file_format_names()
+        ))
+    })?;
+    let t = fmt.read(std::path::Path::new(path))?;
+    let actual = t.schema();
+    if actual != schema {
+        return Err(PinkDbError::Execution(format!(
+            "the file \"{path}\" changed between planning and execution \
+             (planned {} column(s), found {})",
+            schema.len(),
+            actual.len()
+        )));
+    }
+    let (names, types) = actual.into_iter().unzip();
+    Ok(Output {
+        chunks: scan_chunks(&t),
+        names,
+        types,
     })
 }
 
@@ -1524,6 +1603,14 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             "DDL/DML does not produce rows".to_string(),
         )),
         LogicalPlan::Scan { .. } => scan_output(cx, plan),
+        LogicalPlan::FileScan {
+            format,
+            path,
+            schema,
+        } => file_scan_output(cx, format, path, schema),
+        LogicalPlan::CopyTo { .. } => Err(PinkDbError::Execution(
+            "COPY does not produce rows".to_string(),
+        )),
         LogicalPlan::IndexScan {
             db,
             table,
@@ -4251,6 +4338,17 @@ fn explain_into(plan: &LogicalPlan, depth: usize, out: &mut Vec<String>) {
     let pad = "  ".repeat(depth);
     let mut children: Vec<&LogicalPlan> = Vec::new();
     let head = match plan {
+        LogicalPlan::FileScan { format, path, .. } => {
+            format!("FileScan {format} '{path}'")
+        }
+        LogicalPlan::CopyTo {
+            db,
+            table,
+            format,
+            path,
+        } => {
+            format!("CopyTo {} ({format}) -> '{path}'", qualify(db, table))
+        }
         LogicalPlan::CreateTable {
             db,
             name,

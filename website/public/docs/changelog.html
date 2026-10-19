@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-19">2026-10-19<a class="anchor" href="#2026-10-19" aria-label="Permalink: 2026-10-19">#</a></h2>
+<h3>Wave 71 — core <code>arrow</code> extension (Arrow IPC) ✅</h3>
+<ul>
+<li>New engine <strong>file-format extension surface</strong> (<code>pinkdb::filefmt</code>): arrow files work through <code>FROM 'x.arrow'</code>, <code>read_arrow</code>/<code>read_ipc</code>/<code>read_feather</code> and <code>COPY … (FORMAT arrow)</code>, with durable replay re-reading files and lean builds refusing everything with a precise error.</li>
+<li><code>arrow</code> is an <strong>opt-in CLI feature</strong> (+≈3.0 MiB; the default binary grows only 22 KB for the seam). Round-tripped against pyarrow in both directions; DuckDB has no Arrow support to diff against (documented). The Arrow C Data Interface is pinned as a follow-up. <code>.pink</code> remains the native format.</li>
+</ul>
 <h3>Wave 54 — core <code>math</code> extension ✅</h3>
 <ul>
 <li>Seventeen functions via the Rust SDK: <code>exp</code>/<code>ln</code>/<code>log</code>/<code>log2</code>/<code>log10</code>, the trigonometric family, <code>degrees</code>/<code>radians</code>/<code>pi</code>, and the first <strong>volatile</strong> function — <code>random()</code> refuses to run in any WAL-logged statement (replay could diverge), while reads work normally. <code>sqrt</code>/<code>pow</code>/<code>floor</code>/<code>ceil</code>/ <code>sign</code>/<code>greatest</code>/<code>least</code> remain core built-ins.</li>

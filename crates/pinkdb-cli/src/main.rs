@@ -50,9 +50,14 @@ const DISPLAY_CAP: usize = 10_000;
 /// Publish the linked extensions the CLI ships in the process-global
 /// registry — the host-bootstrap step `LOAD EXTENSION '<name>'` resolves
 /// against, on every target. With the default features those are
-/// `pinkdb-json`, `pinkdb-datetime` and `pinkdb-math`; a host that uses the
-/// library instead does the same explicitly (`pinkdb_json::ensure_registered()`,
-/// `pinkdb_datetime::ensure_registered()`, `pinkdb_math::ensure_registered()`).
+/// `pinkdb-json`, `pinkdb-datetime` and `pinkdb-math`; the opt-in `arrow`
+/// feature additionally registers the Arrow IPC **file format**
+/// process-wide, so every store created afterwards (including a durable
+/// reopen that replays a file-reading record) resolves `FROM 'x.arrow'`,
+/// `read_arrow` and `COPY … (FORMAT arrow)`. A host that uses the library
+/// instead does the same explicitly (`pinkdb_json::ensure_registered()`,
+/// `pinkdb_datetime::ensure_registered()`, `pinkdb_math::ensure_registered()`,
+/// `pinkdb_arrow::ensure_registered()`).
 fn register_builtin_extensions() {
     #[cfg(feature = "json")]
     if let Err(e) = pinkdb_json::ensure_registered() {
@@ -66,6 +71,11 @@ fn register_builtin_extensions() {
     if let Err(e) = pinkdb_math::ensure_registered() {
         eprintln!("warning: the math extension could not be registered: {e}");
     }
+    // The arrow extension is engine-adjacent, not a scalar extension: it
+    // registers a *file format* process-wide, before any store is created,
+    // so a durable `.open` can resolve file sources while it replays.
+    #[cfg(feature = "arrow")]
+    pinkdb_arrow::ensure_registered();
 }
 
 /// Load the CLI's built-in extensions into a store it just created or
@@ -226,6 +236,14 @@ fn print_help() {
             "MATH: the math functions (exp, log, sin, ..., random) are not built (rebuild with"
         );
         println!("      the `math` feature, or link `pinkdb-math` and register it).");
+    }
+    if cfg!(feature = "arrow") {
+        println!("ARROW: `FROM 'f.arrow'` / `read_arrow('f.arrow')` read an Arrow IPC file and");
+        println!("      `COPY t TO 'f.arrow' (FORMAT arrow)` writes one (`arrow` feature; the");
+        println!("      format is registered for every store this build opens).");
+    } else {
+        println!("ARROW: the arrow file format is not built (rebuild with the `arrow` feature, or");
+        println!("      link `pinkdb-arrow` and register the format on the store).");
     }
 }
 

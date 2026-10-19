@@ -1,0 +1,194 @@
+//! `pinkdb-arrow` — the core **arrow** extension (wave 71): Arrow IPC
+//! (Feather v2) file read/write over the arrow-rs crates.
+//!
+//! SQL surface (once a host registers [`ArrowFormat`] on a store):
+//!
+//! - `FROM '<file>.arrow'` — a replacement scan resolved by file extension
+//!   (`arrow`, `ipc`, `feather`, `arrows`);
+//! - `FROM read_arrow('<file>.arrow')` — the same read, spelled as a table
+//!   function (`read_ipc`/`read_feather` are aliases);
+//! - `COPY <table> TO '<file>.arrow' [(FORMAT arrow)]` — write one table as
+//!   an Arrow IPC **file** (Feather v2, the `ARROW1` magic); `FORMAT` may be
+//!   omitted when the target's extension resolves (DuckDB's rule).
+//!
+//! ### Why an engine-adjacent crate (the integration decision)
+//!
+//! The scalar extension ABI (waves 29A/49) registers scalar functions only —
+//! it has no way to express a replacement scan, a table function, or a COPY
+//! format. The engine therefore grew a second, minimal extension surface in
+//! wave 71 ([`pinkdb::filefmt::FileFormat`]): the *engine* owns the trait and
+//! the per-store registry, an engine-adjacent first-party crate implements it
+//! (this one — depending on `pinkdb`, never the other way around, exactly
+//! like `pink-lake` implements `AttachedLake`), and the host registers the
+//! implementation when it creates the store. The CLI wires it behind the
+//! opt-in `arrow` cargo feature, so the default binary stays lean — the same
+//! model as the `vortexlake` lake build.
+//!
+//! Alternatives considered and rejected:
+//!
+//! - **a scalar extension** (json/datetime/math style): cannot express table
+//!   sources or write statements — the AST/planner surfaces simply do not
+//!   exist behind the scalar ABI;
+//! - **reusing the attached-lake path** (`.lake attach`'s session-local
+//!   read-only catalog extension): it would have bent lake semantics around
+//!   plain files (session-scoped registration, lake-specific refusal rules in
+//!   durable stores, statistics descriptors, `.lake detach`) for no gain —
+//!   the file surfaces needed their own AST nodes and a COPY plan anyway, and
+//!   `FileFormat` is the smaller trait;
+//! - **a `pinkdb`-internal arrow dependency**: would put arrow-rs in the core
+//!   engine's dependency tree and violate the "default CLI stays lean"
+//!   requirement.
+//!
+//! ### Semantics pinned in this wave
+//!
+//! - **Format**: Arrow IPC **file** format (`ARROW1` magic + footer) — the
+//!   format DuckDB's arrow extension writes and reads. The IPC *stream*
+//!   format is detected by its magic and refused with a message naming the
+//!   difference (a documented follow-up, not a silent misread).
+//! - **Batches**: our writer emits one record batch per engine chunk
+//!   (≤ 2048 rows, DuckDB's vector size); a reader accepts any batch sizes
+//!   and re-chunks the rows into engine chunks.
+//! - **Reading is full-file**: a scan materializes the whole file in memory
+//!   (no projection pushdown, no streaming, no predicate pushdown yet) and a
+//!   file is decoded once per scan; a self-join on the same file decodes it
+//!   once per side.
+//! - **Writing is uncompressed** (pyarrow's and DuckDB's default); reading
+//!   accepts uncompressed, LZ4- and ZSTD-compressed IPC files.
+//! - **Types**: the physical mapping is in [`types`] — engine `INTEGER`
+//!   ⇄ `Int32`, `BIGINT` ⇄ `Int64`, DECIMAL ⇄ `Decimal128`, INTERVAL ⇄
+//!   `Interval(MonthDayNano)`, DATE ⇄ `Date32`, TIMESTAMP ⇄ naive
+//!   `Timestamp(Microsecond)`, … Everything without an exact engine
+//!   counterpart (BLOB, TIME, LIST, STRUCT, MAP, UNION, DICTIONARY,
+//!   `Decimal256`, `Utf8View`… see the table) is refused at *bind* time — a
+//!   clean error naming the column and type, never a silent coercion.
+//! - **C Data Interface**: not part of this wave; see the pinned follow-up in
+//!   this crate's README (`pinkdb-ffi` query-result export + Arrow-array scan
+//!   input, zero-copy where the layout allows).
+//!
+//! ### Durability
+//!
+//! File access is not session-local state: a WAL-logged statement that reads
+//! a file (`INSERT INTO t SELECT * FROM 'f.arrow'`) replays by re-reading
+//! that file (DuckDB's behavior — see [`pinkdb::filefmt`]). `COPY … TO` has
+//! no store effect and is never WAL-logged; like DuckDB, a `COPY` inside a
+//! transaction is not rolled back (the file is external).
+
+pub mod read;
+pub mod types;
+pub mod write;
+
+use std::path::Path;
+use std::sync::Arc;
+
+use pinkdb::filefmt::{FileFormat, FileSchema};
+use pinkdb::types::Result;
+use pinkdb::{DataTable, PinkDb};
+
+/// The registered format's name: `FORMAT arrow`.
+pub const EXTENSION_NAME: &str = "arrow";
+
+/// The file extensions `FROM 'x.<ext>'` resolves through this format.
+/// `arrows` (pyarrow's conventional *stream* suffix) is deliberately in the
+/// list: it resolves here and is then refused by the reader with the precise
+/// "this is an IPC stream" message instead of "no file format registered".
+pub const EXTENSIONS: &[&str] = &["arrow", "ipc", "feather", "arrows"];
+
+/// The `read_*` table functions this format answers to.
+pub const READ_FUNCTIONS: &[&str] = &["read_arrow", "read_ipc", "read_feather"];
+
+/// The Arrow IPC (Feather v2) file format, as the engine's
+/// [`FileFormat`] hook.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArrowFormat;
+
+impl ArrowFormat {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl FileFormat for ArrowFormat {
+    fn name(&self) -> &str {
+        EXTENSION_NAME
+    }
+
+    fn extensions(&self) -> &[&str] {
+        EXTENSIONS
+    }
+
+    fn read_functions(&self) -> &[&str] {
+        READ_FUNCTIONS
+    }
+
+    fn schema(&self, path: &Path) -> Result<FileSchema> {
+        read::schema(path)
+    }
+
+    fn read(&self, path: &Path) -> Result<DataTable> {
+        read::read(path)
+    }
+
+    fn write(&self, path: &Path, table: &DataTable) -> Result<()> {
+        write::write(path, table)
+    }
+}
+
+/// Register the Arrow IPC format on one store (embedder path). Idempotent:
+/// registering again replaces the previous instance.
+pub fn register(db: &mut PinkDb) {
+    db.register_file_format(Arc::new(ArrowFormat));
+}
+
+/// Register the Arrow IPC format **process-wide**, for every store created
+/// afterwards — the host-bootstrap step a durable store needs: recovery
+/// replays inside `open_durable`, before the caller holds the store, so a
+/// WAL record that reads a file (`INSERT … SELECT * FROM 'f.arrow'`) can only
+/// resolve if the format was registered *before* the store was constructed.
+/// The CLI (built with the `arrow` feature) calls this once at startup; an
+/// embedder that opens stores before calling it must use
+/// [`register`] per store instead. Idempotent.
+pub fn ensure_registered() {
+    pinkdb::filefmt::register_global_file_format(Arc::new(ArrowFormat));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registration_exposes_name_extension_and_reader() {
+        let mut db = PinkDb::new();
+        assert!(db.file_format("arrow").is_none());
+        assert!(db.file_format_names().contains("none"));
+        register(&mut db);
+        let f = db.file_format("ARROW").expect("case-insensitive lookup");
+        assert_eq!(f.name(), "arrow");
+        assert_eq!(
+            db.file_format_for_extension("feather").map(|f| f.name()),
+            Some("arrow")
+        );
+        assert_eq!(
+            db.file_format_for_function("read_arrow").map(|f| f.name()),
+            Some("arrow")
+        );
+        // Re-registration replaces instead of duplicating.
+        register(&mut db);
+        assert_eq!(db.file_format_names(), "arrow");
+    }
+
+    /// The engine's path resolution: known extension → format, unknown →
+    /// clean error naming the registered formats.
+    #[test]
+    fn path_resolution_is_extension_driven() {
+        let mut db = PinkDb::new();
+        register(&mut db);
+        assert!(db.file_format_for_path("x.arrow").is_ok());
+        assert!(db.file_format_for_path("x.FEATHER").is_ok());
+        let err = db
+            .file_format_for_path("x.parquet")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no file format is registered"), "{err}");
+        assert!(err.contains("arrow"), "{err}");
+    }
+}
