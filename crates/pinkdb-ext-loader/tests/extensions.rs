@@ -368,11 +368,25 @@ fn execution_from_rayon_workers_is_correct() {
     // host that must be more than one OS thread; on a single-core host a
     // single worker is legitimate. (The deterministic proof of concurrent
     // callbacks is `concurrent_callbacks_are_thread_safe` below.)
-    let threads = common::symbol_i32(&library, "pinkdb_test_distinct_threads");
+    let mut threads = common::symbol_i32(&library, "pinkdb_test_distinct_threads");
     assert!(threads >= 1, "no callback ran?");
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
+    // Rayon wakes its workers lazily: on a throttled CI VM a short first pass
+    // can finish on the calling thread before stealing starts (seen on a
+    // macOS runner). Re-run the already-asserted query until callbacks have
+    // been seen on more than one worker; the fixture accumulates the count.
+    for _ in 0..2 {
+        if threads > 1 || workers <= 1 {
+            break;
+        }
+        let _ = rows(
+            &mut db,
+            "SELECT COUNT(*), SUM(ext_double_it(a)) FROM big WHERE ext_probe(a) > 4000;",
+        );
+        threads = common::symbol_i32(&library, "pinkdb_test_distinct_threads");
+    }
     if workers > 1 {
         assert!(
             threads > 1,
