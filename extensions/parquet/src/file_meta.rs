@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use parquet::basic::Type as PhysicalType;
+use parquet::file::metadata::ParquetMetaData;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::file::statistics::Statistics;
 use parquet::schema::types::Type;
@@ -99,7 +100,7 @@ impl FileMeta {
     }
 }
 
-/// Read one file's metadata (no data pages).
+/// Read one local file's metadata (no data pages).
 pub fn read_file_meta(path: &str) -> Result<FileMeta> {
     let file = std::fs::File::open(path).map_err(|e| {
         PinkDbError::Io(std::io::Error::new(
@@ -110,7 +111,28 @@ pub fn read_file_meta(path: &str) -> Result<FileMeta> {
     let file_size = file.metadata().map(|m| m.len()).map_err(PinkDbError::Io)?;
     let reader = SerializedFileReader::new(file)
         .map_err(|e| PinkDbError::Execution(format!("cannot read parquet file \"{path}\": {e}")))?;
-    let metadata = reader.metadata();
+    let footer_size = read_footer_size(path, file_size);
+    build_meta(path, reader.metadata(), file_size, footer_size)
+}
+
+/// Read one remote object's metadata through its ranged [`ChunkReader`]
+/// (footer + thrift metadata only; no data pages).
+#[cfg(feature = "remote")]
+pub fn read_file_meta_remote(path: &str, spec: &crate::remote::RemoteSpec) -> Result<FileMeta> {
+    let reader = SerializedFileReader::new(crate::remote::RemoteFile::from_spec(spec))
+        .map_err(|e| PinkDbError::Execution(format!("cannot read parquet file \"{path}\": {e}")))?;
+    let footer_size = crate::remote::footer_size(spec)?;
+    build_meta(path, reader.metadata(), spec.len, footer_size)
+}
+
+/// Project one file's parsed metadata into [`FileMeta`] (shared by the local
+/// and remote readers).
+fn build_meta(
+    path: &str,
+    metadata: &ParquetMetaData,
+    file_size: u64,
+    footer_size: u64,
+) -> Result<FileMeta> {
     let file_metadata = metadata.file_metadata();
     let schema_root: Arc<Type> = file_metadata.schema_descr().root_schema_ptr();
     let columns = map_columns(schema_root.as_ref(), file_metadata.schema_descr())?;
@@ -151,9 +173,8 @@ pub fn read_file_meta(path: &str) -> Result<FileMeta> {
         });
     }
 
-    // The footer size: the thrift metadata length recorded in the trailer
-    // (α's `footer_size` — the trailer's 8 bytes are not included).
-    let footer_size = read_footer_size(path, file_size);
+    // The footer size is passed in (read from the local trailer or the
+    // remote ranged trailer; α's `footer_size` excludes the 8-byte trailer).
     let kv = file_metadata
         .key_value_metadata()
         .map(|kvs| {

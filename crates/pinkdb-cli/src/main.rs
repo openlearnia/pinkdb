@@ -79,6 +79,10 @@ fn register_builtin_extensions() {
     pinkdb_arrow::ensure_registered();
     #[cfg(feature = "parquet")]
     pinkdb_parquet::ensure_registered();
+    // The httpfs transport + `read_csv` / `.import <url>` source, registered
+    // process-wide for the same replay reason.
+    #[cfg(feature = "httpfs")]
+    pinkdb_httpfs::ensure_registered();
 }
 
 /// Load the CLI's built-in extensions into a store it just created or
@@ -164,8 +168,13 @@ fn print_help() {
     println!("  .databases             list databases (the current one is marked)");
     println!("  .tables                list tables and views of the current database");
     println!("  .schema <table|view>   show a schema (accepts db.table; quoting honored)");
-    println!("  .import <file.csv> [table]  import CSV (table defaults to file stem;");
-    println!("                         db.table targets another database)");
+    if cfg!(feature = "httpfs") {
+        println!("  .import <file.csv|https://…|s3://…> [table]");
+        println!("                         import CSV from a local file or a remote object");
+    } else {
+        println!("  .import <file.csv> [table]  import CSV (table defaults to file stem;");
+        println!("                         db.table targets another database)");
+    }
     if cfg!(feature = "parquet") {
         println!("  .parquet [stats|reset] parquet reader counters (pushdown evidence)");
     }
@@ -643,14 +652,14 @@ fn quote_ident(s: &str) -> String {
 
 fn cmd_import(db: &mut PinkDb, arg: &str) {
     let Some((file, rest)) = take_token(arg) else {
-        println!("Usage: .import <file.csv> [table]");
+        println!("Usage: .import <file.csv|https://…|s3://…> [table]");
         return;
     };
     let file = unquote(&file);
     let table = match take_token(rest) {
         Some((t, tail)) if tail.trim().is_empty() => Some(t),
         Some(_) => {
-            println!("Usage: .import <file.csv> [table]");
+            println!("Usage: .import <file.csv|https://…|s3://…> [table]");
             return;
         }
         None => None,

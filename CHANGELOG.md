@@ -10,6 +10,16 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 75 — core `httpfs` extension (remote files for every format) ✅
+- New shared transport `pinkdb-httpfs`: the lake's SigV4 S3 client extracted
+  behavior-identically, plus https GET and **byte-range reads**, with
+  `Fetcher` as the contract.
+- Every registered format reads remote paths: CSV (whole-object), **Parquet
+  via a ranged `ChunkReader`** (footer/row-group pages — no whole-file
+  downloads when the size is known), Arrow (whole-object, documented).
+  Claims are by extension regardless of scheme; `--features
+  parquet,arrow,httpfs` composes, and default binaries stay transport-free.
+
 ### Wave 77 — SQL macros ✅
 - `CREATE [OR REPLACE] MACRO … AS expr` and `AS TABLE SELECT …`, with
   `DROP MACRO [IF EXISTS]`, parameter defaults and named arguments, expanded

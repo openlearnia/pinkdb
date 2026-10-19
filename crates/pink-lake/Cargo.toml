@@ -17,8 +17,10 @@ default = []
 # Vortex dependency — the `pinklake` CLI builds.
 vortexlake = ["dep:vortex", "dep:rayon"]
 # Opt-in object storage: `s3://bucket/prefix` lake locations over the S3 REST
-# API (AWS S3, Cloudflare R2, MinIO, …) with a blocking SigV4 client.
-s3 = ["dep:ureq", "dep:hmac", "dep:sha2"]
+# API (AWS S3, Cloudflare R2, MinIO, …). Since wave 75 the SigV4 client lives
+# in the shared `pinkdb-httpfs` crate (also the engine's remote-file
+# transport); this feature forwards to its `s3` half.
+s3 = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3"]
 # Opt-in at-rest encryption (`PNKLAKE1` containers: catalog, snapshots, commit
 # deltas, data files, delete files). Audited RustCrypto crates only (the same
 # AES-256-GCM + Argon2id the engine's `pinkdb/encryption` uses). Without the
@@ -32,11 +34,9 @@ pinkdb = { path = "../pinkdb" }
 # Metadata only: the catalog/snapshot JSON.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# S3 storage (`s3` feature): blocking HTTP over rustls, HMAC-SHA256 for AWS
-# SigV4. No aws-sdk, no async runtime.
-ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
-hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
+# S3 storage (`s3` feature): the shared blocking HTTP/SigV4 client (rustls,
+# no aws-sdk, no async runtime).
+pinkdb-httpfs = { path = "../pinkdb-httpfs", optional = true }
 # The `vortexlake` data format (v2/v3 lakes): one Vortex file per table,
 # written through the `vortex` facade. `default-features = false,
 # features = ["files"]` drops the wasm-bindgen/tensor/parquet-variant extras

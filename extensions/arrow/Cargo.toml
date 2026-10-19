@@ -16,6 +16,8 @@ license = "MIT"
 # build shares those compile units instead of duplicating them.
 [dependencies]
 pinkdb = { path = "../../crates/pinkdb" }
+# Remote files (`remote` feature): the shared https/SigV4 transport.
+pinkdb-httpfs = { path = "../../crates/pinkdb-httpfs", optional = true }
 arrow-array = { version = "59", default-features = false }
 arrow-buffer = { version = "59", default-features = false }
 arrow-schema = { version = "59", default-features = false }
@@ -25,3 +27,11 @@ arrow-schema = { version = "59", default-features = false }
 # features of arrow-ipc and are enabled here. Writing is always uncompressed
 # (DuckDB's and pyarrow's default).
 arrow-ipc = { version = "59", default-features = false, features = ["lz4", "zstd"] }
+
+[features]
+default = []
+# Remote `https://`/`s3://` IPC files over the shared `pinkdb-httpfs`
+# transport. IPC has no ranged layout, so a remote read materializes the whole
+# object (documented); the CLI's `httpfs` feature enables this together with
+# `arrow`. Off by default: no transport in lean builds.
+remote = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3"]

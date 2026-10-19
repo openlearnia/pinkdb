@@ -156,7 +156,7 @@ jobs:
       - name: cargo build --release -p pinkdb-cli (duckdiff artifact)
         # The differential battery includes the opt-in file-format extension
         # probes (both file-format extensions: Arrow IPC and Parquet).
-        run: cargo build --release -p pinkdb-cli --features arrow,parquet
+        run: cargo build --release -p pinkdb-cli --features arrow,parquet,httpfs
 
       - name: upload the release CLI for the duckdiff job
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

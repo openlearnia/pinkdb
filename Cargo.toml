@@ -28,6 +28,9 @@ members = [
     # Core parquet extension (wave 70): read-side Parquet, the same
     # engine-adjacent shape, wired behind the CLI's opt-in `parquet` feature.
     "extensions/parquet",
+    # Shared remote-file transport + `read_csv` table source (wave 75):
+    # https GET/range and the SigV4 S3 client pink-lake's `s3` feature uses.
+    "crates/pinkdb-httpfs",
 ]
 resolver = "2"
 

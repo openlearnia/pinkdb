@@ -8,6 +8,8 @@
 // operations the S3 storage backend needs:
 //
 // - `GET` / `HEAD` / `PUT` / `DELETE` one object (with ETags),
+// - `GET` honoring `Range: bytes=start-end|start-` (206 + `Content-Range`;
+//   416 for an unsatisfiable range),
 // - `PUT` with `If-None-Match: *` (412 when the key exists) and `If-Match`
 //   (412 on a changed ETag; 404 on a vanished key, like AWS),
 // - `ListObjectsV2` (`list-type=2`, `prefix`, `delimiter=/`, paging with
@@ -118,6 +120,9 @@ struct Gate {
 struct State {
     store: Mutex<Store>,
     requests: Mutex<Vec<String>>,
+    /// The `Range` header of every request (`""` when absent), parallel to
+    /// `requests`.
+    ranges: Mutex<Vec<String>>,
     authorizations: Mutex<Vec<String>>,
     /// The access key id the mock accepts.
     access_key_id: Mutex<String>,
@@ -173,6 +178,7 @@ impl MockS3 {
         let state = Arc::new(State {
             store: Mutex::new(Store::default()),
             requests: Mutex::new(Vec::new()),
+            ranges: Mutex::new(Vec::new()),
             authorizations: Mutex::new(Vec::new()),
             access_key_id: Mutex::new("MOCKACCESSKEY".to_string()),
             secret_access_key: Mutex::new("mock-secret".to_string()),
@@ -304,6 +310,12 @@ impl MockS3 {
     /// Every request as `METHOD /path[?query]`, in order.
     pub fn requests(&self) -> Vec<String> {
         self.state.requests.lock().unwrap().clone()
+    }
+
+    /// The `Range` header of every request (`""` when absent), in request
+    /// order (parallel to [`MockS3::requests`]).
+    pub fn ranges(&self) -> Vec<String> {
+        self.state.ranges.lock().unwrap().clone()
     }
 
     /// Every `Authorization` header seen, in order.
@@ -572,6 +584,11 @@ fn handle(mut stream: TcpStream, state: Arc<State>) {
         .lock()
         .unwrap()
         .push(format!("{method} {target}"));
+    state
+        .ranges
+        .lock()
+        .unwrap()
+        .push(header(&headers, "range").unwrap_or_default().to_string());
     if let Some(auth) = header(&headers, "authorization") {
         state.authorizations.lock().unwrap().push(auth.to_string());
     }
@@ -601,6 +618,9 @@ fn handle(mut stream: TcpStream, state: Arc<State>) {
     }
     if let Some(modified) = &response.last_modified {
         write!(out, "Last-Modified: {modified}\r\n").unwrap();
+    }
+    if let Some(content_range) = &response.content_range {
+        write!(out, "Content-Range: {content_range}\r\n").unwrap();
     }
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&response.body);
@@ -652,6 +672,8 @@ struct Response {
     content_length: Option<u64>,
     /// The wire `Last-Modified` (HTTP-date) for object responses.
     last_modified: Option<String>,
+    /// The wire `Content-Range` of a 206 answer.
+    content_range: Option<String>,
 }
 
 impl Response {
@@ -662,7 +684,14 @@ impl Response {
             body,
             content_length: None,
             last_modified: None,
+            content_range: None,
         }
+    }
+
+    /// A 206 answer's `Content-Range`.
+    fn range(mut self, start: u64, end: u64, total: u64) -> Self {
+        self.content_range = Some(format!("bytes {start}-{}/{total}", end.saturating_sub(1)));
+        self
     }
 
     /// The object facts S3 exposes: `Content-Length` always, `Last-Modified`
@@ -685,6 +714,26 @@ impl Response {
             ),
         )
     }
+}
+
+/// Parse `Range: bytes=start-end` / `bytes=start-` against an object of
+/// `len` bytes; `None` when the range is malformed or starts past the end.
+fn parse_byte_range(value: &str, len: u64) -> Option<(u64, u64)> {
+    let spec = value.trim().strip_prefix("bytes=")?;
+    let (start, end) = spec.split_once('-')?;
+    let start: u64 = start.parse().ok()?;
+    if start >= len {
+        return None;
+    }
+    let end = if end.is_empty() {
+        len
+    } else {
+        end.parse::<u64>().ok()?.saturating_add(1).min(len)
+    };
+    if end <= start {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// `Sun, 06 Nov 1994 08:49:37 GMT` for Unix seconds (the one date form this
@@ -792,6 +841,25 @@ fn respond(
         "GET" => match state.store.lock().unwrap().objects.get(&key).cloned() {
             Some(object) => {
                 let len = object.bytes.len() as u64;
+                if let Some(spec) = header(headers, "range") {
+                    return match parse_byte_range(spec, len) {
+                        Some((start, end)) => {
+                            let bytes = object.bytes[start as usize..end as usize].to_vec();
+                            Response::new(206, Some(object.etag), bytes)
+                                .object_meta(end - start, object.modified_secs)
+                                .range(start, end, len)
+                        }
+                        None => {
+                            let mut response = Response::error(
+                                416,
+                                "InvalidRange",
+                                "The requested range is not satisfiable",
+                            );
+                            response.content_range = Some(format!("bytes */{len}"));
+                            response
+                        }
+                    };
+                }
                 Response::new(200, Some(object.etag), object.bytes)
                     .object_meta(len, object.modified_secs)
             }

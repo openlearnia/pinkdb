@@ -27,6 +27,7 @@ use crate::file_meta::{FileMeta, read_file_meta};
 use crate::glob;
 use crate::hive::{HiveColumn, partition_pairs, value_of};
 use crate::parse::parse_bool;
+use crate::remote;
 
 /// The parsed call: `read_parquet`/`parquet_scan` or a metadata function.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,7 +70,11 @@ impl Default for Options {
 /// fine as long as the last component carries a parquet extension.
 fn claims_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    let last = lower.rsplit('/').next().unwrap_or(&lower);
+    // Extension-based regardless of scheme: a remote `x.parquet?token=…`
+    // strips its query/fragment first (the transport still sees the full
+    // URL). `http://` is claimed too; the transport refuses it by default.
+    let path_part = remote::path_only(&lower);
+    let last = path_part.rsplit('/').next().unwrap_or(path_part);
     match last.rsplit_once('.').map(|(_, ext)| ext) {
         Some("parquet" | "parq" | "pq") => true,
         Some(_) => false,
@@ -218,7 +223,7 @@ fn flag(function: &str, name: &str, value: &Value) -> Result<bool> {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutKind {
     /// The file's column at this leaf index (per-file mapping decided by
-    /// [`FileResolved::out_to_file`]).
+    /// `FileResolved::out_to_file`).
     FileColumn,
     /// `file_row_number`: 0-based row index within the file.
     RowNumber,
@@ -238,6 +243,10 @@ pub struct FileResolved {
     /// Per hive column (aligned with [`Resolved::hive`]): this file's value,
     /// `None` when the path has no such key.
     pub hive: Vec<Option<String>>,
+    /// The transport handle for a remote object (reused by the scan); `None`
+    /// for local files.
+    #[cfg(feature = "remote")]
+    pub(crate) remote: Option<remote::RemoteSpec>,
 }
 
 /// A resolved `read_parquet` call: the files, the output schema and where
@@ -262,30 +271,48 @@ impl Resolved {
 /// Resolve a scan call: expand the path, read every file's footer, and build
 /// the union schema.
 pub fn resolve(path: &str, options: &Options) -> Result<Resolved> {
-    let paths = glob::expand(path).map_err(|e| {
-        PinkDbError::Io(std::io::Error::other(format!(
-            "cannot expand the parquet path \"{path}\": {e}"
-        )))
-    })?;
-    if paths.is_empty() {
-        if options.allow_empty {
-            // α: an empty result. pinkdb's zero-column output shape is
-            // representable (names/types empty, no chunks).
-            return Ok(Resolved {
-                files: Vec::new(),
-                schema: Vec::new(),
-                kind: Vec::new(),
-                hive: Vec::new(),
-                options: options.clone(),
-            });
+    let mut metas = Vec::new();
+    #[cfg(feature = "remote")]
+    let mut remote_specs: Vec<Option<remote::RemoteSpec>> = Vec::new();
+    if remote::is_remote(path) {
+        #[cfg(feature = "remote")]
+        {
+            let (meta, spec) = remote::resolve_file(path)?;
+            metas.push(meta);
+            remote_specs.push(Some(spec));
         }
-        return Err(PinkDbError::Io(std::io::Error::other(format!(
-            "No files found that match the pattern \"{path}\""
-        ))));
-    }
-    let mut metas = Vec::with_capacity(paths.len());
-    for path in &paths {
-        metas.push(read_file_meta(path)?);
+        #[cfg(not(feature = "remote"))]
+        {
+            return Err(remote::missing_feature(path));
+        }
+    } else {
+        let paths = glob::expand(path).map_err(|e| {
+            PinkDbError::Io(std::io::Error::other(format!(
+                "cannot expand the parquet path \"{path}\": {e}"
+            )))
+        })?;
+        if paths.is_empty() {
+            if options.allow_empty {
+                // α: an empty result. pinkdb's zero-column output shape is
+                // representable (names/types empty, no chunks).
+                return Ok(Resolved {
+                    files: Vec::new(),
+                    schema: Vec::new(),
+                    kind: Vec::new(),
+                    hive: Vec::new(),
+                    options: options.clone(),
+                });
+            }
+            return Err(PinkDbError::Io(std::io::Error::other(format!(
+                "No files found that match the pattern \"{path}\""
+            ))));
+        }
+        metas.reserve(paths.len());
+        for file in &paths {
+            metas.push(read_file_meta(file)?);
+            #[cfg(feature = "remote")]
+            remote_specs.push(None);
+        }
     }
 
     // Hive columns: the union of the keys across files, alphabetical.
@@ -476,6 +503,8 @@ pub fn resolve(path: &str, options: &Options) -> Result<Resolved> {
                 meta,
                 out_to_file,
                 hive: hive_values,
+                #[cfg(feature = "remote")]
+                remote: remote_specs[i].take(),
             }
         })
         .collect();

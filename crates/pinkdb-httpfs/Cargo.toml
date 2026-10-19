@@ -1,0 +1,25 @@
+[package]
+name = "pinkdb-httpfs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb remote-file transport: HTTPS GET/range reads and the SigV4 S3 object client shared with pink-lake, plus read_csv('url')"
+license = "MIT"
+
+[features]
+default = []
+# SigV4 signing for `s3://` objects (`hmac` + `sha2`). Plain `https://` GET
+# needs neither; pink-lake's `s3` feature enables this one.
+s3 = ["dep:hmac", "dep:sha2"]
+
+[dependencies]
+# The engine: the `read_csv` table source implements `pinkdb::TableSource`
+# (the same engine-adjacent direction as pinkdb-parquet/pinkdb-arrow) and
+# reuses the engine's CSV parser.
+pinkdb = { path = "../pinkdb" }
+# Blocking HTTP over rustls. No async runtime, no aws-sdk. One connection
+# pool per client.
+ureq = { version = "3.4", default-features = false, features = ["rustls"] }
+# SigV4 (`s3` feature): HMAC-SHA256 only.
+hmac = { version = "0.12", optional = true }
+sha2 = { version = "0.10", optional = true }

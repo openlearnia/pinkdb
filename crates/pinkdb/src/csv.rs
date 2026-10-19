@@ -15,12 +15,13 @@
 //! slower. See [`load_bytes`].
 
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rayon::prelude::*;
 
 use crate::storage::PinkDb;
 use crate::types::{DataType, PinkDbError, Result, Value, parse_date, parse_timestamp};
-use crate::vector::{CHUNK_SIZE, Vector};
+use crate::vector::{CHUNK_SIZE, DataChunk, Vector};
 
 /// Rows inspected for head-sample inference (DuckDB's documented default).
 const INFER_SAMPLE_ROWS: usize = 20_480;
@@ -140,6 +141,33 @@ pub fn infer_schema(headers: &[String], records: &[Vec<String>]) -> Vec<DataType
         .collect()
 }
 
+/// The exact whole-file schema of CSV bytes: header names + the inferred type
+/// of every column over **all** non-empty cells.
+///
+/// This is the schema `.import` ends up with on the exact-inference path, and
+/// it is what the wave-75 `read_csv` table source binds (so `read_csv` and
+/// `.import` of the same bytes agree by construction). The fast `.import`
+/// head-sample path may infer the same schema in one pass; whenever the
+/// sample cannot prove the final schema it retries through this exact rule.
+pub fn infer_csv_schema(data: &[u8]) -> Result<Vec<(String, DataType)>> {
+    let mut reader = open_reader(data);
+    let headers = read_headers(&mut reader)?;
+    let mut states = vec![InferState::new(); headers.len()];
+    let mut rec = csv::ByteRecord::new();
+    while reader
+        .read_byte_record(&mut rec)
+        .map_err(PinkDbError::Csv)?
+    {
+        for (i, st) in states.iter_mut().enumerate() {
+            st.feed(field_str(&rec, i)?);
+        }
+    }
+    Ok(headers
+        .into_iter()
+        .zip(states.iter().map(InferState::dtype))
+        .collect())
+}
+
 /// `str::trim` with a fast path: most CSV cells carry no surrounding
 /// whitespace, so the Unicode-aware scan is skipped unless a boundary byte
 /// could be whitespace (ASCII whitespace or non-ASCII).
@@ -211,13 +239,95 @@ fn push_field(col: &mut Vector, field: &str, dtype: DataType) -> Result<()> {
     }
 }
 
-/// Default table name = file stem (e.g. `sales.csv` → `sales`).
+/// Default table name = file stem (e.g. `sales.csv` → `sales`; a URL's
+/// query/fragment is ignored, so `https://h/x.csv?token=…` → `x`).
 fn default_table_name(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    let path = if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("s3://")
+    {
+        path.split(['?', '#']).next().unwrap_or(path)
+    } else {
+        path
+    };
     Path::new(path)
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("imported")
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// URL imports (wave 75): a host-installed whole-object fetcher.
+//
+// The engine cannot depend on the transport crate (`pinkdb-httpfs` depends on
+// the engine for its `read_csv` table source), so `.import https://…` and
+// `import_csv(url)` reach the transport through this process-global hook. The
+// CLI's `httpfs` feature installs `pinkdb_httpfs::UrlFetcher` at startup; a
+// build without it refuses a URL with a clear feature error, never treating
+// the URL as a local path.
+
+/// A host-installed reader for URL imports: `.import https://…/x.csv`,
+/// `.import s3://bucket/x.csv`, and [`import_csv`].
+///
+/// The hook is process-level like extensions and table sources: not
+/// persisted, gone after a reopen, and it must be registered before a durable
+/// import is replayed. `fetch` returns already-human-readable errors (the
+/// engine wraps them in [`PinkDbError::Execution`]).
+pub trait UrlFetcher: std::fmt::Debug + Send + Sync {
+    /// Whether this fetcher serves `url` (normally a scheme match).
+    fn supports(&self, url: &str) -> bool;
+
+    /// The whole object's bytes.
+    fn fetch(&self, url: &str) -> std::result::Result<Vec<u8>, String>;
+}
+
+/// Register a URL fetcher process-wide (idempotent by identity: the newest
+/// registration is consulted first; multiple fetchers may coexist by scheme).
+pub fn register_global_url_fetcher(fetcher: Arc<dyn UrlFetcher>) {
+    let mut fetchers = global_url_fetchers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    fetchers.insert(0, fetcher);
+}
+
+fn global_url_fetchers() -> &'static Mutex<Vec<Arc<dyn UrlFetcher>>> {
+    static GLOBAL: OnceLock<Mutex<Vec<Arc<dyn UrlFetcher>>>> = OnceLock::new();
+    GLOBAL.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Whether `path` is an import URL (any `scheme://`).
+fn is_import_url(path: &str) -> bool {
+    let Some((scheme, _rest)) = path.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+fn read_import_bytes(path: &str) -> Result<Vec<u8>> {
+    if is_import_url(path) {
+        let fetcher = global_url_fetchers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|f| f.supports(path))
+            .cloned();
+        let Some(fetcher) = fetcher else {
+            return Err(PinkDbError::Execution(format!(
+                "cannot import \"{path}\": no URL fetcher is registered in this build; \
+                 build with the `httpfs` feature (or register one with \
+                 `pinkdb::csv::register_global_url_fetcher`)"
+            )));
+        };
+        return fetcher
+            .fetch(path)
+            .map_err(|e| PinkDbError::Execution(format!("cannot import \"{path}\": {e}")));
+    }
+    Ok(std::fs::read(path)?)
 }
 
 fn open_reader(data: &[u8]) -> csv::Reader<&[u8]> {
@@ -258,18 +368,16 @@ fn new_chunk(types: &[DataType]) -> Vec<Vector> {
         .collect()
 }
 
-/// Parse all CSV rows into `types`-shaped vectors, appending them to `table`
-/// in [`CHUNK_SIZE`]-row batches. `table` must already exist.
-fn parse_rows(
-    db: &mut PinkDb,
-    db_name: &str,
-    table: &str,
+/// Read every CSV row into `types`-shaped chunks, emitting each
+/// [`CHUNK_SIZE`]-row batch. Shared by the importer (which appends to a
+/// table) and the wave-75 `read_csv` source (which returns the chunks).
+fn read_chunks(
     data: &[u8],
     types: &[DataType],
+    mut emit: impl FnMut(Vec<Vector>) -> Result<()>,
 ) -> Result<usize> {
     let mut reader = open_reader(data);
     let _ = read_headers(&mut reader)?;
-    let tbl = db.table_mut_in(db_name, table)?;
     let mut chunk = new_chunk(types);
     let mut in_chunk = 0usize;
     let mut count = 0usize;
@@ -291,14 +399,43 @@ fn parse_rows(
         count += 1;
         in_chunk += 1;
         if in_chunk == CHUNK_SIZE {
-            tbl.append_chunk(std::mem::replace(&mut chunk, new_chunk(types)))?;
+            emit(std::mem::replace(&mut chunk, new_chunk(types)))?;
             in_chunk = 0;
         }
     }
     if in_chunk > 0 {
-        tbl.append_chunk(chunk)?;
+        emit(chunk)?;
     }
     Ok(count)
+}
+
+/// Parse all CSV rows into `types`-shaped vectors, appending them to `table`
+/// in [`CHUNK_SIZE`]-row batches. `table` must already exist.
+fn parse_rows(
+    db: &mut PinkDb,
+    db_name: &str,
+    table: &str,
+    data: &[u8],
+    types: &[DataType],
+) -> Result<usize> {
+    let tbl = db.table_mut_in(db_name, table)?;
+    read_chunks(data, types, |chunk| tbl.append_chunk(chunk))
+}
+
+/// Parse CSV bytes into engine chunks of `types` (the schema
+/// [`infer_csv_schema`] returned), one chunk per [`CHUNK_SIZE`] rows.
+///
+/// The dialect and the per-field rules are exactly the importer's
+/// ([`read_chunks`]): comma-separated, `"` quoting with `""` escapes, one
+/// header row, UTF-8, empty cell → NULL. This is the parser the wave-75
+/// `read_csv` table source reuses.
+pub fn parse_csv_chunks(data: &[u8], types: &[DataType]) -> Result<Vec<DataChunk>> {
+    let mut chunks = Vec::new();
+    read_chunks(data, types, |chunk| {
+        chunks.push(DataChunk::new(chunk)?);
+        Ok(())
+    })?;
+    Ok(chunks)
 }
 
 /// Failure inside one fast-path batch.
@@ -524,23 +661,7 @@ fn load_sampled(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Res
 /// Exact two-pass path: infer over every cell, then parse. Same result as the
 /// fast path; used when the sample can't be trusted.
 fn load_full(db: &mut PinkDb, db_name: &str, table: &str, data: &[u8]) -> Result<usize> {
-    // Pass 1: headers + inference (record buffer reused across rows).
-    let mut reader = open_reader(data);
-    let headers = read_headers(&mut reader)?;
-    let mut states = vec![InferState::new(); headers.len()];
-    let mut rec = csv::ByteRecord::new();
-    while reader
-        .read_byte_record(&mut rec)
-        .map_err(PinkDbError::Csv)?
-    {
-        for (i, st) in states.iter_mut().enumerate() {
-            st.feed(field_str(&rec, i)?);
-        }
-    }
-    let schema: Vec<(String, DataType)> = headers
-        .into_iter()
-        .zip(states.iter().map(|st| st.dtype()))
-        .collect();
+    let schema = infer_csv_schema(data)?;
     let types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
     db.create_table_in(db_name, table, schema)?;
     // Pass 2: parse + append (record buffer reused).
@@ -693,7 +814,7 @@ fn resolve_import_target(db: &PinkDb, table: Option<&str>, path: &str) -> Result
 /// before returning (atomic checkpoint publish + WAL roll); in memory it is a
 /// no-op extra step.
 pub fn import_csv(db: &mut PinkDb, path: &str, table: Option<&str>) -> Result<usize> {
-    let data = std::fs::read(path)?;
+    let data = read_import_bytes(path)?;
     let (db_name, table_name) = resolve_import_target(db, table, path)?;
     require_settled_import(db)?;
     let rows = load_bytes(db, &db_name, &table_name, &data)?;
@@ -732,6 +853,37 @@ mod tests {
                          1,west,10.5,true\n\
                          2,east,,FALSE\n\
                          3,west,7,True\n";
+
+    /// `read_csv`'s two public helpers (the surface `pinkdb-httpfs` uses)
+    /// return exactly what `.import` builds for the same bytes.
+    #[test]
+    fn csv_helpers_match_import_semantics() {
+        let mut db = PinkDb::new();
+        import_csv_string(&mut db, "imp", SALES).unwrap();
+        let schema = infer_csv_schema(SALES.as_bytes()).unwrap();
+        assert_eq!(schema, db.table("imp").unwrap().schema());
+        let types: Vec<DataType> = schema.iter().map(|(_, t)| *t).collect();
+        let chunks = parse_csv_chunks(SALES.as_bytes(), &types).unwrap();
+        let mut flat = Vec::new();
+        for chunk in &chunks {
+            for row in 0..chunk.num_rows {
+                flat.push(
+                    (0..types.len())
+                        .map(|col| chunk.columns[col].get(row))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        let table = db.table("imp").unwrap();
+        let expected: Vec<Vec<Value>> = (0..table.num_rows())
+            .map(|row| {
+                (0..table.num_cols())
+                    .map(|col| table.get(row, col).unwrap())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(flat, expected);
+    }
 
     #[test]
     fn inference_picks_expected_types() {
@@ -1183,5 +1335,50 @@ mod tests {
         assert_eq!(vals, vec![1, 2, 3, 4]);
         assert!(back.table("inside").is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Wave 75: `import_csv` accepts a URL through the host-installed
+    /// fetcher; a URL with no fetcher is a clear feature error (never a
+    /// local-path read), and the default table name ignores a query string.
+    #[test]
+    fn import_accepts_urls_through_the_registered_fetcher() {
+        #[derive(Debug)]
+        struct TestFetcher;
+        impl UrlFetcher for TestFetcher {
+            fn supports(&self, url: &str) -> bool {
+                url.starts_with("test://")
+            }
+            fn fetch(&self, _url: &str) -> std::result::Result<Vec<u8>, String> {
+                Ok(b"a,b\n1,x\n2,y\n".to_vec())
+            }
+        }
+        register_global_url_fetcher(Arc::new(TestFetcher));
+        let mut db = PinkDb::new();
+        assert_eq!(
+            import_csv(&mut db, "test://host/sales.csv", None).unwrap(),
+            2
+        );
+        assert_eq!(db.table("sales").unwrap().num_rows(), 2);
+
+        // The file stem of a URL ignores `?token=…`.
+        assert_eq!(
+            import_csv(&mut db, "test://host/daily.csv?token=abc", None).unwrap(),
+            2
+        );
+        assert!(db.table("daily").is_ok());
+
+        // A URL with no registered fetcher is never treated as a local path.
+        let err = import_csv(&mut db, "noscheme://host/x.csv", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no URL fetcher is registered"), "{err}");
+        assert!(err.contains("httpfs"), "{err}");
+
+        // Local paths keep the plain I/O error shape.
+        let missing = std::env::temp_dir().join("pinkdb_no_such_import_file.csv");
+        let err = import_csv(&mut db, missing.to_str().unwrap(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("URL fetcher"), "{err}");
     }
 }

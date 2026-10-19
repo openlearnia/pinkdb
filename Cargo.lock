@@ -2282,13 +2282,11 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
- "hmac",
  "pinkdb",
+ "pinkdb-httpfs",
  "rayon",
  "serde",
  "serde_json",
- "sha2",
- "ureq",
  "vortex",
 ]
 
@@ -2315,6 +2313,7 @@ dependencies = [
  "arrow-ipc",
  "arrow-schema",
  "pinkdb",
+ "pinkdb-httpfs",
 ]
 
 [[package]]
@@ -2325,6 +2324,7 @@ dependencies = [
  "pinkdb",
  "pinkdb-arrow",
  "pinkdb-datetime",
+ "pinkdb-httpfs",
  "pinkdb-json",
  "pinkdb-math",
  "pinkdb-parquet",
@@ -2384,6 +2384,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-httpfs"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "pinkdb",
+ "sha2",
+ "ureq",
+]
+
+[[package]]
 name = "pinkdb-js"
 version = "0.1.0"
 
@@ -2408,8 +2418,10 @@ dependencies = [
 name = "pinkdb-parquet"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "parquet",
  "pinkdb",
+ "pinkdb-httpfs",
 ]
 
 [[package]]

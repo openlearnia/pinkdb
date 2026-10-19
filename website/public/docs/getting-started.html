@@ -226,32 +226,32 @@ release builds on Apple Silicon (exact bytes from a recent measurement):</p>
       <td>default</td>
       <td>—</td>
       <td>the engine, REPL, CSV import, <code>json</code>/<code>datetime</code>/<code>math</code> functions, <code>.pink</code> persistence + WAL</td>
-      <td class="num">3.74 MB<br><span class="doc-meta">3,741,504 B</span></td>
+      <td class="num">3.86 MB<br><span class="doc-meta">3,860,624 B</span></td>
     </tr>
     <tr>
       <td>pinklake</td>
       <td><code>pinklake</code></td>
       <td>all <code>.lake</code> commands over <code>.pink</code> v5 data files
       (no Vortex)</td>
-      <td class="num">5.07 MB<br><span class="doc-meta">5,071,072 B</span></td>
+      <td class="num">5.21 MB<br><span class="doc-meta">5,207,664 B</span></td>
     </tr>
     <tr>
       <td>pinklake + S3/R2</td>
       <td><code>pinklake,s3</code></td>
       <td>pinklake on <code>s3://</code> locations</td>
-      <td class="num">7.07 MB<br><span class="doc-meta">7,074,064 B</span></td>
+      <td class="num">7.23 MB<br><span class="doc-meta">7,231,920 B</span></td>
     </tr>
     <tr>
       <td>vortexlake</td>
       <td><code>vortexlake</code></td>
       <td>Vortex data files, footer-fast attach</td>
-      <td class="num">47.66 MB<br><span class="doc-meta">47,656,976 B</span></td>
+      <td class="num">47.78 MB<br><span class="doc-meta">47,777,088 B</span></td>
     </tr>
     <tr>
       <td>vortexlake + S3/R2</td>
       <td><code>vortexlake,s3</code></td>
       <td>vortexlake on <code>s3://</code> locations</td>
-      <td class="num">≈49.7 MB<br><span class="doc-meta">49,674,464 B</span></td>
+      <td class="num">≈49.8 MB<br><span class="doc-meta">49,794,896 B</span></td>
     </tr>
     <tr>
       <td>s3 only</td>
@@ -264,7 +264,7 @@ release builds on Apple Silicon (exact bytes from a recent measurement):</p>
       <td><code>arrow</code></td>
       <td>file access: <code>FROM 'x.arrow'</code>, <code>read_arrow</code>,
       <code>COPY … (FORMAT arrow)</code> (Arrow IPC)</td>
-      <td class="num">6.95 MB<br><span class="doc-meta">6,950,832 B</span></td>
+      <td class="num">7.05 MB<br><span class="doc-meta">7,049,616 B</span></td>
     </tr>
     <tr>
       <td>parquet</td>
@@ -273,13 +273,25 @@ release builds on Apple Silicon (exact bytes from a recent measurement):</p>
       <code>read_parquet</code>/<code>parquet_scan</code>, the four
       <code>parquet_*</code> metadata functions (read-only; add
       <code>,parquet-zstd</code> for zstd)</td>
-      <td class="num">4.89 MB<br><span class="doc-meta">4,892,448 B</span></td>
+      <td class="num">4.99 MB<br><span class="doc-meta">4,991,168 B</span></td>
     </tr>
     <tr>
       <td>arrow + parquet</td>
       <td><code>arrow,parquet</code></td>
       <td>both file surfaces</td>
-      <td class="num">8.06 MB<br><span class="doc-meta">8,062,368 B</span></td>
+      <td class="num">8.16 MB<br><span class="doc-meta">8,160,880 B</span></td>
+    </tr>
+    <tr>
+      <td>httpfs</td>
+      <td><code>httpfs</code></td>
+      <td>remote reads for CSV + the transport (`read_csv('https://…')`, <code>.import &lt;url&gt;</code>)</td>
+      <td class="num">5.91 MB<br><span class="doc-meta">5,909,856 B</span></td>
+    </tr>
+    <tr>
+      <td>arrow + parquet + httpfs</td>
+      <td><code>arrow,parquet,httpfs</code></td>
+      <td>all file surfaces incl. remote reads</td>
+      <td class="num">10.29 MB<br><span class="doc-meta">10,285,920 B</span></td>
     </tr>
   </tbody>
 </table>

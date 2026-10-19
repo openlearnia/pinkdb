@@ -70,8 +70,9 @@ SQL text
 | `pinkdb-js` | Optional (`js` feature) JavaScript procedure sandbox: the deterministic host contract; the engine binding is the recorded follow-up |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
-| `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed |
-| `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name |
+| `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects whole |
+| `pinkdb-parquet` | opt-in (`parquet` feature) read-side Parquet extension, engine-adjacent: `read_parquet`/`parquet_scan`, the four `parquet_*` metadata functions and DuckDB's replacement scan (`FROM 'file.parquet'`), with projection + row-group-statistics pushdown; flat schemas, TIMESTAMP(nanos)/TIME/UUID/FLOAT16/nested types refused by name; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects through a ranged `ChunkReader` |
+| `pinkdb-httpfs` | opt-in (`httpfs` feature) remote-file transport + `read_csv` table source: `https://` GET/HEAD/byte-range and the SigV4 `s3://` object client **shared with pink-lake and the parquet/arrow `remote` features**; `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; single objects only (no globs/compression/COPY TO yet) |
 | `pink-lake` | minimal lake layer: JSON catalog + snapshots + immutable per-table data files — Vortex with the CLI `vortexlake` feature, `.pink` v4 with the `pinklake` feature; v1 `.pink` data files still readable; local directories or S3/R2 via `s3://` URLs (opt-in `s3` feature — pure storage, it combines explicitly as `pinklake,s3` / `vortexlake,s3`); opt-in `encryption` feature (`PNKLAKE1` containers for every lake artifact, one Argon2id key per session) |
 
 Design rules: Rust edition 2024 (MSRV 1.97), zero async (the server's opt-in
@@ -286,7 +287,8 @@ comments (`SELECT 1; -- note` completes; `SELECT ';'` does not).
 REPL dot-commands: `.help`, `.quit` / `.exit`, `.read`, `.timer`, `.databases`, `.tables`,
 `.schema <t|v>` (accepts `db.table`; views show their output columns),
 `.import <file.csv> [table]` (table defaults to the file stem; `db.table`
-targets another database), `.save <file.pink>`, `.open <file.pink>`.
+targets another database; with `--features httpfs`, an `https://`/`s3://` URL),
+`.save <file.pink>`, `.open <file.pink>`.
 `.databases` marks the current one and counts tables and views separately
 (`main (current) (2 tables, 1 view)`). `.tables` and `.schema` scope to the
 current database; `USE <db>` switches it. Double-quoted identifiers with
@@ -1052,19 +1054,26 @@ implies neither lake build**; combine them explicitly, `pinklake,s3` or
 
 | Build | CLI features | Adds | Data files | Release size |
 |---|---|---|---|---|
-| default | — | no `.lake` commands, no file formats | — | 3,761,936 B |
-| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 5,091,776 B (+1.27 MiB over default, −40.6 MiB vs vortexlake) |
-| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 7,111,568 B |
-| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,677,664 B |
-| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.7 MB (vortexlake + the same ≈2 MB S3 client) |
-| s3 only | `s3` | no `.lake` commands (the client only takes effect with a lake feature) | — | ≈default (3,761,952 B) |
-| arrow | `arrow` | `FROM 'f.arrow'` / `read_arrow` (read) + `COPY … (FORMAT arrow)` (write) | Arrow IPC | 6,950,832 B (+3.04 MiB over default) |
-| parquet | `parquet` | `read_parquet` / `parquet_scan` / `FROM 'f.parquet'`, the four `parquet_*` metadata functions (read-only; add `,parquet-zstd` for zstd) | Parquet | 4,892,448 B (+1.08 MiB over default) |
-| arrow + parquet | `arrow,parquet` | both file surfaces (they share the engine's table-source surface and part of the arrow-rs tree) | Arrow IPC + Parquet | 8,062,368 B (+4.10 MiB over default) |
+| default | — | no `.lake` commands, no file formats | — | 3,860,624 B |
+| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 5,207,664 B (+1.28 MiB over default, −40.6 MiB vs vortexlake) |
+| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations (the SigV4 client is now the shared `pinkdb-httpfs` one) | `.pink` | 7,231,920 B |
+| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,777,088 B |
+| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.8 MB (vortexlake + the same ≈2 MB S3 client) |
+| s3 only | `s3` | no `.lake` commands (the client only takes effect with a lake feature) | — | ≈default (3,860,400 B) |
+| arrow | `arrow` | `FROM 'f.arrow'` / `read_arrow` (read) + `COPY … (FORMAT arrow)` (write) | Arrow IPC | 7,049,616 B (+3.04 MiB over default) |
+| parquet | `parquet` | `read_parquet` / `parquet_scan` / `FROM 'f.parquet'`, the four `parquet_*` metadata functions (read-only; add `,parquet-zstd` for zstd) | Parquet | 4,991,168 B (+1.08 MiB over default) |
+| arrow + parquet | `arrow,parquet` | both file surfaces (they share the engine's table-source surface and part of the arrow-rs tree) | Arrow IPC + Parquet | 8,160,880 B (+4.10 MiB over default) |
+| httpfs | `httpfs` | `read_csv('url')`, `.import <url>`, `FROM 'https://…/x.csv'`; HTTPS + SigV4 S3 transport (always includes `s3://`). With `parquet`/`arrow` also on, enables their `remote` halves | CSV over HTTP(S)/S3 | 5,909,856 B (+1.95 MiB over default) |
+| parquet + httpfs | `parquet,httpfs` | remote parquet too (`read_parquet('https://…')`, ranged footer/row groups) | CSV + Parquet over HTTP(S)/S3 | 7,113,536 B (+3.10 MiB over default) |
+| arrow + httpfs | `arrow,httpfs` | remote Arrow IPC too (whole-object fetch) | CSV + Arrow over HTTP(S)/S3 | 9,116,176 B (+5.01 MiB over default) |
+| arrow + parquet + httpfs | `arrow,parquet,httpfs` | every file surface incl. remote reads | Arrow IPC + Parquet + CSV over HTTP(S)/S3 | 10,285,920 B (+6.13 MiB over default) |
 
 The file-format extensions are orthogonal to the lake builds and to each
 other: either composes with `pinklake`/`vortexlake`/`s3` and with the
 `--no-default-features` lean build, and each pays for its own linked codecs.
+`httpfs` is likewise orthogonal: alone it is transport + CSV; combined with
+`parquet`/`arrow` it enables their `remote` features (the transport is linked
+once).
 All sizes above are `cargo build --release -p pinkdb-cli` on the same tree
 (the lake rows are re-measured at integration; measurement drift is noted as
 a follow-up).
@@ -1079,6 +1088,10 @@ cargo build -p pinkdb-cli --features arrow             # Arrow IPC read/write (`
 cargo build -p pinkdb-cli --features parquet           # read_parquet / FROM 'file.parquet' (snappy + gzip)
 cargo build -p pinkdb-cli --features arrow,parquet     # both file surfaces
 cargo build -p pinkdb-cli --features parquet-zstd      # …plus zstd-compressed files (needs a C toolchain)
+cargo build -p pinkdb-cli --features httpfs            # read_csv / .import over https:// and s3://
+cargo build -p pinkdb-cli --features parquet,httpfs    # + remote parquet (ranged reads)
+cargo build -p pinkdb-cli --features arrow,httpfs      # + remote Arrow IPC (whole object)
+cargo build -p pinkdb-cli --features arrow,parquet,httpfs  # everything (10,187,840 B measured)
 ```
 
 ```text
@@ -1165,7 +1178,7 @@ The same lake layer without the Vortex dependency: a `pinklake` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
 single-table persistence bytes) under `format_version` 4 catalogs (each file
 object carries its own statistics block) — no `vortex` crate and none of its
-~218 transitive crates, a 5.09 MB binary instead of 47.68 MB. It enables every
+~218 transitive crates, a 5.21 MB binary instead of 47.78 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
 (add `,s3`; the storage client alone provides no commands), with the same
 layout, incremental commits, atomic
@@ -1712,6 +1725,84 @@ is opened, which is what makes that replay resolvable). A file deleted
 before replay is a hard recovery error, never a silent drop; a file
 *changed* before replay replays its new content — the documented caveat of
 the re-read policy, matching DuckDB.
+
+### Remote files without a lake (feature `httpfs`, wave 75)
+
+`httpfs` is the **shared remote transport**; each registered file format
+claims its own extensions and reads through it:
+
+```sql
+SELECT * FROM read_csv('https://example.com/sales.csv');
+SELECT * FROM read_csv('s3://bucket/data/sales.csv');
+SELECT * FROM 'https://example.com/sales.csv';   -- replacement scan (.csv)
+
+SELECT * FROM read_parquet('https://example.com/data.parquet');
+SELECT * FROM 's3://bucket/data.parquet';        -- ranged footer/row groups
+
+SELECT * FROM read_arrow('https://example.com/data.arrow');
+SELECT * FROM 's3://bucket/data.arrow';          -- whole object (IPC has no ranges)
+
+SELECT * FROM 'data/sales.csv';                  -- local .csv, same source
+```
+
+```text
+.import https://example.com/sales.csv
+.import s3://bucket/data/sales.csv import_name
+```
+
+- **Claim rules**: claims are by **extension regardless of scheme** — `.csv`
+  goes to the CSV source, `.parquet`/`.parq`/`.pq` to parquet,
+  `.arrow`/`.ipc`/`.feather`/`.arrows` to arrow. The CSV source still claims
+  only `.csv` and never another format's path; parquet and arrow claim
+  `http://` too (the transport refuses plain http unless
+  `PINKDB_HTTPFS_ALLOW_HTTP=1`). A remote path's query/fragment is ignored
+  for the extension decision and kept for the transport.
+- **Parser**: exactly the engine's `.import` parser — comma-separated,
+  `"`-quoting with `""` escapes, one header row, UTF-8, empty fields as
+  NULL, and the same whole-file type inference (INTEGER → BIGINT → DOUBLE →
+  BOOLEAN → DATE → TIMESTAMP → VARCHAR). `read_csv` and `.import` of the same
+  bytes produce the same schema and rows. The wave-76 option surface
+  (`delimiter`, `quote`, `encoding`, `header`, …) is parsed-but-refused today
+  with a precise message, never ignored.
+- **Transport**: one shared crate, `pinkdb-httpfs`, serves both this feature
+  and the lake's `s3` feature. It supports whole-object GET and **byte-range
+  GET** (`Range: bytes=…`) on `https://` and `s3://`, plus HEAD size, through
+  a small `Fetcher` trait (`size`/`fetch`/`fetch_range`). Parquet implements
+  its `ChunkReader` over `fetch_range`, so **footers and row groups are
+  ranged reads** (a whole-object GET happens only when the backend reports no
+  size); Arrow IPC has no ranged protocol, so it fetches the whole object.
+  The S3 half is the extracted SigV4 client: the same `AWS_*` /
+  `PINKDB_S3_*` environment variables, endpoint addressing, conditional
+  writes, retry/backoff and timeouts as before — pink-lake's behavior did not
+  change, its tests and the S3 CI job still cover it.
+- **Credentials**: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` /
+  `AWS_SESSION_TOKEN`; `AWS_REGION` or `AWS_DEFAULT_REGION`; a custom
+  endpoint via `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` (R2 uses
+  `region=auto`); `AWS_S3_FORCE_PATH_STYLE`; `PINKDB_S3_RETRIES`;
+  `PINKDB_S3_ALLOW_HTTP` for a local test endpoint. `https://` is the default;
+  a plain `http://` URL needs `PINKDB_HTTPFS_ALLOW_HTTP=1` (tests only).
+- **Limits**: one object per read — no remote globs/directories, no gzip,
+  and no `COPY TO s3://` (documented follow-ups). A remote read is re-read by
+  the next statement (the re-read policy); a durable store replays a logged
+  URL read by re-fetching it, and a missing object is a hard recovery error.
+- **Size**: opt-in `httpfs` is 5,811,760 B (+1.95 MiB over the 3,762,736 B
+  default); the default binary stays transport-free. The `pinklake,s3` build
+  shares the same client and re-measures at 7,116,144 B; `parquet,httpfs` is
+  6,998,912 B, `arrow,httpfs` 9,018,112 B, and `arrow,parquet,httpfs`
+  10,187,840 B.
+- **Cross-check**: DuckDB 2.0 α's `httpfs` extension is installed here, so
+  `bench/duckdiff.py` compares remote **parquet** and **CSV** over the same
+  local HTTP server (6 probes). DuckDB has no Arrow file reader, so remote
+  Arrow is value-pinned in `extensions/arrow/tests/remote.rs`. duckdiff total:
+  **328/328** (322 before the remote battery).
+
+#### Remote format matrix
+
+| Format | Schemes | Read strategy | Limits |
+|---|---|---|---|
+| CSV (`httpfs`) | `https://`, `s3://` (claim); `http://` explicit-only | whole-object `fetch()`; parser reuses `.import` | single object; default dialect only |
+| Parquet (`parquet/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **ranged** footer + row-group/page reads via `ChunkReader`; whole-object only when HEAD reports no size | single object; no remote globs/dirs |
+| Arrow IPC (`arrow/remote`) | `https://`, `s3://`, `http://` (claim; transport gate) | **whole-object** `fetch()` (IPC has no ranged footer protocol); one fetch per bind→scan | single object; no remote globs/dirs |
 
 A minimal extension registering one `hello_add(BIGINT, BIGINT) -> BIGINT`:
 
@@ -2390,7 +2481,7 @@ and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
 `pinklake` build (`.pink` v4 lake data files, no `vortex` dependency,
-5.09 MB vs 47.68 MB CLI) shipped in wave 45i, and wave 45k gave it exact
+5.21 MB vs 47.78 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for

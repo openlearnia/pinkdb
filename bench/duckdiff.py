@@ -7,10 +7,12 @@ ints exact, floats within tolerance, NULLs, dates/timestamps normalized
 to microseconds. Column names are ignored (header formats differ).
 
 Batteries: small relational set (in-SQL setup) + 1M-row CSV set + the two
-file-format batteries (Arrow IPC and Parquet), which need a pinkdb CLI built
-with both opt-in extensions:
+file-format batteries (Arrow IPC and Parquet) + the remote-file battery
+(wave 75: https/http and s3 are covered by Rust tests; this battery reads
+parquet/CSV from a local HTTP server with both engines), which need a pinkdb
+CLI built with the opt-in extensions:
 
-    cargo build --release -p pinkdb-cli --features arrow,parquet
+    cargo build --release -p pinkdb-cli --features arrow,parquet,httpfs
 
 A binary without one of the features skips that battery with a note (and the
 build command above); the other batteries still run.
@@ -22,9 +24,14 @@ Exit code: 0 iff every query matches.
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import datetime
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 VERBOSE = "--verbose" in sys.argv
 # The CLI under test: defaults to the worktree's release build; PINKDB_CLI
@@ -926,9 +933,218 @@ def run_big(csv_path):
         check(f"big: {label}", ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
 
 
+# ---- wave 75: the httpfs CSV surface (`read_csv` / replacement scan) ----
+#
+# Both engines read the same temp CSV through `read_csv('…')`; DuckDB has CSV
+# built in, while the pinkdb binary under test needs the opt-in `httpfs`
+# feature:
+#
+#   cargo build --release -p pinkdb-cli --features httpfs
+#
+# Remote reads (`https://`/`s3://`, whole-object and Range) are pinned in the
+# Rust tests against an in-test HTTP server and the S3 mock — no network
+# here. This battery compares the local parser and type-inference defaults.
+
+CSV_BODY = """id,region,total,active,day,note
+1,west,10.5,true,2024-01-15,alpha
+2,east,,false,2024-02-20,
+3,west,7,true,2024-03-01,gamma
+4,north,2.25,false,2023-12-31,delta
+"""
+
+CSV_PROBES = [
+    ("csv-count-sum", "SELECT COUNT(*), COUNT(total), SUM(total), AVG(total) FROM read_csv('{f}');", False),
+    ("csv-projection-where", "SELECT id, region, note FROM read_csv('{f}') WHERE total IS NOT NULL ORDER BY id;", True),
+    ("csv-inferred-types", "SELECT * FROM read_csv('{f}') ORDER BY id;", True),
+    ("csv-group-having", "SELECT region, COUNT(*), SUM(total) FROM read_csv('{f}') GROUP BY region HAVING COUNT(*) >= 1 ORDER BY region;", True),
+    ("csv-date-minmax", "SELECT COUNT(*), MIN(day), MAX(day), COUNT(day) FROM read_csv('{f}');", False),
+    ("csv-replacement-scan", "SELECT COUNT(*) FROM '{f}';", False),
+    ("csv-bool-where", "SELECT COUNT(*) FROM read_csv('{f}') WHERE active;", False),
+]
+
+
+def run_csv():
+    print("== csv battery (wave 75) ==")
+    got = pink_query("", "SELECT COUNT(*) FROM read_csv('x.csv');")
+    skipped = got[0] == "error" and (
+        "unknown table function" in got[1]
+        or "no table source is registered" in got[1]
+        or "do not serve it" in got[1]
+    )
+    if skipped:
+        print(
+            "csv reader not built into the pinkdb binary under test; skipping "
+            "(build with `cargo build --release -p pinkdb-cli --features httpfs`)"
+        )
+        return
+    directory = tempfile.mkdtemp(prefix="pinkdb-csv-probes-")
+    path = os.path.join(directory, "probe.csv")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(CSV_BODY)
+    try:
+        for label, template, ordered in CSV_PROBES:
+            sql = template.replace("{f}", path)
+            got = pink_query("", sql)
+            if got[0] == "error":
+                check(label, False, f"pinkdb error: {got[1]}")
+                continue
+            _, types, prows = got
+            d = duck_query("", sql)
+            if d[0] == "error":
+                check(label, False, f"duckdb error: {d[1]}")
+                continue
+            prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+            ok = rows_equal(prows_n, d[1], ordered)
+            check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+# ---- wave 75: remote file access over a local HTTP server ----
+#
+# DuckDB 2.0 alpha's `httpfs` extension is installed in this environment
+# (probed: `LOAD httpfs` succeeds), so parquet/CSV can be compared over the
+# SAME bytes served by a stdlib HTTP server. A CLI without the opt-in
+# `httpfs` feature (or without `parquet`) skips the battery with the build
+# command. Arrow has no DuckDB counterpart (α has no arrow support at all —
+# wave 71's note), so remote Arrow is pinned by values in
+# `extensions/arrow/tests/remote.rs`, not here.
+
+REMOTE_PARQUET_SETUP = """
+COPY (
+  SELECT i::INTEGER AS id,
+         CASE i % 3 WHEN 0 THEN 'west' WHEN 1 THEN 'east' ELSE 'north' END AS region,
+         (i * 1.5)::DOUBLE AS total,
+         (i % 2 = 0) AS active,
+         DATE '2024-01-01' + i::INTEGER AS day
+  FROM range(0, 50) t(i)
+) TO '{path}' (FORMAT parquet);
+"""
+
+REMOTE_CSV = """id,region,total,active
+0,west,0.0,true
+1,east,1.5,false
+2,north,3.0,true
+3,west,4.5,false
+4,east,,true
+"""
+
+
+class _QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+def remote_enabled():
+    got = pink_query("", "SELECT COUNT(*) FROM read_csv('x.csv');")
+    if got[0] == "error" and (
+        "unknown table function" in got[1]
+        or "no table source is registered" in got[1]
+        or "do not serve it" in got[1]
+    ):
+        return False
+    got = pink_query("", "SELECT COUNT(*) FROM read_parquet('x.parquet');")
+    if got[0] == "error" and (
+        "unknown table function" in got[1]
+        or "no table source is registered" in got[1]
+        or "do not serve it" in got[1]
+    ):
+        return False
+    return True
+
+
+def duck_httpfs_available():
+    try:
+        p = subprocess.run(
+            ["duckdb", "-no-agent", "-c", "LOAD httpfs; SELECT 1;"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
+def run_remote():
+    print("== remote battery (wave 75) ==")
+    if not remote_enabled():
+        print(
+            "remote readers not built into the pinkdb binary under test; skipping "
+            "(build with `cargo build --release -p pinkdb-cli --features parquet,httpfs`)"
+        )
+        return
+    if not duck_httpfs_available():
+        print(
+            "duckdb's httpfs extension is unavailable; skipping the remote cross-check "
+            "(remote parquet/CSV values are pinned by the Rust tests)"
+        )
+        return
+
+    directory = tempfile.mkdtemp(prefix="pinkdb-remote-probes-")
+    parquet = os.path.join(directory, "probe.parquet")
+    csv_path = os.path.join(directory, "probe.csv")
+    with open(csv_path, "w", encoding="utf-8") as fh:
+        fh.write(REMOTE_CSV)
+    subprocess.run(
+        ["duckdb", "-no-agent", "-c", REMOTE_PARQUET_SETUP.format(path=parquet)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    handler = partial(_QuietHandler, directory=directory)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    parquet_url = f"{base}/probe.parquet"
+    csv_url = f"{base}/probe.csv"
+
+    probes = [
+        ("remote-parquet-count", f"SELECT COUNT(*), MIN(id), MAX(id), SUM(total) FROM read_parquet('{parquet_url}');", False),
+        ("remote-parquet-filter", f"SELECT id, region FROM read_parquet('{parquet_url}') WHERE id >= 40 ORDER BY id;", True),
+        ("remote-parquet-group", f"SELECT region, COUNT(*), SUM(total) FROM read_parquet('{parquet_url}') GROUP BY region ORDER BY region;", True),
+        ("remote-parquet-replacement", f"SELECT COUNT(*) FROM '{parquet_url}';", False),
+        ("remote-csv-count", f"SELECT COUNT(*), COUNT(total), SUM(total) FROM read_csv('{csv_url}');", False),
+        ("remote-csv-filter", f"SELECT id FROM read_csv('{csv_url}') WHERE active ORDER BY id;", True),
+    ]
+    old = os.environ.get("PINKDB_HTTPFS_ALLOW_HTTP")
+    os.environ["PINKDB_HTTPFS_ALLOW_HTTP"] = "1"
+    try:
+        for label, sql, ordered in probes:
+            got = pink_query("", sql)
+            if got[0] == "error":
+                check(label, False, f"pinkdb error: {got[1]}")
+                continue
+            _, types, prows = got
+            d = duck_query("LOAD httpfs;", sql)
+            if d[0] == "error":
+                check(label, False, f"duckdb error: {d[1]}")
+                continue
+            prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+            ok = rows_equal(prows_n, d[1], ordered)
+            check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+    finally:
+        if old is None:
+            os.environ.pop("PINKDB_HTTPFS_ALLOW_HTTP", None)
+        else:
+            os.environ["PINKDB_HTTPFS_ALLOW_HTTP"] = old
+        httpd.shutdown()
+        httpd.server_close()
+        shutil.rmtree(directory, ignore_errors=True)
+    print(
+        "note: remote Arrow is value-pinned in extensions/arrow/tests/remote.rs "
+        "(DuckDB has no Arrow file reader)"
+    )
+
+
 def main():
     import sys
     run_small()
+    run_csv()
+    run_remote()
     if "--big" in sys.argv:
         idx = sys.argv.index("--big")
         run_big(sys.argv[idx + 1] if idx + 1 < len(sys.argv) else "/tmp/sales_1m.csv")

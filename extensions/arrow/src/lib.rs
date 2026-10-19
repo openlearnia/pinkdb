@@ -1,7 +1,7 @@
 //! `pinkdb-arrow` — the core **arrow** extension (wave 71): Arrow IPC
 //! (Feather v2) file read/write over the arrow-rs crates.
 //!
-//! SQL surface (once a host registers [`ArrowFormat`] on a store):
+//! SQL surface (once a host registers [`ArrowSource`]/[`ArrowSink`]):
 //!
 //! - `FROM '<file>.arrow'` — a replacement scan resolved by file extension
 //!   (`arrow`, `ipc`, `feather`, `arrows`);
@@ -66,6 +66,15 @@
 //! - **C Data Interface**: not part of this wave; see the pinned follow-up in
 //!   this crate's README (`pinkdb-ffi` query-result export + Arrow-array scan
 //!   input, zero-copy where the layout allows).
+//! - **Remote objects** (`remote` feature, enabled by the CLI's `httpfs`
+//!   feature): `read_arrow('https://…/x.arrow')`, `read_arrow('s3://…/x')`,
+//!   and the same paths in the replacement scan. Claims are by extension
+//!   regardless of scheme; plain `http://` is claimed but the shared
+//!   transport refuses it unless `PINKDB_HTTPFS_ALLOW_HTTP=1`. IPC has no
+//!   ranged footer protocol, so a remote read is a **whole-object
+//!   `fetch()`**, cached for the bind→scan pair and re-fetched by the next
+//!   statement (the re-read policy). `pinkdb-cli` prints the missing feature
+//!   for a remote path in a lean build.
 //!
 //! ### Durability
 //!
@@ -77,11 +86,14 @@
 //! `COPY` inside a transaction is not rolled back (the file is external).
 
 pub mod read;
+pub mod remote;
 pub mod types;
 pub mod write;
 
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(feature = "remote")]
+use std::sync::Mutex;
 
 use pinkdb::table_source::{TableFunctionCall, TableScanOutput, TableSource, TableSourceStats};
 use pinkdb::types::Result;
@@ -104,14 +116,36 @@ pub const READ_FUNCTIONS: &[&str] = &["read_arrow", "read_ipc", "read_feather"];
 ///
 /// Reads are full-file: a scan materializes the whole IPC file and returns it
 /// in engine chunks (IPC has no row-group statistics, so the projection and
-/// filter hints are ignored; every column decodes). The counters report one
-/// file and its column count.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ArrowSource;
+/// filter hints are ignored; every column decodes). A remote object (the
+/// `remote` feature) is fetched whole — IPC has no ranged footer protocol —
+/// once per bind→scan pair; the next statement re-fetches (the re-read
+/// policy). The counters report one file and its column count.
+#[derive(Debug, Default)]
+pub struct ArrowSource {
+    /// One-statement remote fetch cache: `bind` fetches the object, `scan`
+    /// consumes it, a later statement re-fetches.
+    #[cfg(feature = "remote")]
+    cache: Mutex<Option<(String, Arc<Vec<u8>>)>>,
+}
 
 impl ArrowSource {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The scan shape for one materialized table (shared by local and
+    /// remote reads).
+    fn scan_table(table: pinkdb::DataTable) -> TableScanOutput {
+        let columns = table.num_cols() as u64;
+        let chunks = AttachedScan::complete(Arc::new(table)).chunks();
+        TableScanOutput {
+            chunks,
+            files: 1,
+            // The IPC file format has no row groups.
+            row_groups: 0,
+            row_groups_pruned: 0,
+            columns_decoded: columns,
+        }
     }
 }
 
@@ -124,6 +158,23 @@ impl TableSource for ArrowSource {
         let Some(path) = self.claim(call)? else {
             return Ok(None);
         };
+        if remote::is_remote(&path) {
+            #[cfg(feature = "remote")]
+            {
+                let bytes = Arc::new(remote::fetch(&path)?);
+                let schema = read::schema_bytes(&bytes, &path)?;
+                let mut cache = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *cache = Some((path, bytes));
+                return Ok(Some(schema));
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                return Err(remote::missing_feature(&path));
+            }
+        }
         Ok(Some(read::schema(Path::new(&path))?))
     }
 
@@ -136,17 +187,33 @@ impl TableSource for ArrowSource {
         let path = self.claim(call)?.ok_or_else(|| {
             pinkdb::PinkDbError::Execution(format!("the arrow source does not serve {call:?}"))
         })?;
+        if remote::is_remote(&path) {
+            #[cfg(feature = "remote")]
+            {
+                let cached = {
+                    let mut cache = self
+                        .cache
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    match cache.as_ref() {
+                        Some((key, _)) if key == &path => cache.take().map(|(_, bytes)| bytes),
+                        _ => None,
+                    }
+                };
+                let bytes = match cached {
+                    Some(bytes) => bytes,
+                    None => Arc::new(remote::fetch(&path)?),
+                };
+                let table = read::read_bytes(&bytes, &path, remote::table_name(&path))?;
+                return Ok(Self::scan_table(table));
+            }
+            #[cfg(not(feature = "remote"))]
+            {
+                return Err(remote::missing_feature(&path));
+            }
+        }
         let table = read::read(Path::new(&path))?;
-        let columns = table.num_cols() as u64;
-        let chunks = AttachedScan::complete(Arc::new(table)).chunks();
-        Ok(TableScanOutput {
-            chunks,
-            files: 1,
-            // The IPC file format has no row groups.
-            row_groups: 0,
-            row_groups_pruned: 0,
-            columns_decoded: columns,
-        })
+        Ok(Self::scan_table(table))
     }
 
     fn stats(&self) -> TableSourceStats {
@@ -181,7 +248,9 @@ impl ArrowSource {
                 }
             }
             TableFunctionCall::Path(path) => {
-                let ext = Path::new(path)
+                // Extension-based regardless of scheme; the query/fragment of
+                // a remote URL is ignored for the decision.
+                let ext = Path::new(remote::path_only(path))
                     .extension()
                     .and_then(|e| e.to_str())
                     .map(|e| e.to_ascii_lowercase());
@@ -220,7 +289,7 @@ impl FileFormat for ArrowSink {
 /// Register the Arrow IPC read source and write sink on one store (embedder
 /// path). Idempotent: registering again replaces the previous instances.
 pub fn register(db: &mut PinkDb) {
-    db.register_table_source(Arc::new(ArrowSource));
+    db.register_table_source(Arc::new(ArrowSource::new()));
     db.register_file_format(Arc::new(ArrowSink));
 }
 
@@ -233,7 +302,7 @@ pub fn register(db: &mut PinkDb) {
 /// opens stores before calling it must use [`register`] per store instead.
 /// Idempotent.
 pub fn ensure_registered() {
-    pinkdb::table_source::register_global_table_source(Arc::new(ArrowSource));
+    pinkdb::table_source::register_global_table_source(Arc::new(ArrowSource::new()));
     pinkdb::filefmt::register_global_file_format(Arc::new(ArrowSink));
 }
 

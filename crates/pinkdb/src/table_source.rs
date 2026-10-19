@@ -1,6 +1,6 @@
 //! Host-registered table sources: the integration point for file readers
-//! (`read_parquet`, `FROM 'file.parquet'`, and the `read_csv('url')` /
-//! arrow work waves 71/75 extend).
+//! (`read_parquet`, `FROM 'file.parquet'`, and the `read_csv('url')` source
+//! waves 71/75 landed).
 //!
 //! ## Why this is not an extension
 //!

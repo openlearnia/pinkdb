@@ -33,7 +33,7 @@ use parquet::data_type::{
     BoolType, ByteArrayType, DoubleType, FixedLenByteArrayType, FloatType, Int32Type, Int64Type,
     Int96Type,
 };
-use parquet::file::reader::{FileReader, RowGroupReader, SerializedFileReader};
+use parquet::file::reader::{ChunkReader, FileReader, RowGroupReader, SerializedFileReader};
 use pinkdb::attached::{PruneOp, PrunePredicate};
 use pinkdb::{
     CHUNK_SIZE, DataChunk, DataType, PinkDbError, Result, TableScanOutput, Value, Vector,
@@ -74,11 +74,33 @@ pub fn scan(
         .map(|i| (!needed[i]).then(|| Arc::new(Vector::new_empty(resolved.schema[i].1))))
         .collect();
 
+    let plan = DecodePlan {
+        resolved,
+        filters,
+        needed,
+        placeholders,
+    };
+
     for file in &resolved.files {
         if !file_survives(resolved, file, filters) {
             continue;
         }
         out.files += 1;
+        // Remote objects are read through parquet's `ChunkReader` over the
+        // shared transport (ranged footer/row groups); local files keep the
+        // page cache.
+        #[cfg(feature = "remote")]
+        if let Some(spec) = &file.remote {
+            let reader = SerializedFileReader::new(crate::remote::RemoteFile::from_spec(spec))
+                .map_err(|e| {
+                    PinkDbError::Execution(format!(
+                        "cannot read parquet file \"{}\": {e}",
+                        file.meta.path
+                    ))
+                })?;
+            scan_reader(&reader, file, &plan, &mut out, &mut chunks)?;
+            continue;
+        }
         let reader =
             SerializedFileReader::new(std::fs::File::open(&file.meta.path).map_err(|e| {
                 PinkDbError::Io(std::io::Error::new(
@@ -93,115 +115,140 @@ pub fn scan(
                 ))
             })?;
 
-        // The output columns this file decodes, as (output, leaf, column).
-        let decoded: Vec<(usize, usize, &FileColumn)> = (0..width)
-            .filter(|out| needed[*out] && resolved.kind[*out] == OutKind::FileColumn)
-            .filter_map(|out| {
-                let leaf = file.out_to_file.get(out).copied().flatten()?;
-                Some((out, leaf, &file.meta.columns[leaf]))
-            })
-            .collect();
-
-        for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
-            if !row_group_survives(resolved, file, rg_index, filters) {
-                out.row_groups_pruned += 1;
-                continue;
-            }
-            out.row_groups += 1;
-            let rows = rg.rows as usize;
-            let row_group_reader = reader.get_row_group(rg_index).map_err(|e| {
-                PinkDbError::Execution(format!(
-                    "cannot read row group {rg_index} of \"{}\": {e}",
-                    file.meta.path
-                ))
-            })?;
-            // One column at a time: each needed file column decodes into
-            // chunk-sized pieces (a vector cannot exceed CHUNK_SIZE rows).
-            let mut pieces: Vec<Vec<Vector>> = Vec::with_capacity(decoded.len());
-            for (_, leaf, column) in &decoded {
-                out.columns_decoded += 1;
-                pieces.push(decode_column(&*row_group_reader, *leaf, column, rows)?);
-            }
-
-            for start in (0..rows).step_by(CHUNK_SIZE) {
-                let chunk_index = start / CHUNK_SIZE;
-                let n = CHUNK_SIZE.min(rows - start);
-                let mut cols: Vec<Arc<Vector>> = Vec::with_capacity(width);
-                for (out_index, placeholder) in placeholders.iter().enumerate() {
-                    if let Some(placeholder) = placeholder {
-                        cols.push(Arc::clone(placeholder));
-                        continue;
-                    }
-                    let value = match &resolved.kind[out_index] {
-                        OutKind::FileColumn => {
-                            let dtype = resolved.schema[out_index].1;
-                            match decoded.iter().position(|(out, _, _)| *out == out_index) {
-                                Some(slot) => {
-                                    let from = file.out_to_file[out_index]
-                                        .map(|leaf| file.meta.columns[leaf].ty)
-                                        .expect("a decoded file column has a leaf");
-                                    let piece = std::mem::replace(
-                                        &mut pieces[slot][chunk_index],
-                                        Vector::new_empty(dtype),
-                                    );
-                                    if from == dtype {
-                                        Arc::new(piece)
-                                    } else {
-                                        Arc::new(cast_vector(
-                                            &piece,
-                                            from,
-                                            dtype,
-                                            &resolved.schema[out_index].0,
-                                        )?)
-                                    }
-                                }
-                                None => {
-                                    // `union_by_name` with a file that does
-                                    // not have the column: every row reads
-                                    // NULL (α's rule).
-                                    let mut vector = Vector::with_capacity(dtype, n);
-                                    for _ in 0..n {
-                                        vector.push_null()?;
-                                    }
-                                    Arc::new(vector)
-                                }
-                            }
-                        }
-                        OutKind::RowNumber => {
-                            let mut vector = Vector::with_capacity(DataType::Bigint, n);
-                            for i in 0..n {
-                                vector.push_valid(Value::Bigint((start + i) as i64))?;
-                            }
-                            Arc::new(vector)
-                        }
-                        OutKind::FileName => {
-                            let mut vector = Vector::with_capacity(DataType::Varchar, n);
-                            for _ in 0..n {
-                                vector.push_valid(Value::Varchar(file.meta.path.clone()))?;
-                            }
-                            Arc::new(vector)
-                        }
-                        OutKind::Hive(index) => {
-                            let column = &resolved.hive[*index];
-                            let value = match file.hive.get(*index).and_then(|v| v.as_ref()) {
-                                Some(text) => crate::hive::value_of(column.ty, text),
-                                None => Value::Null,
-                            };
-                            let mut vector = Vector::with_capacity(column.ty, n);
-                            for _ in 0..n {
-                                vector.push_value(value.clone())?;
-                            }
-                            Arc::new(vector)
-                        }
-                    };
-                    cols.push(value);
-                }
-                chunks.push(DataChunk::projected(cols, n));
-            }
-        }
+        scan_reader(&reader, file, &plan, &mut out, &mut chunks)?;
     }
     out.chunks = chunks;
     Ok(out)
+}
+
+/// The per-statement decode plan the reader helper consumes.
+struct DecodePlan<'a> {
+    resolved: &'a Resolved,
+    filters: &'a [PrunePredicate],
+    needed: Vec<bool>,
+    placeholders: Vec<Option<Arc<Vector>>>,
+}
+
+/// Decode one opened file (local `File` or remote `RemoteFile`): the row
+/// groups that survive pruning, the projected columns, and the engine chunks.
+fn scan_reader<R: ChunkReader + 'static>(
+    reader: &SerializedFileReader<R>,
+    file: &FileResolved,
+    plan: &DecodePlan<'_>,
+    out: &mut TableScanOutput,
+    chunks: &mut Vec<DataChunk>,
+) -> Result<()> {
+    let resolved = plan.resolved;
+    let needed = &plan.needed;
+    let placeholders = &plan.placeholders;
+    let width = resolved.schema.len();
+    // The output columns this file decodes, as (output, leaf, column).
+    let decoded: Vec<(usize, usize, &FileColumn)> = (0..width)
+        .filter(|out| needed[*out] && resolved.kind[*out] == OutKind::FileColumn)
+        .filter_map(|out| {
+            let leaf = file.out_to_file.get(out).copied().flatten()?;
+            Some((out, leaf, &file.meta.columns[leaf]))
+        })
+        .collect();
+
+    for (rg_index, rg) in file.meta.row_groups.iter().enumerate() {
+        if !row_group_survives(plan.resolved, file, rg_index, plan.filters) {
+            out.row_groups_pruned += 1;
+            continue;
+        }
+        out.row_groups += 1;
+        let rows = rg.rows as usize;
+        let row_group_reader = reader.get_row_group(rg_index).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "cannot read row group {rg_index} of \"{}\": {e}",
+                file.meta.path
+            ))
+        })?;
+        // One column at a time: each needed file column decodes into
+        // chunk-sized pieces (a vector cannot exceed CHUNK_SIZE rows).
+        let mut pieces: Vec<Vec<Vector>> = Vec::with_capacity(decoded.len());
+        for (_, leaf, column) in &decoded {
+            out.columns_decoded += 1;
+            pieces.push(decode_column(&*row_group_reader, *leaf, column, rows)?);
+        }
+
+        for start in (0..rows).step_by(CHUNK_SIZE) {
+            let chunk_index = start / CHUNK_SIZE;
+            let n = CHUNK_SIZE.min(rows - start);
+            let mut cols: Vec<Arc<Vector>> = Vec::with_capacity(width);
+            for (out_index, placeholder) in placeholders.iter().enumerate() {
+                if let Some(placeholder) = placeholder {
+                    cols.push(Arc::clone(placeholder));
+                    continue;
+                }
+                let value = match &resolved.kind[out_index] {
+                    OutKind::FileColumn => {
+                        let dtype = resolved.schema[out_index].1;
+                        match decoded.iter().position(|(out, _, _)| *out == out_index) {
+                            Some(slot) => {
+                                let from = file.out_to_file[out_index]
+                                    .map(|leaf| file.meta.columns[leaf].ty)
+                                    .expect("a decoded file column has a leaf");
+                                let piece = std::mem::replace(
+                                    &mut pieces[slot][chunk_index],
+                                    Vector::new_empty(dtype),
+                                );
+                                if from == dtype {
+                                    Arc::new(piece)
+                                } else {
+                                    Arc::new(cast_vector(
+                                        &piece,
+                                        from,
+                                        dtype,
+                                        &resolved.schema[out_index].0,
+                                    )?)
+                                }
+                            }
+                            None => {
+                                // `union_by_name` with a file that does
+                                // not have the column: every row reads
+                                // NULL (α's rule).
+                                let mut vector = Vector::with_capacity(dtype, n);
+                                for _ in 0..n {
+                                    vector.push_null()?;
+                                }
+                                Arc::new(vector)
+                            }
+                        }
+                    }
+                    OutKind::RowNumber => {
+                        let mut vector = Vector::with_capacity(DataType::Bigint, n);
+                        for i in 0..n {
+                            vector.push_valid(Value::Bigint((start + i) as i64))?;
+                        }
+                        Arc::new(vector)
+                    }
+                    OutKind::FileName => {
+                        let mut vector = Vector::with_capacity(DataType::Varchar, n);
+                        for _ in 0..n {
+                            vector.push_valid(Value::Varchar(file.meta.path.clone()))?;
+                        }
+                        Arc::new(vector)
+                    }
+                    OutKind::Hive(index) => {
+                        let column = &resolved.hive[*index];
+                        let value = match file.hive.get(*index).and_then(|v| v.as_ref()) {
+                            Some(text) => crate::hive::value_of(column.ty, text),
+                            None => Value::Null,
+                        };
+                        let mut vector = Vector::with_capacity(column.ty, n);
+                        for _ in 0..n {
+                            vector.push_value(value.clone())?;
+                        }
+                        Arc::new(vector)
+                    }
+                };
+                cols.push(value);
+            }
+            chunks.push(DataChunk::projected(cols, n));
+        }
+    }
+    Ok(())
 }
 
 /// Cast one decoded column to the scan's output type (the conversions

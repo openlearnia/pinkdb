@@ -26,6 +26,7 @@ use parquet::schema::types::Type;
 use pinkdb::{CHUNK_SIZE, DataChunk, DataType, PinkDbError, Result, Value, Vector};
 
 use crate::file_meta::{FileMeta, read_file_meta};
+use crate::remote;
 use crate::schema_map::{alpha_type_name, render_stat};
 
 /// A table being built row by row, chunked at [`CHUNK_SIZE`].
@@ -177,19 +178,27 @@ pub fn bind(function: &str) -> Vec<(String, DataType)> {
 
 /// Run one introspection function over one path (glob-expanded, α's rule).
 pub fn run(function: &str, path: &str) -> Result<Vec<DataChunk>> {
-    let paths = crate::glob::expand(path).map_err(|e| {
-        PinkDbError::Io(std::io::Error::other(format!(
-            "cannot expand the parquet path \"{path}\": {e}"
-        )))
-    })?;
-    if paths.is_empty() {
-        return Err(PinkDbError::Io(std::io::Error::other(format!(
-            "No files found that match the pattern \"{path}\""
-        ))));
-    }
-    let mut metas = Vec::with_capacity(paths.len());
-    for path in paths {
-        metas.push(read_file_meta(&path)?);
+    let mut metas = Vec::new();
+    if remote::is_remote(path) {
+        #[cfg(feature = "remote")]
+        metas.push(remote::read_meta(path)?);
+        #[cfg(not(feature = "remote"))]
+        return Err(remote::missing_feature(path));
+    } else {
+        let paths = crate::glob::expand(path).map_err(|e| {
+            PinkDbError::Io(std::io::Error::other(format!(
+                "cannot expand the parquet path \"{path}\": {e}"
+            )))
+        })?;
+        if paths.is_empty() {
+            return Err(PinkDbError::Io(std::io::Error::other(format!(
+                "No files found that match the pattern \"{path}\""
+            ))));
+        }
+        metas.reserve(paths.len());
+        for path in paths {
+            metas.push(read_file_meta(&path)?);
+        }
     }
     match function {
         "parquet_schema" => schema_rows(&metas),

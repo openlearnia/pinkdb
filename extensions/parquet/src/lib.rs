@@ -68,7 +68,7 @@
 //!   (INTEGER→BIGINT→DOUBLE, DECIMAL widths), DATE+TIMESTAMP → TIMESTAMP, and
 //!   anything else falls back to VARCHAR with the values rendered as text —
 //!   all α's rules.
-//! - **Types**: see [`schema_map`]'s table. TIMESTAMP(nanos), TIME, UUID,
+//! - **Types**: see `schema_map`'s table. TIMESTAMP(nanos), TIME, UUID,
 //!   FLOAT16, BSON and nested schemas are refused with a clear column-named
 //!   error rather than silently re-typed.
 //! - **Pushdown**: the projection decides which columns are decoded; min/max
@@ -84,6 +84,18 @@
 //!   zstd/brotli/lz4 are cargo features; `zstd` compiles the C library
 //!   through `zstd-sys` (it built for wasm here, but a C toolchain that can
 //!   target wasm is not guaranteed everywhere).
+//! - **Remote objects** (`remote` feature, enabled by the CLI's `httpfs`
+//!   feature): `read_parquet('https://…/x.parquet')`,
+//!   `read_parquet('s3://bucket/x.parquet')`, and the same paths in the
+//!   replacement scan. Claims are by extension regardless of scheme
+//!   (`.parquet`/`.parq`/`.pq`); plain `http://` is claimed but the shared
+//!   transport refuses it unless `PINKDB_HTTPFS_ALLOW_HTTP=1`. Remote paths
+//!   are single objects (globs/directories are refused). Reads go through
+//!   parquet's `ChunkReader` over [`pinkdb_httpfs::Fetcher`]: the footer and
+//!   every row-group/column-chunk read are **byte-range GETs**; a whole-object
+//!   GET happens only when the backend reports no size (HEAD without
+//!   `Content-Length`, 405/501), in which case the object is fetched once and
+//!   reused. Credentials/envs are the lake's (`AWS_*` / `PINKDB_S3_*`).
 //!
 //! # Honest limits
 //!
@@ -99,12 +111,16 @@
 //!   min/max/NULL-count statistics only.
 //! - No `hive_types`/`schema` overrides, no pushdown of `LIKE`/`OR`
 //!   predicates, no parallel column decode.
+//! - Remote: one object per call, no globs/directories, no HTTP auth beyond
+//!   the transport (no custom CA), and no ranged `HEAD` cache across
+//!   statements (bind and scan each read the footer again, cheaply).
 
 mod file_meta;
 mod glob;
 mod hive;
 mod introspect;
 mod parse;
+mod remote;
 mod resolve;
 mod scan;
 mod schema_map;

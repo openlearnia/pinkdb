@@ -9,6 +9,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-19</h2>
+<h3>Wave 75 — core <code>httpfs</code> extension (remote files for every format) ✅</h3>
+<ul>
+<li>New shared transport <code>pinkdb-httpfs</code>: the lake's SigV4 S3 client extracted behavior-identically, plus https GET and <strong>byte-range reads</strong>, with <code>Fetcher</code> as the contract.</li>
+<li>Every registered format reads remote paths: CSV (whole-object), <strong>Parquet via a ranged <code>ChunkReader</code></strong> (footer/row-group pages — no whole-file downloads when the size is known), Arrow (whole-object, documented). Claims are by extension regardless of scheme; <code>--features parquet,arrow,httpfs</code> composes, and default binaries stay transport-free.</li>
+</ul>
 <h3>Wave 77 — SQL macros ✅</h3>
 <ul>
 <li><code>CREATE [OR REPLACE] MACRO … AS expr</code> and <code>AS TABLE SELECT …</code>, with <code>DROP MACRO [IF EXISTS]</code>, parameter defaults and named arguments, expanded by <strong>bind-time AST substitution</strong> (no dynamic SQL — call-site typing, invoker rights and injection safety hold). Usable in expressions, FROM, aggregates, windows, CTEs, prepared statements, views and other macros; recursion is refused cleanly.</li>

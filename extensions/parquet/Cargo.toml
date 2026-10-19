@@ -11,6 +11,12 @@ license = "MIT"
 # `PrunePredicate`. The dependency direction matches pink-lake's: the reader
 # depends on the engine, never the other way around.
 pinkdb = { path = "../../crates/pinkdb" }
+# Remote files (`remote` feature): the shared https/SigV4 transport.
+pinkdb-httpfs = { path = "../../crates/pinkdb-httpfs", optional = true }
+# `Bytes` is the byte buffer parquet's `ChunkReader::get_bytes` contract
+# returns (already in the lock through parquet itself; declared directly only
+# for the remote implementation).
+bytes = { version = "1", optional = true }
 # The Apache Arrow `parquet` crate (arrow-rs), pinned to the 59.x family the
 # workspace's Cargo.lock already carries (vortex-* pull arrow-* 59.3.0), so a
 # build that also enables a lake consumes one arrow generation. Only the
@@ -24,6 +30,11 @@ parquet = { version = "59.3", default-features = false }
 default = ["snap", "gzip"]
 snap = ["parquet/snap"]
 gzip = ["parquet/flate2", "parquet/flate2-rust_backend"]
+# Remote `https://`/`s3://` parquet objects over the shared `pinkdb-httpfs`
+# transport: ranged footer/row-group reads (the CLI's `httpfs` feature enables
+# this together with `parquet`). Off by default: the transport (rustls) is
+# linked only when a host asks for it.
+remote = ["dep:pinkdb-httpfs", "pinkdb-httpfs/s3", "dep:bytes"]
 # Opt-in codecs. `zstd` compiles the C zstd library through `zstd-sys`, so it
 # needs a C toolchain that can target the build's target (it built for
 # wasm32-unknown-unknown here with the system clang, but that is not

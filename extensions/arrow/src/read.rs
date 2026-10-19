@@ -9,7 +9,9 @@
 //! documented follow-ups.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+#[cfg(feature = "remote")]
+use std::io::Cursor;
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -39,67 +41,92 @@ const STREAM_MARKER: [u8; 4] = [0xFF, 0xFF, 0xFF, 0xFF];
 
 /// The file's schema (footer only; no column data decoded).
 pub fn schema(path: &Path) -> Result<Vec<(String, DataType)>> {
-    let reader =
-        FileReader::try_new_buffered(open(path)?, None).map_err(|e| format_error(path, &e))?;
-    engine_schema(reader.schema().as_ref())
+    schema_of(open(path)?, &path.display().to_string())
 }
 
 /// The whole file as an engine table, named after the file stem.
 pub fn read(path: &Path) -> Result<DataTable> {
-    let reader =
-        FileReader::try_new_buffered(open(path)?, None).map_err(|e| format_error(path, &e))?;
-    let schema = reader.schema();
-    let columns = engine_schema(schema.as_ref())?;
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
         .unwrap_or("arrow")
         .to_string();
+    read_of(open(path)?, &path.display().to_string(), name)
+}
+
+/// A remote IPC object's schema (whole object; IPC has no ranged footer
+/// protocol — see [`crate::remote`]).
+#[cfg(feature = "remote")]
+pub fn schema_bytes(bytes: &[u8], label: &str) -> Result<Vec<(String, DataType)>> {
+    check_magic(bytes, label)?;
+    schema_of(Cursor::new(bytes), label)
+}
+
+/// A remote IPC object as an engine table (whole object materialized).
+#[cfg(feature = "remote")]
+pub fn read_bytes(bytes: &[u8], label: &str, name: String) -> Result<DataTable> {
+    check_magic(bytes, label)?;
+    read_of(Cursor::new(bytes), label, name)
+}
+
+fn schema_of<R: Read + Seek>(reader: R, label: &str) -> Result<Vec<(String, DataType)>> {
+    let reader = FileReader::try_new_buffered(reader, None).map_err(|e| format_error(label, &e))?;
+    engine_schema(reader.schema().as_ref())
+}
+
+fn read_of<R: Read + Seek>(reader: R, label: &str, name: String) -> Result<DataTable> {
+    let reader = FileReader::try_new_buffered(reader, None).map_err(|e| format_error(label, &e))?;
+    let schema = reader.schema();
+    let columns = engine_schema(schema.as_ref())?;
     let mut table = DataTable::new(name, columns)?;
     for batch in reader {
-        let batch = batch.map_err(|e| format_error(path, &e))?;
-        append_batch(&mut table, &batch, path)?;
+        let batch = batch.map_err(|e| format_error(label, &e))?;
+        append_batch(&mut table, &batch, label)?;
     }
     Ok(table)
 }
 
-/// Open the file and check the IPC *file* magic up front, so a stream file
-/// (or a non-Arrow file) gets a precise message instead of arrow-ipc's
-/// footer error.
+/// The IPC *file* magic check, shared by the local and remote readers, so a
+/// stream file (or a non-Arrow file) gets a precise message instead of
+/// arrow-ipc's footer error.
+fn check_magic(bytes: &[u8], label: &str) -> Result<()> {
+    if bytes.len() < 6 || &bytes[..6] != FILE_MAGIC {
+        if bytes.len() >= 4 && bytes[..4] == STREAM_MARKER {
+            return Err(PinkDbError::Execution(format!(
+                "\"{label}\" is an Arrow IPC stream, not an IPC file (no ARROW1 magic); \
+                 the arrow extension reads/writes the IPC file format \
+                 (`ipc.write_file`; convert a stream with pyarrow's `ipc.open_file`)"
+            )));
+        }
+        return Err(PinkDbError::Execution(format!(
+            "\"{label}\" is not an Arrow IPC file (missing the ARROW1 magic)"
+        )));
+    }
+    Ok(())
+}
+
+/// Open the file and check the IPC *file* magic up front.
 fn open(path: &Path) -> Result<BufReader<File>> {
     let file = File::open(path)
         .map_err(|e| PinkDbError::Execution(format!("cannot open \"{}\": {e}", path.display())))?;
     let mut probe = BufReader::new(file);
     let mut magic = [0u8; 6];
     let read = probe.read(&mut magic).unwrap_or(0);
-    if read < 6 || &magic != FILE_MAGIC {
-        if read >= 4 && magic[..4] == STREAM_MARKER {
-            return Err(PinkDbError::Execution(format!(
-                "\"{}\" is an Arrow IPC stream, not an IPC file (no ARROW1 magic); \
-                 the arrow extension reads/writes the IPC file format \
-                 (`ipc.write_file`; convert a stream with pyarrow's `ipc.open_file`)",
-                path.display()
-            )));
-        }
-        return Err(PinkDbError::Execution(format!(
-            "\"{}\" is not an Arrow IPC file (missing the ARROW1 magic)",
-            path.display()
-        )));
-    }
+    check_magic(&magic[..read], &path.display().to_string())?;
     // The probe read only checks; arrow-ipc starts from offset 0.
     let file = File::open(path)
         .map_err(|e| PinkDbError::Execution(format!("cannot open \"{}\": {e}", path.display())))?;
     Ok(BufReader::new(file))
 }
 
-fn format_error(path: &Path, e: &arrow_schema::ArrowError) -> PinkDbError {
-    PinkDbError::Execution(format!("cannot read \"{}\": {e}", path.display()))
+fn format_error(label: &str, e: &arrow_schema::ArrowError) -> PinkDbError {
+    PinkDbError::Execution(format!("cannot read \"{label}\": {e}"))
 }
 
 /// Convert one record batch and append it as engine chunks (≤ [`CHUNK_SIZE`]
 /// rows each).
-fn append_batch(table: &mut DataTable, batch: &RecordBatch, path: &Path) -> Result<()> {
+fn append_batch(table: &mut DataTable, batch: &RecordBatch, label: &str) -> Result<()> {
     let rows = batch.num_rows();
     if rows == 0 {
         return Ok(());
@@ -107,8 +134,7 @@ fn append_batch(table: &mut DataTable, batch: &RecordBatch, path: &Path) -> Resu
     let dtypes: Vec<DataType> = table.schema().into_iter().map(|(_, t)| t).collect();
     if batch.num_columns() != dtypes.len() {
         return Err(PinkDbError::Execution(format!(
-            "cannot read \"{}\": record batch has {} columns but the file schema has {}",
-            path.display(),
+            "cannot read \"{label}\": record batch has {} columns but the file schema has {}",
             batch.num_columns(),
             dtypes.len()
         )));
