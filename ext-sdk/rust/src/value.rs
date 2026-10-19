@@ -1,0 +1,359 @@
+//! The typed value model: what an extension function's argument and return
+//! types must implement so the registration macro can generate the ABI glue.
+//!
+//! The traits are deliberately small and closed: every implementor is one of
+//! the ABI v1 types, so the macro can derive a function's declared argument
+//! tags ([`ExtArgType::EXT_TYPE`]) and return tag
+//! ([`IntoExtValue::RET_TYPE`]) from the Rust types the author writes. A
+//! custom implementor cannot invent a new ABI type — it can only name an
+//! existing one — which is exactly the guarantee the host relies on.
+
+use pinkdb_ext_loader::{ExtArg, ExtType, ExtValue};
+
+/// The ABI type a Rust argument type maps to.
+///
+/// Implemented for the seven ABI v1 value types and for `Option<T>`, which
+/// wraps the same tag and additionally tells the generated glue that NULL is
+/// a legal input (see [`FromExtArg`]).
+pub trait ExtArgType {
+    /// The `PINKDB_EXT_TYPE_*` tag this type is registered under.
+    const EXT_TYPE: ExtType;
+}
+
+impl ExtArgType for bool {
+    const EXT_TYPE: ExtType = ExtType::Boolean;
+}
+impl ExtArgType for i32 {
+    const EXT_TYPE: ExtType = ExtType::Integer;
+}
+impl ExtArgType for i64 {
+    const EXT_TYPE: ExtType = ExtType::Bigint;
+}
+impl ExtArgType for f64 {
+    const EXT_TYPE: ExtType = ExtType::Double;
+}
+impl ExtArgType for String {
+    const EXT_TYPE: ExtType = ExtType::Varchar;
+}
+impl ExtArgType for &str {
+    const EXT_TYPE: ExtType = ExtType::Varchar;
+}
+impl ExtArgType for Date {
+    const EXT_TYPE: ExtType = ExtType::Date;
+}
+impl ExtArgType for Timestamp {
+    const EXT_TYPE: ExtType = ExtType::Timestamp;
+}
+/// An optional argument keeps its inner type's tag and accepts NULL.
+impl<T: ExtArgType> ExtArgType for Option<T> {
+    const EXT_TYPE: ExtType = T::EXT_TYPE;
+}
+
+/// Decode one ABI argument into the Rust type an author wrote.
+///
+/// A NULL argument arrives as [`ExtArg::Null`] carrying the declared tag. The
+/// plain implementations reject it with a message naming the fix (`Option<T>`
+/// is the way to receive NULL); [`Option<T>`](Option)'s implementation maps it
+/// to `None`. The host's binder already guarantees the declared type, so a
+/// tag mismatch reaching a `decode` is an ABI/engine bug: it is reported as a
+/// clear error rather than a silent reinterpretation.
+///
+/// `&'a str` borrows the host's VARCHAR bytes, which are only valid for the
+/// duration of the call — copy to a `String` to keep them.
+pub trait FromExtArg<'a>: Sized {
+    /// Decode the argument (never called with a type the host did not declare).
+    fn from_ext_arg(arg: &'a ExtArg<'a>) -> Result<Self, String>;
+}
+
+/// The message a non-optional type produces for a NULL argument. `rust` is
+/// the Rust type the author should reach for, `sql` the ABI type name used
+/// for a plain tag mismatch.
+fn type_message(sql: &str, rust: &str, arg: &ExtArg<'_>) -> String {
+    match arg {
+        ExtArg::Null(_) => format!(
+            "NULL (declare the parameter `Option<{rust}>` to receive NULL, or `Option<_>` to \
+             return NULL)"
+        ),
+        other => format!("expected {sql}, got {}", other.ext_type()),
+    }
+}
+
+impl FromExtArg<'_> for bool {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<bool, String> {
+        match arg {
+            ExtArg::Boolean(b) => Ok(*b),
+            other => Err(type_message("BOOLEAN", "bool", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for i32 {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<i32, String> {
+        match arg {
+            ExtArg::Integer(i) => Ok(*i),
+            other => Err(type_message("INTEGER", "i32", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for i64 {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<i64, String> {
+        match arg {
+            ExtArg::Bigint(i) => Ok(*i),
+            other => Err(type_message("BIGINT", "i64", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for f64 {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<f64, String> {
+        match arg {
+            ExtArg::Double(x) => Ok(*x),
+            other => Err(type_message("DOUBLE", "f64", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for String {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<String, String> {
+        match arg {
+            ExtArg::Varchar(bytes) => String::from_utf8(bytes.to_vec())
+                .map_err(|_| "VARCHAR bytes are not valid UTF-8".to_string()),
+            other => Err(type_message("VARCHAR", "String", other)),
+        }
+    }
+}
+
+impl<'a> FromExtArg<'a> for &'a str {
+    fn from_ext_arg(arg: &'a ExtArg<'a>) -> Result<&'a str, String> {
+        match arg {
+            ExtArg::Varchar(bytes) => std::str::from_utf8(bytes)
+                .map_err(|_| "VARCHAR bytes are not valid UTF-8".to_string()),
+            other => Err(type_message("VARCHAR", "&str", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for Date {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<Date, String> {
+        match arg {
+            ExtArg::Date(days) => Ok(Date(*days)),
+            other => Err(type_message("DATE", "Date", other)),
+        }
+    }
+}
+
+impl FromExtArg<'_> for Timestamp {
+    fn from_ext_arg(arg: &ExtArg<'_>) -> Result<Timestamp, String> {
+        match arg {
+            ExtArg::Timestamp(micros) => Ok(Timestamp(*micros)),
+            other => Err(type_message("TIMESTAMP", "Timestamp", other)),
+        }
+    }
+}
+
+impl<'a, T: FromExtArg<'a>> FromExtArg<'a> for Option<T> {
+    fn from_ext_arg(arg: &'a ExtArg<'a>) -> Result<Option<T>, String> {
+        match arg {
+            ExtArg::Null(_) => Ok(None),
+            other => T::from_ext_arg(other).map(Some),
+        }
+    }
+}
+
+/// Encode a Rust return value into an ABI result.
+///
+/// `Result<_, String>` wraps another implementor and turns its `Err` into the
+/// statement error the host reports (on native targets the C ABI carries a
+/// code, not text — see the crate docs). `Option<T>` turns `None` into SQL
+/// NULL. `RET_TYPE` is the tag the function is registered under; the host
+/// checks every non-NULL result against it.
+pub trait IntoExtValue {
+    /// The `PINKDB_EXT_TYPE_*` tag the function is registered under.
+    const RET_TYPE: ExtType;
+    /// Encode the value; `Err` fails the enclosing SQL statement.
+    fn into_ext_value(self) -> Result<ExtValue, String>;
+}
+
+impl IntoExtValue for bool {
+    const RET_TYPE: ExtType = ExtType::Boolean;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Boolean(self))
+    }
+}
+
+impl IntoExtValue for i32 {
+    const RET_TYPE: ExtType = ExtType::Integer;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Integer(self))
+    }
+}
+
+impl IntoExtValue for i64 {
+    const RET_TYPE: ExtType = ExtType::Bigint;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Bigint(self))
+    }
+}
+
+impl IntoExtValue for f64 {
+    const RET_TYPE: ExtType = ExtType::Double;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Double(self))
+    }
+}
+
+impl IntoExtValue for String {
+    const RET_TYPE: ExtType = ExtType::Varchar;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Varchar(self.into_bytes()))
+    }
+}
+
+impl IntoExtValue for &'static str {
+    const RET_TYPE: ExtType = ExtType::Varchar;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Varchar(self.as_bytes().to_vec()))
+    }
+}
+
+impl IntoExtValue for Date {
+    const RET_TYPE: ExtType = ExtType::Date;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Date(self.0))
+    }
+}
+
+impl IntoExtValue for Timestamp {
+    const RET_TYPE: ExtType = ExtType::Timestamp;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        Ok(ExtValue::Timestamp(self.0))
+    }
+}
+
+impl<T: IntoExtValue> IntoExtValue for Option<T> {
+    const RET_TYPE: ExtType = T::RET_TYPE;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        match self {
+            Some(value) => value.into_ext_value(),
+            None => Ok(ExtValue::Null),
+        }
+    }
+}
+
+impl<T: IntoExtValue> IntoExtValue for Result<T, String> {
+    const RET_TYPE: ExtType = T::RET_TYPE;
+    fn into_ext_value(self) -> Result<ExtValue, String> {
+        self.and_then(T::into_ext_value)
+    }
+}
+
+/// A SQL `DATE`: days since 1970-01-01, exactly the ABI's representation.
+///
+/// The SDK does no calendar arithmetic — build one from
+/// [`FromExtArg`]`::from_ext_arg`, an integer day count, or a date library;
+/// the engine prints it in ISO form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Date(pub i32);
+
+/// A SQL `TIMESTAMP`: microseconds since 1970-01-01 00:00:00 UTC, exactly the
+/// ABI's representation (no time zone is carried).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp(pub i64);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_abi_type_has_a_tag_and_option_keeps_it() {
+        assert_eq!(bool::EXT_TYPE, ExtType::Boolean);
+        assert_eq!(i32::EXT_TYPE, ExtType::Integer);
+        assert_eq!(i64::EXT_TYPE, ExtType::Bigint);
+        assert_eq!(f64::EXT_TYPE, ExtType::Double);
+        assert_eq!(<String as ExtArgType>::EXT_TYPE, ExtType::Varchar);
+        assert_eq!(<&str as ExtArgType>::EXT_TYPE, ExtType::Varchar);
+        assert_eq!(Date::EXT_TYPE, ExtType::Date);
+        assert_eq!(Timestamp::EXT_TYPE, ExtType::Timestamp);
+        assert_eq!(Option::<i64>::EXT_TYPE, ExtType::Bigint);
+        assert_eq!(Option::<String>::EXT_TYPE, ExtType::Varchar);
+
+        assert_eq!(i32::RET_TYPE, ExtType::Integer);
+        assert_eq!(<&'static str as IntoExtValue>::RET_TYPE, ExtType::Varchar);
+        assert_eq!(<Option<i64> as IntoExtValue>::RET_TYPE, ExtType::Bigint);
+        assert_eq!(
+            <Result<Option<String>, String> as IntoExtValue>::RET_TYPE,
+            ExtType::Varchar
+        );
+    }
+
+    #[test]
+    fn decoding_covers_every_value_and_null_policy() {
+        let arg = ExtArg::Bigint(7);
+        assert_eq!(i64::from_ext_arg(&arg).unwrap(), 7);
+        assert_eq!(Option::<i64>::from_ext_arg(&arg).unwrap(), Some(7));
+
+        let null = ExtArg::Null(ExtType::Bigint);
+        assert_eq!(Option::<i64>::from_ext_arg(&null).unwrap(), None);
+        let message = i64::from_ext_arg(&null).unwrap_err();
+        assert!(message.contains("NULL"), "{message}");
+        assert!(message.contains("Option<i64>"), "{message}");
+
+        let bytes = b"h\xc3\xa9llo";
+        let text = ExtArg::Varchar(bytes);
+        assert_eq!(String::from_ext_arg(&text).unwrap(), "héllo");
+        assert_eq!(<&str>::from_ext_arg(&text).unwrap(), "héllo");
+        assert!(<&str>::from_ext_arg(&ExtArg::Integer(1)).is_err());
+        assert!(
+            String::from_ext_arg(&ExtArg::Varchar(&[0xff, 0xfe]))
+                .unwrap_err()
+                .contains("UTF-8")
+        );
+
+        assert!(bool::from_ext_arg(&ExtArg::Boolean(true)).unwrap());
+        assert_eq!(f64::from_ext_arg(&ExtArg::Double(2.5)).unwrap(), 2.5);
+        assert_eq!(Date::from_ext_arg(&ExtArg::Date(19)).unwrap(), Date(19));
+        assert_eq!(
+            Timestamp::from_ext_arg(&ExtArg::Timestamp(5)).unwrap(),
+            Timestamp(5)
+        );
+        // A wrong runtime tag is a clear error, never a reinterpretation.
+        let message = i64::from_ext_arg(&ExtArg::Varchar(b"x")).unwrap_err();
+        assert_eq!(message, "expected BIGINT, got VARCHAR");
+    }
+
+    #[test]
+    fn encoding_covers_every_value_and_errors() {
+        assert_eq!(true.into_ext_value().unwrap(), ExtValue::Boolean(true));
+        assert_eq!(3i32.into_ext_value().unwrap(), ExtValue::Integer(3));
+        assert_eq!(4i64.into_ext_value().unwrap(), ExtValue::Bigint(4));
+        assert_eq!(1.5f64.into_ext_value().unwrap(), ExtValue::Double(1.5));
+        assert_eq!(
+            "hi".to_string().into_ext_value().unwrap(),
+            ExtValue::Varchar(b"hi".to_vec())
+        );
+        assert_eq!(
+            "lit".into_ext_value().unwrap(),
+            ExtValue::Varchar(b"lit".to_vec())
+        );
+        assert_eq!(Date(1).into_ext_value().unwrap(), ExtValue::Date(1));
+        assert_eq!(
+            Timestamp(2).into_ext_value().unwrap(),
+            ExtValue::Timestamp(2)
+        );
+        assert_eq!(
+            Option::<i64>::None.into_ext_value().unwrap(),
+            ExtValue::Null
+        );
+        assert_eq!(Some(9i64).into_ext_value().unwrap(), ExtValue::Bigint(9));
+        let err = Err::<i64, String>("nope".to_string())
+            .into_ext_value()
+            .unwrap_err();
+        assert_eq!(err, "nope");
+        let ok: Result<Option<String>, String> = Ok(Some("x".into()));
+        assert_eq!(
+            ok.into_ext_value().unwrap(),
+            ExtValue::Varchar(b"x".to_vec())
+        );
+    }
+}

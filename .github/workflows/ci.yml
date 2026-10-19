@@ -238,11 +238,11 @@ jobs:
           go vet ./...
           go test -race ./...
 
-  # The two extension SDKs, end to end: each smoke script builds the release
+  # The three extension SDKs, end to end: each smoke script builds the release
   # CLI and runs a deterministic LOAD EXTENSION session against the compared
-  # examples (C/C++ and Go).
+  # examples (C/C++, Go and Rust).
   sdk-smokes:
-    name: extension SDK smokes (C/C++ and Go)
+    name: extension SDK smokes (C/C++, Go and Rust)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -276,6 +276,13 @@ jobs:
 
       - name: ./ext-sdk/go/smoke.sh
         run: ./ext-sdk/go/smoke.sh
+
+      # The Rust SDK smoke builds its example with cargo (a workspace member)
+      # and drives the same CLI session, including the volatile-function
+      # refusal. `cargo test -p pinkdb-ext-sdk` (the main build-test job) also
+      # covers the SDK's own native and linked round trips.
+      - name: ./ext-sdk/rust/smoke.sh
+        run: ./ext-sdk/rust/smoke.sh
 
   # Real S3 semantics in a container (adobe/s3mock pulled from Docker Hub):
   # round-trip, concurrency races and refusals through the release CLI.

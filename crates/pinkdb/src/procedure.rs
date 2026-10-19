@@ -1945,6 +1945,13 @@ fn eval_cond(db: &mut PinkDb, frame: &Frame, off: usize, expr: &Expr) -> Result<
 
 /// Bind one constant expression (no table scope) with the frame's variables
 /// substituted as bound values.
+///
+/// A `CALL` is WAL-logged as a single record and replay re-evaluates this
+/// expression, so a **volatile** (nondeterministic) extension call here could
+/// take a different branch (or produce a different value) on replay: it is
+/// refused, exactly like the statement-level guard refuses it in a logged
+/// statement. Deterministic calls keep working here as before — they replay
+/// identically.
 fn bind_constant(
     db: &PinkDb,
     frame: &Frame,
@@ -1953,8 +1960,20 @@ fn bind_constant(
     what: &str,
 ) -> Result<crate::sql::binder::BoundExpr> {
     let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(frame.variables());
-    crate::sql::binder::bind_constant_expr(db, &frame.db_name, expr, Some(slots))
-        .map_err(|e| frame.err(off, format!("{what}: {e}")))
+    let (bound, dynamic) =
+        crate::sql::binder::bind_constant_expr_tracked(db, &frame.db_name, expr, Some(slots))
+            .map_err(|e| frame.err(off, format!("{what}: {e}")))?;
+    if let Some(function) = db.first_volatile_dynamic_function(&dynamic) {
+        return Err(frame.err(
+            off,
+            format!(
+                "{what}: extension function {function}() is volatile (nondeterministic) and cannot \
+                 be evaluated inside a procedure body: a CALL is WAL-logged and replayed, so its \
+                 result could differ. Call it in a read-only statement outside the procedure"
+            ),
+        ));
+    }
+    Ok(bound)
 }
 
 /// Evaluate a bound constant expression against an empty single-row chunk.

@@ -2198,6 +2198,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pinkdb-ext-sdk"
+version = "0.1.0"
+dependencies = [
+ "pinkdb",
+ "pinkdb-ext-loader",
+]
+
+[[package]]
+name = "pinkdb-ext-sdk-example"
+version = "0.1.0"
+dependencies = [
+ "pinkdb-ext-sdk",
+]
+
+[[package]]
 name = "pinkdb-ffi"
 version = "0.1.0"
 dependencies = [

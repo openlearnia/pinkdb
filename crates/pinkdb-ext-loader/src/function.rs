@@ -35,6 +35,11 @@ pub struct DynamicFunction {
     arg_types: Vec<ExtType>,
     /// Declared return type.
     ret_type: ExtType,
+    /// Declared volatile (nondeterministic): registered with
+    /// `PINKDB_EXT_FLAG_VOLATILE`. The engine refuses to run such a call in
+    /// any statement it WAL-logs (see the header's "Deterministic vs
+    /// volatile functions" and `crate::linked`).
+    volatile: bool,
     /// Extension code (valid while `library` is alive).
     callback: PinkdbExtScalarFn,
     /// Opaque extension-chosen context, passed back on every call.
@@ -67,6 +72,7 @@ impl Clone for DynamicFunction {
             n_args: self.n_args,
             arg_types: self.arg_types.clone(),
             ret_type: self.ret_type,
+            volatile: self.volatile,
             callback: self.callback,
             user_data: self.user_data,
             free_fn: self.free_fn,
@@ -84,17 +90,20 @@ impl fmt::Debug for DynamicFunction {
             .field("n_args", &self.n_args)
             .field("arg_types", &self.arg_types)
             .field("ret_type", &self.ret_type)
+            .field("volatile", &self.volatile)
             .finish_non_exhaustive()
     }
 }
 
-/// Everything one `register_scalar` call contributes to a function handle.
+/// Everything one registration call contributes to a function handle.
 /// Mixed into [`DynamicFunction`] immediately, on the loading thread.
 pub(crate) struct Registration {
     pub(crate) name: String,
     pub(crate) n_args: usize,
     pub(crate) arg_types: Vec<ExtType>,
     pub(crate) ret_type: ExtType,
+    /// Decoded [`crate::abi::PINKDB_EXT_FLAG_VOLATILE`] bit.
+    pub(crate) volatile: bool,
     pub(crate) callback: PinkdbExtScalarFn,
     pub(crate) user_data: *mut c_void,
 }
@@ -113,6 +122,7 @@ impl DynamicFunction {
             n_args: reg.n_args,
             arg_types: reg.arg_types,
             ret_type: reg.ret_type,
+            volatile: reg.volatile,
             callback: reg.callback,
             user_data: reg.user_data,
             free_fn,
@@ -144,6 +154,19 @@ impl DynamicFunction {
     /// Declared return type.
     pub fn ret_type(&self) -> ExtType {
         self.ret_type
+    }
+
+    /// Whether the extension declared this function volatile
+    /// (nondeterministic) at registration
+    /// ([`crate::abi::PINKDB_EXT_FLAG_VOLATILE`]). `false` — deterministic —
+    /// is the default for every pre-flag registration and for every
+    /// `register_scalar` call.
+    ///
+    /// The engine refuses to run a volatile call in any statement it
+    /// WAL-logs: replaying logged SQL must land on identical data, and a
+    /// nondeterministic callback cannot promise that.
+    pub fn is_volatile(&self) -> bool {
+        self.volatile
     }
 
     /// Invoke the callback once (one row) and return its result.

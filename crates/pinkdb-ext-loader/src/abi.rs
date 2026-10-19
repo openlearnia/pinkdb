@@ -23,6 +23,19 @@ pub const PINKDB_EXT_ABI_VERSION: u32 = 1;
 /// models so one extension's arity limit does not change with the target.
 pub const PINKDB_EXT_MAX_ARGS: u32 = 64;
 
+/// Registration flag: the function is volatile (nondeterministic) — see the
+/// header's "Deterministic vs volatile functions" section. [`crate::abi::
+/// PinkdbHostApi::register_scalar_flags`] is the only way to set it;
+/// `register_scalar` is the same call with `flags == 0` (deterministic).
+#[cfg(not(target_arch = "wasm32"))]
+pub const PINKDB_EXT_FLAG_VOLATILE: u32 = 0x1;
+
+/// Every registration flag this loader knows. A registration carrying any
+/// other bit is rejected: silently ignoring a flag is exactly how a declared
+/// volatile function would become deterministic again.
+#[cfg(not(target_arch = "wasm32"))]
+pub const PINKDB_EXT_FLAG_KNOWN: u32 = PINKDB_EXT_FLAG_VOLATILE;
+
 // Value / argument type tags (same numbering as the pinkdb C ABI).
 pub const PINKDB_EXT_TYPE_NULL: i32 = 0;
 pub const PINKDB_EXT_TYPE_BOOLEAN: i32 = 1;
@@ -116,9 +129,12 @@ pub type PinkdbExtInitFn =
     unsafe extern "C" fn(api: *const PinkdbHostApi, host_ctx: *mut c_void) -> i32;
 
 /// Host-provided services handed to `pinkdb_extension_init`. Mirrors
-/// `PinkdbHostApi` in the header field for field.
+/// `PinkdbHostApi` in the header field for field. A plain POD: extensions
+/// copy it out of init (the header documents it as init-scoped), and the
+/// fields are all function pointers and integers.
 #[cfg(not(target_arch = "wasm32"))]
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PinkdbHostApi {
     /// [`PINKDB_EXT_ABI_VERSION`].
     pub abi_version: u32,
@@ -144,6 +160,21 @@ pub struct PinkdbHostApi {
     pub alloc: extern "C" fn(size: usize) -> *mut c_void,
     /// Free result text allocated by `alloc`.
     pub free: extern "C" fn(ptr: *mut c_void),
+    /// [`Self::register_scalar`] plus a `PINKDB_EXT_FLAG_*` set
+    /// ([`PINKDB_EXT_FLAG_VOLATILE`]). Appended after ABI v1 shipped, so an
+    /// extension must compare `struct_size` before calling it (see the
+    /// header); the field itself is ABI-identical to a nullable function
+    /// pointer.
+    pub register_scalar_flags: extern "C" fn(
+        ctx: *mut c_void,
+        name: *const c_char,
+        n_args: u32,
+        arg_types: *const i32,
+        ret_type: i32,
+        flags: u32,
+        func: Option<PinkdbExtScalarFn>,
+        user_data: *mut c_void,
+    ) -> i32,
 }
 
 /// The ABI's type tags as a Rust enum (the host never uses the NULL tag for
@@ -368,6 +399,30 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PinkdbHostApi, abi_version), 0);
         assert_eq!(std::mem::offset_of!(PinkdbHostApi, struct_size), 4);
         assert_eq!(std::mem::offset_of!(PinkdbHostApi, register_scalar), 8);
+    }
+
+    /// The volatile flag is an *additive* ABI v1 addition: appending
+    /// `register_scalar_flags` after `free` changes no earlier field's
+    /// offset, so an extension built against the pre-flag header keeps
+    /// working byte-for-byte (it just never reads the new field), while an
+    /// extension that uses it checks `struct_size` first.
+    #[test]
+    fn register_scalar_flags_is_appended_after_the_v1_fields() {
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(std::mem::offset_of!(PinkdbHostApi, alloc), 16);
+            assert_eq!(std::mem::offset_of!(PinkdbHostApi, free), 24);
+            assert_eq!(
+                std::mem::offset_of!(PinkdbHostApi, register_scalar_flags),
+                32
+            );
+            assert_eq!(std::mem::size_of::<PinkdbHostApi>(), 40);
+        }
+        // The check an extension makes before calling the new field: the
+        // host's struct_size covers it exactly when it is the last field.
+        const FIELD_END: usize = std::mem::offset_of!(PinkdbHostApi, register_scalar_flags)
+            + std::mem::size_of::<usize>();
+        assert_eq!(FIELD_END, std::mem::size_of::<PinkdbHostApi>());
     }
 
     #[test]

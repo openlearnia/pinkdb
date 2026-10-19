@@ -1,0 +1,23 @@
+[package]
+name = "my-extension"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "A pinkdb extension skeleton (copy this directory and start here)"
+license = "MIT"
+publish = false
+
+[lib]
+# A loadable extension is a shared library: `cargo build --release` writes
+# `target/release/libmy_extension.dylib` (`.so` on Linux), which
+# `LOAD EXTENSION '<absolute path>'` opens.
+name = "my_extension"
+crate-type = ["cdylib"]
+
+[dependencies]
+# When this directory is copied elsewhere, point the path at a checkout of the
+# SDK (or use a git dependency on your fork).
+pinkdb-ext-sdk = { path = ".." }
+
+# This skeleton is a standalone crate, not a member of the pinkdb workspace.
+[workspace]

@@ -2977,7 +2977,38 @@ pub(crate) fn bind_tracked(
 /// [`bind_tracked`] for a `?`-parameterized statement: `params` carries one
 /// bound value per placeholder, and each `?` binds (and type-infers) against
 /// its slot. A plain statement passes `None`, where any `?` is a clear error.
+///
+/// On top of [`bind_tracked_plan`] this applies the WAL-divergence guard: a
+/// statement whose SQL text the engine logs (see
+/// [`crate::plan::writes_tables`] — INSERT/UPDATE/DELETE, DDL, `CALL`, ...)
+/// may not call a volatile (nondeterministic) extension function. Replay
+/// re-executes the logged text, and a volatile callback could produce a
+/// different value there; refusing the statement before it runs is what makes
+/// divergence impossible rather than merely unlikely. Read-only statements
+/// never reach the WAL and are unaffected, and the guard is applied uniformly
+/// whether or not this store currently has a WAL attached, so the same SQL
+/// behaves identically in tests and on a durable store.
 pub(crate) fn bind_tracked_with(
+    db: &PinkDb,
+    stmt: &Statement,
+    default_db: &str,
+    params: Option<ParamSlots>,
+) -> Result<(LogicalPlan, Vec<String>)> {
+    let (plan, dynamic) = bind_tracked_plan(db, stmt, default_db, params)?;
+    if crate::plan::writes_tables(&plan)
+        && let Some(function) = db.first_volatile_dynamic_function(&dynamic)
+    {
+        return Err(PinkDbError::Execution(format!(
+            "extension function {function}() is volatile (nondeterministic) and cannot be called \
+             in a statement the engine WAL-logs: replaying it could produce a different result. \
+             Use it in a read-only statement, or declare the function deterministic"
+        )));
+    }
+    Ok((plan, dynamic))
+}
+
+/// [`bind_tracked_with`]'s plan construction, without the volatility guard.
+fn bind_tracked_plan(
     db: &PinkDb,
     stmt: &Statement,
     default_db: &str,
@@ -3673,6 +3704,22 @@ pub(crate) fn bind_constant_expr(
     expr: &Expr,
     params: Option<ParamSlots>,
 ) -> Result<BoundExpr> {
+    Ok(bind_constant_expr_tracked(db, default_db, expr, params)?.0)
+}
+
+/// [`bind_constant_expr`] plus the dynamic-function names (lowercased
+/// registry keys) the expression references, in first-use order — the same
+/// list the statement-level binders return.
+///
+/// A caller that logs its whole unit anyway (the procedure executor: a `CALL`
+/// is WAL-logged as one record, and its replay re-evaluates this expression)
+/// applies the volatility guard to expressions bound outside any statement.
+pub(crate) fn bind_constant_expr_tracked(
+    db: &PinkDb,
+    default_db: &str,
+    expr: &Expr,
+    params: Option<ParamSlots>,
+) -> Result<(BoundExpr, Vec<String>)> {
     let mut binder = Binder::new(db, default_db).with_params(params);
     binder.allow_win = false;
     binder.allow_alias = false;
@@ -3683,7 +3730,7 @@ pub(crate) fn bind_constant_expr(
             "an aggregate is not allowed here (no table scope)".to_string(),
         ));
     }
-    Ok(bound)
+    Ok((bound, binder.dynamic_functions_used()))
 }
 
 /// Bind CREATE VIEW: validate the query now (errors surface at creation),

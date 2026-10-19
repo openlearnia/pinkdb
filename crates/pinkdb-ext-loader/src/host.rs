@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::abi::{
-    ExtType, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_MAX_ARGS, PinkdbExtScalarFn, PinkdbHostApi,
+    ExtType, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_FLAG_KNOWN, PINKDB_EXT_MAX_ARGS, PinkdbExtScalarFn,
+    PinkdbHostApi,
 };
 use crate::function::{DynamicFunction, Registration};
 
@@ -47,10 +48,15 @@ pub(crate) fn host_api() -> PinkdbHostApi {
         register_scalar,
         alloc: host_alloc,
         free: host_free,
+        register_scalar_flags,
     }
 }
 
 /// `register_scalar` implementation; never unwinds into extension code.
+///
+/// Deterministic-by-default: exactly [`register_scalar_flags`] with
+/// `flags == 0`, so a registration built against the pre-flag ABI keeps
+/// today's semantics (`DynamicFunction::is_volatile() == false`).
 extern "C" fn register_scalar(
     ctx: *mut c_void,
     name: *const c_char,
@@ -60,8 +66,44 @@ extern "C" fn register_scalar(
     func: Option<PinkdbExtScalarFn>,
     user_data: *mut c_void,
 ) -> i32 {
+    register(ctx, name, n_args, arg_types, ret_type, 0, func, user_data)
+}
+
+/// `register_scalar_flags` implementation (ABI v1 addition); never unwinds
+/// into extension code. `flags` beyond [`PINKDB_EXT_FLAG_KNOWN`] are
+/// rejected: a flag the host does not understand must never be dropped, or a
+/// declared-volatile function would be stored as deterministic.
+extern "C" fn register_scalar_flags(
+    ctx: *mut c_void,
+    name: *const c_char,
+    n_args: u32,
+    arg_types: *const i32,
+    ret_type: i32,
+    flags: u32,
+    func: Option<PinkdbExtScalarFn>,
+    user_data: *mut c_void,
+) -> i32 {
+    register(
+        ctx, name, n_args, arg_types, ret_type, flags, func, user_data,
+    )
+}
+
+/// The shared body of both registration entry points.
+#[allow(clippy::too_many_arguments)]
+fn register(
+    ctx: *mut c_void,
+    name: *const c_char,
+    n_args: u32,
+    arg_types: *const i32,
+    ret_type: i32,
+    flags: u32,
+    func: Option<PinkdbExtScalarFn>,
+    user_data: *mut c_void,
+) -> i32 {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        collect(ctx, name, n_args, arg_types, ret_type, func, user_data)
+        collect(
+            ctx, name, n_args, arg_types, ret_type, flags, func, user_data,
+        )
     }));
     match outcome {
         Ok(Ok(())) => 0,
@@ -88,12 +130,14 @@ fn record_rejection(ctx: *mut c_void, message: String) {
 }
 
 /// Validate one registration and add it to the collector.
+#[allow(clippy::too_many_arguments)]
 fn collect(
     ctx: *mut c_void,
     name: *const c_char,
     n_args: u32,
     arg_types: *const i32,
     ret_type: i32,
+    flags: u32,
     func: Option<PinkdbExtScalarFn>,
     user_data: *mut c_void,
 ) -> Result<(), String> {
@@ -114,11 +158,12 @@ fn collect(
     let name = unsafe { CStr::from_ptr(name) }
         .to_str()
         .map_err(|_| "function name is not valid UTF-8".to_string())?;
-    let (types, ret_type, func) = validate_registration(
+    let (types, ret_type, volatile, func) = validate_registration(
         name,
         n_args,
         arg_types.is_null(),
         ret_type,
+        flags,
         // SAFETY: only called after the arity cap and the NULL-pointer check,
         // and the ABI requires `arg_types` to point at `n_args` tags.
         |i| unsafe { *arg_types.add(i) },
@@ -135,6 +180,7 @@ fn collect(
             n_args: n_args as usize,
             arg_types: types,
             ret_type,
+            volatile,
             callback: func,
             user_data,
         },
@@ -145,22 +191,40 @@ fn collect(
     Ok(())
 }
 
+/// Check one registration's flag set; returns the decoded volatile bit.
+///
+/// Split out so the rule is unit-testable without a live shared library.
+fn validate_flags(name: &str, flags: u32) -> Result<bool, String> {
+    if flags & !PINKDB_EXT_FLAG_KNOWN != 0 {
+        return Err(format!(
+            "function \"{name}\": unknown registration flag bit(s) {:#x} \
+             (this host knows {:#x})",
+            flags & !PINKDB_EXT_FLAG_KNOWN,
+            PINKDB_EXT_FLAG_KNOWN
+        ));
+    }
+    Ok(flags & crate::abi::PINKDB_EXT_FLAG_VOLATILE != 0)
+}
+
 /// Validate one registration's metadata (no pointer dereferencing beyond the
-/// caller-provided tag reader) and return the decoded types plus the checked
-/// non-NULL callback. Split out from [`collect`] so every rejection rule is
-/// unit-testable without a live shared library.
+/// caller-provided tag reader) and return the decoded types, the checked
+/// non-NULL callback, and the decoded volatile bit. Split out from [`collect`]
+/// so every rejection rule is unit-testable without a live shared library.
+#[allow(clippy::too_many_arguments)]
 fn validate_registration(
     name: &str,
     n_args: u32,
     arg_types_is_null: bool,
     ret_type: i32,
+    flags: u32,
     mut arg_tag: impl FnMut(usize) -> i32,
     func: Option<PinkdbExtScalarFn>,
     existing_names: &[String],
-) -> Result<(Vec<ExtType>, ExtType, PinkdbExtScalarFn), String> {
+) -> Result<(Vec<ExtType>, ExtType, bool, PinkdbExtScalarFn), String> {
     if name.is_empty() {
         return Err("function name is empty".to_string());
     }
+    let volatile = validate_flags(name, flags)?;
     if name.len() > 256 {
         let display: String = name.chars().take(40).collect();
         return Err(format!(
@@ -201,7 +265,7 @@ fn validate_registration(
     if existing_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
         return Err(format!("function \"{name}\" is registered twice"));
     }
-    Ok((types, ret_type, func))
+    Ok((types, ret_type, volatile, func))
 }
 
 /// Result-text allocations handed to extensions (process-wide counter).
@@ -280,12 +344,13 @@ mod tests {
         null_types: bool,
         ret_type: i32,
         tags: &[i32],
-    ) -> Result<(Vec<ExtType>, ExtType, PinkdbExtScalarFn), String> {
+    ) -> Result<(Vec<ExtType>, ExtType, bool, PinkdbExtScalarFn), String> {
         validate_registration(
             name,
             n_args,
             null_types,
             ret_type,
+            0,
             |i| tags[i],
             some_fn(),
             &[],
@@ -313,6 +378,7 @@ mod tests {
                 0,
                 false,
                 PINKDB_EXT_TYPE_INTEGER,
+                0,
                 |_| unreachable!(),
                 None,
                 &[]
@@ -350,6 +416,7 @@ mod tests {
                 0,
                 false,
                 PINKDB_EXT_TYPE_INTEGER,
+                0,
                 |_| unreachable!(),
                 some_fn(),
                 &["f".to_string()],
@@ -358,7 +425,7 @@ mod tests {
             "function \"F\" is registered twice"
         );
         // A valid registration decodes the tags in order.
-        let (types, ret, _) = validate(
+        let (types, ret, volatile, _) = validate(
             "ok",
             2,
             false,
@@ -368,5 +435,45 @@ mod tests {
         .unwrap();
         assert_eq!(types, vec![ExtType::Integer, ExtType::Bigint]);
         assert_eq!(ret, ExtType::Integer);
+        // Flags 0 (every `register_scalar` call, and the pre-flag ABI) means
+        // deterministic.
+        assert!(!volatile);
+    }
+
+    /// The volatile flag and the unknown-bit rule (ABI v1 addition): a flag
+    /// the host does not understand must fail the registration, never be
+    /// dropped — a dropped flag would silently make a declared-volatile
+    /// function deterministic.
+    #[test]
+    fn volatile_flag_is_decoded_and_unknown_bits_are_rejected() {
+        let (_, _, volatile, _) = validate_registration(
+            "v",
+            0,
+            false,
+            PINKDB_EXT_TYPE_INTEGER,
+            crate::abi::PINKDB_EXT_FLAG_VOLATILE,
+            |_| unreachable!(),
+            some_fn(),
+            &[],
+        )
+        .unwrap();
+        assert!(volatile, "the volatile bit must be stored");
+
+        let e = validate_registration(
+            "v",
+            0,
+            false,
+            PINKDB_EXT_TYPE_INTEGER,
+            0b11,
+            |_| unreachable!(),
+            some_fn(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("unknown registration flag bit(s) 0x2"),
+            "the rejected bit must be named: {e}"
+        );
+        assert!(e.contains("function \"v\""), "{e}");
     }
 }

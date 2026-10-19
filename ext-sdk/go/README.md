@@ -280,6 +280,25 @@ example, runs a deterministic session in a self-cleaning temp directory, and
 greps 15 checks — VARCHAR results, NULLs, a multibyte round trip, composition
 with built-ins, a 5,000-row parallel query, and both error paths.
 
+## Deterministic vs volatile functions
+
+A registration is **deterministic by default** (`register_scalar`, and any
+`register_scalar_flags` call with `flags == 0`): the callback must be a pure
+function of its arguments, because the engine may WAL-log a statement that
+calls it and re-execute that statement on recovery. A callback that reads a
+clock, a random source, or other ambient state is **not** deterministic:
+register it through the additive `api->register_scalar_flags` entry point with
+`PINKDB_EXT_FLAG_VOLATILE`, and the engine then *refuses to execute* it in any
+statement it WAL-logs (`INSERT`/`UPDATE`/`DELETE`/DDL/`CALL`) with a clear
+error naming the function — before the statement runs, because replaying it
+later could produce a different value than the original session saw. Read-only
+statements may call volatile functions. Unknown flag bits are rejected at
+registration, and a host older than the addition (smaller `struct_size`) does
+not have the field: an extension that needs a volatile registration must fail
+init there rather than silently registering as deterministic. `volatile_ext.c`
+in the loader's test suite is the worked example. (The Rust SDK —
+`ext-sdk/rust/` — expresses the same thing with its `volatile = [...]` list.)
+
 ## Semantics and persistence
 
 Extensions are **process-level**: they are not stored in `.pink` snapshots and

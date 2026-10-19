@@ -7,6 +7,11 @@ members = [
     "crates/pinkdb-ext-loader",
     "crates/pinkdb-js",
     "crates/pink-lake",
+    # The Rust extension SDK (wave 51) and its worked example. Neither is a
+    # dependency of any pinkdb binary: the SDK depends on the loader, never
+    # the other way around.
+    "ext-sdk/rust",
+    "ext-sdk/rust/example/string_ext",
 ]
 resolver = "2"
 

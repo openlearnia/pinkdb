@@ -9,6 +9,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-19</h2>
+<h3>Wave 51 — Rust extension SDK + volatile flag ✅</h3>
+<ul>
+<li>New <code>ext-sdk/rust</code>: declare an extension once (<code>pinkdb_extension!</code>) and get both the native ABI v1 cdylib exports and the wasm/all-target linked registration from safe Rust — typed args, <code>Option</code> NULLs, <code>Result</code> errors, no <code>unsafe</code> in author code.</li>
+<li>Additive <strong>ABI v1 volatile flag</strong>: functions can declare themselves nondeterministic, and the engine refuses to call them in any statement it WAL-logs (replay could diverge) with an explicit error; deterministic extensions are unchanged.</li>
+</ul>
 <h3>Wave 50 — performance pass ✅</h3>
 <ul>
 <li>High-cardinality <code>GROUP BY</code> / <code>COUNT(DISTINCT)</code> got a typed fast path (no per-row values, chunked output, adaptive one-shot reserve): <code>group_id</code> 15.8 → 4.4 ms and <code>distinct_id</code> 15.6 → 4.6 ms — both now ahead of the DuckDB reference on the same corpus.</li>

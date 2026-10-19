@@ -1050,12 +1050,12 @@ implies neither lake build**; combine them explicitly, `pinklake,s3` or
 
 | Build | CLI features | Lake | Data files | Release size |
 |---|---|---|---|---|
-| default | — | no `.lake` commands | — | 2,436,320 B |
-| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 2,692,464 B (+250 KiB over default, −40.7 MiB vs vortexlake) |
-| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 4,701,120 B |
-| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 45,333,984 B |
-| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈47.3 MB (vortexlake + the same ≈2 MB S3 client) |
-| s3 only | `s3` | no `.lake` commands (storage client only) | — | ≈4.4–4.7 MB (default + the S3 client; not measured) |
+| default | — | no `.lake` commands | — | 3,561,344 B |
+| pinklake | `pinklake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (statistics-only attach: exact `COUNT`/`MIN`/`MAX` from the manifest's stats blocks, 0 data-file reads; anything else lazily decodes) | `.pink` (v4 lakes) | 4,874,032 B (+1.25 MiB over default, −40.6 MiB vs vortexlake) |
+| pinklake + S3 | `pinklake,s3` | as above, `s3://bucket/prefix` locations | `.pink` | 6,893,984 B |
+| vortexlake | `vortexlake` | all `.lake` commands incl. read-only `.lake attach`, `.lake attach … write` + `.lake commit` (footer-only statistics fast paths) | Vortex (v4 lakes) | 47,476,880 B |
+| vortexlake + S3 | `vortexlake,s3` | as above, `s3://` locations | Vortex (v4 lakes) | ≈49.5 MB (vortexlake + the same ≈2 MB S3 client) |
+| s3 only | `s3` | no `.lake` commands (the client only takes effect with a lake feature) | — | same bytes as default |
 
 ```sh
 cargo build -p pinkdb-cli --features vortexlake        # Vortex data files, local directories
@@ -1149,7 +1149,7 @@ The same lake layer without the Vortex dependency: a `pinklake` build writes
 and reads **`.pink` v4 data files** (`data/<table>/<uuid>.pink`, the engine's
 single-table persistence bytes) under `format_version` 4 catalogs (each file
 object carries its own statistics block) — no `vortex` crate and none of its
-~218 transitive crates, a 2.69 MB binary instead of 45.3 MB. It enables every
+~218 transitive crates, a 4.87 MB binary instead of 47.5 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
 (add `,s3`; the storage client alone provides no commands), with the same
 layout, incremental commits, atomic
@@ -1693,6 +1693,15 @@ Contract highlights (the header is complete):
   naming the function and code; `init` returning non-zero (or a rejected
   registration) fails the load naming the code/reason. `init` and callbacks
   must not panic/unwind across the ABI boundary.
+- **Determinism (wave 51):** a function is deterministic (a pure function of
+  its arguments) unless it was registered with the additive
+  `PINKDB_EXT_FLAG_VOLATILE` bit through `api->register_scalar_flags`.
+  Deterministic functions may be called in any statement — the engine WAL-logs
+  the SQL and replays it after recovery. A *volatile* call is refused in any
+  statement the engine WAL-logs (`INSERT`/`UPDATE`/`DELETE`/DDL/`CALL`), with a
+  clear error before it runs, because replaying logged SQL could otherwise
+  produce a different value; pure reads may still call it. `register_scalar`
+  is exactly flags 0, so every pre-wave-51 extension keeps today's semantics.
 
 ### Extensions on wasm (linked registry)
 
@@ -1759,6 +1768,62 @@ host-`alloc` memory, panics must be recovered before they cross the ABI
 boundary, and `-buildmode=c-shared` symbol-export rules — and
 `./ext-sdk/go/smoke.sh` builds and exercises the example end to end. Its
 header copy is pinned by the same `cargo test` check.
+
+### Writing extensions (Rust)
+
+Wave 51 adds a Rust SDK (`ext-sdk/rust/`, crate `pinkdb-ext-sdk`): one
+`pinkdb_extension!` declaration defines the extension's name and its
+functions, and the SDK generates the ABI glue — value marshalling, VARCHAR
+ownership, NULL handling, the three `pinkdb_extension_*` exports — from
+typed Rust bodies. Extension authors write no `unsafe` and no C:
+
+```rust
+use pinkdb_ext_sdk::pinkdb_extension;
+
+pinkdb_extension! {
+    name = "my_extension",
+    functions = [
+        fn my_ext_greet(name: Option<&str>) -> Result<Option<String>, String> {
+            Ok(name.map(|n| format!("Hello, {n}!")))
+        },
+    ],
+    volatile = [
+        fn my_ext_now_micros() -> Result<i64, String> { /* read a clock */ },
+    ],
+}
+```
+
+Parameters and returns are the ABI v1 types (`bool`, `i32`, `i64`, `f64`,
+`&str`/`String`, `Date`, `Timestamp`), `Option<T>` makes NULL explicit, and
+`Result<_, String>` returns errors. The same declaration drives both loading
+models: a native cdylib (`LOAD EXTENSION '<path>'`) and wave 49's linked
+registration (`pinkdb_register_linked()`, the only model on wasm), so one
+source covers every target. The SDK depends on the loader crate, never the
+other way around: no pinkdb binary grows because of it.
+
+The `volatile` list is the additive ABI v1 deterministic/volatile flag
+surfaced safely: **functions are deterministic by default** — the engine may
+WAL-log statements that call them and replay them — and a function declared
+volatile (a clock, a random source, ambient state) is **refused in any
+statement the engine WAL-logs** (`INSERT`/`UPDATE`/`DELETE`/DDL/`CALL`), with
+a clear error before it runs, because replaying logged SQL could otherwise
+produce a different value. Pure reads may call volatile functions freely.
+Native C extensions get the same rule through the additive
+`api->register_scalar_flags` entry point and `PINKDB_EXT_FLAG_VOLATILE` (the
+pre-flag `register_scalar` is exactly flags 0, so existing extensions keep
+today's semantics byte-for-byte); the linked model carries it as
+`LinkedFunction::volatile()`.
+
+```sh
+make -C ext-sdk/rust        # builds the example into target/release/
+./ext-sdk/rust/smoke.sh     # builds it, loads it via the release CLI, greps 15 checks
+```
+
+`ext-sdk/rust/README.md` walks through the macro, the type/`Option`/`Result`
+rules, the volatility contract, the error-code mapping (the C ABI carries no
+error text) and the crate's own round-trip tests (native `LOAD EXTENSION`,
+linked registration, durable replay); its header copy is pinned by the same
+`cargo test` check.
 
 ### Extension repository
 
@@ -2230,7 +2295,7 @@ and projection pushdown for attached scans in wave 45e; `.pink` v4 (wave 45h)
 brought single-file saves to roughly the Vortex size (1.015× at 1M, 1.067× at
 10M), and wave 45j added LZ frames (tag 8) that shrink text corpora 3–5×. The
 `pinklake` build (`.pink` v4 lake data files, no `vortex` dependency,
-2.69 MB vs 45.3 MB CLI) shipped in wave 45i, and wave 45k gave it exact
+4.87 MB vs 47.5 MB CLI) shipped in wave 45i, and wave 45k gave it exact
 attach fast paths (a CRC-32-protected per-column statistics block published in
 the manifest; zero data-file reads for `COUNT`/`MIN`/`MAX`) together with a
 `.pink` v4 bit-pack correctness fix (u64 accumulators dropped high bits for
@@ -2277,7 +2342,7 @@ only:
 
 | Workflow | Trigger | Jobs / steps |
 |---|---|---|
-| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,vortexlake`, `pinkdb-cli --features vortexlake,s3` / `pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + both SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
+| `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,vortexlake`, `pinkdb-cli --features vortexlake,s3` / `pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + the C/C++, Go and Rust SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
 | `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
 | `publish-extensions.yml` | manual dispatch only | builds the C/C++ SDK examples (and any `extensions/*/` built by their own Makefile), runs both SDK smokes, fetches the live catalog, skips already-published coordinates, publishes new artifacts with `ext-repo/publish.sh` (wrangler → R2) and prints the artifact/catalog URLs |
 

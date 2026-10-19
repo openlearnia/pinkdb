@@ -122,18 +122,25 @@ pinkdb.registerExtension({
       fn: (x) => x === null ? null : Math.sqrt(x) },
     { name: "js_upper", args: ["VARCHAR"], ret: "VARCHAR",
       fn: (s) => s === null ? null : s.toUpperCase() },
+    { name: "js_now", args: [], ret: "BIGINT", volatile: true,
+      fn: () => Date.now() },
   ],
 });
 
 // LOAD EXTENSION 'js_math';
 // SELECT js_sqrt(9.0), js_upper('hey');   -- 3.0, 'HEY'
+// SELECT js_now();                        -- a read: allowed
+// INSERT INTO t VALUES (js_now());        -- refused: volatile, WAL-logged
 ```
 
 `args` / `ret` are the ABI type names; `fn` is called once per row with
-exactly that row's argument values and returns the row's result. The shim
+exactly that row's argument values and returns the row's result. `volatile`
+(optional, default `false`) marks a nondeterministic function — the engine
+then refuses to run it in any WAL-logged statement (wave 51's rule; the same
+one the native ABI expresses with `PINKDB_EXT_FLAG_VOLATILE`). The shim
 registers the extension through `linked::register`, so from the engine's
 side a JavaScript function is an ordinary linked function — same binder, same
-executor, same WAL prefixing.
+executor, same WAL prefixing, same volatility rule.
 
 Value mapping (`linked::JS_TYPE_MAPPINGS`, `null` for SQL NULL on both
 sides):
@@ -161,9 +168,11 @@ cannot sandbox the embedder's JavaScript engine):
 
 * the callback sees exactly its declared arguments — no database handle, no
   clock, no I/O, no ambient state;
-* a callback must be a pure function of its arguments: a durable store
-  replays committed statements, so `Date.now()` / `Math.random()` inside a
-  script makes replay diverge, and that is the embedder's bug;
+* a callback must be a pure function of its arguments unless it is registered
+  with `volatile: true` — then the engine refuses to run it in any WAL-logged
+  statement instead; a script that reads `Date.now()` / `Math.random()`
+  without declaring itself volatile makes replay diverge, and that is the
+  embedder's bug;
 * a `throw` must not leave host state half-updated if the statement is
   retried;
 * the registry is the only extension source on wasm — `LOAD EXTENSION` can

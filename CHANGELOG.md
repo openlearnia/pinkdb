@@ -10,6 +10,16 @@ one-liners below.
 
 ## 2026-10-19
 
+### Wave 51 — Rust extension SDK + volatile flag ✅
+- New `ext-sdk/rust`: declare an extension once (`pinkdb_extension!`) and get
+  both the native ABI v1 cdylib exports and the wasm/all-target linked
+  registration from safe Rust — typed args, `Option` NULLs, `Result` errors,
+  no `unsafe` in author code.
+- Additive **ABI v1 volatile flag**: functions can declare themselves
+  nondeterministic, and the engine refuses to call them in any statement it
+  WAL-logs (replay could diverge) with an explicit error; deterministic
+  extensions are unchanged.
+
 ### Wave 50 — performance pass ✅
 - High-cardinality `GROUP BY` / `COUNT(DISTINCT)` got a typed fast path (no
   per-row values, chunked output, adaptive one-shot reserve): `group_id`

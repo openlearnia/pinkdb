@@ -263,7 +263,7 @@ examples:</p>
     <tr>
       <td>Rust</td>
       <td><code>ext-sdk/rust/</code> (safe wrapper + macros)</td>
-      <td>planned — see the <a href="../docs/roadmap">roadmap</a></td>
+      <td>shipped (safe wrapper + <code>pinkdb_extension!</code> macros)</td>
     </tr>
   </tbody>
 </table>
@@ -296,11 +296,13 @@ int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);</co
 
 <div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>make <span class="tok-f">-C</span> ext-sdk/c                 <span class="tok-c"># build the examples</span>
 ./ext-sdk/c/smoke.sh              <span class="tok-c"># build + load + query, end to end</span>
-make <span class="tok-f">-C</span> ext-sdk/go &amp;&amp; ./ext-sdk/go/smoke.sh</code></pre></div>
+make <span class="tok-f">-C</span> ext-sdk/go &amp;&amp; ./ext-sdk/go/smoke.sh
+make <span class="tok-f">-C</span> ext-sdk/rust &amp;&amp; ./ext-sdk/rust/smoke.sh</code></pre></div>
 
 <p>Contract highlights (the header is complete):</p>
 
 <ul>
+  <li><strong>Deterministic vs volatile:</strong> a function may declare itself volatile (clock/random-like); the engine then refuses to call it in any statement it WAL-logs (replay could diverge) with an explicit error. Deterministic is the default.</li>
   <li><strong>Thread safety:</strong> callbacks run concurrently on the executor's
   rayon workers — a function may be invoked on several threads at once, so its state
   must be guarded (atomics, locks, TLS). <code>register_scalar</code> is only valid

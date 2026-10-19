@@ -1,0 +1,19 @@
+[package]
+name = "pinkdb-ext-sdk-example"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Worked example for the pinkdb Rust extension SDK: one declaration, a native cdylib and a linked registration"
+license = "MIT"
+publish = false
+
+[lib]
+# A loadable extension IS a shared library: `cargo build` produces
+# `target/<profile>/librust_string_ext.<dll suffix>`, which
+# `LOAD EXTENSION '<path>'` opens with dlopen. The same source is compiled
+# directly by `rustc` in the SDK's native round-trip test.
+name = "rust_string_ext"
+crate-type = ["cdylib"]
+
+[dependencies]
+pinkdb-ext-sdk = { path = "../.." }

@@ -22,8 +22,14 @@
 //! | errors | `i32` return code | `Result<_, String>` |
 //! | panics | forbidden (undefined behavior) | caught at the boundary, reported as a statement error |
 //! | thread safety | promised by the extension | required by the type system (`Send + Sync`) |
+//! | volatility | `PINKDB_EXT_FLAG_VOLATILE` at registration (default: deterministic) | [`LinkedFunction::volatile`] (default: deterministic) |
 //! | version check | `PINKDB_EXT_ABI_VERSION` compared at load | none: the Rust type system checks the ABI at compile time |
 //! | lifecycle | `dlopen`; image stays mapped | process-lifetime registration; no unload |
+//!
+//! Whichever model declared a function, the engine applies one rule: a
+//! *volatile* (nondeterministic) function may not run in a statement the
+//! engine WAL-logs, because replaying that statement's SQL could produce a
+//! different value than the session that wrote it saw.
 //!
 //! # Loading rules
 //!
@@ -163,6 +169,10 @@ pub struct LinkedFunction {
     arg_types: Vec<ExtType>,
     /// Declared return type.
     ret_type: ExtType,
+    /// Volatile (nondeterministic) declaration: the engine refuses to run a
+    /// volatile call in any statement it WAL-logs. `false` — deterministic —
+    /// is the default, matching the native ABI.
+    volatile: bool,
     /// Host code.
     callback: Arc<dyn LinkedScalar>,
 }
@@ -174,6 +184,7 @@ impl std::fmt::Debug for LinkedFunction {
             .field("n_args", &self.arg_types.len())
             .field("arg_types", &self.arg_types)
             .field("ret_type", &self.ret_type)
+            .field("volatile", &self.volatile)
             .finish_non_exhaustive()
     }
 }
@@ -204,8 +215,39 @@ impl LinkedFunction {
             name,
             arg_types,
             ret_type,
+            volatile: false,
             callback: Arc::new(callback),
         })
+    }
+
+    /// Declare this function volatile (nondeterministic): it may read the
+    /// clock, a random source, ambient state, ... The engine then refuses to
+    /// run it in any statement it WAL-logs (INSERT, UPDATE, DELETE, DDL,
+    /// `CALL`, ...) — replaying logged SQL could otherwise produce a
+    /// different value than the session that wrote it saw. Read-only
+    /// statements may call it.
+    ///
+    /// Deterministic (unmarked) is the default, exactly like the native
+    /// ABI's flag-0 registration: mark a function volatile whenever it is
+    /// not a pure function of its arguments.
+    ///
+    /// ```
+    /// # use pinkdb_ext_loader::linked::LinkedFunction;
+    /// # use pinkdb_ext_loader::{ExtArg, ExtType, ExtValue};
+    /// let f = LinkedFunction::new("tick", vec![], ExtType::Integer,
+    ///     |_args: &[ExtArg<'_>]| Ok(ExtValue::Integer(1)))?
+    ///     .volatile();
+    /// assert!(f.is_volatile());
+    /// # Ok::<(), pinkdb_ext_loader::ExtError>(())
+    /// ```
+    pub fn volatile(mut self) -> Self {
+        self.volatile = true;
+        self
+    }
+
+    /// Whether this function is declared volatile (see [`Self::volatile`]).
+    pub fn is_volatile(&self) -> bool {
+        self.volatile
     }
 
     /// Registered name (original case).
@@ -453,11 +495,13 @@ pub struct JsHostFunction {
 pub const JS_HOST_SURFACE: &[JsHostFunction] = &[
     JsHostFunction {
         name: "pinkdb.registerExtension",
-        signature: "pinkdb.registerExtension({ name, functions: [{ name, args, ret, fn }] })",
+        signature: "pinkdb.registerExtension({ name, functions: [{ name, args, ret, fn, volatile }] })",
         docs: "publish an extension in the linked registry (host bootstrap); throws on invalid \
                metadata or a duplicate name. `name` is the registry key `LOAD EXTENSION '<name>'` \
-               takes, `args`/`ret` are ABI type names, and `fn` is called once per row with that \
-               row's argument values and returns the row's result",
+               takes, `args`/`ret` are ABI type names, `volatile` (optional, default false) \
+               declares a nondeterministic function that the engine then refuses to run in any \
+               WAL-logged statement, and `fn` is called once per row with that row's argument \
+               values and returns the row's result",
     },
     JsHostFunction {
         name: "pinkdb.listExtensions",
@@ -536,8 +580,9 @@ pub const JS_SANDBOX_RULES: &[&str] = &[
     "the callback sees exactly its declared arguments: the shim must pass no database handle, \
      no clock, no I/O and no ambient state",
     "a durable store replays committed statements, so a callback must be a pure function of its \
-     arguments; a script that reads Date.now() or Math.random() makes replay diverge and is the \
-     embedder's bug, not the engine's",
+     arguments unless it is registered with `volatile: true` — then the engine refuses to run it \
+     in any WAL-logged statement instead; a script that reads Date.now() or Math.random() without \
+     declaring itself volatile makes replay diverge and is the embedder's bug, not the engine's",
     "a throw fails the enclosing statement (`extension function <name>() failed: <message>`); \
      it must not leave host state half-updated if the statement is retried",
     "the registry is the only extension source on wasm: `LOAD EXTENSION '<name>'` activates \
@@ -690,6 +735,24 @@ mod tests {
         assert_eq!(counter.call(&[]).unwrap(), ExtValue::Integer(0));
         assert_eq!(counter.call(&[]).unwrap(), ExtValue::Integer(1));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    /// Deterministic is the default (matching the native ABI's flag 0) and
+    /// `volatile()` is the only way to declare otherwise.
+    #[test]
+    fn functions_are_deterministic_by_default_and_can_declare_volatility() {
+        let det = int_function("lnk_det");
+        assert!(!det.is_volatile(), "the default must be deterministic");
+        // The builder does not lose the rest of the metadata.
+        let vol = int_function("lnk_vol").volatile();
+        assert!(vol.is_volatile());
+        assert_eq!(vol.n_args(), 1);
+        assert_eq!(vol.arg_types(), [ExtType::Integer]);
+        assert_eq!(vol.ret_type(), ExtType::Integer);
+        assert_eq!(
+            vol.call(&[ExtArg::Integer(2)]).unwrap(),
+            ExtValue::Integer(2)
+        );
     }
 
     #[test]

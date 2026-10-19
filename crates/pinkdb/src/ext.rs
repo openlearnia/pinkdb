@@ -29,7 +29,14 @@
 //! - the optimizer never constant-folds an expression tree containing a
 //!   dynamic call (and never pushes a predicate containing one through a
 //!   join/union), because a callback is opaque in both models: it may be
-//!   impure, non-deterministic, or fail.
+//!   impure, non-deterministic, or fail;
+//! - a statement the engine WAL-logs may not call a *volatile*
+//!   (nondeterministic) extension function: the binder refuses it before it
+//!   runs (replay re-executes the logged SQL text, and a volatile callback
+//!   could produce a different value there). Deterministic is the default in
+//!   both loading models; a function declares volatility at registration
+//!   (the ABI's `PINKDB_EXT_FLAG_VOLATILE`, or
+//!   [`pinkdb_ext_loader::LinkedFunction::volatile`]).
 //!
 //! Extensions are process-level: they are not part of a database snapshot.
 //! A `LOAD EXTENSION` statement is WAL-logged, and every logged record that
@@ -175,6 +182,26 @@ impl PinkDb {
             }
         }
         out
+    }
+
+    /// The first volatile (nondeterministic) dynamic function among `names`
+    /// (lowercased registry keys), by original name, in first-use order.
+    /// Unknown names are skipped, like [`Self::dynamic_function_paths`].
+    ///
+    /// This is the WAL-divergence guard's lookup: the binder calls it for
+    /// every statement whose SQL text the engine would log, and refuses the
+    /// statement when it finds one. A function is volatile only when it was
+    /// declared so at registration (the native ABI's
+    /// `PINKDB_EXT_FLAG_VOLATILE`, or the linked model's
+    /// `LinkedFunction::volatile`); deterministic is the default and keeps
+    /// every pre-flag extension exactly as it was.
+    pub(crate) fn first_volatile_dynamic_function(&self, names: &[String]) -> Option<String> {
+        names.iter().find_map(|name| {
+            self.dynamic_functions
+                .get(&name.to_ascii_lowercase())
+                .filter(|f| f.is_volatile())
+                .map(|f| f.name().to_string())
+        })
     }
 
     /// Distinct sources of every loaded extension (including ones that

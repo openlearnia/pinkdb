@@ -34,14 +34,21 @@
 //! and the arity limit) and the engine integration: the binder resolves
 //! unknown function names case-insensitively, the executor marshals one row
 //! at a time into ABI values, and [`ExtFunction`] / [`ExtHandle`] are what
-//! the engine's registry stores whichever model produced them.
+//! the engine's registry stores whichever model produced them. Both models
+//! also share the volatility rule: a function is deterministic unless it was
+//! declared volatile (the native ABI's `PINKDB_EXT_FLAG_VOLATILE` flag, or
+//! [`LinkedFunction::volatile`]), and the engine refuses to run a volatile
+//! call in any statement it WAL-logs — replaying logged SQL must never
+//! diverge.
 //!
 //! The ABI contract (symbol names, value layout, text ownership, and the
 //! thread-safety requirement on callbacks) lives in the header; this crate is
-//! its single host-side implementation. All `unsafe` in the workspace outside
-//! `pinkdb-ffi` is contained here and is native-only: `dlopen`/`dlsym` (via
-//! `libloading`), invoking extension callbacks, and reading/freeing result
-//! text.
+//! its single host-side implementation. All `unsafe` in the workspace's
+//! runtime crates (outside `pinkdb-ffi`) is contained here and is native-only:
+//! `dlopen`/`dlsym` (via `libloading`), invoking extension callbacks, and
+//! reading/freeing result text. The one other crate with `unsafe` is the Rust
+//! extension SDK (`ext-sdk/rust`), which implements the same ABI from the
+//! *extension* side and is never a dependency of any pinkdb binary.
 //!
 //! [`include/pinkdb_extension.h`]: https://github.com/openlearnia/pinkdb/blob/main/crates/pinkdb-ext-loader/include/pinkdb_extension.h
 
@@ -70,8 +77,8 @@ pub use abi::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use abi::{
-    PINKDB_EXT_ABI_VERSION, PinkdbExtAbiVersionFn, PinkdbExtInitFn, PinkdbExtNameFn,
-    PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi,
+    PINKDB_EXT_ABI_VERSION, PINKDB_EXT_FLAG_KNOWN, PINKDB_EXT_FLAG_VOLATILE, PinkdbExtAbiVersionFn,
+    PinkdbExtInitFn, PinkdbExtNameFn, PinkdbExtScalarFn, PinkdbExtValue, PinkdbHostApi,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use function::DynamicFunction;
@@ -145,6 +152,25 @@ impl ExtFunction {
             #[cfg(not(target_arch = "wasm32"))]
             ExtFunction::Dynamic(f) => f.ret_type(),
             ExtFunction::Linked { func, .. } => func.ret_type(),
+        }
+    }
+
+    /// Whether the function was declared volatile (nondeterministic) — the
+    /// native ABI's `PINKDB_EXT_FLAG_VOLATILE` or the linked model's
+    /// [`LinkedFunction::volatile`]. `false` (deterministic) is the default
+    /// in both models, so every pre-flag extension and every existing
+    /// registration keeps today's semantics.
+    ///
+    /// The engine refuses to run a volatile call in any statement it
+    /// WAL-logs: the logged SQL text is re-executed on recovery, and a
+    /// nondeterministic callback could produce a different value there.
+    /// Read-only statements never reach the WAL and may call volatile
+    /// functions.
+    pub fn is_volatile(&self) -> bool {
+        match self {
+            #[cfg(not(target_arch = "wasm32"))]
+            ExtFunction::Dynamic(f) => f.is_volatile(),
+            ExtFunction::Linked { func, .. } => func.is_volatile(),
         }
     }
 

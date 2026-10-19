@@ -1,0 +1,24 @@
+[package]
+name = "pinkdb-ext-sdk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "Safe Rust SDK for pinkdb loadable extensions (ABI v1): typed callbacks, registration macros, native cdylibs and the linked (wasm) model"
+license = "MIT"
+
+[lib]
+name = "pinkdb_ext_sdk"
+
+[dependencies]
+# The ABI's host-side implementation. The SDK reuses its value model
+# (`ExtArg` / `ExtValue` / `ExtType` / `ExtError`), the linked registry
+# (wave 49) and the `repr(C)` ABI structs the generated exports are built on.
+# Native-only items are target-gated inside the loader, so the dependency
+# stays wasm-compatible, and the loader never depends on this crate.
+pinkdb-ext-loader = { path = "../../crates/pinkdb-ext-loader" }
+
+[dev-dependencies]
+# Deliberate dev-dependency cycle (the loader crate documents the same one):
+# the SDK's tests drive a real engine end to end. Nothing in `pinkdb` or the
+# release binary depends on this crate.
+pinkdb = { path = "../../crates/pinkdb" }

@@ -173,6 +173,24 @@ and trigger your error codes on purpose. `./smoke.sh` is the full worked
 example: it builds the examples and runs a deterministic session covering
 numeric results, NULLs, a VARCHAR result, and both error paths.
 
+## Deterministic vs volatile functions
+
+A registration is **deterministic by default** (`register_scalar`, and any
+`register_scalar_flags` call with `flags == 0`): the callback must be a pure
+function of its arguments, because the engine may WAL-log a statement that
+calls it and re-execute that statement on recovery. A callback that reads a
+clock, a random source, or other ambient state is **not** deterministic:
+register it through the additive `api->register_scalar_flags` entry point with
+`PINKDB_EXT_FLAG_VOLATILE`, and the engine then *refuses to execute* it in any
+statement it WAL-logs (`INSERT`/`UPDATE`/`DELETE`/DDL/`CALL`) with a clear
+error naming the function — before the statement runs, because replaying it
+later could produce a different value than the original session saw. Read-only
+statements may call volatile functions. Unknown flag bits are rejected at
+registration, and a host older than the addition (smaller `struct_size`) does
+not have the field: an extension that needs a volatile registration must fail
+init there rather than silently registering as deterministic. `volatile_ext.c`
+in the loader's test suite is the worked example.
+
 ## Semantics and persistence
 
 - **Extensions are process-level.** They are not stored in `.pink` snapshots

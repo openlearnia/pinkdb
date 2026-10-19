@@ -22,9 +22,10 @@
  *   int32_t     pinkdb_extension_init(const PinkdbHostApi *api, void *host_ctx);
  *       Called exactly once, on the loading thread, right after the version
  *       and name checks. Register functions through `api`; pass `host_ctx`
- *       back to `api->register_scalar` unchanged. Return 0 on success, any
+ *       back to `api->register_scalar` / `api->register_scalar_flags`
+ *       unchanged. Return 0 on success, any
  *       non-zero value aborts the load (the code is reported in the error).
- *       If any `register_scalar` call is rejected the load fails even when
+ *       If any registration call is rejected the load fails even when
  *       init returns 0 — never assume a rejected function exists.
  *       `api->abi_version` is PINKDB_EXT_ABI_VERSION; `api->struct_size` is
  *       the host's `sizeof(PinkdbHostApi)` (a larger value means a newer host
@@ -120,6 +121,10 @@
  *   int32_t register_scalar(void *ctx, const char *name, uint32_t n_args,
  *                           const int32_t *arg_types, int32_t ret_type,
  *                           PinkdbExtScalarFn fn, void *user_data);
+ *   int32_t register_scalar_flags(void *ctx, const char *name, uint32_t n_args,
+ *                                 const int32_t *arg_types, int32_t ret_type,
+ *                                 uint32_t flags, PinkdbExtScalarFn fn,
+ *                                 void *user_data);  (ABI v1 addition)
  * - `ctx` is the `host_ctx` passed to init; pass it through unchanged.
  * - `name` is NUL-terminated UTF-8, non-empty and at most 256 bytes; matched
  *   case-insensitively. Names that collide with a built-in function or with
@@ -136,6 +141,55 @@
  * - The host copies `name` and `arg_types` during the call.
  * - Returns 0 on success, non-zero when the function was rejected (nothing
  *   was registered; the load fails).
+ * - `register_scalar` is exactly `register_scalar_flags` with `flags == 0`
+ *   (deterministic); both share every other rule. `register_scalar_flags`
+ *   lives at the END of `PinkdbHostApi`, so it is an *additive* ABI v1
+ *   addition: extensions that never touch it behave exactly as before.
+ *
+ * ---------------------------------------------------------------------------
+ * Deterministic vs volatile functions (ABI v1 addition)
+ * ---------------------------------------------------------------------------
+ * `flags` is a bit set; the only bit defined today is
+ *
+ *   PINKDB_EXT_FLAG_VOLATILE   the function is nondeterministic: it may read
+ *                              the clock, a random source, ambient state, ...
+ *
+ * - **Default: deterministic** (`flags == 0`, i.e. every `register_scalar`
+ *   call). A deterministic callback must be a pure function of its arguments
+ *   (plus immutable state initialized in `pinkdb_extension_init`): the host
+ *   may WAL-log a statement that calls it and re-execute that statement on
+ *   recovery, and the replayed result must match the original. Returning
+ *   different values for the same arguments on a *durable* store is a
+ *   correctness bug in the extension.
+ * - **PINKDB_EXT_FLAG_VOLATILE** declares the exception. The engine refuses
+ *   to *execute* a volatile call in any statement it WAL-logs (INSERT,
+ *   UPDATE, DELETE, DDL, CALL, ...): the statement fails with
+ *   `extension function <name>() is volatile (nondeterministic) and cannot be
+ *   called in a statement the engine WAL-logs: ...` before it runs, because
+ *   replaying it later could produce a different value than this session saw.
+ *   Read-only statements (a plain SELECT) never reach the WAL and may call
+ *   volatile functions. Rationale: replay re-executes the logged SQL text;
+ *   refusing at the only point where divergence could enter the WAL makes
+ *   divergence impossible instead of merely unlikely.
+ * - The declaration is the author's contract, not something the host can
+ *   verify: the engine cannot tell a pure callback from one that reads the
+ *   clock. Mark a function volatile whenever it is not a pure function of
+ *   its arguments; marking a pure function volatile is safe but pointless
+ *   (it only costs it the right to run in a WAL-logged statement).
+ * - Unknown flag bits are rejected at registration (the load fails) — a
+ *   future flag must never be silently ignored, which for this bit would
+ *   turn a declared-volatile function back into a deterministic one.
+ * - A host older than this addition has a smaller `struct_size` and no
+ *   `register_scalar_flags` field. Compare before use:
+ *
+ *       if (api->struct_size >= offsetof(PinkdbHostApi, register_scalar_flags)
+ *                                + sizeof(api->register_scalar_flags)) { ... }
+ *
+ *   An extension that needs a volatile registration MUST fail
+ *   `pinkdb_extension_init` (return non-zero) on such a host — never fall
+ *   back to `register_scalar`, which would silently register it as
+ *   deterministic and let a durable store replay a call whose value may
+ *   change.
  */
 
 #ifndef PINKDB_EXTENSION_H
@@ -153,6 +207,10 @@ extern "C" {
 
 /* Maximum number of function arguments the host accepts. */
 #define PINKDB_EXT_MAX_ARGS 64
+
+/* Function flags for register_scalar_flags (see "Deterministic vs volatile"
+ * above). The only bit defined today; unknown bits are rejected. */
+#define PINKDB_EXT_FLAG_VOLATILE 0x1u
 
 /* Value / argument type tags (same numbering as the pinkdb C ABI). */
 enum {
@@ -202,6 +260,19 @@ typedef struct PinkdbHostApi {
     /* Allocate result text. Pair with free(); both are thread-safe. */
     void *(*alloc)(size_t size);
     void (*free)(void *ptr);
+
+    /* Appended after ABI v1 shipped (additive; see "Deterministic vs
+     * volatile" above): register_scalar plus a PINKDB_EXT_FLAG_* bit set.
+     * Check `struct_size` before calling — an older host does not have this
+     * field. */
+    int32_t (*register_scalar_flags)(void *ctx,
+                                     const char *name,
+                                     uint32_t n_args,
+                                     const int32_t *arg_types,
+                                     int32_t ret_type,
+                                     uint32_t flags,
+                                     PinkdbExtScalarFn fn,
+                                     void *user_data);
 } PinkdbHostApi;
 
 #ifdef __cplusplus
