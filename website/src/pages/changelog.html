@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-20</h2>
+<h3>Security hardening — pass 3: async TLS downgrade ✅</h3>
+<ul>
+<li><code>--transport async</code> now <strong>refuses</strong> <code>--tls-cert</code>/<code>--tls-key</code> at startup with a clear error instead of silently serving plaintext. TLS remains available on the default sync transport (or via a TLS terminator in front); native async TLS is recorded as a follow-up.</li>
+</ul>
 <h3>Security hardening — extension repository signing ✅</h3>
 <ul>
 <li>The extension catalog is now <strong>Ed25519-signed</strong> (<code>index.json.sig</code>), and <code>.install</code> verifies it against a key <strong>pinned in the binary before it fetches or loads any artifact</strong> — a compromised repository origin can no longer serve a matching hash for its own payload. Unsigned catalogs are refused unless an explicit dev override is set.</li>

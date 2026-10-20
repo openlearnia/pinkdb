@@ -1957,3 +1957,20 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   is hostile, a single pinned key with no revocation/freshness (an old
   catalog can be replayed), and the **live catalog remains unsigned** until
   the operator runs a signed publish and deploys the Worker route.
+
+- 2026-10-20 — Security hardening, pass 3: async transport TLS downgrade (H-2;
+  worktree `wt-sec3`). `--transport async` now **refuses** `--tls-cert` /
+  `--tls-key` before binding: exit code 2 with an actionable message, checked
+  before the sync both-or-neither pairing rule so either flag alone gets the
+  transport-specific error (independent of the `tls` cargo feature). The
+  help/usage text, crate docs and README state that TLS is sync-only and that
+  the async transport refuses the flags — no security flag is accepted and
+  ignored. Tests (gated on `async-server`): a valid rcgen pair + async → exit 2,
+  exact message, no readiness line, port not listening; each flag alone → same;
+  async without TLS still starts and serves `SELECT 1`; `--help` documents the
+  limitation. The sync TLS round-trip/startup-refusal suites stay green.
+  Implementing native async TLS (`tokio-rustls`, handshake timeout and
+  isolation, connection-cap/stall tests, then removing the refusal) is recorded
+  as the follow-up. Gates: server **79/99/90/110** (default/async/tls/both),
+  workspace **1236**, CLI 77, fmt/clippy both toolchains, wasm green; size
+  **0 B**. `duckdiff` skipped (server-only change).

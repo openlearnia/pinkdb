@@ -87,7 +87,9 @@
 //! not the client to the server, so it complements the login rather than
 //! replacing it. HTTP-style trust decisions (bind localhost, treat the port
 //! as trusted) still apply; see the README's "Network server" section.
-//! The async transport carries the same posture (and the same login path).
+//! The async transport carries the same posture (and the same login path), but
+//! it has no TLS path: the binary refuses `--tls-cert`/`--tls-key` together
+//! with `--transport async` instead of serving plaintext.
 pub mod client;
 pub mod protocol;
 pub mod server;

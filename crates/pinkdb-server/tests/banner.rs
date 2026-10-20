@@ -32,6 +32,26 @@ fn help_text_describes_the_real_authentication_policy() {
 }
 
 #[test]
+fn help_text_says_tls_is_sync_only() {
+    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+        .arg("--help")
+        .output()
+        .expect("run pinkdb-server --help");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    // The usage text wraps; compare with normalized whitespace.
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("the async transport has no TLS"),
+        "help does not state the async transport's TLS limitation:\n{text}"
+    );
+    assert!(
+        flat.contains("--tls-cert/--tls-key are refused at startup"),
+        "help does not say the async transport refuses the TLS flags:\n{text}"
+    );
+}
+
+#[test]
 fn startup_banner_does_not_claim_there_is_no_authentication() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
         .args(["--host", "127.0.0.1", "--port", "0"])

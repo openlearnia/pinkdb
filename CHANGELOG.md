@@ -10,6 +10,12 @@ one-liners below.
 
 ## 2026-10-20
 
+### Security hardening — pass 3: async TLS downgrade ✅
+- `--transport async` now **refuses** `--tls-cert`/`--tls-key` at startup with a
+  clear error instead of silently serving plaintext. TLS remains available on
+  the default sync transport (or via a TLS terminator in front); native async
+  TLS is recorded as a follow-up.
+
 ### Security hardening — extension repository signing ✅
 - The extension catalog is now **Ed25519-signed** (`index.json.sig`), and
   `.install` verifies it against a key **pinned in the binary before it

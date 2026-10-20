@@ -1493,7 +1493,10 @@ in-memory when omitted), `--max-connections N` (default 128),
 `--idle-timeout SECS` (default 300; `0` = never), `--transport sync|async`
 (default `sync`; `async` is the tokio I/O transport and needs a build with
 the `async-server` feature) and `--allow-load-extension` (off by default; see
-Security posture). The server
+Security posture). TLS is available only with the default `sync` transport:
+`--transport async` combined with
+`--tls-cert`/`--tls-key` is refused at startup (exit code 2) rather than
+silently serving plaintext. The server
 prints its listening address on startup and runs until terminated.
 
 Server robustness, in one place:
@@ -1606,10 +1609,12 @@ posture through the same login path.
 
 Transport encryption is separate and still opt-in: `--tls-cert`/`--tls-key`
 (crate feature `tls`) encrypt the connection and let the client verify the
-server, but they identify the *server*, not the client. Without a trust
-anchor, anyone who can open a TCP connection to the port still reaches the
-login prompt, so bind `127.0.0.1` (the default) or a trusted network, and do
-not expose the port to the internet.
+server, but they identify the *server*, not the client. TLS is supported by
+the default `sync` transport only; the async transport has no TLS path and
+refuses those flags at startup (exit code 2) rather than serving plaintext.
+Without a trust anchor, anyone who can open a TCP connection to the port
+still reaches the login prompt, so bind `127.0.0.1` (the default) or a
+trusted network, and do not expose the port to the internet.
 
 `LOAD EXTENSION` is additionally refused for remote clients unless the
 server runs with `--allow-load-extension` (library:

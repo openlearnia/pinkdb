@@ -30,6 +30,14 @@
 //!   runtime: a runtime is only created by [`AsyncServer::run_blocking`] /
 //!   [`AsyncServer::spawn`].
 //!
+//! # No TLS on this transport
+//!
+//! This transport is plaintext-only. The binary refuses `--tls-cert`/
+//! `--tls-key` when `--transport async` is selected (usage error, exit 2)
+//! instead of accepting the flags and silently serving plaintext; TLS remains
+//! a property of the blocking [`Server`](crate::Server) transport. Use the
+//! default sync transport when transport encryption is required.
+//!
 //! # Robustness (same bar as the blocking server)
 //!
 //! - At most [`DEFAULT_MAX_CONNECTIONS`] connections are served at once

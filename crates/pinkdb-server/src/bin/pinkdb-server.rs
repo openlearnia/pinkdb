@@ -23,9 +23,12 @@
 //!
 //! `--tls-cert` + `--tls-key` (both, or neither) serve the same protocol over
 //! rustls-encrypted TCP; they are only accepted by a binary built with the
-//! `tls` feature. TLS encrypts the transport and identifies the server; it
-//! does **not** identify the client — login is what gates statements once the
-//! store has users. Bind localhost until then.
+//! `tls` feature **and** only by the default `sync` transport. The async
+//! transport has no TLS path, so `--transport async` combined with either TLS
+//! flag is a usage error (exit 2) instead of a silent plaintext downgrade.
+//! TLS encrypts the transport and identifies the server; it does **not**
+//! identify the client — login is what gates statements once the store has
+//! users. Bind localhost until then.
 
 use std::process::ExitCode;
 
@@ -76,16 +79,19 @@ fn usage() -> &'static str {
      \x20 --max-connections N    concurrent clients served (default 128)\n\
      \x20 --idle-timeout SECS    disconnect clients idle this long; 0 = never (default 300)\n\
      \x20 --transport MODE       sync = blocking thread-per-connection (default);\n\
+     \x20                        the only transport with TLS support\n\
      \x20                        async = tokio I/O, same protocol/engine (needs a\n\
-     \x20                        build with the `async-server` feature)\n\
+     \x20                        build with the `async-server` feature); the async transport\n\
+     \x20                        has no TLS, so --tls-cert/--tls-key are refused at startup\n\
      \x20 --allow-load-extension let clients run LOAD EXTENSION (loads native code on\n\
      \x20                        the server host; off by default)\n\
      \x20 --extension-root PATH  confine every extension load to this directory (a path\n\
      \x20                        outside it is refused; a bare library name, a `..`\n\
      \x20                        component and a symlinked library are always refused)\n\
-     \x20 --tls-cert PATH        serve TLS with this PEM certificate chain\n\
+     \x20 --tls-cert PATH        serve TLS with this PEM certificate chain (sync only)\n\
      \x20 --tls-key PATH         PEM private key matching --tls-cert (PKCS#8/#1/SEC1);\n\
-     \x20                        both or neither, and only in a build with `tls`\n\
+     \x20                        both or neither, only in a build with `tls`, and\n\
+     \x20                        only with the sync transport\n\
      \n\
      At-rest encryption is not wired into the server: PINKDB_KEY is ignored and\n\
      --file must be a plaintext database (an encrypted one is refused at startup).\n\
@@ -172,6 +178,19 @@ fn parse_args() -> Result<Args, String> {
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             other => return Err(format!("unknown argument {other:?}")),
         }
+    }
+    // H-2: the async transport has no TLS path. Refuse the flags outright
+    // rather than accepting and ignoring them (which would serve plaintext on
+    // a port the operator asked to encrypt). This check precedes the pairing
+    // check so either flag alone gets the transport-specific message; the
+    // sync path keeps its existing both-or-neither error unchanged.
+    #[cfg(feature = "async-server")]
+    if args.transport == Transport::Async && (args.tls_cert.is_some() || args.tls_key.is_some()) {
+        return Err(
+            "--transport async does not support TLS; use the default sync transport with \
+             --tls-cert/--tls-key, or remove the TLS flags."
+                .to_string(),
+        );
     }
     // Pairing is validated before anything binds, so a half-configured TLS
     // listener never starts: both flags or neither.
