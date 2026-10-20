@@ -2026,6 +2026,9 @@ fn exec_sql(
         .with_logged_procedure(db.is_durable());
     let (plan, _dynamic) =
         crate::sql::binder::bind_tracked_with(db, sql, &frame.db_name, Some(slots))?;
+    // Lazy index lifecycle: mutation times only set a flag (see
+    // `PinkDb::rebuild_stale_indexes`).
+    db.rebuild_stale_indexes();
     let plan = crate::optimizer::optimize(db, plan);
     if crate::plan::contains_dynamic_scalar(&plan) {
         return Err(frame.err(

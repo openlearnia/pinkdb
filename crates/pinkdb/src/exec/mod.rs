@@ -286,6 +286,7 @@ fn store_materialized_view(db: &mut PinkDb, target: &str, name: &str, out: &Outp
         for col in &mut t.columns {
             col.chunks = vec![std::sync::Arc::new(Vector::new_empty(col.dtype))];
         }
+        t.invalidate_indexes();
     }
     let t = db.table_mut_in(target, name)?;
     for chunk in &out.chunks {
@@ -1384,7 +1385,14 @@ fn table_function_output(
     })
 }
 
-/// Gather output for an index scan: produce chunks containing only the rows/// whose global indices are in `row_indices`, with the table's full column set.
+/// Gather output for an index scan: produce chunks containing only the rows
+/// whose global indices are in `row_indices`, with the table's full column set.
+///
+/// Every index is validated against the *current* chunk set before it is
+/// read (H-4): a stale entry outside the table is skipped, never used to index
+/// a vector. Global row indices are mapped through the chunks' real lengths —
+/// not `ri / CHUNK_SIZE`, which would be wrong as soon as a delete leaves an
+/// interior chunk shorter than [`CHUNK_SIZE`].
 fn index_scan_output(
     cx: &Cx,
     db_name: &str,
@@ -1394,21 +1402,58 @@ fn index_scan_output(
 ) -> Result<Output> {
     let t = cx.db.table_in(db_name, table)?;
     let (names, types): (Vec<String>, Vec<DataType>) = t.schema().into_iter().unzip();
+    // Start offset of each chunk (plus the total row count). All columns share
+    // the same chunk boundaries; column 0 defines them.
+    let offsets: Vec<usize> = {
+        let mut offsets = Vec::with_capacity(t.num_chunks() + 1);
+        let mut offset = 0usize;
+        for chunk in t
+            .columns
+            .first()
+            .map(|c| c.chunks.as_slice())
+            .unwrap_or(&[])
+        {
+            offsets.push(offset);
+            offset += chunk.len();
+        }
+        offsets.push(offset);
+        offsets
+    };
     let mut out_chunks = Vec::new();
     let mut cur_cols: Vec<Vector> = types.iter().map(|ty| Vector::new_empty(*ty)).collect();
     let mut cur_rows = 0usize;
     for &ri in row_indices {
+        // H-4 defence in depth: an index entry that does not address a live
+        // row is skipped rather than panicking (`vector index out of bounds`).
+        if ri >= t.num_rows {
+            continue;
+        }
+        let chunk_idx = offsets.partition_point(|&start| start <= ri) - 1;
+        let row_in_chunk = ri - offsets[chunk_idx];
+        // Validate every column first so a misaligned chunk never leaves a
+        // partially pushed row behind.
+        let mut values = Vec::with_capacity(t.columns.len());
+        let mut valid = true;
+        for col in &t.columns {
+            match col.chunks.get(chunk_idx) {
+                Some(chunk) if row_in_chunk < chunk.len() => values.push(chunk.get(row_in_chunk)),
+                _ => {
+                    valid = false;
+                    break;
+                }
+            }
+        }
+        if !valid {
+            continue;
+        }
         if cur_rows >= CHUNK_SIZE {
             let cols = std::mem::take(&mut cur_cols);
             out_chunks.push(DataChunk::new(cols)?);
             cur_cols = types.iter().map(|ty| Vector::new_empty(*ty)).collect();
             cur_rows = 0;
         }
-        let chunk_idx = ri / CHUNK_SIZE;
-        let row_in_chunk = ri % CHUNK_SIZE;
-        for (ci, col) in t.columns.iter().enumerate() {
-            let v = col.chunks[chunk_idx].get(row_in_chunk);
-            cur_cols[ci].push_value(v)?;
+        for (dst, v) in cur_cols.iter_mut().zip(values) {
+            dst.push_value(v)?;
         }
         cur_rows += 1;
     }
@@ -1710,6 +1755,17 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                     ))
                 }
             };
+            // The optimizer already canonicalized the literal to the indexed
+            // column's type (H-5); re-apply the cast defensively so a plan
+            // built by another path can never probe with a type-tagged key.
+            let column_type = t
+                .columns
+                .get(idx.column)
+                .map(|c| c.dtype)
+                .ok_or_else(|| {
+                    PinkDbError::Catalog(format!("index \"{index}\" has no column"))
+                })?;
+            let key_val = crate::exec::expr::cast_value(key_val, column_type)?;
             let mut key_buf = Vec::new();
             crate::exec::aggregate::encode_value(&mut key_buf, &key_val);
             let row_indices = idx.map.get(&key_buf).cloned().unwrap_or_default();

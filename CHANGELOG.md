@@ -10,6 +10,20 @@ one-liners below.
 
 ## 2026-10-20
 
+### Security hardening — pass 4: index lifecycle ✅
+- Indexed lookups are now **always re-checked**: the optimizer keeps `Filter`
+  above `IndexScan`, and any INSERT/UPDATE/DELETE/COPY marks indexes stale
+  (rebuilt lazily at the next statement boundary) — a stale index can no longer
+  return wrong rows.
+- Out-of-range row ids in an index are skipped instead of panicking (closing a
+  remote DoS), probe keys are canonicalized to the column's type (BIGINT/
+  DOUBLE/DECIMAL + integer literals now find rows), and `DROP COLUMN` reindexes
+  correctly.
+- Indexes remain **session-lifetime**: the hash maps are not stored in `.pink`
+  and the DDL is not replayed from the WAL yet, so reopening a store currently
+  loses its indexes (queries fall back to correct but slower scans). Index
+  persistence is wave 79.
+
 ### Security hardening — pass 3: async TLS downgrade ✅
 - `--transport async` now **refuses** `--tls-cert`/`--tls-key` at startup with a
   clear error instead of silently serving plaintext. TLS remains available on

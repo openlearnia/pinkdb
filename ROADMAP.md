@@ -1974,3 +1974,33 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   as the follow-up. Gates: server **79/99/90/110** (default/async/tls/both),
   workspace **1236**, CLI 77, fmt/clippy both toolchains, wasm green; size
   **0 B**. `duckdiff` skipped (server-only change).
+
+- 2026-10-20 — Security hardening, pass 4: index lifecycle (H-3/H-4/H-5/L-1;
+  worktree `wt-sec4`). Every mutation (INSERT/UPDATE/DELETE/COPY/bulk load,
+  materialized-view clears) now marks a table's indexes stale via
+  `indexes_stale`; `PinkDb::rebuild_stale_indexes` rebuilds them from the live
+  chunks at the next statement boundary (refreshes and WAL reloads trigger it
+  too). The optimizer always emits `Filter` **above** `IndexScan` and refuses
+  an index whose stale flag is set, so an index can only propose candidates —
+  a stale or corrupt one costs performance, never correctness. The index gather
+  bounds-checks every row id against the live row set **and** each column's
+  chunk length, making the stale-index panic (A.5) impossible; it also fixes a
+  latent global-row mapping bug (real per-chunk lengths instead of
+  `ri / CHUNK_SIZE`). Probe keys are canonicalized to the indexed column's type
+  with the engine's `cast_value` (BIGINT/DOUBLE/DECIMAL columns + integer
+  literals now find their rows, A.6), and the rewrite is refused when no
+  faithful key exists (NULL, unrepresentable casts, f64-collapse pairs).
+  `DROP COLUMN` drops indexes on the dropped column and shifts the remaining
+  ordinals (L-1), so a later `ADD COLUMN` cannot make an index point at the
+  wrong column. **Indexes are process-lifetime only**: the hash maps are not in
+  `.pink` (v5 flags bit 3 is reserved for wave 79) and `CREATE`/`DROP INDEX`
+  are **not** replayed from the WAL today, so a reopen loses the index
+  definition and falls back to scans — results stay correct, but the missing
+  durability is wave 79's job (the earlier assumption that replay rebuilt the
+  index is wrong; measured with the durable CLI store). Tests: new
+  `crates/pinkdb/tests/indexes.rs` (15: EXPLAIN `IndexScan` + identical
+  results, A.4/A.5/A.6, INSERT/UPDATE/DELETE/bulk freshness, duplicates/NULL/
+  empty tables, multi-chunk delete mapping, out-of-range entries skipped,
+  corrupt-index candidate rejection, DROP+ADD COLUMN). Gates: pinkdb **665**,
+  workspace **1251**, duckdiff **339/339**, fmt/clippy both toolchains, wasm
+  green; CLI size **+17,296 B**.

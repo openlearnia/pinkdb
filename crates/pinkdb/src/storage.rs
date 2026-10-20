@@ -82,6 +82,14 @@ pub struct DataTable {
     pub constraints: TableConstraints,
     /// In-memory hash indexes for equality lookups.
     pub indexes: Vec<Index>,
+    /// Set by every mutation (INSERT/UPDATE/DELETE/bulk load/COPY) when the
+    /// table has indexes: the maps describe a pre-mutation snapshot. The
+    /// statement path rebuilds them lazily from the live chunks at the next
+    /// statement boundary ([`PinkDb::rebuild_stale_indexes`]), and the
+    /// optimizer refuses to use one while this flag is set, so a stale index
+    /// is only ever a missed optimization — never a wrong answer. See
+    /// [`DataTable::rebuild_indexes`].
+    pub indexes_stale: bool,
     /// Mutation stamp for optimistic-concurrency conflict detection. Drawn
     /// from a process-wide counter on creation and on every
     /// append/update/delete batch, so it is unique across tables: a table
@@ -99,6 +107,28 @@ pub struct Index {
     pub name: String,
     pub column: usize,
     pub map: std::collections::HashMap<Vec<u8>, Vec<usize>>,
+}
+
+/// Build one hash-index map from a column's chunks: non-NULL key encoding →
+/// global row indices (flattened across chunks, using each chunk's real
+/// length). Shared by `CREATE INDEX` and the lazy rebuild so both always
+/// produce identical keys.
+fn index_map_for(column: &Column) -> std::collections::HashMap<Vec<u8>, Vec<usize>> {
+    let mut map = std::collections::HashMap::new();
+    let mut offset = 0usize;
+    for chunk in column.chunks.iter() {
+        for row in 0..chunk.len() {
+            let v = chunk.get(row);
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let mut buf = Vec::new();
+            crate::exec::aggregate::encode_value(&mut buf, &v);
+            map.entry(buf).or_insert_with(Vec::new).push(offset + row);
+        }
+        offset += chunk.len();
+    }
+    map
 }
 
 /// The kind of a declarative key constraint.
@@ -243,6 +273,7 @@ impl DataTable {
             num_rows: 0,
             constraints,
             indexes: Vec::new(),
+            indexes_stale: false,
             version: next_table_version(),
         })
     }
@@ -279,6 +310,7 @@ impl DataTable {
             num_rows,
             constraints: TableConstraints::default(),
             indexes: Vec::new(),
+            indexes_stale: false,
             version: next_table_version(),
         }
     }
@@ -385,8 +417,44 @@ impl DataTable {
         }
         self.constraints.not_null.retain(|&c| c != idx);
         self.constraints.not_null.iter_mut().for_each(reindex);
+        // L-1: an index on the dropped column goes away with it, and every
+        // index to its right shifts left with its column. Without the shift a
+        // later `ADD COLUMN` could land on the stale ordinal and the optimizer
+        // would use the wrong column's map.
+        self.indexes.retain(|i| i.column != idx);
+        for i in &mut self.indexes {
+            reindex(&mut i.column);
+        }
         self.version = next_table_version();
         Ok(())
+    }
+
+    /// Mark the table's hash indexes stale after a mutation. Cheap (one flag);
+    /// [`Self::rebuild_indexes`] rebuilds them lazily on the next indexed
+    /// lookup.
+    pub(crate) fn invalidate_indexes(&mut self) {
+        if !self.indexes.is_empty() {
+            self.indexes_stale = true;
+        }
+    }
+
+    /// Rebuild every hash index on this table from the live chunks, clearing
+    /// the stale flag. Called lazily by [`PinkDb::rebuild_stale_indexes`] at
+    /// the next statement boundary, so a later indexed lookup sees a snapshot
+    /// of the current rows.
+    pub(crate) fn rebuild_indexes(&mut self) {
+        // Drop an index whose column ordinal no longer exists (only possible
+        // if a catalog bug skipped the ALTER reindex) rather than panicking.
+        self.indexes.retain(|i| i.column < self.columns.len());
+        let maps: Vec<_> = self
+            .indexes
+            .iter()
+            .map(|i| index_map_for(&self.columns[i.column]))
+            .collect();
+        for (index, map) in self.indexes.iter_mut().zip(maps) {
+            index.map = map;
+        }
+        self.indexes_stale = false;
     }
 
     /// `ALTER TABLE … RENAME COLUMN`: set the column's display name (the
@@ -521,6 +589,7 @@ impl DataTable {
         }
         self.num_rows += 1;
         self.version = next_table_version();
+        self.invalidate_indexes();
         Ok(())
     }
 
@@ -592,6 +661,7 @@ impl DataTable {
             }
             self.num_rows += rows;
             self.version = next_table_version();
+            self.invalidate_indexes();
             return Ok(());
         }
         // Partial tail: merge, splitting at chunk boundaries as needed.
@@ -620,6 +690,7 @@ impl DataTable {
             self.num_rows += take;
         }
         self.version = next_table_version();
+        self.invalidate_indexes();
         Ok(())
     }
 
@@ -665,6 +736,7 @@ impl DataTable {
         }
         if !updates.is_empty() {
             self.version = next_table_version();
+            self.invalidate_indexes();
         }
         Ok(())
     }
@@ -711,6 +783,7 @@ impl DataTable {
         self.num_rows -= removed;
         if removed > 0 {
             self.version = next_table_version();
+            self.invalidate_indexes();
         }
         Ok(removed)
     }
@@ -1946,28 +2019,52 @@ impl PinkDb {
             return Err(err);
         }
         let t = self.table_mut_in(db, table)?;
-        // Build the index: map each non-NULL key value to global row indices.
-        let mut map = std::collections::HashMap::new();
-        let mut offset = 0usize;
-        for chunk in t.columns[column].chunks.iter() {
-            for row in 0..chunk.len() {
-                let v = chunk.get(row);
-                if matches!(v, crate::types::Value::Null) {
-                    continue;
-                }
-                let mut buf = Vec::new();
-                crate::exec::aggregate::encode_value(&mut buf, &v);
-                let global = offset + row;
-                map.entry(buf).or_insert_with(Vec::new).push(global);
-            }
-            offset += chunk.len();
-        }
+        let Some(col) = t.columns.get(column) else {
+            return Err(PinkDbError::Catalog(format!(
+                "column {column} out of range for table \"{table}\""
+            )));
+        };
+        let map = index_map_for(col);
+        let first_index = t.indexes.is_empty();
         t.indexes.push(Index {
             name: name.to_string(),
             column,
             map,
         });
+        // A new index is fresh, but it must not clear a stale flag left by an
+        // *older* index on the same table: that one still needs its rebuild.
+        if first_index {
+            t.indexes_stale = false;
+        }
         Ok(())
+    }
+
+    /// Rebuild one table's stale hash indexes from its live chunks. The
+    /// optimizer calls this lazily, just before it rewrites an equality lookup
+    /// into an `IndexScan` (see [`DataTable::invalidate_indexes`]).
+    pub fn rebuild_indexes_in(&mut self, db: &str, table: &str) -> Result<()> {
+        if let Some(err) = self.attached_read_only(db, table) {
+            return Err(err);
+        }
+        self.table_mut_in(db, table)?.rebuild_indexes();
+        Ok(())
+    }
+
+    /// Rebuild every stale in-memory hash index (one pass over the store's
+    /// catalogs). The statement path calls this immediately before
+    /// optimization: DML only sets a flag, so the first statement after a
+    /// mutation pays one rebuild per indexed table instead of every mutation
+    /// paying one maintenance update per row. The optimizer independently
+    /// refuses to use an index whose flag is still set, so skipping this call
+    /// only costs performance.
+    pub fn rebuild_stale_indexes(&mut self) {
+        for catalog in self.databases.values_mut() {
+            for table in catalog.tables.values_mut() {
+                if table.indexes_stale {
+                    table.rebuild_indexes();
+                }
+            }
+        }
     }
 
     pub fn drop_index_in(&mut self, db: &str, table: &str, name: &str) -> Result<()> {
@@ -1976,6 +2073,9 @@ impl PinkDb {
         t.indexes.retain(|i| i.name != name);
         if t.indexes.len() == before {
             return Err(PinkDbError::Catalog(format!("index \"{name}\" not found")));
+        }
+        if t.indexes.is_empty() {
+            t.indexes_stale = false;
         }
         Ok(())
     }

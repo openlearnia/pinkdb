@@ -35,9 +35,24 @@ pub fn optimize(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     fold_plan(db, plan)
 }
 
-/// Rewrite `Filter { input: Scan, predicate: col = literal }` into an
-/// `IndexScan` when a hash index exists on that column. Only simple equality
-/// against a literal is supported; everything else keeps the scan.
+/// Propose a hash-index lookup for `Filter { input: Scan, predicate: col =
+/// literal }` when an index exists on that column.
+///
+/// The `Filter` node is **kept above** the [`LogicalPlan::IndexScan`]: the
+/// index only proposes candidate rows, and the original predicate is always
+/// re-checked. A stale or approximate index can therefore cost performance,
+/// never correctness (H-3/H-4 backstop).
+///
+/// The probe key is canonicalized to the *indexed column's* type before it is
+/// stored in the plan (H-5): the binder keeps a numeric literal's own type
+/// (`INTEGER` literal against a `BIGINT`/`DOUBLE`/`DECIMAL` column, or an
+/// explicit `CAST`), while the index map is keyed by the column's stored
+/// representation. If the coercion cannot be represented the rewrite is
+/// refused and the plain scan stays.
+///
+/// A stale index (a mutation set the table's flag and the caller did not
+/// rebuild it yet) is never trusted: the plan keeps the full scan, so
+/// correctness never depends on lifecycle bookkeeping.
 fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan {
     match plan {
         LogicalPlan::Filter { input, predicate } => {
@@ -66,15 +81,36 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
                         };
                     }
                 };
-                let lookup = qdb.as_deref().unwrap_or_else(|| db.current_db());
-                if let Ok(t) = db.table_in(lookup, table)
-                    && let Some(idx) = t.indexes.iter().find(|i| i.column == col_idx)
-                {
-                    return LogicalPlan::IndexScan {
-                        db: qdb.clone(),
-                        table: table.clone(),
-                        index: idx.name.clone(),
-                        value: *lit,
+                let lookup = qdb.clone().unwrap_or_else(|| db.current_db().to_string());
+                let candidate = match db.table_in(&lookup, table) {
+                    Ok(t) if !t.indexes_stale => t
+                        .indexes
+                        .iter()
+                        .find(|i| i.column == col_idx)
+                        .map(|i| (i.name.clone(), t.columns.get(col_idx).map(|c| c.dtype))),
+                    _ => None,
+                };
+                if let Some((index_name, Some(column_type))) = candidate {
+                    let literal = match &*lit {
+                        BoundExpr::Literal(v) => v.clone(),
+                        _ => unreachable!("matched a literal above"),
+                    };
+                    // Canonicalize to the indexed column's type (H-5), or
+                    // keep the full scan when no faithful key exists.
+                    let Some(canonical) = canonical_probe_key(column_type, literal) else {
+                        return LogicalPlan::Filter {
+                            input: Box::new(input),
+                            predicate,
+                        };
+                    };
+                    return LogicalPlan::Filter {
+                        input: Box::new(LogicalPlan::IndexScan {
+                            db: qdb.clone(),
+                            table: table.clone(),
+                            index: index_name,
+                            value: BoundExpr::Literal(canonical),
+                        }),
+                        predicate,
                     };
                 }
             }
@@ -169,6 +205,39 @@ fn apply_indexes(db: &crate::storage::PinkDb, plan: LogicalPlan) -> LogicalPlan 
             plan: Box::new(apply_indexes(db, *plan)),
         },
         other => other,
+    }
+}
+
+/// Canonicalize an equality probe literal to the indexed column's type, or
+/// `None` when the comparison semantics cannot be represented by one key.
+///
+/// `cast_value` is the engine's CAST rule, so for exact pairs (integers ↔
+/// integers, integer → DECIMAL, DOUBLE → wider numeric, DECIMAL scale
+/// differences) the key matches the stored representation. Two mixed pairs
+/// compare through `f64` in [`crate::plan::compare_values`] and collapse
+/// distinct column values, so a single canonical key could *miss* rows that
+/// compare equal (never merely add candidates — the `Filter` above removes
+/// false positives):
+///
+/// - `BIGINT`/`INTEGER` column vs `DOUBLE` literal: above 2^53 several
+///   integers share one `f64` value.
+/// - `DECIMAL` column vs `DOUBLE` literal: several decimals share one `f64`.
+///
+/// Those keep the plain scan. `NULL` also keeps the scan: index maps never
+/// store NULL keys and the predicate yields its normal empty result.
+fn canonical_probe_key(
+    column: crate::types::DataType,
+    literal: crate::types::Value,
+) -> Option<crate::types::Value> {
+    use crate::types::{DataType, Value};
+    if let (DataType::Integer | DataType::Bigint | DataType::Decimal { .. }, Value::Double(_)) =
+        (column, &literal)
+    {
+        return None;
+    }
+    match crate::exec::expr::cast_value(literal, column) {
+        Ok(value) if !value.is_null() => Some(value),
+        _ => None,
     }
 }
 

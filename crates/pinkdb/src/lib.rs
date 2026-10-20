@@ -157,6 +157,10 @@ impl PinkDb {
                 self.boundary_auto_refresh()?;
             }
             let session_db = self.current_db().to_string();
+            // Indexes are invalidated by mutation and rebuilt lazily here:
+            // one rebuild per indexed table at the next statement boundary,
+            // rather than per-row maintenance on every INSERT/UPDATE/DELETE.
+            self.rebuild_stale_indexes();
             let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
             // The runner (not the binder) holds the per-statement source text;
             // a `CREATE MATERIALIZED VIEW` plan persists it (wave 80).
@@ -243,6 +247,9 @@ impl PinkDb {
                     if let Some(g) = &lease {
                         self.rebuild_under_lease(g)?;
                     }
+                    // A reloaded catalog may carry stale index flags from the
+                    // replayed frames; rebuild before planning.
+                    self.rebuild_stale_indexes();
                     self.note_optimistic_fallback_for_test();
                     let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
                     let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
@@ -292,6 +299,7 @@ impl PinkDb {
                         // The refresh may have changed the catalog (or the
                         // replayed frames may name objects bound above):
                         // rebind against the refreshed state.
+                        self.rebuild_stale_indexes();
                         let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
                         let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
                         (optimizer::optimize(self, p), d)

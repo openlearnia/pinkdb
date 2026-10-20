@@ -186,6 +186,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-20">2026-10-20<a class="anchor" href="#2026-10-20" aria-label="Permalink: 2026-10-20">#</a></h2>
+<h3>Security hardening — pass 4: index lifecycle ✅</h3>
+<ul>
+<li>Indexed lookups are now <strong>always re-checked</strong>: the optimizer keeps <code>Filter</code> above <code>IndexScan</code>, and any INSERT/UPDATE/DELETE/COPY marks indexes stale (rebuilt lazily at the next statement boundary) — a stale index can no longer return wrong rows.</li>
+<li>Out-of-range row ids in an index are skipped instead of panicking (closing a remote DoS), probe keys are canonicalized to the column's type (BIGINT/ DOUBLE/DECIMAL + integer literals now find rows), and <code>DROP COLUMN</code> reindexes correctly.</li>
+<li>Indexes remain <strong>session-lifetime</strong>: the hash maps are not stored in <code>.pink</code> and the DDL is not replayed from the WAL yet, so reopening a store currently loses its indexes (queries fall back to correct but slower scans). Index persistence is wave 79.</li>
+</ul>
 <h3>Security hardening — pass 3: async TLS downgrade ✅</h3>
 <ul>
 <li><code>--transport async</code> now <strong>refuses</strong> <code>--tls-cert</code>/<code>--tls-key</code> at startup with a clear error instead of silently serving plaintext. TLS remains available on the default sync transport (or via a TLS terminator in front); native async TLS is recorded as a follow-up.</li>
