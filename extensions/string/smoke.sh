@@ -13,6 +13,9 @@
 # `cargo test -p pinkdb-ext-string` covers the same surface through the linked
 # model; this script is the CLI-visible proof of the native one.
 set -euo pipefail
+# `LOAD EXTENSION` is off by default (security review C-2): this smoke script
+# deliberately loads native code, so it opts in explicitly.
+export PINKDB_ALLOW_LOAD_EXTENSION=1
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
