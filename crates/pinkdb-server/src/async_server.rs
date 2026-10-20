@@ -47,6 +47,11 @@
 //!   writes): a client that sends nothing, or stops reading results, for that
 //!   long is disconnected. Frame bodies are buffered as they arrive, never
 //!   sized from the untrusted length prefix.
+//! - The same per-statement deadline/result caps and login controls as the
+//!   blocking transport (`statement_timeout`, `max_result_rows`,
+//!   `max_result_bytes`, `max_concurrent_logins`): engine work runs on the
+//!   blocking pool under the executor's chunk-boundary deadline, and failed
+//!   logins back off per connection and per IP.
 //! - A panic while executing one statement is caught (`catch_unwind` on the
 //!   blocking thread) and reported as an `Error` frame; the connection and
 //!   every other client stay alive.
@@ -90,7 +95,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use pinkdb::{Connection, Database, PreparedStatement};
+use pinkdb::{Connection, Database, ExecLimits, PreparedStatement};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::{Builder, Runtime};
@@ -100,8 +105,11 @@ use crate::protocol::{
     self, FRAME_READ_STEP, MAX_FRAME_SIZE, PROTOCOL_VERSION, ProtocolError, Request, Response,
 };
 use crate::server::{
-    self, AUTH_REQUIRED, ActiveGuard, CONNECTION_STACK_SIZE, DEFAULT_IDLE_TIMEOUT,
-    DEFAULT_MAX_CONNECTIONS, FrameSink, MAX_PREPARED, auth_required, panic_message, warn_auth_mode,
+    self, AUTH_REQUIRED, ActiveGuard, CONNECTION_STACK_SIZE, ConnectionPolicy,
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONCURRENT_LOGINS, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS, DEFAULT_STATEMENT_TIMEOUT_MS, FrameSink,
+    LoginAttempt, LoginGate, LoginIpLimiter, LoginThrottle, MAX_PREPARED, auth_required,
+    panic_message, warn_auth_mode,
 };
 
 /// First retry delay after a failed `accept()`; doubles up to the max
@@ -141,6 +149,9 @@ pub struct AsyncServer {
     max_connections: usize,
     active: Arc<AtomicUsize>,
     idle_timeout: Option<Duration>,
+    exec_limits: ExecLimits,
+    login_gate: Arc<LoginGate>,
+    login_ips: Arc<LoginIpLimiter>,
 }
 
 impl AsyncServer {
@@ -175,6 +186,13 @@ impl AsyncServer {
             max_connections,
             active: Arc::new(AtomicUsize::new(0)),
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            exec_limits: ExecLimits {
+                statement_timeout: Some(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS)),
+                max_result_rows: Some(DEFAULT_MAX_RESULT_ROWS),
+                max_result_bytes: Some(DEFAULT_MAX_RESULT_BYTES),
+            },
+            login_gate: Arc::new(LoginGate::new(DEFAULT_MAX_CONCURRENT_LOGINS)),
+            login_ips: Arc::new(LoginIpLimiter::new()),
         })
     }
 
@@ -202,6 +220,33 @@ impl AsyncServer {
     /// A zero duration is treated as `None`, like the blocking server.
     pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.idle_timeout = timeout.filter(|t| !t.is_zero());
+        self
+    }
+
+    /// Per-statement wall-clock deadline (M-6), shared with the blocking
+    /// transport's semantics: checked at chunk boundaries inside the
+    /// executor.
+    pub fn statement_timeout(mut self, timeout: Duration) -> Self {
+        self.exec_limits.statement_timeout = Some(timeout);
+        self
+    }
+
+    /// Cap on rows materialized by one statement (join output + final
+    /// result).
+    pub fn max_result_rows(mut self, rows: usize) -> Self {
+        self.exec_limits.max_result_rows = Some(rows);
+        self
+    }
+
+    /// Cap on estimated bytes materialized by one statement.
+    pub fn max_result_bytes(mut self, bytes: usize) -> Self {
+        self.exec_limits.max_result_bytes = Some(bytes);
+        self
+    }
+
+    /// Global cap on Argon2id login verifications in flight (H-6).
+    pub fn max_concurrent_logins(mut self, max: usize) -> Self {
+        self.login_gate = Arc::new(LoginGate::new(max));
         self
     }
 
@@ -262,9 +307,15 @@ impl AsyncServer {
                     self.active.fetch_add(1, Ordering::SeqCst);
                     let db = self.db.clone();
                     let idle_timeout = self.idle_timeout;
+                    let policy = ConnectionPolicy {
+                        limits: self.exec_limits,
+                        gate: Arc::clone(&self.login_gate),
+                        ips: Arc::clone(&self.login_ips),
+                        peer_ip: peer.ip(),
+                    };
                     tokio::spawn(async move {
                         let _guard = guard;
-                        serve_connection(stream, db, idle_timeout).await;
+                        serve_connection(stream, db, idle_timeout, policy).await;
                     });
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -380,7 +431,12 @@ fn reject_over_limit(mut stream: TcpStream, max: usize) {
 /// client. Engine calls run on blocking-pool threads (see [`run_blocking`]);
 /// this task only does frame I/O, timers and the session bookkeeping the
 /// blocking server keeps in its connection thread.
-async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Duration>) {
+async fn serve_connection(
+    stream: TcpStream,
+    db: Database,
+    idle_timeout: Option<Duration>,
+    policy: ConnectionPolicy,
+) {
     let mut stream = stream;
     if let Err(e) = stream.set_nodelay(true) {
         eprintln!("pinkdb-server(async): cannot set TCP_NODELAY on an accepted socket: {e}");
@@ -389,6 +445,8 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
     // Network session: the engine re-checks the store's user catalog before
     // every statement (so a batch cannot continue after its own CREATE USER).
     conn.require_login(true);
+    conn.set_exec_limits(policy.limits);
+    let mut throttle = LoginThrottle::new();
 
     // Handshake: the first request must be a version-matched Hello.
     let protocol_version = match read_request(&mut stream, idle_timeout).await {
@@ -452,14 +510,50 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
         match request {
             // v9 (wave 48): verify credentials on the blocking pool (an
             // Argon2id verification is CPU work) and adopt the principal.
+            // The per-IP check costs no Argon2id, the global gate refuses
+            // excess verifications immediately, and the per-connection
+            // throttle closes after five failures with increasing delays.
             Request::Login { user, password } => {
+                if let Some(retry) = policy.ips.retry_after(policy.peer_ip) {
+                    if send_error(
+                        &mut stream,
+                        &format!(
+                            "too many failed login attempts from this address; retry in {}s",
+                            retry.as_secs().max(1)
+                        ),
+                        idle_timeout,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                let Some(permit) = policy.gate.try_acquire() else {
+                    if send_error(
+                        &mut stream,
+                        "too many concurrent logins; retry shortly",
+                        idle_timeout,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                };
                 let ran = run_blocking(&mut stream, conn, idle_timeout, move |conn, sink| {
                     // `login_reply` is the blocking server's own code path:
                     // the frames cannot drift between the transports.
-                    let _ = server::login_reply(sink, conn, &user, &password);
+                    let attempt = server::login_reply(sink, conn, &user, &password).ok();
+                    // Hold the verification slot until the derivation ends
+                    // (including a frame-send failure path).
+                    drop(permit);
                     Blocked {
-                        close: false,
+                        close: attempt.is_none(),
                         prepared: None,
+                        login: attempt,
                     }
                 })
                 .await;
@@ -471,6 +565,21 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
                         conn = *c;
                         if blocked.close {
                             return;
+                        }
+                        match blocked.login {
+                            Some(LoginAttempt::Succeeded) => {
+                                throttle.reset();
+                                policy.ips.record_success(policy.peer_ip);
+                            }
+                            Some(LoginAttempt::Failed) => {
+                                let delay = throttle.failure_delay();
+                                policy.ips.record_failure(policy.peer_ip);
+                                tokio::time::sleep(delay).await;
+                                if throttle.closed() {
+                                    return;
+                                }
+                            }
+                            None => return,
                         }
                     }
                     Ran { conn: None, .. } => return,
@@ -547,6 +656,7 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
                     Blocked {
                         close,
                         prepared: None,
+                        login: None,
                     }
                 })
                 .await;
@@ -619,6 +729,7 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
                     Blocked {
                         close: false,
                         prepared: parsed,
+                        login: None,
                     }
                 })
                 .await;
@@ -733,6 +844,7 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
                     Blocked {
                         close,
                         prepared: None,
+                        login: None,
                     }
                 })
                 .await;
@@ -768,6 +880,9 @@ struct Blocked {
     /// A parsed prepared statement to register on the connection task
     /// (`Request::Prepare`); `None` for every other action.
     prepared: Option<PreparedStatement>,
+    /// The outcome of a `Request::Login` verification; `None` for every
+    /// other action.
+    login: Option<LoginAttempt>,
 }
 
 /// What [`run_blocking`] hands back to the connection loop.
@@ -790,6 +905,7 @@ impl Ran {
             blocked: Blocked {
                 close: true,
                 prepared: None,
+                login: None,
             },
         }
     }

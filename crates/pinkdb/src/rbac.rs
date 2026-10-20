@@ -420,6 +420,11 @@ fn random_salt() -> Result<[u8; SALT_LEN]> {
 /// Verify `password` against a stored PHC hash. `false` for a wrong password
 /// **and** for a hash that does not parse (a corrupt catalog row must not
 /// authenticate anyone).
+///
+/// The derivation parameters are the ones embedded in `hash` (that is the
+/// `password-hash` verifier contract), which is why
+/// [`validate_password_hash`] bounds them before a hash can enter the
+/// catalog.
 pub fn verify_password(hash: &str, password: &str) -> bool {
     let Ok(parsed) = argon2::PasswordHash::new(hash) else {
         return false;
@@ -432,9 +437,65 @@ pub fn verify_password(hash: &str, password: &str) -> bool {
     .is_ok()
 }
 
+// ---------- password work-factor policy ----------
+//
+// A `PASSWORD_HASH` row is verified with the parameters *inside* the PHC
+// string, so accepting an arbitrary string would let a user choose their own
+// (possibly crackable) work factor — or, in the other direction, make every
+// login allocate gigabytes. The policy floor is the engine's default
+// (`m=19456 KiB, t=2, p=1`, the same OWASP-recommended configuration as the
+// at-rest KDF); the ceiling is the at-rest container's accepted envelope
+// (`m<=77824 KiB`, `t<=8`, `p<=4`, `m*t<=311296`), so a password hash can
+// never cost more than the worst encryption passphrase the format itself
+// accepts. At the ceiling one verification allocates ~76 MiB and costs
+// roughly 0.1 s in release on the development machine — with the server's
+// four-verification in-flight cap that is ~304 MiB transient, not the
+// multiple GiB an unvalidated `m=4000000` would allocate.
+
+/// The policy floor / default `m_cost` (KiB): 19 MiB.
+pub const PASSWORD_HASH_MIN_M_COST_KIB: u32 = crate::crypto::ARGON2_M_COST_KIB;
+/// The policy floor / default `t_cost` (iterations).
+pub const PASSWORD_HASH_MIN_T_COST: u32 = crate::crypto::ARGON2_T_COST;
+/// The policy floor / default `p_cost` (lanes).
+pub const PASSWORD_HASH_MIN_P_COST: u32 = crate::crypto::ARGON2_P_COST;
+/// The policy ceiling for `m_cost` (KiB): 4× the default, the at-rest KDF's
+/// own accepted maximum (`crypto::ARGON2_MAX_M_COST_KIB`). 76 MiB per
+/// verification is the most a login may allocate.
+pub const PASSWORD_HASH_MAX_M_COST_KIB: u32 = 4 * PASSWORD_HASH_MIN_M_COST_KIB;
+/// The policy ceiling for `t_cost`: 4× the default (the at-rest envelope).
+pub const PASSWORD_HASH_MAX_T_COST: u32 = 4 * PASSWORD_HASH_MIN_T_COST;
+/// The policy ceiling for `p_cost`: 4 lanes (the at-rest envelope).
+pub const PASSWORD_HASH_MAX_P_COST: u32 = 4 * PASSWORD_HASH_MIN_P_COST;
+/// The policy ceiling for `m_cost * t_cost` (KiB·iterations): 8× the
+/// default work, matching `crypto::ARGON2_MAX_WORK_KIB`.
+pub const PASSWORD_HASH_MAX_WORK_KIB: u64 =
+    8 * (PASSWORD_HASH_MIN_M_COST_KIB as u64) * (PASSWORD_HASH_MIN_T_COST as u64);
+
+/// A fixed PHC hash used for the **dummy verification** of an unknown user
+/// (M-2): the login path must pay the same Argon2id cost whether or not the
+/// name exists. It is never a valid credential (its hash is 32 zero bytes),
+/// and its parameters are exactly the policy floor. Keep it in sync with
+/// [`PASSWORD_HASH_MIN_M_COST_KIB`] and friends; the unit tests pin it.
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$\
+     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+/// Run the dummy verification for an unknown user, discarding the result.
+fn verify_dummy(password: &str) {
+    #[cfg(test)]
+    DUMMY_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = verify_password(DUMMY_PASSWORD_HASH, password);
+}
+
+/// The fixed dummy hash, exposed to the crate's tests that pin the policy.
+#[cfg(test)]
+pub(crate) fn dummy_password_hash() -> &'static str {
+    DUMMY_PASSWORD_HASH
+}
+
 /// Check a `PASSWORD_HASH '<phc>'` argument at bind time: the string must be
-/// a valid Argon2 PHC hash, so a typo fails the statement instead of
-/// producing a user nobody can log in as.
+/// a valid Argon2id PHC hash **inside the work-factor policy**, so a typo or
+/// a deliberately weak/expensive hash fails the statement instead of
+/// producing a user nobody should log in as (M-8).
 pub fn validate_password_hash(hash: &str) -> Result<()> {
     let parsed = argon2::PasswordHash::new(hash)
         .map_err(|e| PinkDbError::Catalog(format!("PASSWORD_HASH is not a valid PHC hash: {e}")))?;
@@ -444,8 +505,72 @@ pub fn validate_password_hash(hash: &str) -> Result<()> {
             parsed.algorithm
         )));
     }
+    // Argon2 v0x13 (PHC `v=19`) is the only version new credentials use.
+    let version = parsed.version.ok_or_else(|| {
+        PinkDbError::Catalog(
+            "PASSWORD_HASH must name its Argon2 version (v=19), got a hash without one".to_string(),
+        )
+    })?;
+    if version != 19 {
+        return Err(PinkDbError::Catalog(format!(
+            "PASSWORD_HASH must use Argon2 version 19 (v=19), got v={version}"
+        )));
+    }
+    let params = &parsed.params;
+    if params.is_empty() {
+        return Err(PinkDbError::Catalog(format!(
+            "PASSWORD_HASH is missing its Argon2 parameters (need m>={}, t>={}, p>={})",
+            PASSWORD_HASH_MIN_M_COST_KIB, PASSWORD_HASH_MIN_T_COST, PASSWORD_HASH_MIN_P_COST
+        )));
+    }
+    let decimal = |name: &str, what: &str| -> Result<u32> {
+        params.get_decimal(name).ok_or_else(|| {
+            PinkDbError::Catalog(format!(
+                "PASSWORD_HASH is missing its Argon2 {what} parameter \"{name}\""
+            ))
+        })
+    };
+    let m = decimal("m", "memory")?;
+    let t = decimal("t", "iteration")?;
+    let p = decimal("p", "parallelism")?;
+    if m < PASSWORD_HASH_MIN_M_COST_KIB
+        || t < PASSWORD_HASH_MIN_T_COST
+        || p < PASSWORD_HASH_MIN_P_COST
+    {
+        return Err(PinkDbError::Catalog(format!(
+            "PASSWORD_HASH work factor is too low (m={m}, t={t}, p={p}); the policy floor is \
+             m>={}, t>={}, p>={}",
+            PASSWORD_HASH_MIN_M_COST_KIB, PASSWORD_HASH_MIN_T_COST, PASSWORD_HASH_MIN_P_COST
+        )));
+    }
+    if m > PASSWORD_HASH_MAX_M_COST_KIB
+        || t > PASSWORD_HASH_MAX_T_COST
+        || p > PASSWORD_HASH_MAX_P_COST
+        || (m as u64) * (t as u64) > PASSWORD_HASH_MAX_WORK_KIB
+    {
+        return Err(PinkDbError::Catalog(format!(
+            "PASSWORD_HASH work factor is too high (m={m}, t={t}, p={p}); the policy ceiling is \
+             m<={}, t<={}, p<={}, m*t<={}",
+            PASSWORD_HASH_MAX_M_COST_KIB,
+            PASSWORD_HASH_MAX_T_COST,
+            PASSWORD_HASH_MAX_P_COST,
+            PASSWORD_HASH_MAX_WORK_KIB
+        )));
+    }
+    if parsed.salt.is_none() || parsed.hash.is_none() {
+        return Err(PinkDbError::Catalog(
+            "PASSWORD_HASH is missing its salt or hash segment".to_string(),
+        ));
+    }
     Ok(())
 }
+
+/// Test-only counter: how many times [`verify_dummy`] ran. The deterministic
+/// M-2 test proves the unknown-user path performs work; it is compiled out of
+/// normal builds (the timing test covers the observable behavior).
+#[cfg(test)]
+pub(crate) static DUMMY_VERIFICATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// One user: the display name as created plus the Argon2id PHC hash. The
 /// plaintext never reaches the store.
@@ -984,22 +1109,61 @@ impl PinkDb {
         )
     }
 
+    /// The user record a login needs, copied out so the caller can release
+    /// the store lock **before** the expensive Argon2id verification (H-6):
+    /// `Some((display name, PHC hash))`, or `None` for an unknown user.
+    pub(crate) fn login_record(&self, user: &str) -> Option<(String, String)> {
+        self.rbac
+            .users
+            .get(&user.to_ascii_lowercase())
+            .map(|def| (def.name.clone(), def.password_hash.clone()))
+    }
+
+    /// Verify a password against a **copied** user record (see
+    /// [`PinkDb::login_record`]). This is the pure-computation half of a
+    /// login: it touches no store state, so callers must not hold the store
+    /// lock while it runs. An unknown user still pays one dummy Argon2id
+    /// verification (M-2), so the two failure paths cost the same.
+    pub(crate) fn verify_login_record(
+        record: Option<(String, String)>,
+        password: &str,
+    ) -> Result<String> {
+        match record {
+            Some((name, hash)) => {
+                if verify_password(&hash, password) {
+                    Ok(name)
+                } else {
+                    Err(auth_failed())
+                }
+            }
+            None => {
+                verify_dummy(password);
+                Err(auth_failed())
+            }
+        }
+    }
+
     /// Verify a login against the store. Returns the user's display name on
     /// success; `authentication failed` (with the same text for an unknown
     /// user and a wrong password, so a client cannot probe which names
     /// exist) otherwise.
+    ///
+    /// An unknown user performs the same dummy Argon2id verification as a
+    /// wrong password (M-2). Callers that hold the store read lock should
+    /// prefer copying [`PinkDb::login_record`] out and calling
+    /// [`PinkDb::verify_login_record`] after releasing it (H-6); this method
+    /// is the convenience API for embedders that already have exclusive
+    /// access.
     pub fn authenticate(&self, user: &str, password: &str) -> Result<String> {
-        let Some(def) = self.rbac.users.get(&user.to_ascii_lowercase()) else {
-            return Err(auth_failed());
-        };
-        if !verify_password(&def.password_hash, password) {
-            return Err(auth_failed());
-        }
-        Ok(def.name.clone())
+        let record = self.login_record(user);
+        // Re-borrow the record's hash is unnecessary: the verification only
+        // reads the copied PHC string. `self` stays borrowed because of the
+        // method signature, but the expensive derivation is identical.
+        Self::verify_login_record(record, password)
     }
 }
 
-fn auth_failed() -> PinkDbError {
+pub(crate) fn auth_failed() -> PinkDbError {
     PinkDbError::Execution("authentication failed: unknown user or wrong password".to_string())
 }
 
@@ -1381,12 +1545,82 @@ mod tests {
         let pre = PasswordSource::prehashed("$argon2id$whatever".to_string());
         assert_eq!(pre.hashed().unwrap(), "$argon2id$whatever");
         assert_eq!(pre.prehashed_hash(), Some("$argon2id$whatever"));
-        // The PHC parser is lenient about a truncated body (the algorithm is
-        // what `validate_password_hash` checks); a bogus hash must never
-        // authenticate anyone, which is `verify_password`'s job.
+        // A hash that does not parse, or has no policy parameters, never
+        // authenticates anyone and is refused at bind time (M-8).
         assert!(!verify_password("$argon2id$whatever", "whatever"));
-        assert!(validate_password_hash("$argon2id$whatever").is_ok());
+        assert!(validate_password_hash("$argon2id$whatever").is_err());
         assert!(validate_password_hash("nonsense").is_err());
+        // The engine's own default hash is inside the policy.
+        assert!(validate_password_hash(&first).is_ok());
+        // The M-2 dummy hash is a valid, floor-parameter PHC hash.
+        assert!(validate_password_hash(dummy_password_hash()).is_ok());
+    }
+
+    #[test]
+    fn unknown_user_login_performs_the_dummy_verification() {
+        use std::sync::atomic::Ordering;
+        let db = PinkDb::new();
+        let before = DUMMY_VERIFICATIONS.load(Ordering::Relaxed);
+        let err = db.authenticate("nobody", "x").unwrap_err().to_string();
+        assert!(err.starts_with("authentication failed"), "{err}");
+        assert_eq!(
+            DUMMY_VERIFICATIONS.load(Ordering::Relaxed),
+            before + 1,
+            "an unknown user must still run the dummy Argon2id verification"
+        );
+        // A known user with a wrong password does not take the dummy path.
+        let mut db = PinkDb::new();
+        db.execute("CREATE USER alice PASSWORD 'right';").unwrap();
+        let before = DUMMY_VERIFICATIONS.load(Ordering::Relaxed);
+        assert!(db.authenticate("alice", "wrong").is_err());
+        assert_eq!(DUMMY_VERIFICATIONS.load(Ordering::Relaxed), before);
+    }
+
+    #[test]
+    fn password_hash_policy_floor_and_ceiling() {
+        let phc = |m: u32, t: u32, p: u32| {
+            format!(
+                "$argon2id$v=19$m={m},t={t},p={p}$AAAAAAAAAAAAAAAAAAAAAA$\
+                 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            )
+        };
+        // The floor and the ceiling are accepted.
+        assert!(validate_password_hash(&phc(19456, 2, 1)).is_ok());
+        assert!(validate_password_hash(&phc(77824, 4, 1)).is_ok());
+        assert!(validate_password_hash(&phc(19456, 8, 4)).is_ok());
+        // Below the floor.
+        for (m, t, p) in [(19455, 2, 1), (19456, 1, 1), (19456, 2, 0), (8, 1, 1)] {
+            let e = validate_password_hash(&phc(m, t, p))
+                .expect_err(&format!("m={m},t={t},p={p} must be refused"))
+                .to_string();
+            assert!(e.contains("too low"), "{e}");
+            assert!(e.contains("m>=19456"), "{e}");
+        }
+        // Above the ceiling (individual dimensions and the work product).
+        for (m, t, p) in [
+            (77825, 2, 1),
+            (19456, 9, 1),
+            (19456, 2, 5),
+            (77824, 8, 1), // m*t = 622592 > 311296
+            (4000000, 2, 1),
+        ] {
+            let e = validate_password_hash(&phc(m, t, p))
+                .expect_err(&format!("m={m},t={t},p={p} must be refused"))
+                .to_string();
+            assert!(e.contains("too high"), "{e}");
+        }
+        // Version, missing parameters and malformed strings.
+        let v16 = "$argon2id$v=16$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$\
+                   AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert!(validate_password_hash(v16).is_err());
+        assert!(
+            validate_password_hash(
+                "$argon2id$v=19$m=19456$AAAAAAAAAAAAAAAAAAAAAA$\
+                 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            )
+            .is_err()
+        );
+        assert!(validate_password_hash("$argon2id$v=19$m=19456,t=2,p=1$AAAA$AAAA").is_err());
     }
 
     #[test]

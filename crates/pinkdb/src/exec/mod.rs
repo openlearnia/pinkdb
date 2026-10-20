@@ -33,6 +33,163 @@ use crate::storage::{DataTable, PinkDb};
 use crate::types::{DataType, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 
+/// Per-statement resource limits (M-6). The embedded default is
+/// [`ExecLimits::none`] — byte-for-byte the pre-limit behavior — and the
+/// network server always sets its own defaults.
+///
+/// The deadline is checked at **chunk boundaries** inside scans, joins and
+/// row-producing loops (see [`ExecBudget`]); it is not a preemptive thread
+/// stop. A timed-out statement therefore returns an error before its write
+/// back begins, so no partial committed state is possible; the store lock is
+/// released by the normal error path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExecLimits {
+    /// Wall-clock budget for one statement (bind + execution).
+    pub statement_timeout: Option<std::time::Duration>,
+    /// Cap on rows materialized **at one stage**: the join builders' output
+    /// and the final result set each have their own counter, so a Cartesian
+    /// product cannot grow without bound and the returned rows are bounded
+    /// too. Multi-join plans can hold several bounded intermediate outputs.
+    pub max_result_rows: Option<usize>,
+    /// Cap on estimated bytes materialized by the executor (same stages).
+    pub max_result_bytes: Option<usize>,
+}
+
+impl ExecLimits {
+    /// No limits (the embedded default).
+    pub const fn none() -> Self {
+        Self {
+            statement_timeout: None,
+            max_result_rows: None,
+            max_result_bytes: None,
+        }
+    }
+}
+
+/// One statement's live budget. Shared by every `Cx` of the statement (CTE
+/// children included) through an `Arc`, so nested evaluation and parallel
+/// operators add to the same counters.
+pub(crate) struct ExecBudget {
+    timeout: Option<std::time::Duration>,
+    /// Set only when a deadline exists: the unbounded embedded path never
+    /// reads the clock (wasm32 has no guaranteed `Instant` implementation).
+    started: Option<std::time::Instant>,
+    max_rows: Option<usize>,
+    max_bytes: Option<usize>,
+    /// Rows/bytes materialized by join builders (and other intermediate
+    /// operators that charge here).
+    rows: std::sync::atomic::AtomicUsize,
+    bytes: std::sync::atomic::AtomicUsize,
+    /// Rows/bytes of the final result set (`run_read_with`). Kept separate so
+    /// a join result that becomes the statement's output is not charged
+    /// twice: each cap bounds its own materialization stage.
+    result_rows: std::sync::atomic::AtomicUsize,
+    result_bytes: std::sync::atomic::AtomicUsize,
+}
+
+impl ExecBudget {
+    pub(crate) fn new(limits: Option<&ExecLimits>) -> Self {
+        let limits = limits.copied().unwrap_or_default();
+        Self {
+            timeout: limits.statement_timeout,
+            started: limits.statement_timeout.map(|_| std::time::Instant::now()),
+            max_rows: limits.max_result_rows,
+            max_bytes: limits.max_result_bytes,
+            rows: std::sync::atomic::AtomicUsize::new(0),
+            bytes: std::sync::atomic::AtomicUsize::new(0),
+            result_rows: std::sync::atomic::AtomicUsize::new(0),
+            result_bytes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Unbounded, for internal evaluation paths that have no `Connection`
+    /// (materialized-view refresh from the statement-boundary pass, tests).
+    pub(crate) fn unbounded() -> Self {
+        Self::new(None)
+    }
+
+    pub(crate) fn check_deadline(&self) -> Result<()> {
+        if let (Some(timeout), Some(started)) = (self.timeout, self.started)
+            && started.elapsed() >= timeout
+        {
+            return Err(PinkDbError::Execution(format!(
+                "statement timeout: exceeded {} ms",
+                timeout.as_millis().max(1)
+            )));
+        }
+        Ok(())
+    }
+
+    /// Charge `rows` / `bytes` of materialized output against the cap.
+    pub(crate) fn add_materialized(&self, rows: usize, bytes: usize) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if let Some(max) = self.max_rows {
+            let total = self.rows.fetch_add(rows, Ordering::Relaxed) + rows;
+            if total > max {
+                return Err(PinkDbError::Execution(format!(
+                    "result limit exceeded: statement materialized more than {max} rows"
+                )));
+            }
+        }
+        if let Some(max) = self.max_bytes {
+            let total = self.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            if total > max {
+                return Err(PinkDbError::Execution(format!(
+                    "result limit exceeded: statement materialized more than {max} bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Charge rows/bytes of the statement's final result set (a separate
+    /// stage from join materialization, so neither is double counted).
+    pub(crate) fn add_result(&self, rows: usize, bytes: usize) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if let Some(max) = self.max_rows {
+            let total = self.result_rows.fetch_add(rows, Ordering::Relaxed) + rows;
+            if total > max {
+                return Err(PinkDbError::Execution(format!(
+                    "result limit exceeded: statement returned more than {max} rows"
+                )));
+            }
+        }
+        if let Some(max) = self.max_bytes {
+            let total = self.result_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            if total > max {
+                return Err(PinkDbError::Execution(format!(
+                    "result limit exceeded: statement returned more than {max} bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Estimated in-memory size of one value, used only to enforce a byte cap
+/// (exactness is not required; the row cap is the hard bound).
+fn value_approx_bytes(value: &Value) -> usize {
+    std::mem::size_of::<Value>()
+        + match value {
+            Value::Varchar(s) => s.len(),
+            _ => 0,
+        }
+}
+
+fn row_approx_bytes(row: &[Value]) -> usize {
+    row.iter().map(value_approx_bytes).sum()
+}
+
+fn chunk_approx_bytes(chunk: &DataChunk) -> usize {
+    let mut total = 0usize;
+    for column in &chunk.columns {
+        for i in 0..column.len() {
+            total += value_approx_bytes(&column.get(i));
+        }
+    }
+    total
+}
+
 /// Result of one statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryResult {
@@ -184,6 +341,9 @@ pub(crate) struct Cx<'a> {
     /// The simple pruning predicates each attached-lake scan may use (wave
     /// 66): analyzed once with the projections, consumed by `scan_output`.
     pub(crate) prunes: std::sync::Arc<crate::plan::ScanFilters>,
+    /// This statement's deadline and materialization counters (M-6). Shared
+    /// by every evaluation context of the statement.
+    pub(crate) budget: std::sync::Arc<ExecBudget>,
 }
 
 #[derive(Clone)]
@@ -195,6 +355,11 @@ pub(crate) enum Memo {
 
 impl<'a> Cx<'a> {
     pub(crate) fn new(db: &'a PinkDb) -> Self {
+        Self::with_budget(db, std::sync::Arc::new(ExecBudget::unbounded()))
+    }
+
+    /// A context sharing one statement's resource budget.
+    pub(crate) fn with_budget(db: &'a PinkDb, budget: std::sync::Arc<ExecBudget>) -> Self {
         Self {
             db,
             ctes: HashMap::new(),
@@ -204,7 +369,23 @@ impl<'a> Cx<'a> {
             projections: std::sync::Arc::new(crate::plan::ScanProjections::default()),
             // No pruning bound: every attached-lake scan decodes every file.
             prunes: std::sync::Arc::new(crate::plan::ScanFilters::default()),
+            budget,
         }
+    }
+
+    /// The statement deadline check, called at chunk/row boundaries.
+    pub(crate) fn check_deadline(&self) -> Result<()> {
+        self.budget.check_deadline()
+    }
+
+    /// Charge materialized output against the row/byte caps.
+    pub(crate) fn add_materialized(&self, rows: usize, bytes: usize) -> Result<()> {
+        self.budget.add_materialized(rows, bytes)
+    }
+
+    /// Charge the final result set against its own row/byte caps.
+    pub(crate) fn add_result(&self, rows: usize, bytes: usize) -> Result<()> {
+        self.budget.add_result(rows, bytes)
     }
 
     /// Bind the statement's scan projections and pruning predicates
@@ -254,7 +435,8 @@ fn evaluate_materialized_view(db: &mut PinkDb, target: &str, name: &str) -> Resu
             plan
         }
     };
-    let cx = Cx::new(db).with_projections(&query);
+    let cx =
+        Cx::with_budget(db, std::sync::Arc::new(ExecBudget::unbounded())).with_projections(&query);
     eval(&cx, &query)
 }
 
@@ -314,6 +496,18 @@ pub(crate) fn refresh_materialized_view(db: &mut PinkDb, target: &str, name: &st
 
 /// Execute a bound plan.
 pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
+    run_with_budget(db, plan, std::sync::Arc::new(ExecBudget::unbounded()))
+}
+
+/// Execute a bound plan under one statement's resource budget (M-6). The
+/// deadline includes binding at the caller (`Connection::execute_one`) and is
+/// checked here at every plan node, scan/join chunk and row loop.
+pub(crate) fn run_with_budget(
+    db: &mut PinkDb,
+    plan: &LogicalPlan,
+    budget: std::sync::Arc<ExecBudget>,
+) -> Result<QueryResult> {
+    budget.check_deadline()?;
     match plan {
         LogicalPlan::CreateTable {
             db: qdb,
@@ -351,7 +545,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             // create and fill. Every cell is coerced before the first append,
             // so a type error leaves no half-filled table.
             let out = {
-                let cx = Cx::new(db).with_projections(plan);
+                let cx = Cx::with_budget(db, budget.clone()).with_projections(plan);
                 eval(&cx, query)?
             };
             let schema: Vec<(String, DataType)> = out
@@ -362,6 +556,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                 .collect();
             let mut staged = Vec::new();
             for chunk in &out.chunks {
+                budget.check_deadline()?;
                 for i in 0..chunk.num_rows() {
                     let mut values = Vec::with_capacity(schema.len());
                     for (col, (_, t)) in chunk.columns.iter().zip(schema.iter()) {
@@ -391,7 +586,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             };
             let mut staged = Vec::with_capacity(rows.len());
             {
-                let cx = Cx::new(db);
+                let cx = Cx::with_budget(db, budget.clone());
                 for row in rows {
                     let values: Vec<Value> = row
                         .iter()
@@ -437,7 +632,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         } => {
             let target = resolve_db(db, qdb);
             let out = {
-                let cx = Cx::new(db).with_projections(plan);
+                let cx = Cx::with_budget(db, budget.clone()).with_projections(plan);
                 eval(&cx, query)?
             };
             // Target column indices in written order (the binder always
@@ -456,6 +651,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             // append — a type error leaves the table untouched.
             let mut staged = Vec::new();
             for chunk in &out.chunks {
+                budget.check_deadline()?;
                 for i in 0..chunk.num_rows() {
                     // Unlisted columns take their DEFAULT (wave 65).
                     let mut values = defaults.clone();
@@ -486,10 +682,13 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             let mut per_chunk: Vec<Vec<(usize, usize, Value)>>;
             let mut count = 0usize;
             {
-                let cx = Cx::new(db);
+                let cx = Cx::with_budget(db, budget.clone());
                 let t = cx.db.table_in(&target, table)?;
                 per_chunk = vec![Vec::new(); t.num_chunks()];
                 for (ci, writes) in per_chunk.iter_mut().enumerate() {
+                    // Deadline boundary: a timed-out UPDATE fails here, before
+                    // any row is written back (atomic, no partial state).
+                    cx.check_deadline()?;
                     let chunk = t.scan_chunk(ci).ok_or_else(|| {
                         PinkDbError::Execution("storage changed during UPDATE".to_string())
                     })?;
@@ -523,10 +722,11 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             // indices — descending order keeps them valid).
             let mut drops: Vec<Vec<usize>>;
             {
-                let cx = Cx::new(db);
+                let cx = Cx::with_budget(db, budget.clone());
                 let t = cx.db.table_in(&target, table)?;
                 drops = Vec::with_capacity(t.num_chunks());
                 for ci in 0..t.num_chunks() {
+                    cx.check_deadline()?;
                     let chunk = t.scan_chunk(ci).ok_or_else(|| {
                         PinkDbError::Execution("storage changed during DELETE".to_string())
                     })?;
@@ -681,7 +881,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
                                 columns: Vec::new(),
                                 num_rows: 1,
                             };
-                            let cx = Cx::new(db);
+                            let cx = Cx::with_budget(db, budget.clone());
                             let v = eval_expr(expr, &single, &cx)?;
                             if v.len() != 1 {
                                 return Err(PinkDbError::Execution(
@@ -799,7 +999,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             }
             // Evaluate the query first.
             let out = {
-                let cx = Cx::new(db).with_projections(plan);
+                let cx = Cx::with_budget(db, budget.clone()).with_projections(plan);
                 eval(&cx, query)?
             };
             // Drop an existing same-named *table* (the backing table of a
@@ -1114,7 +1314,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             };
             let mut values = Vec::with_capacity(args.len());
             {
-                let cx = Cx::new(db);
+                let cx = Cx::with_budget(db, budget.clone());
                 for arg in args {
                     let v = eval_expr(arg, &single, &cx)?;
                     if v.len() != 1 {
@@ -1184,7 +1384,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             Ok(QueryResult::DroppedMacro { name: name.clone() })
         }
         _ => {
-            let cx = Cx::new(db).with_projections(plan);
+            let cx = Cx::with_budget(db, budget.clone()).with_projections(plan);
             run_read_with(&cx, plan)
         }
     }
@@ -1193,11 +1393,20 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
 /// Execute a read-only plan against a shared store (used under a read lock
 /// by concurrent readers; also backs [`run`]'s query arm).
 pub fn run_read(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
+    run_read_with_budget(db, plan, std::sync::Arc::new(ExecBudget::unbounded()))
+}
+
+/// [`run_read`] under one statement's resource budget (M-6).
+pub(crate) fn run_read_with_budget(
+    db: &PinkDb,
+    plan: &LogicalPlan,
+    budget: std::sync::Arc<ExecBudget>,
+) -> Result<QueryResult> {
     debug_assert!(
         crate::plan::is_read_only(plan),
         "run_read needs a query plan"
     );
-    let cx = Cx::new(db).with_projections(plan);
+    let cx = Cx::with_budget(db, budget).with_projections(plan);
     run_read_with(&cx, plan)
 }
 
@@ -1216,6 +1425,7 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
     let out = eval(cx, plan)?;
     let mut rows = Vec::new();
     for chunk in &out.chunks {
+        cx.check_deadline()?;
         // The final result must be fully materialized: a zero-length column
         // would be an undecoded projection placeholder (a missed reference
         // in the projection analysis), never a result value.
@@ -1227,9 +1437,16 @@ fn run_read_with(cx: &Cx, plan: &LogicalPlan) -> Result<QueryResult> {
                 )));
             }
         }
+        let mut bytes = 0usize;
         for i in 0..chunk.num_rows() {
-            rows.push(chunk.columns.iter().map(|c| c.get(i)).collect());
+            let row: Vec<Value> = chunk.columns.iter().map(|c| c.get(i)).collect();
+            bytes += row_approx_bytes(&row);
+            rows.push(row);
         }
+        // Charge the complete chunk against the final-result cap. Join
+        // builders charge their own output separately, so a CROSS JOIN
+        // cannot grow without bound even before this final materialization.
+        cx.add_result(chunk.num_rows(), bytes)?;
     }
     Ok(QueryResult::Selected {
         names: out.names,
@@ -1328,6 +1545,7 @@ fn scan_output(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
         Some(cols) => project_scan_chunks(t, cols),
         None => scan_chunks(t),
     };
+    cx.check_deadline()?;
     Ok(Output {
         chunks,
         names,
@@ -1378,6 +1596,7 @@ fn table_function_output(
         }
         chunks.push(chunk);
     }
+    cx.check_deadline()?;
     let (names, types) = schema.iter().cloned().unzip();
     Ok(Output {
         chunks,
@@ -1648,6 +1867,7 @@ fn min_max_value(attached: &AttachedTable, index: usize, is_min: bool) -> Option
 /// Apply one Filter chunk: `Ok(None)` when no row passes. Shared by the
 /// materializing path and the LIMIT stream, so both produce the same chunks.
 fn filter_chunk(cx: &Cx, predicate: &BoundExpr, chunk: &DataChunk) -> Result<Option<DataChunk>> {
+    cx.check_deadline()?;
     let pred = eval_expr(predicate, chunk, cx)?;
     let sel = select_true(&pred)?;
     Ok(if sel.len() == chunk.num_rows() {
@@ -1664,6 +1884,7 @@ fn filter_chunk(cx: &Cx, predicate: &BoundExpr, chunk: &DataChunk) -> Result<Opt
 /// instead of deep-copying the payload. A pass-through of an undecoded
 /// projection placeholder fails loudly (`expect_column`), never as NULLs.
 fn project_chunk(cx: &Cx, exprs: &[BoundExpr], chunk: &DataChunk) -> Result<DataChunk> {
+    cx.check_deadline()?;
     let cols: Vec<std::sync::Arc<Vector>> = exprs
         .iter()
         .map(|e| match e {
@@ -1680,6 +1901,10 @@ fn project_chunk(cx: &Cx, exprs: &[BoundExpr], chunk: &DataChunk) -> Result<Data
 }
 
 fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
+    // Per-statement deadline: every plan node and every operator's chunk loop
+    // below re-checks, so a timeout observed here unwinds before any write
+    // back starts.
+    cx.check_deadline()?;
     match plan {
         LogicalPlan::CreateTable { .. }
         | LogicalPlan::CreateTableAs { .. }
@@ -2195,6 +2420,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 memo: cx.memo.clone(),
                 projections: cx.projections.clone(),
                 prunes: cx.prunes.clone(),
+                budget: cx.budget.clone(),
             };
             eval(&child, body)
         }
@@ -2707,6 +2933,7 @@ fn hash_join_probe(
         .chunks
         .par_iter()
         .map(|chunk| -> Result<Vec<DataChunk>> {
+            cx.check_deadline()?;
             let kvs: Vec<Vector> = preserved_keys
                 .iter()
                 .zip(commons.iter())
@@ -2745,7 +2972,9 @@ fn hash_join_probe(
                                 marked[global].store(true, std::sync::atomic::Ordering::Relaxed);
                             }
                             if cur_rows >= CHUNK_SIZE {
-                                finished.push(DataChunk::new(std::mem::take(&mut cur))?);
+                                let chunk = DataChunk::new(std::mem::take(&mut cur))?;
+                                cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
+                                finished.push(chunk);
                                 cur = dtypes
                                     .iter()
                                     .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
@@ -2787,7 +3016,9 @@ fn hash_join_probe(
                             continue;
                         }
                         if cur_rows >= CHUNK_SIZE {
-                            finished.push(DataChunk::new(std::mem::take(&mut cur))?);
+                            let chunk = DataChunk::new(std::mem::take(&mut cur))?;
+                            cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
+                            finished.push(chunk);
                             cur = dtypes
                                 .iter()
                                 .map(|t| Vector::with_capacity(*t, CHUNK_SIZE))
@@ -2816,7 +3047,9 @@ fn hash_join_probe(
                 }
             }
             if cur_rows > 0 {
-                finished.push(DataChunk::new(cur)?);
+                let chunk = DataChunk::new(cur)?;
+                cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
+                finished.push(chunk);
             }
             Ok(finished)
         })
@@ -3523,6 +3756,7 @@ fn fused_join_aggregate(
         .chunks
         .par_iter()
         .map(|chunk| {
+            cx.check_deadline()?;
             build_exprs
                 .iter()
                 .map(|e| eval_fused_vec(e, chunk, cx))
@@ -3538,6 +3772,7 @@ fn fused_join_aggregate(
         .chunks
         .par_iter()
         .map(|chunk| -> Result<Partial> {
+            cx.check_deadline()?;
             let probe_vecs: Vec<FusedVec> = probe_exprs
                 .iter()
                 .map(|e| eval_fused_vec(e, chunk, cx))
@@ -3725,6 +3960,7 @@ fn eval_sort_keys<'a>(
     chunks
         .par_iter()
         .map(|chunk| {
+            cx.check_deadline()?;
             keys.iter()
                 .map(|(k, _)| eval_fused_vec(k, chunk, cx))
                 .collect::<Result<Vec<_>>>()
@@ -4357,6 +4593,9 @@ fn nested_loop_join(
     let mut li_global = 0usize;
     for lchunk in &left.chunks {
         for li in 0..lchunk.num_rows() {
+            // A CROSS JOIN multiplies rows: check the deadline and let the
+            // builder charge every flushed output chunk against the caps.
+            cx.check_deadline()?;
             for (rci, rchunk) in right.chunks.iter().enumerate() {
                 let n = rchunk.num_rows();
                 if n == 0 {
@@ -4393,7 +4632,7 @@ fn nested_loop_join(
                 left_matched[li_global] = true;
                 for &rj in &matched {
                     right_matched[right_starts[rci] + rj] = true;
-                    builder.ensure_room()?;
+                    builder.ensure_room(cx)?;
                     for (dst, col) in builder
                         .cur
                         .iter_mut()
@@ -4424,7 +4663,8 @@ fn nested_loop_join(
         for lchunk in &left.chunks {
             for li in 0..lchunk.num_rows() {
                 if !left_matched[li_global] {
-                    builder.ensure_room()?;
+                    cx.check_deadline()?;
+                    builder.ensure_room(cx)?;
                     for (dst, col) in builder
                         .cur
                         .iter_mut()
@@ -4447,7 +4687,8 @@ fn nested_loop_join(
         for rchunk in &right.chunks {
             for ri in 0..rchunk.num_rows() {
                 if !right_matched[ri_global] {
-                    builder.ensure_room()?;
+                    cx.check_deadline()?;
+                    builder.ensure_room(cx)?;
                     for dst in builder.cur.iter_mut().take(n_left) {
                         dst.push_null()?;
                     }
@@ -4465,7 +4706,7 @@ fn nested_loop_join(
             }
         }
     }
-    builder.finish()
+    builder.finish(cx)
 }
 
 /// Incremental chunk builder for joins (fixed output dtypes, CHUNK_SIZE cap).
@@ -4491,10 +4732,13 @@ impl JoinedChunks {
     }
 
     /// Flush the current chunk when it is full (leaves room for one row).
-    fn ensure_room(&mut self) -> Result<()> {
+    /// The flushed chunk is charged against the statement's materialization
+    /// cap, so a Cartesian product fails after a bounded number of rows.
+    fn ensure_room(&mut self, cx: &Cx) -> Result<()> {
         if self.rows >= CHUNK_SIZE {
-            self.out
-                .push(DataChunk::new(std::mem::take(&mut self.cur))?);
+            let chunk = DataChunk::new(std::mem::take(&mut self.cur))?;
+            cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
+            self.out.push(chunk);
             self.cur = self
                 .dtypes
                 .iter()
@@ -4505,9 +4749,11 @@ impl JoinedChunks {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<DataChunk>> {
+    fn finish(mut self, cx: &Cx) -> Result<Vec<DataChunk>> {
         if self.rows > 0 {
-            self.out.push(DataChunk::new(self.cur)?);
+            let chunk = DataChunk::new(self.cur)?;
+            cx.add_materialized(chunk.num_rows(), chunk_approx_bytes(&chunk))?;
+            self.out.push(chunk);
         }
         Ok(self.out)
     }

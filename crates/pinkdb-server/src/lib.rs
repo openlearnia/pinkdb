@@ -105,7 +105,11 @@ pub use protocol::{
     decode_request, decode_response, encode_request, encode_response, read_request, read_response,
     write_request, write_response,
 };
-pub use server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server, ServerHandle};
+pub use server::{
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_LOGIN_MAX_FAILURES, DEFAULT_MAX_CONCURRENT_LOGINS,
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS,
+    DEFAULT_STATEMENT_TIMEOUT_MS, Server, ServerHandle,
+};
 
 #[cfg(feature = "async-server")]
 pub use async_server::{AsyncServer, AsyncServerHandle};

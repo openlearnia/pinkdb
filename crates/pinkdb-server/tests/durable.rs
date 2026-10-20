@@ -225,3 +225,46 @@ fn unknown_flag_is_rejected_with_usage() {
     assert!(stderr.contains("unknown argument"), "{stderr}");
     assert!(stderr.contains("Usage: pinkdb-server"), "{stderr}");
 }
+
+#[test]
+fn security_limit_flags_reject_zero_and_invalid_values() {
+    for flag in [
+        "--statement-timeout-ms",
+        "--max-result-rows",
+        "--max-result-bytes",
+        "--max-concurrent-logins",
+    ] {
+        for value in ["0", "not-a-number"] {
+            let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+                .args([flag, value])
+                .stdin(Stdio::null())
+                .output()
+                .expect("run pinkdb-server");
+            assert_eq!(out.status.code(), Some(2), "{flag} {value}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(&format!("invalid {flag} value")),
+                "{flag} {value}: {stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn help_lists_the_security_limit_flags() {
+    let out = Command::new(env!("CARGO_BIN_EXE_pinkdb-server"))
+        .arg("--help")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run pinkdb-server --help");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for flag in [
+        "--statement-timeout-ms",
+        "--max-result-rows",
+        "--max-result-bytes",
+        "--max-concurrent-logins",
+    ] {
+        assert!(stdout.contains(flag), "usage is missing {flag}: {stdout}");
+    }
+}

@@ -3,6 +3,8 @@
 //! ```text
 //! pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
 //!               [--max-connections N] [--idle-timeout SECS]
+//!               [--statement-timeout-ms N] [--max-result-rows N]
+//!               [--max-result-bytes N] [--max-concurrent-logins N]
 //!               [--transport sync|async] [--allow-load-extension]
 //!               [--extension-root PATH]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
@@ -35,7 +37,10 @@ use std::process::ExitCode;
 use pinkdb::{Database, DurableOpenOptions};
 use std::time::Duration;
 
-use pinkdb_server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server};
+use pinkdb_server::{
+    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONCURRENT_LOGINS, DEFAULT_MAX_CONNECTIONS,
+    DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS, DEFAULT_STATEMENT_TIMEOUT_MS, Server,
+};
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5433;
@@ -55,6 +60,14 @@ struct Args {
     file: Option<String>,
     max_connections: usize,
     idle_timeout_secs: u64,
+    /// Per-statement engine deadline (milliseconds); always positive.
+    statement_timeout_ms: u64,
+    /// Total materialized-row cap per statement; always positive.
+    max_result_rows: usize,
+    /// Total materialized-byte cap per statement; always positive.
+    max_result_bytes: usize,
+    /// Global cap on concurrent Argon2id login verifications.
+    max_concurrent_logins: usize,
     transport: Transport,
     allow_load_extension: bool,
     /// `--extension-root PATH`: the directory every extension load is
@@ -69,6 +82,8 @@ struct Args {
 fn usage() -> &'static str {
     "Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]\n\
      \x20                    [--max-connections N] [--idle-timeout SECS]\n\
+     \x20                    [--statement-timeout-ms N] [--max-result-rows N]\n\
+     \x20                    [--max-result-bytes N] [--max-concurrent-logins N]\n\
      \x20                    [--transport sync|async] [--allow-load-extension]\n\
      \x20                    [--extension-root PATH]\n\
      \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
@@ -78,6 +93,15 @@ fn usage() -> &'static str {
      \x20 --file PATH            durable database (checkpoint + WAL); in-memory when omitted\n\
      \x20 --max-connections N    concurrent clients served (default 128)\n\
      \x20 --idle-timeout SECS    disconnect clients idle this long; 0 = never (default 300)\n\
+     \x20 --statement-timeout-ms N  per-statement execution deadline in ms (default 30000);\n\
+     \x20                        checked at chunk boundaries; a timed-out statement\n\
+     \x20                        returns an error and never holds the write lock\n\
+     \x20 --max-result-rows N   max rows one statement may materialize, join output\n\
+     \x20                        included (default 10000000)\n\
+     \x20 --max-result-bytes N  max estimated bytes one statement may materialize\n\
+     \x20                        (default 268435456 = 256 MiB)\n\
+     \x20 --max-concurrent-logins N  concurrent Argon2id verifications (default 4);\n\
+     \x20                        excess logins get 'too many concurrent logins'\n\
      \x20 --transport MODE       sync = blocking thread-per-connection (default);\n\
      \x20                        the only transport with TLS support\n\
      \x20                        async = tokio I/O, same protocol/engine (needs a\n\
@@ -110,6 +134,10 @@ fn parse_args() -> Result<Args, String> {
         file: None,
         max_connections: DEFAULT_MAX_CONNECTIONS,
         idle_timeout_secs: DEFAULT_IDLE_TIMEOUT.as_secs(),
+        statement_timeout_ms: DEFAULT_STATEMENT_TIMEOUT_MS,
+        max_result_rows: DEFAULT_MAX_RESULT_ROWS,
+        max_result_bytes: DEFAULT_MAX_RESULT_BYTES,
+        max_concurrent_logins: DEFAULT_MAX_CONCURRENT_LOGINS,
         transport: Transport::Sync,
         allow_load_extension: false,
         extension_root: None,
@@ -154,6 +182,38 @@ fn parse_args() -> Result<Args, String> {
                 args.idle_timeout_secs = raw
                     .parse()
                     .map_err(|_| format!("invalid --idle-timeout value {raw:?}"))?;
+            }
+            "--statement-timeout-ms" => {
+                let raw = value("--statement-timeout-ms")?;
+                args.statement_timeout_ms = raw
+                    .parse()
+                    .ok()
+                    .filter(|n: &u64| *n > 0)
+                    .ok_or_else(|| format!("invalid --statement-timeout-ms value {raw:?}"))?;
+            }
+            "--max-result-rows" => {
+                let raw = value("--max-result-rows")?;
+                args.max_result_rows = raw
+                    .parse()
+                    .ok()
+                    .filter(|n: &usize| *n > 0)
+                    .ok_or_else(|| format!("invalid --max-result-rows value {raw:?}"))?;
+            }
+            "--max-result-bytes" => {
+                let raw = value("--max-result-bytes")?;
+                args.max_result_bytes = raw
+                    .parse()
+                    .ok()
+                    .filter(|n: &usize| *n > 0)
+                    .ok_or_else(|| format!("invalid --max-result-bytes value {raw:?}"))?;
+            }
+            "--max-concurrent-logins" => {
+                let raw = value("--max-concurrent-logins")?;
+                args.max_concurrent_logins = raw
+                    .parse()
+                    .ok()
+                    .filter(|n: &usize| *n > 0)
+                    .ok_or_else(|| format!("invalid --max-concurrent-logins value {raw:?}"))?;
             }
             "--transport" => {
                 let raw = value("--transport")?;
@@ -298,6 +358,10 @@ fn main() -> ExitCode {
             let server = match bound {
                 Ok(server) => server
                     .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
+                    .statement_timeout(Duration::from_millis(args.statement_timeout_ms))
+                    .max_result_rows(args.max_result_rows)
+                    .max_result_bytes(args.max_result_bytes)
+                    .max_concurrent_logins(args.max_concurrent_logins)
                     .allow_load_extension(args.allow_load_extension)
                     .extension_root(extension_root.clone()),
                 Err(e) => {
@@ -331,6 +395,10 @@ fn main() -> ExitCode {
             ) {
                 Ok(server) => server
                     .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
+                    .statement_timeout(Duration::from_millis(args.statement_timeout_ms))
+                    .max_result_rows(args.max_result_rows)
+                    .max_result_bytes(args.max_result_bytes)
+                    .max_concurrent_logins(args.max_concurrent_logins)
                     .allow_load_extension(args.allow_load_extension)
                     .extension_root(extension_root.clone()),
                 Err(e) => {

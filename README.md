@@ -1490,10 +1490,18 @@ cargo build --release -p pinkdb-cli --features client
 `--port` (default `5433`; `0` picks an ephemeral port), `--file` (durable
 `.pink`: the checkpoint loads and the sidecar WAL replays on restart;
 in-memory when omitted), `--max-connections N` (default 128),
-`--idle-timeout SECS` (default 300; `0` = never), `--transport sync|async`
+`--idle-timeout SECS` (default 300; `0` = never),
+`--statement-timeout-ms N` (per-statement engine deadline, default 30000;
+checked at chunk boundaries), `--max-result-rows N` (materialized rows per
+statement, join output included, default 10 000 000), `--max-result-bytes N`
+(estimated materialized bytes per statement, default 268 435 456 = 256 MiB),
+`--max-concurrent-logins N` (in-flight Argon2id verifications, default 4),
+`--transport sync|async`
 (default `sync`; `async` is the tokio I/O transport and needs a build with
 the `async-server` feature) and `--allow-load-extension` (off by default; see
-Security posture). TLS is available only with the default `sync` transport:
+Security posture). The four limit flags reject `0`/invalid values at startup
+(exit 2); the embedded engine's defaults stay unlimited unless a limit is set
+explicitly. TLS is available only with the default `sync` transport:
 `--transport async` combined with
 `--tls-cert`/`--tls-key` is refused at startup (exit code 2) rather than
 silently serving plaintext. The server
@@ -1511,6 +1519,28 @@ Server robustness, in one place:
   clients). Only the nonblocking poll and `EINTR` follow the fast path.
 - **128 concurrent connections** (`DEFAULT_MAX_CONNECTIONS`). Over the cap the
   server sends a best-effort `Error` frame and closes, bounding fds/threads.
+  The refusal is written **on the accept loop** with a 100 ms write timeout:
+  a client that will not read is dropped, no thread is spawned per refusal,
+  and a failed connection-thread spawn is logged and the connection closed.
+- **Per-statement deadline and result caps.** The server always sets a 30 s
+  engine deadline, a 10 000 000-row and a 256 MiB materialized-result cap per
+  statement (all configurable; see the flags above). The deadline is checked
+  at chunk boundaries inside scans, joins and row loops — including the
+  nested-loop join that implements `CROSS JOIN` — so an unbounded Cartesian
+  product or a huge `UPDATE` returns a clear error instead of pinning a
+  connection (and, for a write, the store's write lock) forever. A timed-out
+  `UPDATE`/`DELETE` fails during predicate evaluation, before any write-back,
+  so no partial state is committed. The socket idle timeout is a separate
+  bound on I/O, not on engine work; the deadline is not fully preemptive and
+  cannot interrupt a single in-progress chunk or the final write-back pass.
+- **Login resource bounds.** Password verification runs **outside** the store
+  lock (the catalog record is copied out first), a fixed dummy Argon2id
+  verification runs for unknown users so login timing does not enumerate
+  names, and at most `--max-concurrent-logins` (default 4) verifications run
+  at once — excess requests get `too many concurrent logins` immediately.
+  A connection closes after 5 failed logins with an increasing delay, and a
+  bounded per-IP map (4096 entries, 20 failures/60 s → 60 s block, expiry on
+  access plus oldest-entry eviction) slows reconnects.
 - **Panics are isolated.** A panic while executing one statement is caught,
   logged, and reported as an `Error` frame; the connection and every other
   client stay alive. A panic while the store's write lock is held poisons it;

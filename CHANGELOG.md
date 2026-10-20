@@ -10,6 +10,17 @@ one-liners below.
 
 ## 2026-10-20
 
+### Security hardening — pass 5: auth DoS/timing/hash policy + resource bounds ✅
+- Logins no longer run Argon2id while holding the store lock; failed attempts
+  are rate-limited per connection and per IP, and concurrent verifications are
+  capped — credential-free clients can no longer starve writers or allocate
+  GiBs of transient memory.
+- Unknown users pay the same dummy Argon2id cost as wrong passwords (no timing
+  enumeration), and `PASSWORD_HASH` values are checked against an Argon2id
+  work-factor floor **and** ceiling.
+- The server enforces a 30 s statement timeout, 10M-row and 256 MiB total
+  result caps (configurable), and refused connections no longer spawn a thread.
+
 ### Index DDL durability (minimal half of wave 79) ✅
 - `CREATE INDEX` / `DROP INDEX` now survive reopen **and** checkpoints: the DDL
   is WAL-logged as canonical SQL (quoting preserved), and each checkpoint

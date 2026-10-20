@@ -2033,3 +2033,46 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   toolchains, wasm green; default CLI **+21,680 B**. Remaining wave-79 scope:
   the `.pink` index section + bit 3, persisted maps/statistics, and the
   range/zone-map index-vs-scan choice.
+
+- 2026-10-20 — Security hardening, pass 5: authentication DoS, timing, hash
+  policy, and statement resource bounds (H-6/M-2/M-8/M-6/M-11; worktree
+  `wt-sec5`). **H-6**: `Connection::login` refreshes, copies the display name
+  + PHC hash out under the read lock, **drops the guard**, verifies Argon2id
+  lock-free, then re-refreshes/re-checks the record before adopting the
+  principal (a rotation/drop during derivation cannot be bypassed). The server
+  adds a per-connection failed-login limit (5; delays 25→400 ms, then close), a
+  bounded per-IP limiter (20 failures/60 s → 60 s block, 4096 entries, lazy
+  expiry + oldest-observed eviction) and a non-queueing global verification
+  gate (`LoginGate`, default 4), so 128 clients can no longer allocate ~2.4 GiB
+  of transient Argon2 memory or saturate the read lock. **M-2**: unknown users
+  run a fixed dummy Argon2id verification, so unknown-user and wrong-password
+  paths both pay one derivation and keep identical text (deterministic counter
+  + coarse median timing test). **M-8**: `validate_password_hash` parses the
+  PHC version and m/t/p and enforces floor m≥19456, t≥2, p≥1; ceiling m≤77824,
+  t≤8, p≤4, m·t≤311296; version 19; salt and hash present — applied to
+  CREATE/ALTER USER, persistence loading and WAL replay. Weak hashes fail
+  closed; oversized ones cannot cause multi-GiB logins. **M-6**:
+  `ExecLimits`/`ExecBudget` deadline checks at every plan node and
+  scan/filter/project/sort/aggregate/update/delete/join chunk boundaries, with
+  materialization caps on join/`CROSS JOIN`/hash-join flushes and final
+  results; server defaults 30 s / 10M rows / 256 MiB behind
+  `--statement-timeout-ms`, `--max-result-rows`, `--max-result-bytes`,
+  `--max-concurrent-logins` (invalid/0 rejected); embedded defaults stay
+  unlimited unless explicitly set; timeout errors drop the write lock and
+  UPDATE/DELETE check before write-back. **M-11**: no per-refusal thread —
+  refusals are written on the accept loop with a 100 ms timeout and then
+  closed; accepted-spawn failures are logged and the connection closed; async
+  refusals remain tokio tasks. Tests: 20 new (lock-not-held, rate-limit
+  close/block/expiry/eviction, gate cap, dummy counter + timing, PHC
+  floor/ceiling/malformed, timeout + row/byte caps including CROSS JOIN,
+  exact-cap acceptance, both transports, connection reuse after timeout,
+  non-reading-refusal responsiveness, flag validation). Gates: pinkdb 678 →
+  **686**, server **89** (async **109**, tls **100**, both **120**), CLI 77,
+  workspace 1264 → **1282**, duckdiff **339/339**, fmt/clippy both toolchains,
+  wasm green. Sizes: server **+36,624 B** (~1.05%), CLI **+17,184 B** (~0.44%).
+  Residual: timeout granularity is chunk-boundary (a single in-progress chunk,
+  sort, CREATE INDEX, CHECKPOINT, procedure loop or COPY is not interrupted;
+  write-back is never partial), per-IP dilution via rotating addresses and NAT
+  sharing, embedded unbounded defaults, result caps are estimates and
+  LIMIT-over-join may still materialize the join, legacy weak/oversized hashes
+  now fail closed on load/replay, async refusals remain one tokio task each.

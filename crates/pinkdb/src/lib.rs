@@ -70,7 +70,7 @@ pub use attached::{
 };
 pub use crypto::EncryptionKey;
 pub use db::{AUTHENTICATION_REQUIRED, Connection, Database};
-pub use exec::QueryResult;
+pub use exec::{ExecLimits, QueryResult};
 pub use filefmt::FileFormat;
 pub use macros::{MacroDef, MacroParamDef};
 pub use prepared::{BoundStatement, PreparedStatement};

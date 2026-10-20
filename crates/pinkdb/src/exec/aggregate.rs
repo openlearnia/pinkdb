@@ -1020,6 +1020,7 @@ pub(crate) fn aggregate(
     let partials: Vec<Partial> = inputs
         .par_iter()
         .map(|chunk| {
+            cx.check_deadline()?;
             let key_vecs: Vec<EvalVec> = keys
                 .iter()
                 .map(|k| eval_agg_vec(k, chunk, cx))

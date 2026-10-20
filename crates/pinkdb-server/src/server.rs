@@ -21,7 +21,16 @@
 //! - Accept errors (fd exhaustion, aborted connections, ...) are transient:
 //!   the loop logs, backs off, and keeps serving.
 //! - At most [`DEFAULT_MAX_CONNECTIONS`] connections are served at once;
-//!   over the cap the server sends an `Error` frame and closes.
+//!   over the cap the server sends an `Error` frame and closes. The refusal
+//!   is written on the accept loop with a short timeout (no thread per
+//!   refusal, and a non-reading client is dropped).
+//! - Each statement runs under [`DEFAULT_STATEMENT_TIMEOUT_MS`], a
+//!   [`DEFAULT_MAX_RESULT_ROWS`] row cap and a [`DEFAULT_MAX_RESULT_BYTES`]
+//!   byte cap (all configurable through [`Server`]'s builder methods; the
+//!   embedded engine stays unlimited by default). A timed-out statement
+//!   returns an error, releasing the store lock normally; a timed-out
+//!   `UPDATE`/`DELETE` fails before its write-back, so no partial state is
+//!   committed.
 //! - A panic while executing one statement is caught, reported as an `Error`
 //!   frame, and does not kill the server or the connection.
 //! - Sockets carry an idle timeout ([`DEFAULT_IDLE_TIMEOUT`], configurable
@@ -47,7 +56,13 @@
 //!   batch that creates the first user cannot keep running unauthenticated.
 //!   `Login` itself is answered with `LoggedIn` or the same
 //!   `authentication failed: …` error for an unknown user and a wrong
-//!   password. `Ping` never needs authentication.
+//!   password. `Ping` never needs authentication. Login is resource-bounded
+//!   (H-6): the Argon2id derivation runs without the store lock, unknown
+//!   users still pay a dummy derivation (M-2), at most
+//!   [`DEFAULT_MAX_CONCURRENT_LOGINS`] verifications run at once, a
+//!   connection closes after [`DEFAULT_LOGIN_MAX_FAILURES`] failures with an
+//!   increasing delay, and a bounded per-IP limiter refuses blocked
+//!   addresses before any hashing.
 //! - With the crate feature `tls`, [`Server::bind_tls`] serves the same
 //!   protocol over rustls-encrypted TCP. The handshake runs on the
 //!   connection's own thread (under the same idle timeout), so a failed or
@@ -58,14 +73,15 @@
 //!   and the connection cap, per-connection session isolation and idle
 //!   timeout are unchanged.
 
+use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use pinkdb::{Connection, DataType, Database, QueryResult, Value};
+use pinkdb::{Connection, DataType, Database, ExecLimits, QueryResult, Value};
 
 use crate::protocol::{self, DoneKind, PROTOCOL_VERSION, ProtocolError, Request, Response};
 
@@ -91,9 +107,278 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 128;
 /// Default idle timeout for client sockets (reads and writes).
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Default per-statement wall-clock limit on the server (M-6). The embedded
+/// engine has no limit; the server always sets one so a single statement
+/// cannot pin a connection thread (and, for a write, the store's write lock)
+/// forever. `--statement-timeout-ms` overrides it.
+pub const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+
+/// Default cap on rows materialized by one statement on the server. The
+/// join-builder output (including a `CROSS JOIN`) and the final result set
+/// are each capped at this value. The embedded default is unbounded;
+/// `--max-result-rows` overrides it.
+pub const DEFAULT_MAX_RESULT_ROWS: usize = 10_000_000;
+
+/// Default cap on estimated bytes materialized by one statement on the
+/// server (256 MiB); `--max-result-bytes` overrides it.
+pub const DEFAULT_MAX_RESULT_BYTES: usize = 256 * 1024 * 1024;
+
+/// Default global cap on Argon2id verifications in flight at once. Each
+/// verification allocates the work-factor's memory (19 MiB at the policy
+/// floor, at most 76 MiB at the ceiling), so four bounds the transient
+/// memory the connection cap can otherwise multiply to gigabytes. Excess
+/// login requests get a clear "too many concurrent logins" error instead of
+/// queueing; `--max-concurrent-logins` overrides it.
+pub const DEFAULT_MAX_CONCURRENT_LOGINS: usize = 4;
+
+/// Failed logins a single connection may make before it is closed (H-6).
+/// Each failure is followed by an increasing delay (see
+/// [`LoginThrottle::failure_delay`]).
+pub const DEFAULT_LOGIN_MAX_FAILURES: u32 = 5;
+
+/// Per-IP failed-login window / block policy. A client IP that accumulates
+/// this many failures within [`LOGIN_IP_WINDOW`] is refused (without running
+/// Argon2id) until [`LOGIN_IP_BLOCK`] expires.
+pub(crate) const LOGIN_IP_MAX_FAILURES: u32 = 20;
+pub(crate) const LOGIN_IP_WINDOW: Duration = Duration::from_secs(60);
+pub(crate) const LOGIN_IP_BLOCK: Duration = Duration::from_secs(60);
+
+/// Bound on the per-IP limiter's map. At most this many addresses are
+/// remembered; expired entries are pruned first, then the oldest-observed
+/// entry is evicted, so the map (and its memory) is bounded under a spoofed
+/// or very large client population.
+pub(crate) const LOGIN_IP_MAX_ENTRIES: usize = 4096;
+
+/// Bound on a refusal write on the accept loop (M-11): a client that will
+/// not read its error frame must not stall the accept loop for long.
+pub(crate) const REJECT_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Connection-local prepared statements a client may pin (shared by the
 /// blocking and the `async-server` transports so the cap cannot drift).
 pub(crate) const MAX_PREPARED: usize = 1024;
+
+/// The per-server login controls shared by both transports: the global
+/// in-flight-verification cap, the per-IP failure limiter, and the limits
+/// each connection applies.
+#[derive(Clone)]
+pub(crate) struct ConnectionPolicy {
+    pub(crate) limits: ExecLimits,
+    pub(crate) gate: Arc<LoginGate>,
+    pub(crate) ips: Arc<LoginIpLimiter>,
+    pub(crate) peer_ip: IpAddr,
+}
+
+/// A non-queueing cap on concurrent password verifications.
+pub(crate) struct LoginGate {
+    active: AtomicUsize,
+    max: usize,
+}
+
+impl LoginGate {
+    pub(crate) fn new(max: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max: max.max(1),
+        }
+    }
+
+    /// Try to reserve one verification slot; `None` when all are busy (the
+    /// caller must report "too many concurrent logins", not wait).
+    pub(crate) fn try_acquire(self: &Arc<Self>) -> Option<LoginPermit> {
+        let mut current = self.active.load(Ordering::Acquire);
+        loop {
+            if current >= self.max {
+                return None;
+            }
+            match self.active.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(LoginPermit {
+                        gate: Arc::clone(self),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+}
+
+/// Releases a [`LoginGate`] slot when the verification (or its panic unwind)
+/// ends.
+pub(crate) struct LoginPermit {
+    gate: Arc<LoginGate>,
+}
+
+impl Drop for LoginPermit {
+    fn drop(&mut self) {
+        self.gate.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Per-connection failed-login throttle (H-6): after
+/// [`DEFAULT_LOGIN_MAX_FAILURES`] failures the connection is closed, and each
+/// failure sleeps for an exponentially increasing delay (25 ms, 50 ms, …,
+/// capped at 500 ms) before the next request is read.
+pub(crate) struct LoginThrottle {
+    failures: u32,
+}
+
+impl LoginThrottle {
+    pub(crate) fn new() -> Self {
+        Self { failures: 0 }
+    }
+
+    pub(crate) fn closed(&self) -> bool {
+        self.failures >= DEFAULT_LOGIN_MAX_FAILURES
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.failures = 0;
+    }
+
+    /// Record one failed login; returns the delay to apply before reading the
+    /// next request.
+    pub(crate) fn failure_delay(&mut self) -> Duration {
+        self.failures = self.failures.saturating_add(1);
+        let exponent = self.failures.saturating_sub(1).min(4);
+        Duration::from_millis(25 * (1u64 << exponent)).min(Duration::from_millis(500))
+    }
+}
+
+struct IpEntry {
+    window_start: Instant,
+    last_seen: Instant,
+    failures: u32,
+    blocked_until: Option<Instant>,
+}
+
+/// Bounded per-IP failed-login limiter with expiry. Entries live for
+/// [`LOGIN_IP_WINDOW`] after their last failure (or until a block expires),
+/// after which they are pruned; the map holds at most
+/// [`LOGIN_IP_MAX_ENTRIES`], evicting the oldest-observed entry if a full map
+/// has no expired entries. Documented eviction bounds memory under churn but
+/// means a very large rotating address set can dilute the limit (see the
+/// residual-risk note in the remediation report).
+pub(crate) struct LoginIpLimiter {
+    entries: Mutex<HashMap<IpAddr, IpEntry>>,
+    capacity: usize,
+    window: Duration,
+    block: Duration,
+    max_failures: u32,
+}
+
+impl LoginIpLimiter {
+    pub(crate) fn new() -> Self {
+        Self::with_limits(
+            LOGIN_IP_MAX_ENTRIES,
+            LOGIN_IP_WINDOW,
+            LOGIN_IP_BLOCK,
+            LOGIN_IP_MAX_FAILURES,
+        )
+    }
+
+    pub(crate) fn with_limits(
+        capacity: usize,
+        window: Duration,
+        block: Duration,
+        max_failures: u32,
+    ) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            capacity: capacity.max(1),
+            window,
+            block,
+            max_failures: max_failures.max(1),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, IpEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// How long this address is blocked for, if it is currently blocked.
+    /// Expired blocks are dropped here (expiry is lazy, on access).
+    pub(crate) fn retry_after(&self, ip: IpAddr) -> Option<Duration> {
+        let now = Instant::now();
+        let mut entries = self.lock();
+        let entry = entries.get(&ip)?;
+        match entry.blocked_until {
+            Some(until) if until > now => Some(until - now),
+            Some(_) => {
+                entries.remove(&ip);
+                None
+            }
+            None => {
+                if now.duration_since(entry.window_start) > self.window {
+                    entries.remove(&ip);
+                }
+                None
+            }
+        }
+    }
+
+    /// Record one failed login for `ip`; starts a block once the window's
+    /// failure budget is exhausted.
+    pub(crate) fn record_failure(&self, ip: IpAddr) {
+        let now = Instant::now();
+        let mut entries = self.lock();
+        if entries.len() >= self.capacity {
+            // Expiry first: a blocked entry is live, a recent window is live.
+            entries.retain(|_, entry| {
+                let blocked = entry.blocked_until.is_some_and(|until| until > now);
+                let recent = now.duration_since(entry.window_start) <= self.window;
+                blocked || recent
+            });
+            // Still full: evict the entry observed longest ago (bounded map;
+            // see the type docs).
+            if entries.len() >= self.capacity
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .map(|(ip, _)| *ip)
+            {
+                entries.remove(&oldest);
+            }
+        }
+        let entry = entries.entry(ip).or_insert_with(|| IpEntry {
+            window_start: now,
+            last_seen: now,
+            failures: 0,
+            blocked_until: None,
+        });
+        if now.duration_since(entry.window_start) > self.window {
+            entry.window_start = now;
+            entry.failures = 0;
+        }
+        entry.last_seen = now;
+        entry.failures = entry.failures.saturating_add(1);
+        if entry.failures >= self.max_failures {
+            entry.blocked_until = Some(now + self.block);
+            entry.failures = 0;
+        }
+    }
+
+    /// A successful login clears this address's failure history.
+    pub(crate) fn record_success(&self, ip: IpAddr) {
+        self.lock().remove(&ip);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+}
 
 /// Soft cap on the encoded size of one streamed `Rows` frame; batches are
 /// flushed before they grow past it (the hard protocol cap is 64 MiB).
@@ -172,6 +457,14 @@ pub struct Server {
     max_connections: usize,
     active: Arc<AtomicUsize>,
     idle_timeout: Option<Duration>,
+    /// Per-statement engine limits applied to every accepted connection
+    /// (M-6). The server always has safe defaults; the embedded engine does
+    /// not.
+    exec_limits: ExecLimits,
+    /// Global cap on concurrent Argon2id login verifications (H-6).
+    login_gate: Arc<LoginGate>,
+    /// Bounded per-IP failed-login limiter (H-6).
+    login_ips: Arc<LoginIpLimiter>,
     /// TLS identity when the server was bound via `bind_tls` (crate feature
     /// `tls`); `None` = plaintext TCP.
     #[cfg(feature = "tls")]
@@ -210,6 +503,15 @@ impl Server {
             max_connections,
             active: Arc::new(AtomicUsize::new(0)),
             idle_timeout: Some(DEFAULT_IDLE_TIMEOUT),
+            // The server always bounds per-statement work; an embedder that
+            // wants no limit uses the engine's `Connection` directly.
+            exec_limits: ExecLimits {
+                statement_timeout: Some(Duration::from_millis(DEFAULT_STATEMENT_TIMEOUT_MS)),
+                max_result_rows: Some(DEFAULT_MAX_RESULT_ROWS),
+                max_result_bytes: Some(DEFAULT_MAX_RESULT_BYTES),
+            },
+            login_gate: Arc::new(LoginGate::new(DEFAULT_MAX_CONCURRENT_LOGINS)),
+            login_ips: Arc::new(LoginIpLimiter::new()),
             #[cfg(feature = "tls")]
             tls: None,
         })
@@ -282,6 +584,36 @@ impl Server {
         self
     }
 
+    /// Per-statement wall-clock deadline (M-6). Checked at chunk boundaries
+    /// inside the executor, so a huge scan/join/`UPDATE` fails instead of
+    /// pinning a connection (and the write lock) indefinitely. A zero
+    /// duration makes every statement time out immediately; prefer the
+    /// default unless the flag is explicitly set.
+    pub fn statement_timeout(mut self, timeout: Duration) -> Self {
+        self.exec_limits.statement_timeout = Some(timeout);
+        self
+    }
+
+    /// Cap on rows materialized by one statement (join output + final
+    /// result). A zero cap makes every row-producing statement fail.
+    pub fn max_result_rows(mut self, rows: usize) -> Self {
+        self.exec_limits.max_result_rows = Some(rows);
+        self
+    }
+
+    /// Cap on estimated bytes materialized by one statement.
+    pub fn max_result_bytes(mut self, bytes: usize) -> Self {
+        self.exec_limits.max_result_bytes = Some(bytes);
+        self
+    }
+
+    /// Global cap on Argon2id login verifications in flight (H-6). Excess
+    /// requests get a "too many concurrent logins" error immediately.
+    pub fn max_concurrent_logins(mut self, max: usize) -> Self {
+        self.login_gate = Arc::new(LoginGate::new(max));
+        self
+    }
+
     /// The address the server is listening on.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
@@ -299,7 +631,7 @@ impl Server {
         let mut backoff = ACCEPT_ERROR_MIN_BACKOFF;
         while !self.shutdown.load(Ordering::SeqCst) {
             match self.listener.accept() {
-                Ok((stream, peer)) => {
+                Ok((mut stream, peer)) => {
                     backoff = ACCEPT_ERROR_MIN_BACKOFF;
                     if self.shutdown.load(Ordering::SeqCst) {
                         break;
@@ -318,13 +650,28 @@ impl Server {
                             // signal.
                             continue;
                         }
-                        reject_over_limit(stream, self.max_connections);
+                        // M-11: write the refusal on the accept loop itself
+                        // with a short write timeout. One refusal may cost a
+                        // bounded 100 ms; it never creates an OS thread, and
+                        // a client that will not read is simply dropped.
+                        reject_over_limit(&mut stream, self.max_connections);
                         continue;
                     }
                     let guard = ActiveGuard(Arc::clone(&self.active));
                     self.active.fetch_add(1, Ordering::SeqCst);
                     let db = self.db.clone();
                     let idle_timeout = self.idle_timeout;
+                    let policy = ConnectionPolicy {
+                        limits: self.exec_limits,
+                        gate: Arc::clone(&self.login_gate),
+                        ips: Arc::clone(&self.login_ips),
+                        peer_ip: peer.ip(),
+                    };
+                    // A clone kept only for the spawn-failure path: if the OS
+                    // cannot create the connection thread, report it to the
+                    // client (bounded write) and close, instead of silently
+                    // dropping an accepted connection.
+                    let spawn_error_stream = stream.try_clone().ok();
                     #[cfg(feature = "tls")]
                     let tls = self.tls.clone();
                     if let Err(e) = thread::Builder::new()
@@ -334,15 +681,29 @@ impl Server {
                             let _guard = guard;
                             #[cfg(feature = "tls")]
                             if let Some(config) = tls {
-                                serve_tls_connection(stream, peer, db, idle_timeout, config);
+                                serve_tls_connection(
+                                    stream,
+                                    peer,
+                                    db,
+                                    idle_timeout,
+                                    policy,
+                                    config,
+                                );
                                 return;
                             }
-                            serve_connection(stream, db, idle_timeout);
+                            serve_connection(stream, db, idle_timeout, policy);
                         })
                     {
                         // On a spawn failure the closure (and with it the
-                        // guard) is dropped, so the active count stays exact.
+                        // guard and the original stream) is dropped, so the
+                        // active count stays exact and the connection closes.
                         eprintln!("pinkdb-server: cannot spawn connection thread: {e}");
+                        if let Some(mut stream) = spawn_error_stream {
+                            reject_with(
+                                &mut stream,
+                                &format!("server is out of connection capacity ({e}); close"),
+                            );
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -383,16 +744,29 @@ impl Server {
     }
 }
 
+/// Write one best-effort `Error` frame with a bounded write timeout, then
+/// close. Used by the accept loop for a refusal (M-11) and by the
+/// spawn-failure path, never from a thread spawned per connection.
+pub(crate) fn reject_with(stream: &mut TcpStream, message: &str) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(REJECT_WRITE_TIMEOUT));
+    let _ = protocol::write_response(
+        stream,
+        &Response::Error {
+            message: message.to_string(),
+        },
+    );
+}
+
 /// Best-effort `Error` frame for a connection refused by the cap, then close.
-/// Runs on its own thread (with a bounded write) so a client that never reads
-/// cannot block the accept loop.
-fn reject_over_limit(mut stream: TcpStream, max: usize) {
-    std::thread::spawn(move || {
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
-        let message = format!("connection limit reached (max {max}); try again later");
-        let _ = protocol::write_response(&mut stream, &Response::Error { message });
-    });
+/// Runs **on the accept loop** with a short write timeout: a client that will
+/// not read is dropped after at most [`REJECT_WRITE_TIMEOUT`], and no OS
+/// thread is created per refusal (M-11).
+fn reject_over_limit(stream: &mut TcpStream, max: usize) {
+    reject_with(
+        stream,
+        &format!("connection limit reached (max {max}); try again later"),
+    );
 }
 
 /// A running server's handle (see [`Server::spawn`]).
@@ -440,11 +814,16 @@ impl Drop for ServerHandle {
 
 /// Serve one plaintext client: configure the accepted socket, then run the
 /// protocol.
-fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<Duration>) {
+fn serve_connection(
+    stream: TcpStream,
+    db: Database,
+    idle_timeout: Option<Duration>,
+    policy: ConnectionPolicy,
+) {
     if !configure_socket(&stream, idle_timeout) {
         return;
     }
-    serve_client(stream, db);
+    serve_client(stream, db, policy);
 }
 
 /// Apply the connection-required socket options to a freshly accepted socket.
@@ -481,6 +860,7 @@ fn serve_tls_connection(
     peer: SocketAddr,
     db: Database,
     idle_timeout: Option<Duration>,
+    policy: ConnectionPolicy,
     config: Arc<rustls::ServerConfig>,
 ) {
     if !configure_socket(&stream, idle_timeout) {
@@ -504,7 +884,7 @@ fn serve_tls_connection(
         eprintln!("pinkdb-server: TLS handshake stalled for {peer}; dropping the connection");
         return;
     }
-    serve_client(tls, db);
+    serve_client(tls, db, policy);
 }
 
 /// Serve the pinkdb framed protocol on an established byte stream (plain TCP
@@ -522,12 +902,14 @@ fn serve_tls_connection(
 /// what rustls' `StreamOwned` needs). Buffered read-ahead is untouched by
 /// writes, and `write_frame` flushes, so a write failure is reported at the
 /// frame that hit it.
-fn serve_client<S: Read + Write>(stream: S, db: Database) {
+fn serve_client<S: Read + Write>(stream: S, db: Database, policy: ConnectionPolicy) {
     let mut reader = BufReader::new(stream);
     let mut conn = db.connect();
     // Network session: the engine re-checks the store's user catalog before
     // every statement (so a batch cannot continue after its own CREATE USER).
     conn.require_login(true);
+    conn.set_exec_limits(policy.limits);
+    let mut throttle = LoginThrottle::new();
 
     // Handshake: the first request must be a version-matched Hello.
     let protocol_version = match protocol::read_request(&mut reader) {
@@ -572,13 +954,57 @@ fn serve_client<S: Read + Write>(stream: S, db: Database) {
     loop {
         match protocol::read_request(&mut reader) {
             // v9 (wave 48): verify credentials and adopt the principal. The
-            // connection stays usable on a failure (a client may retry).
+            // connection stays usable after a failure until the per-
+            // connection failure budget is spent (H-6): five failures close
+            // it, each after an increasing delay.
             Ok(Request::Login { user, password }) => {
+                // Per-IP limit first: a blocked address costs no Argon2id.
+                if let Some(retry) = policy.ips.retry_after(policy.peer_ip) {
+                    if send_error(
+                        reader.get_mut(),
+                        &format!(
+                            "too many failed login attempts from this address; retry in {}s",
+                            retry.as_secs().max(1)
+                        ),
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                }
+                // Global in-flight cap: do not queue verifications (each one
+                // allocates the work factor's memory).
+                let Some(permit) = policy.gate.try_acquire() else {
+                    if send_error(
+                        reader.get_mut(),
+                        "too many concurrent logins; retry shortly",
+                    )
+                    .is_err()
+                    {
+                        return;
+                    }
+                    continue;
+                };
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     login_reply(reader.get_mut(), &mut conn, &user, &password)
                 }));
+                drop(permit);
                 match outcome {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(LoginAttempt::Succeeded)) => {
+                        throttle.reset();
+                        policy.ips.record_success(policy.peer_ip);
+                    }
+                    Ok(Ok(LoginAttempt::Failed)) => {
+                        let delay = throttle.failure_delay();
+                        policy.ips.record_failure(policy.peer_ip);
+                        std::thread::sleep(delay);
+                        if throttle.closed() {
+                            // The auth-failed frame was already sent; EOF is
+                            // the close signal (the next request fails).
+                            return;
+                        }
+                    }
                     Ok(Err(_)) => return,
                     Err(payload) => {
                         let message = panic_message(payload.as_ref());
@@ -921,18 +1347,34 @@ pub(crate) fn auth_required(db: &Database, conn: &Connection) -> bool {
     conn.principal().is_none() && db.has_users()
 }
 
+/// The result of one engine login attempt, reported to the transport so it
+/// can apply the per-connection/per-IP backoff without re-parsing frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LoginAttempt {
+    Succeeded,
+    Failed,
+}
+
 /// Answer one `Login` request: verify the credentials, adopt the principal,
 /// and reply `LoggedIn` (or the identical `authentication failed` `Error`).
-/// Shared by both transports.
+/// Shared by both transports. The caller holds a [`LoginPermit`] for the
+/// duration and applies the failure delay/close policy from the returned
+/// [`LoginAttempt`].
 pub(crate) fn login_reply<S: FrameSink + ?Sized>(
     sink: &mut S,
     conn: &mut Connection,
     user: &str,
     password: &str,
-) -> Result<(), ProtocolError> {
+) -> Result<LoginAttempt, ProtocolError> {
     match conn.login(user, password) {
-        Ok(name) => sink.send_frame(&Response::LoggedIn { user: name }),
-        Err(e) => send_error(sink, &e.to_string()),
+        Ok(name) => {
+            sink.send_frame(&Response::LoggedIn { user: name })?;
+            Ok(LoginAttempt::Succeeded)
+        }
+        Err(e) => {
+            send_error(sink, &e.to_string())?;
+            Ok(LoginAttempt::Failed)
+        }
     }
 }
 
@@ -1010,4 +1452,75 @@ pub(crate) fn send_error<S: FrameSink + ?Sized>(
     w.send_frame(&Response::Error {
         message: message.to_string(),
     })
+}
+
+#[cfg(test)]
+mod login_limit_tests {
+    use super::*;
+
+    #[test]
+    fn login_gate_refuses_instead_of_queueing() {
+        let gate = Arc::new(LoginGate::new(1));
+        let first = gate.try_acquire().expect("the first verification fits");
+        assert!(
+            gate.try_acquire().is_none(),
+            "the cap must refuse, not queue"
+        );
+        assert_eq!(gate.in_flight(), 1);
+        drop(first);
+        assert_eq!(gate.in_flight(), 0);
+        assert!(gate.try_acquire().is_some());
+    }
+
+    #[test]
+    fn login_throttle_delays_increase_and_close_after_five() {
+        let mut throttle = LoginThrottle::new();
+        let delays: Vec<Duration> = (0..DEFAULT_LOGIN_MAX_FAILURES)
+            .map(|_| throttle.failure_delay())
+            .collect();
+        assert!(delays_increase(&delays), "{delays:?}");
+        assert!(throttle.closed());
+        throttle.reset();
+        assert!(!throttle.closed());
+    }
+
+    fn delays_increase(delays: &[Duration]) -> bool {
+        delays.windows(2).all(|pair| pair[0] <= pair[1]) && delays.first() < delays.last()
+    }
+
+    #[test]
+    fn ip_limiter_blocks_expires_and_stays_bounded() {
+        let expiry =
+            LoginIpLimiter::with_limits(4, Duration::from_secs(60), Duration::from_millis(40), 2);
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        expiry.record_failure(a);
+        expiry.record_failure(a);
+        assert!(
+            expiry.retry_after(a).is_some(),
+            "two failures must start the block"
+        );
+        // A block expires lazily on access, and a success clears the address.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(expiry.retry_after(a).is_none(), "the block must expire");
+        expiry.record_failure(b);
+        expiry.record_success(b);
+        assert!(expiry.retry_after(b).is_none());
+
+        // Capacity 2 with a one-failure block: a third address evicts the
+        // oldest entry, so the map never grows past its documented bound.
+        let bounded =
+            LoginIpLimiter::with_limits(2, Duration::from_secs(60), Duration::from_secs(60), 1);
+        let a: IpAddr = "10.0.0.1".parse().unwrap();
+        let b: IpAddr = "10.0.0.2".parse().unwrap();
+        let c: IpAddr = "10.0.0.3".parse().unwrap();
+        bounded.record_failure(a);
+        bounded.record_failure(b);
+        bounded.record_failure(c);
+        assert_eq!(bounded.len(), 2, "the per-IP map must stay bounded");
+        assert!(
+            bounded.retry_after(a).is_none(),
+            "the oldest-observed entry is the one evicted"
+        );
+    }
 }

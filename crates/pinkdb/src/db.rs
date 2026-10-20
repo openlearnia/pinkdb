@@ -164,6 +164,7 @@ impl Database {
             // arm the per-statement gate with `Connection::require_login`.
             principal: None,
             require_login: false,
+            exec_limits: None,
         }
     }
 
@@ -381,6 +382,10 @@ pub struct Connection {
     /// unauthenticated. Embedded connections leave this `false`: their
     /// `principal == None` is the documented trusted-session path.
     require_login: bool,
+    /// Per-statement resource limits (M-6). `None` is the embedded default
+    /// (no timeout, no result cap); a network front-end always sets its
+    /// policy with [`Connection::set_exec_limits`].
+    exec_limits: Option<crate::exec::ExecLimits>,
 }
 
 impl Connection {
@@ -422,7 +427,44 @@ impl Connection {
     /// replaces the old one). A session that never logs in — the embedded
     /// API — stays trusted: the engine performs no privilege check for it.
     pub fn login(&mut self, user: &str, password: &str) -> Result<String> {
-        let name = read_lock(&self.db.shared).authenticate(user, password)?;
+        self.login_with_verification_hook(user, password, || {})
+    }
+
+    /// [`Connection::login`] with a hook that runs **after** the user record
+    /// has been copied out and the store lock released, but **before** the
+    /// Argon2id verification. Test-only seam (hidden from docs) for the H-6
+    /// regression test: a concurrent write must be able to proceed at that
+    /// point, proving verification no longer runs under the store read lock.
+    #[doc(hidden)]
+    pub fn login_with_verification_hook<F: FnOnce()>(
+        &mut self,
+        user: &str,
+        password: &str,
+        hook: F,
+    ) -> Result<String> {
+        // Durable stores refresh before reading the catalog, like every
+        // statement boundary: a login must see the users another process
+        // committed. The guard is released immediately after copying the
+        // record; the expensive verification below runs lock-free (H-6).
+        self.db.refresh()?;
+        let record = {
+            let store = read_lock(&self.db.shared);
+            store.login_record(user)
+        };
+        hook();
+        let name = PinkDb::verify_login_record(record.clone(), password)?;
+        // The catalog may have changed during the derivation (ALTER/DROP
+        // USER, locally or in another process): refresh and adopt the
+        // principal only if the exact record still exists, so a password
+        // rotated mid-login cannot be bypassed.
+        self.db.refresh()?;
+        let current = {
+            let store = read_lock(&self.db.shared);
+            store.login_record(user)
+        };
+        if current != record {
+            return Err(crate::rbac::auth_failed());
+        }
         self.principal = Some(user.to_ascii_lowercase());
         Ok(name)
     }
@@ -459,6 +501,20 @@ impl Connection {
     /// difference between an embedder and the server.
     pub fn require_login(&mut self, required: bool) {
         self.require_login = required;
+    }
+
+    /// Set this connection's per-statement resource limits (M-6): a wall
+    /// clock deadline plus materialized-row/byte caps. The embedded default
+    /// is no limit; the network server sets its own policy on every accepted
+    /// connection. A limit applies to **each** statement of a batch, with the
+    /// deadline starting before binding.
+    pub fn set_exec_limits(&mut self, limits: crate::exec::ExecLimits) {
+        self.exec_limits = Some(limits);
+    }
+
+    /// Remove this connection's limits (back to the embedded default).
+    pub fn clear_exec_limits(&mut self) {
+        self.exec_limits = None;
     }
 
     /// The per-statement auth gate: once the store has users, an armed
@@ -545,6 +601,10 @@ impl Connection {
         // next statement is refused. No-op for embedded connections (the
         // gate is armed only by a network front-end) and once logged in.
         self.ensure_login()?;
+        // One budget per statement: the deadline starts here (before bind)
+        // and is shared by every evaluation context of this statement. No
+        // limits (the embedded default) is a zero-cost `None` budget.
+        let budget = Arc::new(crate::exec::ExecBudget::new(self.exec_limits.as_ref()));
         // Transaction control never touches table data: handle first.
         match stmt {
             crate::sql::ast::Statement::Begin => return self.txn_begin(),
@@ -579,6 +639,7 @@ impl Connection {
                 let pre = self.current_db.clone();
                 let (plan, dynamic_functions_used) =
                     crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
+                budget.check_deadline()?;
                 let plan = crate::plan::with_mv_source(plan, sql_text);
                 // Wave 48: an authenticated session is checked in every
                 // transaction state too (the snapshot carries the RBAC
@@ -606,7 +667,7 @@ impl Connection {
                     let stmt_sets = txn.work.plan_sets_store(&plan, &pre);
                     txn.wal_sets.extend(&stmt_sets);
                 }
-                let result = crate::exec::run(&mut txn.work, &plan)?;
+                let result = crate::exec::run_with_budget(&mut txn.work, &plan, budget.clone())?;
                 // Wave 44: a `CALL`'s actual touched set joins this
                 // transaction's read/write bookkeeping (the pre-execution
                 // pass above saw only its argument subqueries).
@@ -673,18 +734,19 @@ impl Connection {
                 // under the exclusive lock.
                 let shared = read_lock(&self.db.shared);
                 let (plan, _) = crate::sql::bind_tracked(&shared, stmt, &pre)?;
+                budget.check_deadline()?;
                 // Wave 48: the privilege check runs on the bound plan under
                 // the same lock the bind took, so no statement can slip
                 // between the check and its execution.
                 enforce(self.principal.as_deref(), &shared, &plan, &pre)?;
                 let result = if is_read_only(&plan) {
-                    let result = crate::exec::run_read(&shared, &plan);
+                    let result = crate::exec::run_read_with_budget(&shared, &plan, budget.clone());
                     // Release before the `USE` logging below re-locks.
                     drop(shared);
                     result?
                 } else {
                     drop(shared);
-                    self.autocommit_write(stmt, sql_text, &pre)?
+                    self.autocommit_write(stmt, sql_text, &pre, budget.clone())?
                 };
                 // `USE` is read-only for locking but still WAL-logged: replay
                 // must switch sessions exactly like this connection did.
@@ -762,6 +824,7 @@ impl Connection {
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
         pre: &str,
+        budget: Arc<crate::exec::ExecBudget>,
     ) -> Result<QueryResult> {
         let mut shared = write_lock(&self.db.shared);
         // Wave 44: the procedure frame is statement-scoped.
@@ -770,6 +833,7 @@ impl Connection {
         // have changed the catalog between the caller's read-guard bind and
         // this lock.
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
@@ -784,12 +848,13 @@ impl Connection {
                 shared.refresh_under_lease(g)?;
             }
             let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+            budget.check_deadline()?;
             let plan = crate::plan::with_mv_source(plan, sql_text);
             enforce(self.principal.as_deref(), &shared, &plan, pre)?;
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
-            let result = crate::exec::run(&mut shared, &plan)?;
+            let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone())?;
             self.log_autocommit(
                 &mut shared,
                 &plan,
@@ -810,7 +875,7 @@ impl Connection {
         sets.canonicalize();
         let base = shared.capture_base()?;
         // Execute with no lease: this is the span other writers overlap.
-        let result = crate::exec::run(&mut shared, &plan)?;
+        let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone())?;
         // Past this point a failure must not leave the uncommitted effect
         // observable: without the lease it cannot be undone, so the handle
         // fail-stops (see `poison_uncommitted`).
@@ -852,12 +917,13 @@ impl Connection {
         }
         shared.note_optimistic_fallback_for_test();
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
+        budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
         enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
         }
-        let result = crate::exec::run(&mut shared, &plan)?;
+        let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone())?;
         self.log_autocommit(
             &mut shared,
             &plan,
