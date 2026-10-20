@@ -1851,3 +1851,26 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   redirects. This closes the file-access block's transport; **iceberg (72)
   remains queued** as the transport's next consumer. Worktrees left in place
   (no-cleanup policy).
+
+- 2026-10-20 — Security hardening, low-severity batch (from
+  `docs/security-review-2026-10-19.md`; worktree `wt-seclow`): **L-2** the
+  server protocol's `Request` Debug now redacts the plaintext login password;
+  **L-3** engine key-material comparison uses `subtle::ConstantTimeEq` (the
+  `encryption`-feature edge only; `subtle` was already locked); **L-11** the
+  SigV4 `Signature` Debug redacts `canonical_request`/`signed_headers` so a
+  live `x-amz-security-token` cannot leak through logs (the code moved to
+  `pinkdb-httpfs` in wave 75); **L-12** every lake commit-delta path
+  (`data_files`, `delete_files`, `compacted_files`, `removed_delete_files`)
+  is validated at manifest-read time, and `LocalStorage` gained
+  `checked_path()` (absolute/`..`/prefix paths → `LakeError::Corrupt`, with
+  `abs()` made escape-proof at I/O); the dead `pink-lake/src/s3/sigv4.rs`
+  copy left by the wave-75 extraction is deleted; **L-13** all five `.pink`
+  RLE decoders (and two LZ guards) use `checked_add` instead of `out.len() +
+  len`; **L-14** the Cloudflare token moved from the job-level env to the
+  `wrangler deploy` step only; the four `.lake` subcommands that bypassed
+  `PINKDB_KEY` now open through `open_lake()` (keyed, fail-closed); the S3
+  test harness pins all three images by multi-arch digest. Gates: pinkdb
+  **642**, server **67**, CLI **73**, pink-lake **121**, workspace **1204**,
+  duckdiff **339/339**, fmt/clippy both toolchains, wasm green, YAML/shell
+  validated. No format change; no new crates. Pass 1 (extension RCE)
+  remains separate.

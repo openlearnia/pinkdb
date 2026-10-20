@@ -15,7 +15,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use super::storage::{Head, LocalCopy, ObjectInfo, Storage, VersionTag};
@@ -35,6 +35,29 @@ impl LocalStorage {
         Self {
             root: root.to_path_buf(),
         }
+    }
+
+    /// Resolve `rel` below the lake root, rejecting anything that `join`
+    /// would let escape: an absolute path (which replaces the root) or a
+    /// `..`/prefix/current-directory component. Empty stays the root, which
+    /// is the trait's documented `abs("")` spelling.
+    fn checked_path(&self, rel: &str) -> Result<PathBuf> {
+        if rel.is_empty() {
+            return Ok(self.root.clone());
+        }
+        let plain = Path::new(rel)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)));
+        if !plain {
+            return Err(LakeError::Corrupt {
+                path: PathBuf::from(rel),
+                message: format!(
+                    "lake path {rel:?} must stay below the lake root (no absolute paths, \
+                     `..`, `.` or drive prefixes)"
+                ),
+            });
+        }
+        Ok(self.root.join(rel))
     }
 
     fn ensure_parent(&self, path: &Path) -> Result<()> {
@@ -66,7 +89,7 @@ impl LocalStorage {
     /// v2 Vortex data files; the snapshot path refuses to replace an
     /// existing version.
     fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         self.ensure_parent(&path)?;
         let (tmp, mut file) = create_unique_tmp(&path).map_err(|e| LakeError::Io {
             context: format!("creating a temp file next to {}", path.display()),
@@ -97,7 +120,7 @@ impl LocalStorage {
     /// published: a published version file is never replaced, and two
     /// concurrent writers cannot both claim the same version.
     fn publish_new(&self, rel: &str, bytes: &[u8]) -> Result<bool> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         self.ensure_parent(&path)?;
         let (tmp, mut file) = create_unique_tmp(&path).map_err(|e| LakeError::Io {
             context: format!("creating a temp file next to {}", path.display()),
@@ -156,16 +179,17 @@ fn local_tag(path: &Path) -> Result<VersionTag> {
 }
 
 impl Storage for LocalStorage {
+    /// Display-only resolution: `abs` cannot return an error, so a hostile
+    /// path resolves to a fixed name *below* the root rather than escaping it
+    /// (`Path::join` would replace the root for an absolute path). Every I/O
+    /// method uses [`LocalStorage::checked_path`] and returns the real error.
     fn abs(&self, rel: &str) -> PathBuf {
-        if rel.is_empty() {
-            self.root.clone()
-        } else {
-            self.root.join(rel)
-        }
+        self.checked_path(rel)
+            .unwrap_or_else(|_| self.root.join(".pinkdb-invalid-rel"))
     }
 
     fn head(&self, rel: &str) -> Result<Head> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         // `fs::metadata` follows symlinks, exactly as `Path::is_file` did.
         match fs::metadata(&path) {
             Ok(meta) if meta.is_file() => Ok(Head::File),
@@ -179,7 +203,7 @@ impl Storage for LocalStorage {
     }
 
     fn stat(&self, rel: &str) -> Result<Option<ObjectInfo>> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         match fs::metadata(&path) {
             Ok(meta) if meta.is_file() => {
                 let modified_micros = meta
@@ -202,7 +226,7 @@ impl Storage for LocalStorage {
     }
 
     fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         fs::read(&path).map_err(|e| LakeError::Io {
             context: context.to_string(),
             source: e,
@@ -211,12 +235,12 @@ impl Storage for LocalStorage {
 
     fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
         let bytes = self.read(rel, context)?;
-        let tag = local_tag(&self.abs(rel))?;
+        let tag = local_tag(&self.checked_path(rel)?)?;
         Ok((bytes, tag))
     }
 
     fn create_dir(&self, rel: &str) -> Result<()> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         fs::create_dir_all(&path).map_err(|e| LakeError::Io {
             context: format!("creating directory {}", path.display()),
             source: e,
@@ -235,7 +259,7 @@ impl Storage for LocalStorage {
         rel: &str,
         fill: &mut dyn FnMut(&mut (dyn Write + Send)) -> Result<()>,
     ) -> Result<u64> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         self.ensure_parent(&path)?;
         let (tmp, file) = create_unique_tmp(&path).map_err(|e| LakeError::Io {
             context: format!("creating a temp file next to {}", path.display()),
@@ -275,7 +299,7 @@ impl Storage for LocalStorage {
     }
 
     fn put_if_match(&self, rel: &str, bytes: &[u8], expected: &VersionTag) -> Result<bool> {
-        let current = local_tag(&self.abs(rel))?;
+        let current = local_tag(&self.checked_path(rel)?)?;
         if &current != expected {
             return Ok(false);
         }
@@ -286,7 +310,7 @@ impl Storage for LocalStorage {
     /// File names directly inside `rel` (sorted; a missing directory reads as
     /// empty). Subdirectories and non-UTF-8 names are skipped.
     fn list(&self, rel: &str) -> Result<Vec<String>> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         let entries = match fs::read_dir(&path) {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -314,7 +338,7 @@ impl Storage for LocalStorage {
     }
 
     fn delete(&self, rel: &str) -> Result<()> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         fs::remove_file(&path).map_err(|e| LakeError::Io {
             context: format!("deleting {}", path.display()),
             source: e,
@@ -325,7 +349,7 @@ impl Storage for LocalStorage {
     /// `rel`, sorted; symlinked directories are not followed (a symlink to a
     /// file counts as a file, exactly as `list` treats it).
     fn list_recursive(&self, rel: &str) -> Result<Vec<String>> {
-        let path = self.abs(rel);
+        let path = self.checked_path(rel)?;
         let mut out = Vec::new();
         let mut stack: Vec<(PathBuf, String)> = vec![(path.clone(), String::new())];
         while let Some((dir, prefix)) = stack.pop() {
@@ -366,11 +390,13 @@ impl Storage for LocalStorage {
     }
 
     fn local_copy(&self, rel: &str, _context: &str) -> Result<LocalCopy> {
-        Ok(LocalCopy::Path(self.abs(rel)))
+        Ok(LocalCopy::Path(self.checked_path(rel)?))
     }
 
     fn local_path(&self, rel: &str) -> Option<PathBuf> {
-        Some(self.abs(rel))
+        // A hostile relative path has no local path; callers fall back to the
+        // generic read path, which rejects it with a clean error.
+        self.checked_path(rel).ok()
     }
 }
 
@@ -408,4 +434,59 @@ fn create_unique_tmp(path: &Path) -> std::io::Result<(PathBuf, File)> {
         ErrorKind::AlreadyExists,
         "could not create a unique temp file",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_path_rejects_escapes_and_accepts_data_paths() {
+        let root = PathBuf::from("/tmp/pinkdb-lake-root");
+        let storage = LocalStorage::new(&root);
+
+        for hostile in ["../escape", "/etc/x", "data/../../escape"] {
+            let err = storage.checked_path(hostile).unwrap_err();
+            assert!(
+                err.to_string().contains("must stay below the lake root"),
+                "{hostile}: {err}"
+            );
+            // The infallible display path never leaves the root either.
+            assert!(storage.abs(hostile).starts_with(&root), "{hostile}");
+            assert_ne!(storage.abs(hostile), root.join(hostile));
+        }
+
+        assert_eq!(storage.checked_path("").unwrap(), root);
+        assert_eq!(
+            storage.checked_path("data/main.t/abc.pink").unwrap(),
+            root.join("data/main.t/abc.pink")
+        );
+        assert_eq!(
+            storage.abs("data/main.t/abc.pink"),
+            root.join("data/main.t/abc.pink")
+        );
+    }
+
+    #[test]
+    fn storage_io_refuses_hostile_paths_without_touching_the_parent() {
+        let root = std::env::temp_dir().join(format!("pinkdb-local-{}", fresh_id()));
+        fs::create_dir_all(&root).unwrap();
+        let storage = LocalStorage::new(&root);
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("escape-{}", fresh_id()));
+
+        assert!(storage.read("../escape", "test").is_err());
+        assert!(storage.head("/etc/x").is_err());
+        assert!(storage.put("../escape", b"must not be written").is_err());
+        assert!(storage.create_dir("..").is_err());
+        assert!(!outside.exists(), "a hostile path escaped the lake root");
+
+        // A normal lake-relative path still works.
+        storage.put("data/main.t/ok.pink", b"ok").unwrap();
+        assert_eq!(storage.read("data/main.t/ok.pink", "test").unwrap(), b"ok");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

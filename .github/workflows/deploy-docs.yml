@@ -27,9 +27,6 @@ jobs:
     name: build + wrangler deploy
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -46,4 +43,11 @@ jobs:
 
       - name: wrangler deploy (website/)
         working-directory: website
+        # The Cloudflare token is needed only by this step: keeping it out of
+        # the job-level env means `npm install -g wrangler` and
+        # `website/build.py` never see it (same scoping as
+        # publish-extensions.yml).
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: wrangler deploy

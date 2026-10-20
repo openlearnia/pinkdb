@@ -391,6 +391,7 @@ mod imp {
     use aes_gcm::aead::rand_core::{OsRng, RngCore};
     use aes_gcm::aead::{Aead, KeyInit, Payload};
     use aes_gcm::{Aes256Gcm, Nonce};
+    use subtle::ConstantTimeEq;
 
     /// A derived 32-byte key, zeroed on drop (best-effort).
     struct DerivedKey {
@@ -857,7 +858,9 @@ mod imp {
         /// different key/mode beside a WAL sealed with this one.
         pub(crate) fn matches_key(&self, key: &EncryptionKey) -> bool {
             match derive_for_open(key, self.spec.kdf, self.spec.params.as_ref()) {
-                Ok(derived) => derived.bytes == self.key.bytes,
+                // Constant-time: a short-circuiting comparison of key material
+                // is a timing oracle for a prefix match.
+                Ok(derived) => derived.bytes.ct_eq(&self.key.bytes).into(),
                 Err(_) => false,
             }
         }
@@ -1005,6 +1008,21 @@ mod enc_tests {
             assert_eq!(open_container(&sealed_big, &key, 0).unwrap(), big);
             assert_eq!(open_container(&sealed, &key, 0).unwrap(), plain);
         }
+    }
+
+    #[test]
+    fn matches_key_is_exact_and_constant_time_by_construction() {
+        let key = EncryptionKey::from_raw([0x5Au8; 32]);
+        let cipher = RecordCipher::create(&key, 1).unwrap();
+        assert!(cipher.matches_key(&key));
+        assert!(!cipher.matches_key(&EncryptionKey::from_raw([0x5Bu8; 32])));
+        assert!(!cipher.matches_key(&EncryptionKey::from_passphrase("not-the-key")));
+        // The comparison itself is `subtle::ConstantTimeEq` (see the import):
+        // derive a key that differs only in its last byte and confirm the
+        // guard still rejects it, so the switch did not change behavior.
+        let mut almost = [0x5Au8; 32];
+        almost[31] ^= 1;
+        assert!(!cipher.matches_key(&EncryptionKey::from_raw(almost)));
     }
 
     #[test]

@@ -74,7 +74,7 @@ pub(crate) struct SigningInput<'a> {
 
 /// The signed request's authentication material (and the intermediates, so
 /// tests can pin the exact canonical request and string to sign).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Signature {
     /// `x-amz-date` value.
     pub(crate) amz_date: String,
@@ -84,6 +84,23 @@ pub(crate) struct Signature {
     pub(crate) string_to_sign: String,
     pub(crate) signed_headers: String,
     pub(crate) signature: String,
+}
+
+/// Manual `Debug`: `canonical_request` embeds every signed header's value,
+/// including `x-amz-security-token` (a live AWS session credential), and
+/// `signed_headers` names the secret-bearing set. Both are redacted while the
+/// other fields stay visible, so a log still shows that a signature exists.
+impl std::fmt::Debug for Signature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Signature")
+            .field("amz_date", &self.amz_date)
+            .field("authorization", &self.authorization)
+            .field("canonical_request", &"<redacted>")
+            .field("string_to_sign", &self.string_to_sign)
+            .field("signed_headers", &"<redacted>")
+            .field("signature", &self.signature)
+            .finish()
+    }
 }
 
 /// SigV4 canonicalization of a header value: trim, and collapse each run of
@@ -242,6 +259,45 @@ mod tests {
         assert_eq!(canonical_value("  a   b\t c  "), "a b c");
         assert_eq!(canonical_value("plain"), "plain");
         assert_eq!(canonical_value("   "), "");
+    }
+
+    /// `Debug` must never print the canonical request (it carries every
+    /// signed header value, including a live session token).
+    #[test]
+    fn debug_redacts_the_canonical_request_and_session_token() {
+        let (amz_date, date_stamp) = at(1_440_938_160);
+        let mut with_token = creds();
+        with_token.session_token = Some("SECRET-SESSION-TOKEN-VALUE".to_string());
+        let signed = sign(
+            &with_token,
+            &SigningInput {
+                method: "GET",
+                canonical_uri: "/",
+                canonical_query: "",
+                headers: vec![("host", "example.amazonaws.com"), ("x-amz-date", &amz_date)],
+                payload_hash: EMPTY_HASH,
+                amz_date: &amz_date,
+                date_stamp: &date_stamp,
+                region: "us-east-1",
+                service: "service",
+            },
+        );
+        assert!(
+            signed
+                .canonical_request
+                .contains("SECRET-SESSION-TOKEN-VALUE"),
+            "the test request must actually carry the token: {}",
+            signed.canonical_request
+        );
+        let dbg = format!("{signed:?}");
+        assert!(!dbg.contains("SECRET-SESSION-TOKEN-VALUE"), "{dbg}");
+        // The canonical request's header block (and the field naming the
+        // signed set) is gone; `authorization` still names the header *set*,
+        // which is not a secret.
+        assert!(!dbg.contains("host:example.amazonaws.com"), "{dbg}");
+        assert!(dbg.contains("canonical_request"), "{dbg}");
+        assert!(dbg.contains("signed_headers: \"<redacted>\""), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
     }
 
     /// AWS SigV4 test suite `get-vanilla`: the plainest request there is, in

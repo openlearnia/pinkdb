@@ -205,7 +205,7 @@ impl From<io::Error> for ProtocolError {
 // ---------- messages ----------
 
 /// One client request.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Request {
     /// First message on a connection; carries the client's protocol version.
     Hello { protocol_version: u32 },
@@ -226,6 +226,33 @@ pub enum Request {
     /// (`authentication failed: …`) on failure; the connection stays usable
     /// either way, so a client can retry.
     Login { user: String, password: String },
+}
+
+/// Manual `Debug`: a derived one would print the plaintext login password in
+/// any log line or panic message that formats a request. Every other field is
+/// safe to show; `Login` keeps the user and redacts the password.
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Request::Hello { protocol_version } => f
+                .debug_struct("Hello")
+                .field("protocol_version", protocol_version)
+                .finish(),
+            Request::Execute { sql } => f.debug_struct("Execute").field("sql", sql).finish(),
+            Request::Ping => f.debug_struct("Ping").finish(),
+            Request::Prepare { sql } => f.debug_struct("Prepare").field("sql", sql).finish(),
+            Request::ExecutePrepared { handle, values } => f
+                .debug_struct("ExecutePrepared")
+                .field("handle", handle)
+                .field("values", values)
+                .finish(),
+            Request::Login { user, .. } => f
+                .debug_struct("Login")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl Request {
@@ -991,5 +1018,22 @@ impl<'a> Reader<'a> {
                 self.remaining()
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_debug_redacts_the_password() {
+        let req = Request::Login {
+            user: "alice".to_string(),
+            password: "correct horse battery staple".to_string(),
+        };
+        let dbg = format!("{req:?}");
+        assert!(dbg.contains("alice"), "{dbg}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(!dbg.contains("correct horse battery staple"), "{dbg}");
     }
 }

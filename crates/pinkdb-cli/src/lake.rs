@@ -1000,7 +1000,7 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
             return;
         }
     }
-    let mut lake = match Lake::open_url(&dir) {
+    let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -1097,7 +1097,7 @@ fn cmd_inlining(arg: &str) {
             return;
         }
     }
-    let mut lake = match Lake::open_url(&dir) {
+    let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -1158,7 +1158,7 @@ fn cmd_flush(arg: &str) {
             return;
         }
     }
-    let mut lake = match Lake::open_url(&dir) {
+    let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");
@@ -1328,7 +1328,7 @@ fn cmd_add_data_files(arg: &str) {
             return;
         }
     }
-    let mut lake = match Lake::open_url(&dir) {
+    let mut lake = match open_lake(&dir) {
         Ok(lake) => lake,
         Err(e) => {
             cli_error!("{e}");

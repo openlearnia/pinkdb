@@ -8,6 +8,19 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-20
+
+### Security hardening — low-severity batch ✅
+- Redacted the login password from the server protocol's `Debug` output (L-2)
+  and the SigV4 canonical request / session token from `Signature`'s (L-11).
+- Constant-time key-material comparison in the encryption layer (L-3).
+- Every lake commit-delta path is validated, and local storage refuses
+  absolute/`..` paths (L-12); the stale extracted SigV4 copy is deleted.
+- Checked arithmetic in all `.pink` RLE decoders (32-bit overflow, L-13).
+- The Cloudflare API token is scoped to the deploy step only (L-14).
+- The four `.lake` subcommands that bypassed `PINKDB_KEY` now use the keyed
+  constructor; the S3 test harness pins image digests.
+
 ## 2026-10-19
 
 ### Wave 75 — core `httpfs` extension (remote files for every format) ✅

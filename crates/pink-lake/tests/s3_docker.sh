@@ -51,6 +51,8 @@
 #     docker run -d --name pk-rustfs -p 127.0.0.1:9100:9000 \
 #       -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin \
 #       rustfs/rustfs:latest
+#   The script itself pins every image by digest (`repo:tag@sha256:…`), so the
+#   tag in these recipes is only for readability; see the pin table below.
 #
 # On this machine (2026-10-14) seaweedfs and rustfs both answered the
 # two-writer conditional race with exactly one 200 in every trial, while
@@ -117,9 +119,17 @@ QUICKROWS="${QUICKROWS:-1000}"
 PORT="${PORT:-}"
 REGION="us-east-1"
 
+# The servers are pinned by digest, not by mutable `:latest` tag: a re-tag
+# between runs must not silently change the code CI executes. Update a pin
+# when intentionally bumping the server, with:
+#   docker buildx imagetools inspect <repo>:<tag> | sed -n 's/^Digest: *//p'
+# (or `docker manifest inspect -v <image>` and use the top-level descriptor's
+# digest). The multi-arch index digest is used; Docker picks this host's arch.
 case "$SERVER" in
 s3mock)
-    IMAGE="adobe/s3mock:latest"
+    IMAGE_TAG="adobe/s3mock:latest"
+    IMAGE_DIGEST="sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92"
+    IMAGE="$IMAGE_TAG@$IMAGE_DIGEST"
     CONTAINER_DEFAULT="pinkdb-s3mock-itest"
     DEFAULT_PORT=9090
     CONTAINER_PORT=9090
@@ -128,7 +138,9 @@ s3mock)
     SECRET_KEY="${SECRET_KEY:-pinkdb-itest-secret}"
     ;;
 seaweedfs)
-    IMAGE="chrislusf/seaweedfs:latest"
+    IMAGE_TAG="chrislusf/seaweedfs:latest"
+    IMAGE_DIGEST="sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d"
+    IMAGE="$IMAGE_TAG@$IMAGE_DIGEST"
     CONTAINER_DEFAULT="pk-seaweed"
     CONTAINER_FALLBACK="pinkdb-seaweed-itest"
     DEFAULT_PORT=8333
@@ -138,7 +150,9 @@ seaweedfs)
     SECRET_KEY="${SECRET_KEY:-anysecret}"
     ;;
 rustfs)
-    IMAGE="rustfs/rustfs:latest"
+    IMAGE_TAG="rustfs/rustfs:latest"
+    IMAGE_DIGEST="sha256:9ca9559533b537d10482fe923288b676ad08f92a7069d9a17327fbae3cab688b"
+    IMAGE="$IMAGE_TAG@$IMAGE_DIGEST"
     CONTAINER_DEFAULT="pk-rustfs"
     DEFAULT_PORT=9100
     CONTAINER_PORT=9000
@@ -371,10 +385,14 @@ s.close()
 PY
 }
 
-# docker reports `repo` for a container created from `repo:latest`
+# A container created by this script records the pinned `repo:tag@digest`;
+# an older one (or a hand-made documented recipe) records just the tag, which
+# stays accepted so reuse behavior is unchanged.
 same_image() { # <observed image>
     local observed="$1"
-    [ "$observed" = "$IMAGE" ] || [ "$observed" = "${IMAGE%:latest}" ]
+    [ "$observed" = "$IMAGE" ] \
+        || [ "$observed" = "$IMAGE_TAG" ] \
+        || [ "$observed" = "${IMAGE_TAG%:latest}" ]
 }
 
 mapped_port() { # <container> <container-port> — host port of a TCP mapping

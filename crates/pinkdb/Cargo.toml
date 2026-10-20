@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 # byte-identical. `cargo build --features encryption`. (RBAC's Argon2id
 # password hashing is *not* behind a feature: user DDL is part of the
 # default SQL surface.)
-encryption = ["dep:aes-gcm"]
+encryption = ["dep:aes-gcm", "dep:subtle"]
 # Opt-in JavaScript procedures (`CREATE PROCEDURE … LANGUAGE JAVASCRIPT AS
 # $$…$$`): links the pinkdb-js sandbox crate. Off by default — the default
 # build stays engine-free and lean. `cargo build --features js`.
@@ -32,6 +32,9 @@ rayon = "1.12.0"
 # a wasm32 build links no RNG backend through this edge. `aes-gcm` is
 # `encryption`-only.
 aes-gcm = { version = "0.10", optional = true }
+# Constant-time comparison for the encrypted-WAL key-match guard. It already
+# rides in through aes-gcm; naming it directly makes `ct_eq` this crate's API.
+subtle = { version = "2.6", default-features = false, optional = true }
 argon2 = { version = "0.5", default-features = false, features = [
     "alloc",
     "password-hash",

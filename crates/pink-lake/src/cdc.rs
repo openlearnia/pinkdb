@@ -69,7 +69,7 @@ use crate::catalog::{CommitManifest, DeleteRef, TableEntry};
 use crate::local::CATALOG_FILE;
 use crate::schema::TableSchema;
 use crate::storage::Storage;
-use crate::{Lake, LakeError, Result, only_table, split_key};
+use crate::{Lake, LakeError, Result, only_table, split_key, validate_rel_path};
 
 /// What one [`ChangeRow`] is: the row version was added (`Insert`) or ended
 /// (`Delete`) at its version. Serialized lowercase, matching DuckLake's
@@ -502,6 +502,29 @@ fn kind_rank(kind: ChangeKind) -> u8 {
     }
 }
 
+/// Every path a commit delta names must be a plain lake-relative `data/…`
+/// path, exactly like the main manifest's `files` list. A tampered
+/// `commits/<v>.json` must fail here, before any `abs`/read, so an absolute
+/// path or `..` can never reach another location on disk.
+fn validate_commit_paths(manifest: &CommitManifest) -> Result<()> {
+    for delta in manifest.tables.values() {
+        for file in &delta.data_files {
+            validate_rel_path(file.path())?;
+        }
+        for delete in &delta.delete_files {
+            validate_rel_path(&delete.path)?;
+            validate_rel_path(&delete.file)?;
+        }
+        for rel in &delta.compacted_files {
+            validate_rel_path(rel)?;
+        }
+        for rel in &delta.removed_delete_files {
+            validate_rel_path(rel)?;
+        }
+    }
+    Ok(())
+}
+
 /// Read one `commits/<v>.json`; `None` when the object does not exist.
 fn read_commit_manifest(
     storage: &dyn Storage,
@@ -531,5 +554,75 @@ fn read_commit_manifest(
             ),
         });
     }
+    validate_commit_paths(&manifest)?;
     Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{FileRef, TableDelta};
+    use std::collections::BTreeMap;
+
+    fn manifest_with_data_file(path: &str) -> CommitManifest {
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "main.t".to_string(),
+            TableDelta {
+                data_files: vec![FileRef::Path(path.to_string())],
+                rows_added: 1,
+                ..TableDelta::default()
+            },
+        );
+        CommitManifest {
+            format_version: 5,
+            version: 7,
+            base_version: 6,
+            updated: "2026-10-19T00:00:00Z".to_string(),
+            tables,
+        }
+    }
+
+    #[test]
+    fn commit_delta_paths_are_validated_before_any_read() {
+        assert!(validate_commit_paths(&manifest_with_data_file("data/main.t/x.pink")).is_ok());
+        for hostile in ["../escape", "/etc/x", "data/../../escape"] {
+            let err = validate_commit_paths(&manifest_with_data_file(hostile)).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("data file path must be relative and under data/"),
+                "{hostile}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_delta_delete_file_paths_are_validated_too() {
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "main.t".to_string(),
+            TableDelta {
+                delete_files: vec![DeleteRef {
+                    path: "data/main.t/x.pinkdel".to_string(),
+                    file: "../escape".to_string(),
+                    count: 1,
+                }],
+                rows_deleted: 1,
+                ..TableDelta::default()
+            },
+        );
+        let manifest = CommitManifest {
+            format_version: 5,
+            version: 7,
+            base_version: 6,
+            updated: "2026-10-19T00:00:00Z".to_string(),
+            tables,
+        };
+        let err = validate_commit_paths(&manifest).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("data file path must be relative and under data/"),
+            "{err}"
+        );
+    }
 }

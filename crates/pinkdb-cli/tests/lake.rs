@@ -455,6 +455,30 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
     assert!(out.contains("the lake is encrypted"), "{out}");
     assert!(out.contains("2"), "{out}");
 
+    // The write-side maintenance subcommands open through `open_lake` too:
+    // a keyed process must be able to change an encrypted lake's partition
+    // spec (before the fix this used the keyless constructor and refused).
+    let out = run_with_env(
+        &format!(
+            ".lake partition {lake} t by (a)\n.quit\n",
+            lake = lake.display()
+        ),
+        &key,
+    );
+    assert!(
+        out.contains("Partitioned main.t by (a)"),
+        "a keyed .lake partition must unseal the lake: {out}"
+    );
+    // ... and without the key the same subcommand still fails closed.
+    let out = run_no_key(&format!(
+        ".lake partition {lake} t clear\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("the lake is encrypted"),
+        "a keyless .lake partition must refuse an encrypted lake: {out}"
+    );
+
     // Failures: no key, wrong key, and a keyed save onto a plaintext lake.
     let out = run_no_key(&format!(
         ".lake open {lake}\n.quit\n",

@@ -1523,7 +1523,11 @@ fn lz_decompress(tokens: &[u8], raw_len: usize) -> Result<Vec<u8>> {
         pos += 1;
         if ctrl & 1 == 0 {
             let len = usize::from(ctrl >> 1) + 1;
-            if out.len() + len > raw_len {
+            if out
+                .len()
+                .checked_add(len)
+                .is_none_or(|total| total > raw_len)
+            {
                 return Err(corrupt("LZ literal run overruns the frame length"));
             }
             let end = pos + len;
@@ -1542,7 +1546,11 @@ fn lz_decompress(tokens: &[u8], raw_len: usize) -> Result<Vec<u8>> {
             if off == 0 || off > out.len() {
                 return Err(corrupt("LZ back-reference out of range"));
             }
-            if out.len() + len > raw_len {
+            if out
+                .len()
+                .checked_add(len)
+                .is_none_or(|total| total > raw_len)
+            {
                 return Err(corrupt("LZ match overruns the frame length"));
             }
             // Overlapping copy (off < len) must read byte by byte.
@@ -1703,7 +1711,7 @@ fn decode_rle_i32(r: &mut Reader, n: usize, runs: usize) -> Result<Vec<i32>> {
     for _ in 0..runs {
         let v = r.i32()?;
         let len = r.u32()? as usize;
-        if out.len() + len > n {
+        if out.len().checked_add(len).is_none_or(|total| total > n) {
             return r.err("RLE run overflows chunk length");
         }
         out.extend(std::iter::repeat_n(v, len));
@@ -1719,7 +1727,7 @@ fn decode_rle_i64(r: &mut Reader, n: usize, runs: usize) -> Result<Vec<i64>> {
     for _ in 0..runs {
         let v = r.i64()?;
         let len = r.u32()? as usize;
-        if out.len() + len > n {
+        if out.len().checked_add(len).is_none_or(|total| total > n) {
             return r.err("RLE run overflows chunk length");
         }
         out.extend(std::iter::repeat_n(v, len));
@@ -1735,7 +1743,7 @@ fn decode_rle_f64(r: &mut Reader, n: usize, runs: usize) -> Result<Vec<f64>> {
     for _ in 0..runs {
         let v = r.f64()?;
         let len = r.u32()? as usize;
-        if out.len() + len > n {
+        if out.len().checked_add(len).is_none_or(|total| total > n) {
             return r.err("RLE run overflows chunk length");
         }
         out.extend(std::iter::repeat_n(v, len));
@@ -1751,7 +1759,7 @@ fn decode_rle_bool(r: &mut Reader, n: usize, runs: usize) -> Result<Vec<bool>> {
     for _ in 0..runs {
         let v = r.u8()? != 0;
         let len = r.u32()? as usize;
-        if out.len() + len > n {
+        if out.len().checked_add(len).is_none_or(|total| total > n) {
             return r.err("RLE run overflows chunk length");
         }
         out.extend(std::iter::repeat_n(v, len));
@@ -1767,7 +1775,7 @@ fn decode_rle_strs(r: &mut Reader, n: usize, runs: usize) -> Result<Vec<Arc<str>
     let mut out = Vec::with_capacity(n);
     for v in vals {
         let len = r.u32()? as usize;
-        if out.len() + len > n {
+        if out.len().checked_add(len).is_none_or(|total| total > n) {
             return r.err("RLE run overflows chunk length");
         }
         out.extend(std::iter::repeat_n(v, len));
@@ -3786,6 +3794,26 @@ mod tests {
         assert_eq!(back.table("e").unwrap().num_rows(), 0);
         assert_eq!(back.table("big").unwrap().num_rows(), CHUNK_SIZE + 100);
         assert_eq!(all_values(&db, "big"), all_values(&back, "big"));
+    }
+
+    #[test]
+    fn rle_decoders_reject_lengths_that_would_overflow() {
+        // Two runs: the first fills one slot, the second claims u32::MAX
+        // more. On a 32-bit target `1 + u32::MAX` wraps to 0, so the old
+        // `out.len() + len > n` guard let a multi-gigabyte `repeat_n`
+        // through; the checked add must report a clean corruption error.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&7i32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&7i32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut r = Reader::new(&bytes);
+        let err = decode_rle_i32(&mut r, 1, 2).unwrap_err();
+        assert!(
+            err.to_string().contains("RLE run overflows chunk length"),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("panicked"), "{err}");
     }
 
     #[test]
