@@ -14,8 +14,14 @@ fn cli() -> Command {
 
 /// stdout, stderr, exit code — separately.
 fn run_split(stdin: &str) -> (String, String, Option<i32>) {
+    run_split_args(&[], stdin)
+}
+
+/// [`run_split`] with command-line arguments.
+fn run_split_args(args: &[&str], stdin: &str) -> (String, String, Option<i32>) {
     use std::io::Write;
     let mut child = cli()
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -44,8 +50,13 @@ fn math_functions_work_without_a_load_statement() {
     assert!(out.contains("2.718281828459045"), "{out}");
     assert!(out.contains("3.0"), "{out}");
     assert!(out.contains("1024.0"), "{out}");
-    // Loading the built-in extension explicitly is the documented duplicate.
+    // The statement is off by default: it loads and runs native code.
     let (_, err, code) = run_split("LOAD EXTENSION 'math';\n");
+    assert_eq!(code, Some(1));
+    assert!(err.contains("LOAD EXTENSION is disabled"), "{err}");
+    // With the opt-in, loading the built-in extension explicitly is the
+    // documented duplicate.
+    let (_, err, code) = run_split_args(&["--allow-load-extension"], "LOAD EXTENSION 'math';\n");
     assert_eq!(code, Some(1));
     assert!(err.contains("already loaded"), "{err}");
 }

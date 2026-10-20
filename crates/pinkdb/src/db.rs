@@ -268,10 +268,28 @@ impl Database {
     }
 
     /// Allow or refuse the SQL `LOAD EXTENSION` statement for every
-    /// connection of this database (default: allowed). Network servers turn
-    /// it off unless the operator opts in.
+    /// connection of this database (default: **refused**).
+    ///
+    /// The statement makes the process load and run native code from a path
+    /// the SQL text names, so it is opt-in everywhere. Network servers
+    /// additionally confine the paths to an extension root (see
+    /// [`Self::set_extension_root`]).
     pub fn set_allow_sql_load_extension(&self, allow: bool) {
         write_lock(&self.shared).set_allow_sql_load_extension(allow);
+    }
+
+    /// Confine every extension load of this database to `root` (the
+    /// directory that holds the extension libraries). `None` removes the
+    /// confinement; the loader's own path rules always apply.
+    pub fn set_extension_root(&self, root: Option<std::path::PathBuf>) {
+        write_lock(&self.shared).set_extension_root(root);
+    }
+
+    /// Allow or refuse WAL replay to load an extension this database's WAL
+    /// records (default: refused). With it on, the recorded path is still
+    /// only honoured when it resolves inside the extension root.
+    pub fn set_allow_extension_replay(&self, allow: bool) {
+        write_lock(&self.shared).set_allow_extension_replay(allow);
     }
 
     /// fsync the WAL (meaningful with [`crate::SyncPolicy::Batch`]). Takes

@@ -127,9 +127,31 @@ void pinkdb_close(pinkdb_handle *handle);
 
 /* Execute one or more `;`-separated SQL statements.
  * Returns NULL on error (see pinkdb_last_error); free with
- * pinkdb_result_free. */
+ * pinkdb_result_free.
+ *
+ * SECURITY: this can load native code. The SQL statement
+ * `LOAD EXTENSION '<path>'` makes the host process load and run a native
+ * library (dlopen) from a path the SQL text names. It is DISABLED by
+ * default on every handle: pinkdb_execute can only load native code after
+ * pinkdb_set_allow_sql_load_extension(handle, 1) has enabled it. An
+ * application that forwards untrusted input to pinkdb_execute inherits
+ * arbitrary native code execution once the switch is on. */
 pinkdb_result *pinkdb_execute(pinkdb_handle *handle, const char *sql,
                               size_t sql_len);
+
+/* Allow (non-zero) or refuse (zero) the SQL `LOAD EXTENSION` statement on
+ * this handle. Returns 1 on success, 0 on failure (a NULL handle; see
+ * pinkdb_last_error).
+ *
+ * SECURITY: `LOAD EXTENSION '<path>'` makes the host process load and run a
+ * native library from a path the SQL text names — arbitrary native code
+ * execution for anyone who can influence the SQL. The statement is disabled
+ * by default on every handle; enable it only for a handle whose SQL comes
+ * from a trusted source. The loaded path must name a regular file (not a
+ * symlink) inside a directory; a bare library name (which the dynamic
+ * loader would resolve through its search path) is refused. */
+int32_t pinkdb_set_allow_sql_load_extension(pinkdb_handle *handle,
+                                            int32_t allow);
 
 /* Free a result. NULL-safe. */
 void pinkdb_result_free(pinkdb_result *result);

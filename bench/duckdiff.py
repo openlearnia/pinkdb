@@ -145,8 +145,13 @@ def pink_tables(setup, sql):
     script = setup + "\n" + sql + "\n.quit\n"
     # Errors go to stderr; merge it so an error stays in sequence with the
     # result tables.
+    # The SQL `LOAD EXTENSION` statement loads and runs native code, so it
+    # is off by default: the probes that need it opt in.
+    env = dict(os.environ)
+    env["PINKDB_ALLOW_LOAD_EXTENSION"] = "1"
     p = subprocess.run(PINKDB, input=script, stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True, timeout=300)
+                       stderr=subprocess.STDOUT, text=True, timeout=300,
+                       env=env)
     tables = []
     types, rows, state = None, [], 0  # 0 idle, 1 header, 2 types, 3 data
     for line in p.stdout.splitlines():

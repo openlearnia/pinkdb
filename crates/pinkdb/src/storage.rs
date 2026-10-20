@@ -883,12 +883,24 @@ pub struct PinkDb {
     /// snapshots of a keyed store are written encrypted (feature
     /// `encryption`); [`PinkDb::save`] stays a plaintext explicit API.
     pub(crate) encryption_key: Option<EncryptionKey>,
-    /// Whether the SQL `LOAD EXTENSION` statement may run (default `true`:
-    /// the embedded API is trusted). Network front-ends turn it off so a
-    /// remote client cannot make the host process `dlopen` a library. WAL
-    /// replay is unaffected: it runs at open, before a front-end can flip
-    /// this, and the Rust [`PinkDb::load_extension`] API is never gated.
+    /// Whether the SQL `LOAD EXTENSION` statement may run (default
+    /// **false**: loading an extension runs native code, so it is opt-in
+    /// everywhere — the embedded API, the C ABI, the CLI and the server).
+    /// The Rust [`PinkDb::load_extension`] API is a separate, explicit
+    /// choice by the host and is not gated by this switch.
     pub(crate) allow_sql_load_extension: bool,
+    /// Whether WAL replay may load an extension that the WAL records
+    /// (default **false**). A durable store that used an extension no
+    /// longer loads it on open: the recorded path is resolved against the
+    /// rules in [`crate::ext`], and unless the extension is already loaded
+    /// in this process (or the operator opted in *and* configured an
+    /// extension root) the open fails with an actionable error. Never
+    /// silently skipped, never auto-loaded.
+    pub(crate) allow_extension_replay: bool,
+    /// The directory every extension load is confined to, when set
+    /// (`None` = no root configured; the loader's own path rules still
+    /// apply). A path outside the root is refused.
+    pub(crate) extension_root: Option<std::path::PathBuf>,
     /// True only while [`PinkDb::replay_frames`] executes recovered WAL
     /// records (hazard H5): a replayed `LOAD EXTENSION` prefix may name an
     /// extension this process already has loaded (its own earlier record, or
@@ -973,6 +985,8 @@ impl Clone for PinkDb {
             wal_txn_sets: self.wal_txn_sets.clone(),
             encryption_key: self.encryption_key.clone(),
             allow_sql_load_extension: self.allow_sql_load_extension,
+            allow_extension_replay: self.allow_extension_replay,
+            extension_root: self.extension_root.clone(),
             replaying: false,
             attached_lakes: self.attached_lakes.clone(),
             table_sources: self.table_sources.clone(),
@@ -1029,7 +1043,9 @@ impl PinkDb {
             wal_txn_ext_loaded: Vec::new(),
             wal_txn_sets: crate::wal::FrameSets::default(),
             encryption_key: None,
-            allow_sql_load_extension: true,
+            allow_sql_load_extension: false,
+            allow_extension_replay: false,
+            extension_root: None,
             replaying: false,
             attached_lakes: Vec::new(),
             // Process-global table sources (`table_source::
@@ -1050,6 +1066,9 @@ impl PinkDb {
 
     /// Allow or refuse the SQL `LOAD EXTENSION` statement on this store
     /// (see the field docs; the Rust load API stays available either way).
+    ///
+    /// Off by default: the statement makes the host process load and run
+    /// native code from a path the SQL text names, so it is opt-in.
     pub fn set_allow_sql_load_extension(&mut self, allow: bool) {
         self.allow_sql_load_extension = allow;
     }
@@ -1057,6 +1076,36 @@ impl PinkDb {
     /// Whether the SQL `LOAD EXTENSION` statement may run on this store.
     pub fn allow_sql_load_extension(&self) -> bool {
         self.allow_sql_load_extension
+    }
+
+    /// Allow or refuse WAL replay to load an extension the WAL records
+    /// (default: refused).
+    ///
+    /// With this on, a replayed `LOAD EXTENSION '<path>'` is only honoured
+    /// when the path resolves inside the configured extension root (see
+    /// [`Self::set_extension_root`]); without a root, nothing is loaded.
+    /// Either way, an extension that is already loaded in this process is
+    /// reused as it is — never loaded a second time.
+    pub fn set_allow_extension_replay(&mut self, allow: bool) {
+        self.allow_extension_replay = allow;
+    }
+
+    /// Whether WAL replay may load an extension the WAL records.
+    pub fn allow_extension_replay(&self) -> bool {
+        self.allow_extension_replay
+    }
+
+    /// Confine every extension load to `root` (the directory that holds the
+    /// extension libraries). `None` removes the confinement; the loader's
+    /// own path rules (no bare names, no `..`, no symlinked library, regular
+    /// files only) always apply.
+    pub fn set_extension_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.extension_root = root;
+    }
+
+    /// The extension root this store confines loads to, if any.
+    pub fn extension_root(&self) -> Option<&std::path::Path> {
+        self.extension_root.as_deref()
     }
 
     /// Configure the at-rest key used by checkpoints and snapshots of this

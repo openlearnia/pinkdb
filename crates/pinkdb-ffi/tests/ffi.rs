@@ -105,6 +105,43 @@ fn errors_and_guards_through_the_c_abi() {
     pinkdb_close(h);
 }
 
+/// C-2: `LOAD EXTENSION` is refused by default through the C ABI, and
+/// `pinkdb_set_allow_sql_load_extension` flips the behavior.
+#[test]
+fn the_load_extension_switch_flips_the_behavior() {
+    let h = pinkdb_open_memory();
+    assert!(!h.is_null());
+
+    // Off by default: the statement is refused before anything is opened.
+    let sql = CString::new("LOAD EXTENSION '/definitely/not/a/lib.dylib';").unwrap();
+    let (ptr, len) = (sql.as_ptr(), sql.as_bytes().len());
+    let r = pinkdb_execute(h, ptr, len);
+    assert!(r.is_null(), "the statement must be refused by default");
+    let message = last_error();
+    assert!(message.contains("LOAD EXTENSION is disabled"), "{message}");
+
+    // The switch turns it on: the loader's own error proves the gate is no
+    // longer the blocker.
+    assert_eq!(pinkdb_set_allow_sql_load_extension(h, 1), 1);
+    let r = pinkdb_execute(h, ptr, len);
+    assert!(r.is_null());
+    let message = last_error();
+    assert!(!message.contains("LOAD EXTENSION is disabled"), "{message}");
+    assert!(message.contains("cannot load extension"), "{message}");
+
+    // And it turns it off again.
+    assert_eq!(pinkdb_set_allow_sql_load_extension(h, 0), 1);
+    let r = pinkdb_execute(h, ptr, len);
+    assert!(r.is_null());
+    assert!(last_error().contains("LOAD EXTENSION is disabled"));
+
+    // A NULL handle is refused, not a crash.
+    assert_eq!(pinkdb_set_allow_sql_load_extension(ptr::null_mut(), 1), 0);
+    assert!(last_error().contains("null handle"));
+
+    pinkdb_close(h);
+}
+
 #[test]
 fn ownership_loops_do_not_leak_or_corrupt() {
     let h = pinkdb_open_memory();

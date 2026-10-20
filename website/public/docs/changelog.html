@@ -186,6 +186,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-20">2026-10-20<a class="anchor" href="#2026-10-20" aria-label="Permalink: 2026-10-20">#</a></h2>
+<h3>Security hardening — pass 1: extension loading ✅</h3>
+<ul>
+<li><strong><code>LOAD EXTENSION</code> is off by default</strong> everywhere (engine, CLI, C ABI, bindings); enable it explicitly with <code>--allow-load-extension</code> / <code>PINKDB_ALLOW_LOAD_EXTENSION</code>, the new C-ABI switch, or the binding opt-ins.</li>
+<li><strong>Opening a database file can no longer execute native code recorded in its WAL</strong>: replay refuses a recorded <code>LOAD EXTENSION</code> unless the library is already mapped in the process or the new replay opt-in + extension root allow it — otherwise it is a hard, actionable error (the audit's reproduced attack is now a regression test, marker absent).</li>
+<li>Extensions are path-confined: no bare loader-path names, no <code>..</code>, no symlinked libraries, plus an optional <code>--extension-root</code> on server and CLI.</li>
+</ul>
 <h3>Security hardening — low-severity batch ✅</h3>
 <ul>
 <li>Redacted the login password from the server protocol's <code>Debug</code> output (L-2) and the SigV4 canonical request / session token from <code>Signature</code>'s (L-11).</li>

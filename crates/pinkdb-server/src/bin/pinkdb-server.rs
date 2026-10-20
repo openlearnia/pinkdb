@@ -4,6 +4,7 @@
 //! pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]
 //!               [--max-connections N] [--idle-timeout SECS]
 //!               [--transport sync|async] [--allow-load-extension]
+//!               [--extension-root PATH]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
 //! ```
 //!
@@ -27,7 +28,7 @@
 
 use std::process::ExitCode;
 
-use pinkdb::Database;
+use pinkdb::{Database, DurableOpenOptions};
 use std::time::Duration;
 
 use pinkdb_server::{DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONNECTIONS, Server};
@@ -52,6 +53,9 @@ struct Args {
     idle_timeout_secs: u64,
     transport: Transport,
     allow_load_extension: bool,
+    /// `--extension-root PATH`: the directory every extension load is
+    /// confined to.
+    extension_root: Option<String>,
     /// `--tls-cert PATH`: must be paired with `--tls-key`.
     tls_cert: Option<String>,
     /// `--tls-key PATH`: must be paired with `--tls-cert`.
@@ -62,6 +66,7 @@ fn usage() -> &'static str {
     "Usage: pinkdb-server [--host HOST] [--port PORT] [--file PATH.pink]\n\
      \x20                    [--max-connections N] [--idle-timeout SECS]\n\
      \x20                    [--transport sync|async] [--allow-load-extension]\n\
+     \x20                    [--extension-root PATH]\n\
      \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
@@ -74,6 +79,9 @@ fn usage() -> &'static str {
      \x20                        build with the `async-server` feature)\n\
      \x20 --allow-load-extension let clients run LOAD EXTENSION (loads native code on\n\
      \x20                        the server host; off by default)\n\
+     \x20 --extension-root PATH  confine every extension load to this directory (a path\n\
+     \x20                        outside it is refused; a bare library name, a `..`\n\
+     \x20                        component and a symlinked library are always refused)\n\
      \x20 --tls-cert PATH        serve TLS with this PEM certificate chain\n\
      \x20 --tls-key PATH         PEM private key matching --tls-cert (PKCS#8/#1/SEC1);\n\
      \x20                        both or neither, and only in a build with `tls`\n\
@@ -95,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
         idle_timeout_secs: DEFAULT_IDLE_TIMEOUT.as_secs(),
         transport: Transport::Sync,
         allow_load_extension: false,
+        extension_root: None,
         tls_cert: None,
         tls_key: None,
     };
@@ -155,6 +164,7 @@ fn parse_args() -> Result<Args, String> {
                 }
             }
             "--allow-load-extension" if inline.is_none() => args.allow_load_extension = true,
+            "--extension-root" => args.extension_root = Some(value("--extension-root")?),
             "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             other => return Err(format!("unknown argument {other:?}")),
@@ -189,15 +199,47 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let db = match &args.file {
-        Some(path) => match Database::open(path) {
-            Ok(db) => db,
-            Err(e) => {
-                eprintln!("Error: cannot open durable database {path:?}: {e}");
-                return ExitCode::FAILURE;
+    // The extension root: every extension load is confined to it.
+    let extension_root: Option<std::path::PathBuf> = match &args.extension_root {
+        Some(root) => {
+            let root = std::path::PathBuf::from(root);
+            if !root.is_dir() {
+                eprintln!(
+                    "Error: --extension-root {:?} is not a directory",
+                    root.display()
+                );
+                return ExitCode::from(2);
             }
-        },
-        None => Database::new(),
+            Some(root)
+        }
+        None => None,
+    };
+
+    let db = match &args.file {
+        Some(path) => {
+            // The durable open carries the extension policy: a WAL that
+            // records an extension is only replayed into a load when the
+            // operator opted in *and* the library is inside the extension
+            // root. Without the opt-in the open fails with an actionable
+            // error instead of loading a path the file names.
+            let opts = DurableOpenOptions {
+                allow_extension_replay: args.allow_load_extension,
+                extension_root: extension_root.clone(),
+                ..DurableOpenOptions::default()
+            };
+            match Database::open_with_options(path, opts) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("Error: cannot open durable database {path:?}: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => {
+            let db = Database::new();
+            db.set_extension_root(extension_root.clone());
+            db
+        }
     };
 
     let mode = match &args.file {
@@ -234,7 +276,8 @@ fn main() -> ExitCode {
             let server = match bound {
                 Ok(server) => server
                     .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
-                    .allow_load_extension(args.allow_load_extension),
+                    .allow_load_extension(args.allow_load_extension)
+                    .extension_root(extension_root.clone()),
                 Err(e) => {
                     eprintln!("Error: cannot bind {}:{}: {e}", args.host, args.port);
                     return ExitCode::FAILURE;
@@ -266,7 +309,8 @@ fn main() -> ExitCode {
             ) {
                 Ok(server) => server
                     .idle_timeout(Some(Duration::from_secs(args.idle_timeout_secs)))
-                    .allow_load_extension(args.allow_load_extension),
+                    .allow_load_extension(args.allow_load_extension)
+                    .extension_root(extension_root.clone()),
                 Err(e) => {
                     eprintln!("Error: cannot bind {}:{}: {e}", args.host, args.port);
                     return ExitCode::FAILURE;

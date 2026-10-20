@@ -247,6 +247,11 @@ func (db *DB) ABI() uint32 {
 // bytes are preserved. Errors carry the message from pinkdb_last_error and
 // leave the database usable. After Close, Execute returns ErrClosed (the only
 // method that fails on a closed DB).
+//
+// The SQL statement LOAD EXTENSION '<path>' loads and runs native code from a
+// path the SQL text names. It is disabled by default: SetAllowLoadExtension
+// has to enable it first. Do not enable it for a database whose SQL comes
+// from untrusted input.
 func (db *DB) Execute(sql string) ([]Result, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -282,6 +287,36 @@ func (db *DB) executeNative(sqlPtr *C.char, sqlLen C.size_t) (*C.pinkdb_result, 
 		return nil, nativeError()
 	}
 	return result, nil
+}
+
+// SetAllowLoadExtension allows or refuses the SQL LOAD EXTENSION '<path>'
+// statement on this database.
+//
+// The statement makes the host process load and run a native library from a
+// path the SQL text names — arbitrary native code execution for anyone who
+// can influence the SQL. It is disabled by default, so Execute cannot load
+// native code until this is called with true.
+//
+// Only enable it for a database whose SQL comes from a trusted source. The
+// loaded path must name a regular file inside a directory (a bare library
+// name, which the dynamic loader would resolve through its search path, is
+// refused), and it must not be a symlink.
+//
+// It returns ErrClosed after Close.
+func (db *DB) SetAllowLoadExtension(allow bool) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed {
+		return ErrClosed
+	}
+	value := C.int32_t(0)
+	if allow {
+		value = 1
+	}
+	if C.pinkdb_set_allow_sql_load_extension(db.handle, value) == 0 {
+		return nativeError()
+	}
+	return nil
 }
 
 // Close frees the native handle. It is idempotent: after the first call,

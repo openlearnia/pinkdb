@@ -1874,3 +1874,35 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   duckdiff **339/339**, fmt/clippy both toolchains, wasm green, YAML/shell
   validated. No format change; no new crates. Pass 1 (extension RCE)
   remains separate.
+
+- 2026-10-20 — Security hardening, pass 1: extension-loading RCE (review
+  C-1/C-2/H-7; worktree `wt-sec1`). `LOAD EXTENSION` is now **off by default**
+  everywhere (engine store default false; C ABI
+  `pinkdb_set_allow_sql_load_extension`; CLI `--allow-load-extension` /
+  `PINKDB_ALLOW_LOAD_EXTENSION`; Python/Go binding opt-ins; the C header now
+  documents that `pinkdb_execute` can load native code). **WAL replay never
+  auto-loads code from a file**: the replay force-allow is deleted,
+  `DurableOpenOptions` gained `allow_extension_replay` (default false) and
+  `extension_root` (default None), and a recorded load resolves in this order —
+  already loaded in this process by **canonical path** (the mapped image is
+  reused: no `dlopen`, no constructor, no re-init) → opt-in with a path
+  **inside the root** → **hard error at open** naming both options (never a
+  silent skip). The WAL now records the canonical path. Loader: bare names
+  (dynamic-loader search path), `..`, symlinked libraries and non-regular
+  files are refused; paths are canonicalized; `load_in_root` /
+  `resolve_path_in_root` confine to a root; server and CLI gained
+  `--extension-root`. The review's A.1 attack is a **passing regression test**
+  (a fixture extension whose constructor writes a marker: the marker must stay
+  absent after reopen, and the open fails unless the opt-in + matching root
+  allow it), plus default-off, C-ABI switch, confinement, server/CLI flag and
+  binding tests. Documented behavior change: a durable store that used an
+  extension refuses to open unless the extension is already mapped in-process
+  or the replay opt-in + root are supplied. Gates: pinkdb **644**, ext-loader
+  72 → **81**, server **70/87/81**, CLI **77/82/87**, FFI 16 → **17**, Python
+  **60**, Go **40**, workspace 1198 → **1217**, duckdiff **339/339**, fmt and
+  clippy clean on both toolchains, wasm green. Size: default CLI **+37,056 B**
+  (the gate cannot be feature-gated). Residual risk recorded: already-mapped
+  libraries can be re-enabled by a crafted file (no new code runs), a TOCTOU
+  window remains between validation and `dlopen`, a root-contained library's
+  `DT_NEEDED` dependencies are not confined, and `PinkDb::load_extension`
+  stays host-trusted.

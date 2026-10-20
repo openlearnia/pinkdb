@@ -214,7 +214,7 @@ fn fixture_extension() -> PathBuf {
 fn extension_calls_inside_a_body_are_refused() {
     let ext = fixture_extension();
     let (out, err, code) = run_split(
-        &[],
+        &["--allow-load-extension"],
         &format!(
             "LOAD EXTENSION '{}';\n\
              CREATE TABLE t (a INTEGER);\n\
@@ -230,7 +230,7 @@ fn extension_calls_inside_a_body_are_refused() {
     assert!(err.contains("loadable-extension"), "{err}");
     // The call is atomic: the refused statement left nothing behind.
     let (out, err, code) = run_split(
-        &[],
+        &["--allow-load-extension"],
         &format!(
             "LOAD EXTENSION '{}';\n\
              CREATE TABLE t (a INTEGER);\n\

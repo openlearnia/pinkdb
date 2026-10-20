@@ -173,8 +173,20 @@ impl AsyncServer {
     /// Let remote clients run SQL `LOAD EXTENSION` (default: refused). Only
     /// for trusted networks: the statement makes the server process load and
     /// run a native library from its own filesystem.
+    ///
+    /// Combine it with [`AsyncServer::extension_root`] to confine the paths
+    /// a remote client may name to one directory.
     pub fn allow_load_extension(self, allow: bool) -> Self {
         self.db.set_allow_sql_load_extension(allow);
+        self
+    }
+
+    /// Confine every extension load of the served database to `root` (the
+    /// directory that holds the extension libraries). `None` removes the
+    /// confinement; the loader's own path rules (a directory, no `..`, a
+    /// regular file, not a symlink) always apply.
+    pub fn extension_root(self, root: Option<std::path::PathBuf>) -> Self {
+        self.db.set_extension_root(root);
         self
     }
 

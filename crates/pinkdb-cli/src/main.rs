@@ -9,6 +9,7 @@
 //! failed. A statement still open at end of input runs as if terminated.
 
 use std::io::IsTerminal;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -17,6 +18,16 @@ static HAD_ERROR: AtomicBool = AtomicBool::new(false);
 
 /// `.timer on|off` (default: on for an interactive terminal, else off).
 static TIMER: AtomicBool = AtomicBool::new(false);
+
+/// Whether the SQL `LOAD EXTENSION` statement may run in this session
+/// (`--allow-load-extension`, or `PINKDB_ALLOW_LOAD_EXTENSION=1`).
+///
+/// **Off by default**: the statement makes the process load and run a native
+/// library from a path the SQL text names.
+static ALLOW_LOAD_EXTENSION: AtomicBool = AtomicBool::new(false);
+
+/// The directory every extension load is confined to (`--extension-root`).
+static EXTENSION_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
 /// Report a failed statement or command: `Error: …` on stderr, and remember
 /// it for the exit status.
@@ -956,6 +967,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                     let key = db.encryption_key().cloned();
                     *db = PinkDb::new();
                     db.set_encryption_key(key);
+                    apply_extension_policy(db);
                     load_builtin_extensions(db);
                 }
                 // `PINKDB_KEY` (if set) is already installed on the store, so
@@ -983,6 +995,7 @@ fn run_dot_local(db: &mut PinkDb, line: &str) -> bool {
                             );
                         }
                         *db = new_db;
+                        apply_extension_policy(db);
                         load_builtin_extensions(db);
                         println!("Opened {path}");
                     }
@@ -1263,6 +1276,13 @@ struct Opts {
     tls_ca_cert: Option<String>,
     /// `--tls-insecure`: skip certificate verification (local tests only).
     tls_insecure: bool,
+    /// `--allow-load-extension`: let the SQL `LOAD EXTENSION` statement run
+    /// (it loads and runs native code). Also honoured through
+    /// `PINKDB_ALLOW_LOAD_EXTENSION=1`.
+    allow_load_extension: bool,
+    /// `--extension-root PATH`: confine every extension load to this
+    /// directory.
+    extension_root: Option<String>,
 }
 
 fn print_usage() {
@@ -1279,6 +1299,14 @@ fn print_usage() {
     println!("  --password PASS    the login password; PINKDB_PASSWORD is read when the");
     println!("                     flag is absent (a flag value is visible to other local");
     println!("                     users through the process list and the shell history)");
+    println!("  --allow-load-extension");
+    println!("                     let SQL `LOAD EXTENSION '<path>'` run: it loads and runs");
+    println!("                     native code from a path the SQL names (off by default;");
+    println!("                     PINKDB_ALLOW_LOAD_EXTENSION=1 does the same)");
+    println!("  --extension-root PATH");
+    println!("                     confine every extension load to this directory (a path");
+    println!("                     outside it, a bare library name, a `..` component and a");
+    println!("                     symlinked library are always refused)");
     if cfg!(feature = "tls") {
         println!("  --tls              encrypt the remote connection (TLS)");
         println!("  --tls-ca-cert PATH PEM certificate to trust for the server (a CA, or the");
@@ -1298,6 +1326,8 @@ fn parse_args() -> Result<Opts, String> {
         tls: false,
         tls_ca_cert: None,
         tls_insecure: false,
+        allow_load_extension: false,
+        extension_root: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1329,6 +1359,14 @@ fn parse_args() -> Result<Opts, String> {
             }
             "--tls" => opts.tls = true,
             "--tls-insecure" => opts.tls_insecure = true,
+            "--allow-load-extension" => opts.allow_load_extension = true,
+            "--extension-root" => {
+                let value = args.next().ok_or("--extension-root requires a path")?;
+                opts.extension_root = Some(value);
+            }
+            other if other.starts_with("--extension-root=") => {
+                opts.extension_root = Some(other["--extension-root=".len()..].to_string());
+            }
             "--tls-ca-cert" => {
                 let value = args.next().ok_or("--tls-ca-cert requires a path")?;
                 opts.tls_ca_cert = Some(value);
@@ -1461,6 +1499,7 @@ fn build_session(opts: &Opts, key: Option<EncryptionKey>) -> Session {
         None => {
             let mut db = PinkDb::new();
             db.set_encryption_key(key);
+            apply_extension_policy(&mut db);
             load_builtin_extensions(&mut db);
             Session::Local(LocalSession::new(db))
         }
@@ -1546,6 +1585,12 @@ fn remote_session(mut client: Client, opts: &Opts) -> Session {
 /// Durable-open options from the environment: `PINKDB_BUSY_TIMEOUT_MS`
 /// (optional) bounds how long `.open` and later statements wait for another
 /// process's write lease before reporting the database busy.
+///
+/// The extension policy rides along: a WAL that records an extension is
+/// replayed into a load only when the operator opted in
+/// (`--allow-load-extension`) *and* the library is inside the extension root
+/// (`--extension-root`). Without the opt-in, such a database fails to open
+/// with an actionable error instead of loading a path the file names.
 fn durable_options() -> DurableOpenOptions {
     let mut opts = DurableOpenOptions::default();
     if let Ok(ms) = std::env::var("PINKDB_BUSY_TIMEOUT_MS")
@@ -1553,7 +1598,25 @@ fn durable_options() -> DurableOpenOptions {
     {
         opts.busy_timeout = std::time::Duration::from_millis(ms);
     }
+    opts.allow_extension_replay = ALLOW_LOAD_EXTENSION.load(Ordering::Relaxed);
+    opts.extension_root = extension_root();
     opts
+}
+
+/// The configured extension root, if any.
+fn extension_root() -> Option<std::path::PathBuf> {
+    EXTENSION_ROOT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Apply the CLI's extension policy to a store: whether the SQL
+/// `LOAD EXTENSION` statement may run, and the directory every extension
+/// load is confined to.
+fn apply_extension_policy(db: &mut PinkDb) {
+    db.set_allow_sql_load_extension(ALLOW_LOAD_EXTENSION.load(Ordering::Relaxed));
+    db.set_extension_root(extension_root());
 }
 
 fn main() {
@@ -1565,6 +1628,29 @@ fn main() {
             std::process::exit(2);
         }
     };
+    // The extension policy of this session: `LOAD EXTENSION` is off unless
+    // the operator asked for it (the flag or the environment variable), and
+    // every load is confined to the extension root when one is configured.
+    let allow_load_extension = opts.allow_load_extension
+        || matches!(
+            std::env::var("PINKDB_ALLOW_LOAD_EXTENSION")
+                .ok()
+                .as_deref()
+                .map(str::trim),
+            Some("1") | Some("true") | Some("yes")
+        );
+    ALLOW_LOAD_EXTENSION.store(allow_load_extension, Ordering::Relaxed);
+    if let Some(root) = &opts.extension_root {
+        let root = std::path::PathBuf::from(root);
+        if !root.is_dir() {
+            eprintln!(
+                "Error: --extension-root {:?} is not a directory",
+                root.display()
+            );
+            std::process::exit(2);
+        }
+        *EXTENSION_ROOT.lock().unwrap_or_else(|p| p.into_inner()) = Some(root);
+    }
     // The linked registry must know the CLI's built-in extensions before any
     // store is created: a durable reopen whose WAL replays a json record
     // resolves the name here during replay.

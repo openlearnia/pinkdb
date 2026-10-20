@@ -482,6 +482,19 @@ pub struct DurableOpenOptions {
     /// for hosts that want to retry themselves.
     pub busy_timeout: Duration,
     pub lock_mode: LockMode,
+    /// Whether WAL replay may load an extension the WAL records (default
+    /// **false**).
+    ///
+    /// A durable store that used a native extension no longer loads it when
+    /// it is opened: the recorded path is never `dlopen`ed on the file's
+    /// say-so. With this on, the recorded path is still only honoured when
+    /// it resolves inside `extension_root` — an extension that is already
+    /// loaded in this process is reused as it is, and anything else fails
+    /// the open with an actionable error.
+    pub allow_extension_replay: bool,
+    /// The directory extension loads are confined to (`None` = no root).
+    /// A recorded path outside the root is refused.
+    pub extension_root: Option<PathBuf>,
 }
 
 impl Default for DurableOpenOptions {
@@ -490,6 +503,8 @@ impl Default for DurableOpenOptions {
             policy: SyncPolicy::Sync,
             busy_timeout: Duration::from_secs(5),
             lock_mode: LockMode::Required,
+            allow_extension_replay: false,
+            extension_root: None,
         }
     }
 }
@@ -3476,6 +3491,11 @@ impl PinkDb {
             PinkDb::new()
         };
         db.encryption_key = key.cloned();
+        // The extension policy of this open, applied *before* the replay:
+        // a recorded `LOAD EXTENSION` is resolved against these settings
+        // (see `PinkDb::resolve_replay_extension`), never auto-loaded.
+        db.allow_extension_replay = opts.allow_extension_replay;
+        db.extension_root = opts.extension_root.clone();
         // When the live WAL is missing or torn, continue the generation
         // sequence past every roll (recovery has already recreated the file
         // with this generation when that was needed).
@@ -4042,9 +4062,10 @@ impl PinkDb {
     /// Replay recovered frames into the LIVE store: WAL detached so nothing
     /// re-enters logging/publishing/auto-checkpoint (H1), replay in the WAL
     /// lineage session with the local session restored afterwards (H2/H3),
-    /// `LOAD EXTENSION` not gated by the SQL front-end switch (H5), and the
-    /// deterministic hard-error policy (H6). `local_session` is the session
-    /// the store had before the refresh (a full rebuild must preserve it).
+    /// extension loads resolved against the store's extension policy (H5),
+    /// and the deterministic hard-error policy (H6). `local_session` is the
+    /// session the store had before the refresh (a full rebuild must
+    /// preserve it).
     fn replay_frames(
         &mut self,
         wal: &mut Wal,
@@ -4065,14 +4086,15 @@ impl PinkDb {
             _ => self.fallback_db(),
         };
         self.set_current_db(&start);
-        // H5: the SQL `LOAD EXTENSION` gate is a front-end policy; WAL replay
-        // must be able to re-load the extensions its records need. A record
-        // may also re-load an extension this process already has mapped
-        // (the registry is process-local and never persisted, so a registry
-        // outlives the records that loaded it): replay mode turns an exact
-        // path match into a no-op instead of a duplicate-load error.
-        let allow = self.allow_sql_load_extension;
-        self.allow_sql_load_extension = true;
+        // H5: a replayed `LOAD EXTENSION` is never auto-loaded. The record
+        // may name an extension this process already has mapped (the
+        // registry is process-local and never persisted, so a registry
+        // outlives the records that loaded it): such a record is satisfied
+        // by the loaded library, without a second `dlopen`. Anything else
+        // needs the operator's explicit opt-in (`allow_extension_replay`)
+        // *and* an extension root that contains the library — otherwise the
+        // replay fails with an actionable error (see
+        // `PinkDb::resolve_replay_extension`).
         let previously_loaded: HashSet<String> =
             self.loaded_extension_paths().into_iter().collect();
         self.replaying = true;
@@ -4084,7 +4106,6 @@ impl PinkDb {
             }
         }
         self.replaying = false;
-        self.allow_sql_load_extension = allow;
         if result.is_ok() {
             // Extensions these frames loaded are covered by the current WAL
             // generation: a later record touching one of them must not emit

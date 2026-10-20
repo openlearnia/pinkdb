@@ -295,6 +295,8 @@ fn load_extension_sql_resolves_registered_names() {
     let name = "wave49_sql_stmt";
     linked::register(demo(name)).unwrap();
     let mut db = PinkDb::new();
+    // The statement is off by default (it loads and runs native code).
+    db.set_allow_sql_load_extension(true);
 
     let sql = format!("LOAD EXTENSION '{name}';");
     match db.execute(&sql).unwrap().pop().unwrap() {
@@ -313,9 +315,11 @@ fn load_extension_sql_resolves_registered_names() {
     assert!(e.contains("is already loaded"), "{e}");
 
     // A string that is neither a loadable library nor a registered name keeps
-    // the dlopen error — the registry fallback never hides it.
+    // the load error — the registry fallback never hides it. A bare name (no
+    // directory) is refused outright: the dynamic loader would resolve it
+    // through its own search path.
     let e = error(&mut db, "LOAD EXTENSION 'wave49_absent_extension.dylib';");
-    assert!(e.contains("cannot load extension"), "{e}");
+    assert!(e.contains("is not a loadable path"), "{e}");
     assert!(
         e.contains("wave49_absent_extension.dylib"),
         "the path must be named: {e}"
@@ -490,6 +494,8 @@ fn durable_records_touching_linked_functions_replay() {
 
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        // The statement is off by default (it loads and runs native code).
+        db.set_allow_sql_load_extension(true);
         let sql = format!(
             "LOAD EXTENSION '{name}'; CREATE TABLE t (a INTEGER); \
              INSERT INTO t VALUES (1), (2), (3);"

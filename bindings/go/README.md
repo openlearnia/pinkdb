@@ -53,6 +53,7 @@ func main() {
 | `Open(path string) (*DB, error)` | Open a durable database (checkpoint + WAL) at `path`. |
 | `OpenMemory() (*DB, error)` | Open a fresh, empty in-memory database. |
 | `(*DB).Execute(sql string) ([]Result, error)` | Run one or more `;`-separated statements; one `Result` per statement. |
+| `(*DB).SetAllowLoadExtension(allow bool) error` | Allow or refuse the SQL `LOAD EXTENSION '<path>'` statement (off by default). |
 | `(*DB).Prepare(sql string) (*Stmt, error)` | Parse exactly one statement with `?` placeholders into a reusable `Stmt`. |
 | `(*Stmt).Execute(args ...any) (Result, error)` | Bind one value per `?` and run the statement once. |
 | `(*Stmt).ParameterCount() int` | Number of `?` placeholders. |
@@ -67,6 +68,12 @@ or one containing a NUL byte before any native call; a path with invalid
 UTF-8 fails at the native boundary with `path is not valid UTF-8`. SQL that
 is not valid UTF-8 fails with `SQL is not valid UTF-8` and leaves the handle
 usable.
+
+> **Security.** The SQL statement `LOAD EXTENSION '<path>'` makes the host
+> process load and run a native library from a path the SQL text names. It is
+> **disabled by default**: call `(*DB).SetAllowLoadExtension(true)` to enable
+> it for a handle whose SQL comes from a trusted source. Never enable it for
+> a database whose SQL is influenced by untrusted input.
 
 `Result` mirrors one statement's outcome:
 

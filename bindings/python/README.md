@@ -44,6 +44,12 @@ with pinkdb.connect_memory() as db:            # or pinkdb.connect("data.pink")
 `Database.execute(sql)` runs one or more `;`-separated statements and returns
 a list of `Result` objects, one per statement:
 
+> **Security.** The SQL statement `LOAD EXTENSION '<path>'` makes the host
+> process load and run a native library from a path the SQL text names. It is
+> **disabled by default**: call `Database.allow_load_extension(True)` to
+> enable it for a handle whose SQL comes from a trusted source. Never enable
+> it for a database whose SQL is influenced by untrusted input.
+
 | Attribute | Contents |
 |---|---|
 | `kind` | `selected`, `created`, `inserted`, `updated`, `deleted`, `began`, `committed`, `rolledback`, `created_view`, `dropped_table`, `dropped_view`, `created_database`, `dropped_database`, `used`, `loaded_extension`, `checkpointed`, `altered_table`, `created_user`, `altered_user`, `dropped_user`, `created_role`, `dropped_role`, `granted`, `revoked` |

@@ -12,6 +12,25 @@
 //! `pinkdb-ext-loader` crate and is native-only, the engine stays
 //! zero-unsafe, and the built-in binder/executor path is unchanged when no
 //! extension is loaded. See `docs/wasm-extensions.md` for the wasm model.
+//!
+//! # Loading native code is opt-in
+//!
+//! The SQL statement `LOAD EXTENSION '<path>'` makes the process load and
+//! run a native library, so it is **refused by default** on every store:
+//! the embedded API, the C ABI, the CLI and the server all require an
+//! explicit opt-in ([`db::Database::set_allow_sql_load_extension`]). The
+//! paths themselves are confined by the loader's rules — a directory (never
+//! a bare name the dynamic loader would search for), no `..`, a regular
+//! file, no symlink — and by the store's extension root when it has one
+//! ([`db::Database::set_extension_root`]).
+//!
+//! WAL replay never loads a path recovered from a file. A durable store that
+//! used an extension now **fails to open** unless the extension is already
+//! loaded in this process, or the open opted into extension replay
+//! ([`wal::DurableOpenOptions::allow_extension_replay`]) *and* configured an
+//! extension root ([`wal::DurableOpenOptions::extension_root`]). The open
+//! fails with an actionable error — the record is never skipped silently
+//! and the library is never loaded behind the operator's back.
 
 pub mod attached;
 pub mod crypto;

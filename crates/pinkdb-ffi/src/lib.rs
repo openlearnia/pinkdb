@@ -17,6 +17,9 @@
 //! - prepared statements (`pinkdb_prepare`) take one `pink_value` per `?`
 //!   placeholder, in textual order; the value structs are read during the
 //!   call only (VARCHAR payloads are copied).
+//! - the SQL statement `LOAD EXTENSION '<path>'` loads and runs native code
+//!   and is **disabled by default**: `pinkdb_execute` can only load native
+//!   code after `pinkdb_set_allow_sql_load_extension` has enabled it.
 
 // Raw-pointer arguments are NULL-checked before every dereference and the
 // pointer-taking signatures are dictated by the C ABI, so the lint that wants
@@ -527,6 +530,32 @@ pub extern "C" fn pinkdb_execute(
             ptr::null_mut()
         }
     }
+}
+
+/// Allow (non-zero) or refuse (zero) the SQL `LOAD EXTENSION` statement on
+/// this handle. Returns 1 on success, 0 on failure (a NULL handle — see
+/// `pinkdb_last_error`).
+///
+/// # Security
+///
+/// `LOAD EXTENSION '<path>'` makes the host process load and run a native
+/// library from a path the SQL text names. It is **disabled by default** on
+/// every handle: `pinkdb_execute` can only load native code after this
+/// function has enabled it. Enable it only for a handle whose SQL text comes
+/// from a trusted source — an application that forwards untrusted input to
+/// `pinkdb_execute` inherits arbitrary native code execution otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_set_allow_sql_load_extension(handle: *mut PinkHandle, allow: i32) -> i32 {
+    if handle.is_null() {
+        set_error("null handle");
+        return 0;
+    }
+    clear_error();
+    // SAFETY: non-null (checked) and uniquely owned per the single-handle
+    // contract; no other reference exists during the call.
+    let h = unsafe { &mut *handle };
+    h.db.set_allow_sql_load_extension(allow != 0);
+    1
 }
 
 /// Read an `(ptr, len)` SQL argument as UTF-8, setting the thread-local error

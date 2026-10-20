@@ -1098,6 +1098,43 @@ fn load_extension_is_refused_for_remote_clients_by_default() {
     assert!(!msg.contains("LOAD EXTENSION is disabled"), "{msg}");
 }
 
+/// H-7: with an extension root configured, a remote client cannot name a
+/// path outside it — the load is refused before the file is touched.
+#[test]
+fn a_remote_client_cannot_load_a_path_outside_the_extension_root() {
+    let dir = std::env::temp_dir().join(format!("pinkdb_server_root_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("root")).unwrap();
+    let outside = dir.join("outside.dylib");
+    let inside = dir.join("root").join("inside.dylib");
+
+    let server = Server::bind("127.0.0.1:0", Database::new())
+        .unwrap()
+        .allow_load_extension(true)
+        .extension_root(Some(dir.join("root")));
+    let addr = server.local_addr().to_string();
+    let _handle = server.spawn().unwrap();
+    let mut c = Client::connect(&addr).unwrap();
+
+    // Outside the root: refused, whatever the file is.
+    let msg = c
+        .execute(&format!("LOAD EXTENSION '{}';", outside.display()))
+        .expect_err("a path outside the root must be refused")
+        .to_string();
+    assert!(msg.contains("outside the extension root"), "{msg}");
+
+    // Inside the root: the confinement lets it through and the loader
+    // reports the missing file (the gate is not the blocker any more).
+    let msg = c
+        .execute(&format!("LOAD EXTENSION '{}';", inside.display()))
+        .expect_err("the missing library still errors")
+        .to_string();
+    assert!(!msg.contains("outside the extension root"), "{msg}");
+    assert!(msg.contains("cannot load extension"), "{msg}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn idle_clients_are_disconnected_and_announced_frames_are_not_preallocated() {
     let server = Server::bind("127.0.0.1:0", Database::new())

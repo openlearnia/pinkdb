@@ -904,26 +904,25 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             Ok(QueryResult::Checkpointed)
         }
         LogicalPlan::LoadExtension { path } => {
+            if db.replaying {
+                // WAL replay (hazard H5): a recorded path is never loaded on
+                // the file's say-so. The replay resolves it against the
+                // store's extension policy — an extension already loaded in
+                // this process is reused as it is, a path inside the
+                // configured extension root is loaded only when the operator
+                // opted in, and anything else fails the replay with an
+                // actionable error (never a silent skip).
+                let name = db.resolve_replay_extension(path)?;
+                return Ok(QueryResult::LoadedExtension { name });
+            }
             if !db.allow_sql_load_extension() {
                 return Err(PinkDbError::Execution(
-                    "LOAD EXTENSION is disabled on this connection (the server \
-                     must be started with --allow-load-extension)"
+                    "LOAD EXTENSION is disabled on this connection (it is off by default: \
+                     it makes the process load and run native code from a path the SQL names; \
+                     enable it explicitly — the server's --allow-load-extension flag, or \
+                     Database::set_allow_sql_load_extension(true))"
                         .to_string(),
                 ));
-            }
-            // WAL replay (hazard H5): a replayed `LOAD EXTENSION` prefix may
-            // name an extension this process already has loaded — its own
-            // earlier record, or a record a checkpoint rolled away while the
-            // in-process registry (which is never persisted) kept the
-            // library mapped. The record's intent is "the extension must be
-            // available here"; an exact path match already satisfies it, so
-            // it is a no-op instead of the user-facing duplicate error. A
-            // different path claiming the same name still fails in
-            // `load_extension` (running `init` twice would corrupt it).
-            if db.replaying
-                && let Some(name) = db.loaded_extension_name_for_path(path)
-            {
-                return Ok(QueryResult::LoadedExtension { name });
             }
             // Process-level side effect: load the library (native) or
             // resolve the name in the linked registry (wasm; natively too,

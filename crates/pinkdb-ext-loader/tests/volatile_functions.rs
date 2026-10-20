@@ -288,6 +288,8 @@ fn deterministic_statements_replay_and_volatile_ones_never_reach_the_wal() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        // The statement is off by default (it loads and runs native code).
+        db.set_allow_sql_load_extension(true);
         db.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a BIGINT);"
         ))
@@ -338,6 +340,8 @@ fn legacy_registrations_still_wal_log_and_replay() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        // The statement is off by default (it loads and runs native code).
+        db.set_allow_sql_load_extension(true);
         db.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER);"
         ))
@@ -421,6 +425,8 @@ fn linked_volatile_functions_obey_the_same_rule() {
     // The same rule through a Connection's session (a fresh store loading
     // the same registry entry by name).
     let shared = Database::from_store(PinkDb::new());
+    // The statement is off by default (it loads and runs native code).
+    shared.set_allow_sql_load_extension(true);
     let mut conn = shared.connect();
     conn.execute(&format!("LOAD EXTENSION '{name}';")).unwrap();
     conn.execute("CREATE TABLE t (a INTEGER);").unwrap();

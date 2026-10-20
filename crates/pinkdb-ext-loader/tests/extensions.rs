@@ -37,6 +37,15 @@ fn error(db: &mut PinkDb, sql: &str) -> String {
     }
 }
 
+/// Let the SQL `LOAD EXTENSION` statement run on this store.
+///
+/// The statement loads and runs native code, so it is **off by default** on
+/// every store (the engine, the C ABI, the CLI and the server all require an
+/// explicit opt-in). These tests exercise the loader, so they opt in.
+fn allow_load(db: &mut PinkDb) {
+    db.set_allow_sql_load_extension(true);
+}
+
 fn ints(rows: &[Vec<Value>]) -> Vec<i64> {
     rows.iter()
         .map(|r| match r[0] {
@@ -652,6 +661,7 @@ fn conn_rows(conn: &mut pinkdb::Connection, sql: &str) -> Vec<Vec<Value>> {
 fn load_extension_statement_loads_and_registers() {
     let path = common::extension_path("test_ext");
     let mut db = PinkDb::new();
+    allow_load(&mut db);
     // Nothing is registered before the statement.
     assert_eq!(
         error(&mut db, "SELECT ext_double_it(21);"),
@@ -678,6 +688,7 @@ fn load_extension_statement_loads_and_registers() {
 
     // A multi-statement string: the LOAD applies to everything after it.
     let mut db2 = PinkDb::new();
+    allow_load(&mut db2);
     let sql = format!(
         "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER); \
          INSERT INTO t VALUES (1), (2), (3); SELECT SUM(ext_double_it(a)) FROM t;"
@@ -695,6 +706,7 @@ fn load_extension_statement_loads_and_registers() {
 fn load_extension_statement_works_through_connections() {
     let path = common::extension_path("test_ext");
     let db = Database::from_store(PinkDb::new());
+    db.set_allow_sql_load_extension(true);
     let mut c1 = db.connect();
     match c1
         .execute(&format!("LOAD EXTENSION '{path}';"))
@@ -716,6 +728,7 @@ fn load_extension_statement_works_through_connections() {
 #[test]
 fn load_extension_statement_failures_are_clear_errors() {
     let mut db = PinkDb::new();
+    allow_load(&mut db);
 
     // A missing file / bad path is an execution error naming the path.
     let e = error(
@@ -768,6 +781,7 @@ fn load_extension_statement_failures_are_clear_errors() {
 fn reloading_the_same_extension_statement_is_a_clear_error() {
     let path = common::extension_path("test_ext");
     let mut db = PinkDb::new();
+    allow_load(&mut db);
     db.execute(&format!("LOAD EXTENSION '{path}';")).unwrap();
     // Reload is *not* silently idempotent: the second load reports the
     // already-loaded extension name (pinned decision, same as the library
@@ -819,8 +833,14 @@ fn load_extension_inside_a_transaction_is_refused() {
     assert_eq!(e, "unknown function \"ext_double_it\"");
 }
 
+/// A durable record that touches the extension is prefixed with
+/// `LOAD EXTENSION '<path>'`; reopening replays that prefix.
+///
+/// The replay never loads the path again: the library this process already
+/// has mapped is reused (same canonical path), so the extension's functions
+/// are available and no second `dlopen` happens.
 #[test]
-fn wal_replay_reloads_the_extension() {
+fn wal_replay_reuses_the_already_loaded_extension() {
     let path = common::extension_path("test_ext");
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(format!("ext_sql_wal_{}", std::process::id()));
@@ -832,6 +852,7 @@ fn wal_replay_reloads_the_extension() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        allow_load(&mut db);
         let sql = format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER); \
              INSERT INTO t VALUES (1), (2), (3);"
@@ -857,8 +878,8 @@ fn wal_replay_reloads_the_extension() {
             .unwrap();
         db.flush_wal().unwrap();
     }
-    // Reopen: replay re-runs LOAD EXTENSION (a fresh process-level load) and
-    // the inserts; the function is callable on the replayed store.
+    // Reopen: the replayed prefix is satisfied by the library this process
+    // already has mapped (no second load), and the inserts replay.
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
         assert_eq!(
@@ -879,17 +900,19 @@ fn wal_replay_reloads_the_extension() {
     }
 
     // 2. The same round-trip through a *copy* of the library that is deleted
-    //    before the reopen: a missing file at replay time is a hard recovery
-    //    error naming the path, never a silent drop. The copy is a FRESH
-    //    compile (not `fs::copy`) so it carries its own install name — a copy
-    //    would be resolved by dyld to the already-loaded original whenever
-    //    another test still holds it, defeating the deleted-file assertion.
+    //    before the reopen: the replay reuses the mapped image, so the
+    //    missing file is never opened again (and the rows still replay).
+    //    The copy is a FRESH compile (not `fs::copy`) so it carries its own
+    //    install name — a copy would be resolved by dyld to the
+    //    already-loaded original whenever another test still holds it,
+    //    defeating the deleted-file assertion.
     let copy = dir.join(format!("test_ext_copy{}", std::env::consts::DLL_SUFFIX));
     common::compile_to("test_ext", &copy);
     let ckpt2 = dir.join("missing.pink");
     let ckpt2 = ckpt2.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt2).unwrap();
+        allow_load(&mut db);
         db.execute(&format!("LOAD EXTENSION '{}';", copy.display()))
             .unwrap();
         db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (ext_double_it(10));")
@@ -897,10 +920,11 @@ fn wal_replay_reloads_the_extension() {
         db.flush_wal().unwrap();
     }
     std::fs::remove_file(&copy).unwrap();
-    let e = PinkDb::open_durable(ckpt2).unwrap_err().to_string();
-    assert!(e.contains("WAL replay failed at lsn"), "{e}");
-    assert!(e.contains("cannot load extension"), "{e}");
-    assert!(e.contains("test_ext_copy"), "{e}");
+    let mut db = PinkDb::open_durable(ckpt2).unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT a FROM t;"),
+        vec![vec![Value::Integer(20)]]
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -918,6 +942,7 @@ fn refresh_replay_accepts_reloading_an_already_loaded_extension() {
     let ckpt = dir.join("db.pink");
     let ckpt = ckpt.to_str().unwrap();
     let mut a = PinkDb::open_durable(ckpt).unwrap();
+    allow_load(&mut a);
     a.execute(&format!(
         "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER); \
          INSERT INTO t VALUES (ext_double_it(1));"
@@ -1072,6 +1097,7 @@ fn autocommit_record_touching_an_extension_survives_a_checkpoint() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        allow_load(&mut db);
         db.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER);"
         ))
@@ -1109,6 +1135,7 @@ fn transaction_spanning_a_checkpoint_survives_reopen() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let db = Database::open(ckpt).unwrap();
+        db.set_allow_sql_load_extension(true);
         let mut c = db.connect();
         c.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER);"
@@ -1153,6 +1180,7 @@ fn use_plus_extension_record_survives_a_checkpoint() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        allow_load(&mut db);
         db.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE DATABASE db1; CREATE TABLE db1.t (a INTEGER);"
         ))
@@ -1185,6 +1213,7 @@ fn replay_loads_only_the_extensions_the_record_touches() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        allow_load(&mut db);
         db.execute(&format!(
             "LOAD EXTENSION '{}'; CREATE TABLE t (a INTEGER);",
             a.display()
@@ -1225,6 +1254,7 @@ fn checkpoint_without_extension_use_stays_openable() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        allow_load(&mut db);
         db.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);"
         ))
@@ -1242,6 +1272,7 @@ fn checkpoint_without_extension_use_stays_openable() {
         error(&mut db, "SELECT ext_double_it(1);"),
         "unknown function \"ext_double_it\""
     );
+    allow_load(&mut db);
     db.execute(&format!("LOAD EXTENSION '{path}';")).unwrap();
     assert_eq!(
         rows(&mut db, "SELECT ext_double_it(21);"),
@@ -1261,6 +1292,7 @@ fn subquery_dynamic_calls_are_prefixed_too() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        allow_load(&mut db);
         db.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (0);"
         ))
@@ -1293,6 +1325,7 @@ fn reopen_does_not_reprefix_extensions_the_generation_loaded() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        allow_load(&mut db);
         db.execute(&format!(
             "LOAD EXTENSION '{path}'; CREATE TABLE t (a INTEGER);"
         ))

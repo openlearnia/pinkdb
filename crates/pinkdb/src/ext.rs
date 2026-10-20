@@ -44,12 +44,23 @@
 //! (the library path, or the registry name for a linked function) when the
 //! current WAL generation has not loaded that extension yet (see
 //! [`crate::wal::Wal`]). Replay therefore re-loads exactly the extensions the
-//! replayed records need. A checkpoint rolls the WAL and never persists an
+//! replayed records need — but a path recovered from a file is **never**
+//! loaded on the file's say-so: the replay resolves it against the store's
+//! extension policy (see [`PinkDb::resolve_replay_extension`]), and a
+//! durable store that used an extension now fails to open unless the
+//! extension is already loaded in this process or the operator opted in with
+//! an extension root. A checkpoint rolls the WAL and never persists an
 //! extension: after a checkpoint the next record touching one is prefixed
 //! again, and an extension whose source is gone at replay time is a hard
 //! recovery error (never a silent drop). Extensions loaded before the last
 //! checkpoint are gone after a reopen — re-load them (for a linked extension
 //! that means: re-register it before opening the store).
+//!
+//! Loading an extension runs native code, so the SQL statement is **off by
+//! default** ([`PinkDb::set_allow_sql_load_extension`]) and every path goes
+//! through the loader's rules: a directory (never a bare name the dynamic
+//! loader would search for), no `..`, a regular file, no symlink — and, when
+//! the store has an extension root, a path inside that root.
 
 use crate::storage::PinkDb;
 use crate::types::{DataType, PinkDbError, Result, Value};
@@ -118,6 +129,10 @@ impl PinkDb {
     /// what replay needs (a missing file at replay time is a hard recovery
     /// error, never a silent drop).
     ///
+    /// The path goes through the loader's path rules (a directory, no `..`,
+    /// a regular file, not a symlink) and, when the store has an extension
+    /// root ([`Self::set_extension_root`]), must be inside it.
+    ///
     /// Native only. When `path` is not a loadable library but a *linked*
     /// extension is registered under exactly that name, the linked extension
     /// is loaded instead ([`PinkDb::load_linked_extension`]): that is how a
@@ -126,7 +141,7 @@ impl PinkDb {
     /// error, unchanged.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_extension(&mut self, path: &str) -> Result<String> {
-        match pinkdb_ext_loader::load_extension(self, path) {
+        match self.load_native_extension(path) {
             Ok(name) => Ok(name),
             Err(dlopen_error) => {
                 if pinkdb_ext_loader::linked::is_registered(path) {
@@ -136,6 +151,20 @@ impl PinkDb {
                 }
             }
         }
+    }
+
+    /// The native half of [`Self::load_extension`]: open the library — inside
+    /// the store's extension root, when it has one — and register its
+    /// functions.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_native_extension(&mut self, path: &str) -> std::result::Result<String, ExtError> {
+        let ext = match self.extension_root.clone() {
+            Some(root) => pinkdb_ext_loader::load_in_root(&root, path)?,
+            None => pinkdb_ext_loader::load(path)?,
+        };
+        let name = ext.name().to_string();
+        self.register_handle(ExtHandle::Dynamic(ext))?;
+        Ok(name)
     }
 
     /// wasm targets have no dynamic linker, so the argument is a **registry
@@ -223,14 +252,32 @@ impl PinkDb {
     }
 
     /// The declared name of the extension whose *source* is exactly `path`,
-    /// if any. Used by WAL replay (hazard H5): a replayed `LOAD EXTENSION
-    /// '<source>'` whose extension is already loaded in this process is
+    /// if any. Used by WAL replay (rule 1 of
+    /// [`Self::resolve_replay_extension`]): a replayed `LOAD EXTENSION
+    /// '<source>'` whose extension is already loaded in this store is
     /// satisfied by the existing registration instead of re-running `init`
     /// (which the duplicate-load guard would refuse) — or, for a linked
-    /// extension, instead of consulting the registry again. A different source
-    /// that claims the same extension *name* is still a hard replay error —
-    /// running with the wrong library would silently change query results.
+    /// extension, instead of consulting the registry again. A different
+    /// source that claims the same extension *name* is still a hard replay
+    /// error — running with the wrong library would silently change query
+    /// results.
+    ///
+    /// A native extension matches on the **canonical path** (the directory
+    /// resolved plus the file name), so two spellings of the same file are
+    /// the same extension; a linked one matches on its registry name.
     pub(crate) fn loaded_extension_name_for_path(&self, path: &str) -> Option<String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(key) = pinkdb_ext_loader::canonical_key(path) {
+                for ext in self.loaded_extensions.values() {
+                    if let ExtHandle::Dynamic(dynamic) = ext
+                        && dynamic.canonical_path() == key
+                    {
+                        return Some(ext.name().to_string());
+                    }
+                }
+            }
+        }
         self.loaded_extensions
             .values()
             .find(|ext| ext.source() == path)
@@ -245,6 +292,120 @@ impl PinkDb {
     pub fn is_extension_loaded(&self, name: &str) -> bool {
         self.loaded_extensions
             .contains_key(&name.to_ascii_lowercase())
+    }
+
+    /// The canonical paths of the natively-loaded extensions of this store —
+    /// the identity the WAL replay compares a recorded path against (see
+    /// [`Self::resolve_replay_extension`]). Empty on a target without a
+    /// dynamic loader (wasm).
+    pub fn loaded_extension_canonical_paths(&self) -> Vec<std::path::PathBuf> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut out: Vec<std::path::PathBuf> = Vec::new();
+            for ext in self.loaded_extensions.values() {
+                if let ExtHandle::Dynamic(dynamic) = ext {
+                    let path = dynamic.canonical_path();
+                    if !out.contains(&path) {
+                        out.push(path);
+                    }
+                }
+            }
+            out
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Resolve a `LOAD EXTENSION '<source>'` statement that WAL replay
+    /// re-executes.
+    ///
+    /// A path recovered from a file is **never** loaded on the file's
+    /// say-so. The rules, in order:
+    ///
+    /// 1. the extension is already loaded in this process — either this
+    ///    store already has it (same source) or the loader's process-wide
+    ///    registry has that very file mapped. The mapped library is
+    ///    *reused*: no `dlopen`, no constructor, no `init` a second time.
+    ///    A *linked* extension (its source is a registry name, not a path)
+    ///    is resolved in the process-global registry the host published —
+    ///    the code is already in the process, so a file cannot introduce
+    ///    new native code through it.
+    /// 2. the operator opted in (`allow_extension_replay`) **and** the
+    ///    recorded path resolves inside the configured extension root. The
+    ///    library is then loaded from the root, under the loader's path
+    ///    rules (a directory, no `..`, a regular file, not a symlink).
+    /// 3. otherwise the replay fails with an actionable error: nothing is
+    ///    skipped silently, nothing is loaded.
+    ///
+    /// **Behavior change.** A durable store that used an extension no
+    /// longer loads it when it is opened. Re-open it with the extension
+    /// already loaded in the process, or with the opt-in and a root.
+    pub(crate) fn resolve_replay_extension(&mut self, source: &str) -> Result<String> {
+        // 1a. This store already has the extension: the record's intent
+        // ("the extension must be available here") is satisfied.
+        if let Some(name) = self.loaded_extension_name_for_path(source) {
+            return Ok(name);
+        }
+        // 1b. The library is already mapped in this process: reuse the
+        // mapped image instead of loading the file again.
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(ext) = pinkdb_ext_loader::loaded_extension(source) {
+            let name = ext.name().to_string();
+            self.register_handle(ExtHandle::Dynamic(ext))
+                .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+            return Ok(name);
+        }
+        // 1c. A linked extension: its source is a registry name, and the
+        // registry is published by the host at bootstrap — the code is
+        // already in this process.
+        if pinkdb_ext_loader::linked::is_registered(source) {
+            return self.load_linked_extension(source);
+        }
+        // 2. The explicit opt-in, with the extension root.
+        if self.allow_extension_replay {
+            return self.load_replay_extension_from_root(source);
+        }
+        // 3. Fail closed.
+        Err(PinkDbError::Execution(format!(
+            "WAL replay refused to load the extension \"{source}\": a database file never loads \
+             native code on its own. Load the extension in this process before opening the \
+             database, or open it with the extension-replay opt-in \
+             (DurableOpenOptions::allow_extension_replay) and an extension root that contains \
+             the library"
+        )))
+    }
+
+    /// Rule 2 of [`Self::resolve_replay_extension`]: the opt-in is on — load
+    /// the recorded path, which must resolve inside the configured extension
+    /// root.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn load_replay_extension_from_root(&mut self, source: &str) -> Result<String> {
+        if self.extension_root.is_none() {
+            return Err(PinkDbError::Execution(format!(
+                "WAL replay refused to load the extension \"{source}\": the extension-replay \
+                 opt-in needs an extension root (DurableOpenOptions::extension_root) and the \
+                 library must be inside it"
+            )));
+        }
+        self.load_native_extension(source).map_err(|e| {
+            PinkDbError::Execution(format!(
+                "WAL replay refused to load the extension \"{source}\": {e}"
+            ))
+        })
+    }
+
+    /// Rule 2 of [`Self::resolve_replay_extension`] on a target without a
+    /// dynamic loader: there is nothing to load — the extension must be
+    /// registered in the process before the database is opened.
+    #[cfg(target_arch = "wasm32")]
+    fn load_replay_extension_from_root(&mut self, source: &str) -> Result<String> {
+        Err(PinkDbError::Execution(format!(
+            "WAL replay refused to load the extension \"{source}\": this target has no dynamic \
+             loader, so an extension must be registered in the process before the database is \
+             opened"
+        )))
     }
 
     /// Register one extension handle — the shared half of both loading

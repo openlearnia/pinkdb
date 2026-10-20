@@ -10,6 +10,18 @@ one-liners below.
 
 ## 2026-10-20
 
+### Security hardening — pass 1: extension loading ✅
+- **`LOAD EXTENSION` is off by default** everywhere (engine, CLI, C ABI,
+  bindings); enable it explicitly with `--allow-load-extension` /
+  `PINKDB_ALLOW_LOAD_EXTENSION`, the new C-ABI switch, or the binding opt-ins.
+- **Opening a database file can no longer execute native code recorded in its
+  WAL**: replay refuses a recorded `LOAD EXTENSION` unless the library is
+  already mapped in the process or the new replay opt-in + extension root
+  allow it — otherwise it is a hard, actionable error (the audit's reproduced
+  attack is now a regression test, marker absent).
+- Extensions are path-confined: no bare loader-path names, no `..`, no
+  symlinked libraries, plus an optional `--extension-root` on server and CLI.
+
 ### Security hardening — low-severity batch ✅
 - Redacted the login password from the server protocol's `Debug` output (L-2)
   and the SigV4 canonical request / session token from `Signature`'s (L-11).

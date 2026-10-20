@@ -261,6 +261,8 @@ fn deterministic_extension_statements_wal_log_and_replay() {
     let ckpt = ckpt.to_str().unwrap();
     {
         let mut db = PinkDb::open_durable(ckpt).unwrap();
+        // The statement is off by default (it loads and runs native code).
+        db.set_allow_sql_load_extension(true);
         db.execute(&format!(
             "LOAD EXTENSION '{}'; CREATE TABLE t (a BIGINT);",
             fixture.display()

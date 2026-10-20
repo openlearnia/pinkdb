@@ -210,6 +210,11 @@ def _bind(lib: ctypes.CDLL, path: str) -> None:
         ctypes.c_void_p,
     )
     declare(
+        "pinkdb_set_allow_sql_load_extension",
+        [ctypes.c_void_p, ctypes.c_int32],
+        ctypes.c_int32,
+    )
+    declare(
         "pinkdb_prepare",
         [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t],
         ctypes.c_void_p,
@@ -586,6 +591,13 @@ class Database:
         Returns a :class:`Result` per statement. Raises :class:`Error` with
         the message from ``pinkdb_last_error`` if any statement fails; the
         handle remains usable afterwards.
+
+        .. warning::
+           The SQL statement ``LOAD EXTENSION '<path>'`` loads and runs
+           native code from a path the SQL text names. It is **disabled by
+           default**: :meth:`allow_load_extension` has to enable it first.
+           Do not enable it for a database whose SQL comes from untrusted
+           input.
         """
         if not isinstance(sql, str):
             raise TypeError("sql must be a str")
@@ -603,6 +615,31 @@ class Database:
                 return _snapshot(self._lib, result_ptr)
             finally:
                 self._lib.pinkdb_result_free(result_ptr)
+
+    def allow_load_extension(self, allow: bool = True) -> None:
+        """Allow or refuse the SQL ``LOAD EXTENSION '<path>'`` statement.
+
+        The statement makes the host process load and run a native library
+        from a path the SQL text names — arbitrary native code execution for
+        anyone who can influence the SQL. It is **disabled by default**, so
+        :meth:`execute` cannot load native code until this is called with
+        ``True``.
+
+        Only enable it for a database whose SQL comes from a trusted source.
+        The loaded path must name a regular file inside a directory (a bare
+        library name, which the dynamic loader would resolve through its
+        search path, is refused), and it must not be a symlink.
+        """
+        if not isinstance(allow, bool):
+            raise TypeError("allow must be a bool")
+        with self._lock:
+            if self._handle is None:
+                raise Error("database is closed")
+            rc = self._lib.pinkdb_set_allow_sql_load_extension(
+                self._handle, 1 if allow else 0
+            )
+            if not rc:
+                raise Error(_last_error(self._lib))
 
     def prepare(self, sql: str) -> "Statement":
         """Parse one SQL statement with ``?`` placeholders into a reusable

@@ -402,6 +402,50 @@ func TestErrorKeepsHandleUsable(t *testing.T) {
 	}
 }
 
+func TestLoadExtensionIsRefusedByDefault(t *testing.T) {
+	db := mustOpenMemory(t)
+	defer db.Close()
+
+	// The statement loads and runs native code: it is off by default.
+	_, err := db.Execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+	if err == nil || !strings.Contains(err.Error(), "LOAD EXTENSION is disabled") {
+		t.Fatalf("Execute(LOAD EXTENSION) = %v, want a 'disabled' error", err)
+	}
+
+	// The opt-in flips the behavior: the gate is no longer the blocker, the
+	// loader reports its own error for the missing file.
+	if err := db.SetAllowLoadExtension(true); err != nil {
+		t.Fatalf("SetAllowLoadExtension(true) = %v, want nil", err)
+	}
+	_, err = db.Execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+	if err == nil {
+		t.Fatal("Execute(LOAD EXTENSION) = nil error, want the loader's error")
+	}
+	if strings.Contains(err.Error(), "LOAD EXTENSION is disabled") {
+		t.Fatalf("Execute(LOAD EXTENSION) = %v, want the loader's error", err)
+	}
+	if !strings.Contains(err.Error(), "cannot load extension") {
+		t.Fatalf("Execute(LOAD EXTENSION) = %v, want 'cannot load extension'", err)
+	}
+
+	// And it can be turned off again.
+	if err := db.SetAllowLoadExtension(false); err != nil {
+		t.Fatalf("SetAllowLoadExtension(false) = %v, want nil", err)
+	}
+	_, err = db.Execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+	if err == nil || !strings.Contains(err.Error(), "LOAD EXTENSION is disabled") {
+		t.Fatalf("Execute(LOAD EXTENSION) = %v, want a 'disabled' error", err)
+	}
+}
+
+func TestSetAllowLoadExtensionOnAClosedDB(t *testing.T) {
+	db := mustOpenMemory(t)
+	db.Close()
+	if err := db.SetAllowLoadExtension(true); err != ErrClosed {
+		t.Fatalf("SetAllowLoadExtension on a closed DB = %v, want ErrClosed", err)
+	}
+}
+
 func TestEmptyAndCommentOnlySQLReturnsNoResults(t *testing.T) {
 	db := mustOpenMemory(t)
 	defer db.Close()

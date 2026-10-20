@@ -315,6 +315,42 @@ class ErrorTests(unittest.TestCase):
                     with self.assertRaises(TypeError):
                         db.execute(bad)
 
+
+class LoadExtensionTests(unittest.TestCase):
+    """``LOAD EXTENSION`` loads and runs native code: it is off by default."""
+
+    def test_the_statement_is_refused_by_default(self):
+        with pinkdb.connect_memory() as db:
+            with self.assertRaises(pinkdb.Error) as ctx:
+                db.execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+            self.assertIn("LOAD EXTENSION is disabled", str(ctx.exception))
+
+    def test_the_opt_in_flips_the_behavior(self):
+        with pinkdb.connect_memory() as db:
+            db.allow_load_extension(True)
+            with self.assertRaises(pinkdb.Error) as ctx:
+                db.execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+            # The gate is no longer the blocker: the loader reports its own
+            # error for the missing file.
+            self.assertNotIn("LOAD EXTENSION is disabled", str(ctx.exception))
+            self.assertIn("cannot load extension", str(ctx.exception))
+            # And it can be turned off again.
+            db.allow_load_extension(False)
+            with self.assertRaises(pinkdb.Error) as ctx:
+                db.execute("LOAD EXTENSION '/definitely/not/a/lib.dylib';")
+            self.assertIn("LOAD EXTENSION is disabled", str(ctx.exception))
+
+    def test_the_opt_in_validates_its_argument(self):
+        with pinkdb.connect_memory() as db:
+            with self.assertRaises(TypeError):
+                db.allow_load_extension("yes")
+
+    def test_the_opt_in_on_a_closed_handle_raises(self):
+        db = pinkdb.connect_memory()
+        db.close()
+        with self.assertRaises(pinkdb.Error):
+            db.allow_load_extension(True)
+
     def test_empty_sql_returns_no_results(self):
         with pinkdb.connect_memory() as db:
             self.assertEqual(db.execute(""), [])

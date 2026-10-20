@@ -33,7 +33,8 @@
 //!   [`Server::allow_load_extension`]: letting a remote client `dlopen` a
 //!   host library is remote code execution (and, since wave 48, the SQL
 //!   statement also requires the `ADMIN` privilege on an authenticated
-//!   session).
+//!   session). [`Server::extension_root`] additionally confines the paths a
+//!   client may name to one directory.
 //! - **Authentication (wave 48).** The store's user catalog decides: while
 //!   it has **no users**, a connection is trusted (embedded semantics) —
 //!   the pre-wave-48 behavior, warned about loudly at startup. As soon as
@@ -251,8 +252,20 @@ impl Server {
     /// Let remote clients run SQL `LOAD EXTENSION` (default: refused). Only
     /// for trusted networks: the statement makes the server process load and
     /// run a native library from its own filesystem.
+    ///
+    /// Combine it with [`Server::extension_root`] to confine the paths a
+    /// remote client may name to one directory.
     pub fn allow_load_extension(self, allow: bool) -> Self {
         self.db.set_allow_sql_load_extension(allow);
+        self
+    }
+
+    /// Confine every extension load of the served database to `root` (the
+    /// directory that holds the extension libraries). `None` removes the
+    /// confinement; the loader's own path rules (a directory, no `..`, a
+    /// regular file, not a symlink) always apply.
+    pub fn extension_root(self, root: Option<std::path::PathBuf>) -> Self {
+        self.db.set_extension_root(root);
         self
     }
 

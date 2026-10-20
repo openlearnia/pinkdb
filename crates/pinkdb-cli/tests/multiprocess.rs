@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use pinkdb::{PinkDb, QueryResult, SyncPolicy, Value};
+use pinkdb::{DurableOpenOptions, PinkDb, QueryResult, SyncPolicy, Value};
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -64,6 +64,12 @@ impl Cli {
             .stdin(Stdio::piped())
             .stdout(writer.try_clone().expect("clone pipe writer"))
             .stderr(writer);
+        // The `LOAD EXTENSION` statement is off by default (it loads and runs
+        // native code); the extension test in this file opts in. The root
+        // confines every load to this process's scratch directory — the
+        // cross-process replay needs it to resolve the recorded path.
+        cmd.env("PINKDB_ALLOW_LOAD_EXTENSION", "1");
+        cmd.arg("--extension-root").arg(cwd);
         if let Some(ms) = busy_timeout_ms {
             cmd.env("PINKDB_BUSY_TIMEOUT_MS", ms.to_string());
         }
@@ -1260,8 +1266,15 @@ fn refresh_replay_reloads_a_real_extension_across_processes() {
     a.quit();
     b.quit();
     // A fresh process replays the whole generation: the prefixed record loads
-    // the extension exactly once; every row is present exactly once.
-    let (mut db, _) = PinkDb::open_durable_with(ckpt.to_str().unwrap(), SyncPolicy::Sync).unwrap();
+    // the extension exactly once; every row is present exactly once. This
+    // process never had the library mapped, so the replay needs the
+    // extension-replay opt-in and the extension root.
+    let opts = DurableOpenOptions {
+        allow_extension_replay: true,
+        extension_root: Some(dir.clone()),
+        ..DurableOpenOptions::default()
+    };
+    let (mut db, _) = PinkDb::open_durable_with_options(ckpt.to_str().unwrap(), opts).unwrap();
     assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![2, 4, 6]);
     cleanup(&ckpt);
 }

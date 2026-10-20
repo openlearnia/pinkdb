@@ -20,6 +20,28 @@
 //! # }
 //! ```
 //!
+//! ### Path rules (native targets)
+//!
+//! Loading a library runs its code, so *which* file is opened matters as
+//! much as the ABI handshake. Every native load goes through
+//! [`resolve_path`]:
+//!
+//! - the path must contain a directory: a bare name (`libfoo.so`) would be
+//!   resolved through the *dynamic loader's* search path
+//!   (`LD_LIBRARY_PATH`, `/usr/lib`, …) — a file the caller never chose;
+//! - the path must not contain a `..` component;
+//! - the path must resolve to a regular file whose last component is not a
+//!   symlink (the canonical path must be the very file that was named);
+//! - [`load_in_root`] additionally requires the resolved path to be inside a
+//!   configured extension root.
+//!
+//! The loader also keeps a process-wide registry of the libraries it has
+//! loaded ([`loaded_paths`], [`loaded_extension`]): a library stays mapped for
+//! the lifetime of the process, and a host can ask whether a path is already
+//! loaded *without* touching the filesystem. The engine's WAL replay uses it
+//! to answer exactly that question before it may load anything.
+//!
+//!
 //! **wasm targets** have no dynamic linker and no filesystem, so a wasm build
 //! links no `dlopen` at all: extensions are linked into the host and
 //! published to a process-global registry through the safe Rust API of
@@ -68,7 +90,9 @@ pub mod linked;
 use std::ffi::{CStr, c_void};
 use std::fmt;
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::Arc;
+use std::path::{Component, Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub use abi::{
     ExtArg, ExtType, ExtValue, PINKDB_EXT_MAX_ARGS, PINKDB_EXT_TYPE_BIGINT,
@@ -295,6 +319,11 @@ impl ExtHandle {
 pub enum ExtError {
     /// The shared library could not be opened (`dlopen` failed).
     Load { path: String, message: String },
+    /// The path is not an acceptable extension path: empty, a bare name
+    /// (which the dynamic loader would resolve through its search path), a
+    /// `..` component, a symlink, not a regular file, or outside the
+    /// configured extension root. See [`resolve_path`].
+    InvalidPath { path: String, message: String },
     /// The library opened but does not export a required ABI symbol.
     MissingSymbol { path: String, symbol: String },
     /// The extension was built against a different ABI version.
@@ -342,6 +371,9 @@ impl fmt::Display for ExtError {
         match self {
             ExtError::Load { path, message } => {
                 write!(f, "cannot load extension \"{path}\": {message}")
+            }
+            ExtError::InvalidPath { path, message } => {
+                write!(f, "extension \"{path}\" is not a loadable path: {message}")
             }
             ExtError::MissingSymbol { path, symbol } => write!(
                 f,
@@ -394,12 +426,19 @@ impl std::error::Error for ExtError {}
 ///
 /// The handle owns an [`Arc`] of the shared library, so the code stays mapped
 /// as long as the host keeps the `LoadedExtension` — even when the extension
-/// registered no functions at all.
+/// registered no functions at all. The loader's process-wide registry keeps
+/// one more handle, so a loaded library stays mapped for the lifetime of the
+/// process even after every store that used it is dropped.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Debug, Clone)]
 pub struct LoadedExtension {
     name: String,
     path: String,
+    /// The canonical absolute path of the library: the resolved directory
+    /// plus the file name (the file itself is not a symlink — see
+    /// [`resolve_path`]). This is the identity the loader's registry and the
+    /// engine's WAL replay compare.
+    canonical_path: PathBuf,
     functions: Vec<DynamicFunction>,
     /// Keeps the library mapped independently of the functions (the
     /// zero-function case: without this, dropping the handle would unload the
@@ -415,9 +454,16 @@ impl LoadedExtension {
         &self.name
     }
 
-    /// The path passed to [`load`] / [`load_extension`].
+    /// The canonical absolute path of the library this extension was loaded
+    /// from.
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// The canonical absolute path of the library this extension was loaded
+    /// from, as a [`PathBuf`] (the identity the registry compares).
+    pub fn canonical_path(&self) -> PathBuf {
+        self.canonical_path.clone()
     }
 
     /// Registered functions.
@@ -441,12 +487,231 @@ pub trait ExtHost {
     fn register_extension(&mut self, ext: LoadedExtension) -> Result<(), ExtError>;
 }
 
+// ---------- path resolution (the loader's path rules) ----------
+
+/// Resolve `path` to the canonical absolute path of a loadable extension
+/// file, applying the loader's path rules. Every native load goes through
+/// it, so the rules hold for the SQL statement, the Rust API and the WAL
+/// replay alike:
+///
+/// - the path must not be empty and must contain a path separator: a bare
+///   name (`libfoo.so`) would be resolved through the *dynamic loader's*
+///   search path (`LD_LIBRARY_PATH`, `/usr/lib`, …) — a file the caller
+///   never chose;
+/// - the path must not contain a `..` component: it is an escape vector,
+///   and `canonicalize` would resolve it silently;
+/// - the path must resolve to an existing **regular file**;
+/// - the last component must not be a **symlink**: the canonical path
+///   (which follows symlinks) must be the very same path as the resolved
+///   directory joined with the file name. A symlinked library is a
+///   redirection the caller cannot see.
+///
+/// The returned path is absolute and canonical: it is what the loader
+/// `dlopen`s, what [`LoadedExtension::path`] reports and what the engine
+/// records in the WAL.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_path(path: &str) -> Result<PathBuf, ExtError> {
+    let key = path_key_checked(path)?;
+    check_regular_file(path, &key)
+}
+
+/// [`resolve_path`] plus root confinement: the resolved path must be inside
+/// `root` (the root itself is resolved the same way, so a symlinked root
+/// directory is fine — only the *library* must not be a symlink).
+///
+/// This is the entry point a host uses when it configures an extension
+/// directory: a path that escapes the root (through `..`, through a
+/// symlinked directory, or by naming a file outside it) is refused. The root
+/// is checked *first*: a path outside it is refused whatever it names, so
+/// the error never depends on whether the file exists.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn resolve_path_in_root(root: &Path, path: &str) -> Result<PathBuf, ExtError> {
+    let key = path_key_checked(path)?;
+    let root_canonical = std::fs::canonicalize(root).map_err(|e| {
+        invalid_path(
+            path,
+            &format!(
+                "the extension root {} cannot be resolved: {e}",
+                root.display()
+            ),
+        )
+    })?;
+    if !root_canonical.is_dir() {
+        return Err(invalid_path(
+            path,
+            &format!(
+                "the extension root {} is not a directory",
+                root_canonical.display()
+            ),
+        ));
+    }
+    if !key.starts_with(&root_canonical) {
+        return Err(invalid_path(
+            path,
+            &format!(
+                "the path is outside the extension root {}",
+                root_canonical.display()
+            ),
+        ));
+    }
+    check_regular_file(path, &key)
+}
+
+/// The loader's path rules, up to the file's own checks: the path must not
+/// be empty, must name a directory (a bare name would be resolved through
+/// the dynamic loader's search path), must not contain a `..` component, and
+/// must have a resolvable parent directory.
+///
+/// Returns the *key* of the path: its parent directory resolved, plus the
+/// file name (which is left unresolved — the file itself is never a symlink).
+#[cfg(not(target_arch = "wasm32"))]
+fn path_key_checked(path: &str) -> Result<PathBuf, ExtError> {
+    if path.is_empty() {
+        return Err(ExtError::Load {
+            path: path.to_string(),
+            message: "empty path".to_string(),
+        });
+    }
+    let raw = Path::new(path);
+    if !path.contains('/') && !path.contains(std::path::MAIN_SEPARATOR) {
+        return Err(invalid_path(
+            path,
+            "a bare name would be resolved through the dynamic loader's search path; \
+             give the path of the library (with a directory)",
+        ));
+    }
+    if raw.components().any(|c| c == Component::ParentDir) {
+        return Err(invalid_path(path, "the path contains a `..` component"));
+    }
+    path_key(raw).ok_or_else(|| invalid_path(path, "the path has no file name"))
+}
+
+/// The file's own rules: it must exist, be a regular file, and not be a
+/// symlink (the canonical path — which follows symlinks — must be the very
+/// file that was named).
+#[cfg(not(target_arch = "wasm32"))]
+fn check_regular_file(path: &str, key: &Path) -> Result<PathBuf, ExtError> {
+    // `symlink_metadata` does not follow the final symlink.
+    let meta = std::fs::symlink_metadata(key).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            // A missing file is a load failure, not a malformed path.
+            ExtError::Load {
+                path: path.to_string(),
+                message: e.to_string(),
+            }
+        } else {
+            invalid_path(path, &format!("cannot stat the path: {e}"))
+        }
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(invalid_path(
+            path,
+            "the path is a symlink; load the real file instead",
+        ));
+    }
+    if !meta.is_file() {
+        return Err(invalid_path(path, "the path is not a regular file"));
+    }
+    let canonical = std::fs::canonicalize(key)
+        .map_err(|e| invalid_path(path, &format!("cannot resolve the path: {e}")))?;
+    if canonical != key {
+        return Err(invalid_path(
+            path,
+            "the path resolves to a different file than the one named",
+        ));
+    }
+    Ok(canonical)
+}
+
+/// The canonical key of a path: its parent directory resolved (symlinks in
+/// the directory are followed — a *directory* symlink is a normal way to
+/// publish an extension tree) plus the file name, which is left unresolved.
+/// The parent is left unresolved when it cannot be resolved (it does not
+/// exist), so the caller reports the accurate "no such file" error.
+#[cfg(not(target_arch = "wasm32"))]
+fn path_key(path: &Path) -> Option<PathBuf> {
+    let file_name = path.file_name()?;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let parent = match std::fs::canonicalize(parent) {
+        Ok(p) => p,
+        Err(_) => parent.to_path_buf(),
+    };
+    Some(parent.join(file_name))
+}
+
+/// An [`ExtError::InvalidPath`] for `path`.
+#[cfg(not(target_arch = "wasm32"))]
+fn invalid_path(path: &str, message: &str) -> ExtError {
+    ExtError::InvalidPath {
+        path: path.to_string(),
+        message: message.to_string(),
+    }
+}
+
+// ---------- the process-wide registry of loaded libraries ----------
+
+/// Every extension library this process has loaded, with its canonical
+/// path. The registry keeps the library mapped for the lifetime of the
+/// process (the [`Arc`] inside each [`LoadedExtension`]), so a host can ask
+/// "is this library already loaded?" without touching the filesystem — the
+/// question WAL replay has to answer before it may load anything.
+#[cfg(not(target_arch = "wasm32"))]
+static LOADED: OnceLock<Mutex<Vec<LoadedExtension>>> = OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+fn loaded_registry() -> &'static Mutex<Vec<LoadedExtension>> {
+    LOADED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// The canonical paths of every extension library this process has loaded
+/// through [`load`] / [`load_in_root`], in load order.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn loaded_paths() -> Vec<PathBuf> {
+    let guard = loaded_registry().lock().unwrap_or_else(|p| p.into_inner());
+    guard.iter().map(|e| e.canonical_path()).collect()
+}
+
+/// The canonical key of `path`: its parent directory resolved, plus the file
+/// name (the file itself is not resolved — a symlinked library is refused
+/// elsewhere). `None` when the path names no file.
+///
+/// This is the identity the loader's registry compares: two spellings of the
+/// same file (`/tmp/x/../lib.dylib`, `/tmp/./lib.dylib`) have the same key.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn canonical_key(path: &str) -> Option<PathBuf> {
+    path_key(Path::new(path))
+}
+
+/// The already-loaded extension whose canonical path is `path`'s, if this
+/// process has loaded that very file.
+///
+/// This is the lookup WAL replay uses before it may load anything: a
+/// recorded path that names a library this process already has mapped is
+/// *not* loaded again — the mapped image (and its functions) is reused, so
+/// no constructor and no `init` runs again. The comparison is on canonical
+/// paths, not on the spelling of the path: `/tmp/x/../lib.dylib` and
+/// `/tmp/lib.dylib` are the same file, `/tmp/other/lib.dylib` is not.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn loaded_extension(path: &str) -> Option<LoadedExtension> {
+    let key = path_key(Path::new(path))?;
+    let guard = loaded_registry().lock().unwrap_or_else(|p| p.into_inner());
+    guard.iter().find(|e| e.canonical_path() == key).cloned()
+}
+
 /// Load `path` and register its functions on `db`; returns the extension's
 /// declared name.
 ///
 /// Fails — without registering anything — when the library does not open, is
 /// missing an ABI symbol, reports a different ABI version, has an invalid
 /// name, fails `pinkdb_extension_init`, or when `db` rejects a registration.
+///
+/// The path goes through [`resolve_path`] first: a bare name, a `..`
+/// component, a symlink or anything that is not a regular file is refused
+/// before the library is opened. Use [`load_in_root`] to confine the load to
+/// a directory.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load_extension<H: ExtHost + ?Sized>(db: &mut H, path: &str) -> Result<String, ExtError> {
     let ext = load(path)?;
@@ -460,19 +725,35 @@ pub fn load_extension<H: ExtHost + ?Sized>(db: &mut H, path: &str) -> Result<Str
 /// Symbol checks happen in a fixed order: wrong ABI version is reported before
 /// a missing init symbol, so a foreign library built for a future ABI gets the
 /// version error rather than a confusing symbol error.
+///
+/// The path is resolved first ([`resolve_path`]): only an absolute, canonical
+/// path to a regular file that is not a symlink is ever opened.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
-    if path.is_empty() {
-        return Err(ExtError::Load {
-            path: path.to_string(),
-            message: "empty path".to_string(),
-        });
-    }
+    let canonical = resolve_path(path)?;
+    load_resolved(&canonical, path)
+}
+
+/// [`load`], confined to `root`: the resolved path must be inside `root`
+/// (see [`resolve_path_in_root`]). This is the entry point for a host that
+/// configures an extension directory — the server's `--extension-root`, the
+/// CLI's `--extension-root`, the engine's `extension_root` open option.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn load_in_root(root: &Path, path: &str) -> Result<LoadedExtension, ExtError> {
+    let canonical = resolve_path_in_root(root, path)?;
+    load_resolved(&canonical, path)
+}
+
+/// Open the already-resolved `canonical` path and run the ABI v1 handshake.
+/// `display` is the path the caller wrote (used in the error messages).
+#[cfg(not(target_arch = "wasm32"))]
+fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, ExtError> {
+    let path = display.to_string();
     // SAFETY: dlopen runs the library's initializers and maps its code; that
     // is exactly what loading an extension means, and the caller asked for
     // this path. The handle is kept alive by the returned functions.
-    let library = unsafe { libloading::Library::new(path) }.map_err(|e| ExtError::Load {
-        path: path.to_string(),
+    let library = unsafe { libloading::Library::new(canonical) }.map_err(|e| ExtError::Load {
+        path: path.clone(),
         message: e.to_string(),
     })?;
     let library = Arc::new(library);
@@ -538,7 +819,10 @@ pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
 
     let mut collector = host::Collector {
         library: Arc::clone(&library),
-        path: path.to_string(),
+        // The canonical path, like the handle's: the engine records it in
+        // the WAL (`LOAD EXTENSION '<path>'`), and a canonical path resolves
+        // the same way in every process that replays it.
+        path: canonical.to_string_lossy().into_owned(),
         functions: Vec::new(),
         error: None,
     };
@@ -563,9 +847,21 @@ pub fn load(path: &str) -> Result<LoadedExtension, ExtError> {
 
     Ok(LoadedExtension {
         name,
-        path: path.to_string(),
+        // The canonical path, not the spelling the caller used: it is what
+        // the engine records in the WAL, and a canonical path resolves the
+        // same way in every process that replays it.
+        path: canonical.to_string_lossy().into_owned(),
+        canonical_path: canonical.to_path_buf(),
         functions: collector.functions,
         _library: library,
+    })
+    .inspect(|ext| {
+        // The process-wide registry: the library stays mapped for the
+        // lifetime of the process, and a later WAL replay can find this very
+        // file by its canonical path (and reuse it instead of loading it
+        // again).
+        let mut guard = loaded_registry().lock().unwrap_or_else(|p| p.into_inner());
+        guard.push(ext.clone());
     })
 }
 
