@@ -10,6 +10,18 @@ one-liners below.
 
 ## 2026-10-20
 
+### Wave 90 — tag-driven release train + `install.sh` ✅
+- A `v*` tag now builds and publishes 36 smoke-tested artifacts (24 CLI variants ×
+  12 server variants) for Linux x86_64/aarch64 and macOS arm64/x86_64, with an
+  immutable `SHA256SUMS` manifest and a single publish job that refuses to overwrite
+  an existing release.
+- Extensions build per platform on the same tag and fan in to one signed catalog
+  publish (plus one Worker deploy), so releases and the extension repository stay in
+  lockstep.
+- `install.sh` installs latest or a pinned version with checksum verification,
+  variant selection, atomic install to `~/.local/bin`, and no sudo; the docs site has
+  an install page, and the CLI reports `--version`.
+
 ### Security hardening — pass 5: auth DoS/timing/hash policy + resource bounds ✅
 - Logins no longer run Argon2id while holding the store lock; failed attempts
   are rate-limited per connection and per IP, and concurrent verifications are

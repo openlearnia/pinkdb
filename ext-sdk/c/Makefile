@@ -24,9 +24,14 @@ SHARED := -shared
 SO_EXT := so
 endif
 
+# Cross-architecture build on macOS (the release workflow builds darwin-x64
+# on an Apple Silicon runner): `make TARGET_ARCH=x86_64`.
+TARGET_ARCH ?=
+ARCH_FLAGS := $(if $(TARGET_ARCH),-arch $(TARGET_ARCH),)
+
 # -Wall -Wextra: the SDK builds warning-free; keep it that way.
-CFLAGS   = -std=c99 -O2 -fPIC -Wall -Wextra -Iinclude
-CXXFLAGS = -std=c++17 -O2 -fPIC -Wall -Wextra -Iinclude
+CFLAGS   = -std=c99 -O2 -fPIC -Wall -Wextra $(ARCH_FLAGS) -Iinclude
+CXXFLAGS = -std=c++17 -O2 -fPIC -Wall -Wextra $(ARCH_FLAGS) -Iinclude
 
 BUILD := build
 

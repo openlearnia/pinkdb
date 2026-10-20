@@ -1309,6 +1309,7 @@ struct Opts {
 fn print_usage() {
     println!("Usage: pinkdb [--host HOST:PORT] [--user NAME] [--password PASS] [-c COMMAND]...");
     println!();
+    println!("  -V, --version      print the version and exit");
     println!("  -c COMMAND         run SQL or a dot-command, then exit (repeatable)");
     println!("  --host HOST:PORT   run as a client of a pinkdb-server (remote mode)");
     if cfg!(feature = "client") {
@@ -1355,6 +1356,13 @@ fn parse_args() -> Result<Opts, String> {
         match arg.as_str() {
             "-h" | "--help" => {
                 print_usage();
+                std::process::exit(0);
+            }
+            // Release tooling (install.sh, smoke.sh) identifies a binary
+            // without running a SQL session; keep the format stable:
+            // `pinkdb <semver>` on stdout.
+            "-V" | "--version" => {
+                println!("pinkdb {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "--host" => {
@@ -1712,11 +1720,15 @@ fn main() {
     if interactive {
         match &session {
             Session::Local(_) => {
-                println!("pinkdb v0.1.0 — mini DuckDB (in-memory). Type .help, end SQL with ;")
+                println!(
+                    "pinkdb v{} — mini DuckDB (in-memory). Type .help, end SQL with ;",
+                    env!("CARGO_PKG_VERSION")
+                )
             }
             #[cfg(feature = "client")]
             Session::Remote(client) => println!(
-                "pinkdb v0.1.0 — mini DuckDB (remote {}, server v{}). Type .help, end SQL with ;",
+                "pinkdb v{} — mini DuckDB (remote {}, server v{}). Type .help, end SQL with ;",
+                env!("CARGO_PKG_VERSION"),
                 host.as_deref().unwrap_or(""),
                 client.server_version()
             ),

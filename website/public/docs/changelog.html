@@ -124,6 +124,7 @@
 <p class="side-group-title">Start here</p>
 <ul>
 <li><a href="getting-started">Getting started</a></li>
+<li><a href="install">Install</a></li>
 </ul>
 </div>
 <div class="side-group">
@@ -186,6 +187,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-20">2026-10-20<a class="anchor" href="#2026-10-20" aria-label="Permalink: 2026-10-20">#</a></h2>
+<h3>Wave 90 — tag-driven release train + <code>install.sh</code> ✅</h3>
+<ul>
+<li>A <code>v*</code> tag now builds and publishes 36 smoke-tested artifacts (24 CLI variants × 12 server variants) for Linux x86_64/aarch64 and macOS arm64/x86_64, with an immutable <code>SHA256SUMS</code> manifest and a single publish job that refuses to overwrite an existing release.</li>
+<li>Extensions build per platform on the same tag and fan in to one signed catalog publish (plus one Worker deploy), so releases and the extension repository stay in lockstep.</li>
+<li><code>install.sh</code> installs latest or a pinned version with checksum verification, variant selection, atomic install to <code>~/.local/bin</code>, and no sudo; the docs site has an install page, and the CLI reports <code>--version</code>.</li>
+</ul>
 <h3>Security hardening — pass 5: auth DoS/timing/hash policy + resource bounds ✅</h3>
 <ul>
 <li>Logins no longer run Argon2id while holding the store lock; failed attempts are rate-limited per connection and per IP, and concurrent verifications are capped — credential-free clients can no longer starve writers or allocate GiBs of transient memory.</li>

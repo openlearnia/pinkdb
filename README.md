@@ -29,6 +29,36 @@ cargo run -p pinkdb-cli          # debug REPL
 cargo build --release -p pinkdb-cli
 ```
 
+### Install a release binary
+
+Linux (x86_64/aarch64) and macOS (arm64/x86_64) release builds are published
+from `v*` tags. Download the installer, inspect it, and run it — the script
+fetches `SHA256SUMS`, verifies the artifact (fail closed), and installs
+atomically to `${PREFIX:-$HOME/.local}/bin`:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/openlearnia/pinkdb/main/install.sh
+sh install.sh
+```
+
+Pin a version or choose a feature variant:
+
+```sh
+sh install.sh --version 0.1.0 --variant default
+sh install.sh --variant pinklake-s3     # .lake over .pink files + s3://
+sh install.sh --variant vortexlake      # Vortex data files
+sh install.sh --variant lean            # no linked json/datetime/math
+```
+
+`--dry-run` prints the resolved version, asset, URL and destination without
+downloading; `--force` replaces an existing install. Supported variants are
+`default`, `lean`, `pinklake`, `pinklake-s3`, `vortexlake`, `vortexlake-s3`.
+Server binaries (`pinkdb-server-<version>-<os>-<arch>-{default,async-server,tls}.tar.gz`)
+and the `SHA256SUMS` manifest are attached to the same release. **Windows is
+not supported** — there is no Windows binary or `install.ps1`. See
+[`docs/releasing.md`](docs/releasing.md) for the full matrix, checksum
+verification, and immutable-release policy.
+
 Library use:
 
 ```rust
@@ -2572,18 +2602,19 @@ cargo run --release -p pinkdb --example query_bench  # full query battery (ms)
 
 ## CI/CD
 
-Three GitHub Actions workflows in `.github/workflows/`, GitHub-hosted runners
+Four GitHub Actions workflows in `.github/workflows/`, GitHub-hosted runners
 only:
 
 | Workflow | Trigger | Jobs / steps |
 |---|---|---|
 | `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,vortexlake`, `pinkdb-cli --features vortexlake,s3` / `pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + the C/C++, Go and Rust SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
+| `release.yml` | push of a `v*` tag, or manual dispatch with a version | `prepare` (tag/version/Cargo.toml match + matrix), one `build` matrix job per CLI/server variant × platform (build → `scripts/release/smoke.sh` → tarball + `.sha256`, no secrets), then one `publish` job (`contents: write`) that downloads all 36 artifacts, regenerates and validates `SHA256SUMS`, refuses an existing release, and uploads the GitHub release |
 | `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
-| `publish-extensions.yml` | manual dispatch only | builds the C/C++ SDK examples (and any `extensions/*/` built by their own Makefile), runs both SDK smokes, fetches the live catalog, skips already-published coordinates, publishes new artifacts with `ext-repo/publish.sh` (wrangler → R2), signs the catalog, verifies the local/live signature and the new artifacts, and prints the artifact/catalog URLs |
+| `publish-extensions.yml` | push of a `v*` tag, or manual dispatch | builds the extension catalog in a per-platform matrix (C/C++, Go and Rust SDKs plus `extensions/*/Makefile`s; `file` architecture check; native SDK smokes), fans in to one publish job that fetches the live catalog, skips already-published coordinates, publishes with `ext-repo/publish.sh` (wrangler → R2), signs the catalog, verifies the local/live signature and artifacts, and deploys the Worker exactly once |
 
 ### Required repository secrets
 
-Set both under *Settings → Secrets and variables → Actions*. Two names are
+Set these under *Settings → Secrets and variables → Actions*. Two names are
 accepted for each — `CF_API_TOKEN` / `CF_ACCOUNT_ID` (tried first; used by this
 repository's organization) or `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`
 (the fallback):
@@ -2594,17 +2625,22 @@ repository's organization) or `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`
 | `CF_ACCOUNT_ID` (or `CLOUDFLARE_ACCOUNT_ID`) | the account that owns the `pinkdb-docs` / `pinkdb-ext-repo` Workers and the `pinkdb-extensions` R2 bucket (find it in the Cloudflare dashboard); store it as a secret, never in the repository | same |
 | `PINKDB_EXT_SIGNING_KEY` | the Ed25519 catalog-signing private key (PEM content, base64 of the PEM, or a path). Never commit or log it; `docs/extension-signing.md` is the contract | `publish-extensions.yml` publish step only |
 
+The release workflow needs no configured secret: its single `publish` job uses
+the automatic `GITHUB_TOKEN` with `contents: write`; build jobs have no secrets
+and only `contents: read`.
+
 ### Publishing extensions by hand
 
 Actions → **Publish extensions** → *Run workflow*. Every input is optional:
 
 - `name` — publish a single discovered extension, e.g. `cpp_ext`;
 - `version` — artifact version (default: the version in `crates/pinkdb/Cargo.toml`);
-- `platform` — platform tag; it must match the runner (default derived from it:
-  `darwin-arm64` on `macos-latest`) — publishing for another platform means
-  changing `runs-on`, not forcing a tag.
+- `platform` — one catalog platform tag (`darwin-arm64`, `darwin-x64`,
+  `linux-x64`, `linux-arm64`); the workflow selects the matching runner
+  (default: `darwin-arm64`, the historical manual runner).
 
-With no inputs the workflow publishes every discovered artifact. Publishing is
+With no inputs the workflow publishes every discovered artifact for that one
+platform; a tag push builds all four platforms. Publishing is
 immutable: coordinates already in the live catalog are skipped (the publisher,
 `ext-repo/publish.py`, refuses them on its own too), and every catalog entry
 carries the artifact's SHA-256 and size. The catalog is signed with Ed25519
@@ -2615,6 +2651,13 @@ missing or invalid signature before downloading anything. See
 `docs/extension-signing.md`.
 
 ### Verifying the workflows
+
+Release and installer logic is also exercised locally without GitHub:
+`tests/install/run.sh` serves a fake release tree to `install.sh` (latest,
+pinned, variants, tampered/missing checksums, `--force`, prefixes, cleanup),
+and `tests/release/test_package.sh` checks asset naming, tar contents,
+`SHA256SUMS`, the matrix and extension discovery. `docs/releasing.md` is the
+release contract.
 
 Workflows can only be *truly* verified on GitHub — no local runner is used
 here. Locally we lint every workflow with `actionlint`, parse them as YAML, and

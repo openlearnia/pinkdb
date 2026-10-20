@@ -22,9 +22,15 @@ else
 SO_EXT := so
 endif
 
+# Cross-architecture build: `make TARGET=x86_64-apple-darwin` (used by the
+# release workflow's darwin-x64 job).
+TARGET ?=
+TARGET_DIR := $(if $(TARGET),target/$(TARGET),target)
+CARGO_TARGET_FLAG := $(if $(TARGET),--target $(TARGET),)
+
 all:
-	$(CARGO) build --release -p pinkdb-ext-sdk-example
-	@printf 'example built: %s\n' "target/release/librust_string_ext.$(SO_EXT)"
+	$(CARGO) build --release $(CARGO_TARGET_FLAG) -p pinkdb-ext-sdk-example
+	@printf 'example built: %s\n' "$(TARGET_DIR)/release/librust_string_ext.$(SO_EXT)"
 
 template:
 	$(CARGO) build --release --manifest-path template/Cargo.toml

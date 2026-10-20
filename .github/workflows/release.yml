@@ -1,0 +1,252 @@
+# Tag-driven release: build, smoke-test, and publish the CLI + server matrix.
+#
+# Trigger: pushing a tag `v<version>` (the normal path), or workflow_dispatch
+# with an explicit version for a re-run/manual release. The version must match
+# Cargo.toml in the engine, CLI, and server crates; a mismatch fails before
+# any build starts.
+#
+# Design (see docs/releasing.md):
+#   * build is one matrix job per kind/variant/platform, with no secrets and
+#     `contents: read`;
+#   * every artifact is smoke-tested by scripts/release/smoke.sh before it is
+#     uploaded — build jobs upload only after package.sh succeeds;
+#   * the publish job is the only writer (`contents: write`), runs once per
+#     tag, refuses an existing release (immutable name+version+platform
+#     policy), regenerates and validates SHA256SUMS, then creates the release.
+#
+# No pull_request trigger: a tag is the only thing that publishes.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to release (no v prefix; must match Cargo.toml)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  prepare:
+    name: resolve version + matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.coords.outputs.version }}
+      tag: ${{ steps.coords.outputs.tag }}
+      matrix: ${{ steps.coords.outputs.matrix }}
+      expected_assets: ${{ steps.coords.outputs.expected_assets }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: resolve version, tag, and matrix
+        id: coords
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            case "$REF_NAME" in
+              v[0-9]*) ;;
+              *) echo "::error::release tags must look like v<version>, got '$REF_NAME'"; exit 1 ;;
+            esac
+            tag="$REF_NAME"
+            version="${tag#v}"
+          else
+            version="${INPUT_VERSION#v}"
+            tag="v$version"
+          fi
+          case "$version" in
+            '' | *[!0-9A-Za-z._+-]*)
+              echo "::error::invalid release version '$version'"
+              exit 1
+              ;;
+          esac
+          for manifest in crates/pinkdb/Cargo.toml crates/pinkdb-cli/Cargo.toml crates/pinkdb-server/Cargo.toml; do
+            cargo_version=$(grep -m1 '^version' "$manifest" | cut -d'"' -f2)
+            if [ "$cargo_version" != "$version" ]; then
+              echo "::error::$manifest version $cargo_version does not match release $version"
+              exit 1
+            fi
+          done
+          matrix=$(python3 scripts/release/matrix.py --kind all)
+          expected_assets=$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$matrix")
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "matrix=$matrix"
+            echo "expected_assets=$expected_assets"
+          } >>"$GITHUB_OUTPUT"
+          echo "release $tag: $expected_assets artifacts"
+
+  build:
+    name: ${{ matrix.kind }}/${{ matrix.variant }} (${{ matrix.platform }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: release-${{ matrix.kind }}-${{ matrix.platform }}-${{ matrix.variant }}
+
+      - name: add cross target
+        if: matrix.target != ''
+        run: rustup target add "${{ matrix.target }}"
+
+      # macOS arm64 runners run x86_64 binaries under Rosetta. Install it when
+      # the runner lacks it; a cross artifact is never published unexercised.
+      - name: enable Rosetta for the darwin-x86_64 smoke
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: |
+          set -euo pipefail
+          if ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          arch -x86_64 /usr/bin/true || {
+            echo "::error::Rosetta is unavailable; smoke darwin-x86_64 on an Intel runner instead (docs/releasing.md)"
+            exit 1
+          }
+
+      - name: build, smoke, package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          KIND: ${{ matrix.kind }}
+          VARIANT: ${{ matrix.variant }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          args=(--kind "$KIND" --variant "$VARIANT" --version "$VERSION" --out dist)
+          if [ -n "$TARGET" ]; then
+            args+=(--target "$TARGET")
+          fi
+          ./scripts/release/package.sh "${args[@]}"
+
+      - name: upload the tested artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.kind }}-${{ matrix.platform }}-${{ matrix.variant }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: validate + publish (immutable)
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-release-${{ needs.prepare.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: download every tested artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: regenerate and validate SHA256SUMS
+        env:
+          EXPECTED_ASSETS: ${{ needs.prepare.outputs.expected_assets }}
+        run: |
+          set -euo pipefail
+          count=$(find dist -maxdepth 1 -type f -name '*.tar.gz' | wc -l | tr -d ' ')
+          if [ "$count" -ne "$EXPECTED_ASSETS" ]; then
+            echo "::error::expected $EXPECTED_ASSETS tested artifacts, downloaded $count; refusing a partial release"
+            exit 1
+          fi
+          ./scripts/release/manifest.sh dist
+          ./scripts/release/manifest.sh --check dist
+
+      # Immutability: a release for this tag is never modified or replaced.
+      # (The tag itself exists on a tag push; the check is about the release.)
+      - name: refuse an existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; published assets/versions are immutable — bump the version instead"
+            exit 1
+          fi
+
+      - name: create the release and upload assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          EXPECTED_ASSETS: ${{ needs.prepare.outputs.expected_assets }}
+        run: |
+          set -euo pipefail
+          cat >release-notes.md <<EOF
+          pinkdb $VERSION
+
+          Release artifacts are built and smoke-tested per platform/variant on
+          the tag. Verify downloads against SHA256SUMS (and the per-asset
+          .sha256 sidecars): https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG
+
+          Install: sh install.sh [--version $VERSION] [--variant default|lean|pinklake|pinklake-s3|vortexlake|vortexlake-s3]
+          EOF
+          args=(--title "pinkdb $VERSION" --notes-file release-notes.md)
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            tag_sha=$(git rev-list -n 1 "$TAG")
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $TAG points at $tag_sha, not the checked-out $GITHUB_SHA; refusing to attach mismatched assets"
+              exit 1
+            fi
+            args+=(--verify-tag)
+          else
+            args+=(--target "$GITHUB_SHA")
+          fi
+          # Create as a draft first so a failed upload never exposes a partial
+          # release. Publishing flips the draft; any failure leaves it hidden.
+          gh release create "$TAG" --draft "${args[@]}"
+          gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS
+          gh release edit "$TAG" --draft=false
+          gh release view "$TAG" --json assets --jq '.assets | length' >"dist/uploaded-assets"
+          uploaded=$(cat dist/uploaded-assets)
+          expected=$((EXPECTED_ASSETS * 2 + 1))
+          if [ "$uploaded" -ne "$expected" ]; then
+            echo "::error::release has $uploaded assets, expected $expected"
+            exit 1
+          fi
+          echo "published $TAG with $uploaded assets"

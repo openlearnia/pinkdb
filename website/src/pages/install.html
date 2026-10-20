@@ -1,0 +1,105 @@
+<h1>Install pinkdb</h1>
+
+<p class="doc-meta">Prebuilt CLI binaries for Linux and macOS, published from
+<code>v*</code> tags. The installer is a plain shell script in this repository —
+download it, read it, then run it. It verifies the artifact against the
+release's <code>SHA256SUMS</code> before installing; nothing is piped into a
+shell.</p>
+
+<h2>Quick install</h2>
+
+<pre class="code" data-lang="sh"><code>curl -fsSLO https://raw.githubusercontent.com/openlearnia/pinkdb/main/install.sh
+sh install.sh</code></pre>
+
+<p>By default it installs the <strong>latest</strong> release's
+<code>default</code> CLI variant to <code>${PREFIX:-$HOME/.local}/bin/pinkdb</code>.
+If that directory is not on your <code>PATH</code>, the script prints the
+export line to add. It never uses <code>sudo</code>.</p>
+
+<aside class="marginalia">
+  <span class="margin-tag">verify first</span>
+  <p>The script fetches <code>SHA256SUMS</code> from the same release, requires
+  an entry for the exact asset, and refuses on a mismatch. <code>--dry-run</code>
+  prints the version, asset, URL and destination without downloading.</p>
+</aside>
+
+<h2>Choose a variant</h2>
+
+<p>The release matrix ships the same feature variants as the cargo builds. Pass
+<code>--variant NAME</code> (or set <code>PINKDB_VARIANT</code>):</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Variant</th><th>Features</th><th>What you get</th></tr></thead>
+  <tbody>
+    <tr><td><code>default</code></td><td>default</td><td>REPL, CSV import, <code>.pink</code> + WAL, json/datetime/math functions</td></tr>
+    <tr><td><code>lean</code></td><td><code>--no-default-features</code></td><td>the same core without the linked json/datetime/math extensions</td></tr>
+    <tr><td><code>pinklake</code></td><td><code>pinklake</code></td><td><code>.lake</code> over <code>.pink</code> data files</td></tr>
+    <tr><td><code>pinklake-s3</code></td><td><code>pinklake,s3</code></td><td>pinklake + <code>s3://</code> storage (AWS S3, R2)</td></tr>
+    <tr><td><code>vortexlake</code></td><td><code>vortexlake</code></td><td><code>.lake</code> over Vortex data files</td></tr>
+    <tr><td><code>vortexlake-s3</code></td><td><code>vortexlake,s3</code></td><td>Vortex lake + <code>s3://</code> storage</td></tr>
+  </tbody>
+</table>
+</div>
+
+<pre class="code" data-lang="sh"><code>sh install.sh --variant pinklake-s3
+sh install.sh --variant vortexlake --prefix "$HOME/bin"</code></pre>
+
+<h2>Pin a version</h2>
+
+<p>Without a version the installer asks GitHub for the latest release. Pin one
+with <code>--version</code> or <code>PINKDB_VERSION</code>; the asset is fetched
+from <code>releases/download/v&lt;version&gt;/…</code>:</p>
+
+<pre class="code" data-lang="sh"><code>sh install.sh --version 0.1.0
+PINKDB_VERSION=0.1.0 sh install.sh --variant lean</code></pre>
+
+<h2>Platform support</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>OS</th><th>Architectures</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Linux</td><td><code>x86_64</code>, <code>aarch64</code></td><td>published and smoke-tested per tag</td></tr>
+    <tr><td>macOS</td><td><code>arm64</code>, <code>x86_64</code></td><td>published and smoke-tested per tag (x86_64 cross-built on the arm runner)</td></tr>
+    <tr><td>Windows</td><td>—</td><td><strong>not supported</strong>: no binary and no <code>install.ps1</code> yet</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The installer normalizes <code>uname</code> spellings (<code>arm64</code> and
+<code>aarch64</code> are the same asset architecture). Unsupported operating
+systems, architectures and variants fail with a clear message before any
+download.</p>
+
+<h2>Verify the download</h2>
+
+<p>Every release carries a <code>SHA256SUMS</code> manifest and a
+<code>.sha256</code> sidecar for each tarball. To verify manually, download the
+manifest next to the asset and check it:</p>
+
+<pre class="code" data-lang="sh"><code>curl -fsSLO https://github.com/openlearnia/pinkdb/releases/download/v0.1.0/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS</code></pre>
+
+<p>Release assets and their names are immutable: a published
+name+version+platform is never overwritten. See the
+<a href="https://github.com/openlearnia/pinkdb/blob/main/docs/releasing.md" rel="noopener">release
+guide</a> for the full matrix, secret scoping and recovery rules, and the
+<a href="https://github.com/openlearnia/pinkdb/releases" rel="noopener">releases
+page</a> for download links. This page is static and does not call the GitHub
+API at runtime.</p>
+
+<h2>Server binaries</h2>
+
+<p>The network server ships as separate tarballs on the same tag:
+<code>pinkdb-server-&lt;version&gt;-&lt;os&gt;-&lt;arch&gt;-default</code> (blocking
+transport), <code>-async-server</code> (tokio transport) and <code>-tls</code>
+(rustls). They contain the <code>pinkdb-server</code> binary; use the same
+<code>SHA256SUMS</code> to verify them. Install with your package manager or by
+unpacking the tarball; there is no server install script.</p>
+
+<h2>Build from source</h2>
+
+<p>If your platform or feature combination is not in the matrix, build it with
+cargo: see <a href="{{root}}docs/getting-started.html">Getting started</a> for
+the feature matrix and the release sizes.</p>

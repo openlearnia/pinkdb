@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Install — pinkdb</title>
+<meta name="description" content="Install a released pinkdb CLI on Linux or macOS with install.sh: latest or pinned version, feature variants, SHA-256 verification, and the supported platform matrix.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/install.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Install — pinkdb">
+<meta property="og:description" content="Install a released pinkdb CLI on Linux or macOS with install.sh: latest or pinned version, feature variants, SHA-256 verification, and the supported platform matrix.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/install.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Install</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+<li><a href="install" class="active" aria-current="page">Install</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="dialect">SQL dialect</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
+<li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<p class="eyebrow">Start here</p>
+<h1>Install pinkdb</h1>
+
+<p class="doc-meta">Prebuilt CLI binaries for Linux and macOS, published from
+<code>v*</code> tags. The installer is a plain shell script in this repository —
+download it, read it, then run it. It verifies the artifact against the
+release's <code>SHA256SUMS</code> before installing; nothing is piped into a
+shell.</p>
+
+<h2 id="quick-install">Quick install<a class="anchor" href="#quick-install" aria-label="Permalink: Quick install">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>curl <span class="tok-f">-fsSLO</span> https://raw.githubusercontent.com/openlearnia/pinkdb/main/install.sh
+sh install.sh</code></pre></div>
+
+<p>By default it installs the <strong>latest</strong> release's
+<code>default</code> CLI variant to <code>${PREFIX:-$HOME/.local}/bin/pinkdb</code>.
+If that directory is not on your <code>PATH</code>, the script prints the
+export line to add. It never uses <code>sudo</code>.</p>
+
+<aside class="marginalia">
+  <span class="margin-tag">verify first</span>
+  <p>The script fetches <code>SHA256SUMS</code> from the same release, requires
+  an entry for the exact asset, and refuses on a mismatch. <code>--dry-run</code>
+  prints the version, asset, URL and destination without downloading.</p>
+</aside>
+
+<h2 id="choose-a-variant">Choose a variant<a class="anchor" href="#choose-a-variant" aria-label="Permalink: Choose a variant">#</a></h2>
+
+<p>The release matrix ships the same feature variants as the cargo builds. Pass
+<code>--variant NAME</code> (or set <code>PINKDB_VARIANT</code>):</p>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Variant</th><th>Features</th><th>What you get</th></tr></thead>
+  <tbody>
+    <tr><td><code>default</code></td><td>default</td><td>REPL, CSV import, <code>.pink</code> + WAL, json/datetime/math functions</td></tr>
+    <tr><td><code>lean</code></td><td><code>--no-default-features</code></td><td>the same core without the linked json/datetime/math extensions</td></tr>
+    <tr><td><code>pinklake</code></td><td><code>pinklake</code></td><td><code>.lake</code> over <code>.pink</code> data files</td></tr>
+    <tr><td><code>pinklake-s3</code></td><td><code>pinklake,s3</code></td><td>pinklake + <code>s3://</code> storage (AWS S3, R2)</td></tr>
+    <tr><td><code>vortexlake</code></td><td><code>vortexlake</code></td><td><code>.lake</code> over Vortex data files</td></tr>
+    <tr><td><code>vortexlake-s3</code></td><td><code>vortexlake,s3</code></td><td>Vortex lake + <code>s3://</code> storage</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>sh install.sh <span class="tok-f">--variant</span> pinklake-s3
+sh install.sh <span class="tok-f">--variant</span> vortexlake <span class="tok-f">--prefix</span> <span class="tok-s">"$HOME/bin"</span></code></pre></div>
+
+<h2 id="pin-a-version">Pin a version<a class="anchor" href="#pin-a-version" aria-label="Permalink: Pin a version">#</a></h2>
+
+<p>Without a version the installer asks GitHub for the latest release. Pin one
+with <code>--version</code> or <code>PINKDB_VERSION</code>; the asset is fetched
+from <code>releases/download/v&lt;version&gt;/…</code>:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>sh install.sh <span class="tok-f">--version</span> 0.1.0
+<span class="tok-v">PINKDB_VERSION</span>=0.1.0 sh install.sh <span class="tok-f">--variant</span> lean</code></pre></div>
+
+<h2 id="platform-support">Platform support<a class="anchor" href="#platform-support" aria-label="Permalink: Platform support">#</a></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>OS</th><th>Architectures</th><th>Status</th></tr></thead>
+  <tbody>
+    <tr><td>Linux</td><td><code>x86_64</code>, <code>aarch64</code></td><td>published and smoke-tested per tag</td></tr>
+    <tr><td>macOS</td><td><code>arm64</code>, <code>x86_64</code></td><td>published and smoke-tested per tag (x86_64 cross-built on the arm runner)</td></tr>
+    <tr><td>Windows</td><td>—</td><td><strong>not supported</strong>: no binary and no <code>install.ps1</code> yet</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The installer normalizes <code>uname</code> spellings (<code>arm64</code> and
+<code>aarch64</code> are the same asset architecture). Unsupported operating
+systems, architectures and variants fail with a clear message before any
+download.</p>
+
+<h2 id="verify-the-download">Verify the download<a class="anchor" href="#verify-the-download" aria-label="Permalink: Verify the download">#</a></h2>
+
+<p>Every release carries a <code>SHA256SUMS</code> manifest and a
+<code>.sha256</code> sidecar for each tarball. To verify manually, download the
+manifest next to the asset and check it:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>curl <span class="tok-f">-fsSLO</span> https://github.com/openlearnia/pinkdb/releases/download/v0.1.0/SHA256SUMS
+sha256sum <span class="tok-f">-c</span> <span class="tok-f">--ignore-missing</span> SHA256SUMS</code></pre></div>
+
+<p>Release assets and their names are immutable: a published
+name+version+platform is never overwritten. See the
+<a href="https://github.com/openlearnia/pinkdb/blob/main/docs/releasing.md" rel="noopener">release
+guide</a> for the full matrix, secret scoping and recovery rules, and the
+<a href="https://github.com/openlearnia/pinkdb/releases" rel="noopener">releases
+page</a> for download links. This page is static and does not call the GitHub
+API at runtime.</p>
+
+<h2 id="server-binaries">Server binaries<a class="anchor" href="#server-binaries" aria-label="Permalink: Server binaries">#</a></h2>
+
+<p>The network server ships as separate tarballs on the same tag:
+<code>pinkdb-server-&lt;version&gt;-&lt;os&gt;-&lt;arch&gt;-default</code> (blocking
+transport), <code>-async-server</code> (tokio transport) and <code>-tls</code>
+(rustls). They contain the <code>pinkdb-server</code> binary; use the same
+<code>SHA256SUMS</code> to verify them. Install with your package manager or by
+unpacking the tarball; there is no server install script.</p>
+
+<h2 id="build-from-source">Build from source<a class="anchor" href="#build-from-source" aria-label="Permalink: Build from source">#</a></h2>
+
+<p>If your platform or feature combination is not in the matrix, build it with
+cargo: see <a href="../docs/getting-started">Getting started</a> for
+the feature matrix and the release sizes.</p>
+
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="getting-started"><span class="pager-dir">Previous</span><span class="pager-title">Getting started</span></a><a class="pager-link next" href="guide-csv-to-lake"><span class="pager-dir">Next</span><span class="pager-title">CSV to a lake</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/install.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#quick-install">Quick install</a></li>
+  <li><a href="#choose-a-variant">Choose a variant</a></li>
+  <li><a href="#pin-a-version">Pin a version</a></li>
+  <li><a href="#platform-support">Platform support</a></li>
+  <li><a href="#verify-the-download">Verify the download</a></li>
+  <li><a href="#server-binaries">Server binaries</a></li>
+  <li><a href="#build-from-source">Build from source</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

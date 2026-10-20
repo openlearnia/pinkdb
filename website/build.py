@@ -71,6 +71,8 @@ NAV = [
         "items": [
             {"key": "getting-started", "label": "Getting started",
              "out": "docs/getting-started.html"},
+            {"key": "install", "label": "Install",
+             "out": "docs/install.html"},
         ],
     },
     {
@@ -169,6 +171,16 @@ PAGES = {
             "Build the pinkdb CLI — with or without the lake, S3, encryption "
             "and repository features — import a CSV, run your first queries, "
             "and save the database to a .pink file."
+        ),
+    },
+    "install.html": {
+        "out": "docs/install.html",
+        "nav": "install",
+        "title": "Install — pinkdb",
+        "description": (
+            "Install a released pinkdb CLI on Linux or macOS with install.sh: "
+            "latest or pinned version, feature variants, SHA-256 verification, "
+            "and the supported platform matrix."
         ),
     },
     "cli.html": {

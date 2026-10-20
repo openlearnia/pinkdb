@@ -1,4 +1,8 @@
 /target/
+# Release packaging output (scripts/release/package.sh) and per-platform
+# extension staging (scripts/release/build-extensions.sh).
+/dist/
+/ext-dist/
 *.pink
 !crates/pinkdb/tests/fixtures/*.pink
 # Lake fixture data files (their catalog/snapshot JSONs are tracked normally).

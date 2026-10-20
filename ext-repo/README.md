@@ -36,8 +36,9 @@ versioning/immutability rules. Short version:
   (`application/octet-stream`, correct `Content-Length`/`ETag`, immutable cache).
 - An existing `name`+`version`+`platform` artifact is **immutable**;
   re-publishing the same coordinates is refused (bump the version instead).
-- Platform tags: `darwin-arm64` today; `darwin-x64`, `linux-x64`,
-  `linux-arm64`, `windows-x64` reserved.
+- Platform tags published by the tag matrix: `darwin-arm64`, `darwin-x64`,
+  `linux-x64`, `linux-arm64`; `windows-x64` is reserved (no Windows build yet —
+  see `../docs/releasing.md`).
 
 ## This directory
 

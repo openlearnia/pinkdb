@@ -18,15 +18,21 @@ else
 SO_EXT := so
 endif
 
+# Cross-architecture build: `make TARGET=x86_64-apple-darwin` (the release
+# workflow's darwin-x64 job uses this; target/release stays host-only).
+TARGET ?=
+TARGET_DIR := $(if $(TARGET),$(ROOT)/target/$(TARGET),$(ROOT)/target)
+CARGO_TARGET_FLAG := $(if $(TARGET),--target $(TARGET),)
+
 all:
-	$(CARGO) build --release -p pinkdb-ext-string --features abi-exports
+	$(CARGO) build --release $(CARGO_TARGET_FLAG) -p pinkdb-ext-string --features abi-exports
 	mkdir -p build
-	cp "$(ROOT)/target/release/libstring_ext.$(SO_EXT)" build/
+	cp "$(TARGET_DIR)/release/libstring_ext.$(SO_EXT)" build/
 	@printf 'extension built: %s\n' "extensions/string/build/libstring_ext.$(SO_EXT)"
 
 debug:
-	$(CARGO) build -p pinkdb-ext-string --features abi-exports
-	@printf 'debug library: %s\n' "$(ROOT)/target/debug/libstring_ext.$(SO_EXT)"
+	$(CARGO) build $(CARGO_TARGET_FLAG) -p pinkdb-ext-string --features abi-exports
+	@printf 'debug library: %s\n' "$(TARGET_DIR)/debug/libstring_ext.$(SO_EXT)"
 
 clean:
 	rm -rf build
