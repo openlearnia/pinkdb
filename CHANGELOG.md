@@ -10,6 +10,16 @@ one-liners below.
 
 ## 2026-10-20
 
+### Security hardening — extension repository signing ✅
+- The extension catalog is now **Ed25519-signed** (`index.json.sig`), and
+  `.install` verifies it against a key **pinned in the binary before it
+  fetches or loads any artifact** — a compromised repository origin can no
+  longer serve a matching hash for its own payload. Unsigned catalogs are
+  refused unless an explicit dev override is set.
+- `publish.py` and `verify.sh` sign/verify; the publish workflow signs with the
+  `PINKDB_EXT_SIGNING_KEY` secret and adds a verification gate. No new default
+  dependencies (+~319 KiB only in `repo` builds).
+
 ### Security hardening — pass 2: authentication gate ✅
 - The login gate is now evaluated **per statement inside a batch** (both
   transports, prepared statements included): an unauthenticated `CREATE USER;

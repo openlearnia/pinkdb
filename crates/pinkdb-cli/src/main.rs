@@ -379,10 +379,31 @@ fn cmd_install(db: &mut PinkDb, arg: &str) {
             println!("  repository: {}", installed.repository);
             println!("  path:       {}", installed.path.display());
             println!("  sha256:     {}", installed.sha256);
+            match &installed.trust {
+                repo::Trust::Signed { key_id } => {
+                    println!("  signature:  verified (key {key_id})");
+                }
+                repo::Trust::UnsignedDev => {
+                    println!(
+                        "  signature:  NOT VERIFIED (PINKDB_EXT_ALLOW_UNSIGNED=1 is set — INSECURE)"
+                    );
+                }
+            }
             if !installed.downloaded {
                 println!("  cached:     yes");
             }
-            match db.load_extension(&installed.path.to_string_lossy()) {
+            // Copy the verified bytes into a fresh 0700 directory with
+            // `create_new`, re-hash the copy, and only then load it. The
+            // staging directory is removed when `staged` drops; the loaded
+            // library stays mapped.
+            let staged = match repo::stage_for_loading(&installed.entry, &installed.path) {
+                Ok(staged) => staged,
+                Err(e) => {
+                    cli_error!("{e}");
+                    return;
+                }
+            };
+            match db.load_extension(&staged.path().to_string_lossy()) {
                 Ok(loaded) => println!("Extension {loaded} loaded."),
                 Err(e) => cli_error!("{e}"),
             }

@@ -23,9 +23,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
 
 const OFFICIAL: &str = "https://pinkdb-ext-repo.defaultcms.workers.dev";
+
+/// Ed25519 SPKI DER prefix (the raw key is the final 32 bytes).
+const ED25519_SPKI_PREFIX: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 // ---------- temp homes ----------
 
@@ -44,6 +51,15 @@ impl TempHome {
     fn path(&self) -> &Path {
         &self.0
     }
+
+    /// Seed `repositories.json` so a test never falls back to the live
+    /// default repository (which is `OFFICIAL` when the file is absent).
+    fn configure(&self, repositories: &[&str]) {
+        fs::create_dir_all(&self.0).expect("create temp home");
+        let value = serde_json::json!({ "repositories": repositories });
+        fs::write(self.0.join("repositories.json"), value.to_string())
+            .expect("write repositories.json");
+    }
 }
 
 impl Drop for TempHome {
@@ -55,13 +71,83 @@ impl Drop for TempHome {
 // ---------- the CLI and the fixture server ----------
 
 /// Run the real CLI binary with `PINKDB_HOME` pointed at `home`, feeding it
-/// `script` on stdin; returns stdout.
+/// `script` on stdin; returns stdout. The test public key replaces the
+/// production pin through the documented dev override.
 fn run_cli(home: &Path, script: &str) -> String {
+    run_cli_with(home, script, &[], Some(&test_public_key_pem()))
+}
+
+/// Like [`run_cli`], with extra environment variables (e.g. the unsigned dev
+/// escape hatch).
+fn run_cli_env(home: &Path, script: &str, envs: &[(&str, &str)]) -> String {
+    run_cli_with(home, script, envs, Some(&test_public_key_pem()))
+}
+
+/// Run with the **embedded production pin** (no test override).
+fn run_cli_pinned(home: &Path, script: &str) -> String {
+    run_cli_with(home, script, &[], None)
+}
+
+fn run_cli_with(
+    home: &Path,
+    script: &str,
+    envs: &[(&str, &str)],
+    public_key_pem: Option<&str>,
+) -> String {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
-    command.env("PINKDB_HOME", home);
+    command
+        .env("PINKDB_HOME", home)
+        .env_remove("PINKDB_EXT_REPO_PUBKEY")
+        .env_remove("PINKDB_EXT_ALLOW_UNSIGNED");
+    if let Some(pem) = public_key_pem {
+        command.env("PINKDB_EXT_REPO_PUBKEY", pem);
+    }
+    for (key, value) in envs {
+        command.env(key, value);
+    }
     let (out, status) = common::run_merged(command, script);
     common::assert_script_exit(status);
     out
+}
+
+// ---------- catalog signing helpers ----------
+
+/// A fixed test signing key: no RNG, deterministic across runs.
+fn test_signing_key() -> &'static SigningKey {
+    static KEY: OnceLock<SigningKey> = OnceLock::new();
+    KEY.get_or_init(|| SigningKey::from_bytes(&[9u8; 32]))
+}
+
+fn spki_der(key: &SigningKey) -> Vec<u8> {
+    let mut der = ED25519_SPKI_PREFIX.to_vec();
+    der.extend_from_slice(key.verifying_key().as_bytes());
+    der
+}
+
+fn key_id(key: &SigningKey) -> String {
+    Sha256::digest(spki_der(key))
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The test key as an SPKI PEM, for `PINKDB_EXT_REPO_PUBKEY`.
+fn test_public_key_pem() -> String {
+    format!(
+        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+        base64::engine::general_purpose::STANDARD.encode(spki_der(test_signing_key()))
+    )
+}
+
+/// `PINKDB-SIG1 <keyid> <base64 signature over the exact bytes>`.
+fn sign_envelope(bytes: &[u8]) -> String {
+    let signature = test_signing_key().sign(bytes);
+    format!(
+        "PINKDB-SIG1 {} {}\n",
+        key_id(test_signing_key()),
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
+    )
 }
 
 /// A loopback HTTP server serving `/index.json` and the artifact paths, with
@@ -74,7 +160,22 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Serve a catalog signed by the fixed test key.
     fn start(catalog: String, artifacts: Vec<(String, Vec<u8>)>) -> Fixture {
+        let signature = sign_envelope(catalog.as_bytes());
+        Fixture::start_with_signature(catalog, Some(signature), artifacts)
+    }
+
+    /// Serve a catalog with **no** `index.json.sig` (HTTP 404).
+    fn start_unsigned(catalog: String, artifacts: Vec<(String, Vec<u8>)>) -> Fixture {
+        Fixture::start_with_signature(catalog, None, artifacts)
+    }
+
+    fn start_with_signature(
+        catalog: String,
+        signature: Option<String>,
+        artifacts: Vec<(String, Vec<u8>)>,
+    ) -> Fixture {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
         listener
             .set_nonblocking(true)
@@ -98,7 +199,9 @@ impl Fixture {
         let handle = thread::spawn(move || {
             while !flag.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => serve(stream, &catalog, &artifacts, &record),
+                    Ok((stream, _)) => {
+                        serve(stream, &catalog, signature.as_deref(), &artifacts, &record)
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
                     }
@@ -128,6 +231,13 @@ impl Fixture {
             .filter(|path| path.starts_with("/artifacts/"))
             .count()
     }
+
+    fn signature_requests(&self) -> usize {
+        self.requests()
+            .iter()
+            .filter(|path| path.as_str() == "/index.json.sig")
+            .count()
+    }
 }
 
 impl Drop for Fixture {
@@ -142,6 +252,7 @@ impl Drop for Fixture {
 fn serve(
     mut stream: TcpStream,
     catalog: &str,
+    signature: Option<&str>,
     artifacts: &HashMap<String, Vec<u8>>,
     requests: &Mutex<Vec<String>>,
 ) {
@@ -167,6 +278,10 @@ fn serve(
     requests.lock().unwrap().push(path.clone());
     let (status, content_type, body): (&str, &str, &[u8]) = match path.as_str() {
         "/index.json" => ("200 OK", "application/json", catalog.as_bytes()),
+        "/index.json.sig" => match signature {
+            Some(text) => ("200 OK", "text/plain", text.as_bytes()),
+            None => ("404 Not Found", "text/plain", b"fixture: no signature"),
+        },
         other => match artifacts.get(other) {
             Some(bytes) => ("200 OK", "application/octet-stream", bytes.as_slice()),
             None => ("404 Not Found", "text/plain", b"fixture: not found"),
@@ -392,12 +507,10 @@ fn install_end_to_end_from_fixture_server() {
         catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
         vec![(file.clone(), bytes.clone())],
     );
+    home.configure(&[&server.base_url()]);
     let out = run_cli(
         home.path(),
-        &format!(
-            ".repositories add {base}\n.install repo_ext\nSELECT ext_repo_triple(CAST(14 AS BIGINT));\n.installed\n.quit\n",
-            base = server.base_url()
-        ),
+        ".install repo_ext\nSELECT ext_repo_triple(CAST(14 AS BIGINT));\n.installed\n.quit\n",
     );
 
     assert!(
@@ -409,6 +522,13 @@ fn install_end_to_end_from_fixture_server() {
         "{out}"
     );
     assert!(out.contains(&format!("sha256:     {sha}")), "{out}");
+    assert!(
+        out.contains(&format!(
+            "signature:  verified (key {})",
+            key_id(test_signing_key())
+        )),
+        "{out}"
+    );
     assert!(out.contains("Extension repo_ext loaded."), "{out}");
     assert!(out.contains("│ 42"), "{out}");
     assert!(out.contains("1 row"), "{out}");
@@ -428,6 +548,158 @@ fn install_end_to_end_from_fixture_server() {
         "exactly one artifact download"
     );
     assert_no_temp_files(home.path());
+}
+
+#[test]
+fn unsigned_catalog_is_refused_before_any_artifact_request() {
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    let server = Fixture::start_unsigned(
+        catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
+        vec![(file.clone(), bytes.clone())],
+    );
+    let home = TempHome::new("unsigned");
+    home.configure(&[&server.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
+
+    assert!(out.contains("catalog signature is missing"), "{out}");
+    assert!(out.contains("refusing an unsigned catalog"), "{out}");
+    assert!(out.contains("PINKDB_EXT_ALLOW_UNSIGNED=1"), "{out}");
+    assert!(!out.contains("Extension repo_ext loaded."), "{out}");
+    // Only the catalog and its signature were requested: the artifact fetch
+    // never happened.
+    assert_eq!(
+        server.requests(),
+        vec!["/index.json", "/index.json.sig"],
+        "verification must precede the artifact fetch"
+    );
+    assert_eq!(server.artifact_requests(), 0);
+    assert_eq!(server.signature_requests(), 1);
+}
+
+#[test]
+fn unsigned_catalog_loads_only_with_the_explicit_dev_flag() {
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    let server = Fixture::start_unsigned(
+        catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
+        vec![(file.clone(), bytes.clone())],
+    );
+    let home = TempHome::new("unsigned-dev");
+    home.configure(&[&server.base_url()]);
+    let out = run_cli_env(
+        home.path(),
+        ".install repo_ext\nSELECT ext_repo_triple(CAST(14 AS BIGINT));\n.quit\n",
+        &[("PINKDB_EXT_ALLOW_UNSIGNED", "1")],
+    );
+
+    assert!(
+        out.contains("WARNING: PINKDB_EXT_ALLOW_UNSIGNED=1: catalog signatures are NOT verified"),
+        "{out}"
+    );
+    assert!(out.contains("catalog is UNSIGNED"), "{out}");
+    assert!(out.contains("signature:  NOT VERIFIED"), "{out}");
+    assert!(out.contains("Extension repo_ext loaded."), "{out}");
+    assert!(out.contains("│ 42"), "{out}");
+    assert_eq!(server.artifact_requests(), 1);
+}
+
+#[test]
+fn tampered_catalog_signature_is_refused_before_any_artifact_request() {
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    let catalog = catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]);
+    // A well-formed envelope over bytes that are not this catalog.
+    let signature = sign_envelope(b"a different catalog");
+    let server = Fixture::start_with_signature(
+        catalog,
+        Some(signature),
+        vec![(file.clone(), bytes.clone())],
+    );
+    let home = TempHome::new("tampered-sig");
+    home.configure(&[&server.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
+
+    assert!(
+        out.contains("catalog signature verification failed"),
+        "{out}"
+    );
+    assert!(!out.contains("Extension repo_ext loaded."), "{out}");
+    assert_eq!(server.artifact_requests(), 0);
+    assert_eq!(server.requests(), vec!["/index.json", "/index.json.sig"]);
+}
+
+#[test]
+fn malformed_catalog_signature_is_refused_before_any_artifact_request() {
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    let server = Fixture::start_with_signature(
+        catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
+        Some("PINKDB-SIG1 0000000000000000 !!!not-base64!!!\n".to_string()),
+        vec![(file.clone(), bytes.clone())],
+    );
+    let home = TempHome::new("malformed-sig");
+    home.configure(&[&server.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
+    assert!(out.contains("malformed catalog signature"), "{out}");
+    assert_eq!(server.artifact_requests(), 0);
+}
+
+#[test]
+fn signature_with_an_unknown_key_id_is_refused_against_the_pinned_key() {
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    let sha = sha256_hex(&bytes);
+    // `Fixture::start` signs with the test key; run this one against the
+    // embedded production pin (no PINKDB_EXT_REPO_PUBKEY override).
+    let server = Fixture::start(
+        catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
+        vec![(file.clone(), bytes.clone())],
+    );
+    let home = TempHome::new("pinned-unknown");
+    home.configure(&[&server.base_url()]);
+    let out = run_cli_pinned(home.path(), ".install repo_ext\n.quit\n");
+    assert!(
+        out.contains("catalog signature uses unknown key id"),
+        "{out}"
+    );
+    assert!(out.contains("refusing the catalog"), "{out}");
+    assert!(out.contains("c84e54bfea6b2d09"), "{out}");
+    assert_eq!(server.artifact_requests(), 0);
+}
+
+#[test]
+fn tampered_artifact_is_refused_and_never_loaded() {
+    let bytes = fs::read(fixture_extension()).unwrap();
+    let platform = host_platform();
+    let file = artifact_file("0.1.0", &platform);
+    // The catalog signs the good artifact's hash; the server sends other
+    // bytes (a hostile origin with a valid catalog signature).
+    let sha = sha256_hex(&bytes);
+    let server = Fixture::start(
+        catalog_document(&[entry("repo_ext", "0.1.0", 1, &platform, &file, &sha)]),
+        vec![(file.clone(), b"tampered artifact bytes".to_vec())],
+    );
+    let home = TempHome::new("tampered-artifact");
+    home.configure(&[&server.base_url()]);
+    let out = run_cli(
+        home.path(),
+        ".install repo_ext\nSELECT ext_repo_triple(CAST(14 AS BIGINT));\n.quit\n",
+    );
+    assert!(out.contains("sha256 mismatch for repo_ext 0.1.0"), "{out}");
+    assert!(out.contains("artifact discarded"), "{out}");
+    assert!(!out.contains("Extension repo_ext loaded."), "{out}");
+    assert!(!out.contains("│ 42"), "{out}");
+    assert_eq!(server.artifact_requests(), 1);
 }
 
 #[test]
@@ -465,14 +737,9 @@ fn resolution_follows_config_order_and_picks_the_highest_version() {
     // First match wins: repository A (0.2.0) beats B's higher 0.9.9, and B is
     // never even consulted.
     let home = TempHome::new("order-first");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.repositories add {}\n.install repo_ext\n.quit\n",
-            a.base_url(),
-            b.base_url()
-        ),
-    );
+    let (a_base, b_base) = (a.base_url(), b.base_url());
+    home.configure(&[&a_base, &b_base]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(out.contains("Installed repo_ext 0.2.0"), "{out}");
     assert!(
         b.requests().is_empty(),
@@ -483,14 +750,9 @@ fn resolution_follows_config_order_and_picks_the_highest_version() {
     // A repository without the extension falls through to the next one.
     let empty = Fixture::start(catalog_document(&[]), vec![]);
     let home = TempHome::new("order-fallthrough");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.repositories add {}\n.install repo_ext\n.quit\n",
-            empty.base_url(),
-            b.base_url()
-        ),
-    );
+    let (empty_base, b_base) = (empty.base_url(), b.base_url());
+    home.configure(&[&empty_base, &b_base]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(out.contains("Installed repo_ext 0.9.9"), "{out}");
 
     // No version: the highest semver-ish version (0.10.0 > 0.2.0 numerically).
@@ -502,24 +764,14 @@ fn resolution_follows_config_order_and_picks_the_highest_version() {
         serve_all(),
     );
     let home = TempHome::new("order-highest");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.install repo_ext\n.quit\n",
-            c.base_url()
-        ),
-    );
+    home.configure(&[&c.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(out.contains("Installed repo_ext 0.10.0"), "{out}");
 
     // An exact version is honored.
     let home = TempHome::new("order-exact");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.install repo_ext@0.2.0\n.quit\n",
-            c.base_url()
-        ),
-    );
+    home.configure(&[&c.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext@0.2.0\n.quit\n");
     assert!(out.contains("Installed repo_ext 0.2.0"), "{out}");
 }
 
@@ -541,13 +793,8 @@ fn platform_abi_and_format_errors_are_clear() {
         vec![(file.clone(), bytes.clone())],
     );
     let home = TempHome::new("err-platform");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.install repo_ext\n.quit\n",
-            wrong_platform.base_url()
-        ),
-    );
+    home.configure(&[&wrong_platform.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(
         out.contains("was not found in any configured repository"),
         "{out}"
@@ -566,13 +813,8 @@ fn platform_abi_and_format_errors_are_clear() {
         vec![(file.clone(), bytes.clone())],
     );
     let home = TempHome::new("err-abi");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.install repo_ext\n.quit\n",
-            wrong_abi.base_url()
-        ),
-    );
+    home.configure(&[&wrong_abi.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(out.contains("with ABI 1 (available:"), "{out}");
     assert!(out.contains("(ABI 2)"), "{out}");
 
@@ -582,13 +824,8 @@ fn platform_abi_and_format_errors_are_clear() {
         vec![],
     );
     let home = TempHome::new("err-format");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.install repo_ext\n.quit\n",
-            bad_format.base_url()
-        ),
-    );
+    home.configure(&[&bad_format.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(
         out.contains("unsupported repository format version 2 (expected 1)"),
         "{out}"
@@ -596,10 +833,8 @@ fn platform_abi_and_format_errors_are_clear() {
 
     // An unreachable repository is a clear fetch error, not a silent skip.
     let home = TempHome::new("err-unreachable");
-    let out = run_cli(
-        home.path(),
-        ".repositories add http://127.0.0.1:1\n.install repo_ext\n.quit\n",
-    );
+    home.configure(&["http://127.0.0.1:1"]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(
         out.contains("GET http://127.0.0.1:1/index.json failed"),
         "{out}"
@@ -607,6 +842,7 @@ fn platform_abi_and_format_errors_are_clear() {
 
     // Usage errors do not touch the network.
     let home = TempHome::new("err-usage");
+    home.configure(&["http://127.0.0.1:9"]);
     let out = run_cli(home.path(), ".install\n.install repo_ext 0.1.0\n.quit\n");
     assert_eq!(
         out.matches("Usage: .install <name[@version]>").count(),
@@ -626,13 +862,8 @@ fn sha256_mismatch_refuses_the_artifact_and_leaves_nothing() {
         vec![(file.clone(), bytes.clone())],
     );
     let home = TempHome::new("sha");
-    let out = run_cli(
-        home.path(),
-        &format!(
-            ".repositories add {}\n.install repo_ext\n.quit\n",
-            server.base_url()
-        ),
-    );
+    home.configure(&[&server.base_url()]);
+    let out = run_cli(home.path(), ".install repo_ext\n.quit\n");
     assert!(out.contains("sha256 mismatch for repo_ext 0.1.0"), "{out}");
     assert!(out.contains("artifact discarded"), "{out}");
     assert!(out.contains(&wrong), "{out}");
@@ -656,15 +887,13 @@ fn second_install_reuses_the_cached_copy() {
         vec![(file.clone(), bytes.clone())],
     );
     let home = TempHome::new("cache");
-    let script = format!(
-        ".repositories add {base}\n.install repo_ext\n.quit\n",
-        base = server.base_url()
-    );
-    let first = run_cli(home.path(), &script);
+    home.configure(&[&server.base_url()]);
+    let script = ".install repo_ext\n.quit\n";
+    let first = run_cli(home.path(), script);
     assert!(first.contains("Extension repo_ext loaded."), "{first}");
     assert_eq!(server.artifact_requests(), 1);
 
-    let second = run_cli(home.path(), &script);
+    let second = run_cli(home.path(), script);
     assert!(second.contains("cached:     yes"), "{second}");
     assert!(second.contains("Extension repo_ext loaded."), "{second}");
     assert_eq!(

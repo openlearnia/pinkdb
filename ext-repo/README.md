@@ -20,6 +20,9 @@ versioning/immutability rules. Short version:
   the live `math_ext` 0.1.0 entry predates it). Carries
   `Access-Control-Allow-Origin: *` so the docs page can fetch it cross-origin;
   `OPTIONS /index.json` answers the preflight.
+- `GET /index.json.sig` — detached Ed25519 signature over the exact
+  `index.json` bytes (`PINKDB-SIG1 <keyid> <base64>`), used by `.install` and
+  `verify.sh` before trusting any artifact hash.
 - `GET /` — a short info page: repository title, format version, and links to
   the docs catalog UI and `/index.json`. It is styled in the docs site's
   "soft data-zine" paper palette with system fonts only (no webfont requests,
@@ -43,7 +46,9 @@ FORMAT.md    repository format v1 (index schema, URLs, immutability rules)
 README.md    this file
 publish.py   publish one built extension (Python stdlib only; drives wrangler)
 publish.sh   wrapper:  ./publish.sh <dylib> --name … --version … --platform … --description …
-verify.sh    download an artifact URL and check its SHA-256 against the index
+verify.sh    verify the catalog signature + every artifact hash (local or remote)
+tests/       stdlib unittest for publish.py signing and verify.sh
+keys/        extension-signing.pub.pem (the pinned catalog public key)
 worker/      the Cloudflare Worker: src/index.js (info page + machine
              endpoints) and verify-ui.mjs (checks the info page, CORS,
              catalog and artifacts against a live repository; also runs the
@@ -72,21 +77,31 @@ make -C ext-sdk/c    # build the C SDK examples (if not built yet)
    `name`+`version`+`platform` is already published;
 3. copies the artifact to `artifacts/<name>/<version>/<platform>/<file>`
    (local mirror) and appends the entry to the index (sorted, fresh `updated`);
-4. uploads the artifact and then the catalog to R2 with
-   `wrangler r2 object put --remote` (artifact first, so a failed catalog
-   upload cannot leave the catalog pointing at a missing artifact);
-5. prints the resulting URLs.
+4. signs the exact index bytes with Ed25519 when `PINKDB_EXT_SIGNING_KEY` is
+   set (PEM path, PEM content, or base64 of the PEM) and writes
+   `index.json.sig`;
+5. uploads the artifact, the signature, and the catalog to R2 with
+   `wrangler r2 object put --remote` (artifact first, catalog last, so a failed
+   catalog upload cannot leave the catalog pointing at a missing artifact);
+6. prints the resulting URLs.
 
 ```text
 uploaded pinkdb-extensions/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
+uploaded pinkdb-extensions/index.json.sig
 uploaded pinkdb-extensions/index.json
 published math_ext 0.1.0 (darwin-arm64)
   sha256:   38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
   size:     17088 bytes
   artifact: https://pinkdb-ext-repo.defaultcms.workers.dev/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
   catalog:  https://pinkdb-ext-repo.defaultcms.workers.dev/index.json
+  signature: https://pinkdb-ext-repo.defaultcms.workers.dev/index.json.sig (key c84e54bfea6b2d09)
   staged:   /…/ext-repo/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
 ```
+
+Without `PINKDB_EXT_SIGNING_KEY` the publisher keeps the old unsigned behavior
+and prints a loud warning; pinned clients refuse that catalog. See
+[`../docs/extension-signing.md`](../docs/extension-signing.md) for the key,
+envelope, rotation, and threat model.
 
 Re-running is safe for **new** versions (the index is re-read and appended to);
 re-publishing existing coordinates exits 1 by design. The catalog URL is
@@ -94,16 +109,27 @@ cached for 60 s, so a fresh publish can take up to a minute to appear.
 
 ## Verifying
 
+Local mirror (signature first, then every artifact hash):
+
 ```sh
-./ext-repo/verify.sh https://pinkdb-ext-repo.defaultcms.workers.dev/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
-# OK   https://…/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
-#      sha256 38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2 (matches the index entry; 17088 bytes)
+./ext-repo/verify.sh
+# OK   catalog signature /…/ext-repo/index.json (key c84e54bfea6b2d09)
+# OK   math_ext 0.1.0 (darwin-arm64): sha256 38abc… (17088 bytes)
+# checked 1 artifact(s), 0 failure(s)
 ```
 
-It downloads the artifact with `curl`, fetches the catalog (default
-`<origin>/index.json`, override with a second argument), finds the entry whose
-`file` matches the URL path, and compares the SHA-256. Any mismatch, missing
-entry, or failed download exits non-zero.
+`--skip-artifacts` verifies only the catalog signature; `--index`, `--sig`, and
+`--pubkey` override the paths. Remote mode fetches the catalog + signature,
+verifies both, then checks one artifact URL against the now-signed catalog:
+
+```sh
+./ext-repo/verify.sh https://pinkdb-ext-repo.defaultcms.workers.dev/artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib
+# OK   catalog signature …
+# OK   artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib: sha256 38abc… (17088 bytes)
+```
+
+Any missing/malformed/unknown-key/invalid signature, missing artifact, hash
+mismatch, or failed download exits non-zero.
 
 ## Consuming from a client
 
@@ -116,25 +142,32 @@ Installed math_ext 0.1.0 (darwin-arm64)
   repository: https://pinkdb-ext-repo.defaultcms.workers.dev
   path:       ~/.pinkdb/extensions/math_ext/0.1.0/darwin-arm64/math_ext.dylib
   sha256:     38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
+  signature:  verified (key c84e54bfea6b2d09)
 Extension math_ext loaded.
 ```
 
 What that client does (implemented in `crates/pinkdb-cli/src/repo/`):
 
-1. fetch `<repo>/index.json` — repositories come from
-   `$PINKDB_HOME/repositories.json` (default `~/.pinkdb`), which defaults to
-   the live repository above when absent; the client is a cargo feature, so
-   the default binary links no HTTP/TLS code;
-2. select the entry with `format_version == 1`, `abi == 1`, the client's
+1. fetch `<repo>/index.json` **and** `<repo>/index.json.sig` — repositories
+   come from `$PINKDB_HOME/repositories.json` (default `~/.pinkdb`), which
+   defaults to the live repository above when absent; the client is a cargo
+   feature, so the default binary links no HTTP/TLS code;
+2. verify the Ed25519 signature over the exact catalog bytes against the key
+   pinned in the binary **before any artifact request** (a missing, malformed,
+   unknown-key, or invalid signature is fatal; see
+   `../docs/extension-signing.md` for the dev-only overrides);
+3. select the entry with `format_version == 1`, `abi == 1`, the client's
    platform tag (derived at runtime, e.g. `darwin-arm64`), and the wanted
    `name` (+ version; highest semver-ish version if unspecified) —
    repositories are tried in config order and the first match wins;
-3. download `<repo>/<file>` (timeout and size caps) to a temp file, verify its
+4. download `<repo>/<file>` (timeout and size caps) to a temp file, verify its
    `sha256`, and only then rename it into
    `$PINKDB_HOME/extensions/<name>/<version>/<platform>/<file>`; a mismatch is
    refused and deletes the temp file (nothing left behind);
-4. `LOAD EXTENSION` the verified artifact into the session (extensions stay
-   process-level; the stable cache path is what WAL replay re-loads).
+5. stage the verified file in a private `0700` temp directory with
+   `create_new`, re-hash the staged copy, and `LOAD EXTENSION` that path
+   (extensions stay process-level; the stable cache path is what WAL replay
+   re-loads).
 
 `.repositories list` / `add` / `remove` manages the repository list and
 `.installed` lists the cache. The worker needs no changes for that: the

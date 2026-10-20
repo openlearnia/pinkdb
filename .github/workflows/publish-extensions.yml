@@ -10,6 +10,12 @@
 #   CF_API_TOKEN   Cloudflare API token with Workers Scripts: Edit + R2: Edit
 #                  (R2 is what the publisher uploads to)
 #   CF_ACCOUNT_ID  the account that owns the R2 bucket
+#   PINKDB_EXT_SIGNING_KEY
+#                  Ed25519 private key for the catalog signature (PEM content,
+#                  base64 of the PEM, or a path). Passed ONLY to the publish
+#                  step; see docs/extension-signing.md. Publishing without it
+#                  is refused by this workflow (the publisher would otherwise
+#                  upload an unsigned catalog that pinned clients reject).
 #
 # Inputs (all optional):
 #   name      publish only this extension (default: every discovered one)
@@ -264,13 +270,20 @@ jobs:
       # on a name+version+platform already present in the index); the
       # discovery step above only turns "already published" into a skip so a
       # default run stays idempotent.
-      - name: publish to the extension repository
+      - name: publish to the extension repository (signs the catalog)
         if: steps.discover.outputs.count != '0'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # Scoped to this step only: the signing key is never exported to the
+          # build, smoke, discovery, or verification steps.
+          PINKDB_EXT_SIGNING_KEY: ${{ secrets.PINKDB_EXT_SIGNING_KEY }}
         run: |
           set -euo pipefail
+          if [ -z "${PINKDB_EXT_SIGNING_KEY:-}" ]; then
+            echo "::error::PINKDB_EXT_SIGNING_KEY is not set; refusing to publish an unsigned catalog"
+            exit 1
+          fi
           while IFS=$'\t' read -r name version platform artifact description; do
             [ -n "$name" ] || continue
             echo "==> $name $version ($platform)"
@@ -279,6 +292,36 @@ jobs:
               --version "$version" \
               --platform "$platform" \
               --description "$description"
+          done < /tmp/pinkdb-publish.tsv
+
+      # Post-sign gate: the local mirror's signature must verify against the
+      # in-tree public key, the live catalog + signature must verify, and
+      # every artifact published by this run must download and hash-match the
+      # signed catalog. Non-zero on any failure.
+      - name: verify the published catalog signature and artifacts
+        if: steps.discover.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          ./ext-repo/verify.sh --skip-artifacts
+
+          # Cache-bust the live catalog (the Worker serves it with max-age=60);
+          # the signature is over the bytes, not the URL, and the Worker routes
+          # on the path, so a query string is safe here.
+          ts=$(date +%s)
+          tmp=$(mktemp -d)
+          trap 'rm -rf "$tmp"' EXIT
+          curl -fsSL "$PINKDB_EXT_REPO_URL/index.json?ts=$ts" -o "$tmp/index.json"
+          curl -fsSL "$PINKDB_EXT_REPO_URL/index.json.sig?ts=$ts" -o "$tmp/index.json.sig"
+          ./ext-repo/verify.sh \
+            --index "$tmp/index.json" \
+            --sig "$tmp/index.json.sig" \
+            --skip-artifacts
+
+          while IFS=$'\t' read -r name version platform artifact _; do
+            [ -n "$name" ] || continue
+            ./ext-repo/verify.sh \
+              "$PINKDB_EXT_REPO_URL/artifacts/$name/$version/$platform/$(basename "$artifact")" \
+              "$PINKDB_EXT_REPO_URL/index.json?ts=$ts"
           done < /tmp/pinkdb-publish.tsv
 
       - name: report artifact URLs
@@ -290,7 +333,7 @@ jobs:
             echo "$PINKDB_EXT_REPO_URL/artifacts/$name/$version/$platform/$(basename "$artifact")"
           done < /tmp/pinkdb-publish.tsv
           echo "catalog: $PINKDB_EXT_REPO_URL/index.json"
-          curl -fsSL "$PINKDB_EXT_REPO_URL/index.json" -o /tmp/pinkdb-catalog.json
+          curl -fsSL "$PINKDB_EXT_REPO_URL/index.json?ts=$(date +%s)" -o /tmp/pinkdb-catalog.json
           python3 - <<'PY'
           import json
           with open("/tmp/pinkdb-catalog.json", encoding="utf-8") as f:
@@ -299,17 +342,8 @@ jobs:
           print(f"live catalog: {len(extensions)} entries, updated {catalog.get('updated')}")
           PY
 
-      # ── Future work: cryptographic signing ──────────────────────────────
-      # There is no signing yet, and this step does not fake one. Integrity
-      # today: ext-repo/publish.py writes the artifact's SHA-256 (and size)
-      # into the catalog entry, and ext-repo/verify.sh checks a download
-      # against it. A future wave would add a detached signature per
-      # artifact (e.g. minisign/sigstore) plus signer/key-id fields in the
-      # catalog schema (FORMAT.md v2), a host-side verification path in
-      # `.install`, and re-verification in this workflow before upload.
-      - name: signing — placeholder (checksums only)
-        run: |
-          echo "No cryptographic signing is configured."
-          echo "Integrity today is the SHA-256 recorded in the catalog by publish.py"
-          echo "and checked by ext-repo/verify.sh; artifact coordinates are immutable."
-          echo "See the comment above this step for the planned signing shape."
+      # Catalog signing is implemented in publish.py (Ed25519 over the exact
+      # index.json bytes → index.json.sig, uploaded next to the catalog), the
+      # post-sign gate above verifies it with the in-tree public key, and the
+      # CLI's `.install` pins that key and verifies before any artifact fetch.
+      # See docs/extension-signing.md.

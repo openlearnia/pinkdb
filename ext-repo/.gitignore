@@ -2,3 +2,4 @@
 # a mirror used to enforce coordinate immutability).
 /artifacts/
 /index.json
+/index.json.sig

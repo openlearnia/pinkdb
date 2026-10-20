@@ -14,9 +14,17 @@ What it does:
   3. copies the artifact to artifacts/<name>/<version>/<platform>/<file>;
   4. appends the entry to index.json (sorted, fresh `updated` timestamp;
      the entry records `sha256` and the optional-but-recommended `size`);
-  5. uploads the artifact and the catalog to the R2 bucket with
-     `wrangler r2 object put --remote` (artifact first, catalog second);
+  5. uploads the artifact, the detached signature (when signing), and the
+     catalog to the R2 bucket with `wrangler r2 object put --remote`
+     (artifact first, catalog last);
   6. prints the resulting URLs.
+
+Signing (see ../docs/extension-signing.md): when `PINKDB_EXT_SIGNING_KEY` is
+set — to a PEM file path, PEM content, or base64 of the PEM — `index.json` is
+signed with Ed25519 (`openssl pkeyutl -sign -rawin`) and `index.json.sig` is
+uploaded next to it. Without the variable the publish stays unsigned (the
+historical behavior) and prints a loud warning: a client that pins the key
+will refuse that catalog.
 
 Safe to re-run: a partial failure (e.g. the catalog upload) leaves the index
 unchanged locally, so re-running completes the publish. Re-publishing existing
@@ -28,6 +36,8 @@ See FORMAT.md for the repository format.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime
 import hashlib
 import json
@@ -36,6 +46,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -44,6 +55,11 @@ BUCKET = os.environ.get("PINKDB_EXT_BUCKET", "pinkdb-extensions")
 BASE_URL = os.environ.get(
     "PINKDB_EXT_REPO_URL", "https://pinkdb-ext-repo.defaultcms.workers.dev"
 ).rstrip("/")
+
+# Catalog signing (docs/extension-signing.md).
+SIGNING_KEY_ENV = "PINKDB_EXT_SIGNING_KEY"
+SIGNATURE_FILE = "index.json.sig"
+SIGNATURE_PREFIX = "PINKDB-SIG1"
 
 # Platform tags defined by FORMAT.md v1: darwin-arm64 is the tag produced
 # today; the others are reserved for future builds.
@@ -121,6 +137,159 @@ def r2_put(key: str, file_path: str, content_type: str, cwd: str) -> None:
         sys.stderr.write(proc.stdout or "")
         die(f"wrangler failed to upload {BUCKET}/{key} (exit {proc.returncode})")
     print(f"uploaded {BUCKET}/{key}")
+
+
+def warn(message: str) -> None:
+    print(f"warning: {message}", file=sys.stderr)
+
+
+def _openssl(args: list, what: str) -> bytes:
+    """Run openssl with no secret on the command line; return stdout."""
+    try:
+        proc = subprocess.run(
+            ["openssl", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except FileNotFoundError:
+        die(
+            "openssl is required to sign the catalog (OpenSSL 3.x: "
+            "`openssl pkeyutl -sign -rawin`) but was not found on PATH"
+        )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
+        die(f"openssl failed to {what} (exit {proc.returncode})")
+    return proc.stdout
+
+
+def _temp_pem(pem: str) -> str:
+    """Write PEM content to a 0600 temp file and return its path."""
+    fd, path = tempfile.mkstemp(prefix="pinkdb-signing-key-", suffix=".pem")
+    data = (pem if pem.endswith("\n") else pem + "\n").encode("ascii")
+    try:
+        os.chmod(path, 0o600)
+        os.write(fd, data)
+    except BaseException:
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    os.close(fd)
+    return path
+
+
+def resolve_signing_key(value: str) -> tuple:
+    """Resolve `PINKDB_EXT_SIGNING_KEY` to (key path, temp path or None).
+
+    Accepts a PEM file path, PEM content, or base64 of the PEM. The private
+    key is never printed or logged.
+    """
+    text = value.strip()
+    if not text:
+        die(f"{SIGNING_KEY_ENV} is set but empty")
+    if "PRIVATE KEY-----" in text:
+        return _temp_pem(text), True
+    if os.path.isfile(text):
+        return os.path.abspath(text), False
+    try:
+        decoded = base64.b64decode("".join(text.split()), validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        die(
+            f"{SIGNING_KEY_ENV} is not a PEM file path, PEM content, or base64 "
+            "of a PEM private key"
+        )
+    if "PRIVATE KEY-----" not in decoded:
+        die(f"{SIGNING_KEY_ENV} decoded to a value that is not a PEM private key")
+    return _temp_pem(decoded), True
+
+
+def _spki_key_id(der: bytes) -> str:
+    return hashlib.sha256(der).hexdigest()[:16]
+
+
+def _pinned_key_id(repo_dir: str):
+    path = os.path.join(repo_dir, "keys", "extension-signing.pub.pem")
+    if not os.path.isfile(path):
+        return None
+    try:
+        proc = subprocess.run(
+            ["openssl", "pkey", "-pubin", "-in", path, "-outform", "DER"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return _spki_key_id(proc.stdout)
+
+
+def sign_catalog(index_path: str, repo_dir: str, signature_path: str):
+    """Sign the exact `index_path` bytes and write the detached envelope.
+
+    Returns `(key_id, signature_path)` or `None` when the key variable is
+    absent (the historical unsigned behavior), with a loud warning.
+    """
+    value = os.environ.get(SIGNING_KEY_ENV)
+    if value is None or not value.strip():
+        warn(
+            f"{SIGNING_KEY_ENV} is not set: publishing an UNSIGNED catalog. "
+            "Clients that pin the signing key WILL REFUSE it (fail closed). "
+            "Set the variable to sign."
+        )
+        return None
+
+    key_path, cleanup = resolve_signing_key(value)
+    try:
+        mode = os.stat(key_path).st_mode & 0o777
+        if mode & 0o077:
+            warn(
+                f"signing key {key_path} is accessible by group/other "
+                f"(mode {mode:o}); restrict it to 0600"
+            )
+        # Key id = first 16 hex of SHA-256(SPKI DER).
+        public_der = _openssl(
+            ["pkey", "-in", key_path, "-pubout", "-outform", "DER"],
+            "derive the signing public key",
+        )
+        key_id = _spki_key_id(public_der)
+        pinned = _pinned_key_id(repo_dir)
+        if pinned is not None and pinned != key_id:
+            warn(
+                f"signing key id {key_id} differs from the in-tree public key "
+                f"{pinned}: clients that pin {pinned} will refuse this catalog "
+                "until a binary ships the new key (rotation)"
+            )
+        signature = _openssl(
+            [
+                "pkeyutl",
+                "-sign",
+                "-rawin",
+                "-inkey",
+                key_path,
+                "-in",
+                index_path,
+            ],
+            "sign index.json",
+        )
+        if len(signature) != 64:
+            die(
+                f"openssl produced a {len(signature)}-byte signature; "
+                "expected a 64-byte Ed25519 signature"
+            )
+        envelope = (
+            f"{SIGNATURE_PREFIX} {key_id} "
+            f"{base64.b64encode(signature).decode('ascii')}\n"
+        )
+        with open(signature_path, "w", encoding="ascii") as f:
+            f.write(envelope)
+        return key_id, signature_path
+    finally:
+        if cleanup:
+            try:
+                os.unlink(key_path)
+            except OSError:
+                pass
 
 
 def coordinates(entries: list) -> set:
@@ -266,23 +435,58 @@ def main(argv=None) -> int:
         json.dump(index, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
-    # Upload artifact first, catalog second: if the catalog upload fails, an
-    # unreferenced object remains (harmless and re-runnable) instead of a
-    # catalog entry pointing at a missing artifact.
+    # Sign the exact bytes that are about to be uploaded. `index_tmp` is only
+    # renamed into place after both uploads succeed, so the local mirror and
+    # its signature always describe the same bytes.
+    signature_tmp = index_tmp + ".sig"
+    try:
+        signed = sign_catalog(index_tmp, repo_dir, signature_tmp)
+    except BaseException:
+        for path in (index_tmp, signature_tmp):
+            if os.path.exists(path):
+                os.remove(path)
+        raise
+
+    # Upload artifact first, signature second, catalog last: if the catalog
+    # upload fails, an unreferenced object remains (harmless and re-runnable)
+    # instead of a catalog entry pointing at a missing artifact. A signature
+    # uploaded before the catalog can only describe the new bytes, and a
+    # stale signature never verifies (clients fail closed).
     try:
         r2_put(file_field, staged, "application/octet-stream", repo_dir)
+        if signed is not None:
+            r2_put(
+                SIGNATURE_FILE,
+                signature_tmp,
+                "text/plain; charset=utf-8",
+                repo_dir,
+            )
         r2_put("index.json", index_tmp, "application/json", repo_dir)
     except SystemExit:
-        if os.path.exists(index_tmp):
-            os.remove(index_tmp)
+        for path in (index_tmp, signature_tmp):
+            if os.path.exists(path):
+                os.remove(path)
         raise
     os.replace(index_tmp, index_path)
+    if signed is not None:
+        os.replace(signature_tmp, index_path + ".sig")
+    else:
+        # Never leave a stale local signature next to an unsigned catalog.
+        stale = index_path + ".sig"
+        if os.path.exists(stale):
+            os.remove(stale)
+            warn(f"removed the stale local {os.path.basename(stale)}")
 
     print(f"published {args.name} {args.version} ({args.platform})")
     print(f"  sha256:   {sha}")
     print(f"  size:     {size} bytes")
     print(f"  artifact: {BASE_URL}/{file_field}")
     print(f"  catalog:  {BASE_URL}/index.json")
+    if signed is not None:
+        key_id, _ = signed
+        print(f"  signature: {BASE_URL}/{SIGNATURE_FILE} (key {key_id})")
+    else:
+        print("  signature: NONE (unsigned catalog)")
     print(f"  staged:   {staged}")
     return 0
 

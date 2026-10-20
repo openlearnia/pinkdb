@@ -2015,11 +2015,14 @@ linked registration, durable replay); its header copy is pinned by the same
 
 Built extensions are published to a hosted catalog (Cloudflare Worker + R2,
 format v1) at <https://pinkdb-ext-repo.defaultcms.workers.dev>: `GET
-/index.json` is the catalog and `GET /artifacts/…` serves the bytes. The
+/index.json` is the catalog, `GET /index.json.sig` its detached Ed25519
+signature, and `GET /artifacts/…` serves the bytes. The
 `ext-repo/` directory holds the format spec (`ext-repo/FORMAT.md`), the
 publisher (`publish.sh`/`publish.py`), the verifier (`verify.sh`), and the
-worker source. The first published artifact is the C SDK example `math_ext`
-0.1.0 (`darwin-arm64`).
+worker source. Catalog authenticity is an Ed25519 detached signature over the
+exact `index.json` bytes (`index.json.sig`), verified by `.install` against a
+key pinned in the binary (see `docs/extension-signing.md`). The first published
+artifact is the C SDK example `math_ext` 0.1.0 (`darwin-arm64`).
 
 #### Installing extensions (`.install`)
 
@@ -2038,6 +2041,7 @@ Installed math_ext 0.1.0 (darwin-arm64)
   repository: https://pinkdb-ext-repo.defaultcms.workers.dev
   path:       /Users/you/.pinkdb/extensions/math_ext/0.1.0/darwin-arm64/math_ext.dylib
   sha256:     38abc8b345466e0710bf9c2497a99b0b5c0a3e906874cae1c3323ee3e754b9b2
+  signature:  verified (key c84e54bfea6b2d09)
 Extension math_ext loaded.
 pinkdb> SELECT ext_clamp(CAST(42 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGINT));
 ```
@@ -2063,9 +2067,19 @@ pinkdb> SELECT ext_clamp(CAST(42 AS BIGINT), CAST(0 AS BIGINT), CAST(10 AS BIGIN
   SHA-256 before the rename; a mismatch is refused and leaves nothing behind.
   Installing the same coordinates again reuses the verified copy (no
   re-download). `.installed` lists the cache.
-- **Load:** `.install` finishes by `LOAD EXTENSION`-ing the artifact into the
-  current session; the extension then behaves exactly as described below
-  (process-level, WAL replay re-loads it by path).
+- **Catalog authenticity:** before any artifact is requested, `.install` fetches
+  `index.json.sig` and verifies the Ed25519 signature over the exact catalog
+  bytes against the key embedded in the binary
+  (`ext-repo/keys/extension-signing.pub.pem`). Missing/malformed/unknown-key/
+  invalid signatures are fatal; there is no unsigned fallback. The dev-only
+  overrides `PINKDB_EXT_REPO_PUBKEY` (replace the pin) and
+  `PINKDB_EXT_ALLOW_UNSIGNED=1` (skip verification) print loud warnings and are
+  **insecure**. See `docs/extension-signing.md`.
+- **Load:** `.install` finishes by staging the verified file in a private
+  `0700` temp directory with `create_new`, re-hashing the staged copy, then
+  `LOAD EXTENSION`-ing that path into the current session; the extension then
+  behaves exactly as described below (process-level, WAL replay re-loads it by
+  path).
 
 Semantics and persistence:
 
@@ -2530,7 +2544,7 @@ only:
 |---|---|---|
 | `ci.yml` | push to `main`, every pull request | `build-test` — `cargo fmt --check`, `cargo build`, `cargo test -q`, `cargo clippy --all-targets -- -D warnings`, the feature tests (`pink-lake --features s3` / `s3,vortexlake`, `pinkdb-cli --features vortexlake,s3` / `pinklake` / `pinklake,s3` / `s3` / `encryption` / `client` / `repo`, `pinkdb --features encryption`), clippy on every feature set, the SIGKILL kill loops (plain, multi-db, targeted, encrypted), the wasm check, then the release CLI uploaded as an artifact; `duckdiff` — downloads that CLI, installs the DuckDB CLI and runs `python3 bench/duckdiff.py`; `bindings` — release `pinkdb-ffi`, the C example (`make -C crates/pinkdb-ffi hello`), the Python `unittest` suite, and `gofmt` + `go vet` + `go test -race`; `sdk-smokes` — `make -C ext-sdk/c` + the C/C++, Go and Rust SDK smoke scripts; `s3-docker` — `crates/pink-lake/tests/s3_docker.sh` (s3mock in Docker; a hard gate); `macos` — workspace, lake and encryption tests plus the Python binding on macOS; `msrv` — `cargo check` of the whole workspace on Rust 1.97 (the edition-2024 MSRV); `audit` — `cargo audit`; `docs` — `website/build.py` and the roadmap-page sync check. Actions are pinned to commit SHAs |
 | `deploy-docs.yml` | push to `main` touching `website/**` (or the workflow itself), manual dispatch | `python3 website/build.py`, then `wrangler deploy` from `website/` (the `pinkdb-docs` Worker) |
-| `publish-extensions.yml` | manual dispatch only | builds the C/C++ SDK examples (and any `extensions/*/` built by their own Makefile), runs both SDK smokes, fetches the live catalog, skips already-published coordinates, publishes new artifacts with `ext-repo/publish.sh` (wrangler → R2) and prints the artifact/catalog URLs |
+| `publish-extensions.yml` | manual dispatch only | builds the C/C++ SDK examples (and any `extensions/*/` built by their own Makefile), runs both SDK smokes, fetches the live catalog, skips already-published coordinates, publishes new artifacts with `ext-repo/publish.sh` (wrangler → R2), signs the catalog, verifies the local/live signature and the new artifacts, and prints the artifact/catalog URLs |
 
 ### Required repository secrets
 
@@ -2543,6 +2557,7 @@ repository's organization) or `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID`
 |---|---|---|
 | `CF_API_TOKEN` (or `CLOUDFLARE_API_TOKEN`) | a Cloudflare API token scoped to **Workers Scripts: Edit** (docs Worker) and **R2: Edit** (extension artifact + catalog uploads) | `deploy-docs.yml`, `publish-extensions.yml` |
 | `CF_ACCOUNT_ID` (or `CLOUDFLARE_ACCOUNT_ID`) | the account that owns the `pinkdb-docs` / `pinkdb-ext-repo` Workers and the `pinkdb-extensions` R2 bucket (find it in the Cloudflare dashboard); store it as a secret, never in the repository | same |
+| `PINKDB_EXT_SIGNING_KEY` | the Ed25519 catalog-signing private key (PEM content, base64 of the PEM, or a path). Never commit or log it; `docs/extension-signing.md` is the contract | `publish-extensions.yml` publish step only |
 
 ### Publishing extensions by hand
 
@@ -2557,10 +2572,12 @@ Actions → **Publish extensions** → *Run workflow*. Every input is optional:
 With no inputs the workflow publishes every discovered artifact. Publishing is
 immutable: coordinates already in the live catalog are skipped (the publisher,
 `ext-repo/publish.py`, refuses them on its own too), and every catalog entry
-carries the artifact's SHA-256 and size. There is no cryptographic signing yet —
-checksums are the integrity mechanism (`ext-repo/verify.sh` checks a download
-against the catalog); the workflow has a placeholder step documenting the
-planned signing shape rather than faking one.
+carries the artifact's SHA-256 and size. The catalog is signed with Ed25519
+(`index.json.sig`) using the `PINKDB_EXT_SIGNING_KEY` secret, passed only to the
+publish step; a post-sign gate verifies the local and live signatures and every
+artifact published by the run. `.install` pins the public key and refuses a
+missing or invalid signature before downloading anything. See
+`docs/extension-signing.md`.
 
 ### Verifying the workflows
 

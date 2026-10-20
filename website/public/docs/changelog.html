@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-20">2026-10-20<a class="anchor" href="#2026-10-20" aria-label="Permalink: 2026-10-20">#</a></h2>
+<h3>Security hardening — extension repository signing ✅</h3>
+<ul>
+<li>The extension catalog is now <strong>Ed25519-signed</strong> (<code>index.json.sig</code>), and <code>.install</code> verifies it against a key <strong>pinned in the binary before it fetches or loads any artifact</strong> — a compromised repository origin can no longer serve a matching hash for its own payload. Unsigned catalogs are refused unless an explicit dev override is set.</li>
+<li><code>publish.py</code> and <code>verify.sh</code> sign/verify; the publish workflow signs with the <code>PINKDB_EXT_SIGNING_KEY</code> secret and adds a verification gate. No new default dependencies (+~319 KiB only in <code>repo</code> builds).</li>
+</ul>
 <h3>Security hardening — pass 2: authentication gate ✅</h3>
 <ul>
 <li>The login gate is now evaluated <strong>per statement inside a batch</strong> (both transports, prepared statements included): an unauthenticated <code>CREATE USER; GRANT ADMIN</code> batch can no longer promote itself — the created user exists without admin rights.</li>

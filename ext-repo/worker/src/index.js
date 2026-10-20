@@ -8,6 +8,8 @@
 //                      cross-origin, so the catalog carries CORS *.
 //   OPTIONS /index.json → CORS preflight for the catalog (204)
 //   GET /index.json  → the catalog (short cache, ETag, CORS *)
+//   GET /index.json.sig → detached Ed25519 catalog signature (short cache,
+//                      ETag, CORS *; see ../../../docs/extension-signing.md)
 //   GET /artifacts/… → artifact bytes (octet-stream, Content-Length, ETag,
 //                      immutable caching — artifacts are immutable; no CORS,
 //                      they are plain `<a download>` targets)
@@ -17,6 +19,7 @@
 
 const FORMAT_VERSION = 1;
 const INDEX_KEY = "index.json";
+const SIGNATURE_KEY = "index.json.sig";
 const INDEX_CACHE = "public, max-age=60";
 const ARTIFACT_CACHE = "public, max-age=31536000, immutable";
 const TEXT = "text/plain; charset=utf-8";
@@ -64,6 +67,10 @@ export default {
 
     if (pathname === "/index.json") {
       return await serveIndex(request, env);
+    }
+
+    if (pathname === "/index.json.sig") {
+      return await serveSignature(request, env);
     }
 
     if (pathname.startsWith("/artifacts/")) {
@@ -314,14 +321,19 @@ code {
       <a href="/index.json">GET /index.json</a>
       <span class="note">The raw catalog: plain JSON, ETag, <code>Access-Control-Allow-Origin: *</code>.</span>
     </li>
+    <li class="card">
+      <span class="num">03</span>
+      <a href="/index.json.sig">GET /index.json.sig</a>
+      <span class="note">Detached Ed25519 signature over the exact catalog bytes (<code>PINKDB-SIG1 &lt;keyid&gt; &lt;base64&gt;</code>).</span>
+    </li>
   </ul>
 
   <pre class="route">/artifacts/&lt;name&gt;/&lt;version&gt;/&lt;platform&gt;/&lt;file&gt;</pre>
   <p class="meta">format v${FORMAT_VERSION} &#183; immutable bytes, byte-identical downloads
-  &#183; always verify the SHA-256 from the catalog before loading. No directory
-  listings, no writes.</p>
+  &#183; always verify the catalog signature and the SHA-256 from that catalog
+  before loading. No directory listings, no writes.</p>
   <ul class="chips">
-    <li>cors: /index.json only</li>
+    <li>cors: /index.json, /index.json.sig</li>
     <li>catalog cache: 60 s</li>
     <li>artifacts: immutable, 1 y</li>
     <li>405 on non-GET</li>
@@ -350,6 +362,35 @@ async function serveIndex(request, env) {
   return new Response(request.method === "HEAD" ? null : object.body, {
     headers: {
       "content-type": "application/json; charset=utf-8",
+      "content-length": String(object.size),
+      etag,
+      "cache-control": INDEX_CACHE,
+      ...CORS_ORIGIN,
+    },
+  });
+}
+
+async function serveSignature(request, env) {
+  const object = await env.EXT_BUCKET.get(SIGNATURE_KEY);
+  if (object === null) {
+    return new Response(
+      "index.json.sig not found: the catalog is unsigned (clients that pin the signing key refuse it)\n",
+      {
+        status: 404,
+        headers: { "content-type": TEXT, "cache-control": "no-store", ...CORS_ORIGIN },
+      },
+    );
+  }
+  const etag = object.httpEtag;
+  if (matchesEtag(request, etag)) {
+    return new Response(null, {
+      status: 304,
+      headers: { etag, "cache-control": INDEX_CACHE, ...CORS_ORIGIN },
+    });
+  }
+  return new Response(request.method === "HEAD" ? null : object.body, {
+    headers: {
+      "content-type": "text/plain; charset=utf-8",
       "content-length": String(object.size),
       etag,
       "cache-control": INDEX_CACHE,

@@ -1929,3 +1929,31 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   transports, batch-refused-before-first-statement, A.7 both transports,
   role-granted ADMIN over the wire and engine, prepared gating, banner text,
   empty-catalog engine unit).
+
+- 2026-10-20 — Security hardening: extension repository signing (M-10;
+  worktree `wt-signing`). `publish.py` signs the **exact `index.json` bytes**
+  with Ed25519 (`openssl pkeyutl -sign -rawin`) and emits/uploads
+  `index.json.sig` (`PINKDB-SIG1 <keyid> <base64>`, key id = first 16 hex of
+  SHA-256(SPKI DER); accepts a PEM path/content/base64; no key = unsigned
+  publish with a loud warning). `verify.sh` verifies the catalog and every
+  artifact. `.install` fetches catalog + signature, verifies against the key
+  **pinned in the binary** (embedded SPKI PEM; current key id
+  `c84e54bfea6b2d09`) **before any artifact request**, then verifies the
+  SHA-256, stages a copy in a `0700` directory with `create_new`, re-hashes it
+  from disk, and only then loads it. A 404 signature means "unsigned" and is
+  refused unless `PINKDB_EXT_ALLOW_UNSIGNED=1` (loud dev warning);
+  `PINKDB_EXT_REPO_PUBKEY` replaces the pin for tests/rotation. The Worker
+  serves `/index.json.sig`; the publish workflow scopes
+  `PINKDB_EXT_SIGNING_KEY` to the publish step and adds a post-sign
+  verification gate against the live catalog + every artifact. Deps:
+  `ed25519-dalek` + `base64` behind `repo` only (default binary unchanged;
+  `repo` build +327 KB). Tests: 10 signature unit, 2 staging, 6 CLI
+  integration (unsigned/tampered/unknown-key/malformed/refused before any
+  artifact fetch), 14 Python (publish/verify modes); real-key end-to-end
+  install verified locally. Gates: CLI 77 / repo **122**, workspace ~1230,
+  duckdiff **339/339**, fmt/clippy both toolchains, wasm green.
+  Residual: the `create_new`-then-`dlopen` TOCTOU window (open-fd loading is
+  the recorded follow-up), the env overrides are insecure if the environment
+  is hostile, a single pinned key with no revocation/freshness (an old
+  catalog can be replayed), and the **live catalog remains unsigned** until
+  the operator runs a signed publish and deploys the Worker route.

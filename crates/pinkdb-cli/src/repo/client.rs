@@ -1,15 +1,20 @@
-//! The HTTP side of the repository client: fetch `<base>/index.json`,
-//! resolve `name[@version]` for the current platform, download the artifact
-//! to the local cache (atomic temp + rename), verify its SHA-256, and report
-//! where it landed.
+//! The HTTP side of the repository client: fetch `<base>/index.json` and
+//! `<base>/index.json.sig`, verify the detached signature **before any
+//! artifact request**, resolve `name[@version]` for the current platform,
+//! download the artifact to the local cache (atomic temp + rename), verify
+//! its SHA-256, and report where it landed. `.install` then stages the
+//! verified cache file in a private `0700` temporary directory, re-hashes the
+//! staged bytes, and only then `dlopen`s it (see
+//! `docs/extension-signing.md`).
 //!
 //! Resolution order is the configured repository order; the first repository
 //! that has a matching artifact wins. A repository whose catalog cannot be
-//! fetched is a hard error (no silent fallback to a later repository). The
-//! current platform tag is derived at runtime from the OS and architecture
-//! (`darwin-arm64` on an Apple-silicon Mac) and must match an entry exactly;
-//! only ABI v1 artifacts are accepted. When no version is given, the highest
-//! semver-ish version for the platform is chosen.
+//! fetched or whose signature does not verify is a hard error (no silent
+//! fallback to a later repository). The current platform tag is derived at
+//! runtime from the OS and architecture (`darwin-arm64` on an Apple-silicon
+//! Mac) and must match an entry exactly; only ABI v1 artifacts are accepted.
+//! When no version is given, the highest semver-ish version for the platform
+//! is chosen.
 
 use std::fs;
 use std::io::Read;
@@ -22,9 +27,12 @@ use ureq::Agent;
 
 use super::catalog::{ABI_VERSION, Catalog, Entry, Lookup, lookup};
 use super::config::extensions_dir;
+use super::signature::{SIGNATURE_FILE, Trust, Verifier};
 
 /// Catalog size cap (a catalog is a small JSON document).
 pub const CATALOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Detached-signature size cap (the envelope is one short line).
+pub const SIGNATURE_MAX_BYTES: u64 = 16 * 1024;
 /// Artifact size cap; a downloaded file larger than this is refused.
 pub const ARTIFACT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 /// Whole-request timeout (connect + transfer).
@@ -81,8 +89,17 @@ fn plain_http_agent() -> Agent {
         .into()
 }
 
-/// Fetch and parse one repository catalog.
-pub fn fetch_catalog(agent: &Agent, base: &str) -> Result<Catalog, String> {
+/// Fetch and parse one repository catalog, after authenticating its detached
+/// signature over the exact catalog bytes.
+///
+/// The signature is fetched even when it is absent (a 404 is "unsigned"), so
+/// a malformed catalog or a missing signature is reported before the caller
+/// can look up an artifact.
+pub fn fetch_catalog(
+    agent: &Agent,
+    base: &str,
+    verifier: &Verifier,
+) -> Result<(Catalog, Trust), String> {
     let url = format!("{base}/index.json");
     let mut response = agent
         .get(&url)
@@ -94,7 +111,31 @@ pub fn fetch_catalog(agent: &Agent, base: &str) -> Result<Catalog, String> {
         .limit(CATALOG_MAX_BYTES)
         .read_to_vec()
         .map_err(|e| read_error("catalog", base, &url, e, CATALOG_MAX_BYTES))?;
-    Catalog::parse(&bytes).map_err(|e| format!("repository {base}: {e}"))
+    let envelope = fetch_signature(agent, base)?;
+    let trust = verifier
+        .verify(&bytes, envelope.as_deref())
+        .map_err(|e| format!("repository {base}: {e}"))?;
+    let catalog = Catalog::parse(&bytes).map_err(|e| format!("repository {base}: {e}"))?;
+    Ok((catalog, trust))
+}
+
+/// Fetch `<base>/index.json.sig`; a 404 means the catalog is unsigned (the
+/// verifier decides whether that is acceptable). Any other failure is a hard
+/// error, so a flaky signature endpoint can never silently disable signing.
+fn fetch_signature(agent: &Agent, base: &str) -> Result<Option<Vec<u8>>, String> {
+    let url = format!("{base}/{SIGNATURE_FILE}");
+    let mut response = match agent.get(&url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(e) => return Err(format!("repository {base}: GET {url} failed: {e}")),
+    };
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(SIGNATURE_MAX_BYTES)
+        .read_to_vec()
+        .map_err(|e| read_error("signature", base, &url, e, SIGNATURE_MAX_BYTES))?;
+    Ok(Some(bytes))
 }
 
 /// A successfully installed (downloaded or reused) artifact.
@@ -109,6 +150,8 @@ pub struct Installed {
     pub sha256: String,
     /// False when a previously cached copy was reused.
     pub downloaded: bool,
+    /// How the catalog that described this artifact was authenticated.
+    pub trust: Trust,
 }
 
 /// Resolve, download, and verify `name[@version]` from the configured
@@ -125,6 +168,7 @@ pub fn install(
             "no repositories are configured; add one with `.repositories add <url>`".to_string(),
         );
     }
+    let verifier = Verifier::from_env()?;
     let platform = platform_tag()?;
     let mut reasons = Vec::with_capacity(repositories.len());
     for base in repositories {
@@ -135,7 +179,7 @@ pub fn install(
         } else {
             agent
         };
-        let catalog = fetch_catalog(agent, base)?;
+        let (catalog, trust) = fetch_catalog(agent, base, &verifier)?;
         match lookup(&catalog, name, version, &platform, ABI_VERSION) {
             Lookup::Found(entry) => {
                 let entry = entry.clone();
@@ -147,6 +191,7 @@ pub fn install(
                     path: dest,
                     sha256,
                     downloaded,
+                    trust,
                 });
             }
             Lookup::NoMatch(reason) => reasons.push(format!("{base}: {reason}")),
@@ -160,6 +205,98 @@ pub fn install(
         "extension {wanted:?} was not found in any configured repository ({})",
         reasons.join("; ")
     ))
+}
+
+/// A verified artifact staged for `dlopen` in a private temporary directory.
+///
+/// The directory is created with mode `0700` (and the file with `0600` on
+/// Unix), the file is written with `create_new` (never following a planted
+/// symlink or reusing a name), and the bytes are re-hashed from disk after
+/// the write. Dropping the value removes the directory (best effort; on Unix
+/// the loaded library stays mapped).
+#[derive(Debug)]
+pub struct StagedArtifact {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl StagedArtifact {
+    /// Path of the re-hashed file to pass to `dlopen`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StagedArtifact {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Copy an already-catalog-verified artifact into a fresh `0700` directory
+/// with `create_new`, then re-hash the on-disk copy and compare it with the
+/// signed catalog entry. Nothing is returned unless both hashes match.
+pub fn stage_for_loading(entry: &Entry, source: &Path) -> Result<StagedArtifact, String> {
+    let file_name = entry
+        .file
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("catalog entry for {} has no file name", entry.name))?;
+
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("pinkdb-ext-load-{}-{seq}", process::id()));
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(&dir).map_err(|e| {
+        format!(
+            "cannot create private staging directory {}: {e}",
+            dir.display()
+        )
+    })?;
+
+    let path = dir.join(file_name);
+    let staged = (|| {
+        let mut input =
+            fs::File::open(source).map_err(|e| format!("cannot read {}: {e}", source.display()))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut output = options
+            .open(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        std::io::copy(&mut input, &mut output)
+            .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        output
+            .sync_all()
+            .map_err(|e| format!("cannot sync {}: {e}", path.display()))?;
+        drop(output);
+
+        let actual = sha256_file(&path)?;
+        if actual != entry.sha256 {
+            return Err(format!(
+                "staged artifact {} failed re-hash: catalog says {}, file has {}; refusing to load it",
+                path.display(),
+                entry.sha256,
+                actual
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(e) = staged {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+    Ok(StagedArtifact { dir, path })
 }
 
 /// The cache path for one entry: the artifact's base name under
@@ -410,5 +547,56 @@ mod tests {
         let big = vec![0xab; 200_000];
         fs::write(&path, &big).unwrap();
         assert_eq!(sha256_file(&path).unwrap(), sha256_hex(&big));
+    }
+
+    #[test]
+    fn stage_for_loading_writes_a_private_copy_and_rehashes_it() {
+        let dir = TempDir::new("stage");
+        let source = dir.path().join("artifact.dylib");
+        let bytes = b"verified extension bytes";
+        fs::write(&source, bytes).unwrap();
+        let entry = sample_entry(
+            "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib",
+            &sha256_hex(bytes),
+        );
+
+        let staged = stage_for_loading(&entry, &source).unwrap();
+        assert_eq!(fs::read(staged.path()).unwrap(), bytes);
+        assert_ne!(staged.path(), source);
+        let parent = staged.path().parent().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "staging directory must be 0700"
+            );
+            assert_eq!(
+                fs::metadata(staged.path()).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "staged file must be 0600"
+            );
+            // The directory is unique per call, even with the same entry.
+            let second = stage_for_loading(&entry, &source).unwrap();
+            assert_ne!(second.path().parent(), Some(parent));
+        }
+        let staged_path = staged.path().to_path_buf();
+        drop(staged);
+        assert!(!staged_path.exists(), "staging directory was not removed");
+    }
+
+    #[test]
+    fn stage_for_loading_refuses_a_tampered_source() {
+        let dir = TempDir::new("stage-tamper");
+        let source = dir.path().join("artifact.dylib");
+        fs::write(&source, b"tampered bytes").unwrap();
+        let entry = sample_entry(
+            "artifacts/math_ext/0.1.0/darwin-arm64/math_ext.dylib",
+            &sha256_hex(b"the bytes the catalog signed"),
+        );
+        let err = stage_for_loading(&entry, &source).unwrap_err();
+        assert!(err.contains("failed re-hash"), "{err}");
+        assert!(err.contains(&entry.sha256), "{err}");
     }
 }

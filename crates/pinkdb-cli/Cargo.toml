@@ -72,9 +72,9 @@ encryption = ["pinkdb/encryption", "pink-lake?/encryption"]
 # sandbox contract; the engine binding is the recorded follow-up).
 js = ["pinkdb/js"]
 # Opt-in extension-repository client: `.install`, `.repositories`, `.installed`.
-# Keeps the default binary lean: HTTP + TLS, JSON parsing, and SHA-256 live
-# only behind this feature.
-repo = ["dep:ureq", "dep:serde_json", "dep:sha2"]
+# Keeps the default binary lean: HTTP + TLS, JSON parsing, SHA-256 and Ed25519
+# catalog-signature verification live only behind this feature.
+repo = ["dep:ureq", "dep:serde_json", "dep:sha2", "dep:ed25519-dalek", "dep:base64"]
 # Opt-in lake layer (full): `.lake save/open/versions/tables/info/attach`
 # snapshot the store into a `pink-lake` directory (JSON metadata + immutable
 # Vortex data files). Keeps the default binary lean: lake + JSON metadata +
@@ -122,10 +122,15 @@ pinkdb-parquet = { path = "../../extensions/parquet", optional = true }
 # https GET/range + the SigV4 S3 client shared with pink-lake.
 pinkdb-httpfs = { path = "../pinkdb-httpfs", optional = true }
 # Repository client (repo feature): blocking HTTP over rustls (no gzip: the
-# repository serves raw artifacts), catalog JSON, and SHA-256 verification.
+# repository serves raw artifacts), catalog JSON, SHA-256 verification, and
+# Ed25519 verification of the detached catalog signature. `ed25519-dalek`
+# compiles only when the feature is on; the default binary is byte-for-byte
+# unaffected.
 ureq = { version = "3.4", default-features = false, features = ["rustls"], optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["std"], optional = true }
+base64 = { version = "0.23", optional = true }
 # Lake layer (vortexlake/pinklake features): catalog + immutable data files.
 pink-lake = { path = "../pink-lake", optional = true }
 

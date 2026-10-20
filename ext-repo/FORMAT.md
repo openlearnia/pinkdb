@@ -77,6 +77,7 @@ Entry fields:
 |---|---|---|---|
 | `/` | `text/html; charset=utf-8` | `no-store` | Short info page: repository title, format version, links to the docs catalog UI and `/index.json`. The browsable UI lives in the docs site and fetches `/index.json` client-side. |
 | `/index.json` | `application/json; charset=utf-8` | `public, max-age=60` | Catalog; carries `ETag`, supports `If-None-Match` → `304`, and `Access-Control-Allow-Origin: *`. `OPTIONS /index.json` answers `204` with `Access-Control-Allow-Methods: GET, HEAD, OPTIONS`. |
+| `/index.json.sig` | `text/plain; charset=utf-8` | `public, max-age=60` | Detached Ed25519 signature over the exact `/index.json` bytes: one line `PINKDB-SIG1 <keyid> <base64 signature>`. Carries `ETag`, supports `If-None-Match` → `304` and CORS `*`. |
 | `/artifacts/<name>/<version>/<platform>/<file>` | `application/octet-stream` | `public, max-age=31536000, immutable` | Artifact bytes with `Content-Length` and `ETag`; supports `If-None-Match` → `304`. |
 | anything else | `text/plain` | `no-store` | `404`. Missing catalog / missing artifact are `404` with a one-line body. |
 
@@ -121,16 +122,27 @@ match its own platform exactly.
 
 ## Integrity
 
-`sha256` is the SHA-256 of the raw artifact file as served. Clients MUST
-verify the download against the index entry before loading the library; the
-repository provides no signatures in v1 (reserved for a later format version).
-`verify.sh` in this directory performs exactly that check against the live
-repository.
+`sha256` is the SHA-256 of the raw artifact file as served. Clients MUST verify
+the download against the index entry before loading the library.
+
+The catalog itself is authenticated: `/index.json.sig` carries an Ed25519
+signature over the exact `/index.json` bytes, and clients MUST verify it against
+the public key pinned in the binary **before downloading any artifact** (the
+signature transitively authenticates every `sha256` in the catalog). A missing,
+malformed, unknown-key, or invalid signature is fatal; there is no unsigned
+fallback except an explicitly warned development flag. The format is specified
+in [`../docs/extension-signing.md`](../docs/extension-signing.md); the public
+key is [`keys/extension-signing.pub.pem`](keys/extension-signing.pub.pem).
+
+`verify.sh` performs both checks locally (signature + every artifact hash) and
+against a live repository.
 
 ## Publishing
 
 Use `publish.py` (see `README.md` for the walkthrough). It computes the hash
 and size, enforces the immutability rule above against the current index,
 stages the artifact at `artifacts/<name>/<version>/<platform>/<file>`, rewrites
-`index.json` (sorted, fresh `updated`), and uploads both objects to the R2
-bucket with `wrangler r2 object put --remote`.
+`index.json` (sorted, fresh `updated`), signs the exact bytes (when
+`PINKDB_EXT_SIGNING_KEY` is set) into `index.json.sig`, and uploads the
+artifact, signature, and catalog to the R2 bucket with
+`wrangler r2 object put --remote`.
