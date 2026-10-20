@@ -597,6 +597,7 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
             table,
             column,
             if_not_exists,
+            ..
         } => {
             let target = resolve_db(db, qdb);
             if db.table_in(&target, table).is_err() {
@@ -622,20 +623,20 @@ pub fn run(db: &mut PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         LogicalPlan::DropIndex {
             db: qdb,
             name,
+            table,
             if_exists,
         } => {
             let target = resolve_db(db, qdb);
-            // Find which table has this index.
-            let tables = db.list_tables_in(&target);
+            // The binder resolved the owning table (and the touched set a
+            // durable frame records). Use it, so execution drops the same
+            // object the plan named.
             let mut found = false;
-            for tbl in &tables {
-                if let Ok(t) = db.table_in(&target, tbl)
-                    && t.indexes.iter().any(|i| i.name == *name)
-                {
-                    db.drop_index_in(&target, tbl, name)?;
-                    found = true;
-                    break;
-                }
+            if let Some(tbl) = table
+                && let Ok(t) = db.table_in(&target, tbl)
+                && t.indexes.iter().any(|i| i.name == *name)
+            {
+                db.drop_index_in(&target, tbl, name)?;
+                found = true;
             }
             if !found && !*if_exists {
                 return Err(PinkDbError::Catalog(format!("index \"{name}\" not found")));

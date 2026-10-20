@@ -13,7 +13,50 @@
 //!   of the remaining ones, so a later `ADD COLUMN` cannot make an index point
 //!   at the wrong column.
 
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use pinkdb::{CHUNK_SIZE, PinkDb, QueryResult, Value};
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Self-cleaning scratch directory for one durable test: every file under it
+/// (checkpoint, sidecar WAL, lock file) is removed when the guard drops.
+struct Scratch {
+    dir: PathBuf,
+    ckpt: PathBuf,
+}
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "pinkdb_idx_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create test scratch dir");
+        let ckpt = dir.join("db.pink");
+        Self { dir, ckpt }
+    }
+
+    fn path(&self) -> &str {
+        self.ckpt.to_str().unwrap()
+    }
+
+    fn ckpt(&self) -> &Path {
+        &self.ckpt
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn durable(scratch: &Scratch) -> PinkDb {
+    PinkDb::open_durable(scratch.path()).unwrap()
+}
 
 fn rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
     match db.execute(sql).unwrap().pop().unwrap() {
@@ -487,4 +530,297 @@ fn drop_column_removes_an_index_on_that_column() {
     assert!(err.contains("not found"), "{err}");
     // The remaining column is still queryable.
     assert_eq!(rows(&mut db, "SELECT b FROM t;"), int_rows(&[10]));
+}
+
+// ---------------------------------------------------------------------------
+// Durable lifecycle: index DDL survives reopen, checkpoints and replay
+// ---------------------------------------------------------------------------
+
+/// The measured wave-79 bug: `CREATE INDEX` was in-memory only, so a reopen
+/// silently lost it. Without a checkpoint the definition must come back from
+/// the WAL; `DROP INDEX` must persist the same way.
+#[test]
+fn durable_create_and_drop_index_survive_reopen_without_checkpoint() {
+    let p = Scratch::new("reopen");
+    let query = "SELECT a FROM t WHERE a = 2;";
+    {
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER, s VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (2, 'bb');")
+            .unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        assert!(explain(&mut db, query).contains("IndexScan"), "in session");
+    }
+    {
+        let mut db = durable(&p);
+        assert!(
+            explain(&mut db, query).contains("IndexScan"),
+            "index lost on reopen without a checkpoint"
+        );
+        assert_eq!(
+            rows(&mut db, "SELECT s FROM t WHERE a = 2 ORDER BY s;"),
+            vec![
+                vec![Value::Varchar("b".into())],
+                vec![Value::Varchar("bb".into())]
+            ]
+        );
+        db.execute("DROP INDEX i;").unwrap();
+        assert!(!explain(&mut db, query).contains("IndexScan"));
+    }
+    let mut db = durable(&p);
+    assert!(
+        !explain(&mut db, query).contains("IndexScan"),
+        "dropped index came back on reopen"
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT a FROM t ORDER BY a;"),
+        int_rows(&[1, 2, 2])
+    );
+}
+
+/// A checkpoint folds the store into `.pink` (no index section) and rolls the
+/// WAL. The definition must be re-logged into the fresh generation, exactly
+/// once, and repeated checkpoints must neither duplicate nor resurrect it.
+#[test]
+fn durable_checkpoint_carries_index_and_repeats_do_not_duplicate_it() {
+    let p = Scratch::new("ckpt");
+    let query = "SELECT a FROM t WHERE a = 2;";
+    {
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER, s VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        db.checkpoint().unwrap();
+        assert!(explain(&mut db, query).contains("IndexScan"));
+    }
+    let mut db = durable(&p);
+    assert!(
+        explain(&mut db, query).contains("IndexScan"),
+        "checkpoint dropped the index"
+    );
+    assert_eq!(
+        db.table_in("main", "t").unwrap().indexes.len(),
+        1,
+        "exactly one definition after the checkpoint re-log"
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT s FROM t WHERE a = 2;"),
+        vec![vec![Value::Varchar("b".into())]]
+    );
+    // Two more checkpoints: each folds the previous re-log into `.pink` and
+    // must write the live set once into the next generation.
+    db.checkpoint().unwrap();
+    db.checkpoint().unwrap();
+    drop(db);
+    let mut db = durable(&p);
+    assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 1);
+    assert!(explain(&mut db, query).contains("IndexScan"));
+}
+
+#[test]
+fn durable_checkpoint_then_drop_index_stays_dropped() {
+    let p = Scratch::new("ckptdrop");
+    let query = "SELECT a FROM t WHERE a = 1;";
+    {
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (1), (2);").unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("DROP INDEX i;").unwrap();
+        assert!(!explain(&mut db, query).contains("IndexScan"));
+        // A later checkpoint must not resurrect the dropped definition.
+        db.checkpoint().unwrap();
+    }
+    let mut db = durable(&p);
+    assert!(
+        !explain(&mut db, query).contains("IndexScan"),
+        "a dropped index was resurrected by the checkpoint re-log"
+    );
+    assert_eq!(
+        db.table_in("main", "t").unwrap().indexes.len(),
+        0,
+        "a dropped index must not be re-logged"
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT a FROM t ORDER BY a;"),
+        int_rows(&[1, 1, 2])
+    );
+}
+
+#[test]
+fn durable_checkpoint_then_drop_table_with_index_reopens_clean() {
+    let p = Scratch::new("ckptdroptable");
+    {
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("CREATE TABLE keep (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1);").unwrap();
+        db.execute("INSERT INTO keep VALUES (7);").unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        db.checkpoint().unwrap();
+        db.execute("DROP TABLE t;").unwrap();
+    }
+    let mut db = durable(&p);
+    let err = db.execute("SELECT a FROM t;").unwrap_err().to_string();
+    assert!(err.contains("not found"), "{err}");
+    assert_eq!(
+        rows(&mut db, "SELECT a FROM keep;"),
+        int_rows(&[7]),
+        "the rest of the store must replay normally"
+    );
+}
+
+/// Multiple databases/tables/indexes, quoted + unicode identifiers (spaces,
+/// keywords, an embedded quote), `IF NOT EXISTS`, and a name dropped then
+/// recreated on a different column: every definition must re-bind exactly.
+#[test]
+fn durable_indexes_round_trip_quoted_unicode_and_recreated_names() {
+    let p = Scratch::new("quoted");
+    {
+        let mut db = durable(&p);
+        db.execute("CREATE DATABASE \"dätä base\";").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("CREATE TABLE \"dätä base\".\"täble one\" (\"col ü\" INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20);")
+            .unwrap();
+        db.execute("INSERT INTO \"dätä base\".\"täble one\" VALUES (7), (8);")
+            .unwrap();
+        db.execute("CREATE INDEX \"i\"\"q\" ON t(a);").unwrap();
+        db.execute("CREATE INDEX \"index select\" ON \"dätä base\".\"täble one\"(\"col ü\");")
+            .unwrap();
+        db.execute("CREATE INDEX IF NOT EXISTS dup ON t(b);")
+            .unwrap();
+        db.execute("CREATE INDEX IF NOT EXISTS dup ON t(b);")
+            .unwrap();
+        // Same name, dropped and recreated on another column.
+        db.execute("CREATE INDEX r ON t(b);").unwrap();
+        db.execute("DROP INDEX r;").unwrap();
+        db.execute("CREATE INDEX r ON t(a);").unwrap();
+        db.checkpoint().unwrap();
+    }
+    let mut db = durable(&p);
+    let cols = |db: &PinkDb, index: &str| -> usize {
+        db.table_in("main", "t")
+            .unwrap()
+            .indexes
+            .iter()
+            .find(|i| i.name == index)
+            .unwrap_or_else(|| panic!("index {index:?} missing"))
+            .column
+    };
+    assert_eq!(cols(&db, "i\"q"), 0);
+    assert_eq!(cols(&db, "dup"), 1);
+    assert_eq!(cols(&db, "r"), 0, "recreation must log its final column");
+    assert_eq!(
+        db.table_in("dätä base", "täble one").unwrap().indexes.len(),
+        1
+    );
+    assert!(
+        explain(
+            &mut db,
+            "SELECT \"col ü\" FROM \"dätä base\".\"täble one\" WHERE \"col ü\" = 7;"
+        )
+        .contains("IndexScan"),
+        "quoted/unicode table index lost"
+    );
+    assert!(explain(&mut db, "SELECT b FROM t WHERE a = 2;").contains("IndexScan"));
+    assert_eq!(
+        rows(&mut db, "SELECT b FROM t WHERE a = 2;"),
+        int_rows(&[20])
+    );
+}
+
+/// A second durable handle learns the definition through the touched-set
+/// covered frame (and loses it again when the first handle drops it).
+#[test]
+fn durable_second_handle_refresh_observes_index_ddl() {
+    let p = Scratch::new("refresh");
+    let query = "SELECT a FROM t WHERE a = 2;";
+    let mut a = durable(&p);
+    a.execute("CREATE TABLE t (a INTEGER);").unwrap();
+    a.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+    // `b` is opened before the index exists; its next statement refreshes.
+    let mut b = durable(&p);
+    a.execute("CREATE INDEX i ON t(a);").unwrap();
+    assert!(
+        explain(&mut b, query).contains("IndexScan"),
+        "refreshing reader missed the index frame"
+    );
+    assert_eq!(rows(&mut b, "SELECT a FROM t WHERE a = 2;"), int_rows(&[2]));
+    // Another handle's checkpoint rolls the WAL (no index section in
+    // `.pink`): the refreshing reader must rebuild from the re-log record.
+    a.checkpoint().unwrap();
+    assert!(
+        explain(&mut b, query).contains("IndexScan"),
+        "refreshing reader missed the checkpoint re-log"
+    );
+    a.execute("DROP INDEX i;").unwrap();
+    assert!(
+        !explain(&mut b, query).contains("IndexScan"),
+        "refreshing reader missed the drop frame"
+    );
+}
+
+/// One transaction's record preserves statement order: create, drop, create
+/// the same name; ROLLBACK leaves nothing behind.
+#[test]
+fn durable_transaction_preserves_index_ddl_order() {
+    let p = Scratch::new("txnorder");
+    {
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20);")
+            .unwrap();
+        db.execute("BEGIN; CREATE INDEX i ON t(a); DROP INDEX i; CREATE INDEX i ON t(b); COMMIT;")
+            .unwrap();
+        assert_eq!(db.table_in("main", "t").unwrap().indexes[0].column, 1);
+    }
+    let mut db = durable(&p);
+    assert_eq!(
+        db.table_in("main", "t").unwrap().indexes[0].column,
+        1,
+        "the last create in the transaction must win"
+    );
+    assert!(explain(&mut db, "SELECT a FROM t WHERE b = 20;").contains("IndexScan"));
+    assert!(
+        !explain(&mut db, "SELECT b FROM t WHERE a = 2;").contains("IndexScan"),
+        "the dropped a-index must not be replayed"
+    );
+    // A rolled-back drop logs nothing.
+    db.execute("BEGIN; DROP INDEX i; ROLLBACK;").unwrap();
+    drop(db);
+    let mut db = durable(&p);
+    assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 1);
+    assert!(explain(&mut db, "SELECT a FROM t WHERE b = 20;").contains("IndexScan"));
+}
+
+/// `.pink` has no index section (bit 3 stays clear): creating an index changes
+/// neither the serialized bytes nor the flags word.
+#[test]
+fn durable_index_does_not_change_pink_bytes_or_flags() {
+    let p = Scratch::new("bytes");
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+    let before = db.to_pink_bytes().unwrap();
+    db.execute("CREATE INDEX i ON t(a);").unwrap();
+    let after = db.to_pink_bytes().unwrap();
+    assert_eq!(
+        before, after,
+        "the in-memory index must not leak into `.pink` bytes"
+    );
+    let flags = u32::from_le_bytes(after[8..12].try_into().unwrap());
+    assert_eq!(flags & 0x8, 0, "reserved index bit 3 must stay clear");
+    // A durable checkpoint of the indexed store also keeps the flag clear.
+    db.save(p.path()).unwrap();
+    let on_disk = std::fs::read(p.ckpt()).unwrap();
+    let flags = u32::from_le_bytes(on_disk[8..12].try_into().unwrap());
+    assert_eq!(flags & 0x8, 0);
 }

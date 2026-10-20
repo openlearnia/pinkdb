@@ -1225,10 +1225,13 @@ fn check_table(
     ))
 }
 
-/// The statement text a committed `CREATE/ALTER USER` is logged with: the
-/// rewritten `PASSWORD_HASH '<phc>'` form, so the WAL (and everything replayed
-/// from it) never carries the plaintext. Every other statement logs its own
-/// source text unchanged.
+/// The statement text a committed statement is logged with. `CREATE/ALTER
+/// USER` is rewritten to its `PASSWORD_HASH '<phc>'` form, so the WAL (and
+/// everything replayed from it) never carries the plaintext. Index DDL is
+/// rewritten to a canonical, fully-qualified, identifier-quoted statement:
+/// `.pink` has no index section and replay re-executes the text, so it must
+/// re-bind exactly regardless of how the session spelled it. Every other
+/// statement logs its own source text unchanged.
 pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
     match plan {
         LogicalPlan::CreateUser {
@@ -1249,14 +1252,58 @@ pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
             quote_ident(name),
             password_hash
         ),
+        LogicalPlan::CreateIndex {
+            db,
+            name,
+            table,
+            column_name,
+            if_not_exists,
+            ..
+        } => format!(
+            "CREATE INDEX {}{} ON {}({})",
+            if *if_not_exists { "IF NOT EXISTS " } else { "" },
+            quote_ident(name),
+            qualified_ident(db, table),
+            quote_ident(column_name)
+        ),
+        LogicalPlan::DropIndex {
+            db,
+            name,
+            if_exists,
+            ..
+        } => format!(
+            "DROP INDEX {}{}",
+            if *if_exists { "IF EXISTS " } else { "" },
+            qualified_ident(db, name)
+        ),
         _ => sql.to_string(),
+    }
+}
+
+/// The canonical `CREATE INDEX` statement for one live definition, used when
+/// a checkpoint folds state into a `.pink` (which has no index section) and
+/// rolls the WAL: the fresh generation must carry every definition again.
+pub(crate) fn index_create_statement(db: &str, table: &str, index: &str, column: &str) -> String {
+    format!(
+        "CREATE INDEX {} ON {}.{}({})",
+        quote_ident(index),
+        quote_ident(db),
+        quote_ident(table),
+        quote_ident(column)
+    )
+}
+
+fn qualified_ident(db: &Option<String>, name: &str) -> String {
+    match db {
+        Some(db) => format!("{}.{}", quote_ident(db), quote_ident(name)),
+        None => quote_ident(name),
     }
 }
 
 /// Quote an identifier for a rewritten WAL statement when the as-written
 /// name would not re-parse as a bare identifier (it holds spaces, a keyword,
 /// punctuation, …). Doubling the quotes is the grammar's escape.
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     let bare = !name.is_empty()
         && name
             .chars()
@@ -1371,6 +1418,42 @@ mod tests {
         assert_eq!(
             wal_statement_text(&plan, "ALTER USER select PASSWORD 's';"),
             "ALTER USER \"select\" PASSWORD_HASH '$argon2id$hash'"
+        );
+    }
+
+    #[test]
+    fn wal_statement_text_canonicalizes_index_ddl() {
+        use crate::plan::LogicalPlan;
+        // Index DDL is re-parsed on replay (`.pink` has no index section), so
+        // the logged text is fully qualified and every identifier is quoted
+        // exactly: keywords, spaces, unicode and an embedded quote included.
+        let create = LogicalPlan::CreateIndex {
+            db: Some("d ä".to_string()),
+            name: "select".to_string(),
+            table: "t x".to_string(),
+            column: 0,
+            column_name: "a\"b".to_string(),
+            if_not_exists: true,
+        };
+        assert_eq!(
+            wal_statement_text(&create, "CREATE INDEX IF NOT EXISTS select ON t(a);"),
+            "CREATE INDEX IF NOT EXISTS \"select\" ON \"d ä\".\"t x\"(\"a\"\"b\")"
+        );
+        let drop = LogicalPlan::DropIndex {
+            db: Some("d ä".to_string()),
+            name: "ix".to_string(),
+            table: Some("t x".to_string()),
+            if_exists: true,
+        };
+        assert_eq!(
+            wal_statement_text(&drop, "DROP INDEX ix;"),
+            "DROP INDEX IF EXISTS \"d ä\".ix"
+        );
+        // The checkpoint re-log uses the same canonical quoting, without the
+        // optional-clause prefix.
+        assert_eq!(
+            index_create_statement("d ä", "t x", "select", "a\"b"),
+            "CREATE INDEX \"select\" ON \"d ä\".\"t x\"(\"a\"\"b\")"
         );
     }
 

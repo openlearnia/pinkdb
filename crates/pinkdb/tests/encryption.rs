@@ -1021,3 +1021,44 @@ fn save_stays_explicitly_plaintext_for_a_keyed_store() {
     db.save_with_key(enc.to_str().unwrap(), &key).unwrap();
     assert!(std::fs::read(&enc).unwrap().starts_with(ENC_MAGIC));
 }
+
+/// Wave 79 durability half with at-rest encryption: the canonical index DDL
+/// is sealed into the encrypted WAL, survives a checkpoint (re-logged into the
+/// fresh encrypted generation) and replays on a keyed reopen.
+#[test]
+fn encrypted_durable_index_survives_checkpoint_and_reopen() {
+    let s = Scratch::new("idx");
+    let key = raw_key();
+    let query = "SELECT a FROM t WHERE a = 2;";
+    let explain = |db: &mut PinkDb| -> String {
+        rows_of(db, &format!("EXPLAIN {query};"))
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Varchar(s) => s.clone(),
+                other => panic!("expected EXPLAIN text, got {other:?}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    {
+        let mut db = PinkDb::open_durable_with_key(s.path(), &key).unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, v VARCHAR);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b');")
+            .unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        db.checkpoint().unwrap();
+        assert!(explain(&mut db).contains("IndexScan"));
+    }
+    let mut db = PinkDb::open_durable_with_key(s.path(), &key).unwrap();
+    assert!(
+        explain(&mut db).contains("IndexScan"),
+        "encrypted checkpoint lost the index"
+    );
+    assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 1);
+    assert_eq!(ints(&mut db, "SELECT a FROM t WHERE a = 2;"), vec![2]);
+    db.execute("DROP INDEX i;").unwrap();
+    drop(db);
+    let mut db = PinkDb::open_durable_with_key(s.path(), &key).unwrap();
+    assert!(!explain(&mut db).contains("IndexScan"));
+}

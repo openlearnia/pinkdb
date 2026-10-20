@@ -1246,6 +1246,22 @@ pub(crate) fn record_writes(
         | LogicalPlan::DropTable { db, name, .. } => {
             tables.insert(key(db, name));
         }
+        // Wave 79 (durability half): an index definition is catalog state of
+        // its table (rebuilt by re-executing the logged statement). Recording
+        // the pair makes the commit merge carry the table, the frame's
+        // touched set cover it, and a concurrent writer of that table
+        // conflict instead of silently losing/keeping the index.
+        LogicalPlan::CreateIndex { db, table, .. } => {
+            tables.insert(key(db, table));
+        }
+        LogicalPlan::DropIndex {
+            db,
+            table: Some(table),
+            ..
+        } => {
+            tables.insert(key(db, table));
+        }
+        LogicalPlan::DropIndex { table: None, .. } => {}
         // A materialized-view statement writes its backing table; the
         // definition itself rides along in the same WAL record (wave 80).
         // `REFRESH MATERIALIZED VIEWS` names the whole database instead — the

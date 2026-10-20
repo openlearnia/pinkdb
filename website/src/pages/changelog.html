@@ -9,6 +9,10 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-20</h2>
+<h3>Index DDL durability (minimal half of wave 79) ✅</h3>
+<ul>
+<li><code>CREATE INDEX</code> / <code>DROP INDEX</code> now survive reopen <strong>and</strong> checkpoints: the DDL is WAL-logged as canonical SQL (quoting preserved), and each checkpoint re-logs the live definitions into the fresh WAL generation. No <code>.pink</code> format change — indexes are still rebuilt from data at open, and flags bit 3 remains reserved for the full persistence work.</li>
+</ul>
 <h3>Security hardening — pass 4: index lifecycle ✅</h3>
 <ul>
 <li>Indexed lookups are now <strong>always re-checked</strong>: the optimizer keeps <code>Filter</code> above <code>IndexScan</code>, and any INSERT/UPDATE/DELETE/COPY marks indexes stale (rebuilt lazily at the next statement boundary) — a stale index can no longer return wrong rows.</li>

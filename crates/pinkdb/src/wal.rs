@@ -193,7 +193,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::crypto::{self, EncryptionKey, RecordCipher, TAG_LEN};
-use crate::storage::PinkDb;
+use crate::storage::{DataTable, DbCatalog, Index, PinkDb};
 use crate::types::{PinkDbError, Result};
 
 pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
@@ -4211,6 +4211,11 @@ impl PinkDb {
         // Refresh-first: the persisted state must include every committed
         // frame of every process.
         self.refresh_under_lease(guard)?;
+        // The definitions the fresh WAL must carry. Computed *before* the
+        // checkpoint mutates anything: a catalog that cannot be rendered is a
+        // clean error with the checkpoint untouched, never a published
+        // `.pink` whose definitions then failed to re-log.
+        let relog = self.live_index_statements()?;
         let mut guard_wal = wal
             .lock()
             .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
@@ -4253,7 +4258,65 @@ impl PinkDb {
         // tracked replay session so later appends `USE`-prefix correctly.
         let fallback = self.fallback_db();
         guard_wal.set_session_db(&fallback);
+        // Wave 79 (durability half): `.pink` has no index section, so a
+        // checkpoint would otherwise silently drop every index definition
+        // when it truncates the WAL. Carry the live catalog across the
+        // boundary: one canonical record in the fresh generation, fully
+        // qualified and deterministic. A dropped index is absent from the
+        // live catalog, so it is not resurrected.
+        Self::relog_index_definitions(&mut guard_wal, relog)?;
         Ok(())
+    }
+
+    /// Every live index as a canonical, re-parseable `CREATE INDEX` statement,
+    /// sorted by (database, table, index), plus the frame's touched set. Used
+    /// by the checkpoint boundary, which cannot persist index definitions in
+    /// `.pink` (no index section yet).
+    pub(crate) fn live_index_statements(&self) -> Result<(Vec<String>, FrameSets)> {
+        let mut dbs: Vec<&DbCatalog> = self.databases.values().collect();
+        dbs.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut stmts = Vec::new();
+        let mut sets = FrameSets::default();
+        for catalog in dbs {
+            let mut tables: Vec<&DataTable> = catalog.tables.values().collect();
+            tables.sort_by(|a, b| a.name.cmp(&b.name));
+            for table in tables {
+                let mut indexes: Vec<&Index> = table.indexes.iter().collect();
+                indexes.sort_by(|a, b| a.name.cmp(&b.name));
+                for index in indexes {
+                    let column = table.columns.get(index.column).ok_or_else(|| {
+                        PinkDbError::Execution(format!(
+                            "index \"{}\" on table \"{}.{}\" names column ordinal {} out of range",
+                            index.name, catalog.name, table.name, index.column
+                        ))
+                    })?;
+                    stmts.push(crate::rbac::index_create_statement(
+                        &catalog.name,
+                        &table.name,
+                        &index.name,
+                        &column.name,
+                    ));
+                    sets.add_table(&catalog.name, &table.name);
+                }
+            }
+        }
+        Ok((stmts, sets))
+    }
+
+    /// Re-log the live index definitions into the WAL generation started by
+    /// the checkpoint that just succeeded. `Wal::append` canonicalizes the
+    /// set, syncs per policy, publishes the commit slot and journals the
+    /// frame; the statements are fully qualified, so no `USE` prefix is
+    /// needed and no session state changes.
+    fn relog_index_definitions(
+        wal: &mut Wal,
+        (stmts, mut sets): (Vec<String>, FrameSets),
+    ) -> Result<()> {
+        if stmts.is_empty() {
+            return Ok(());
+        }
+        sets.canonicalize();
+        wal.append(&stmts, Some(&sets))
     }
 
     /// The `.pink` path this database is durable to, if any.
@@ -8599,6 +8662,185 @@ mod tests {
             "no open base: the journal is empty, got {entries:?}"
         );
         assert_eq!(wal.lock().unwrap().open_bases_for_test(), 0);
+        cleanup(&p);
+    }
+
+    /// Index DDL is logged as canonical, fully-qualified, identifier-quoted
+    /// text and its frame's touched set covers the indexed table. The
+    /// checkpoint re-log is one deterministic record; repeating the checkpoint
+    /// reproduces exactly that record (never a duplicate).
+    #[test]
+    fn index_ddl_frames_are_canonical_and_checkpoint_relogs_once() {
+        let p = tmp_ckpt("idxddl");
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER, \"b b\" INTEGER);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10);").unwrap();
+        db.execute("CREATE INDEX \"i x\" ON t(\"b b\");").unwrap();
+        let rec = records_of(&wal_path(&p))
+            .into_iter()
+            .find(|r| r.stmts.iter().any(|s| s.contains("CREATE INDEX")))
+            .expect("create-index record");
+        assert_eq!(rec.stmts, vec!["CREATE INDEX \"i x\" ON main.t(\"b b\")"]);
+        assert_eq!(
+            rec.sets.as_ref().expect("known touched set").table_pairs(),
+            &[("main".to_string(), "t".to_string())]
+        );
+
+        db.execute("DROP INDEX \"i x\";").unwrap();
+        let rec = records_of(&wal_path(&p))
+            .into_iter()
+            .find(|r| r.stmts.iter().any(|s| s.contains("DROP INDEX")))
+            .expect("drop-index record");
+        assert_eq!(rec.stmts, vec!["DROP INDEX main.\"i x\""]);
+        assert_eq!(
+            rec.sets.as_ref().expect("known touched set").table_pairs(),
+            &[("main".to_string(), "t".to_string())]
+        );
+
+        // A fresh set of live definitions across two databases, sorted
+        // deterministically by (database, table, index).
+        db.execute("CREATE INDEX z ON t(a);").unwrap();
+        db.execute("CREATE DATABASE db1;").unwrap();
+        db.execute("CREATE TABLE db1.t (a INTEGER);").unwrap();
+        db.execute("CREATE INDEX a ON db1.t(a);").unwrap();
+        db.checkpoint().unwrap();
+        let recs = records_of(&wal_path(&p));
+        assert_eq!(recs.len(), 1, "one re-log record after a checkpoint");
+        assert_eq!(
+            recs[0].stmts,
+            vec!["CREATE INDEX a ON db1.t(a)", "CREATE INDEX z ON main.t(a)",]
+        );
+        assert_eq!(
+            recs[0]
+                .sets
+                .as_ref()
+                .expect("known touched set")
+                .table_pairs(),
+            &[
+                ("db1".to_string(), "t".to_string()),
+                ("main".to_string(), "t".to_string()),
+            ]
+        );
+
+        // Repeated checkpoints fold the previous re-log away and write the
+        // same single record again (no duplication, no resurrection).
+        db.checkpoint().unwrap();
+        let recs = records_of(&wal_path(&p));
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].stmts,
+            vec!["CREATE INDEX a ON db1.t(a)", "CREATE INDEX z ON main.t(a)",]
+        );
+        cleanup(&p);
+    }
+
+    /// A torn index record at the WAL tail is discarded by recovery: it must
+    /// neither fabricate an index nor surface a replay error.
+    #[test]
+    fn torn_index_record_tail_does_not_fabricate_an_index() {
+        let p = tmp_ckpt("idxtorn");
+        write_pink(&p, &[1, 2]);
+        let wal = wal_path(&p);
+        write_wal_lsns(&wal, 1, &[(1, vec!["CREATE INDEX i ON t(a)".to_string()])]);
+        let len = std::fs::metadata(&wal).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(len - 7)
+            .unwrap();
+
+        let mut db = durable(&p);
+        assert!(
+            !db.execute("EXPLAIN SELECT a FROM t WHERE a = 1;")
+                .unwrap()
+                .iter()
+                .any(|r| format!("{r:?}").contains("IndexScan")),
+            "a torn record must not fabricate an index"
+        );
+        assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        cleanup(&p);
+    }
+
+    /// Recovery keeps an intact index record before the torn tail and applies
+    /// no part of the truncated statement.
+    #[test]
+    fn recovery_keeps_an_intact_index_record_before_a_torn_tail() {
+        let p = tmp_ckpt("idxtornkeep");
+        write_pink(&p, &[1, 2]);
+        let wal = wal_path(&p);
+        write_wal_lsns(
+            &wal,
+            1,
+            &[
+                (1, vec!["CREATE INDEX i ON t(a)".to_string()]),
+                (2, vec!["INSERT INTO t VALUES (3)".to_string()]),
+            ],
+        );
+        let len = std::fs::metadata(&wal).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .unwrap()
+            .set_len(len - 5)
+            .unwrap();
+
+        let mut db = durable(&p);
+        let plan = db
+            .execute("EXPLAIN SELECT a FROM t WHERE a = 1;")
+            .unwrap()
+            .into_iter()
+            .map(|r| format!("{r:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            plan.contains("IndexScan"),
+            "intact index record lost: {plan}"
+        );
+        assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
+        cleanup(&p);
+    }
+
+    /// The `Connection`/`Database` front-end shares the same logging path:
+    /// index DDL inside a transaction and a SQL `CHECKPOINT` must survive a
+    /// reopen (the checkpoint re-log included). `Connection` does not run the
+    /// optimizer, so the assertions use the durable `PinkDb` handle.
+    #[test]
+    fn connection_index_ddl_survives_reopen_and_checkpoint() {
+        let p = tmp_ckpt("idxconn");
+        {
+            let store = crate::Database::open(p.to_str().unwrap()).unwrap();
+            let mut c = store.connect();
+            c.execute("CREATE TABLE t (a INTEGER);").unwrap();
+            c.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+            c.execute("BEGIN; CREATE INDEX i ON t(a); COMMIT;").unwrap();
+            c.execute("CHECKPOINT;").unwrap();
+            assert_eq!(ints_conn(&mut c, "SELECT a FROM t WHERE a = 2;"), vec![2]);
+        }
+        {
+            let mut db = durable(&p);
+            assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 1);
+            let plan = db
+                .execute("EXPLAIN SELECT a FROM t WHERE a = 2;")
+                .unwrap()
+                .into_iter()
+                .map(|r| format!("{r:?}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                plan.contains("IndexScan"),
+                "Connection path lost the index across CHECKPOINT: {plan}"
+            );
+        }
+        {
+            let store = crate::Database::open(p.to_str().unwrap()).unwrap();
+            let mut c = store.connect();
+            c.execute("DROP INDEX i;").unwrap();
+        }
+        let mut db = durable(&p);
+        assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 0);
+        assert_eq!(ints(&mut db, "SELECT a FROM t ORDER BY a;"), vec![1, 2]);
         cleanup(&p);
     }
 }

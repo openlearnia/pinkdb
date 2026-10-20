@@ -3291,6 +3291,7 @@ fn bind_tracked_plan(
                 name: name.clone(),
                 table: table.clone(),
                 column: col_idx,
+                column_name: column.clone(),
                 if_not_exists: *if_not_exists,
             })
         }
@@ -3298,11 +3299,23 @@ fn bind_tracked_plan(
             db: qdb,
             name,
             if_exists,
-        } => empty(LogicalPlan::DropIndex {
-            db: Some(Binder::new(db, default_db).resolve_db(qdb)?),
-            name: name.clone(),
-            if_exists: *if_exists,
-        }),
+        } => {
+            let target_db = Binder::new(db, default_db).resolve_db(qdb)?;
+            // Resolve the owning table now: the executed plan's written table
+            // is what the WAL frame touches and what a durable replay rebuilds
+            // (`.pink` has no index section). A missing index stays `None`
+            // (`IF EXISTS` no-op), and the statement still logs.
+            let table = db.list_tables_in(&target_db).into_iter().find(|tbl| {
+                db.table_in(&target_db, tbl)
+                    .is_ok_and(|t| t.indexes.iter().any(|i| i.name == *name))
+            });
+            empty(LogicalPlan::DropIndex {
+                db: Some(target_db),
+                name: name.clone(),
+                table,
+                if_exists: *if_exists,
+            })
+        }
         Statement::AlterTable { db: qdb, name, op } => {
             bind_alter_table(db, default_db, qdb.as_deref(), name, op, params.clone())
         }

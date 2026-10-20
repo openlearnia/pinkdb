@@ -10,6 +10,13 @@ one-liners below.
 
 ## 2026-10-20
 
+### Index DDL durability (minimal half of wave 79) ✅
+- `CREATE INDEX` / `DROP INDEX` now survive reopen **and** checkpoints: the DDL
+  is WAL-logged as canonical SQL (quoting preserved), and each checkpoint
+  re-logs the live definitions into the fresh WAL generation. No `.pink`
+  format change — indexes are still rebuilt from data at open, and flags bit 3
+  remains reserved for the full persistence work.
+
 ### Security hardening — pass 4: index lifecycle ✅
 - Indexed lookups are now **always re-checked**: the optimizer keeps `Filter`
   above `IndexScan`, and any INSERT/UPDATE/DELETE/COPY marks indexes stale

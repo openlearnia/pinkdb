@@ -125,12 +125,21 @@ pub enum LogicalPlan {
         db: Option<String>,
         name: String,
         table: String,
+        /// Resolved column ordinal in `table.columns`.
         column: usize,
+        /// The column's catalog spelling, retained for the canonical WAL
+        /// statement (`CREATE INDEX` is re-parsed on replay, so the logged
+        /// text must name the column, not its ordinal).
+        column_name: String,
         if_not_exists: bool,
     },
     DropIndex {
         db: Option<String>,
         name: String,
+        /// The table owning the index, resolved by the binder so the plan's
+        /// touched set covers the catalog object a durable replay rebuilds.
+        /// `None` when the index does not exist (`IF EXISTS` no-op).
+        table: Option<String>,
         if_exists: bool,
     },
     IndexScan {
@@ -551,6 +560,12 @@ pub fn writes_tables(plan: &LogicalPlan) -> bool {
             | LogicalPlan::Delete { .. }
             | LogicalPlan::DropTable { .. }
             | LogicalPlan::AlterTable { .. }
+            // Wave 79 (durability half): the hash index catalog is in-memory
+            // and `.pink` has no index section, so `CREATE/DROP INDEX` is
+            // replayed from the WAL. The map itself is rebuilt from the
+            // replayed table data.
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::DropIndex { .. }
             | LogicalPlan::CreateDatabase { .. }
             | LogicalPlan::DropDatabase { .. }
             | LogicalPlan::Use { .. }
