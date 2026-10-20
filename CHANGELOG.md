@@ -10,6 +10,16 @@ one-liners below.
 
 ## 2026-10-20
 
+### Security hardening — pass 2: authentication gate ✅
+- The login gate is now evaluated **per statement inside a batch** (both
+  transports, prepared statements included): an unauthenticated `CREATE USER;
+  GRANT ADMIN` batch can no longer promote itself — the created user exists
+  without admin rights.
+- "Empty catalog ⇒ trusted" now applies only to embedded/trusted sessions; an
+  authenticated session whose catalog is emptied is denied, not promoted.
+  Role-granted ADMIN is honored consistently, and the server's startup text no
+  longer claims there is no authentication.
+
 ### Security hardening — pass 1: extension loading ✅
 - **`LOAD EXTENSION` is off by default** everywhere (engine, CLI, C ABI,
   bindings); enable it explicitly with `--allow-load-extension` /

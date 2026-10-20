@@ -10,21 +10,22 @@
 //!
 //! Without `--file` the database is in-memory; with it, the server opens the
 //! durable checkpoint + WAL path (wave 22): rows acked to a client survive a
-//! server crash and are replayed on the next start. No authentication and no
-//! TLS in this wave — bind localhost.
+//! server crash and are replayed on the next start. Authentication is opt-in
+//! per store: while the store has no users every connection is trusted, and
+//! once a user exists every statement request must log in first. Bind
+//! localhost until the store has users.
 //!
 //! `--transport sync` (the default) is the blocking thread-per-connection
 //! server. `--transport async` is the tokio transport from the optional
 //! `async-server` feature: same protocol, same engine (which stays
 //! synchronous — see the crate docs' "Async carve-out" section), same
 //! robustness knobs; the flag needs a build with that feature.
-//! server crash and are replayed on the next start.
 //!
 //! `--tls-cert` + `--tls-key` (both, or neither) serve the same protocol over
 //! rustls-encrypted TCP; they are only accepted by a binary built with the
-//! `tls` feature. TLS encrypts the transport — there is still **no
-//! authentication**: every peer that completes a handshake (and, by default,
-//! that is every peer) gets the full SQL surface. Bind localhost.
+//! `tls` feature. TLS encrypts the transport and identifies the server; it
+//! does **not** identify the client — login is what gates statements once the
+//! store has users. Bind localhost until then.
 
 use std::process::ExitCode;
 
@@ -89,9 +90,11 @@ fn usage() -> &'static str {
      At-rest encryption is not wired into the server: PINKDB_KEY is ignored and\n\
      --file must be a plaintext database (an encrypted one is refused at startup).\n\
      \n\
-     Security: no authentication (TLS only encrypts the transport; it does not\n\
-     identify clients). Keep the bind address on localhost or a trusted network;\n\
-     anyone who can reach the port has full SQL access."
+     Security: authentication is opt-in per store — while the store has no\n\
+     users every connection is trusted and can run any SQL; once a user\n\
+     exists, every statement request requires Login first. TLS only encrypts\n\
+     the transport (it identifies the server, not clients). Keep the bind\n\
+     address on localhost or a trusted network until the store has users."
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -337,13 +340,14 @@ fn announce(addr: std::net::SocketAddr, mode: &str, transport: &str) {
     );
     if transport == "TLS" {
         eprintln!(
-            "pinkdb-server: TLS encrypts the transport only — there is no authentication; \
-             keep the bind address trusted"
+            "pinkdb-server: TLS encrypts the transport only — it identifies the server, not \
+             the client; authentication is required once the store has users"
         );
     } else {
         eprintln!(
-            "pinkdb-server: no authentication, no TLS on this transport — keep the bind \
-             address trusted"
+            "pinkdb-server: authentication is required once the store has users; while it \
+             has none, every connection is trusted and this port is plaintext — keep the \
+             bind address trusted"
         );
     }
 }

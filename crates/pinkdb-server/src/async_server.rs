@@ -378,6 +378,9 @@ async fn serve_connection(stream: TcpStream, db: Database, idle_timeout: Option<
         eprintln!("pinkdb-server(async): cannot set TCP_NODELAY on an accepted socket: {e}");
     }
     let mut conn = db.connect();
+    // Network session: the engine re-checks the store's user catalog before
+    // every statement (so a batch cannot continue after its own CREATE USER).
+    conn.require_login(true);
 
     // Handshake: the first request must be a version-matched Hello.
     let protocol_version = match read_request(&mut stream, idle_timeout).await {

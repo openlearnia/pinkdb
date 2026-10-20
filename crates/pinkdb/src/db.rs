@@ -51,6 +51,12 @@ use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
 use crate::wal::{BaseToken, DurableOpenOptions, Lease, LeaseGuard};
 
+/// The refusal a network-front-end [`Connection`] reports when its store has
+/// users and the session has not logged in. The check runs per statement
+/// (see [`Connection::require_login`]), not once per request.
+pub const AUTHENTICATION_REQUIRED: &str =
+    "authentication required: this database has users defined; log in first";
+
 /// One-time warning flag for poisoned-lock recovery (see [`read_lock`]).
 static POISON_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -154,9 +160,10 @@ impl Database {
             txn: None,
             current_db,
             // A plain connect is trusted (see `Connection::principal`).
-            // Network front-ends authenticate with `Connection::login`; the
-            // store's own policy switch is `Database::has_users`.
+            // Network front-ends authenticate with `Connection::login` and
+            // arm the per-statement gate with `Connection::require_login`.
             principal: None,
+            require_login: false,
         }
     }
 
@@ -364,7 +371,16 @@ pub struct Connection {
     /// statement of this connection run under that user's privileges.
     /// `None` — a plain [`Database::connect`], the FFI, wasm — is the
     /// documented **trusted** embedded session: no privilege check happens.
+    /// (A network front-end additionally arms [`Connection::require_login`],
+    /// which refuses statements once the store has users until a login.)
     principal: Option<String>,
+    /// `true` when this connection is served by a network front-end, which
+    /// requires a login as soon as the shared store has users. The check
+    /// runs per statement, inside [`Connection::execute`], so a multi-
+    /// statement batch cannot create the first user and then keep running
+    /// unauthenticated. Embedded connections leave this `false`: their
+    /// `principal == None` is the documented trusted-session path.
+    require_login: bool,
 }
 
 impl Connection {
@@ -416,12 +432,51 @@ impl Connection {
         self.principal.as_deref()
     }
 
-    /// Forget this session's principal: the connection becomes trusted
-    /// again. Network front-ends do not expose this (a client cannot opt out
-    /// of authentication mid-connection); it exists for embedders that
-    /// logged a connection in for one statement.
+    /// Forget this session's principal. An embedded connection becomes
+    /// trusted again; a network connection (see [`Connection::require_login`])
+    /// must log in before its next statement once the store has users.
+    /// Network front-ends do not expose this (a client cannot opt out of
+    /// authentication mid-connection); it exists for embedders that logged a
+    /// connection in for one statement.
     pub fn logout(&mut self) {
         self.principal = None;
+    }
+
+    /// Arm (or disarm) the network authentication gate.
+    ///
+    /// A network front-end arms this on every accepted connection. While it
+    /// is armed and this session has no principal, **each** statement is
+    /// refused with [`AUTHENTICATION_REQUIRED`] as soon as the shared store
+    /// has at least one user ([`Database::has_users`]). Because the check
+    /// runs inside [`Connection::execute`] — before every statement, not
+    /// once per call — a multi-statement batch can create the first user and
+    /// nothing else: the next statement of that same batch is refused. A
+    /// prepared statement is checked at execution for the same reason.
+    ///
+    /// Embedded connections leave the gate off: `principal == None` stays
+    /// the documented trusted session (the FFI, wasm and plain
+    /// [`Database::connect`] paths), so this method is the only behavioral
+    /// difference between an embedder and the server.
+    pub fn require_login(&mut self, required: bool) {
+        self.require_login = required;
+    }
+
+    /// The per-statement auth gate: once the store has users, an armed
+    /// connection without a principal may not run any statement. A session
+    /// that logged in earlier keeps its principal (sticky), so it is always
+    /// checked by the RBAC pass — never treated as trusted again.
+    fn ensure_login(&self) -> Result<()> {
+        if !self.require_login || self.principal.is_some() {
+            return Ok(());
+        }
+        // A durable store may be shared with another process: refresh first so
+        // `has_users` reflects the latest committed catalog, not a snapshot
+        // from before the other process created the first user.
+        self.db.refresh()?;
+        if self.db.has_users() {
+            return Err(PinkDbError::Execution(AUTHENTICATION_REQUIRED.to_string()));
+        }
+        Ok(())
     }
 
     /// Parse `sql` into a reusable prepared statement (exactly one statement,
@@ -484,6 +539,12 @@ impl Connection {
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
     ) -> Result<QueryResult> {
+        // Network authentication gate: evaluated before *every* statement of
+        // a batch with the store's current user catalog, so the first
+        // `CREATE USER` of an unauthenticated batch is allowed and the very
+        // next statement is refused. No-op for embedded connections (the
+        // gate is armed only by a network front-end) and once logged in.
+        self.ensure_login()?;
         // Transaction control never touches table data: handle first.
         match stmt {
             crate::sql::ast::Statement::Begin => return self.txn_begin(),
@@ -1075,9 +1136,10 @@ impl Connection {
 }
 
 /// Enforce one session principal's privileges on one bound plan (wave 48),
-/// called at every point a statement is about to execute. A no-op for a
-/// trusted session (`principal == None` — the embedded API) and for a store
-/// with no RBAC data at all.
+/// called at every point a statement is about to execute. A no-op only for a
+/// trusted session (`principal == None` — the embedded API); an authenticated
+/// principal is always checked, even if the RBAC catalog no longer contains
+/// it (an empty catalog grants nothing, so the statement is denied).
 fn enforce(
     principal: Option<&str>,
     store: &PinkDb,

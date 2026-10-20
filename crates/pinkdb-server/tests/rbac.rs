@@ -135,6 +135,138 @@ fn authentication_is_required_once_any_user_exists() {
 }
 
 #[test]
+fn an_unauthenticated_batch_cannot_create_and_promote_an_admin() {
+    for flavor in flavors() {
+        let (_handle, addr, db) = start_fresh(flavor);
+        let mut client = Client::connect(&addr).unwrap();
+        // H-1: one unauthenticated batch that bootstraps a user and promotes
+        // it. The first statement is the documented bootstrap (allowed while
+        // the catalog is empty); the gate re-evaluates before the GRANT and
+        // refuses it.
+        let e =
+            err_of(client.execute("CREATE USER evil PASSWORD 'evil-secret'; GRANT ADMIN TO evil;"));
+        assert!(e.contains("authentication required"), "{flavor:?}: {e}");
+        // The user exists (the first statement committed), but is not admin:
+        // the GRANT never ran.
+        assert!(db.has_users());
+        // Logging in as the created user confirms it has no privileges.
+        client.login("evil", "evil-secret").unwrap();
+        let e = err_of(client.execute("CREATE USER mallory PASSWORD 'x';"));
+        assert!(e.contains("needs the ADMIN privilege"), "{flavor:?}: {e}");
+        let mut probe = Client::connect(&addr).unwrap();
+        assert!(probe.login("mallory", "x").is_err());
+    }
+}
+
+#[test]
+fn a_batch_is_refused_before_its_first_statement_when_users_exist() {
+    for flavor in flavors() {
+        let (_handle, addr, db) = start_fresh(flavor);
+        embedded(&db)
+            .execute("CREATE USER alice PASSWORD 'alice-secret';")
+            .unwrap();
+        let mut client = Client::connect(&addr).unwrap();
+        // Every statement request is refused while the connection has no
+        // principal — including a batch whose first statement would otherwise
+        // run before the gate noticed the catalog.
+        let e = err_of(client.execute("CREATE TABLE pwned (i INTEGER); SELECT 1;"));
+        assert!(e.contains("authentication required"), "{flavor:?}: {e}");
+        let mut trusted = embedded(&db);
+        let e = trusted
+            .execute("SELECT * FROM pwned;")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("not found"), "{flavor:?}: {e}");
+    }
+}
+
+#[test]
+fn an_authenticated_session_is_not_promoted_when_the_last_user_is_dropped() {
+    for flavor in flavors() {
+        let (_handle, addr, db) = start_fresh(flavor);
+        embedded(&db)
+            .execute(
+                "CREATE USER root PASSWORD 'root-secret';\
+                 GRANT ADMIN TO root;\
+                 CREATE USER alice PASSWORD 'alice-secret';",
+            )
+            .unwrap();
+        let mut alice = Client::connect(&addr).unwrap();
+        alice.login("alice", "alice-secret").unwrap();
+        let e = err_of(alice.execute("CREATE TABLE alice_table (a INTEGER);"));
+        assert!(e.contains("permission denied"), "{flavor:?}: {e}");
+
+        // An authenticated admin empties the catalog (M-1).
+        let mut root = Client::connect(&addr).unwrap();
+        root.login("root", "root-secret").unwrap();
+        root.execute("DROP USER alice; DROP USER root;").unwrap();
+        assert!(!db.has_users());
+
+        // Alice authenticated earlier: she stays checked, and an empty
+        // catalog means no grants, not full access.
+        let e = err_of(alice.execute("CREATE TABLE alice_table (a INTEGER);"));
+        assert!(
+            e.contains("permission denied"),
+            "{flavor:?}: empty catalog promoted a live session: {e}"
+        );
+        let e = err_of(alice.execute("CREATE USER mallory PASSWORD 'x';"));
+        assert!(e.contains("needs the ADMIN privilege"), "{flavor:?}: {e}");
+        let mut probe = Client::connect(&addr).unwrap();
+        assert!(probe.login("mallory", "x").is_err());
+    }
+}
+
+#[test]
+fn a_role_granted_admin_is_honored_over_the_wire() {
+    for flavor in flavors() {
+        let (_handle, addr, db) = start_fresh(flavor);
+        embedded(&db)
+            .execute(
+                "CREATE USER alice PASSWORD 'alice-secret';\
+                 CREATE ROLE ops;\
+                 GRANT ADMIN TO ops;\
+                 GRANT ops TO alice;",
+            )
+            .unwrap();
+        let mut alice = Client::connect(&addr).unwrap();
+        alice.login("alice", "alice-secret").unwrap();
+        // ADMIN-held-through-a-role satisfies the admin-only statements.
+        alice
+            .execute("CREATE USER bob PASSWORD 'bob-secret';")
+            .unwrap_or_else(|e| panic!("{flavor:?}: {e}"));
+        alice.execute("CREATE DATABASE other;").unwrap();
+        let mut bob = Client::connect(&addr).unwrap();
+        bob.login("bob", "bob-secret").unwrap();
+        let e = err_of(bob.execute("CREATE DATABASE nope;"));
+        assert!(e.contains("needs the ADMIN privilege"), "{flavor:?}: {e}");
+    }
+}
+
+#[test]
+fn prepared_execution_is_gated_when_the_catalog_changes() {
+    for flavor in flavors() {
+        let (_handle, addr, db) = start_fresh(flavor);
+        let mut client = Client::connect(&addr).unwrap();
+        // Parsing is allowed while the catalog is empty.
+        let (handle, _) = client.prepare("CREATE USER pwned PASSWORD 'x';").unwrap();
+        // The first user appears after the prepare but before the execute.
+        embedded(&db)
+            .execute("CREATE USER alice PASSWORD 'alice-secret';")
+            .unwrap();
+        let e = err_of(client.execute_prepared(handle, &[]));
+        assert!(e.contains("authentication required"), "{flavor:?}: {e}");
+        let mut probe = Client::connect(&addr).unwrap();
+        assert!(probe.login("pwned", "x").is_err());
+        // After login the same prepared statement executes.
+        embedded(&db).execute("GRANT ADMIN TO alice;").unwrap();
+        client.login("alice", "alice-secret").unwrap();
+        client.execute_prepared(handle, &[]).unwrap();
+        let mut probe = Client::connect(&addr).unwrap();
+        assert_eq!(probe.login("pwned", "x").unwrap(), "pwned");
+    }
+}
+
+#[test]
 fn privileges_are_enforced_per_statement_through_the_server() {
     for flavor in flavors() {
         let (_handle, addr, db) = start_fresh(flavor);

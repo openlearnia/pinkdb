@@ -186,6 +186,11 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-20">2026-10-20<a class="anchor" href="#2026-10-20" aria-label="Permalink: 2026-10-20">#</a></h2>
+<h3>Security hardening — pass 2: authentication gate ✅</h3>
+<ul>
+<li>The login gate is now evaluated <strong>per statement inside a batch</strong> (both transports, prepared statements included): an unauthenticated <code>CREATE USER; GRANT ADMIN</code> batch can no longer promote itself — the created user exists without admin rights.</li>
+<li>"Empty catalog ⇒ trusted" now applies only to embedded/trusted sessions; an authenticated session whose catalog is emptied is denied, not promoted. Role-granted ADMIN is honored consistently, and the server's startup text no longer claims there is no authentication.</li>
+</ul>
 <h3>Security hardening — pass 1: extension loading ✅</h3>
 <ul>
 <li><strong><code>LOAD EXTENSION</code> is off by default</strong> everywhere (engine, CLI, C ABI, bindings); enable it explicitly with <code>--allow-load-extension</code> / <code>PINKDB_ALLOW_LOAD_EXTENSION</code>, the new C-ABI switch, or the binding opt-ins.</li>

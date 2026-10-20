@@ -1906,3 +1906,26 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   window remains between validation and `dlopen`, a root-contained library's
   `DT_NEEDED` dependencies are not confined, and `PinkDb::load_extension`
   stays host-trusted.
+
+- 2026-10-20 — Security hardening, pass 2: authentication gate + escalation
+  (H-1/M-1 + role-ADMIN + banner; worktree `wt-sec2`). The server-armed gate
+  now runs **inside `Connection` before every statement** (`require_login`),
+  so a multi-statement batch is checked between statements against the store's
+  current `has_users()`: the unauthenticated `CREATE USER evil …; GRANT ADMIN
+  TO evil` batch creates the user but **refuses the grant** (A.2 pinned as a
+  test on both transports), and prepared execution is covered through the same
+  path while the early request-level refusal stays for clean errors. The
+  empty-catalog shortcut moved out of `check_statement`: only
+  `principal == None` (embedded/trusted) skips checks, so an authenticated
+  session whose catalog is emptied is denied (A.7 on both transports). The
+  engine refreshes a durable store's catalog before the gate, so cross-process
+  user commits are observed (a residual TOCTOU window is documented).
+  Role-derived ADMIN is now honored consistently by enforcement and
+  `PinkDb::principal_is_admin` (`is_admin_resolved`), and the server's
+  usage/announce text no longer claims "no authentication". Gates: pinkdb
+  645 → **650**, server **78** (async **95**, tls **89**), CLI 77, workspace
+  1223 → **1235**, duckdiff **339/339**, fmt/clippy both toolchains, wasm
+  green. Size: server +336 B; CLI unchanged. Tests added: 12 (A.2 both
+  transports, batch-refused-before-first-statement, A.7 both transports,
+  role-granted ADMIN over the wire and engine, prepared gating, banner text,
+  empty-catalog engine unit).

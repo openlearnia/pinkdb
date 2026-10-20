@@ -514,7 +514,8 @@ impl RbacCatalog {
 
     /// Does `principal` hold `priv` on `object`? Direct grants, grants to
     /// any role the principal is a member of, and `ADMIN` (which passes
-    /// every check) all count.
+    /// every check, including one granted to a role the principal belongs
+    /// to) all count.
     pub(crate) fn allowed(
         &self,
         principal: &str,
@@ -522,7 +523,7 @@ impl RbacCatalog {
         privilege: Privilege,
     ) -> bool {
         let principal = principal.to_ascii_lowercase();
-        if self.is_admin(&principal) {
+        if self.is_admin_resolved(&principal) {
             return true;
         }
         let mut holders = vec![principal];
@@ -560,6 +561,19 @@ impl RbacCatalog {
     /// Is `principal` a global admin?
     pub(crate) fn is_admin(&self, principal: &str) -> bool {
         self.admins.contains(&principal.to_ascii_lowercase())
+    }
+
+    /// Is `principal` a global admin directly **or through a role it is a
+    /// member of**? This is the documented model: a role's `ADMIN` grant
+    /// flows to every member, and the enforcement path uses this resolution
+    /// (not the direct-membership [`RbacCatalog::is_admin`]).
+    pub(crate) fn is_admin_resolved(&self, principal: &str) -> bool {
+        let principal = principal.to_ascii_lowercase();
+        self.is_admin(&principal)
+            || self
+                .roles_of(&principal)
+                .iter()
+                .any(|role| self.is_admin(role))
     }
 
     /// Every privilege `principal` holds on `object` through a **grant**
@@ -938,13 +952,7 @@ impl PinkDb {
     /// Is this principal (a user or a role) a global admin? (Roles pass their
     /// `ADMIN` down to every member, like any other grant.)
     pub fn principal_is_admin(&self, principal: &str) -> bool {
-        let principal = principal.to_ascii_lowercase();
-        self.rbac.is_admin(&principal)
-            || self
-                .rbac
-                .roles_of(&principal)
-                .iter()
-                .any(|role| self.rbac.is_admin(role))
+        self.rbac.is_admin_resolved(principal)
     }
 
     /// The privileges `principal` effectively holds on one table: its direct
@@ -1064,9 +1072,12 @@ fn read_checked(plan: &LogicalPlan) -> bool {
 /// Called by [`crate::Connection`] for every statement of an authenticated
 /// session, after binding and before execution. Returns a
 /// `permission denied: …` error naming the missing privilege and the
-/// statement that needs it. A no-op for a store with no RBAC data at all
-/// (nothing can be granted, so nothing is checked — the pre-wave-48
-/// behavior), and for `ADMIN` principals.
+/// statement that needs it. An `ADMIN` principal (directly, or through a
+/// role it is a member of) passes every check. An authenticated principal is
+/// **always** checked: the "empty catalog ⇒ trusted" policy belongs to the
+/// trusted-session path ([`crate::Connection`] with no principal), never to
+/// a session that authenticated earlier, so emptying the catalog simply
+/// removes every grant and denies.
 pub(crate) fn check_statement(
     store: &PinkDb,
     principal: &str,
@@ -1074,12 +1085,7 @@ pub(crate) fn check_statement(
     default_db: &str,
 ) -> Result<()> {
     let rbac = store.rbac();
-    // Nothing is configured: every check would fail, so skip the pass
-    // entirely (a store without users has no way to grant anything).
-    if rbac.users.is_empty() && rbac.roles.is_empty() && rbac.admins.is_empty() {
-        return Ok(());
-    }
-    if rbac.is_admin(principal) {
+    if rbac.is_admin_resolved(principal) {
         return Ok(());
     }
     // 1. Statement-kind privileges.
@@ -1369,13 +1375,32 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_catalog_short_circuits_the_check() {
-        // A store with no RBAC data at all: the pass is skipped so an
-        // authenticated session (or none) cannot be locked out by a catalog
-        // that has nothing to grant.
+    fn an_empty_catalog_still_checks_an_authenticated_principal() {
+        // M-1: the "no RBAC data ⇒ skip" shortcut applies only to a trusted
+        // session (principal == None), never to one that authenticated
+        // earlier. With an empty catalog there are no grants, so a
+        // privileged statement is denied instead of silently promoted.
         let db = PinkDb::new();
-        let plan = LogicalPlan::ShowDatabases;
-        assert!(check_statement(&db, "alice", &plan, "main").is_ok());
         assert!(!db.has_users());
+        let e = check_statement(&db, "alice", &LogicalPlan::Checkpoint, "main")
+            .expect_err("an authenticated principal keeps being checked");
+        assert!(e.to_string().contains("ADMIN privilege"), "{e}");
+    }
+
+    #[test]
+    fn role_granted_admin_is_resolved_by_the_enforcement_path() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE USER alice PASSWORD 'alice-secret';")
+            .unwrap();
+        db.execute("CREATE ROLE ops;").unwrap();
+        db.execute("GRANT ADMIN TO ops;").unwrap();
+        db.execute("GRANT ops TO alice;").unwrap();
+        assert!(db.principal_is_admin("alice"));
+        // The same plan that is admin-only is accepted only because of the
+        // role-held ADMIN: `check_statement` uses the resolved check.
+        assert!(check_statement(&db, "alice", &LogicalPlan::Checkpoint, "main").is_ok());
+        db.execute("REVOKE ADMIN FROM ops;").unwrap();
+        assert!(!db.principal_is_admin("alice"));
+        assert!(check_statement(&db, "alice", &LogicalPlan::Checkpoint, "main").is_err());
     }
 }

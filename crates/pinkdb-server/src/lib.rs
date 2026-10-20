@@ -65,13 +65,20 @@
 //!   working. After a successful login the connection runs as that user and
 //!   the engine checks every statement against its grants (`permission
 //!   denied: …` for a missing privilege). The gate is evaluated per
-//!   statement, so a connection that creates the first user must log in
-//!   before its next statement.
+//!   statement — inside a multi-statement `Execute` batch and at prepared-
+//!   statement execution, against the store's *current* user catalog — so a
+//!   connection that creates the first user must log in before its next
+//!   statement, even when both statements arrive in one batch. Emptying the
+//!   catalog does not promote a session that logged in earlier: an
+//!   authenticated principal is always checked and an empty catalog simply
+//!   grants nothing.
 //! - **The embedded API is trusted by construction.** `pinkdb::Database`
 //!   handles, the C ABI crate and the wasm bindings carry no principal, so
 //!   they run every statement unchecked — exactly as before this wave. Only
 //!   [`pinkdb::Connection::login`] (through `Request::Login` here) puts a
-//!   session under privilege checks.
+//!   session under privilege checks; the server additionally arms
+//!   [`pinkdb::Connection::require_login`] on every network connection, which
+//!   is what re-evaluates the store's user catalog before each statement.
 //!
 //! Passwords are hashed with Argon2id when the DDL runs; neither the `.pink`
 //! catalog nor the WAL ever holds the plaintext. Transport encryption is a

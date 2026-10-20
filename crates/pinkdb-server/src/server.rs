@@ -41,8 +41,11 @@
 //!   one user exists, every statement request of a connection without a
 //!   successful [`Request::Login`](crate::protocol::Request::Login) is
 //!   refused with an `Error` frame; after the login, each statement runs
-//!   under that user's grants (the engine's per-statement check). `Login`
-//!   itself is answered with `LoggedIn` or the same
+//!   under that user's grants (the engine's per-statement check). The gate
+//!   is re-evaluated between the statements of a multi-statement batch and
+//!   at prepared-statement execution against the *current* catalog, so a
+//!   batch that creates the first user cannot keep running unauthenticated.
+//!   `Login` itself is answered with `LoggedIn` or the same
 //!   `authentication failed: …` error for an unknown user and a wrong
 //!   password. `Ping` never needs authentication.
 //! - With the crate feature `tls`, [`Server::bind_tls`] serves the same
@@ -50,9 +53,10 @@
 //!   connection's own thread (under the same idle timeout), so a failed or
 //!   stalled handshake logs and drops that connection while the server keeps
 //!   serving. A plaintext client on a TLS listener (or vice versa) fails its
-//!   own connection and nothing else. TLS encrypts the transport only: there
-//!   is still no authentication, and the connection cap, per-connection
-//!   session isolation and idle timeout are unchanged.
+//!   own connection and nothing else. TLS encrypts the transport only: it
+//!   identifies the server, not the client (login is the client identity),
+//!   and the connection cap, per-connection session isolation and idle
+//!   timeout are unchanged.
 
 use std::io::{BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -232,8 +236,8 @@ impl Server {
     /// binds: a missing or unreadable file, PEM that does not parse, an empty
     /// file, or a key that does not match the leaf certificate refuses
     /// startup with a message naming the file and the reason. Client
-    /// certificates are not requested; TLS here is transport encryption, not
-    /// authentication.
+    /// certificates are not requested; TLS here is transport encryption and
+    /// server identity, not client authentication.
     #[cfg(feature = "tls")]
     pub fn bind_tls_with_max_connections(
         addr: impl ToSocketAddrs,
@@ -521,6 +525,9 @@ fn serve_tls_connection(
 fn serve_client<S: Read + Write>(stream: S, db: Database) {
     let mut reader = BufReader::new(stream);
     let mut conn = db.connect();
+    // Network session: the engine re-checks the store's user catalog before
+    // every statement (so a batch cannot continue after its own CREATE USER).
+    conn.require_login(true);
 
     // Handshake: the first request must be a version-matched Hello.
     let protocol_version = match protocol::read_request(&mut reader) {

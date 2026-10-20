@@ -519,6 +519,128 @@ fn authenticated_sessions_are_checked_per_statement() {
 }
 
 #[test]
+fn the_network_gate_checks_every_statement_of_a_batch() {
+    let shared = Database::new();
+    let mut conn = shared.connect();
+    conn.require_login(true);
+    // Bootstrap policy: the first `CREATE USER` is allowed while the catalog
+    // is empty. The *next* statement of the same batch sees the current
+    // `has_users() == true` and is refused.
+    let e = conn
+        .execute("CREATE USER evil PASSWORD 'evil-secret'; GRANT ADMIN TO evil;")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("authentication required"), "{e}");
+    assert!(shared.has_users());
+    // The user exists and can log in…
+    let mut evil = shared.connect();
+    evil.require_login(true);
+    assert_eq!(evil.login("evil", "evil-secret").unwrap(), "evil");
+    // … but is an ordinary user: the GRANT never ran, so escalation is still
+    // refused by the privilege check.
+    let e = execute(&mut evil, "CREATE USER mallory PASSWORD 'x';");
+    assert!(e.contains("needs the ADMIN privilege"), "{e}");
+
+    // A batch that starts while users exist is refused before its first
+    // statement, so no side effect can precede the refusal.
+    let mut late = shared.connect();
+    late.require_login(true);
+    let e = late
+        .execute("CREATE TABLE pwned (i INTEGER); SELECT 1;")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("authentication required"), "{e}");
+    let mut trusted = shared.connect();
+    let e = execute(&mut trusted, "SELECT * FROM pwned;");
+    assert!(e.contains("not found"), "{e}");
+}
+
+#[test]
+fn prepared_execution_is_gated_after_users_appear() {
+    let shared = Database::new();
+    let mut conn = shared.connect();
+    conn.require_login(true);
+    // Parsing is not execution: a prepared statement may be created while
+    // the catalog is still empty.
+    let stmt = conn.prepare("CREATE USER pwned PASSWORD 'x';").unwrap();
+    shared
+        .connect()
+        .execute("CREATE USER alice PASSWORD 'alice-secret';")
+        .unwrap();
+    // The catalog changed before the execute: the gate sees the *current*
+    // users and refuses; nothing runs.
+    let e = conn.execute_prepared(&stmt, &[]).unwrap_err().to_string();
+    assert!(e.contains("authentication required"), "{e}");
+    assert!(
+        shared.connect().login("pwned", "x").is_err(),
+        "the prepared statement ran without authentication"
+    );
+    // After a login (and ADMIN for the DDL), the same prepared statement
+    // executes normally.
+    shared.connect().execute("GRANT ADMIN TO alice;").unwrap();
+    conn.login("alice", "alice-secret").unwrap();
+    conn.execute_prepared(&stmt, &[]).unwrap();
+    assert_eq!(
+        shared.connect().login("pwned", "x").unwrap(),
+        "pwned",
+        "the prepared statement did not run after login"
+    );
+}
+
+#[test]
+fn emptying_the_catalog_does_not_promote_a_live_session() {
+    let mut db = store();
+    exec(
+        &mut db,
+        "CREATE USER root PASSWORD 'root-secret';\
+         GRANT ADMIN TO root;",
+    );
+    let shared = Database::from_store(db);
+    let mut alice = alice(&shared);
+    // No grants: refused while the catalog is populated.
+    let e = execute(&mut alice, "CREATE TABLE alice_table (a INTEGER);");
+    assert!(e.contains("permission denied"), "{e}");
+    // The trusted admin path removes every user. The documented "no users ⇒
+    // trust new connections" policy must not promote a session that
+    // authenticated earlier.
+    admin_sql(
+        &shared,
+        "DROP USER alice;\
+         DROP USER root;",
+    );
+    assert!(!shared.has_users());
+    let e = execute(&mut alice, "CREATE TABLE alice_table (a INTEGER);");
+    assert!(
+        e.contains("permission denied"),
+        "empty catalog promoted a live session: {e}"
+    );
+    let e = execute(&mut alice, "CREATE USER mallory PASSWORD 'x';");
+    assert!(e.contains("needs the ADMIN privilege"), "{e}");
+    assert!(
+        shared.connect().login("mallory", "x").is_err(),
+        "the denied CREATE USER still created the user"
+    );
+}
+
+#[test]
+fn a_role_granted_admin_is_honored_by_enforcement() {
+    let mut db = store();
+    exec(&mut db, "CREATE ROLE ops;");
+    exec(&mut db, "GRANT ADMIN TO ops;");
+    exec(&mut db, "GRANT ops TO analyst;");
+    exec(&mut db, "GRANT analyst TO alice;");
+    assert!(db.principal_is_admin("alice"), "role-held ADMIN resolves");
+    let shared = Database::from_store(db);
+    let mut alice = alice(&shared);
+    // User management is ADMIN-only; the role-held grant satisfies it.
+    assert!(execute(&mut alice, "CREATE USER bob PASSWORD 'bob-secret';").is_empty());
+    // Revoking the role's ADMIN closes the bypass again.
+    admin_sql(&shared, "REVOKE ADMIN FROM ops;");
+    let e = execute(&mut alice, "CREATE USER carol PASSWORD 'x';");
+    assert!(e.contains("needs the ADMIN privilege"), "{e}");
+}
+
+#[test]
 fn privileges_flow_through_nested_roles_and_admin_passes_everything() {
     let mut db = store();
     exec(&mut db, "CREATE ROLE reader;");

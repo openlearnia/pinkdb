@@ -69,7 +69,7 @@ pub use attached::{
     AtSpec, AttachedLake, AttachedScan, AttachedTable, ColumnStats, PruneOp, PrunePredicate,
 };
 pub use crypto::EncryptionKey;
-pub use db::{Connection, Database};
+pub use db::{AUTHENTICATION_REQUIRED, Connection, Database};
 pub use exec::QueryResult;
 pub use filefmt::FileFormat;
 pub use macros::{MacroDef, MacroParamDef};
