@@ -333,7 +333,7 @@ jobs:
 
       # The Rust SDK smoke builds its example with cargo (a workspace member)
       # and drives the same CLI session, including the volatile-function
-      # refusal. `cargo test -p pinkdb-ext-sdk` (the main build-test job) also
+      # refusal. `cargo test -p pinkdb-ext-sdk` (the core test job) also
       # covers the SDK's own native and linked round trips, and
       # `cargo test -p pinkdb-math` links both core extensions plus a locally
       # declared one into one binary (tests/coexist.rs).
