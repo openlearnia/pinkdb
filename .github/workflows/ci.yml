@@ -26,11 +26,11 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Core workspace: build, the full test suite, clippy, the feature matrix
-  # that matters (S3 / lake / encryption), the wasm check, and the release
-  # CLI artifact the duckdiff job consumes.
-  build-test:
-    name: build, test, clippy, features, wasm
+  # Core: formatting, the default workspace test suite, and the SIGKILL
+  # crash-recovery loops. The feature matrices run in `feature-tests` so each
+  # family gets its own runner instead of sharing one serial job.
+  core:
+    name: core tests
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -44,7 +44,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: default
+          shared-key: ci
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -55,79 +55,93 @@ jobs:
       - name: cargo test
         run: cargo test -q
 
+      # SIGKILL crash-recovery loops against the dev CLI (plain, multi-db,
+      # kill-during-checkpoint, encrypted).
+      - name: kill loops (bench/kill_loop.py)
+        run: |
+          cargo build -p pinkdb-cli
+          python3 bench/kill_loop.py 20
+          python3 bench/kill_loop.py 20 --multi-db
+          python3 bench/kill_loop.py --targeted 10
+          cargo build -p pinkdb-cli --features encryption
+          # Scope the passphrase to this one invocation: an ambient
+          # PINKDB_KEY would otherwise encrypt the plain runs' checkpoints.
+          PINKDB_KEY=ci-kill-loop-passphrase python3 bench/kill_loop.py 15 --encrypted
+
+  # Feature matrix: split by feature family so lake/CLI/server suites run on
+  # separate runners. Every entry shares the same rust-cache key, so a runner
+  # that restores a cache built by another entry only recompiles the missing
+  # feature artifacts.
+  feature-tests:
+    name: feature tests (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: lake
+            run: |
+              cargo test -p pink-lake --features s3
+              cargo test -p pink-lake --features s3,vortexlake
+              cargo test -p pink-lake --features s3,encryption
+              cargo test -p pink-lake --features s3,vortexlake,encryption
+          - name: cli-lake
+            run: |
+              cargo test -p pinkdb-cli --features vortexlake,s3
+              cargo test -p pinkdb-cli --features vortexlake,s3,encryption
+              cargo test -p pinkdb-cli --features pinklake
+              cargo test -p pinkdb-cli --features pinklake,s3
+              cargo test -p pinkdb-cli --features s3
+          - name: cli-misc
+            run: |
+              cargo test -p pinkdb-cli --features encryption
+              cargo test -p pinkdb --features encryption
+              cargo test -p pinkdb-cli --features client
+              cargo test -p pinkdb-cli --features client,tls
+              cargo test -p pinkdb-cli --features repo
+          - name: server
+            run: |
+              cargo test -p pinkdb-server --features tls
+              cargo test -p pinkdb-server --features async-server
+              cargo test -p pinkdb-server --features ui
+              cargo test -p pinkdb-server --features ui,tls
+              ! cargo tree -p pinkdb-server | grep -q tokio
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+
+      - name: ${{ matrix.name }} feature tests
+        run: ${{ matrix.run }}
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+
       - name: cargo clippy (-D warnings)
         run: cargo clippy --all-targets -- -D warnings
-
-      # Feature matrix: the combinations that change runtime behavior.
-      # pink-lake's default is the v1 `.pink` format; `vortexlake` is the
-      # Vortex data format. For the CLI, `s3` is pure storage: it implies
-      # neither lake build, so it is pinned alone too.
-      - name: cargo test -p pink-lake --features s3
-        run: cargo test -p pink-lake --features s3
-
-      - name: cargo test -p pink-lake --features s3,vortexlake
-        run: cargo test -p pink-lake --features s3,vortexlake
-
-      - name: cargo test -p pink-lake --features s3,encryption
-        run: cargo test -p pink-lake --features s3,encryption
-
-      - name: cargo test -p pink-lake --features s3,vortexlake,encryption
-        run: cargo test -p pink-lake --features s3,vortexlake,encryption
-
-      - name: cargo test -p pinkdb-cli --features vortexlake,s3
-        run: cargo test -p pinkdb-cli --features vortexlake,s3
-
-      - name: cargo test -p pinkdb-cli --features vortexlake,s3,encryption
-        run: cargo test -p pinkdb-cli --features vortexlake,s3,encryption
-
-      - name: cargo test -p pinkdb-cli --features pinklake
-        run: cargo test -p pinkdb-cli --features pinklake
-
-      - name: cargo test -p pinkdb-cli --features pinklake,s3
-        run: cargo test -p pinkdb-cli --features pinklake,s3
-
-      # `s3` alone: the storage client compiles, but no `.lake` commands.
-      - name: cargo test -p pinkdb-cli --features s3
-        run: cargo test -p pinkdb-cli --features s3
-
-      - name: cargo test -p pinkdb-cli --features encryption
-        run: cargo test -p pinkdb-cli --features encryption
-
-      - name: cargo test -p pinkdb --features encryption
-        run: cargo test -p pinkdb --features encryption
-
-      - name: cargo test -p pinkdb-cli --features client
-        run: cargo test -p pinkdb-cli --features client
-
-      # TLS transport (46): the server and the remote CLI. Certificates are
-      # generated at test time (rcgen, a test-only dependency), so no
-      # openssl/system trust store is needed and the default build is
-      # unaffected.
-      - name: cargo test -p pinkdb-server --features tls
-        run: cargo test -p pinkdb-server --features tls
-
-      - name: cargo test -p pinkdb-cli --features client,tls
-        run: cargo test -p pinkdb-cli --features client,tls
-
-      - name: cargo test -p pinkdb-cli --features repo
-        run: cargo test -p pinkdb-cli --features repo
-
-      # Wave 47: the opt-in tokio transport (the documented I/O-boundary
-      # carve-out). The default server build stays async-free.
-      - name: cargo test -p pinkdb-server --features async-server
-        run: cargo test -p pinkdb-server --features async-server
-
-      # Wave 78: the opt-in warehouse browsing console. Its tokio/axum stack is
-      # a second documented async carve-out and stays behind the `ui` feature,
-      # so the default server graph below is still async-free.
-      - name: cargo test -p pinkdb-server --features ui
-        run: cargo test -p pinkdb-server --features ui
-
-      - name: cargo test -p pinkdb-server --features ui,tls
-        run: cargo test -p pinkdb-server --features ui,tls
-
-      - name: default pinkdb-server graph has no async runtime (wave 47 carve-out)
-        run: "! cargo tree -p pinkdb-server | grep -q tokio"
 
       - name: cargo clippy, feature sets (-D warnings)
         run: |
@@ -144,23 +158,44 @@ jobs:
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features async-server -- -D warnings
 
-      # SIGKILL crash-recovery loops against the dev CLI (plain, multi-db,
-      # kill-during-checkpoint, encrypted).
-      - name: kill loops (bench/kill_loop.py)
-        run: |
-          cargo build -p pinkdb-cli
-          python3 bench/kill_loop.py 20
-          python3 bench/kill_loop.py 20 --multi-db
-          python3 bench/kill_loop.py --targeted 10
-          cargo build -p pinkdb-cli --features encryption
-          # Scope the passphrase to this one invocation: an ambient
-          # PINKDB_KEY would otherwise encrypt the plain runs' checkpoints.
-          PINKDB_KEY=ci-kill-loop-passphrase python3 bench/kill_loop.py 15 --encrypted
+  wasm:
+    name: wasm32 check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
 
       - name: wasm check (the core must stay wasm32-compatible)
         run: |
           rustup target add wasm32-unknown-unknown
           cargo build -p pinkdb --target wasm32-unknown-unknown
+
+  # The release CLI the duckdiff job consumes. It runs in parallel with the
+  # test/clippy jobs instead of at the end of a serial mega-job.
+  release-cli:
+    name: release CLI (duckdiff artifact)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: install Rust (stable)
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
 
       - name: cargo build --release -p pinkdb-cli (duckdiff artifact)
         # The differential battery includes the opt-in file-format extension
@@ -175,12 +210,12 @@ jobs:
           if-no-files-found: error
 
   # Differential test against DuckDB. Reuses the release CLI built by
-  # `build-test` (downloaded from the artifact) instead of rebuilding it
+  # `release-cli` (downloaded from the artifact) instead of rebuilding it
   # here; `--big <csv>` enables the 1M-row battery locally.
   duckdiff:
     name: differential vs DuckDB
     runs-on: ubuntu-latest
-    needs: build-test
+    needs: release-cli
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
