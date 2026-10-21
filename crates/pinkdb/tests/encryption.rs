@@ -1027,9 +1027,9 @@ fn save_stays_explicitly_plaintext_for_a_keyed_store() {
     assert!(std::fs::read(&enc).unwrap().starts_with(ENC_MAGIC));
 }
 
-/// Wave 79 durability half with at-rest encryption: the canonical index DDL
-/// is sealed into the encrypted WAL, survives a checkpoint (re-logged into the
-/// fresh encrypted generation) and replays on a keyed reopen.
+/// Wave 79 with at-rest encryption: the canonical index DDL is sealed into
+/// the encrypted WAL, survives a checkpoint (inside the encrypted `.pink`'s
+/// index section) and comes back on a keyed reopen.
 #[test]
 fn encrypted_durable_index_survives_checkpoint_and_reopen() {
     let s = Scratch::new("idx");

@@ -111,9 +111,10 @@ pub struct Index {
 
 /// Build one hash-index map from a column's chunks: non-NULL key encoding →
 /// global row indices (flattened across chunks, using each chunk's real
-/// length). Shared by `CREATE INDEX` and the lazy rebuild so both always
-/// produce identical keys.
-fn index_map_for(column: &Column) -> std::collections::HashMap<Vec<u8>, Vec<usize>> {
+/// length). Shared by `CREATE INDEX`, the lazy rebuild and the `.pink`
+/// loader (which rebuilds every persisted index from the decoded rows) so all
+/// of them produce identical keys.
+pub(crate) fn index_map_for(column: &Column) -> std::collections::HashMap<Vec<u8>, Vec<usize>> {
     let mut map = std::collections::HashMap::new();
     let mut offset = 0usize;
     for chunk in column.chunks.iter() {

@@ -193,7 +193,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::crypto::{self, EncryptionKey, RecordCipher, TAG_LEN};
-use crate::storage::{DataTable, DbCatalog, Index, PinkDb};
+use crate::storage::PinkDb;
 use crate::types::{PinkDbError, Result};
 
 pub const WAL_MAGIC: &[u8; 8] = b"PINKWAL1";
@@ -4387,11 +4387,6 @@ impl PinkDb {
         // Refresh-first: the persisted state must include every committed
         // frame of every process.
         self.refresh_under_lease(guard)?;
-        // The definitions the fresh WAL must carry. Computed *before* the
-        // checkpoint mutates anything: a catalog that cannot be rendered is a
-        // clean error with the checkpoint untouched, never a published
-        // `.pink` whose definitions then failed to re-log.
-        let relog = self.live_index_statements()?;
         let mut guard_wal = wal
             .lock()
             .map_err(|_| PinkDbError::Execution("internal lock error (poisoned)".to_string()))?;
@@ -4434,65 +4429,10 @@ impl PinkDb {
         // tracked replay session so later appends `USE`-prefix correctly.
         let fallback = self.fallback_db();
         guard_wal.set_session_db(&fallback);
-        // Wave 79 (durability half): `.pink` has no index section, so a
-        // checkpoint would otherwise silently drop every index definition
-        // when it truncates the WAL. Carry the live catalog across the
-        // boundary: one canonical record in the fresh generation, fully
-        // qualified and deterministic. A dropped index is absent from the
-        // live catalog, so it is not resurrected.
-        Self::relog_index_definitions(&mut guard_wal, relog)?;
+        // Index definitions and their maps ride in the published `.pink`
+        // itself (flags bit 3, wave 79), atomically with the data, so the
+        // fresh WAL generation starts empty like every other catalog object.
         Ok(())
-    }
-
-    /// Every live index as a canonical, re-parseable `CREATE INDEX` statement,
-    /// sorted by (database, table, index), plus the frame's touched set. Used
-    /// by the checkpoint boundary, which cannot persist index definitions in
-    /// `.pink` (no index section yet).
-    pub(crate) fn live_index_statements(&self) -> Result<(Vec<String>, FrameSets)> {
-        let mut dbs: Vec<&DbCatalog> = self.databases.values().collect();
-        dbs.sort_by(|a, b| a.name.cmp(&b.name));
-        let mut stmts = Vec::new();
-        let mut sets = FrameSets::default();
-        for catalog in dbs {
-            let mut tables: Vec<&DataTable> = catalog.tables.values().collect();
-            tables.sort_by(|a, b| a.name.cmp(&b.name));
-            for table in tables {
-                let mut indexes: Vec<&Index> = table.indexes.iter().collect();
-                indexes.sort_by(|a, b| a.name.cmp(&b.name));
-                for index in indexes {
-                    let column = table.columns.get(index.column).ok_or_else(|| {
-                        PinkDbError::Execution(format!(
-                            "index \"{}\" on table \"{}.{}\" names column ordinal {} out of range",
-                            index.name, catalog.name, table.name, index.column
-                        ))
-                    })?;
-                    stmts.push(crate::rbac::index_create_statement(
-                        &catalog.name,
-                        &table.name,
-                        &index.name,
-                        &column.name,
-                    ));
-                    sets.add_table(&catalog.name, &table.name);
-                }
-            }
-        }
-        Ok((stmts, sets))
-    }
-
-    /// Re-log the live index definitions into the WAL generation started by
-    /// the checkpoint that just succeeded. `Wal::append` canonicalizes the
-    /// set, syncs per policy, publishes the commit slot and journals the
-    /// frame; the statements are fully qualified, so no `USE` prefix is
-    /// needed and no session state changes.
-    fn relog_index_definitions(
-        wal: &mut Wal,
-        (stmts, mut sets): (Vec<String>, FrameSets),
-    ) -> Result<()> {
-        if stmts.is_empty() {
-            return Ok(());
-        }
-        sets.canonicalize();
-        wal.append(&stmts, Some(&sets))
     }
 
     /// The `.pink` path this database is durable to, if any.
@@ -8909,11 +8849,11 @@ mod tests {
     }
 
     /// Index DDL is logged as canonical, fully-qualified, identifier-quoted
-    /// text and its frame's touched set covers the indexed table. The
-    /// checkpoint re-log is one deterministic record; repeating the checkpoint
-    /// reproduces exactly that record (never a duplicate).
+    /// text and its frame's touched set covers the indexed table. A
+    /// checkpoint folds the definitions into `.pink` and leaves the fresh
+    /// WAL generation empty (no re-log record).
     #[test]
-    fn index_ddl_frames_are_canonical_and_checkpoint_relogs_once() {
+    fn index_ddl_frames_are_canonical_and_checkpoint_does_not_relog() {
         let p = tmp_ckpt("idxddl");
         let mut db = durable(&p);
         db.execute("CREATE TABLE t (a INTEGER, \"b b\" INTEGER);")
@@ -8941,40 +8881,23 @@ mod tests {
             &[("main".to_string(), "t".to_string())]
         );
 
-        // A fresh set of live definitions across two databases, sorted
-        // deterministically by (database, table, index).
+        // A checkpoint publishes the definitions (and maps) inside `.pink`
+        // (flags bit 3), so the fresh WAL generation carries no index
+        // record at all, and repeated checkpoints keep it that way.
         db.execute("CREATE INDEX z ON t(a);").unwrap();
         db.execute("CREATE DATABASE db1;").unwrap();
         db.execute("CREATE TABLE db1.t (a INTEGER);").unwrap();
         db.execute("CREATE INDEX a ON db1.t(a);").unwrap();
         db.checkpoint().unwrap();
-        let recs = records_of(&wal_path(&p));
-        assert_eq!(recs.len(), 1, "one re-log record after a checkpoint");
-        assert_eq!(
-            recs[0].stmts,
-            vec!["CREATE INDEX a ON db1.t(a)", "CREATE INDEX z ON main.t(a)",]
-        );
-        assert_eq!(
-            recs[0]
-                .sets
-                .as_ref()
-                .expect("known touched set")
-                .table_pairs(),
-            &[
-                ("db1".to_string(), "t".to_string()),
-                ("main".to_string(), "t".to_string()),
-            ]
-        );
-
-        // Repeated checkpoints fold the previous re-log away and write the
-        // same single record again (no duplication, no resurrection).
+        assert!(records_of(&wal_path(&p)).is_empty(), "no index re-log");
+        let flags = u32::from_le_bytes(std::fs::read(&p).unwrap()[8..12].try_into().unwrap());
+        assert_eq!(flags & 0x8, 0x8, "the checkpoint carries the index section");
         db.checkpoint().unwrap();
-        let recs = records_of(&wal_path(&p));
-        assert_eq!(recs.len(), 1);
-        assert_eq!(
-            recs[0].stmts,
-            vec!["CREATE INDEX a ON db1.t(a)", "CREATE INDEX z ON main.t(a)",]
-        );
+        assert!(records_of(&wal_path(&p)).is_empty());
+        drop(db);
+        let db = durable(&p);
+        assert_eq!(db.table_in("main", "t").unwrap().indexes.len(), 1);
+        assert_eq!(db.table_in("db1", "t").unwrap().indexes.len(), 1);
         cleanup(&p);
     }
 
@@ -9047,7 +8970,7 @@ mod tests {
 
     /// The `Connection`/`Database` front-end shares the same logging path:
     /// index DDL inside a transaction and a SQL `CHECKPOINT` must survive a
-    /// reopen (the checkpoint re-log included). `Connection` does not run the
+    /// reopen (through the checkpoint's `.pink` index section). `Connection` does not run the
     /// optimizer, so the assertions use the durable `PinkDb` handle.
     #[test]
     fn connection_index_ddl_survives_reopen_and_checkpoint() {

@@ -579,9 +579,9 @@ fn durable_create_and_drop_index_survive_reopen_without_checkpoint() {
     );
 }
 
-/// A checkpoint folds the store into `.pink` (no index section) and rolls the
-/// WAL. The definition must be re-logged into the fresh generation, exactly
-/// once, and repeated checkpoints must neither duplicate nor resurrect it.
+/// A checkpoint folds the store into `.pink` (index section, flags bit 3)
+/// and rolls the WAL. The definition must come back exactly once, and
+/// repeated checkpoints must neither duplicate nor resurrect it.
 #[test]
 fn durable_checkpoint_carries_index_and_repeats_do_not_duplicate_it() {
     let p = Scratch::new("ckpt");
@@ -604,14 +604,13 @@ fn durable_checkpoint_carries_index_and_repeats_do_not_duplicate_it() {
     assert_eq!(
         db.table_in("main", "t").unwrap().indexes.len(),
         1,
-        "exactly one definition after the checkpoint re-log"
+        "exactly one definition after the checkpoint"
     );
     assert_eq!(
         rows(&mut db, "SELECT s FROM t WHERE a = 2;"),
         vec![vec![Value::Varchar("b".into())]]
     );
-    // Two more checkpoints: each folds the previous re-log into `.pink` and
-    // must write the live set once into the next generation.
+    // Two more checkpoints: each republishes the live set in `.pink`.
     db.checkpoint().unwrap();
     db.checkpoint().unwrap();
     drop(db);
@@ -638,12 +637,12 @@ fn durable_checkpoint_then_drop_index_stays_dropped() {
     let mut db = durable(&p);
     assert!(
         !explain(&mut db, query).contains("IndexScan"),
-        "a dropped index was resurrected by the checkpoint re-log"
+        "a dropped index was resurrected by the checkpoint"
     );
     assert_eq!(
         db.table_in("main", "t").unwrap().indexes.len(),
         0,
-        "a dropped index must not be re-logged"
+        "a dropped index must not be persisted"
     );
     assert_eq!(
         rows(&mut db, "SELECT a FROM t ORDER BY a;"),
@@ -753,12 +752,12 @@ fn durable_second_handle_refresh_observes_index_ddl() {
         "refreshing reader missed the index frame"
     );
     assert_eq!(rows(&mut b, "SELECT a FROM t WHERE a = 2;"), int_rows(&[2]));
-    // Another handle's checkpoint rolls the WAL (no index section in
-    // `.pink`): the refreshing reader must rebuild from the re-log record.
+    // Another handle's checkpoint rolls the WAL: the refreshing reader must
+    // pick the index up from the checkpoint's `.pink` index section.
     a.checkpoint().unwrap();
     assert!(
         explain(&mut b, query).contains("IndexScan"),
-        "refreshing reader missed the checkpoint re-log"
+        "refreshing reader lost the index across another handle's checkpoint"
     );
     a.execute("DROP INDEX i;").unwrap();
     assert!(
@@ -801,26 +800,174 @@ fn durable_transaction_preserves_index_ddl_order() {
     assert!(explain(&mut db, "SELECT a FROM t WHERE b = 20;").contains("IndexScan"));
 }
 
-/// `.pink` has no index section (bit 3 stays clear): creating an index changes
-/// neither the serialized bytes nor the flags word.
+fn flags_of(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes[8..12].try_into().unwrap())
+}
+
+/// The sorted (key-agnostic) posting lists of one index: comparable across
+/// processes and builds, unlike the map's iteration order.
+fn postings(db: &PinkDb, table: &str, index: &str) -> Vec<Vec<usize>> {
+    let t = db.table_in("main", table).unwrap();
+    let idx = t.indexes.iter().find(|i| i.name == index).unwrap();
+    let mut groups: Vec<Vec<usize>> = idx.map.values().cloned().collect();
+    groups.sort();
+    groups
+}
+
+/// A store without indexes keeps its exact bytes and bit 3 clear; dropping
+/// the last index returns to those bytes.
 #[test]
-fn durable_index_does_not_change_pink_bytes_or_flags() {
-    let p = Scratch::new("bytes");
+fn pink_without_indexes_is_byte_identical_and_bit_3_clear() {
     let mut db = PinkDb::new();
     db.execute("CREATE TABLE t (a INTEGER);").unwrap();
     db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
     let before = db.to_pink_bytes().unwrap();
+    assert_eq!(flags_of(&before) & 0x8, 0);
     db.execute("CREATE INDEX i ON t(a);").unwrap();
-    let after = db.to_pink_bytes().unwrap();
-    assert_eq!(
-        before, after,
-        "the in-memory index must not leak into `.pink` bytes"
-    );
-    let flags = u32::from_le_bytes(after[8..12].try_into().unwrap());
-    assert_eq!(flags & 0x8, 0, "reserved index bit 3 must stay clear");
-    // A durable checkpoint of the indexed store also keeps the flag clear.
+    let with = db.to_pink_bytes().unwrap();
+    assert_eq!(flags_of(&with) & 0x8, 0x8, "an indexed store sets bit 3");
+    db.execute("DROP INDEX i;").unwrap();
+    assert_eq!(db.to_pink_bytes().unwrap(), before);
+}
+
+/// Indexes round-trip through `.pink` (definitions in the section, maps
+/// rebuilt from the rows at load): duplicates, NULLs (never indexed),
+/// several chunks with a partially emptied one, DOUBLE `-0.0`/`0.0`/NaN
+/// keys, VARCHAR and empty tables. The reloaded maps equal the saved ones and
+/// every lookup matches a scan.
+#[test]
+fn pink_index_section_round_trips_maps_and_answers() {
+    let p = Scratch::new("roundtrip");
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (k INTEGER, d DOUBLE, s VARCHAR);")
+        .unwrap();
+    let n = 2 * CHUNK_SIZE + 904;
+    let values: Vec<String> = (0..n)
+        .map(|i| {
+            let k = if i % 11 == 0 {
+                "NULL".to_string()
+            } else {
+                (i % 97).to_string()
+            };
+            let d = match i % 3 {
+                0 => "-0.0".to_string(),
+                1 => "0.0".to_string(),
+                _ => format!("{}.5", i / 7),
+            };
+            format!("({k}, {d}, 'v{}')", i % 13)
+        })
+        .collect();
+    db.execute(&format!("INSERT INTO t VALUES {};", values.join(", ")))
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (5, 'NaN'::DOUBLE, NULL), (6, 'NaN'::DOUBLE, 'x');")
+        .unwrap();
+    db.execute("DELETE FROM t WHERE k BETWEEN 10 AND 20;")
+        .unwrap();
+    db.execute("CREATE TABLE empty (a INTEGER);").unwrap();
+    db.execute("CREATE INDEX ik ON t(k);").unwrap();
+    db.execute("CREATE INDEX id ON t(d);").unwrap();
+    db.execute("CREATE INDEX \"i s\" ON t(s);").unwrap();
+    db.execute("CREATE INDEX ie ON empty(a);").unwrap();
     db.save(p.path()).unwrap();
+    let mut loaded = PinkDb::open(p.path()).unwrap();
+    for index in ["ik", "id", "i s"] {
+        assert_eq!(
+            postings(&loaded, "t", index),
+            postings(&db, "t", index),
+            "{index}"
+        );
+    }
+    assert!(postings(&loaded, "empty", "ie").is_empty());
+    assert!(!loaded.table_in("main", "t").unwrap().indexes_stale);
+    for (q, scan) in [
+        (
+            "SELECT count(*) FROM t WHERE k = 5;",
+            "SELECT count(*) FROM t WHERE k + 0 = 5;",
+        ),
+        (
+            "SELECT count(*) FROM t WHERE s = 'v3';",
+            "SELECT count(*) FROM t WHERE s || '' = 'v3';",
+        ),
+    ] {
+        assert!(explain(&mut loaded, q).contains("IndexScan"), "{q}");
+        assert_eq!(rows(&mut loaded, q), rows(&mut loaded, scan), "{q}");
+    }
+    // DOUBLE keys: `-0.0`/`0.0` share one group and NaN has its own. (A scan
+    // is not the reference here: the comparison kernel treats NaN as equal
+    // to every double, so the index is compared with the saved store.)
+    let q = "SELECT count(*) FROM t WHERE d = 0.0;";
+    assert!(explain(&mut loaded, q).contains("IndexScan"));
+    assert_eq!(rows(&mut loaded, q), rows(&mut db, q));
+    // Two loads (two independently seeded maps), same bytes: nothing in the
+    // section depends on a map's iteration order.
+    let again = PinkDb::open(p.path()).unwrap();
+    assert_eq!(
+        loaded.to_pink_bytes().unwrap(),
+        again.to_pink_bytes().unwrap()
+    );
+}
+
+/// An index left stale by DML (its rebuild waits for the next statement
+/// boundary) saves and reloads with a map of the live rows.
+#[test]
+fn pink_saves_a_stale_index_from_the_live_rows() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2);").unwrap();
+    db.execute("CREATE INDEX i ON t(a);").unwrap();
+    db.execute("INSERT INTO t VALUES (2), (3);").unwrap();
+    let bytes = db.to_pink_bytes().unwrap();
+    let scratch = Scratch::new("stale");
+    std::fs::write(scratch.ckpt(), &bytes).unwrap();
+    let mut loaded = PinkDb::open(scratch.path()).unwrap();
+    assert_eq!(
+        postings(&loaded, "t", "i"),
+        vec![vec![0], vec![1, 2], vec![3]]
+    );
+    assert_eq!(
+        rows(&mut loaded, "SELECT a FROM t WHERE a = 2;"),
+        int_rows(&[2, 2])
+    );
+}
+
+/// A damaged in-memory map (the H-4 corruption above) never reaches the
+/// file: the reload rebuilds the exact map from the rows.
+#[test]
+fn pink_reload_replaces_a_damaged_in_memory_map() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (id INTEGER);").unwrap();
+    db.execute("INSERT INTO t VALUES (1), (2), (2);").unwrap();
+    db.execute("CREATE INDEX ix ON t(id);").unwrap();
+    {
+        let t = db.table_mut_in("main", "t").unwrap();
+        for rows in t.indexes[0].map.values_mut() {
+            rows.push(9999);
+        }
+    }
+    let scratch = Scratch::new("damaged");
+    db.save(scratch.path()).unwrap();
+    let loaded = PinkDb::open(scratch.path()).unwrap();
+    assert_eq!(postings(&loaded, "t", "ix"), vec![vec![0], vec![1, 2]]);
+}
+
+/// A durable checkpoint publishes the index section; reopening restores the
+/// index from it (no WAL record needed) with identical answers.
+#[test]
+fn durable_checkpoint_publishes_the_index_section() {
+    let p = Scratch::new("bytes");
+    {
+        let mut db = durable(&p);
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (2);").unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        db.checkpoint().unwrap();
+    }
     let on_disk = std::fs::read(p.ckpt()).unwrap();
-    let flags = u32::from_le_bytes(on_disk[8..12].try_into().unwrap());
-    assert_eq!(flags & 0x8, 0);
+    assert_eq!(flags_of(&on_disk) & 0x8, 0x8);
+    let mut db = durable(&p);
+    assert_eq!(postings(&db, "t", "i"), vec![vec![0], vec![1, 2]]);
+    assert_eq!(
+        rows(&mut db, "SELECT a FROM t WHERE a = 2;"),
+        int_rows(&[2, 2])
+    );
 }

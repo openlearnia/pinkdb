@@ -9,6 +9,18 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Index persistence in `.pink` (wave 79, part 2) ✅
+- Index definitions are now stored **in the `.pink` file** (v5 flags bit 3,
+  about 30 bytes per index), so a checkpoint publishes indexes atomically with
+  the data and no longer re-logs them into the fresh WAL.
+- The hash maps are rebuilt from the table's rows when the file is opened, so
+  an index can never disagree with the data it indexes. (Storing the maps
+  themselves was measured: no faster to open once verified, and 2–4 MB larger
+  per million-row index.)
+- Stores without indexes are byte-identical to before; files with indexes
+  need this build or newer (older builds refuse them with "upgrade pinkdb").
+- Still open in wave 79: using indexes/zone maps for range predicates.
+
 ### Security hardening — pass 7 (final): terminal escaping, crypto/WAL/loader/FFI hardening ✅
 - A single terminal sanitizer now covers **every rendered identifier** (all
   result variants, column names, catalog/lake output, errors), closing ANSI/OSC

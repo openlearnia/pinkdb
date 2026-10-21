@@ -6,12 +6,12 @@
 //! flags u32                 (0 = no optional sections; bit 0 = tables carry
 //!                            a constraint section, bit 1 = a column-default
 //!                            section, bit 2 = each database carries a
-//!                            materialized-view section, bit 4 = a
+//!                            materialized-view section, bit 3 = every
+//!                            table carries a hash-index section, bit 4 = a
 //!                            stored-procedure section, bit 5 = a
 //!                            store-level RBAC section, bit 6 = a
 //!                            SQL-macro section; unknown bits are a
-//!                            hard error; bit 3 is reserved for index
-//!                            persistence)
+//!                            hard error)
 //! db_count u32
 //! per database:
 //!   name_len u32 + name bytes
@@ -39,6 +39,13 @@
 //!                      5=DictBitpack, 6=ALP, 8=LZ frame; 7 and 9 reserved)
 //!         validity_len u32 + validity bytes (bit set = valid)
 //!         payload (encoding-specific)
+//!     if flags bit 3 (wave 79):
+//!       index_count u32
+//!       per index (sorted by name):
+//!         name_len u32 + name bytes
+//!         column u32
+//!         distinct_keys u64   (distinct non-NULL keys at save time)
+//!         indexed_rows u64    (non-NULL rows at save time)
 //! crc32 u32 (IEEE, over every preceding byte including the magic)
 //! ```
 //!
@@ -48,6 +55,16 @@
 //! and the global `ADMIN` holders — every name in canonical (lowercased)
 //! key form, sorted. The plaintext of a password is never written: the
 //! hashed form is the only one the catalog (and the WAL) ever see.
+//!
+//! The index section (`FLAG_INDEXES`, wave 79) persists each hash index's
+//! definition and save-time statistics, so a checkpoint carries indexes
+//! atomically with the data. The hash maps themselves are **not** stored:
+//! the loader rebuilds each one from the decoded column, so an index can
+//! never disagree with the rows it indexes, whatever the file claims.
+//! (Persisted posting lists were measured and dropped: verifying them at load
+//! cost as much as rebuilding — 1M rows: 28 vs 23 ms at 1k distinct keys,
+//! 165 vs 149 ms unique — while adding 2–4 MB per index.) The statistics are
+//! facts for readers that do not rebuild; the loader only bounds them.
 //!
 //! v2 files (`PINKDB02`) are the v4 container without the `flags` word and
 //! the CRC trailer; v3 files (`PINKDB03`) are v2 + a CRC; v1 files
@@ -99,7 +116,8 @@ use rayon::prelude::*;
 
 use crate::crypto::EncryptionKey;
 use crate::storage::{
-    Column, DataTable, ForeignKeyConstraint, KeyConstraint, KeyKind, PinkDb, TableConstraints,
+    Column, DataTable, ForeignKeyConstraint, Index, KeyConstraint, KeyKind, PinkDb,
+    TableConstraints,
 };
 use crate::types::{DataType, Interval, PinkDbError, Result, Value};
 use crate::vector::{CHUNK_SIZE, Vector, VectorData};
@@ -134,9 +152,16 @@ const FLAG_DEFAULTS: u32 = 0x2;
 /// count) after its tables. Set iff at least one database has a materialized
 /// view, so stores without them keep v4-shaped bodies byte for byte. An older
 /// v5 build refuses the file cleanly through the unknown-flags check — bit 3
-/// (`0x8`) is reserved for index persistence (wave 79), so stored procedures
+/// (`0x8`) is the index section ([`FLAG_INDEXES`]), so stored procedures
 /// (wave 44) take bit 4.
 const FLAG_MATERIALIZED_VIEWS: u32 = 0x4;
+
+/// Flags bit 3 (v5+, wave 79): every table carries the hash-index section
+/// (definitions + statistics, see the module docs) after its column
+/// chunks. Set iff at least one table has an index, so stores without
+/// indexes keep their exact previous bytes. An older v5 build refuses the
+/// file cleanly through the unknown-flags check.
+const FLAG_INDEXES: u32 = 0x8;
 
 /// [`FLAG_PROCEDURES`], visible to the crate's tests (the store's flags word
 /// is asserted from `crate::procedure`'s persistence tests).
@@ -2251,6 +2276,11 @@ impl PinkDb {
         let with_procedures = self.has_procedures();
         let with_macros = self.has_macros();
         let with_rbac = self.has_rbac_data();
+        let with_indexes = self.list_databases().iter().any(|db| {
+            self.list_tables_in(db)
+                .iter()
+                .any(|t| self.table_in(db, t).is_ok_and(|t| !t.indexes.is_empty()))
+        });
         w.u32(
             if with_constraints {
                 FLAG_CONSTRAINTS
@@ -2258,6 +2288,7 @@ impl PinkDb {
                 0
             } | if with_defaults { FLAG_DEFAULTS } else { 0 }
                 | if with_mvs { FLAG_MATERIALIZED_VIEWS } else { 0 }
+                | if with_indexes { FLAG_INDEXES } else { 0 }
                 | if with_procedures { FLAG_PROCEDURES } else { 0 }
                 | if with_macros { FLAG_MACROS } else { 0 }
                 | if with_rbac { FLAG_RBAC } else { 0 },
@@ -2368,6 +2399,9 @@ impl PinkDb {
                         w.bytes(&col.validity);
                         w.bytes(&col.payload);
                     }
+                }
+                if with_indexes {
+                    write_indexes(&mut w, t);
                 }
             }
             if with_macros {
@@ -2603,6 +2637,7 @@ impl PinkDb {
         let mut constraints = false;
         let mut defaults = false;
         let mut mvs = false;
+        let mut indexes = false;
         let mut procedures = false;
         let mut macros = false;
         let mut rbac = false;
@@ -2612,6 +2647,7 @@ impl PinkDb {
                 if f & !(FLAG_CONSTRAINTS
                     | FLAG_DEFAULTS
                     | FLAG_MATERIALIZED_VIEWS
+                    | FLAG_INDEXES
                     | FLAG_PROCEDURES
                     | FLAG_MACROS
                     | FLAG_RBAC)
@@ -2624,6 +2660,7 @@ impl PinkDb {
                 constraints = f & FLAG_CONSTRAINTS != 0;
                 defaults = f & FLAG_DEFAULTS != 0;
                 mvs = f & FLAG_MATERIALIZED_VIEWS != 0;
+                indexes = f & FLAG_INDEXES != 0;
                 procedures = f & FLAG_PROCEDURES != 0;
                 macros = f & FLAG_MACROS != 0;
                 rbac = f & FLAG_RBAC != 0;
@@ -2643,7 +2680,13 @@ impl PinkDb {
                 db.create_database(&dbname)?;
                 let n_tables = r.u32()?;
                 for _ in 0..n_tables {
-                    load_table(&mut r, &mut db, &dbname, v5, constraints, defaults)?;
+                    let sections = TableSections {
+                        v4: v5,
+                        constraints,
+                        defaults,
+                        indexes,
+                    };
+                    load_table(&mut r, &mut db, &dbname, sections)?;
                 }
                 if v5 && macros {
                     load_macros(&mut r, &mut db, &dbname)?;
@@ -2663,7 +2706,7 @@ impl PinkDb {
             db.create_database("main")?;
             let n_tables = r.u32()?;
             for _ in 0..n_tables {
-                load_table(&mut r, &mut db, "main", false, false, false)?;
+                load_table(&mut r, &mut db, "main", TableSections::default())?;
             }
         }
         if v5 && rbac {
@@ -2719,6 +2762,77 @@ fn write_constraints(w: &mut Writer, c: &TableConstraints) {
         w.u32(1);
         w.u32(*col as u32);
     }
+}
+
+/// One table's hash-index section (`FLAG_INDEXES`, wave 79): every index
+/// (sorted by name) with its column ordinal and statistics. `indexed_rows` is
+/// the column's non-NULL count (exact without the map); `distinct_keys` comes
+/// from the map, rebuilt from the live column first when the map is stale.
+fn write_indexes(w: &mut Writer, t: &DataTable) {
+    let mut indexes: Vec<&Index> = t
+        .indexes
+        .iter()
+        .filter(|i| i.column < t.columns.len())
+        .collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+    w.u32(indexes.len() as u32);
+    for index in indexes {
+        let column = &t.columns[index.column];
+        let distinct = if t.indexes_stale {
+            crate::storage::index_map_for(column).len()
+        } else {
+            index.map.len()
+        };
+        let indexed: usize = column.chunks.iter().map(|c| c.len() - c.null_count()).sum();
+        w.str(&index.name);
+        w.u32(index.column as u32);
+        w.u64(distinct as u64);
+        w.u64(indexed as u64);
+    }
+}
+
+/// Decode one table's hash-index section and rebuild each map from the
+/// table's already-decoded column (the maps are never read from the file).
+/// The statistics are bounded by the table's real row count but otherwise
+/// not trusted: the rebuilt map is the authority.
+fn read_indexes(r: &mut Reader, t: &DataTable) -> Result<Vec<Index>> {
+    let n = r.u32()? as usize;
+    // Each index costs at least 24 bytes (name length, column, two counts).
+    if n > r.remaining() / 24 {
+        return r.err("index count exceeds the remaining file");
+    }
+    let mut out: Vec<Index> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        if name.is_empty() {
+            return r.err("empty index name");
+        }
+        if let Some(prev) = out.last()
+            && prev.name >= name
+        {
+            return r.err(&format!(
+                "index \"{name}\" is duplicated or out of name order"
+            ));
+        }
+        let column = r.u32()? as usize;
+        let Some(col) = t.columns.get(column) else {
+            return r.err(&format!(
+                "index \"{name}\" names column {column} of a {}-column table",
+                t.columns.len()
+            ));
+        };
+        let distinct = r.u64()?;
+        let indexed = r.u64()?;
+        if indexed > t.num_rows() as u64 || distinct > indexed {
+            return r.err(&format!("index \"{name}\" statistics exceed the table"));
+        }
+        out.push(Index {
+            name,
+            column,
+            map: crate::storage::index_map_for(col),
+        });
+    }
+    Ok(out)
 }
 
 /// Policy tags in a materialized-view section (wave 80).
@@ -3372,14 +3486,32 @@ fn read_constraints(r: &mut Reader, n_cols: usize) -> Result<TableConstraints> {
 
 /// Decode one table from `r` into `db`'s `dbname` database. `v4` selects the
 /// v4-only error messages (reserved tags, unknown flags).
+/// Which optional per-table parts a file carries (decided by its magic and
+/// flags word).
+#[derive(Debug, Clone, Copy, Default)]
+struct TableSections {
+    /// The v4+ typed codecs.
+    v4: bool,
+    /// `FLAG_CONSTRAINTS`.
+    constraints: bool,
+    /// `FLAG_DEFAULTS`.
+    defaults: bool,
+    /// `FLAG_INDEXES`.
+    indexes: bool,
+}
+
 fn load_table(
     r: &mut Reader,
     db: &mut PinkDb,
     dbname: &str,
-    v4: bool,
-    constraints: bool,
-    defaults: bool,
+    sections: TableSections,
 ) -> Result<()> {
+    let TableSections {
+        v4,
+        constraints,
+        defaults,
+        indexes,
+    } = sections;
     let name = r.str()?;
     let n_cols = r.u32()? as usize;
     // Each column costs at least 5 bytes (name length + dtype tag).
@@ -3465,6 +3597,10 @@ fn load_table(
     for ci in 0..n_chunks {
         let chunk: Vec<Arc<Vector>> = columns.iter().map(|c| Arc::clone(&c[ci])).collect();
         t.append_shared_chunk(&chunk)?;
+    }
+    if indexes {
+        t.indexes = read_indexes(r, t)?;
+        t.indexes_stale = false;
     }
     Ok(())
 }
@@ -4235,10 +4371,10 @@ mod tests {
         // check, not the CRC, is what fires). Bits 0 (constraint section) and
         // 1 (column defaults) and 2 (materialized views) are known; their
         // absence/presence is exercised by the constraint/default and
-        // materialized-view round-trip tests. Bit 3 is reserved for the next
-        // format-gated section (index persistence).
+        // materialized-view round-trip tests. Bits 3..=6 are known too; bit 7
+        // is the next format-gated section.
         let mut data = full.clone();
-        data[8..12].copy_from_slice(&8u32.to_le_bytes());
+        data[8..12].copy_from_slice(&0x80u32.to_le_bytes());
         fix_crc(&mut data);
         let err = PinkDb::load_bytes(&data).unwrap_err().to_string();
         assert!(err.contains("unsupported .pink v5 flags"), "{err}");
@@ -6161,22 +6297,131 @@ $AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         assert!(err.contains("corrupt file"), "truncated: {err}");
     }
 
-    /// The next format-gated section (bit 3, `0x8`: index persistence) is
-    /// refused by this build through the shared unknown-flags check — the
-    /// "clean newer-format refusal" rule this section relies on for older
-    /// builds.
+    /// The next format-gated section (bit 7, `0x80`) is refused by this
+    /// build through the shared unknown-flags check — the "clean newer-format
+    /// refusal" rule every optional section (the index section's bit 3
+    /// included) relies on for older builds.
     #[test]
     fn wave80_unknown_v5_flag_bits_are_refused() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE t (a INTEGER);").unwrap();
         let mut bytes = db.to_bytes().unwrap();
-        bytes[8..12].copy_from_slice(&0x8u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(&0x80u32.to_le_bytes());
         let n = bytes.len();
         let crc = crate::wal::crc32(&bytes[..n - 4]);
         bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
         let err = PinkDb::load_bytes(&bytes).unwrap_err().to_string();
         assert!(err.contains("upgrade pinkdb"), "{err}");
-        assert!(err.contains("0x00000008"), "{err}");
+        assert!(err.contains("0x00000080"), "{err}");
+    }
+
+    /// The index-section image of `t (a INTEGER)` holding `1, 2, 2, NULL`
+    /// with one index on `a`, re-built from explicit section fields so each
+    /// test can corrupt exactly one of them (the CRC is recomputed, so the
+    /// section check — not the checksum — is what must fire).
+    fn wave79_index_file(name: &str, column: u32, distinct: u64, indexed: u64) -> Vec<u8> {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (2), (NULL);")
+            .unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        let full = db.to_bytes().unwrap();
+        // count u32 + name "i" + column u32 + two u64 counts.
+        let section_len = 4 + 5 + 4 + 8 + 8;
+        let mut out = full[..full.len() - 4 - section_len].to_vec();
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&column.to_le_bytes());
+        out.extend_from_slice(&distinct.to_le_bytes());
+        out.extend_from_slice(&indexed.to_le_bytes());
+        out.extend_from_slice(&[0u8; 4]);
+        fix_crc(&mut out);
+        out
+    }
+
+    #[test]
+    fn wave79_index_section_layout_is_the_documented_one() {
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (2), (NULL);")
+            .unwrap();
+        db.execute("CREATE INDEX i ON t(a);").unwrap();
+        // Two distinct keys over three non-NULL rows.
+        let expected = wave79_index_file("i", 0, 2, 3);
+        assert_eq!(db.to_bytes().unwrap(), expected);
+        let flags = u32::from_le_bytes(expected[8..12].try_into().unwrap());
+        assert_eq!(flags, FLAG_INDEXES);
+        let loaded = PinkDb::load_bytes(&expected).unwrap();
+        let t = loaded.table_in("main", "t").unwrap();
+        assert_eq!(t.indexes.len(), 1);
+        assert!(!t.indexes_stale);
+        assert_eq!(
+            t.indexes[0].map,
+            crate::storage::index_map_for(&t.columns[0])
+        );
+    }
+
+    /// The map is rebuilt from the rows, never from the file: statistics
+    /// that are in bounds but wrong still load the exact map.
+    #[test]
+    fn wave79_index_map_comes_from_the_rows_not_the_statistics() {
+        let loaded = PinkDb::load_bytes(&wave79_index_file("i", 0, 1, 1)).unwrap();
+        let t = loaded.table_in("main", "t").unwrap();
+        assert_eq!(t.indexes[0].map.len(), 2);
+        assert_eq!(
+            t.indexes[0].map,
+            crate::storage::index_map_for(&t.columns[0])
+        );
+    }
+
+    /// A malformed index section is a clean "corrupt file" error, never a
+    /// panic.
+    #[test]
+    fn wave79_corrupt_index_sections_are_refused() {
+        let cases: [(&str, Vec<u8>); 4] = [
+            ("empty name", wave79_index_file("", 0, 2, 3)),
+            ("column out of range", wave79_index_file("i", 5, 2, 3)),
+            ("indexed rows exceed table", wave79_index_file("i", 0, 2, 5)),
+            ("distinct > indexed", wave79_index_file("i", 0, 4, 3)),
+        ];
+        for (what, bytes) in cases {
+            let err = PinkDb::load_bytes(&bytes)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("corrupt file"), "{what}: {err}");
+        }
+        // Two indexes: a duplicate name and a reversed name order are both
+        // refused (the writer emits names strictly ascending).
+        let mut db = PinkDb::new();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER);")
+            .unwrap();
+        db.execute("CREATE INDEX x ON t(a);").unwrap();
+        db.execute("CREATE INDEX y ON t(b);").unwrap();
+        let good = db.to_bytes().unwrap();
+        let entry = 4 + 1 + 4 + 8 + 8;
+        let second = good.len() - 4 - entry;
+        assert_eq!(good[second + 4], b'y');
+        for name in *b"xa" {
+            let mut bad = good.clone();
+            bad[second + 4] = name;
+            fix_crc(&mut bad);
+            let err = PinkDb::load_bytes(&bad)
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("out of name order"), "{err}");
+        }
+        // Truncated inside the section.
+        let mut short = good[..good.len() - 4 - 3].to_vec();
+        short.extend_from_slice(&[0u8; 4]);
+        fix_crc(&mut short);
+        let err = PinkDb::load_bytes(&short)
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("corrupt file"), "{err}");
     }
 
     /// A corrupt constraint section is a clean error, never a panic.

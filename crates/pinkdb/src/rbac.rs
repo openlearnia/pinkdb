@@ -1472,19 +1472,6 @@ pub(crate) fn wal_statement_text(plan: &LogicalPlan, sql: &str) -> String {
     }
 }
 
-/// The canonical `CREATE INDEX` statement for one live definition, used when
-/// a checkpoint folds state into a `.pink` (which has no index section) and
-/// rolls the WAL: the fresh generation must carry every definition again.
-pub(crate) fn index_create_statement(db: &str, table: &str, index: &str, column: &str) -> String {
-    format!(
-        "CREATE INDEX {} ON {}.{}({})",
-        quote_ident(index),
-        quote_ident(db),
-        quote_ident(table),
-        quote_ident(column)
-    )
-}
-
 fn qualified_ident(db: &Option<String>, name: &str) -> String {
     match db {
         Some(db) => format!("{}.{}", quote_ident(db), quote_ident(name)),
@@ -1686,9 +1673,9 @@ mod tests {
     #[test]
     fn wal_statement_text_canonicalizes_index_ddl() {
         use crate::plan::LogicalPlan;
-        // Index DDL is re-parsed on replay (`.pink` has no index section), so
-        // the logged text is fully qualified and every identifier is quoted
-        // exactly: keywords, spaces, unicode and an embedded quote included.
+        // Index DDL is re-parsed on WAL replay, so the logged text is fully
+        // qualified and every identifier is quoted exactly: keywords, spaces,
+        // unicode and an embedded quote included.
         let create = LogicalPlan::CreateIndex {
             db: Some("d ä".to_string()),
             name: "select".to_string(),
@@ -1710,12 +1697,6 @@ mod tests {
         assert_eq!(
             wal_statement_text(&drop, "DROP INDEX ix;"),
             "DROP INDEX IF EXISTS \"d ä\".ix"
-        );
-        // The checkpoint re-log uses the same canonical quoting, without the
-        // optional-clause prefix.
-        assert_eq!(
-            index_create_statement("d ä", "t x", "select", "a\"b"),
-            "CREATE INDEX \"select\" ON \"d ä\".\"t x\"(\"a\"\"b\")"
         );
     }
 
