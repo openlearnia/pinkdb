@@ -115,7 +115,7 @@ fn save_open_query_and_metadata_commands() {
     assert!(lake.join("snapshots/1.json").is_file());
     assert!(lake.join("snapshots/2.json").is_file());
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
     assert!(catalog.contains("\"version\": 2"), "{catalog}");
     assert!(catalog.contains("\"main.t\""), "{catalog}");
     assert!(catalog.contains("\"analytics.u\""), "{catalog}");
@@ -134,7 +134,7 @@ fn save_open_query_and_metadata_commands() {
         ".lake info {lake}\n.lake versions {lake}\n.lake tables {lake}\n.quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("format version:  5"), "{out}");
+    assert!(out.contains("format version:  6"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
     assert!(out.contains("snapshots:       2 (1, 2)"), "{out}");
     assert!(out.contains("tables (2):"), "{out}");
@@ -429,7 +429,7 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
     );
     assert!(out.contains("2 (current)"), "{out}");
     assert!(out.contains("main.t (2 rows)"), "{out}");
-    assert!(out.contains("format version:  5"), "{out}");
+    assert!(out.contains("format version:  6"), "{out}");
 
     // A fresh process loads the encrypted version and answers queries.
     let out = run_with_env(
@@ -1353,7 +1353,7 @@ fn attach_never_touches_the_lake() {
     entries.sort();
     assert_eq!(
         entries,
-        vec!["catalog.json", "commits", "data", "snapshots"],
+        vec!["catalog.json", "commits", "data", "highest.json", "lake.json", "snapshots"],
         "{out}"
     );
     cleanup(&dir);
@@ -1530,7 +1530,7 @@ fn lean_written_v1_v4_fixture_opens_queries_and_migrates() {
     ));
     assert!(out.contains("Saved lake version 3"), "{out}");
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
     assert!(catalog.contains(".vortex"), "{catalog}");
     for path in before {
         assert!(path.is_file(), "v1 file {} must stay", path.display());
@@ -1837,7 +1837,7 @@ fn writable_attach_commit_appends_without_rewriting() {
     // The new version lists both data files plus the delete file, and the
     // v4 manifest adds up.
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
     assert!(catalog.contains("\"rows\": 200"), "{catalog}");
     assert!(
         catalog.contains("\"rows\": 2"),
@@ -1930,7 +1930,7 @@ fn writable_attach_schema_evolution_publishes_and_time_travels() {
     };
     assert_eq!(data_only(&lake.join("data")), files_before + 1);
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
     assert!(catalog.contains("\"schema_version\": 2"), "{catalog}");
     assert!(catalog.contains("\"name\": \"n\""), "{catalog}");
     assert!(catalog.contains("\"default\": \"42\""), "{catalog}");

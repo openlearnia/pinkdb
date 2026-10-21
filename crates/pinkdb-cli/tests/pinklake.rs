@@ -135,17 +135,17 @@ fn lean_save_open_versions_tables_info() {
     assert!(out.contains("2 tables, 3 rows"), "{out}");
     assert!(out.contains("Opened lake version 2"), "{out}");
     assert!(out.contains("2 (current)"), "{out}");
-    assert!(out.contains("format version:  5"), "{out}");
+    assert!(out.contains("format version:  6"), "{out}");
     assert!(out.contains("main.t (2 rows)"), "{out}");
     assert!(out.contains("analytics.u (1 row)"), "{out}");
     // The reloaded values are the inserted ones (NULL included).
     assert!(out.contains("│ 1       │ x       │"), "{out}");
     assert!(out.contains("│ 2       │ NULL    │"), "{out}");
 
-    // The on-disk shape: a v1 catalog, no `format` fields, `.pink` data
+    // The on-disk shape: a v6 catalog, no `format` fields, `.pink` data
     // files with the engine's own magic.
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 5"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
     assert!(catalog.contains("\"format\": \"pink\""), "{catalog}");
     let files = data_files(&lake.join("data"));
     assert_eq!(files.len(), 2);

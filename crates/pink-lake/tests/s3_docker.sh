@@ -817,7 +817,7 @@ assert_contains "$TMP/roundtrip_save.log" "lake: $ITEST"
 assert_re "$TMP/roundtrip_save.log" '^1$'
 assert_re "$TMP/roundtrip_save.log" '^2 \(current\)$'
 assert_contains "$TMP/roundtrip_save.log" "main.t (3 rows)"
-assert_contains "$TMP/roundtrip_save.log" "format version:  5"
+assert_contains "$TMP/roundtrip_save.log" "format version:  6"
 assert_contains "$TMP/roundtrip_save.log" "current version: 2"
 assert_contains "$TMP/roundtrip_save.log" "snapshots:       2 (1, 2)"
 assert_contains "$TMP/roundtrip_save.log" "tables (1):"
