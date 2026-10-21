@@ -3,6 +3,10 @@ members = [
     "crates/pinkdb",
     "crates/pinkdb-cli",
     "crates/pinkdb-server",
+    # Wave 78: the server's warehouse browsing UI (a read-only web console).
+    # A sibling of `pinkdb-server`, pulled in by that crate's optional `ui`
+    # feature, so the default server binary stays exactly as it was.
+    "crates/pinkdb-server-ui",
     "crates/pinkdb-ffi",
     "crates/pinkdb-ext-loader",
     "crates/pinkdb-js",

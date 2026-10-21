@@ -8,6 +8,7 @@
 //!               [--transport sync|async] [--allow-load-extension]
 //!               [--extension-root PATH]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
+//!               [--enable-ui --ui-host HOST --ui-port PORT]  (built with `ui`)
 //! ```
 //!
 //! Without `--file` the database is in-memory; with it, the server opens the
@@ -45,6 +46,22 @@ use pinkdb_server::{
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5433;
 
+/// The console's default bind address: loopback only.
+#[cfg(feature = "ui")]
+const DEFAULT_UI_HOST: &str = "127.0.0.1";
+/// The console's default port.
+#[cfg(feature = "ui")]
+const DEFAULT_UI_PORT: u16 = 8080;
+/// The console's runtime threads.
+#[cfg(feature = "ui")]
+const DEFAULT_UI_WORKERS: usize = 4;
+/// The console's concurrent connections.
+#[cfg(feature = "ui")]
+const DEFAULT_UI_MAX_CONNECTIONS: usize = 64;
+/// The console's row-preview page-size bound.
+#[cfg(feature = "ui")]
+const DEFAULT_UI_MAX_PAGE_SIZE: usize = 500;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Transport {
     Sync,
@@ -77,6 +94,31 @@ struct Args {
     tls_cert: Option<String>,
     /// `--tls-key PATH`: must be paired with `--tls-cert`.
     tls_key: Option<String>,
+    /// Wave 78: serve the read-only warehouse browsing console.
+    #[cfg(feature = "ui")]
+    enable_ui: bool,
+    /// `--ui-host HOST`: the console's bind address (loopback by default).
+    #[cfg(feature = "ui")]
+    ui_host: String,
+    /// `--ui-port PORT`: the console's TCP port.
+    #[cfg(feature = "ui")]
+    ui_port: u16,
+    /// `--ui-auth basic`: require HTTP Basic authentication against the
+    /// store's own users.
+    #[cfg(feature = "ui")]
+    ui_auth_basic: bool,
+    /// `--ui-token TOKEN`: require this bearer token.
+    #[cfg(feature = "ui")]
+    ui_token: Option<String>,
+    /// `--ui-workers N`: the console's runtime threads.
+    #[cfg(feature = "ui")]
+    ui_workers: usize,
+    /// `--ui-max-connections N`: the console's concurrent connections.
+    #[cfg(feature = "ui")]
+    ui_max_connections: usize,
+    /// `--ui-max-page-size N`: the console's page-size bound.
+    #[cfg(feature = "ui")]
+    ui_max_page_size: usize,
 }
 
 fn usage() -> &'static str {
@@ -116,6 +158,20 @@ fn usage() -> &'static str {
      \x20 --tls-key PATH         PEM private key matching --tls-cert (PKCS#8/#1/SEC1);\n\
      \x20                        both or neither, only in a build with `tls`, and\n\
      \x20                        only with the sync transport\n\
+     \x20 --enable-ui           serve the read-only warehouse browsing console (wave 78);\n\
+     \x20                        needs a build with the `ui` feature; off by default\n\
+     \x20 --ui-host HOST        the console's bind address (default 127.0.0.1; a\n\
+     \x20                        non-loopback address is refused: the console has no\n\
+     \x20                        TLS of its own)\n\
+     \x20 --ui-port PORT        the console's TCP port (default 8080; 0 = ephemeral)\n\
+     \x20 --ui-auth basic       require HTTP Basic authentication against the store's\n\
+     \x20                        own users (the engine verifies the password, and the\n\
+     \x20                        console's statements run under that user's grants)\n\
+     \x20 --ui-token TOKEN      require this bearer token on every API request\n\
+     \x20                        (constant-time comparison; independent of the catalog)\n\
+     \x20 --ui-workers N        the console's runtime threads (default 4)\n\
+     \x20 --ui-max-connections N  the console's concurrent connections (default 64)\n\
+     \x20 --ui-max-page-size N  the console's row-preview page-size bound (default 500)\n\
      \n\
      At-rest encryption is not wired into the server: PINKDB_KEY is ignored and\n\
      --file must be a plaintext database (an encrypted one is refused at startup).\n\
@@ -124,7 +180,13 @@ fn usage() -> &'static str {
      users every connection is trusted and can run any SQL; once a user\n\
      exists, every statement request requires Login first. TLS only encrypts\n\
      the transport (it identifies the server, not clients). Keep the bind\n\
-     address on localhost or a trusted network until the store has users."
+     address on localhost or a trusted network until the store has users.\n\
+     \n\
+     The warehouse console (--enable-ui) is read-only: it has no DML and no\n\
+     DDL endpoint. It binds 127.0.0.1 by default and refuses any other\n\
+     address (it has no TLS of its own). A store with users is never served\n\
+     unauthenticated: start it with --ui-auth basic or --ui-token. Serving a\n\
+     store without users prints a loud warning."
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -143,6 +205,22 @@ fn parse_args() -> Result<Args, String> {
         extension_root: None,
         tls_cert: None,
         tls_key: None,
+        #[cfg(feature = "ui")]
+        enable_ui: false,
+        #[cfg(feature = "ui")]
+        ui_host: DEFAULT_UI_HOST.to_string(),
+        #[cfg(feature = "ui")]
+        ui_port: DEFAULT_UI_PORT,
+        #[cfg(feature = "ui")]
+        ui_auth_basic: false,
+        #[cfg(feature = "ui")]
+        ui_token: None,
+        #[cfg(feature = "ui")]
+        ui_workers: DEFAULT_UI_WORKERS,
+        #[cfg(feature = "ui")]
+        ui_max_connections: DEFAULT_UI_MAX_CONNECTIONS,
+        #[cfg(feature = "ui")]
+        ui_max_page_size: DEFAULT_UI_MAX_PAGE_SIZE,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -236,6 +314,120 @@ fn parse_args() -> Result<Args, String> {
             "--extension-root" => args.extension_root = Some(value("--extension-root")?),
             "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
+            "--enable-ui" => {
+                #[cfg(feature = "ui")]
+                {
+                    args.enable_ui = true;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-host" => {
+                let raw = value("--ui-host")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_host = raw;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-port" => {
+                let raw = value("--ui-port")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_port = raw
+                        .parse()
+                        .map_err(|_| format!("invalid --ui-port value {raw:?}"))?;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-auth" => {
+                let raw = value("--ui-auth")?;
+                #[cfg(feature = "ui")]
+                {
+                    if raw != "basic" {
+                        return Err(format!(
+                            "invalid --ui-auth value {raw:?}: the only mode is `basic` \
+                             (HTTP Basic against the store's users)"
+                        ));
+                    }
+                    args.ui_auth_basic = true;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-token" => {
+                let raw = value("--ui-token")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_token = Some(raw);
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-workers" => {
+                let raw = value("--ui-workers")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_workers = raw
+                        .parse()
+                        .ok()
+                        .filter(|n: &usize| *n > 0)
+                        .ok_or_else(|| format!("invalid --ui-workers value {raw:?}"))?;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-max-connections" => {
+                let raw = value("--ui-max-connections")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_max_connections = raw
+                        .parse()
+                        .ok()
+                        .filter(|n: &usize| *n > 0)
+                        .ok_or_else(|| format!("invalid --ui-max-connections value {raw:?}"))?;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
+            "--ui-max-page-size" => {
+                let raw = value("--ui-max-page-size")?;
+                #[cfg(feature = "ui")]
+                {
+                    args.ui_max_page_size = raw
+                        .parse()
+                        .ok()
+                        .filter(|n: &usize| *n > 0)
+                        .ok_or_else(|| format!("invalid --ui-max-page-size value {raw:?}"))?;
+                }
+                #[cfg(not(feature = "ui"))]
+                {
+                    let _ = raw;
+                    return Err(ui_feature_missing());
+                }
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -252,6 +444,16 @@ fn parse_args() -> Result<Args, String> {
                 .to_string(),
         );
     }
+    // The console's two credential modes are mutually exclusive: the
+    // operator asks for one, not two.
+    #[cfg(feature = "ui")]
+    if args.ui_auth_basic && args.ui_token.is_some() {
+        return Err(
+            "--ui-auth basic and --ui-token are mutually exclusive: pick one credential for \
+             the console"
+                .to_string(),
+        );
+    }
     // Pairing is validated before anything binds, so a half-configured TLS
     // listener never starts: both flags or neither.
     if args.tls_cert.is_some() != args.tls_key.is_some() {
@@ -260,6 +462,14 @@ fn parse_args() -> Result<Args, String> {
         );
     }
     Ok(args)
+}
+
+/// The message for a build without the console.
+#[cfg(not(feature = "ui"))]
+fn ui_feature_missing() -> String {
+    "--enable-ui and the --ui-* flags need a build with the `ui` feature (this build has \
+     no warehouse console); rebuild with `cargo build -p pinkdb-server --features ui`."
+        .to_string()
 }
 
 fn main() -> ExitCode {
@@ -327,6 +537,23 @@ fn main() -> ExitCode {
     let mode = match &args.file {
         Some(path) => format!("durable: {path}"),
         None => "in-memory".to_string(),
+    };
+
+    // The warehouse browsing console (wave 78): opt-in, read-only, loopback
+    // by default. A configuration the exposure policy refuses stops the
+    // server: the operator asked for the console, so running without it
+    // would be a silent downgrade.
+    #[cfg(feature = "ui")]
+    let _ui_handle = if args.enable_ui {
+        match start_ui(&args, &db) {
+            Ok(handle) => Some(handle),
+            Err(msg) => {
+                eprintln!("Error: {msg}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
     };
 
     match args.transport {
@@ -416,6 +643,32 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Start the read-only warehouse browsing console (wave 78).
+#[cfg(feature = "ui")]
+fn start_ui(args: &Args, db: &Database) -> Result<pinkdb_server::ui::UiHandle, String> {
+    use pinkdb_server::ui::{UiAuth, UiOptions, UiServer};
+    let auth = match (&args.ui_token, args.ui_auth_basic) {
+        (Some(token), _) => UiAuth::Token(token.clone()),
+        (None, true) => UiAuth::Basic,
+        (None, false) => UiAuth::None,
+    };
+    let opts = UiOptions {
+        workers: args.ui_workers,
+        max_connections: args.ui_max_connections,
+        max_page_size: args.ui_max_page_size,
+        auth,
+        ..UiOptions::default()
+    };
+    let server = UiServer::bind((args.ui_host.as_str(), args.ui_port), db.clone(), opts)
+        .map_err(|e| format!("cannot start the warehouse console: {e}"))?;
+    let addr = server.local_addr();
+    let handle = server
+        .spawn()
+        .map_err(|e| format!("cannot start the warehouse console: {e}"))?;
+    println!("pinkdb-server: warehouse console on http://{addr} (read-only)");
+    Ok(handle)
 }
 
 /// The listening line is the readiness signal (tests wait for it).

@@ -19,6 +19,11 @@ async-server = ["dep:tokio"]
 # key configuration. Off by default: the default build has no TLS code and no
 # TLS dependencies.
 tls = ["dep:rustls", "dep:rustls-pemfile"]
+# Opt-in warehouse browsing UI (wave 78): the read-only web console the
+# server serves next to its binary protocol. Off by default: the default
+# build does not even compile the console crate, so the lean server binary is
+# unchanged (see `docs/server-ui.md`).
+ui = ["dep:pinkdb-server-ui"]
 [lib]
 name = "pinkdb_server"
 path = "src/lib.rs"
@@ -44,6 +49,10 @@ tokio = { version = "1.53", default-features = false, features = [
 # client and the lake S3 client already use elsewhere in the workspace.
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12", "ring"], optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
+# The warehouse browsing UI (`ui` feature only): a read-only web console
+# (axum/tokio) with its own runtime on its own thread. Optional, so the
+# default build pulls neither the console nor its async runtime.
+pinkdb-server-ui = { path = "../pinkdb-server-ui", optional = true }
 
 [dev-dependencies]
 # Test-only self-signed certificate generation (the `tls` tests); `ring` is

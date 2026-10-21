@@ -90,11 +90,33 @@
 //! The async transport carries the same posture (and the same login path), but
 //! it has no TLS path: the binary refuses `--tls-cert`/`--tls-key` together
 //! with `--transport async` instead of serving plaintext.
+//!
+//! # The warehouse browsing UI (wave 78)
+//!
+//! With the `ui` cargo feature (off by default) the server can also serve a
+//! **read-only web console** — a browser UI with the store's catalog, paged
+//! row previews and statistics. The console lives in the sibling crate
+//! [`pinkdb_server_ui`](https://docs.rs/pinkdb-server-ui) and is re-exported
+//! by the [`ui`] module; the binary turns it on with `--enable-ui`.
+//!
+//! The console is **read-only by construction** (no DML, no DDL, no
+//! mutating route), it binds **loopback only** (a non-loopback bind is
+//! refused: the console has no TLS of its own), and a store that has users
+//! is never served unauthenticated (the server refuses to start without
+//! `--ui-auth basic` or `--ui-token`). It owns its own tokio runtime on its
+//! own thread, so it works with either transport, and every synchronous
+//! engine call runs on a bounded blocking pool. See `docs/server-ui.md`.
 pub mod client;
 pub mod protocol;
 pub mod server;
 #[cfg(feature = "tls")]
 pub mod tls;
+
+/// The warehouse browsing UI (wave 78): the read-only web console the
+/// server can serve next to its binary protocol. Only in a build with the
+/// `ui` cargo feature (off by default); see `docs/server-ui.md`.
+#[cfg(feature = "ui")]
+pub mod ui;
 
 #[cfg(feature = "async-server")]
 pub mod async_server;

@@ -117,6 +117,15 @@ jobs:
       - name: cargo test -p pinkdb-server --features async-server
         run: cargo test -p pinkdb-server --features async-server
 
+      # Wave 78: the opt-in warehouse browsing console. Its tokio/axum stack is
+      # a second documented async carve-out and stays behind the `ui` feature,
+      # so the default server graph below is still async-free.
+      - name: cargo test -p pinkdb-server --features ui
+        run: cargo test -p pinkdb-server --features ui
+
+      - name: cargo test -p pinkdb-server --features ui,tls
+        run: cargo test -p pinkdb-server --features ui,tls
+
       - name: default pinkdb-server graph has no async runtime (wave 47 carve-out)
         run: "! cargo tree -p pinkdb-server | grep -q tokio"
 

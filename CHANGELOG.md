@@ -8,6 +8,18 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-21
+
+### Wave 78 — server warehouse browsing UI ✅
+- A feature-gated (`ui`, default off) read-only console served by
+  `pinkdb-server`: embedded self-hosted assets, paged row previews, catalog and
+  row-count/size JSON endpoints. Built on **axum + tokio + maud** (a documented
+  async carve-out; the console owns its runtime and every engine read runs on a
+  bounded blocking pool).
+- Fails closed: opt-in, loopback-only, non-loopback binds refused, and a store
+  with RBAC users refuses to start without Basic auth (per-user grants) or a
+  bearer token. The default server binary grows by only ~128 B.
+
 ## 2026-10-20
 
 ### Wave 90 — tag-driven release train + `install.sh` ✅

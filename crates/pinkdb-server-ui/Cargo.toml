@@ -1,0 +1,46 @@
+[package]
+name = "pinkdb-server-ui"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb-server warehouse browsing UI: a read-only web console (wave 78)"
+license = "MIT"
+
+[lib]
+name = "pinkdb_server_ui"
+path = "src/lib.rs"
+
+[dependencies]
+pinkdb = { path = "../pinkdb" }
+# HTTP surface (wave 78): axum's router/extractors on top of hyper, driven by
+# a tokio runtime the console owns (see the crate docs' "Async carve-out").
+# The default features are off: the console needs no multipart, no form
+# bodies, no websockets and no HTTP/2 — only HTTP/1.1, JSON and query strings.
+axum = { version = "0.8", default-features = false, features = [
+    "json",
+    "query",
+    "tokio",
+] }
+tokio = { version = "1.53", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "io-util",
+    "net",
+    "sync",
+    "time",
+] }
+# The connection layer: hyper's HTTP/1.1 server (header count/size limits and
+# the header read timeout) plus hyper-util's tower glue and tokio timer.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["service", "tokio"] }
+# `tower_service` is the trait the peer-address wrapper implements (axum
+# already pulls it in).
+tower-service = "0.3"
+# JSON payloads (already in the workspace lockfile).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# HTML: maud generates the markup at compile time, escapes every interpolated
+# value by default, and has no runtime dependency (see the crate docs).
+maud = { version = "0.27", features = ["axum"] }
+# HTTP Basic credentials are base64 (already in the workspace lockfile).
+base64 = "0.23"
