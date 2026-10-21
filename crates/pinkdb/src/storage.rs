@@ -1032,6 +1032,26 @@ pub struct PinkDb {
     /// …" error). Reads are the separate table-source registry above. See
     /// [`crate::filefmt`].
     pub(crate) file_formats: Vec<Arc<dyn crate::filefmt::FileFormat>>,
+    /// Extension packages active on this store (wave 86), keyed by lowercased
+    /// package name; the value is the declared name. Process-level like
+    /// extensions: cloned with the store, never persisted, and a store clone
+    /// (transaction snapshot) shares them. A second load of a key is refused.
+    pub(crate) loaded_packages: HashMap<String, String>,
+    /// The package that installed each active table source, keyed by the
+    /// source's lowercased registry name. The binder records the package so
+    /// a logged statement that reads the source is prefixed with its
+    /// `LOAD EXTENSION` when the current WAL generation has not loaded it.
+    pub(crate) package_table_sources: HashMap<String, String>,
+    /// The package that installed each active file format, keyed by the
+    /// format's lowercased name (the COPY-sink half of
+    /// [`Self::package_table_sources`]).
+    pub(crate) package_file_formats: HashMap<String, String>,
+    /// The package that registered each dynamic scalar function, keyed by
+    /// the function's lowercased name. A package's scalars register like a
+    /// linked extension (whose source is the linked extension's own name), so
+    /// this map keeps the WAL prefix pointing at the **package** — the name
+    /// replay can resolve.
+    pub(crate) package_dynamic_functions: HashMap<String, String>,
     /// Where SQL `COPY … TO` may write (M-3). Embedded stores default to
     /// [`crate::CopyToPolicy::Unrestricted`]; a network server installs
     /// `Disabled` at bind time and the `--allow-copy-to --copy-root` opt-in
@@ -1086,6 +1106,10 @@ impl Clone for PinkDb {
             proc_frame: self.proc_frame.clone(),
             rbac: self.rbac.clone(),
             file_formats: self.file_formats.clone(),
+            loaded_packages: self.loaded_packages.clone(),
+            package_table_sources: self.package_table_sources.clone(),
+            package_file_formats: self.package_file_formats.clone(),
+            package_dynamic_functions: self.package_dynamic_functions.clone(),
             copy_to_policy: self.copy_to_policy.clone(),
         }
     }
@@ -1148,6 +1172,12 @@ impl PinkDb {
             // Process-global sinks (`filefmt::register_global_file_format`)
             // seed every store constructed after the registration.
             file_formats: crate::filefmt::seeded_global_formats(),
+            // A package is process-global but its surfaces activate per
+            // store, when `LOAD EXTENSION '<package>'` runs.
+            loaded_packages: HashMap::new(),
+            package_table_sources: HashMap::new(),
+            package_file_formats: HashMap::new(),
+            package_dynamic_functions: HashMap::new(),
             copy_to_policy: crate::CopyToPolicy::Unrestricted,
         }
     }

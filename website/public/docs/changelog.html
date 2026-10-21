@@ -188,6 +188,52 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-21">2026-10-21<a class="anchor" href="#2026-10-21" aria-label="Permalink: 2026-10-21">#</a></h2>
+<h3>Wave 86 — extensions can provide table functions and COPY formats ✅</h3>
+<ul>
+<li>New <strong>extension packages</strong>: a host registers a named bundle of scalar functions, table functions/file readers and <code>COPY</code> formats; <code>LOAD EXTENSION '&lt;name&gt;'</code> turns it on for one database, atomically (a name clash refuses the whole package).</li>
+<li>Durable stores replay package usage after a reopen, and new log records that read through a package re-load it automatically.</li>
+<li>The Arrow extension can now be offered this way (<code>pinkdb_arrow::register_package()</code>, then <code>LOAD EXTENSION 'arrow'</code>), in addition to its existing always-on registration.</li>
+</ul>
+<h3>Wave 85 — pinkdb in the browser (Playground) ✅</h3>
+<ul>
+<li>The docs site has a <strong>Playground</strong>: the real engine compiled to wasm, running in your tab with no server, with example queries and a result grid.</li>
+<li>Keep your database in Memory, IndexedDB or OPFS; writes autosave, and you can Export/Import <code>.pink</code> files (the same format the CLI uses). Damaged files are refused without touching your saved data, and a second tab opens a read-only copy.</li>
+<li>New public <code>PinkDb::from_pink_bytes</code> loads a database from snapshot bytes.</li>
+</ul>
+<h3>Wave 84 — query execution profiles ✅</h3>
+<ul>
+<li><code>execute_profiled</code> (embedded <code>PinkDb</code> and <code>Connection</code>) returns each statement's timings — parse, bind, optimize, execute, WAL log, total — with its rows, columns, kind and transaction state. Results and WAL bytes are unchanged, and plain <code>execute</code> costs exactly what it did.</li>
+<li>Server protocol <strong>v10</strong>: a client can turn profiling on per connection and receives one profile after each statement (<code>Client::set_profiling</code>, <code>Client::execute_profiled</code>). v9 clients are refused at the handshake.</li>
+<li>The CLI's <code>.timer on</code> line now shows the phase breakdown, locally and against a server.</li>
+<li>C API: <code>pinkdb_set_profiling</code> and <code>pinkdb_result_profile_*</code> accessors.</li>
+</ul>
+<h3>Wave 83 — procedures can COMMIT, catch errors, and <code>DO</code> blocks ✅</h3>
+<ul>
+<li>A procedure called <strong>outside</strong> a transaction can now <code>COMMIT</code> and <code>ROLLBACK</code> in its body (Postgres-style): long batch jobs keep the progress they committed if they later fail. Inside <code>BEGIN … COMMIT</code> this is refused ("started at a different scope"); a plain <code>CALL</code> stays all-or-nothing.</li>
+<li><code>BEGIN … EXCEPTION WHEN OTHERS THEN … END</code> blocks catch errors: the block's work is undone and the handler runs with <code>SQLERRM</code>.</li>
+<li>New <code>DO $$ BEGIN … END $$</code> statement runs an anonymous block once.</li>
+<li>Durable stores log a committing procedure's work as self-contained segments, so replay is exact even if the procedure is later changed or dropped.</li>
+<li>Fixed: quoted variable names (<code>DECLARE "my var" …</code>) work, including non-ASCII names.</li>
+</ul>
+<h3>Wave 81 — JavaScript procedures run (quickjs-ng) ✅</h3>
+<ul>
+<li>With the <code>js</code> feature (+1.1 MB), <code>CREATE PROCEDURE … LANGUAGE JAVASCRIPT</code> now works: the body runs in quickjs-ng with <code>print</code>, <code>db.exec</code>, <code>db.query</code>, <code>db.value</code> and a seeded <code>db.random()</code>; <code>?</code> parameters are bound as values.</li>
+<li>Same guarantees as SQL procedures: a <code>CALL</code> is all-or-nothing, transaction control is refused, and durable stores replay calls exactly (no clock, no <code>Math.random</code>, no I/O, no <code>eval</code>).</li>
+<li>Runaway scripts stop cleanly at step, host-call, memory and stack limits; syntax errors are reported at <code>CREATE</code> time.</li>
+<li><code>print</code> lines come back with the call and the CLI shows them (not yet over the server protocol or FFI). Native targets only for now.</li>
+</ul>
+<h3>Fix — DOUBLE NaN comparison semantics now match DuckDB ✅</h3>
+<ul>
+<li><code>NaN = NaN</code> is true, NaN equals no other value and sorts above every other double (<code>+inf</code> included), and <code>-0.0 = 0.0</code> — in filters, ORDER BY (NaN last ascending, first descending), MIN/MAX (<code>max</code> over a column with a NaN is NaN), range joins and window ordering. Scans used to treat NaN as equal to every value (<code>WHERE d = 0.0</code> matched NaN rows), disagreeing with the hash index; an index once again changes only the plan, never the result.</li>
+<li>Parquet row-group pruning keeps a DOUBLE row group for <code>&gt;</code>/<code>&gt;=</code>/<code>= NaN</code> (its statistics never cover NaN); ORDER BY over NaN keys now takes the fast byte-key sort instead of falling back.</li>
+</ul>
+<h3>Index persistence in <code>.pink</code> (wave 79, part 2) ✅</h3>
+<ul>
+<li>Index definitions are now stored <strong>in the <code>.pink</code> file</strong> (v5 flags bit 3, about 30 bytes per index), so a checkpoint publishes indexes atomically with the data and no longer re-logs them into the fresh WAL.</li>
+<li>The hash maps are rebuilt from the table's rows when the file is opened, so an index can never disagree with the data it indexes. (Storing the maps themselves was measured: no faster to open once verified, and 2–4 MB larger per million-row index.)</li>
+<li>Stores without indexes are byte-identical to before; files with indexes need this build or newer (older builds refuse them with "upgrade pinkdb").</li>
+<li>Still open in wave 79: using indexes/zone maps for range predicates.</li>
+</ul>
 <h3>Security hardening — pass 7 (final): terminal escaping, crypto/WAL/loader/FFI hardening ✅</h3>
 <ul>
 <li>A single terminal sanitizer now covers <strong>every rendered identifier</strong> (all result variants, column names, catalog/lake output, errors), closing ANSI/OSC injection while preserving legitimate UTF-8.</li>

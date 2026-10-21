@@ -21,10 +21,12 @@
 //! This crate implements both (depending on `pinkdb`, never the other way
 //! around, exactly like `pink-lake` implements `AttachedLake`), and the host
 //! registers them when it creates the store — or process-wide via
-//! [`ensure_registered`], the bootstrap a durable store needs. The CLI wires
-//! it behind the opt-in `arrow` cargo feature, so the default binary stays
-//! lean — the same model as the `vortexlake` lake build. (Wave 70/71
-//! unification: both file-format crates now share this one read surface; see
+//! [`ensure_registered`], the bootstrap a durable store needs, or as an
+//! **extension package** ([`package`]/[`register_package`], wave 86), which
+//! activates per store through `LOAD EXTENSION 'arrow'`. The CLI wires it
+//! behind the opt-in `arrow` cargo feature, so the default binary stays lean
+//! — the same model as the `vortexlake` lake build. (Wave 70/71 unification:
+//! both file-format crates now share this one read surface; see
 //! `extensions/parquet`.)
 //!
 //! Alternatives considered and rejected:
@@ -97,7 +99,9 @@ use std::sync::Mutex;
 
 use pinkdb::table_source::{TableFunctionCall, TableScanOutput, TableSource, TableSourceStats};
 use pinkdb::types::Result;
-use pinkdb::{AttachedScan, DataTable, DataType, FileFormat, PinkDb, PrunePredicate};
+use pinkdb::{
+    AttachedScan, DataTable, DataType, ExtensionPackage, FileFormat, PinkDb, PrunePredicate,
+};
 
 /// The registered format's name: `FORMAT arrow`.
 pub const EXTENSION_NAME: &str = "arrow";
@@ -304,6 +308,39 @@ pub fn register(db: &mut PinkDb) {
 pub fn ensure_registered() {
     pinkdb::table_source::register_global_table_source(Arc::new(ArrowSource::new()));
     pinkdb::filefmt::register_global_file_format(Arc::new(ArrowSink));
+}
+
+/// This extension as an [`ExtensionPackage`] (wave 86): [`ArrowSource`] as
+/// the table source and [`ArrowSink`] as the file format, under the name
+/// [`EXTENSION_NAME`] (`arrow`).
+///
+/// [`register_package`] publishes exactly this package; build one yourself
+/// to bundle the Arrow surfaces with other sources, sinks or scalars.
+pub fn package() -> ExtensionPackage {
+    ExtensionPackage::new(EXTENSION_NAME)
+        .with_table_source(Arc::new(ArrowSource::new()))
+        .with_file_format(Arc::new(ArrowSink))
+}
+
+/// Publish the Arrow read source and write sink as an **extension package** —
+/// the third registration model, next to [`register`] (one store) and
+/// [`ensure_registered`] (every store, process-wide from startup).
+///
+/// Registration is process-global but activates **nothing**: a store gets the
+/// Arrow reader and writer only after `LOAD EXTENSION 'arrow'` (or
+/// [`PinkDb::load_extension_package`]), and only that store. Activation is
+/// atomic — if a source or format name collides with a built-in, a
+/// process-global registration or an earlier load, the whole package is
+/// refused and the store is left unchanged.
+///
+/// A process must pick **one** model: if [`ensure_registered`] already owns
+/// the `arrow` names globally (the CLI's bootstrap), a package load is refused
+/// with that collision error rather than silently mixing models. For a durable
+/// store, publish the package **before** the store is opened, so WAL replay
+/// can resolve the `LOAD EXTENSION 'arrow'` prefixes it records. The package
+/// is plain Rust (no `dlopen`), so it works on wasm32 like the linked model.
+pub fn register_package() -> Result<()> {
+    pinkdb::register_extension_package(package())
 }
 
 #[cfg(test)]

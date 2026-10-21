@@ -1908,6 +1908,17 @@ surface (`pinkdb::filefmt::FileFormat`). Both extensions are engine-adjacent
 crates implementing those traits over the arrow-rs crates — the same shape as
 `pink-lake` implementing `AttachedLake`:
 
+`pinkdb-arrow` also publishes that surface as an **extension package** (wave
+86): `pinkdb_arrow::register_package()` registers the package process-wide,
+and a store gets the Arrow reader/writer only after
+`LOAD EXTENSION 'arrow'` (or `PinkDb::load_extension_package`). That is the
+third registration model, next to `register(&mut db)` (one store) and
+`ensure_registered()` (every store, from startup); pick one per process,
+because a package whose source or format name is already registered globally
+is refused at load, atomically, leaving the store unchanged. Register the
+package before `open_durable` so durable replay can resolve it, activation is
+per store, and packages are plain Rust, so they work on wasm32 too.
+
 | Extension | Crate | Read | Write |
 |---|---|---|---|
 | `arrow` | `extensions/arrow` (`pinkdb-arrow`) | `FROM 'f.arrow'` / `read_arrow('f.arrow')` (`read_ipc`/`read_feather`; `.arrow`/`.ipc`/`.feather`/`.arrows`) | `COPY t TO 'f.arrow' (FORMAT arrow)` |

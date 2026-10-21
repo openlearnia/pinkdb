@@ -2,7 +2,7 @@
 //! (`read_parquet`, `FROM 'file.parquet'`, and the `read_csv('url')` source
 //! waves 71/75 landed).
 //!
-//! ## Why this is not an extension
+//! ## Why this is not a C-ABI extension
 //!
 //! The extension host (`crate::ext`, ABI v1) registers **scalar functions**:
 //! one callback per row over ABI values. A file reader is none of that — it
@@ -13,6 +13,16 @@
 //! ([`crate::attached`]): the engine stays dependency-free, and the reader
 //! (e.g. `pinkdb-parquet`) depends on the engine, never the other way
 //! around.
+//!
+//! Wave 86 added [`crate::package::ExtensionPackage`]: a host-published,
+//! process-global package that bundles scalar functions with table sources
+//! and COPY sinks. `LOAD EXTENSION '<package>'` resolves it (a loadable
+//! library still wins on native targets) and appends the package's sources
+//! to **this store's** registry, atomically and without touching another
+//! store. The sources are still plain Rust values the embedder compiled in —
+//! the C ABI remains scalar-only — and a logged statement that reads one is
+//! WAL-prefixed with the package's `LOAD EXTENSION`, exactly like a
+//! statement calling a package scalar.
 //!
 //! ## What the engine does with a source
 //!
@@ -261,6 +271,18 @@ pub fn register_global_table_source(source: Arc<dyn TableSource>) {
     sources.push(source);
 }
 
+/// Whether a source is registered process-globally under `name`
+/// (case-insensitive). Package activation consults this before installing a
+/// source: a name that a global registration already owns stays out of
+/// reach, even on a store constructed before that registration.
+pub(crate) fn is_global_table_source(name: &str) -> bool {
+    global_sources()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|s| s.name().eq_ignore_ascii_case(name))
+}
+
 /// The process-global sources a store starts with (see
 /// [`register_global_table_source`]).
 pub(crate) fn seeded_global_table_sources() -> Vec<Arc<dyn TableSource>> {
@@ -284,6 +306,10 @@ impl PinkDb {
     /// again.
     pub fn register_table_source(&mut self, source: Arc<dyn TableSource>) {
         let name = source.name().to_ascii_lowercase();
+        // A host registration replaces whatever occupied the name, including
+        // a package's source: the package mapping would otherwise prefix WAL
+        // records with an extension that no longer provides the surface.
+        self.package_table_sources.remove(&name);
         if let Some(existing) = self
             .table_sources
             .iter_mut()
@@ -300,6 +326,7 @@ impl PinkDb {
     /// unknown-function error.
     pub fn clear_table_sources(&mut self) {
         self.table_sources.clear();
+        self.package_table_sources.clear();
     }
 
     /// The registered table sources, in registration order.

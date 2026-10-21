@@ -336,6 +336,64 @@ make <span class="tok-f">-C</span> ext-sdk/rust &amp;&amp; ./ext-sdk/rust/smoke.
   server runs with <code>--allow-load-extension</code>.</li>
 </ul>
 
+<h2 id="extension-packages-table-functions-and-copy-sinks-wave-86">Extension packages: table functions and COPY sinks (wave 86)<a class="anchor" href="#extension-packages-table-functions-and-copy-sinks-wave-86" aria-label="Permalink: Extension packages: table functions and COPY sinks (wave 86)">#</a></h2>
+
+<p>A scalar extension registers row functions only — the C ABI cannot express a
+replacement scan, a table function, or a COPY format. An <strong>extension
+package</strong> is the host-level bundle for those surfaces: one name carrying
+optional linked scalar functions, any number of table sources
+(<code>FROM read_x(...)</code> and <code>FROM 'file.x'</code>), and COPY sinks
+(<code>COPY … (FORMAT x)</code>). A package is plain Rust compiled into the
+host — there is no <code>dlopen</code> — so it also works on wasm32, exactly
+like the linked registry.</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Rust</span></div><pre class="code" data-lang="rust"><code><span class="tok-k">use</span> std::sync::Arc;
+<span class="tok-k">use</span> pinkdb::{ExtensionPackage, PinkDb, register_extension_package};
+
+<span class="tok-c">// The crate that implements the traits publishes one package per process.</span>
+register_extension_package(
+    ExtensionPackage::new(<span class="tok-s">"lake"</span>)
+        .with_table_source(Arc::new(ReadLake))   <span class="tok-c">// FROM read_lake(...) / FROM 'f.lake'</span>
+        .with_file_format(Arc::new(LakeSink)),   <span class="tok-c">// COPY t TO 'f.lake' (FORMAT lake)</span>
+)?;
+
+<span class="tok-k">let</span> <span class="tok-k">mut</span> db = PinkDb::new();
+db.set_allow_sql_load_extension(<span class="tok-k">true</span>);       <span class="tok-c">// the SQL gate, off by default</span>
+db.execute(<span class="tok-s">"LOAD EXTENSION 'lake';"</span>)?;       <span class="tok-c">// this store only</span>
+<span class="tok-c">// Embedders may skip the gate: db.load_extension_package("lake")?;</span></code></pre></div>
+
+<ul>
+  <li><strong>Opt-in gate:</strong> <code>LOAD EXTENSION</code> keeps its
+  default-off gate (<code>--allow-load-extension</code> on the server,
+  <code>set_allow_sql_load_extension</code> in an embedder). The host API
+  <code>PinkDb::load_extension_package</code> is an explicit embedder choice
+  and is not gated.</li>
+  <li><strong>Per-store activation:</strong> a loaded package installs its
+  sources and sinks on that store only; another store is unaffected even
+  though the package is registered process-wide. Loading the same package
+  twice is an error, like any other extension.</li>
+  <li><strong>Atomic refusal:</strong> every scalar, table-source and format
+  name is checked against the built-ins, the global registries and earlier
+  loads <em>before</em> anything is installed. A collision refuses the whole
+  package and leaves the store exactly as it was. Pick one model per process:
+  a package whose source or format name is already registered globally (for
+  example by <code>ensure_registered</code>) is refused at load.</li>
+  <li><strong>Durable stores:</strong> a logged statement that reads a package
+  source or writes through its sink is prefixed with
+  <code>LOAD EXTENSION '&lt;package&gt;'</code> when the current WAL generation
+  has not loaded it, so replay re-activates it. The package must be registered
+  <strong>before</strong> the store is opened — replay runs inside
+  <code>open_durable</code>. A checkpoint resets that coverage, so the first
+  record afterwards is prefixed again.</li>
+  <li><strong>wasm:</strong> packages are plain Rust and need no dynamic
+  loader; on wasm <code>LOAD EXTENSION '&lt;name&gt;'</code> resolves a
+  package first, then the linked registry.</li>
+  <li><strong>In this repo:</strong> <code>pinkdb_arrow::register_package()</code>
+  publishes the Arrow package, and <code>LOAD EXTENSION 'arrow'</code> gives a
+  store <code>FROM 'f.arrow'</code>, <code>read_arrow</code> and
+  <code>COPY … (FORMAT arrow)</code>.</li>
+</ul>
+
 <ul class="next-links">
   <li><a href="../extensions">Extension catalog →</a></li>
   <li><a href="../docs/api-c">C API →</a></li>
@@ -354,6 +412,7 @@ make <span class="tok-f">-C</span> ext-sdk/rust &amp;&amp; ./ext-sdk/rust/smoke.
   <li><a href="#installing-from-the-extension-repository">Installing from the extension repository</a></li>
   <li><a href="#writing-an-extension">Writing an extension</a></li>
   <li><a href="#extensions-and-durable-databases">Extensions and durable databases</a></li>
+  <li><a href="#extension-packages-table-functions-and-copy-sinks-wave-86">Extension packages: table functions and COPY sinks (wave 86)</a></li>
 </ul>
 <p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
 </nav>

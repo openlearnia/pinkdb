@@ -157,6 +157,64 @@ make -C ext-sdk/rust && ./ext-sdk/rust/smoke.sh</code></pre>
   server runs with <code>--allow-load-extension</code>.</li>
 </ul>
 
+<h2>Extension packages: table functions and COPY sinks (wave 86)</h2>
+
+<p>A scalar extension registers row functions only — the C ABI cannot express a
+replacement scan, a table function, or a COPY format. An <strong>extension
+package</strong> is the host-level bundle for those surfaces: one name carrying
+optional linked scalar functions, any number of table sources
+(<code>FROM read_x(...)</code> and <code>FROM 'file.x'</code>), and COPY sinks
+(<code>COPY … (FORMAT x)</code>). A package is plain Rust compiled into the
+host — there is no <code>dlopen</code> — so it also works on wasm32, exactly
+like the linked registry.</p>
+
+<pre class="code" data-lang="rust"><code>use std::sync::Arc;
+use pinkdb::{ExtensionPackage, PinkDb, register_extension_package};
+
+// The crate that implements the traits publishes one package per process.
+register_extension_package(
+    ExtensionPackage::new("lake")
+        .with_table_source(Arc::new(ReadLake))   // FROM read_lake(...) / FROM 'f.lake'
+        .with_file_format(Arc::new(LakeSink)),   // COPY t TO 'f.lake' (FORMAT lake)
+)?;
+
+let mut db = PinkDb::new();
+db.set_allow_sql_load_extension(true);       // the SQL gate, off by default
+db.execute("LOAD EXTENSION 'lake';")?;       // this store only
+// Embedders may skip the gate: db.load_extension_package("lake")?;</code></pre>
+
+<ul>
+  <li><strong>Opt-in gate:</strong> <code>LOAD EXTENSION</code> keeps its
+  default-off gate (<code>--allow-load-extension</code> on the server,
+  <code>set_allow_sql_load_extension</code> in an embedder). The host API
+  <code>PinkDb::load_extension_package</code> is an explicit embedder choice
+  and is not gated.</li>
+  <li><strong>Per-store activation:</strong> a loaded package installs its
+  sources and sinks on that store only; another store is unaffected even
+  though the package is registered process-wide. Loading the same package
+  twice is an error, like any other extension.</li>
+  <li><strong>Atomic refusal:</strong> every scalar, table-source and format
+  name is checked against the built-ins, the global registries and earlier
+  loads <em>before</em> anything is installed. A collision refuses the whole
+  package and leaves the store exactly as it was. Pick one model per process:
+  a package whose source or format name is already registered globally (for
+  example by <code>ensure_registered</code>) is refused at load.</li>
+  <li><strong>Durable stores:</strong> a logged statement that reads a package
+  source or writes through its sink is prefixed with
+  <code>LOAD EXTENSION '&lt;package&gt;'</code> when the current WAL generation
+  has not loaded it, so replay re-activates it. The package must be registered
+  <strong>before</strong> the store is opened — replay runs inside
+  <code>open_durable</code>. A checkpoint resets that coverage, so the first
+  record afterwards is prefixed again.</li>
+  <li><strong>wasm:</strong> packages are plain Rust and need no dynamic
+  loader; on wasm <code>LOAD EXTENSION '&lt;name&gt;'</code> resolves a
+  package first, then the linked registry.</li>
+  <li><strong>In this repo:</strong> <code>pinkdb_arrow::register_package()</code>
+  publishes the Arrow package, and <code>LOAD EXTENSION 'arrow'</code> gives a
+  store <code>FROM 'f.arrow'</code>, <code>read_arrow</code> and
+  <code>COPY … (FORMAT arrow)</code>.</li>
+</ul>
+
 <ul class="next-links">
   <li><a href="{{root}}extensions.html">Extension catalog →</a></li>
   <li><a href="{{root}}docs/api-c.html">C API →</a></li>

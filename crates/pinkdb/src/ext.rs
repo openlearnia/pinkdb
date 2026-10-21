@@ -1,12 +1,17 @@
 //! Extension host integration — the scalar-function registry and the two
 //! loading models that feed it.
 //!
-//! Two models, one registry (waves 29A / 49):
+//! Three host surfaces, one resolution order (waves 29A / 49 / 86):
 //!
 //! - **native `dlopen`** (ABI v1): [`PinkDb::load_extension`] loads a cdylib
 //!   through `pinkdb-ext-loader`, which owns every `unsafe` (dlopen, symbol
 //!   lookup, callback invocation, result-text ownership). A `LOAD EXTENSION
 //!   '<path>'` statement is the SQL face of the same call.
+//! - **extension packages** (wave 86, [`crate::package`]): a process-global,
+//!   host-published bundle of scalar functions plus table sources and COPY
+//!   sinks. When the dlopen attempt fails, a registered package name loads
+//!   the package ([`PinkDb::load_extension_package`]); on wasm (no dynamic
+//!   loader) a package is consulted before the linked registry.
 //! - **linked registration** (wave 49): a wasm sandbox has no dynamic linker,
 //!   so there an extension is linked into the host and published to the
 //!   process-global registry in `pinkdb_ext_loader::linked` (safe Rust
@@ -133,18 +138,21 @@ impl PinkDb {
     /// a regular file, not a symlink) and, when the store has an extension
     /// root ([`Self::set_extension_root`]), must be inside it.
     ///
-    /// Native only. When `path` is not a loadable library but a *linked*
-    /// extension is registered under exactly that name, the linked extension
-    /// is loaded instead ([`PinkDb::load_linked_extension`]): that is how a
-    /// replayed `LOAD EXTENSION '<name>'` record — written when a linked
-    /// function was called — resolves here. Anything else keeps the dlopen
-    /// error, unchanged.
+    /// Native only. When `path` is not a loadable library, a registered
+    /// extension **package** of exactly that name is activated
+    /// ([`PinkDb::load_extension_package`]); otherwise a *linked* extension
+    /// registered under that name is loaded ([`PinkDb::load_linked_extension`]).
+    /// That is how a replayed `LOAD EXTENSION '<name>'` record — written when
+    /// a linked function or a package-provided surface was touched —
+    /// resolves here. Anything else keeps the dlopen error, unchanged.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_extension(&mut self, path: &str) -> Result<String> {
         match self.load_native_extension(path) {
             Ok(name) => Ok(name),
             Err(dlopen_error) => {
-                if pinkdb_ext_loader::linked::is_registered(path) {
+                if crate::package::is_registered_extension_package(path) {
+                    self.load_extension_package(path)
+                } else if pinkdb_ext_loader::linked::is_registered(path) {
                     self.load_linked_extension(path)
                 } else {
                     Err(PinkDbError::Execution(dlopen_error.to_string()))
@@ -168,12 +176,17 @@ impl PinkDb {
     }
 
     /// wasm targets have no dynamic linker, so the argument is a **registry
-    /// name**, not a path: the linked registry
-    /// (`pinkdb_ext_loader::linked::register`) is this target's only extension
-    /// source. `LOAD EXTENSION '<name>'` is the SQL face of this call.
+    /// name**, not a path: a registered extension package
+    /// ([`PinkDb::load_extension_package`]) or the linked registry
+    /// (`pinkdb_ext_loader::linked::register`) carries it. `LOAD EXTENSION
+    /// '<name>'` is the SQL face of this call.
     #[cfg(target_arch = "wasm32")]
     pub fn load_extension(&mut self, name: &str) -> Result<String> {
-        self.load_linked_extension(name)
+        if crate::package::is_registered_extension_package(name) {
+            self.load_extension_package(name)
+        } else {
+            self.load_linked_extension(name)
+        }
     }
 
     /// Load a *linked* extension by its registry name (the wasm loading model;
@@ -201,17 +214,29 @@ impl PinkDb {
     }
 
     /// Sources of the extensions providing `names` (lowercased registry
-    /// keys), deduped in first-use order. Unknown names are skipped: they were
+    /// keys), deduped in first-use order. A name is either a dynamic function
+    /// (its source is the library path or linked registry name) or an
+    /// extension **package** recorded for a package-provided table source or
+    /// COPY sink (its source is the package name). A package's scalars map to
+    /// the package itself, so replay resolves the one `LOAD EXTENSION` name
+    /// that installs the whole surface. Unknown names are skipped: they were
     /// bound against this registry moments earlier and extensions are never
     /// unloaded, so this can only skip a name that was never registered.
     pub(crate) fn dynamic_function_paths(&self, names: &[String]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for name in names {
-            if let Some(f) = self.dynamic_functions.get(&name.to_ascii_lowercase()) {
-                let source = f.source();
-                if !out.iter().any(|p| p == source) {
-                    out.push(source.to_string());
-                }
+            let key = name.to_ascii_lowercase();
+            let source = if let Some(package) = self.package_dynamic_functions.get(&key) {
+                package.clone()
+            } else if let Some(f) = self.dynamic_functions.get(&key) {
+                f.source().to_string()
+            } else if let Some(package) = self.loaded_packages.get(&key) {
+                package.clone()
+            } else {
+                continue;
+            };
+            if !out.iter().any(|p| p == &source) {
+                out.push(source);
             }
         }
         out
@@ -240,12 +265,18 @@ impl PinkDb {
     /// Distinct sources of every loaded extension (including ones that
     /// registered no functions), for seeding the WAL's tracked set after
     /// recovery: the library path for a `dlopen` extension, the registry name
-    /// for a linked one.
+    /// for a linked one, and the package name for an extension package (with
+    /// or without scalars).
     pub(crate) fn loaded_extension_paths(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         for ext in self.loaded_extensions.values() {
             if !out.iter().any(|p| p == ext.source()) {
                 out.push(ext.source().to_string());
+            }
+        }
+        for package in self.loaded_packages.values() {
+            if !out.iter().any(|p| p == package) {
+                out.push(package.clone());
             }
         }
         out
@@ -266,6 +297,11 @@ impl PinkDb {
     /// resolved plus the file name), so two spellings of the same file are
     /// the same extension; a linked one matches on its registry name.
     pub(crate) fn loaded_extension_name_for_path(&self, path: &str) -> Option<String> {
+        // An active package is keyed by its name (the source the WAL records
+        // for its table sources, sinks and scalars).
+        if let Some(name) = self.loaded_packages.get(&path.to_ascii_lowercase()) {
+            return Some(name.clone());
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
             if let Some(key) = pinkdb_ext_loader::canonical_key(path) {
@@ -290,8 +326,8 @@ impl PinkDb {
     /// before running `LOAD EXTENSION '<name>'`, whose second load is a
     /// documented error.
     pub fn is_extension_loaded(&self, name: &str) -> bool {
-        self.loaded_extensions
-            .contains_key(&name.to_ascii_lowercase())
+        let key = name.to_ascii_lowercase();
+        self.loaded_extensions.contains_key(&key) || self.loaded_packages.contains_key(&key)
     }
 
     /// The canonical paths of the natively-loaded extensions of this store —
@@ -357,7 +393,14 @@ impl PinkDb {
                 .map_err(|e| PinkDbError::Execution(e.to_string()))?;
             return Ok(name);
         }
-        // 1c. A linked extension: its source is a registry name, and the
+        // 1c. An extension package: like a linked extension, its source is a
+        // registry name the host published at bootstrap, so the code is
+        // already in this process. A package is consulted before the
+        // scalar-only linked registry (the same order `load_extension` uses).
+        if crate::package::is_registered_extension_package(source) {
+            return self.load_extension_package(source);
+        }
+        // 1d. A linked extension: its source is a registry name, and the
         // registry is published by the host at bootstrap — the code is
         // already in this process.
         if pinkdb_ext_loader::linked::is_registered(source) {
@@ -408,16 +451,24 @@ impl PinkDb {
         )))
     }
 
-    /// Register one extension handle — the shared half of both loading
-    /// models: validate everything, then insert everything.
-    fn register_handle(&mut self, handle: ExtHandle) -> std::result::Result<(), ExtError> {
+    /// Validate one extension handle without registering anything — the
+    /// shared half of both loading models, and the pre-flight check an
+    /// extension-package activation runs before it installs *any* surface.
+    pub(crate) fn validate_handle(&self, handle: &ExtHandle) -> std::result::Result<(), ExtError> {
         // Pin duplicate loads by name: a second load of the same extension
         // must fail even if it were to register a disjoint set of functions
-        // (init would run twice against shared state).
+        // (init would run twice against shared state). A package and a
+        // scalar extension share one name space.
         let name_key = handle.name().to_ascii_lowercase();
         if self.loaded_extensions.contains_key(&name_key) {
             return Err(ExtError::registration(format!(
                 "extension \"{}\" is already loaded",
+                handle.name()
+            )));
+        }
+        if self.loaded_packages.contains_key(&name_key) {
+            return Err(ExtError::registration(format!(
+                "extension package \"{}\" is already loaded",
                 handle.name()
             )));
         }
@@ -444,6 +495,22 @@ impl PinkDb {
             }
             keys.push(key);
         }
+        Ok(())
+    }
+
+    /// Register one extension handle — the shared half of both loading
+    /// models: validate everything, then insert everything.
+    pub(crate) fn register_handle(
+        &mut self,
+        handle: ExtHandle,
+    ) -> std::result::Result<(), ExtError> {
+        self.validate_handle(&handle)?;
+        let name_key = handle.name().to_ascii_lowercase();
+        let functions = handle.functions();
+        let keys: Vec<String> = functions
+            .iter()
+            .map(|f| f.name().to_ascii_lowercase())
+            .collect();
         for (f, key) in functions.into_iter().zip(keys) {
             self.dynamic_functions.insert(key, f);
         }

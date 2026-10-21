@@ -32,6 +32,17 @@
 //! so a host can bootstrap every store it creates with one call (the same
 //! call that registers the read side).
 //!
+//! ### Extension packages (wave 86)
+//!
+//! A sink can ship inside a [`crate::package::ExtensionPackage`] together
+//! with scalar functions and table sources. `LOAD EXTENSION '<package>'`
+//! appends the package's sinks to **this store's** format list (the same
+//! list `register_file_format` fills, consulted together with the
+//! process-global seed), atomically: a format-name collision with a global
+//! registration or an already-active sink refuses the whole package before
+//! anything is installed. Another store sees nothing until it loads the
+//! package itself.
+//!
 //! ### Durability
 //!
 //! A file read is an **external input**, not session-local state: a logged
@@ -66,6 +77,18 @@ pub fn register_global_file_format(format: Arc<dyn FileFormat>) {
     let key = format.name().to_ascii_lowercase();
     formats.retain(|f| f.name().to_ascii_lowercase() != key);
     formats.push(format);
+}
+
+/// Whether a sink is registered process-globally under `name`
+/// (case-insensitive). Package activation consults this before installing a
+/// format: a name a global registration already owns stays out of reach,
+/// even on a store constructed before that registration.
+pub(crate) fn is_global_file_format(name: &str) -> bool {
+    global_formats()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|f| f.name().eq_ignore_ascii_case(name))
 }
 
 /// The process-global formats a store starts with (see
@@ -109,6 +132,9 @@ impl PinkDb {
     /// a replacement never affects a running statement).
     pub fn register_file_format(&mut self, format: Arc<dyn FileFormat>) {
         let key = format.name().to_ascii_lowercase();
+        // A host registration replaces whatever occupied the name, including
+        // a package's sink: drop the package mapping with it.
+        self.package_file_formats.remove(&key);
         self.file_formats
             .retain(|f| f.name().to_ascii_lowercase() != key);
         self.file_formats.push(format);

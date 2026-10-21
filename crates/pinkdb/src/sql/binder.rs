@@ -991,12 +991,14 @@ struct Binder<'a> {
     /// with child scopes: a mutating statement that depends on one is
     /// refused on a durable database (the logged SQL could never replay).
     views_used: Rc<RefCell<Vec<String>>>,
-    /// Dynamic-function names (lowercased registry keys) referenced while
-    /// binding this statement, in first-use order. Shared with child scopes,
-    /// so subquery bodies inside `ScalarSubquery`/`InSubquery`/`Exists` (and
+    /// Extension sources referenced while binding this statement, in
+    /// first-use order: dynamic-function names (lowercased registry keys) and
+    /// extension-**package** names (a table function, replacement scan or
+    /// COPY sink that came from a package). Shared with child scopes, so
+    /// subquery bodies inside `ScalarSubquery`/`InSubquery`/`Exists` (and
     /// derived tables/views/CTE bodies) are covered. The WAL layer maps them
-    /// back to their extension paths so a logged record can be prefixed with
-    /// the `LOAD EXTENSION` statements its replay needs.
+    /// back to their extension sources so a logged record can be prefixed
+    /// with the `LOAD EXTENSION` statements its replay needs.
     dynamic_functions_used: Rc<RefCell<Vec<String>>>,
     /// `?` slots when binding a parameterized statement (shared with child
     /// scopes); `None` binds a plain statement, where a `?` is an error.
@@ -1170,10 +1172,24 @@ impl<'a> Binder<'a> {
         self.views_used.borrow().clone()
     }
 
-    /// Dynamic-function names (lowercased registry keys) referenced while
-    /// binding, in first-use order.
+    /// Extension sources (dynamic-function and package names, lowercased)
+    /// referenced while binding, in first-use order.
     fn dynamic_functions_used(&self) -> Vec<String> {
         self.dynamic_functions_used.borrow().clone()
+    }
+
+    /// Record that this statement used a surface provided by an extension
+    /// package, so the WAL layer can prefix the logged record with the
+    /// package's `LOAD EXTENSION` (mirroring a dynamic-function call).
+    fn note_extension_package(&self, package: Option<&str>) {
+        let Some(package) = package else {
+            return;
+        };
+        let key = package.to_ascii_lowercase();
+        let mut used = self.dynamic_functions_used.borrow_mut();
+        if !used.contains(&key) {
+            used.push(key);
+        }
     }
 
     fn lookup_column(&self, table: Option<&str>, col: &str) -> Result<(usize, DataType)> {
@@ -3084,11 +3100,12 @@ pub fn bind(db: &PinkDb, stmt: &Statement, default_db: &str) -> Result<LogicalPl
     Ok(bind_tracked(db, stmt, default_db)?.0)
 }
 
-/// [`bind`] plus the dynamic-function names (lowercased registry keys) the
-/// statement's expressions reference, in first-use order — collected by the
-/// binder (subquery bodies included) so the WAL layer can map them to
-/// extension paths and prefix a logged record with the `LOAD EXTENSION`
-/// statements its replay needs.
+/// [`bind`] plus the extension sources the statement references, in
+/// first-use order — dynamic-function names (lowercased registry keys) and
+/// extension-package names (for package-provided table sources / COPY
+/// sinks), collected by the binder (subquery bodies included) so the WAL
+/// layer can map them to extension sources and prefix a logged record with
+/// the `LOAD EXTENSION` statements its replay needs.
 pub(crate) fn bind_tracked(
     db: &PinkDb,
     stmt: &Statement,
@@ -4330,6 +4347,13 @@ fn bind_copy_to(
         })?,
         None => db.file_format_for_path(path)?,
     };
+    // A package-provided sink is recorded like a dynamic function call: the
+    // WAL layer maps the name to the package whose `LOAD EXTENSION` replay
+    // needs (COPY itself has no store effect and is never logged, but the
+    // plan-level record keeps the bookkeeping uniform).
+    let package = db
+        .package_of_file_format(fmt.name())
+        .map(|p| p.to_ascii_lowercase());
     Ok((
         LogicalPlan::CopyTo {
             db: Some(table_db),
@@ -4337,7 +4361,7 @@ fn bind_copy_to(
             format: fmt.name().to_string(),
             path: path.to_string(),
         },
-        Vec::new(),
+        package.into_iter().collect(),
     ))
 }
 
@@ -5518,6 +5542,7 @@ fn literal_arg_value(expr: &Expr) -> Option<Value> {
 /// Bind a table-function FROM source against the registered table sources.
 fn bind_table_function(
     db: &PinkDb,
+    binder: &Binder<'_>,
     name: &str,
     args: &[TableFunctionArg],
     alias: &Option<String>,
@@ -5528,6 +5553,7 @@ fn bind_table_function(
     };
     for source in db.table_sources() {
         if let Some(schema) = source.bind(&call)? {
+            binder.note_extension_package(db.package_of_table_source(source.name()));
             let eff = alias.clone().unwrap_or_else(|| name.to_string());
             return Ok((
                 ScopeTable {
@@ -5749,7 +5775,7 @@ fn bind_source(
                 ));
             }
             let args = bind_table_function_args(args)?;
-            bind_table_function(db, name, &args, alias)
+            bind_table_function(db, binder, name, &args, alias)
         }
         FromSource::Path(path) => {
             if let Some(at) = at {
@@ -5763,6 +5789,7 @@ fn bind_source(
             let call = TableFunctionCall::Path(path.clone());
             for source in db.table_sources() {
                 if let Some(schema) = source.bind(&call)? {
+                    binder.note_extension_package(db.package_of_table_source(source.name()));
                     let eff = alias.clone().unwrap_or_else(|| replacement_scan_name(path));
                     return Ok((
                         ScopeTable {

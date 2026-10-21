@@ -9,6 +9,17 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Wave 86 — extensions can provide table functions and COPY formats ✅
+- New **extension packages**: a host registers a named bundle of scalar
+  functions, table functions/file readers and `COPY` formats; `LOAD
+  EXTENSION '<name>'` turns it on for one database, atomically (a name
+  clash refuses the whole package).
+- Durable stores replay package usage after a reopen, and new log records
+  that read through a package re-load it automatically.
+- The Arrow extension can now be offered this way
+  (`pinkdb_arrow::register_package()`, then `LOAD EXTENSION 'arrow'`), in
+  addition to its existing always-on registration.
+
 ### Wave 85 — pinkdb in the browser (Playground) ✅
 - The docs site has a **Playground**: the real engine compiled to wasm,
   running in your tab with no server, with example queries and a result

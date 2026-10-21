@@ -55,6 +55,10 @@ pub(crate) mod js;
 pub mod macros;
 pub(crate) mod mv;
 pub mod optimizer;
+/// Extension packages (wave 86): one host-published registry entry that
+/// bundles scalar functions with table sources and COPY sinks.
+/// `LOAD EXTENSION '<package>'` activates it on one store, atomically.
+pub mod package;
 pub mod persist;
 pub mod plan;
 pub mod prepared;
@@ -84,6 +88,7 @@ pub use exec::{ExecLimits, QueryResult};
 pub use filefmt::FileFormat;
 pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use macros::{MacroDef, MacroParamDef};
+pub use package::{ExtensionPackage, extension_package_names, register_extension_package};
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};
 pub use profile::QueryProfile;
