@@ -881,7 +881,11 @@ printf '%s\n' "$KEYS" | grep -qE '^itest/data/main\.t/[0-9a-f-]+\.vortex$' \
     || fail "the roundtrip's Vortex data object is missing"
 printf '%s\n' "$KEYS" | grep -qxF "itest/commits/2.json" \
     || fail "itest/commits/2.json (the v2 delta manifest) is missing"
-assert_listing_count "$KEYS" "itest/" 5
+printf '%s\n' "$KEYS" | grep -qxF "itest/lake.json" \
+    || fail "itest/lake.json (the v6 lake identity) is missing"
+printf '%s\n' "$KEYS" | grep -qxF "itest/highest.json" \
+    || fail "itest/highest.json (the rollback marker) is missing"
+assert_listing_count "$KEYS" "itest/" 7
 note "keys: $(printf '%s ' $KEYS)"
 
 # catalog.json == snapshots/<version>.json (bytes), fetched + cmp.
@@ -948,14 +952,18 @@ printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.vortex$' \
     || fail "the encrypted roundtrip's data object is missing"
 printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/commits/2.json" \
     || fail "enc/commits/2.json (the v2 delta manifest) is missing"
+printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/lake.json" \
+    || fail "enc/lake.json (the v6 lake identity) is missing"
+printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/highest.json" \
+    || fail "enc/highest.json (the rollback marker) is missing"
 for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
     s3curl -fsS --max-time 30 -o "$TMP/enc_data.bin" "$ENDPOINT/$BUCKET/$k" \
         || fail "fetching $k failed"
     [ "$(head -c 8 "$TMP/enc_data.bin")" = "PNKLAKE1" ] \
         || fail "$k is not a PNKLAKE1 container"
 done
-assert_listing_count "$ENC_KEYS" "enc/" 5
-ok "every enc/ object is ciphertext (catalog, snapshots, commit delta, data)"
+assert_listing_count "$ENC_KEYS" "enc/" 7
+ok "every enc/ object is ciphertext (catalog, snapshots, commit delta, data; identity + highest markers present)"
 
 # A fresh process with the key opens and queries the encrypted lake.
 {
@@ -992,6 +1000,10 @@ assert_contains "$TMP/enc_commit.log" "Committed lake version 3"
 ENC_KEYS="$(list_keys "enc/")" || fail "listing enc/ failed"
 printf '%s\n' "$ENC_KEYS" | grep -qE '^enc/data/main\.t/[0-9a-f-]+\.pinkdel$' \
     || fail "the encrypted commit's delete file is missing"
+printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/lake.json" \
+    || fail "enc/lake.json (the v6 lake identity) is missing"
+printf '%s\n' "$ENC_KEYS" | grep -qxF "enc/highest.json" \
+    || fail "enc/highest.json (the rollback marker) is missing"
 for k in $(printf '%s\n' "$ENC_KEYS" | grep -E '^enc/data/'); do
     s3curl -fsS --max-time 30 -o "$TMP/enc_data.bin" "$ENDPOINT/$BUCKET/$k" \
         || fail "fetching $k failed"
@@ -1283,7 +1295,7 @@ LEFTOVER_MAX=$((FINAL - 1 + RACE_CONFLICTS + CLAIMS - UNIQUE_VERSIONS))
 if [ "$DATA_COUNT" -gt "$LEFTOVER_MAX" ]; then
     fail "more data objects ($DATA_COUNT) than referenced + possible leftovers ($LEFTOVER_MAX)"
 fi
-assert_listing_count "$CONC_KEYS" "conc/" "$((1 + FINAL + (FINAL - 1) + DATA_COUNT))"
+assert_listing_count "$CONC_KEYS" "conc/" "$((3 + FINAL + (FINAL - 1) + DATA_COUNT))"
 ok "conc/data: $DATA_COUNT object(s), $((DATA_COUNT - (FINAL - 1))) unreferenced leftover(s) from conflicted writers"
 
 # --- concurrency (b): a slow save deterministically loses one version ------
