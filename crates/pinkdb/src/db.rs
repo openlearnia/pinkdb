@@ -42,14 +42,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::QueryResult;
 use crate::crypto::EncryptionKey;
 use crate::plan::{LogicalPlan, is_read_only};
 use crate::storage::{PinkDb, ViewDef};
 use crate::types::{PinkDbError, Result};
 use crate::wal::{BaseToken, DurableOpenOptions, Lease, LeaseGuard};
+use crate::{QueryProfile, QueryResult};
 
 /// The refusal a network-front-end [`Connection`] reports when its store has
 /// users and the session has not logged in. The check runs per statement
@@ -320,6 +320,18 @@ impl Database {
     }
 }
 
+/// Phase timings collected for one statement of a [`Connection`] when
+/// profiling is requested (wave 84). Kept separate from the public
+/// [`QueryProfile`] so the runner fills the facts (`rows`, `columns`, `kind`,
+/// transaction state) once, next to the result.
+#[derive(Default)]
+struct ProfileDraft {
+    bind: Duration,
+    optimize: Duration,
+    execute: Duration,
+    log: Duration,
+}
+
 struct Txn {
     /// Private working copy (snapshot at BEGIN + own writes).
     work: PinkDb,
@@ -399,7 +411,36 @@ impl Connection {
     /// Parse and run every statement, returning one result each.
     /// Multi-statement strings mix freely (each statement locks as needed).
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
+        self.execute_inner(sql, None)
+    }
+
+    /// Run every statement like [`Connection::execute`], also returning one
+    /// [`QueryProfile`] per statement (wave 84).
+    ///
+    /// Results and errors are exactly those of [`Connection::execute`]: the
+    /// first failing statement returns its error and earlier statements keep
+    /// their effects.
+    ///
+    /// Unlike the engine runner, this path binds and validates under the store
+    /// lock it executes against and runs no optimizer pass, so
+    /// [`QueryProfile::optimize`] is always zero here.
+    pub fn execute_profiled(&mut self, sql: &str) -> Result<Vec<(QueryResult, QueryProfile)>> {
+        let mut profiles = Vec::new();
+        let results = self.execute_inner(sql, Some(&mut profiles))?;
+        Ok(results.into_iter().zip(profiles).collect())
+    }
+
+    /// The one runner behind [`Connection::execute`] and
+    /// [`Connection::execute_profiled`]. With `profiles == None` it reads no
+    /// clock and allocates nothing for profiling.
+    fn execute_inner(
+        &mut self,
+        sql: &str,
+        mut profiles: Option<&mut Vec<QueryProfile>>,
+    ) -> Result<Vec<QueryResult>> {
+        let profiling = profiles.is_some();
         read_lock(&self.db.shared).ensure_wal_healthy()?;
+        let parse_start = profiling.then(Instant::now);
         let stmts = crate::sql::parse_statements(sql)?;
         // Per-statement source text: the WAL logs committed statements and a
         // materialized view persists its defining SQL (wave 80), so the split
@@ -411,10 +452,38 @@ impl Connection {
             ));
         }
         let texts = Some(texts);
+        let parse = parse_start.map(|start| start.elapsed()).unwrap_or_default();
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
             let text = texts.as_ref().map(|t| t[i].as_str());
-            out.push(self.execute_one(stmt, text)?);
+            if profiling {
+                // `BEGIN` itself is outside the transaction it opens; `COMMIT`
+                // and `ROLLBACK` themselves still run inside it.
+                let in_transaction = self.txn.is_some();
+                let stmt_start = Instant::now();
+                let mut draft = ProfileDraft::default();
+                let result = self.execute_one(stmt, text, Some(&mut draft))?;
+                let total = stmt_start.elapsed() + if i == 0 { parse } else { Duration::ZERO };
+                let (rows, columns, kind) = crate::result_facts(&result);
+                if let Some(sink) = profiles.as_deref_mut() {
+                    sink.push(QueryProfile {
+                        parse,
+                        bind: draft.bind,
+                        optimize: draft.optimize,
+                        execute: draft.execute,
+                        log: draft.log,
+                        total,
+                        rows,
+                        columns,
+                        kind: kind.to_string(),
+                        in_transaction,
+                        engine_version: env!("CARGO_PKG_VERSION"),
+                    });
+                }
+                out.push(result);
+            } else {
+                out.push(self.execute_one(stmt, text, None)?);
+            }
         }
         Ok(out)
     }
@@ -601,6 +670,7 @@ impl Connection {
         &mut self,
         stmt: &crate::sql::ast::Statement,
         sql_text: Option<&str>,
+        mut profile: Option<&mut ProfileDraft>,
     ) -> Result<QueryResult> {
         // Network authentication gate: evaluated before *every* statement of
         // a batch with the store's current user catalog, so the first
@@ -612,11 +682,33 @@ impl Connection {
         // and is shared by every evaluation context of this statement. No
         // limits (the embedded default) is a zero-cost `None` budget.
         let budget = Arc::new(crate::exec::ExecBudget::new(self.exec_limits.as_ref()));
-        // Transaction control never touches table data: handle first.
+        // Transaction control never touches table data: handle first. The
+        // whole transition (including COMMIT's WAL append) is execution time.
         match stmt {
-            crate::sql::ast::Statement::Begin => return self.txn_begin(),
-            crate::sql::ast::Statement::Commit => return self.txn_commit(),
-            crate::sql::ast::Statement::Rollback => return self.txn_rollback(),
+            crate::sql::ast::Statement::Begin => {
+                let start = profile.as_ref().map(|_| Instant::now());
+                let result = self.txn_begin();
+                if let Some(p) = profile.as_deref_mut() {
+                    p.execute += start.map(|s| s.elapsed()).unwrap_or_default();
+                }
+                return result;
+            }
+            crate::sql::ast::Statement::Commit => {
+                let start = profile.as_ref().map(|_| Instant::now());
+                let result = self.txn_commit();
+                if let Some(p) = profile.as_deref_mut() {
+                    p.execute += start.map(|s| s.elapsed()).unwrap_or_default();
+                }
+                return result;
+            }
+            crate::sql::ast::Statement::Rollback => {
+                let start = profile.as_ref().map(|_| Instant::now());
+                let result = self.txn_rollback();
+                if let Some(p) = profile.as_deref_mut() {
+                    p.execute += start.map(|s| s.elapsed()).unwrap_or_default();
+                }
+                return result;
+            }
             _ => {}
         }
         // Wave 80: automatic materialized-view refresh at the statement
@@ -644,10 +736,14 @@ impl Connection {
                     )));
                 }
                 let pre = self.current_db.clone();
+                let bind_start = profile.as_ref().map(|_| Instant::now());
                 let (plan, dynamic_functions_used) =
                     crate::sql::bind_tracked(&txn.work, stmt, &pre)?;
                 budget.check_deadline()?;
                 let plan = crate::plan::with_mv_source(plan, sql_text);
+                if let Some(p) = profile.as_deref_mut() {
+                    p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
+                }
                 // Wave 48: an authenticated session is checked in every
                 // transaction state too (the snapshot carries the RBAC
                 // catalog as of BEGIN).
@@ -674,7 +770,11 @@ impl Connection {
                     let stmt_sets = txn.work.plan_sets_store(&plan, &pre);
                     txn.wal_sets.extend(&stmt_sets);
                 }
+                let exec_start = profile.as_ref().map(|_| Instant::now());
                 let result = crate::exec::run_with_budget(&mut txn.work, &plan, budget.clone())?;
+                if let Some(p) = profile.as_deref_mut() {
+                    p.execute += exec_start.map(|s| s.elapsed()).unwrap_or_default();
+                }
                 // Wave 44: a `CALL`'s actual touched set joins this
                 // transaction's read/write bookkeeping (the pre-execution
                 // pass above saw only its argument subqueries).
@@ -740,20 +840,34 @@ impl Connection {
                 // a shared lock; a write takes the write lease, then rebinds
                 // under the exclusive lock.
                 let shared = read_lock(&self.db.shared);
+                let bind_start = profile.as_ref().map(|_| Instant::now());
                 let (plan, _) = crate::sql::bind_tracked(&shared, stmt, &pre)?;
                 budget.check_deadline()?;
+                if let Some(p) = profile.as_deref_mut() {
+                    p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
+                }
                 // Wave 48: the privilege check runs on the bound plan under
                 // the same lock the bind took, so no statement can slip
                 // between the check and its execution.
                 enforce(self.principal.as_deref(), &shared, &plan, &pre)?;
                 let result = if is_read_only(&plan) {
+                    let exec_start = profile.as_ref().map(|_| Instant::now());
                     let result = crate::exec::run_read_with_budget(&shared, &plan, budget.clone());
                     // Release before the `USE` logging below re-locks.
                     drop(shared);
+                    if let Some(p) = profile.as_deref_mut() {
+                        p.execute += exec_start.map(|s| s.elapsed()).unwrap_or_default();
+                    }
                     result?
                 } else {
                     drop(shared);
-                    self.autocommit_write(stmt, sql_text, &pre, budget.clone())?
+                    self.autocommit_write(
+                        stmt,
+                        sql_text,
+                        &pre,
+                        budget.clone(),
+                        profile.as_deref_mut(),
+                    )?
                 };
                 // `USE` is read-only for locking but still WAL-logged: replay
                 // must switch sessions exactly like this connection did.
@@ -764,6 +878,7 @@ impl Connection {
                 if is_read_only(&plan)
                     && let QueryResult::Used { .. } = &result
                 {
+                    let log_start = profile.as_ref().map(|_| Instant::now());
                     let lease = self.db.acquire_lease()?;
                     if let Some(g) = &lease {
                         // Refresh before logging: the `USE` record must
@@ -789,6 +904,9 @@ impl Connection {
                             &[],
                             Some(&sets),
                         )?;
+                    }
+                    if let Some(p) = profile {
+                        p.log += log_start.map(|s| s.elapsed()).unwrap_or_default();
                     }
                     drop(shared);
                     drop(lease);
@@ -832,6 +950,7 @@ impl Connection {
         sql_text: Option<&str>,
         pre: &str,
         budget: Arc<crate::exec::ExecBudget>,
+        mut profile: Option<&mut ProfileDraft>,
     ) -> Result<QueryResult> {
         let mut shared = write_lock(&self.db.shared);
         // Wave 44: the procedure frame is statement-scoped.
@@ -839,9 +958,13 @@ impl Connection {
         // Rebind under the exclusive lock: a concurrent local commit could
         // have changed the catalog between the caller's read-guard bind and
         // this lock.
+        let bind_start = profile.as_ref().map(|_| Instant::now());
         let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
         budget.check_deadline()?;
         let plan = crate::plan::with_mv_source(plan, sql_text);
+        if let Some(p) = profile.as_deref_mut() {
+            p.bind += bind_start.map(|s| s.elapsed()).unwrap_or_default();
+        }
         enforce(self.principal.as_deref(), &shared, &plan, pre)?;
         if crate::plan::writes_tables(&plan) {
             shared.refuse_logged_attached_reads(&plan)?;
@@ -849,11 +972,14 @@ impl Connection {
         if !self.db.lease.is_some() || !crate::plan::optimistic_eligible(&plan) {
             // Serialized path: lease first, then refresh, run, log.
             drop(shared);
+            let exec_start = profile.as_ref().map(|_| Instant::now());
             let lease = self.db.acquire_lease()?;
             let mut shared = write_lock(&self.db.shared);
             if let Some(g) = &lease {
                 shared.refresh_under_lease(g)?;
             }
+            // The refresh/rebind under the lease is execution time: it is the
+            // span the caller waits on, not a second bind phase.
             let (plan, dynamic_functions_used) = crate::sql::bind_tracked(&shared, stmt, pre)?;
             budget.check_deadline()?;
             let plan = crate::plan::with_mv_source(plan, sql_text);
@@ -866,6 +992,8 @@ impl Connection {
             let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone());
             shared.standalone_call = false;
             let result = result?;
+            let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
+            let log_start = profile.as_ref().map(|_| Instant::now());
             self.log_autocommit(
                 &mut shared,
                 &plan,
@@ -876,11 +1004,17 @@ impl Connection {
                 lease.as_ref(),
                 None,
             )?;
+            let log = log_start.map(|start| start.elapsed()).unwrap_or_default();
+            if let Some(p) = profile.as_deref_mut() {
+                p.execute += execute;
+                p.log += log;
+            }
             drop(shared);
             drop(lease);
             return Ok(result);
         }
         // Optimistic fast path.
+        let exec_start = profile.as_ref().map(|_| Instant::now());
         let mut sets = crate::wal::FrameSets::default();
         crate::plan::plan_sets(&plan, pre, &mut sets);
         sets.canonicalize();
@@ -906,6 +1040,8 @@ impl Connection {
         };
         if conflict.is_none() {
             shared.note_optimistic_success_for_test();
+            let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
+            let log_start = profile.as_ref().map(|_| Instant::now());
             self.log_autocommit(
                 &mut shared,
                 &plan,
@@ -916,6 +1052,11 @@ impl Connection {
                 lease.as_ref(),
                 Some(&sets),
             )?;
+            let log = log_start.map(|start| start.elapsed()).unwrap_or_default();
+            if let Some(p) = profile.as_deref_mut() {
+                p.execute += execute;
+                p.log += log;
+            }
             drop(shared);
             drop(lease);
             return Ok(result);
@@ -935,6 +1076,8 @@ impl Connection {
             shared.refuse_logged_attached_reads(&plan)?;
         }
         let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone())?;
+        let execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
+        let log_start = profile.as_ref().map(|_| Instant::now());
         self.log_autocommit(
             &mut shared,
             &plan,
@@ -945,6 +1088,11 @@ impl Connection {
             lease.as_ref(),
             None,
         )?;
+        let log = log_start.map(|start| start.elapsed()).unwrap_or_default();
+        if let Some(p) = profile {
+            p.execute += execute;
+            p.log += log;
+        }
         drop(shared);
         drop(lease);
         Ok(result)

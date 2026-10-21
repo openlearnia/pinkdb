@@ -54,6 +54,8 @@ pub mod persist;
 pub mod plan;
 pub mod prepared;
 pub mod procedure;
+/// Opt-in per-statement execution profiles (wave 84).
+pub mod profile;
 /// Role-based access control (wave 48): users, roles, grants, password
 /// hashing, and the privilege check authenticated sessions run under.
 pub mod rbac;
@@ -79,6 +81,7 @@ pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use macros::{MacroDef, MacroParamDef};
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};
+pub use profile::QueryProfile;
 pub use rbac::{
     GrantObject, GrantPrivs, GrantSpec, GrantTarget, PasswordSource, Privilege, UserDef,
     hash_password, validate_password_hash, verify_password,
@@ -130,7 +133,38 @@ impl PinkDb {
     /// The embedded session's current database (`USE`) applies to every later
     /// statement in the same string; unqualified names resolve against it.
     pub fn execute(&mut self, sql: &str) -> types::Result<Vec<QueryResult>> {
+        self.execute_inner(sql, None)
+    }
+
+    /// Parse and run every statement like [`PinkDb::execute`], also returning
+    /// one [`QueryProfile`] per statement (wave 84).
+    ///
+    /// The results and errors are exactly those of [`PinkDb::execute`]: the
+    /// first failing statement returns its error and the statements before it
+    /// keep their effects. Profiling only reads clocks, so it never changes a
+    /// result or a WAL byte.
+    pub fn execute_profiled(
+        &mut self,
+        sql: &str,
+    ) -> types::Result<Vec<(QueryResult, QueryProfile)>> {
+        let mut profiles = Vec::new();
+        let results = self.execute_inner(sql, Some(&mut profiles))?;
+        Ok(results.into_iter().zip(profiles).collect())
+    }
+
+    /// The one runner behind [`PinkDb::execute`] and
+    /// [`PinkDb::execute_profiled`].
+    ///
+    /// `profiles == None` is the historical, zero-cost path: it reads no clock
+    /// and allocates nothing for profiling.
+    fn execute_inner(
+        &mut self,
+        sql: &str,
+        mut profiles: Option<&mut Vec<QueryProfile>>,
+    ) -> types::Result<Vec<QueryResult>> {
+        let profiling = profiles.is_some();
         self.ensure_wal_healthy()?;
+        let parse_start = profiling.then(std::time::Instant::now);
         let stmts = sql::parse_statements(sql)?;
         // Per-statement source text: the WAL logs committed statements, and a
         // materialized view persists its defining SQL (wave 80) — the split
@@ -142,8 +176,12 @@ impl PinkDb {
             ));
         }
         let texts = Some(texts);
+        let parse = parse_start.map(|start| start.elapsed()).unwrap_or_default();
         let mut out = Vec::with_capacity(stmts.len());
         for (i, stmt) in stmts.iter().enumerate() {
+            // The statement that is about to run: `BEGIN` itself is outside
+            // the transaction it opens, `COMMIT` itself is still inside.
+            let in_transaction = self.in_transaction();
             // Wave 44: the procedure frame is statement-scoped — whatever a
             // `CALL` recorded belongs to that statement and is read by the
             // logging/conflict paths below.
@@ -166,11 +204,20 @@ impl PinkDb {
             // one rebuild per indexed table at the next statement boundary,
             // rather than per-row maintenance on every INSERT/UPDATE/DELETE.
             self.rebuild_stale_indexes();
+            // `total` starts at bind start; the statement's share of `parse`
+            // is added below (only the first statement carries it).
+            let stmt_start = profiling.then(std::time::Instant::now);
+            let bind_start = profiling.then(std::time::Instant::now);
             let (plan, dynamic_functions_used) = sql::bind_tracked(self, stmt, &session_db)?;
             // The runner (not the binder) holds the per-statement source text;
             // a `CREATE MATERIALIZED VIEW` plan persists it (wave 80).
             let plan = plan::with_mv_source(plan, texts.as_ref().map(|t| t[i].as_str()));
+            let bind = bind_start.map(|start| start.elapsed()).unwrap_or_default();
+            let optimize_start = profiling.then(std::time::Instant::now);
             let plan = optimizer::optimize(self, plan);
+            let optimize = optimize_start
+                .map(|start| start.elapsed())
+                .unwrap_or_default();
             // Store/process-level statements cannot be undone by a snapshot
             // commit of the multi-writer path: refuse inside a txn.
             // (LOAD EXTENSION is process-level too: the private snapshot's
@@ -210,62 +257,137 @@ impl PinkDb {
                     self.txn_writes.extend(writes);
                 }
             }
-            // Autocommit writes to plain tables take the optimistic fast
-            // path: execute with no lease, then validate + append under it
-            // (with a pessimistic fallback when the commit conflicts). The
-            // serialized path below covers everything else.
-            let optimistic = self.is_durable()
-                && !self.in_transaction()
-                && !self.replaying
-                && plan::optimistic_eligible(&plan);
-            if optimistic {
-                let mut sets = crate::wal::FrameSets::default();
-                plan::plan_sets(&plan, &session_db, &mut sets);
-                sets.canonicalize();
-                let base = self.capture_base()?;
-                // The execution span no other writer waits for.
-                let first = exec::run(self, &plan)?;
-                // Past this point a failure must not leave the uncommitted
-                // effect observable: without the lease it cannot be undone,
-                // so the handle fail-stops (see `poison_uncommitted`).
-                let lease = match self.acquire_lease() {
-                    Ok(l) => l,
-                    Err(e) => return Err(self.poison_uncommitted(&e)),
+            // Execution begins before the optimistic/serialized choice: it
+            // covers the lease wait, a refresh/rebind under the lease and the
+            // optimistic conflict retry, but never WAL logging.
+            let exec_start = profiling.then(std::time::Instant::now);
+            let execute: std::time::Duration;
+            let log: std::time::Duration;
+            let result = 'stmt: {
+                // Autocommit writes to plain tables take the optimistic fast
+                // path: execute with no lease, then validate + append under it
+                // (with a pessimistic fallback when the commit conflicts). The
+                // serialized path below covers everything else.
+                let optimistic = self.is_durable()
+                    && !self.in_transaction()
+                    && !self.replaying
+                    && plan::optimistic_eligible(&plan);
+                if optimistic {
+                    let mut sets = crate::wal::FrameSets::default();
+                    plan::plan_sets(&plan, &session_db, &mut sets);
+                    sets.canonicalize();
+                    let base = self.capture_base()?;
+                    // The execution span no other writer waits for.
+                    let first = exec::run(self, &plan)?;
+                    // Past this point a failure must not leave the uncommitted
+                    // effect observable: without the lease it cannot be undone,
+                    // so the handle fail-stops (see `poison_uncommitted`).
+                    let lease = match self.acquire_lease() {
+                        Ok(l) => l,
+                        Err(e) => return Err(self.poison_uncommitted(&e)),
+                    };
+                    let conflict = match (&base, &lease) {
+                        (Some(b), Some(g)) => {
+                            let position = b.position();
+                            match self.optimistic_commit_check(g, &position, &sets) {
+                                Ok(c) => c,
+                                Err(e) => return Err(self.poison_uncommitted(&e)),
+                            }
+                        }
+                        _ => None,
+                    };
+                    let (result, plan, dynamic_functions_used) = if conflict.is_none() {
+                        self.note_optimistic_success_for_test();
+                        (first, plan, dynamic_functions_used)
+                    } else {
+                        // Conflict: discard the never-logged effect (reload the
+                        // committed state) and re-execute under the held lease —
+                        // exactly one attempt reaches the WAL.
+                        if let Some(g) = &lease {
+                            self.rebuild_under_lease(g)?;
+                        }
+                        // A reloaded catalog may carry stale index flags from the
+                        // replayed frames; rebuild before planning.
+                        self.rebuild_stale_indexes();
+                        self.note_optimistic_fallback_for_test();
+                        let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                        let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
+                        let p = optimizer::optimize(self, p);
+                        if plan::writes_tables(&p) {
+                            self.refuse_logged_attached_reads(&p)?;
+                        }
+                        (exec::run(self, &p)?, p, d)
+                    };
+                    // Session transitions are applied before WAL logging so the
+                    // log record carries the post-statement session database.
+                    match &result {
+                        QueryResult::Used { db } => self.set_current_db(db),
+                        QueryResult::DroppedDatabase { name }
+                            if name.eq_ignore_ascii_case(self.current_db()) =>
+                        {
+                            let fallback = self.fallback_db();
+                            self.set_current_db(&fallback);
+                        }
+                        _ => {}
+                    }
+                    self.mark_committed_mv_writes(&plan, &session_db);
+                    execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
+                    let log_start = profiling.then(std::time::Instant::now);
+                    if let Some(texts) = &texts {
+                        self.wal_log_statement(
+                            &plan,
+                            &texts[i],
+                            &dynamic_functions_used,
+                            Some(&sets),
+                        )?;
+                        self.maybe_auto_checkpoint(lease.as_ref());
+                    }
+                    log = log_start.map(|start| start.elapsed()).unwrap_or_default();
+                    drop(lease);
+                    break 'stmt result;
+                }
+                // Transaction control manages its own lease (`begin` holds it
+                // until `commit`/`rollback`). Other mutating statements (and
+                // CHECKPOINT under these rules) take the lease around
+                // `[refresh → execute → append → publish → auto-checkpoint]`;
+                // reads never take it.
+                let needs_lease = self.is_durable()
+                    && !self.in_transaction()
+                    && (plan::writes_tables(&plan)
+                        || matches!(plan, plan::LogicalPlan::Checkpoint));
+                let lease = if needs_lease {
+                    self.acquire_lease()?
+                } else {
+                    None
                 };
-                let conflict = match (&base, &lease) {
-                    (Some(b), Some(g)) => {
-                        let position = b.position();
-                        match self.optimistic_commit_check(g, &position, &sets) {
-                            Ok(c) => c,
-                            Err(e) => return Err(self.poison_uncommitted(&e)),
+                let (plan, dynamic_functions_used) = match &lease {
+                    Some(g) => {
+                        if self.refresh_under_lease(g)? {
+                            // The refresh may have changed the catalog (or the
+                            // replayed frames may name objects bound above):
+                            // rebind against the refreshed state.
+                            self.rebuild_stale_indexes();
+                            let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
+                            let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
+                            (optimizer::optimize(self, p), d)
+                        } else {
+                            (plan, dynamic_functions_used)
                         }
                     }
-                    _ => None,
+                    None => (plan, dynamic_functions_used),
                 };
-                let (result, plan, dynamic_functions_used) = if conflict.is_none() {
-                    self.note_optimistic_success_for_test();
-                    (first, plan, dynamic_functions_used)
-                } else {
-                    // Conflict: discard the never-logged effect (reload the
-                    // committed state) and re-execute under the held lease —
-                    // exactly one attempt reaches the WAL.
-                    if let Some(g) = &lease {
-                        self.rebuild_under_lease(g)?;
-                    }
-                    // A reloaded catalog may carry stale index flags from the
-                    // replayed frames; rebuild before planning.
-                    self.rebuild_stale_indexes();
-                    self.note_optimistic_fallback_for_test();
-                    let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
-                    let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
-                    let p = optimizer::optimize(self, p);
-                    if plan::writes_tables(&p) {
-                        self.refuse_logged_attached_reads(&p)?;
-                    }
-                    (exec::run(self, &p)?, p, d)
-                };
-                // Session transitions are applied before WAL logging so the
-                // log record carries the post-statement session database.
+                // Wave 83: a `CALL` outside a transaction may `COMMIT`/`ROLLBACK`
+                // in its body (the flag never outlives this statement).
+                self.standalone_call = !self.in_transaction();
+                let result = exec::run(self, &plan);
+                self.standalone_call = false;
+                let result = result?;
+                // Wave 44: a `CALL`'s actual touched set joins the open
+                // transaction's conflict bookkeeping (its pre-execution pass saw
+                // an empty set).
+                self.note_proc_frame_in_txn(&plan);
+                // Session transitions are applied before WAL logging so the log
+                // record carries the post-statement session database.
                 match &result {
                     QueryResult::Used { db } => self.set_current_db(db),
                     QueryResult::DroppedDatabase { name }
@@ -277,73 +399,83 @@ impl PinkDb {
                     _ => {}
                 }
                 self.mark_committed_mv_writes(&plan, &session_db);
+                execute = exec_start.map(|start| start.elapsed()).unwrap_or_default();
+                let log_start = profiling.then(std::time::Instant::now);
                 if let Some(texts) = &texts {
-                    self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, Some(&sets))?;
+                    self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, None)?;
                     self.maybe_auto_checkpoint(lease.as_ref());
                 }
+                log = log_start.map(|start| start.elapsed()).unwrap_or_default();
                 drop(lease);
-                out.push(result);
-                continue;
-            }
-            // Transaction control manages its own lease (`begin` holds it
-            // until `commit`/`rollback`). Other mutating statements (and
-            // CHECKPOINT under these rules) take the lease around
-            // `[refresh → execute → append → publish → auto-checkpoint]`;
-            // reads never take it.
-            let needs_lease = self.is_durable()
-                && !self.in_transaction()
-                && (plan::writes_tables(&plan) || matches!(plan, plan::LogicalPlan::Checkpoint));
-            let lease = if needs_lease {
-                self.acquire_lease()?
-            } else {
-                None
+                result
             };
-            let (plan, dynamic_functions_used) = match &lease {
-                Some(g) => {
-                    if self.refresh_under_lease(g)? {
-                        // The refresh may have changed the catalog (or the
-                        // replayed frames may name objects bound above):
-                        // rebind against the refreshed state.
-                        self.rebuild_stale_indexes();
-                        let (p, d) = sql::bind_tracked(self, stmt, &session_db)?;
-                        let p = plan::with_mv_source(p, texts.as_ref().map(|t| t[i].as_str()));
-                        (optimizer::optimize(self, p), d)
+            if let Some(sink) = profiles.as_deref_mut() {
+                let total = stmt_start.map(|start| start.elapsed()).unwrap_or_default()
+                    + if i == 0 {
+                        parse
                     } else {
-                        (plan, dynamic_functions_used)
-                    }
-                }
-                None => (plan, dynamic_functions_used),
-            };
-            // Wave 83: a `CALL` outside a transaction may `COMMIT`/`ROLLBACK`
-            // in its body (the flag never outlives this statement).
-            self.standalone_call = !self.in_transaction();
-            let result = exec::run(self, &plan);
-            self.standalone_call = false;
-            let result = result?;
-            // Wave 44: a `CALL`'s actual touched set joins the open
-            // transaction's conflict bookkeeping (its pre-execution pass saw
-            // an empty set).
-            self.note_proc_frame_in_txn(&plan);
-            // Session transitions are applied before WAL logging so the log
-            // record carries the post-statement session database.
-            match &result {
-                QueryResult::Used { db } => self.set_current_db(db),
-                QueryResult::DroppedDatabase { name }
-                    if name.eq_ignore_ascii_case(self.current_db()) =>
-                {
-                    let fallback = self.fallback_db();
-                    self.set_current_db(&fallback);
-                }
-                _ => {}
+                        std::time::Duration::ZERO
+                    };
+                let (rows, columns, kind) = result_facts(&result);
+                sink.push(QueryProfile {
+                    parse,
+                    bind,
+                    optimize,
+                    execute,
+                    log,
+                    total,
+                    rows,
+                    columns,
+                    kind: kind.to_string(),
+                    in_transaction,
+                    engine_version: env!("CARGO_PKG_VERSION"),
+                });
             }
-            self.mark_committed_mv_writes(&plan, &session_db);
-            if let Some(texts) = &texts {
-                self.wal_log_statement(&plan, &texts[i], &dynamic_functions_used, None)?;
-                self.maybe_auto_checkpoint(lease.as_ref());
-            }
-            drop(lease);
             out.push(result);
         }
         Ok(out)
+    }
+}
+
+/// The profile facts of one result: `(rows, columns, QueryResult kind)`.
+fn result_facts(result: &QueryResult) -> (u64, u32, &'static str) {
+    match result {
+        QueryResult::Selected { names, rows, .. } => {
+            (rows.len() as u64, names.len() as u32, "Selected")
+        }
+        QueryResult::Inserted { count } => (*count as u64, 0, "Inserted"),
+        QueryResult::Updated { count } => (*count as u64, 0, "Updated"),
+        QueryResult::Deleted { count } => (*count as u64, 0, "Deleted"),
+        QueryResult::Created => (0, 0, "Created"),
+        QueryResult::Began => (0, 0, "Began"),
+        QueryResult::Committed => (0, 0, "Committed"),
+        QueryResult::RolledBack => (0, 0, "RolledBack"),
+        QueryResult::CreatedView { .. } => (0, 0, "CreatedView"),
+        QueryResult::DroppedTable { .. } => (0, 0, "DroppedTable"),
+        QueryResult::CreatedIndex { .. } => (0, 0, "CreatedIndex"),
+        QueryResult::DroppedIndex { .. } => (0, 0, "DroppedIndex"),
+        QueryResult::CreatedMaterializedView { .. } => (0, 0, "CreatedMaterializedView"),
+        QueryResult::RefreshedMaterializedView { .. } => (0, 0, "RefreshedMaterializedView"),
+        QueryResult::RefreshedMaterializedViews { .. } => (0, 0, "RefreshedMaterializedViews"),
+        QueryResult::DroppedMaterializedView { .. } => (0, 0, "DroppedMaterializedView"),
+        QueryResult::DroppedView { .. } => (0, 0, "DroppedView"),
+        QueryResult::CreatedDatabase { .. } => (0, 0, "CreatedDatabase"),
+        QueryResult::DroppedDatabase { .. } => (0, 0, "DroppedDatabase"),
+        QueryResult::Used { .. } => (0, 0, "Used"),
+        QueryResult::LoadedExtension { .. } => (0, 0, "LoadedExtension"),
+        QueryResult::AlteredTable { .. } => (0, 0, "AlteredTable"),
+        QueryResult::Checkpointed => (0, 0, "Checkpointed"),
+        QueryResult::CreatedProcedure { .. } => (0, 0, "CreatedProcedure"),
+        QueryResult::DroppedProcedure { .. } => (0, 0, "DroppedProcedure"),
+        QueryResult::CreatedMacro { .. } => (0, 0, "CreatedMacro"),
+        QueryResult::DroppedMacro { .. } => (0, 0, "DroppedMacro"),
+        QueryResult::Called { .. } => (0, 0, "Called"),
+        QueryResult::CreatedUser { .. } => (0, 0, "CreatedUser"),
+        QueryResult::AlteredUser { .. } => (0, 0, "AlteredUser"),
+        QueryResult::DroppedUser { .. } => (0, 0, "DroppedUser"),
+        QueryResult::CreatedRole { .. } => (0, 0, "CreatedRole"),
+        QueryResult::DroppedRole { .. } => (0, 0, "DroppedRole"),
+        QueryResult::Granted { .. } => (0, 0, "Granted"),
+        QueryResult::Revoked { .. } => (0, 0, "Revoked"),
     }
 }

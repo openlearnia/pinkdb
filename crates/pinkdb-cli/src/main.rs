@@ -11,7 +11,7 @@
 use std::io::IsTerminal;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Set by [`cli_error!`]; decides the exit status of a non-interactive run.
 static HAD_ERROR: AtomicBool = AtomicBool::new(false);
@@ -39,7 +39,9 @@ macro_rules! cli_error {
     }};
 }
 
-use pinkdb::{DataType, DurableOpenOptions, EncryptionKey, PinkDb, QueryResult, Value};
+use pinkdb::{
+    DataType, DurableOpenOptions, EncryptionKey, PinkDb, QueryProfile, QueryResult, Value,
+};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
@@ -176,7 +178,7 @@ fn print_help() {
     println!("  .help                  show this help");
     println!("  .quit | .exit          leave the shell");
     println!("  .read <file.sql>       run SQL and dot-commands from a file");
-    println!("  .timer on|off          print each statement's run time");
+    println!("  .timer on|off          print each statement's run time with a phase breakdown");
     println!("  .databases             list databases (the current one is marked)");
     println!("  .tables                list tables and views of the current database");
     println!("  .schema <table|view>   show a schema (accepts db.table; quoting honored)");
@@ -752,16 +754,42 @@ impl LocalSession {
         }
     }
 
+    /// Execute one SQL string without profiling: the historical zero-cost
+    /// path.
+    fn run_sql(&mut self, sql: &str) -> Result<Vec<QueryResult>, pinkdb::PinkDbError> {
+        self.run_sql_with(sql, false).map(|(results, _)| results)
+    }
+
+    /// Execute one SQL string with the profiling runner (wave 84), returning
+    /// the results and one profile per statement.
+    fn run_sql_profiled(
+        &mut self,
+        sql: &str,
+    ) -> Result<(Vec<QueryResult>, Vec<QueryProfile>), pinkdb::PinkDbError> {
+        self.run_sql_with(sql, true)
+    }
+
     /// Execute one SQL string, maintaining the transaction buffer and
     /// retrying a conflicting COMMIT (bounded). When a retry succeeds only
     /// the transaction's outcome is reported (the earlier attempt's
     /// statement results were already rendered and its effects discarded by
     /// the abort).
-    fn run_sql(&mut self, sql: &str) -> Result<Vec<QueryResult>, pinkdb::PinkDbError> {
+    fn run_sql_with(
+        &mut self,
+        sql: &str,
+        profiled: bool,
+    ) -> Result<(Vec<QueryResult>, Vec<QueryProfile>), pinkdb::PinkDbError> {
         let was = self.db.in_transaction();
         let pre_db = self.db.current_db().to_string();
-        match self.db.execute(sql) {
-            Ok(results) => {
+        let executed = match profiled {
+            true => self
+                .db
+                .execute_profiled(sql)
+                .map(|pairs| pairs.into_iter().unzip()),
+            false => self.db.execute(sql).map(|results| (results, Vec::new())),
+        };
+        match executed {
+            Ok((results, profiles)) => {
                 let now = self.db.in_transaction();
                 if !was && now {
                     self.txn_pre_db = Some(pre_db);
@@ -775,7 +803,7 @@ impl LocalSession {
                     self.txn_sql.clear();
                     self.txn_pre_db = None;
                 }
-                Ok(results)
+                Ok((results, profiles))
             }
             Err(e) => {
                 let now = self.db.in_transaction();
@@ -809,13 +837,27 @@ impl LocalSession {
                              (attempt {attempt}/{})",
                             self.txn_retries
                         );
-                        match self.db.execute(&retry_sql) {
-                            Ok(mut results) => {
+                        let retried = match profiled {
+                            true => self
+                                .db
+                                .execute_profiled(&retry_sql)
+                                .map(|pairs| pairs.into_iter().unzip()),
+                            false => self
+                                .db
+                                .execute(&retry_sql)
+                                .map(|results| (results, Vec::new())),
+                        };
+                        match retried {
+                            Ok((mut results, mut profiles)) => {
                                 self.txn_pre_db = None;
                                 // Only the transaction's outcome: the
                                 // statement results of the first attempt
                                 // were already printed.
-                                return Ok(vec![results.pop().unwrap_or(QueryResult::Committed)]);
+                                let profile = profiles.pop();
+                                return Ok((
+                                    vec![results.pop().unwrap_or(QueryResult::Committed)],
+                                    profile.into_iter().collect(),
+                                ));
                             }
                             Err(e2) => {
                                 if self.db.in_transaction() {
@@ -874,8 +916,24 @@ fn run_dot(session: &mut Session, line: &str) -> bool {
     match cmd {
         ".timer" => {
             match rest {
-                "on" => TIMER.store(true, Ordering::Relaxed),
-                "off" => TIMER.store(false, Ordering::Relaxed),
+                "on" => {
+                    TIMER.store(true, Ordering::Relaxed);
+                    #[cfg(feature = "client")]
+                    if let Session::Remote(client) = session
+                        && let Err(e) = client.set_profiling(true)
+                    {
+                        cli_error!("{e}");
+                    }
+                }
+                "off" => {
+                    TIMER.store(false, Ordering::Relaxed);
+                    #[cfg(feature = "client")]
+                    if let Session::Remote(client) = session
+                        && let Err(e) = client.set_profiling(false)
+                    {
+                        cli_error!("{e}");
+                    }
+                }
                 _ => println!("Usage: .timer on|off"),
             }
             return true;
@@ -1069,7 +1127,7 @@ fn print_help_remote() {
     println!("  .help                  show this help");
     println!("  .quit | .exit          leave the shell");
     println!("  .read <file.sql>       run SQL and dot-commands from a file");
-    println!("  .timer on|off          print each statement's run time");
+    println!("  .timer on|off          print each statement's run time with a phase breakdown");
     println!("  .databases/.tables/.schema/.import/.save/.open are not available in remote mode");
     println!("  .install/.repositories/.installed are not available in remote mode");
     println!("  .lake is not available in remote mode");
@@ -1326,22 +1384,90 @@ fn render_results_into(out: &mut String, results: &[QueryResult]) {
 
 /// Run one SQL string in the session's mode (local or remote) and print the
 /// results with the same renderer and the same timing line either way.
+///
+/// With the timer on, the engine (local) or the server (remote) also profiles
+/// every statement: the line keeps its historical `Run Time (s): real X.XXX`
+/// prefix and appends the summed phases on the same line. Remote mode reports
+/// only the statements the server profiled (none when it could not be
+/// enabled), in which case the line is the historical one unchanged.
 fn run_sql_session(session: &mut Session, sql: &str) {
     let t0 = Instant::now();
+    let timer = TIMER.load(Ordering::Relaxed);
+    let mut profiles: Option<Vec<QueryProfile>> = None;
     match session {
-        Session::Local(local) => match local.run_sql(sql) {
-            Ok(results) => render_results(&results),
-            Err(e) => cli_error!("{e}"),
-        },
+        Session::Local(local) => {
+            if timer {
+                match local.run_sql_profiled(sql) {
+                    Ok((results, ps)) => {
+                        render_results(&results);
+                        profiles = Some(ps);
+                    }
+                    Err(e) => cli_error!("{e}"),
+                }
+            } else {
+                match local.run_sql(sql) {
+                    Ok(results) => render_results(&results),
+                    Err(e) => cli_error!("{e}"),
+                }
+            }
+        }
         #[cfg(feature = "client")]
-        Session::Remote(client) => match client.execute(sql) {
-            Ok(results) => render_results(&results),
-            Err(e) => cli_error!("{e}"),
-        },
+        Session::Remote(client) => {
+            if timer {
+                match client.execute_profiled(sql) {
+                    Ok(pairs) => {
+                        let (results, ps): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+                        render_results(&results);
+                        profiles = Some(ps.into_iter().flatten().collect());
+                    }
+                    Err(e) => cli_error!("{e}"),
+                }
+            } else {
+                match client.execute(sql) {
+                    Ok(results) => render_results(&results),
+                    Err(e) => cli_error!("{e}"),
+                }
+            }
+        }
     }
-    if TIMER.load(Ordering::Relaxed) {
-        println!("Run Time (s): real {:.3}", t0.elapsed().as_secs_f64());
+    if timer {
+        print!("Run Time (s): real {:.3}", t0.elapsed().as_secs_f64());
+        if let Some(profiles) = profiles.filter(|ps| !ps.is_empty()) {
+            print_phase_breakdown(&profiles);
+        }
+        println!();
     }
+}
+
+/// Append ` (parse A, bind B, optimize C, execute D, log E ms)` in
+/// milliseconds with three decimals: bind/optimize/execute/log summed over
+/// `profiles`; `parse` counted once — the whole SQL string is parsed once and
+/// every statement's profile reports that same shared time.
+fn print_phase_breakdown(profiles: &[QueryProfile]) {
+    let parse = profiles
+        .iter()
+        .map(|p| p.parse)
+        .max()
+        .unwrap_or(Duration::ZERO);
+    let mut bind = Duration::ZERO;
+    let mut optimize = Duration::ZERO;
+    let mut execute = Duration::ZERO;
+    let mut log = Duration::ZERO;
+    for profile in profiles {
+        bind += profile.bind;
+        optimize += profile.optimize;
+        execute += profile.execute;
+        log += profile.log;
+    }
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    print!(
+        " (parse {:.3}, bind {:.3}, optimize {:.3}, execute {:.3}, log {:.3} ms)",
+        ms(parse),
+        ms(bind),
+        ms(optimize),
+        ms(execute),
+        ms(log)
+    );
 }
 
 /// Parsed command line.
@@ -1675,6 +1801,14 @@ fn remote_session(mut client: Client, opts: &Opts) -> Session {
             }
         }
     }
+    // The timer defaults on for an interactive terminal; enable the server's
+    // per-connection profiling now so the first statement already reports a
+    // breakdown.
+    if TIMER.load(Ordering::Relaxed)
+        && let Err(e) = client.set_profiling(true)
+    {
+        cli_error!("{e}");
+    }
     Session::Remote(client)
 }
 
@@ -1754,6 +1888,13 @@ fn main() {
     // Only the remote banner (client feature) needs the host string.
     #[cfg(feature = "client")]
     let host = opts.host.clone();
+    // The timer defaults on for an interactive terminal. Decide it before the
+    // session exists so a remote connect can enable the server's profiling;
+    // `-c` runs as a script, where the timer stays off unless asked for.
+    let interactive = std::io::stdin().is_terminal();
+    if opts.commands.is_empty() {
+        TIMER.store(interactive, Ordering::Relaxed);
+    }
     let mut session = build_session(
         &opts,
         match EncryptionKey::from_env() {
@@ -1782,8 +1923,6 @@ fn main() {
         exit_for_script();
     }
 
-    let interactive = std::io::stdin().is_terminal();
-    TIMER.store(interactive, Ordering::Relaxed);
     if interactive {
         match &session {
             Session::Local(_) => {

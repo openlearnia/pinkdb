@@ -83,7 +83,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use pinkdb::{Connection, DataType, Database, ExecLimits, QueryResult, Value};
+use pinkdb::{Connection, DataType, Database, ExecLimits, QueryProfile, QueryResult, Value};
 
 use crate::protocol::{self, DoneKind, PROTOCOL_VERSION, ProtocolError, Request, Response};
 
@@ -1080,6 +1080,8 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
     let mut prepared: std::collections::HashMap<u64, pinkdb::PreparedStatement> =
         std::collections::HashMap::new();
     let mut next_handle: u64 = 1;
+    // v10 (wave 84): per-connection profiling, off until `SetProfiling`.
+    let mut profiling = false;
 
     loop {
         // Reset the frame deadline between frames (never per byte).
@@ -1152,6 +1154,17 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                     }
                 }
             }
+            // v10 (wave 84): toggle this connection's profiling flag. The
+            // reply is the resulting setting, so a client never has to infer
+            // it.
+            Ok(Request::SetProfiling { enabled }) => {
+                profiling = enabled;
+                if protocol::write_response(reader.get_mut(), &Response::ProfilingSet { enabled })
+                    .is_err()
+                {
+                    return;
+                }
+            }
             Ok(Request::Execute { sql }) => {
                 if auth_required(&db, &conn) {
                     if send_error(reader.get_mut(), AUTH_REQUIRED).is_err() {
@@ -1161,7 +1174,21 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                 }
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_statement_hook(&sql);
-                    conn.execute(&sql)
+                    if profiling {
+                        conn.execute_profiled(&sql).map(|profiled| {
+                            profiled
+                                .into_iter()
+                                .map(|(result, profile)| (result, Some(profile)))
+                                .collect::<Vec<_>>()
+                        })
+                    } else {
+                        conn.execute(&sql).map(|results| {
+                            results
+                                .into_iter()
+                                .map(|result| (result, None))
+                                .collect::<Vec<_>>()
+                        })
+                    }
                 }));
                 match outcome {
                     Ok(Ok(results)) => {
@@ -1175,7 +1202,7 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                                 return;
                             }
                         };
-                        for result in &results {
+                        for (result, profile) in &results {
                             if let Err(e) = send_result(reader.get_mut(), result) {
                                 // A streaming failure (e.g. a single value
                                 // larger than the frame cap) is reported
@@ -1184,6 +1211,17 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                                 if !matches!(e, ProtocolError::Io(_)) {
                                     let _ = send_error(reader.get_mut(), &e.to_string());
                                 }
+                                return;
+                            }
+                            // v10: one Profile per statement, after its Done
+                            // and before the next result group.
+                            if let Some(profile) = profile
+                                && protocol::write_response(
+                                    reader.get_mut(),
+                                    &profile_frame(profile),
+                                )
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -1327,16 +1365,39 @@ fn serve_client<S: Read + Write + FrameReadTimeout>(
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let bound = conn.bind(stmt, &values)?;
                     run_statement_hook(bound.sql());
-                    conn.execute_bound(&bound)
+                    if profiling {
+                        // `execute_bound` runs `execute` on the substituted
+                        // SQL, so the profiled runner parses the same text and
+                        // returns the same result — plus the profile.
+                        let mut profiled = conn.execute_profiled(bound.sql())?;
+                        profiled
+                            .pop()
+                            .map(|(result, profile)| (result, Some(profile)))
+                            .ok_or_else(|| {
+                                pinkdb::PinkDbError::Execution(
+                                    "internal error: bound statement produced no result"
+                                        .to_string(),
+                                )
+                            })
+                    } else {
+                        conn.execute_bound(&bound).map(|result| (result, None))
+                    }
                 }));
                 match outcome {
-                    Ok(Ok(result)) => {
+                    Ok(Ok((result, profile))) => {
                         // A bound statement is exactly one statement: one
                         // result group, then the batch terminator.
                         if let Err(e) = send_result(reader.get_mut(), &result) {
                             if !matches!(e, ProtocolError::Io(_)) {
                                 let _ = send_error(reader.get_mut(), &e.to_string());
                             }
+                            return;
+                        }
+                        // v10: the statement's profile follows its Done.
+                        if let Some(profile) = profile
+                            && protocol::write_response(reader.get_mut(), &profile_frame(&profile))
+                                .is_err()
+                        {
                             return;
                         }
                         if protocol::write_response(
@@ -1468,6 +1529,30 @@ pub(crate) fn send_result<S: FrameSink + ?Sized>(
         QueryResult::Granted { description } => done(w, DoneKind::Granted, 0, description),
         QueryResult::Revoked { description } => done(w, DoneKind::Revoked, 0, description),
     }
+}
+
+/// Convert one engine [`QueryProfile`] into its v10 `Profile` response frame.
+/// Shared by both transports, so the wire bytes cannot drift.
+pub(crate) fn profile_frame(profile: &QueryProfile) -> Response {
+    Response::Profile {
+        parse: duration_nanos(profile.parse),
+        bind: duration_nanos(profile.bind),
+        optimize: duration_nanos(profile.optimize),
+        execute: duration_nanos(profile.execute),
+        log: duration_nanos(profile.log),
+        total: duration_nanos(profile.total),
+        rows: profile.rows,
+        columns: profile.columns,
+        kind: profile.kind.clone(),
+        in_transaction: profile.in_transaction,
+        engine_version: profile.engine_version.to_string(),
+    }
+}
+
+/// A `Duration` on the wire is `u64` nanoseconds, saturating at `u64::MAX`
+/// (a duration beyond ~584 years cannot be represented).
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The refusal every statement request gets on a connection that has not

@@ -9,6 +9,18 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Wave 84 — query execution profiles ✅
+- `execute_profiled` (embedded `PinkDb` and `Connection`) returns each
+  statement's timings — parse, bind, optimize, execute, WAL log, total —
+  with its rows, columns, kind and transaction state. Results and WAL bytes
+  are unchanged, and plain `execute` costs exactly what it did.
+- Server protocol **v10**: a client can turn profiling on per connection and
+  receives one profile after each statement (`Client::set_profiling`,
+  `Client::execute_profiled`). v9 clients are refused at the handshake.
+- The CLI's `.timer on` line now shows the phase breakdown, locally and
+  against a server.
+- C API: `pinkdb_set_profiling` and `pinkdb_result_profile_*` accessors.
+
 ### Wave 83 — procedures can COMMIT, catch errors, and `DO` blocks ✅
 - A procedure called **outside** a transaction can now `COMMIT` and
   `ROLLBACK` in its body (Postgres-style): long batch jobs keep the progress

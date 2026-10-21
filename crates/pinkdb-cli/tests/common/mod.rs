@@ -31,6 +31,40 @@ pub fn run_merged(mut command: Command, stdin: &str) -> (String, ExitStatus) {
     (out, status)
 }
 
+/// Whether `line` is exactly a `.timer on` line with the phase breakdown:
+/// `^Run Time \(s\): real [0-9]+\.[0-9]{3} \(parse [0-9.]+, bind [0-9.]+,
+/// optimize [0-9.]+, execute [0-9.]+, log [0-9.]+ ms\)$`.
+pub fn is_timer_line(line: &str) -> bool {
+    fn digits(s: &str) -> bool {
+        s.chars().all(|c| c.is_ascii_digit())
+    }
+    fn digits_and_dots(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit() || c == '.')
+    }
+    let Some(rest) = line.strip_prefix("Run Time (s): real ") else {
+        return false;
+    };
+    let Some((real, rest)) = rest.split_once(" (parse ") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(" ms)") else {
+        return false;
+    };
+    let Some((int, frac)) = real.split_once('.') else {
+        return false;
+    };
+    if int.is_empty() || !digits(int) || frac.len() != 3 || !digits(frac) {
+        return false;
+    }
+    let phases: Vec<&str> = rest.split(", ").collect();
+    phases.len() == 5
+        && digits_and_dots(phases[0])
+        && ["bind ", "optimize ", "execute ", "log "]
+            .iter()
+            .zip(&phases[1..])
+            .all(|(label, phase)| phase.strip_prefix(label).is_some_and(digits_and_dots))
+}
+
 /// A clean script exit: 0 (no errors) or 1 (a statement or command failed);
 /// never a signal or a panic exit code.
 pub fn assert_script_exit(status: ExitStatus) {

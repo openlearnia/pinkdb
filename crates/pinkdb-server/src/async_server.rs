@@ -528,6 +528,8 @@ async fn serve_connection(
     // connection; [`MAX_PREPARED`] bounds the metadata a client can pin.
     let mut prepared: HashMap<u64, PreparedStatement> = HashMap::new();
     let mut next_handle: u64 = 1;
+    // v10 (wave 84): per-connection profiling, off until `SetProfiling`.
+    let mut profiling = false;
 
     loop {
         let request = match read_request(&mut stream, idle_timeout).await {
@@ -620,6 +622,20 @@ async fn serve_connection(
                     Ran { conn: None, .. } => return,
                 }
             }
+            // v10 (wave 84): toggle this connection's profiling flag.
+            Request::SetProfiling { enabled } => {
+                profiling = enabled;
+                if send_response(
+                    &mut stream,
+                    &Response::ProfilingSet { enabled },
+                    idle_timeout,
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+            }
             Request::Execute { sql } => {
                 if auth_required(&db, &conn) {
                     if send_error(&mut stream, AUTH_REQUIRED, idle_timeout)
@@ -633,13 +649,27 @@ async fn serve_connection(
                 let ran = run_blocking(&mut stream, conn, idle_timeout, move |conn, sink| {
                     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         server::run_statement_hook(&sql);
-                        conn.execute(&sql)
+                        if profiling {
+                            conn.execute_profiled(&sql).map(|profiled| {
+                                profiled
+                                    .into_iter()
+                                    .map(|(result, profile)| (result, Some(profile)))
+                                    .collect::<Vec<_>>()
+                            })
+                        } else {
+                            conn.execute(&sql).map(|results| {
+                                results
+                                    .into_iter()
+                                    .map(|result| (result, None))
+                                    .collect::<Vec<_>>()
+                            })
+                        }
                     }));
                     let mut close = false;
                     match outcome {
                         Ok(Ok(results)) => match u32::try_from(results.len()) {
                             Ok(statements) => {
-                                for result in &results {
+                                for (result, profile) in &results {
                                     if let Err(e) = server::send_result(sink, result) {
                                         // A streaming failure (e.g. a single
                                         // value larger than the frame cap) is
@@ -648,6 +678,14 @@ async fn serve_connection(
                                         if !matches!(e, ProtocolError::Io(_)) {
                                             let _ = server::send_error(sink, &e.to_string());
                                         }
+                                        close = true;
+                                        break;
+                                    }
+                                    // v10: one Profile per statement, after its
+                                    // Done and before the next result group.
+                                    if let Some(profile) = profile
+                                        && sink.send_frame(&server::profile_frame(profile)).is_err()
+                                    {
                                         close = true;
                                         break;
                                     }
@@ -843,17 +881,38 @@ async fn serve_connection(
                     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                         let bound = conn.bind(&stmt, &values)?;
                         server::run_statement_hook(bound.sql());
-                        conn.execute_bound(&bound)
+                        if profiling {
+                            // `execute_bound` runs `execute` on the
+                            // substituted SQL, so the profiled runner parses
+                            // the same text and returns the same result — plus
+                            // the profile.
+                            let mut profiled = conn.execute_profiled(bound.sql())?;
+                            profiled
+                                .pop()
+                                .map(|(result, profile)| (result, Some(profile)))
+                                .ok_or_else(|| {
+                                    pinkdb::PinkDbError::Execution(
+                                        "internal error: bound statement produced no result"
+                                            .to_string(),
+                                    )
+                                })
+                        } else {
+                            conn.execute_bound(&bound).map(|result| (result, None))
+                        }
                     }));
                     let mut close = false;
                     match outcome {
-                        Ok(Ok(result)) => {
+                        Ok(Ok((result, profile))) => {
                             // A bound statement is exactly one statement: one
                             // result group, then the batch terminator.
                             if let Err(e) = server::send_result(sink, &result) {
                                 if !matches!(e, ProtocolError::Io(_)) {
                                     let _ = server::send_error(sink, &e.to_string());
                                 }
+                                close = true;
+                            } else if let Some(profile) = profile
+                                && sink.send_frame(&server::profile_frame(&profile)).is_err()
+                            {
                                 close = true;
                             } else if sink
                                 .send_frame(&Response::BatchDone { statements: 1 })

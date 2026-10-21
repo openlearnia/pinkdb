@@ -11,6 +11,20 @@ use std::process::{Command, Stdio};
 use pinkdb::Database;
 use pinkdb_server::Server;
 
+/// Run one CLI script against a fresh in-process server and return the
+/// merged output.
+fn run_remote(script: &str) -> String {
+    let server = Server::bind("127.0.0.1:0", Database::new()).expect("bind");
+    let addr = server.local_addr().to_string();
+    let handle = server.spawn().expect("spawn");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
+    command.args(["--host", &addr]);
+    let (text, status) = common::run_merged(command, script);
+    common::assert_script_exit(status);
+    handle.join();
+    text
+}
+
 #[test]
 fn remote_repl_round_trip() {
     let server = Server::bind("127.0.0.1:0", Database::new()).expect("bind");
@@ -131,4 +145,44 @@ fn remote_and_local_rendering_are_identical() {
     assert!(local.contains("│ b"), "{local}");
     assert!(local.contains("Error:"), "{local}");
     handle.join();
+}
+
+/// Wave 84: `.timer on` enables profiling on the connection and every SQL
+/// string prints the server's summed phase breakdown; `.timer off` disables
+/// it, produces no timer line, and the results stay byte-identical.
+#[test]
+fn remote_timer_reports_the_servers_profile() {
+    let statements = "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2);\n\
+                      SELECT a FROM t ORDER BY a;\n\
+                      SELECT SUM(a) FROM t;\n";
+    let timed_script = format!(".timer on\n{statements}.timer off\nSELECT 7 AS answer;\n");
+    let text = run_remote(&timed_script);
+
+    let timer_lines: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("Run Time (s):"))
+        .collect();
+    // Three SQL strings ran while the timer was on; the statement after
+    // `.timer off` produced no line.
+    assert_eq!(
+        timer_lines.len(),
+        3,
+        "expected one timer line per SQL string:\n{text}"
+    );
+    for line in &timer_lines {
+        assert!(
+            common::is_timer_line(line),
+            "remote timer line does not have the server's breakdown: {line:?}\n{text}"
+        );
+    }
+    assert!(text.contains("│ 7"), "{text}");
+
+    // Removing only the timer lines reproduces the untimed remote run.
+    let plain = run_remote(&format!("{statements}SELECT 7 AS answer;\n"));
+    let stripped: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.starts_with("Run Time (s):"))
+        .collect();
+    let plain_lines: Vec<&str> = plain.lines().collect();
+    assert_eq!(stripped, plain_lines, "timer changed the remote results");
 }

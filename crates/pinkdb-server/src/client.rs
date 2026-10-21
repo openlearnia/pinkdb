@@ -20,8 +20,9 @@
 
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 
-use pinkdb::{DataType, QueryResult, Value};
+use pinkdb::{DataType, QueryProfile, QueryResult, Value};
 
 use crate::protocol::{self, DoneKind, PROTOCOL_VERSION, ProtocolError, Request, Response};
 
@@ -286,6 +287,36 @@ impl Client {
         self.finish(result)
     }
 
+    /// v10 (wave 84): enable or disable per-connection statement profiling on
+    /// the server. Off by default; the setting is answered by the server's
+    /// resulting flag and lives until changed (or the connection ends).
+    /// [`Client::execute_profiled`] returns a profile per statement while it
+    /// is on.
+    pub fn set_profiling(&mut self, enabled: bool) -> Result<()> {
+        self.check_usable()?;
+        let result = (|| {
+            protocol::write_request(self.reader.get_mut(), &Request::SetProfiling { enabled })?;
+            match protocol::read_response(&mut self.reader)? {
+                Response::ProfilingSet { enabled: replied } => {
+                    if replied != enabled {
+                        return Err(ProtocolError::Unexpected(format!(
+                            "server set profiling to {replied}, asked for {enabled}"
+                        ))
+                        .into());
+                    }
+                    Ok(())
+                }
+                Response::Error { message } => Err(ProtocolError::Server(message).into()),
+                other => Err(ProtocolError::Unexpected(format!(
+                    "expected ProfilingSet, got {}",
+                    other.kind()
+                ))
+                .into()),
+            }
+        })();
+        self.finish(result)
+    }
+
     /// Run every statement in `sql` on the server, returning one result each.
     ///
     /// The server sends one result group per statement and then a
@@ -295,9 +326,29 @@ impl Client {
     /// [`ClientError::Protocol`] `Server` error — matching the embedded
     /// engine's all-or-nothing `execute` (earlier statements' results are
     /// never sent).
+    ///
+    /// When profiling was enabled with [`Client::set_profiling`], the server
+    /// also sends one `Profile` frame per statement; this method consumes and
+    /// discards them, so both modes return the same results.
     pub fn execute(&mut self, sql: &str) -> Result<Vec<QueryResult>> {
         self.check_usable()?;
         let result = self.execute_inner(sql);
+        self.finish(result)
+    }
+
+    /// v10 (wave 84): like [`Client::execute`], but also returns the profile
+    /// of each statement — the remote form of
+    /// `pinkdb::Connection::execute_profiled`.
+    ///
+    /// The profile is `Some` when profiling is enabled on this connection
+    /// (see [`Client::set_profiling`]) and `None` when it is off. Results and
+    /// errors are exactly those of [`Client::execute`].
+    pub fn execute_profiled(
+        &mut self,
+        sql: &str,
+    ) -> Result<Vec<(QueryResult, Option<QueryProfile>)>> {
+        self.check_usable()?;
+        let result = self.execute_profiled_inner(sql);
         self.finish(result)
     }
 
@@ -308,7 +359,21 @@ impl Client {
                 sql: sql.to_string(),
             },
         )?;
-        self.read_batch()
+        self.read_batch().map(|(results, _)| results)
+    }
+
+    fn execute_profiled_inner(
+        &mut self,
+        sql: &str,
+    ) -> Result<Vec<(QueryResult, Option<QueryProfile>)>> {
+        protocol::write_request(
+            self.reader.get_mut(),
+            &Request::Execute {
+                sql: sql.to_string(),
+            },
+        )?;
+        let (results, profiles) = self.read_batch()?;
+        Ok(results.into_iter().zip(profiles).collect())
     }
 
     /// v5: parse one statement with `?` placeholders into a connection-local
@@ -359,13 +424,16 @@ impl Client {
                 values: values.to_vec(),
             },
         )?;
-        self.read_batch()
+        self.read_batch().map(|(results, _)| results)
     }
 
     /// Read result groups until the `BatchDone` terminator; shared by
-    /// `Execute` and `ExecutePrepared`.
-    fn read_batch(&mut self) -> Result<Vec<QueryResult>> {
-        let mut results = Vec::new();
+    /// `Execute` and `ExecutePrepared`. Returns the results plus one profile
+    /// slot per statement (`None` when profiling is off, or when this client
+    /// sent a plain execution while the server had profiling enabled).
+    fn read_batch(&mut self) -> Result<(Vec<QueryResult>, Vec<Option<QueryProfile>>)> {
+        let mut results: Vec<QueryResult> = Vec::new();
+        let mut profiles: Vec<Option<QueryProfile>> = Vec::new();
         let mut current: PendingResult = None;
         loop {
             match protocol::read_response(&mut self.reader)? {
@@ -416,6 +484,53 @@ impl Client {
                 }
                 Response::Done { kind, count, name } => {
                     results.push(build_result(kind, count, name, current.take())?);
+                    profiles.push(None);
+                }
+                // v10: the profile of the statement whose `Done` just
+                // arrived. It must not precede any Done, and one statement
+                // gets at most one profile.
+                Response::Profile {
+                    parse,
+                    bind,
+                    optimize,
+                    execute,
+                    log,
+                    total,
+                    rows,
+                    columns,
+                    kind,
+                    in_transaction,
+                    engine_version,
+                } => {
+                    if current.is_some() {
+                        return Err(ProtocolError::Malformed(
+                            "Profile frame before the pending result set's Done".to_string(),
+                        )
+                        .into());
+                    }
+                    match profiles.last_mut() {
+                        Some(slot) if slot.is_none() => {
+                            *slot = Some(QueryProfile {
+                                parse: Duration::from_nanos(parse),
+                                bind: Duration::from_nanos(bind),
+                                optimize: Duration::from_nanos(optimize),
+                                execute: Duration::from_nanos(execute),
+                                log: Duration::from_nanos(log),
+                                total: Duration::from_nanos(total),
+                                rows,
+                                columns,
+                                kind,
+                                in_transaction,
+                                engine_version: engine_version_static(engine_version),
+                            });
+                        }
+                        _ => {
+                            return Err(ProtocolError::Malformed(
+                                "Profile frame without a preceding Done".to_string(),
+                            )
+                            .into());
+                        }
+                    }
                 }
                 Response::BatchDone { statements } => {
                     if current.is_some() {
@@ -431,7 +546,7 @@ impl Client {
                         ))
                         .into());
                     }
-                    return Ok(results);
+                    return Ok((results, profiles));
                 }
                 Response::Error { message } => {
                     return Err(ProtocolError::Server(message).into());
@@ -491,6 +606,28 @@ fn configure_client_socket(stream: &TcpStream) {
         if let Err(e) = stream.set_write_timeout(timeout) {
             eprintln!("pinkdb: cannot set the client write timeout: {e}");
         }
+    }
+}
+
+/// Map the wire `engine_version` onto the `&'static str` that
+/// [`pinkdb::QueryProfile`] requires.
+///
+/// The wire value is an owned string, so it cannot become `&'static str`
+/// directly. The only engine version this build can vouch for is its own
+/// compile-time package version — in this workspace `pinkdb` and
+/// `pinkdb-server` are released in lockstep, and the engine does not
+/// re-export a version constant, so `CARGO_PKG_VERSION` here is also the
+/// version the embedded `pinkdb` reports. A match returns that static `env!`
+/// string with no allocation and no leak. Any other value (a remote server
+/// built from a different release) maps to the fixed `"remote"` placeholder:
+/// `Box::leak`ing every unrecognized wire string would grow the process for
+/// each decoded `Profile` frame a peer sends.
+fn engine_version_static(version: String) -> &'static str {
+    const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+    if version == ENGINE_VERSION {
+        ENGINE_VERSION
+    } else {
+        "remote"
     }
 }
 

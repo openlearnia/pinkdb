@@ -171,6 +171,21 @@ LIMIT n [OFFSET m] | OFFSET m;
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
 ```
 
+### Query profiles
+
+`PinkDb::execute_profiled` and `Connection::execute_profiled` (wave 84) run
+SQL exactly like `execute` and also return one `QueryProfile` per statement:
+`parse` (shared by the statements of one call), `bind` (which also builds
+the plan), `optimize`, `execute` (including lease waits and conflict
+retries), `log` (WAL append + auto-checkpoint), `total`, plus `rows`,
+`columns`, the result `kind`, `in_transaction` and `engine_version`.
+Profiling only reads clocks: results and WAL bytes are identical, and plain
+`execute` is unchanged (measured equal before/after; profiling itself costs
+~2% on tiny statements). The `Connection` path has no optimizer step, so its
+`optimize` is always 0. Remote clients enable it per connection
+(`Client::set_profiling`, protocol v10); C callers use
+`pinkdb_set_profiling` and the `pinkdb_result_profile_*` accessors.
+
 ### Stored procedures
 
 ```sql
@@ -362,7 +377,10 @@ database). `CREATE`/`DROP DATABASE` are refused inside a transaction.
 
 Scripting follows sqlite3/duckdb conventions: errors go to **stderr**; when
 stdin is not a terminal (or with `-c COMMAND`, repeatable) there is no banner
-and no per-statement timing (`.timer on` turns it back on), and the process
+and no per-statement timing (`.timer on` turns it back on; the line reads
+`Run Time (s): real 0.012 (parse 0.010, bind 0.020, optimize 0.005, execute
+11.900, log 0.090 ms)`, from the local engine or, remote, from the server's
+profiles), and the process
 **exits 1** if any statement or dot-command failed. A statement still open at
 end of input runs as if terminated, and `;` is recognized outside strings and
 comments (`SELECT 1; -- note` completes; `SELECT ';'` does not).
@@ -1668,10 +1686,12 @@ NULL/BOOL/I32/I64/F64/VARCHAR/DATE/TIMESTAMP; `DataType` tag byte), then
 { user }` answers `Login`; so neither side parses SQL just to count
 statements. A failing statement ends the batch with a single
 `Error { message }` instead; SQL errors arrive as `Error` frames and the
-connection stays open. The protocol version is **9** (v2 added the
+connection stays open. The protocol version is **10** (v2 added the
 `BatchDone` terminator, v3 `LoadedExtension`, v4 `Checkpointed`, v5
 prepared statements, v6 DECIMAL/INTERVAL, v7 `AlteredTable`, v8 `Called`,
-v9 the `Login`/`LoggedIn` frames and the RBAC `Done` kinds).
+v9 the `Login`/`LoggedIn` frames and the RBAC `Done` kinds, v10 query
+profiles: `SetProfiling { enabled }` → `ProfilingSet`, after which every
+statement's `Done` is followed by one `Profile` frame).
 
 The client (`pinkdb_server::Client`) reconstructs pinkdb's public
 `QueryResult`/`Value`/`DataType`, so the CLI renders remote results with the

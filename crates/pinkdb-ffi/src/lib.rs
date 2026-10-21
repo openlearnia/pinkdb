@@ -20,6 +20,13 @@
 //! - the SQL statement `LOAD EXTENSION '<path>'` loads and runs native code
 //!   and is **disabled by default**: `pinkdb_execute` can only load native
 //!   code after `pinkdb_set_allow_sql_load_extension` has enabled it.
+//! - query profiling is opt-in per handle ([`pinkdb_set_profiling`], off by
+//!   default). While it is on, the result of `pinkdb_execute` /
+//!   `pinkdb_execute_prepared` carries one profile per statement, read with
+//!   the `pinkdb_result_profile_*` accessors (same statement index as the
+//!   other result accessors). When it is off those accessors report "no
+//!   profile": 0 for numeric fields and NULL for the kind string; call
+//!   [`pinkdb_result_profile_available`] to tell that apart from a real zero.
 
 // Raw-pointer arguments are NULL-checked before every dereference and the
 // pointer-taking signatures are dictated by the C ABI, so the lint that wants
@@ -31,7 +38,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
-use pinkdb::{DataType, PinkDb, QueryResult, Value};
+use pinkdb::{DataType, PinkDb, QueryProfile, QueryResult, Value};
 
 /// ABI version reported by [`pinkdb_abi_version`].
 pub const PINKDB_ABI_VERSION: u32 = 1;
@@ -328,10 +335,44 @@ enum StmtData {
     },
 }
 
+/// One profile, marshaled once at execution time. Durations are nanoseconds
+/// and `kind` is NUL-terminated so the accessor can hand out a stable pointer.
+struct ProfileData {
+    parse: u64,
+    bind: u64,
+    optimize: u64,
+    execute: u64,
+    log: u64,
+    total: u64,
+    rows: u64,
+    columns: u32,
+    kind: Vec<u8>,
+}
+
+impl ProfileData {
+    fn from_profile(p: &QueryProfile) -> ProfileData {
+        let nanos = |d: std::time::Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        ProfileData {
+            parse: nanos(p.parse),
+            bind: nanos(p.bind),
+            optimize: nanos(p.optimize),
+            execute: nanos(p.execute),
+            log: nanos(p.log),
+            total: nanos(p.total),
+            rows: p.rows,
+            columns: p.columns,
+            kind: nul_terminated(&p.kind),
+        }
+    }
+}
+
 /// Owns one `pinkdb_execute` outcome. Every pointer handed out by the
 /// `pinkdb_result_*` accessors borrows from here.
 pub struct PinkResult {
     stmts: Vec<StmtData>,
+    /// One per statement, in the same order, when profiling was enabled for
+    /// the execution that produced this result; empty otherwise.
+    profiles: Vec<ProfileData>,
 }
 
 fn kind_of(r: &QueryResult) -> i32 {
@@ -447,7 +488,20 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
             }
         })
         .collect();
-    PinkResult { stmts }
+    PinkResult {
+        stmts,
+        profiles: Vec::new(),
+    }
+}
+
+/// Build a result that also owns one profile per statement. The engine
+/// returns pairs in statement order, so the arrays line up with the
+/// statement-index accessors.
+fn build_profiled_result(pairs: Vec<(QueryResult, QueryProfile)>) -> PinkResult {
+    let (results, profiles): (Vec<QueryResult>, Vec<QueryProfile>) = pairs.into_iter().unzip();
+    let mut result = build_result(results);
+    result.profiles = profiles.iter().map(ProfileData::from_profile).collect();
+    result
 }
 
 // ----- handles -----
@@ -455,6 +509,8 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
 /// Opaque database handle. Not thread-safe: use one handle per thread.
 pub struct PinkHandle {
     db: PinkDb,
+    /// Per-handle session setting (`pinkdb_set_profiling`), off by default.
+    profiling: bool,
 }
 
 fn c_path(path: *const c_char) -> Option<String> {
@@ -482,7 +538,10 @@ pub extern "C" fn pinkdb_open(path: *const c_char) -> *mut PinkHandle {
     };
     clear_error();
     match catch_unwind(AssertUnwindSafe(|| PinkDb::open_durable(&path))) {
-        Ok(Ok(db)) => Box::into_raw(Box::new(PinkHandle { db })),
+        Ok(Ok(db)) => Box::into_raw(Box::new(PinkHandle {
+            db,
+            profiling: false,
+        })),
         Ok(Err(e)) => {
             set_error(&e.to_string());
             ptr::null_mut()
@@ -500,7 +559,10 @@ pub extern "C" fn pinkdb_open_memory() -> *mut PinkHandle {
     clear_error();
     // A panic must never unwind across the extern "C" boundary.
     match catch_unwind(AssertUnwindSafe(|| {
-        Box::new(PinkHandle { db: PinkDb::new() })
+        Box::new(PinkHandle {
+            db: PinkDb::new(),
+            profiling: false,
+        })
     })) {
         Ok(handle) => Box::into_raw(handle),
         Err(_) => {
@@ -521,8 +583,24 @@ pub extern "C" fn pinkdb_close(handle: *mut PinkHandle) {
     drop(unsafe { Box::from_raw(handle) });
 }
 
+/// Box a result, refusing to unwind across the C ABI. The closure runs inside
+/// `catch_unwind` so a panic while marshaling (`build_result`) is contained too.
+fn into_boxed_result(build: impl FnOnce() -> PinkResult) -> *mut PinkResult {
+    match catch_unwind(AssertUnwindSafe(build)) {
+        Ok(result) => Box::into_raw(Box::new(result)),
+        Err(_) => {
+            set_error("internal error: building the result panicked");
+            ptr::null_mut()
+        }
+    }
+}
+
 /// Execute one or more SQL statements (UTF-8, `(ptr, len)`, embedded NULs
 /// allowed). Returns NULL on error; free with [`pinkdb_result_free`].
+///
+/// With profiling enabled on the handle (see [`pinkdb_set_profiling`]) the
+/// result also carries one profile per statement; otherwise this calls the
+/// plain `PinkDb::execute` path (no clocks, no profile allocation).
 #[unsafe(no_mangle)]
 pub extern "C" fn pinkdb_execute(
     handle: *mut PinkHandle,
@@ -541,24 +619,52 @@ pub extern "C" fn pinkdb_execute(
     // SAFETY: non-null (checked) and uniquely owned per the single-handle
     // contract; no other reference exists during the call.
     let h = unsafe { &mut *handle };
-    match catch_unwind(AssertUnwindSafe(|| h.db.execute(text))) {
-        Ok(Ok(results)) => match catch_unwind(AssertUnwindSafe(|| Box::new(build_result(results))))
-        {
-            Ok(result) => Box::into_raw(result),
-            Err(_) => {
-                set_error("internal error: building the result panicked");
+    if h.profiling {
+        match catch_unwind(AssertUnwindSafe(|| h.db.execute_profiled(text))) {
+            Ok(Ok(pairs)) => into_boxed_result(|| build_profiled_result(pairs)),
+            Ok(Err(e)) => {
+                set_error(&e.to_string());
                 ptr::null_mut()
             }
-        },
-        Ok(Err(e)) => {
-            set_error(&e.to_string());
-            ptr::null_mut()
+            Err(_) => {
+                set_error("internal error: statement panicked");
+                ptr::null_mut()
+            }
         }
-        Err(_) => {
-            set_error("internal error: statement panicked");
-            ptr::null_mut()
+    } else {
+        match catch_unwind(AssertUnwindSafe(|| h.db.execute(text))) {
+            Ok(Ok(results)) => into_boxed_result(|| build_result(results)),
+            Ok(Err(e)) => {
+                set_error(&e.to_string());
+                ptr::null_mut()
+            }
+            Err(_) => {
+                set_error("internal error: statement panicked");
+                ptr::null_mut()
+            }
         }
     }
+}
+
+/// Enable (non-zero) or disable (zero) query profiling on this handle. Off by
+/// default; the setting is per handle (per session) and applies to later
+/// `pinkdb_execute` / `pinkdb_execute_prepared` calls. Returns 1 on success, 0
+/// on failure (a NULL handle — see `pinkdb_last_error`).
+///
+/// Profiling only reads clocks: it never changes a result or a WAL byte, and
+/// when it is off both execute functions take the plain engine path.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_set_profiling(handle: *mut PinkHandle, enabled: i32) -> i32 {
+    if handle.is_null() {
+        set_error("null handle");
+        return 0;
+    }
+    clear_error();
+    // SAFETY: non-null (checked) and uniquely owned per the single-handle
+    // contract; no other reference exists during the call.
+    let h = unsafe { &mut *handle };
+    h.profiling = enabled != 0;
+    1
 }
 
 /// Allow (non-zero) or refuse (zero) the SQL `LOAD EXTENSION` statement on
@@ -754,25 +860,36 @@ pub extern "C" fn pinkdb_execute_prepared(
     // single-handle contract.
     let h = unsafe { &mut *handle };
     let stmt = unsafe { &*prepared };
-    match catch_unwind(AssertUnwindSafe(|| {
-        h.db.execute_prepared(&stmt.stmt, &bound)
-    })) {
-        Ok(Ok(result)) => {
-            match catch_unwind(AssertUnwindSafe(|| Box::new(build_result(vec![result])))) {
-                Ok(result) => Box::into_raw(result),
-                Err(_) => {
-                    set_error("internal error: building the result panicked");
-                    ptr::null_mut()
-                }
+    if h.profiling {
+        // The engine's profiled runner takes SQL, so bind first (the same bind
+        // `execute_prepared` does) and then run the substituted statement.
+        match catch_unwind(AssertUnwindSafe(|| {
+            let bound_stmt = stmt.stmt.bind(&h.db, h.db.current_db(), &bound)?;
+            h.db.execute_profiled(bound_stmt.sql())
+        })) {
+            Ok(Ok(pairs)) => into_boxed_result(|| build_profiled_result(pairs)),
+            Ok(Err(e)) => {
+                set_error(&e.to_string());
+                ptr::null_mut()
+            }
+            Err(_) => {
+                set_error("internal error: statement panicked");
+                ptr::null_mut()
             }
         }
-        Ok(Err(e)) => {
-            set_error(&e.to_string());
-            ptr::null_mut()
-        }
-        Err(_) => {
-            set_error("internal error: statement panicked");
-            ptr::null_mut()
+    } else {
+        match catch_unwind(AssertUnwindSafe(|| {
+            h.db.execute_prepared(&stmt.stmt, &bound)
+        })) {
+            Ok(Ok(result)) => into_boxed_result(|| build_result(vec![result])),
+            Ok(Err(e)) => {
+                set_error(&e.to_string());
+                ptr::null_mut()
+            }
+            Err(_) => {
+                set_error("internal error: statement panicked");
+                ptr::null_mut()
+            }
         }
     }
 }
@@ -951,6 +1068,124 @@ pub extern "C" fn pinkdb_result_name(result: *const PinkResult, statement: usize
     match stmt_at(result, statement) {
         Some(StmtData::Simple { name: Some(n), .. }) => n.as_ptr() as *const c_char,
         _ => ptr::null(),
+    }
+}
+
+// ----- per-statement query profiles (wave 84) -----
+
+fn profile_at<'a>(result: *const PinkResult, statement: usize) -> Option<&'a ProfileData> {
+    if result.is_null() {
+        return None;
+    }
+    // SAFETY: non-null, owned by the caller, read-only access.
+    let r = unsafe { &*result };
+    r.profiles.get(statement)
+}
+
+/// 1 when the result carries a profile for `statement`, else 0 (profiling was
+/// off for that execution, no profile exists, the result is NULL, or the
+/// statement index is out of range). This is the status the numeric profile
+/// accessors cannot express: they return 0 both for "no profile" and for a
+/// real zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_available(
+    result: *const PinkResult,
+    statement: usize,
+) -> i32 {
+    i32::from(profile_at(result, statement).is_some())
+}
+
+/// Profile: parsing time in nanoseconds. 0 when
+/// [`pinkdb_result_profile_available`] returns 0, or when a NULL result /
+/// out-of-range index is passed.
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_parse_ns(
+    result: *const PinkResult,
+    statement: usize,
+) -> u64 {
+    profile_at(result, statement).map_or(0, |p| p.parse)
+}
+
+/// Profile: binding/planning time in nanoseconds (see
+/// [`pinkdb_result_profile_parse_ns`] for the 0 conventions).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_bind_ns(
+    result: *const PinkResult,
+    statement: usize,
+) -> u64 {
+    profile_at(result, statement).map_or(0, |p| p.bind)
+}
+
+/// Profile: optimizer time in nanoseconds (see
+/// [`pinkdb_result_profile_parse_ns`] for the 0 conventions).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_optimize_ns(
+    result: *const PinkResult,
+    statement: usize,
+) -> u64 {
+    profile_at(result, statement).map_or(0, |p| p.optimize)
+}
+
+/// Profile: execution time in nanoseconds (see
+/// [`pinkdb_result_profile_parse_ns`] for the 0 conventions).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_execute_ns(
+    result: *const PinkResult,
+    statement: usize,
+) -> u64 {
+    profile_at(result, statement).map_or(0, |p| p.execute)
+}
+
+/// Profile: WAL logging/checkpoint time in nanoseconds (zero for reads and
+/// in-memory stores; see [`pinkdb_result_profile_parse_ns`] for the 0
+/// conventions).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_log_ns(result: *const PinkResult, statement: usize) -> u64 {
+    profile_at(result, statement).map_or(0, |p| p.log)
+}
+
+/// Profile: total wall time in nanoseconds (see
+/// [`pinkdb_result_profile_parse_ns`] for the 0 conventions).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_total_ns(
+    result: *const PinkResult,
+    statement: usize,
+) -> u64 {
+    profile_at(result, statement).map_or(0, |p| p.total)
+}
+
+/// Profile: result rows (or the affected count for INSERT/UPDATE/DELETE), 0
+/// when there is no profile or the statement produces no rows (see
+/// [`pinkdb_result_profile_parse_ns`] for the 0 conventions).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_rows(result: *const PinkResult, statement: usize) -> u64 {
+    profile_at(result, statement).map_or(0, |p| p.rows)
+}
+
+/// Profile: result columns (SELECT only), 0 when there is no profile or the
+/// statement produces no result set (see
+/// [`pinkdb_result_profile_parse_ns`] for the 0 conventions).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_columns(
+    result: *const PinkResult,
+    statement: usize,
+) -> u32 {
+    profile_at(result, statement).map_or(0, |p| p.columns)
+}
+
+/// Profile: statement kind as a NUL-terminated string (`"Selected"`,
+/// `"Inserted"`, …), owned by the result and valid until it is freed; NULL
+/// when there is no profile (profiling off, NULL result, or out-of-range
+/// statement index).
+#[unsafe(no_mangle)]
+pub extern "C" fn pinkdb_result_profile_kind(
+    result: *const PinkResult,
+    statement: usize,
+) -> *const c_char {
+    match profile_at(result, statement) {
+        // SAFETY: the Vec bytes are heap-stable and NUL-terminated.
+        Some(p) => p.kind.as_ptr() as *const c_char,
+        None => ptr::null(),
     }
 }
 

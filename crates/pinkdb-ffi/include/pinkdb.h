@@ -10,11 +10,11 @@
  *   `pinkdb_*_free` function (`pinkdb_result_free`, `pinkdb_prepared_free`
  *   and `pinkdb_close`). Never free the same pointer twice.
  * - Text pointers (`pinkdb_result_column_name`, `pinkdb_result_name`,
- *   `pink_value.text_ptr`, `pinkdb_last_error`) borrow from their owning
- *   result/handle/thread and stay valid only until that owner is freed or the
- *   next FFI call on the same thread. Copy them if you need them longer.
- *   `text_ptr` is followed by a NUL byte but may contain embedded NULs —
- *   always trust `text_len`.
+ *   `pinkdb_result_profile_kind`, `pink_value.text_ptr`, `pinkdb_last_error`)
+ *   borrow from their owning result/handle/thread and stay valid only until
+ *   that owner is freed or the next FFI call on the same thread. Copy them if
+ *   you need them longer. `text_ptr` is followed by a NUL byte but may contain
+ *   embedded NULs — always trust `text_len`.
  * - Handles are NOT thread-safe: never call into one handle from two threads
  *   at once (serialize calls, e.g. with a mutex — the Go and Python bindings
  *   do). A durable file may be opened by several handles/processes; writes are
@@ -139,6 +139,18 @@ void pinkdb_close(pinkdb_handle *handle);
 pinkdb_result *pinkdb_execute(pinkdb_handle *handle, const char *sql,
                               size_t sql_len);
 
+/* Enable (non-zero) or disable (zero) query profiling on this handle.
+ * Profiling is OFF by default and is a per-handle (per-session) setting.
+ * Returns 1 on success, 0 on failure (a NULL handle; see pinkdb_last_error).
+ *
+ * While enabled, the result returned by pinkdb_execute /
+ * pinkdb_execute_prepared carries one profile per statement, read with the
+ * pinkdb_result_profile_* accessors using the same statement index as the
+ * other result accessors. Profiling only reads clocks: it never changes
+ * results or WAL bytes, and when it is off both execute functions take the
+ * plain engine path (zero profiling cost). */
+int32_t pinkdb_set_profiling(pinkdb_handle *handle, int32_t enabled);
+
 /* Allow (non-zero) or refuse (zero) the SQL `LOAD EXTENSION` statement on
  * this handle. Returns 1 on success, 0 on failure (a NULL handle; see
  * pinkdb_last_error).
@@ -218,6 +230,64 @@ size_t pinkdb_result_affected(const pinkdb_result *result, size_t statement);
 /* CREATE/DROP VIEW/TABLE/DATABASE, USE and LOAD EXTENSION results: the
  * object/session/extension name (NUL-terminated), else NULL. */
 const char *pinkdb_result_name(const pinkdb_result *result, size_t statement);
+
+/* Query profiles (wave 84; opt-in with pinkdb_set_profiling).
+ *
+ * The profile of a statement exists only when profiling was enabled on the
+ * handle for the execution that produced this result. "No profile" is
+ * reported by pinkdb_result_profile_available returning 0, the numeric
+ * accessors returning 0, and pinkdb_result_profile_kind returning NULL; it is
+ * never an error and never crashes. A NULL result or an out-of-range
+ * statement index is likewise reported as "no profile" (0/NULL), matching
+ * the other index accessors. Call pinkdb_result_profile_available first when
+ * a real zero (for example `log_ns` on a read) must be told apart from the
+ * absence of a profile.
+ *
+ * Durations are nanoseconds (uint64_t); rows and columns are the profile's
+ * own counts (SELECT rows/columns, or the affected count for
+ * INSERT/UPDATE/DELETE). The kind string is NUL-terminated, borrowed from the
+ * result, and valid until pinkdb_result_free (see the lifetime contract at
+ * the top of this header). */
+int32_t pinkdb_result_profile_available(const pinkdb_result *result,
+                                        size_t statement);
+
+/* Parsing time of the SQL text, in nanoseconds. */
+uint64_t pinkdb_result_profile_parse_ns(const pinkdb_result *result,
+                                        size_t statement);
+
+/* Binding/planning time, in nanoseconds. */
+uint64_t pinkdb_result_profile_bind_ns(const pinkdb_result *result,
+                                       size_t statement);
+
+/* Optimizer time, in nanoseconds. */
+uint64_t pinkdb_result_profile_optimize_ns(const pinkdb_result *result,
+                                           size_t statement);
+
+/* Execution time, in nanoseconds. */
+uint64_t pinkdb_result_profile_execute_ns(const pinkdb_result *result,
+                                          size_t statement);
+
+/* WAL logging/checkpoint time, in nanoseconds (0 for reads and in-memory
+ * stores). */
+uint64_t pinkdb_result_profile_log_ns(const pinkdb_result *result,
+                                      size_t statement);
+
+/* Total wall time of the statement, in nanoseconds. */
+uint64_t pinkdb_result_profile_total_ns(const pinkdb_result *result,
+                                        size_t statement);
+
+/* Result rows (SELECT) or affected count (INSERT/UPDATE/DELETE). */
+uint64_t pinkdb_result_profile_rows(const pinkdb_result *result,
+                                    size_t statement);
+
+/* Result columns (SELECT only). */
+uint32_t pinkdb_result_profile_columns(const pinkdb_result *result,
+                                       size_t statement);
+
+/* Statement kind ("Selected", "Inserted", ...), NUL-terminated, owned by the
+ * result; NULL when there is no profile. */
+const char *pinkdb_result_profile_kind(const pinkdb_result *result,
+                                       size_t statement);
 
 /* Last error on the calling thread (NUL-terminated), or NULL when the last
  * call on this thread succeeded. Valid until the next FFI call on this

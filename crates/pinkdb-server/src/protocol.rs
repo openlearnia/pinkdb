@@ -19,7 +19,8 @@
 //! # Messages
 //!
 //! Requests: [`Request::Hello`], [`Request::Execute`], [`Request::Ping`],
-//! [`Request::Prepare`], [`Request::ExecutePrepared`], [`Request::Login`].
+//! [`Request::Prepare`], [`Request::ExecutePrepared`], [`Request::Login`],
+//! [`Request::SetProfiling`].
 //!
 //! Responses: [`Response::HelloOk`], [`Response::Pong`], and, per executed
 //! statement, one result group — [`Response::ResultSet`] followed by zero or
@@ -31,6 +32,16 @@
 //! [`Response::Error`] frame and no `BatchDone` (the same all-or-nothing
 //! contract as `Connection::execute`: earlier statements' results are not
 //! sent because the engine returns them only on success).
+//!
+//! # Profiling (v10)
+//!
+//! [`Request::SetProfiling`] toggles a per-connection session flag (started
+//! disabled) and is answered by [`Response::ProfilingSet`]. While the flag is
+//! on, the server sends one [`Response::Profile`] frame after *each*
+//! statement's [`Response::Done`] and before the next result group (or
+//! [`Response::BatchDone`]); while it is off, no `Profile` frame is sent and
+//! the wire is byte-for-byte the pre-v10 exchange. Profiling never changes a
+//! statement's result.
 //!
 //! [`PROTOCOL_VERSION`] is the wire version; a mismatched `Hello` is rejected
 //! by the server with a clear `Error` frame.
@@ -61,7 +72,11 @@ use pinkdb::{DataType, Value};
 /// [`DoneKind`]s (tags 19–25). A server whose store has users **requires** a
 /// successful login before `Execute`/`Prepare`/`ExecutePrepared`; a store
 /// with no users keeps the pre-v9 trusted behavior.
-pub const PROTOCOL_VERSION: u32 = 9;
+/// v10: [`Request::SetProfiling`] (tag 7) toggles a connection-local
+/// profiling flag, [`Response::ProfilingSet`] (tag 19) confirms it, and while
+/// it is on the server sends one [`Response::Profile`] (tag 20) after each
+/// statement's `Done` with that statement's timings and facts (wave 84).
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Hard maximum frame size (64 MiB).
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
@@ -97,6 +112,8 @@ pub mod msg_type {
     /// `Hello`/`HelloOk` and before the first statement when the server
     /// requires authentication; a connection may log in again to switch user.
     pub const LOGIN: u8 = 6;
+    /// v10: toggle per-connection statement profiling.
+    pub const SET_PROFILING: u8 = 7;
 
     pub const HELLO_OK: u8 = 10;
     pub const PONG: u8 = 11;
@@ -111,6 +128,11 @@ pub mod msg_type {
     /// v9: reply to `Login`; body is the authenticated user's name as the
     /// store spells it (the catalog keys are lowercased).
     pub const LOGGED_IN: u8 = 18;
+    /// v10: reply to `SetProfiling`; body is the resulting flag (0 or 1).
+    pub const PROFILING_SET: u8 = 19;
+    /// v10: one statement's profile, sent after its `Done` while profiling is
+    /// enabled for the connection.
+    pub const PROFILE: u8 = 20;
 }
 
 /// Value tag bytes (one per [`Value`] variant).
@@ -226,6 +248,11 @@ pub enum Request {
     /// (`authentication failed: …`) on failure; the connection stays usable
     /// either way, so a client can retry.
     Login { user: String, password: String },
+    /// v10: enable or disable per-connection statement profiling. The reply is
+    /// [`Response::ProfilingSet`]; the flag lives for this connection and
+    /// starts disabled. While on, every executed statement is followed by one
+    /// [`Response::Profile`] frame.
+    SetProfiling { enabled: bool },
 }
 
 /// Manual `Debug`: a derived one would print the plaintext login password in
@@ -251,6 +278,10 @@ impl std::fmt::Debug for Request {
                 .field("user", user)
                 .field("password", &"<redacted>")
                 .finish(),
+            Request::SetProfiling { enabled } => f
+                .debug_struct("SetProfiling")
+                .field("enabled", enabled)
+                .finish(),
         }
     }
 }
@@ -265,6 +296,7 @@ impl Request {
             Request::Prepare { .. } => msg_type::PREPARE,
             Request::ExecutePrepared { .. } => msg_type::EXECUTE_PREPARED,
             Request::Login { .. } => msg_type::LOGIN,
+            Request::SetProfiling { .. } => msg_type::SET_PROFILING,
         }
     }
 
@@ -277,6 +309,7 @@ impl Request {
             Request::Prepare { .. } => "Prepare",
             Request::ExecutePrepared { .. } => "ExecutePrepared",
             Request::Login { .. } => "Login",
+            Request::SetProfiling { .. } => "SetProfiling",
         }
     }
 
@@ -299,6 +332,7 @@ impl Request {
                 put_str(&mut buf, user)?;
                 put_str(&mut buf, password)?;
             }
+            Request::SetProfiling { enabled } => put_u8(&mut buf, u8::from(*enabled)),
         }
         Ok(buf)
     }
@@ -334,6 +368,9 @@ impl Request {
             msg_type::LOGIN => Request::Login {
                 user: r.string("Login.user")?,
                 password: r.string("Login.password")?,
+            },
+            msg_type::SET_PROFILING => Request::SetProfiling {
+                enabled: r.flag("SetProfiling.enabled")?,
             },
             other => {
                 return Err(ProtocolError::Malformed(format!(
@@ -384,6 +421,26 @@ pub enum Response {
     /// v9: reply to [`Request::Login`]; `user` is the authenticated user's
     /// name as the store spells it.
     LoggedIn { user: String },
+    /// v10: reply to [`Request::SetProfiling`]; the connection's resulting
+    /// profiling flag.
+    ProfilingSet { enabled: bool },
+    /// v10: timings and facts of the statement whose `Done` frame precedes
+    /// this one (sent only while the connection has profiling enabled). The
+    /// durations are nanoseconds, saturating at `u64::MAX` on encode; the
+    /// fields mirror [`pinkdb::QueryProfile`].
+    Profile {
+        parse: u64,
+        bind: u64,
+        optimize: u64,
+        execute: u64,
+        log: u64,
+        total: u64,
+        rows: u64,
+        columns: u32,
+        kind: String,
+        in_transaction: bool,
+        engine_version: String,
+    },
     /// The statement (or handshake) failed; the connection stays usable.
     Error { message: String },
 }
@@ -496,6 +553,8 @@ impl Response {
             Response::BatchDone { .. } => msg_type::BATCH_DONE,
             Response::Prepared { .. } => msg_type::PREPARED,
             Response::LoggedIn { .. } => msg_type::LOGGED_IN,
+            Response::ProfilingSet { .. } => msg_type::PROFILING_SET,
+            Response::Profile { .. } => msg_type::PROFILE,
             Response::Error { .. } => msg_type::ERROR,
         }
     }
@@ -511,6 +570,8 @@ impl Response {
             Response::BatchDone { .. } => "BatchDone",
             Response::Prepared { .. } => "Prepared",
             Response::LoggedIn { .. } => "LoggedIn",
+            Response::ProfilingSet { .. } => "ProfilingSet",
+            Response::Profile { .. } => "Profile",
             Response::Error { .. } => "Error",
         }
     }
@@ -578,6 +639,32 @@ impl Response {
                 put_u32(&mut buf, *parameter_count);
             }
             Response::LoggedIn { user } => put_str(&mut buf, user)?,
+            Response::ProfilingSet { enabled } => put_u8(&mut buf, u8::from(*enabled)),
+            Response::Profile {
+                parse,
+                bind,
+                optimize,
+                execute,
+                log,
+                total,
+                rows,
+                columns,
+                kind,
+                in_transaction,
+                engine_version,
+            } => {
+                put_u64(&mut buf, *parse);
+                put_u64(&mut buf, *bind);
+                put_u64(&mut buf, *optimize);
+                put_u64(&mut buf, *execute);
+                put_u64(&mut buf, *log);
+                put_u64(&mut buf, *total);
+                put_u64(&mut buf, *rows);
+                put_u32(&mut buf, *columns);
+                put_str(&mut buf, kind)?;
+                put_u8(&mut buf, u8::from(*in_transaction));
+                put_str(&mut buf, engine_version)?;
+            }
             Response::Error { message } => put_str(&mut buf, message)?,
         }
         Ok(buf)
@@ -644,6 +731,22 @@ impl Response {
             },
             msg_type::LOGGED_IN => Response::LoggedIn {
                 user: r.string("LoggedIn.user")?,
+            },
+            msg_type::PROFILING_SET => Response::ProfilingSet {
+                enabled: r.flag("ProfilingSet.enabled")?,
+            },
+            msg_type::PROFILE => Response::Profile {
+                parse: r.u64("Profile.parse")?,
+                bind: r.u64("Profile.bind")?,
+                optimize: r.u64("Profile.optimize")?,
+                execute: r.u64("Profile.execute")?,
+                log: r.u64("Profile.log")?,
+                total: r.u64("Profile.total")?,
+                rows: r.u64("Profile.rows")?,
+                columns: r.u32("Profile.columns")?,
+                kind: r.string("Profile.kind")?,
+                in_transaction: r.flag("Profile.in_transaction")?,
+                engine_version: r.string("Profile.engine_version")?,
             },
             msg_type::ERROR => Response::Error {
                 message: r.string("Error.message")?,
@@ -894,6 +997,18 @@ impl<'a> Reader<'a> {
 
     fn u8(&mut self, what: &'static str) -> Result<u8, ProtocolError> {
         Ok(self.take(1, what)?[0])
+    }
+
+    /// A boolean on the wire is exactly `0` or `1`; anything else is
+    /// malformed (no truthiness at the protocol boundary).
+    fn flag(&mut self, what: &'static str) -> Result<bool, ProtocolError> {
+        match self.u8(what)? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(ProtocolError::Malformed(format!(
+                "{what} must be 0 or 1, got {other}"
+            ))),
+        }
     }
 
     fn u32(&mut self, what: &'static str) -> Result<u32, ProtocolError> {

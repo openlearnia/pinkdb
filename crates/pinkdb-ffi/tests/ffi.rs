@@ -272,3 +272,188 @@ fn prepared_durable_round_trip_through_the_c_abi() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn profile_kind(r: *const PinkResult, statement: usize) -> Option<String> {
+    let p = pinkdb_result_profile_kind(r, statement);
+    if p.is_null() {
+        None
+    } else {
+        Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
+    }
+}
+
+#[test]
+fn profiling_is_off_by_default_and_reports_no_profile() {
+    let h = pinkdb_open_memory();
+    assert!(!h.is_null());
+    let r = exec(h, "SELECT 1 AS n;");
+    assert_eq!(pinkdb_result_profile_available(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_parse_ns(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_bind_ns(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_optimize_ns(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_execute_ns(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_log_ns(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_total_ns(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_rows(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_columns(r, 0), 0);
+    assert!(pinkdb_result_profile_kind(r, 0).is_null());
+
+    // Out-of-range indices and a NULL result are "no profile", never a crash.
+    assert_eq!(pinkdb_result_profile_available(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_parse_ns(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_bind_ns(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_optimize_ns(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_execute_ns(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_log_ns(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_total_ns(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_rows(r, 7), 0);
+    assert_eq!(pinkdb_result_profile_columns(r, 7), 0);
+    assert!(pinkdb_result_profile_kind(r, 7).is_null());
+    assert_eq!(pinkdb_result_profile_available(ptr::null(), 0), 0);
+    assert_eq!(pinkdb_result_profile_total_ns(ptr::null(), 0), 0);
+    assert!(pinkdb_result_profile_kind(ptr::null(), 0).is_null());
+
+    // A NULL handle is a documented error.
+    assert_eq!(pinkdb_set_profiling(ptr::null_mut(), 1), 0);
+    assert!(last_error().contains("null handle"));
+
+    pinkdb_result_free(r);
+    pinkdb_close(h);
+}
+
+#[test]
+fn profiling_reports_every_statement_of_a_batch() {
+    let h = pinkdb_open_memory();
+    assert_eq!(pinkdb_set_profiling(h, 1), 1);
+    assert!(last_error().is_empty());
+    let r = exec(
+        h,
+        "CREATE TABLE t (i INTEGER, s VARCHAR);
+         INSERT INTO t VALUES (1, 'a'), (2, 'b');
+         SELECT i, s FROM t ORDER BY i;",
+    );
+    assert_eq!(pinkdb_result_statement_count(r), 3);
+    for statement in 0..3 {
+        assert_eq!(
+            pinkdb_result_profile_available(r, statement),
+            1,
+            "statement {statement} has no profile"
+        );
+    }
+
+    assert_eq!(profile_kind(r, 0).as_deref(), Some("Created"));
+    assert_eq!(pinkdb_result_profile_rows(r, 0), 0);
+    assert_eq!(pinkdb_result_profile_columns(r, 0), 0);
+
+    assert_eq!(profile_kind(r, 1).as_deref(), Some("Inserted"));
+    assert_eq!(pinkdb_result_profile_rows(r, 1), 2);
+    assert_eq!(pinkdb_result_profile_columns(r, 1), 0);
+
+    assert_eq!(profile_kind(r, 2).as_deref(), Some("Selected"));
+    assert_eq!(pinkdb_result_profile_rows(r, 2), 2);
+    assert_eq!(pinkdb_result_profile_columns(r, 2), 2);
+
+    // Timings are nanoseconds; total covers bind..log plus (for the first
+    // statement only) its share of the batch's parse time.
+    for statement in 0..3 {
+        let phases = pinkdb_result_profile_bind_ns(r, statement)
+            + pinkdb_result_profile_optimize_ns(r, statement)
+            + pinkdb_result_profile_execute_ns(r, statement)
+            + pinkdb_result_profile_log_ns(r, statement);
+        assert!(
+            pinkdb_result_profile_total_ns(r, statement) >= phases,
+            "statement {statement}: total is less than its phases"
+        );
+        if statement == 0 {
+            assert!(
+                pinkdb_result_profile_total_ns(r, statement)
+                    >= phases + pinkdb_result_profile_parse_ns(r, statement),
+                "the first statement's total must include parse"
+            );
+        }
+    }
+
+    // Out-of-range on a profiled result is still "no profile".
+    assert_eq!(pinkdb_result_profile_available(r, 3), 0);
+    assert_eq!(pinkdb_result_profile_total_ns(r, 3), 0);
+    assert!(pinkdb_result_profile_kind(r, 3).is_null());
+
+    pinkdb_result_free(r);
+
+    // Turning profiling off means later results carry no profile.
+    assert_eq!(pinkdb_set_profiling(h, 0), 1);
+    let r = exec(h, "SELECT 1;");
+    assert_eq!(pinkdb_result_profile_available(r, 0), 0);
+    assert!(pinkdb_result_profile_kind(r, 0).is_null());
+    pinkdb_result_free(r);
+    pinkdb_close(h);
+}
+
+#[test]
+fn profiling_covers_prepared_statements() {
+    let h = pinkdb_open_memory();
+    assert_eq!(pinkdb_set_profiling(h, 1), 1);
+    let r = exec(h, "CREATE TABLE t (i INTEGER, s VARCHAR);");
+    pinkdb_result_free(r);
+
+    let insert = CString::new("INSERT INTO t VALUES (?, ?);").unwrap();
+    let prep = pinkdb_prepare(h, insert.as_ptr(), insert.as_bytes().len());
+    assert!(!prep.is_null(), "{:?}", last_error());
+    let i = PinkValue {
+        type_tag: PINKDB_TYPE_INTEGER,
+        is_null: 0,
+        int64: 7,
+        double: 0.0,
+        text_ptr: ptr::null(),
+        text_len: 0,
+    };
+    let mut text = b"seven".to_vec();
+    text.push(0);
+    let s = PinkValue {
+        type_tag: PINKDB_TYPE_VARCHAR,
+        is_null: 0,
+        int64: 0,
+        double: 0.0,
+        text_ptr: text.as_ptr() as *const c_char,
+        text_len: text.len() - 1,
+    };
+    let values = [i, s];
+    let r = pinkdb_execute_prepared(h, prep, values.as_ptr(), 2);
+    assert!(!r.is_null(), "{:?}", last_error());
+    assert_eq!(pinkdb_result_profile_available(r, 0), 1);
+    assert_eq!(profile_kind(r, 0).as_deref(), Some("Inserted"));
+    assert_eq!(pinkdb_result_profile_rows(r, 0), 1);
+    assert_eq!(pinkdb_result_profile_columns(r, 0), 0);
+    pinkdb_result_free(r);
+    pinkdb_prepared_free(prep);
+
+    let select = CString::new("SELECT i, s FROM t;").unwrap();
+    let prep = pinkdb_prepare(h, select.as_ptr(), select.as_bytes().len());
+    assert!(!prep.is_null(), "{:?}", last_error());
+    let r = pinkdb_execute_prepared(h, prep, ptr::null(), 0);
+    assert!(!r.is_null(), "{:?}", last_error());
+    assert_eq!(profile_kind(r, 0).as_deref(), Some("Selected"));
+    assert_eq!(pinkdb_result_profile_rows(r, 0), 1);
+    assert_eq!(pinkdb_result_profile_columns(r, 0), 2);
+    pinkdb_result_free(r);
+    pinkdb_prepared_free(prep);
+    pinkdb_close(h);
+}
+
+#[test]
+fn profiling_is_per_handle() {
+    let profiled = pinkdb_open_memory();
+    let plain = pinkdb_open_memory();
+    assert_eq!(pinkdb_set_profiling(profiled, 1), 1);
+
+    let r = exec(profiled, "SELECT 1;");
+    assert_eq!(pinkdb_result_profile_available(r, 0), 1);
+    pinkdb_result_free(r);
+
+    let r = exec(plain, "SELECT 1;");
+    assert_eq!(pinkdb_result_profile_available(r, 0), 0);
+    pinkdb_result_free(r);
+
+    pinkdb_close(profiled);
+    pinkdb_close(plain);
+}

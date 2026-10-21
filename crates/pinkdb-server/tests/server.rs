@@ -399,6 +399,151 @@ fn huge_rows_stream_in_multiple_bounded_frames() {
     handle.join();
 }
 
+// ---------- v10: profiling (wave 84) ----------
+
+/// Off by default: `execute_profiled` returns the same results as `execute`
+/// and no profiles. Once enabled, every statement of a multi-statement batch
+/// gets its own profile with the right kind/rows/columns.
+#[test]
+fn profiling_is_off_by_default_and_set_profiling_profiles_each_statement() {
+    let (handle, addr) = start();
+    let mut c = Client::connect(&addr).unwrap();
+
+    // Read-only, so it can run identically with and without profiling.
+    let sql = "SELECT 1 AS a; SELECT 2 AS b, 3 AS c;";
+    let plain = c.execute(sql).unwrap();
+    let profiled = c.execute_profiled(sql).unwrap();
+    assert_eq!(profiled.len(), plain.len());
+    for ((result, profile), expected) in profiled.iter().zip(&plain) {
+        assert_eq!(result, expected, "profiling must not change results");
+        assert!(profile.is_none(), "profiling was never enabled");
+    }
+
+    // Enable profiling: each statement of the batch gets a profile with the
+    // engine's facts for that statement.
+    c.set_profiling(true).unwrap();
+    let profiled = c
+        .execute_profiled(
+            "CREATE TABLE prof (a INTEGER); \
+             INSERT INTO prof VALUES (1), (2); \
+             SELECT a FROM prof ORDER BY a;",
+        )
+        .unwrap();
+    assert_eq!(profiled.len(), 3);
+    let facts: Vec<(String, u64, u32)> = profiled
+        .iter()
+        .map(|(_, profile)| {
+            let profile = profile.as_ref().expect("profile while enabled");
+            (profile.kind.clone(), profile.rows, profile.columns)
+        })
+        .collect();
+    assert_eq!(
+        facts,
+        vec![
+            ("Created".to_string(), 0, 0),
+            ("Inserted".to_string(), 2, 0),
+            ("Selected".to_string(), 2, 1),
+        ]
+    );
+    // Results are unchanged by profiling.
+    assert_eq!(profiled[0].0, QueryResult::Created);
+    assert_eq!(profiled[1].0, QueryResult::Inserted { count: 2 });
+    match &profiled[2].0 {
+        QueryResult::Selected { rows: out, .. } => {
+            assert_eq!(out, &vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]);
+        }
+        other => panic!("expected Selected, got {other:?}"),
+    }
+    for (_, profile) in &profiled {
+        let profile = profile.as_ref().unwrap();
+        assert!(!profile.in_transaction);
+        assert_eq!(profile.engine_version, env!("CARGO_PKG_VERSION"));
+        assert!(
+            profile.total >= profile.bind + profile.optimize + profile.execute + profile.log,
+            "total must cover the measured phases: {profile:?}"
+        );
+    }
+
+    // `in_transaction` is the state the statement ran in: BEGIN itself is
+    // outside the transaction it opens; INSERT and COMMIT run inside it.
+    let profiled = c
+        .execute_profiled("BEGIN; INSERT INTO prof VALUES (3); COMMIT;")
+        .unwrap();
+    assert_eq!(profiled.len(), 3);
+    assert_eq!(
+        profiled
+            .iter()
+            .map(|(_, profile)| profile.as_ref().unwrap().in_transaction)
+            .collect::<Vec<_>>(),
+        vec![false, true, true]
+    );
+
+    // While profiling is on, the plain `execute` must consume the Profile
+    // frames (and still return exactly the results).
+    assert_eq!(
+        rows(c.execute("SELECT a FROM prof ORDER BY a;").unwrap()),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)]
+        ]
+    );
+
+    // Turning it off returns `None` profiles again.
+    c.set_profiling(false).unwrap();
+    let profiled = c.execute_profiled("SELECT 4;").unwrap();
+    assert_eq!(profiled.len(), 1);
+    assert!(profiled[0].1.is_none());
+    handle.join();
+}
+
+/// The exact frame order on the wire: one Profile after each statement's
+/// Done, and none at all while profiling is off.
+#[test]
+fn profile_frames_follow_each_done_only_while_enabled() {
+    let (handle, addr) = start();
+    let mut raw = Raw::connect(&addr);
+
+    raw.execute("SELECT 1; SELECT 2;");
+    let mut dones = 0;
+    loop {
+        match raw.read() {
+            Response::Profile { .. } => panic!("no Profile frame may arrive while disabled"),
+            Response::Done { .. } => dones += 1,
+            Response::BatchDone { statements } => {
+                assert_eq!(statements, 2);
+                break;
+            }
+            Response::ResultSet { .. } | Response::Rows { .. } => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    assert_eq!(dones, 2);
+
+    protocol::write_request(&mut raw.writer, &Request::SetProfiling { enabled: true }).unwrap();
+    assert_eq!(
+        raw.read(),
+        Response::ProfilingSet { enabled: true },
+        "SetProfiling is answered before any statement"
+    );
+
+    raw.execute("SELECT 1; SELECT 2;");
+    for _ in 0..2 {
+        assert!(matches!(raw.read(), Response::ResultSet { .. }));
+        assert!(matches!(raw.read(), Response::Rows { .. }));
+        assert!(matches!(raw.read(), Response::Done { .. }));
+        match raw.read() {
+            Response::Profile { kind, rows, .. } => {
+                assert_eq!(kind, "Selected");
+                assert_eq!(rows, 1);
+            }
+            other => panic!("expected a Profile right after Done, got {other:?}"),
+        }
+    }
+    assert_eq!(raw.read(), Response::BatchDone { statements: 2 });
+    handle.join();
+}
+
 #[test]
 fn ping_round_trips() {
     let (handle, addr) = start();
@@ -444,6 +589,32 @@ fn mismatched_hello_is_rejected() {
                 message.contains(&format!("v{}", PROTOCOL_VERSION)),
                 "{message}"
             );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+    handle.join();
+}
+
+/// v10: a version-9 client is refused cleanly at the handshake (the server
+/// names both versions and closes), exactly like any other mismatch.
+#[test]
+fn a_version_9_hello_is_refused() {
+    let (handle, addr) = start();
+    let stream = TcpStream::connect(&addr).unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    protocol::write_request(
+        &mut writer,
+        &Request::Hello {
+            protocol_version: 9,
+        },
+    )
+    .unwrap();
+    let mut reader = BufReader::new(stream);
+    match protocol::read_response(&mut reader).unwrap() {
+        Response::Error { message } => {
+            assert!(message.contains("protocol version mismatch"), "{message}");
+            assert!(message.contains("server speaks v10"), "{message}");
+            assert!(message.contains("asked for v9"), "{message}");
         }
         other => panic!("expected Error, got {other:?}"),
     }

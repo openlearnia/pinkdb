@@ -63,16 +63,22 @@ fn requests_round_trip() {
         user: "alice".to_string(),
         password: String::new(),
     });
+    request_round_trip(Request::SetProfiling { enabled: true });
+    request_round_trip(Request::SetProfiling { enabled: false });
 }
 
 /// Wave 48 pins the wire surface of protocol v9: the version number, the
-/// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. A change here is
-/// a protocol change and must bump [`PROTOCOL_VERSION`].
+/// `Login`/`LoggedIn` tags, and the seven RBAC `Done` kinds. Wave 84 adds the
+/// v10 profiling messages; a change here is a protocol change and must bump
+/// [`PROTOCOL_VERSION`].
 #[test]
-fn protocol_v9_pins_the_login_frames_and_rbac_done_kinds() {
-    assert_eq!(PROTOCOL_VERSION, 9);
+fn protocol_v10_pins_the_profiling_frames_and_keeps_the_v9_surface() {
+    assert_eq!(PROTOCOL_VERSION, 10);
     assert_eq!(msg_type::LOGIN, 6);
     assert_eq!(msg_type::LOGGED_IN, 18);
+    assert_eq!(msg_type::SET_PROFILING, 7);
+    assert_eq!(msg_type::PROFILING_SET, 19);
+    assert_eq!(msg_type::PROFILE, 20);
     for (kind, tag) in [
         (DoneKind::Selected, 0),
         (DoneKind::Used, 13),
@@ -141,6 +147,94 @@ fn responses_round_trip() {
     response_round_trip(Response::BatchDone {
         statements: u32::MAX,
     });
+    response_round_trip(Response::ProfilingSet { enabled: true });
+    response_round_trip(Response::ProfilingSet { enabled: false });
+}
+
+#[test]
+fn profile_round_trips_every_field_and_extremes() {
+    response_round_trip(Response::Profile {
+        parse: 0,
+        bind: 1,
+        optimize: 2,
+        execute: 3,
+        log: 4,
+        total: 5,
+        rows: 6,
+        columns: 7,
+        kind: "Selected".to_string(),
+        in_transaction: false,
+        engine_version: "0.1.0".to_string(),
+    });
+    response_round_trip(Response::Profile {
+        parse: u64::MAX,
+        bind: u64::MAX,
+        optimize: u64::MAX,
+        execute: u64::MAX,
+        log: u64::MAX,
+        total: u64::MAX,
+        rows: u64::MAX,
+        columns: u32::MAX,
+        kind: String::new(),
+        in_transaction: true,
+        engine_version: String::new(),
+    });
+}
+
+/// Hand-build a `Profile` body: seven u64s, u32 columns, the kind string, the
+/// in_transaction byte, and the engine-version string.
+fn profile_body(in_transaction: u8) -> Vec<u8> {
+    let mut body = Vec::new();
+    for n in 1..=7u64 {
+        body.extend_from_slice(&n.to_le_bytes());
+    }
+    body.extend_from_slice(&3u32.to_le_bytes());
+    body.extend_from_slice(&8u32.to_le_bytes());
+    body.extend_from_slice(b"Selected");
+    body.push(in_transaction);
+    body.extend_from_slice(&5u32.to_le_bytes());
+    body.extend_from_slice(b"0.1.0");
+    body
+}
+
+#[test]
+fn malformed_profile_frames_are_rejected() {
+    // Truncated: the engine_version string claims 5 bytes, 4 arrive.
+    let mut truncated = profile_body(1);
+    truncated.pop();
+    let err = decode_response(&frame(msg_type::PROFILE, &truncated)).unwrap_err();
+    assert!(err.to_string().contains("truncated"), "{err}");
+
+    // Trailing bytes after a complete body are rejected.
+    let mut trailing = profile_body(0);
+    trailing.push(0);
+    let err = decode_response(&frame(msg_type::PROFILE, &trailing)).unwrap_err();
+    assert!(err.to_string().contains("trailing bytes"), "{err}");
+
+    // in_transaction is a strict 0/1 flag, not a truthiness byte.
+    let err = decode_response(&frame(msg_type::PROFILE, &profile_body(2))).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("Profile.in_transaction must be 0 or 1, got 2"),
+        "{err}"
+    );
+}
+
+#[test]
+fn set_profiling_rejects_a_non_boolean_byte() {
+    let err = decode_request(&frame(msg_type::SET_PROFILING, &[2])).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("SetProfiling.enabled must be 0 or 1, got 2"),
+        "{err}"
+    );
+    // The reply validates its flag the same way.
+    let err = decode_response(&frame(msg_type::PROFILING_SET, &[2])).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ProfilingSet.enabled must be 0 or 1, got 2"),
+        "{err}"
+    );
 }
 
 #[test]
