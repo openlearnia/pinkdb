@@ -375,11 +375,11 @@ fn stats_keeps(
         PruneOp::IsNotNull => stats.null_count != Some(rows),
         _ => {
             // `<>` needs both bounds and must be sure *all* values equal the
-            // literal; floats are excluded (a NaN never equals, and NaN rows
-            // would match `<>`).
+            // literal; floats are excluded (the bounds do not cover NaN, and
+            // NaN rows would match `<>` any non-NaN literal).
             if filter.op == PruneOp::NotEq {
-                // A NaN never equals a literal, so a row group holding one
-                // could still match `<>`; floats never prune on it. Decimals
+                // A NaN equals only NaN, so a row group holding one could
+                // still match `<>`; floats never prune on it. Decimals
                 // compare exactly, so they may.
                 if column.ty == DataType::Double {
                     return true;
@@ -399,6 +399,16 @@ fn stats_keeps(
                 return true;
             };
             if literal.is_null() || !comparable(column.ty, literal) {
+                return true;
+            }
+            // NaN sorts above every other double (`num_cmp`, DuckDB order),
+            // but Parquet DOUBLE statistics never cover NaN (writers skip it
+            // and no NaN count is recorded): the max cannot bound `>`/`>=`,
+            // and no bound excludes `= NaN`. `<`/`<=` never match a NaN row.
+            if column.ty == DataType::Double
+                && (matches!(filter.op, PruneOp::Gt | PruneOp::GtEq)
+                    || matches!(literal, Value::Double(x) if x.is_nan()))
+            {
                 return true;
             }
             match filter.op {

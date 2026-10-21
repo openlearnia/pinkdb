@@ -1423,8 +1423,8 @@ mod tests {
         ));
         let db = &mut PinkDb::new();
         db.attach_lake(fake.clone()).unwrap();
-        // The whole query materializes because MIN(c) is not provable; the
-        // engine's first-seen comparator skips the later NaN and answers 3.0.
+        // The whole query materializes because MIN(c) is not provable; NaN
+        // sorts above every other double, so the engine answers 3.0.
         assert_eq!(
             query(db, "SELECT COUNT(c), MIN(c) FROM t;"),
             vec![vec![Value::Bigint(2), Value::Double(3.0)]]

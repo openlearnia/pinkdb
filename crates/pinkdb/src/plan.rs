@@ -2169,11 +2169,21 @@ pub(crate) fn win_output_schema(
     (names, types)
 }
 
-/// Numeric ordering shared by [`compare_values`] and the aggregators' typed
-/// MIN/MAX fast path.
+/// Numeric ordering shared by [`compare_values`], the typed DOUBLE
+/// comparison kernels, and the aggregators' typed MIN/MAX fast path.
+///
+/// DuckDB's total order: `-0.0 == 0.0`, every NaN equals every other NaN,
+/// and NaN sorts after every other double (including `+inf`) — so it equals
+/// no non-NaN value, `MAX` over a column with a NaN is NaN, and ORDER BY puts
+/// NaNs last ascending. This matches the hash encodings (`encode_value`,
+/// `Vector::hash_row`), which fold all NaNs onto one key and `-0.0` onto
+/// `0.0`, so an index lookup, a hash join and a scan agree.
+#[inline]
 pub(crate) fn num_cmp(x: f64, y: f64) -> std::cmp::Ordering {
-    // NaN sorts equal to itself here (grouping/display edge, not ORDER truth).
-    x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+    // `partial_cmp` is `None` only when at least one side is NaN; then
+    // `is_nan` ordering gives NaN == NaN and NaN > non-NaN.
+    x.partial_cmp(&y)
+        .unwrap_or_else(|| x.is_nan().cmp(&y.is_nan()))
 }
 
 /// A DOUBLE `Value` (the mixed decimal/double comparator's helper; callers

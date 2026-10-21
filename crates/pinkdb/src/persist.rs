@@ -243,9 +243,10 @@ const PARALLEL_SAVE_MIN_CHUNKS: usize = 32;
 // its manifest; the engine itself never reads them back.
 
 /// Exact per-column statistics the `.pink` writer observed while saving one
-/// column: NULL count, the min/max of the non-NULL values (first-seen wins
-/// ties, exactly like the engine's MIN/MAX accumulators), and the exact NaN
-/// count (non-zero only for DOUBLE columns).
+/// column: NULL count, the min/max of the non-NULL, non-NaN values
+/// (first-seen wins ties, exactly like the engine's MIN/MAX accumulators),
+/// and the exact NaN count (non-zero only for DOUBLE columns; NaN sorts
+/// above every other double, so with any NaN the engine's MAX is NaN).
 ///
 /// These are *facts*, not yet gated for use: a DOUBLE min/max with any NaN —
 /// or one that is zero (`-0.0 == 0.0` in the engine's comparator) — is still
@@ -293,8 +294,9 @@ struct ChunkColumnStats {
 }
 
 /// The running merge of a column's chunk statistics (few comparisons per
-/// chunk; uses the engine's own [`crate::plan::compare_values`] so ties and
-/// NaN behave exactly like the MIN/MAX accumulators).
+/// chunk; uses the engine's own [`crate::plan::compare_values`] so ties
+/// behave exactly like the MIN/MAX accumulators; NaN never reaches it — the
+/// chunk stats count NaN separately).
 #[derive(Debug, Clone, PartialEq)]
 struct ColumnStatsAcc {
     null_count: u64,
@@ -5929,8 +5931,11 @@ mod tests {
                         nulls += 1;
                         continue;
                     }
+                    // NaN is counted, not ranked: the min/max facts cover
+                    // the non-NaN values (NaN would always be the max).
                     if matches!(v, Value::Double(x) if x.is_nan()) {
                         nan_count += 1;
+                        continue;
                     }
                     if min
                         .as_ref()

@@ -2244,12 +2244,12 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   BIGINT unique / VARCHAR 5k distinct) while adding 2.0 / 4.0 / 2.0 MB to a
   10.1 MB file; skipping per-row verification would have traded that
   invariant for speed. The shipped section adds ~30 B per index. Found in
-  passing (not changed): the scan comparison kernel treats DOUBLE `NaN` as
-  equal to every value (`partial_cmp(..).unwrap_or(Equal)` in
-  `exec/expr.rs`), so `d = 0.0` on a column holding NaN counts the NaN rows
-  on a scan but not through an index — a pre-existing scan/index
-  disagreement; and a save→load→save of a table after `DELETE` can differ in
-  validity-buffer length (not canonical bytes). Tests: the section layout
+  passing: the scan comparison kernel treated DOUBLE `NaN` as equal to
+  every value (`partial_cmp(..).unwrap_or(Equal)` in `exec/expr.rs`), so
+  `d = 0.0` on a column holding NaN counted the NaN rows on a scan but not
+  through an index — fixed in the next entry; and (not changed) a
+  save→load→save of a table after `DELETE` can differ in validity-buffer
+  length (not canonical bytes). Tests: the section layout
   pinned byte for byte, rows-not-statistics map authority, 7 corrupt-section
   refusals, round trips over three chunks with NULLs/duplicates/`-0.0`/NaN/
   VARCHAR keys and an emptied range, bit-3 clear without indexes (and after
@@ -2257,5 +2257,38 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   publication; the part-1 re-log tests now assert an empty post-checkpoint
   WAL. Gates: pinkdb **700**, workspace **1353**, `encryption` **744**,
   duckdiff **283/283** (default-feature CLI), fmt/clippy both toolchains
-  (Homebrew 1.97.1, rustup stable 1.99), wasm green. Remaining wave-79 scope: the range/zone-map
-  index-vs-scan choice.
+  (Homebrew 1.97.1, rustup stable 1.99), wasm green. Remaining wave-79
+  scope: the range/zone-map index-vs-scan choice.
+
+- 2026-10-21 — Fix: DOUBLE NaN comparison semantics (found in passing by wave
+  79 part 2's index-vs-scan test). The scan compared DOUBLE with
+  `partial_cmp(..).unwrap_or(Equal)`, so NaN compared **Equal to every value**:
+  `WHERE d = 0.0` over `{-0.0, 0.0, NaN, 1.5}` returned 3 rows while the hash
+  `IndexScan` (whose `encode_value` keys NaN separately) returned 2, breaking
+  the index-never-changes-the-result contract. `plan::num_cmp` is now DuckDB's
+  total order (probed against the local `duckdb`): `NaN = NaN` for every
+  payload, NaN equals no other value and sorts above every other double
+  (`+inf` included), `-0.0 = 0.0`. It backs `compare_values` (ORDER BY
+  fallback, MIN/MAX, nested-loop/range joins, windows, GREATEST/LEAST), both
+  typed DOUBLE comparison kernels in `exec/expr.rs` (vector-vs-vector and
+  column-vs-literal) and the aggregators' typed MIN/MAX path. The byte-arena
+  sort key now encodes NaN as all-ones (above `+inf`), so NaN keys no longer
+  force the legacy `Value` sort or disable top-N (`encode_key_into` cannot
+  fail any more). Integration audit: hash GROUP BY/DISTINCT/JOIN already
+  folded NaN/-0.0 (unchanged); `.pink`/Vortex/inlined lake statistics already
+  exclude NaN from min/max and gate DOUBLE extremes on `nan_count == 0`, so
+  lake zone maps stay sound; **Parquet row-group pruning** had no NaN count and
+  became unsound for `>`/`>=`/`= NaN` on DOUBLE under the new order (a group
+  with max 3.0 and a NaN row was pruned for `d > 5.0`) — it now keeps DOUBLE
+  groups for those predicates (`<`/`<=`/`=` non-NaN still prune). Display of a
+  stored `-0.0` is unchanged (DuckDB's ORDER BY output prints such rows as
+  `0.0`; pinkdb keeps the value's sign — a display-only difference, not
+  probed). Tests: `indexes.rs` IndexScan-vs-scan over NaN payloads/±0/±inf for
+  nine literals (fails before the fix), the comparison-kernel truth table +
+  literal-on-either-side cases, NaN sort/top-N encoding (ASC/DESC/LIMIT vs the
+  legacy comparator), the Parquet NaN row-group test, and a 21-probe duckdiff
+  NaN battery (comparisons, BETWEEN/IN, ORDER BY ASC/DESC/LIMIT, MIN/MAX,
+  GROUP BY, DISTINCT, `=`/`<`/`>=` joins, `rank()`); the stale "NaN = NaN out
+  of scope" note in `math-nan-predicates` is gone. Gates: pinkdb **694**,
+  workspace **1348**, parquet ext **26**, duckdiff **304/304** (default CLI
+  features), fmt/clippy both toolchains, wasm green.
