@@ -1353,7 +1353,14 @@ fn attach_never_touches_the_lake() {
     entries.sort();
     assert_eq!(
         entries,
-        vec!["catalog.json", "commits", "data", "highest.json", "lake.json", "snapshots"],
+        vec![
+            "catalog.json",
+            "commits",
+            "data",
+            "highest.json",
+            "lake.json",
+            "snapshots"
+        ],
         "{out}"
     );
     cleanup(&dir);
