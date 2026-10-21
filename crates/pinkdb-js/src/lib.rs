@@ -12,19 +12,20 @@
 //! requests. `pinkdb` links it behind the optional `js` cargo feature, so the
 //! default build stays lean and engine-free.
 //!
-//! # Status: the engine binding is deliberately not shipped yet
+//! # The engine (wave 81)
 //!
-//! [`engine_available`] returns `Err` in this build, and [`run_procedure`]
-//! therefore reports [`JsError::EngineUnavailable`] — a clean, documented
-//! refusal, not a half-wired engine. `pinkdb` refuses `CREATE PROCEDURE …
-//! LANGUAGE JAVASCRIPT` with the same message *before* storing anything, so a
-//! database can never hold a definition this build cannot run. The follow-up
-//! is exactly one step: bind a maintained engine — decided: **quickjs-ng via
-//! the vendored `rquickjs` crate (~1.1 MB, vs Boa's ~30 MB; small binaries
-//! are a requirement)**, a contained-FFI carve-out like `pinkdb-ffi` — inside
-//! [`run_procedure`], enforce [`DENIED_INTRINSICS`] through the engine's
-//! intrinsic selection, and wire [`Host`] to the executor's
-//! `db.exec`/`db.query`; the contract below is what it must satisfy.
+//! With the `engine` cargo feature (turned on by `pinkdb`'s `js` feature)
+//! the body runs in **quickjs-ng** through the vendored `rquickjs` crate —
+//! see the `engine` module for the intrinsic selection, the limits and the
+//! one contained `unsafe` block. Without it, [`engine_available`] returns
+//! `Err` and [`run_procedure`] reports [`JsError::EngineUnavailable`]: a
+//! clean, documented refusal. `pinkdb` checks [`engine_available`] before
+//! storing a `LANGUAGE JAVASCRIPT` definition, so a database can never hold
+//! a definition its build cannot run.
+//!
+//! The engine compiles for `wasm32-unknown-unknown` (rquickjs ships the
+//! bindings and a libc shim) but is not yet exercised there; `js` is
+//! supported on native targets only until a wasm test runner covers it.
 //!
 //! # The host contract
 //!
@@ -35,7 +36,12 @@
 //! db.exec(sql [, params])         → affected-row count (DML/DDL)
 //! db.query(sql [, params])        → array of rows (arrays of values)
 //! db.value(sql [, params])        → the first column of the first row, or null
+//! db.random()                     → a deterministic number in [0, 1)
 //! ```
+//!
+//! The body is the body of a strict-mode function whose parameters are the
+//! procedure's parameters (each must be a plain JavaScript identifier);
+//! `return x` makes `x` the call's result.
 //!
 //! Every statement is sent to the host as a [`HostRequest`], which the
 //! executor binds with parameters **as bound values** — exactly like the SQL
@@ -60,10 +66,13 @@
 //! * **no ambient I/O** — no `fetch`, `XMLHttpRequest`, `require`, `import`,
 //!   `process`, `setTimeout`/`setInterval`, `Atomics`/`SharedArrayBuffer`, and
 //!   no filesystem or network host function exists.
+//! * **no run-time compilation** — `eval` and the `Function` constructor are
+//!   not available (the engine's `Eval` intrinsic is not installed).
 //! * **bounded execution** — [`SandboxConfig::statement_limit`] caps the
-//!   number of host calls and [`SandboxConfig::step_limit`] the script's
-//!   evaluation steps, so a runaway script fails the call cleanly instead of
-//!   wedging the engine.
+//!   number of host calls, [`SandboxConfig::step_limit`] the script's
+//!   evaluation steps, and [`SandboxConfig::memory_limit`] /
+//!   [`SandboxConfig::stack_limit`] its heap and native stack, so a runaway
+//!   script fails the call cleanly instead of wedging the engine.
 //!
 //! Anything a script can observe is either an argument, a host reply, or the
 //! script text: that is the whole guarantee the WAL replay strategy needs, and
@@ -73,28 +82,57 @@
 //!
 //! Values cross the boundary as [`JsValue`] (never as JavaScript objects with
 //! hidden state): `NULL`/`null`/`undefined` map to `NULL`, booleans to
-//! `BOOLEAN`, integral numbers to `BIGINT` (or `INTEGER` when they fit — the
-//! host binds them exactly like literals), other numbers to `DOUBLE`, strings
-//! to `VARCHAR`. A value of any other JavaScript type in a parameter position
-//! is a [`JsError::Value`] naming the argument.
+//! `BOOLEAN`, integral numbers within `±(2^53 − 1)` to `BIGINT` (or `INTEGER`
+//! when they fit — the host binds them exactly like literals), other numbers
+//! (fractions, NaN, ±∞, `-0`) to `DOUBLE`, strings to `VARCHAR`, and a
+//! `BigInt` in the `BIGINT` range to `BIGINT`. Going the other way, integers
+//! beyond `±(2^53 − 1)` arrive as `BigInt`, so they are never rounded. A
+//! value of any other JavaScript type is a [`JsError::Value`] naming its
+//! position.
 
 use std::fmt;
+
+#[cfg(feature = "engine")]
+mod engine;
 
 /// The engine status of this build: `Ok(())` when [`run_procedure`] can
 /// evaluate scripts.
 ///
-/// This build has no engine binding, so it returns the documented refusal
-/// naming the intended path. `pinkdb` calls this before storing a
-/// `LANGUAGE JAVASCRIPT` definition, so the refusal happens at `CREATE`
-/// time, never at `CALL` time.
+/// Without the `engine` feature this is the documented refusal. `pinkdb`
+/// calls it before storing a `LANGUAGE JAVASCRIPT` definition, so the refusal
+/// happens at `CREATE` time, never at `CALL` time.
 pub fn engine_available() -> Result<(), String> {
-    Err(
-        "the JavaScript engine is not built into this pinkdb-js build (roadmap wave 44 \
-         ships the SQL procedural language and the JavaScript sandbox *contract*; the engine \
-         binding — quickjs-ng via the vendored `rquickjs` crate (~1.1 MB engine), configured per `DENIED_INTRINSICS` \
-         — is the recorded follow-up)"
-            .to_string(),
-    )
+    #[cfg(feature = "engine")]
+    {
+        Ok(())
+    }
+    #[cfg(not(feature = "engine"))]
+    {
+        Err(
+            "the JavaScript engine is not built into this pinkdb-js build (enable the \
+             `engine` feature — pinkdb's `js` feature does — to bind quickjs-ng)"
+                .to_string(),
+        )
+    }
+}
+
+/// Check a definition without running it: every parameter name must be a
+/// plain JavaScript identifier and the body must compile as a function body.
+/// `pinkdb` calls this at `CREATE PROCEDURE … LANGUAGE JAVASCRIPT`, so a
+/// syntax error is reported when the procedure is defined, not when it is
+/// first called.
+pub fn check_script(source: &str, params: &[&str]) -> Result<(), JsError> {
+    #[cfg(feature = "engine")]
+    {
+        engine::check_script(source, params)
+    }
+    #[cfg(not(feature = "engine"))]
+    {
+        let _ = (source, params);
+        Err(JsError::EngineUnavailable(
+            engine_available().expect_err("no engine in this build"),
+        ))
+    }
 }
 
 /// JavaScript intrinsics and globals the sandbox must remove (or never
@@ -160,6 +198,11 @@ pub const HOST_FUNCTIONS: &[HostFunctionSpec] = &[
         signature: "db.value(sql, params?)",
         docs: "return the first column of the first row of a query, or null",
     },
+    HostFunctionSpec {
+        name: "db.random",
+        signature: "db.random()",
+        docs: "a number in [0, 1) from a generator seeded by the definition (replay-stable)",
+    },
 ];
 
 /// Determinism knobs the host pins for one call. Both are part of the call's
@@ -170,8 +213,15 @@ pub struct SandboxConfig {
     pub seed: u64,
     /// Upper bound on host calls (`db.exec`/`db.query`/`db.value`) per call.
     pub statement_limit: u64,
-    /// Upper bound on evaluated script steps per call.
+    /// Upper bound on evaluated script steps per call. The engine counts in
+    /// quickjs-ng's interrupt budget (one check per 10,000 internal
+    /// operations), so the limit is enforced in those units: deterministic
+    /// for a given script and build, not a portable instruction count.
     pub step_limit: u64,
+    /// Upper bound on the script's heap, in bytes.
+    pub memory_limit: usize,
+    /// Upper bound on the native stack the script may use, in bytes.
+    pub stack_limit: usize,
 }
 
 impl Default for SandboxConfig {
@@ -180,6 +230,8 @@ impl Default for SandboxConfig {
             seed: 0,
             statement_limit: 10_000,
             step_limit: 50_000_000,
+            memory_limit: 64 * 1024 * 1024,
+            stack_limit: 256 * 1024,
         }
     }
 }
@@ -262,26 +314,40 @@ impl fmt::Display for JsError {
 
 impl std::error::Error for JsError {}
 
-/// Evaluate one JavaScript procedure body.
+/// Evaluate one JavaScript procedure body with `args` bound to the
+/// parameters named `params`, sending every `print`/`db.*` call to `host`.
+/// Returns the body's `return` value (`Null` when it returns nothing).
 ///
-/// In this build every call reports [`JsError::EngineUnavailable`] before the
-/// script is looked at (the engine binding is the recorded follow-up).
+/// Without the `engine` feature every call reports
+/// [`JsError::EngineUnavailable`] before the script is looked at.
 pub fn run_procedure(
-    _source: &str,
-    _config: &SandboxConfig,
-    _host: &mut dyn Host,
+    source: &str,
+    params: &[&str],
+    args: &[JsValue],
+    config: &SandboxConfig,
+    host: &mut dyn Host,
 ) -> Result<JsValue, JsError> {
-    Err(JsError::EngineUnavailable(
-        engine_available().expect_err("this build has no engine"),
-    ))
+    #[cfg(feature = "engine")]
+    {
+        engine::run_procedure(source, params, args, config, host)
+    }
+    #[cfg(not(feature = "engine"))]
+    {
+        let _ = (source, params, args, config, host);
+        Err(JsError::EngineUnavailable(
+            engine_available().expect_err("this build has no engine"),
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "engine"))]
     struct NoHost;
 
+    #[cfg(not(feature = "engine"))]
     impl Host for NoHost {
         fn handle(&mut self, _request: HostRequest) -> Result<HostReply, String> {
             panic!("the host must never be called when the engine is unavailable")
@@ -290,12 +356,13 @@ mod tests {
 
     /// The build-level refusal is clean, documented, and happens before any
     /// script or host interaction.
+    #[cfg(not(feature = "engine"))]
     #[test]
     fn engine_unavailable_refusal_is_clean() {
         let err = engine_available().expect_err("no engine in this build");
         assert!(err.contains("not built"), "{err}");
-        assert!(err.contains("follow-up"), "{err}");
-        let err = run_procedure("1 + 1", &SandboxConfig::default(), &mut NoHost)
+        assert!(err.contains("`engine` feature"), "{err}");
+        let err = run_procedure("1 + 1", &[], &[], &SandboxConfig::default(), &mut NoHost)
             .expect_err("no engine in this build");
         assert!(matches!(err, JsError::EngineUnavailable(_)), "{err:?}");
         assert!(err.to_string().contains("not built"), "{err}");
@@ -317,11 +384,14 @@ mod tests {
         }
     }
 
-    /// The host surface is exactly the documented four functions.
+    /// The host surface is exactly the documented five functions.
     #[test]
     fn host_surface_is_small_and_documented() {
         let names: Vec<&str> = HOST_FUNCTIONS.iter().map(|f| f.name).collect();
-        assert_eq!(names, vec!["print", "db.exec", "db.query", "db.value"]);
+        assert_eq!(
+            names,
+            vec!["print", "db.exec", "db.query", "db.value", "db.random"]
+        );
         assert!(HOST_FUNCTIONS.iter().all(|f| !f.docs.is_empty()));
     }
 }

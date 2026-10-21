@@ -390,10 +390,13 @@ fn build_result(results: Vec<QueryResult>) -> PinkResult {
             // presented as that row set (the statement stream needs no new
             // C-ABI entry); any other call outcome is a simple statement whose
             // count is the number of body statements it ran.
+            // A JavaScript body's `print` lines are not carried over the
+            // C ABI yet (wave 81 follow-up).
             QueryResult::Called {
                 name,
                 statements,
                 result: Some(inner),
+                ..
             } => match *inner {
                 QueryResult::Selected { names, types, rows } => StmtData::Sel(SelStmt {
                     names: names.into_iter().map(|n| nul_terminated(&n)).collect(),

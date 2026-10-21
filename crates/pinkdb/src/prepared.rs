@@ -212,7 +212,7 @@ impl PinkDb {
 
 /// Parameter-count mismatch: the message names the missing/excess positions
 /// (1-based), like DuckDB's bind errors do.
-fn check_arity(expected: usize, got: usize) -> Result<()> {
+pub(crate) fn check_arity(expected: usize, got: usize) -> Result<()> {
     if expected == got {
         return Ok(());
     }

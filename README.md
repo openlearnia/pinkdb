@@ -97,7 +97,7 @@ SQL text
 | `pinkdb::crypto` | optional at-rest encryption (`PINKENC1` container: AES-256-GCM + Argon2id) behind the `encryption` feature; a parse/identity stub otherwise |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb::procedure` | Stored procedures: the SQL procedural language (parser + `CALL` executor), catalog definitions, `.pink` section |
-| `pinkdb-js` | Optional (`js` feature) JavaScript procedure sandbox: the deterministic host contract; the engine binding is the recorded follow-up |
+| `pinkdb-js` | Optional (`js` feature) JavaScript procedure sandbox: quickjs-ng via `rquickjs` (~1.1 MB), the deterministic host contract, limits and value conversions |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
 | `pinkdb-arrow` | opt-in (`arrow` feature) Arrow IPC (Feather v2) file extension, engine-adjacent: a **table source** for `FROM 'f.arrow'` / `read_arrow` and a **COPY sink** for `COPY … (FORMAT arrow)`; reads materialize the file, writes are uncompressed; its `remote` feature (enabled by the CLI `httpfs` feature) reads `https://`/`s3://` objects whole |
@@ -233,16 +233,40 @@ call's actual read/write set (it depends on the data: loop conditions, `IF`
 branches) is recorded by the executor into the WAL frame and the transaction's
 conflict set, so multi-writer conflict detection still holds.
 
-**JavaScript procedures** (`LANGUAGE JAVASCRIPT`, syntax
-`CREATE PROCEDURE p(a BIGINT) LANGUAGE JAVASCRIPT AS $$ ... $$`) are an
-optional build (`js` cargo feature) and **refuse cleanly in this release**:
-the `pinkdb-js` crate ships the sandbox *contract* — the deterministic host
-API (`print`, `db.exec`, `db.query`, `db.value`), the denied-intrinsics policy
-(no clock, no randomness, no ambient I/O) and the value conversions — while
-the engine binding is the recorded follow-up. `CREATE PROCEDURE … LANGUAGE
-JAVASCRIPT` without the feature names the rebuild
-(`--features js`); with it, `pinkdb-js` reports the missing engine. The SQL
-procedural language needs no feature and is always available.
+**JavaScript procedures** (`LANGUAGE JAVASCRIPT`, wave 81) are an optional
+build (`js` cargo feature, +1.1 MB): the body runs in **quickjs-ng** as a
+strict-mode function of the declared parameters.
+
+```sql
+CREATE PROCEDURE add_many(n INTEGER, prefix VARCHAR) LANGUAGE JAVASCRIPT AS $$
+  for (let i = 1; i <= n; i++) {
+    db.exec('INSERT INTO t VALUES (?, ?)', [i, prefix + i]);
+  }
+  print('inserted', n);
+  return db.value('SELECT count(*) FROM t');
+$$;
+CALL add_many(3, 'r');
+```
+
+A script sees only `print(...)`, `db.exec(sql, params?)` (affected rows),
+`db.query(sql, params?)` (rows as arrays), `db.value(sql, params?)` (first
+column of the first row) and `db.random()`; `?` placeholders are bound as
+values, never spliced into SQL. The same rules as SQL bodies apply: a `CALL`
+is statement-atomic, transaction control and store-level statements are
+refused, and a durable store logs the `CALL` and replays it. Replay is exact
+because the sandbox has no clock (`Date`, `performance`), no `Math.random`
+(`db.random()` is seeded from the definition), no I/O, timers or modules, and
+no run-time code compilation (`eval`, `Function`). Each call gets a fresh
+engine with step, host-call, memory and stack limits, and JavaScript calls
+nest at most 4 deep. Values: integers within ±2^53 are numbers, larger
+BIGINTs are `BigInt`; DATE/TIMESTAMP/DECIMAL/INTERVAL arrive as their text.
+`print` lines are returned with the call (`QueryResult::Called::output`) and
+shown by the CLI; the server protocol and FFI do not carry them yet. The
+body is compiled at `CREATE` time, so a syntax error is reported then.
+Without the feature, `CREATE PROCEDURE … LANGUAGE JAVASCRIPT` names the
+rebuild (`--features js`). Native targets only for now: the engine compiles
+for wasm32 but is not yet verified there. The SQL procedural language needs
+no feature and is always available.
 
 ### Databases
 
@@ -2611,11 +2635,10 @@ ties in ORDER BY have no stable order on either engine).
   loadable-extension function (their replay could not be honest); there is no
   `SHOW PROCEDURES` (a missing call reports the missing name), no OUT/INOUT
   parameters and no exception handlers yet
-- JavaScript procedures: the `js` feature links the `pinkdb-js` sandbox
-  *contract* only — `CREATE PROCEDURE … LANGUAGE JAVASCRIPT` refuses in this
-  release (the engine binding is the recorded follow-up); a JavaScript
-  definition loaded from a `.pink` file stays inert and `CALL` reports the
-  same refusal
+- JavaScript procedures need the `js` feature (native targets only); without
+  it a JavaScript definition loaded from a `.pink` file stays inert and
+  `CALL` names the rebuild. `print` output is not carried by the server
+  protocol or the FFI yet
 - Known gaps and their scheduled waves are tracked in `docs/GAPS.md`
 
 Post-v1 roadmap: C/Python/Go language bindings, Parquet reader (see

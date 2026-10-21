@@ -277,10 +277,14 @@ pub enum QueryResult {
     /// statements, and `result` is what it returned — the last statement's
     /// result, or the `RETURN <expr>` value (a one-row, one-column
     /// `Selected` named `return`). `None` for a body that ran no statement.
+    /// `output` holds the lines a JavaScript body `print`ed (wave 81; nested
+    /// calls' lines included, in order) — always empty for SQL bodies, and
+    /// not carried by the server protocol or the FFI yet.
     Called {
         name: String,
         statements: usize,
         result: Option<Box<QueryResult>>,
+        output: Vec<String>,
     },
     /// `CREATE USER` (wave 48).
     CreatedUser {

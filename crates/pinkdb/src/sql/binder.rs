@@ -3508,8 +3508,13 @@ fn bind_create_procedure(
         crate::procedure::ProcLanguage::Sql => {
             Some(crate::procedure::parse_body(name, &param_names, body)?)
         }
-        // A JavaScript body is opaque text for the sandbox to evaluate.
-        crate::procedure::ProcLanguage::JavaScript => None,
+        // A JavaScript body is opaque text for the sandbox to evaluate; it
+        // must compile (and its parameters be JavaScript identifiers) now.
+        crate::procedure::ProcLanguage::JavaScript => {
+            #[cfg(feature = "js")]
+            crate::js::check_definition(name, body, &param_names)?;
+            None
+        }
     };
     Ok((
         LogicalPlan::CreateProcedure {

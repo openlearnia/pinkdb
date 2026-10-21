@@ -1295,7 +1295,14 @@ fn render_results_into(out: &mut String, results: &[QueryResult]) {
                 name,
                 statements,
                 result,
+                output,
             } => {
+                // A JavaScript body's `print` lines come first, in order;
+                // they are script-controlled text, so they are sanitized
+                // like every other rendered string.
+                for line in output {
+                    let _ = writeln!(out, "{}", clean(line));
+                }
                 let _ = writeln!(
                     out,
                     "Procedure {} called ({statements} statement{}).",
@@ -2085,6 +2092,7 @@ mod tests {
                 name: n(),
                 statements: 1,
                 result: None,
+                output: vec![n()],
             },
             QueryResult::Selected {
                 names: vec![n()],

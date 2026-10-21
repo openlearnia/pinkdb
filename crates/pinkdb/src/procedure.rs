@@ -143,10 +143,16 @@ pub enum ProcLanguage {
 pub(crate) fn check_language_available(language: ProcLanguage) -> Result<()> {
     match language {
         ProcLanguage::Sql => Ok(()),
-        ProcLanguage::JavaScript => Err(PinkDbError::Execution(format!(
-            "JavaScript procedures are not available in this build: {}",
-            js_unavailable_reason()
-        ))),
+        ProcLanguage::JavaScript => {
+            #[cfg(feature = "js")]
+            if crate::js::engine_available().is_ok() {
+                return Ok(());
+            }
+            Err(PinkDbError::Execution(format!(
+                "JavaScript procedures are not available in this build: {}",
+                js_unavailable_reason()
+            )))
+        }
     }
 }
 
@@ -1462,7 +1468,7 @@ fn parse_expr_text_at(name: &str, off: usize, text: &str, what: &str) -> Result<
 /// Returns the SQL statement name for the error. `CALL` is allowed (bounded by
 /// [`MAX_CALL_DEPTH`]); a `?` never reaches here — [`parse_body`] refuses
 /// placeholders in the body text up front.
-fn refused_in_body(stmt: &Statement) -> Option<&'static str> {
+pub(crate) fn refused_in_body(stmt: &Statement) -> Option<&'static str> {
     Some(match stmt {
         Statement::Begin => "BEGIN (use BEGIN ... END for a block)",
         Statement::Commit => "COMMIT",
@@ -1710,12 +1716,12 @@ fn execute_call_inner(
     if let Some(e) = unsupported_language(def) {
         return Err(e);
     }
-    let Some(body) = &def.body else {
+    if def.language == ProcLanguage::Sql && def.body.is_none() {
         return Err(PinkDbError::Execution(format!(
             "procedure \"{}\" has no body in this build",
             def.name
         )));
-    };
+    }
     if args.len() != def.params.len() {
         return Err(PinkDbError::Execution(format!(
             "procedure \"{}\" takes {} argument(s), but {} were given",
@@ -1738,6 +1744,44 @@ fn execute_call_inner(
             value,
         });
     }
+    // Statement atomicity: the outermost call is all-or-nothing. It takes its
+    // own snapshot (the store clone the transaction machinery uses anyway) and
+    // restores it on failure — *including* inside a caller's transaction,
+    // where the restore keeps that transaction open and its earlier
+    // statements, buffered WAL text and validation base untouched. On success
+    // the snapshot is simply dropped: the call's effect stays in memory, and
+    // the runner logs the `CALL` statement like any other statement's. The
+    // rule is the same for both languages.
+    let snapshot = if db.proc_depth == 1 {
+        Some(Box::new(db.clone()))
+    } else {
+        None
+    };
+    let out = match def.language {
+        ProcLanguage::Sql => run_sql_body(db, db_name, def, scope),
+        ProcLanguage::JavaScript => run_js_body(db, db_name, def, scope),
+    };
+    if out.is_err()
+        && let Some(snap) = snapshot
+    {
+        db.proc_snapshot_restore(snap);
+    }
+    out
+}
+
+/// Run a SQL body with its parameter scope (the caller owns atomicity).
+fn run_sql_body(
+    db: &mut PinkDb,
+    db_name: &str,
+    def: &ProcedureDef,
+    scope: Vec<Var>,
+) -> Result<QueryResult> {
+    let Some(body) = &def.body else {
+        return Err(PinkDbError::Execution(format!(
+            "procedure \"{}\" has no body in this build",
+            def.name
+        )));
+    };
     let mut frame = Frame {
         name: &def.name,
         db_name: db_name.to_string(),
@@ -1745,28 +1789,7 @@ fn execute_call_inner(
         statements: 0,
         last: None,
     };
-    // Statement atomicity: the outermost call is all-or-nothing. It takes its
-    // own snapshot (the store clone the transaction machinery uses anyway) and
-    // restores it on failure — *including* inside a caller's transaction,
-    // where the restore keeps that transaction open and its earlier
-    // statements, buffered WAL text and validation base untouched. On success
-    // the snapshot is simply dropped: the call's effect stays in memory, and
-    // the runner logs the `CALL` statement like any other statement's.
-    let snapshot = if db.proc_depth == 1 {
-        Some(Box::new(db.clone()))
-    } else {
-        None
-    };
-    let flow = match exec_block(db, &mut frame, &body.stmts) {
-        Ok(f) => f,
-        Err(e) => {
-            if let Some(snap) = snapshot {
-                db.proc_snapshot_restore(snap);
-            }
-            return Err(e);
-        }
-    };
-    drop(snapshot);
+    let flow = exec_block(db, &mut frame, &body.stmts)?;
     let result = match flow {
         Flow::Return(Some(result)) => Some(result),
         Flow::Return(None) | Flow::Normal => frame.last,
@@ -1775,20 +1798,54 @@ fn execute_call_inner(
         name: def.name.clone(),
         statements: frame.statements,
         result: result.map(Box::new),
+        output: Vec::new(),
     })
 }
 
-/// A clean error for a definition this build cannot run (the JavaScript
-/// engine is an optional, not-yet-bound build-time component).
+/// Run a JavaScript body in the `pinkdb-js` sandbox (the caller owns
+/// atomicity; `unsupported_language` already refused builds without it).
+#[cfg(feature = "js")]
+fn run_js_body(
+    db: &mut PinkDb,
+    db_name: &str,
+    def: &ProcedureDef,
+    scope: Vec<Var>,
+) -> Result<QueryResult> {
+    let args: Vec<Value> = scope.into_iter().map(|v| v.value).collect();
+    crate::js::call(db, db_name, def, &args)
+}
+
+#[cfg(not(feature = "js"))]
+fn run_js_body(
+    _db: &mut PinkDb,
+    _db_name: &str,
+    def: &ProcedureDef,
+    _scope: Vec<Var>,
+) -> Result<QueryResult> {
+    Err(unsupported_language_error(def))
+}
+
+/// A clean error for a definition this build cannot run (a build without
+/// the `js` feature, or a `pinkdb-js` without its engine).
 fn unsupported_language(def: &ProcedureDef) -> Option<PinkDbError> {
     match def.language {
         ProcLanguage::Sql => None,
-        ProcLanguage::JavaScript => Some(PinkDbError::Execution(format!(
-            "procedure \"{}\" is written in JavaScript, and this build cannot run it: {}",
-            def.name,
-            js_unavailable_reason()
-        ))),
+        ProcLanguage::JavaScript => {
+            #[cfg(feature = "js")]
+            if crate::js::engine_available().is_ok() {
+                return None;
+            }
+            Some(unsupported_language_error(def))
+        }
     }
+}
+
+fn unsupported_language_error(def: &ProcedureDef) -> PinkDbError {
+    PinkDbError::Execution(format!(
+        "procedure \"{}\" is written in JavaScript, and this build cannot run it: {}",
+        def.name,
+        js_unavailable_reason()
+    ))
 }
 
 /// Execute a block: a fresh variable scope for its statements.
@@ -2021,18 +2078,30 @@ fn exec_sql(
     off: usize,
     sql: &Statement,
 ) -> Result<QueryResult> {
-    let slots = crate::sql::binder::ParamSlots::new(Vec::new())
-        .with_variables(frame.variables())
-        .with_logged_procedure(db.is_durable());
-    let (plan, _dynamic) =
-        crate::sql::binder::bind_tracked_with(db, sql, &frame.db_name, Some(slots))?;
+    let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(frame.variables());
+    let db_name = frame.db_name.clone();
+    run_call_statement(db, &db_name, slots, sql, |msg| frame.err(off, msg))
+}
+
+/// Bind, check and run one statement of a procedure call — the shared path
+/// of SQL bodies (variables as bound literals) and JavaScript host calls
+/// (`?` placeholders bound to the script's values). `err` builds the
+/// language-specific "this statement cannot be part of a logged call" error.
+pub(crate) fn run_call_statement(
+    db: &mut PinkDb,
+    db_name: &str,
+    slots: crate::sql::binder::ParamSlots,
+    sql: &Statement,
+    err: impl Fn(&str) -> PinkDbError,
+) -> Result<QueryResult> {
+    let slots = slots.with_logged_procedure(db.is_durable());
+    let (plan, _dynamic) = crate::sql::binder::bind_tracked_with(db, sql, db_name, Some(slots))?;
     // Lazy index lifecycle: mutation times only set a flag (see
     // `PinkDb::rebuild_stale_indexes`).
     db.rebuild_stale_indexes();
     let plan = crate::optimizer::optimize(db, plan);
     if crate::plan::contains_dynamic_scalar(&plan) {
-        return Err(frame.err(
-            off,
+        return Err(err(
             "a statement of this procedure calls a loadable-extension function; extension \
              callbacks are opaque (impure or nondeterministic), so a durable store cannot \
              replay this call — run the statement outside the procedure instead",
@@ -2044,8 +2113,8 @@ fn exec_sql(
     // The call's actual touched set (the WAL frame's payload and the
     // transaction's conflict set): collected here because loop conditions are
     // data-dependent and cannot be approximated before execution.
-    let sets = db.plan_sets_store(&plan, &frame.db_name);
-    let writes = db.plan_writes_of(&plan, &frame.db_name);
+    let sets = db.plan_sets_store(&plan, db_name);
+    let writes = db.plan_writes_of(&plan, db_name);
     db.proc_frame.add_sets(&sets);
     db.proc_frame.add_writes(&writes);
     crate::exec::run(db, &plan)
@@ -2138,6 +2207,7 @@ mod tests {
                 name,
                 statements,
                 result,
+                ..
             } => (name, statements, result.map(|r| *r)),
             other => panic!("expected a CALL result from {sql}, got {other:?}"),
         }
@@ -2181,6 +2251,7 @@ mod tests {
                 name: "add_row".to_string(),
                 statements: 1,
                 result: Some(Box::new(QueryResult::Inserted { count: 1 })),
+                output: Vec::new(),
             }
         );
         // DROP; IF EXISTS is a no-op afterwards.
@@ -3083,8 +3154,9 @@ mod tests {
     }
 
     /// A JavaScript definition that reached the catalog (a store written by a
-    /// build with the sandbox) stays inert: `CALL` reports the refusal the
-    /// build can offer, and the definition is not executed as SQL.
+    /// build with the sandbox): a build without `js` keeps it inert and
+    /// reports the refusal at `CALL`; a `js` build runs it (wave 81). It is
+    /// never executed as SQL.
     #[test]
     fn javascript_definitions_refuse_at_call_time_too() {
         let mut db = PinkDb::new();
@@ -3100,10 +3172,18 @@ mod tests {
             },
         )
         .unwrap();
-        let msg = err(&mut db, "CALL js_def(1);");
         if cfg!(feature = "js") {
-            assert!(msg.contains("not built"), "{msg}");
+            let (_, _, result) = called(&mut db, "CALL js_def(1);");
+            assert_eq!(
+                result,
+                Some(QueryResult::Selected {
+                    names: vec!["return".to_string()],
+                    types: vec![DataType::Integer],
+                    rows: vec![vec![Value::Integer(2)]],
+                })
+            );
         } else {
+            let msg = err(&mut db, "CALL js_def(1);");
             assert!(
                 msg.contains("`js`") && msg.contains("--features js"),
                 "{msg}"
@@ -3167,23 +3247,24 @@ mod tests {
         assert!(msg.contains("nesting too deep"), "{msg}");
     }
 
-    /// The SQL body of a JavaScript definition is refused in a build without
-    /// the `js` feature (and reports the missing engine with it); nothing is
-    /// stored either way.
+    /// A JavaScript definition is refused in a build without the `js` feature
+    /// (nothing is stored); a `js` build stores it (wave 81).
     #[test]
     fn javascript_definitions_are_refused_cleanly() {
         let mut db = PinkDb::new();
-        let msg = err(
-            &mut db,
-            "CREATE PROCEDURE js1() LANGUAGE JAVASCRIPT AS $$ return 1; $$;",
-        );
         if cfg!(feature = "js") {
-            assert!(msg.contains("not built"), "{msg}");
+            db.execute("CREATE PROCEDURE js1() LANGUAGE JAVASCRIPT AS $$ return 1; $$;")
+                .unwrap();
+            assert!(db.procedure_in("main", "js1").is_ok());
         } else {
+            let msg = err(
+                &mut db,
+                "CREATE PROCEDURE js1() LANGUAGE JAVASCRIPT AS $$ return 1; $$;",
+            );
             assert!(msg.contains("`js`"), "{msg}");
             assert!(msg.contains("--features js"), "{msg}");
+            assert!(db.procedure_in("main", "js1").is_err());
         }
-        assert!(db.procedure_in("main", "js1").is_err());
         // The `LANGUAGE` clause may also follow the body, and the SQL
         // language may be written explicitly.
         db.execute("CREATE PROCEDURE ok() AS $$ BEGIN SELECT 1; END $$ LANGUAGE SQL;")
@@ -3402,6 +3483,7 @@ mod tests {
                 name: "nothing".to_string(),
                 statements: 0,
                 result: None,
+                output: Vec::new(),
             }
         );
         // `RETURN` inside a loop unwinds the whole call, and the returned

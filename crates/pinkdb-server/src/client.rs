@@ -514,6 +514,9 @@ fn build_result(
             name,
             statements: to_count(count)?,
             result,
+            // JavaScript `print` lines are not carried by the protocol yet
+            // (wave 81 follow-up).
+            output: Vec::new(),
         });
     }
     if kind == DoneKind::Selected {

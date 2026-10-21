@@ -9,7 +9,12 @@ license = "MIT"
 [lib]
 crate-type = ["rlib"]
 
-# No dependencies on purpose: the sandbox contract is engine-agnostic, and the
-# engine binding (the recorded follow-up) will add exactly one, feature-gated,
-# pure-Rust engine dependency. The default pinkdb build links nothing here.
+# The contract alone has no dependencies. The `engine` feature binds
+# quickjs-ng through `rquickjs` (vendored C sources compiled with `cc`; no
+# bindgen), and `pinkdb`'s `js` feature turns it on — the default pinkdb
+# build links nothing here.
+[features]
+engine = ["dep:rquickjs"]
+
 [dependencies]
+rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }

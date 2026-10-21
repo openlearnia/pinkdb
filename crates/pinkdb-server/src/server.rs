@@ -1421,10 +1421,13 @@ pub(crate) fn send_result<S: FrameSink + ?Sized>(
         QueryResult::DroppedProcedure { name } => done(w, DoneKind::DroppedTable, 0, name),
         QueryResult::CreatedMacro { name } => done(w, DoneKind::Created, 0, name),
         QueryResult::DroppedMacro { name } => done(w, DoneKind::DroppedTable, 0, name),
+        // A JavaScript body's `print` lines are not carried by the protocol
+        // yet (wave 81 follow-up; it would need a protocol bump).
         QueryResult::Called {
             name,
             statements,
             result,
+            ..
         } => {
             // The call's own result rides the frames before `Done(Called)` —
             // only a result set can (see `DoneKind::Called`).

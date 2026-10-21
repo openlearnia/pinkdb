@@ -19,7 +19,7 @@ encryption = ["dep:aes-gcm", "dep:subtle", "dep:sha2"]
 # Opt-in JavaScript procedures (`CREATE PROCEDURE … LANGUAGE JAVASCRIPT AS
 # $$…$$`): links the pinkdb-js sandbox crate. Off by default — the default
 # build stays engine-free and lean. `cargo build --features js`.
-js = ["dep:pinkdb-js"]
+js = ["dep:pinkdb-js", "pinkdb-js/engine"]
 
 [dependencies]
 csv = "1"

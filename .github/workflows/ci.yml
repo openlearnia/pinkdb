@@ -100,6 +100,14 @@ jobs:
               cargo test -p pinkdb-cli --features client
               cargo test -p pinkdb-cli --features client,tls
               cargo test -p pinkdb-cli --features repo
+          - name: js
+            run: |
+              cargo test -p pinkdb-js
+              cargo test -p pinkdb-js --features engine
+              cargo test -p pinkdb --features js
+              cargo test -p pinkdb-cli --features js
+              # The default build must never link the engine.
+              ! cargo tree -p pinkdb-cli -e normal | grep -q rquickjs
           - name: server
             run: |
               cargo test -p pinkdb-server --features tls
@@ -157,6 +165,9 @@ jobs:
           cargo clippy --all-targets -p pinkdb-cli --features pinklake -- -D warnings
           cargo clippy --all-targets -p pinkdb-cli --features s3 -- -D warnings
           cargo clippy --all-targets -p pinkdb-server --features async-server -- -D warnings
+          cargo clippy --all-targets -p pinkdb-js --features engine -- -D warnings
+          cargo clippy --all-targets -p pinkdb --features js -- -D warnings
+          cargo clippy --all-targets -p pinkdb-cli --features js -- -D warnings
 
   wasm:
     name: wasm32 check

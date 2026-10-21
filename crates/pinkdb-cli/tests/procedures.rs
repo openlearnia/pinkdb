@@ -306,3 +306,31 @@ fn remote_calls_round_trip() {
     assert!(text.contains("│ 7"), "{text}");
     handle.join();
 }
+
+/// Wave 81 (`--features js`): a JavaScript procedure's `print` lines render
+/// before the call's line, sanitized like every other rendered string, and
+/// its return value renders as the `return` column.
+#[cfg(feature = "js")]
+#[test]
+fn cli_renders_javascript_print_output() {
+    let (out, err, code) = run_split(
+        &[],
+        "CREATE TABLE t (a INTEGER);\n\
+         CREATE PROCEDURE js(n INTEGER) LANGUAGE JAVASCRIPT AS $$ \
+           db.exec('INSERT INTO t VALUES (?)', [n]); \
+           print('hello', n, '\\x1b[31mred'); \
+           return n * 2; $$;\n\
+         CALL js(21);\n",
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let hello = out.find("hello 21").unwrap_or_else(|| panic!("{out}"));
+    let called = out
+        .find("Procedure js called")
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(hello < called, "print lines come first: {out}");
+    assert!(
+        !out.contains('\u{1b}'),
+        "terminal escapes are sanitized: {out:?}"
+    );
+    assert!(out.contains("42"), "the returned value: {out}");
+}

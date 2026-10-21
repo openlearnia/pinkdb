@@ -9,6 +9,19 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Wave 81 — JavaScript procedures run (quickjs-ng) ✅
+- With the `js` feature (+1.1 MB), `CREATE PROCEDURE … LANGUAGE JAVASCRIPT`
+  now works: the body runs in quickjs-ng with `print`, `db.exec`,
+  `db.query`, `db.value` and a seeded `db.random()`; `?` parameters are
+  bound as values.
+- Same guarantees as SQL procedures: a `CALL` is all-or-nothing, transaction
+  control is refused, and durable stores replay calls exactly (no clock, no
+  `Math.random`, no I/O, no `eval`).
+- Runaway scripts stop cleanly at step, host-call, memory and stack limits;
+  syntax errors are reported at `CREATE` time.
+- `print` lines come back with the call and the CLI shows them (not yet over
+  the server protocol or FFI). Native targets only for now.
+
 ### Fix — DOUBLE NaN comparison semantics now match DuckDB ✅
 - `NaN = NaN` is true, NaN equals no other value and sorts above every other
   double (`+inf` included), and `-0.0 = 0.0` — in filters, ORDER BY (NaN last

@@ -1,6 +1,7 @@
 # Wave 81 — JavaScript procedure engine binding (kickoff plan)
 
-Prepared 2026-10-21. Status: **in progress** (started 2026-10-21). The roadmap's
+Prepared 2026-10-21. Status: **done** (landed 2026-10-21; see the ROADMAP
+progress log for what shipped and the deviations noted under each decision). The roadmap's
 deferral condition ("until the skipped block 46–56 is finished") is met:
 every wave 46–56 is `done`.
 
@@ -131,6 +132,36 @@ The default build stays engine-free and byte-identical.
 4. **wasm** — try `--features js` on wasm32-unknown-unknown; ship it if it
    builds and the sandbox tests pass, otherwise document `js` as native-only
    and keep the wasm gate on default features.
+
+## What changed during implementation
+
+- **Decision 2 (no run-time compilation) kept, mechanism changed.**
+  quickjs-ng cannot compile *anything* without the `Eval` intrinsic — not
+  even the host's own compile of the body ("eval is not supported"). The
+  engine installs `Eval`, compiles the body, then runs a lock-down script
+  that deletes `eval` and replaces `Function` and the `.constructor` of
+  functions, generators, async functions and async generators with a
+  throwing stub, before any user code runs. Tests probe every route.
+- **`Promise` is installed** (the plan omitted it). Creating an `async`
+  function without it leaks inside quickjs-ng and aborts at runtime teardown
+  (`list_empty(&rt->gc_obj_list)`), which would let any script crash the
+  host process. With `Promise`, jobs are drained before the call returns,
+  under the same limits; `queueMicrotask` (installed with it) is deleted.
+- `BigInt::to_i64` wraps modulo 2^64, so `BigInt → BIGINT` goes through the
+  exact decimal text and refuses out-of-range values.
+- `db.query` refuses a non-query statement *before* running it, so a script
+  that catches the error is not left with a write.
+- `db.random` was promised by the wave-44 docs but missing from
+  `HOST_FUNCTIONS`; it is listed now.
+- One contained `unsafe` block in `pinkdb-js` (lifetime-erased host pointer,
+  guarded for the duration of the call): the engine requires `'static` host
+  closures, and the alternatives were a helper thread per call (impossible on
+  wasm32) or moving the store out of `&mut` (unsafe on panic).
+- wasm: `--features js` **compiles** for wasm32-unknown-unknown, but no wasm
+  test runner is installed, so per decision 4 `js` is documented as
+  native-only.
+- The release matrix gains no `js` CLI variant yet (follow-up, together with
+  carrying `print` output in the protocol and FFI).
 
 ## Gates
 
