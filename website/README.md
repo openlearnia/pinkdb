@@ -101,16 +101,26 @@ website/
 ## Build
 
 ```sh
-python3 tools/make-changelog.py   # CHANGELOG.md → src/pages/changelog.html (do this first)
-python3 build.py
+python3 build.py                 # regenerates the changelog page, then the site
+../scripts/check-website.sh      # what CI runs: fails if the committed site is stale
 ```
 
 The changelog page is generated, never edited by hand: `tools/make-changelog.py`
 renders the repo-root `CHANGELOG.md` into `src/pages/changelog.html` (a small
-markdown subset: `##`/`###` headings, lists, paragraphs, inline code/bold/links).
-CI re-runs the tool and `build.py` and fails if `git diff` finds the committed
-fragment or `public/` stale — so after editing `CHANGELOG.md`, regenerate and
-commit both.
+markdown subset: `##`/`###` headings, lists, paragraphs, inline code/bold/links),
+and `build.py` runs it first, so one command produces the whole site. CI's
+"docs site builds" job runs `scripts/check-website.sh`, which rebuilds and
+fails if the committed fragment or `public/` differs (or a generated file is
+untracked) — so after editing `CHANGELOG.md` or anything here, run
+`build.py` and commit the output.
+
+To catch this before CI does, enable the repo's pre-commit hook once per
+clone; it runs the same check whenever a commit touches `CHANGELOG.md` or
+`website/`:
+
+```sh
+git config core.hooksPath scripts/git-hooks
+```
 
 This wipes and regenerates `public/`:
 

@@ -1417,8 +1417,9 @@ fn attach_of_the_v2_fixture_matches_open() {
     let base = common::tail_after_marker(&opened);
     assert_eq!(common::tail_after_marker(&attached), base);
     // The fixture's DOUBLE column holds NaN payloads, so its MIN/MAX take
-    // the materializing path on both arms.
-    assert!(base.contains("-0.0") && base.contains("inf"), "{base}");
+    // the materializing path on both arms. Under DuckDB's NaN order (NaN
+    // sorts above +inf), MAX over a column holding NaN is NaN.
+    assert!(base.contains("-0.0") && base.contains("NaN"), "{base}");
 }
 
 /// `.lake open` after an attach still replaces the store and drops the

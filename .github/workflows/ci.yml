@@ -469,8 +469,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: generate docs (build must be committed)
+        # The same script the local pre-commit hook runs
+        # (scripts/git-hooks/pre-commit), so the two checks cannot drift.
         run: |
-          python3 website/tools/make-changelog.py
-          python3 website/build.py
-          git diff --exit-code -- website/public website/src/pages/changelog.html \
-            || { echo "::error::website output is stale — run website/tools/make-changelog.py + website/build.py and commit the result"; exit 1; }
+          scripts/check-website.sh \
+            || { echo "::error::website output is stale — run python3 website/build.py (it also regenerates the changelog page) and commit the result"; exit 1; }

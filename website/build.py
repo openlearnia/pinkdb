@@ -803,7 +803,24 @@ def validate_nav() -> None:
             )
 
 
+def regenerate_changelog() -> None:
+    """Render CHANGELOG.md into ``src/pages/changelog.html`` first, so one
+    ``build.py`` run always produces the whole site. (The generator stays a
+    standalone tool too; CI's "docs site builds" job fails on any stale
+    output, and running the two steps separately is how it went stale.)"""
+    import importlib.util
+
+    tool = ROOT / "tools" / "make-changelog.py"
+    spec = importlib.util.spec_from_file_location("make_changelog", tool)
+    if spec is None or spec.loader is None:
+        sys.exit(f"error: cannot load {tool}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.main()
+
+
 def main() -> int:
+    regenerate_changelog()
     if not LAYOUT.is_file():
         sys.exit(f"error: missing template {LAYOUT}")
     if not PAGES_DIR.is_dir():

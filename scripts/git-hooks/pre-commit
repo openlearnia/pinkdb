@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+# pinkdb pre-commit hook. Enable once per clone:
+#   git config core.hooksPath scripts/git-hooks
+#
+# When a commit touches CHANGELOG.md or anything under website/, regenerate
+# the docs site and refuse the commit if the staged/committed output would be
+# stale — the exact check CI's "docs site builds" job runs
+# (scripts/check-website.sh). Bypass deliberately with `git commit --no-verify`.
+set -eu
+if git diff --cached --name-only | grep -qE '^(CHANGELOG\.md|website/)'; then
+    # The check compares the working tree; anything regenerated but not yet
+    # staged shows up as a modification and fails the commit.
+    if ! scripts/check-website.sh; then
+        echo "pre-commit: stage the regenerated site and commit again" >&2
+        exit 1
+    fi
+fi
