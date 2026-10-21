@@ -1176,6 +1176,9 @@ fn save_snapshot_refuses_a_foreign_lease_holder() {
         "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1); checkpoint;",
         "p1-ready",
     );
+    // Spawn p2 *before* taking the foreign lock: a child that inherited the
+    // lock fd would keep the flock alive after the test drops it.
+    let mut p2 = Cli::spawn(&dir, None);
     let foreign = {
         let f = std::fs::OpenOptions::new()
             .read(true)
@@ -1185,15 +1188,36 @@ fn save_snapshot_refuses_a_foreign_lease_holder() {
         f.try_lock().unwrap();
         f
     };
-    let mut p2 = Cli::spawn(&dir, None);
     p2.send(".save db.pink\n");
     let line = p2.expect_error("in use by another handle or process");
     assert!(
         line.contains("in use by another handle or process"),
         "{line}"
     );
-    // Once the holder exits, the same snapshot proceeds.
+    // Once the holder exits, the same snapshot proceeds. Wait until the OS
+    // lock is actually free (a loaded CI runner can observe the close a
+    // little after `drop`), then ask p2 to save again.
     drop(foreign);
+    let mut freed = false;
+    for _ in 0..100 {
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        match probe.try_lock() {
+            Ok(()) => {
+                drop(probe);
+                freed = true;
+                break;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(std::fs::TryLockError::Error(e)) => panic!("lock probe failed: {e}"),
+        }
+    }
+    assert!(freed, "the foreign lock was not released within 10s");
     let before = std::fs::read(&ckpt).unwrap();
     p2.send(".save db.pink\n");
     p2.wait_for("Saved");
