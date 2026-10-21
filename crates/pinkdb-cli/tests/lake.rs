@@ -469,15 +469,36 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
         out.contains("Partitioned main.t by (a)"),
         "a keyed .lake partition must unseal the lake: {out}"
     );
-    // ... and without the key the same subcommand still fails closed.
-    let out = run_no_key(&format!(
-        ".lake partition {lake} t clear\n.quit\n",
-        lake = lake.display()
-    ));
-    assert!(
-        out.contains("the lake is encrypted"),
-        "a keyless .lake partition must refuse an encrypted lake: {out}"
+    // The other maintenance subcommands use the same keyed open.
+    let out = run_with_env(
+        &format!(
+            ".lake inlining {lake} main.t 0\n\
+             .lake inlining {lake} main.t default\n\
+             .lake flush {lake}\n\
+             .lake add_data_files {lake} main.t data/main.t/does-not-exist.vortex\n\
+             .quit\n",
+            lake = lake.display()
+        ),
+        &key,
     );
+    assert!(
+        !out.contains("the lake is encrypted"),
+        "inlining/flush/add_data_files must unseal a keyed lake: {out}"
+    );
+    // ... and without the key the same subcommands still fail closed.
+    for sub in [
+        ".lake partition {lake} t clear",
+        ".lake inlining {lake} main.t 0",
+        ".lake flush {lake}",
+        ".lake add_data_files {lake} main.t data/main.t/x.vortex",
+    ] {
+        let command = sub.replace("{lake}", &lake.display().to_string());
+        let out = run_no_key(&format!("{command}\n.quit\n"));
+        assert!(
+            out.contains("the lake is encrypted"),
+            "a keyless {sub} must refuse an encrypted lake: {out}"
+        );
+    }
 
     // Failures: no key, wrong key, and a keyed save onto a plaintext lake.
     let out = run_no_key(&format!(

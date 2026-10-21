@@ -536,7 +536,7 @@ mod tests {
         let f = by_name("json_object");
         assert_eq!((f.min_args(), f.max_args()), (0, 64));
         assert!(f.is_variadic());
-        assert_eq!(f.arg_type_at(7), ExtType::Varchar);
+        assert_eq!(f.arg_type_at(7), Some(ExtType::Varchar));
         let f = by_name("json_array");
         assert_eq!(f.min_args(), 0);
         assert!(f.is_variadic());

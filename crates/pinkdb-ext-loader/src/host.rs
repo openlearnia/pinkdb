@@ -5,7 +5,7 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::abi::{
     ExtType, PINKDB_EXT_ABI_VERSION, PINKDB_EXT_FLAG_KNOWN, PINKDB_EXT_MAX_ARGS, PinkdbExtScalarFn,
@@ -24,20 +24,36 @@ unsafe extern "C" {
 
 /// State collected while an extension's `pinkdb_extension_init` runs.
 ///
-/// Lives on the loading thread's stack only; the extension receives a
-/// `*mut Collector` as the `host_ctx` argument and passes it back to
-/// `register_scalar`. The ABI forbids calling `register_scalar` outside init.
+/// L-8: the loader allocates this on the **heap** and keeps it alive for the
+/// library's lifetime (the [`LoadedExtension`] and the process-wide registry
+/// both hold an `Arc`). The extension receives `*mut Collector` as its
+/// `host_ctx`; after init returns, `init_complete` is set and any later
+/// `register_scalar` is rejected deterministically instead of writing into a
+/// dead stack frame.
 pub(crate) struct Collector {
     /// Keeps the library mapped via every collected function.
     pub(crate) library: Arc<libloading::Library>,
     /// Path the library was loaded from; copied into every function so the
     /// engine can map a called function back to its extension.
     pub(crate) path: String,
+    /// Set exactly once, after `pinkdb_extension_init` returns. Registration
+    /// is only legal before this transition.
+    pub(crate) init_complete: AtomicBool,
     pub(crate) functions: Vec<DynamicFunction>,
     /// First rejected registration, if any: the load fails even when the
     /// extension's init returns 0 (a rejected function must never look
     /// registered).
     pub(crate) error: Option<String>,
+}
+
+impl std::fmt::Debug for Collector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Collector")
+            .field("path", &self.path)
+            .field("init_complete", &self.init_complete.load(Ordering::Relaxed))
+            .field("functions", &self.functions.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Build the API struct for one `pinkdb_extension_init` call.
@@ -147,6 +163,13 @@ fn collect(
     // rejected below.
     let collector = unsafe { ctx.cast::<Collector>().as_mut() }
         .ok_or_else(|| "internal error: NULL host context".to_string())?;
+    if collector.init_complete.load(Ordering::Acquire) {
+        return Err(
+            "register_scalar called after pinkdb_extension_init returned (the host context is \
+             init-scoped)"
+                .to_string(),
+        );
+    }
     if let Some(first) = &collector.error {
         return Err(format!("a previous registration failed: {first}"));
     }

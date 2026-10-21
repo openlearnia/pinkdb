@@ -62,6 +62,8 @@ pub mod storage;
 /// Host-registered table sources (wave 70): the engine-adjacent surface the
 /// `pinkdb-parquet` crate (`read_parquet`, `FROM 'file.parquet'`) plugs into.
 pub mod table_source;
+/// Terminal-safe rendering for untrusted identifiers and values.
+pub mod text;
 pub mod types;
 pub mod vector;
 pub mod wal;
@@ -85,6 +87,7 @@ pub use storage::{DataTable, PinkDb, ViewDef};
 pub use table_source::{
     TableFunctionArg, TableFunctionCall, TableScanOutput, TableSource, TableSourceStats,
 };
+pub use text::sanitize_terminal;
 pub use types::{DataType, PinkDbError, Result, Value};
 pub use vector::{CHUNK_SIZE, DataChunk, Vector, VectorData};
 pub use wal::{

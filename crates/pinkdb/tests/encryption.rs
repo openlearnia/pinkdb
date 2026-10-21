@@ -156,10 +156,14 @@ fn assert_same_values(a: &[Vec<Value>], b: &[Vec<Value>]) {
 /// Length of the public container header, i.e. where the payload begins.
 fn payload_start(data: &[u8]) -> usize {
     assert_eq!(&data[..8], ENC_MAGIC);
+    let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
     let kdf = data[13];
-    let mut pos = 34;
+    // Legacy v1-v3: 34-byte fixed header; current v4: 42 (128-bit nonce base).
+    let fixed = if version >= 4 { 42 } else { 34 };
+    let mut pos = fixed;
     if kdf == 1 {
-        let salt_len = u32::from_le_bytes(data[46..50].try_into().unwrap()) as usize;
+        let salt_len =
+            u32::from_le_bytes(data[fixed + 12..fixed + 16].try_into().unwrap()) as usize;
         pos += 16 + salt_len;
     }
     pos + 30 + 16
@@ -172,11 +176,12 @@ fn wal_records_start(data: &[u8]) -> usize {
     // block since v2 (wave 45m) and are written as v3 since wave 45o (the
     // payload gained the per-frame touched sets). Checkpoints stay v2.
     let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
-    assert!(
-        (2..=3).contains(&version),
-        "WAL containers are v2 or v3, got {version}"
-    );
-    payload_start(data) + 88
+    let block = match version {
+        4 => 144,
+        2 | 3 => 88,
+        other => panic!("unexpected WAL container version {other}"),
+    };
+    payload_start(data) + block
 }
 
 /// A 900-byte string with no useful repeats (16-char hex chunks of a seeded
@@ -410,12 +415,12 @@ fn passphrase_saves_store_fresh_argon2id_params() {
     let bytes = std::fs::read(s.ckpt()).unwrap();
     // Header: kdf id = 1 (Argon2id), then m/t/p/salt_len and the salt.
     assert_eq!(bytes[13], 1, "kdf must be Argon2id");
-    let m = u32::from_le_bytes(bytes[34..38].try_into().unwrap());
-    let t = u32::from_le_bytes(bytes[38..42].try_into().unwrap());
-    let p = u32::from_le_bytes(bytes[42..46].try_into().unwrap());
-    let salt_len = u32::from_le_bytes(bytes[46..50].try_into().unwrap());
+    let m = u32::from_le_bytes(bytes[42..46].try_into().unwrap());
+    let t = u32::from_le_bytes(bytes[46..50].try_into().unwrap());
+    let p = u32::from_le_bytes(bytes[50..54].try_into().unwrap());
+    let salt_len = u32::from_le_bytes(bytes[54..58].try_into().unwrap());
     assert_eq!((m, t, p, salt_len), (19 * 1024, 2, 1, 16));
-    assert_eq!(payload_start(&bytes), 34 + 16 + 16 + 46);
+    assert_eq!(payload_start(&bytes), 42 + 16 + 16 + 46);
 
     // Same passphrase, fresh salt per save: different container bytes.
     let other = s.dir.join("again.pink");

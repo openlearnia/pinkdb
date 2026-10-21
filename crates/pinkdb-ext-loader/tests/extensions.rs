@@ -57,6 +57,68 @@ fn ints(rows: &[Vec<Value>]) -> Vec<i64> {
 
 // ---------- loading and calling ----------
 
+/// L-8: the host context is heap-owned for the library's lifetime, and a
+/// registration attempted after `pinkdb_extension_init` returned is a clean
+/// error instead of a write into a dead stack frame.
+#[test]
+fn late_registration_after_init_is_rejected_without_ub() {
+    let path = common::extension_path("late_register_ext");
+    let ext = pinkdb_ext_loader::load(&path).expect("load the late-register extension");
+    assert_eq!(ext.name(), "late-register-test");
+    assert_eq!(
+        ext.functions().len(),
+        1,
+        "only init-time registration lands"
+    );
+
+    // Call the extension's post-init probe. It still holds the host ctx it
+    // was given during init; the collector behind it must still be alive.
+    let library = unsafe { libloading::Library::new(&path) }.expect("open the extension");
+    let late = unsafe {
+        library
+            .get::<extern "C" fn() -> i32>(b"pinkdb_test_late_register\0")
+            .expect("late-register probe")
+    };
+    assert_ne!(late(), 0, "a post-init registration must be rejected");
+
+    // The extension remains fully usable: no registration was corrupted.
+    let base = ext
+        .functions()
+        .iter()
+        .find(|f| f.name() == "late_base")
+        .expect("init-time function")
+        .clone();
+    assert_eq!(base.call(&[]).unwrap(), ExtValue::Integer(7));
+}
+
+/// L-9: a bogus `text_len` is rejected before the host reads or frees the
+/// extension buffer, and a non-VARCHAR tag's text pointer is never freed.
+#[test]
+fn malformed_extension_varchar_results_are_rejected_safely() {
+    let path = common::extension_path("bogus_values_ext");
+    let ext = pinkdb_ext_loader::load(&path).expect("load the bogus-values extension");
+
+    let bogus_len = ext
+        .functions()
+        .iter()
+        .find(|f| f.name() == "bogus_len")
+        .expect("bogus_len")
+        .clone();
+    let err = bogus_len.call(&[]).unwrap_err().to_string();
+    assert!(err.contains("over the"), "{err}");
+    assert!(err.contains("refusing to read or free"), "{err}");
+
+    // INTEGER with a non-NULL text pointer: the value is returned and the
+    // pointer is not freed (freeing a static buffer would abort the process).
+    let bogus_tag = ext
+        .functions()
+        .iter()
+        .find(|f| f.name() == "bogus_tag")
+        .expect("bogus_tag")
+        .clone();
+    assert_eq!(bogus_tag.call(&[]).unwrap(), ExtValue::Integer(42));
+}
+
 #[test]
 fn loads_and_runs_typed_scalar_functions() {
     let mut db = test_db();

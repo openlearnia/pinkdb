@@ -85,7 +85,7 @@ use pink_lake::{
     CleanupSettings, CommitSettings, ExpireSettings, Lake, MergeSettings, RewriteSettings,
     WritableAttachment,
 };
-use pinkdb::PinkDb;
+use pinkdb::{PinkDb, sanitize_terminal};
 
 use crate::{plural, take_token, unquote};
 
@@ -1017,11 +1017,18 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
     match result {
         Ok(report) if !report.committed => {
             if keys.is_empty() {
-                println!("Table {key} in {dir} has no partition specification (nothing to clear)");
+                println!(
+                    "Table {} in {dir} has no partition specification (nothing to clear)",
+                    sanitize_terminal(&key)
+                );
             } else {
                 println!(
-                    "Table {key} in {dir} is already partitioned by ({}); nothing published",
-                    keys.join(", ")
+                    "Table {} in {dir} is already partitioned by ({}); nothing published",
+                    sanitize_terminal(&key),
+                    keys.iter()
+                        .map(|k| sanitize_terminal(k))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
         }
@@ -1029,16 +1036,21 @@ fn cmd_partition(db: &PinkDb, arg: &str) {
             set_baseline_version_only(&dir, report.version);
             if keys.is_empty() {
                 println!(
-                    "Cleared the partition specification of {key} in {dir} (version {} in \
+                    "Cleared the partition specification of {} in {dir} (version {} in \
                      {:.3}s); existing files keep their values",
+                    sanitize_terminal(&key),
                     report.version,
                     t0.elapsed().as_secs_f64(),
                 );
             } else {
                 println!(
-                    "Partitioned {key} by ({}) in {dir} (version {} in {:.3}s; new writes \
+                    "Partitioned {} by ({}) in {dir} (version {} in {:.3}s; new writes \
                      split into one data file per {} value)",
-                    keys.join(", "),
+                    sanitize_terminal(&key),
+                    keys.iter()
+                        .map(|k| sanitize_terminal(k))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     report.version,
                     t0.elapsed().as_secs_f64(),
                     if keys.len() == 1 {
@@ -1107,20 +1119,25 @@ fn cmd_inlining(arg: &str) {
     let settings = commit_settings();
     match lake.set_inlining_limit(&table, limit, &settings) {
         Ok(report) if !report.committed => {
-            println!("Table {table} in {dir} already has that inlining limit; nothing published");
+            println!(
+                "Table {} in {dir} already has that inlining limit; nothing published",
+                sanitize_terminal(&table)
+            );
         }
         Ok(report) => {
             set_baseline_version_only(&dir, report.version);
             match limit {
                 Some(limit) => println!(
-                    "Table {table} in {dir}: commits appending at most {limit} row{} are stored \
+                    "Table {} in {dir}: commits appending at most {limit} row{} are stored \
                      in the catalog metadata (version {}); 0 disables inlining",
+                    sanitize_terminal(&table),
                     if limit == 1 { "" } else { "s" },
                     report.version,
                 ),
                 None => println!(
-                    "Cleared the inlining limit of {table} in {dir} (version {}); the \
+                    "Cleared the inlining limit of {} in {dir} (version {}); the \
                      handle's data_inlining_row_limit default applies",
+                    sanitize_terminal(&table),
                     report.version,
                 ),
             }
@@ -1168,15 +1185,19 @@ fn cmd_flush(arg: &str) {
     let t0 = Instant::now();
     match lake.flush_inlined_data(table.as_deref()) {
         Ok(report) if !report.committed => match table {
-            Some(table) => println!("Table {table} in {dir} has no live inlined rows to flush"),
+            Some(table) => println!(
+                "Table {} in {dir} has no live inlined rows to flush",
+                sanitize_terminal(&table)
+            ),
             None => println!("{dir} has no live inlined rows to flush"),
         },
         Ok(report) => {
             set_baseline_version_only(&dir, report.version);
             for (key, rows) in &report.tables {
                 println!(
-                    "Flushed {rows} inlined row{} of {key} into {dir} data files (version {})",
+                    "Flushed {rows} inlined row{} of {} into {dir} data files (version {})",
                     plural(*rows as usize),
+                    sanitize_terminal(key),
                     report.version,
                 );
             }
@@ -1274,8 +1295,10 @@ fn cmd_changes(arg: &str) {
                 )
             };
             println!(
-                "{key}  version {}  rowid {rowid}  {}{values}",
-                row.version, row.change_type
+                "{}  version {}  rowid {rowid}  {}{values}",
+                sanitize_terminal(&key),
+                row.version,
+                sanitize_terminal(row.change_type.as_str())
             );
         }
     }
@@ -1288,7 +1311,11 @@ fn cmd_changes(arg: &str) {
 /// else in its canonical display.
 fn render_change_value(value: &pinkdb::Value) -> String {
     match value {
-        pinkdb::Value::Varchar(s) => format!("'{}'", s.replace('\'', "''")),
+        // The change log is data read from the lake: a VARCHAR may contain a
+        // terminal escape sequence (or a hostile lake may have written one).
+        pinkdb::Value::Varchar(s) => {
+            format!("'{}'", sanitize_terminal(s).replace('\'', "''"))
+        }
         other => other.to_string(),
     }
 }
@@ -1341,8 +1368,10 @@ fn cmd_add_data_files(arg: &str) {
             set_baseline_version_only(&dir, report.version);
             for (_, path, rows) in &report.files {
                 println!(
-                    "Registered {path} ({rows} row{}) as {table} in {dir} (version {})",
+                    "Registered {} ({rows} row{}) as {} in {dir} (version {})",
+                    sanitize_terminal(path),
                     plural(*rows as usize),
+                    sanitize_terminal(&table),
                     report.version,
                 );
             }
@@ -1409,12 +1438,12 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
     }
     let stats = db.attached_decode_stats();
     for ((location, tables), (_, loads, columns, files)) in lakes.into_iter().zip(stats) {
-        println!("{location}");
+        println!("{}", sanitize_terminal(&location));
         for t in tables {
             println!(
                 "  {}.{} ({} row{})",
-                t.db,
-                t.table,
+                sanitize_terminal(&t.db),
+                sanitize_terminal(&t.table),
                 t.rows,
                 plural(t.rows as usize)
             );
@@ -1428,9 +1457,13 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
     }
     for (location, wa) in writables().iter() {
         let changed = wa.changed_tables(db).unwrap_or_default();
-        println!("{location} (writable)");
+        println!("{} (writable)", sanitize_terminal(&location));
         for (key, rows) in wa.tables() {
-            println!("  {key} ({rows} row{})", plural(rows as usize));
+            println!(
+                "  {} ({rows} row{})",
+                sanitize_terminal(&key),
+                plural(rows as usize)
+            );
         }
         if changed.is_empty() {
             println!(
@@ -1510,12 +1543,12 @@ fn cmd_snapshots(arg: &str) {
                 } else {
                     println!("version {}", info.version);
                 }
-                println!("  time:    {}", info.time);
+                println!("  time:    {}", sanitize_terminal(&info.time));
                 if let Some(author) = &info.author {
-                    println!("  author:  {author}");
+                    println!("  author:  {}", sanitize_terminal(author));
                 }
                 if let Some(message) = &info.message {
-                    println!("  message: {message}");
+                    println!("  message: {}", sanitize_terminal(message));
                 }
                 println!(
                     "  tables:  {} ({} row{})",
@@ -1528,29 +1561,32 @@ fn cmd_snapshots(arg: &str) {
                     None => println!("  changes: (not recorded)"),
                     Some(changes) if changes.is_empty() => println!("  changes: (none)"),
                     Some(changes) => {
+                        let names = |list: &[String]| {
+                            list.iter()
+                                .map(|n| sanitize_terminal(n))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
                         let mut parts = Vec::new();
                         if !changes.tables_created.is_empty() {
-                            parts.push(format!("created: {}", changes.tables_created.join(", ")));
+                            parts.push(format!("created: {}", names(&changes.tables_created)));
                         }
                         if !changes.tables_dropped.is_empty() {
-                            parts.push(format!("dropped: {}", changes.tables_dropped.join(", ")));
+                            parts.push(format!("dropped: {}", names(&changes.tables_dropped)));
                         }
                         if !changes.tables_rewritten.is_empty() {
-                            parts.push(format!(
-                                "rewritten: {}",
-                                changes.tables_rewritten.join(", ")
-                            ));
+                            parts.push(format!("rewritten: {}", names(&changes.tables_rewritten)));
                         }
                         let mut rows: Vec<String> = changes
                             .rows_added
                             .iter()
-                            .map(|(table, n)| format!("{table} +{n}"))
+                            .map(|(table, n)| format!("{} +{n}", sanitize_terminal(table)))
                             .collect();
                         rows.extend(
                             changes
                                 .rows_removed
                                 .iter()
-                                .map(|(table, n)| format!("{table} -{n}")),
+                                .map(|(table, n)| format!("{} -{n}", sanitize_terminal(table))),
                         );
                         if !rows.is_empty() {
                             parts.push(format!("rows: {}", rows.join(", ")));
@@ -1586,7 +1622,11 @@ fn cmd_tables(arg: &str) {
         Ok(tables) if tables.is_empty() => println!("(no tables)"),
         Ok(tables) => {
             for (name, rows) in tables {
-                println!("{name} ({rows} row{})", plural(rows as usize));
+                println!(
+                    "{} ({rows} row{})",
+                    sanitize_terminal(&name),
+                    plural(rows as usize)
+                );
             }
             warn_missing_data_files(&lake);
         }
@@ -1652,7 +1692,11 @@ fn cmd_info(arg: &str) {
     }
     println!("  tables ({}):", tables.len());
     for (name, rows) in tables {
-        println!("    {name} ({rows} row{})", plural(rows as usize));
+        println!(
+            "    {} ({rows} row{})",
+            sanitize_terminal(&name),
+            plural(rows as usize)
+        );
     }
     warn_missing_data_files(&lake);
 }
@@ -1664,8 +1708,9 @@ fn warn_missing_data_files(lake: &Lake) {
         Ok(missing) => {
             for (table, path) in missing {
                 println!(
-                    "warning: table \"{table}\" references missing data file {}",
-                    path.display()
+                    "warning: table \"{}\" references missing data file {}",
+                    sanitize_terminal(&table),
+                    sanitize_terminal(&path.display().to_string())
                 );
             }
         }
@@ -1834,7 +1879,7 @@ fn cmd_merge(arg: &str) {
             for table in &report.tables {
                 println!(
                     "{}: merged {} file{} into {}",
-                    table.table,
+                    sanitize_terminal(&table.table),
                     table.files_processed,
                     plural(table.files_processed as usize),
                     table.files_created
@@ -1919,7 +1964,7 @@ fn cmd_rewrite(arg: &str) {
             for table in &report.tables {
                 println!(
                     "{}: rewrote {} file{} into {}",
-                    table.table,
+                    sanitize_terminal(&table.table),
                     table.files_processed,
                     plural(table.files_processed as usize),
                     table.files_created
@@ -2106,9 +2151,9 @@ fn cmd_cleanup(arg: &str, kind: CleanupKind) {
         Ok(report) => {
             for path in &report.paths {
                 if report.dry_run {
-                    println!("would delete {path}");
+                    println!("would delete {}", sanitize_terminal(path));
                 } else {
-                    println!("deleted {path}");
+                    println!("deleted {}", sanitize_terminal(path));
                 }
             }
             if report.dry_run {
@@ -2208,7 +2253,7 @@ fn cmd_files(arg: &str) {
 fn print_file_info(info: &pink_lake::LakeFileInfo) {
     let mut parts: Vec<String> = Vec::new();
     if let Some(table) = &info.table {
-        parts.push(format!("table={table}"));
+        parts.push(format!("table={}", sanitize_terminal(table)));
     }
     if let Some(rows) = info.rows {
         parts.push(format!("rows={rows}"));
@@ -2225,14 +2270,15 @@ fn print_file_info(info: &pink_lake::LakeFileInfo) {
     if let Some(delete) = &info.delete_file {
         let rows = info.delete_file_rows.unwrap_or(0);
         parts.push(format!(
-            "delete={delete} ({rows} position{})",
+            "delete={} ({rows} position{})",
+            sanitize_terminal(delete),
             plural(rows as usize)
         ));
     }
     if !info.referenced {
         parts.push("unreferenced".to_string());
     }
-    println!("{}: {}", info.path, parts.join(" "));
+    println!("{}: {}", sanitize_terminal(&info.path), parts.join(" "));
 }
 
 /// `{region=east, day=NULL}`-style text for a file's partition values.
@@ -2240,8 +2286,8 @@ fn partition_text(partition: &BTreeMap<String, Option<String>>) -> String {
     partition
         .iter()
         .map(|(key, value)| match value {
-            Some(value) => format!("{key}={value}"),
-            None => format!("{key}=NULL"),
+            Some(value) => format!("{}={}", sanitize_terminal(key), sanitize_terminal(value)),
+            None => format!("{}=NULL", sanitize_terminal(key)),
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -2273,7 +2319,14 @@ fn cmd_table_info(arg: &str) {
                 let partition = if info.partition_by.is_empty() {
                     String::new()
                 } else {
-                    format!(", partitioned by ({})", info.partition_by.join(", "))
+                    format!(
+                        ", partitioned by ({})",
+                        info.partition_by
+                            .iter()
+                            .map(|k| sanitize_terminal(k))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
                 };
                 let inlining = if info.inlined_history > 0 {
                     format!(
@@ -2291,7 +2344,7 @@ fn cmd_table_info(arg: &str) {
                 };
                 println!(
                     "{}: {} file{}, {}, {} delete file{}, {}, {} row{}, schema version {}{}{}",
-                    info.table,
+                    sanitize_terminal(&info.table),
                     info.file_count,
                     plural(info.file_count as usize),
                     bytes_text(info.file_size_bytes),
@@ -2343,7 +2396,9 @@ fn cmd_options(arg: &str) {
             for option in options {
                 println!(
                     "{}: {}  ({})",
-                    option.name, option.value, option.description
+                    sanitize_terminal(&option.name),
+                    sanitize_terminal(&option.value),
+                    sanitize_terminal(&option.description)
                 );
             }
         }
@@ -2370,7 +2425,39 @@ fn cmd_settings(arg: &str) {
         }
     };
     let settings = lake.settings();
-    println!("catalog_type:      {}", settings.catalog_type);
-    println!("extension_version: {}", settings.extension_version);
-    println!("data_path:         {}", settings.data_path);
+    println!(
+        "catalog_type:      {}",
+        sanitize_terminal(&settings.catalog_type)
+    );
+    println!(
+        "extension_version: {}",
+        sanitize_terminal(&settings.extension_version)
+    );
+    println!(
+        "data_path:         {}",
+        sanitize_terminal(&settings.data_path)
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M-9: a lake's change-log values and partition keys are data from disk,
+    /// not trusted terminal text.
+    #[test]
+    fn change_values_and_partition_keys_are_sanitized() {
+        let value = pinkdb::Value::Varchar("\u{1b}]0;pwned\u{7}".to_string());
+        let rendered = render_change_value(&value);
+        assert!(!rendered.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(rendered.contains("\\u{1b}"), "{rendered}");
+
+        let partition = BTreeMap::from([
+            ("\u{1b}[31mkey".to_string(), Some("Chloé".to_string())),
+            ("ok".to_string(), None),
+        ]);
+        let text = partition_text(&partition);
+        assert!(!text.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(text.contains("Chloé"), "{text}");
+    }
 }

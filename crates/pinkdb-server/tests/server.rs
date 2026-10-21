@@ -1160,6 +1160,51 @@ fn idle_clients_are_disconnected_and_announced_frames_are_not_preallocated() {
     assert_server_healthy(&addr);
 }
 
+/// The idle timeout is a per-frame deadline, not a per-socket-read timeout: a
+/// client that drips one byte at a time (each well inside the timeout) must
+/// still be disconnected once the frame as a whole overruns it, while a
+/// normal client is unaffected.
+#[test]
+fn slow_drip_client_is_disconnected_at_the_frame_deadline() {
+    let server = Server::bind("127.0.0.1:0", Database::new())
+        .unwrap()
+        .idle_timeout(Some(Duration::from_millis(300)));
+    let addr = server.local_addr().to_string();
+    let _handle = server.spawn().unwrap();
+
+    let mut raw = Raw::connect(&addr);
+    // Execute frame: length prefix (4) + type (1) + body. Send it one byte
+    // every 100 ms, so no single socket read stalls for the timeout but the
+    // whole frame takes well over 300 ms.
+    let sql = b"SELECT 1;";
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&((sql.len() + 1) as u32).to_le_bytes());
+    frame.push(msg_type::EXECUTE);
+    frame.extend_from_slice(sql);
+    for b in frame {
+        // Once the deadline passes the server closes; the next write then
+        // fails with BrokenPipe, which is exactly the disconnect we want.
+        if raw.writer.write_all(&[b]).is_err() {
+            break;
+        }
+        if raw.writer.flush().is_err() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // The server may send one Error frame, then closes; either way the next
+    // reads reach EOF instead of serving the statement.
+    let mut sink = Vec::new();
+    let _ = raw.reader.read_to_end(&mut sink);
+    assert!(
+        !sink.windows(4).any(|w| w == b"rows"),
+        "the dripped frame must not have executed"
+    );
+
+    // A normal client still connects and runs statements.
+    assert_server_healthy(&addr);
+}
+
 #[test]
 fn checkpoint_round_trips_as_its_own_done_kind() {
     let (_handle, addr) = start();

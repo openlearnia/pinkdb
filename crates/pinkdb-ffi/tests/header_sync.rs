@@ -4,6 +4,9 @@
 //! exactly the set `src/lib.rs` exports.
 
 use std::collections::BTreeSet;
+use std::mem::{align_of, offset_of, size_of};
+
+use pinkdb_ffi::PinkValue;
 
 const HEADER: &str = include_str!("../include/pinkdb.h");
 const SOURCE: &str = include_str!("../src/lib.rs");
@@ -69,6 +72,110 @@ fn enumerators_match_the_rust_constants() {
             }
         }
     }
+}
+
+/// Fields of the `pink_value` typedef, in declaration order, with their C
+/// type spelling.
+fn pink_value_fields() -> Vec<(String, String)> {
+    let start = HEADER
+        .find("typedef struct pink_value {")
+        .expect("pink_value typedef");
+    let rest = &HEADER[start..];
+    let end = rest.find("} pink_value;").expect("pink_value typedef end");
+    rest[..end]
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with("/*")
+                || line.starts_with('*')
+                || line.ends_with('{')
+            {
+                return None;
+            }
+            let (ty, name) = line
+                .trim_end_matches(';')
+                .rsplit_once(char::is_whitespace)?;
+            let name = name.trim().trim_start_matches('*').trim();
+            let ty = ty.trim();
+            let ty = if line.contains('*') {
+                format!("{ty} *")
+            } else {
+                ty.to_string()
+            };
+            Some((name.to_string(), ty))
+        })
+        .collect()
+}
+
+/// `(size, align)` of the C spellings the struct may use on this target.
+fn c_size_align(ty: &str, pointer: usize) -> (usize, usize) {
+    match ty {
+        "int32_t" => (4, 4),
+        "int64_t" | "double" => (8, 8),
+        "const char *" => (pointer, pointer),
+        "size_t" => (pointer, pointer),
+        other => panic!("pink_value has an unhandled C type: {other:?}"),
+    }
+}
+
+/// Lay a `repr(C)` struct out from the header's field types.
+fn c_layout(fields: &[(String, String)]) -> (Vec<usize>, usize) {
+    let pointer = size_of::<usize>();
+    let mut offsets = Vec::new();
+    let mut offset = 0usize;
+    let mut align = 1usize;
+    for (_, ty) in fields {
+        let (size, field_align) = c_size_align(ty, pointer);
+        align = align.max(field_align);
+        offset = offset.next_multiple_of(field_align);
+        offsets.push(offset);
+        offset += size;
+    }
+    (offsets, offset.next_multiple_of(align))
+}
+
+#[test]
+fn pink_value_layout_matches_the_header() {
+    let fields = pink_value_fields();
+    let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "type_tag", "is_null", "int64", "double_", "text_ptr", "text_len"
+        ],
+        "pink_value's fields changed; update PinkValue and every binding"
+    );
+    let (offsets, size) = c_layout(&fields);
+
+    let rust_names = [
+        "type_tag", "is_null", "int64", "double_", "text_ptr", "text_len",
+    ];
+    let rust_offsets = [
+        offset_of!(PinkValue, type_tag),
+        offset_of!(PinkValue, is_null),
+        offset_of!(PinkValue, int64),
+        offset_of!(PinkValue, double),
+        offset_of!(PinkValue, text_ptr),
+        offset_of!(PinkValue, text_len),
+    ];
+    for (i, name) in rust_names.iter().enumerate() {
+        assert_eq!(
+            offsets[i], rust_offsets[i],
+            "pink_value.{name}: header offset {} != Rust {}",
+            offsets[i], rust_offsets[i]
+        );
+    }
+    assert_eq!(
+        size,
+        size_of::<PinkValue>(),
+        "pink_value size differs between the header and Rust"
+    );
+    assert_eq!(
+        align_of::<PinkValue>(),
+        size_of::<usize>(),
+        "unexpected PinkValue alignment"
+    );
 }
 
 #[test]

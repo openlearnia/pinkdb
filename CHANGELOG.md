@@ -9,6 +9,18 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Security hardening — pass 7 (final): terminal escaping, crypto/WAL/loader/FFI hardening ✅
+- A single terminal sanitizer now covers **every rendered identifier** (all
+  result variants, column names, catalog/lake output, errors), closing ANSI/OSC
+  injection while preserving legitimate UTF-8.
+- Engine containers v4 and lake containers v2 use a 128-bit nonce base (96-bit
+  derived GCM nonces); WAL v4 authenticates its publish block; tampering is
+  rejected. Legacy formats still open, and are rewritten on the next save.
+- The extension loader validates zero-arg types, owns its collector, refuses
+  post-init registration, bounds VARCHAR copies and ignores non-VARCHAR frees;
+  the FFI bounds `value_count` and pins `PinkValue`'s layout. The sync transport
+  enforces a per-frame deadline; the CI installer and Docker images are pinned.
+
 ### Security hardening — pass 6: filesystem privileges, file modes, lake binding ✅
 - `COPY … TO` now needs `ADMIN` and is **off by default on the server**; with
   the opt-in it is confined to a configured root, refuses traversal/symlinks,

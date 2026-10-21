@@ -206,12 +206,19 @@ impl ExtFunction {
 
     /// The declared type of argument `index` (0-based): the positional type,
     /// or the repeated last type for a variadic argument past the declared
-    /// list. Clamped to the declared list, so it is defined for every index
-    /// of a function that declares at least one type.
-    pub fn arg_type_at(&self, index: usize) -> ExtType {
+    /// list. `None` for a zero-argument function (there is no declared type
+    /// to clamp to) — callers must have checked the arity first.
+    pub fn arg_type_at(&self, index: usize) -> Option<ExtType> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
-            ExtFunction::Dynamic(f) => f.arg_types()[index.min(f.n_args() - 1)],
+            ExtFunction::Dynamic(f) => {
+                let n = f.n_args();
+                if n == 0 {
+                    None
+                } else {
+                    Some(f.arg_types()[index.min(n - 1)])
+                }
+            }
             ExtFunction::Linked { func, .. } => func.arg_type_at(index),
         }
     }
@@ -439,12 +446,11 @@ pub struct LoadedExtension {
     /// [`resolve_path`]). This is the identity the loader's registry and the
     /// engine's WAL replay compare.
     canonical_path: PathBuf,
-    functions: Vec<DynamicFunction>,
-    /// Keeps the library mapped independently of the functions (the
-    /// zero-function case: without this, dropping the handle would unload the
-    /// code immediately after a successful load). Never read: holding the
-    /// `Arc` is the whole point.
-    _library: Arc<libloading::Library>,
+    /// L-8: the heap-allocated init collector, retained for the library's
+    /// lifetime. It owns the registered functions *and* keeps the host
+    /// context pointer valid, so a late `register_scalar` reaches the
+    /// `init_complete` flag instead of a dead stack frame.
+    collector: Arc<host::Collector>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -468,13 +474,18 @@ impl LoadedExtension {
 
     /// Registered functions.
     pub fn functions(&self) -> &[DynamicFunction] {
-        &self.functions
+        &self.collector.functions
     }
 
     /// Consume the handle, yielding the functions (and with them the shared
     /// library reference: the code stays mapped while any survives).
     pub fn into_functions(self) -> Vec<DynamicFunction> {
-        self.functions
+        // The registry may hold a second handle for the same library; then
+        // the collector stays shared and its functions are cloned.
+        match Arc::try_unwrap(self.collector) {
+            Ok(collector) => collector.functions,
+            Err(shared) => shared.functions.clone(),
+        }
     }
 }
 
@@ -817,22 +828,32 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
             }
         })?;
 
-    let mut collector = host::Collector {
+    // L-8: heap-allocate the collector and retain it with the handle (and the
+    // registry). Its address is stable for the library's lifetime, so the
+    // `host_ctx` an extension may have kept is never a dead stack frame; the
+    // flag makes a post-init registration a clean error.
+    let mut collector = Arc::new(host::Collector {
         library: Arc::clone(&library),
         // The canonical path, like the handle's: the engine records it in
         // the WAL (`LOAD EXTENSION '<path>'`), and a canonical path resolves
         // the same way in every process that replays it.
         path: canonical.to_string_lossy().into_owned(),
+        init_complete: std::sync::atomic::AtomicBool::new(false),
         functions: Vec::new(),
         error: None,
-    };
+    });
     let api = host::host_api();
     // SAFETY: `api` is a fully initialized host-owned struct, valid for the
-    // duration of the call; `&mut collector` is passed as the opaque ctx the
-    // ABI routes back to our `register_scalar`. The extension must not store
-    // `api` beyond the call (documented) and must not unwind.
-    let code = unsafe { init_fn(&api, std::ptr::from_mut(&mut collector).cast::<c_void>()) };
-    if let Some(first_error) = collector.error.take() {
+    // duration of the call; `Arc::as_ptr(&collector)` is a live, stable
+    // `Collector` address passed as the opaque ctx the ABI routes back to our
+    // `register_scalar`. The extension must not store `api` beyond the call
+    // (documented) and must not unwind.
+    let code = unsafe { init_fn(&api, Arc::as_ptr(&collector).cast_mut().cast::<c_void>()) };
+    // Close registration before evaluating the outcome: init is over.
+    collector
+        .init_complete
+        .store(true, std::sync::atomic::Ordering::Release);
+    if let Some(first_error) = Arc::get_mut(&mut collector).and_then(|c| c.error.take()) {
         // A rejected registration fails the load even if init returned 0.
         return Err(ExtError::Registration {
             message: first_error,
@@ -852,8 +873,7 @@ fn load_resolved(canonical: &Path, display: &str) -> Result<LoadedExtension, Ext
         // same way in every process that replays it.
         path: canonical.to_string_lossy().into_owned(),
         canonical_path: canonical.to_path_buf(),
-        functions: collector.functions,
-        _library: library,
+        collector,
     })
     .inspect(|ext| {
         // The process-wide registry: the library stays mapped for the

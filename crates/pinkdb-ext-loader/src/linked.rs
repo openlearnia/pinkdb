@@ -358,11 +358,11 @@ impl LinkedFunction {
 
     /// The declared type of argument `index` (0-based): the positional type,
     /// or the last declared type for a variadic argument past the declared
-    /// list. The index is clamped to the declared list, so this is defined
-    /// for any index of a function that declares at least one type.
-    pub fn arg_type_at(&self, index: usize) -> ExtType {
-        let i = index.min(self.arg_types.len() - 1);
-        self.arg_types[i]
+    /// list. `None` for a zero-argument function: there is no declared type,
+    /// and `len - 1` must never underflow (it is OOB in release builds).
+    pub fn arg_type_at(&self, index: usize) -> Option<ExtType> {
+        let i = index.min(self.arg_types.len().checked_sub(1)?);
+        Some(self.arg_types[i])
     }
 
     /// Declared return type.
@@ -411,14 +411,23 @@ impl LinkedFunction {
             });
         }
         for (i, a) in args.iter().enumerate() {
-            if a.ext_type() != self.arg_type_at(i) {
+            let Some(expected) = self.arg_type_at(i) else {
+                return Err(ExtError::BadResult {
+                    function: self.name.clone(),
+                    message: format!(
+                        "argument {} was supplied, but the function declares no arguments",
+                        i + 1
+                    ),
+                });
+            };
+            if a.ext_type() != expected {
                 return Err(ExtError::BadResult {
                     function: self.name.clone(),
                     message: format!(
                         "argument {} has type {}, registered as {}",
                         i + 1,
                         a.ext_type(),
-                        self.arg_type_at(i)
+                        expected
                     ),
                 });
             }
@@ -802,6 +811,10 @@ mod tests {
             |_args: &[ExtArg<'_>]| Ok(ExtValue::Varchar(b"nope".to_vec())),
         )
         .unwrap();
+        // L-6: a zero-argument function has no argument type; querying one
+        // must return `None`, not underflow `len - 1`.
+        assert_eq!(wrong.arg_type_at(0), None);
+        assert_eq!(wrong.arg_type_at(usize::MAX), None);
         let err = wrong.call(&[]).unwrap_err();
         assert!(
             err.to_string()
@@ -894,9 +907,9 @@ mod tests {
         assert_eq!(variadic.min_args(), 0);
         assert_eq!(variadic.max_args(), PINKDB_EXT_MAX_ARGS as usize);
         assert!(variadic.is_variadic());
-        assert_eq!(variadic.arg_type_at(0), ExtType::Integer);
-        assert_eq!(variadic.arg_type_at(1), ExtType::Varchar);
-        assert_eq!(variadic.arg_type_at(9), ExtType::Varchar);
+        assert_eq!(variadic.arg_type_at(0), Some(ExtType::Integer));
+        assert_eq!(variadic.arg_type_at(1), Some(ExtType::Varchar));
+        assert_eq!(variadic.arg_type_at(9), Some(ExtType::Varchar));
         assert_eq!(
             variadic
                 .call(&[

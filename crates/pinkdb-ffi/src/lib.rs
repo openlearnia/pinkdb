@@ -137,6 +137,32 @@ pub struct PinkValue {
     pub text_len: usize,
 }
 
+// L-10: the struct crosses the C ABI by value. Pin the layout at compile
+// time so a field reorder or type change fails the build instead of silently
+// reinterpreting every value in the Python and Go bindings. These offsets
+// must match `include/pinkdb.h`'s `pink_value` (checked again by
+// `tests/header_sync.rs`).
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(std::mem::offset_of!(PinkValue, type_tag) == 0);
+    assert!(std::mem::offset_of!(PinkValue, is_null) == 4);
+    assert!(std::mem::offset_of!(PinkValue, int64) == 8);
+    assert!(std::mem::offset_of!(PinkValue, double) == 16);
+    assert!(std::mem::offset_of!(PinkValue, text_ptr) == 24);
+    assert!(std::mem::offset_of!(PinkValue, text_len) == 32);
+    assert!(std::mem::size_of::<PinkValue>() == 40);
+};
+#[cfg(target_pointer_width = "32")]
+const _: () = {
+    assert!(std::mem::offset_of!(PinkValue, type_tag) == 0);
+    assert!(std::mem::offset_of!(PinkValue, is_null) == 4);
+    assert!(std::mem::offset_of!(PinkValue, int64) == 8);
+    assert!(std::mem::offset_of!(PinkValue, double) == 16);
+    assert!(std::mem::offset_of!(PinkValue, text_ptr) == 20);
+    assert!(std::mem::offset_of!(PinkValue, text_len) == 24);
+    assert!(std::mem::size_of::<PinkValue>() == 28);
+};
+
 impl PinkValue {
     fn null() -> Self {
         Self {
@@ -678,6 +704,33 @@ pub extern "C" fn pinkdb_execute_prepared(
     }
     if values.is_null() && value_count > 0 {
         set_error("null values pointer with non-zero count");
+        return ptr::null_mut();
+    }
+    // L-7: `value_count` arrives from the caller before the array can be
+    // validated. A `Vec::with_capacity(2^62)` aborts the process, so check the
+    // count against what the prepared statement actually takes (and a hard
+    // ceiling far above any real statement) *before* touching the allocator.
+    const MAX_BOUND_VALUES: usize = 65_536;
+    let expected = unsafe { &*prepared }.stmt.parameter_count();
+    if value_count > MAX_BOUND_VALUES {
+        set_error(&format!(
+            "value_count {value_count} exceeds the maximum of {MAX_BOUND_VALUES} bound values"
+        ));
+        return ptr::null_mut();
+    }
+    if value_count != expected {
+        // Keep the engine's established wording (the bindings assert it
+        // verbatim); the only change is that the check now happens before
+        // the allocation.
+        let message = if value_count < expected {
+            format!("values were not provided for prepared statement parameters: {expected}")
+        } else {
+            format!(
+                "parameter count mismatch: the prepared statement takes {expected}, but values \
+                 were provided for: {value_count}"
+            )
+        };
+        set_error(&message);
         return ptr::null_mut();
     }
     let mut bound: Vec<pinkdb::Value> = Vec::with_capacity(value_count);

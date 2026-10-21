@@ -17,6 +17,9 @@ name = "pinkdb_ext_loader"
 libloading = "0.8"
 
 [dev-dependencies]
+# The late-registration test opens the same test extension to call its
+# post-init probe symbol.
+libloading = "0.8"
 # Deliberate dev-dependency cycle: `pinkdb` depends on this crate (the
 # `PinkDb::load_extension` wrapper and the dynamic-function registry live in
 # the engine, next to the binder/executor integration). Cargo permits cycles

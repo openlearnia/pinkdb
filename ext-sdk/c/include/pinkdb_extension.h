@@ -43,7 +43,8 @@
  *   type_tag  PINKDB_EXT_TYPE_* — the *declared* type of the value/argument;
  *   is_null   non-zero ⇒ the value is NULL (only type_tag is meaningful; for
  *             results the host ignores every other field, including text_ptr
- *             — but still frees a non-NULL text_ptr, see ownership below);
+ *             and text_len, and never frees a pointer carried under a
+ *             non-VARCHAR tag, see ownership below);
  *   int64     BOOLEAN (0/1), INTEGER, BIGINT, DATE (days since 1970-01-01),
  *             TIMESTAMP (microseconds since 1970-01-01 UTC), and INTERVAL
  *             (microseconds — see the INTERVAL note below);
@@ -53,7 +54,8 @@
  *             pattern (see below);
  *   text_ptr  VARCHAR bytes; NULL when absent;
  *   text_len  byte length of text_ptr (embedded NUL bytes are allowed; a
- *             trailing NUL is neither required nor read).
+ *             trailing NUL is neither required nor read). A VARCHAR result
+ *             over 64 MiB is rejected without reading or freeing the buffer.
  *
  * INTERVAL (type tag 9, same number as the pinkdb C ABI's
  * PINKDB_TYPE_INTERVAL) is a calendar interval with DuckDB's three fields:
@@ -110,9 +112,14 @@
  * bytes out of `text_ptr` and then calls `api->free(text_ptr)` *immediately*
  * after the call returns. Rules:
  * - `text_ptr` must be NULL or a pointer returned by `api->alloc`;
- * - a non-NULL `text_ptr` is always freed by the host, even when
- *   `is_null` is set or the callback returns a non-zero code — never return
- *   a stack, static, or interior pointer there, and never keep it;
+ * - a non-NULL `text_ptr` on a **VARCHAR** result is always freed by the
+ *   host, even when `is_null` is set or the callback returns a non-zero
+ *   code — never return a stack, static, or interior pointer there, and
+ *   never keep it;
+ * - a `text_ptr` carried under any non-VARCHAR tag is ignored and **never
+ *   freed** (it is not a VARCHAR result buffer), and a VARCHAR result whose
+ *   `text_len` exceeds 64 MiB is rejected without reading or freeing the
+ *   pointer;
  * - the host never frees a NULL `text_ptr`;
  * - VARCHAR inputs (`args[i].text_ptr`) are host-owned: never free them.
  *
@@ -132,6 +139,9 @@
  *   only valid during `pinkdb_extension_init` — copy it (it is a small POD)
  *   if callbacks need it later;
  * - `register_scalar` may only be called from inside `pinkdb_extension_init`.
+ *   The host heap-allocates the context for the library's lifetime and sets
+ *   an init-complete flag when init returns; a later call returns non-zero
+ *   deterministically (it never writes into a dead frame).
  * Extensions are never unloaded while the host process lives: the host keeps
  * the library mapped for every extension it accepted — including one that
  * registered no functions — for as long as the store holding the registration

@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod common;
+
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Unique scratch directory for one test.
@@ -71,6 +73,27 @@ fn non_utf8_pinkdb_key_is_a_hard_error_not_a_plaintext_save() {
         !dir.join("x.pink").exists(),
         "no plaintext file may be written for a set key"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Informational (pass 7): an ambient `PINKDB_PASSWORD` is a remote-mode
+/// credential only. Exporting it for an unrelated purpose must not stop a
+/// local REPL from starting (previously the env value was adopted without
+/// `--host`, and the "credentials require --host" validation failed).
+#[test]
+fn ambient_password_does_not_break_a_local_session() {
+    let dir = scratch("password_local");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pinkdb"));
+    command
+        .env("PINKDB_PASSWORD", "ambient-secret")
+        .current_dir(&dir);
+    let (text, status) = common::run_merged(command, "SELECT 1;\n.quit\n");
+    common::assert_script_exit(status);
+    assert!(
+        !text.contains("require --host"),
+        "a local session must ignore PINKDB_PASSWORD:\n{text}"
+    );
+    assert!(text.contains("1 row"), "the REPL did not run:\n{text}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

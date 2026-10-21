@@ -34,7 +34,8 @@ static EXTENSION_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 macro_rules! cli_error {
     ($($arg:tt)*) => {{
         $crate::HAD_ERROR.store(true, ::std::sync::atomic::Ordering::Relaxed);
-        eprintln!("Error: {}", format_args!($($arg)*));
+        let message = format!($($arg)*);
+        eprintln!("Error: {}", pinkdb::sanitize_terminal(&message));
     }};
 }
 
@@ -495,15 +496,15 @@ fn cmd_installed() {
         Ok(files) => {
             println!(
                 "Installed extensions ({}):",
-                repo::extensions_dir(&home).display()
+                pinkdb::sanitize_terminal(&repo::extensions_dir(&home).display().to_string())
             );
             for f in files {
                 println!(
                     "  {} {} {} {}",
-                    f.name,
-                    f.version,
-                    f.platform,
-                    f.path.display()
+                    pinkdb::sanitize_terminal(&f.name),
+                    pinkdb::sanitize_terminal(&f.version),
+                    pinkdb::sanitize_terminal(&f.platform),
+                    pinkdb::sanitize_terminal(&f.path.display().to_string())
                 );
             }
         }
@@ -527,7 +528,7 @@ fn cmd_databases(db: &PinkDb) {
         } else {
             format!("({tables}, {nv} view{})", plural(nv))
         };
-        println!("{name}{marker} {label}");
+        println!("{}{marker} {label}", pinkdb::sanitize_terminal(&name));
     }
 }
 
@@ -549,13 +550,17 @@ fn cmd_tables(db: &PinkDb) {
     }
     for t in tables {
         let n = db.table(&t).map(|x| x.num_rows()).unwrap_or(0);
-        println!("{t} ({n} rows)");
+        println!("{} ({n} rows)", pinkdb::sanitize_terminal(&t));
     }
     for t in attached {
-        println!("{} ({} rows, attached)", t.table, t.rows);
+        println!(
+            "{} ({} rows, attached)",
+            pinkdb::sanitize_terminal(&t.table),
+            t.rows
+        );
     }
     for v in views {
-        println!("{v} (view)");
+        println!("{} (view)", pinkdb::sanitize_terminal(&v));
     }
 }
 
@@ -585,11 +590,11 @@ fn cmd_schema(db: &mut PinkDb, arg: &str) {
     };
     match table_result {
         Ok(t) => {
-            println!("CREATE TABLE {} (", t.name);
+            println!("CREATE TABLE {} (", pinkdb::sanitize_terminal(&t.name));
             let schema = t.schema();
             for (i, (col, dtype)) in schema.iter().enumerate() {
                 let comma = if i + 1 == schema.len() { "" } else { "," };
-                println!("  {col} {dtype}{comma}");
+                println!("  {} {dtype}{comma}", pinkdb::sanitize_terminal(col));
             }
             println!("); -- {} rows, {} chunks", t.num_rows(), t.num_chunks());
         }
@@ -601,10 +606,10 @@ fn cmd_schema(db: &mut PinkDb, arg: &str) {
                 None => db.attached_table_in(db.current_db(), &lookup_name),
             };
             if let Some(att) = attached {
-                println!("CREATE TABLE {} (", att.table);
+                println!("CREATE TABLE {} (", pinkdb::sanitize_terminal(&att.table));
                 for (i, (col, dtype)) in att.schema.iter().enumerate() {
                     let comma = if i + 1 == att.schema.len() { "" } else { "," };
-                    println!("  {col} {dtype}{comma}");
+                    println!("  {} {dtype}{comma}", pinkdb::sanitize_terminal(col));
                 }
                 println!("); -- {} rows, attached (read-only)", att.rows);
                 return;
@@ -626,10 +631,10 @@ fn cmd_schema(db: &mut PinkDb, arg: &str) {
                     match db.execute(&format!("SELECT * FROM {qualified} LIMIT 0;")) {
                         Ok(results) => match results.first() {
                             Some(QueryResult::Selected { names, types, .. }) => {
-                                println!("CREATE VIEW {view_name} (");
+                                println!("CREATE VIEW {} (", pinkdb::sanitize_terminal(&view_name));
                                 for (i, (n, t)) in names.iter().zip(types).enumerate() {
                                     let comma = if i + 1 == names.len() { "" } else { "," };
-                                    println!("  {n} {t}{comma}");
+                                    println!("  {} {t}{comma}", pinkdb::sanitize_terminal(n));
                                 }
                                 println!("); -- view (session-local)");
                             }
@@ -1086,31 +1091,9 @@ fn display_value(v: &Value) -> String {
         }
         // Stored text is untrusted: never emit raw control characters (a
         // terminal escape sequence in a row would inject output).
-        Value::Varchar(s) => sanitize_cell(s),
+        Value::Varchar(s) => pinkdb::sanitize_terminal(s),
         _ => v.to_string(),
     }
-}
-
-/// Escape control characters in a displayed VARCHAR cell: `\n`/`\r` become a
-/// space (a newline would break the box) and every other control (notably ESC)
-/// is shown as `\u{..}`.
-fn sanitize_cell(s: &str) -> String {
-    if !s.chars().any(char::is_control) {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\t' => out.push('\t'),
-            '\n' | '\r' => out.push(' '),
-            c if c.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{{{:x}}}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Formats a `SELECT` result as the DuckDB-style box table: header names,
@@ -1126,6 +1109,10 @@ fn sanitize_cell(s: &str) -> String {
 /// byte.
 fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> String {
     let shown = rows.len().min(DISPLAY_CAP);
+    // Column names are untrusted too (a quoted identifier may contain ESC, and
+    // a hostile server may send arbitrary bytes): sanitize before measuring,
+    // so the width and the printed text agree.
+    let names: Vec<String> = names.iter().map(|n| pinkdb::sanitize_terminal(n)).collect();
     let cells: Vec<Vec<String>> = rows
         .iter()
         .take(shown)
@@ -1167,7 +1154,7 @@ fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> S
     };
 
     border(&mut out, "┌", "┬", "┐");
-    row_out(&mut out, names);
+    row_out(&mut out, &names);
     row_out(&mut out, &type_row);
     border(&mut out, "├", "┼", "┤");
     for row in &cells {
@@ -1187,74 +1174,144 @@ fn format_select(names: &[String], types: &[DataType], rows: &[Vec<Value>]) -> S
 
 /// Print each statement result with the shared DuckDB-style renderer.
 fn render_results(results: &[QueryResult]) {
+    print!("{}", render_results_text(results));
+}
+
+/// The renderer's output as a string (the unit tests assert on it directly).
+fn render_results_text(results: &[QueryResult]) -> String {
+    let mut out = String::new();
+    render_results_into(&mut out, results);
+    out
+}
+
+fn render_results_into(out: &mut String, results: &[QueryResult]) {
+    use std::fmt::Write as _;
+    // Every object name in a `QueryResult` originates in SQL (a quoted
+    // identifier may contain ESC) or on the wire (a hostile server): render
+    // each through the shared sanitizer.
+    let clean = pinkdb::sanitize_terminal;
     for r in results {
         match r {
-            QueryResult::Created => println!("Table created."),
-            QueryResult::Inserted { count } => println!("Inserted {count} row(s)."),
-            QueryResult::Updated { count } => println!("Updated {count} row(s)."),
-            QueryResult::Deleted { count } => println!("Deleted {count} row(s)."),
-            QueryResult::Began => println!("Transaction started."),
-            QueryResult::Committed => println!("Transaction committed."),
-            QueryResult::RolledBack => println!("Transaction rolled back."),
-            QueryResult::CreatedView { name } => println!("View {name} created."),
-            QueryResult::DroppedTable { name } => println!("Table {name} dropped."),
-            QueryResult::CreatedIndex { name } => println!("Index {name} created."),
-            QueryResult::DroppedIndex { name } => println!("Index {name} dropped."),
+            QueryResult::Created => {
+                let _ = writeln!(out, "Table created.");
+            }
+            QueryResult::Inserted { count } => {
+                let _ = writeln!(out, "Inserted {count} row(s).");
+            }
+            QueryResult::Updated { count } => {
+                let _ = writeln!(out, "Updated {count} row(s).");
+            }
+            QueryResult::Deleted { count } => {
+                let _ = writeln!(out, "Deleted {count} row(s).");
+            }
+            QueryResult::Began => {
+                let _ = writeln!(out, "Transaction started.");
+            }
+            QueryResult::Committed => {
+                let _ = writeln!(out, "Transaction committed.");
+            }
+            QueryResult::RolledBack => {
+                let _ = writeln!(out, "Transaction rolled back.");
+            }
+            QueryResult::CreatedView { name } => {
+                let _ = writeln!(out, "View {} created.", clean(name));
+            }
+            QueryResult::DroppedTable { name } => {
+                let _ = writeln!(out, "Table {} dropped.", clean(name));
+            }
+            QueryResult::CreatedIndex { name } => {
+                let _ = writeln!(out, "Index {} created.", clean(name));
+            }
+            QueryResult::DroppedIndex { name } => {
+                let _ = writeln!(out, "Index {} dropped.", clean(name));
+            }
             QueryResult::CreatedMaterializedView { name } => {
-                println!("Materialized view {name} created.")
+                let _ = writeln!(out, "Materialized view {} created.", clean(name));
             }
             QueryResult::RefreshedMaterializedView { name } => {
-                println!("Materialized view {name} refreshed.")
+                let _ = writeln!(out, "Materialized view {} refreshed.", clean(name));
             }
             QueryResult::RefreshedMaterializedViews { names } => {
-                println!("Refreshed {} materialized view(s).", names.len())
+                let _ = writeln!(out, "Refreshed {} materialized view(s).", names.len());
             }
             QueryResult::DroppedMaterializedView { name } => {
-                println!("Materialized view {name} dropped.")
+                let _ = writeln!(out, "Materialized view {} dropped.", clean(name));
             }
-            QueryResult::DroppedView { name } => println!("View {name} dropped."),
+            QueryResult::DroppedView { name } => {
+                let _ = writeln!(out, "View {} dropped.", clean(name));
+            }
             QueryResult::CreatedDatabase { name } => {
-                println!("Database {name} created.")
+                let _ = writeln!(out, "Database {} created.", clean(name));
             }
             QueryResult::DroppedDatabase { name } => {
-                println!("Database {name} dropped.")
+                let _ = writeln!(out, "Database {} dropped.", clean(name));
             }
-            QueryResult::Used { db } => println!("Using database {db}."),
+            QueryResult::Used { db } => {
+                let _ = writeln!(out, "Using database {}.", clean(db));
+            }
             QueryResult::LoadedExtension { name } => {
-                println!("Extension {name} loaded.")
+                let _ = writeln!(out, "Extension {} loaded.", clean(name));
             }
-            QueryResult::Checkpointed => println!("Checkpoint complete."),
-            QueryResult::AlteredTable { name } => println!("Table {name} altered."),
-            QueryResult::CreatedProcedure { name } => println!("Procedure {name} created."),
-            QueryResult::DroppedProcedure { name } => println!("Procedure {name} dropped."),
-            QueryResult::CreatedMacro { name } => println!("Macro {name} created."),
-            QueryResult::DroppedMacro { name } => println!("Macro {name} dropped."),
-            QueryResult::CreatedUser { name } => println!("User {name} created."),
-            QueryResult::AlteredUser { name } => println!("User {name} altered."),
-            QueryResult::DroppedUser { name } => println!("User {name} dropped."),
-            QueryResult::CreatedRole { name } => println!("Role {name} created."),
-            QueryResult::DroppedRole { name } => println!("Role {name} dropped."),
-            QueryResult::Granted { description } => println!("Granted {description}."),
-            QueryResult::Revoked { description } => println!("Revoked {description}."),
+            QueryResult::Checkpointed => {
+                let _ = writeln!(out, "Checkpoint complete.");
+            }
+            QueryResult::AlteredTable { name } => {
+                let _ = writeln!(out, "Table {} altered.", clean(name));
+            }
+            QueryResult::CreatedProcedure { name } => {
+                let _ = writeln!(out, "Procedure {} created.", clean(name));
+            }
+            QueryResult::DroppedProcedure { name } => {
+                let _ = writeln!(out, "Procedure {} dropped.", clean(name));
+            }
+            QueryResult::CreatedMacro { name } => {
+                let _ = writeln!(out, "Macro {} created.", clean(name));
+            }
+            QueryResult::DroppedMacro { name } => {
+                let _ = writeln!(out, "Macro {} dropped.", clean(name));
+            }
+            QueryResult::CreatedUser { name } => {
+                let _ = writeln!(out, "User {} created.", clean(name));
+            }
+            QueryResult::AlteredUser { name } => {
+                let _ = writeln!(out, "User {} altered.", clean(name));
+            }
+            QueryResult::DroppedUser { name } => {
+                let _ = writeln!(out, "User {} dropped.", clean(name));
+            }
+            QueryResult::CreatedRole { name } => {
+                let _ = writeln!(out, "Role {} created.", clean(name));
+            }
+            QueryResult::DroppedRole { name } => {
+                let _ = writeln!(out, "Role {} dropped.", clean(name));
+            }
+            QueryResult::Granted { description } => {
+                let _ = writeln!(out, "Granted {}.", clean(description));
+            }
+            QueryResult::Revoked { description } => {
+                let _ = writeln!(out, "Revoked {}.", clean(description));
+            }
             QueryResult::Called {
                 name,
                 statements,
                 result,
             } => {
-                println!(
-                    "Procedure {name} called ({statements} statement{}).",
+                let _ = writeln!(
+                    out,
+                    "Procedure {} called ({statements} statement{}).",
+                    clean(name),
                     if *statements == 1 { "" } else { "s" }
                 );
                 if let Some(inner) = result {
-                    render_results(std::slice::from_ref(&**inner));
+                    render_results_into(out, std::slice::from_ref(&**inner));
                 }
             }
             QueryResult::Selected { names, types, rows } => {
                 if rows.is_empty() {
-                    println!("(no rows)");
+                    let _ = writeln!(out, "(no rows)");
                 }
                 let table = format_select(names, types, rows);
-                println!("{table}");
+                let _ = writeln!(out, "{table}");
             }
         }
     }
@@ -1416,10 +1473,13 @@ fn parse_args() -> Result<Opts, String> {
 }
 
 /// Reject credential-flag combinations the client cannot honor, and pick up
-/// `PINKDB_PASSWORD` when `--password` is absent (wave 48). Credentials are a
-/// remote-mode feature: without `--host` there is nothing to log in to.
+/// `PINKDB_PASSWORD` when `--password` is absent **for a remote session**
+/// (wave 48). Credentials are a remote-mode feature: without `--host` there
+/// is nothing to log in to, and a machine that exports the variable for an
+/// unrelated purpose must still be able to start the local REPL.
 fn validate_auth_args(opts: &mut Opts) -> Result<(), String> {
-    if opts.password.is_none()
+    if opts.host.is_some()
+        && opts.password.is_none()
         && let Ok(value) = std::env::var("PINKDB_PASSWORD")
         && !value.is_empty()
     {
@@ -1980,6 +2040,83 @@ fn has_sql_content(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M-9: every name-carrying `QueryResult` variant is sanitized. A single
+    /// ESC in any of them must never reach the rendered text raw.
+    #[test]
+    fn every_result_variant_sanitizes_its_names() {
+        let evil = "\u{1b}]0;pwned\u{7}";
+        let n = || evil.to_string();
+        let results = vec![
+            QueryResult::Created,
+            QueryResult::Inserted { count: 1 },
+            QueryResult::Updated { count: 1 },
+            QueryResult::Deleted { count: 1 },
+            QueryResult::Began,
+            QueryResult::Committed,
+            QueryResult::RolledBack,
+            QueryResult::CreatedView { name: n() },
+            QueryResult::DroppedTable { name: n() },
+            QueryResult::CreatedIndex { name: n() },
+            QueryResult::DroppedIndex { name: n() },
+            QueryResult::CreatedMaterializedView { name: n() },
+            QueryResult::RefreshedMaterializedView { name: n() },
+            QueryResult::RefreshedMaterializedViews { names: vec![n()] },
+            QueryResult::DroppedMaterializedView { name: n() },
+            QueryResult::DroppedView { name: n() },
+            QueryResult::CreatedDatabase { name: n() },
+            QueryResult::DroppedDatabase { name: n() },
+            QueryResult::Used { db: n() },
+            QueryResult::LoadedExtension { name: n() },
+            QueryResult::Checkpointed,
+            QueryResult::AlteredTable { name: n() },
+            QueryResult::CreatedProcedure { name: n() },
+            QueryResult::DroppedProcedure { name: n() },
+            QueryResult::CreatedMacro { name: n() },
+            QueryResult::DroppedMacro { name: n() },
+            QueryResult::CreatedUser { name: n() },
+            QueryResult::AlteredUser { name: n() },
+            QueryResult::DroppedUser { name: n() },
+            QueryResult::CreatedRole { name: n() },
+            QueryResult::DroppedRole { name: n() },
+            QueryResult::Granted { description: n() },
+            QueryResult::Revoked { description: n() },
+            QueryResult::Called {
+                name: n(),
+                statements: 1,
+                result: None,
+            },
+            QueryResult::Selected {
+                names: vec![n()],
+                types: vec![DataType::Varchar],
+                rows: vec![vec![Value::Varchar(n())]],
+            },
+        ];
+        let text = render_results_text(&results);
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "raw control in rendered results: {text:?}"
+        );
+        assert!(text.contains("\\u{1b}"), "{text}");
+        assert!(text.contains("Procedure"), "{text}");
+    }
+
+    #[test]
+    fn sanitized_column_names_keep_the_box_aligned() {
+        let names = vec!["a\u{1b}[31mB".to_string(), "Chloé".to_string()];
+        let types = vec![DataType::Integer, DataType::Varchar];
+        let rows = vec![vec![Value::Integer(1), Value::Varchar("x".to_string())]];
+        let out = format_select(&names, &types, &rows);
+        assert!(!out.contains('\u{1b}'));
+        // The sanitized header occupies its escaped width; every border line
+        // must have the same display length.
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| l.starts_with('│'))
+            .map(|l| l.chars().count())
+            .collect();
+        assert!(widths.windows(2).all(|w| w[0] == w[1]), "{out}");
+    }
 
     #[test]
     fn renders_small_result_exactly() {

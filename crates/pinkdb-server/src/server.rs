@@ -34,10 +34,12 @@
 //! - A panic while executing one statement is caught, reported as an `Error`
 //!   frame, and does not kill the server or the connection.
 //! - Sockets carry an idle timeout ([`DEFAULT_IDLE_TIMEOUT`], configurable
-//!   via [`Server::idle_timeout`]): a client that sends nothing (or reads
-//!   nothing) for that long is disconnected, so stalled peers cannot pin the
-//!   connection cap. Frame bodies are buffered as they arrive, never sized
-//!   from the untrusted length prefix.
+//!   via [`Server::idle_timeout`]): **one deadline per frame**, not per
+//!   socket read. The whole length prefix, type byte and body must arrive
+//!   within the timeout; the deadline resets only between frames, so a client
+//!   dripping one byte just before each timeout is disconnected instead of
+//!   pinning the connection cap forever. Frame bodies are buffered as they
+//!   arrive, never sized from the untrusted length prefix.
 //! - SQL `LOAD EXTENSION` is refused unless the operator opts in with
 //!   [`Server::allow_load_extension`]: letting a remote client `dlopen` a
 //!   host library is remote code execution (and, since wave 48, the SQL
@@ -74,7 +76,7 @@
 //!   timeout are unchanged.
 
 use std::collections::HashMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -867,7 +869,84 @@ fn serve_connection(
     if !configure_socket(&stream, idle_timeout) {
         return;
     }
-    serve_client(stream, db, policy);
+    serve_client(stream, db, idle_timeout, policy);
+}
+
+/// A stream whose read timeout can be adjusted before each underlying read.
+trait FrameReadTimeout {
+    fn set_frame_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
+}
+
+impl FrameReadTimeout for TcpStream {
+    fn set_frame_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.set_read_timeout(timeout)
+    }
+}
+
+#[cfg(feature = "tls")]
+impl FrameReadTimeout for rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+    fn set_frame_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        self.sock.set_read_timeout(timeout)
+    }
+}
+
+/// Per-frame receive deadline for the blocking transport.
+///
+/// `SO_RCVTIMEO` alone bounds each socket operation, so a client sending one
+/// byte just before every timeout could keep a connection (and its 16 MiB
+/// thread) forever. This wrapper gives every frame one deadline: before each
+/// underlying read it shrinks the socket timeout to the time remaining, and a
+/// frame that has not fully arrived by then fails with `TimedOut`. The
+/// deadline is reset only between frames ([`Self::begin_frame`]), not after
+/// each byte.
+struct FrameDeadline<S> {
+    inner: S,
+    idle: Option<Duration>,
+    deadline: Option<Instant>,
+}
+
+impl<S> FrameDeadline<S> {
+    fn new(inner: S, idle: Option<Duration>) -> Self {
+        Self {
+            inner,
+            idle,
+            deadline: None,
+        }
+    }
+
+    fn begin_frame(&mut self) {
+        self.deadline = self.idle.map(|idle| Instant::now() + idle);
+    }
+}
+
+impl<S: Write> Write for FrameDeadline<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<S: Read + FrameReadTimeout> Read for FrameDeadline<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(deadline) = self.deadline {
+            let now = Instant::now();
+            let Some(remaining) = deadline.checked_duration_since(now) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "frame deadline exceeded",
+                ));
+            };
+            // A zero duration means "no timeout" to the OS, so keep at least
+            // one millisecond; the next iteration sees the expired deadline
+            // and fails cleanly.
+            let remaining = remaining.max(Duration::from_millis(1));
+            self.inner.set_frame_read_timeout(Some(remaining))?;
+        }
+        self.inner.read(buf)
+    }
 }
 
 /// Apply the connection-required socket options to a freshly accepted socket.
@@ -928,7 +1007,7 @@ fn serve_tls_connection(
         eprintln!("pinkdb-server: TLS handshake stalled for {peer}; dropping the connection");
         return;
     }
-    serve_client(tls, db, policy);
+    serve_client(tls, db, idle_timeout, policy);
 }
 
 /// Serve the pinkdb framed protocol on an established byte stream (plain TCP
@@ -946,8 +1025,13 @@ fn serve_tls_connection(
 /// what rustls' `StreamOwned` needs). Buffered read-ahead is untouched by
 /// writes, and `write_frame` flushes, so a write failure is reported at the
 /// frame that hit it.
-fn serve_client<S: Read + Write>(stream: S, db: Database, policy: ConnectionPolicy) {
-    let mut reader = BufReader::new(stream);
+fn serve_client<S: Read + Write + FrameReadTimeout>(
+    stream: S,
+    db: Database,
+    idle_timeout: Option<Duration>,
+    policy: ConnectionPolicy,
+) {
+    let mut reader = BufReader::new(FrameDeadline::new(stream, idle_timeout));
     let mut conn = db.connect();
     // Network session: the engine re-checks the store's user catalog before
     // every statement (so a batch cannot continue after its own CREATE USER).
@@ -955,7 +1039,9 @@ fn serve_client<S: Read + Write>(stream: S, db: Database, policy: ConnectionPoli
     conn.set_exec_limits(policy.limits);
     let mut throttle = LoginThrottle::new();
 
-    // Handshake: the first request must be a version-matched Hello.
+    // Handshake: the first request must be a version-matched Hello. The
+    // deadline covers the whole Hello frame, not each socket read.
+    reader.get_mut().begin_frame();
     let protocol_version = match protocol::read_request(&mut reader) {
         Ok(Request::Hello { protocol_version }) => protocol_version,
         Ok(other) => {
@@ -996,6 +1082,8 @@ fn serve_client<S: Read + Write>(stream: S, db: Database, policy: ConnectionPoli
     let mut next_handle: u64 = 1;
 
     loop {
+        // Reset the frame deadline between frames (never per byte).
+        reader.get_mut().begin_frame();
         match protocol::read_request(&mut reader) {
             // v9 (wave 48): verify credentials and adopt the principal. The
             // connection stays usable after a failure until the per-

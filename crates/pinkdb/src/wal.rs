@@ -230,14 +230,40 @@ const LOCK_SLOT_A: u64 = 0;
 #[cfg_attr(not(test), allow(dead_code))]
 const WAL_SLOT_B: u64 = 64;
 const WAL_SLOT_A: u64 = 40;
-/// The fixed plaintext publish block of an encrypted (container v2) WAL at
-/// `payload_start`: `wal_id [16] | crc32(wal_id||generation||version) u32 | zero u32 |
-/// slot A (24) | slot B (24) | zero [16]`; records follow. The block is
-/// deliberately outside the AEAD AAD: slots mutate, and a tampered slot can
-/// at most cause a spurious refresh.
-const ENC_PUBLISH_BLOCK_LEN: usize = 88;
-const ENC_SLOT_A: u64 = 24;
-const ENC_SLOT_B: u64 = 48;
+/// The authenticated publish block of a current (container v4) WAL at
+/// `payload_start` (L-5):
+///
+/// ```text
+/// meta:  wal_id [16] | generation u64 | block version u16 | reserved u16  (28)
+/// meta-tag: nonce [12] | tag [16]                                        (28)
+/// slot A: seq u64 | value u64 | nonce [12] | tag [16]                    (44)
+/// slot B: seq u64 | value u64 | nonce [12] | tag [16]                    (44)
+/// ```
+///
+/// `meta` and each slot are authenticated as their own AEAD units under the
+/// WAL's data key: `meta` is static (it identifies the file), while the slots
+/// mutate on every publish, so each slot carries a fresh random 96-bit nonce
+/// and a tag over `(seq, value)`. Tampering with the meta is a hard recovery
+/// error; a slot whose tag does not verify is ignored (it is only a commit
+/// hint, and the records are authoritative).
+const ENC_PUBLISH_BLOCK_LEN: usize = 144;
+const ENC_PUBLISH_META_LEN: usize = 28;
+/// The static meta tag follows the meta: nonce [12] then tag [16].
+const ENC_PUBLISH_META_TAG_END: usize = ENC_PUBLISH_META_LEN + 12 + 16;
+const ENC_PUBLISH_SLOT_LEN: usize = 44;
+const ENC_PUBLISH_BLOCK_VERSION: u16 = 2;
+const ENC_SLOT_A: u64 = 56;
+const ENC_SLOT_B: u64 = 100;
+
+/// The pre-v4 publish block (`wal_id | crc | reserved | slot A | slot B |
+/// reserved`), read only long enough to upgrade the file.
+#[cfg(feature = "encryption")]
+const LEGACY_ENC_PUBLISH_BLOCK_LEN: usize = 88;
+#[cfg(feature = "encryption")]
+const LEGACY_ENC_SLOT_A: u64 = 24;
+#[cfg(feature = "encryption")]
+const LEGACY_ENC_SLOT_B: u64 = 48;
+
 /// CRC domains keep a lock-file slot from verifying as a WAL slot.
 const LOCK_SLOT_DOMAIN: &[u8] = b"pinkdb-lock-epoch-v1";
 const WAL_SLOT_DOMAIN: &[u8] = b"pinkdb-wal-slot-v1";
@@ -851,28 +877,111 @@ impl LeaseGuard {
     }
 }
 
-/// Encode the encrypted WAL's fixed 88-byte plaintext publish block; an
-/// `initial` slot edge seeds slot A for a rebuild/upgrade (design 9.2).
+/// The static, authenticated identity of a current publish block.
+fn publish_meta(wal_id: &WalId, generation: u64) -> [u8; ENC_PUBLISH_META_LEN] {
+    let mut meta = [0u8; ENC_PUBLISH_META_LEN];
+    meta[..16].copy_from_slice(wal_id);
+    meta[16..24].copy_from_slice(&generation.to_le_bytes());
+    meta[24..26].copy_from_slice(&ENC_PUBLISH_BLOCK_VERSION.to_le_bytes());
+    meta
+}
+
+/// Encode the encrypted WAL's authenticated publish block; an `initial` slot
+/// edge seeds one slot for a rebuild/upgrade (design 9.2).
 fn encode_publish_block(
+    cipher: &crypto::RecordCipher,
     wal_id: &WalId,
     generation: u64,
     initial: Option<(u64, u64)>,
-) -> [u8; ENC_PUBLISH_BLOCK_LEN] {
+) -> Result<[u8; ENC_PUBLISH_BLOCK_LEN]> {
     let mut b = [0u8; ENC_PUBLISH_BLOCK_LEN];
-    b[..16].copy_from_slice(wal_id);
-    let crc = publish_block_crc(wal_id, generation, crypto::WAL_CONTAINER_VERSION);
-    b[16..20].copy_from_slice(&crc.to_le_bytes());
+    let meta = publish_meta(wal_id, generation);
+    let (nonce, tag) = cipher.seal_publish_meta(&meta)?;
+    b[..ENC_PUBLISH_META_LEN].copy_from_slice(&meta);
+    b[ENC_PUBLISH_META_LEN..ENC_PUBLISH_META_LEN + 12].copy_from_slice(&nonce);
+    b[ENC_PUBLISH_META_LEN + 12..ENC_PUBLISH_META_TAG_END].copy_from_slice(&tag);
     if let Some((seq, value)) = initial {
-        let at = if seq.is_multiple_of(2) {
-            ENC_SLOT_B
+        let (slot, at) = if seq.is_multiple_of(2) {
+            (1u8, ENC_SLOT_B as usize)
         } else {
-            ENC_SLOT_A
-        } as usize;
-        b[at..at + SLOT_LEN].copy_from_slice(&slot_bytes(seq, value, WAL_SLOT_DOMAIN));
+            (0u8, ENC_SLOT_A as usize)
+        };
+        b[at..at + ENC_PUBLISH_SLOT_LEN]
+            .copy_from_slice(&encode_publish_slot(cipher, &meta, slot, seq, value)?);
     }
-    b
+    Ok(b)
 }
 
+fn encode_publish_slot(
+    cipher: &crypto::RecordCipher,
+    meta: &[u8; ENC_PUBLISH_META_LEN],
+    slot: u8,
+    seq: u64,
+    value: u64,
+) -> Result<[u8; ENC_PUBLISH_SLOT_LEN]> {
+    let (nonce, tag) = cipher.seal_publish_slot(meta, slot, seq, value)?;
+    let mut b = [0u8; ENC_PUBLISH_SLOT_LEN];
+    b[..8].copy_from_slice(&seq.to_le_bytes());
+    b[8..16].copy_from_slice(&value.to_le_bytes());
+    b[16..28].copy_from_slice(&nonce);
+    b[28..44].copy_from_slice(&tag);
+    Ok(b)
+}
+
+/// Verify a current publish block: the static meta must authenticate (a
+/// tampered identity is a hard recovery error), and the slots contribute
+/// only when their own tag verifies.
+fn open_publish_block(
+    cipher: &crypto::RecordCipher,
+    block: &[u8],
+    generation: u64,
+) -> std::result::Result<(WalId, u64), String> {
+    if block.len() != ENC_PUBLISH_BLOCK_LEN {
+        return Err("truncated publish block".to_string());
+    }
+    let meta: [u8; ENC_PUBLISH_META_LEN] = block[..ENC_PUBLISH_META_LEN]
+        .try_into()
+        .expect("fixed meta length");
+    let nonce: [u8; 12] = block[ENC_PUBLISH_META_LEN..ENC_PUBLISH_META_LEN + 12]
+        .try_into()
+        .expect("12-byte nonce");
+    let tag = &block[ENC_PUBLISH_META_LEN + 12..ENC_PUBLISH_META_TAG_END];
+    if !cipher.open_publish_meta(&meta, &nonce, tag) {
+        return Err(
+            "publish block authentication failed (wal_id/generation was modified)".to_string(),
+        );
+    }
+    let block_version = u16::from_le_bytes(meta[24..26].try_into().expect("2 bytes"));
+    if block_version != ENC_PUBLISH_BLOCK_VERSION || meta[26..28] != [0u8; 2] {
+        return Err(format!("unsupported publish block version {block_version}"));
+    }
+    if u64::from_le_bytes(meta[16..24].try_into().expect("8 bytes")) != generation {
+        return Err("publish block generation does not match the container".to_string());
+    }
+    let mut wal_id = [0u8; 16];
+    wal_id.copy_from_slice(&meta[..16]);
+    let mut published_seq = 0u64;
+    for slot in 0..2u8 {
+        let at = if slot == 0 {
+            ENC_SLOT_A as usize
+        } else {
+            ENC_SLOT_B as usize
+        };
+        let raw = &block[at..at + ENC_PUBLISH_SLOT_LEN];
+        let seq = u64::from_le_bytes(raw[..8].try_into().expect("8 bytes"));
+        let value = u64::from_le_bytes(raw[8..16].try_into().expect("8 bytes"));
+        let slot_nonce: [u8; 12] = raw[16..28].try_into().expect("12-byte nonce");
+        let slot_tag = &raw[28..44];
+        if cipher.open_publish_slot(&meta, slot, seq, value, &slot_nonce, slot_tag) {
+            published_seq = published_seq.max(seq);
+        }
+    }
+    Ok((wal_id, published_seq))
+}
+
+/// Legacy publish-block CRC (container v2/v3). Read-only: current blocks are
+/// authenticated by [`open_publish_block`].
+#[cfg(feature = "encryption")]
 fn publish_block_crc(wal_id: &WalId, generation: u64, version: u32) -> u32 {
     let mut v = Vec::with_capacity(16 + 12);
     v.extend_from_slice(wal_id);
@@ -1346,6 +1455,7 @@ enum HeaderError {
     #[cfg(feature = "encryption")]
     BadPublishBlock {
         payload_start: usize,
+        block_len: usize,
         what: String,
     },
 }
@@ -1384,9 +1494,9 @@ impl Wal {
     }
 
     /// Create (or recreate) the WAL file at `path` with just a header and
-    /// position it for appends: the plaintext v3 header (fresh `wal_id`), or
-    /// — when `cipher` is given — an encrypted container v2 header plus the
-    /// fixed 88-byte publish block. The returned fd is opened `append`: a
+    /// position it for appends: the plaintext v4 header (fresh `wal_id`), or
+    /// — when `cipher` is given — an encrypted container v4 header plus the
+    /// authenticated 144-byte publish block. The returned fd is opened `append`: a
     /// second process may append between this process's writes, and a
     /// non-append fd would overwrite from its cached offset.
     fn create_file(
@@ -1405,7 +1515,7 @@ impl Wal {
             match &cipher {
                 Some(c) => {
                     f.write_all(c.header())?;
-                    f.write_all(&encode_publish_block(&wal_id, generation, None))?;
+                    f.write_all(&encode_publish_block(c, &wal_id, generation, None)?)?;
                 }
                 None => f.write_all(&Self::header_for(generation, &wal_id))?,
             }
@@ -1575,7 +1685,22 @@ impl Wal {
         let wrote = OpenOptions::new()
             .write(true)
             .open(&self.path)
-            .and_then(|f| write_slot(&f, self.slots_at, seq, self.last_lsn, WAL_SLOT_DOMAIN));
+            .and_then(|f| match &self.cipher {
+                Some(cipher) => {
+                    let meta = publish_meta(&self.wal_id, self.generation);
+                    let slot = if seq.is_multiple_of(2) { 1 } else { 0 };
+                    let bytes = encode_publish_slot(cipher, &meta, slot, seq, self.last_lsn)
+                        .map_err(std::io::Error::other)?;
+                    let offset = self.slots_at
+                        + if slot == 0 {
+                            0
+                        } else {
+                            ENC_PUBLISH_SLOT_LEN as u64
+                        };
+                    file_write_all_at(&f, &bytes, offset)
+                }
+                None => write_slot(&f, self.slots_at, seq, self.last_lsn, WAL_SLOT_DOMAIN),
+            });
         if wrote.is_err() {
             warn_slot_once("WAL commit slot");
         }
@@ -2435,10 +2560,11 @@ fn rewrite_encrypted(
         let mut f = crate::fsutil::create_private(&rewrite)?;
         f.write_all(fresh.header())?;
         f.write_all(&encode_publish_block(
+            &fresh,
             &wal_id,
             generation,
             Some((1, last_lsn)),
-        ))?;
+        )?)?;
         for rec in records {
             let payload = encode_payload(&rec.stmts, rec.sets.as_ref())?;
             let len = record_len_guard(payload.len())?;
@@ -2579,7 +2705,7 @@ fn read_wal_identity(path: &Path) -> Result<WalIdentity> {
     let mut f = File::open(path)?;
     let meta = f.metadata()?;
     // Enough for any container header (max salt + key-check) plus the
-    // 88-byte publish block, or a plaintext v3 header.
+    // authenticated 144-byte publish block, or a plaintext v4 header.
     let mut buf = [0u8; 512];
     let n = f.read(&mut buf)?;
     let h =
@@ -2650,7 +2776,7 @@ fn scan_wal(
     let data = std::fs::read(path)?;
     #[cfg(not(feature = "encryption"))]
     refuse_container(path, &data)?;
-    let header = match parse_wal_header(&data) {
+    let mut header = match parse_wal_header(&data) {
         Ok(h) => h,
         Err(e) if header_torn(data.len(), &e) => {
             // A torn creation (crash while creating/recreating the WAL): no
@@ -2674,6 +2800,25 @@ fn scan_wal(
         }
         (None, None) => None,
     };
+    // L-5: a current publish block is authenticated once the cipher exists.
+    // A tampered static identity is a hard error; a tampered slot is ignored
+    // (frames are authoritative).
+    if let Some(c) = &cipher
+        && let Some(enc) = &header.enc
+        && enc.version >= crypto::WAL_CONTAINER_VERSION
+    {
+        let end = enc.payload_start + ENC_PUBLISH_BLOCK_LEN;
+        if data.len() < end {
+            return Err(PinkDbError::Execution(
+                "encrypted WAL: truncated publish block".to_string(),
+            ));
+        }
+        let (wal_id, published_seq) =
+            open_publish_block(c, &data[enc.payload_start..end], enc.context)
+                .map_err(PinkDbError::Execution)?;
+        header.wal_id = wal_id;
+        header.published_seq = published_seq;
+    }
     if header.legacy {
         // Upgrade under the lease, then re-scan the (now current) file.
         upgrade_legacy_wal(path, &data, &header, key)?;
@@ -2814,7 +2959,7 @@ fn roll_path(wal: &Path, generation: u64) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Parse a live WAL header: plaintext v2/v3/v4, container v1/v2/v3. No key
+/// Parse a live WAL header: plaintext v2-v4, container v1-v4. No key
 /// needed (the container key-check is verified separately when a cipher is
 /// built). `legacy` marks a file whose record payloads predate the current
 /// per-frame touched sets: those are upgraded under the lease before replay.
@@ -2853,31 +2998,57 @@ fn parse_wal_header(data: &[u8]) -> std::result::Result<WalHeader, HeaderError> 
                     legacy: true,
                 });
             }
-            if data.len() < payload_start + ENC_PUBLISH_BLOCK_LEN {
+            let (block_len, slot_a, slot_b) = if enc.version >= crypto::WAL_CONTAINER_VERSION {
+                (ENC_PUBLISH_BLOCK_LEN, ENC_SLOT_A, ENC_SLOT_B)
+            } else {
+                (
+                    LEGACY_ENC_PUBLISH_BLOCK_LEN,
+                    LEGACY_ENC_SLOT_A,
+                    LEGACY_ENC_SLOT_B,
+                )
+            };
+            if data.len() < payload_start + block_len {
                 return Err(HeaderError::BadPublishBlock {
                     payload_start,
+                    block_len,
                     what: "truncated publish block".to_string(),
                 });
             }
-            let block = &data[payload_start..payload_start + ENC_PUBLISH_BLOCK_LEN];
+            let block = &data[payload_start..payload_start + block_len];
             let mut wal_id = [0u8; 16];
             wal_id.copy_from_slice(&block[..16]);
-            let crc = u32::from_le_bytes(block[16..20].try_into().expect("4 bytes"));
-            if crc != publish_block_crc(&wal_id, enc.context, enc.version) {
-                return Err(HeaderError::BadPublishBlock {
-                    payload_start,
-                    what: "publish block CRC mismatch".to_string(),
-                });
+            let published_seq;
+            if enc.version >= crypto::WAL_CONTAINER_VERSION {
+                // The static meta and the slots are authenticated later, once
+                // the cipher (and therefore the key) exists. Until then the
+                // unverified hint is zero; `scan_wal` overwrites it.
+                published_seq = 0;
+                let block_version = u16::from_le_bytes(block[24..26].try_into().expect("2 bytes"));
+                if block_version != ENC_PUBLISH_BLOCK_VERSION || block[26..28] != [0u8; 2] {
+                    return Err(HeaderError::Reserved);
+                }
+            } else {
+                let crc = u32::from_le_bytes(block[16..20].try_into().expect("4 bytes"));
+                if crc != publish_block_crc(&wal_id, enc.context, enc.version) {
+                    return Err(HeaderError::BadPublishBlock {
+                        payload_start,
+                        block_len,
+                        what: "publish block CRC mismatch".to_string(),
+                    });
+                }
+                if block[20..24] != [0u8; 4] || block[72..88] != [0u8; 16] {
+                    return Err(HeaderError::Reserved);
+                }
+                published_seq = slot_max_in(block, slot_a as usize, WAL_SLOT_DOMAIN);
             }
-            if block[20..24] != [0u8; 4] || block[72..88] != [0u8; 16] {
+            if slot_b <= slot_a {
                 return Err(HeaderError::Reserved);
             }
-            let published_seq = slot_max_in(block, ENC_SLOT_A as usize, WAL_SLOT_DOMAIN);
             return Ok(WalHeader {
                 generation: enc.context,
                 wal_id,
-                records_start: payload_start + ENC_PUBLISH_BLOCK_LEN,
-                slots_at: payload_start as u64 + ENC_SLOT_A,
+                records_start: payload_start + block_len,
+                slots_at: payload_start as u64 + slot_a,
                 published_seq,
                 legacy: enc.version < crypto::WAL_CONTAINER_VERSION,
                 enc: Some(enc),
@@ -3003,9 +3174,11 @@ fn header_torn(data_len: usize, e: &HeaderError) -> bool {
         #[cfg(feature = "encryption")]
         HeaderError::Container(_) => data_len <= crypto::MAX_HEADER_LEN + ENC_PUBLISH_BLOCK_LEN,
         #[cfg(feature = "encryption")]
-        HeaderError::BadPublishBlock { payload_start, .. } => {
-            data_len <= payload_start + ENC_PUBLISH_BLOCK_LEN
-        }
+        HeaderError::BadPublishBlock {
+            payload_start,
+            block_len,
+            ..
+        } => data_len <= payload_start + block_len,
     }
 }
 
@@ -7336,6 +7509,31 @@ mod tests {
             cleanup(&p);
         }
 
+        /// L-5: the static publish-block identity is authenticated. Flipping
+        /// `wal_id` must be rejected on recovery, not silently accepted as a
+        /// different incarnation.
+        #[test]
+        fn tampered_publish_block_identity_is_rejected_on_recovery() {
+            let p = tmp_ckpt("encpubmeta");
+            {
+                let mut db = durable_keyed(&p);
+                db.execute("CREATE TABLE t (a INTEGER);").unwrap();
+                db.execute("INSERT INTO t VALUES (1);").unwrap();
+            }
+            let wal = std::fs::read(wal_path(&p)).unwrap();
+            let payload_start = crypto::parse_container_header(&wal)
+                .expect("container header")
+                .payload_start;
+            let mut tampered = wal.clone();
+            tampered[payload_start] ^= 0x01; // wal_id[0]
+            std::fs::write(wal_path(&p), &tampered).unwrap();
+            let err = PinkDb::open_durable_with_key(p.to_str().unwrap(), &key())
+                .expect_err("a tampered publish-block identity must be refused")
+                .to_string();
+            assert!(err.contains("publish block authentication failed"), "{err}");
+            cleanup(&p);
+        }
+
         #[test]
         fn encrypted_torn_header_is_recreated_encrypted() {
             let p = tmp_ckpt("enctorn");
@@ -7348,9 +7546,13 @@ mod tests {
             .unwrap();
             let wal = std::fs::read(wal_path(&p)).unwrap();
             assert!(wal.starts_with(crypto::ENC_MAGIC), "recreated encrypted");
-            // Raw-key container header (80 bytes) + the 88-byte publish
-            // block (container v2, wave 45m).
-            assert_eq!(wal.len(), 80 + 88, "recreated as container v2");
+            // Raw-key v4 container header (88 bytes) + the authenticated
+            // 144-byte publish block.
+            assert_eq!(
+                wal.len(),
+                88 + ENC_PUBLISH_BLOCK_LEN,
+                "recreated as container v4"
+            );
             assert_eq!(info.truncated_bytes, 0);
             drop(db);
             cleanup(&p);
@@ -7417,7 +7619,11 @@ mod tests {
             db.checkpoint().unwrap();
             let wal = std::fs::read(wal_path(&p)).unwrap();
             assert!(wal.starts_with(crypto::ENC_MAGIC));
-            assert_eq!(wal.len(), 80 + 88, "fresh generation is header + block");
+            assert_eq!(
+                wal.len(),
+                88 + ENC_PUBLISH_BLOCK_LEN,
+                "fresh generation is header + authenticated block"
+            );
             db.execute("INSERT INTO t VALUES (2);").unwrap();
             drop(db);
             let mut back = durable_keyed(&p);
@@ -7668,15 +7874,19 @@ mod tests {
                 ints(&mut back, "SELECT a FROM t ORDER BY a;"),
                 vec![1, 2, 3, 4]
             );
-            // The publish block is a hint: corrupting only its slots must not
-            // block or misread anything (wal_id + CRC are untouched). The
-            // block starts at the container's `payload_start`; slots at
-            // +24..+72.
+            // The publish block is a hint: corrupting only its authenticated
+            // slots must not block or misread anything (the static meta is
+            // untouched). The block starts at the container's `payload_start`;
+            // the slots are the last 88 bytes.
             let payload_start = crypto::parse_container_header(&pristine)
                 .expect("container header")
                 .payload_start;
             let mut slot_corrupt = pristine.clone();
-            for b in slot_corrupt.iter_mut().skip(payload_start + 24).take(48) {
+            for b in slot_corrupt
+                .iter_mut()
+                .skip(payload_start + ENC_SLOT_A as usize)
+                .take(2 * ENC_PUBLISH_SLOT_LEN)
+            {
                 *b ^= 0xA5;
             }
             std::fs::write(&wal, &slot_corrupt).unwrap();
@@ -7686,13 +7896,13 @@ mod tests {
                 vec![1, 2, 3, 4]
             );
 
-            // A flip of the container version word (3 → 1) must not take the
+            // A flip of the container version word (4 → 1) must not take the
             // legacy-upgrade path and silently drop the records that follow
             // the publish block: the key-check AAD binds the version, so the
             // keyed open is refused and the file is left untouched.
             std::fs::write(&wal, &pristine).unwrap();
             let mut v1 = pristine.clone();
-            assert_eq!(u32::from_le_bytes(v1[8..12].try_into().unwrap()), 3);
+            assert_eq!(u32::from_le_bytes(v1[8..12].try_into().unwrap()), 4);
             v1[8] = 1; // version 1: legacy container, records at payload_start
             std::fs::write(&wal, &v1).unwrap();
             let err = PinkDb::open_durable_with_key(p.to_str().unwrap(), &key()).unwrap_err();
@@ -8043,7 +8253,7 @@ mod tests {
             // are authoritative, the slots are ignored when invalid.
             let wal = wal_path(&p);
             let mut data = std::fs::read(&wal).unwrap();
-            for b in &mut data[WAL_SLOT_A as usize..ENC_SLOT_B as usize + SLOT_LEN] {
+            for b in &mut data[WAL_SLOT_A as usize..WAL_SLOT_B as usize + SLOT_LEN] {
                 *b ^= 0xA5;
             }
             std::fs::write(&wal, &data).unwrap();

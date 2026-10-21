@@ -212,8 +212,15 @@ fn eval_dynamic_scalar(
         ext_args.clear();
         for (i, v) in vecs.iter().enumerate() {
             // Positional declared type; a variadic function repeats the last
-            // one for arguments past its declared list.
-            crate::ext::push_ext_arg(&mut ext_args, v, row, function.arg_type_at(i));
+            // one for arguments past its declared list. The binder checked the
+            // arity, so a missing type here is an internal invariant failure,
+            // never an out-of-bounds index (`None` is the 0-argument case).
+            let Some(arg_type) = function.arg_type_at(i) else {
+                return Err(PinkDbError::Execution(format!(
+                    "function \"{name}\" declares no argument {i}, but the call supplied one"
+                )));
+            };
+            crate::ext::push_ext_arg(&mut ext_args, v, row, arg_type);
         }
         let value = function
             .call(&ext_args)

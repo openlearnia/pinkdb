@@ -5,11 +5,11 @@
 //!
 //! ```text
 //! magic "PINKENC1" (8 bytes)
-//! container version u32 (= 2; version 1 files are read and upgraded)
+//! container version u32 (= 4; versions 1-3 are read and upgraded)
 //! cipher id u8 (1 = AES-256-GCM)
 //! kdf id u8 (0 = raw 32-byte key, 1 = Argon2id)
 //! context u64 (0 for a checkpoint; the WAL generation for a WAL file)
-//! nonce prefix [8] (fresh random bytes per container)
+//! nonce base [16] (fresh 128-bit random value per container, v4+)
 //! key-check length u32 (= 30)
 //! [kdf id == 1] m_cost u32 KiB | t_cost u32 | p_cost u32 | salt_len u32 | salt
 //! key-check: AEAD of a fixed 30-byte plaintext, 30 + 16 bytes
@@ -22,9 +22,20 @@
 //!               where `plain_len` is the *plaintext* payload length
 //! ```
 //!
-//! Every AEAD unit uses nonce `nonce_prefix || counter u32 LE`: counter 0 is
-//! the key-check, then 1, 2, ... per checkpoint segment / WAL record. Within
-//! one container a (key, nonce) pair is therefore never reused. Every keyed
+//! # Nonce construction (v4, L-4)
+//!
+//! Each container mints a fresh 128-bit random `nonce_base`. Every AEAD unit
+//! uses a 96-bit nonce derived as
+//! `truncate96(SHA-256("pinkdb-nonce-v4" || domain || nonce_base || counter))`
+//! with counter 0 for the key-check and 1, 2, ... per checkpoint segment /
+//! WAL record. The random input is 128 bits and the per-unit nonce space is
+//! 96 bits, so the birthday bound that governs the fixed-plaintext key-check
+//! is `P ≈ n²/2⁹⁷` (the previous format's 64-bit prefix gave `n²/2⁶⁵`).
+//! Containers written by versions 1-3 still use the legacy
+//! `8-byte prefix || counter` nonce and are read, then rewritten in the
+//! current format (WALs at open; checkpoints on their next save).
+//!
+//! Within one container a (key, nonce) pair is therefore never reused. Every keyed
 //! *open* of a WAL rebuilds it with a fresh random prefix (and a fresh
 //! `wal_id`), the wave-22 policy: a file cut exactly at a record boundary is
 //! byte-identical to a cleanly shorter one, so a counter resynced from the
@@ -66,34 +77,42 @@ use crate::types::{PinkDbError, Result};
 /// produce the "file is encrypted; build with the encryption feature" error.
 pub const ENC_MAGIC: &[u8; 8] = b"PINKENC1";
 
-const ENC_VERSION: u32 = 2;
+/// Current container version (L-4/L-5): 128-bit random nonce base with a
+/// derived 96-bit nonce, and (for WALs) an authenticated publish block.
+const ENC_VERSION: u32 = 4;
 /// The pre-multi-process container version: no WAL publish block. Files are
 /// read as-is (checkpoints) or rebuilt as current (WALs) at open.
 const ENC_VERSION_V1: u32 = 1;
+/// Legacy checkpoint/wal containers with the 64-bit nonce prefix. They are
+/// still read (and upgraded), but never written.
+const ENC_VERSION_V2: u32 = 2;
+const ENC_VERSION_V3: u32 = 3;
 /// The container version every fresh **checkpoint** this build writes uses.
-/// Deliberately unchanged by wave 45o: `.pink` bytes stay as wave 45m wrote
-/// them (the per-frame touched sets live only in the WAL payloads).
 pub(crate) const CONTAINER_VERSION: u32 = ENC_VERSION;
-/// The container version a **WAL** this build writes uses (wave 45o): the
-/// record payload gained the frame's touched-object set, so an older build
-/// must refuse the file; the version word makes that refusal clean (a WAL
-/// container older than this is rebuilt in place at open). The publish
-/// block's CRC domain binds this version.
-pub(crate) const WAL_CONTAINER_VERSION: u32 = 3;
+/// The container version a **WAL** this build writes uses: the record payload
+/// carries the frame's touched-object set (wave 45o) and the publish block is
+/// authenticated (L-5). An older container is rebuilt in place at open.
+pub(crate) const WAL_CONTAINER_VERSION: u32 = ENC_VERSION;
 const CIPHER_AES256_GCM: u8 = 1;
 const KDF_RAW: u8 = 0;
 const KDF_ARGON2ID: u8 = 1;
 
 const KEY_LEN: usize = 32;
 pub(crate) const TAG_LEN: usize = 16;
-const NONCE_PREFIX_LEN: usize = 8;
+/// v4+: the random per-container nonce base.
+pub(crate) const NONCE_BASE_LEN: usize = 16;
+/// Versions 1-3: the old random nonce prefix.
+const LEGACY_NONCE_PREFIX_LEN: usize = 8;
 
 /// Plaintext authenticated by the key-check block so a wrong key is reported
 /// as `wrong key` instead of a parse error.
 const KEY_CHECK_PLAIN: &[u8] = b"pinkdb encryption key-check/v1";
 
-/// magic(8) + version(4) + cipher(1) + kdf(1) + context(8) + prefix(8) + key-check len(4).
-const HEADER_FIXED_LEN: usize = 34;
+/// magic(8) + version(4) + cipher(1) + kdf(1) + context(8) + base(16) +
+/// key-check len(4).
+const HEADER_FIXED_LEN: usize = 42;
+/// The v1-v3 fixed header (8-byte nonce prefix).
+const LEGACY_HEADER_FIXED_LEN: usize = 34;
 const KDF_PARAMS_LEN: usize = 16; // m_cost, t_cost, p_cost, salt_len
 const DEFAULT_SALT_LEN: u32 = 16;
 const MIN_SALT_LEN: u32 = 8;
@@ -238,14 +257,16 @@ impl Drop for EncryptionKey {
 /// the key, and locate the payload — no key required.
 #[derive(Debug, Clone)]
 pub(crate) struct ContainerHeader {
-    /// Container format version (1, 2, or 3 for WALs).
+    /// Container format version (1-4; 4 is current).
     pub version: u32,
     /// 0 for a checkpoint, the WAL generation for a WAL file.
     pub context: u64,
     pub kdf: u8,
     /// `(m_cost KiB, t_cost, p_cost, salt)` for [`KDF_ARGON2ID`].
     pub params: Option<(u32, u32, u32, Vec<u8>)>,
-    pub prefix: [u8; NONCE_PREFIX_LEN],
+    /// v4+: 128-bit random nonce base. Legacy v1-v3 files carry the 8-byte
+    /// old prefix in the first half (the rest is zero).
+    pub nonce_base: [u8; NONCE_BASE_LEN],
     /// Header bytes up to (but excluding) the key-check ciphertext: the AAD
     /// base bound into every unit.
     pub aad_base: Vec<u8>,
@@ -259,11 +280,15 @@ pub(crate) fn is_container(data: &[u8]) -> bool {
     data.starts_with(ENC_MAGIC)
 }
 
-/// Whether a container `version` is one this build reads: a fresh checkpoint,
-/// a WAL, or a legacy (v1) file. A newer version is a hard error, never a torn
-/// creation — a newer build may have written records this one cannot parse.
+/// Whether a container `version` is one this build reads: current v4, or the
+/// legacy checkpoint/WAL versions 1-3. A newer version is a hard error, never
+/// a torn creation — a newer build may have written records this one cannot
+/// parse.
 pub(crate) fn is_known_container_version(version: u32) -> bool {
-    version == ENC_VERSION || version == ENC_VERSION_V1 || version == WAL_CONTAINER_VERSION
+    matches!(
+        version,
+        ENC_VERSION | ENC_VERSION_V1 | ENC_VERSION_V2 | ENC_VERSION_V3
+    )
 }
 
 fn corrupt(what: &str) -> PinkDbError {
@@ -276,14 +301,13 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
     if !is_container(data) {
         return Err(corrupt("bad container magic"));
     }
-    if data.len() < HEADER_FIXED_LEN {
+    if data.len() < LEGACY_HEADER_FIXED_LEN {
         return Err(corrupt("truncated container header"));
     }
     let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-    if version != ENC_VERSION && version != ENC_VERSION_V1 && version != WAL_CONTAINER_VERSION {
+    if !is_known_container_version(version) {
         return Err(corrupt(&format!(
-            "unsupported container version {version} (want {WAL_CONTAINER_VERSION} for WALs, \
-             {ENC_VERSION} for checkpoints, or an older version for legacy files)"
+            "unsupported container version {version} (this build reads versions 1-4)"
         )));
     }
     let cipher = data[12];
@@ -292,13 +316,25 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
     }
     let kdf = data[13];
     let context = u64::from_le_bytes(data[14..22].try_into().expect("8 bytes"));
-    let mut prefix = [0u8; NONCE_PREFIX_LEN];
-    prefix.copy_from_slice(&data[22..30]);
-    let key_check_len = u32::from_le_bytes(data[30..34].try_into().expect("4 bytes")) as usize;
+    let (nonce_base, key_check_len, mut pos) = if version >= ENC_VERSION {
+        if data.len() < HEADER_FIXED_LEN {
+            return Err(corrupt("truncated container header"));
+        }
+        let mut base = [0u8; NONCE_BASE_LEN];
+        base.copy_from_slice(&data[22..22 + NONCE_BASE_LEN]);
+        let len_at = 22 + NONCE_BASE_LEN;
+        let len =
+            u32::from_le_bytes(data[len_at..len_at + 4].try_into().expect("4 bytes")) as usize;
+        (base, len, HEADER_FIXED_LEN)
+    } else {
+        let mut base = [0u8; NONCE_BASE_LEN];
+        base[..LEGACY_NONCE_PREFIX_LEN].copy_from_slice(&data[22..30]);
+        let len = u32::from_le_bytes(data[30..34].try_into().expect("4 bytes")) as usize;
+        (base, len, LEGACY_HEADER_FIXED_LEN)
+    };
     if key_check_len != KEY_CHECK_PLAIN.len() {
         return Err(corrupt(&format!("bad key-check length {key_check_len}")));
     }
-    let mut pos = HEADER_FIXED_LEN;
     let params = match kdf {
         KDF_RAW => None,
         KDF_ARGON2ID => {
@@ -347,7 +383,7 @@ pub(crate) fn parse_container_header(data: &[u8]) -> Result<ContainerHeader> {
         context,
         kdf,
         params,
-        prefix,
+        nonce_base,
         aad_base: data[..pos].to_vec(),
         key_check,
         payload_start,
@@ -394,8 +430,8 @@ mod imp {
     use subtle::ConstantTimeEq;
 
     /// A derived 32-byte key, zeroed on drop (best-effort).
-    struct DerivedKey {
-        bytes: [u8; KEY_LEN],
+    pub(crate) struct DerivedKey {
+        pub(crate) bytes: [u8; KEY_LEN],
     }
 
     impl Drop for DerivedKey {
@@ -421,7 +457,7 @@ mod imp {
         context: u64,
         kdf: u8,
         params: Option<(u32, u32, u32, Vec<u8>)>,
-        prefix: [u8; NONCE_PREFIX_LEN],
+        nonce_base: [u8; NONCE_BASE_LEN],
     }
 
     impl HeaderSpec {
@@ -434,7 +470,11 @@ mod imp {
             v.push(CIPHER_AES256_GCM);
             v.push(self.kdf);
             v.extend_from_slice(&self.context.to_le_bytes());
-            v.extend_from_slice(&self.prefix);
+            if self.version >= ENC_VERSION {
+                v.extend_from_slice(&self.nonce_base);
+            } else {
+                v.extend_from_slice(&self.nonce_base[..LEGACY_NONCE_PREFIX_LEN]);
+            }
             v.extend_from_slice(&(KEY_CHECK_PLAIN.len() as u32).to_le_bytes());
             if let Some((m, t, p, salt)) = &self.params {
                 v.extend_from_slice(&m.to_le_bytes());
@@ -447,27 +487,48 @@ mod imp {
         }
     }
 
-    fn random_prefix() -> [u8; NONCE_PREFIX_LEN] {
-        let mut prefix = [0u8; NONCE_PREFIX_LEN];
-        OsRng.fill_bytes(&mut prefix);
-        prefix
+    fn random_nonce_base() -> [u8; NONCE_BASE_LEN] {
+        let mut base = [0u8; NONCE_BASE_LEN];
+        OsRng.fill_bytes(&mut base);
+        base
     }
 
-    fn nonce_for(prefix: &[u8; NONCE_PREFIX_LEN], counter: u32) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[..NONCE_PREFIX_LEN].copy_from_slice(prefix);
-        nonce[NONCE_PREFIX_LEN..].copy_from_slice(&counter.to_le_bytes());
-        nonce
+    /// The 96-bit GCM nonce of one unit. Current containers derive it from a
+    /// 128-bit random base and the counter (L-4); legacy containers keep the
+    /// old `prefix || counter` construction so their files still open.
+    pub(crate) fn nonce_for(
+        version: u32,
+        base: &[u8; NONCE_BASE_LEN],
+        domain: Domain,
+        counter: u32,
+    ) -> [u8; 12] {
+        if version >= ENC_VERSION {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"pinkdb-nonce-v4\0");
+            h.update(domain.label());
+            h.update(base);
+            h.update(counter.to_le_bytes());
+            let digest = h.finalize();
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&digest[..12]);
+            nonce
+        } else {
+            let mut nonce = [0u8; 12];
+            nonce[..LEGACY_NONCE_PREFIX_LEN].copy_from_slice(&base[..LEGACY_NONCE_PREFIX_LEN]);
+            nonce[LEGACY_NONCE_PREFIX_LEN..].copy_from_slice(&counter.to_le_bytes());
+            nonce
+        }
     }
 
-    fn key_check_aad(domain: Domain, aad_base: &[u8]) -> Vec<u8> {
+    pub(crate) fn key_check_aad(domain: Domain, aad_base: &[u8]) -> Vec<u8> {
         let mut v = Vec::with_capacity(domain.label().len() + aad_base.len());
         v.extend_from_slice(domain.label());
         v.extend_from_slice(aad_base);
         v
     }
 
-    fn unit_aad(domain: Domain, aad_base: &[u8], counter: u32) -> Vec<u8> {
+    pub(crate) fn unit_aad(domain: Domain, aad_base: &[u8], counter: u32) -> Vec<u8> {
         let mut v = key_check_aad(domain, aad_base);
         v.extend_from_slice(&counter.to_le_bytes());
         v
@@ -480,9 +541,12 @@ mod imp {
         v
     }
 
-    fn seal_unit(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seal_unit(
         key: &DerivedKey,
-        prefix: &[u8; NONCE_PREFIX_LEN],
+        version: u32,
+        base: &[u8; NONCE_BASE_LEN],
+        domain: Domain,
         counter: u32,
         aad: &[u8],
         plain: &[u8],
@@ -491,7 +555,7 @@ mod imp {
             .map_err(|_| PinkDbError::Execution("crypto: bad key length".to_string()))?;
         cipher
             .encrypt(
-                Nonce::from_slice(&nonce_for(prefix, counter)),
+                Nonce::from_slice(&nonce_for(version, base, domain, counter)),
                 Payload { msg: plain, aad },
             )
             .map_err(|_| PinkDbError::Execution("crypto: encryption failed".to_string()))
@@ -500,7 +564,9 @@ mod imp {
     /// `None` = authentication failed (wrong key or tampering).
     fn try_open_unit(
         key: &DerivedKey,
-        prefix: &[u8; NONCE_PREFIX_LEN],
+        version: u32,
+        base: &[u8; NONCE_BASE_LEN],
+        domain: Domain,
         counter: u32,
         aad: &[u8],
         ciphertext: &[u8],
@@ -508,7 +574,7 @@ mod imp {
         let cipher = Aes256Gcm::new_from_slice(&key.bytes).ok()?;
         cipher
             .decrypt(
-                Nonce::from_slice(&nonce_for(prefix, counter)),
+                Nonce::from_slice(&nonce_for(version, base, domain, counter)),
                 Payload {
                     msg: ciphertext,
                     aad,
@@ -577,7 +643,7 @@ mod imp {
         domain: Domain,
         version: u32,
     ) -> Result<(HeaderSpec, Vec<u8>, Vec<u8>, DerivedKey)> {
-        let prefix = random_prefix();
+        let nonce_base = random_nonce_base();
         let (spec, derived) = match (&key.raw, &key.passphrase) {
             (Some(raw), _) => (
                 HeaderSpec {
@@ -585,7 +651,7 @@ mod imp {
                     context,
                     kdf: KDF_RAW,
                     params: None,
-                    prefix,
+                    nonce_base,
                 },
                 DerivedKey { bytes: *raw },
             ),
@@ -600,7 +666,7 @@ mod imp {
                         context,
                         kdf: KDF_ARGON2ID,
                         params: Some((ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, salt)),
-                        prefix,
+                        nonce_base,
                     },
                     derived,
                 )
@@ -614,7 +680,9 @@ mod imp {
         let aad_base = spec.aad_base();
         let key_check = seal_unit(
             &derived,
-            &spec.prefix,
+            spec.version,
+            &spec.nonce_base,
+            domain,
             0,
             &key_check_aad(domain, &aad_base),
             KEY_CHECK_PLAIN,
@@ -648,7 +716,9 @@ mod imp {
             let seg = &plain[pos..end];
             let ct = seal_unit(
                 &derived,
-                &spec.prefix,
+                spec.version,
+                &spec.nonce_base,
+                Domain::Checkpoint,
                 counter,
                 &unit_aad(Domain::Checkpoint, &aad_base, counter),
                 seg,
@@ -665,7 +735,9 @@ mod imp {
         }
         let terminal = seal_unit(
             &derived,
-            &spec.prefix,
+            spec.version,
+            &spec.nonce_base,
+            Domain::Checkpoint,
             counter,
             &unit_aad(Domain::Checkpoint, &aad_base, counter),
             &[],
@@ -693,7 +765,9 @@ mod imp {
         let derived = derive_for_open(key, header.kdf, header.params.as_ref())?;
         if try_open_unit(
             &derived,
-            &header.prefix,
+            header.version,
+            &header.nonce_base,
+            Domain::Checkpoint,
             0,
             &key_check_aad(Domain::Checkpoint, &header.aad_base),
             &header.key_check,
@@ -722,7 +796,9 @@ mod imp {
             }
             let plain = try_open_unit(
                 &derived,
-                &header.prefix,
+                header.version,
+                &header.nonce_base,
+                Domain::Checkpoint,
                 counter,
                 &unit_aad(Domain::Checkpoint, &header.aad_base, counter),
                 &data[start..end],
@@ -780,7 +856,9 @@ mod imp {
             let derived = derive_for_open(key, header.kdf, header.params.as_ref())?;
             if try_open_unit(
                 &derived,
-                &header.prefix,
+                header.version,
+                &header.nonce_base,
+                Domain::Wal,
                 0,
                 &key_check_aad(Domain::Wal, &header.aad_base),
                 &header.key_check,
@@ -794,7 +872,7 @@ mod imp {
                 context: header.context,
                 kdf: header.kdf,
                 params: header.params.clone(),
-                prefix: header.prefix,
+                nonce_base: header.nonce_base,
             };
             let payload_start = header.payload_start;
             Ok((
@@ -820,12 +898,14 @@ mod imp {
                 context,
                 kdf: self.spec.kdf,
                 params: self.spec.params.clone(),
-                prefix: random_prefix(),
+                nonce_base: random_nonce_base(),
             };
             let aad_base = spec.aad_base();
             let key_check = seal_unit(
                 &self.key,
-                &spec.prefix,
+                spec.version,
+                &spec.nonce_base,
+                Domain::Wal,
                 0,
                 &key_check_aad(Domain::Wal, &aad_base),
                 KEY_CHECK_PLAIN,
@@ -873,7 +953,9 @@ mod imp {
             })?;
             seal_unit(
                 &self.key,
-                &self.spec.prefix,
+                self.spec.version,
+                &self.spec.nonce_base,
+                Domain::Wal,
                 counter,
                 &wal_aad(&self.aad_base, lsn, counter),
                 plain,
@@ -885,11 +967,119 @@ mod imp {
         pub(crate) fn open(&self, counter: u32, lsn: u64, ciphertext: &[u8]) -> Option<Vec<u8>> {
             try_open_unit(
                 &self.key,
-                &self.spec.prefix,
+                self.spec.version,
+                &self.spec.nonce_base,
+                Domain::Wal,
                 counter,
                 &wal_aad(&self.aad_base, lsn, counter),
                 ciphertext,
             )
+        }
+
+        /// L-5: the WAL publish block is authenticated as its own AEAD units
+        /// (a static metadata MAC plus one MAC per mutable slot), independent
+        /// of the record nonce sequence. Each call stores a fresh random
+        /// 96-bit nonce next to the tag, so updating a slot can never reuse a
+        /// nonce.
+        fn publish_aad(&self, label: &[u8], meta: &[u8], slot: Option<u8>) -> Vec<u8> {
+            let mut v = Vec::with_capacity(label.len() + self.aad_base.len() + meta.len() + 1);
+            v.extend_from_slice(label);
+            v.extend_from_slice(&self.aad_base);
+            v.extend_from_slice(meta);
+            if let Some(index) = slot {
+                v.push(index);
+            }
+            v
+        }
+
+        fn seal_detached(&self, aad: &[u8], plain: &[u8]) -> Result<([u8; 12], [u8; TAG_LEN])> {
+            let cipher = Aes256Gcm::new_from_slice(&self.key.bytes)
+                .map_err(|_| PinkDbError::Execution("crypto: bad key length".to_string()))?;
+            let mut nonce = [0u8; 12];
+            OsRng.fill_bytes(&mut nonce);
+            let sealed = cipher
+                .encrypt(Nonce::from_slice(&nonce), Payload { msg: plain, aad })
+                .map_err(|_| PinkDbError::Execution("crypto: encryption failed".to_string()))?;
+            let (ciphertext, tag) = sealed.split_at(sealed.len() - TAG_LEN);
+            debug_assert_eq!(ciphertext.len(), plain.len());
+            let mut out_tag = [0u8; TAG_LEN];
+            out_tag.copy_from_slice(tag);
+            Ok((nonce, out_tag))
+        }
+
+        fn open_detached(&self, aad: &[u8], nonce: &[u8; 12], tag: &[u8]) -> bool {
+            if tag.len() != TAG_LEN {
+                return false;
+            }
+            let Ok(cipher) = Aes256Gcm::new_from_slice(&self.key.bytes) else {
+                return false;
+            };
+            let mut ciphertext = Vec::with_capacity(tag.len());
+            ciphertext.extend_from_slice(tag);
+            cipher
+                .decrypt(
+                    Nonce::from_slice(nonce),
+                    Payload {
+                        msg: &ciphertext,
+                        aad,
+                    },
+                )
+                .is_ok()
+        }
+
+        /// Seal the static publish-block metadata; returns `(nonce, tag)`.
+        pub(crate) fn seal_publish_meta(&self, meta: &[u8]) -> Result<([u8; 12], [u8; 16])> {
+            self.seal_detached(
+                &self.publish_aad(b"pinkdb-enc-wal-publish-v2\0", meta, None),
+                &[],
+            )
+        }
+
+        /// Verify the static publish-block metadata.
+        pub(crate) fn open_publish_meta(&self, meta: &[u8], nonce: &[u8; 12], tag: &[u8]) -> bool {
+            self.open_detached(
+                &self.publish_aad(b"pinkdb-enc-wal-publish-v2\0", meta, None),
+                nonce,
+                tag,
+            )
+        }
+
+        /// Seal one mutable publish slot (`seq, value`).
+        pub(crate) fn seal_publish_slot(
+            &self,
+            meta: &[u8],
+            slot: u8,
+            seq: u64,
+            value: u64,
+        ) -> Result<([u8; 12], [u8; 16])> {
+            let mut plain = [0u8; 16];
+            plain[..8].copy_from_slice(&seq.to_le_bytes());
+            plain[8..].copy_from_slice(&value.to_le_bytes());
+            let mut aad = self.publish_aad(b"pinkdb-enc-wal-publish-v2\0", meta, Some(slot));
+            // The slot is stored in the clear (readers need it before the key
+            // is derived for `read_wal_identity`), so the tag authenticates
+            // the value as part of the AAD.
+            aad.extend_from_slice(&plain);
+            self.seal_detached(&aad, &[])
+        }
+
+        /// Verify one slot; `false` when the tag does not authenticate (a
+        /// torn or tampered slot is ignored: the frames stay authoritative).
+        pub(crate) fn open_publish_slot(
+            &self,
+            meta: &[u8],
+            slot: u8,
+            seq: u64,
+            value: u64,
+            nonce: &[u8; 12],
+            tag: &[u8],
+        ) -> bool {
+            let mut plain = [0u8; 16];
+            plain[..8].copy_from_slice(&seq.to_le_bytes());
+            plain[8..].copy_from_slice(&value.to_le_bytes());
+            let mut aad = self.publish_aad(b"pinkdb-enc-wal-publish-v2\0", meta, Some(slot));
+            aad.extend_from_slice(&plain);
+            self.open_detached(&aad, nonce, tag)
         }
     }
 }
@@ -927,11 +1117,44 @@ mod imp {
         pub(crate) fn open(&self, _counter: u32, _lsn: u64, _ciphertext: &[u8]) -> Option<Vec<u8>> {
             None
         }
+        pub(crate) fn seal_publish_meta(&self, _meta: &[u8]) -> Result<([u8; 12], [u8; 16])> {
+            Err(unavailable())
+        }
+        pub(crate) fn open_publish_meta(
+            &self,
+            _meta: &[u8],
+            _nonce: &[u8; 12],
+            _tag: &[u8],
+        ) -> bool {
+            false
+        }
+        pub(crate) fn seal_publish_slot(
+            &self,
+            _meta: &[u8],
+            _slot: u8,
+            _seq: u64,
+            _value: u64,
+        ) -> Result<([u8; 12], [u8; 16])> {
+            Err(unavailable())
+        }
+        pub(crate) fn open_publish_slot(
+            &self,
+            _meta: &[u8],
+            _slot: u8,
+            _seq: u64,
+            _value: u64,
+            _nonce: &[u8; 12],
+            _tag: &[u8],
+        ) -> bool {
+            false
+        }
     }
 }
 
 #[cfg(not(feature = "encryption"))]
 pub(crate) use imp::RecordCipher;
+#[cfg(all(test, feature = "encryption"))]
+pub(crate) use imp::{DerivedKey, key_check_aad, nonce_for, seal_unit, unit_aad};
 #[cfg(feature = "encryption")]
 pub(crate) use imp::{RecordCipher, open_container, seal_container};
 
@@ -1008,6 +1231,118 @@ mod enc_tests {
             assert_eq!(open_container(&sealed_big, &key, 0).unwrap(), big);
             assert_eq!(open_container(&sealed, &key, 0).unwrap(), plain);
         }
+    }
+
+    /// L-4: v4 headers carry 128 random bits; the derived 96-bit nonce
+    /// changes with the base, the counter, and the domain, and is not the old
+    /// `prefix || counter` construction.
+    #[test]
+    fn v4_nonce_base_is_128_random_bits_and_drives_a_derived_nonce() {
+        let key = EncryptionKey::from_raw([0x44u8; 32]);
+        let a = seal_container(b"same plaintext", &key, 0).unwrap();
+        let b = seal_container(b"same plaintext", &key, 0).unwrap();
+        let ha = parse_container_header(&a).unwrap();
+        let hb = parse_container_header(&b).unwrap();
+        assert_eq!(ha.version, 4);
+        assert_eq!(
+            ha.payload_start,
+            HEADER_FIXED_LEN + KEY_CHECK_PLAIN.len() + TAG_LEN
+        );
+        assert!(ha.nonce_base.iter().any(|x| *x != 0));
+        assert_ne!(ha.nonce_base, hb.nonce_base, "each container mints a base");
+        assert_eq!(ha.nonce_base.len() * 8, 128, "the random input is 128 bits");
+
+        let n0 = nonce_for(ha.version, &ha.nonce_base, Domain::Checkpoint, 0);
+        let n1 = nonce_for(ha.version, &ha.nonce_base, Domain::Checkpoint, 1);
+        let nw = nonce_for(ha.version, &ha.nonce_base, Domain::Wal, 0);
+        assert_ne!(n0, n1, "the counter separates units");
+        assert_ne!(n0, nw, "the domain separates units");
+        // The legacy construction's last four bytes are the counter; v4's
+        // derived nonce must not leave them in the clear.
+        assert_ne!(&n0[8..], &0u32.to_le_bytes());
+        // Legacy files keep the old construction so they still open.
+        let legacy = nonce_for(2, &ha.nonce_base, Domain::Checkpoint, 7);
+        assert_eq!(&legacy[..8], &ha.nonce_base[..8]);
+        assert_eq!(&legacy[8..], &7u32.to_le_bytes());
+    }
+
+    /// L-4 old-format policy: a version-2 checkpoint (64-bit prefix) is read,
+    /// and the next save writes version 4.
+    #[test]
+    fn legacy_v2_checkpoint_is_read_and_upgraded_on_save() {
+        fn legacy_v2(plain: &[u8], key: &EncryptionKey) -> Vec<u8> {
+            let (derived, prefix) = match (&key.raw, &key.passphrase) {
+                (Some(raw), _) => (DerivedKey { bytes: *raw }, [0x11u8; 8]),
+                _ => panic!("this fixture uses a raw key"),
+            };
+            let mut base = [0u8; NONCE_BASE_LEN];
+            base[..LEGACY_NONCE_PREFIX_LEN].copy_from_slice(&prefix);
+            let mut header = Vec::new();
+            header.extend_from_slice(ENC_MAGIC);
+            header.extend_from_slice(&2u32.to_le_bytes());
+            header.push(CIPHER_AES256_GCM);
+            header.push(KDF_RAW);
+            header.extend_from_slice(&0u64.to_le_bytes());
+            header.extend_from_slice(&prefix);
+            header.extend_from_slice(&(KEY_CHECK_PLAIN.len() as u32).to_le_bytes());
+            let key_check = seal_unit(
+                &derived,
+                2,
+                &base,
+                Domain::Checkpoint,
+                0,
+                &key_check_aad(Domain::Checkpoint, &header),
+                KEY_CHECK_PLAIN,
+            )
+            .unwrap();
+            let mut out = header.clone();
+            out.extend_from_slice(&key_check);
+            let mut counter = 1u32;
+            for seg in plain.chunks(SEGMENT_PLAIN_MAX) {
+                let ct = seal_unit(
+                    &derived,
+                    2,
+                    &base,
+                    Domain::Checkpoint,
+                    counter,
+                    &unit_aad(Domain::Checkpoint, &header, counter),
+                    seg,
+                )
+                .unwrap();
+                out.extend_from_slice(&(seg.len() as u32).to_le_bytes());
+                out.extend_from_slice(&ct);
+                counter += 1;
+            }
+            let terminal = seal_unit(
+                &derived,
+                2,
+                &base,
+                Domain::Checkpoint,
+                counter,
+                &unit_aad(Domain::Checkpoint, &header, counter),
+                &[],
+            )
+            .unwrap();
+            out.extend_from_slice(&0u32.to_le_bytes());
+            out.extend_from_slice(&terminal);
+            out
+        }
+
+        let key = EncryptionKey::from_raw([0x27u8; 32]);
+        let old = legacy_v2(b"old checkpoint payload", &key);
+        assert_eq!(parse_container_header(&old).unwrap().version, 2);
+        assert_eq!(
+            open_container(&old, &key, 0).unwrap(),
+            b"old checkpoint payload"
+        );
+
+        // Writes are always current-format.
+        let new = seal_container(b"new checkpoint payload", &key, 0).unwrap();
+        assert_eq!(parse_container_header(&new).unwrap().version, 4);
+        assert_eq!(
+            open_container(&new, &key, 0).unwrap(),
+            b"new checkpoint payload"
+        );
     }
 
     #[test]
@@ -1157,7 +1492,7 @@ mod enc_tests {
             v.push(CIPHER_AES256_GCM);
             v.push(KDF_ARGON2ID);
             v.extend_from_slice(&0u64.to_le_bytes());
-            v.extend_from_slice(&[0x5Au8; 8]);
+            v.extend_from_slice(&[0x5Au8; NONCE_BASE_LEN]);
             v.extend_from_slice(&(KEY_CHECK_PLAIN.len() as u32).to_le_bytes());
             v.extend_from_slice(&m.to_le_bytes());
             v.extend_from_slice(&t.to_le_bytes());

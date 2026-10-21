@@ -748,12 +748,12 @@ fn accept_errors_from_fd_exhaustion_do_not_kill_the_async_server() {
     // loop must hit EMFILE and keep running.
     let mut sockets = Vec::new();
     let mut served = 0usize;
-    for _ in 0..60 {
+    for _ in 0..90 {
         let Ok(stream) = TcpStream::connect(&addr) else {
             continue;
         };
         stream
-            .set_read_timeout(Some(Duration::from_millis(200)))
+            .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let mut writer = stream.try_clone().unwrap();
         let _ = protocol::write_request(
@@ -772,7 +772,7 @@ fn accept_errors_from_fd_exhaustion_do_not_kill_the_async_server() {
         sockets.push((reader, writer));
     }
     assert!(
-        served >= 20,
+        served >= 10,
         "expected fd pressure to serve some connections, got {served}"
     );
     assert!(

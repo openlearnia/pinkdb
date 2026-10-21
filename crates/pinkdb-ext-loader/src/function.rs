@@ -14,6 +14,12 @@ use std::sync::Arc;
 use crate::ExtError;
 use crate::abi::{ExtArg, ExtType, ExtValue, PinkdbExtScalarFn, PinkdbExtValue};
 
+/// Largest VARCHAR result the host will copy out of extension memory (64
+/// MiB). The ABI lets an extension set an arbitrary `text_len`; without a
+/// bound a bogus value turns the host's copy into an out-of-bounds read.
+/// A legitimate result over this size is reported as an error instead.
+pub const MAX_VARCHAR_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
 /// One scalar function provided by a loaded extension.
 ///
 /// `DynamicFunction` is `Clone` (a cheap handle: shared library handle plus
@@ -221,10 +227,15 @@ impl DynamicFunction {
         // non-zero error code we validate below.
         let code = unsafe { (self.callback)(self.user_data, args_ptr, abi_args.len(), &mut out) };
 
-        // Freeing contract: a non-NULL text pointer was allocated with
-        // `api->alloc`, and the host owns it — always release it, regardless
-        // of is_null, of the return code, or of decode errors below.
-        let free_text = !out.text_ptr.is_null();
+        // Freeing contract (L-9): only a **VARCHAR** result's non-NULL text
+        // pointer can have been allocated with `api->alloc`. A pointer in any
+        // other tag (a buggy or hostile extension) is ignored, never freed.
+        // An over-limit length is likewise not honoured: the pointer cannot be
+        // trusted to be a host allocation of that size, so it is not read and
+        // not freed.
+        let free_text = !out.text_ptr.is_null()
+            && out.text_len <= MAX_VARCHAR_RESULT_BYTES
+            && ExtType::from_tag(out.type_tag) == Some(ExtType::Varchar);
 
         if code != 0 {
             // Error path: the result struct is not read (the callback may not
@@ -271,6 +282,16 @@ impl DynamicFunction {
             ExtType::Bigint => ExtValue::Bigint(out.int64),
             ExtType::Double => ExtValue::Double(out.double),
             ExtType::Varchar => {
+                if out.text_len > MAX_VARCHAR_RESULT_BYTES {
+                    return Err(ExtError::BadResult {
+                        function: self.name.clone(),
+                        message: format!(
+                            "returned a {}-byte VARCHAR, over the {MAX_VARCHAR_RESULT_BYTES}-byte \
+                             host limit; refusing to read or free the buffer",
+                            out.text_len
+                        ),
+                    });
+                }
                 let bytes = if out.text_len == 0 {
                     Vec::new()
                 } else {
@@ -287,8 +308,10 @@ impl DynamicFunction {
                     // point at at least `text_len` readable bytes that stay
                     // valid until the callback returns (we are still inside
                     // that window) and to have been allocated with
-                    // `api->alloc`. The copy is owned Rust memory; the
-                    // extension buffer is freed by `call` right after.
+                    // `api->alloc`. `text_len` has been capped above, so a
+                    // corrupt length cannot turn this into an unbounded read.
+                    // The copy is owned Rust memory; the extension buffer is
+                    // freed by `call` right after.
                     unsafe { slice::from_raw_parts(out.text_ptr as *const u8, out.text_len) }
                         .to_vec()
                 };

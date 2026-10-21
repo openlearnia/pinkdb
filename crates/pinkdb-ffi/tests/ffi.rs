@@ -155,6 +155,47 @@ fn ownership_loops_do_not_leak_or_corrupt() {
     pinkdb_close(h);
 }
 
+/// L-7: `value_count` is validated before the host allocates its binding
+/// vector. An absurd count must be a clean error, never a capacity abort.
+#[test]
+fn absurd_prepared_value_count_is_rejected_before_allocation() {
+    let h = pinkdb_open_memory();
+    assert!(!h.is_null());
+    let sql = CString::new("SELECT ?;").unwrap();
+    let prep = pinkdb_prepare(h, sql.as_ptr(), sql.as_bytes().len());
+    assert!(!prep.is_null(), "{:?}", last_error());
+    assert_eq!(pinkdb_prepared_parameter_count(prep), 1);
+
+    let dummy = PinkValue {
+        type_tag: PINKDB_TYPE_INTEGER,
+        is_null: 0,
+        int64: 1,
+        double: 0.0,
+        text_ptr: ptr::null(),
+        text_len: 0,
+    };
+    let r = pinkdb_execute_prepared(h, prep, &dummy, 1usize << 62);
+    assert!(r.is_null(), "an absurd value_count must be refused");
+    let err = last_error();
+    assert!(err.contains("exceeds the maximum"), "{err}");
+
+    // A plain wrong count is a normal user error, not an abort either.
+    let r = pinkdb_execute_prepared(h, prep, &dummy, 2);
+    assert!(r.is_null());
+    let err = last_error();
+    assert!(
+        err.contains("prepared statement takes 1, but values were provided for: 2"),
+        "{err}"
+    );
+
+    // The handle still works normally.
+    let r = pinkdb_execute_prepared(h, prep, &dummy, 1);
+    assert!(!r.is_null(), "{:?}", last_error());
+    pinkdb_result_free(r);
+    pinkdb_prepared_free(prep);
+    pinkdb_close(h);
+}
+
 /// A prepared INSERT on a durable database: the WAL carries the substituted
 /// SQL, and reopening replays it to the same rows.
 #[test]

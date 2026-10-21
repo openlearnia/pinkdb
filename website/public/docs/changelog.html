@@ -187,6 +187,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-21">2026-10-21<a class="anchor" href="#2026-10-21" aria-label="Permalink: 2026-10-21">#</a></h2>
+<h3>Security hardening — pass 7 (final): terminal escaping, crypto/WAL/loader/FFI hardening ✅</h3>
+<ul>
+<li>A single terminal sanitizer now covers <strong>every rendered identifier</strong> (all result variants, column names, catalog/lake output, errors), closing ANSI/OSC injection while preserving legitimate UTF-8.</li>
+<li>Engine containers v4 and lake containers v2 use a 128-bit nonce base (96-bit derived GCM nonces); WAL v4 authenticates its publish block; tampering is rejected. Legacy formats still open, and are rewritten on the next save.</li>
+<li>The extension loader validates zero-arg types, owns its collector, refuses post-init registration, bounds VARCHAR copies and ignores non-VARCHAR frees; the FFI bounds <code>value_count</code> and pins <code>PinkValue</code>'s layout. The sync transport enforces a per-frame deadline; the CI installer and Docker images are pinned.</li>
+</ul>
 <h3>Security hardening — pass 6: filesystem privileges, file modes, lake binding ✅</h3>
 <ul>
 <li><code>COPY … TO</code> now needs <code>ADMIN</code> and is <strong>off by default on the server</strong>; with the opt-in it is confined to a configured root, refuses traversal/symlinks, and writes atomically as a <code>0600</code> temp file. Table-function scans likewise require <code>ADMIN</code> in authenticated sessions, including nested/CTE shapes.</li>

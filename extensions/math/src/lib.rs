@@ -508,13 +508,16 @@ mod tests {
         assert_eq!(by_name("exp").min_args(), 1);
         assert_eq!(by_name("exp").max_args(), 1);
         assert_eq!(by_name("exp").ret_type(), ExtType::Double);
-        assert_eq!(by_name("exp").arg_type_at(0), ExtType::Double);
+        assert_eq!(by_name("exp").arg_type_at(0), Some(ExtType::Double));
         let log = by_name("log");
         assert_eq!((log.min_args(), log.max_args()), (1, 2));
         assert!(!log.is_variadic());
-        assert_eq!(log.arg_type_at(1), ExtType::Double);
+        assert_eq!(log.arg_type_at(1), Some(ExtType::Double));
         assert_eq!(by_name("pi").min_args(), 0);
         assert_eq!(by_name("pi").max_args(), 0);
+        // L-6: a zero-argument function has no argument type to clamp to.
+        assert_eq!(by_name("pi").arg_type_at(0), None);
+        assert_eq!(by_name("random").arg_type_at(0), None);
         assert!(by_name("random").is_volatile());
         assert!(!by_name("exp").is_volatile());
         // None of the names shadows an engine built-in (the engine refuses

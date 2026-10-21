@@ -2509,6 +2509,7 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "vortex",
 ]
 
@@ -2524,6 +2525,7 @@ dependencies = [
  "pinkdb-ext-loader",
  "pinkdb-js",
  "rayon",
+ "sha2",
  "subtle",
 ]
 

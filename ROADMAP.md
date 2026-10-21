@@ -2171,3 +2171,53 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   appends) and a symlink-parent swap between validation and temp creation is a
   narrow TOCTOU mitigated by root confinement; tightening scans `data/**` on
   lake open; table-function paths are ADMIN-gated rather than root-confined.
+
+- 2026-10-21 — Security hardening, pass 7 (**final**): terminal escaping, crypto,
+  WAL, loader/FFI and operational hardening (M-9, L-4…L-10 + the informational
+  items; worktree `wt-sec7`). **M-9**: one public `pinkdb::sanitize_terminal`
+  now guards every rendered identifier/name — all `QueryResult` variants,
+  `Selected` column names (before width calculation), `cmd_databases`/
+  `cmd_tables`/`cmd_schema`, `.installed`, CLI errors, and lake names/keys/
+  changes/paths; ANSI/CSI/OSC/DCS are escaped, legitimate UTF-8 is preserved,
+  and VARCHAR cells keep the existing behavior. **L-4**: engine containers v4
+  and lake containers v2 use a fresh 128-bit random `nonce_base`; the 96-bit
+  GCM nonce is `truncate96(SHA-256("pinkdb-nonce-v4" || domain || base ||
+  counter))`, dropping the key-check birthday bound from n²/2⁶⁵ to n²/2⁹⁷;
+  read-old/write-new (engine v1–v3 and lake v1 open; keyed WALs rebuild at open,
+  checkpoints/lake artifacts rewrite on save). **L-5**: WAL v4 authenticates a
+  144-byte publish block (static identity + meta AEAD tag + two individually
+  authenticated slots with fresh 96-bit nonces); tampered identity is a hard
+  recovery error and a torn slot is a hint, frames remain authoritative; v2/v3
+  blocks are read only for upgrade. **L-6**: `arg_type_at` returns
+  `Option<ExtType>`, so zero-argument functions cannot underflow. **L-7**: the
+  FFI validates `value_count` (hard cap 65,536 + exact parameter-count match)
+  before allocating. **L-8**: the `Collector` is `Arc`-owned by the loaded
+  library and carries an `init_complete` flag; post-init registration errors
+  deterministically. **L-9**: VARCHAR results decode the type first, ignore and
+  never free non-VARCHAR pointers, and cap copies at 64 MiB. **L-10**:
+  `offset_of!`/`size_of` const assertions pin `PinkValue` for 64/32-bit layouts
+  and the header-sync test now parses and lays out the C struct. Informational:
+  per-frame idle deadline on the sync transport (whole prefix/type/body, reset
+  between frames), `PINKDB_PASSWORD` only with `--host`, keyed `.lake
+  partition/inlining/flush/add_data_files`, a pinned DuckDB alpha artifact with
+  SHA-256 verification in CI (no piped remote installer), digest-pinned Docker
+  images, and `--tls-insecure` documented as a residual footgun. Tests: sanitizer
+  coverage for every result variant + alignment + hostile-server output, v4/v2
+  nonce and legacy-format tests, WAL publish-block tampering, zero-arg loader,
+  absurd FFI counts, late-registration, bogus VARCHAR length/pointer, FFI
+  layout, slow-drip frame deadline, ambient-password, keyed lake maintenance,
+  and the S3 v6 identity/count expectations. Gates: pinkdb **693**, server
+  **95** (async **115**, tls **106**, both **126**, ui **96**, ui,tls **107**),
+  CLI **81** (**88** with client; lake combos 124/89/93/82), workspace **1346**,
+  encryption **737**, lake **124/253**, arrow **30**, FFI **19**, ext-loader
+  **83**, Python **60**, Go ok, duckdiff **339/339**, fmt/clippy both toolchains,
+  wasm green, actionlint/YAML/shell clean. Sizes: engine rlib **+38,480 B**,
+  server **+1,456 B**, CLI **+1,168 B**, FFI dylib **+2,224 B**. The closing
+  C/H/M/L + informational matrix and the residual-risk register live in
+  `docs/security-remediation-pass7.md`; **no findings remain beyond the
+  documented residuals** (dlopen TOCTOU, single pinned signing key/no
+  revocation, env overrides, no native async TLS, unsigned local extensions,
+  index-rebuild cost, full-storage-control lake rollback, table-function/COPY
+  path policy, renderer-side terminal protection, legacy encrypted bytes
+  retaining the old birthday bound until rewritten, slot-hint suppression, and
+  `--tls-insecure`).

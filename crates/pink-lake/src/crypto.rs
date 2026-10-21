@@ -13,12 +13,12 @@
 //!
 //! ```text
 //! magic "PNKLAKE1" (8 bytes)
-//! container version u32 (= 1)
+//! container version u32 (= 2; version 1 is read)
 //! cipher id u8 (1 = AES-256-GCM)
 //! kdf id u8 (0 = raw 32-byte key, 1 = Argon2id)
 //! domain u8 (1 = manifest, 2 = data file, 3 = commit delta, 4 = delete file)
 //! key-check length u32 (= the key-check plaintext's length)
-//! nonce prefix [8] (fresh random bytes *per container*)
+//! nonce base [16] (fresh 128-bit random value *per container*, v2+)
 //! binding length u32
 //! binding bytes ("" for a manifest; the lake-relative path otherwise)
 //! [kdf id == 1] m_cost u32 KiB | t_cost u32 | p_cost u32 | salt_len u32 | salt
@@ -29,15 +29,19 @@
 //!          is detected by its absence)
 //! ```
 //!
-//! Every AEAD unit uses nonce `nonce_prefix || counter u32 LE`: counter 0 is
-//! the key-check, then 1, 2, … per payload frame. The prefix is fresh random
-//! bytes **per container** (never shared across the containers of one save),
-//! so a (key, nonce) pair is never reused — not within one container, and not
-//! across the data files, the manifest, or the delete files of a version. The
-//! AAD binds the whole public header (magic, version, cipher, KDF id, domain,
-//! binding, prefix, and the KDF parameters — all of it is `aad_base`) plus
-//! the counter, so a container cannot be reinterpreted across domains,
-//! paths, or parameters.
+//! Every AEAD unit uses a 96-bit nonce derived as
+//! `truncate96(SHA-256("pinkdb-nonce-v4" || domain || nonce_base || counter))`
+//! (L-4): counter 0 is the key-check, then 1, 2, … per payload frame. The
+//! base is fresh 128-bit random data **per container** (never shared across
+//! the containers of one save), so a (key, nonce) pair is never reused — not
+//! within one container, and not across the data files, the manifest, or the
+//! delete files of a version. The birthday bound for the fixed-plaintext
+//! key-check is `P ≈ n²/2⁹⁷` (the version-1 64-bit prefix gave `n²/2⁶⁵`).
+//! Version-1 containers still open with the legacy `prefix || counter` nonce;
+//! every write emits version 2. The AAD binds the whole public header (magic,
+//! version, cipher, KDF id, domain, binding, nonce base, and the KDF
+//! parameters — all of it is `aad_base`) plus the counter, so a container
+//! cannot be reinterpreted across domains, paths, or parameters.
 //!
 //! The binding is the whole integrity story for *identity*: a data or delete
 //! file's container authenticates the lake-relative path it was written for,
@@ -103,24 +107,32 @@ pub(crate) const ENC_MAGIC: &[u8; 8] = b"PNKLAKE1";
 /// precise error when one is mistaken for a lake artifact.
 const ENGINE_ENC_MAGIC: &[u8; 8] = b"PINKENC1";
 
-/// Container format version written and read by this build. A newer version
-/// is refused with a clean message (the format stays additive-friendly).
-pub(crate) const CONTAINER_VERSION: u32 = 1;
+/// Container format version written by this build (L-4: 128-bit nonce base).
+/// Version 1 is still read with the legacy 8-byte prefix. A newer version is
+/// refused with a clean message (the format stays additive-friendly).
+pub(crate) const CONTAINER_VERSION: u32 = 2;
+/// The legacy version, read-only.
+const CONTAINER_VERSION_V1: u32 = 1;
 const CIPHER_AES256_GCM: u8 = 1;
 const KDF_RAW: u8 = 0;
 const KDF_ARGON2ID: u8 = 1;
 
 const KEY_LEN: usize = 32;
 const TAG_LEN: usize = 16;
-const NONCE_PREFIX_LEN: usize = 8;
+/// v2+: the random per-container nonce base.
+const NONCE_BASE_LEN: usize = 16;
+/// v1: the old random nonce prefix.
+const LEGACY_NONCE_PREFIX_LEN: usize = 8;
 
 /// Plaintext authenticated by the key-check block so a wrong key is reported
 /// as `wrong key` instead of a parse error.
 const KEY_CHECK_PLAIN: &[u8] = b"pinkdb lake encryption key-check/v1";
 
 /// magic(8) + version(4) + cipher(1) + kdf(1) + domain(1) + key-check
-/// length(4) + nonce prefix(8) + binding length(4).
-const HEADER_FIXED_LEN: usize = 31;
+/// length(4) + nonce base(16) + binding length(4).
+const HEADER_FIXED_LEN: usize = 39;
+/// The v1 fixed header (8-byte nonce prefix).
+const LEGACY_HEADER_FIXED_LEN: usize = 31;
 const KDF_PARAMS_LEN: usize = 16; // m_cost, t_cost, p_cost, salt_len
 const DEFAULT_SALT_LEN: u32 = 16;
 const MIN_SALT_LEN: u32 = 8;
@@ -417,17 +429,37 @@ mod imp {
         }
     }
 
-    fn random_prefix() -> [u8; NONCE_PREFIX_LEN] {
-        let mut prefix = [0u8; NONCE_PREFIX_LEN];
-        OsRng.fill_bytes(&mut prefix);
-        prefix
+    fn random_nonce_base() -> [u8; NONCE_BASE_LEN] {
+        let mut base = [0u8; NONCE_BASE_LEN];
+        OsRng.fill_bytes(&mut base);
+        base
     }
 
-    fn nonce_for(prefix: &[u8; NONCE_PREFIX_LEN], counter: u32) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[..NONCE_PREFIX_LEN].copy_from_slice(prefix);
-        nonce[NONCE_PREFIX_LEN..].copy_from_slice(&counter.to_le_bytes());
-        nonce
+    /// The 96-bit nonce of one unit (L-4): a 128-bit random base plus the
+    /// counter for v2+, the legacy `prefix || counter` for v1 files.
+    pub(crate) fn nonce_for(
+        version: u32,
+        base: &[u8; NONCE_BASE_LEN],
+        domain: Domain,
+        counter: u32,
+    ) -> [u8; 12] {
+        if version >= CONTAINER_VERSION {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(b"pinkdb-nonce-v4\0");
+            h.update([domain.id()]);
+            h.update(base);
+            h.update(counter.to_le_bytes());
+            let digest = h.finalize();
+            let mut nonce = [0u8; 12];
+            nonce.copy_from_slice(&digest[..12]);
+            nonce
+        } else {
+            let mut nonce = [0u8; 12];
+            nonce[..LEGACY_NONCE_PREFIX_LEN].copy_from_slice(&base[..LEGACY_NONCE_PREFIX_LEN]);
+            nonce[LEGACY_NONCE_PREFIX_LEN..].copy_from_slice(&counter.to_le_bytes());
+            nonce
+        }
     }
 
     /// The AAD of one unit: the whole public header (which already binds the
@@ -441,7 +473,9 @@ mod imp {
 
     fn seal_unit(
         key: &DerivedKey,
-        prefix: &[u8; NONCE_PREFIX_LEN],
+        version: u32,
+        base: &[u8; NONCE_BASE_LEN],
+        domain: Domain,
         counter: u32,
         aad: &[u8],
         plain: &[u8],
@@ -450,7 +484,7 @@ mod imp {
             .map_err(|_| internal("bad key length for AES-256-GCM"))?;
         cipher
             .encrypt(
-                Nonce::from_slice(&nonce_for(prefix, counter)),
+                Nonce::from_slice(&nonce_for(version, base, domain, counter)),
                 Payload { msg: plain, aad },
             )
             .map_err(|_| internal("AEAD encryption failed"))
@@ -459,7 +493,9 @@ mod imp {
     /// `None` = authentication failed (wrong key or tampering).
     fn try_open_unit(
         key: &DerivedKey,
-        prefix: &[u8; NONCE_PREFIX_LEN],
+        version: u32,
+        base: &[u8; NONCE_BASE_LEN],
+        domain: Domain,
         counter: u32,
         aad: &[u8],
         ciphertext: &[u8],
@@ -467,7 +503,7 @@ mod imp {
         let cipher = Aes256Gcm::new_from_slice(&key.bytes).ok()?;
         cipher
             .decrypt(
-                Nonce::from_slice(&nonce_for(prefix, counter)),
+                Nonce::from_slice(&nonce_for(version, base, domain, counter)),
                 Payload {
                     msg: ciphertext,
                     aad,
@@ -507,13 +543,14 @@ mod imp {
     /// cheap header edit.
     fn header_base(
         derivation: &Derivation,
-        prefix: &[u8; NONCE_PREFIX_LEN],
+        nonce_base: &[u8; NONCE_BASE_LEN],
         domain: Domain,
         binding: &str,
+        version: u32,
     ) -> Vec<u8> {
         let mut v = Vec::with_capacity(HEADER_FIXED_LEN + KDF_PARAMS_LEN + MAX_SALT_LEN as usize);
         v.extend_from_slice(ENC_MAGIC);
-        v.extend_from_slice(&CONTAINER_VERSION.to_le_bytes());
+        v.extend_from_slice(&version.to_le_bytes());
         v.push(CIPHER_AES256_GCM);
         v.push(match derivation {
             Derivation::Raw => KDF_RAW,
@@ -521,7 +558,11 @@ mod imp {
         });
         v.push(domain.id());
         v.extend_from_slice(&(KEY_CHECK_PLAIN.len() as u32).to_le_bytes());
-        v.extend_from_slice(prefix);
+        if version >= CONTAINER_VERSION {
+            v.extend_from_slice(nonce_base);
+        } else {
+            v.extend_from_slice(&nonce_base[..LEGACY_NONCE_PREFIX_LEN]);
+        }
         v.extend_from_slice(&(binding.len() as u32).to_le_bytes());
         v.extend_from_slice(binding.as_bytes());
         if let Derivation::Argon2 {
@@ -542,10 +583,11 @@ mod imp {
 
     /// The public part of a parsed container header.
     struct ParsedHeader {
+        version: u32,
         domain: u8,
         binding: String,
         derivation: Derivation,
-        prefix: [u8; NONCE_PREFIX_LEN],
+        nonce_base: [u8; NONCE_BASE_LEN],
         aad_base: Vec<u8>,
         key_check: Vec<u8>,
         /// Offset where the payload frames begin (also the header length).
@@ -565,11 +607,11 @@ mod imp {
                 "not a pink-lake encrypted container (bad magic)",
             ));
         }
-        if data.len() < HEADER_FIXED_LEN {
+        if data.len() < LEGACY_HEADER_FIXED_LEN {
             return Err(tampered(path, "truncated container header"));
         }
         let version = u32::from_le_bytes(data[8..12].try_into().expect("4 bytes"));
-        if version != CONTAINER_VERSION {
+        if version != CONTAINER_VERSION && version != CONTAINER_VERSION_V1 {
             return Err(crate::LakeError::UnsupportedContainer {
                 path: path.to_path_buf(),
                 found: version,
@@ -591,10 +633,22 @@ mod imp {
                 format!("bad key-check length {key_check_len}"),
             ));
         }
-        let mut prefix = [0u8; NONCE_PREFIX_LEN];
-        prefix.copy_from_slice(&data[19..27]);
-        let binding_len = u32::from_le_bytes(data[27..31].try_into().expect("4 bytes")) as usize;
-        let mut pos = HEADER_FIXED_LEN;
+        let (nonce_base, binding_len, mut pos) = if version >= CONTAINER_VERSION {
+            if data.len() < HEADER_FIXED_LEN {
+                return Err(tampered(path, "truncated container header"));
+            }
+            let mut base = [0u8; NONCE_BASE_LEN];
+            base.copy_from_slice(&data[19..19 + NONCE_BASE_LEN]);
+            let len_at = 19 + NONCE_BASE_LEN;
+            let len =
+                u32::from_le_bytes(data[len_at..len_at + 4].try_into().expect("4 bytes")) as usize;
+            (base, len, HEADER_FIXED_LEN)
+        } else {
+            let mut base = [0u8; NONCE_BASE_LEN];
+            base[..LEGACY_NONCE_PREFIX_LEN].copy_from_slice(&data[19..27]);
+            let len = u32::from_le_bytes(data[27..31].try_into().expect("4 bytes")) as usize;
+            (base, len, LEGACY_HEADER_FIXED_LEN)
+        };
         // Checked: on a 32-bit target `pos + binding_len` can wrap for a crafted
         // (up to u32::MAX) length, letting the slice below panic.
         let Some(binding_end) = pos
@@ -661,10 +715,11 @@ mod imp {
         let key_check = data[pos..pos + key_check_len + TAG_LEN].to_vec();
         let payload_start = pos + key_check_len + TAG_LEN;
         Ok(ParsedHeader {
+            version,
             domain,
             binding,
             derivation,
-            prefix,
+            nonce_base,
             aad_base: data[..pos].to_vec(),
             key_check,
             payload_start,
@@ -762,13 +817,48 @@ mod imp {
             binding: &str,
             plain: &[u8],
         ) -> Result<Vec<u8>> {
+            self.seal_version(
+                path,
+                domain,
+                binding,
+                plain,
+                CONTAINER_VERSION,
+                random_nonce_base(),
+            )
+        }
+
+        /// Test-only: seal in the legacy v1 layout (8-byte prefix) so the
+        /// read-old/write-new policy is exercised against real bytes.
+        #[cfg(test)]
+        pub(crate) fn seal_v1(
+            &self,
+            path: &Path,
+            domain: Domain,
+            binding: &str,
+            plain: &[u8],
+        ) -> Result<Vec<u8>> {
+            let mut base = [0u8; NONCE_BASE_LEN];
+            OsRng.fill_bytes(&mut base[..LEGACY_NONCE_PREFIX_LEN]);
+            self.seal_version(path, domain, binding, plain, CONTAINER_VERSION_V1, base)
+        }
+
+        fn seal_version(
+            &self,
+            path: &Path,
+            domain: Domain,
+            binding: &str,
+            plain: &[u8],
+            version: u32,
+            nonce_base: [u8; NONCE_BASE_LEN],
+        ) -> Result<Vec<u8>> {
             let key = self.derive(path, &self.write)?;
-            let prefix = random_prefix();
-            let aad = header_base(&self.write, &prefix, domain, binding);
+            let aad = header_base(&self.write, &nonce_base, domain, binding, version);
             let mut out = aad.clone();
             out.extend_from_slice(&seal_unit(
                 &key,
-                &prefix,
+                version,
+                &nonce_base,
+                domain,
                 0,
                 &unit_aad(&aad, 0),
                 KEY_CHECK_PLAIN,
@@ -781,7 +871,15 @@ mod imp {
                     return Err(internal("too many container frames"));
                 }
                 let frame = &plain[pos..end];
-                let ct = seal_unit(&key, &prefix, counter, &unit_aad(&aad, counter), frame)?;
+                let ct = seal_unit(
+                    &key,
+                    version,
+                    &nonce_base,
+                    domain,
+                    counter,
+                    &unit_aad(&aad, counter),
+                    frame,
+                )?;
                 out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
                 out.extend_from_slice(&ct);
                 counter += 1;
@@ -790,7 +888,15 @@ mod imp {
             if counter == u32::MAX {
                 return Err(internal("too many container frames"));
             }
-            let terminal = seal_unit(&key, &prefix, counter, &unit_aad(&aad, counter), &[])?;
+            let terminal = seal_unit(
+                &key,
+                version,
+                &nonce_base,
+                domain,
+                counter,
+                &unit_aad(&aad, counter),
+                &[],
+            )?;
             out.extend_from_slice(&0u32.to_le_bytes());
             out.extend_from_slice(&terminal);
             Ok(out)
@@ -808,12 +914,14 @@ mod imp {
             sink: &'a mut (dyn Write + Send),
         ) -> Result<SealWriter<'a>> {
             let key = self.derive(path, &self.write)?;
-            let prefix = random_prefix();
-            let aad = header_base(&self.write, &prefix, domain, binding);
+            let nonce_base = random_nonce_base();
+            let aad = header_base(&self.write, &nonce_base, domain, binding, CONTAINER_VERSION);
             let mut header = aad.clone();
             header.extend_from_slice(&seal_unit(
                 &key,
-                &prefix,
+                CONTAINER_VERSION,
+                &nonce_base,
+                domain,
                 0,
                 &unit_aad(&aad, 0),
                 KEY_CHECK_PLAIN,
@@ -828,7 +936,8 @@ mod imp {
             Ok(SealWriter {
                 path: path.to_path_buf(),
                 key,
-                prefix,
+                nonce_base,
+                domain,
                 aad,
                 sink,
                 buf: Vec::with_capacity(SEGMENT_PLAIN_MAX),
@@ -889,7 +998,9 @@ mod imp {
             let key = self.derive(path, &header.derivation)?;
             if try_open_unit(
                 &key,
-                &header.prefix,
+                header.version,
+                &header.nonce_base,
+                domain,
                 0,
                 &unit_aad(&header.aad_base, 0),
                 &header.key_check,
@@ -929,7 +1040,9 @@ mod imp {
                 }
                 let plain = try_open_unit(
                     &key,
-                    &header.prefix,
+                    header.version,
+                    &header.nonce_base,
+                    domain,
                     counter,
                     &unit_aad(&header.aad_base, counter),
                     &data[start..end],
@@ -978,7 +1091,8 @@ mod imp {
     pub(crate) struct SealWriter<'a> {
         path: std::path::PathBuf,
         key: Arc<DerivedKey>,
-        prefix: [u8; NONCE_PREFIX_LEN],
+        nonce_base: [u8; NONCE_BASE_LEN],
+        domain: Domain,
         aad: Vec<u8>,
         sink: &'a mut (dyn Write + Send),
         buf: Vec<u8>,
@@ -1000,7 +1114,9 @@ mod imp {
             let plain = std::mem::take(&mut self.buf);
             let ct = seal_unit(
                 &self.key,
-                &self.prefix,
+                CONTAINER_VERSION,
+                &self.nonce_base,
+                self.domain,
                 self.counter,
                 &unit_aad(&self.aad, self.counter),
                 &plain,
@@ -1030,7 +1146,9 @@ mod imp {
                 }
                 let terminal = seal_unit(
                     &self.key,
-                    &self.prefix,
+                    CONTAINER_VERSION,
+                    &self.nonce_base,
+                    self.domain,
                     self.counter,
                     &unit_aad(&self.aad, self.counter),
                     &[],
@@ -1238,6 +1356,65 @@ mod tests {
         assert_eq!(
             crypto.open(&path(), Domain::Manifest, "", &b).unwrap(),
             b"same bytes"
+        );
+    }
+
+    /// L-4: v2 containers carry a 128-bit nonce base; the derived nonce
+    /// separates domains and counters.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn v2_nonce_base_is_128_bits_and_domain_separated() {
+        let crypto = Crypto::new(EncryptionKey::from_raw([0x31u8; 32])).unwrap();
+        let a = seal(&crypto, Domain::Manifest, "", b"same");
+        let b = seal(&crypto, Domain::Manifest, "", b"same");
+        assert_eq!(u32::from_le_bytes(a[8..12].try_into().unwrap()), 2);
+        let base_a: [u8; 16] = a[19..35].try_into().unwrap();
+        let base_b: [u8; 16] = b[19..35].try_into().unwrap();
+        assert!(base_a.iter().any(|x| *x != 0));
+        assert_ne!(base_a, base_b);
+        assert_ne!(
+            imp::nonce_for(2, &base_a, Domain::Manifest, 0),
+            imp::nonce_for(2, &base_a, Domain::DataFile, 0)
+        );
+        assert_ne!(
+            imp::nonce_for(2, &base_a, Domain::Manifest, 0),
+            imp::nonce_for(2, &base_a, Domain::Manifest, 1)
+        );
+    }
+
+    /// L-4 old-format policy: a version-1 lake container opens, while every
+    /// new seal is version 2.
+    #[cfg(feature = "encryption")]
+    #[test]
+    fn legacy_v1_lake_container_is_read_and_writes_are_v2() {
+        let crypto = Crypto::new(EncryptionKey::from_raw([0x32u8; 32])).unwrap();
+        let old = crypto
+            .seal_v1(
+                &path(),
+                Domain::DataFile,
+                "data/t/x.pink",
+                b"old lake bytes",
+            )
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(old[8..12].try_into().unwrap()), 1);
+        assert_eq!(
+            crypto
+                .open(&path(), Domain::DataFile, "data/t/x.pink", &old)
+                .unwrap(),
+            b"old lake bytes"
+        );
+        let new = seal(
+            &crypto,
+            Domain::DataFile,
+            "data/t/x.pink",
+            b"new lake bytes",
+        );
+        assert_eq!(u32::from_le_bytes(new[8..12].try_into().unwrap()), 2);
+        assert_eq!(
+            crypto
+                .open(&path(), Domain::DataFile, "data/t/x.pink", &new)
+                .unwrap(),
+            b"new lake bytes"
         );
     }
 
