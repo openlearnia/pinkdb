@@ -85,6 +85,11 @@ vortexlake = ["dep:pink-lake", "pink-lake/vortexlake"]
 # data-file format, without the Vortex dependency (~42 MB of binary size).
 # Reading a v2/v3 Vortex lake fails with a clear feature error.
 pinklake = ["dep:pink-lake"]
+# Opt-in Parquet lake format (wave 87): `pinklake` plus the parquet extension
+# and the `pink-lake-parquet` provider. Registers the `parquet` format at
+# startup, so `.lake format parquet` makes subsequent `.lake save`/commits
+# write `.parquet` data files (read through the existing parquet reader).
+parquetlake = ["pinklake", "parquet", "dep:pink-lake-parquet"]
 # Opt-in object storage for the lake: `.lake …` accepts `s3://bucket/prefix`
 # URLs (AWS S3, Cloudflare R2) via pink-lake's `s3` feature (ureq + SigV4).
 # Pure storage: it implies neither lake build, and on its own it adds the
@@ -133,6 +138,9 @@ ed25519-dalek = { version = "2.2", default-features = false, features = ["std"],
 base64 = { version = "0.23", optional = true }
 # Lake layer (vortexlake/pinklake features): catalog + immutable data files.
 pink-lake = { path = "../pink-lake", optional = true }
+# Parquet lake format provider (`parquetlake` feature): the LakeFormat bridge
+# over pinkdb-parquet's reader and writer.
+pink-lake-parquet = { path = "../pink-lake-parquet", optional = true }
 
 [dev-dependencies]
 # Test-only self-signed certificate generation for the TLS remote-mode tests.

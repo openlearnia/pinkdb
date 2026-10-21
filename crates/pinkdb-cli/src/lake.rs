@@ -166,6 +166,50 @@ fn writables() -> MutexGuard<'static, BTreeMap<String, WritableAttachment>> {
     WRITABLES.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+/// The session's `.lake format <id>` choice: the data-file format every
+/// subsequent full save / commit / inlined flush writes. `None` keeps the
+/// build default (`vortex` with `vortexlake`, else `pink`). Per session, not
+/// persisted (a lake's existing files keep their entry's format).
+static WRITE_FORMAT: Mutex<Option<String>> = Mutex::new(None);
+
+fn chosen_write_format() -> Option<String> {
+    WRITE_FORMAT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// The build's default write format, matching `pink-lake`'s choice.
+fn default_write_format_id() -> &'static str {
+    if cfg!(feature = "vortexlake") {
+        "vortex"
+    } else {
+        "pink"
+    }
+}
+
+fn current_write_format_id() -> String {
+    chosen_write_format().unwrap_or_else(|| default_write_format_id().to_string())
+}
+
+/// The ids this binary has providers for. The lake registry is keyed and has
+/// no listing API; these are the three ids any pinkdb build can register
+/// (`pink` always, `vortex` with `vortexlake`, `parquet` with `parquetlake`).
+fn registered_format_ids() -> Vec<&'static str> {
+    ["pink", "vortex", "parquet"]
+        .into_iter()
+        .filter(|id| pink_lake::format::lake_format(id).is_some())
+        .collect()
+}
+
+/// Apply the session's chosen format to a handle that is about to write.
+fn apply_write_format(lake: &mut Lake) -> pink_lake::Result<()> {
+    match chosen_write_format() {
+        Some(id) => lake.set_write_format(&id),
+        None => Ok(()),
+    }
+}
+
 /// The commit retry settings of a `.lake commit`, from the environment with
 /// DuckLake's defaults (`PINKDB_LAKE_MAX_RETRY_COUNT`,
 /// `PINKDB_LAKE_RETRY_BACKOFF`, `PINKDB_LAKE_RETRY_WAIT_MS`). An unparseable
@@ -228,6 +272,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "table_info" | "tableinfo" => cmd_table_info(rest),
         "options" => cmd_options(rest),
         "settings" => cmd_settings(rest),
+        "format" => cmd_format(rest),
         "detach" => cmd_detach(db, rest),
         "attached" => cmd_attached(db, rest),
         "versions" => cmd_versions(rest),
@@ -237,7 +282,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "" => println!(
             "Usage: .lake <save|open|attach|commit|partition|inlining|flush|changes|\
              add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
-             settings|detach|attached|versions|snapshots|tables|info> ..."
+             settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),
         other => cli_error!("unknown .lake subcommand \"{other}\". Try .help"),
     }
@@ -335,6 +380,10 @@ fn cmd_save(db: &PinkDb, arg: &str) {
             return;
         }
     };
+    if let Err(e) = apply_write_format(&mut lake) {
+        cli_error!("{e}");
+        return;
+    }
     if let Some(base) = baseline(&lake) {
         let current = lake.current_version();
         if current != base && !force {
@@ -669,6 +718,10 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
             return;
         }
     };
+    if let Err(e) = apply_write_format(wa.lake_mut()) {
+        cli_error!("{e}");
+        return;
+    }
     if let Some(limit) = attach_inlining_limit() {
         wa.set_data_inlining_row_limit(limit);
     }
@@ -824,6 +877,13 @@ fn cmd_commit(db: &mut PinkDb, arg: &str) {
         return;
     };
     let mut wa = wa;
+    // A format chosen after the writable attach (`.lake format`) applies to
+    // this commit's new data files too.
+    if let Err(e) = apply_write_format(wa.lake_mut()) {
+        writables().insert(dir.clone(), wa);
+        cli_error!("{e}");
+        return;
+    }
     // The WAL covers the changes first: every statement feeding this commit
     // is durable before the lake publishes, so a crash can only lose the
     // publication, never the change (re-running .lake commit after reopen is
@@ -1182,6 +1242,10 @@ fn cmd_flush(arg: &str) {
             return;
         }
     };
+    if let Err(e) = apply_write_format(&mut lake) {
+        cli_error!("{e}");
+        return;
+    }
     let t0 = Instant::now();
     match lake.flush_inlined_data(table.as_deref()) {
         Ok(report) if !report.committed => match table {
@@ -2436,6 +2500,57 @@ fn cmd_settings(arg: &str) {
     println!(
         "data_path:         {}",
         sanitize_terminal(&settings.data_path)
+    );
+}
+
+/// `.lake format [<id>]`: show the session's write format and the registered
+/// provider ids, or choose the format for every subsequent full save, commit
+/// and inlined flush (`Lake::set_write_format`, applied here and to the
+/// session's writable attachments). An id with no registered provider is a
+/// clear error — never a silent fallback to the build default.
+fn cmd_format(arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        println!("Lake write format: {}", current_write_format_id());
+        println!("Registered formats: {}", registered_format_ids().join(", "));
+        println!("Usage: .lake format <id>");
+        return;
+    }
+    let Some((token, rest)) = take_token(arg) else {
+        println!("Usage: .lake format <id>");
+        return;
+    };
+    if !rest.trim().is_empty() {
+        println!("Usage: .lake format <id>");
+        return;
+    }
+    let id = unquote(&token);
+    if pink_lake::format::lake_format(&id).is_none() {
+        let ids = registered_format_ids();
+        cli_error!(
+            "unknown lake format \"{id}\"; registered formats: {} (a lake format provider is \
+             registered by the build feature that ships it, e.g. `parquetlake` for parquet)",
+            ids.join(", ")
+        );
+        return;
+    }
+    // Existing writable attachments write through their own handle: apply the
+    // choice now so a following `.lake commit` uses it.
+    {
+        let mut writables = writables();
+        for (location, wa) in writables.iter_mut() {
+            if let Err(e) = wa.lake_mut().set_write_format(&id) {
+                cli_error!(
+                    "cannot apply format \"{id}\" to the writable attach at {location}: {e}"
+                );
+                return;
+            }
+        }
+    }
+    *WRITE_FORMAT.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.clone());
+    println!(
+        "Lake write format set to \"{id}\" for subsequent .lake save / .lake commit / \
+         .lake flush writes"
     );
 }
 

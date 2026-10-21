@@ -736,7 +736,22 @@ store-unique, so a table dropped and recreated underneath a transaction is
 always a conflict. The plain `PinkDb` API remains for single-connection
 embedding.
 
-## Lake layer (features `pinklake` / `vortexlake`)
+## Lake layer (features `pinklake` / `vortexlake` / `parquetlake`)
+
+**Data-file formats are providers (wave 87).** A lake's data files are
+written by a registered `pink_lake::format::LakeFormat` provider, named by the
+id each catalog entry pins (`"pink"`, `"vortex"`, `"parquet"`, …): `.pink` is
+always built in, Vortex comes with `vortexlake`, and the `parquetlake` CLI
+feature registers **Parquet** (`crates/pink-lake-parquet`, over a new
+`pinkdb-parquet` writer: every type except INTERVAL — Parquet's INTERVAL is
+millisecond-precision, so such a table is refused rather than written
+lossily). Choose the write format with `.lake format <id>` (no argument lists
+the registered ids) or `Lake::set_write_format`; everything else — catalog,
+commits, attach (exact `COUNT`/`MIN`/`MAX` from manifest statistics), S3,
+encryption, maintenance — works the same for every provider. A lake whose
+catalog names an id this build has no provider for is refused with a clear
+error. Existing catalogs are byte-identical. Iceberg reads through the same
+seam are a follow-up.
 
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
 JSON catalog plus immutable per-table data files, on local disk or (with the

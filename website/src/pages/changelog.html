@@ -9,6 +9,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-21</h2>
+<h3>Wave 87 — lake data formats are pluggable; Parquet lakes ✅</h3>
+<ul>
+<li>A lake's data files are now written by a registered <strong>format provider</strong>: <code>.pink</code> is built in, Vortex comes with <code>vortexlake</code>, and the new <code>parquetlake</code> CLI feature adds <strong>Parquet</strong>.</li>
+<li><code>.lake format parquet</code> (or <code>Lake::set_write_format</code>) picks the format for the next saves; attach, commits, S3, encryption and maintenance work the same for every format. INTERVAL columns are refused in Parquet (it cannot store microseconds exactly).</li>
+<li>A lake that names a format this build doesn't have is refused with a clear error; existing lakes are unchanged.</li>
+</ul>
 <h3>Wave 86 — extensions can provide table functions and COPY formats ✅</h3>
 <ul>
 <li>New <strong>extension packages</strong>: a host registers a named bundle of scalar functions, table functions/file readers and <code>COPY</code> formats; <code>LOAD EXTENSION '&lt;name&gt;'</code> turns it on for one database, atomically (a name clash refuses the whole package).</li>

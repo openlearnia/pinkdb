@@ -1332,11 +1332,8 @@ impl Lake {
             ),
             option(
                 "data_format",
-                "Data-file format this build writes",
-                match self.write_format() {
-                    FileFormat::Pink => "pink".to_string(),
-                    FileFormat::Vortex => "vortex".to_string(),
-                },
+                "Data-file format this build writes (a registered provider id)",
+                self.write_format().id().to_string(),
             ),
             option(
                 "current_version",

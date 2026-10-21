@@ -3,23 +3,23 @@
 //!
 //! Attaching reads `catalog.json` + the chosen manifest (exactly what
 //! [`Lake::load`] reads first). What it reads from the data files depends on
-//! the entry's format:
+//! the entry's registered format provider ([`crate::format`]):
 //!
-//! - a **Vortex** entry (`vortexlake` builds): each data file's footer,
-//!   the `pinkdb.table` identity/schema segment and the stored statistics —
-//!   no data segment is read and no column is decoded. Locally that is a
-//!   positioned read of the postscript + footer per file; over object storage
-//!   (which has no ranged reads in this build) — and for an encrypted lake,
-//!   where the container must be unsealed before the footer can be parsed —
-//!   the whole object is read into memory and opened in place, still skipping
-//!   the decode.
-//! - a **`.pink`** entry (every build): the per-file statistics blocks
-//!   published in the manifest and nothing else — no data file is opened at
-//!   attach, encrypted or not (the blocks ride inside the sealed manifest).
-//!   Each block carries a file's schema and exact per-column
-//!   statistics and is CRC-protected against its key, path and row count (see
-//!   [`crate::stats`]); a `.pink` file published without one is refused with
-//!   a clear message.
+//! - a format whose provider advertises **footer statistics** (Vortex, in
+//!   `vortexlake` builds): each data file's footer, the `pinkdb.table`
+//!   identity/schema segment and the stored statistics — no data segment is
+//!   read and no column is decoded. Locally that is a positioned read of the
+//!   postscript + footer per file; over object storage (which has no ranged
+//!   reads in this build) — and for an encrypted lake, where the container
+//!   must be unsealed before the footer can be parsed — the whole object is
+//!   read into memory and opened in place, still skipping the decode.
+//! - a **`.pink`** entry (every build) and every provider that returns no
+//!   footer statistics: the per-file statistics blocks published in the
+//!   manifest and nothing else — no data file is opened at attach, encrypted
+//!   or not (the blocks ride inside the sealed manifest). Each block carries
+//!   a file's schema and exact per-column statistics and is CRC-protected
+//!   against its key, path and row count (see [`crate::stats`]); a file
+//!   published without one is refused with a clear message.
 //!
 //! A v4 table may list several data files (incremental appends) and
 //! positional delete files. Attach merges the files' statistics into the
@@ -95,11 +95,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pinkdb::attached::AttachedScan;
-use pinkdb::{
-    AtSpec, AttachedLake, AttachedTable, ColumnStats, DataTable, PinkDb, PinkDbError, Value,
-};
+use pinkdb::{AtSpec, AttachedLake, AttachedTable, ColumnStats, DataTable, PinkDbError, Value};
 
-use crate::catalog::{DeleteRef, FileFormat, PartitionKey, TableEntry};
+use crate::catalog::{DeleteRef, PartitionKey, TableEntry};
+use crate::format::{DataFile, LakeFormat};
 use crate::incremental::entry_layout;
 use crate::inlined::InlinedFact;
 use crate::storage::{Head, Storage};
@@ -107,7 +106,7 @@ use crate::storage::{Head, Storage};
 use crate::vortex_file;
 use crate::zone::{self, FileFacts};
 use crate::{
-    Lake, LakeError, Result, apply_file_deletes, copy_chunks, manifest_for, only_table, path_str,
+    Lake, LakeError, Result, apply_file_deletes, copy_chunks, manifest_for, only_table,
     published_versions, split_key, validate_rel_path,
 };
 
@@ -135,27 +134,15 @@ pub struct AttachmentReport {
     /// statistics blocks ride inside the (now encrypted) manifest. Never a
     /// decode either way.
     pub encrypted: bool,
-    /// True when every attached entry is a `.pink` entry, so attach read the
-    /// manifests' CRC-protected statistics blocks and **no data file at
-    /// all** (the "statistics-only" shape); false when any entry needed a
-    /// Vortex footer read (the "footer-only" shape).
+    /// True when no attached entry needed a data-file footer read, so attach
+    /// read the manifests' CRC-protected statistics blocks and **no data file
+    /// at all** (the "statistics-only" shape); false when any entry's
+    /// provider carries its statistics in the file (Vortex's "footer-only"
+    /// shape).
     pub statistics_only: bool,
     /// The read-only handle to register with the engine
     /// ([`pinkdb::PinkDb::attach_lake`]).
     pub lake: Arc<dyn AttachedLake>,
-}
-
-/// The data-file format one attached table materializes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachedFormat {
-    /// The engine's single-table `.pink` bytes (v1/v4 lean entries): decode
-    /// via [`PinkDb::open`] — the same decode `.lake open` performs. No
-    /// projected reads exist for this format, so a projection materializes
-    /// the whole table and caches it.
-    Pink,
-    /// A Vortex file (v2/v3/v4 `vortexlake` entries): projected
-    /// footer-only decodes.
-    Vortex,
 }
 
 /// A `.pink` file's schema and gated statistics, as attach wants them.
@@ -199,7 +186,12 @@ struct AttachedEntry {
     /// The table's partition specification at this version (possibly empty).
     keys: Vec<PartitionKey>,
     files: Vec<AttachedFile>,
-    format: AttachedFormat,
+    /// The registered provider this entry's data files are read with (the
+    /// catalog's format id resolved through [`crate::format`]).
+    format: Arc<dyn LakeFormat>,
+    /// Whether the provider decodes column projections (Vortex). `false`
+    /// means a projected request materializes the whole table.
+    projected: bool,
     /// The v5 schema record of this version's entry (wave 65); `None` for a
     /// legacy entry, whose files carry the schema themselves and must agree.
     record: Option<crate::schema::TableSchema>,
@@ -382,7 +374,7 @@ impl AttachedLake for LakeAttachment {
                     });
                 }
                 self.loads.fetch_add(1, Ordering::Relaxed);
-                let decoded_count = if entry.format == AttachedFormat::Pink {
+                let decoded_count = if !entry.projected {
                     // A `.pink` projection decodes the whole table.
                     cached.present.len() as u64
                 } else {
@@ -395,7 +387,7 @@ impl AttachedLake for LakeAttachment {
                 let (fresh, _fresh_present) = self
                     .load_entry(&entry, Some(&missing))
                     .map_err(|e| PinkDbError::Execution(e.to_string()))?;
-                if entry.format == AttachedFormat::Pink {
+                if !entry.projected {
                     // A `.pink` projection decodes the whole table: the fresh
                     // decode is the complete state, no column merge needed.
                     cached.present = vec![true; fresh.num_cols()];
@@ -415,7 +407,7 @@ impl AttachedLake for LakeAttachment {
             }
             None => {
                 self.loads.fetch_add(1, Ordering::Relaxed);
-                let decoded_count = if entry.format == AttachedFormat::Pink {
+                let decoded_count = if !entry.projected {
                     // A `.pink` projection decodes the whole table (no
                     // projected reader); it counts every column.
                     requested.len() as u64
@@ -426,7 +418,7 @@ impl AttachedLake for LakeAttachment {
                     .fetch_add(decoded_count, Ordering::Relaxed);
                 self.files_decoded
                     .fetch_add(entry.files.len() as u64, Ordering::Relaxed);
-                let full = entry.format == AttachedFormat::Pink || requested.iter().all(|&w| w);
+                let full = !entry.projected || requested.iter().all(|&w| w);
                 let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
                 let (table, present) = self
                     .load_entry(&entry, if full { None } else { Some(&decoded) })
@@ -488,14 +480,14 @@ impl AttachedLake for LakeAttachment {
         self.loads.fetch_add(1, Ordering::Relaxed);
         self.files_decoded
             .fetch_add(survivors.len() as u64, Ordering::Relaxed);
-        let decoded_count = if entry.format == AttachedFormat::Pink {
+        let decoded_count = if !entry.projected {
             requested.len() as u64
         } else {
             requested.iter().filter(|&&w| w).count() as u64
         };
         self.columns_decoded
             .fetch_add(decoded_count, Ordering::Relaxed);
-        let full = entry.format == AttachedFormat::Pink || requested.iter().all(|&w| w);
+        let full = !entry.projected || requested.iter().all(|&w| w);
         let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
         let (table, present) = self
             .load_some(&entry, &survivors, if full { None } else { Some(&decoded) })
@@ -806,162 +798,155 @@ fn load_file(
     columns: Option<&[usize]>,
 ) -> Result<(DataTable, Vec<bool>)> {
     let key = entry.key();
-    match entry.format {
-        AttachedFormat::Pink => {
-            // No projected `.pink` read exists: any missing column
-            // materializes the whole table (one decode, the same `.lake open`
-            // performs).
-            let table = load_pink_file(storage, root, &file.rel, &entry.db, &entry.table)?;
-            if table.num_rows() as u64 != file.rows {
-                return Err(LakeError::Corrupt {
-                    path: storage.abs(&file.rel),
-                    message: format!(
-                        "table \"{key}\": data file \"{}\" has {} rows, but the manifest \
-                         says {}",
-                        file.rel,
-                        table.num_rows(),
-                        file.rows
-                    ),
-                });
-            }
-            let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
-            match &entry.record {
-                Some(schema) => {
-                    let mapping = schema.map_file(
-                        file.schema_version,
-                        &table.schema(),
-                        &storage.abs(&file.rel),
-                    )?;
-                    let all = vec![true; table.num_cols()];
-                    schema.project_table(&mapping, &table, &all, &entry.table)
-                }
-                None => {
-                    let present = vec![true; table.num_cols()];
-                    Ok((table, present))
-                }
-            }
+    let abs = storage.abs(&file.rel);
+    let data_file = DataFile::new(&abs, &file.rel, storage);
+    if !entry.projected {
+        // No projected reader exists for this provider (the engine `.pink`
+        // bytes are the built-in case): any missing column materializes the
+        // whole table through the provider's reader — one decode, the same
+        // `.lake open` performs.
+        let table = decode_via_provider(entry, &data_file, root)?;
+        if table.num_rows() as u64 != file.rows {
+            return Err(LakeError::Corrupt {
+                path: storage.abs(&file.rel),
+                message: format!(
+                    "table \"{key}\": data file \"{}\" has {} rows, but the manifest \
+                     says {}",
+                    file.rel,
+                    table.num_rows(),
+                    file.rows
+                ),
+            });
         }
-        AttachedFormat::Vortex => {
-            #[cfg(feature = "vortexlake")]
-            {
-                // With a record: resolve which physical columns the request
-                // needs (mapped logical ones only — never a dropped column's
-                // bytes) from the file's own (footer) schema.
-                let (table, present) = match &entry.record {
-                    Some(schema) => {
-                        let path = storage.abs(&file.rel);
-                        let footer = vortex_file::read_footer(&path, storage, &file.rel)?;
-                        let mapping =
-                            schema.map_file(file.schema_version, &footer.schema, &path)?;
-                        let wanted: Vec<bool> = match columns {
-                            Some(cols) => {
-                                let mut w = vec![false; schema.columns.len()];
-                                for &i in cols {
-                                    if i < w.len() {
-                                        w[i] = true;
-                                    }
-                                }
-                                w
-                            }
-                            None => vec![true; schema.columns.len()],
-                        };
-                        let mut physical: Vec<usize> = Vec::new();
-                        for (li, on) in wanted.iter().enumerate() {
-                            if *on
-                                && let Some(pi) = mapping.physical[li]
-                                && !physical.contains(&pi)
-                            {
-                                physical.push(pi);
-                            }
-                        }
-                        physical.sort_unstable();
-                        let (file_table, file_present) = if physical.len() == footer.schema.len() {
-                            let table =
-                                load_table(storage, root, &file.rel, &entry.db, &entry.table)?;
-                            let present = vec![true; table.num_cols()];
-                            (table, present)
-                        } else {
-                            // Decode at least one physical column: the row
-                            // count has to come from somewhere even when the
-                            // request only needs default-filled columns.
-                            let decode_cols: Vec<usize> = if physical.is_empty() {
-                                vec![0]
-                            } else {
-                                physical.clone()
-                            };
-                            load_projected_table(
-                                storage,
-                                root,
-                                &file.rel,
-                                &entry.db,
-                                &entry.table,
-                                &decode_cols,
-                            )?
-                        };
-                        if file_table.num_rows() as u64 != file.rows {
-                            return Err(LakeError::Corrupt {
-                                path: storage.abs(&file.rel),
-                                message: format!(
-                                    "table \"{key}\": data file \"{}\" has {} rows, but the \
-                                     manifest says {}",
-                                    file.rel,
-                                    file_table.num_rows(),
-                                    file.rows
-                                ),
-                            });
-                        }
-                        let file_table =
-                            apply_file_deletes(&file_table, &file.deletes, &key, &file.rel)?;
-                        schema.project_table(&mapping, &file_table, &file_present, &entry.table)?
-                    }
-                    None => {
-                        let (table, present) = match columns {
-                            Some(cols) => load_projected_table(
-                                storage,
-                                root,
-                                &file.rel,
-                                &entry.db,
-                                &entry.table,
-                                cols,
-                            )?,
-                            None => {
-                                let table =
-                                    load_table(storage, root, &file.rel, &entry.db, &entry.table)?;
-                                let present = vec![true; table.num_cols()];
-                                (table, present)
-                            }
-                        };
-                        if table.num_rows() as u64 != file.rows {
-                            return Err(LakeError::Corrupt {
-                                path: storage.abs(&file.rel),
-                                message: format!(
-                                    "table \"{key}\": data file \"{}\" has {} rows, but the \
-                                     manifest says {}",
-                                    file.rel,
-                                    table.num_rows(),
-                                    file.rows
-                                ),
-                            });
-                        }
-                        let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
-                        (table, present)
-                    }
-                };
+        let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
+        match &entry.record {
+            Some(schema) => {
+                let mapping = schema.map_file(
+                    file.schema_version,
+                    &table.schema(),
+                    &storage.abs(&file.rel),
+                )?;
+                let all = vec![true; table.num_cols()];
+                schema.project_table(&mapping, &table, &all, &entry.table)
+            }
+            None => {
+                let present = vec![true; table.num_cols()];
                 Ok((table, present))
             }
-            #[cfg(not(feature = "vortexlake"))]
-            {
-                // Unreachable: `read_manifest` refuses a Vortex entry before
-                // an attach could see one. A clear error, never a panic.
-                Err(LakeError::FeatureMissing {
-                    feature: "vortexlake",
-                    message: format!(
-                        "table \"{key}\" uses a Vortex data file (\"{}\"); this build reads \
-                         `.pink` lakes only — rebuild with the `vortexlake` feature",
-                        file.rel
-                    ),
-                })
-            }
+        }
+    } else {
+        #[cfg(feature = "vortexlake")]
+        {
+            // With a record: resolve which physical columns the request
+            // needs (mapped logical ones only — never a dropped column's
+            // bytes) from the file's own (footer) schema.
+            let (table, present) = match &entry.record {
+                Some(schema) => {
+                    let path = storage.abs(&file.rel);
+                    let footer = entry.format.footer_stats(&data_file)?.ok_or_else(|| {
+                        LakeError::Internal {
+                            message: format!(
+                                "format \"{}\" advertises footer statistics but returned none \
+                                 for \"{}\"",
+                                entry.format.id(),
+                                file.rel
+                            ),
+                        }
+                    })?;
+                    let mapping = schema.map_file(file.schema_version, &footer.schema, &path)?;
+                    let wanted: Vec<bool> = match columns {
+                        Some(cols) => {
+                            let mut w = vec![false; schema.columns.len()];
+                            for &i in cols {
+                                if i < w.len() {
+                                    w[i] = true;
+                                }
+                            }
+                            w
+                        }
+                        None => vec![true; schema.columns.len()],
+                    };
+                    let mut physical: Vec<usize> = Vec::new();
+                    for (li, on) in wanted.iter().enumerate() {
+                        if *on
+                            && let Some(pi) = mapping.physical[li]
+                            && !physical.contains(&pi)
+                        {
+                            physical.push(pi);
+                        }
+                    }
+                    physical.sort_unstable();
+                    let (file_table, file_present) = if physical.len() == footer.schema.len() {
+                        let table = decode_via_provider(entry, &data_file, root)?;
+                        let present = vec![true; table.num_cols()];
+                        (table, present)
+                    } else {
+                        // Decode at least one physical column: the row count
+                        // has to come from somewhere even when the request
+                        // only needs default-filled columns.
+                        let decode_cols: Vec<usize> = if physical.is_empty() {
+                            vec![0]
+                        } else {
+                            physical.clone()
+                        };
+                        load_projected_table(entry, storage, root, &file.rel, &decode_cols)?
+                    };
+                    if file_table.num_rows() as u64 != file.rows {
+                        return Err(LakeError::Corrupt {
+                            path: storage.abs(&file.rel),
+                            message: format!(
+                                "table \"{key}\": data file \"{}\" has {} rows, but the \
+                                 manifest says {}",
+                                file.rel,
+                                file_table.num_rows(),
+                                file.rows
+                            ),
+                        });
+                    }
+                    let file_table =
+                        apply_file_deletes(&file_table, &file.deletes, &key, &file.rel)?;
+                    schema.project_table(&mapping, &file_table, &file_present, &entry.table)?
+                }
+                None => {
+                    let (table, present) = match columns {
+                        Some(cols) => load_projected_table(entry, storage, root, &file.rel, cols)?,
+                        None => {
+                            let table = decode_via_provider(entry, &data_file, root)?;
+                            let present = vec![true; table.num_cols()];
+                            (table, present)
+                        }
+                    };
+                    if table.num_rows() as u64 != file.rows {
+                        return Err(LakeError::Corrupt {
+                            path: storage.abs(&file.rel),
+                            message: format!(
+                                "table \"{key}\": data file \"{}\" has {} rows, but the \
+                                 manifest says {}",
+                                file.rel,
+                                table.num_rows(),
+                                file.rows
+                            ),
+                        });
+                    }
+                    let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
+                    (table, present)
+                }
+            };
+            Ok((table, present))
+        }
+        #[cfg(not(feature = "vortexlake"))]
+        {
+            // Unreachable: `read_manifest` refuses a format this build has no
+            // provider for before an attach could see one. A clear error,
+            // never a panic.
+            Err(LakeError::FeatureMissing {
+                feature: "vortexlake",
+                message: format!(
+                    "table \"{key}\" uses a data file (\"{}\") whose provider is not built \
+                     into this lean build — rebuild with the `vortexlake` feature",
+                    file.rel
+                ),
+            })
         }
     }
 }
@@ -972,28 +957,25 @@ fn catalog_error(e: LakeError) -> PinkDbError {
     PinkDbError::Catalog(e.to_string())
 }
 
-/// [`Lake::load`]'s per-file decode for one Vortex table: read the file,
-/// decode it into a one-table store, check the file's identity against its
-/// catalog key, and hand the table back (chunks shared by `Arc`, never copied
-/// twice).
-#[cfg(feature = "vortexlake")]
-fn load_table(
-    storage: &dyn Storage,
+/// Decode one data file through its registered provider (a full decode),
+/// check the file's identity against its catalog key, and hand the table back
+/// (chunks shared by `Arc`, never copied twice).
+fn decode_via_provider(
+    entry: &AttachedEntry,
+    file: &DataFile<'_>,
     root: &std::path::Path,
-    rel: &str,
-    dbname: &str,
-    tablename: &str,
 ) -> Result<DataTable> {
-    let path = storage.abs(rel);
-    let bytes = storage.read(rel, &format!("loading data file \"{rel}\""))?;
-    let mini = vortex_file::decode_table_owned(&path, bytes)?;
-    let (file_db, file_table) = only_table(&mini, rel, root)?;
-    if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(tablename) {
+    let mini = entry.format.read(file)?;
+    let (file_db, file_table) = only_table(&mini, file.rel(), root)?;
+    if !file_db.eq_ignore_ascii_case(&entry.db)
+        || !file_table.name.eq_ignore_ascii_case(&entry.table)
+    {
         return Err(LakeError::Corrupt {
-            path,
+            path: file.path().to_path_buf(),
             message: format!(
-                "data file holds {file_db}.{}, but the catalog says \"{dbname}.{tablename}\"",
-                file_table.name
+                "data file holds {file_db}.{}, but the catalog says \"{}\"",
+                file_table.name,
+                entry.key()
             ),
         });
     }
@@ -1005,22 +987,25 @@ fn load_table(
 /// hand the full-schema table (decoded columns + NULL placeholders) back.
 #[cfg(feature = "vortexlake")]
 fn load_projected_table(
+    entry: &AttachedEntry,
     storage: &dyn Storage,
     root: &std::path::Path,
     rel: &str,
-    dbname: &str,
-    tablename: &str,
     columns: &[usize],
 ) -> Result<(DataTable, Vec<bool>)> {
     let path = storage.abs(rel);
-    let (mini, present) = vortex_file::decode_projected(&path, storage, rel, columns)?;
+    let data_file = DataFile::new(&path, rel, storage);
+    let (mini, present) = vortex_file::decode_projected(&data_file, columns)?;
     let (file_db, file_table) = only_table(&mini, rel, root)?;
-    if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(tablename) {
+    if !file_db.eq_ignore_ascii_case(&entry.db)
+        || !file_table.name.eq_ignore_ascii_case(&entry.table)
+    {
         return Err(LakeError::Corrupt {
             path,
             message: format!(
-                "data file holds {file_db}.{}, but the catalog says \"{dbname}.{tablename}\"",
-                file_table.name
+                "data file holds {file_db}.{}, but the catalog says \"{}\"",
+                file_table.name,
+                entry.key()
             ),
         });
     }
@@ -1060,44 +1045,36 @@ fn merge_projected(
     ))
 }
 
-/// The `.pink` per-file read for one table: open the file with the very
-/// decode `.lake open` performs and check its identity. `.pink` files have no
-/// projected reader, so there is one full decode per file.
-fn load_pink_file(
-    storage: &dyn Storage,
-    root: &std::path::Path,
-    rel: &str,
-    dbname: &str,
-    tablename: &str,
-) -> Result<DataTable> {
-    let path = storage.abs(rel);
-    let copy = storage.local_copy(rel, &format!("loading data file \"{rel}\""))?;
-    let mini = PinkDb::open(path_str(copy.path())?).map_err(|e| LakeError::Engine {
-        context: format!("loading data file \"{rel}\" for table \"{dbname}.{tablename}\""),
-        source: e,
-    })?;
-    let (file_db, file_table) = only_table(&mini, rel, root)?;
-    if !file_db.eq_ignore_ascii_case(dbname) || !file_table.name.eq_ignore_ascii_case(tablename) {
-        return Err(LakeError::Corrupt {
-            path,
-            message: format!(
-                "data file holds {file_db}.{}, but the catalog says \"{dbname}.{tablename}\"",
-                file_table.name
-            ),
-        });
-    }
-    Ok(file_table.clone())
-}
-
 /// One `.pink` file's schema + gated statistics: its published per-file block
 /// (v4), or the entry-level block (v1). Either way the block is CRC-verified
 /// and cross-checked against the entry's key, the file's path and its row
 /// count, so a block pasted under another file can never attach.
+#[cfg(test)]
 fn pink_file_stats(
     entry_key: &str,
     entry: &TableEntry,
     file: &crate::catalog::FileRef,
     manifest_path: &std::path::Path,
+) -> Result<SchemaAndStats> {
+    block_file_stats(
+        entry_key,
+        entry,
+        file,
+        manifest_path,
+        crate::format::PINK_FORMAT_ID,
+    )
+}
+
+/// The manifest-published statistics of one data file whose format does not
+/// carry its own (the built-in `.pink` bytes, and any extension provider that
+/// returns no footer): the per-file block (v4) or the entry-level block (v1).
+/// `format_id` names the format in the stats-less error.
+fn block_file_stats(
+    entry_key: &str,
+    entry: &TableEntry,
+    file: &crate::catalog::FileRef,
+    manifest_path: &std::path::Path,
+    format_id: &str,
 ) -> Result<SchemaAndStats> {
     let rel = file.path();
     // v4: the block rides inside the file's manifest object. v1: the entry
@@ -1107,9 +1084,14 @@ fn pink_file_stats(
         None => match entry.stats.as_ref() {
             Some(block) if matches!(file, crate::catalog::FileRef::Path(_)) => (block, None),
             _ => {
+                let what = if format_id == crate::format::PINK_FORMAT_ID {
+                    "`.pink`".to_string()
+                } else {
+                    format!("`{format_id}`")
+                };
                 return Err(LakeError::NotRepresentable {
                     message: format!(
-                        "lake table \"{entry_key}\": `.pink` data file \"{rel}\" was published \
+                        "lake table \"{entry_key}\": {what} data file \"{rel}\" was published \
                          without a statistics block (statistics are published by saves from \
                          this build onwards); use .lake open, or save the store again to \
                          publish statistics"
@@ -1407,16 +1389,18 @@ pub(crate) fn build_from(
             }
         }
         let format = entry.format();
-        if format != FileFormat::Pink {
+        let provider = crate::format::format_for(format.id(), &manifest_path)?;
+        let projected = provider.supports_projection();
+        if provider.has_footer_stats() {
             statistics_only = false;
         }
         // The v5 schema record (wave 65), when this entry has one.
         let record = crate::schema::TableSchema::from_entry(key, entry, &manifest_path)?;
         // Per-file (surviving rows, stats in logical-schema order), in
         // manifest order — the stats are the file's zone map (wave 66): the
-        // `.pink` block's gated column facts, or for Vortex the footer's,
-        // cross-checked against a catalog-published block when one rides on
-        // the file.
+        // manifest-published block's gated column facts, or the format's own
+        // footer statistics (Vortex), cross-checked against a
+        // catalog-published block when one rides on the file.
         let mut per_file: Vec<(u64, Vec<ColumnStats>)> = Vec::with_capacity(entry.files.len());
         // Per-file zone maps (ungated by deletes: deleting rows only shrinks
         // a file's value set, so a file that provably could not match a
@@ -1433,97 +1417,106 @@ pub(crate) fn build_from(
             let rows = file.rows().unwrap_or(entry.rows);
             let deleted = layout.get(fi).map(|(_, _, d)| d.len() as u64).unwrap_or(0);
             let surviving = rows.saturating_sub(deleted);
-            let (file_schema, file_stats) = match format {
-                FileFormat::Pink => pink_file_stats(key, entry, file, &manifest_path)?,
-                FileFormat::Vortex => {
-                    #[cfg(feature = "vortexlake")]
+            let (file_schema, file_stats) = if provider.has_footer_stats() {
+                #[cfg(feature = "vortexlake")]
+                {
+                    let path = storage.abs(file.path());
+                    // A keyed (encrypted) session reports `local_path`
+                    // as `None` too: the whole object is read and
+                    // unsealed before the footer is parsed, which is the
+                    // documented stage-1 cost, not an object-storage
+                    // fact.
+                    let local = storage.local_path(file.path()).is_some();
+                    remote |= !local && !encrypted;
+                    let data_file = DataFile::new(&path, file.path(), &**storage);
+                    let footer =
+                        provider
+                            .footer_stats(&data_file)?
+                            .ok_or_else(|| LakeError::Internal {
+                                message: format!(
+                                    "format \"{}\" advertises footer statistics but returned none \
+                                 for \"{}\"",
+                                    provider.id(),
+                                    file.path()
+                                ),
+                            })?;
+                    if !footer.db.eq_ignore_ascii_case(dbname)
+                        || !footer.table.eq_ignore_ascii_case(table)
                     {
-                        let path = storage.abs(file.path());
-                        // A keyed (encrypted) session reports `local_path`
-                        // as `None` too: the whole object is read and
-                        // unsealed before the footer is parsed, which is the
-                        // documented stage-1 cost, not an object-storage
-                        // fact.
-                        let local = storage.local_path(file.path()).is_some();
-                        remote |= !local && !encrypted;
-                        let footer = vortex_file::read_footer(&path, &**storage, file.path())?;
-                        if !footer.db.eq_ignore_ascii_case(dbname)
-                            || !footer.table.eq_ignore_ascii_case(table)
-                        {
-                            return Err(LakeError::Corrupt {
-                                path,
-                                message: format!(
-                                    "data file holds {}.{}, but the catalog says \"{key}\"",
-                                    footer.db, footer.table
-                                ),
-                            });
-                        }
-                        if footer.rows != rows {
-                            return Err(LakeError::Corrupt {
-                                path: manifest_path.clone(),
-                                message: format!(
-                                    "table \"{key}\": data file \"{}\" has {} rows, but the \
-                                     manifest says {rows}",
-                                    file.path(),
-                                    footer.rows
-                                ),
-                            });
-                        }
-                        // A catalog-published zone map must not contradict
-                        // the file's own footer (the footer is the authority;
-                        // the block may be the more informative of the two —
-                        // a truncated VARCHAR statistic the footer refuses
-                        // can still be exact in the block). Any field the
-                        // footer proves must match.
-                        let block_stats = match vortex_catalog_stats(key, file, &manifest_path)? {
-                            Some((block_schema, block_stats)) => {
-                                if block_schema != footer.schema {
+                        return Err(LakeError::Corrupt {
+                            path,
+                            message: format!(
+                                "data file holds {}.{}, but the catalog says \"{key}\"",
+                                footer.db, footer.table
+                            ),
+                        });
+                    }
+                    if footer.rows != rows {
+                        return Err(LakeError::Corrupt {
+                            path: manifest_path.clone(),
+                            message: format!(
+                                "table \"{key}\": data file \"{}\" has {} rows, but the \
+                                 manifest says {rows}",
+                                file.path(),
+                                footer.rows
+                            ),
+                        });
+                    }
+                    // A catalog-published zone map must not contradict
+                    // the file's own footer (the footer is the authority;
+                    // the block may be the more informative of the two —
+                    // a truncated VARCHAR statistic the footer refuses
+                    // can still be exact in the block). Any field the
+                    // footer proves must match.
+                    let block_stats = match vortex_catalog_stats(key, file, &manifest_path)? {
+                        Some((block_schema, block_stats)) => {
+                            if block_schema != footer.schema {
+                                return Err(LakeError::Corrupt {
+                                    path: manifest_path.clone(),
+                                    message: format!(
+                                        "table \"{key}\": the catalog zone map of \"{}\" \
+                                         disagrees with the file's footer on the schema",
+                                        file.path()
+                                    ),
+                                });
+                            }
+                            for (i, (b, f)) in block_stats.iter().zip(&footer.stats).enumerate() {
+                                if !zone_stats_compatible(b, f) {
                                     return Err(LakeError::Corrupt {
                                         path: manifest_path.clone(),
                                         message: format!(
-                                            "table \"{key}\": the catalog zone map of \"{}\" \
-                                             disagrees with the file's footer on the schema",
+                                            "table \"{key}\": the catalog zone map of \
+                                             \"{}\" disagrees with the file's footer on \
+                                             column {i}",
                                             file.path()
                                         ),
                                     });
                                 }
-                                for (i, (b, f)) in block_stats.iter().zip(&footer.stats).enumerate()
-                                {
-                                    if !zone_stats_compatible(b, f) {
-                                        return Err(LakeError::Corrupt {
-                                            path: manifest_path.clone(),
-                                            message: format!(
-                                                "table \"{key}\": the catalog zone map of \
-                                                 \"{}\" disagrees with the file's footer on \
-                                                 column {i}",
-                                                file.path()
-                                            ),
-                                        });
-                                    }
-                                }
-                                Some(block_stats)
                             }
-                            None => None,
-                        };
-                        let stats = block_stats.unwrap_or(footer.stats);
-                        (footer.schema, stats)
-                    }
-                    #[cfg(not(feature = "vortexlake"))]
-                    {
-                        // Unreachable: `read_manifest` refuses a Vortex entry
-                        // before an attach could see one. A clear error,
-                        // never a panic.
-                        return Err(LakeError::FeatureMissing {
-                            feature: "vortexlake",
-                            message: format!(
-                                "table \"{key}\" uses a Vortex data file (\"{}\"); this \
-                                 build reads `.pink` lakes only — rebuild with the \
-                                 `vortexlake` feature to attach it",
-                                file.path()
-                            ),
-                        });
-                    }
+                            Some(block_stats)
+                        }
+                        None => None,
+                    };
+                    let stats = block_stats.unwrap_or(footer.stats);
+                    (footer.schema, stats)
                 }
+                #[cfg(not(feature = "vortexlake"))]
+                {
+                    // Unreachable: `read_manifest` refuses an entry whose
+                    // provider this lean build does not register. A clear
+                    // error, never a panic.
+                    return Err(LakeError::FeatureMissing {
+                        feature: "vortexlake",
+                        message: format!(
+                            "table \"{key}\" uses a Vortex data file (\"{}\"); this \
+                             build reads `.pink` lakes only — rebuild with the \
+                             `vortexlake` feature to attach it",
+                            file.path()
+                        ),
+                    });
+                }
+            } else {
+                block_file_stats(key, entry, file, &manifest_path, provider.id())?
             };
             let (zone_stats, stats) = match &record {
                 // Project the file's physical statistics onto the logical
@@ -1749,11 +1742,8 @@ pub(crate) fn build_from(
                 schema,
                 keys,
                 files: file_list,
-                format: if format == FileFormat::Pink {
-                    AttachedFormat::Pink
-                } else {
-                    AttachedFormat::Vortex
-                },
+                format: provider,
+                projected,
                 record,
                 inlined: entry.live_inlined().into_iter().cloned().collect(),
             },
@@ -2047,7 +2037,7 @@ mod tests {
                 row_id_start: None,
             }],
             rows: 3,
-            format: Some(FileFormat::Pink),
+            format: Some(FileFormat::pink()),
             stats: None,
             deletes: Vec::new(),
             partition_by: None,

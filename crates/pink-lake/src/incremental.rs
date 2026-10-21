@@ -1923,16 +1923,16 @@ impl Lake {
                         });
                     }
                 }
-                let mini =
-                    self.open_data_file(rel, format)
-                        .map_err(|e| LakeError::NotRepresentable {
-                            message: format!(
-                                "ducklake_add_data_files: \"{rel}\" cannot be read as a {:?} data \
-                             file of a pinkdb lake ({e}); the file must be a data file this \
-                             lake's format and schema describe",
-                                format
-                            ),
-                        })?;
+                let mini = self.open_data_file(rel, format.clone()).map_err(|e| {
+                    LakeError::NotRepresentable {
+                        message: format!(
+                            "ducklake_add_data_files: \"{rel}\" cannot be read as a {} data \
+                                 file of a pinkdb lake ({e}); the file must be a data file this \
+                                 lake's format and schema describe",
+                            entry.format().id()
+                        ),
+                    }
+                })?;
                 let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
                 let (dbname, table_name) = split_key(table, &manifest_path)?;
                 if !file_db.eq_ignore_ascii_case(dbname)

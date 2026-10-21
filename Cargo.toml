@@ -11,6 +11,10 @@ members = [
     "crates/pinkdb-ext-loader",
     "crates/pinkdb-js",
     "crates/pink-lake",
+    # Wave 87: the Parquet lake format provider (the LakeFormat bridge over
+    # the parquet extension's reader/writer). Depends on pink-lake and
+    # pinkdb-parquet, never the other way around.
+    "crates/pink-lake-parquet",
     # The Rust extension SDK (wave 51) and its worked example. Neither is a
     # dependency of any pinkdb binary: the SDK depends on the loader, never
     # the other way around.

@@ -1,8 +1,9 @@
 //! pinkdb's **parquet** reader: `read_parquet` / `parquet_scan`, DuckDB's
 //! replacement scan (`FROM 'file.parquet'`), and the four metadata functions
 //! (`parquet_schema`, `parquet_metadata`, `parquet_file_metadata`,
-//! `parquet_kv_metadata`). Wave 70 of the roadmap; **read-side only** —
-//! `COPY … (FORMAT parquet)` is a follow-up.
+//! `parquet_kv_metadata`). Wave 70 of the roadmap. Wave 87 added the
+//! write half ([`write::write_table`]) that backs the lake's Parquet format
+//! provider; the SQL `COPY … (FORMAT parquet)` surface is still a follow-up.
 //!
 //! # Why this is a crate, not a loadable extension
 //!
@@ -99,7 +100,8 @@
 //!
 //! # Honest limits
 //!
-//! - Read-only: no `COPY … (FORMAT parquet)` yet.
+//! - No SQL `COPY … (FORMAT parquet)` yet (the writer behind it exists in
+//!   [`write`]; the lake consumes that directly).
 //! - Flat schemas only (no LIST/MAP/STRUCT, no repeated fields).
 //! - No TIME, TIMESTAMP(nanos), UUID, FLOAT16, BSON, VARIANT, GEOMETRY.
 //! - Unannotated BINARY reads as VARCHAR (α's `binary_as_string=true`);
@@ -124,6 +126,7 @@ mod remote;
 mod resolve;
 mod scan;
 mod schema_map;
+pub mod write;
 
 use std::sync::Arc;
 

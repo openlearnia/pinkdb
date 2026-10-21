@@ -52,7 +52,8 @@
 //! (merge-on-read). `rows` is the logical count and must equal
 //! `sum(files.rows) - sum(deletes.count)`. A v4 entry's `format` is
 //! `"vortex"` in a `vortexlake` build or `"pink"` (the engine's
-//! single-table `.pink` bytes) in a lean one; every v4 data file carries a
+//! single-table `.pink` bytes) in a lean one — or any other id a registered
+//! provider ([`crate::format`]) supplies; every v4 data file carries a
 //! CRC-protected statistics/zone-map block in its `files` object — for
 //! `.pink` the exact facts its encode pass collected, for Vortex the same
 //! facts published from the writer and cross-checked against the file's own
@@ -120,6 +121,37 @@
 //! — never a corrupt-file error and never a wrong-format guess. A v4 `.pink`
 //! lake stays readable in every build (its data files open standalone with
 //! [`PinkDb::open`]).
+//!
+//! # Data-file format providers (wave 87)
+//!
+//! An entry's `format` string is a **format id**, resolved through a
+//! process-global registry ([`crate::format`]). The crate registers the built-ins
+//! lazily: `"pink"` in every build and `"vortex"` with the `vortexlake`
+//! feature. An extension registers a [`format::LakeFormat`] — writer, reader,
+//! optional footer statistics, extension, id — with
+//! [`format::register_lake_format`], making its id usable in a catalog:
+//!
+//! ```text
+//! pink_lake::format::register_lake_format(Arc::new(MyFormat))?;
+//! let mut lake = pink_lake::Lake::open(dir)?;
+//! lake.set_write_format("my-format")?;
+//! lake.write_from_store(&store)?;
+//! ```
+//!
+//! The writer contract is the `.pink` writer's own: [`format::LakeFormat::write`]
+//! returns the file bytes and the exact per-column [`pinkdb::persist::SavedTableStats`]
+//! facts, which the lake seals into the manifest's CRC-protected block (the
+//! shared exactness gate in `stats` applies to every provider). Attach reads
+//! that block, or the format's own footer when it advertises one via
+//! [`format::LakeFormat::footer_stats`] (Vortex), and either way the decode
+//! goes through [`format::LakeFormat::read`]. Format ids are pinned in the
+//! catalog: existing manifests stay byte-identical (`"pink"`/`"vortex"`, and
+//! a v1 entry without `format` still means `"pink"`), while an id with no
+//! registered provider is a clean [`LakeError::UnknownFormat`] naming the id
+//! at open, attach, read and maintenance — never a panic and never a silent
+//! fallback. [`Lake::set_write_format`] selects a registered format for a
+//! handle's subsequent writes; the default is unchanged (Vortex with
+//! `vortexlake`, `.pink` otherwise).
 //!
 //! `.lake open` (every build) and `.lake attach` (every build) are the two
 //! ways in: `open` eagerly loads a version into the store, `attach` reads
@@ -346,6 +378,7 @@ mod catalog;
 mod cdc;
 mod crypto;
 mod delete_file;
+pub mod format;
 mod incremental;
 mod inlined;
 mod local;
@@ -554,6 +587,13 @@ pub enum LakeError {
     /// `min_file_size` not below `max_file_size`. The message is
     /// DuckLake-shaped where one exists.
     InvalidOption { message: String },
+    /// A catalog entry names a data-file format no provider is registered
+    /// for in this process (see [`crate::format`]). The id is named verbatim; the
+    /// lake never falls back to another format.
+    UnknownFormat { path: PathBuf, format: String },
+    /// [`format::register_lake_format`] was called with an id that is already
+    /// registered. A format id resolves to exactly one provider per process.
+    DuplicateFormat { format: String },
     /// The key material itself is unusable (e.g. a non-UTF-8 `PINKDB_KEY`).
     BadKey { message: String },
     /// A bug in this crate (e.g. serializing its own structs).
@@ -674,6 +714,23 @@ impl fmt::Display for LakeError {
             ),
             LakeError::BadKey { message } => write!(f, "invalid encryption key: {message}"),
             LakeError::InvalidOption { message } => write!(f, "{message}"),
+            LakeError::UnknownFormat { path, format } => write!(
+                f,
+                "corrupt lake metadata at {}: no lake format provider is registered for \
+                 data-file format {format:?} (this build registers `pink`{}; extensions register \
+                 one with pink_lake::format::register_lake_format)",
+                path.display(),
+                if cfg!(feature = "vortexlake") {
+                    " and `vortex`"
+                } else {
+                    "; `vortex` needs the `vortexlake` feature"
+                }
+            ),
+            LakeError::DuplicateFormat { format } => write!(
+                f,
+                "a lake format provider with id {format:?} is already registered (format ids \
+                 are unique per process)"
+            ),
             LakeError::Internal { message } => write!(f, "internal lake error: {message}"),
         }
     }
@@ -730,6 +787,11 @@ pub struct Lake {
     /// [`DEFAULT_INLINING_ROW_LIMIT`] and a table's persisted
     /// [`TableEntry::inlined_limit`] wins over it.
     inline_row_limit: u64,
+    /// The data-file format [`Lake::set_write_format`] selected for this
+    /// handle's subsequent writes; `None` keeps the build default (Vortex
+    /// with `vortexlake`, else `pink`). Not persisted — a reopened handle
+    /// starts at the default again.
+    write_format_choice: Option<FileFormat>,
 }
 
 impl Lake {
@@ -859,6 +921,7 @@ impl Lake {
             version: 1,
             pending_commit: None,
             inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
+            write_format_choice: None,
         })
     }
 
@@ -992,6 +1055,7 @@ impl Lake {
             version: manifest.version,
             pending_commit: None,
             inline_row_limit: DEFAULT_INLINING_ROW_LIMIT,
+            write_format_choice: None,
         })
     }
 
@@ -1380,7 +1444,8 @@ impl Lake {
                 // encoders). Every file of a recorded entry then carries the
                 // schema epoch it was written under (1: a full save writes the
                 // current schema).
-                let (files, written) = self.write_data_files(&key, Some(format), &keys, src)?;
+                let (files, written) =
+                    self.write_data_files(&key, Some(format.clone()), &keys, src)?;
                 bytes_written += written;
                 rows += src.num_rows() as u64;
                 // Wave 68: the save folds every live inlined row into the new
@@ -1442,7 +1507,7 @@ impl Lake {
                     TableEntry {
                         files,
                         rows: src.num_rows() as u64,
-                        format: Some(format),
+                        format: Some(format.clone()),
                         stats: None,
                         deletes: Vec::new(),
                         partition_by: (!keys.is_empty()).then_some(keys),
@@ -1527,36 +1592,50 @@ impl Lake {
         })
     }
 
-    /// The data-file format this build writes: Vortex with `vortexlake`,
-    /// engine `.pink` bytes without it.
+    /// Choose the registered data-file format this handle writes for every
+    /// subsequent save/append that does not pin a format explicitly (see the
+    /// [`crate::format`] module). The id must have a provider registered in this
+    /// process — an unknown id is [`LakeError::UnknownFormat`], and `vortex`
+    /// in a build without the `vortexlake` feature is
+    /// [`LakeError::FeatureMissing`]; nothing is silently substituted.
+    ///
+    /// The choice is per handle and not persisted: [`Lake::open`] and
+    /// [`Lake::create`] always start with the build default (Vortex with
+    /// `vortexlake`, else `.pink`). A full save and a commit that creates or
+    /// appends to a table use the handle's choice, so set it on the handle
+    /// performing the write; maintenance rewrites always re-encode under the
+    /// entry's own pinned format.
+    pub fn set_write_format(&mut self, id: &str) -> Result<()> {
+        crate::format::format_for(id, &self.root.join(CATALOG_FILE))?;
+        self.write_format_choice = Some(FileFormat::new(id));
+        Ok(())
+    }
+
+    /// The data-file format this handle writes: the one
+    /// [`Lake::set_write_format`] selected, else the build default — Vortex
+    /// with `vortexlake`, engine `.pink` bytes without it.
     fn write_format(&self) -> FileFormat {
-        #[cfg(feature = "vortexlake")]
-        {
-            FileFormat::Vortex
-        }
-        #[cfg(not(feature = "vortexlake"))]
-        {
-            FileFormat::Pink
-        }
+        self.write_format_choice
+            .clone()
+            .unwrap_or_else(default_write_format)
     }
 
     /// Write one immutable data file for `key` holding `src`, returning its
     /// manifest reference (path, row count, and the CRC-protected
     /// statistics/zone-map block the writer published for it) and the bytes
-    /// written. `format` defaults to this build's
-    /// [`write_format`](Lake::write_format) and must be explicit to append a
-    /// file to an entry of the other format.
+    /// written. `format` defaults to this handle's [`write_format`]
+    /// ([`Lake::write_format`]) and must be explicit to append a file to an
+    /// entry of another format.
     ///
-    /// - `vortexlake`: a Vortex file, streamed — locally straight into a
-    ///   unique `create_new` temp sibling plus fsync + rename; over S3
-    ///   buffered for one atomic PUT. The Vortex footer carries the
-    ///   statistics; wave 66 additionally publishes the same facts as the
-    ///   file's catalog zone map (CRC-protected, cross-checked against the
-    ///   footer at attach), so pruning never needs the footer.
-    /// - `.pink`: the engine's own single-table persistence bytes via `put`,
-    ///   same temp→fsync→rename / single-PUT atomicity; the entry's per-file
-    ///   `stats` block lets `.lake attach` answer `COUNT`/`MIN`/`MAX` without
-    ///   opening the file, and now also prunes by zone map.
+    /// The encoding is the registered provider's
+    /// ([`format::LakeFormat`](crate::format::LakeFormat)): it streams its
+    /// bytes through `Storage::put_streamed` (a unique `create_new` temp
+    /// sibling plus fsync + rename locally; one atomic PUT over S3; sealed as
+    /// one container for an encrypted lake) and publishes the exact
+    /// per-column facts as the file's catalog statistics block, so
+    /// `.lake attach` answers `COUNT`/`MIN`/`MAX` and prunes by zone map
+    /// without opening the file. Vortex additionally carries the same facts in
+    /// its footer (cross-checked at attach).
     fn write_data_file(
         &self,
         key: &str,
@@ -1564,76 +1643,35 @@ impl Lake {
         src: &DataTable,
     ) -> Result<(FileRef, u64)> {
         let (dbname, table) = split_key(key, &self.root.join(CATALOG_FILE))?;
+        let format = format.unwrap_or_else(|| self.write_format());
+        let provider = crate::format::format_for(format.id(), &self.root.join(CATALOG_FILE))?;
         let dir = format!("data/{}", encode_key(key));
         let id = fresh_id();
         let rows = src.num_rows() as u64;
-        match format.unwrap_or_else(|| self.write_format()) {
-            FileFormat::Vortex => {
-                #[cfg(feature = "vortexlake")]
-                {
-                    let rel = format!("{dir}/{id}.vortex");
-                    let written = self.storage.put_streamed(&rel, &mut |sink| {
-                        vortex_file::encode_table_into(dbname, table, src, sink)
-                    })?;
-                    // The catalog zone map for this file: the exact facts the
-                    // Vortex footer will also carry (the encoder is lossless;
-                    // the shared gate drops what it cannot prove).
-                    let saved = pinkdb::persist::table_stats(dbname, table, src);
-                    let block = stats::StatsBlock::from_saved(key, &rel, &saved)?;
-                    Ok((
-                        FileRef::Entry {
-                            path: rel,
-                            rows,
-                            schema_version: None,
-                            stats: Some(block),
-                            partition: None,
-                            row_id_start: None,
-                        },
-                        written,
-                    ))
-                }
-                #[cfg(not(feature = "vortexlake"))]
-                {
-                    let _ = (dbname, table, id, dir);
-                    Err(LakeError::FeatureMissing {
-                        feature: "vortexlake",
-                        message: "writing a Vortex data file needs the `vortexlake` feature"
-                            .to_string(),
-                    })
-                }
-            }
-            FileFormat::Pink => {
-                let rel = format!("{dir}/{id}.pink");
-                let mini = single_table_store(dbname, table, src)?;
-                let (bytes, saved) =
-                    mini.to_pink_bytes_with_stats()
-                        .map_err(|e| LakeError::Engine {
-                            context: format!("saving table \"{key}\""),
-                            source: e,
-                        })?;
-                let saved = saved
-                    .iter()
-                    .find(|s| s.db == dbname && s.table == table)
-                    .ok_or_else(|| LakeError::Internal {
-                        message: format!(
-                            "the single-table encoder for \"{key}\" returned no statistics"
-                        ),
-                    })?;
-                let block = stats::StatsBlock::from_saved(key, &rel, saved)?;
-                self.storage.put(&rel, &bytes)?;
-                Ok((
-                    FileRef::Entry {
-                        path: rel,
-                        rows,
-                        schema_version: None,
-                        stats: Some(block),
-                        partition: None,
-                        row_id_start: None,
-                    },
-                    bytes.len() as u64,
-                ))
-            }
-        }
+        let rel = format!("{dir}/{id}.{}", provider.extension());
+        let mut saved = None;
+        let written = self.storage.put_streamed(&rel, &mut |sink| {
+            saved = Some(provider.write_streamed(dbname, table, src, sink)?);
+            Ok(())
+        })?;
+        let saved = saved.ok_or_else(|| LakeError::Internal {
+            message: format!(
+                "the \"{}\" format provider returned no statistics for \"{key}\"",
+                provider.id()
+            ),
+        })?;
+        let block = stats::StatsBlock::from_saved(key, &rel, &saved)?;
+        Ok((
+            FileRef::Entry {
+                path: rel,
+                rows,
+                schema_version: None,
+                stats: Some(block),
+                partition: None,
+                row_id_start: None,
+            },
+            written,
+        ))
     }
 
     /// Write `src` as one or more data files under the partition spec `keys`
@@ -1711,7 +1749,7 @@ impl Lake {
         let mut written = 0u64;
         for (label, indices) in groups {
             let sub = crate::incremental::sub_table(src, &indices)?;
-            let (file, bytes) = self.write_data_file(key, format, &sub)?;
+            let (file, bytes) = self.write_data_file(key, format.clone(), &sub)?;
             written += bytes;
             let partition: BTreeMap<String, Option<String>> = label
                 .into_iter()
@@ -2025,7 +2063,7 @@ impl Lake {
             }
             for (i, (rel, file_rows, deleted)) in layout.iter().enumerate() {
                 validate_rel_path(rel)?;
-                let mini = self.open_data_file(rel, format)?;
+                let mini = self.open_data_file(rel, format.clone())?;
                 let (file_db, file_table) = only_table(&mini, rel, &self.root)?;
                 if !file_db.eq_ignore_ascii_case(dbname)
                     || !file_table.name.eq_ignore_ascii_case(table)
@@ -2151,50 +2189,27 @@ impl Lake {
     }
 
     /// Decode one data file into its one-table store (the caller checks the
-    /// file's identity, schema and row count against the manifest).
+    /// file's identity, schema and row count against the manifest). The
+    /// entry's format id is resolved through the provider registry — an id
+    /// with no provider is a clean [`LakeError::UnknownFormat`].
     fn open_data_file(&self, rel: &str, format: FileFormat) -> Result<PinkDb> {
+        let provider = crate::format::format_for(format.id(), &self.root.join(CATALOG_FILE))?;
         let path = self.storage.abs(rel);
-        match format {
-            // The engine's own single-table persistence bytes, opened by path
-            // (over object storage this downloads a temp copy that is removed
-            // when dropped).
-            FileFormat::Pink => {
-                let copy = self
-                    .storage
-                    .local_copy(rel, &format!("loading data file \"{rel}\""))?;
-                PinkDb::open(path_str(copy.path())?).map_err(|e| LakeError::Engine {
-                    context: format!("loading data file \"{rel}\""),
-                    source: e,
-                })
-            }
-            // A Vortex file that decodes into the same shape. The bytes are
-            // moved into the decoder's buffer (zero copy).
-            FileFormat::Vortex => {
-                #[cfg(feature = "vortexlake")]
-                {
-                    let bytes = self
-                        .storage
-                        .read(rel, &format!("loading data file \"{rel}\""))?;
-                    vortex_file::decode_table_owned(&path, bytes)
-                }
-                #[cfg(not(feature = "vortexlake"))]
-                {
-                    // Unreachable: `read_manifest` refuses a Vortex entry in a
-                    // build without the feature long before a file could get
-                    // here. Kept as a clear error, not a panic.
-                    let _ = &path;
-                    Err(LakeError::FeatureMissing {
-                        feature: "vortexlake",
-                        message: format!(
-                            "the data file \"{rel}\" is a Vortex file, and this build was \
-                             built without Vortex format support — rebuild with the \
-                             `vortexlake` feature (for the CLI: \
-                             `cargo build -p pinkdb-cli --features vortexlake`)"
-                        ),
-                    })
-                }
-            }
-        }
+        let file = crate::format::DataFile::new(&path, rel, &*self.storage);
+        provider.read(&file)
+    }
+}
+
+/// The build's default data-file format: Vortex with `vortexlake`, engine
+/// `.pink` bytes without it.
+fn default_write_format() -> FileFormat {
+    #[cfg(feature = "vortexlake")]
+    {
+        FileFormat::new(crate::format::VORTEX_FORMAT_ID)
+    }
+    #[cfg(not(feature = "vortexlake"))]
+    {
+        FileFormat::pink()
     }
 }
 
@@ -2750,10 +2765,16 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                 }
             }
         }
-        match (v, entry.format) {
-            (1, Some(FileFormat::Vortex)) => {
+        match (v, entry.format.as_ref().map(FileFormat::id)) {
+            (1, Some(crate::format::VORTEX_FORMAT_ID)) => {
                 return Err(corrupt(format!(
                     "table \"{key}\" declares a vortex data file in a format_version 1 \
+                     manifest (version 1 data files are engine `.pink` bytes)"
+                )));
+            }
+            (1, Some(id)) if id != crate::format::PINK_FORMAT_ID => {
+                return Err(corrupt(format!(
+                    "table \"{key}\" declares data-file format \"{id}\" in a format_version 1 \
                      manifest (version 1 data files are engine `.pink` bytes)"
                 )));
             }
@@ -2763,11 +2784,17 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                      {v} entry requires `\"format\": \"vortex\"`)"
                 )));
             }
-            (2 | 3, Some(FileFormat::Pink)) => {
+            (2 | 3, Some(crate::format::PINK_FORMAT_ID)) => {
                 return Err(corrupt(format!(
                     "table \"{key}\" declares a pink data file in a format_version {v} \
                      manifest (Vortex-era writers emit Vortex only; `.pink` data files are \
                      format_version 1)"
+                )));
+            }
+            (2 | 3, Some(id)) if id != crate::format::VORTEX_FORMAT_ID => {
+                return Err(corrupt(format!(
+                    "table \"{key}\" declares data-file format \"{id}\" in a format_version {v} \
+                     manifest (Vortex-era writers emit Vortex only)"
                 )));
             }
             (4..=6, None) => {
@@ -2776,7 +2803,7 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                      entry requires `\"format\"`: \"pink\" or \"vortex\")"
                 )));
             }
-            (4..=6, Some(FileFormat::Vortex)) => {
+            (4..=6, Some(crate::format::VORTEX_FORMAT_ID)) => {
                 #[cfg(not(feature = "vortexlake"))]
                 return Err(LakeError::FeatureMissing {
                     feature: "vortexlake",
@@ -2787,6 +2814,16 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                          --features vortexlake`)",
                         path.display(),
                     ),
+                });
+            }
+            // The one place a catalog id is resolved at parse time: an id
+            // with no registered provider refuses the whole manifest here,
+            // so open/attach/read/maintenance all fail cleanly and never
+            // guess another format.
+            (4..=6, Some(id)) if crate::format::lake_format(id).is_none() => {
+                return Err(LakeError::UnknownFormat {
+                    path: path.to_path_buf(),
+                    format: id.to_string(),
                 });
             }
             _ => {}

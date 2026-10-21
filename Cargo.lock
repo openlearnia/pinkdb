@@ -2514,6 +2514,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pink-lake-parquet"
+version = "0.1.0"
+dependencies = [
+ "pink-lake",
+ "pinkdb",
+ "pinkdb-parquet",
+ "serde_json",
+]
+
+[[package]]
 name = "pinkdb"
 version = "0.1.0"
 dependencies = [
@@ -2548,6 +2558,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "pink-lake",
+ "pink-lake-parquet",
  "pinkdb",
  "pinkdb-arrow",
  "pinkdb-datetime",

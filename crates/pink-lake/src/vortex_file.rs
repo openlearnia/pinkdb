@@ -87,6 +87,7 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::ScalarValue;
 use vortex::session::VortexSession;
 
+use crate::format::{DataFile, FileFooter};
 use crate::{LakeError, Result, empty_single_table_store};
 
 /// The user metadata segment key holding the table identity + pinkdb schema.
@@ -456,33 +457,32 @@ pub(crate) fn decode_table_owned(path: &Path, bytes: Vec<u8>) -> Result<PinkDb> 
 /// whole file's encoded data, unlike the full decode path (which builds the
 /// table it returns anyway).
 pub(crate) fn decode_projected(
-    path: &Path,
-    storage: &dyn crate::storage::Storage,
-    rel: &str,
+    file: &DataFile<'_>,
     projection: &[usize],
 ) -> Result<(PinkDb, Vec<bool>)> {
+    let path = file.path();
     with_decoder_guard(path, "opening and decoding it", || {
         let (runtime, session) = session();
-        let file = match storage.local_path(rel) {
+        let opened = match file.local_path() {
             // Local: positioned reads of the footer plus exactly the
             // projected fields' segments.
-            Some(local) => runtime
-                .block_on(session.open_options().include_metadata().open_path(&local))
-                .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?,
+            Some(local) => {
+                runtime.block_on(session.open_options().include_metadata().open_path(&local))
+            }
             // Object storage: whole-object read, still no unprojected decode.
             None => {
-                let bytes = storage.read(rel, &format!("loading data file \"{rel}\""))?;
+                let bytes = file.read()?;
                 session
                     .open_options()
                     .include_metadata()
                     .open_buffer(ByteBuffer::from(bytes))
-                    .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?
             }
-        };
-        let metadata = parse_metadata(path, &file)?;
-        let schema = schema_of(path, &file, &metadata)?;
+        }
+        .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?;
+        let metadata = parse_metadata(path, &opened)?;
+        let schema = schema_of(path, &opened, &metadata)?;
         decode_projected_file(
-            path, &runtime, &session, file, &metadata, &schema, projection,
+            path, &runtime, &session, opened, &metadata, &schema, projection,
         )
     })
 }
@@ -820,25 +820,13 @@ fn null_vector(dtype: DataType, rows: usize) -> Vector {
     Vector::from_raw(data, Vec::new())
 }
 
-/// What a footer-only read of one data file yields: identity, schema, exact
-/// row count, and the exact per-column statistics the executor can answer
-/// aggregates from. No column data is read or decoded.
-#[derive(Debug)]
-pub(crate) struct FileFooter {
-    pub(crate) db: String,
-    pub(crate) table: String,
-    pub(crate) rows: u64,
-    pub(crate) schema: Vec<(String, DataType)>,
-    pub(crate) stats: Vec<ColumnStats>,
-}
-
 /// Open one data file *footer-only*: the footer, the `pinkdb.table` metadata
 /// segment and the stored statistics — no data segments, no decode.
 ///
 /// Locally this uses positioned reads (`open_path`); over object storage (no
 /// ranged reads in this build) — and for an **encrypted** lake, where the
 /// container must be unsealed before anything can be parsed — the whole
-/// object is read into memory through [`Storage::read`] and opened in place,
+/// object is read into memory through [`DataFile::read`] and opened in place,
 /// which still skips the decode. (Footer-range reads over unsealed segments
 /// are the documented follow-up.) Runs inside the decoder guard, so a
 /// malformed file is a clean [`LakeError::Corrupt`] naming the data file,
@@ -847,36 +835,33 @@ pub(crate) struct FileFooter {
 /// Cross-file validation (the `pinkdb.table` identity matching the catalog
 /// key, the row count matching the manifest, one file per table) is the
 /// caller's job — this entry point only reports what the file itself says.
-pub(crate) fn read_footer(
-    path: &Path,
-    storage: &dyn crate::storage::Storage,
-    rel: &str,
-) -> Result<FileFooter> {
+pub(crate) fn read_footer(file: &DataFile<'_>) -> Result<FileFooter> {
+    let path = file.path();
     with_decoder_guard(path, "opening it footer-only", || {
         let (runtime, session) = session();
-        let file = match storage.local_path(rel) {
+        let opened = match file.local_path() {
             // Local: positioned reads of the postscript + footer + metadata
             // segments; the file's data segments are never touched.
-            Some(local) => runtime
-                .block_on(session.open_options().include_metadata().open_path(&local))
-                .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?,
+            Some(local) => {
+                runtime.block_on(session.open_options().include_metadata().open_path(&local))
+            }
             // Object storage: whole-object read, still no decode.
             None => {
-                let bytes = storage.read(rel, &format!("loading data file \"{rel}\""))?;
+                let bytes = file.read()?;
                 session
                     .open_options()
                     .include_metadata()
                     .open_buffer(ByteBuffer::from(bytes))
-                    .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?
             }
-        };
-        let metadata = parse_metadata(path, &file)?;
-        let schema = schema_of(path, &file, &metadata)?;
-        let stats = file_column_stats(path, &file, &schema)?;
+        }
+        .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?;
+        let metadata = parse_metadata(path, &opened)?;
+        let schema = schema_of(path, &opened, &metadata)?;
+        let stats = file_column_stats(path, &opened, &schema)?;
         Ok(FileFooter {
             db: metadata.db,
             table: metadata.table,
-            rows: file.row_count(),
+            rows: opened.row_count(),
             schema,
             stats,
         })
@@ -2091,7 +2076,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("data/t")).unwrap();
         std::fs::write(dir.join(rel), bytes).unwrap();
         let storage = crate::local::LocalStorage::new(&dir);
-        let out = read_footer(&dir.join(rel), &storage, rel);
+        let path = dir.join(rel);
+        let file = crate::format::DataFile::new(&path, rel, &storage);
+        let out = read_footer(&file);
         std::fs::remove_dir_all(&dir).ok();
         out
     }

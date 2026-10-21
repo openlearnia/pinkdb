@@ -1,0 +1,18 @@
+[package]
+name = "pink-lake-parquet"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pink-lake's Parquet data-file format provider: the wave-87 LakeFormat bridge over pinkdb-parquet's reader and writer"
+license = "MIT"
+
+[dependencies]
+pink-lake = { path = "../pink-lake" }
+pinkdb = { path = "../pinkdb" }
+# The existing parquet reader (`read_parquet`, the source) and the new
+# low-level writer (`write_table`). Default features keep the codecs the
+# reader already supports.
+pinkdb-parquet = { path = "../../extensions/parquet" }
+
+[dev-dependencies]
+serde_json = "1"

@@ -263,7 +263,7 @@ fn lake_errors_are_clear() {
         out.contains(
             "Usage: .lake <save|open|attach|commit|partition|inlining|flush|changes|\
              add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
-             settings|detach|attached|versions|snapshots|tables|info> ..."
+             settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),
         "{out}"
     );

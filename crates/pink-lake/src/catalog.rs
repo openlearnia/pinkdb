@@ -32,7 +32,13 @@
 //! deleted positions) and must equal `sum(files.rows) - sum(deletes.count)`.
 //! Every entry declares its `format`: `"vortex"` in a `vortexlake` build,
 //! `"pink"` (the engine's single-table `.pink` bytes, with a per-file
-//! CRC-protected statistics block) in a lean one.
+//! CRC-protected statistics block) in a lean one. The field is a **format
+//! id**, resolved through the process-global provider registry
+//! ([`crate::format`]): `"pink"` and `"vortex"` are the built-ins, and an
+//! extension may register more. An id with no registered provider is a clean
+//! [`LakeError::UnknownFormat`] at open/attach/read/maintenance — never a
+//! panic or a silent fallback. The catalog stores only the id string, so
+//! existing manifests stay byte-identical.
 //!
 //! `format_version` 2 and 3 are single-file Vortex lakes (3: larger row
 //! blocks), readable but not written any more; a v1 manifest — written by the
@@ -248,21 +254,43 @@ fn bucket_n(transform: &str) -> &str {
         .unwrap_or(transform)
 }
 
-/// The data-file format of one table entry.
+/// The data-file format id of one table entry.
 ///
-/// `Pink` is the engine's own `.pink` single-table persistence bytes (the v1
-/// lake format, and the v4 lean format); `Vortex` is a Vortex file (the v2/v3
-/// format and the v4 `vortexlake` format). Serialized as a lowercase
-/// string. Unambiguous in every version: a v1 entry has no `format` field at
-/// all (it loads as `Pink`), and a v4 entry must declare one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum FileFormat {
-    /// The engine's `.pink` single-table persistence bytes (format_version 1,
-    /// or 4 in a lean build).
-    Pink,
-    /// A Vortex file (format_version 2/3, or 4 in a `vortexlake` build).
-    Vortex,
+/// A thin handle over the catalog's lowercase `format` string, resolved
+/// through the process-global provider registry ([`crate::format`]):
+///
+/// - `"pink"` is the engine's own `.pink` single-table persistence bytes (the
+///   v1 lake format, and the v4 lean format); it is registered by every
+///   build;
+/// - `"vortex"` is a Vortex file (the v2/v3 format and the v4 `vortexlake`
+///   format), registered by `vortexlake` builds;
+/// - extensions may register further ids.
+///
+/// Serialized exactly as that string (`#[serde(transparent)]`), so existing
+/// catalogs stay byte-identical. The type deliberately accepts any string on
+/// deserialization: an unknown id is refused later, by the provider registry,
+/// with a clean error naming it. Unambiguous in every version: a v1 entry has
+/// no `format` field at all (it loads as `"pink"`), and a v4 entry must
+/// declare one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct FileFormat(String);
+
+impl FileFormat {
+    /// A handle for the given catalog id.
+    pub(crate) fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// The built-in `"pink"` format (the v1 default).
+    pub(crate) fn pink() -> Self {
+        Self(crate::format::PINK_FORMAT_ID.to_string())
+    }
+
+    /// The catalog id string.
+    pub(crate) fn id(&self) -> &str {
+        &self.0
+    }
 }
 
 /// One data file of a table entry.
@@ -679,7 +707,7 @@ pub(crate) struct TableEntry {
     /// Logical rows: data rows minus the positions every delete file drops.
     pub(crate) rows: u64,
     /// The data-file format; required in a `format_version` 2+ manifest,
-    /// absent (⇒ [`FileFormat::Pink`]) in a `format_version` 1 manifest.
+    /// absent (⇒ `"pink"`) in a `format_version` 1 manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) format: Option<FileFormat>,
     /// The v1 `.pink` statistics block (see the struct docs).
@@ -730,7 +758,7 @@ impl TableEntry {
     /// The format to load this entry's files with: v1 entries without a
     /// `format` field are engine `.pink` bytes.
     pub(crate) fn format(&self) -> FileFormat {
-        self.format.unwrap_or(FileFormat::Pink)
+        self.format.clone().unwrap_or_else(FileFormat::pink)
     }
 
     /// The entry's partition keys, or an empty slice when unpartitioned.

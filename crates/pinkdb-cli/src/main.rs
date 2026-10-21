@@ -93,6 +93,13 @@ fn register_builtin_extensions() {
     pinkdb_arrow::ensure_registered();
     #[cfg(feature = "parquet")]
     pinkdb_parquet::ensure_registered();
+    // The lake's Parquet data-file format provider (`parquetlake`): registered
+    // process-wide before any handle exists, so `.lake format parquet` and
+    // the save/commit paths resolve the id.
+    #[cfg(feature = "parquetlake")]
+    if let Err(e) = pink_lake_parquet::register() {
+        eprintln!("warning: the parquet lake format could not be registered: {e}");
+    }
     // The httpfs transport + `read_csv` / `.import <url>` source, registered
     // process-wide for the same replay reason.
     #[cfg(feature = "httpfs")]
@@ -252,6 +259,8 @@ fn print_help() {
         println!(
             "  .lake info {LAKE}           show the lake's format version, versions, and tables"
         );
+        println!("  .lake format [<id>]         show or choose the data-file format for");
+        println!("                                subsequent .lake save / .lake commit writes");
         println!(
             "  FROM t AT (VERSION => n)     query an attached lake table at a version \
              (or AT (TIMESTAMP => TIMESTAMP '…'))"
