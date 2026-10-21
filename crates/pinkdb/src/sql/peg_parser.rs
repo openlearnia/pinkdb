@@ -984,6 +984,7 @@ peg::parser! {
             / refresh_stmt()
             / checkpoint()
             / call_stmt()
+            / do_stmt()
             / grant_stmt()
             / revoke_stmt()
             / show_stmt()
@@ -1284,6 +1285,11 @@ peg::parser! {
             = word("call") t:table_ref() args:call_args() {
                   Statement::Call { db: t.0, name: t.1, args }
               }
+
+        /// `DO '<body>'` / `DO $$ <body> $$` (wave 83): an anonymous procedural
+        /// block. `do` is matched as a word, so it stays usable as a name.
+        rule do_stmt() -> Statement
+            = word("do") body:string_lit() { Statement::Do { body } }
 
         rule call_args() -> Vec<Expr>
             = lparen() rparen() { Vec::new() }

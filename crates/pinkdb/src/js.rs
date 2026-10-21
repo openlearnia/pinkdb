@@ -177,7 +177,7 @@ impl SqlHost<'_> {
         let values: Vec<Value> = params.into_iter().map(from_js).collect();
         let slots = crate::sql::binder::ParamSlots::new(values);
         self.statements += 1;
-        let result =
+        let (result, _wrote) =
             crate::procedure::run_call_statement(self.db, self.db_name, slots, &stmt, |msg| {
                 PinkDbError::Execution(format!("{what}: {msg}"))
             })

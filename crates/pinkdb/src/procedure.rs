@@ -277,11 +277,26 @@ pub enum ProcStmtKind {
     Return(Option<Expr>),
     /// `RAISE expr`.
     Raise(Expr),
-    /// An ordinary SQL statement (carrying its source text for messages).
+    /// An ordinary SQL statement: `text` is a one-line snippet for messages,
+    /// `source` the full statement text (wave 83: a committed segment logs
+    /// it, see [`render_segment_statement`]).
     Sql {
         stmt: Statement,
         text: String,
+        source: String,
     },
+    /// `BEGIN … EXCEPTION WHEN OTHERS THEN … END` (wave 83): the body runs
+    /// under a savepoint; an error restores it and runs `handler` with
+    /// `SQLERRM` bound to the message.
+    Guarded {
+        body: Vec<ProcStmt>,
+        handler: Vec<ProcStmt>,
+    },
+    /// `COMMIT` (wave 83): only in the outermost procedure of a standalone
+    /// `CALL`.
+    Commit,
+    /// `ROLLBACK` (wave 83): same rule as `COMMIT`.
+    Rollback,
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +647,8 @@ enum Kind {
     Begin,
     Return(Option<Expr>),
     Raise(Expr),
+    Commit,
+    Rollback,
     Sql(Box<Statement>),
     Stop(Stop),
 }
@@ -643,8 +660,18 @@ enum Stop {
     End,
     EndIf,
     EndWhile,
-    Elsif { cond: Expr, rest: Option<Seg> },
-    Else { rest: Option<Seg> },
+    Elsif {
+        cond: Expr,
+        rest: Option<Seg>,
+    },
+    Else {
+        rest: Option<Seg>,
+    },
+    /// `EXCEPTION WHEN OTHERS THEN [stmt]` (wave 83) ends a block's body and
+    /// opens its handler.
+    Exception {
+        rest: Option<Seg>,
+    },
 }
 
 impl Stop {
@@ -655,6 +682,7 @@ impl Stop {
             Stop::EndWhile => "END WHILE",
             Stop::Elsif { .. } => "ELSIF",
             Stop::Else { .. } => "ELSE",
+            Stop::Exception { .. } => "EXCEPTION",
         }
     }
 }
@@ -737,24 +765,77 @@ impl<'a> BodyParser<'a> {
         if let Some(rest) = rest_seg(rest, off + 5) {
             self.pending = Some(rest);
         }
-        self.enter(off)?;
-        let (stmts, stop) = self.parse_stmts(Block::Top)?;
-        if stop != Stop::End {
-            let at = self.peek().map(|s| s.off).unwrap_or(self.body.len());
-            return Err(self.err(
-                at,
-                format!("block is closed by {} (expected END)", stop.describe()),
-            ));
-        }
-        self.take(); // consume END
-        self.leave();
+        let kind = self.parse_begin_block(off)?;
         if let Some(extra) = self.peek() {
             return Err(self.err(
                 extra.off,
                 "statements are not allowed after the body's closing END",
             ));
         }
+        let stmts = match kind {
+            ProcStmtKind::Block(stmts) => stmts,
+            guarded => vec![ProcStmt { off, kind: guarded }],
+        };
         Ok(ProcBody { stmts })
+    }
+
+    /// After a consumed `BEGIN`: the block's statements, an optional
+    /// `EXCEPTION WHEN OTHERS THEN` handler (wave 83), and the closing `END`
+    /// (consumed). The handler is a sibling scope of the body with `SQLERRM`
+    /// declared; transaction control anywhere inside a guarded block is
+    /// refused here, at `CREATE` time.
+    fn parse_begin_block(&mut self, off: usize) -> Result<ProcStmtKind> {
+        self.enter(off)?;
+        let (stmts, stop) = self.parse_stmts(Block::Top)?;
+        match stop {
+            Stop::End => {
+                self.take();
+                self.leave();
+                Ok(ProcStmtKind::Block(stmts))
+            }
+            Stop::Exception { rest } => {
+                let eoff = self.peek().map(|s| s.off).unwrap_or(self.body.len());
+                self.take();
+                self.leave();
+                self.pending = rest;
+                self.enter(eoff)?;
+                self.declare(eoff, "SQLERRM")?;
+                let (handler, stop) = self.parse_stmts(Block::Top)?;
+                if stop != Stop::End {
+                    let at = self.peek().map(|s| s.off).unwrap_or(self.body.len());
+                    return Err(self.err(
+                        at,
+                        format!(
+                            "an EXCEPTION handler is closed by {} (expected END)",
+                            stop.describe()
+                        ),
+                    ));
+                }
+                self.take();
+                self.leave();
+                for s in stmts.iter().chain(handler.iter()) {
+                    if let Some(at) = find_txn_control(s) {
+                        return Err(self.err(
+                            at,
+                            "COMMIT/ROLLBACK is not allowed inside a block with an EXCEPTION \
+                             handler (the handler's savepoint would span the commit); move it \
+                             outside the block",
+                        ));
+                    }
+                }
+                Ok(ProcStmtKind::Guarded {
+                    body: stmts,
+                    handler,
+                })
+            }
+            other => {
+                let at = self.peek().map(|s| s.off).unwrap_or(self.body.len());
+                Err(self.err(
+                    at,
+                    format!("block is closed by {} (expected END)", other.describe()),
+                ))
+            }
+        }
     }
 
     fn enter(&mut self, off: usize) -> Result<()> {
@@ -822,22 +903,17 @@ impl<'a> BodyParser<'a> {
             match kind {
                 Kind::Stop(_) => unreachable!("returned above"),
                 Kind::Begin => {
-                    self.enter(off)?;
-                    let (stmts, inner) = self.parse_stmts(Block::Top)?;
-                    if inner != Stop::End {
-                        let at = self.peek().map(|s| s.off).unwrap_or(self.body.len());
-                        return Err(self.err(
-                            at,
-                            format!("block is closed by {} (expected END)", inner.describe()),
-                        ));
-                    }
-                    self.take();
-                    self.leave();
-                    out.push(ProcStmt {
-                        off,
-                        kind: ProcStmtKind::Block(stmts),
-                    });
+                    let kind = self.parse_begin_block(off)?;
+                    out.push(ProcStmt { off, kind });
                 }
+                Kind::Commit => out.push(ProcStmt {
+                    off,
+                    kind: ProcStmtKind::Commit,
+                }),
+                Kind::Rollback => out.push(ProcStmt {
+                    off,
+                    kind: ProcStmtKind::Rollback,
+                }),
                 Kind::If { cond } => {
                     self.enter(off)?;
                     let (body, mut stop) = self.parse_stmts(Block::If)?;
@@ -945,9 +1021,14 @@ impl<'a> BodyParser<'a> {
                 }
                 Kind::Sql(stmt) => {
                     let text = snippet(&seg.text);
+                    let source = trim_sql_start(&seg.text).trim_end().to_string();
                     out.push(ProcStmt {
                         off,
-                        kind: ProcStmtKind::Sql { stmt: *stmt, text },
+                        kind: ProcStmtKind::Sql {
+                            stmt: *stmt,
+                            text,
+                            source,
+                        },
                     });
                 }
             }
@@ -1066,6 +1147,51 @@ impl<'a> BodyParser<'a> {
                         None,
                     ));
                 }
+                // Wave 83: transaction control is a body statement (the
+                // runtime decides whether this CALL may use it).
+                "commit" | "rollback" => {
+                    let rest = strip_leading_word(rest, "work")
+                        .or_else(|| strip_leading_word(rest, "transaction"))
+                        .unwrap_or(rest);
+                    if !is_trivia_only(rest) {
+                        return Err(self.err(
+                            base,
+                            format!("expected `{}` on its own", w.to_ascii_uppercase()),
+                        ));
+                    }
+                    let kind = if w == "commit" {
+                        Kind::Commit
+                    } else {
+                        Kind::Rollback
+                    };
+                    return Ok((kind, None));
+                }
+                "exception" => {
+                    let Some(after_when) = strip_leading_word(rest, "when") else {
+                        return Err(self.err(
+                            base,
+                            "expected EXCEPTION WHEN OTHERS THEN after a block's statements",
+                        ));
+                    };
+                    let Some(after_cond) = strip_leading_word(after_when, "others") else {
+                        return Err(self.err(
+                            base,
+                            "only EXCEPTION WHEN OTHERS is supported (pinkdb errors carry no \
+                             SQLSTATE condition names yet)",
+                        ));
+                    };
+                    let Some(handler) = strip_leading_word(after_cond, "then") else {
+                        return Err(self.err(base, "expected THEN after EXCEPTION WHEN OTHERS"));
+                    };
+                    // `handler` is a suffix of `text`: its offset in the body.
+                    let handler_off = base + (text.len() - handler.len());
+                    return Ok((
+                        Kind::Stop(Stop::Exception {
+                            rest: rest_seg(handler, handler_off),
+                        }),
+                        None,
+                    ));
+                }
                 "elsif" => {
                     let (cond, rest) =
                         split_header(self.name, base, text, rest_from, "THEN", "ELSIF")?;
@@ -1099,6 +1225,22 @@ impl<'a> BodyParser<'a> {
             Kind::Sql(Box::new(parse_sql_segment(self.name, seg)?)),
             None,
         ))
+    }
+}
+
+/// The byte offset of the first `COMMIT`/`ROLLBACK` in `stmt` (nested
+/// blocks included), if any.
+fn find_txn_control(stmt: &ProcStmt) -> Option<usize> {
+    let first = |stmts: &[ProcStmt]| stmts.iter().find_map(find_txn_control);
+    match &stmt.kind {
+        ProcStmtKind::Commit | ProcStmtKind::Rollback => Some(stmt.off),
+        ProcStmtKind::If { branches, else_ } => branches
+            .iter()
+            .find_map(|(_, body)| first(body))
+            .or_else(|| first(else_)),
+        ProcStmtKind::While { body, .. } | ProcStmtKind::Block(body) => first(body),
+        ProcStmtKind::Guarded { body, handler } => first(body).or_else(|| first(handler)),
+        _ => None,
     }
 }
 
@@ -1170,19 +1312,21 @@ fn parse_ident_at<'t>(name: &str, off: usize, text: &'t str) -> Result<(String, 
     let bytes = text.as_bytes();
     match bytes.first() {
         Some(b'"') => {
+            // Char-wise (a quoted name may hold any UTF-8): `""` is a quote.
             let mut out = String::new();
-            let mut i = 1;
-            while i < bytes.len() {
-                if bytes[i] == b'"' {
-                    if bytes.get(i + 1) == Some(&b'"') {
+            let mut chars = text.char_indices().skip(1).peekable();
+            while let Some((i, c)) = chars.next() {
+                if c == '"' {
+                    if chars.peek().is_some_and(|&(_, n)| n == '"') {
                         out.push('"');
-                        i += 2;
+                        chars.next();
                     } else {
-                        return Ok((out, text[i + 1..].trim_start()));
+                        // Untrimmed, like the bare branch: `ident_end` checks
+                        // the boundary right after the closing quote.
+                        return Ok((out, &text[i + 1..]));
                     }
                 } else {
-                    out.push(bytes[i] as char);
-                    i += 1;
+                    out.push(c);
                 }
             }
             Err(PinkDbError::Parse(format!(
@@ -1480,6 +1624,8 @@ pub(crate) fn refused_in_body(stmt: &Statement) -> Option<&'static str> {
         Statement::DropDatabase { .. } => "DROP DATABASE",
         Statement::CreateProcedure { .. } => "CREATE PROCEDURE",
         Statement::DropProcedure { .. } => "DROP PROCEDURE",
+        // Wave 83: an anonymous block is a top-level statement only.
+        Statement::Do { .. } => "DO",
         // Wave 77: a macro definition is catalog metadata the call's snapshot
         // undo would not carry, exactly like a procedure definition. Macro
         // *use* inside a body is ordinary SQL and is allowed.
@@ -1561,6 +1707,11 @@ pub(crate) struct ProcFrame {
     /// The `(database, table)` pairs among those that were *written* (the ON
     /// COMMIT materialized-view trigger's dirty set).
     writes: std::collections::HashSet<(String, String)>,
+    /// Wave 83: set when the call used `COMMIT`/`ROLLBACK`. The runner then
+    /// logs these statements (the final segment, executed in the named
+    /// database) instead of the `CALL` text — re-running a call that
+    /// committed part of its work would apply that part twice.
+    segment_log: Option<(String, Vec<String>)>,
 }
 
 impl ProcFrame {
@@ -1581,6 +1732,13 @@ impl ProcFrame {
         let mut out = self.touched.clone();
         out.canonicalize();
         out
+    }
+
+    /// The final segment to log instead of the `CALL` statement (wave 83),
+    /// as `(database, statements)`; `None` for a call without transaction
+    /// control (it logs its own text, as before).
+    pub(crate) fn segment_log(&self) -> Option<&(String, Vec<String>)> {
+        self.segment_log.as_ref()
     }
 
     /// The set of tables the call wrote.
@@ -1633,6 +1791,27 @@ struct Frame<'a> {
     statements: usize,
     /// The last statement's result.
     last: Option<QueryResult>,
+    /// `CALL` or `DO` (transaction control is refused in `DO`).
+    kind: CallKind,
+    /// The outermost call's restore point (wave 83): the snapshot the call
+    /// returns to on failure — taken at call start, moved by every `COMMIT`
+    /// and `ROLLBACK`. `None` in nested calls (their caller owns atomicity).
+    restore: Option<Box<PinkDb>>,
+    /// The pending WAL segment (wave 83): the writing statements run since
+    /// the last `COMMIT`, rendered for replay. `Some` only when the call may
+    /// use transaction control on a durable store.
+    segment: Option<Vec<String>>,
+    /// The body ran `COMMIT` or `ROLLBACK`.
+    txn_controlled: bool,
+}
+
+/// What kind of procedural call a frame runs (wave 83).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CallKind {
+    /// `CALL name(...)`.
+    Procedure,
+    /// `DO '<body>'`.
+    Do,
 }
 
 /// What a block did.
@@ -1694,6 +1873,27 @@ pub(crate) fn execute_call(
     def: &ProcedureDef,
     args: Vec<Value>,
 ) -> Result<QueryResult> {
+    execute_call_kind(db, db_name, def, args, CallKind::Procedure)
+}
+
+/// Run one `DO` block (wave 83): an anonymous, parameterless SQL body with
+/// the same atomicity, depth bound and logging rules as a `CALL` — but no
+/// transaction control.
+pub(crate) fn execute_do(
+    db: &mut PinkDb,
+    db_name: &str,
+    def: &ProcedureDef,
+) -> Result<QueryResult> {
+    execute_call_kind(db, db_name, def, Vec::new(), CallKind::Do)
+}
+
+fn execute_call_kind(
+    db: &mut PinkDb,
+    db_name: &str,
+    def: &ProcedureDef,
+    args: Vec<Value>,
+    kind: CallKind,
+) -> Result<QueryResult> {
     if db.proc_depth >= MAX_CALL_DEPTH {
         return Err(PinkDbError::Execution(format!(
             "procedure call depth exceeded (limit {MAX_CALL_DEPTH}) calling \"{}\"; \
@@ -1702,7 +1902,7 @@ pub(crate) fn execute_call(
         )));
     }
     db.proc_depth += 1;
-    let out = execute_call_inner(db, db_name, def, args);
+    let out = execute_call_inner(db, db_name, def, args, kind);
     db.proc_depth = db.proc_depth.saturating_sub(1);
     out
 }
@@ -1712,6 +1912,7 @@ fn execute_call_inner(
     db_name: &str,
     def: &ProcedureDef,
     args: Vec<Value>,
+    kind: CallKind,
 ) -> Result<QueryResult> {
     if let Some(e) = unsupported_language(def) {
         return Err(e);
@@ -1751,55 +1952,88 @@ fn execute_call_inner(
     // statements, buffered WAL text and validation base untouched. On success
     // the snapshot is simply dropped: the call's effect stays in memory, and
     // the runner logs the `CALL` statement like any other statement's. The
-    // rule is the same for both languages.
+    // rule is the same for both languages; a SQL body's `COMMIT` moves the
+    // restore point (wave 83), so a later failure keeps the committed work.
     let snapshot = if db.proc_depth == 1 {
-        Some(Box::new(db.clone()))
+        Some(boxed_snapshot(db))
     } else {
         None
     };
-    let out = match def.language {
-        ProcLanguage::Sql => run_sql_body(db, db_name, def, scope),
-        ProcLanguage::JavaScript => run_js_body(db, db_name, def, scope),
+    let (out, restore) = match def.language {
+        ProcLanguage::Sql => run_sql_body(db, db_name, def, scope, kind, snapshot),
+        ProcLanguage::JavaScript => (run_js_body(db, db_name, def, scope), snapshot),
     };
     if out.is_err()
-        && let Some(snap) = snapshot
+        && let Some(snap) = restore
     {
         db.proc_snapshot_restore(snap);
     }
     out
 }
 
-/// Run a SQL body with its parameter scope (the caller owns atomicity).
+/// Run a SQL body with its parameter scope. Returns the outcome and the
+/// call's current restore point (the caller restores it on failure): the
+/// call-start snapshot, or the state at the body's last `COMMIT`/`ROLLBACK`.
 fn run_sql_body(
     db: &mut PinkDb,
     db_name: &str,
     def: &ProcedureDef,
     scope: Vec<Var>,
-) -> Result<QueryResult> {
+    kind: CallKind,
+    restore: Option<Box<PinkDb>>,
+) -> (Result<QueryResult>, Option<Box<PinkDb>>) {
     let Some(body) = &def.body else {
-        return Err(PinkDbError::Execution(format!(
-            "procedure \"{}\" has no body in this build",
-            def.name
-        )));
+        return (
+            Err(PinkDbError::Execution(format!(
+                "procedure \"{}\" has no body in this build",
+                def.name
+            ))),
+            restore,
+        );
     };
+    // A durable store records the writing statements of a call that may
+    // commit, so a COMMIT can log its segment (wave 83).
+    let segment = (kind == CallKind::Procedure
+        && db.standalone_call
+        && db.proc_depth == 1
+        && db.is_durable()
+        && !db.replaying)
+        .then(Vec::new);
     let mut frame = Frame {
         name: &def.name,
         db_name: db_name.to_string(),
         scopes: vec![scope],
         statements: 0,
         last: None,
+        kind,
+        restore,
+        segment,
+        txn_controlled: false,
     };
-    let flow = exec_block(db, &mut frame, &body.stmts)?;
+    let flow = match exec_block(db, &mut frame, &body.stmts) {
+        Ok(flow) => flow,
+        Err(e) => return (Err(e), frame.restore),
+    };
+    if frame.txn_controlled {
+        // The runner logs the final segment instead of the CALL text.
+        db.proc_frame.segment_log = Some((
+            frame.db_name.clone(),
+            frame.segment.take().unwrap_or_default(),
+        ));
+    }
     let result = match flow {
         Flow::Return(Some(result)) => Some(result),
         Flow::Return(None) | Flow::Normal => frame.last,
     };
-    Ok(QueryResult::Called {
-        name: def.name.clone(),
-        statements: frame.statements,
-        result: result.map(Box::new),
-        output: Vec::new(),
-    })
+    (
+        Ok(QueryResult::Called {
+            name: def.name.clone(),
+            statements: frame.statements,
+            result: result.map(Box::new),
+            output: Vec::new(),
+        }),
+        frame.restore,
+    )
 }
 
 /// Run a JavaScript body in the `pinkdb-js` sandbox (the caller owns
@@ -1926,6 +2160,15 @@ fn exec_stmts(db: &mut PinkDb, frame: &mut Frame, stmts: &[ProcStmt]) -> Result<
                     return Ok(Flow::Return(v));
                 }
             }
+            ProcStmtKind::Guarded { body, handler } => {
+                if let Flow::Return(v) = exec_guarded(db, frame, body, handler)? {
+                    return Ok(Flow::Return(v));
+                }
+            }
+            ProcStmtKind::Commit | ProcStmtKind::Rollback => {
+                let commit = matches!(stmt.kind, ProcStmtKind::Commit);
+                txn_control(db, frame, stmt.off, commit)?;
+            }
             ProcStmtKind::Return(expr) => {
                 let value = match expr {
                     None => None,
@@ -1959,19 +2202,72 @@ fn exec_stmts(db: &mut PinkDb, frame: &mut Frame, stmts: &[ProcStmt]) -> Result<
                     ))?,
                 });
             }
-            ProcStmtKind::Sql { stmt: sql, text } => {
+            ProcStmtKind::Sql {
+                stmt: sql,
+                text,
+                source,
+            } => {
                 frame.statements += 1;
-                let result = exec_sql(db, frame, stmt.off, sql).map_err(|e| {
+                let (result, writes) = exec_sql(db, frame, stmt.off, sql).map_err(|e| {
                     PinkDbError::Execution(format!(
                         "procedure \"{}\": statement {} (`{text}`): {e}",
                         frame.name, frame.statements
                     ))
                 })?;
+                if writes && frame.segment.is_some() {
+                    let rendered = render_segment_statement(frame, source)?;
+                    if let Some(segment) = frame.segment.as_mut() {
+                        segment.push(rendered);
+                    }
+                }
                 frame.last = Some(result);
             }
         }
     }
     Ok(Flow::Normal)
+}
+
+/// A heap snapshot of the store for a restore point or savepoint. Out of
+/// line on purpose: `Box::new(db.clone())` builds the whole `PinkDb` on the
+/// stack first, and in a recursive caller that temporary would stay in the
+/// frame for every nested block and `CALL` level.
+#[inline(never)]
+fn boxed_snapshot(db: &PinkDb) -> Box<PinkDb> {
+    Box::new(db.clone())
+}
+
+/// A block with an `EXCEPTION WHEN OTHERS` handler (wave 83). Kept out of
+/// line: the savepoint is a whole-store clone, and `exec_stmts` recurses
+/// once per nested block and `CALL` level, so its own frame must stay small.
+#[inline(never)]
+fn exec_guarded(
+    db: &mut PinkDb,
+    frame: &mut Frame,
+    body: &[ProcStmt],
+    handler: &[ProcStmt],
+) -> Result<Flow> {
+    // Savepoint: the store as of block entry, and the pending segment's
+    // length (the block's statements leave it if the block fails).
+    let savepoint = boxed_snapshot(db);
+    let mark = frame.segment.as_ref().map(Vec::len);
+    let e = match exec_block(db, frame, body) {
+        Ok(flow) => return Ok(flow),
+        Err(e) => e,
+    };
+    // A WAL write failure is fail-stop, never handled.
+    db.ensure_wal_healthy()?;
+    db.savepoint_restore(savepoint);
+    if let (Some(segment), Some(mark)) = (frame.segment.as_mut(), mark) {
+        segment.truncate(mark);
+    }
+    frame.scopes.push(vec![Var {
+        name: "SQLERRM".to_string(),
+        dtype: DataType::Varchar,
+        value: Value::Varchar(e.to_string()),
+    }]);
+    let out = exec_stmts(db, frame, handler);
+    frame.scopes.pop();
+    out
 }
 
 fn type_name(v: &Value) -> String {
@@ -2072,12 +2368,14 @@ fn eval_expr_value(
 /// Execute one ordinary SQL statement of a body: rebind it against the current
 /// catalog with the frame's variables as values, refuse the constructs whose
 /// replay would not be deterministic, record its touched set, and run it.
+/// Run one SQL statement of a body; the flag says whether it wrote (only
+/// writing statements reach a committed segment).
 fn exec_sql(
     db: &mut PinkDb,
     frame: &mut Frame,
     off: usize,
     sql: &Statement,
-) -> Result<QueryResult> {
+) -> Result<(QueryResult, bool)> {
     let slots = crate::sql::binder::ParamSlots::new(Vec::new()).with_variables(frame.variables());
     let db_name = frame.db_name.clone();
     run_call_statement(db, &db_name, slots, sql, |msg| frame.err(off, msg))
@@ -2093,7 +2391,7 @@ pub(crate) fn run_call_statement(
     slots: crate::sql::binder::ParamSlots,
     sql: &Statement,
     err: impl Fn(&str) -> PinkDbError,
-) -> Result<QueryResult> {
+) -> Result<(QueryResult, bool)> {
     let slots = slots.with_logged_procedure(db.is_durable());
     let (plan, _dynamic) = crate::sql::binder::bind_tracked_with(db, sql, db_name, Some(slots))?;
     // Lazy index lifecycle: mutation times only set a flag (see
@@ -2117,7 +2415,102 @@ pub(crate) fn run_call_statement(
     let writes = db.plan_writes_of(&plan, db_name);
     db.proc_frame.add_sets(&sets);
     db.proc_frame.add_writes(&writes);
-    crate::exec::run(db, &plan)
+    let wrote = crate::plan::writes_tables(&plan);
+    Ok((crate::exec::run(db, &plan)?, wrote))
+}
+
+/// `COMMIT` / `ROLLBACK` in a body (wave 83). Allowed only in the outermost
+/// procedure of a standalone `CALL`. `COMMIT` logs the pending segment (on a
+/// durable store) and moves the call's restore point to the current state;
+/// `ROLLBACK` returns to the restore point and discards the segment.
+#[inline(never)]
+fn txn_control(db: &mut PinkDb, frame: &mut Frame, off: usize, commit: bool) -> Result<()> {
+    let what = if commit { "COMMIT" } else { "ROLLBACK" };
+    if frame.kind == CallKind::Do {
+        return Err(frame.err(
+            off,
+            format!(
+                "{what} is not allowed in a DO block (a DO block is atomic; run the work as a \
+                 procedure called outside a transaction to commit in steps)"
+            ),
+        ));
+    }
+    if db.proc_depth > 1 {
+        return Err(frame.err(
+            off,
+            format!(
+                "{what} is only allowed in the outermost procedure of a CALL (\"{}\" was \
+                 called by another procedure or a JavaScript body)",
+                frame.name
+            ),
+        ));
+    }
+    if !db.standalone_call {
+        return Err(frame.err(
+            off,
+            format!(
+                "{what} is not allowed here: this CALL runs inside a transaction that was \
+                 started at a different scope (by BEGIN). Call the procedure outside a \
+                 transaction to let it manage its own, or commit/roll back from the caller"
+            ),
+        ));
+    }
+    if commit {
+        if let Some(segment) = frame.segment.as_mut()
+            && !segment.is_empty()
+        {
+            let sets = db.proc_frame.touched();
+            db.wal_append_session(
+                &frame.db_name,
+                &frame.db_name,
+                segment,
+                &[],
+                &[],
+                Some(&sets),
+            )?;
+            segment.clear();
+        }
+    } else {
+        if let Some(point) = frame.restore.take() {
+            db.savepoint_restore(point);
+        }
+        if let Some(segment) = frame.segment.as_mut() {
+            segment.clear();
+        }
+    }
+    frame.restore = Some(boxed_snapshot(db));
+    frame.txn_controlled = true;
+    Ok(())
+}
+
+/// One writing statement of a committed segment, made self-contained for
+/// WAL replay (wave 83): a `DO` block that declares every variable visible
+/// to the statement — innermost binding per name — with its exact value
+/// (the prepared-statement literal renderer), then runs the statement's own
+/// source text. Replay binds it exactly as the live call did.
+fn render_segment_statement(frame: &Frame, source: &str) -> Result<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut visible: Vec<&Var> = Vec::new();
+    for scope in frame.scopes.iter().rev() {
+        for var in scope.iter().rev() {
+            if seen.insert(var.name.to_ascii_lowercase()) {
+                visible.push(var);
+            }
+        }
+    }
+    let mut body = String::from("BEGIN\n");
+    for var in visible.iter().rev() {
+        body.push_str(&format!(
+            "DECLARE {} {} DEFAULT {};\n",
+            crate::rbac::quote_ident(&var.name),
+            var.dtype,
+            crate::prepared::value_literal(&var.value)?
+        ));
+    }
+    body.push_str(source);
+    // A newline first: the source may end in a `--` comment.
+    body.push_str("\n;\nEND");
+    Ok(format!("DO '{}'", body.replace('\'', "''")))
 }
 
 #[cfg(test)]

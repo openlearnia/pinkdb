@@ -3403,6 +3403,25 @@ fn bind_tracked_plan(
             name,
             args,
         } => bind_call(db, default_db, qdb.as_deref(), name, args, params.clone()),
+        // Wave 83: an anonymous block binds to a `Call` carrying its parsed
+        // definition — the same execution, atomicity, logging and RBAC path
+        // (running one requires ADMIN in an authenticated session, like CALL).
+        Statement::Do { body } => {
+            let target = Binder::new(db, default_db).resolve_db(&None)?;
+            let parsed = crate::procedure::parse_body("DO", &[], body)?;
+            empty(LogicalPlan::Call {
+                db: Some(target),
+                name: "DO".to_string(),
+                args: Vec::new(),
+                inline: Some(Box::new(crate::procedure::ProcedureDef {
+                    name: "DO".to_string(),
+                    params: Vec::new(),
+                    language: crate::procedure::ProcLanguage::Sql,
+                    source: body.clone(),
+                    body: Some(parsed),
+                })),
+            })
+        }
         Statement::CreateMacro {
             db: qdb,
             name,
@@ -3761,6 +3780,7 @@ fn bind_call(
             db: Some(target),
             name: def.name.clone(),
             args: bound,
+            inline: None,
         },
         Vec::new(),
     ))

@@ -190,6 +190,13 @@ pub enum Statement {
         name: String,
         args: Vec<Expr>,
     },
+    /// `DO '<body>'` (wave 83): run an anonymous SQL procedural block
+    /// (`BEGIN ... END`, the procedure-body language) once — atomic like a
+    /// `CALL`, no parameters, no transaction control. It is also how a
+    /// procedure's committed segments are written to the WAL.
+    Do {
+        body: String,
+    },
     /// `CREATE MACRO name(params) AS <body>` (wave 77): a stored SQL macro.
     ///
     /// The body is a template, not a query: `AS expr` is a scalar macro and

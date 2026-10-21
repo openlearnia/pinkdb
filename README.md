@@ -177,6 +177,7 @@ LIMIT n [OFFSET m] | OFFSET m;
 CREATE [OR REPLACE] PROCEDURE name(param TYPE, ...) AS $$ ... $$;
 DROP PROCEDURE [IF EXISTS] name;
 CALL name(args, ...);
+DO $$ BEGIN ... END $$;   -- an anonymous block, run once (wave 83)
 ```
 
 The body is one `BEGIN ... END` block written as a string literal —
@@ -195,15 +196,21 @@ escaping. Inside it:
   one-row result set named `return`), `RETURN` alone keeps the last
   statement's result;
 * `RAISE expr` — abort the call with that (VARCHAR) message;
+* `BEGIN ... EXCEPTION WHEN OTHERS THEN ... END` — a block with an error
+  handler (wave 83): an error inside the block undoes the block's work (a
+  savepoint) and runs the handler, where `SQLERRM` holds the message;
+  variables keep their values, and an error in the handler propagates;
+* `COMMIT` / `ROLLBACK` — transaction control in a standalone `CALL` (wave
+  83, see below);
 * any ordinary SQL statement (DML, table DDL, `SELECT`, `SHOW`, `DESCRIBE`,
   `EXPLAIN`) and nested `CALL`s (recursion is bounded at 32 levels).
 
 `CALL` returns the call's own outcome: the procedure's name, how many body
 statements ran, and the result of the last statement it executed (`SELECT`
 rows, an `Inserted` count, …). Store/process-level statements are refused in a
-body at `CREATE` time (`USE`, transaction control, `CHECKPOINT`,
-`LOAD EXTENSION`, `CREATE`/`DROP DATABASE`, materialized-view DDL and nested
-procedure DDL).
+body at `CREATE` time (`USE`, `BEGIN` as a transaction start, `CHECKPOINT`,
+`LOAD EXTENSION`, `CREATE`/`DROP DATABASE`, materialized-view DDL, nested
+procedure DDL and `DO`).
 
 **Values, never text.** Parameters and variables are handed to the binder as
 bound values at each statement's bind, so no input can change the shape of an
@@ -220,10 +227,33 @@ its place in the commit order — a statement-level rule, not a savepoint.
 `CREATE`/`DROP PROCEDURE` are refused inside a transaction: the definition is
 catalog metadata, like a materialized view's.
 
+**A procedure that manages its own transaction** (wave 83, Postgres-style).
+When a `CALL` runs **outside** any transaction, the outermost procedure body
+may `COMMIT` (make everything so far durable and start a new transaction)
+and `ROLLBACK` (undo back to the last `COMMIT` and continue). A later failure
+then undoes only the work since the last `COMMIT`. Inside `BEGIN … COMMIT`
+the caller owns the transaction, so a body `COMMIT`/`ROLLBACK` fails with a
+"started at a different scope" error; nested procedures, `DO` blocks,
+JavaScript bodies and blocks with an `EXCEPTION` handler cannot use them
+either. Use this for long batch jobs that should keep the progress they made
+(commit every N rows); keep the default — an atomic `CALL` — whenever the
+work must be all-or-nothing. Compared with Snowflake: a Snowflake procedure
+called outside a transaction is *not* atomic (a failure leaves earlier
+statements committed); pinkdb keeps a standalone `CALL` atomic unless the
+body commits explicitly. Snowflake-style autonomous inner transactions (an
+inner commit surviving an outer rollback) are not supported.
+
+**`DO` blocks** run an anonymous body once — the same language, atomic like
+a `CALL`, no parameters and no transaction control. Like `CALL`, running one
+requires `ADMIN` in an authenticated session.
+
 **Durability.** Procedures live per database in the catalog, are written to
 `.pink` (flags bit 4) and replay through the ordinary WAL path: a durable
 store logs the committed `CALL` statement text and replays it by re-executing
-the call. That is sound because the engine has no nondeterministic built-in
+the call (a call that used `COMMIT`/`ROLLBACK` logs each committed segment
+instead: the statements that ran, as self-contained `DO` blocks with every
+variable pinned to its exact value, so replay never re-runs the procedure).
+That is sound because the engine has no nondeterministic built-in
 function (no clock, no randomness) and the constructs that could break replay
 are refused while the call runs — a body statement that reads an attached
 lake table, reads a session-local view (durable stores only), or calls a
@@ -2628,13 +2658,15 @@ ties in ORDER BY have no stable order on either engine).
   (no signatures yet), and only `darwin-arm64` builds are published
 - Stored procedures (wave 44): a body's expressions bind at `CALL` time (the
   catalog may change between calls), so a mistyped condition is a call-time
-  error, not a create-time one; a body cannot `USE`, manage transactions,
-  `CHECKPOINT`, `LOAD EXTENSION`, touch databases or materialized views, or
-  create/drop procedures; recursion is capped at 32 levels; a durable store
+  error, not a create-time one; a body cannot `USE`, `CHECKPOINT`,
+  `LOAD EXTENSION`, touch databases or materialized views, or create/drop
+  procedures; `COMMIT`/`ROLLBACK` only in the outermost procedure of a
+  standalone `CALL`; recursion is capped at 32 levels; a durable store
   refuses a procedure that reads a session-local view or calls a
   loadable-extension function (their replay could not be honest); there is no
   `SHOW PROCEDURES` (a missing call reports the missing name), no OUT/INOUT
-  parameters and no exception handlers yet
+  parameters, and exception handlers catch only `WHEN OTHERS` (no SQLSTATE
+  condition names, no `SAVEPOINT` statement)
 - JavaScript procedures need the `js` feature (native targets only); without
   it a JavaScript definition loaded from a `.pink` file stays inert and
   `CALL` names the rebuild. `print` output is not carried by the server

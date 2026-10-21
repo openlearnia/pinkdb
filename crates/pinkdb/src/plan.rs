@@ -219,6 +219,9 @@ pub enum LogicalPlan {
         db: Option<String>,
         name: String,
         args: Vec<BoundExpr>,
+        /// `DO` (wave 83): the anonymous block's definition, run instead of
+        /// a catalog lookup (`name` is `DO`, `args` is empty).
+        inline: Option<Box<crate::procedure::ProcedureDef>>,
     },
     /// `CREATE [OR REPLACE] MACRO ...` (wave 77): store the parsed template
     /// in the target database's catalog. `source` is the statement text the

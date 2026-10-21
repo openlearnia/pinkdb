@@ -9,6 +9,20 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Wave 83 — procedures can COMMIT, catch errors, and `DO` blocks ✅
+- A procedure called **outside** a transaction can now `COMMIT` and
+  `ROLLBACK` in its body (Postgres-style): long batch jobs keep the progress
+  they committed if they later fail. Inside `BEGIN … COMMIT` this is refused
+  ("started at a different scope"); a plain `CALL` stays all-or-nothing.
+- `BEGIN … EXCEPTION WHEN OTHERS THEN … END` blocks catch errors: the
+  block's work is undone and the handler runs with `SQLERRM`.
+- New `DO $$ BEGIN … END $$` statement runs an anonymous block once.
+- Durable stores log a committing procedure's work as self-contained
+  segments, so replay is exact even if the procedure is later changed or
+  dropped.
+- Fixed: quoted variable names (`DECLARE "my var" …`) work, including
+  non-ASCII names.
+
 ### Wave 81 — JavaScript procedures run (quickjs-ng) ✅
 - With the `js` feature (+1.1 MB), `CREATE PROCEDURE … LANGUAGE JAVASCRIPT`
   now works: the body runs in quickjs-ng with `print`, `db.exec`,

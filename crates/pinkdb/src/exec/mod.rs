@@ -1308,6 +1308,7 @@ pub(crate) fn run_with_budget(
             db: qdb,
             name,
             args,
+            inline,
         } => {
             let target = resolve_db(db, qdb);
             // The arguments are constant expressions: evaluate them against
@@ -1328,6 +1329,10 @@ pub(crate) fn run_with_budget(
                     }
                     values.push(v.get(0));
                 }
+            }
+            // `DO` (wave 83) runs its own definition.
+            if let Some(def) = inline {
+                return crate::procedure::execute_do(db, &target, def);
             }
             // Resolve the definition now (the binder did too, but the catalog
             // may have been refreshed between bind and execution).

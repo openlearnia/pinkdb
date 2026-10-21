@@ -81,6 +81,17 @@ The 40b items below (WAL growth, write-before-log, bind/execute race, file locki
   - No WAL decoder fuzz and no property tests.
   - duckdiff runs outside the gated jobs.
 
+## Open items found after wave 80
+
+- **Debug-build stack headroom for deep procedure recursion** (found in
+  wave 83). A recursive SQL procedure with one nested block per level
+  overflows a 2 MiB thread stack in **debug** builds at depth ~29 (28 with
+  wave 83's restructuring, 27 through a guarded block) — below
+  `MAX_CALL_DEPTH` (32) — and a stack overflow aborts the process instead of
+  failing the call. Release builds run the full 32 levels through guarded
+  blocks in 512 KiB. A proper fix bounds the executor by measured stack use
+  (or grows the stack), rather than by call depth alone.
+
 ## Docs drift and hygiene (wave 40c — closed)
 
 - `website/` still describes the deleted hand-written parser (`architecture.html`), protocol v2 (`server.html`), "wave 26 shipped" (`index.html`), stale test counts (`roadmap.html`), and TLS/RBAC as waves 45/47.

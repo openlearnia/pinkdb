@@ -314,7 +314,12 @@ impl PinkDb {
                 }
                 None => (plan, dynamic_functions_used),
             };
-            let result = exec::run(self, &plan)?;
+            // Wave 83: a `CALL` outside a transaction may `COMMIT`/`ROLLBACK`
+            // in its body (the flag never outlives this statement).
+            self.standalone_call = !self.in_transaction();
+            let result = exec::run(self, &plan);
+            self.standalone_call = false;
+            let result = result?;
             // Wave 44: a `CALL`'s actual touched set joins the open
             // transaction's conflict bookkeeping (its pre-execution pass saw
             // an empty set).

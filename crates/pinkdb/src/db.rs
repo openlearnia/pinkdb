@@ -861,7 +861,11 @@ impl Connection {
             if crate::plan::writes_tables(&plan) {
                 shared.refuse_logged_attached_reads(&plan)?;
             }
-            let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone())?;
+            // Wave 83: an autocommit CALL may COMMIT/ROLLBACK in its body.
+            shared.standalone_call = true;
+            let result = crate::exec::run_with_budget(&mut shared, &plan, budget.clone());
+            shared.standalone_call = false;
+            let result = result?;
             self.log_autocommit(
                 &mut shared,
                 &plan,
@@ -967,6 +971,18 @@ impl Connection {
             // for the next statement boundary (a no-op for MV-free stores).
             let writes = shared.plan_writes_of(plan, pre);
             shared.mark_mv_writes(&writes);
+        }
+        // Wave 83: a CALL that used COMMIT/ROLLBACK logs its final segment
+        // (its committed ones are already in the WAL) instead of its text.
+        if matches!(plan, LogicalPlan::Call { .. })
+            && let Some((db, stmts)) = shared.proc_frame.segment_log().cloned()
+        {
+            if !stmts.is_empty() {
+                let sets = shared.proc_frame.touched();
+                shared.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets))?;
+                shared.maybe_auto_checkpoint(lease);
+            }
+            return Ok(());
         }
         if let Some(text) = sql_text
             && crate::plan::writes_tables(plan)

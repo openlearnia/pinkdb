@@ -1009,6 +1009,11 @@ pub struct PinkDb {
     /// MAX_CALL_DEPTH`]) and decides where a call's statement-scoped frame
     /// bookkeeping begins/ends. Never persisted.
     pub(crate) proc_depth: usize,
+    /// True while the statement runner executes a `CALL` with no enclosing
+    /// transaction (wave 83): the only context where the outermost
+    /// procedure body may `COMMIT`/`ROLLBACK`. Set and cleared around one
+    /// statement by the runners; never persisted.
+    pub(crate) standalone_call: bool,
     /// What the `CALL` currently executing actually touched (wave 44): every
     /// table its statements read or wrote, plus the writes alone (for the
     /// ON COMMIT trigger). Cleared at each statement boundary — the call's
@@ -1077,6 +1082,7 @@ impl Clone for PinkDb {
             // frame (the caller's `proc_frame_reset` clears it at the next
             // boundary).
             proc_depth: self.proc_depth,
+            standalone_call: self.standalone_call,
             proc_frame: self.proc_frame.clone(),
             rbac: self.rbac.clone(),
             file_formats: self.file_formats.clone(),
@@ -1136,6 +1142,7 @@ impl PinkDb {
             mv_pending: HashSet::new(),
             txn_writes: HashSet::new(),
             proc_depth: 0,
+            standalone_call: false,
             proc_frame: crate::procedure::ProcFrame::default(),
             rbac: crate::rbac::RbacCatalog::default(),
             // Process-global sinks (`filefmt::register_global_file_format`)
@@ -1606,6 +1613,21 @@ impl PinkDb {
         self.txn_base = base;
     }
 
+    /// Restore a procedure savepoint (wave 83: an `EXCEPTION` handler's
+    /// block, or a body `ROLLBACK`): the data and catalog go back to `snap`,
+    /// while the call's own bookkeeping stays current — the touched set (so
+    /// the failed statements' reads still count for conflict detection),
+    /// the call depth, the session and the transaction base.
+    pub(crate) fn savepoint_restore(&mut self, snap: Box<PinkDb>) {
+        let frame = std::mem::take(&mut self.proc_frame);
+        let depth = self.proc_depth;
+        let standalone = self.standalone_call;
+        self.proc_snapshot_restore(snap);
+        self.proc_frame = frame;
+        self.proc_depth = depth;
+        self.standalone_call = standalone;
+    }
+
     /// True while a `BEGIN..COMMIT/ROLLBACK` block is open.
     pub fn in_transaction(&self) -> bool {
         self.txn_snapshot.is_some()
@@ -1737,6 +1759,19 @@ impl PinkDb {
         // own statements to this transaction's record and replay them twice.
         if self.replaying || !crate::plan::writes_tables(plan) {
             return Ok(());
+        }
+        // Wave 83: a CALL whose body used COMMIT/ROLLBACK already logged its
+        // committed segments; what remains is the final segment (re-running
+        // the CALL text would apply the committed part twice).
+        if matches!(plan, crate::plan::LogicalPlan::Call { .. })
+            && !self.in_transaction()
+            && let Some((db, stmts)) = self.proc_frame.segment_log().cloned()
+        {
+            if stmts.is_empty() {
+                return Ok(());
+            }
+            let sets = self.proc_frame.touched();
+            return self.wal_append_session(&db, &db, &stmts, &[], &[], Some(&sets));
         }
         // Wave 48: a `CREATE/ALTER USER` is logged in its `PASSWORD_HASH`
         // form — the plaintext of the statement text must never reach the
