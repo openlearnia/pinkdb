@@ -1438,7 +1438,7 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
     }
     let stats = db.attached_decode_stats();
     for ((location, tables), (_, loads, columns, files)) in lakes.into_iter().zip(stats) {
-        println!("{}", sanitize_terminal(&location));
+        println!("{}", sanitize_terminal(location));
         for t in tables {
             println!(
                 "  {}.{} ({} row{})",
@@ -1457,7 +1457,7 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
     }
     for (location, wa) in writables().iter() {
         let changed = wa.changed_tables(db).unwrap_or_default();
-        println!("{} (writable)", sanitize_terminal(&location));
+        println!("{} (writable)", sanitize_terminal(location));
         for (key, rows) in wa.tables() {
             println!(
                 "  {} ({rows} row{})",
