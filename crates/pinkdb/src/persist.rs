@@ -2593,6 +2593,19 @@ impl PinkDb {
         }
     }
 
+    /// Load a database from an in-memory `.pink` image (the bytes
+    /// [`PinkDb::to_pink_bytes`] returns, or a `.pink` file read into memory).
+    ///
+    /// A thin wrapper over the same loader [`PinkDb::open`] uses: all five
+    /// format versions are accepted, a CRC mismatch or any malformed section
+    /// is a clean error (never a panic), and an image written by a newer
+    /// pinkdb is refused with the "upgrade pinkdb" message. An encrypted
+    /// (`PINKENC1`) container is not a plain image and is refused as a bad
+    /// magic.
+    pub fn from_pink_bytes(data: &[u8]) -> Result<PinkDb> {
+        Self::load_bytes(data)
+    }
+
     /// Decode a serialized `.pink` image (v1, v2, v3, v4 or v5 magic).
     fn load_bytes(data: &[u8]) -> Result<PinkDb> {
         let data = if data.starts_with(MAGIC_V3)
@@ -3911,6 +3924,34 @@ mod tests {
         // -0.0 round-trips exactly (storage is bit-exact).
         assert_eq!(b[0][3], Value::Double(-0.0));
         assert!(matches!(b[0][3], Value::Double(x) if x.to_bits() == (-0.0f64).to_bits()));
+    }
+
+    #[test]
+    fn from_pink_bytes_round_trips_and_refuses_garbage() {
+        let mut db = PinkDb::new();
+        db.execute(
+            "CREATE TABLE t (a INTEGER, b VARCHAR); \
+             INSERT INTO t VALUES (1, 'x'), (2, NULL);",
+        )
+        .unwrap();
+        let bytes = db.to_pink_bytes().unwrap();
+        let mut back = PinkDb::from_pink_bytes(&bytes).unwrap();
+        assert_eq!(
+            back.execute("SELECT * FROM t ORDER BY a;").unwrap(),
+            db.execute("SELECT * FROM t ORDER BY a;").unwrap()
+        );
+        // Garbage is a clean error, never a panic.
+        let err = match PinkDb::from_pink_bytes(b"not a pink file") {
+            Ok(_) => panic!("garbage must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("bad magic"), "{err}");
+        // A newer format is refused through the shared newer-magic path.
+        let err = match PinkDb::from_pink_bytes(b"PINKDB09rest") {
+            Ok(_) => panic!("a newer format must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("newer pinkdb"), "{err}");
     }
 
     #[test]

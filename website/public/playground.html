@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Playground — pinkdb</title>
+<meta name="description" content="Run pinkdb in the browser: the real engine compiled to WebAssembly, with a SQL editor, per-statement result grids, and memory, IndexedDB or OPFS storage for .pink snapshots.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/playground.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Playground — pinkdb">
+<meta property="og:description" content="Run pinkdb in the browser: the real engine compiled to WebAssembly, with a SQL editor, per-statement result grids, and memory, IndexedDB or OPFS storage for .pink snapshots.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/playground.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="assets/favicon.png">
+<link rel="preload" href="assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="./"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="docs/getting-started">Docs</a></li>
+        <li><a href="docs/guide-csv-to-lake">Guides</a></li>
+        <li><a href="docs/bindings">API</a></li>
+        <li><a href="playground" class="active" aria-current="page">Playground</a></li>
+        <li><a href="extensions">Extensions</a></li>
+        <li><a href="docs/roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container home">
+<link rel="stylesheet" href="assets/playground/playground.css">
+
+<section class="hero pg-hero">
+  <p class="kicker">wasm playground</p>
+  <h1>Run pinkdb <span class="hero-mark">in your browser</span></h1>
+  <p class="lede">The real engine, compiled to WebAssembly: columnar vectors,
+  vectorized execution, joins, CTEs and window functions. There is no server
+  in the middle — every statement runs in this tab.</p>
+  <ul class="chips">
+    <li class="chip">engine <span class="chip-num">wasm</span></li>
+    <li class="chip">storage <span class="chip-num">memory · indexeddb · opfs</span></li>
+    <li class="chip"><span class="chip-num">0</span> third-party requests</li>
+  </ul>
+</section>
+
+<div class="callout ok pg-fineprint">
+  <span class="callout-title">stays in the browser</span>
+  <p>Statements and rows never leave this tab. <strong>Memory</strong> is
+  session-only and forgets everything on reload. <strong>IndexedDB</strong> and
+  <strong>OPFS</strong> keep a whole <code>.pink</code> snapshot in this browser's
+  own storage: writes autosave after half a second, and <em>Save</em> writes one
+  immediately. <em>Export</em> downloads the same bytes as
+  <code>pinkdb-playground.pink</code>; <em>Import</em> restores a file into the
+  engine and saves it to the selected persistent storage. The database is the
+  same <code>.pink</code> format the CLI writes.</p>
+</div>
+
+<section class="pg-app" aria-label="pinkdb playground">
+  <div class="pg-toolbar">
+    <label class="pg-field" for="pg-examples">Examples
+      <select id="pg-examples">
+        <option value="">Examples…</option>
+      </select>
+    </label>
+    <label class="pg-field" for="pg-backend">Storage
+      <select id="pg-backend">
+        <option value="memory">Memory</option>
+        <option value="indexeddb">IndexedDB</option>
+        <option value="opfs">OPFS</option>
+      </select>
+    </label>
+    <div class="pg-actions">
+      <button class="button primary" id="pg-run" type="button">Run</button>
+      <button class="button" id="pg-save" type="button">Save</button>
+      <button class="button" id="pg-export" type="button">Export</button>
+      <button class="button" id="pg-import" type="button">Import</button>
+      <button class="button ghost" id="pg-clear" type="button">Clear</button>
+      <button class="button ghost" id="pg-keep" type="button">Keep data</button>
+    </div>
+  </div>
+
+  <div class="pg-editor">
+    <label class="sr-only" for="pg-editor">SQL statements</label>
+    <textarea id="pg-editor" spellcheck="false" autocapitalize="off"
+      autocomplete="off" wrap="off"
+      placeholder="SELECT 42 AS answer;"></textarea>
+    <div class="pg-editor-foot">
+      <span>Ctrl/Cmd + Enter runs everything in the editor</span>
+      <span>one statement per card</span>
+    </div>
+  </div>
+
+  <p class="pg-status" role="status" aria-live="polite">
+    <span id="pg-status-backend">store: loading…</span>
+    <span id="pg-status-autosave">autosave: loading…</span>
+    <span id="pg-status-storage">storage: quota unknown</span>
+    <span id="pg-status-version">engine: loading…</span>
+  </p>
+
+  <p class="pg-note" id="pg-note" role="status" aria-live="polite" hidden></p>
+
+  <div class="pg-results" id="pg-results" aria-live="polite"></div>
+</section>
+
+<input id="pg-import-file" type="file" accept=".pink,application/octet-stream" hidden>
+
+<script type="module" src="assets/playground/playground.js"></script>
+
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="docs/getting-started">Docs</a> · <a href="extensions">Extensions</a> · <a href="docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>

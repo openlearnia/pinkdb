@@ -4,5 +4,6 @@
 set -eu
 
 cd "$(dirname "$0")"
+bash tools/build-wasm.sh
 python3 build.py
 exec wrangler deploy

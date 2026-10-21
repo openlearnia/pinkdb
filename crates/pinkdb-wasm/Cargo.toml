@@ -1,0 +1,14 @@
+[package]
+name = "pinkdb-wasm"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+description = "pinkdb browser ABI: a wasm32-unknown-unknown cdylib over the pinkdb embedding API"
+license = "MIT"
+
+[lib]
+name = "pinkdb_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pinkdb = { path = "../pinkdb" }

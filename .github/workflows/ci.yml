@@ -190,6 +190,11 @@ jobs:
           rustup target add wasm32-unknown-unknown
           cargo build -p pinkdb --target wasm32-unknown-unknown
 
+      - name: playground module (wave 85) — fresh build + Node smoke test
+        run: |
+          bash website/tools/build-wasm.sh
+          node website/tools/wasm-smoke.mjs
+
   # The release CLI the duckdiff job consumes. It runs in parallel with the
   # test/clippy jobs instead of at the end of a serial mega-job.
   release-cli:

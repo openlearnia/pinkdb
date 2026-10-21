@@ -35,6 +35,9 @@ members = [
     # Shared remote-file transport + `read_csv` table source (wave 75):
     # https GET/range and the SigV4 S3 client pink-lake's `s3` feature uses.
     "crates/pinkdb-httpfs",
+    # Browser playground (wave 85): the wasm32-unknown-unknown ABI over the
+    # engine, a cdylib loaded by the docs site's playground.
+    "crates/pinkdb-wasm",
 ]
 resolver = "2"
 

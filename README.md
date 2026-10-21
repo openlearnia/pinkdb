@@ -97,6 +97,7 @@ SQL text
 | `pinkdb::crypto` | optional at-rest encryption (`PINKENC1` container: AES-256-GCM + Argon2id) behind the `encryption` feature; a parse/identity stub otherwise |
 | `pinkdb::db` | Multi-writer `Database`/`Connection` over `Arc<RwLock<PinkDb>>` |
 | `pinkdb::procedure` | Stored procedures: the SQL procedural language (parser + `CALL` executor), catalog definitions, `.pink` section |
+| `pinkdb-wasm` | The browser playground's glue: a `cdylib` with a raw JS-callable ABI (`pw_open`/`pw_exec`/`pw_snapshot`/`pw_restore`, JSON results) over the wasm32 core |
 | `pinkdb-js` | Optional (`js` feature) JavaScript procedure sandbox: quickjs-ng via `rquickjs` (~1.1 MB), the deterministic host contract, limits and value conversions |
 | `pinkdb-cli` | rustyline REPL, dot-commands, box-drawn output |
 | `pinkdb-server` | TCP server + blocking client (framed binary protocol, thread-per-connection); no external deps |
@@ -170,6 +171,21 @@ LIMIT n [OFFSET m] | OFFSET m;
 -- Scalar subqueries `(SELECT ...)` anywhere an expression goes
 -- (uncorrelated only: exactly 1 row × 1 col, 0 rows → NULL).
 ```
+
+### Browser playground
+
+The docs site's **Playground** page (wave 85) runs the real engine compiled
+to wasm in a Web Worker — no server. Storage is Memory (session-only),
+IndexedDB or OPFS: each keeps a whole `.pink` snapshot (the same format the
+CLI writes), autosaved 500 ms after a write, atomically (one IndexedDB
+transaction; OPFS writes a temp file and renames it). Export/Import move
+`.pink` files in and out; a snapshot the engine refuses (corrupt, newer
+format) is reported and never overwritten. A second tab on the same
+persistent store gets a read-only in-memory copy (Web Locks). No COOP/COEP
+headers and no third-party requests. `website/tools/build-wasm.sh` builds
+the module (`crates/pinkdb-wasm`, ~2.25 MiB) and
+`website/tools/wasm-smoke.mjs` tests it under Node. A WAL-grade
+virtual file system for crash-safe incremental writes is a follow-up.
 
 ### Query profiles
 

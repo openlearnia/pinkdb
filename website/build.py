@@ -12,15 +12,18 @@ Output mapping
 - ``src/pages/404.html``            -> ``public/404.html``
 - ``src/pages/extensions.html``     -> ``public/extensions.html`` (top level, so
   the page is served at ``/extensions`` — the extension catalog)
+- ``src/pages/playground.html``     -> ``public/playground.html`` (top level,
+  the wasm playground)
 - ``src/pages/extensions-guide.html`` -> ``public/docs/extensions.html``
 - every other fragment              -> ``public/docs/<same name>``
 
-The first three have explicit ``out`` entries in ``PAGES``; every other
-fragment uses the ``docs/`` default.
+The pages above with explicit ``out`` entries in ``PAGES`` keep their
+top-level paths; every other fragment uses the ``docs/`` default.
 
 Layouts
 -------
-- ``home``  (index.html): hero page, full-width container, no sidebar.
+- ``home``  (index.html, playground.html): hero page, full-width container,
+  no sidebar.
 - ``docs``  (default): left sidebar with the grouped documentation nav and
   active-page highlighting, a section eyebrow, permalinked ``<h2>``
   headings, previous/next links and an edit-on-GitHub link, and (on wide
@@ -142,6 +145,7 @@ TOPNAV = [
     ("docs", "Docs", "docs/getting-started.html"),
     ("guides", "Guides", "docs/guide-csv-to-lake.html"),
     ("api", "API", "docs/bindings.html"),
+    ("playground", "Playground", "playground.html"),
     ("extensions", "Extensions", "extensions.html"),
     ("roadmap", "Roadmap", "docs/roadmap.html"),
 ]
@@ -380,6 +384,18 @@ PAGES = {
             "The pinkdb extension catalog: browse published artifacts (name, "
             "version, platform, ABI, SHA-256), install with .install <name>, "
             "and download the immutable bytes."
+        ),
+    },
+    "playground.html": {
+        "out": "playground.html",
+        "nav": "",
+        "layout": "home",
+        "toc": False,
+        "title": "Playground — pinkdb",
+        "description": (
+            "Run pinkdb in the browser: the real engine compiled to "
+            "WebAssembly, with a SQL editor, per-statement result grids, and "
+            "memory, IndexedDB or OPFS storage for .pink snapshots."
         ),
     },
     "404.html": {

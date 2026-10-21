@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Wave 85 — pinkdb in the browser (Playground) ✅
+- The docs site has a **Playground**: the real engine compiled to wasm,
+  running in your tab with no server, with example queries and a result
+  grid.
+- Keep your database in Memory, IndexedDB or OPFS; writes autosave, and you
+  can Export/Import `.pink` files (the same format the CLI uses). Damaged
+  files are refused without touching your saved data, and a second tab
+  opens a read-only copy.
+- New public `PinkDb::from_pink_bytes` loads a database from snapshot bytes.
+
 ### Wave 84 — query execution profiles ✅
 - `execute_profiled` (embedded `PinkDb` and `Connection`) returns each
   statement's timings — parse, bind, optimize, execute, WAL log, total —

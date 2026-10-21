@@ -31,6 +31,11 @@
 //! extension root ([`wal::DurableOpenOptions::extension_root`]). The open
 //! fails with an actionable error — the record is never skipped silently
 //! and the library is never loaded behind the operator's back.
+// On wasm32-unknown-unknown `std::fs::File` is an inert stub without
+// `Drop`, so clippy flags the deliberate `drop(file)` calls that close files
+// before a rename or release a lease on native targets (wave 85: the
+// playground module lints the core for wasm32).
+#![cfg_attr(target_arch = "wasm32", allow(clippy::drop_non_drop))]
 
 pub mod attached;
 pub mod crypto;

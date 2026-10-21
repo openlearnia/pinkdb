@@ -1,0 +1,273 @@
+/* ==========================================================================
+   Playground — page furniture for the wasm editor.
+   Colours come from the tokens in ../style.css (light-dark day/night pairs);
+   nothing here introduces a new colour. Results reuse the site's table,
+   sticker and index-card language.
+   ========================================================================== */
+
+.pg-hero { padding-bottom: 0.2rem; }
+.pg-hero h1 { max-width: 22ch; }
+
+.pg-fineprint {
+  max-width: 76ch;
+  font-size: 0.93rem;
+}
+.pg-fineprint p { max-width: none; }
+.pg-fineprint code { white-space: nowrap; }
+
+.pg-app { margin: 1.6rem 0 1rem; }
+
+/* ---------- Controls ---------- */
+
+.pg-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.7rem 1rem;
+  margin: 1.2rem 0 0.9rem;
+  padding-bottom: 0.9rem;
+  border-bottom: 2px dashed var(--line-strong);
+}
+
+.pg-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.28rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+
+.pg-field select {
+  min-width: 11rem;
+  max-width: 100%;
+  background: var(--paper-2);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+  border: 1.6px solid var(--ink);
+  border-radius: 7px 10px 8px 11px;
+  padding: 0.38rem 0.55rem 0.42rem;
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+}
+.pg-field select:disabled { opacity: 0.55; cursor: not-allowed; }
+.pg-field select:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
+
+.pg-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.45rem;
+  margin-left: auto;
+}
+.pg-actions .button { font-size: 0.86rem; padding: 0.34rem 0.72rem 0.38rem; }
+.pg-actions .button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  translate: none;
+  rotate: none;
+  box-shadow: var(--shadow-sm);
+}
+
+/* ---------- Editor ---------- */
+
+.pg-editor {
+  border: 1.8px solid var(--ink);
+  border-radius: 8px 12px 9px 13px;
+  background: var(--paper-2);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.pg-editor textarea {
+  display: block;
+  width: 100%;
+  min-height: 17rem;
+  resize: vertical;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: 0.88rem;
+  line-height: 1.62;
+  font-variant-numeric: tabular-nums;
+  padding: 1rem 1.1rem 1.1rem;
+  tab-size: 2;
+}
+.pg-editor textarea:focus { outline: none; }
+.pg-editor:focus-within {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+}
+
+.pg-editor-foot {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 0.3rem 1rem;
+  padding: 0.4rem 1rem 0.46rem;
+  border-top: 1.6px dashed var(--line-strong);
+  background: var(--paper-3);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+}
+
+/* ---------- Status line ---------- */
+
+.pg-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem 1.1rem;
+  margin: 0.9rem 0 0;
+  padding: 0.45rem 0.75rem 0.5rem;
+  border: 1.5px dashed var(--line-strong);
+  border-radius: 7px 11px 8px 12px;
+  background: var(--paper-2);
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+}
+.pg-status span { white-space: nowrap; }
+
+.pg-note {
+  margin: 0.7rem 0 0;
+  padding: 0.55rem 0.85rem 0.6rem;
+  border: 1.5px solid var(--line-strong);
+  border-left: 5px solid var(--blue);
+  border-radius: 6px 10px 8px 12px;
+  background: var(--paper-2);
+  color: var(--ink-2);
+  font-size: 0.88rem;
+  line-height: 1.5;
+  max-width: 80ch;
+}
+.pg-note[data-tone="error"] { border-left-color: var(--pink); }
+.pg-note[data-tone="ok"] { border-left-color: var(--green-ink); }
+.pg-note[hidden] { display: none; }
+
+/* ---------- Results ---------- */
+
+.pg-run-summary {
+  margin: 1.1rem 0 0.5rem;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.pg-results { display: grid; gap: 0.9rem; margin-top: 0.6rem; }
+
+.pg-result {
+  border: 1.8px solid var(--ink);
+  border-radius: 10px 15px 11px 16px;
+  background: var(--paper-2);
+  box-shadow: var(--shadow-sm);
+  overflow: hidden;
+  animation: zine-rise 0.34s var(--ease) both;
+}
+
+.pg-result-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 0.85rem 0.55rem;
+  background: var(--paper-3);
+  border-bottom: 1.6px dashed var(--line);
+}
+.pg-result-meta {
+  margin-left: auto;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.pg-result .table-wrap {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+}
+.pg-result table { font-size: 0.86rem; }
+.pg-result thead th { background: var(--paper-2); }
+.pg-result tbody tr:hover { background: color-mix(in srgb, var(--pink) 4.5%, transparent); }
+
+.pg-col-name { display: block; }
+.pg-col-type {
+  display: block;
+  margin-top: 0.1rem;
+  color: var(--ink-3);
+  font-size: 0.62rem;
+  font-weight: 400;
+  letter-spacing: 0.07em;
+  text-transform: none;
+}
+
+.pg-null {
+  display: inline-block;
+  padding: 0.02rem 0.34rem 0.04rem;
+  border: 1.3px dashed var(--line-strong);
+  border-radius: 4px;
+  background: var(--paper-3);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-style: italic;
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+}
+
+.pg-message {
+  margin: 0;
+  padding: 0.7rem 0.95rem 0.8rem;
+  max-width: none;
+  color: var(--ink-2);
+  font-size: 0.92rem;
+}
+
+/* A failed statement is still one inline card, in the error accent. */
+.pg-result-error { border-color: var(--pink-deep); }
+.pg-result-error .pg-result-head { background: var(--pink-soft); }
+.pg-result-error .pg-message { color: var(--pink-deep); font-weight: 550; }
+
+.pg-empty {
+  margin: 0;
+  padding: 0.75rem 0.95rem 0.85rem;
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  max-width: none;
+}
+
+/* ---------- Small screens ---------- */
+
+@media (max-width: 48rem) {
+  .pg-actions { margin-left: 0; width: 100%; }
+  .pg-field { flex: 1 1 10rem; }
+  .pg-field select { min-width: 0; width: 100%; }
+  .pg-editor textarea { min-height: 13rem; font-size: 0.84rem; }
+  .pg-result .table-wrap { overflow-x: auto; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pg-result { animation: none; }
+  .pg-app *, .pg-app *::before, .pg-app *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
