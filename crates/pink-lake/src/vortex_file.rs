@@ -933,8 +933,9 @@ fn file_column_stats(
 ///   truncated VARCHAR statistic is written `Inexact`, so truncation needs no
 ///   separate check here;
 /// - a DOUBLE column's min/max additionally needs an exact `NaNCount == 0`
-///   (the engine's comparator treats NaN as equal to everything and keeps the
-///   first-seen value, which a min/max statistic cannot reproduce) and a
+///   (the engine's comparator sorts NaN above every other double, and a
+///   min/max statistic excludes NaN, so it bounds neither `MAX` nor a
+///   `>`/`= NaN` zone-map test) and a
 ///   nonzero statistic (`-0.0 == 0.0` in the same comparator, so the sign of
 ///   a first-seen zero is not recoverable);
 /// - a column that cannot contain NULLs has an exact `null_count` of 0 even

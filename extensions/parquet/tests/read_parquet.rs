@@ -417,6 +417,66 @@ fn projection_and_filter_pruning_are_visible_in_counters() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Parquet DOUBLE statistics never cover NaN (the writer skips it and no
+/// NaN count is recorded), yet NaN sorts above every double (DuckDB order):
+/// a row group whose max is 3.0 may still hold a NaN that satisfies
+/// `d > 5.0` or `d = NaN`, so those predicates must not prune it by its
+/// bounds. `<` / `<=` never match a NaN row and keep pruning.
+#[test]
+fn double_nan_rows_survive_row_group_pruning() {
+    let dir = temp_dir("nan");
+    let path = dir.join("nan.parquet");
+    let d = vec![
+        Some(1.0),
+        Some(f64::NAN),
+        Some(3.0),
+        Some(-0.0),
+        Some(10.0),
+        Some(11.0),
+        Some(12.0),
+        Some(13.0),
+    ];
+    write_file(
+        path.to_str().unwrap(),
+        &[
+            Column::Int32("id", (0..8).map(Some).collect()),
+            Column::Double("d", d),
+        ],
+        4,
+        Compression::UNCOMPRESSED,
+        vec![],
+    );
+    let mut db = store();
+    let mut ids = |pred: &str| {
+        let before = stats(&db);
+        let rows = select(
+            &mut db,
+            &format!(
+                "SELECT id FROM '{}' WHERE {pred} ORDER BY id;",
+                path.display()
+            ),
+        );
+        let after = stats(&db);
+        let ids: Vec<i32> = rows
+            .iter()
+            .map(|r| match r[0] {
+                Value::Integer(i) => i,
+                ref other => panic!("{other:?}"),
+            })
+            .collect();
+        (ids, after.row_groups_pruned - before.row_groups_pruned)
+    };
+    assert_eq!(ids("d > 5.0"), (vec![1, 4, 5, 6, 7], 0));
+    assert_eq!(ids("d >= 12.0"), (vec![1, 6, 7], 0));
+    assert_eq!(ids("d = CAST('NaN' AS DOUBLE)"), (vec![1], 0));
+    assert_eq!(ids("d > CAST('inf' AS DOUBLE)"), (vec![1], 0));
+    assert_eq!(ids("d = 0.0"), (vec![3], 1));
+    // `<` cannot match NaN: the second group still prunes by its min.
+    assert_eq!(ids("d < 5.0"), (vec![0, 2, 3], 1));
+    assert_eq!(ids("d <= 3.0"), (vec![0, 2, 3], 1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn globs_multi_file_and_filename_columns() {
     let dir = temp_dir("glob");

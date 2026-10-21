@@ -1768,7 +1768,8 @@ fn project_scan_chunks(t: &DataTable, cols: &[usize]) -> Vec<DataChunk> {
 ///   (a non-nullable column always has an exact 0);
 /// - `MIN`/`MAX` use a column statistic only when the lake marked it exact:
 ///   truncated VARCHAR statistics are inexact, a DOUBLE column with any NaN
-///   is refused (the engine's NaN ordering is first-seen), and a zero DOUBLE
+///   is refused (statistics exclude NaN, which sorts above every other
+///   double, so `MAX` would be NaN), and a zero DOUBLE
 ///   statistic is refused (`-0.0 == 0.0` in the engine's comparator, which
 ///   keeps the first-seen zero, so the sign is not recoverable from a
 ///   min/max alone);
@@ -2495,8 +2496,8 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
             // Top-N fast path: LIMIT directly over SORT selects the first
             // `limit` rows with bounded per-partition heaps instead of a full
             // sort. Only worth it when the limit is much smaller than the row
-            // count; otherwise — or when a NaN float key disables the byte
-            // encoding — fall back to the full sort + truncate.
+            // count; otherwise — or when the byte encoding is unavailable —
+            // fall back to the full sort + truncate.
             if let LogicalPlan::Sort {
                 input: sort_in,
                 keys,
@@ -2511,7 +2512,7 @@ fn eval(cx: &Cx, plan: &LogicalPlan) -> Result<Output> {
                 let chunks = if limit.saturating_mul(16) <= n {
                     match top_n(cx, &inner.chunks, keys, *limit)? {
                         Some(chunks) => chunks,
-                        // NaN float key: full sort with the legacy comparator.
+                        // No byte encoding: full sort with the legacy comparator.
                         None => sort(cx, &inner.chunks, keys)?,
                     }
                 } else {
@@ -4017,21 +4018,17 @@ fn push_be(out: &mut Vec<u8>, x: u64, width: usize, desc: bool) {
 /// - INTEGER/DATE, BIGINT/TIMESTAMP: big-endian two's complement with the
 ///   sign bit flipped (`x ^ MIN`), so unsigned byte order = signed order;
 /// - DOUBLE: sign-magnitude → total-order bits (negatives inverted,
-///   positives get the sign bit); −0.0 folds onto +0.0 because
-///   `compare_values`'s `partial_cmp` calls them Equal;
+///   positives get the sign bit); −0.0 folds onto +0.0 and every NaN onto
+///   all-ones (above `+inf`'s encoding), matching `num_cmp`'s DuckDB order;
 /// - VARCHAR: each UTF-8 byte shifted up one (bytes are ≤ 0xF4, so `0x00`
 ///   is free) then a `0x00` terminator. The shift preserves order and the
 ///   terminator makes the encoding prefix-free ("ab" must beat "a" DESC).
 ///   DESC: inverted shifted bytes + inverted terminator `0xFF`.
-///
-/// Returns `false` for a NaN DOUBLE cell: `compare_values` treats NaN as
-/// Equal to everything, which no byte order can express, so the caller
-/// aborts encoding and sorts with the `Value` comparator instead.
-fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) -> bool {
+fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) {
     let desc = spec.desc;
     if v.is_null(idx) {
         out.push(if spec.nulls_first { 0x00 } else { 0xFF });
-        return true;
+        return;
     }
     out.push(if spec.nulls_first { 0x01 } else { 0x00 });
     match v.data() {
@@ -4043,12 +4040,11 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) ->
         VectorData::Int64(d) => push_be(out, (d[idx] ^ i64::MIN) as u64, 8, desc),
         VectorData::Float64(d) => {
             let x = d[idx];
-            if x.is_nan() {
-                return false;
-            }
-            let x = if x == 0.0 { 0.0 } else { x }; // −0.0 == +0.0 in compare_values
+            let x = if x == 0.0 { 0.0 } else { x }; // −0.0 == +0.0 in num_cmp
             let b = x.to_bits();
-            let b = if b & (1u64 << 63) != 0 {
+            let b = if x.is_nan() {
+                u64::MAX // NaN == NaN, above +inf (0xFFF0…) in num_cmp
+            } else if b & (1u64 << 63) != 0 {
                 !b
             } else {
                 b | (1u64 << 63)
@@ -4080,7 +4076,6 @@ fn encode_key_into(v: &Vector, idx: usize, spec: SortSpec, out: &mut Vec<u8>) ->
             push_be_i128(out, key, desc);
         }
     }
-    true
 }
 
 /// Big-endian i128 with the sign bit flipped (ascending byte order); `desc`
@@ -4095,9 +4090,8 @@ fn push_be_i128(out: &mut Vec<u8>, x: i128, desc: bool) {
 }
 
 /// Pack all rows' keys into one arena. `None` ⇒ the byte order cannot
-/// reproduce `compare_values` exactly (NaN in a FLOAT key, dtypes differing
-/// across chunks, or sizes past `u32`) and the caller must use the `Value`
-/// comparator path.
+/// reproduce `compare_values` exactly (dtypes differing across chunks, or
+/// sizes past `u32`) and the caller must use the `Value` comparator path.
 fn encode_sort_keys(
     chunks: &[DataChunk],
     keyed: &[Vec<FusedVec>],
@@ -4134,9 +4128,7 @@ fn encode_sort_keys(
                 }
                 offsets.push(bytes.len() as u32);
                 for (ki, (_, spec)) in keys.iter().enumerate() {
-                    if !encode_key_into(ks[ki].v(), i, *spec, &mut bytes) {
-                        return None;
-                    }
+                    encode_key_into(ks[ki].v(), i, *spec, &mut bytes);
                 }
             }
             Some((bytes, offsets))
@@ -4264,8 +4256,8 @@ fn sort(cx: &Cx, chunks: &[DataChunk], keys: &[(BoundExpr, SortSpec)]) -> Result
 /// Top-N selection for `LIMIT` directly over `SORT`: every rayon partition
 /// keeps a bounded max-heap of its `limit` smallest rows under the byte
 /// comparator; the ≤ partitions × limit candidates merge to the global first
-/// `limit`. `Ok(None)` ⇒ encoding unavailable (NaN float key); the caller
-/// then falls back to a full sort.
+/// `limit`. `Ok(None)` ⇒ encoding unavailable (see [`encode_sort_keys`]);
+/// the caller then falls back to a full sort.
 fn top_n(
     cx: &Cx,
     chunks: &[DataChunk],
@@ -4327,7 +4319,7 @@ fn top_n(
 
 /// Legacy fallback: materialize `Value` keys and compare with
 /// [`compare_values`] (NULLS LAST, `seq` tiebreak), exactly as before the
-/// byte-arena path. Reached when a FLOAT key contains NaN.
+/// byte-arena path. Reached when [`encode_sort_keys`] refuses the input.
 fn sort_legacy(
     chunks: &[DataChunk],
     keys: &[(BoundExpr, SortSpec)],
@@ -9863,60 +9855,72 @@ mod tests {
         assert_eq!(big, full);
     }
 
-    /// A NaN float key cannot be encoded (`compare_values` makes NaN Equal to
-    /// everything), so sort/top-N must refuse the byte arena and fall back to
-    /// the legacy `Value` comparator — same result as that path, no panic.
+    /// NaN float keys encode like `num_cmp` orders them (DuckDB: every NaN
+    /// payload equal, above `+inf`; `-0.0 == 0.0`), so sort/top-N take the
+    /// byte arena and agree with the legacy `Value` comparator.
     #[test]
-    fn order_nan_float_uses_legacy_comparator() {
+    fn order_nan_float_encodes_duckdb_order() {
         let mut db = PinkDb::new();
         db.execute("CREATE TABLE f (d DOUBLE, id INTEGER);")
             .unwrap();
         db.execute(
-            "INSERT INTO f VALUES (3.0, 1), (1.0, 2), (NULL, 3), (2.0, 4), (1.5, 5), (0.0 / 0.0, 6);",
+            "INSERT INTO f VALUES (3.0, 1), ('NaN'::DOUBLE, 2), (NULL, 3), ('inf'::DOUBLE, 4), \
+             ('-0.0'::DOUBLE, 5), (0.0 / 0.0, 6), ('-inf'::DOUBLE, 7), (0.0, 8);",
         )
         .unwrap();
-        // Encoding (and top-N over it) must refuse the NaN key...
         let cx = Cx::new(&db);
         let t = db.table("f").unwrap();
         let chunks: Vec<DataChunk> = (0..t.num_chunks())
             .map(|i| t.scan_chunk(i).unwrap())
             .collect();
-        let keys = vec![(
-            BoundExpr::Column {
-                index: 0,
-                dtype: DataType::Double,
-            },
-            SortSpec {
-                desc: false,
-                nulls_first: false,
-            },
-        )];
-        let keyed = eval_sort_keys(&cx, &chunks, &keys).unwrap();
-        assert!(encode_sort_keys(&chunks, &keyed, &keys).is_none());
-        assert!(top_n(&cx, &chunks, &keys, 1).unwrap().is_none());
-        // ... so ORDER BY runs the legacy comparator path unchanged.
-        let rows = select(&mut db, "SELECT d, id FROM f ORDER BY d;");
-        let legacy = sort_legacy(&chunks, &keys, &keyed).unwrap();
-        let mut expected = Vec::new();
-        for chunk in &legacy {
-            for i in 0..chunk.num_rows() {
-                expected.push(chunk.columns.iter().map(|c| c.get(i)).collect::<Vec<V>>());
-            }
-        }
         // `Value::Double(NaN) != Value::Double(NaN)`, so compare Debug forms.
         let debug_rows =
             |rows: &[Vec<V>]| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
-        assert_eq!(debug_rows(&rows), debug_rows(&expected));
-        assert_eq!(rows.len(), 6);
-        assert!(
-            rows.iter()
-                .any(|r| matches!(r[0], V::Double(x) if x.is_nan()))
-        );
+        let flatten = |out: &[DataChunk]| {
+            let mut rows = Vec::new();
+            for chunk in out {
+                for i in 0..chunk.num_rows() {
+                    rows.push(chunk.columns.iter().map(|c| c.get(i)).collect::<Vec<V>>());
+                }
+            }
+            rows
+        };
+        for desc in [false, true] {
+            let keys = vec![(
+                BoundExpr::Column {
+                    index: 0,
+                    dtype: DataType::Double,
+                },
+                SortSpec {
+                    desc,
+                    nulls_first: false,
+                },
+            )];
+            let keyed = eval_sort_keys(&cx, &chunks, &keys).unwrap();
+            assert!(encode_sort_keys(&chunks, &keyed, &keys).is_some());
+            let arena = flatten(&sort(&cx, &chunks, &keys).unwrap());
+            let legacy = flatten(&sort_legacy(&chunks, &keys, &keyed).unwrap());
+            assert_eq!(debug_rows(&arena), debug_rows(&legacy), "desc={desc}");
+            let top = flatten(&top_n(&cx, &chunks, &keys, 3).unwrap().unwrap());
+            assert_eq!(debug_rows(&top), debug_rows(&arena[..3]), "desc={desc}");
+        }
+        // Stable sort: equal keys keep insertion order (-0.0 before 0.0,
+        // NaN id 2 before NaN id 6); NULLs last both ways.
+        let ids = |sql: &str, db: &mut PinkDb| {
+            select(db, sql)
+                .into_iter()
+                .map(|r| r[0].clone())
+                .collect::<Vec<V>>()
+        };
+        let asc: Vec<V> = [7, 5, 8, 1, 4, 2, 6, 3].map(V::Integer).to_vec();
+        assert_eq!(ids("SELECT id FROM f ORDER BY d;", &mut db), asc);
+        let desc: Vec<V> = [2, 6, 4, 1, 5, 8, 7, 3].map(V::Integer).to_vec();
+        assert_eq!(ids("SELECT id FROM f ORDER BY d DESC;", &mut db), desc);
     }
 
-    /// End-to-end `LIMIT` over `ORDER BY` with a NaN key: top-N refuses the
-    /// byte encoding, so `eval`'s fallback full-sort branch runs on the
-    /// already-evaluated sort input and truncates to the same rows.
+    /// End-to-end `LIMIT` over `ORDER BY` with a NaN key: top-N encodes it
+    /// and returns the same rows as full-sort-then-truncate (NaN last ASC,
+    /// first DESC).
     #[test]
     fn order_nan_limit_end_to_end() {
         const N: usize = 100;
@@ -9930,14 +9934,18 @@ mod tests {
                 format!("({}.0, {i})", i % 13)
             }
         });
-        // 2 × 16 = 32 ≤ 100 → the top-N path is attempted and refuses.
-        let limited = select(&mut db, "SELECT d, id FROM f ORDER BY d LIMIT 2;");
-        let full = select(&mut db, "SELECT d, id FROM f ORDER BY d;");
-        assert_eq!(limited.len(), 2);
         // `Value::Double(NaN) != Value::Double(NaN)`, so compare Debug forms.
         let debug_rows =
             |rows: &[Vec<V>]| rows.iter().map(|r| format!("{r:?}")).collect::<Vec<_>>();
+        // 2 × 16 = 32 ≤ 100 → the top-N path runs.
+        let limited = select(&mut db, "SELECT d, id FROM f ORDER BY d LIMIT 2;");
+        let full = select(&mut db, "SELECT d, id FROM f ORDER BY d;");
+        assert_eq!(limited.len(), 2);
         assert_eq!(debug_rows(&limited), debug_rows(&full[..2]));
+        assert!(matches!(full[N - 1][0], V::Double(x) if x.is_nan()));
+        let top = select(&mut db, "SELECT d, id FROM f ORDER BY d DESC LIMIT 2;");
+        assert!(matches!(top[0][0], V::Double(x) if x.is_nan()));
+        assert_eq!(top[0][1], V::Integer(7));
     }
 
     /// Differential check: the byte-arena path must be byte-identical to the

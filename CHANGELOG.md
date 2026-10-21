@@ -9,6 +9,17 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Fix — DOUBLE NaN comparison semantics now match DuckDB ✅
+- `NaN = NaN` is true, NaN equals no other value and sorts above every other
+  double (`+inf` included), and `-0.0 = 0.0` — in filters, ORDER BY (NaN last
+  ascending, first descending), MIN/MAX (`max` over a column with a NaN is
+  NaN), range joins and window ordering. Scans used to treat NaN as equal to
+  every value (`WHERE d = 0.0` matched NaN rows), disagreeing with the hash
+  index; an index once again changes only the plan, never the result.
+- Parquet row-group pruning keeps a DOUBLE row group for `>`/`>=`/`= NaN`
+  (its statistics never cover NaN); ORDER BY over NaN keys now takes the fast
+  byte-key sort instead of falling back.
+
 ### Security hardening — pass 7 (final): terminal escaping, crypto/WAL/loader/FFI hardening ✅
 - A single terminal sanitizer now covers **every rendered identifier** (all
   result variants, column names, catalog/lake output, errors), closing ANSI/OSC

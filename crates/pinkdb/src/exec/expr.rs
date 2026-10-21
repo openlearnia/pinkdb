@@ -495,7 +495,7 @@ fn eval_comparison(
                         a,
                         s,
                         scalar_left,
-                        |x, y| x.partial_cmp(y).unwrap_or(Ordering::Equal),
+                        |x, y| crate::plan::num_cmp(*x, *y),
                         &mut out,
                     )?;
                     true
@@ -577,8 +577,8 @@ fn eval_comparison(
     let mut out = Vector::new_empty(DataType::Boolean);
     if l.dtype() == r.dtype() {
         // Same dtype ⇒ same layout; each arm mirrors `compare_values` for
-        // that type. DOUBLE keeps `num_cmp`: NaN compares Equal to
-        // everything (`partial_cmp(..).unwrap_or(Equal)`, NOT `total_cmp`).
+        // that type. DOUBLE uses `num_cmp` (DuckDB order: NaN == NaN, NaN
+        // above every other double, -0.0 == 0.0).
         match (l.data(), r.data()) {
             (VectorData::Boolean(a), VectorData::Boolean(b)) => {
                 cmp_loop(op, &l, &r, a, b, |x, y| x.cmp(y), &mut out)?;
@@ -596,7 +596,7 @@ fn eval_comparison(
                     &r,
                     a,
                     b,
-                    |x, y| x.partial_cmp(y).unwrap_or(Ordering::Equal),
+                    |x, y| crate::plan::num_cmp(*x, *y),
                     &mut out,
                 )?;
             }
@@ -2603,70 +2603,105 @@ mod tests {
 
     #[test]
     fn comparison_nan_matches_num_cmp() {
-        // plan::compare_values: NaN compares Equal to everything. Pin that
-        // reference behavior first, then the typed DOUBLE kernel.
-        assert_eq!(
-            compare_values(&V::Double(f64::NAN), &V::Double(1.0)),
-            Ordering::Equal
-        );
-        assert_eq!(
-            compare_values(&V::Double(1.0), &V::Double(f64::NAN)),
-            Ordering::Equal
-        );
+        // plan::compare_values: DuckDB order — NaN == NaN, NaN above every
+        // other double (+inf included), -0.0 == 0.0. Pin that reference
+        // behavior first, then the typed DOUBLE kernels.
+        let nan = f64::NAN;
+        let other_nan = f64::from_bits(0xfff8_0000_0000_0042); // negative NaN payload
+        for (a, b, want) in [
+            (nan, 1.0, Ordering::Greater),
+            (1.0, nan, Ordering::Less),
+            (nan, f64::INFINITY, Ordering::Greater),
+            (f64::NEG_INFINITY, nan, Ordering::Less),
+            (nan, nan, Ordering::Equal),
+            (nan, other_nan, Ordering::Equal),
+            (-0.0, 0.0, Ordering::Equal),
+            (1.0, 2.0, Ordering::Less),
+        ] {
+            assert_eq!(
+                compare_values(&V::Double(a), &V::Double(b)),
+                want,
+                "{a} vs {b}"
+            );
+        }
 
-        let mut l = Vector::new_empty(DataType::Double);
-        l.push_valid(V::Double(f64::NAN)).unwrap();
-        l.push_valid(V::Double(1.0)).unwrap();
-        l.push_null().unwrap();
-        l.push_valid(V::Double(2.0)).unwrap();
-        let mut r = Vector::new_empty(DataType::Double);
-        r.push_valid(V::Double(1.0)).unwrap();
-        r.push_valid(V::Double(f64::NAN)).unwrap();
-        r.push_valid(V::Double(5.0)).unwrap();
-        r.push_null().unwrap();
-        let chunk = DataChunk::new(vec![l, r]).unwrap();
+        // Rows: (NaN, 1), (1, NaN), (NULL, 5), (2, NULL), (NaN, NaN'),
+        // (-0.0, 0.0), (NaN, inf).
+        let lhs = [
+            Some(nan),
+            Some(1.0),
+            None,
+            Some(2.0),
+            Some(nan),
+            Some(-0.0),
+            Some(nan),
+        ];
+        let rhs = [
+            Some(1.0),
+            Some(nan),
+            Some(5.0),
+            None,
+            Some(other_nan),
+            Some(0.0),
+            Some(f64::INFINITY),
+        ];
+        let mk = |vals: &[Option<f64>]| {
+            let mut v = Vector::new_empty(DataType::Double);
+            for x in vals {
+                match x {
+                    Some(x) => v.push_valid(V::Double(*x)).unwrap(),
+                    None => v.push_null().unwrap(),
+                }
+            }
+            v
+        };
+        let chunk = DataChunk::new(vec![mk(&lhs), mk(&rhs)]).unwrap();
         let db = PinkDb::new();
         let cx = test_cx(&db);
-        let cmp = |op: BinaryOp| {
+        let col = |index: usize| B::Column {
+            index,
+            dtype: DataType::Double,
+        };
+        let eval = |op: BinaryOp, left: B, right: B| {
             let e = B::Binary {
                 op,
-                left: Box::new(B::Column {
-                    index: 0,
-                    dtype: DataType::Double,
-                }),
-                right: Box::new(B::Column {
-                    index: 1,
-                    dtype: DataType::Double,
-                }),
+                left: Box::new(left),
+                right: Box::new(right),
                 dtype: DataType::Boolean,
             };
             eval_expr(&e, &chunk, &cx).unwrap()
         };
+        // One char per row: T(rue) / F(alse) / N(ULL).
+        let tfn = |v: &Vector| {
+            (0..v.len())
+                .map(|i| match v.get(i) {
+                    V::Boolean(true) => 'T',
+                    V::Boolean(false) => 'F',
+                    _ => 'N',
+                })
+                .collect::<String>()
+        };
+        // Vector-vs-vector kernel.
+        for (op, want) in [
+            (BinaryOp::Eq, "FFNNTTF"),
+            (BinaryOp::NotEq, "TTNNFFT"),
+            (BinaryOp::Lt, "FTNNFFF"),
+            (BinaryOp::LtEq, "FTNNTTF"),
+            (BinaryOp::Gt, "TFNNFFT"),
+            (BinaryOp::GtEq, "TFNNTTT"),
+        ] {
+            assert_eq!(tfn(&eval(op, col(0), col(1))), want, "{op:?}");
+        }
 
-        // Row 0: NaN vs 1.0 ⇒ Equal; row 1: 1.0 vs NaN ⇒ Equal.
-        let eq = cmp(BinaryOp::Eq);
-        assert_eq!((eq.get(0), eq.get(1)), (V::Boolean(true), V::Boolean(true)));
-        let ne = cmp(BinaryOp::NotEq);
+        // Column-vs-literal kernel, literal on either side: `d = NaN`
+        // matches only the NaN rows; `inf < d` only NaN; `-0.0 = 0.0`.
+        let lit = |x: f64| B::Literal(V::Double(x));
+        assert_eq!(tfn(&eval(BinaryOp::Eq, col(0), lit(other_nan))), "TFNFTFT");
         assert_eq!(
-            (ne.get(0), ne.get(1)),
-            (V::Boolean(false), V::Boolean(false))
+            tfn(&eval(BinaryOp::Lt, lit(f64::INFINITY), col(0))),
+            "TFNFTFT"
         );
-        let lt = cmp(BinaryOp::Lt);
-        assert_eq!(
-            (lt.get(0), lt.get(1)),
-            (V::Boolean(false), V::Boolean(false))
-        );
-        let gt = cmp(BinaryOp::Gt);
-        assert_eq!(
-            (gt.get(0), gt.get(1)),
-            (V::Boolean(false), V::Boolean(false))
-        );
-        let le = cmp(BinaryOp::LtEq);
-        assert_eq!((le.get(0), le.get(1)), (V::Boolean(true), V::Boolean(true)));
-        let ge = cmp(BinaryOp::GtEq);
-        assert_eq!((ge.get(0), ge.get(1)), (V::Boolean(true), V::Boolean(true)));
-        // NULL on either side ⇒ NULL.
-        assert_eq!((eq.get(2), eq.get(3)), (V::Null, V::Null));
+        assert_eq!(tfn(&eval(BinaryOp::Eq, col(1), lit(-0.0))), "FFFNFTF");
     }
 
     #[test]

@@ -572,11 +572,10 @@ STRING_EXT_QUERIES = [
     # ±infinity is compared through predicates: the harness treats float(x - x)
     # as unordered, exactly like NaN, so a raw `inf` cell could not pass.
     ("math-infinities", "SELECT exp(1000.0) > 1e308, exp(-1000.0) = 0.0, ln(0.0) < -1e308, log(0.0) < -1e308, log(2.0, 0.0) < -1e308, cot(0.0) > 1e308;", False, False),
-    # NaN values are probed through ordered comparisons only: pinkdb's float
-    # comparison maps an unordered pair to *equal* (a pre-existing divergence
-    # from DuckDB's NaN = NaN, out of this wave's scope), so `NaN = 0` would
-    # differ while `NaN < 0` agrees (false both sides).
-    ("math-nan-predicates", "SELECT ln(-1.0) < 0.0, sqrt(-1.0) < 0.0, asin(2.0) < 0.0, acos(2.0) < 0.0, log(-1.0) < 0.0, tan(pi() / 2.0) > 1e15;", False, False),
+    # NaN values are probed through predicates (the harness cannot compare a
+    # raw NaN cell): NaN sorts above every double, so `NaN < 0` is false and
+    # `NaN > 1e308` true on both sides (see the NaN battery below).
+    ("math-nan-predicates", "SELECT ln(-1.0) < 0.0, sqrt(-1.0) < 0.0, asin(2.0) < 0.0, acos(2.0) < 0.0, log(-1.0) < 0.0, ln(-1.0) > 1e308, sqrt(-1.0) = 0.0, tan(pi() / 2.0) > 1e15;", False, False),
     ("math-trig", "SELECT sin(0.0), cos(0.0), tan(0.0), sin(pi() / 2.0), cos(pi()), sin(pi() / 6.0), tan(pi() / 4.0);", False, False),
     ("math-trig-inverses", "SELECT asin(1.0), acos(1.0), acos(0.0), atan(1.0), atan2(0.0, 0.0), atan2(1.0, 0.0), atan2(0.0, -1.0), atan2(-1.0, 0.0);", False, False),
     ("math-cot", "SELECT cot(1.0), cot(pi() / 4.0), cot(pi() / 2.0), cot(0.0) > 1e308;", False, False),
@@ -596,6 +595,43 @@ STRING_EXT_QUERIES = [
     ("math-random-shape", "SELECT random() >= 0.0 AND random() < 1.0;", False, False),
     ("math-log-arity", "SELECT log();", False, True),
     ("math-log-too-many", "SELECT log(1.0, 2.0, 3.0);", False, True),
+]
+
+
+# ---- DOUBLE NaN / signed-zero semantics ----
+#
+# DuckDB's total order on DOUBLE: NaN = NaN (every payload), NaN equals no
+# other value and sorts above every other double (+inf included), and
+# -0.0 = 0.0. The table holds two NaN payloads and both zeros; probes return
+# ids, counts and booleans because the harness treats a NaN cell as unordered.
+NAN_SETUP = """
+CREATE TABLE fz (id INTEGER, d DOUBLE);
+INSERT INTO fz VALUES (1, CAST('-0.0' AS DOUBLE)), (2, 0.0), (3, CAST('NaN' AS DOUBLE)), (4, 1.5),
+ (5, -CAST('NaN' AS DOUBLE)), (6, NULL), (7, CAST('inf' AS DOUBLE)), (8, CAST('-inf' AS DOUBLE)), (9, CAST('NaN' AS DOUBLE));
+"""
+
+NAN_QUERIES = [
+    ("nan-eq-zero", "SELECT count(*) FROM fz WHERE d = 0.0;", False, False),
+    ("nan-eq-neg-zero", "SELECT id FROM fz WHERE d = CAST('-0.0' AS DOUBLE) ORDER BY id;", True, False),
+    ("nan-eq-nan", "SELECT id FROM fz WHERE d = CAST('NaN' AS DOUBLE) ORDER BY id;", True, False),
+    ("nan-ne-nan", "SELECT id FROM fz WHERE d <> CAST('NaN' AS DOUBLE) ORDER BY id;", True, False),
+    ("nan-gt-inf", "SELECT id FROM fz WHERE d > CAST('inf' AS DOUBLE) ORDER BY id;", True, False),
+    ("nan-lt-nan", "SELECT id FROM fz WHERE d < CAST('NaN' AS DOUBLE) ORDER BY id;", True, False),
+    ("nan-ge-range", "SELECT id FROM fz WHERE d >= 1.0 ORDER BY id;", True, False),
+    ("nan-between", "SELECT id FROM fz WHERE d BETWEEN 0.0 AND CAST('inf' AS DOUBLE) ORDER BY id;", True, False),
+    ("nan-in-list", "SELECT id FROM fz WHERE d IN (1.5, CAST('NaN' AS DOUBLE)) ORDER BY id;", True, False),
+    ("nan-scalar", "SELECT CAST('NaN' AS DOUBLE) = CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE) > CAST('inf' AS DOUBLE), 1 < CAST('NaN' AS DOUBLE), CAST('NaN' AS DOUBLE) <> CAST('NaN' AS DOUBLE), CAST('-0.0' AS DOUBLE) = 0.0, CAST('NaN' AS DOUBLE) > CAST(5 AS DECIMAL(4,1));", False, False),
+    ("nan-order-asc", "SELECT id FROM fz ORDER BY d, id;", True, False),
+    ("nan-order-desc", "SELECT id FROM fz ORDER BY d DESC, id;", True, False),
+    ("nan-order-limit", "SELECT id FROM fz ORDER BY d DESC NULLS LAST, id LIMIT 3;", True, False),
+    ("nan-min-max", "SELECT min(d) = CAST('-inf' AS DOUBLE), max(d) = CAST('NaN' AS DOUBLE), max(d) > CAST('inf' AS DOUBLE) FROM fz;", False, False),
+    ("nan-min-max-no-inf", "SELECT max(d) = CAST('NaN' AS DOUBLE), min(d) FROM fz WHERE id IN (3, 4, 5);", False, False),
+    ("nan-group-by", "SELECT min(id), count(*) FROM fz GROUP BY d ORDER BY 1;", True, False),
+    ("nan-distinct", "SELECT count(DISTINCT d) FROM fz;", False, False),
+    ("nan-join-eq", "SELECT a.id AS l, b.id AS r FROM fz a JOIN fz b ON a.d = b.d ORDER BY l, r;", True, False),
+    ("nan-join-lt", "SELECT count(*) FROM fz a JOIN fz b ON a.d < b.d;", False, False),
+    ("nan-join-ge", "SELECT count(*) FROM fz a JOIN fz b ON a.d >= b.d;", False, False),
+    ("nan-window-rank", "SELECT id, rank() OVER (ORDER BY d) FROM fz ORDER BY id;", True, False),
 ]
 
 
@@ -644,6 +680,9 @@ def run_small():
         run_case(label, sql, ordered, expect_error, SETUP)
     for label, sql, ordered, expect_error in STRING_EXT_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + STRING_EXT_SETUP)
+    for label, sql, ordered, expect_error in NAN_QUERIES:
+        run_case(label, sql, ordered, expect_error, SETUP + "\n" + NAN_SETUP,
+                 SETUP + "\n" + NAN_SETUP)
     run_arrow()
     run_parquet()
 
@@ -818,10 +857,12 @@ def run_pair(label, psql, dsql, shared_setup_and_psetup, ordered):
     check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
 
 
-def run_case(label, sql, ordered, expect_error, setup):
+def run_case(label, sql, ordered, expect_error, setup, duck_setup=SETUP):
+    """`setup` is pinkdb's; DuckDB runs `duck_setup` (the shared SETUP unless
+    the battery's extra tables are plain SQL both engines accept)."""
     got = pink_query(setup, sql)
     if expect_error:
-        d = duck_query(SETUP, sql)
+        d = duck_query(duck_setup, sql)
         check(label, got[0] == "error" and d[0] == "error",
               f"pink={got[0]} duck={d[0]}")
         return
@@ -829,7 +870,7 @@ def run_case(label, sql, ordered, expect_error, setup):
         check(label, False, f"pinkdb error: {got[1]}")
         return
     _, types, prows = got
-    d = duck_query(SETUP, sql)
+    d = duck_query(duck_setup, sql)
     if d[0] == "error":
         check(label, False, f"duckdb error: {d[1]}")
         return

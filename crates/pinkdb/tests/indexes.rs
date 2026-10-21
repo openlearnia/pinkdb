@@ -208,6 +208,64 @@ fn probe_key_matches_double_column_with_integer_literal() {
     assert!(explain(&mut db, query).contains("IndexScan"));
 }
 
+/// DOUBLE equality follows DuckDB (NaN = NaN, NaN equals no other value,
+/// `-0.0 = 0.0`) on the scan *and* through the hash index, so the index
+/// cannot change the result even over NaN payloads and signed zeros. The
+/// scan used to treat NaN as equal to everything (`d = 0.0` matched it).
+#[test]
+fn double_nan_and_signed_zero_index_scan_matches_the_scan() {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (id INTEGER, d DOUBLE);")
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, '-0.0'::DOUBLE), (2, 0.0), (3, 'NaN'::DOUBLE), (4, 1.5), \
+         (5, 0.0 / 0.0), (6, -('NaN'::DOUBLE)), (7, NULL), (8, 'inf'::DOUBLE), (9, '-inf'::DOUBLE);",
+    )
+    .unwrap();
+
+    let ids = |db: &mut PinkDb, literal: &str| {
+        rows(
+            db,
+            &format!("SELECT id FROM t WHERE d = {literal} ORDER BY id;"),
+        )
+    };
+    let cases = [
+        ("0.0", int_rows(&[1, 2])),
+        ("'-0.0'::DOUBLE", int_rows(&[1, 2])),
+        ("0", int_rows(&[1, 2])),
+        ("'NaN'::DOUBLE", int_rows(&[3, 5, 6])),
+        ("-('NaN'::DOUBLE)", int_rows(&[3, 5, 6])),
+        ("1.5", int_rows(&[4])),
+        ("'inf'::DOUBLE", int_rows(&[8])),
+        ("'-inf'::DOUBLE", int_rows(&[9])),
+        ("2.0", int_rows(&[])),
+    ];
+    let scanned: Vec<_> = cases.iter().map(|(lit, _)| ids(&mut db, lit)).collect();
+    for ((lit, want), got) in cases.iter().zip(&scanned) {
+        assert_eq!(got, want, "scan: d = {lit}");
+    }
+    assert_eq!(
+        rows(&mut db, "SELECT count(*) FROM t WHERE d = 0.0;"),
+        vec![vec![Value::Bigint(2)]],
+        "the reported repro"
+    );
+
+    db.execute("CREATE INDEX ix ON t(d);").unwrap();
+    for ((lit, _), want) in cases.iter().zip(&scanned) {
+        let query = format!("SELECT id FROM t WHERE d = {lit} ORDER BY id;");
+        let plan = explain(&mut db, query.trim_end_matches(';'));
+        assert!(
+            plan.contains("IndexScan"),
+            "no IndexScan for d = {lit}:\n{plan}"
+        );
+        assert_eq!(&ids(&mut db, lit), want, "IndexScan: d = {lit}");
+    }
+    assert_eq!(
+        rows(&mut db, "SELECT count(*) FROM t WHERE d = 0.0;"),
+        vec![vec![Value::Bigint(2)]]
+    );
+}
+
 #[test]
 fn probe_key_matches_decimal_column_with_integer_and_other_scales() {
     let mut db = PinkDb::new();

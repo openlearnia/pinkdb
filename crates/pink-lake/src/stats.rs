@@ -28,8 +28,9 @@
 //! [`serve_column_stats`] is the single place a raw proven statistic becomes
 //! an attachable [`ColumnStats`], used by both this block and the Vortex
 //! footer path (`vortex_file::column_stats`): a DOUBLE min/max needs an exact
-//! `NaNCount == 0` (the engine's comparator treats NaN as equal to
-//! everything and keeps the first-seen value) and a nonzero value
+//! `NaNCount == 0` (the engine's comparator sorts NaN above every other
+//! double, and a min/max statistic excludes NaN, so it bounds neither `MAX`
+//! nor a `>`/`= NaN` zone-map test) and a nonzero value
 //! (`-0.0 == 0.0` in the same comparator, so the sign of a first-seen zero is
 //! not recoverable); everything else passes through exactly as proven.
 //!
