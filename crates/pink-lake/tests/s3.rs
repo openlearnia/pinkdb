@@ -92,7 +92,7 @@ fn full_cycle_create_save_open_versions_tables() {
     // create → v1, snapshots/1.json + catalog.json at the lake prefix.
     let mut lake = Lake::create_s3(mock_config(&mock, "test-bucket", "lakes/mine")).unwrap();
     assert_eq!(lake.current_version(), 1);
-    assert_eq!(lake.format_version(), 5);
+    assert_eq!(lake.format_version(), 6);
     assert_eq!(lake.versions().unwrap(), vec![1]);
     assert_eq!(lake.path().to_str().unwrap(), "s3://test-bucket/lakes/mine");
     let keys = mock.keys();
@@ -126,7 +126,7 @@ fn full_cycle_create_save_open_versions_tables() {
         "catalog.json must be byte-identical to its snapshot"
     );
     assert!(
-        catalog.starts_with(b"{\n  \"format_version\": 5"),
+        catalog.starts_with(b"{\n  \"format_version\": 6"),
         "{}",
         String::from_utf8_lossy(&catalog)
     );
@@ -297,30 +297,24 @@ fn resaving_a_published_snapshot_is_refused() {
     lake.write_from_store(&db).unwrap(); // v2
     let v2_catalog = mock.object("lake/catalog.json").unwrap();
     lake.write_from_store(&db).unwrap(); // v3
+    let v3_snapshot = mock.object("lake/snapshots/3.json").unwrap();
 
-    // "Roll back": restore the v2 catalog; the save that would land on the
-    // existing v3 snapshot must refuse (create-only via If-None-Match: *),
-    // never replace it.
+    // M-7: "roll back" by restoring the v2 catalog is refused at open,
+    // because the authenticated highest.json records version 3. Nothing is
+    // rewritten.
     mock.put_object("lake/catalog.json", &v2_catalog);
-    let mut lake = Lake::open_s3(mock_config(&mock, bucket, "lake")).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    assert_eq!(lake.current_version(), 2);
-    let err = lake.write_from_store(&db).unwrap_err();
-    assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
+    let err = Lake::open_s3(mock_config(&mock, bucket, "lake")).unwrap_err();
+    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
     let msg = err.to_string();
-    assert!(msg.contains("snapshot 3 already exists"), "{msg}");
-    assert!(
-        msg.contains("refusing to replace a published version"),
-        "{msg}"
-    );
+    assert!(msg.contains("rollback detected"), "{msg}");
+    assert!(msg.contains("highest.json records version 3"), "{msg}");
     assert_eq!(
         mock.object("lake/catalog.json").unwrap(),
         v2_catalog,
-        "the rolled-back-to catalog is untouched"
+        "the rolled-back catalog is left untouched"
     );
-    // Both the rolled-back version and the orphaned snapshot stay loadable.
-    assert!(lake.load(None).is_ok());
-    assert!(lake.load(Some(3)).is_ok());
+    // The published v3 snapshot is never replaced.
+    assert_eq!(mock.object("lake/snapshots/3.json").unwrap(), v3_snapshot);
 }
 
 #[test]
@@ -1091,7 +1085,7 @@ fn v1_pink_data_files_load_over_s3() {
     // A v1 lake still migrates on the next save (a full Vortex rewrite).
     let mut lake = lake;
     assert_eq!(lake.write_from_store(&loaded).unwrap(), 2);
-    assert_eq!(lake.format_version(), 5);
+    assert_eq!(lake.format_version(), 6);
     assert!(
         mock.keys()
             .iter()

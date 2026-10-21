@@ -152,6 +152,9 @@ pub struct AsyncServer {
     exec_limits: ExecLimits,
     login_gate: Arc<LoginGate>,
     login_ips: Arc<LoginIpLimiter>,
+    /// M-3: whether `COPY … TO` is opted in and the root it is confined to.
+    copy_to_allowed: bool,
+    copy_root: Option<std::path::PathBuf>,
 }
 
 impl AsyncServer {
@@ -178,6 +181,7 @@ impl AsyncServer {
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         db.set_allow_sql_load_extension(false);
+        db.set_copy_to_policy(pinkdb::CopyToPolicy::Disabled);
         Ok(AsyncServer {
             listener,
             local_addr,
@@ -193,6 +197,8 @@ impl AsyncServer {
             },
             login_gate: Arc::new(LoginGate::new(DEFAULT_MAX_CONCURRENT_LOGINS)),
             login_ips: Arc::new(LoginIpLimiter::new()),
+            copy_to_allowed: false,
+            copy_root: None,
         })
     }
 
@@ -214,6 +220,35 @@ impl AsyncServer {
     pub fn extension_root(self, root: Option<std::path::PathBuf>) -> Self {
         self.db.set_extension_root(root);
         self
+    }
+
+    /// Let remote clients run `COPY … TO` (default: refused), confined to
+    /// [`AsyncServer::copy_root`]. Same semantics as the blocking server:
+    /// ADMIN is also required, destinations are written atomically with mode
+    /// 0600, and opting in without a root refuses every `COPY TO`.
+    pub fn allow_copy_to(self, allow: bool) -> Self {
+        let mut server = self;
+        server.copy_to_allowed = allow;
+        server.apply_copy_policy();
+        server
+    }
+
+    /// Confine every `COPY … TO` destination to `root` (see
+    /// [`Server::copy_root`](crate::Server::copy_root)).
+    pub fn copy_root(self, root: Option<std::path::PathBuf>) -> Self {
+        let mut server = self;
+        server.copy_root = root;
+        server.apply_copy_policy();
+        server
+    }
+
+    fn apply_copy_policy(&self) {
+        let policy = match (&self.copy_root, self.copy_to_allowed) {
+            (Some(root), true) => pinkdb::CopyToPolicy::Confined(root.clone()),
+            (None, true) => pinkdb::CopyToPolicy::RootRequired,
+            _ => pinkdb::CopyToPolicy::Disabled,
+        };
+        self.db.set_copy_to_policy(policy);
     }
 
     /// Per-socket idle timeout for reads and writes (`None` = wait forever).

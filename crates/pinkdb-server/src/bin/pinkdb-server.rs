@@ -7,6 +7,7 @@
 //!               [--max-result-bytes N] [--max-concurrent-logins N]
 //!               [--transport sync|async] [--allow-load-extension]
 //!               [--extension-root PATH]
+//!               [--allow-copy-to --copy-root PATH]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
 //!               [--enable-ui --ui-host HOST --ui-port PORT]  (built with `ui`)
 //! ```
@@ -90,6 +91,12 @@ struct Args {
     /// `--extension-root PATH`: the directory every extension load is
     /// confined to.
     extension_root: Option<String>,
+    /// `--allow-copy-to`: let clients run COPY … TO (off by default; ADMIN is
+    /// still required in an authenticated session).
+    allow_copy_to: bool,
+    /// `--copy-root PATH`: the directory every COPY … TO destination is
+    /// confined to. Opting in without it refuses every COPY.
+    copy_root: Option<String>,
     /// `--tls-cert PATH`: must be paired with `--tls-key`.
     tls_cert: Option<String>,
     /// `--tls-key PATH`: must be paired with `--tls-cert`.
@@ -128,6 +135,7 @@ fn usage() -> &'static str {
      \x20                    [--max-result-bytes N] [--max-concurrent-logins N]\n\
      \x20                    [--transport sync|async] [--allow-load-extension]\n\
      \x20                    [--extension-root PATH]\n\
+     \x20                    [--allow-copy-to --copy-root PATH]\n\
      \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
@@ -154,6 +162,11 @@ fn usage() -> &'static str {
      \x20 --extension-root PATH  confine every extension load to this directory (a path\n\
      \x20                        outside it is refused; a bare library name, a `..`\n\
      \x20                        component and a symlinked library are always refused)\n\
+     \x20 --allow-copy-to        let clients run COPY TO (writes files on the server\n\
+     \x20                        host; off by default; ADMIN is also required)\n\
+     \x20 --copy-root PATH       confine every COPY TO destination to this directory\n\
+     \x20                        (required with --allow-copy-to; `..`, absolute\n\
+     \x20                        escapes and symlinked parents/targets are refused)\n\
      \x20 --tls-cert PATH        serve TLS with this PEM certificate chain (sync only)\n\
      \x20 --tls-key PATH         PEM private key matching --tls-cert (PKCS#8/#1/SEC1);\n\
      \x20                        both or neither, only in a build with `tls`, and\n\
@@ -203,6 +216,8 @@ fn parse_args() -> Result<Args, String> {
         transport: Transport::Sync,
         allow_load_extension: false,
         extension_root: None,
+        allow_copy_to: false,
+        copy_root: None,
         tls_cert: None,
         tls_key: None,
         #[cfg(feature = "ui")]
@@ -312,6 +327,8 @@ fn parse_args() -> Result<Args, String> {
             }
             "--allow-load-extension" if inline.is_none() => args.allow_load_extension = true,
             "--extension-root" => args.extension_root = Some(value("--extension-root")?),
+            "--allow-copy-to" if inline.is_none() => args.allow_copy_to = true,
+            "--copy-root" => args.copy_root = Some(value("--copy-root")?),
             "--tls-cert" => args.tls_cert = Some(value("--tls-cert")?),
             "--tls-key" => args.tls_key = Some(value("--tls-key")?),
             "--enable-ui" => {
@@ -461,6 +478,16 @@ fn parse_args() -> Result<Args, String> {
             "--tls-cert and --tls-key must be given together (both or neither)".to_string(),
         );
     }
+    // M-3: opting in without a root would leave the destination policy at
+    // "root required" (every COPY refused). Refuse the unusable startup
+    // instead of silently accepting a flag that can never take effect.
+    if args.allow_copy_to && args.copy_root.is_none() {
+        return Err(
+            "--allow-copy-to requires --copy-root PATH (COPY TO is confined to a directory; \
+             there is no unrestricted server mode)"
+                .to_string(),
+        );
+    }
     Ok(args)
 }
 
@@ -500,6 +527,19 @@ fn main() -> ExitCode {
                     "Error: --extension-root {:?} is not a directory",
                     root.display()
                 );
+                return ExitCode::from(2);
+            }
+            Some(root)
+        }
+        None => None,
+    };
+
+    // COPY TO destination root (M-3): validated before anything binds.
+    let copy_root: Option<std::path::PathBuf> = match &args.copy_root {
+        Some(root) => {
+            let root = std::path::PathBuf::from(root);
+            if !root.is_dir() {
+                eprintln!("Error: --copy-root {:?} is not a directory", root.display());
                 return ExitCode::from(2);
             }
             Some(root)
@@ -590,7 +630,9 @@ fn main() -> ExitCode {
                     .max_result_bytes(args.max_result_bytes)
                     .max_concurrent_logins(args.max_concurrent_logins)
                     .allow_load_extension(args.allow_load_extension)
-                    .extension_root(extension_root.clone()),
+                    .extension_root(extension_root.clone())
+                    .allow_copy_to(args.allow_copy_to)
+                    .copy_root(copy_root.clone()),
                 Err(e) => {
                     eprintln!("Error: cannot bind {}:{}: {e}", args.host, args.port);
                     return ExitCode::FAILURE;
@@ -627,7 +669,9 @@ fn main() -> ExitCode {
                     .max_result_bytes(args.max_result_bytes)
                     .max_concurrent_logins(args.max_concurrent_logins)
                     .allow_load_extension(args.allow_load_extension)
-                    .extension_root(extension_root.clone()),
+                    .extension_root(extension_root.clone())
+                    .allow_copy_to(args.allow_copy_to)
+                    .copy_root(copy_root.clone()),
                 Err(e) => {
                     eprintln!("Error: cannot bind {}:{}: {e}", args.host, args.port);
                     return ExitCode::FAILURE;

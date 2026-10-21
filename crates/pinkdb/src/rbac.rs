@@ -1252,6 +1252,28 @@ pub(crate) fn check_statement(
     if rbac.is_admin_resolved(principal) {
         return Ok(());
     }
+    // M-4: a table-function scan (`read_parquet`, `read_arrow`, the
+    // replacement scan `FROM 'file.parquet'`) reads external files with a
+    // client-controlled path. It has no catalog object to grant on, so it is
+    // ADMIN-only in an authenticated session. The walk covers the whole
+    // statement — CTEs, subqueries, `UNION` arms, materialized-view
+    // definitions and `EXPLAIN` — not just the top node. A plain view's
+    // defining query is unbound until the view is read, and the expanded
+    // plan is checked then.
+
+    if crate::plan::contains_table_function(plan) {
+        let admin_only = |what: &str| -> Result<()> {
+            Err(denied(
+                principal,
+                "the ADMIN privilege",
+                &format!(
+                    "GRANT ADMIN TO {} (this statement is: {what})",
+                    rbac.display_of(principal)
+                ),
+            ))
+        };
+        return admin_only("a file/table-function scan");
+    }
     // 1. Statement-kind privileges.
     let create_on_db = |db: String| -> Result<()> {
         if rbac.allowed(
@@ -1293,6 +1315,12 @@ pub(crate) fn check_statement(
         }
         LogicalPlan::Checkpoint => return admin_only("CHECKPOINT"),
         LogicalPlan::LoadExtension { .. } => return admin_only("LOAD EXTENSION"),
+        // M-3: writing a file on the server host is never implied by SELECT.
+        // A dedicated filesystem-write privilege would need a new grant
+        // keyword and `.pink`/WAL persistence surface, so this pass reuses
+        // ADMIN. The server's own `--allow-copy-to/--copy-root` opt-in is a
+        // second, independent gate.
+        LogicalPlan::CopyTo { .. } => return admin_only("COPY TO"),
         // A procedure body binds only when it runs (its statements may read
         // or write anything the definer can reach), so running one requires
         // ADMIN. Defining one only needs CREATE on the database.

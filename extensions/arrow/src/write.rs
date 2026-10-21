@@ -5,7 +5,6 @@
 //! operation: the file is created first, so a type the format cannot express
 //! fails at the schema step before any byte reaches the target.
 
-use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
@@ -31,24 +30,27 @@ pub fn write(path: &Path, table: &DataTable) -> Result<()> {
         .map(|(name, dtype)| arrow_field(&name, dtype))
         .collect::<Result<_>>()?;
     let schema = Schema::new(fields);
-    let file = File::create(path).map_err(|e| {
-        PinkDbError::Execution(format!("cannot create \"{}\": {e}", path.display()))
-    })?;
-    let mut writer = FileWriter::try_new_buffered(BufWriter::new(file), &schema)
-        .map_err(|e| PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display())))?;
-    for i in 0..table.num_chunks() {
-        let Some(chunk) = table.scan_chunk(i) else {
-            continue;
-        };
-        let batch = build_batch(&schema, &chunk)?;
-        writer.write(&batch).map_err(|e| {
-            PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
-        })?;
-    }
-    writer.finish().map_err(|e| {
-        PinkDbError::Execution(format!("cannot finish \"{}\": {e}", path.display()))
-    })?;
-    Ok(())
+    // M-3: never `File::create` at the client-named path. The shared helper
+    // writes a `create_new` temp sibling (0600), refuses a symlinked target,
+    // and atomically renames it into place.
+    pinkdb::write_atomic_private(path, |file| {
+        let mut writer =
+            FileWriter::try_new_buffered(BufWriter::new(file), &schema).map_err(|e| {
+                PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
+            })?;
+        for i in 0..table.num_chunks() {
+            let Some(chunk) = table.scan_chunk(i) else {
+                continue;
+            };
+            let batch = build_batch(&schema, &chunk)?;
+            writer.write(&batch).map_err(|e| {
+                PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
+            })?;
+        }
+        writer.finish().map_err(|e| {
+            PinkDbError::Execution(format!("cannot finish \"{}\": {e}", path.display()))
+        })
+    })
 }
 
 /// One engine chunk as one record batch (columns in schema order).

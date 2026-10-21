@@ -561,7 +561,14 @@ fn create_adoption_republishes_the_stored_ciphertext() {
     )
     .unwrap();
     let err = Lake::create_with_key(&lake_dir, key()).unwrap_err();
-    assert!(matches!(err, LakeError::Conflict { .. }), "{err:?}");
+    // M-7: the snapshot container is bound to (lake, version), so copying a
+    // version-2 container over snapshots/1.json fails authentication before
+    // the empty-snapshot shape check; either refusal is clean, never an
+    // adoption of the wrong version.
+    assert!(
+        matches!(err, LakeError::Conflict { .. } | LakeError::Tampered { .. }),
+        "{err:?}"
+    );
     cleanup(&dir);
 }
 
@@ -926,4 +933,104 @@ fn data_files(dir: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+/// M-7: two lakes under the same key have distinct identities, and copying
+/// one lake's manifest over another's is refused (the container is bound to
+/// `(lake_id, version)`).
+#[test]
+fn cross_lake_catalog_and_snapshot_substitution_is_refused() {
+    let dir = scratch("identity_swap");
+    let a = dir.join("a");
+    let b = dir.join("b");
+    let db = fixture_store();
+    let mut lake_a = Lake::create_with_key(&a, key()).unwrap();
+    lake_a.write_from_store(&db).unwrap(); // v2
+    let mut lake_b = Lake::create_with_key(&b, key()).unwrap();
+    lake_b.write_from_store(&db).unwrap(); // v2
+    assert_ne!(
+        Lake::open_with_key(&a, key()).unwrap().lake_id(),
+        Lake::open_with_key(&b, key()).unwrap().lake_id(),
+        "each lake must have its own identity"
+    );
+
+    std::fs::copy(b.join("catalog.json"), a.join("catalog.json")).unwrap();
+    let err = Lake::open_with_key(&a, key()).unwrap_err();
+    assert!(
+        matches!(err, LakeError::Tampered { .. } | LakeError::Corrupt { .. }),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("lake") || err.to_string().contains("bound"),
+        "{err}"
+    );
+
+    // Restore A's catalog, then substitute only a same-version snapshot from
+    // B: the snapshot binding names B's identity, so the open refuses.
+    let good = std::fs::read(a.join("snapshots/2.json")).unwrap();
+    std::fs::write(a.join("catalog.json"), &good).unwrap();
+    Lake::open_with_key(&a, key()).unwrap();
+    std::fs::copy(b.join("snapshots/2.json"), a.join("snapshots/2.json")).unwrap();
+    let err = Lake::open_with_key(&a, key()).unwrap_err();
+    assert!(
+        matches!(err, LakeError::Tampered { .. } | LakeError::Corrupt { .. }),
+        "{err:?}"
+    );
+    cleanup(&dir);
+}
+
+/// M-7: a catalog below the authenticated highest version is a rollback and
+/// is refused at open.
+#[test]
+fn catalog_rollback_below_highest_is_refused() {
+    let dir = scratch("rollback");
+    let lake_dir = dir.join("lake");
+    let db = fixture_store();
+    let mut lake = Lake::create_with_key(&lake_dir, key()).unwrap();
+    lake.write_from_store(&db).unwrap(); // v2
+    let v2_catalog = std::fs::read(lake_dir.join("catalog.json")).unwrap();
+    lake.write_from_store(&db).unwrap(); // v3
+
+    std::fs::write(lake_dir.join("catalog.json"), &v2_catalog).unwrap();
+    let err = Lake::open_with_key(&lake_dir, key()).unwrap_err();
+    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
+    assert!(err.to_string().contains("rollback detected"), "{err}");
+
+    // A catalog *version vs snapshot version* mismatch is also refused: the
+    // v2 snapshot container is bound to version 2, not to the name it was
+    // copied over.
+    let v3_catalog = std::fs::read(lake_dir.join("snapshots/3.json")).unwrap();
+    std::fs::write(lake_dir.join("catalog.json"), &v3_catalog).unwrap();
+    std::fs::copy(
+        lake_dir.join("snapshots/2.json"),
+        lake_dir.join("snapshots/3.json"),
+    )
+    .unwrap();
+    let err = Lake::open_with_key(&lake_dir, key()).unwrap_err();
+    assert!(
+        matches!(err, LakeError::Tampered { .. } | LakeError::Corrupt { .. }),
+        "{err:?}"
+    );
+    cleanup(&dir);
+}
+
+/// M-7 legacy policy: a keyed lake without `lake.json` cannot be authenticated
+/// and is refused with an actionable message rather than silently accepted.
+#[test]
+fn keyed_lake_without_identity_is_refused() {
+    let dir = scratch("no_identity");
+    let lake_dir = dir.join("lake");
+    let db = fixture_store();
+    save_store_with_key(&db, &lake_dir, key()).unwrap();
+    std::fs::remove_file(lake_dir.join("lake.json")).unwrap();
+    let err = Lake::open_with_key(&lake_dir, key()).unwrap_err();
+    assert!(
+        matches!(err, LakeError::Corrupt { .. } | LakeError::Tampered { .. }),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string().contains("identity") || err.to_string().contains("lake.json"),
+        "{err}"
+    );
+    cleanup(&dir);
 }

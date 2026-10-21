@@ -193,7 +193,7 @@ fn v2_fixture_lake_still_loads() {
     copy_dir(&fixture, &copy);
     let mut lake = Lake::open(&copy).unwrap();
     lake.write_from_store(&loaded).unwrap();
-    assert_eq!(lake.format_version(), 5);
+    assert_eq!(lake.format_version(), 6);
     assert_same_store(&expected, &Lake::open(&copy).unwrap().load(None).unwrap());
     // The old v2 snapshot stays loadable from the upgraded lake.
     assert_same_store(
@@ -221,7 +221,7 @@ fn snapshot_roundtrip_is_bit_exact() {
     // Catalog shape: v4, one Vortex file per table, `format` declared.
     let catalog = read_json(&dir.join("catalog.json"));
     assert_eq!(catalog["format_version"], FORMAT_VERSION);
-    assert_eq!(FORMAT_VERSION, 5, "v5 adds the schema records");
+    assert_eq!(FORMAT_VERSION, 6, "v6 adds lake identity binding");
     assert_eq!(catalog["version"], 2);
     let updated = catalog["updated"].as_str().unwrap();
     assert_eq!(updated.len(), 24, "ISO-8601 millis: {updated}");
@@ -504,10 +504,10 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
 
     // An unsupported format_version is named, not misparsed.
     let mut future = read_json(&dir.join("catalog.json"));
-    future["format_version"] = serde_json::json!(6);
+    future["format_version"] = serde_json::json!(7);
     write_json(&dir.join("catalog.json"), &future);
     let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("unsupported lake format_version 6"), "{err}");
+    assert!(err.contains("unsupported lake format_version 7"), "{err}");
     assert!(err.contains("newer pinkdb"), "{err}");
 
     // A version 2 manifest must declare a format on every entry; a missing
@@ -813,10 +813,18 @@ fn tampered_versions_are_clean_errors_never_a_wrap() {
     }
 
     // The cap itself (`u64::MAX - 1`) still loads, but cannot be incremented.
+    // A coherent fixture now needs the catalog, its snapshot and the
+    // highest-version marker (M-7); a lone tampered catalog is refused.
     let ceiling = u64::MAX - 1;
     let mut cat = read_json(&dir.join("catalog.json"));
     cat["version"] = serde_json::json!(ceiling);
     write_json(&dir.join("catalog.json"), &cat);
+    let mut snap = cat.clone();
+    write_json(&dir.join(format!("snapshots/{ceiling}.json")), &snap);
+    let mut highest = read_json(&dir.join("highest.json"));
+    highest["version"] = serde_json::json!(ceiling);
+    write_json(&dir.join("highest.json"), &highest);
+    let _ = &mut snap;
     let mut lake = Lake::open(&dir).unwrap();
     assert_eq!(lake.current_version(), ceiling);
     let catalog_before = std::fs::read(dir.join("catalog.json")).unwrap();
@@ -840,11 +848,11 @@ fn tampered_versions_are_clean_errors_never_a_wrap() {
     assert!(err.contains("corrupt lake metadata"), "{err}");
     assert!(err.contains("snapshots/2.json"), "{err}");
     // ...and the unwritable snapshot is not listed as published.
-    assert_eq!(lake.versions().unwrap(), vec![1]);
+    assert_eq!(lake.versions().unwrap(), vec![1, ceiling]);
 
-    // `load(Some(v))` for a version above the current one is a clean
-    // not-found, never a surprise snapshot read.
-    let err = lake.load(Some(ceiling)).unwrap_err().to_string();
+    // `load(Some(v))` for a version with no snapshot is a clean not-found,
+    // never a surprise read.
+    let err = lake.load(Some(ceiling - 1)).unwrap_err().to_string();
     assert!(err.contains("has no snapshot version"), "{err}");
     cleanup(&dir);
 }
@@ -896,34 +904,28 @@ fn rollback_resave_refuses_to_replace_a_published_snapshot() {
     lake.write_from_store(&db).unwrap(); // v3
     let v3_snapshot = std::fs::read(dir.join("snapshots/3.json")).unwrap();
 
-    // "Roll back": restore the v2 catalog over the v3 one.
+    // M-7: "roll back" by restoring the v2 catalog over the v3 one is
+    // refused at open, because highest.json records version 3. The marker is
+    // what makes the rollback visible; without it the old handle would have
+    // tried (and failed) to replace the published v3 snapshot.
     std::fs::write(dir.join("catalog.json"), &v2_catalog).unwrap();
-    let mut lake = Lake::open(&dir).unwrap();
-    assert_eq!(lake.current_version(), 2);
-    assert_eq!(lake.versions().unwrap(), vec![1, 2], "v3 left the chain");
-
-    let err = lake.write_from_store(&db).unwrap_err();
-    assert!(matches!(&err, LakeError::Conflict { .. }), "{err:?}");
+    let err = Lake::open(&dir).unwrap_err();
+    assert!(matches!(&err, LakeError::Corrupt { .. }), "{err:?}");
     let msg = err.to_string();
-    assert!(msg.contains("snapshot 3 already exists"), "{msg}");
-    assert!(
-        msg.contains("refusing to replace a published version"),
-        "{msg}"
-    );
+    assert!(msg.contains("rollback detected"), "{msg}");
+    assert!(msg.contains("highest.json records version 3"), "{msg}");
+    // The authoritative v3 catalog and its snapshot are untouched.
     assert_eq!(
         std::fs::read(dir.join("snapshots/3.json")).unwrap(),
         v3_snapshot,
-        "the published snapshot is untouched"
+        "the published snapshot is never rewritten by a rollback attempt"
     );
     assert_eq!(
         std::fs::read(dir.join("catalog.json")).unwrap(),
         v2_catalog,
-        "the catalog is untouched"
+        "the refused open leaves the rolled-back catalog untouched"
     );
-    // The rolled-back-to version still loads; the orphaned snapshot remains
-    // explicitly loadable.
-    assert!(lake.load(None).is_ok());
-    assert!(lake.load(Some(3)).is_ok());
+    let _ = lake;
     cleanup(&dir);
 }
 
@@ -942,13 +944,14 @@ fn a_catalog_without_tables_is_corrupt_not_an_empty_lake() {
     assert!(err.contains("corrupt lake metadata"), "{err}");
     assert!(err.contains("tables"), "{err}");
 
-    // The same missing field in a snapshot is corrupt too.
+    // The same missing field in a snapshot is corrupt too. The catalog of
+    // the same version is cross-checked at open (M-7), so the corruption is
+    // caught there rather than only at a later time-travel load.
     std::fs::write(dir.join("catalog.json"), &good_catalog).unwrap();
     let mut snap = read_json(&dir.join("snapshots/2.json"));
     snap.as_object_mut().unwrap().remove("tables");
     write_json(&dir.join("snapshots/2.json"), &snap);
-    let lake = Lake::open(&dir).unwrap();
-    let err = lake.load(Some(2)).unwrap_err().to_string();
+    let err = Lake::open(&dir).unwrap_err().to_string();
     assert!(err.contains("corrupt lake metadata"), "{err}");
     assert!(err.contains("tables"), "{err}");
     cleanup(&dir);
@@ -1352,9 +1355,9 @@ fn v1_lake_migrates_to_vortex_on_save() {
 
     // Saving again publishes a v4 snapshot: a full rewrite in Vortex.
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
-    assert_eq!(lake.format_version(), 5, "the handle now reports v5");
+    assert_eq!(lake.format_version(), 6, "the handle now reports v6");
     let catalog = read_json(&dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 5);
+    assert_eq!(catalog["format_version"], 6);
     for (key, entry) in catalog["tables"].as_object().unwrap() {
         assert_eq!(entry["format"], "vortex", "{key}");
         assert!(
@@ -1434,7 +1437,7 @@ fn v1_v4_fixture_written_by_the_lean_writer_loads_and_migrates() {
 
     // Saving migrates to v4 (Vortex) without touching the v1 files.
     assert_eq!(lake.write_from_store(&expected).unwrap(), 3);
-    assert_eq!(lake.format_version(), 5);
+    assert_eq!(lake.format_version(), 6);
     let migrated = lake.load(None).unwrap();
     assert_same_store(&expected, &migrated);
     assert_eq!(
@@ -1464,7 +1467,7 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
     let original_bytes = store_bytes(&db, &dir, "original");
 
     let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.format_version(), 5, "create publishes a v5 lake");
+    assert_eq!(lake.format_version(), 6, "create publishes a v6 lake");
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
 
@@ -2173,7 +2176,7 @@ fn v1_stats_fixture_attaches_in_the_full_build() {
     let store = migrated.load(None).unwrap();
     migrated.write_from_store(&store).unwrap();
     let catalog = read_json(&copy.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 5, "{catalog}");
+    assert_eq!(catalog["format_version"], 6, "{catalog}");
     assert_eq!(
         catalog["tables"]["main.fid"]["format"], "vortex",
         "{catalog}"
@@ -2712,5 +2715,113 @@ fn unparseable_snapshot_times_are_listed_but_never_guessed_at() {
         ),
         Err(e) => panic!("{e}"),
     }
+    cleanup(&dir);
+}
+
+/// M-5: every lake artifact a save publishes is owner-only (0600), and an
+/// artifact a pre-fix build left world-readable is narrowed on the next open.
+#[cfg(unix)]
+#[test]
+fn lake_artifacts_are_owner_only_and_existing_ones_are_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    fn files_under(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files_under(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+
+    let dir = scratch("artifact_modes");
+    let db = fixture_store();
+    save_store(&db, &dir).unwrap();
+
+    let mut files = Vec::new();
+    files_under(&dir, &mut files);
+    assert!(!files.is_empty());
+    for path in &files {
+        assert_eq!(
+            mode(path),
+            0o600,
+            "lake artifact {} is world/group accessible",
+            path.display()
+        );
+    }
+
+    // A pre-fix lake: chmod the catalog and one data file to 0644, then open.
+    let catalog = dir.join("catalog.json");
+    let data = data_files(&dir).into_iter().next().unwrap();
+    std::fs::set_permissions(&catalog, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _lake = Lake::open(&dir).unwrap();
+    assert_eq!(mode(&catalog), 0o600, "catalog was not tightened on open");
+    assert_eq!(mode(&data), 0o600, "data file was not tightened on open");
+    cleanup(&dir);
+}
+
+/// M-7 (plaintext): the lake identity binds the catalog/snapshots to one
+/// lake; a same-version manifest from another lake is refused, and the id is
+/// stable across opens.
+#[test]
+fn plaintext_lake_identity_refuses_cross_lake_substitution() {
+    let dir = scratch("identity_plain");
+    let a = dir.join("a");
+    let b = dir.join("b");
+    let db = fixture_store();
+    let mut lake_a = Lake::create(&a).unwrap();
+    lake_a.write_from_store(&db).unwrap();
+    let id_a = lake_a.lake_id().to_string();
+    assert_eq!(id_a.len(), 32);
+    assert!(id_a.bytes().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(Lake::open(&a).unwrap().lake_id(), id_a);
+
+    let mut lake_b = Lake::create(&b).unwrap();
+    lake_b.write_from_store(&db).unwrap();
+    assert_ne!(lake_b.lake_id(), id_a);
+
+    std::fs::copy(b.join("catalog.json"), a.join("catalog.json")).unwrap();
+    let err = Lake::open(&a).unwrap_err();
+    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
+    assert!(err.to_string().contains("another lake"), "{err}");
+
+    // Restore A's catalog and swap only its same-version snapshot.
+    let good = std::fs::read(a.join("snapshots/2.json")).unwrap();
+    std::fs::write(a.join("catalog.json"), &good).unwrap();
+    Lake::open(&a).unwrap();
+    std::fs::copy(b.join("snapshots/2.json"), a.join("snapshots/2.json")).unwrap();
+    let err = Lake::open(&a).unwrap_err();
+    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("another lake") || err.to_string().contains("snapshot disagree"),
+        "{err}"
+    );
+    cleanup(&dir);
+}
+
+/// M-7: the snapshot file name and the manifest's declared version must
+/// agree (catalog.version == its snapshot's version).
+#[test]
+fn snapshot_version_must_match_its_file() {
+    let dir = scratch("snapshot_version");
+    let db = fixture_store();
+    let mut lake = Lake::create(&dir).unwrap();
+    lake.write_from_store(&db).unwrap(); // v2
+    let mut snap = read_json(&dir.join("snapshots/2.json"));
+    snap["version"] = serde_json::json!(3);
+    write_json(&dir.join("snapshots/2.json"), &snap);
+    let err = Lake::open(&dir).unwrap_err();
+    assert!(matches!(err, LakeError::Corrupt { .. }), "{err:?}");
+    assert!(
+        err.to_string().contains("declares version 3, expected 2"),
+        "{err}"
+    );
     cleanup(&dir);
 }

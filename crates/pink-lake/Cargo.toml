@@ -37,6 +37,9 @@ serde_json = "1"
 # S3 storage (`s3` feature): the shared blocking HTTP/SigV4 client (rustls,
 # no aws-sdk, no async runtime).
 pinkdb-httpfs = { path = "../pinkdb-httpfs", optional = true }
+# OS randomness for the 128-bit lake id (M-7). Same version as the engine's
+# password-salt source; no new crate enters the lockfile.
+getrandom = "0.2"
 # The `vortexlake` data format (v2/v3 lakes): one Vortex file per table,
 # written through the `vortex` facade. `default-features = false,
 # features = ["files"]` drops the wasm-bindgen/tensor/parquet-variant extras

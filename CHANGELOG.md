@@ -9,6 +9,18 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-21
+### Security hardening — pass 6: filesystem privileges, file modes, lake binding ✅
+- `COPY … TO` now needs `ADMIN` and is **off by default on the server**; with
+  the opt-in it is confined to a configured root, refuses traversal/symlinks,
+  and writes atomically as a `0600` temp file. Table-function scans likewise
+  require `ADMIN` in authenticated sessions, including nested/CTE shapes.
+- WALs, checkpoints, lock files and lake artifacts are created `0600` (lake
+  directories `0700`), and existing engine/lake files are tightened on open.
+- Lake catalogs are now **v6**: manifests are bound to `(lake_id, version)`,
+  a `highest.json` marker detects rollbacks, and cross-lake/foreign-manifest
+  substitution is refused. Local tags now include `(dev, ino)` so a
+  same-size/same-second replacement can no longer slip past the CAS.
+
 
 ### Wave 78 — server warehouse browsing UI ✅
 - A feature-gated (`ui`, default off) read-only console served by

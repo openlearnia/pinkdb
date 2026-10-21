@@ -1026,6 +1026,11 @@ pub struct PinkDb {
     /// …" error). Reads are the separate table-source registry above. See
     /// [`crate::filefmt`].
     pub(crate) file_formats: Vec<Arc<dyn crate::filefmt::FileFormat>>,
+    /// Where SQL `COPY … TO` may write (M-3). Embedded stores default to
+    /// [`crate::CopyToPolicy::Unrestricted`]; a network server installs
+    /// `Disabled` at bind time and the `--allow-copy-to --copy-root` opt-in
+    /// installs `Confined(root)`.
+    pub(crate) copy_to_policy: crate::CopyToPolicy,
 }
 
 impl Default for PinkDb {
@@ -1074,6 +1079,7 @@ impl Clone for PinkDb {
             proc_frame: self.proc_frame.clone(),
             rbac: self.rbac.clone(),
             file_formats: self.file_formats.clone(),
+            copy_to_policy: self.copy_to_policy.clone(),
         }
     }
 }
@@ -1134,6 +1140,7 @@ impl PinkDb {
             // Process-global sinks (`filefmt::register_global_file_format`)
             // seed every store constructed after the registration.
             file_formats: crate::filefmt::seeded_global_formats(),
+            copy_to_policy: crate::CopyToPolicy::Unrestricted,
         }
     }
 
@@ -1179,6 +1186,19 @@ impl PinkDb {
     /// The extension root this store confines loads to, if any.
     pub fn extension_root(&self) -> Option<&std::path::Path> {
         self.extension_root.as_deref()
+    }
+
+    /// Set the `COPY … TO` destination policy (M-3). Embedded stores default
+    /// to [`crate::CopyToPolicy::Unrestricted`]; a network server installs
+    /// `Disabled` before accepting connections and `Confined(root)` only when
+    /// the operator opts in.
+    pub fn set_copy_to_policy(&mut self, policy: crate::CopyToPolicy) {
+        self.copy_to_policy = policy;
+    }
+
+    /// The current `COPY … TO` destination policy.
+    pub fn copy_to_policy(&self) -> &crate::CopyToPolicy {
+        &self.copy_to_policy
     }
 
     /// Configure the at-rest key used by checkpoints and snapshots of this

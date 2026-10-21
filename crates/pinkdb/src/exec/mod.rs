@@ -1475,6 +1475,25 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         unreachable!("execute_copy_to needs a CopyTo node");
     };
     let target = resolve_db(db, qdb);
+    // M-3: the destination policy is enforced in the engine, not at bind
+    // time, so a policy changed after prepare still applies. A disabled
+    // server refuses even an ADMIN; the opt-in form confines the parent.
+    let destination = match db.copy_to_policy() {
+        crate::CopyToPolicy::Disabled => {
+            return Err(PinkDbError::Execution(
+                "COPY TO is disabled on this server (writing server-side files is off by \
+                 default; the operator must opt in with --allow-copy-to and --copy-root)"
+                    .to_string(),
+            ));
+        }
+        crate::CopyToPolicy::RootRequired => {
+            return Err(PinkDbError::Execution(
+                "COPY TO requires a destination root (start the server with --copy-root DIR)"
+                    .to_string(),
+            ));
+        }
+        policy => crate::fsutil::resolve_copy_destination(policy, path)?,
+    };
     let format = db.file_format(format).ok_or_else(|| {
         PinkDbError::Catalog(format!(
             "no file format \"{format}\" is registered (registered formats: {})",
@@ -1482,7 +1501,7 @@ fn execute_copy_to(db: &PinkDb, plan: &LogicalPlan) -> Result<QueryResult> {
         ))
     })?;
     let t = db.table_in(&target, table)?;
-    format.write(std::path::Path::new(path), t)?;
+    format.write(&destination, t)?;
     let rows = i64::try_from(t.num_rows).unwrap_or(i64::MAX);
     Ok(QueryResult::Selected {
         names: vec!["Count".to_string()],

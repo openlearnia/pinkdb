@@ -520,6 +520,7 @@ fn legacy_v4_lake_upgrades_on_the_first_schema_change() {
     let catalog_path = lake_dir.join("catalog.json");
     let mut manifest = json(&catalog_path);
     manifest["format_version"] = serde_json::json!(4);
+    manifest.as_object_mut().unwrap().remove("lake_id");
     for (_, e) in manifest["tables"].as_object_mut().unwrap() {
         e.as_object_mut().unwrap().remove("schema_version");
         e.as_object_mut().unwrap().remove("columns");
@@ -554,7 +555,7 @@ fn legacy_v4_lake_upgrades_on_the_first_schema_change() {
         ]
     );
     let e = entry(&lake_dir, "main.t");
-    assert_eq!(json(&catalog_path)["format_version"], 5);
+    assert_eq!(json(&catalog_path)["format_version"], 6);
     assert_eq!(e["schema_version"], 2, "the legacy base is epoch 1: {e}");
     assert_eq!(e["files"][0]["schema_version"], 1, "migrated file: {e}");
     cleanup(&dir);

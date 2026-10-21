@@ -1528,8 +1528,12 @@ statement, join output included, default 10 000 000), `--max-result-bytes N`
 `--max-concurrent-logins N` (in-flight Argon2id verifications, default 4),
 `--transport sync|async`
 (default `sync`; `async` is the tokio I/O transport and needs a build with
-the `async-server` feature) and `--allow-load-extension` (off by default; see
-Security posture). The four limit flags reject `0`/invalid values at startup
+the `async-server` feature), `--allow-load-extension` (off by default; see
+Security posture), `--allow-copy-to` and `--copy-root PATH`. The last two are
+the `COPY … TO` opt-in: off by default (the server refuses it even for
+`ADMIN`), and when enabled every destination is confined to `--copy-root`,
+written atomically with mode 0600. `--allow-copy-to` without `--copy-root` is
+a startup error (exit 2). The four limit flags reject `0`/invalid values at startup
 (exit 2); the embedded engine's defaults stay unlimited unless a limit is set
 explicitly. TLS is available only with the default `sync` transport:
 `--transport async` combined with
@@ -1683,6 +1687,17 @@ load and run a native library from its own filesystem, and even with RBAC
 that is a host-level capability (an authenticated session also needs
 `ADMIN`). WAL replay at startup still re-loads extensions a durable database
 already recorded.
+
+`COPY … TO` is treated the same way and more strictly: an authenticated
+session needs `ADMIN` (a `SELECT` grant never implies a filesystem write),
+and the server refuses it by default (library:
+`Server::allow_copy_to(true).copy_root(Some(dir))`). With the opt-in, a
+destination is canonicalized under the root, `..`/symlinked
+parents/symlinked targets are refused, and the write goes to a `create_new`
+temp file (0600) renamed atomically over the target. File/table-function
+scans (`read_parquet`, `read_arrow`, `FROM 'file.parquet'`) likewise require
+`ADMIN` in an authenticated session; the embedded API stays trusted. See
+[`docs/security-remediation-pass6.md`](docs/security-remediation-pass6.md).
 
 ### Warehouse browsing UI (wave 78)
 

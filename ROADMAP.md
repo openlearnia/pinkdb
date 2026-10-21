@@ -2127,3 +2127,47 @@ Deferred (not currently scheduled): JS/wasm, Node-native, and Java bindings.
   entries). Residual: loopback-only until console TLS, user-less stores are
   unauthenticated, token mode is operator-level, sizes are estimates, deep
   paging scans, and the query console is a follow-up.
+
+- 2026-10-21 — Security hardening, pass 6: filesystem privileges, durable file
+  modes, and lake integrity binding (M-3/M-4/M-5/M-7/M-12; worktree `wt-sec6`).
+  **M-3**: `COPY … TO` now requires **ADMIN** (SELECT never authorizes a
+  filesystem write) and the server refuses it by default; `Server::allow_copy_to`
+  + `copy_root` (and `--allow-copy-to`/`--copy-root`; a root is mandatory) install
+  a confinement policy — destinations are canonicalized under the root, `..`,
+  absolute escapes, symlinked parents and symlinked targets are refused, and
+  every write goes through `pinkdb::write_atomic_private` (unique `create_new`
+  temp sibling, 0600, flush/fsync, atomic rename, parent fsync) in the engine,
+  the test sink and the Arrow writer. **M-4**: table-function plans are detected
+  by a full statement walk (CTEs, set-operation arms, expression subqueries,
+  materialized-view queries, `INSERT … SELECT`, `CREATE TABLE AS`, `EXPLAIN`)
+  and denied unless the principal is ADMIN; the embedded/trusted path is
+  unchanged and table-source path policy stays source-owned (documented).
+  **M-5**: WAL, recovery temps, checkpoint `.pink`/`.tmp`, lock files, engine
+  saves and every lake artifact (catalog/snapshots/commits/data/delete/lake.json/
+  highest.json) are created **0600**, newly created lake directories **0700**,
+  and existing checkpoint/WAL/lock/lake files are tightened best-effort on open
+  (shared user-owned parents untouched; non-Unix no-op). The A.9 reproduction is
+  a regression test. **M-7**: lake catalog format **v6** with a random
+  `lake_id`, manifest containers AEAD-bound to `lake:<lake_id>:<version>`,
+  `lake.json` identity + `highest.json` rollback marker, catalog↔snapshot
+  identity/version cross-checks and rollback refusal; keyed pre-v6 lakes are
+  cleanly refused (empty-binding containers cannot be upgraded safely) and
+  plaintext pre-v6 lakes upgrade on the next save. **M-12**: local
+  `read_tagged` opens once, `fstat`s and reads the **same fd**, and the tag now
+  includes `(dev, ino)` in addition to length/mtime — a same-length/same-second
+  replacement is distinguished and `put_if_match` rejects the stale tag.
+  Tests: engine file modes (fresh 0600, existing 0644 tightened, A.9), server
+  COPY refusal/opt-in/root escapes/symlinks/atomic replace/both transports,
+  table-function denial in every nesting shape, lake cross-lake/rollback/
+  version-mismatch refusal (local + S3), keyed-legacy refusal, and the M-12
+  inode/race cases. Gates: pinkdb **689**, server **94** (async **114**, tls
+  **105**, both **125**), CLI **78**, workspace **1293**, duckdiff **339/339**,
+  encryption **730**, lake **251** (all features), arrow **30**, fmt/clippy both
+  toolchains, wasm green. Sizes vs pass-5: `pinkdb` **+17,424 B**,
+  `pinkdb-server` **+19,344 B**. Residual: full-storage-control rollback still
+  needs an external witness/object lock; legacy keyed pre-v6 lakes need a
+  pre-M-7 build to migrate; coarse-timestamp filesystems now fall back to inode
+  identity (network FS inode reuse remains); COPY atomically replaces (never
+  appends) and a symlink-parent swap between validation and temp creation is a
+  narrow TOCTOU mitigated by root confinement; tightening scans `data/**` on
+  lake open; table-function paths are ADMIN-gated rather than root-confined.

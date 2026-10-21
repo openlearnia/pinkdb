@@ -4,7 +4,8 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 5,
+//!   "format_version": 6,
+//!   "lake_id": "<32 lowercase hex>",
 //!   "updated": "<iso8601>",
 //!   "version": 3,
 //!   "tables": {
@@ -587,6 +588,12 @@ pub(crate) struct Catalog {
     pub(crate) format_version: u32,
     pub(crate) updated: String,
     pub(crate) version: u64,
+    /// The lake's random 128-bit identity, hex (M-7; format_version 6).
+    /// Absent in v1–v5 manifests. Every v6 manifest must carry it; `Lake`
+    /// checks it against `lake.json` on open and against the container
+    /// binding when encrypted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lake_id: Option<String>,
     pub(crate) tables: BTreeMap<String, TableEntry>,
     /// The save that published this version: the author it recorded
     /// (`ducklake_set_commit_message`'s `author`), if any. Optional and

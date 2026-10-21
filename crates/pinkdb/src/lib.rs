@@ -41,6 +41,7 @@ mod ext;
 /// Registered file formats (wave 71): the engine half of the first-party
 /// `arrow` extension — see [`filefmt::FileFormat`].
 pub mod filefmt;
+pub mod fsutil;
 /// The optional JavaScript procedure sandbox (cargo feature `js`): the bridge
 /// to `pinkdb-js`, which refuses cleanly when no engine is bound.
 #[cfg(feature = "js")]
@@ -72,6 +73,7 @@ pub use crypto::EncryptionKey;
 pub use db::{AUTHENTICATION_REQUIRED, Connection, Database};
 pub use exec::{ExecLimits, QueryResult};
 pub use filefmt::FileFormat;
+pub use fsutil::{CopyToPolicy, write_atomic_private};
 pub use macros::{MacroDef, MacroParamDef};
 pub use prepared::{BoundStatement, PreparedStatement};
 pub use procedure::{ProcLanguage, ProcedureDef};

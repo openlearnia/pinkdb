@@ -187,6 +187,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-21">2026-10-21<a class="anchor" href="#2026-10-21" aria-label="Permalink: 2026-10-21">#</a></h2>
+<h3>Security hardening — pass 6: filesystem privileges, file modes, lake binding ✅</h3>
+<ul>
+<li><code>COPY … TO</code> now needs <code>ADMIN</code> and is <strong>off by default on the server</strong>; with the opt-in it is confined to a configured root, refuses traversal/symlinks, and writes atomically as a <code>0600</code> temp file. Table-function scans likewise require <code>ADMIN</code> in authenticated sessions, including nested/CTE shapes.</li>
+<li>WALs, checkpoints, lock files and lake artifacts are created <code>0600</code> (lake directories <code>0700</code>), and existing engine/lake files are tightened on open.</li>
+<li>Lake catalogs are now <strong>v6</strong>: manifests are bound to <code>(lake_id, version)</code>, a <code>highest.json</code> marker detects rollbacks, and cross-lake/foreign-manifest substitution is refused. Local tags now include <code>(dev, ino)</code> so a same-size/same-second replacement can no longer slip past the CAS.</li>
+</ul>
 <h3>Wave 78 — server warehouse browsing UI ✅</h3>
 <ul>
 <li>A feature-gated (<code>ui</code>, default off) read-only console served by <code>pinkdb-server</code>: embedded self-hosted assets, paged row previews, catalog and row-count/size JSON endpoints. Built on <strong>axum + tokio + maud</strong> (a documented async carve-out; the console owns its runtime and every engine read runs on a bounded blocking pool).</li>

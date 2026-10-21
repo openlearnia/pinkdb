@@ -43,11 +43,15 @@
 //! file's container authenticates the lake-relative path it was written for,
 //! so swapping two files (even of the same shape) fails authentication
 //! instead of silently loading different values. A **manifest** is bound to
-//! nothing path-like on purpose: `catalog.json` and `snapshots/<v>.json` are
-//! byte-identical by construction (the same sealed bytes are published to
-//! both — see [`Crypto::seal`]), and a path binding would break that
-//! invariant. Commit delta manifests (`commits/<v>.json`) are bound to their
-//! own path (their audit value depends on not being interchangeable).
+//! `(lake_id, version)` (M-7), not to its path: `catalog.json` and
+//! `snapshots/<v>.json` are byte-identical by construction (the same sealed
+//! bytes are published to both — see [`Crypto::seal`]), so a path binding
+//! would break that invariant. The lake identity makes a same-version
+//! manifest from another lake under the same key fail authentication, and the
+//! version makes an older snapshot under a newer name fail too. Commit delta
+//! manifests (`commits/<v>.json`) are bound to their own path (their audit
+//! value depends on not being interchangeable), and `highest.json` is bound
+//! to `(lake_id, highest_version)`.
 //!
 //! # Key material and the KDF policy
 //!
@@ -162,6 +166,8 @@ pub(crate) enum Domain {
     Commit,
     /// One `data/<table>/<uuid>.pinkdel` delete file, bound to its path.
     DeleteFile,
+    /// `highest.json`, bound to `(lake_id, highest_version)` (M-7).
+    Highest,
 }
 
 impl Domain {
@@ -171,6 +177,7 @@ impl Domain {
             Domain::DataFile => 2,
             Domain::Commit => 3,
             Domain::DeleteFile => 4,
+            Domain::Highest => 5,
         }
     }
 
@@ -180,6 +187,7 @@ impl Domain {
             2 => "a data file",
             3 => "a commit delta manifest",
             4 => "a delete file",
+            5 => "the highest-version marker",
             _ => "an unknown artifact",
         }
     }
@@ -573,7 +581,7 @@ mod imp {
         }
         let kdf = data[13];
         let domain = data[14];
-        if !(1..=4).contains(&domain) {
+        if !(1..=5).contains(&domain) {
             return Err(tampered(path, format!("unknown container domain {domain}")));
         }
         let key_check_len = u32::from_le_bytes(data[15..19].try_into().expect("4 bytes")) as usize;
@@ -829,6 +837,14 @@ mod imp {
             })
         }
 
+        /// The authenticated header binding of one container (public data,
+        /// covered by the AEAD). Used for manifest/highest objects whose
+        /// version is encoded in the binding itself: the caller opens with
+        /// it, then cross-checks the decrypted payload against it (M-7).
+        pub(crate) fn container_binding(&self, path: &Path, data: &[u8]) -> Result<String> {
+            Ok(parse_header(path, data)?.binding)
+        }
+
         /// Verify the key-check and open a whole container. All of the
         /// failure modes are authenticated: see the module docs.
         pub(crate) fn open(
@@ -1078,6 +1094,9 @@ mod imp {
     #[allow(unused_variables)]
     impl Crypto {
         pub(crate) fn new(key: EncryptionKey) -> Result<Self> {
+            Err(unavailable())
+        }
+        pub(crate) fn container_binding(&self, _path: &Path, _data: &[u8]) -> Result<String> {
             Err(unavailable())
         }
         pub(crate) fn seal(

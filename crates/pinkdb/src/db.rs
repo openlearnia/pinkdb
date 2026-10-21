@@ -286,6 +286,13 @@ impl Database {
         write_lock(&self.shared).set_allow_sql_load_extension(allow);
     }
 
+    /// Set the `COPY … TO` destination policy (M-3). The network server makes
+    /// this `Disabled` at bind time; `--allow-copy-to --copy-root DIR` sets
+    /// `Confined(DIR)`.
+    pub fn set_copy_to_policy(&self, policy: crate::CopyToPolicy) {
+        write_lock(&self.shared).set_copy_to_policy(policy);
+    }
+
     /// Confine every extension load of this database to `root` (the
     /// directory that holds the extension libraries). `None` removes the
     /// confinement; the loader's own path rules always apply.

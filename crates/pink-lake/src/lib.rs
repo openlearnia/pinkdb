@@ -10,6 +10,8 @@
 //!
 //! ```text
 //! <lake>/
+//!   lake.json                   random 128-bit lake identity (never replaced)
+//!   highest.json                authenticated highest published version
 //!   catalog.json                current catalog (authoritative for "latest")
 //!   snapshots/<version>.json    immutable manifests, one per published version
 //!   commits/<version>.json      immutable per-commit delta manifests (audit)
@@ -22,7 +24,8 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 5,
+//!   "format_version": 6,
+//!   "lake_id": "0123456789abcdef0123456789abcdef",
 //!   "updated": "2026-10-14T12:34:56.789Z",
 //!   "version": 2,
 //!   "tables": {
@@ -381,6 +384,17 @@ pub use s3::{DEFAULT_RETRIES, S3Config};
 
 /// The catalog format version this build writes (and its newest read).
 ///
+/// Version 6 (M-7): every manifest records the lake's random 128-bit
+/// `lake_id`, and `lake.json` (identity) plus `highest.json` (the
+/// monotonically increasing published version) anchor it. Manifests are
+/// sealed under a `(lake_id, version)` binding; a catalog below
+/// `highest.json`, a catalog/snapshot version mismatch, or a manifest from
+/// another lake under the same key is refused at open. A v6 manifest without
+/// a valid `lake_id` is corrupt; a pre-v6 manifest never has one. A keyed
+/// pre-v6 lake is refused with a clear legacy-format error (its manifest
+/// containers carry the empty binding and cannot be upgraded safely in
+/// place); a plaintext pre-v6 lake opens and is upgraded on its next save.
+///
 /// Version 5 (wave 65): version 4 plus the per-table **schema record** —
 /// `schema_version`, `columns` (every live column with its type, default and
 /// the epoch it appeared) and `renames` — so `ALTER TABLE` publishes
@@ -417,19 +431,31 @@ pub use s3::{DEFAULT_RETRIES, S3Config};
 /// every entry. Version 1 (wave 34): one engine `.pink` file per entry (no
 /// `format` field) plus one entry-level statistics block.
 ///
-/// A build without `vortexlake` — the `pinklake` builds — writes v5
-/// with `.pink` files and refuses a v5 (or v2/v3/v4) Vortex lake with a clear
+/// A build without `vortexlake` — the `pinklake` builds — writes v6
+/// with `.pink` files and refuses a v6 (or v2/v3/v4/v5) Vortex lake with a clear
 /// [`LakeError::FeatureMissing`], never a corrupt-file error.
-pub const FORMAT_VERSION: u32 = 5;
+pub const FORMAT_VERSION: u32 = 6;
 
 /// The oldest catalog format version this build still reads.
 pub const MIN_FORMAT_VERSION: u32 = 1;
 
-/// The newest catalog format version this codebase knows: 5 (the schema
-/// record). A manifest above this (a future format) is
-/// [`LakeError::Unsupported`] in every build; a v5 Vortex lake in a build
-/// without `vortexlake` is [`LakeError::FeatureMissing`].
-pub const MAX_FORMAT_VERSION: u32 = 5;
+/// The newest catalog format version this codebase knows: 6 (the schema
+/// record plus lake identity/highest-version binding). A manifest above this
+/// (a future format) is [`LakeError::Unsupported`] in every build; a v4/v5/v6
+/// Vortex lake in a build without `vortexlake` is
+/// [`LakeError::FeatureMissing`].
+pub const MAX_FORMAT_VERSION: u32 = 6;
+
+/// The `lake.json` identity format this build writes.
+pub(crate) const LAKE_ID_FORMAT: u32 = 1;
+
+/// The lake-relative name of the identity object (M-7). Created once, never
+/// replaced.
+pub(crate) const LAKE_FILE: &str = "lake.json";
+
+/// The lake-relative name of the authenticated highest-published-version
+/// marker (M-7). Rewritten after every successful catalog replacement.
+pub(crate) const HIGHEST_FILE: &str = "highest.json";
 
 /// The largest manifest `version` this build reads or writes.
 ///
@@ -687,6 +713,9 @@ pub struct SaveReport {
 pub struct Lake {
     root: PathBuf,
     storage: Arc<dyn Storage>,
+    /// The lake's random 128-bit identity (hex), recorded in every v6
+    /// manifest and in `lake.json`/`highest.json` (M-7).
+    lake_id: String,
     format_version: u32,
     version: u64,
     /// The author/commit message [`Lake::set_commit_message`] recorded for the
@@ -758,8 +787,21 @@ impl Lake {
             return Err(LakeError::AlreadyALake { path: root });
         }
         storage.create_dir("")?;
+        // M-7: one random 128-bit identity per lake, fixed for its lifetime.
+        // An interrupted create may already have written it; adopt that id
+        // instead of minting a second one.
+        let lake_id = match read_identity(&*storage, &root)? {
+            Some(id) => id,
+            None => {
+                let id = fresh_lake_id()?;
+                storage.put_new(LAKE_FILE, &identity_json(&id)?)?;
+                id
+            }
+        };
+        storage.set_manifest_lake_id(Some(lake_id.clone()));
         let manifest = Catalog {
             format_version: FORMAT_VERSION,
+            lake_id: Some(lake_id.clone()),
             updated: time::iso8601_utc(SystemTime::now()),
             version: 1,
             tables: BTreeMap::new(),
@@ -772,7 +814,7 @@ impl Lake {
         // Seal the manifest **once**: the same bytes are published as the
         // snapshot and as the catalog (the byte-identity invariant of every
         // published version). A keyless create seals nothing.
-        let bytes = storage.seal_manifest(&plain)?;
+        let bytes = storage.seal_manifest(&plain, &lake_id, 1)?;
         // Adopt (do not rewrite) an empty version-1 snapshot a concurrent or
         // interrupted create already put there: the catalog must stay
         // byte-identical to the snapshot of its version, so the *stored*
@@ -804,9 +846,15 @@ impl Lake {
         if !storage.put_new(CATALOG_FILE, &bytes)? {
             return Err(LakeError::AlreadyALake { path: root });
         }
+        // Publish the rollback marker *after* the catalog: a crash between
+        // the two leaves a catalog without a marker (refused at open), never
+        // a marker above the authoritative catalog (which would look like a
+        // rollback).
+        storage.put_highest(HIGHEST_FILE, &highest_json(&lake_id, 1)?, &lake_id, 1)?;
         Ok(Self {
             root,
             storage,
+            lake_id,
             format_version: FORMAT_VERSION,
             version: 1,
             pending_commit: None,
@@ -845,10 +893,101 @@ impl Lake {
     fn open_with(inner: Arc<dyn Storage>, key: Option<EncryptionKey>) -> Result<Self> {
         let storage: Arc<dyn Storage> = Arc::new(CryptoStorage::new(inner, key)?);
         let root = storage.abs("");
+        storage.tighten_existing()?;
+        let identity = read_identity(&*storage, &root)?;
+        if let Some(id) = &identity {
+            storage.set_manifest_lake_id(Some(id.clone()));
+        }
         let manifest = read_catalog(&*storage, &root)?;
+        let lake_id = match manifest.lake_id.clone() {
+            Some(id) => {
+                match &identity {
+                    Some(expected) if expected == &id => {}
+                    Some(expected) => {
+                        return Err(LakeError::Corrupt {
+                            path: root.join(CATALOG_FILE),
+                            message: format!(
+                                "catalog.json declares lake {id}, but lake.json identifies \
+                                 this lake as {expected} (a manifest from another lake was \
+                                 substituted)"
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(LakeError::Corrupt {
+                            path: root.join(LAKE_FILE),
+                            message: "catalog.json is a v6 manifest, but lake.json is missing \
+                                      (the lake identity was removed)"
+                                .to_string(),
+                        });
+                    }
+                }
+                id
+            }
+            None => {
+                // A plaintext pre-v6 lake opens and is upgraded on its next
+                // save. A keyed pre-v6 lake cannot be authenticated safely:
+                // its manifest containers carry the empty binding.
+                if storage.encrypted() {
+                    return Err(LakeError::Corrupt {
+                        path: root.join(CATALOG_FILE),
+                        message: "this is a pre-v6 encrypted lake: its manifest containers \
+                                  carry no lake-id/version binding and this build refuses to \
+                                  open a weaker-bound format; create a new keyed lake (or \
+                                  load and re-save it with a pre-M-7 build)"
+                            .to_string(),
+                    });
+                }
+                match identity {
+                    Some(id) => id,
+                    None => fresh_lake_id()?,
+                }
+            }
+        };
+        if manifest.format_version >= 6 {
+            // The authenticated highest-version marker: a catalog below it is
+            // a rollback. A catalog *above* it is the narrow crash window
+            // between the catalog replace and the marker write; heal it.
+            let highest = read_highest(&*storage, &lake_id)?;
+            if manifest.version < highest {
+                return Err(LakeError::Corrupt {
+                    path: root.join(CATALOG_FILE),
+                    message: format!(
+                        "rollback detected: catalog.json declares version {}, but the \
+                         authenticated highest.json records version {highest} (restore the \
+                         catalog at version {highest} or later)",
+                        manifest.version
+                    ),
+                });
+            }
+            if manifest.version > highest {
+                storage.put_highest(
+                    HIGHEST_FILE,
+                    &highest_json(&lake_id, manifest.version)?,
+                    &lake_id,
+                    manifest.version,
+                )?;
+            }
+            // Catalog and snapshot of the same version must agree on both the
+            // version and the lake identity (M-7).
+            let (snapshot, snapshot_path) = manifest_for(&*storage, &root, Some(manifest.version))?;
+            if snapshot.version != manifest.version
+                || snapshot.lake_id.as_deref() != Some(lake_id.as_str())
+            {
+                return Err(LakeError::Corrupt {
+                    path: snapshot_path,
+                    message: format!(
+                        "catalog.json version {} and its snapshot disagree on the version or \
+                         lake identity (expected {lake_id})",
+                        manifest.version
+                    ),
+                });
+            }
+        }
         Ok(Self {
             root,
             storage,
+            lake_id,
             format_version: manifest.format_version,
             version: manifest.version,
             pending_commit: None,
@@ -994,6 +1133,12 @@ impl Lake {
         self.version
     }
 
+    /// The lake's random 128-bit identity (32 lowercase hex characters), as
+    /// recorded in v6 manifests, `lake.json` and `highest.json` (M-7).
+    pub fn lake_id(&self) -> &str {
+        &self.lake_id
+    }
+
     /// Whether this handle is a keyed (encrypted) lake session. A handle that
     /// opened or created a lake successfully with a key is always encrypted;
     /// one created without a key always writes plaintext.
@@ -1040,7 +1185,10 @@ impl Lake {
         let mut out = Vec::new();
         for version in self.versions()? {
             match manifest_for(&*self.storage, &self.root, Some(version)) {
-                Ok((manifest, _)) => {
+                Ok((manifest, path)) => {
+                    if self.check_lake_id(&manifest, &path).is_err() {
+                        continue;
+                    }
                     let time_micros = time::parse_iso8601_utc(&manifest.updated);
                     out.push(SnapshotInfo::of(&manifest, time_micros));
                 }
@@ -1184,6 +1332,9 @@ impl Lake {
         // Fail fast on a handle another writer has already outdated (before
         // any data file is written).
         self.ensure_catalog_unchanged()?;
+        // M-7: a plaintext pre-v6 lake gets its identity here, before the
+        // manifest that records it is built.
+        self.ensure_identity()?;
         let version = self
             .version
             .checked_add(1)
@@ -1322,6 +1473,7 @@ impl Lake {
             .map(|previous| ChangeSummary::diff(&previous.tables, &tables));
         let manifest = Catalog {
             format_version: FORMAT_VERSION,
+            lake_id: Some(self.lake_id.clone()),
             updated: time::iso8601_utc(SystemTime::now()),
             version,
             tables,
@@ -1335,7 +1487,7 @@ impl Lake {
         // `snapshots/<version>.json` and as `catalog.json`, so the
         // byte-identity invariant survives encryption. A keyless save seals
         // nothing.
-        let bytes = self.storage.seal_manifest(&plain)?;
+        let bytes = self.storage.seal_manifest(&plain, &self.lake_id, version)?;
         let commit_manifest = catalog::CommitManifest {
             format_version: FORMAT_VERSION,
             version,
@@ -1615,6 +1767,10 @@ impl Lake {
         sealed: &[u8],
         what: &str,
     ) -> Result<()> {
+        // M-7: a plaintext pre-v6 lake has no identity object yet; create it
+        // before the catalog that names it (the manifest bytes already carry
+        // `lake_id`). Every publishing path funnels through here.
+        self.ensure_identity()?;
         // Re-check that the catalog is still the version our snapshot was
         // taken from, right before replacing it, and replace it
         // conditionally: `If-Match: <etag>` over S3 (a 412 is the conflict
@@ -1660,6 +1816,11 @@ impl Lake {
             }
             self.storage.reconcile_snapshot(version, plain)?;
         }
+        // M-7: publish the authenticated highest-version marker only after
+        // the catalog replacement succeeded. A later open refuses a catalog
+        // below it; a crash between the two is the narrow window healed at
+        // open (catalog above marker, never the reverse).
+        self.write_highest(version)?;
         self.version = version;
         // The commit record is published; a later save without a new
         // `set_commit_message` must not repeat it.
@@ -1671,9 +1832,83 @@ impl Lake {
     }
 
     /// The manifest for the latest version (`None`) or one snapshot, with the
-    /// path it was read from (for error attribution).
+    /// path it was read from (for error attribution). The lake identity is
+    /// cross-checked here, so a snapshot substituted from another lake (same
+    /// key) is refused even when it parses.
     fn manifest(&self, version: Option<u64>) -> Result<(Catalog, PathBuf)> {
-        manifest_for(&*self.storage, &self.root, version)
+        let (manifest, path) = manifest_for(&*self.storage, &self.root, version)?;
+        self.check_lake_id(&manifest, &path)?;
+        Ok((manifest, path))
+    }
+
+    /// Enforce the v6 lake identity on one parsed manifest (M-7).
+    fn check_lake_id(&self, manifest: &Catalog, path: &Path) -> Result<()> {
+        if manifest.format_version >= 6
+            && manifest.lake_id.as_deref() != Some(self.lake_id.as_str())
+        {
+            return Err(LakeError::Corrupt {
+                path: path.to_path_buf(),
+                message: format!(
+                    "manifest declares lake {}, but this lake is {} (a manifest from another \
+                     lake was substituted)",
+                    manifest.lake_id.as_deref().unwrap_or("<none>"),
+                    self.lake_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Write (or repair) `lake.json` before publishing a v6 manifest. A
+    /// plaintext pre-v6 lake has no identity yet; its first save creates one
+    /// here. A concurrent creator that won the create-only write is adopted.
+    fn ensure_identity(&mut self) -> Result<()> {
+        match read_identity(&*self.storage, &self.root)? {
+            Some(id) => {
+                if id != self.lake_id {
+                    self.lake_id = id;
+                }
+                Ok(())
+            }
+            None => {
+                let bytes = identity_json(&self.lake_id)?;
+                if !self.storage.put_new(LAKE_FILE, &bytes)? {
+                    let id = read_identity(&*self.storage, &self.root)?.ok_or_else(|| {
+                        LakeError::Corrupt {
+                            path: self.root.join(LAKE_FILE),
+                            message: "lake.json appeared and disappeared while creating the \
+                                      lake identity"
+                                .to_string(),
+                        }
+                    })?;
+                    self.lake_id = id;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Publish `highest.json` for `version`, refusing to move it backwards.
+    fn write_highest(&self, version: u64) -> Result<()> {
+        if self.storage.exists(HIGHEST_FILE)? {
+            let current = read_highest(&*self.storage, &self.lake_id)?;
+            if version < current {
+                return Err(LakeError::Conflict {
+                    path: self.root.join(HIGHEST_FILE),
+                    message: format!(
+                        "refusing to move the highest published version backwards ({} -> \
+                         {version})",
+                        current
+                    ),
+                });
+            }
+        }
+        self.storage.put_highest(
+            HIGHEST_FILE,
+            &highest_json(&self.lake_id, version)?,
+            &self.lake_id,
+            version,
+        )
     }
 
     /// A save-time conflict: `snapshots/<version>.json` is already there.
@@ -2162,6 +2397,180 @@ pub(crate) fn published_versions(storage: &dyn Storage, up_to: u64) -> Result<Ve
     Ok(out)
 }
 
+/// The AEAD binding of a manifest (`catalog.json` / `snapshots/<v>.json`)
+/// and of the `highest.json` marker: the lake identity and the published
+/// version, not the path (the catalog and its snapshot are byte-identical,
+/// so they must share one binding). M-7.
+pub(crate) fn manifest_binding(lake_id: &str, version: u64) -> String {
+    format!("lake:{lake_id}:{version}")
+}
+
+/// Parse `lake:<32 hex>:<version>`; `None` for the legacy empty binding or
+/// any other shape.
+pub(crate) fn parse_manifest_binding(binding: &str) -> Option<(&str, u64)> {
+    let rest = binding.strip_prefix("lake:")?;
+    let (id, version) = rest.rsplit_once(':')?;
+    if !is_lake_id(id) {
+        return None;
+    }
+    Some((id, version.parse().ok()?))
+}
+
+/// A lake id is exactly 32 lowercase hex characters (128 bits).
+pub(crate) fn is_lake_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A fresh 128-bit lake id from OS randomness (hex). Unlike [`fresh_id`]
+/// (time/pid/stack derived, adequate for unique file names but predictable),
+/// this is the identity an attacker must not be able to re-create or guess.
+pub(crate) fn fresh_lake_id() -> Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|e| LakeError::Io {
+        context: "obtaining OS randomness for the lake identity".to_string(),
+        source: std::io::Error::other(e.to_string()),
+    })?;
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    Ok(out)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LakeIdentity {
+    lake_format: u32,
+    lake_id: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct HighestVersion {
+    lake_format: u32,
+    lake_id: String,
+    version: u64,
+}
+
+fn identity_json(lake_id: &str) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&LakeIdentity {
+        lake_format: LAKE_ID_FORMAT,
+        lake_id: lake_id.to_string(),
+    })
+    .map_err(|e| LakeError::Internal {
+        message: format!("serializing lake identity: {e}"),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn highest_json(lake_id: &str, version: u64) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(&HighestVersion {
+        lake_format: LAKE_ID_FORMAT,
+        lake_id: lake_id.to_string(),
+        version,
+    })
+    .map_err(|e| LakeError::Internal {
+        message: format!("serializing highest.json: {e}"),
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Read `lake.json`, or `None` when this is a pre-v6 lake (the file did not
+/// exist before M-7).
+fn read_identity(storage: &dyn Storage, _root: &Path) -> Result<Option<String>> {
+    match storage.head(LAKE_FILE)? {
+        Head::Missing => Ok(None),
+        Head::NotAFile => Err(LakeError::Corrupt {
+            path: storage.abs(LAKE_FILE),
+            message: "lake.json is not a regular file".to_string(),
+        }),
+        Head::File => {
+            let path = storage.abs(LAKE_FILE);
+            let bytes = storage.read(LAKE_FILE, &format!("reading {}", path.display()))?;
+            let identity: LakeIdentity =
+                serde_json::from_slice(&bytes).map_err(|e| LakeError::Corrupt {
+                    path: path.clone(),
+                    message: format!("lake.json does not parse: {e}"),
+                })?;
+            if identity.lake_format != LAKE_ID_FORMAT {
+                return Err(LakeError::Unsupported {
+                    path,
+                    found: identity.lake_format,
+                });
+            }
+            if !is_lake_id(&identity.lake_id) {
+                return Err(LakeError::Corrupt {
+                    path,
+                    message: "lake.json carries an invalid lake_id (expected 32 lowercase hex \
+                              characters)"
+                        .to_string(),
+                });
+            }
+            Ok(Some(identity.lake_id))
+        }
+    }
+}
+
+/// Read and validate `highest.json` for `lake_id`. A missing or unreadable
+/// marker is a hard error for a v6 lake: accepting the catalog without it
+/// would silently restore the rollback surface M-7 closes.
+fn read_highest(storage: &dyn Storage, lake_id: &str) -> Result<u64> {
+    let path = storage.abs(HIGHEST_FILE);
+    match storage.head(HIGHEST_FILE)? {
+        Head::Missing => {
+            return Err(LakeError::Corrupt {
+                path,
+                message: "highest.json is missing (the authenticated rollback marker was \
+                          removed); refusing to open"
+                    .to_string(),
+            });
+        }
+        Head::NotAFile => {
+            return Err(LakeError::Corrupt {
+                path,
+                message: "highest.json is not a regular file".to_string(),
+            });
+        }
+        Head::File => {}
+    }
+    let bytes = storage.read_highest(
+        HIGHEST_FILE,
+        &format!("reading {}", path.display()),
+        lake_id,
+    )?;
+    let highest: HighestVersion =
+        serde_json::from_slice(&bytes).map_err(|e| LakeError::Corrupt {
+            path: path.clone(),
+            message: format!("highest.json does not parse: {e}"),
+        })?;
+    if highest.lake_format != LAKE_ID_FORMAT {
+        return Err(LakeError::Unsupported {
+            path,
+            found: highest.lake_format,
+        });
+    }
+    if highest.lake_id != lake_id {
+        return Err(LakeError::Corrupt {
+            path: path.clone(),
+            message: format!(
+                "highest.json belongs to lake {}, not to this lake ({lake_id})",
+                highest.lake_id
+            ),
+        });
+    }
+    if highest.version < 1 || highest.version > MAX_VERSION {
+        return Err(LakeError::Corrupt {
+            path,
+            message: format!(
+                "highest.json version {} is outside the supported range 1..={MAX_VERSION}",
+                highest.version
+            ),
+        });
+    }
+    Ok(highest.version)
+}
+
 /// Read and validate `catalog.json`.
 fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
     let path = storage.abs(CATALOG_FILE);
@@ -2230,6 +2639,32 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
             ),
         });
     }
+    // M-7: v6 manifests carry the lake identity; older manifests never do.
+    if manifest.format_version >= 6 {
+        match manifest.lake_id.as_deref() {
+            Some(id) if is_lake_id(id) => {}
+            Some(id) => {
+                return Err(LakeError::Corrupt {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "format_version 6 manifest carries an invalid lake_id {id:?} \
+                         (expected 32 lowercase hex characters)"
+                    ),
+                });
+            }
+            None => {
+                return Err(LakeError::Corrupt {
+                    path: path.to_path_buf(),
+                    message: "format_version 6 manifest has no lake_id (the lake identity is \
+                              mandatory from v6)"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    // An older manifest may carry the field (a hand-edited or future-additive
+    // fixture); only v6 requires it. It is ignored below v6, where the lake is
+    // upgraded on its next save.
     let v = manifest.format_version;
     let corrupt = |message: String| LakeError::Corrupt {
         path: path.to_path_buf(),
@@ -2335,13 +2770,13 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                      format_version 1)"
                 )));
             }
-            (4 | 5, None) => {
+            (4..=6, None) => {
                 return Err(corrupt(format!(
                     "table \"{key}\" does not declare a data file format (a format_version {v} \
                      entry requires `\"format\"`: \"pink\" or \"vortex\")"
                 )));
             }
-            (4 | 5, Some(FileFormat::Vortex)) => {
+            (4..=6, Some(FileFormat::Vortex)) => {
                 #[cfg(not(feature = "vortexlake"))]
                 return Err(LakeError::FeatureMissing {
                     feature: "vortexlake",
@@ -2366,7 +2801,7 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                          {v} manifest (only v4 entries carry per-file row counts)"
                     )));
                 }
-                (4 | 5, FileRef::Path(_)) => {
+                (4..=6, FileRef::Path(_)) => {
                     return Err(corrupt(format!(
                         "table \"{key}\" lists a data file without its row count (a \
                          format_version {v} entry lists files as {{\"path\", \"rows\"}} \
@@ -2374,7 +2809,7 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                     )));
                 }
                 (
-                    4 | 5,
+                    4..=6,
                     FileRef::Entry {
                         path: rel,
                         stats: _stats,

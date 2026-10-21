@@ -1390,7 +1390,8 @@ impl Lake {
         // The table's schema lives in its data files; attach reads it without
         // materializing anything.
         let (tdb, ttable) = split_key(table, &self.root)?;
-        let (attachment, _) = crate::attach::build_from(&self.storage, &self.root, None)?;
+        let (attachment, _) =
+            crate::attach::build_from(&self.storage, &self.root, None, Some(&self.lake_id))?;
         let schema = attachment
             .tables()
             .iter()
@@ -1756,6 +1757,7 @@ impl Lake {
             let schema_version = crate::next_schema_version(Some(&head), &tables);
             let new_catalog = Catalog {
                 format_version: FORMAT_VERSION,
+                lake_id: Some(self.lake_id.clone()),
                 updated: crate::time::iso8601_utc(SystemTime::now()),
                 version,
                 tables,
@@ -2048,6 +2050,7 @@ impl Lake {
             let schema_version = crate::next_schema_version(Some(&head), &tables);
             let new_catalog = Catalog {
                 format_version: FORMAT_VERSION,
+                lake_id: Some(self.lake_id.clone()),
                 updated: crate::time::iso8601_utc(SystemTime::now()),
                 version,
                 tables,
@@ -2654,6 +2657,7 @@ impl Lake {
         let schema_version = crate::next_schema_version(Some(&head), &tables);
         let new_catalog = crate::catalog::Catalog {
             format_version: crate::FORMAT_VERSION,
+            lake_id: Some(self.lake_id.clone()),
             updated: crate::time::iso8601_utc(std::time::SystemTime::now()),
             version,
             tables,
@@ -2738,7 +2742,9 @@ impl Lake {
     ) -> Result<()> {
         let commit_rel = format!("commits/{version}.json");
         let snapshot_rel = format!("snapshots/{version}.json");
-        let snapshot_bytes = self.storage.seal_manifest(snapshot_plain)?;
+        let snapshot_bytes = self
+            .storage
+            .seal_manifest(snapshot_plain, &self.lake_id, version)?;
         if !self.storage.put_new(&commit_rel, commit_bytes)? {
             // Version `version` already published (another writer won the
             // race), or a stray delta manifest from a crashed attempt that

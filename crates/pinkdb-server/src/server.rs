@@ -469,6 +469,11 @@ pub struct Server {
     /// `tls`); `None` = plaintext TCP.
     #[cfg(feature = "tls")]
     tls: Option<Arc<rustls::ServerConfig>>,
+    /// M-3: whether `COPY … TO` is opted in, and the destination root that
+    /// confines it. Both default off; the served database gets
+    /// `CopyToPolicy::Disabled` at bind time.
+    copy_to_allowed: bool,
+    copy_root: Option<std::path::PathBuf>,
 }
 
 impl Server {
@@ -495,6 +500,9 @@ impl Server {
         listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         db.set_allow_sql_load_extension(false);
+        // M-3: a network client must not write server-side files by default,
+        // even with ADMIN. The opt-in is `--allow-copy-to --copy-root`.
+        db.set_copy_to_policy(pinkdb::CopyToPolicy::Disabled);
         Ok(Server {
             listener,
             local_addr,
@@ -514,6 +522,8 @@ impl Server {
             login_ips: Arc::new(LoginIpLimiter::new()),
             #[cfg(feature = "tls")]
             tls: None,
+            copy_to_allowed: false,
+            copy_root: None,
         })
     }
 
@@ -573,6 +583,40 @@ impl Server {
     pub fn extension_root(self, root: Option<std::path::PathBuf>) -> Self {
         self.db.set_extension_root(root);
         self
+    }
+
+    /// Let remote clients run `COPY … TO` (default: refused), confined to
+    /// [`Server::copy_root`]. Even with this on, `COPY TO` requires ADMIN in
+    /// an authenticated session; the destination is written atomically with
+    /// mode 0600 and may not escape the root (no `..`, no symlinked parent or
+    /// target).
+    ///
+    /// Opting in without a root leaves the policy at `RootRequired`: every
+    /// `COPY TO` is refused with that message rather than writing anywhere.
+    pub fn allow_copy_to(self, allow: bool) -> Self {
+        let mut server = self;
+        server.copy_to_allowed = allow;
+        server.apply_copy_policy();
+        server
+    }
+
+    /// Confine every `COPY … TO` destination to `root`. The directory must
+    /// exist; `None` removes the root (and, with `allow_copy_to`, makes every
+    /// `COPY TO` a refusal).
+    pub fn copy_root(self, root: Option<std::path::PathBuf>) -> Self {
+        let mut server = self;
+        server.copy_root = root;
+        server.apply_copy_policy();
+        server
+    }
+
+    fn apply_copy_policy(&self) {
+        let policy = match (&self.copy_root, self.copy_to_allowed) {
+            (Some(root), true) => pinkdb::CopyToPolicy::Confined(root.clone()),
+            (None, true) => pinkdb::CopyToPolicy::RootRequired,
+            _ => pinkdb::CopyToPolicy::Disabled,
+        };
+        self.db.set_copy_to_policy(policy);
     }
 
     /// Per-socket idle timeout for reads and writes (`None` = wait forever).

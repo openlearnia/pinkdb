@@ -240,8 +240,10 @@ mod tests {
                 out.push_str(&cells.join("|"));
                 out.push('\n');
             }
-            std::fs::write(path, out).map_err(|e| {
-                PinkDbError::Execution(format!("cannot write \"{}\": {e}", path.display()))
+            use std::io::Write as _;
+            crate::fsutil::write_atomic_private(path, |f| {
+                f.write_all(out.as_bytes())?;
+                Ok(())
             })
         }
     }
@@ -295,6 +297,13 @@ mod tests {
             std::fs::read_to_string(&file).unwrap(),
             "a:INTEGER,s:VARCHAR\n1|x\n|\n3|\n"
         );
+        // M-3/M-5: even the embedded (trusted) path writes owner-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "COPY destination must be 0600");
+        }
 
         // Extension inference when FORMAT is omitted.
         db.execute(&format!("COPY t TO '{}';", file2.display()))

@@ -621,6 +621,7 @@ impl Lake {
             let schema_version = next_schema_version(Some(&head), &tables);
             let new_catalog = Catalog {
                 format_version: FORMAT_VERSION,
+                lake_id: Some(self.lake_id.clone()),
                 updated: crate::time::iso8601_utc(SystemTime::now()),
                 version,
                 tables,

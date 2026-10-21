@@ -335,8 +335,32 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// unchanged. The decorator's write methods recognize the container magic
     /// and store already-sealed bytes as-is, so this is the one seam where
     /// "seal once, publish twice" is expressed.
-    fn seal_manifest(&self, plain: &[u8]) -> Result<Vec<u8>> {
+    fn seal_manifest(&self, plain: &[u8], _lake_id: &str, _version: u64) -> Result<Vec<u8>> {
         Ok(plain.to_vec())
+    }
+
+    /// Pin the lake identity every manifest this session reads must carry
+    /// (M-7). The plaintext backends ignore it; the encryption decorator
+    /// checks container bindings against it.
+    fn set_manifest_lake_id(&self, _lake_id: Option<String>) {}
+
+    /// Publish the authenticated highest-version marker. Plaintext backends
+    /// store the bytes as-is; the encryption decorator binds them to
+    /// `(lake_id, version)`.
+    fn put_highest(&self, rel: &str, bytes: &[u8], _lake_id: &str, _version: u64) -> Result<()> {
+        self.put(rel, bytes)
+    }
+
+    /// Read and authenticate the highest-version marker. The default is a
+    /// plain read; the encryption decorator verifies the container binding.
+    fn read_highest(&self, rel: &str, context: &str, _lake_id: &str) -> Result<Vec<u8>> {
+        self.read(rel, context)
+    }
+
+    /// Best-effort narrow pre-existing artifacts to 0600 (M-5). The local
+    /// backend overrides this; object storage has no file modes.
+    fn tighten_existing(&self) -> Result<()> {
+        Ok(())
     }
 
     /// [`Storage::read`] plus the object's **stored** bytes as the backend
@@ -352,19 +376,72 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     }
 }
 
+/// The version encoded in `snapshots/<v>.json`, if `rel` is a canonical
+/// snapshot name.
+fn snapshot_version(rel: &str) -> Option<u64> {
+    let stem = rel.strip_prefix("snapshots/")?.strip_suffix(".json")?;
+    crate::canonical_version_number(stem)
+}
+
+/// A pre-v6 encrypted manifest has the empty binding: refuse it with a clean
+/// upgrade message instead of an opaque authentication failure.
+fn legacy_manifest_error(path: &Path) -> LakeError {
+    LakeError::Corrupt {
+        path: path.to_path_buf(),
+        message: "pre-v6 encrypted lake manifest (no lake-id/version binding); this build \
+                  refuses the weaker-bound format — create a new keyed lake (or load and \
+                  re-save it with a pre-M-7 build)"
+            .to_string(),
+    }
+}
+
+/// Cross-check a decrypted manifest's `(lake_id, version)` against the
+/// container binding it authenticated under (M-7).
+fn check_manifest_binding(
+    path: &Path,
+    plain: &[u8],
+    binding: &str,
+    lake_id: &str,
+    version: u64,
+) -> Result<()> {
+    let value: serde_json::Value =
+        serde_json::from_slice(plain).map_err(|e| LakeError::Corrupt {
+            path: path.to_path_buf(),
+            message: format!("manifest does not parse: {e}"),
+        })?;
+    let got_id = value.get("lake_id").and_then(|v| v.as_str());
+    let got_version = value.get("version").and_then(|v| v.as_u64());
+    if got_id != Some(lake_id) || got_version != Some(version) {
+        return Err(LakeError::Tampered {
+            path: path.to_path_buf(),
+            message: format!(
+                "the manifest container is bound to (lake {lake_id}, version {version}), but \
+                 its payload declares (lake {}, version {})",
+                got_id.unwrap_or("<none>"),
+                got_version.map_or_else(|| "<none>".to_string(), |v| v.to_string())
+            ),
+        });
+    }
+    let expected = crate::manifest_binding(lake_id, version);
+    if binding != expected {
+        return Err(LakeError::Tampered {
+            path: path.to_path_buf(),
+            message: "manifest container binding is inconsistent".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// The lake-relative-path → container domain/binding mapping every encrypted
 /// object is sealed and opened under (see the `crypto` module docs).
 fn crypto_domain(rel: &str) -> (crypto::Domain, &str) {
     if rel == CATALOG_FILE || rel.starts_with("snapshots/") {
-        // Manifests are bound to nothing path-like: catalog.json and
-        // snapshots/<v>.json are the same bytes by construction, so the
-        // byte-identity invariant forces a binding that names neither path nor
-        // version. Consequence (deliberate, documented): a same-key manifest
-        // from another lake/version authenticates here — the caller's
-        // declared-`version`-vs-filename check is what rejects a mismatch, and
-        // a same-version replay across lakes sharing one key remains a known
-        // rollback surface, traded for the invariant.
+        // Unreachable for plaintext manifests (`sealed` refuses them and
+        // `plain` handles the pair explicitly with a `(lake_id, version)`
+        // binding); kept as a defensive fallback for any future caller.
         (crypto::Domain::Manifest, "")
+    } else if rel == crate::HIGHEST_FILE {
+        (crypto::Domain::Highest, rel)
     } else if rel.starts_with("commits/") {
         (crypto::Domain::Commit, rel)
     } else if rel.ends_with(".pinkdel") {
@@ -398,6 +475,10 @@ fn crypto_domain(rel: &str) -> (crypto::Domain, &str) {
 pub(crate) struct CryptoStorage {
     inner: Arc<dyn Storage>,
     crypto: Option<Arc<Crypto>>,
+    /// The lake identity every manifest container must be bound to (M-7).
+    /// Set from `lake.json` before the catalog is read; `None` while a
+    /// pre-v6 lake is being recognised.
+    manifest_lake_id: std::sync::RwLock<Option<String>>,
 }
 
 impl CryptoStorage {
@@ -410,7 +491,11 @@ impl CryptoStorage {
             Some(key) => Some(Arc::new(Crypto::new(key)?)),
             None => None,
         };
-        Ok(Self { inner, crypto })
+        Ok(Self {
+            inner,
+            crypto,
+            manifest_lake_id: std::sync::RwLock::new(None),
+        })
     }
 
     /// The plaintext of one stored object: unsealed (and authenticated) for a
@@ -422,6 +507,49 @@ impl CryptoStorage {
             Some(crypto) => {
                 if !crypto::is_container(&stored) {
                     return Err(crypto::not_encrypted_error(&path));
+                }
+                // M-7: manifest containers are bound to `(lake_id, version)`,
+                // not the empty binding. `catalog.json` carries its version
+                // inside the (public, authenticated) header binding; a
+                // snapshot's version is in its file name. Both are
+                // cross-checked against the decrypted JSON, so a container
+                // re-sealed for another version/lake cannot be substituted.
+                if rel == CATALOG_FILE {
+                    let header_binding = crypto.container_binding(&path, &stored)?;
+                    let (id, version) = crate::parse_manifest_binding(&header_binding)
+                        .ok_or_else(|| legacy_manifest_error(&path))?;
+                    let expected = self
+                        .manifest_lake_id
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone();
+                    if let Some(expected) = expected
+                        && expected != id
+                    {
+                        return Err(LakeError::Tampered {
+                            path,
+                            message: format!(
+                                "catalog.json is bound to lake {id}, not to this lake \
+                                 ({expected}); a manifest from another lake was substituted"
+                            ),
+                        });
+                    }
+                    let plain =
+                        crypto.open(&path, crypto::Domain::Manifest, &header_binding, &stored)?;
+                    check_manifest_binding(&path, &plain, &header_binding, id, version)?;
+                    return Ok(plain);
+                }
+                if let Some(version) = snapshot_version(rel) {
+                    let id = self
+                        .manifest_lake_id
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone()
+                        .ok_or_else(|| legacy_manifest_error(&path))?;
+                    let binding = crate::manifest_binding(&id, version);
+                    let plain = crypto.open(&path, crypto::Domain::Manifest, &binding, &stored)?;
+                    check_manifest_binding(&path, &plain, &binding, &id, version)?;
+                    return Ok(plain);
                 }
                 let (domain, binding) = crypto_domain(rel);
                 crypto.open(&path, domain, binding, &stored)
@@ -441,6 +569,19 @@ impl CryptoStorage {
     /// for the catalog), which are published as-is so the shared bytes stay
     /// byte-identical.
     fn sealed(&self, rel: &str, bytes: &[u8]) -> Result<Vec<u8>> {
+        // A plaintext manifest must go through `seal_manifest`, the one seam
+        // that knows `(lake_id, version)`; falling back to the empty binding
+        // here would silently restore the pre-M-7 surface.
+        if (rel == CATALOG_FILE || rel.starts_with("snapshots/"))
+            && !crypto::is_container(bytes)
+            && self.crypto.is_some()
+        {
+            return Err(LakeError::Internal {
+                message: "a manifest must be sealed through Storage::seal_manifest \
+                          (lake_id/version binding)"
+                    .to_string(),
+            });
+        }
         match &self.crypto {
             None => Ok(bytes.to_vec()),
             Some(crypto) => {
@@ -619,14 +760,73 @@ impl Storage for CryptoStorage {
         self.crypto.is_some()
     }
 
-    fn seal_manifest(&self, plain: &[u8]) -> Result<Vec<u8>> {
+    fn seal_manifest(&self, plain: &[u8], lake_id: &str, version: u64) -> Result<Vec<u8>> {
         match &self.crypto {
             None => Ok(plain.to_vec()),
             Some(crypto) => {
                 let path = self.inner.abs(CATALOG_FILE);
-                crypto.seal(&path, crypto::Domain::Manifest, "", plain)
+                crypto.seal(
+                    &path,
+                    crypto::Domain::Manifest,
+                    &crate::manifest_binding(lake_id, version),
+                    plain,
+                )
             }
         }
+    }
+
+    fn set_manifest_lake_id(&self, lake_id: Option<String>) {
+        *self
+            .manifest_lake_id
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = lake_id;
+    }
+
+    fn put_highest(&self, rel: &str, bytes: &[u8], lake_id: &str, version: u64) -> Result<()> {
+        match &self.crypto {
+            None => self.inner.put(rel, bytes),
+            Some(crypto) => {
+                let path = self.inner.abs(rel);
+                let sealed = crypto.seal(
+                    &path,
+                    crypto::Domain::Highest,
+                    &crate::manifest_binding(lake_id, version),
+                    bytes,
+                )?;
+                self.inner.put(rel, &sealed)
+            }
+        }
+    }
+
+    fn read_highest(&self, rel: &str, context: &str, lake_id: &str) -> Result<Vec<u8>> {
+        let stored = self.inner.read(rel, context)?;
+        match &self.crypto {
+            None => Ok(stored),
+            Some(crypto) => {
+                let path = self.inner.abs(rel);
+                if !crypto::is_container(&stored) {
+                    return Err(crypto::not_encrypted_error(&path));
+                }
+                let binding = crypto.container_binding(&path, &stored)?;
+                let (id, version) = crate::parse_manifest_binding(&binding)
+                    .ok_or_else(|| legacy_manifest_error(&path))?;
+                if id != lake_id {
+                    return Err(LakeError::Tampered {
+                        path,
+                        message: format!(
+                            "highest.json is bound to lake {id}, not to this lake ({lake_id})"
+                        ),
+                    });
+                }
+                let plain = crypto.open(&path, crypto::Domain::Highest, &binding, &stored)?;
+                check_manifest_binding(&path, &plain, &binding, id, version)?;
+                Ok(plain)
+            }
+        }
+    }
+
+    fn tighten_existing(&self) -> Result<()> {
+        self.inner.tighten_existing()
     }
 }
 
@@ -803,7 +1003,10 @@ mod tests {
         // A keyless `seal_manifest` is the identity (plaintext lakes keep
         // byte-identical manifests) and `local_copy` refuses the container
         // before the engine could open it as a `.pink` file.
-        assert_eq!(storage.seal_manifest(b"{\"v\":1}").unwrap(), b"{\"v\":1}");
+        assert_eq!(
+            storage.seal_manifest(b"{\"v\":1}", "id", 1).unwrap(),
+            b"{\"v\":1}"
+        );
         let err = storage
             .local_copy(CATALOG_FILE, "loading catalog.json")
             .unwrap_err();
@@ -834,8 +1037,11 @@ mod tests {
         assert!(storage.encrypted());
 
         // The manifest pair: sealed once, published twice, byte-identical.
-        let plain = b"{\n  \"format_version\": 4\n}\n";
-        let sealed = storage.seal_manifest(plain).unwrap();
+        let plain = b"{\n  \"format_version\": 6,\n  \"lake_id\": \
+                     \"0123456789abcdef0123456789abcdef\",\n  \"version\": 4\n}\n";
+        let sealed = storage
+            .seal_manifest(plain, "0123456789abcdef0123456789abcdef", 4)
+            .unwrap();
         assert!(sealed.starts_with(b"PNKLAKE1"));
         assert!(storage.put_new("snapshots/1.json", &sealed).unwrap());
         assert!(storage.put_new(CATALOG_FILE, &sealed).unwrap());

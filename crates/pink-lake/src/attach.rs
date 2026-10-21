@@ -222,6 +222,8 @@ pub(crate) struct LakeAttachment {
     location: String,
     storage: Arc<dyn Storage>,
     root: std::path::PathBuf,
+    /// The lake identity this attachment's manifests must carry (M-7).
+    lake_id: Option<String>,
     /// lowercased `(db, table)` → the data files and how to decode them.
     files: HashMap<(String, String), AttachedEntry>,
     tables: Vec<AttachedTable>,
@@ -587,9 +589,14 @@ impl LakeAttachment {
         let mut index = Vec::with_capacity(versions.len());
         for version in versions {
             match manifest_for(&*self.storage, &self.root, Some(version)) {
-                Ok((manifest, _)) => {
+                Ok((manifest, _))
+                    if self.lake_id.is_none()
+                        || manifest.format_version < 6
+                        || manifest.lake_id.as_deref() == self.lake_id.as_deref() =>
+                {
                     index.push((version, crate::time::parse_iso8601_utc(&manifest.updated)))
                 }
+                Ok(_) => continue,
                 Err(LakeError::VersionNotFound { .. }) => continue,
                 Err(LakeError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
@@ -650,8 +657,13 @@ impl LakeAttachment {
         if let Some(view) = views.get(&version) {
             return Ok(VersionView::Built(Arc::clone(view)));
         }
-        let (attachment, _) = build_from(&self.storage, &self.root, Some(version))
-            .map_err(|e| PinkDbError::Execution(e.to_string()))?;
+        let (attachment, _) = build_from(
+            &self.storage,
+            &self.root,
+            Some(version),
+            self.lake_id.as_deref(),
+        )
+        .map_err(|e| PinkDbError::Execution(e.to_string()))?;
         views.insert(version, Arc::clone(&attachment));
         Ok(VersionView::Built(attachment))
     }
@@ -1302,7 +1314,7 @@ pub(crate) fn build(
     lake: &Lake,
     version: Option<u64>,
 ) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
-    build_from(&lake.storage, lake.path(), version)
+    build_from(&lake.storage, lake.path(), version, Some(&lake.lake_id))
 }
 
 /// [`build`] without a [`Lake`] handle: the storage root and the version to
@@ -1312,8 +1324,22 @@ pub(crate) fn build_from(
     storage: &Arc<dyn Storage>,
     root: &std::path::Path,
     version: Option<u64>,
+    lake_id: Option<&str>,
 ) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
     let (manifest, manifest_path) = manifest_for(&**storage, root, version)?;
+    if let Some(expected) = lake_id
+        && manifest.format_version >= 6
+        && manifest.lake_id.as_deref() != Some(expected)
+    {
+        return Err(LakeError::Corrupt {
+            path: manifest_path.clone(),
+            message: format!(
+                "manifest declares lake {}, but this lake is {expected} (a manifest from \
+                 another lake was substituted)",
+                manifest.lake_id.as_deref().unwrap_or("<none>")
+            ),
+        });
+    }
     let root = root.to_path_buf();
     let mut tables: Vec<AttachedTable> = Vec::with_capacity(manifest.tables.len());
     let mut files: HashMap<(String, String), AttachedEntry> = HashMap::new();
@@ -1738,6 +1764,7 @@ pub(crate) fn build_from(
         location: root.display().to_string(),
         storage: Arc::clone(storage),
         root,
+        lake_id: lake_id.map(str::to_string),
         files,
         tables,
         cache: Mutex::new(HashMap::new()),

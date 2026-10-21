@@ -3,9 +3,12 @@
 //! frames against **both** transports (the blocking server always, the
 //! `async-server` feature's tokio transport when it is built).
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use pinkdb::{Database, QueryResult};
+use pinkdb::{
+    DataType, Database, FileFormat, QueryResult, TableFunctionCall, TableScanOutput, TableSource,
+};
 use pinkdb_server::protocol::{PROTOCOL_VERSION, Request, Response, read_response, write_request};
 use pinkdb_server::{Client, Server, ServerHandle};
 
@@ -45,21 +48,94 @@ enum Handle {
 }
 
 fn start(flavor: Flavor, db: Database) -> (Handle, String) {
+    start_configured(flavor, db, false, None)
+}
+
+/// Start a server with an explicit COPY policy (`allow_copy`/`copy_root`).
+fn start_configured(
+    flavor: Flavor,
+    db: Database,
+    allow_copy: bool,
+    copy_root: Option<std::path::PathBuf>,
+) -> (Handle, String) {
     match flavor {
         Flavor::Blocking => {
-            let server = Server::bind("127.0.0.1:0", db).expect("bind ephemeral server");
+            let server = Server::bind("127.0.0.1:0", db)
+                .expect("bind ephemeral server")
+                .allow_copy_to(allow_copy)
+                .copy_root(copy_root);
             let addr = server.local_addr().to_string();
             let handle = server.spawn().expect("spawn server");
             (Handle::Blocking(handle), addr)
         }
         #[cfg(feature = "async-server")]
         Flavor::Async => {
-            let server = AsyncServer::bind("127.0.0.1:0", db).expect("bind ephemeral async server");
+            let server = AsyncServer::bind("127.0.0.1:0", db)
+                .expect("bind ephemeral async server")
+                .allow_copy_to(allow_copy)
+                .copy_root(copy_root);
             let addr = server.local_addr().to_string();
             let handle = server.spawn().expect("spawn async server");
             (Handle::Async(handle), addr)
         }
     }
+}
+
+/// A `COPY … TO` sink for the server tests (the shipped server registers no
+/// format, so the tests register a deterministic one).
+#[derive(Debug)]
+struct TestSink;
+
+impl FileFormat for TestSink {
+    fn name(&self) -> &str {
+        "testfmt"
+    }
+    fn extensions(&self) -> &[&str] {
+        &["testfmt"]
+    }
+    fn write(&self, path: &std::path::Path, table: &pinkdb::DataTable) -> pinkdb::Result<()> {
+        use std::io::Write as _;
+        pinkdb::write_atomic_private(path, |file| {
+            file.write_all(format!("rows={}\n", table.num_rows()).as_bytes())?;
+            Ok(())
+        })
+    }
+}
+
+/// A table source that claims `read_parquet` / `FROM 'file'` and returns an
+/// empty result, so the privilege path is exercised without a parquet build.
+#[derive(Debug)]
+struct DummySource;
+
+impl TableSource for DummySource {
+    fn name(&self) -> &str {
+        "rbac-dummy"
+    }
+    fn bind(&self, call: &TableFunctionCall) -> pinkdb::Result<Option<Vec<(String, DataType)>>> {
+        let claimed = matches!(call, TableFunctionCall::Path(_))
+            || call.function_name().as_deref() == Some("read_parquet");
+        Ok(claimed.then(|| vec![("a".to_string(), DataType::Bigint)]))
+    }
+    fn scan(
+        &self,
+        _call: &TableFunctionCall,
+        _projection: Option<&[usize]>,
+        _filters: &[pinkdb::PrunePredicate],
+    ) -> pinkdb::Result<TableScanOutput> {
+        Ok(TableScanOutput {
+            chunks: Vec::new(),
+            ..TableScanOutput::default()
+        })
+    }
+}
+
+fn ensure_test_globals() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        pinkdb::filefmt::register_global_file_format(Arc::new(TestSink));
+        pinkdb::table_source::register_global_table_source(Arc::new(DummySource));
+    });
 }
 
 /// Start a server over a fresh store; the store handle is returned so tests
@@ -506,5 +582,243 @@ fn raw_login_frames_round_trip() {
         }
         write_request(&mut writer, &Request::Ping).unwrap();
         assert_eq!(read_response(&mut reader).unwrap(), Response::Pong);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M-3: COPY … TO is ADMIN-only and server-side opt-in.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn copy_to_is_refused_by_default_even_for_admin() {
+    for flavor in flavors() {
+        ensure_test_globals();
+        let db = Database::new();
+        let (handle, addr) = start(flavor, db.clone());
+        let root = std::env::temp_dir().join(format!(
+            "pinkdb_rbac_copy_default_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("out.testfmt");
+
+        let mut trusted = embedded(&db);
+        trusted
+            .execute(
+                "CREATE TABLE t (a INTEGER);\
+                 INSERT INTO t VALUES (1);\
+                 CREATE USER admin PASSWORD 'admin-secret';\
+                 GRANT ADMIN TO admin;",
+            )
+            .unwrap();
+        let mut admin = Client::connect(&addr).unwrap();
+        admin.login("admin", "admin-secret").unwrap();
+        let e = err_of(admin.execute(&format!("COPY t TO '{}' (FORMAT testfmt);", file.display())));
+        assert!(
+            e.contains("COPY TO is disabled"),
+            "{flavor:?}: an ADMIN must not bypass the server opt-in: {e}"
+        );
+        assert!(!file.exists(), "{flavor:?}: no file may be written");
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn copy_to_opt_in_requires_admin_and_confines_the_destination() {
+    for flavor in flavors() {
+        ensure_test_globals();
+        let db = Database::new();
+        let root = std::env::temp_dir().join(format!(
+            "pinkdb_rbac_copy_root_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let outside = root
+            .parent()
+            .unwrap()
+            .join(format!("pinkdb_rbac_copy_outside_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let (handle, addr) = start_configured(flavor, db.clone(), true, Some(root.clone()));
+
+        let mut trusted = embedded(&db);
+        trusted
+            .execute(
+                "CREATE TABLE t (a INTEGER);\
+                 INSERT INTO t VALUES (1), (2);\
+                 CREATE USER admin PASSWORD 'admin-secret';\
+                 CREATE USER alice PASSWORD 'alice-secret';\
+                 GRANT ADMIN TO admin;\
+                 GRANT SELECT ON TABLE t TO alice;",
+            )
+            .unwrap();
+
+        // A mere SELECT grant (and no ADMIN) is refused.
+        let mut alice = Client::connect(&addr).unwrap();
+        alice.login("alice", "alice-secret").unwrap();
+        let e = err_of(alice.execute(&format!(
+            "COPY t TO '{}' (FORMAT testfmt);",
+            root.join("alice.testfmt").display()
+        )));
+        assert!(e.contains("needs the ADMIN privilege"), "{flavor:?}: {e}");
+
+        let mut admin = Client::connect(&addr).unwrap();
+        admin.login("admin", "admin-secret").unwrap();
+
+        // Inside the root: allowed, atomic replace, owner-only mode.
+        let file = root.join("sub").join("out.testfmt");
+        let first = admin
+            .execute(&format!("COPY t TO '{}' (FORMAT testfmt);", file.display()))
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "rows=2\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{flavor:?}: COPY destination mode");
+        }
+        // A second COPY atomically replaces the target (truncate semantics).
+        std::fs::write(&file, "old longer content").unwrap();
+        admin
+            .execute(&format!("COPY t TO '{}' (FORMAT testfmt);", file.display()))
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "rows=2\n");
+
+        // Outside the root, `..`, and an absolute escape are refused.
+        for hostile in [
+            outside.join("escape.testfmt"),
+            root.join("..").join("escape.testfmt"),
+            std::path::PathBuf::from("/tmp/pinkdb-rbac-escape.testfmt"),
+        ] {
+            let e = err_of(admin.execute(&format!(
+                "COPY t TO '{}' (FORMAT testfmt);",
+                hostile.display()
+            )));
+            assert!(
+                e.contains("outside the configured COPY root") || e.contains("`..` path component"),
+                "{flavor:?}: {hostile:?}: {e}"
+            );
+            assert!(!hostile.exists(), "{flavor:?}: {hostile:?} was written");
+        }
+
+        // A symlinked target and a symlinked parent are refused.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let real = root.join("real.testfmt");
+            std::fs::write(&real, b"keep").unwrap();
+            let link = root.join("link.testfmt");
+            symlink(&real, &link).unwrap();
+            let e =
+                err_of(admin.execute(&format!("COPY t TO '{}' (FORMAT testfmt);", link.display())));
+            assert!(e.contains("symlink"), "{flavor:?}: {e}");
+            assert_eq!(std::fs::read(&real).unwrap(), b"keep");
+
+            let linked_dir = root.join("linked-dir");
+            symlink(&outside, &linked_dir).unwrap();
+            let e = err_of(admin.execute(&format!(
+                "COPY t TO '{}' (FORMAT testfmt);",
+                linked_dir.join("x.testfmt").display()
+            )));
+            assert!(
+                e.contains("symlink") || e.contains("outside the configured COPY root"),
+                "{flavor:?}: {e}"
+            );
+            assert!(!outside.join("x.testfmt").exists());
+        }
+
+        // Opting in without a root refuses every COPY with a clear message.
+        let (handle2, addr2) = start_configured(flavor, db.clone(), true, None);
+        let mut admin2 = Client::connect(&addr2).unwrap();
+        admin2.login("admin", "admin-secret").unwrap();
+        let e = err_of(admin2.execute(&format!(
+            "COPY t TO '{}' (FORMAT testfmt);",
+            root.join("no-root.testfmt").display()
+        )));
+        assert!(e.contains("requires a destination root"), "{flavor:?}: {e}");
+        assert!(!root.join("no-root.testfmt").exists());
+
+        drop(handle);
+        drop(handle2);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M-4: table-function scans require ADMIN in an authenticated session.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn table_functions_require_admin_in_every_statement_shape() {
+    for flavor in flavors() {
+        ensure_test_globals();
+        let db = Database::new();
+        let (handle, addr) = start(flavor, db.clone());
+        // Before the first user exists every connection is trusted: the
+        // unauthenticated network path keeps working exactly like the
+        // embedded one.
+        let mut anon = Client::connect(&addr).unwrap();
+        anon.execute("SELECT * FROM read_parquet('/tmp/anon.parquet');")
+            .unwrap_or_else(|e| panic!("{flavor:?}: {e}"));
+        drop(anon);
+        embedded(&db)
+            .execute(
+                "CREATE USER admin PASSWORD 'admin-secret';\
+                 CREATE USER alice PASSWORD 'alice-secret';\
+                 GRANT ADMIN TO admin;",
+            )
+            .unwrap();
+
+        // Embedded/trusted behavior is unchanged: no principal, no check.
+        let mut trusted = embedded(&db);
+        assert!(
+            trusted
+                .execute("SELECT * FROM read_parquet('/tmp/trusted.parquet');")
+                .is_ok(),
+            "{flavor:?}: embedded/trusted table-function scans keep working"
+        );
+
+        // A zero-grant authenticated user is denied before execution.
+        let mut alice = Client::connect(&addr).unwrap();
+        alice.login("alice", "alice-secret").unwrap();
+        for sql in [
+            "SELECT * FROM read_parquet('/tmp/x.parquet');",
+            "WITH c AS (SELECT * FROM read_parquet('/tmp/x.parquet')) SELECT * FROM c;",
+            "SELECT * FROM read_parquet('/tmp/x.parquet') UNION ALL SELECT 1;",
+            "SELECT (SELECT count(*) FROM read_parquet('/tmp/x.parquet'));",
+            "SELECT (SELECT count(*) FROM read_parquet('/tmp/x.parquet')) IN (SELECT 1);",
+            "EXPLAIN SELECT * FROM read_parquet('/tmp/x.parquet');",
+        ] {
+            let e = err_of(alice.execute(sql));
+            assert!(
+                e.contains("needs the ADMIN privilege"),
+                "{flavor:?}: {sql}: {e}"
+            );
+        }
+
+        // ADMIN may run the same statements.
+        let mut admin = Client::connect(&addr).unwrap();
+        admin.login("admin", "admin-secret").unwrap();
+        for sql in [
+            "SELECT * FROM read_parquet('/tmp/x.parquet');",
+            "WITH c AS (SELECT * FROM read_parquet('/tmp/x.parquet')) SELECT * FROM c;",
+            "SELECT * FROM read_parquet('/tmp/x.parquet') UNION ALL SELECT 1;",
+            "EXPLAIN SELECT * FROM read_parquet('/tmp/x.parquet');",
+        ] {
+            admin
+                .execute(sql)
+                .unwrap_or_else(|e| panic!("{flavor:?}: {sql}: {e}"));
+        }
+        drop(handle);
     }
 }

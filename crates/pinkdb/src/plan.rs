@@ -979,6 +979,171 @@ fn expr_tables_read(
     }
 }
 
+/// Does `plan` (including every nested expression/subquery) contain a
+/// [`LogicalPlan::TableFunction`] leaf? M-4: `check_statement` uses this to
+/// require ADMIN for any file/table-function scan in an authenticated
+/// session, wherever the node sits (CTE body, `UNION` arm, subquery,
+/// materialized view or `EXPLAIN`). The matches are exhaustive on purpose,
+/// mirroring [`collect_tables_read`]: a new plan variant must decide whether
+/// it carries a nested plan or expression.
+pub(crate) fn contains_table_function(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::TableFunction { .. } => true,
+        LogicalPlan::CreateTableAs { query, .. }
+        | LogicalPlan::InsertSelect { query, .. }
+        | LogicalPlan::CreateMaterializedView { query, .. }
+        | LogicalPlan::Explain { plan: query } => contains_table_function(query),
+        LogicalPlan::Cte { query, body, .. } => {
+            contains_table_function(query) || contains_table_function(body)
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            contains_table_function(input) || expr_contains_table_function(predicate)
+        }
+        LogicalPlan::Window { input, windows, .. } => {
+            contains_table_function(input)
+                || windows.iter().any(|w| {
+                    w.arg
+                        .iter()
+                        .chain(w.partition.iter())
+                        .chain(w.order.iter().map(|(e, _)| e))
+                        .any(expr_contains_table_function)
+                })
+        }
+        LogicalPlan::Join {
+            left,
+            right,
+            left_keys,
+            right_keys,
+            ..
+        } => {
+            contains_table_function(left)
+                || contains_table_function(right)
+                || left_keys
+                    .iter()
+                    .chain(right_keys.iter())
+                    .any(expr_contains_table_function)
+        }
+        LogicalPlan::NestedLoopJoin {
+            left, right, on, ..
+        } => {
+            contains_table_function(left)
+                || contains_table_function(right)
+                || on.as_ref().is_some_and(expr_contains_table_function)
+        }
+        LogicalPlan::Aggregate { input, keys, aggs } => {
+            contains_table_function(input)
+                || keys
+                    .iter()
+                    .chain(aggs.iter().filter_map(|a| a.arg.as_ref()))
+                    .any(expr_contains_table_function)
+        }
+        LogicalPlan::Project { input, exprs, .. } => {
+            contains_table_function(input) || exprs.iter().any(expr_contains_table_function)
+        }
+        LogicalPlan::Sort { input, keys } => {
+            contains_table_function(input)
+                || keys.iter().any(|(e, _)| expr_contains_table_function(e))
+        }
+        LogicalPlan::Distinct { input }
+        | LogicalPlan::Limit { input, .. }
+        | LogicalPlan::Offset { input, .. } => contains_table_function(input),
+        LogicalPlan::SetOp { left, right, .. } => {
+            contains_table_function(left) || contains_table_function(right)
+        }
+        LogicalPlan::IndexScan { value, .. } => expr_contains_table_function(value),
+        LogicalPlan::Call { args, .. } => args.iter().any(expr_contains_table_function),
+        LogicalPlan::Insert { rows, .. } => rows.iter().flatten().any(expr_contains_table_function),
+        LogicalPlan::Update {
+            sets, predicate, ..
+        } => {
+            sets.iter().any(|(_, e)| expr_contains_table_function(e))
+                || predicate.as_ref().is_some_and(expr_contains_table_function)
+        }
+        LogicalPlan::Delete { predicate, .. } => {
+            predicate.as_ref().is_some_and(expr_contains_table_function)
+        }
+        LogicalPlan::AlterTable { op, .. } => match op {
+            AlterTablePlan::AddColumn { default, .. } => {
+                default.as_ref().is_some_and(expr_contains_table_function)
+            }
+            AlterTablePlan::DropColumn { .. }
+            | AlterTablePlan::RenameColumn { .. }
+            | AlterTablePlan::RenameTable { .. } => false,
+        },
+        LogicalPlan::Scan { .. }
+        | LogicalPlan::CopyTo { .. }
+        | LogicalPlan::SingleRow
+        | LogicalPlan::Begin
+        | LogicalPlan::Commit
+        | LogicalPlan::Rollback
+        | LogicalPlan::CreateView { .. }
+        | LogicalPlan::RefreshMaterializedView { .. }
+        | LogicalPlan::RefreshMaterializedViews { .. }
+        | LogicalPlan::DropMaterializedView { .. }
+        | LogicalPlan::ShowMaterializedViews { .. }
+        | LogicalPlan::DropTable { .. }
+        | LogicalPlan::CreateIndex { .. }
+        | LogicalPlan::DropIndex { .. }
+        | LogicalPlan::DropView { .. }
+        | LogicalPlan::CreateDatabase { .. }
+        | LogicalPlan::DropDatabase { .. }
+        | LogicalPlan::Use { .. }
+        | LogicalPlan::LoadExtension { .. }
+        | LogicalPlan::Checkpoint
+        | LogicalPlan::ShowTables { .. }
+        | LogicalPlan::ShowDatabases
+        | LogicalPlan::Describe { .. }
+        | LogicalPlan::CreateProcedure { .. }
+        | LogicalPlan::DropProcedure { .. }
+        | LogicalPlan::CreateMacro { .. }
+        | LogicalPlan::DropMacro { .. }
+        | LogicalPlan::ShowMacros { .. }
+        | LogicalPlan::DescribeMacro { .. }
+        | LogicalPlan::CreateUser { .. }
+        | LogicalPlan::AlterUser { .. }
+        | LogicalPlan::DropUser { .. }
+        | LogicalPlan::CreateRole { .. }
+        | LogicalPlan::DropRole { .. }
+        | LogicalPlan::Grant { .. }
+        | LogicalPlan::Revoke { .. }
+        | LogicalPlan::CreateTable { .. } => false,
+    }
+}
+
+fn expr_contains_table_function(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Literal(_)
+        | BoundExpr::Column { .. }
+        | BoundExpr::AggRef { .. }
+        | BoundExpr::WindowRef { .. } => false,
+        BoundExpr::Binary { left, right, .. } => {
+            expr_contains_table_function(left) || expr_contains_table_function(right)
+        }
+        BoundExpr::Not(e)
+        | BoundExpr::Negate { expr: e, .. }
+        | BoundExpr::IsNull { expr: e, .. }
+        | BoundExpr::Cast { expr: e, .. } => expr_contains_table_function(e),
+        BoundExpr::Scalar { args, .. } | BoundExpr::Coalesce { args, .. } => {
+            args.iter().any(expr_contains_table_function)
+        }
+        BoundExpr::DynamicScalar { args, .. } => args.iter().any(expr_contains_table_function),
+        BoundExpr::Case {
+            branches, else_, ..
+        } => {
+            branches
+                .iter()
+                .any(|(c, v)| expr_contains_table_function(c) || expr_contains_table_function(v))
+                || else_.as_deref().is_some_and(expr_contains_table_function)
+        }
+        BoundExpr::ScalarSubquery { query, .. } | BoundExpr::Exists { query, .. } => {
+            contains_table_function(query)
+        }
+        BoundExpr::InSubquery { expr, query, .. } => {
+            expr_contains_table_function(expr) || contains_table_function(query)
+        }
+    }
+}
+
 /// The catalog-table columns each `Scan` in a plan can be read through,
 /// keyed by the scan node's address.
 ///

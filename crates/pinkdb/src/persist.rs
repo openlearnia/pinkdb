@@ -2478,7 +2478,10 @@ impl PinkDb {
 
     fn write_sync(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
-        let mut f = std::fs::File::create(path)?;
+        // M-5: checkpoints (and the `.tmp` staging file they are written to)
+        // are owner-only, never umask-derived.
+        crate::fsutil::tighten(path);
+        let mut f = crate::fsutil::create_private(path)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         Ok(())
@@ -2497,10 +2500,7 @@ impl PinkDb {
         tmp.push(format!(".tmp-{}-{seq}", std::process::id()));
         let tmp = std::path::PathBuf::from(tmp);
         let write = (|| -> Result<()> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
+            let mut f = crate::fsutil::create_new_private(&tmp)?;
             f.write_all(bytes)?;
             f.sync_all()?;
             Ok(())

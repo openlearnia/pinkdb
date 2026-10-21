@@ -602,13 +602,10 @@ impl Drop for LeaseGuard {
 
 impl Lease {
     fn open(checkpoint: &Path, mode: LockMode, busy_timeout: Duration) -> Result<Arc<Lease>> {
-        let lock_path = PathBuf::from(format!("{}.lock", checkpoint.display()));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
+        let lock_path = lock_path(checkpoint);
+        // M-5: owner-only, and narrow a pre-existing 0644 lock file.
+        crate::fsutil::tighten(&lock_path);
+        let file = crate::fsutil::open_rw_private(&lock_path, false)?;
         let ms = busy_timeout.as_millis().min(u64::MAX as u128) as u64;
         Ok(Arc::new(Lease {
             file,
@@ -1401,12 +1398,10 @@ impl Wal {
         {
             // No `append(true)` here: std rejects append+truncate on Unix,
             // and a fresh file needs only sequential writes from offset 0.
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(path)?;
+            // M-5: the WAL holds literal SQL text, so it is owner-only — and
+            // an existing umask-created file is narrowed before truncation.
+            crate::fsutil::tighten(path);
+            let mut f = crate::fsutil::open_rw_private(path, true)?;
             match &cipher {
                 Some(c) => {
                     f.write_all(c.header())?;
@@ -2436,11 +2431,8 @@ fn rewrite_encrypted(
     let last_lsn = records.last().map(|r| r.lsn).unwrap_or(0);
     let rewrite = rewrite_path(path);
     {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&rewrite)?;
+        crate::fsutil::tighten(&rewrite);
+        let mut f = crate::fsutil::create_private(&rewrite)?;
         f.write_all(fresh.header())?;
         f.write_all(&encode_publish_block(
             &wal_id,
@@ -2496,11 +2488,8 @@ fn upgrade_plain(path: &Path, data: &[u8], generation: u64, records_start: usize
     }
     let upgrade = upgrade_path(path, generation);
     {
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&upgrade)?;
+        crate::fsutil::tighten(&upgrade);
+        let mut f = crate::fsutil::create_private(&upgrade)?;
         f.write_all(&out)?;
         f.sync_all()?;
     }
@@ -2794,6 +2783,12 @@ fn scan_wal(
 fn wal_path(checkpoint: &Path) -> PathBuf {
     let mut s = checkpoint.as_os_str().to_os_string();
     s.push(".wal");
+    PathBuf::from(s)
+}
+
+fn lock_path(checkpoint: &Path) -> PathBuf {
+    let mut s = checkpoint.as_os_str().to_os_string();
+    s.push(".lock");
     PathBuf::from(s)
 }
 
@@ -3468,6 +3463,14 @@ impl PinkDb {
         // 0. Take the lease: recovery and appends from two processes would
         //    corrupt the WAL. Unlike the old lifetime lock, it is released
         //    when this open completes.
+        //
+        //    M-5 migration: narrow artifacts a pre-fix build created with the
+        //    process umask (0644). Best-effort: an artifact we do not own is
+        //    left alone and the open proceeds.
+        crate::fsutil::tighten(&ckpt);
+        crate::fsutil::tighten(&wal);
+        crate::fsutil::tighten(&lock_path(&ckpt));
+        crate::fsutil::tighten(&tmp);
         let lease = Lease::open(&ckpt, opts.lock_mode, opts.busy_timeout)?;
         let guard = lease.acquire()?;
         let mut mutated = false;
@@ -4880,6 +4883,36 @@ mod tests {
             db.execute(&format!("INSERT INTO t VALUES ({r});")).unwrap();
         }
         db.save(path.to_str().unwrap()).unwrap();
+    }
+
+    /// M-5: the checkpoint's `.tmp` staging file (exactly what
+    /// `Wal::checkpoint` writes before the roll/rename) is created 0600, not
+    /// umask-derived.
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_staging_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "pinkdb_ckpt_tmp_mode_{}_{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ckpt = dir.join("db.pink");
+        let db = PinkDb::new();
+        let tmp = tmp_path(&ckpt);
+        db.save_sync(&tmp).unwrap();
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "checkpoint staging {} is {mode:o}",
+            tmp.display()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Write a WAL file with the given generation and (lsn, statements)
