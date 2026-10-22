@@ -77,7 +77,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use pinkdb::persist::SavedTableStats;
-use pinkdb::{ColumnStats, DataTable, DataType, PinkDb};
+use pinkdb::{ColumnStats, DataTable, DataType, PinkDb, Value};
 
 use crate::storage::{LocalCopy, Storage};
 use crate::{LakeError, Result};
@@ -89,6 +89,23 @@ pub const PINK_FORMAT_ID: &str = "pink";
 /// The format id of Vortex data files — registered by `vortexlake` builds.
 pub const VORTEX_FORMAT_ID: &str = "vortex";
 
+/// Where a data file's footer lives inside the file.
+///
+/// The lake's catalog records it for the formats that carry one (the
+/// engine's `.pink` files, `format_version` 7), so a reader fetches the
+/// footer **without** probing the file's 20-byte trailer: one ranged read
+/// instead of two, and the footer is still checksum-verified before a
+/// single byte of it is decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FooterLocation {
+    /// The footer's offset in the file.
+    pub offset: u64,
+    /// The footer's length in bytes.
+    pub length: u64,
+    /// The footer's CRC32C (the trailer's checksum for it).
+    pub crc32c: u32,
+}
+
 /// The output of one data-file write: the encoded bytes plus the exact
 /// per-column statistics the catalog block publishes for them (the same
 /// [`SavedTableStats`] facts the `.pink` writer collects).
@@ -99,6 +116,10 @@ pub struct EncodedFile {
     /// Exact per-column statistics, in schema order (the `stats` module's
     /// canonical encoding).
     pub stats: SavedTableStats,
+    /// Where the file's footer is, when the format carries one (the engine's
+    /// `.pink` files do). The catalog records it, so a reader needs no
+    /// trailer probe to find the footer.
+    pub footer: Option<FooterLocation>,
 }
 
 /// One published data file, as a provider's reader sees it.
@@ -110,13 +131,47 @@ pub struct DataFile<'a> {
     path: &'a Path,
     rel: &'a str,
     storage: Arc<dyn Storage>,
+    footer: Option<FooterLocation>,
+    deletes: Option<Arc<Vec<u64>>>,
 }
 
 impl<'a> DataFile<'a> {
     /// Wrap one data-file reference for a provider (crate-internal: the lake
     /// owns the storage handle).
     pub(crate) fn new(path: &'a Path, rel: &'a str, storage: Arc<dyn Storage>) -> Self {
-        Self { path, rel, storage }
+        Self {
+            path,
+            rel,
+            storage,
+            footer: None,
+            deletes: None,
+        }
+    }
+
+    /// Attach the catalog-recorded footer location (the lake knows it; a
+    /// provider uses it to fetch the footer without a trailer probe).
+    pub(crate) fn with_footer(mut self, footer: Option<FooterLocation>) -> Self {
+        self.footer = footer;
+        self
+    }
+
+    /// Attach the file's positional deletes (the row positions the catalog's
+    /// delete files drop). A provider that **prunes** rows (row groups) must
+    /// not prune a file with deletes: the delete positions address the file's
+    /// rows, and pruning would move them.
+    pub(crate) fn with_deletes(mut self, deletes: Vec<u64>) -> Self {
+        self.deletes = Some(Arc::new(deletes));
+        self
+    }
+
+    /// The file's catalog-recorded footer location, when the catalog has one.
+    pub fn footer(&self) -> Option<FooterLocation> {
+        self.footer
+    }
+
+    /// The file's positional deletes, when it has any.
+    pub fn deletes(&self) -> Option<&[u64]> {
+        self.deletes.as_ref().map(|deletes| deletes.as_slice())
     }
 
     /// The file's absolute path, for error messages (`s3://…` over object
@@ -303,19 +358,23 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
     /// The default buffers through [`LakeFormat::write`]; a provider whose
     /// encoder can stream overrides this (Vortex does) so a local save never
     /// materializes the whole file.
+    ///
+    /// Returns the published statistics and, when the format carries a
+    /// footer, where it is in the written file (the catalog records it, so a
+    /// reader finds the footer without probing the trailer).
     fn write_streamed(
         &self,
         db: &str,
         table: &str,
         src: &DataTable,
         sink: &mut (dyn Write + Send),
-    ) -> Result<SavedTableStats> {
+    ) -> Result<(SavedTableStats, Option<FooterLocation>)> {
         let encoded = self.write(db, table, src)?;
         sink.write_all(&encoded.bytes).map_err(|e| LakeError::Io {
             context: format!("writing the data file of \"{db}.{table}\""),
             source: e,
         })?;
-        Ok(encoded.stats)
+        Ok((encoded.stats, encoded.footer))
     }
 
     /// Decode one data file into the one-database/one-table [`PinkDb`] store
@@ -475,6 +534,14 @@ fn is_name_component(name: &str) -> bool {
 
 /// The built-in engine `.pink` format: one single-table store per file, with
 /// the exact statistics its encode pass collected.
+///
+/// The file is a `PINKDB06` image (wave 102): a data region of column chunks
+/// (row groups of 122,880 rows, one chunk per column per row group, each
+/// with its own CRC32C and exact statistics) followed by a footer and a
+/// 20-byte trailer. A reader therefore needs the footer and **only** the
+/// projected column chunks of the row groups that survive the scan's
+/// filters — read through the lake's positional reader, coalesced and
+/// fetched with a bounded number of requests in flight.
 #[derive(Debug)]
 struct PinkFormat;
 
@@ -503,7 +570,20 @@ impl LakeFormat for PinkFormat {
                     "the single-table encoder for \"{db}.{table}\" returned no statistics"
                 ),
             })?;
-        Ok(EncodedFile { bytes, stats })
+        let (offset, length, crc32c) =
+            pinkdb::persist::footer_location(&bytes).map_err(|e| LakeError::Engine {
+                context: format!("reading the footer of the .pink file of \"{db}.{table}\""),
+                source: e,
+            })?;
+        Ok(EncodedFile {
+            bytes,
+            stats,
+            footer: Some(FooterLocation {
+                offset,
+                length,
+                crc32c,
+            }),
+        })
     }
 
     fn read(&self, file: &DataFile<'_>) -> Result<PinkDb> {
@@ -513,6 +593,306 @@ impl LakeFormat for PinkFormat {
             source: e,
         })
     }
+
+    /// The file's schema, identity, row count and exact per-column
+    /// statistics, read from its footer alone (no data segment).
+    ///
+    /// The footer is fetched through the lake's positional reader: one ranged
+    /// read when the catalog records the footer's location, two (the trailer
+    /// plus the footer) when it does not.
+    fn footer_stats(&self, file: &DataFile<'_>) -> Result<Option<FileFooter>> {
+        let Some(source) = file.range_source() else {
+            // A sealed lake has no plaintext ranges: the caller falls back to
+            // the whole-object read.
+            return Ok(None);
+        };
+        let (bytes, crc) = read_footer(file, source.as_ref())?;
+        let layout = pinkdb::persist::read_layout(&bytes, crc).map_err(|e| LakeError::Engine {
+            context: format!("reading the footer of data file \"{}\"", file.rel()),
+            source: e,
+        })?;
+        let Some(table) = layout.tables.first() else {
+            return Err(LakeError::Corrupt {
+                path: file.path().to_path_buf(),
+                message: "the .pink data file holds no table".to_string(),
+            });
+        };
+        let stats = table
+            .schema
+            .iter()
+            .enumerate()
+            .map(|(i, (_, dtype))| {
+                // The footer's per-chunk statistics are per row group; the
+                // file's own facts are their union (the exactness gate is
+                // the shared one).
+                let mut nulls = 0u64;
+                let mut min = None;
+                let mut max = None;
+                let mut nans = 0u64;
+                for group in &table.row_groups {
+                    let Some(chunk) = group.columns.get(i) else {
+                        continue;
+                    };
+                    nulls += chunk.null_count;
+                    nans += chunk.nan_count;
+                    min = tighter(min, chunk.min.clone());
+                    max = tighter(max, chunk.max.clone());
+                }
+                crate::stats::serve_column_stats(*dtype, Some(nulls), min, max, Some(nans))
+            })
+            .collect();
+        Ok(Some(FileFooter {
+            db: table.db.clone(),
+            table: table.table.clone(),
+            rows: table.row_count,
+            schema: table.schema.clone(),
+            stats,
+        }))
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
+    }
+
+    /// The `.pink` footer records **exact** per-column-chunk statistics, so
+    /// a row group that cannot match the query's predicates is skipped
+    /// without reading a byte of it.
+    fn prunes_row_groups(&self) -> bool {
+        true
+    }
+
+    fn read_projected(
+        &self,
+        file: &DataFile<'_>,
+        columns: &[usize],
+        filters: &[pinkdb::PrunePredicate],
+    ) -> Result<Option<(PinkDb, Vec<bool>)>> {
+        // An encrypted lake has no plaintext byte ranges (a sealed container
+        // must be unsealed whole): the caller falls back to a full decode.
+        let Some(source) = file.range_source() else {
+            return Ok(None);
+        };
+        // 1. The footer: the row-group directory (where every column chunk
+        //    is, and what it proves).
+        let (bytes, crc) = read_footer(file, source.as_ref())?;
+        let layout = pinkdb::persist::read_layout(&bytes, crc).map_err(|e| LakeError::Engine {
+            context: format!("reading the footer of data file \"{}\"", file.rel()),
+            source: e,
+        })?;
+        let Some(table) = layout.tables.first() else {
+            return Err(LakeError::Corrupt {
+                path: file.path().to_path_buf(),
+                message: "the .pink data file holds no table".to_string(),
+            });
+        };
+        // 2. The row groups that survive the scan's filters.
+        let groups = surviving_row_groups(table, filters, file.deletes());
+        // 3. The projected column chunks of those row groups — and only
+        //    those bytes.
+        let spans = chunk_spans(table, columns, &groups);
+        // 4. Fetch them: coalesced, with a bounded number of requests in
+        //    flight.
+        let merged = crate::ranged::coalesce_spans(spans);
+        let fetched = crate::ranged::fetch_spans(source.as_ref(), &merged, crate::parallel_limit());
+        let mut windows = Vec::with_capacity(fetched.len());
+        for (span, bytes) in merged.iter().zip(fetched) {
+            windows.push(pinkdb::persist::PinkByteWindow {
+                offset: span.start,
+                bytes: bytes?,
+            });
+        }
+        // 5. Decode (in parallel, in file order).
+        let decoded = pinkdb::persist::decode_projected_columns(table, columns, &groups, &windows)
+            .map_err(|e| LakeError::Engine {
+                context: format!("decoding data file \"{}\"", file.rel()),
+                source: e,
+            })?;
+        // 6. The one-database/one-table store the lake's loaders expect.
+        let store = build_pink_store(file, &table.db, &table.table, decoded)?;
+        let mut present = vec![false; table.schema.len()];
+        for &column in columns {
+            if column < present.len() {
+                present[column] = true;
+            }
+        }
+        Ok(Some((store, present)))
+    }
+}
+
+/// The tighter of two statistics values: the smaller of two minimums, the
+/// larger of two maximums (`None` is "no fact").
+fn tighter(current: Option<Value>, other: Option<Value>) -> Option<Value> {
+    match (current, other) {
+        (Some(a), Some(b)) => Some(if pinkdb::plan::compare_values(&b, &a).is_lt() {
+            b
+        } else {
+            a
+        }),
+        (Some(a), None) => Some(a),
+        (None, b) => b,
+    }
+}
+
+/// Read one `.pink` data file's footer through the lake's positional reader.
+///
+/// With the catalog-recorded location (wave 102, `format_version` 7) this is
+/// **one** ranged read and the footer is still checksum-verified. Without it
+/// the reader probes the file's 20-byte trailer first (two reads).
+fn read_footer(file: &DataFile<'_>, source: &dyn RangedFile) -> Result<(Vec<u8>, Option<u32>)> {
+    if let Some(location) = file.footer() {
+        let bytes = source.read_range(location.offset, location.length)?;
+        return Ok((bytes, Some(location.crc32c)));
+    }
+    let len = source.len();
+    if len < pinkdb::persist::TRAILER_LEN as u64 {
+        return Err(LakeError::Corrupt {
+            path: file.path().to_path_buf(),
+            message: "the .pink data file is shorter than its trailer".to_string(),
+        });
+    }
+    let trailer = source.read_range(
+        len - pinkdb::persist::TRAILER_LEN as u64,
+        pinkdb::persist::TRAILER_LEN as u64,
+    )?;
+    let (offset, length, crc32c) =
+        pinkdb::persist::parse_trailer(&trailer, len).map_err(|e| LakeError::Engine {
+            context: format!("reading the trailer of data file \"{}\"", file.rel()),
+            source: e,
+        })?;
+    let bytes = source.read_range(offset, length)?;
+    Ok((bytes, Some(crc32c)))
+}
+
+/// The row groups of one `.pink` file that survive the scan's predicates.
+///
+/// The footer's per-chunk statistics are exact, so a row group whose
+/// statistics prove that no row can match is skipped without reading it.
+/// The same zone-map rules the lake prunes whole files with apply here
+/// ([`crate::zone`]), and the same exactness gate applies to a DOUBLE's
+/// min/max.
+///
+/// A file with **positional deletes** is never pruned: a delete position
+/// addresses a row of the file, and dropping rows would move it.
+fn surviving_row_groups(
+    table: &pinkdb::persist::PinkTableLayout,
+    filters: &[pinkdb::PrunePredicate],
+    deletes: Option<&[u64]>,
+) -> Vec<usize> {
+    if filters.is_empty() || deletes.is_some_and(|d| !d.is_empty()) {
+        return (0..table.row_groups.len()).collect();
+    }
+    table
+        .row_groups
+        .iter()
+        .enumerate()
+        .filter_map(|(index, group)| {
+            let zone: Vec<pinkdb::ColumnStats> = table
+                .schema
+                .iter()
+                .enumerate()
+                .map(|(i, (_, dtype))| {
+                    let Some(chunk) = group.columns.get(i) else {
+                        return pinkdb::ColumnStats::unknown();
+                    };
+                    crate::stats::serve_column_stats(
+                        *dtype,
+                        Some(chunk.null_count),
+                        chunk.min.clone(),
+                        chunk.max.clone(),
+                        Some(chunk.nan_count),
+                    )
+                })
+                .collect();
+            let facts = crate::zone::FileFacts {
+                rows: group.rows,
+                zone: Some(&zone),
+                partition: None,
+            };
+            if crate::zone::file_prunes(facts, &[], &table.schema, filters) {
+                None
+            } else {
+                Some(index)
+            }
+        })
+        .collect()
+}
+
+/// The byte ranges of the projected columns of the given row groups.
+fn chunk_spans(
+    table: &pinkdb::persist::PinkTableLayout,
+    columns: &[usize],
+    groups: &[usize],
+) -> Vec<crate::ranged::ByteSpan> {
+    let mut spans = Vec::new();
+    for &group in groups {
+        let Some(rg) = table.row_groups.get(group) else {
+            continue;
+        };
+        for &column in columns {
+            let Some(chunk) = rg.columns.get(column) else {
+                continue;
+            };
+            if chunk.length == 0 {
+                continue;
+            }
+            spans.push(crate::ranged::ByteSpan {
+                start: chunk.offset,
+                len: chunk.length,
+            });
+        }
+    }
+    spans
+}
+
+/// Build the one-database/one-table store the lake's loaders expect out of
+/// a decoded `.pink` file.
+fn build_pink_store(
+    file: &DataFile<'_>,
+    db: &str,
+    table: &str,
+    decoded: DataTable,
+) -> Result<PinkDb> {
+    let mut store = PinkDb::new();
+    if !db.eq_ignore_ascii_case("main") {
+        store.create_database(db).map_err(|e| LakeError::Engine {
+            context: format!("creating database \"{db}\""),
+            source: e,
+        })?;
+        store.drop_database("main").map_err(|e| LakeError::Engine {
+            context: "dropping the default database".to_string(),
+            source: e,
+        })?;
+    }
+    store
+        .create_table_in(db, table, decoded.schema())
+        .map_err(|e| LakeError::Engine {
+            context: format!("creating table \"{db}.{table}\""),
+            source: e,
+        })?;
+    {
+        let dst = store
+            .table_mut_in(db, table)
+            .map_err(|e| LakeError::Engine {
+                context: format!("opening table \"{db}.{table}\""),
+                source: e,
+            })?;
+        for index in 0..decoded.num_chunks() {
+            let chunk = decoded
+                .scan_chunk(index)
+                .ok_or_else(|| LakeError::Internal {
+                    message: format!(
+                        "chunk {index} of \"{db}.{table}\" disappeared while decoding"
+                    ),
+                })?;
+            dst.append_shared_chunk(&chunk.columns)
+                .map_err(|e| LakeError::Engine {
+                    context: format!("appending rows to \"{db}.{table}\""),
+                    source: e,
+                })?;
+        }
+    }
+    let _ = file;
+    Ok(store)
 }
 
 /// The built-in Vortex format (`vortexlake` builds): one Vortex file per
@@ -537,6 +917,7 @@ impl LakeFormat for VortexFormat {
         Ok(EncodedFile {
             bytes,
             stats: pinkdb::persist::table_stats(db, table, src),
+            footer: None,
         })
     }
 
@@ -546,9 +927,9 @@ impl LakeFormat for VortexFormat {
         table: &str,
         src: &DataTable,
         sink: &mut (dyn Write + Send),
-    ) -> Result<SavedTableStats> {
+    ) -> Result<(SavedTableStats, Option<FooterLocation>)> {
         crate::vortex_file::encode_table_into(db, table, src, sink)?;
-        Ok(pinkdb::persist::table_stats(db, table, src))
+        Ok((pinkdb::persist::table_stats(db, table, src), None))
     }
 
     fn read(&self, file: &DataFile<'_>) -> Result<PinkDb> {

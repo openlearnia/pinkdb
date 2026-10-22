@@ -115,7 +115,7 @@ fn save_open_query_and_metadata_commands() {
     assert!(lake.join("snapshots/1.json").is_file());
     assert!(lake.join("snapshots/2.json").is_file());
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
     assert!(catalog.contains("\"version\": 2"), "{catalog}");
     assert!(catalog.contains("\"main.t\""), "{catalog}");
     assert!(catalog.contains("\"analytics.u\""), "{catalog}");
@@ -134,7 +134,7 @@ fn save_open_query_and_metadata_commands() {
         ".lake info {lake}\n.lake versions {lake}\n.lake tables {lake}\n.quit\n",
         lake = lake.display()
     ));
-    assert!(out.contains("format version:  6"), "{out}");
+    assert!(out.contains("format version:  7"), "{out}");
     assert!(out.contains("current version: 2"), "{out}");
     assert!(out.contains("snapshots:       2 (1, 2)"), "{out}");
     assert!(out.contains("tables (2):"), "{out}");
@@ -429,7 +429,7 @@ fn keyed_lake_commands_roundtrip_and_fail_closed() {
     );
     assert!(out.contains("2 (current)"), "{out}");
     assert!(out.contains("main.t (2 rows)"), "{out}");
-    assert!(out.contains("format version:  6"), "{out}");
+    assert!(out.contains("format version:  7"), "{out}");
 
     // A fresh process loads the encrypted version and answers queries.
     let out = run_with_env(
@@ -1207,15 +1207,6 @@ fn attach_errors_are_clear_and_never_panic() {
     ));
     assert!(out.contains("is not a pink-lake directory"), "{out}");
 
-    // The v1 fixture: no statistics, refused with a clear message.
-    let v1 = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v1");
-    let (out, err, code) = run_captured(&format!(".lake attach {}\n.quit\n", v1.display()));
-    assert_eq!(code, 1);
-    assert!(
-        err.contains("without a statistics block") && err.contains("use .lake open"),
-        "{out}\n{err}"
-    );
-
     // A missing data file.
     let missing_lake = dir.join("missing_lake");
     copy_dir(&lake, &missing_lake);
@@ -1385,41 +1376,6 @@ fn attach_never_touches_the_lake() {
         "{out}"
     );
     cleanup(&dir);
-}
-
-/// The checked-in version 2 fixture lake attaches (its files were written by
-/// the older writer), and the answers match `.lake open`.
-#[test]
-fn attach_of_the_v2_fixture_matches_open() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v2");
-    let queries = "SELECT '===BEGIN===' AS marker;\n\
-                   SELECT COUNT(*) FROM fid;\n\
-                   SELECT COUNT(v), MIN(i), MAX(i), MIN(g), MAX(g) FROM fid;\n\
-                   SELECT MIN(b), MAX(b), MIN(dt), MAX(dt), MIN(ts), MAX(ts) FROM fid;\n\
-                   SELECT MIN(d), MAX(d) FROM fid;\n\
-                   SELECT s FROM big ORDER BY a LIMIT 3;\n\
-                   SELECT a FROM big WHERE s = 'region1' ORDER BY a LIMIT 2;\n\
-                   SELECT a, s FROM empty;\n\
-                   SELECT y FROM empty ORDER BY x;\n\
-                   SELECT '===END===' AS marker;\n";
-    let opened = run(&format!(
-        ".lake open {}\nUSE main;\n{queries}.quit\n",
-        fixture.display()
-    ));
-    let attached = run(&format!(
-        ".lake attach {}\nUSE main;\n{queries}.quit\n",
-        fixture.display()
-    ));
-    assert!(
-        attached.contains("footer-only"),
-        "attach output: {attached}"
-    );
-    let base = common::tail_after_marker(&opened);
-    assert_eq!(common::tail_after_marker(&attached), base);
-    // The fixture's DOUBLE column holds NaN payloads, so its MIN/MAX take
-    // the materializing path on both arms. Under DuckDB's NaN order (NaN
-    // sorts above +inf), MAX over a column holding NaN is NaN.
-    assert!(base.contains("-0.0") && base.contains("NaN"), "{base}");
 }
 
 /// `.lake open` after an attach still replaces the store and drops the
@@ -1764,7 +1720,7 @@ fn writable_attach_commit_appends_without_rewriting() {
     // The new version lists both data files plus the delete file, and the
     // v4 manifest adds up.
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
     assert!(catalog.contains("\"rows\": 200"), "{catalog}");
     assert!(
         catalog.contains("\"rows\": 2"),
@@ -1857,7 +1813,7 @@ fn writable_attach_schema_evolution_publishes_and_time_travels() {
     };
     assert_eq!(data_only(&lake.join("data")), files_before + 1);
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
     assert!(catalog.contains("\"schema_version\": 2"), "{catalog}");
     assert!(catalog.contains("\"name\": \"n\""), "{catalog}");
     assert!(catalog.contains("\"default\": \"42\""), "{catalog}");

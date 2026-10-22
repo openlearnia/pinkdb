@@ -25,7 +25,7 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 6,
+//!   "format_version": 7,
 //!   "lake_id": "0123456789abcdef0123456789abcdef",
 //!   "updated": "2026-10-14T12:34:56.789Z",
 //!   "version": 2,
@@ -171,39 +171,27 @@
 //! and applies to the handle's subsequent **full saves** and to tables it
 //! creates.
 //!
-//! **Pinning (the hybrid migration rule).** A format chosen explicitly — a
-//! per-table choice, an explicit [`Lake::set_write_format`], or
-//! [`Lake::rewrite_table_format`] — is recorded in the table's catalog entry
-//! as `"format_pinned": true` (omitted when false, so catalogs written by
-//! default stay byte-identical, and older builds ignore the field). An entry
-//! written under the build default is **not** pinned and keeps the wave-45
-//! behavior: a full save re-encodes it into the saving build's write format,
-//! so a pinklake-written lake migrates to Vortex on its next save in a
-//! vortexlake build. An entry whose format id is not a built-in default
-//! (anything but `pink`/`vortex`, e.g. `parquet`) is always treated as
-//! pinned.
+//! A table **keeps its format** on every save and append: changing it is
+//! always explicit (wave 102 removed the wave 88 hybrid rule that migrated
+//! default-written tables, together with every legacy catalog version). A
+//! full save resolves each table's format in this order:
 //!
-//! A full save resolves each table's format in this order:
+//! 1. the handle's explicit per-table choice ([`Lake::set_table_format`]);
+//! 2. else the format the table's previous entry already has;
+//! 3. else (a new table) the handle's write format ([`Lake::set_write_format`],
+//!    else the build default).
 //!
-//! 1. the handle's explicit per-table choice ([`Lake::set_table_format`]) —
-//!    that format, pinned;
-//! 2. else the previous entry if it is pinned (or its format id is not a
-//!    built-in default) — its format, pinned;
-//! 3. else the handle's write format — pinned exactly when
-//!    [`Lake::set_write_format`] was called explicitly, otherwise the build
-//!    default and unpinned.
-//!
-//! Appends always use the entry's format and keep its pin flag: an existing
-//! entry has exactly one format, so a commit/flush writes its new files in
+//! Appends always use the entry's format: an existing entry has exactly one
+//! format, so a commit/flush writes its new files in
 //! that format (a per-table choice never makes an append mix formats inside
 //! one entry). A table created by a commit uses the per-table choice (pinned)
 //! else the handle's write format (pinned when explicitly chosen).
 //! Converting a table is explicit maintenance — [`Lake::rewrite_table_format`]
 //! (the `.lake rewrite <dir> <table> format <id>` command) rewrites every
 //! file of the table into the requested format in one atomically published
-//! version, materializing any positional deletes, and pins the result; old
-//! files are retired by the ordinary expire/cleanup path. Ordinary
-//! compaction/rewrite keeps the entry's format and pin flag.
+//! version, materializing any positional deletes; old files are retired by
+//! the ordinary expire/cleanup path. Ordinary compaction/rewrite keeps the
+//! entry's format.
 //!
 //! **Unavailable formats are refused per table, not per lake.** In a
 //! format_version 4–6 catalog, an entry whose format id has no registered
@@ -479,6 +467,7 @@ mod local;
 mod maintenance;
 #[cfg(test)]
 mod mock_s3;
+mod ranged;
 #[cfg(feature = "s3")]
 mod s3;
 mod schema;
@@ -566,17 +555,20 @@ pub use s3::{DEFAULT_RETRIES, S3Config};
 /// whose entries include Vortex tables **opens**: those tables are listed by
 /// [`Lake::unavailable_tables`], skipped by [`Lake::load`], and refused per
 /// table on read/write (wave 88, rule 5).
-pub const FORMAT_VERSION: u32 = 6;
+pub const FORMAT_VERSION: u32 = 7;
 
-/// The oldest catalog format version this build still reads.
-pub const MIN_FORMAT_VERSION: u32 = 1;
+/// The oldest catalog format version this build reads: the current one
+/// (wave 102 dropped every older catalog — pinkdb carries no legacy readers
+/// while in early development; an older lake is refused with "written by an
+/// older pinkdb").
+pub const MIN_FORMAT_VERSION: u32 = 7;
 
 /// The newest catalog format version this codebase knows: 6 (the schema
 /// record plus lake identity/highest-version binding). A manifest above this
 /// (a future format) is [`LakeError::Unsupported`] in every build; a v4/v5/v6
 /// Vortex lake in a build without `vortexlake` is
 /// [`LakeError::FeatureMissing`].
-pub const MAX_FORMAT_VERSION: u32 = 6;
+pub const MAX_FORMAT_VERSION: u32 = 7;
 
 /// The `lake.json` identity format this build writes.
 pub(crate) const LAKE_ID_FORMAT: u32 = 1;
@@ -720,24 +712,16 @@ impl fmt::Display for LakeError {
                     write!(
                         f,
                         "unsupported lake format_version {found} at {} (this build reads \
-                         format_version {MIN_FORMAT_VERSION}..={MAX_FORMAT_VERSION}; the lake \
-                         was written by a newer pinkdb — upgrade to open it)",
-                        path.display()
-                    )
-                } else if cfg!(feature = "vortexlake") {
-                    write!(
-                        f,
-                        "unsupported lake format_version {found} at {} (this build reads \
-                         format_version {MIN_FORMAT_VERSION}..={FORMAT_VERSION} including the \
-                         v1 `.pink` form)",
+                         format_version {FORMAT_VERSION} only; the lake was written by a newer \
+                         pinkdb — upgrade to open it)",
                         path.display()
                     )
                 } else {
                     write!(
                         f,
-                        "unsupported lake format_version {found} at {} (this build reads/writes \
-                         format_version {FORMAT_VERSION} with `.pink` data files; Vortex \
-                         format_version 2/3/4/5 needs the `vortexlake` feature)",
+                        "unsupported lake format_version {found} at {}: this lake was written by \
+                         an older pinkdb; this build reads format_version {FORMAT_VERSION} only \
+                         (no legacy readers while pinkdb is in early development)",
                         path.display()
                     )
                 }
@@ -1184,7 +1168,7 @@ impl Lake {
                     None => {
                         return Err(LakeError::Corrupt {
                             path: root.join(LAKE_FILE),
-                            message: "catalog.json is a v6 manifest, but lake.json is missing \
+                            message: "catalog.json is a v6+ manifest, but lake.json is missing \
                                       (the lake identity was removed)"
                                 .to_string(),
                         });
@@ -1776,17 +1760,16 @@ impl Lake {
                 let keys: Vec<PartitionKey> = previous_entry
                     .and_then(|e| e.partition_by.clone())
                     .unwrap_or_default();
-                // Wave 88: the per-table choice wins, else a previous entry
-                // that is pinned (or names a non-builtin format) keeps its
-                // format and is pinned, else the handle's write format (pinned
-                // only when it was chosen explicitly — the build default keeps
-                // the wave-45 migration rule). One data file per partition
-                // value set (exactly one for an unpartitioned or empty table),
-                // written before anything references it (see
+                // Wave 102: a table **keeps its format** on every save (no
+                // migration): the handle's per-table choice wins, else the
+                // table's existing catalog format, else the handle's write
+                // format for a table the save creates. One data file per
+                // partition value set (exactly one for an unpartitioned or
+                // empty table), written before anything references it (see
                 // [`Lake::write_data_files`] for the encoders). Every file of
                 // a recorded entry then carries the schema epoch it was
                 // written under (1: a full save writes the current schema).
-                let (format, format_pinned) = self.resolve_save_format(&key, previous_entry);
+                let format = self.resolve_save_format(&key, previous_entry);
                 let (files, written) = self.write_data_files(&key, format.clone(), &keys, src)?;
                 bytes_written += written;
                 rows += src.num_rows() as u64;
@@ -1856,7 +1839,6 @@ impl Lake {
                         // assigned one below.
                         table_id: previous_entry.and_then(|e| e.table_id.clone()),
                         format: Some(format.clone()),
-                        format_pinned,
                         stats: None,
                         deletes: Vec::new(),
                         partition_by: (!keys.is_empty()).then_some(keys),
@@ -1873,7 +1855,7 @@ impl Lake {
             }
         }
         // Unavailable entries ride through the save verbatim: same files,
-        // statistics, partition spec, schema record and pin flag (the store
+        // statistics, partition spec and schema record (the store
         // had no table under their keys, checked above). They are not a
         // change, so the delta manifest lists nothing for them.
         for (key, entry) in carried {
@@ -2024,38 +2006,40 @@ impl Lake {
             .unwrap_or_else(default_write_format)
     }
 
-    /// The format **and pin flag** a full save of `key` writes (wave 88):
+    /// The format a full save of `key` writes (wave 102 — **no migration**):
     ///
-    /// 1. the handle's per-table choice — that format, pinned;
-    /// 2. else a previous entry whose format is pinned (or whose id is not a
-    ///    built-in default) — its format, pinned;
-    /// 3. else the handle's write format — pinned exactly when
-    ///    [`Lake::set_write_format`] was called explicitly, so the build
-    ///    default keeps the wave-45 migration behavior.
-    fn resolve_save_format(&self, key: &str, previous: Option<&TableEntry>) -> (FileFormat, bool) {
+    /// 1. the handle's per-table choice ([`Lake::set_table_format`]) — that
+    ///    format;
+    /// 2. else the table's existing catalog format — it is kept, whatever it
+    ///    is;
+    /// 3. else (a table the save creates) the handle's write format.
+    ///
+    /// A table therefore **keeps its format on every save and append**;
+    /// changing it is explicit only — [`Lake::set_table_format`],
+    /// [`Lake::rewrite_table_format`], or the CLI's `.lake format … for …`
+    /// / `.lake rewrite … format …`. The wave-88 hybrid migration rule (and
+    /// the `format_pinned` flag it needed) is gone: a build never
+    /// re-encodes a table into another format behind the user's back.
+    fn resolve_save_format(&self, key: &str, previous: Option<&TableEntry>) -> FileFormat {
         if let Some(format) = self.table_format_choices.get(key) {
-            return (format.clone(), true);
+            return format.clone();
         }
         if let Some(entry) = previous {
-            let format = entry.format();
-            if entry.format_pinned || !is_builtin_format(format.id()) {
-                return (format, true);
-            }
+            return entry.format();
         }
-        (self.write_format(), self.write_format_choice.is_some())
+        self.write_format()
     }
 
-    /// The format **and pin flag** a commit/flush writes for `key` (wave 88):
-    /// an existing entry's format and pin flag always win (an append never
-    /// mixes formats inside one entry); a table the commit creates uses the
-    /// handle's per-table choice (pinned), else its write format (pinned when
-    /// explicitly chosen).
-    fn resolve_append_format(&self, key: &str, entry: Option<&TableEntry>) -> (FileFormat, bool) {
+    /// The format a commit/flush writes for `key` (wave 102): an existing
+    /// entry's format always wins (an append never mixes formats inside one
+    /// entry); a table the commit creates uses the handle's per-table choice,
+    /// else its write format.
+    fn resolve_append_format(&self, key: &str, entry: Option<&TableEntry>) -> FileFormat {
         match entry {
-            Some(entry) => (entry.format(), entry.format_pinned),
+            Some(entry) => entry.format(),
             None => match self.table_format_choices.get(key) {
-                Some(format) => (format.clone(), true),
-                None => (self.write_format(), self.write_format_choice.is_some()),
+                Some(format) => format.clone(),
+                None => self.write_format(),
             },
         }
     }
@@ -2094,7 +2078,7 @@ impl Lake {
             saved = Some(provider.write_streamed(dbname, table, src, sink)?);
             Ok(())
         })?;
-        let saved = saved.ok_or_else(|| LakeError::Internal {
+        let (saved, footer) = saved.ok_or_else(|| LakeError::Internal {
             message: format!(
                 "the \"{}\" format provider returned no statistics for \"{key}\"",
                 provider.id()
@@ -2109,6 +2093,11 @@ impl Lake {
                 stats: Some(block),
                 partition: None,
                 row_id_start: None,
+                // Wave 102: the file's footer location, so a reader finds
+                // the footer without probing the file's trailer.
+                footer_offset: footer.map(|f| f.offset),
+                footer_len: footer.map(|f| f.length),
+                footer_crc32c: footer.map(|f| f.crc32c),
             },
             written,
         ))
@@ -2644,13 +2633,6 @@ impl Lake {
         let file = crate::format::DataFile::new(&path, rel, Arc::clone(&self.storage));
         provider.read(&file)
     }
-}
-
-/// Whether a format id is one of the built-in defaults (`pink`, `vortex`) —
-/// the formats an entry written under the build default may carry. An entry
-/// naming anything else is always treated as pinned (wave 88, rule 2).
-fn is_builtin_format(id: &str) -> bool {
-    id == crate::format::PINK_FORMAT_ID || id == crate::format::VORTEX_FORMAT_ID
 }
 
 /// The build's default data-file format: Vortex with `vortexlake`, engine
@@ -3243,7 +3225,7 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                      manifest (Vortex-era writers emit Vortex only)"
                 )));
             }
-            (4..=6, None) => {
+            (4..=7, None) => {
                 return Err(corrupt(format!(
                     "table \"{key}\" does not declare a data file format (a format_version {v} \
                      entry requires `\"format\"`: \"pink\" or \"vortex\")"
@@ -3254,7 +3236,7 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
             // read or targeted write of it fails with the provider error
             // (wave 88, rule 5). The id is deliberately resolved later, per
             // table, so this build can still carry the entry forward.
-            (4..=6, Some(_)) => {}
+            (4..=7, Some(_)) => {}
             _ => {}
         }
     }
@@ -3267,7 +3249,7 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                          {v} manifest (only v4 entries carry per-file row counts)"
                     )));
                 }
-                (4..=6, FileRef::Path(_)) => {
+                (4..=7, FileRef::Path(_)) => {
                     return Err(corrupt(format!(
                         "table \"{key}\" lists a data file without its row count (a \
                          format_version {v} entry lists files as {{\"path\", \"rows\"}} \
@@ -3275,7 +3257,7 @@ fn read_manifest(path: &Path, bytes: &[u8]) -> Result<Catalog> {
                     )));
                 }
                 (
-                    4..=6,
+                    4..=7,
                     FileRef::Entry {
                         path: rel,
                         stats: _stats,
@@ -3845,7 +3827,8 @@ mod tests {
     #[test]
     fn a_bad_file_partition_key_names_the_table_not_the_key() {
         let catalog = serde_json::json!({
-            "format_version": 5,
+            "format_version": 7,
+            "lake_id": "0123456789abcdef0123456789abcdef",
             "version": 2,
             "updated": "2026-01-01T00:00:00.000Z",
             "tables": {

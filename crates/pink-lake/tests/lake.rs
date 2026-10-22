@@ -163,46 +163,6 @@ fn data_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The path of the lake fixture checked in under `tests/fixtures/lake_v1/`
-/// (written by the wave-34 writer, before Vortex).
-fn v1_fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1")
-}
-
-fn v2_fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v2")
-}
-
-/// A format_version 2 lake (one Vortex block per engine chunk) still loads
-/// value- and bit-exactly with the v3 reader, and saving migrates it to v3.
-#[test]
-fn v2_fixture_lake_still_loads() {
-    let fixture = v2_fixture_dir();
-    let catalog = read_json(&fixture.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 2, "fixture must stay v2");
-    let expected = common::fidelity_store();
-
-    let lake = Lake::open(&fixture).unwrap();
-    assert_eq!(lake.format_version(), 2);
-    let loaded = lake.load(None).unwrap();
-    assert_same_store(&expected, &loaded);
-
-    // Re-save into a scratch copy: a v4 snapshot that loads identically.
-    let dir = scratch("v2_migrate");
-    let copy = dir.join("lake");
-    copy_dir(&fixture, &copy);
-    let mut lake = Lake::open(&copy).unwrap();
-    lake.write_from_store(&loaded).unwrap();
-    assert_eq!(lake.format_version(), 6);
-    assert_same_store(&expected, &Lake::open(&copy).unwrap().load(None).unwrap());
-    // The old v2 snapshot stays loadable from the upgraded lake.
-    assert_same_store(
-        &expected,
-        &Lake::open(&copy).unwrap().load(Some(2)).unwrap(),
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn snapshot_roundtrip_is_bit_exact() {
     let dir = scratch("bit_exact");
@@ -221,7 +181,10 @@ fn snapshot_roundtrip_is_bit_exact() {
     // Catalog shape: v4, one Vortex file per table, `format` declared.
     let catalog = read_json(&dir.join("catalog.json"));
     assert_eq!(catalog["format_version"], FORMAT_VERSION);
-    assert_eq!(FORMAT_VERSION, 6, "v6 adds lake identity binding");
+    assert_eq!(
+        FORMAT_VERSION, 7,
+        "v7 records each .pink file's footer location"
+    );
     assert_eq!(catalog["version"], 2);
     let updated = catalog["updated"].as_str().unwrap();
     assert_eq!(updated.len(), 24, "ISO-8601 millis: {updated}");
@@ -502,18 +465,36 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     let err = Lake::open(&dir).unwrap_err().to_string();
     assert!(err.contains("under data/"), "{err}");
 
-    // An unsupported format_version is named, not misparsed.
-    let mut future = read_json(&dir.join("catalog.json"));
-    future["format_version"] = serde_json::json!(7);
+    // The current catalog, restored after each tampering below.
+    std::fs::write(dir.join("catalog.json"), serde_json::to_vec(&abs).unwrap()).unwrap();
+    let mut base = read_json(&dir.join("catalog.json"));
+    base["tables"]["main.t"]["files"] =
+        read_json(&dir.join("snapshots/2.json"))["tables"]["main.t"]["files"].clone();
+
+    // A newer format_version is named, not misparsed.
+    let mut future = base.clone();
+    future["format_version"] = serde_json::json!(8);
     write_json(&dir.join("catalog.json"), &future);
     let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("unsupported lake format_version 7"), "{err}");
+    assert!(err.contains("unsupported lake format_version 8"), "{err}");
     assert!(err.contains("newer pinkdb"), "{err}");
 
-    // A version 2 manifest must declare a format on every entry; a missing
-    // one is corrupt v2 metadata, not a silent `.pink` downgrade.
-    let mut no_format = read_json(&dir.join("catalog.json"));
-    no_format["format_version"] = serde_json::json!(2);
+    // Every older catalog is refused outright (wave 102: no legacy readers).
+    for old in [1u32, 4, 6] {
+        let mut older = base.clone();
+        older["format_version"] = serde_json::json!(old);
+        write_json(&dir.join("catalog.json"), &older);
+        let err = Lake::open(&dir).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("unsupported lake format_version {old}")),
+            "{err}"
+        );
+        assert!(err.contains("older pinkdb"), "{err}");
+    }
+
+    // An entry must declare its data-file format; a missing one is corrupt
+    // metadata, not a silent `.pink` default.
+    let mut no_format = base.clone();
     no_format["tables"]["main.t"]
         .as_object_mut()
         .unwrap()
@@ -523,46 +504,17 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     assert!(err.contains("corrupt lake metadata"), "{err}");
     assert!(err.contains("does not declare a data file format"), "{err}");
 
-    // A version 1 manifest cannot reference a vortex data file.
-    let mut v1_vortex = read_json(&dir.join("catalog.json"));
-    v1_vortex["format_version"] = serde_json::json!(1);
-    v1_vortex["tables"]["main.t"]["format"] = serde_json::json!("vortex");
-    write_json(&dir.join("catalog.json"), &v1_vortex);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(
-        err.contains("vortex data file in a format_version 1 manifest"),
-        "{err}"
-    );
-
     // A missing field is corrupt, not defaulted.
     write_json(
         &dir.join("catalog.json"),
-        &serde_json::json!({"format_version": 1, "version": 2, "tables": {}}),
+        &serde_json::json!({"format_version": 7, "version": 2, "tables": {}}),
     );
     let err = Lake::open(&dir).unwrap_err().to_string();
     assert!(err.contains("corrupt lake metadata"), "{err}");
 
-    // No data files for a table.
-    write_json(
-        &dir.join("catalog.json"),
-        &serde_json::json!({
-            "format_version": 1,
-            "updated": "2026-10-14T00:00:00.000Z",
-            "version": 2,
-            "tables": {"main.t": {"files": [], "rows": 3}}
-        }),
-    );
-    let lake = Lake::open(&dir).unwrap();
-    assert!(
-        lake.load(None)
-            .unwrap_err()
-            .to_string()
-            .contains("no data files")
-    );
-
     // A snapshot whose declared version disagrees with its file name.
-    let mut wrong = read_json(&dir.join("catalog.json"));
+    write_json(&dir.join("catalog.json"), &base);
+    let mut wrong = base.clone();
     wrong["version"] = serde_json::json!(7);
     write_json(&dir.join("snapshots/5.json"), &wrong);
     let lake = Lake::open(&dir).unwrap();
@@ -570,17 +522,12 @@ fn corrupt_metadata_is_a_clear_error_not_a_panic() {
     assert!(err.contains("declares version 7, expected 5"), "{err}");
 
     // A referenced data file that does not exist.
-    write_json(
-        &dir.join("catalog.json"),
-        &serde_json::json!({
-            "format_version": 1,
-            "updated": "2026-10-14T00:00:00.000Z",
-            "version": 2,
-            "tables": {"main.t": {"files": ["data/main.t/missing.pink"], "rows": 3}}
-        }),
-    );
+    let mut missing = base.clone();
+    missing["tables"]["main.t"]["files"][0]["path"] = serde_json::json!("data/main.t/missing.pink");
+    write_json(&dir.join("catalog.json"), &missing);
+    let lake = Lake::open(&dir).unwrap();
     let err = lake.load(None).unwrap_err().to_string();
-    assert!(err.contains("loading data file"), "{err}");
+    assert!(err.contains("missing.pink"), "{err}");
     cleanup(&dir);
 }
 
@@ -1242,24 +1189,6 @@ fn an_interrupted_create_is_healed_not_bricked() {
     cleanup(&dir);
 }
 
-/// The compatibility pin in the other direction: `tests/fixtures/lake_v1_v4/`
-/// is a v1 lake written by the **lean** (`vortexlake`-less) writer —
-/// engine v4 `.pink` data files under a v1 catalog. The full build opens it
-/// bit-exactly and migrates it to v3 on the next save, while the lean build
-/// reads the same directory in `tests/pinklake.rs`.
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let target = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
-    }
-}
-
 #[test]
 fn vortex_roundtrip_preserves_every_bit_pattern() {
     let dir = scratch("vortex_bits");
@@ -1267,7 +1196,7 @@ fn vortex_roundtrip_preserves_every_bit_pattern() {
     let original_bytes = store_bytes(&db, &dir, "original");
 
     let mut lake = Lake::create(&dir).unwrap();
-    assert_eq!(lake.format_version(), 6, "create publishes a v6 lake");
+    assert_eq!(lake.format_version(), 7, "create publishes a v7 lake");
     lake.write_from_store(&db).unwrap();
     let loaded = lake.load(None).unwrap();
 
@@ -1393,19 +1322,6 @@ fn catalog_format_fields_are_validated() {
         "the unreadable table is skipped"
     );
     assert!(lake.attach(None).is_ok(), "attach lists the table");
-
-    // A v3 entry declaring `"pink"` is corrupt: the v3 writer emits Vortex
-    // only, so this is tampered metadata, not a downgrade (v4 allows pink).
-    let mut cat = read_json(&dir.join("catalog.json"));
-    cat["format_version"] = serde_json::json!(3);
-    cat["tables"]["main.t"]["format"] = serde_json::json!("pink");
-    write_json(&dir.join("catalog.json"), &cat);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(
-        err.contains("declares a pink data file in a format_version 3 manifest"),
-        "{err}"
-    );
-    assert!(err.contains("Vortex-era writers emit Vortex only"), "{err}");
 
     // A `format` of the wrong JSON type is corrupt too.
     let mut cat = read_json(&dir.join("catalog.json"));
@@ -1806,14 +1722,6 @@ fn attach_refusals_are_clean_errors() {
     let missing = dir.join("nope");
     let err = Lake::open(&missing).unwrap_err().to_string();
     assert!(err.contains("is not a pink-lake directory"), "{err}");
-
-    // A v1 lake without statistics blocks: nothing to read without a data
-    // file, refused with a clear pointer.
-    let fixture = v1_fixture_dir();
-    let lake = Lake::open(&fixture).unwrap();
-    let err = lake.attach(None).unwrap_err().to_string();
-    assert!(err.contains("without a statistics block"), "{err}");
-    assert!(err.contains("use .lake open"), "{err}");
 
     // A missing data file.
     let lake_dir = dir.join("lake");
@@ -2340,35 +2248,6 @@ fn snapshot_records_carry_messages_and_change_summaries() {
         "the failed save's pending record must not publish"
     );
     cleanup(&dir);
-}
-
-/// Time travel resolves through a v1 `.pink` lake's statistics blocks: the
-/// attached `lake_v1_v4_stats` fixture (the lean writer's cross-build pin)
-/// answers `AT (VERSION => 2)` from its published blocks — no data file
-/// opened — and names the version in the error for a version before the
-/// table existed.
-#[test]
-fn time_travel_on_a_v1_stats_fixture_resolves_versions() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1_v4_stats");
-    let report = Lake::open(&fixture).unwrap().attach(None).unwrap();
-    assert_eq!(report.version, 2);
-    let lake = Arc::clone(&report.lake);
-    let mut db = PinkDb::new();
-    db.attach_lake(report.lake.clone()).unwrap();
-    let fid = select_rows(&mut db, "SELECT COUNT(*) FROM main.fid;");
-    assert_eq!(fid, vec![vec![Value::Bigint(6)]]);
-    // The same answer through the AT path (the pinned version), still
-    // statistics-only.
-    assert_eq!(
-        try_rows(&mut db, "SELECT COUNT(*) FROM main.fid AT (VERSION => 2);").unwrap(),
-        vec![vec![Value::Bigint(6)]]
-    );
-    assert_eq!(lake.decode_stats(), (0, 0, 0), "no data file may be opened");
-    // v1 is the empty lake: every table did not exist yet.
-    let err = try_rows(&mut db, "SELECT * FROM main.fid AT (VERSION => 1);").unwrap_err();
-    assert!(err.contains("does not exist at version 1"), "{err}");
-    let err = try_rows(&mut db, "SELECT * FROM main.fid AT (VERSION => 3);").unwrap_err();
-    assert!(err.contains("no snapshot found at version 3"), "{err}");
 }
 
 /// A snapshot whose publish time does not parse (a hand-edited/tampered

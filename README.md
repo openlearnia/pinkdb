@@ -833,12 +833,10 @@ follow-up.
 `.lake format <id> for <db.table>` (`Lake::set_table_format`) chooses a
 table's format for later saves, and `.lake rewrite <dir> <table> format <id>`
 (`Lake::rewrite_table_format`) converts an existing table in one atomically
-published version. A format chosen explicitly — per table, with `.lake format
-<id>`, or by a rewrite — is **pinned** in the table's catalog entry
-(`"format_pinned": true`): later saves and appends keep it. A table written
-under the build default is not pinned and migrates to the saving build's
-format, as described under **Migration** below; Parquet tables are always
-pinned. A table whose format this build cannot read (an unregistered id, or
+published version. A table keeps its format on every save and append;
+changing it is always explicit (wave 102 removed the wave 88 "migrate
+unpinned tables on save" rule along with every legacy catalog version). A
+table whose format this build cannot read (an unregistered id, or
 Vortex in a build without `vortexlake`) is refused **per table**, not per
 lake: `.lake open` loads the other tables and prints a warning for each
 skipped one, `.lake attach` lists it but any read of it fails naming the
@@ -965,27 +963,22 @@ below). All three are additive and absent when a save records nothing, so an
 older reader ignores them and a manifest written today without a message is
 byte-identical to the pre-wave-64 shape.
 
-**Format history and defaults:**
-
-| catalog `format_version` | data file | written by | read by this build |
-|---|---|---|---|
-| 1 | `data/<table>/<uuid>.pink` — the engine's single-table persistence bytes; a `pinklake` save also publishes a CRC-protected per-column statistics block in the entry (wave 45k) | wave 34 | yes (entries have no `format` field; `.pink` opens standalone with `PinkDb::open`); `.lake attach` reads the statistics block, opening no data file |
-| 2 | `data/<table>/<uuid>.vortex` — one Vortex file per table (one `files` entry), `"format": "vortex"` on every entry; one row block per 2,048-row engine chunk | waves 35–40 | yes |
-| 3 | as 2, but row blocks of 8,192 rows / ~1 MiB (fewer blocks → less per-block stats/compression work on save) | waves 45 | yes |
-| 4 | **incremental**: every data file is listed as `{path, rows}`, a table's file list grows by appended files, positional delete files (`<uuid>.pinkdel`) drop rows merge-on-read, `rows` must equal `sum(files.rows) − sum(deletes.count)`, and `format` is `"vortex"` (vortexlake build) or `"pink"` (pinklake build; each `.pink` file carries its own CRC-protected statistics block). Wave 66 adds (additively): a table's `partition_by` spec, a data file's `partition` values, and a catalog-published zone map (`stats`) on Vortex files too — an older v4 reader ignores the fields and reads the same files | this build (default) | yes |
-
-**Migration:** open an old lake and `.lake save` again — the next snapshot is a
-full rewrite in this build's v4 format; old snapshots and their data files stay
-untouched, so every published version still loads. A `pinklake` build
-refuses a v2/v3 **Vortex** lake with the rebuild-with-`vortexlake` error and,
-since wave 88, skips the Vortex tables of a v4+ lake per table (a
-pinklake-written lake opens bit-exactly in a vortexlake build, which migrates
-its unpinned tables on the next save), and a v1/v2/v3 lake stays readable in
-both builds. Any unknown
-`format_version` (a lake written by a newer pinkdb) refuses with "the lake was
-written by a newer pinkdb — upgrade to open it", and a wrong-shape entry (a
-v2/v3 entry without `format`, a v4 file object without its row count, a v4
-manifest whose rows do not add up) is a clear `Corrupt` error, never a guess.
+**One catalog version (wave 102).** This build reads and writes catalog
+`format_version` **7** only: incremental entries (every data file listed as
+`{path, rows}` with its statistics, positional delete files merge-on-read,
+`rows = sum(files.rows) − sum(deletes.count)`), an explicit `format` per entry
+(`"pink"`, `"vortex"`, `"parquet"`, …), the schema record, the lake identity
+binding, and — new in 7 — each `.pink` data file's **footer location**
+(`footer_offset` / `footer_len` / `footer_crc32c`), so a projected read fetches
+the footer directly. `.pink` data files are `PINKDB06` (row groups of column
+chunks; attach reads only the projected chunks of row groups that survive the
+query's filters, by range and concurrently). pinkdb is in early development
+and keeps **no legacy readers**: a lake written by an older pinkdb is refused
+with "written by an older pinkdb; this build reads format_version 7 only",
+and a newer one with "written by a newer pinkdb — upgrade to open it". A
+wrong-shape entry (an entry without `format`, a file object without its row
+count, a manifest whose rows do not add up, a data path outside `data/`) is a
+clear `Corrupt` error, never a guess.
 
 - **Schema and typing live in the data files.** A data file is a plain
   Vortex file: one struct array, one field per column, row order preserved;
@@ -1441,8 +1434,8 @@ same size. See the dependency/build note above.
 
 The same lake layer without the Vortex dependency: a `pinklake` build writes
 and reads **`.pink` data files** (`data/<table>/<uuid>.pink`, the engine's
-single-table persistence bytes, `PINKDB06`) under `format_version` 4 catalogs (each file
-object carries its own statistics block) — no `vortex` crate and none of its
+single-table persistence bytes, `PINKDB06`) under `format_version` 7 catalogs (each file
+object carries its own statistics block and footer location) — no `vortex` crate and none of its
 ~218 transitive crates, a 5.21 MB binary instead of 47.78 MB. It enables every
 `.lake` command (save/open/attach/commit/versions/tables/info) and S3/R2
 (add `,s3`; the storage client alone provides no commands), with the same
@@ -1472,11 +1465,10 @@ constant in file size, 0 data-file reads) while eager open costs 29.9 /
 `.pink`. In-session query results are identical, and both builds answer the
 statistics fast paths identically.
 
-Cross-build compatibility is verified both ways: a lake written by the
-pinklake build opens **bit-exactly** in a `vortexlake` build (the next save
-migrates it to `format_version` 3 and leaves the v1 files untouched), and a
-pinklake build refuses a v3 lake cleanly; a checked-in fixture pins the
-pinklake-written format.
+A lake written by the pinklake build opens **bit-exactly** in a `vortexlake`
+build (its `.pink` tables stay `.pink` until a table's format is changed
+explicitly); a pinklake build opens a lake with Vortex tables and refuses only
+those tables, per table.
 
 ### Object storage (S3/R2)
 

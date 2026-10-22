@@ -4,7 +4,7 @@
 //!
 //! ```json
 //! {
-//!   "format_version": 6,
+//!   "format_version": 7,
 //!   "lake_id": "<32 lowercase hex>",
 //!   "updated": "<iso8601>",
 //!   "version": 3,
@@ -59,24 +59,14 @@
 //! (`crate::replication`) compares the source entry's id with the one it
 //! recorded and reseeds when it changed.
 //!
-//! Wave 88 adds the optional per-table `"format_pinned"` flag:
-//!
-//! ```json
-//! "main.t": { "files": [ … ], "rows": 7, "format": "vortex",
-//!             "format_pinned": true }
-//! ```
-//!
-//! A format chosen explicitly — a per-table choice, an explicit
-//! `Lake::set_write_format`, or `Lake::rewrite_table_format` — is recorded as
-//! `true`; an entry written under the build default is not pinned (the field
-//! is omitted, so catalogs written by default stay byte-identical, and older
-//! builds ignore it). A full save keeps a pinned entry's format; an unpinned
-//! entry keeps the wave-45 migration behavior (it is re-encoded into the
-//! saving build's write format). An entry whose format id is not a built-in
-//! default (anything but `pink`/`vortex`) is always treated as pinned.
+//! Every entry declares its `format`, and a table keeps it across saves and
+//! appends; changing it is always explicit (`Lake::set_table_format`,
+//! `Lake::rewrite_table_format`). Wave 102 (`format_version` 7, the only
+//! version this build reads) adds each `.pink` data file's footer location
+//! to its file object (`footer_offset`, `footer_len`, `footer_crc32c`).
 //!
 //! `format_version` 2 and 3 are single-file Vortex lakes (3: larger row
-//! blocks), readable but not written any more; a v1 manifest — written by the
+//! blocks) — no longer read (wave 102 dropped every pre-7 catalog); a v1 manifest — written by the
 //! wave-34 lean writer — has no `format` field, implies the engine's `.pink`
 //! bytes, and carries one entry-level statistics block. In v1–v3 every entry
 //! lists exactly one data file, as a plain string path.
@@ -380,6 +370,22 @@ pub(crate) enum FileRef {
         /// recorded; see the struct docs).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         row_id_start: Option<u64>,
+        /// Wave 102 (`format_version` 7): where the file's footer is, so a
+        /// reader fetches it **without** probing the file's 20-byte trailer —
+        /// one ranged read instead of two. Recorded for the engine's `.pink`
+        /// data files (the only format whose footer the lake locates this
+        /// way); absent for every other format, and for a `.pink` file
+        /// written by an older build.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        footer_offset: Option<u64>,
+        /// The footer's length in bytes (with [`FileRef::Entry::footer_offset`]
+        ///).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        footer_len: Option<u64>,
+        /// The footer's CRC32C, as the file's trailer records it. The reader
+        /// verifies the footer against it before decoding a byte of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        footer_crc32c: Option<u32>,
     },
 }
 
@@ -392,6 +398,9 @@ impl<'de> Deserialize<'de> for FileRef {
         D: serde::Deserializer<'de>,
     {
         use serde::de::Error as _;
+        // A short-lived deserialization helper: the size difference between
+        // the bare-path and object forms does not matter here.
+        #[allow(clippy::large_enum_variant)]
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Repr {
@@ -403,6 +412,9 @@ impl<'de> Deserialize<'de> for FileRef {
                 stats: Option<crate::stats::StatsBlock>,
                 partition: Option<BTreeMap<String, Option<String>>>,
                 row_id_start: Option<u64>,
+                footer_offset: Option<u64>,
+                footer_len: Option<u64>,
+                footer_crc32c: Option<u32>,
             },
         }
         match Repr::deserialize(deserializer)? {
@@ -414,6 +426,9 @@ impl<'de> Deserialize<'de> for FileRef {
                 stats,
                 partition,
                 row_id_start,
+                footer_offset,
+                footer_len,
+                footer_crc32c,
             } => {
                 let Some(rows) = rows else {
                     return Err(D::Error::custom(format!(
@@ -429,6 +444,9 @@ impl<'de> Deserialize<'de> for FileRef {
                     stats,
                     partition,
                     row_id_start,
+                    footer_offset,
+                    footer_len,
+                    footer_crc32c,
                 })
             }
         }
@@ -493,7 +511,10 @@ impl FileRef {
                 schema_version,
                 stats,
                 partition,
-                ..
+                row_id_start: _,
+                footer_offset,
+                footer_len,
+                footer_crc32c,
             } => FileRef::Entry {
                 path: path.clone(),
                 rows: *rows,
@@ -501,6 +522,9 @@ impl FileRef {
                 stats: stats.clone(),
                 partition: partition.clone(),
                 row_id_start: start,
+                footer_offset: *footer_offset,
+                footer_len: *footer_len,
+                footer_crc32c: *footer_crc32c,
             },
         }
     }
@@ -535,6 +559,9 @@ impl FileRef {
                 stats,
                 partition,
                 row_id_start,
+                footer_offset,
+                footer_len,
+                footer_crc32c,
                 ..
             } => FileRef::Entry {
                 path: path.clone(),
@@ -543,7 +570,29 @@ impl FileRef {
                 stats: stats.clone(),
                 partition: partition.clone(),
                 row_id_start: *row_id_start,
+                footer_offset: *footer_offset,
+                footer_len: *footer_len,
+                footer_crc32c: *footer_crc32c,
             },
+        }
+    }
+
+    /// The file's recorded footer location (wave 102): where its footer is,
+    /// how long it is and the CRC32C the file's trailer records for it.
+    /// `None` for a format whose footer the lake does not locate this way.
+    pub(crate) fn footer_location(&self) -> Option<crate::format::FooterLocation> {
+        match self {
+            FileRef::Path(_) => None,
+            FileRef::Entry {
+                footer_offset,
+                footer_len,
+                footer_crc32c,
+                ..
+            } => Some(crate::format::FooterLocation {
+                offset: (*footer_offset)?,
+                length: (*footer_len)?,
+                crc32c: (*footer_crc32c)?,
+            }),
         }
     }
 }
@@ -755,18 +804,6 @@ pub(crate) struct TableEntry {
     /// absent (⇒ `"pink"`) in a `format_version` 1 manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) format: Option<FileFormat>,
-    /// Wave 88: true when [`TableEntry::format`] was chosen **explicitly**
-    /// (a per-table choice, an explicit
-    /// [`Lake::set_write_format`](crate::Lake::set_write_format), or
-    /// [`Lake::rewrite_table_format`](crate::Lake::rewrite_table_format)), so
-    /// a later full save keeps it. Unpinned entries follow the wave-45
-    /// migration behavior: a full save re-encodes them into the saving
-    /// build's write format. Omitted when false, so catalogs written by
-    /// default stay byte-identical; older builds ignore the field. An entry
-    /// whose format id is not a built-in default (`pink`/`vortex`) is always
-    /// treated as pinned, whatever this field says.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) format_pinned: bool,
     /// The v1 `.pink` statistics block (see the struct docs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stats: Option<crate::stats::StatsBlock>,

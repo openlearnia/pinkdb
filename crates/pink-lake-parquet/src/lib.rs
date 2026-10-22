@@ -106,6 +106,7 @@ impl LakeFormat for ParquetLakeFormat {
         Ok(EncodedFile {
             bytes,
             stats: pinkdb::persist::table_stats(db, table, src),
+            footer: None,
         })
     }
 

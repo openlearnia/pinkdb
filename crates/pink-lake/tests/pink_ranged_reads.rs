@@ -1,0 +1,166 @@
+//! `.pink` lake data files (`PINKDB06`, wave 102) are read by range over
+//! object storage: attach answers `COUNT(*)` from the catalog, a query reads
+//! only the projected column chunks of the row groups that survive its
+//! filters, and the catalog's footer location means no trailer probe.
+//!
+//! Measured against the mock S3 (every request and its `Range` header are
+//! recorded). The table has two row groups (200,000 rows; a row group is
+//! 122,880 rows) and a monotonic `seq` column, so a `seq` predicate prunes
+//! one row group exactly.
+
+#![cfg(feature = "s3")]
+
+#[path = "../src/mock_s3.rs"]
+mod mock_s3;
+
+use mock_s3::MockS3;
+use pink_lake::{Lake, S3Config};
+use pinkdb::{PinkDb, QueryResult, Value};
+
+const ROWS: i64 = 200_000;
+
+fn mock_config(mock: &MockS3, prefix: &str) -> S3Config {
+    S3Config::new("pink-bucket")
+        .with_prefix(prefix)
+        .with_region("auto")
+        .with_endpoint(mock.endpoint())
+        .allow_http(true)
+        .with_credentials(mock.access_key_id(), "mock-secret")
+}
+
+fn store() -> PinkDb {
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE t (seq BIGINT, i INTEGER, s VARCHAR, d DOUBLE);")
+        .unwrap();
+    let t = db.table_mut("t").unwrap();
+    for row in 0..ROWS {
+        t.append_row(vec![
+            Value::Bigint(row),
+            Value::Integer((row % 1000) as i32),
+            Value::Varchar(format!("value-{}-{}", row % 97, row)),
+            Value::Double(row as f64 / 3.0),
+        ])
+        .unwrap();
+    }
+    db
+}
+
+fn rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
+    match db.execute(sql).unwrap().pop().unwrap() {
+        QueryResult::Selected { rows, .. } => rows,
+        other => panic!("expected rows from {sql}, got {other:?}"),
+    }
+}
+
+/// The data-file requests issued since `from`: `(ranged GETs, whole-object
+/// GETs)` against `.pink` objects.
+fn data_requests(mock: &MockS3, from: usize) -> (usize, usize) {
+    let requests = mock.requests();
+    let ranges = mock.ranges();
+    let mut ranged = 0;
+    let mut whole = 0;
+    for (request, range) in requests.iter().zip(ranges.iter()).skip(from) {
+        if request.starts_with("GET ") && request.contains(".pink") {
+            if range.is_empty() {
+                whole += 1;
+            } else {
+                ranged += 1;
+            }
+        }
+    }
+    (ranged, whole)
+}
+
+/// The bytes requested by ranged GETs of `.pink` objects since `from`.
+fn pink_range_bytes(mock: &MockS3, from: usize) -> usize {
+    mock.requests()
+        .iter()
+        .zip(mock.ranges().iter())
+        .skip(from)
+        .filter(|(request, _)| request.starts_with("GET ") && request.contains(".pink"))
+        .filter_map(|(_, range)| {
+            let (start, end) = range.strip_prefix("bytes=")?.split_once('-')?;
+            Some(end.parse::<usize>().ok()? - start.parse::<usize>().ok()? + 1)
+        })
+        .sum()
+}
+
+/// One fresh attach + query; returns the data requests the query issued
+/// (attach itself must issue none) and the result rows.
+fn attached_query(mock: &MockS3, prefix: &str, sql: &str) -> ((usize, usize), Vec<Vec<Value>>) {
+    let lake = Lake::open_s3(mock_config(mock, prefix)).unwrap();
+    let before_attach = mock.requests().len();
+    let report = lake.attach(None).unwrap();
+    assert_eq!(
+        data_requests(mock, before_attach),
+        (0, 0),
+        "attach reads only the catalog for a `.pink` lake"
+    );
+    let before_query = mock.requests().len();
+    let mut db = PinkDb::new();
+    db.attach_lake(report.lake).unwrap();
+    let result = rows(&mut db, sql);
+    (data_requests(mock, before_query), result)
+}
+
+#[test]
+fn pink_lake_reads_only_projected_chunks_of_surviving_row_groups() {
+    let mock = MockS3::start();
+    let prefix = "lakes/pink";
+    let mut source = store();
+    {
+        let mut lake = Lake::create_s3(mock_config(&mock, prefix)).unwrap();
+        lake.set_write_format("pink").unwrap();
+        lake.set_data_inlining_row_limit(0);
+        lake.write_from_store(&source).unwrap();
+    }
+
+    // The catalog records the data file's footer location (format_version 7).
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&mock.object(&format!("{prefix}/catalog.json")).unwrap()).unwrap();
+    assert_eq!(catalog["format_version"], 7, "{catalog}");
+    let file = &catalog["tables"]["main.t"]["files"][0];
+    assert_eq!(catalog["tables"]["main.t"]["format"], "pink", "{catalog}");
+    assert!(file["footer_offset"].is_u64(), "{file}");
+    assert!(file["footer_len"].is_u64(), "{file}");
+    let file_len = mock
+        .object(&format!("{prefix}/{}", file["path"].as_str().unwrap()))
+        .unwrap()
+        .len();
+
+    // COUNT(*) is answered from the catalog: no data-file request at all.
+    let ((ranged, whole), got) = attached_query(&mock, prefix, "SELECT COUNT(*) FROM t;");
+    assert_eq!(got, vec![vec![Value::Bigint(ROWS)]]);
+    assert_eq!((ranged, whole), (0, 0), "COUNT(*) is metadata-only");
+
+    // Two of four columns over both row groups: ranged requests only — the
+    // footer (located by the catalog, no trailer probe) plus the projected
+    // chunks — never a whole-object download.
+    let before = mock.requests().len();
+    let sql = "SELECT SUM(i), MAX(d) FROM t;";
+    let ((ranged, whole), got) = attached_query(&mock, prefix, sql);
+    assert_eq!(got, rows(&mut source, sql), "{sql}");
+    assert_eq!(
+        whole, 0,
+        "a projected `.pink` read never downloads the whole file"
+    );
+    assert!(ranged >= 2, "footer + at least one chunk range: {ranged}");
+    let fetched = pink_range_bytes(&mock, before);
+    assert!(
+        fetched < file_len * 3 / 4,
+        "two of four columns read {fetched} of {file_len} bytes"
+    );
+
+    // A `seq` predicate prunes the second row group: fewer bytes still, the
+    // same answer as the in-memory store.
+    let before = mock.requests().len();
+    let sql = "SELECT COUNT(*), SUM(i) FROM t WHERE seq < 1000;";
+    let ((_, whole), got) = attached_query(&mock, prefix, sql);
+    assert_eq!(got, rows(&mut source, sql), "{sql}");
+    assert_eq!(whole, 0);
+    let pruned_fetch = pink_range_bytes(&mock, before);
+    assert!(
+        pruned_fetch < fetched,
+        "pruning one of two row groups reads less: {pruned_fetch} vs {fetched}"
+    );
+}

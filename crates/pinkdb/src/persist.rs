@@ -3647,6 +3647,395 @@ fn older_pinkdb_error(version: u8) -> PinkDbError {
     ))
 }
 
+// ---------- the projected-read API (wave 102) ----------
+//
+// A reader that must not download a whole `.pink` file needs three things
+// from this module: the footer's **location** (so it can fetch exactly the
+// footer), the footer's **layout** (the row-group directory: where every
+// column chunk is, and what it proves), and a way to **decode** the column
+// chunks it fetched. The three functions below are that surface; they are
+// the only ones a projected reader needs, and they are used by the lake's
+// `pink` provider (crates/pink-lake).
+
+/// One column chunk of a `PINKDB06` file, as a reader outside the crate
+/// sees it: where its bytes are, and what they prove.
+///
+/// A chunk is self-describing: it carries its own CRC32C (so a reader
+/// verifies exactly the bytes it fetched, with no whole-file checksum) and
+/// its exact statistics (so a reader can prune the row group it belongs to
+/// without decoding a single page).
+#[derive(Debug, Clone)]
+pub struct PinkColumnChunk {
+    /// The chunk's absolute offset in the file.
+    pub offset: u64,
+    /// The chunk's length in bytes (the page index plus the pages).
+    pub length: u64,
+    /// The number of pages (engine chunks) in it.
+    pub page_count: u32,
+    /// A bitmask of the encoding tags the chunk's pages use.
+    pub encodings: u32,
+    /// The chunk's CRC32C, over the page index and the pages.
+    pub crc32c: u32,
+    /// The chunk's exact NULL count.
+    pub null_count: u64,
+    /// The chunk's exact NaN count (doubles only).
+    pub nan_count: u64,
+    /// The chunk's exact minimum (`None` when it holds no non-NULL value).
+    pub min: Option<Value>,
+    /// The chunk's exact maximum (`None` like `min`).
+    pub max: Option<Value>,
+}
+
+/// One row group of a `PINKDB06` file: its row count and one entry per
+/// column, in schema order.
+#[derive(Debug, Clone)]
+pub struct PinkRowGroup {
+    /// The row group's exact row count.
+    pub rows: u64,
+    /// One entry per column, in schema order.
+    pub columns: Vec<PinkColumnChunk>,
+}
+
+/// One table of a `PINKDB06` file: its identity, its physical schema and
+/// its row-group directory.
+#[derive(Debug, Clone)]
+pub struct PinkTableLayout {
+    /// The database the file's metadata names.
+    pub db: String,
+    /// The table the file's metadata names.
+    pub table: String,
+    /// The table's physical schema, in scan order.
+    pub schema: Vec<(String, DataType)>,
+    /// The table's exact row count.
+    pub row_count: u64,
+    /// The table's row groups, in file order.
+    pub row_groups: Vec<PinkRowGroup>,
+}
+
+/// The parsed layout of a `PINKDB06` file: every table it holds, with its
+/// schema and its row-group directory.
+#[derive(Debug, Clone, Default)]
+pub struct PinkLayout {
+    /// The file's tables, in footer order.
+    pub tables: Vec<PinkTableLayout>,
+}
+
+impl PinkLayout {
+    /// The table the file's metadata names, if it holds one. The comparison
+    /// is case-insensitive (the engine's catalog rules).
+    pub fn table(&self, db: &str, table: &str) -> Option<&PinkTableLayout> {
+        self.tables
+            .iter()
+            .find(|t| t.db.eq_ignore_ascii_case(db) && t.table.eq_ignore_ascii_case(table))
+    }
+}
+
+/// One fetched byte window of a `PINKDB06` file: the bytes at `offset`.
+///
+/// A projected reader fetches exactly the byte ranges it needs and hands
+/// them back here; [`decode_projected_columns`] slices the column chunks out
+/// of them.
+#[derive(Debug, Clone)]
+pub struct PinkByteWindow {
+    /// The window's offset in the file.
+    pub offset: u64,
+    /// The window's bytes.
+    pub bytes: Vec<u8>,
+}
+
+/// The footer's location and checksum, read from a `PINKDB06` file's
+/// 20-byte trailer.
+///
+/// Returns `(offset, length, crc32c)`: the footer's byte range in the file
+/// and the CRC32C the trailer records for it. A reader that already knows
+/// where the footer is (the lake's catalog records it, `format_version` 7)
+/// needs no trailer read at all — this function is the fallback for a
+/// reader that does not.
+pub fn footer_location(bytes: &[u8]) -> Result<(u64, u64, u32)> {
+    if bytes.len() < TRAILER_LEN {
+        return Err(PinkDbError::Execution(
+            "not a .pink file (bad magic)".to_string(),
+        ));
+    }
+    let trailer = &bytes[bytes.len() - TRAILER_LEN..];
+    check_magic(bytes, &trailer[12..20])?;
+    let (start, len) = footer_span_raw(bytes)?;
+    Ok((
+        start as u64,
+        len as u64,
+        u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]),
+    ))
+}
+
+/// Parse a `PINKDB06` file's 20-byte trailer: the footer's `(offset,
+/// length)` and its CRC32C.
+///
+/// `trailer` is the file's last 20 bytes (`footer_crc32c u32 | footer_len
+/// u64 | "PINKDB06"`); `file_len` is the file's total length (the trailer
+/// names the footer's *length*, so its offset follows from it). A reader
+/// that fetched only the trailer (the lake's ranged read) uses this instead
+/// of [`footer_location`].
+pub fn parse_trailer(trailer: &[u8], file_len: u64) -> Result<(u64, u64, u32)> {
+    if trailer.len() < TRAILER_LEN {
+        return Err(PinkDbError::Execution(
+            "not a .pink file (bad magic)".to_string(),
+        ));
+    }
+    if &trailer[12..20] != MAGIC_V6 {
+        return Err(PinkDbError::Execution(
+            "not a .pink file (bad magic)".to_string(),
+        ));
+    }
+    let crc32c = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let length = u64::from_le_bytes([
+        trailer[4],
+        trailer[5],
+        trailer[6],
+        trailer[7],
+        trailer[8],
+        trailer[9],
+        trailer[10],
+        trailer[11],
+    ]);
+    let offset = file_len
+        .checked_sub(TRAILER_LEN as u64)
+        .and_then(|s| s.checked_sub(length))
+        .ok_or_else(|| {
+            PinkDbError::Execution("corrupt file: the footer length is out of range".to_string())
+        })?;
+    Ok((offset, length, crc32c))
+}
+
+/// Parse the footer region of a `PINKDB06` file into its layout.
+///
+/// `region` is the footer's bytes (the `length` bytes the trailer points
+/// at). `crc32c` is the checksum the trailer records for them; pass `None`
+/// to skip the check (a reader that fetched the footer region but not the
+/// trailer — the lake's catalog-recorded location). A mismatch is refused
+/// before a single byte of the footer is decoded.
+pub fn read_layout(region: &[u8], crc32c: Option<u32>) -> Result<PinkLayout> {
+    if let Some(want) = crc32c
+        && crate::persist::crc32c(region) != want
+    {
+        return Err(PinkDbError::Execution(
+            "corrupt file: the footer checksum does not match (the file is damaged)".to_string(),
+        ));
+    }
+    let footer = parse_store_footer(region)?;
+    Ok(PinkLayout {
+        tables: footer
+            .databases
+            .iter()
+            .flat_map(|db| {
+                db.tables.iter().map(move |t| PinkTableLayout {
+                    db: db.name.clone(),
+                    table: t.name.clone(),
+                    schema: t.schema.clone(),
+                    row_count: t.row_count,
+                    row_groups: t
+                        .row_groups
+                        .iter()
+                        .map(|rg| PinkRowGroup {
+                            rows: rg.rows,
+                            columns: rg
+                                .columns
+                                .iter()
+                                .map(|c| PinkColumnChunk {
+                                    offset: c.offset,
+                                    length: c.length,
+                                    page_count: c.page_count,
+                                    encodings: c.encodings,
+                                    crc32c: c.crc32c,
+                                    null_count: c.null_count,
+                                    nan_count: c.nan_count,
+                                    min: c.min.clone(),
+                                    max: c.max.clone(),
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect(),
+    })
+}
+
+/// Decode the given physical columns of one table from the given byte
+/// windows.
+///
+/// `columns` are ascending physical column indices of `table` (the table's
+/// own schema order). `row_groups` are the indices of the row groups to
+/// decode, ascending (a reader that pruned row groups passes only the
+/// survivors). `windows` are the byte ranges the reader fetched; together
+/// they must cover every requested column chunk — a chunk that is not
+/// covered is a clean error, never a silent empty column.
+///
+/// The decoded table carries the file's **full physical schema**: an
+/// unprojected column is an all-NULL placeholder of the right length, so
+/// the result is chunk-aligned with a full decode and can be merged into
+/// one. The column chunks are decoded **in parallel** and assembled in
+/// file order, so the values and their order are exactly a full decode's.
+pub fn decode_projected_columns(
+    table: &PinkTableLayout,
+    columns: &[usize],
+    row_groups: &[usize],
+    windows: &[PinkByteWindow],
+) -> Result<DataTable> {
+    let n_cols = table.schema.len();
+    if columns.is_empty()
+        || columns.iter().any(|&i| i >= n_cols)
+        || columns.windows(2).any(|w| w[0] >= w[1])
+    {
+        return Err(PinkDbError::Execution(format!(
+            "corrupt file: invalid column projection {columns:?} for the {n_cols}-column table \
+             \"{}.{}\"",
+            table.db, table.table
+        )));
+    }
+    if row_groups.windows(2).any(|w| w[0] >= w[1])
+        || row_groups.iter().any(|&g| g >= table.row_groups.len())
+    {
+        return Err(PinkDbError::Execution(format!(
+            "corrupt file: invalid row-group selection {row_groups:?} for the table \
+             \"{}.{}\"",
+            table.db, table.table
+        )));
+    }
+    // The pages of one column, across the selected row groups: `pages[column]`
+    // is the column's page list, in file order.
+    let pages: Vec<Vec<Arc<Vector>>> = columns
+        .par_iter()
+        .map(|&ci| {
+            row_groups
+                .par_iter()
+                .map(|&group| {
+                    let rg = &table.row_groups[group];
+                    let dir = &rg.columns[ci];
+                    let bytes = window_bytes(windows, dir.offset, dir.length)?;
+                    decode_chunk_bytes(bytes, dir.page_count, dir.crc32c, table.schema[ci].1)
+                })
+                .collect::<Result<Vec<Vec<Arc<Vector>>>>>()
+                .map(|groups| groups.into_iter().flatten().collect())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // The page boundaries are shared by every column (the writer's
+    // invariant), so the pages line up: page `p` of one column holds the
+    // same rows as page `p` of another.
+    let page_counts: Vec<usize> = pages.iter().map(|p| p.len()).collect();
+    if page_counts.windows(2).any(|w| w[0] != w[1]) {
+        return Err(PinkDbError::Execution(format!(
+            "corrupt file: the columns of table \"{}.{}\" disagree on their page count \
+             ({page_counts:?})",
+            table.db, table.table
+        )));
+    }
+    let total_pages = page_counts.first().copied().unwrap_or(0);
+    let total_rows: usize = row_groups
+        .iter()
+        .map(|&g| table.row_groups[g].rows as usize)
+        .sum();
+    if row_groups.len() == table.row_groups.len() && total_rows != table.row_count as usize {
+        return Err(PinkDbError::Execution(format!(
+            "corrupt file: table \"{}.{}\" claims {} rows but its row groups hold {total_rows}",
+            table.db, table.table, table.row_count
+        )));
+    }
+    // The row count of every page (shared by all columns: the writer's
+    // invariant). An unprojected column is one NULL chunk per page, so the
+    // table stays chunk-aligned with a full decode.
+    let page_lengths: Vec<usize> = pages
+        .first()
+        .map(|p| p.iter().map(|v| v.len()).collect())
+        .unwrap_or_default();
+    // Assemble the table: the projected columns carry their decoded pages,
+    // the others an all-NULL placeholder of the same length.
+    let mut out: Vec<crate::storage::Column> = Vec::with_capacity(n_cols);
+    for (ci, (name, dtype)) in table.schema.iter().enumerate() {
+        let mut chunks: Vec<Arc<Vector>> = Vec::with_capacity(total_pages);
+        match columns.iter().position(|&c| c == ci) {
+            Some(slot) => {
+                for page in &pages[slot] {
+                    chunks.push(Arc::clone(page));
+                }
+            }
+            None => {
+                for &len in &page_lengths {
+                    chunks.push(Arc::new(null_vector(*dtype, len)));
+                }
+            }
+        }
+        out.push(crate::storage::Column {
+            name: name.clone(),
+            dtype: *dtype,
+            default: None,
+            chunks,
+        });
+    }
+    Ok(DataTable::from_columns(
+        table.table.clone(),
+        out,
+        total_rows,
+    ))
+}
+
+/// The bytes of one column chunk, sliced out of the reader's windows.
+fn window_bytes(windows: &[PinkByteWindow], offset: u64, length: u64) -> Result<&[u8]> {
+    let end = offset.checked_add(length).ok_or_else(|| {
+        PinkDbError::Execution("corrupt file: the column chunk range overflows".to_string())
+    })?;
+    for window in windows {
+        let wend = window.offset.saturating_add(window.bytes.len() as u64);
+        if window.offset <= offset && end <= wend {
+            let from = usize::try_from(offset - window.offset).map_err(|_| {
+                PinkDbError::Execution(
+                    "corrupt file: the column chunk offset is out of range".to_string(),
+                )
+            })?;
+            let to = from
+                + usize::try_from(length).map_err(|_| {
+                    PinkDbError::Execution(
+                        "corrupt file: the column chunk length is out of range".to_string(),
+                    )
+                })?;
+            return Ok(&window.bytes[from..to]);
+        }
+    }
+    Err(PinkDbError::Execution(format!(
+        "corrupt file: the column chunk at offset {offset} ({length} bytes) was not fetched"
+    )))
+}
+
+/// An all-NULL vector of `dtype` with `rows` rows: the placeholder an
+/// unprojected column holds in a projected decode. No reader ever sees its
+/// values (it exists so the table's chunking is identical to a full
+/// decode's).
+fn null_vector(dtype: DataType, rows: usize) -> Vector {
+    let data = match dtype {
+        DataType::Boolean => VectorData::Boolean(vec![false; rows]),
+        DataType::Integer => VectorData::Int32(vec![0; rows]),
+        DataType::Bigint => VectorData::Int64(vec![0; rows]),
+        DataType::Double => VectorData::Float64(vec![0.0; rows]),
+        DataType::Varchar => VectorData::VarChar(vec![Arc::from(""); rows]),
+        DataType::Date => VectorData::Date32(vec![0; rows]),
+        DataType::Timestamp => VectorData::TimestampMicros(vec![0; rows]),
+        DataType::Decimal { precision, scale } => VectorData::Decimal {
+            values: vec![0; rows],
+            precision,
+            scale,
+        },
+        DataType::Interval => VectorData::Interval(vec![
+            crate::types::Interval {
+                months: 0,
+                days: 0,
+                micros: 0,
+            };
+            rows
+        ]),
+    };
+    // No validity words: every row reads NULL.
+    Vector::from_raw(data, Vec::new())
+}
+
 /// Read (and verify) the footer of a `PINKDB06` image.
 fn read_store_footer(data: &[u8]) -> Result<StoreFooter> {
     if data.len() < TRAILER_LEN {
@@ -3656,30 +4045,7 @@ fn read_store_footer(data: &[u8]) -> Result<StoreFooter> {
     }
     let trailer = &data[data.len() - TRAILER_LEN..];
     let want_crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    let magic = &trailer[12..20];
-    if magic != MAGIC_V6 {
-        // A file from a newer pinkdb?
-        if magic.starts_with(b"PINKDB0") && magic[7].is_ascii_digit() && magic[7] > b'6' {
-            return Err(PinkDbError::Execution(format!(
-                "written by a newer pinkdb (format v{}); upgrade pinkdb",
-                magic[7] - b'0'
-            )));
-        }
-        // A file from an older pinkdb? Its magic is at the *start*.
-        if data.len() >= 8 && data.starts_with(b"PINKDB0") && data[7].is_ascii_digit() {
-            let v = data[7];
-            if v <= b'6' {
-                return Err(older_pinkdb_error(v - b'0'));
-            }
-            return Err(PinkDbError::Execution(format!(
-                "written by a newer pinkdb (format v{}); upgrade pinkdb",
-                v - b'0'
-            )));
-        }
-        return Err(PinkDbError::Execution(
-            "not a .pink file (bad magic)".to_string(),
-        ));
-    }
+    check_magic(data, &trailer[12..20])?;
     let (start, len) = footer_span_raw(data)?;
     let footer = &data[start..start + len];
     if crc32c(footer) != want_crc {
@@ -3687,6 +4053,49 @@ fn read_store_footer(data: &[u8]) -> Result<StoreFooter> {
             "corrupt file: the footer checksum does not match (the file is damaged)".to_string(),
         ));
     }
+    parse_store_footer(footer)
+}
+
+/// Check a file's magic: the trailer's for a `PINKDB06` image, the file's
+/// first bytes for an older layout (whose magic sat at the start).
+///
+/// The two refusals are the format's contract: an older pinkdb's file is
+/// never guessed at, and a newer one asks for an upgrade.
+fn check_magic(data: &[u8], trailer_magic: &[u8]) -> Result<()> {
+    if trailer_magic == MAGIC_V6 {
+        return Ok(());
+    }
+    // A file from a newer pinkdb?
+    if trailer_magic.starts_with(b"PINKDB0")
+        && trailer_magic[7].is_ascii_digit()
+        && trailer_magic[7] > b'6'
+    {
+        return Err(PinkDbError::Execution(format!(
+            "written by a newer pinkdb (format v{}); upgrade pinkdb",
+            trailer_magic[7] - b'0'
+        )));
+    }
+    // A file from an older pinkdb? Its magic is at the *start*.
+    if data.len() >= 8 && data.starts_with(b"PINKDB0") && data[7].is_ascii_digit() {
+        let v = data[7];
+        if v <= b'6' {
+            return Err(older_pinkdb_error(v - b'0'));
+        }
+        return Err(PinkDbError::Execution(format!(
+            "written by a newer pinkdb (format v{}); upgrade pinkdb",
+            v - b'0'
+        )));
+    }
+    Err(PinkDbError::Execution(
+        "not a .pink file (bad magic)".to_string(),
+    ))
+}
+
+/// Parse a `PINKDB06` footer region (the bytes the trailer points at) into
+/// the store's metadata and row-group directory. The region's checksum is
+/// **not** checked here — the caller checks it (see [`read_store_footer`]
+/// and [`read_layout`]).
+fn parse_store_footer(footer: &[u8]) -> Result<StoreFooter> {
     let mut r = Reader::new(footer);
     let version = r.u32()?;
     if version != FOOTER_VERSION {
@@ -3916,16 +4325,31 @@ fn decode_column_chunk(
             "corrupt file: the column chunk is outside the file".to_string(),
         ));
     }
-    let bytes = &data[start..end];
-    if crc32c(bytes) != dir.crc32c {
-        return Err(PinkDbError::Execution(format!(
-            "corrupt file: the column chunk at offset {start} fails its checksum (the file is damaged)"
-        )));
+    decode_chunk_bytes(&data[start..end], dir.page_count, dir.crc32c, dtype)
+}
+
+/// Decode one column chunk's bytes: verify its CRC32C, then decode its
+/// pages (the page index plus the pages themselves).
+///
+/// The chunk's bytes are the *whole* chunk: the page index (the page count
+/// plus one `(offset, length)` pair per page) followed by the pages. A
+/// caller that fetched only the chunk (a projected, ranged reader) hands
+/// exactly those bytes here.
+fn decode_chunk_bytes(
+    bytes: &[u8],
+    expected_pages: u32,
+    crc: u32,
+    dtype: DataType,
+) -> Result<Vec<Arc<Vector>>> {
+    if crc32c(bytes) != crc {
+        return Err(PinkDbError::Execution(
+            "corrupt file: a column chunk fails its checksum (the file is damaged)".to_string(),
+        ));
     }
     // The page index, then the pages.
     let mut r = Reader::new(bytes);
     let page_count = r.u32()? as usize;
-    if page_count != dir.page_count as usize {
+    if page_count != expected_pages as usize {
         return Err(PinkDbError::Execution(
             "corrupt file: the column chunk's page count disagrees with the footer".to_string(),
         ));

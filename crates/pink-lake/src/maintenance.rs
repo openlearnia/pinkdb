@@ -779,30 +779,15 @@ impl Lake {
                 skipped.push(key.clone());
                 continue;
             }
-            // Wave 88: a conversion into the format the entry already pins
-            // is a no-op (checked before the legacy rule, so converting a v1
-            // `.pink` entry to `pink` is not an error). An unpinned v4+
-            // entry is pinned by the explicit request (metadata-only): the
-            // rewrite pins its result.
+            // A conversion into the format the entry already has is a no-op
+            // (wave 102: formats never change implicitly, so there is no pin
+            // to record).
             let target_format = (kind == CompactionKind::Convert)
                 .then(|| options.target_format.clone())
                 .flatten();
             if let Some(target) = &target_format
                 && target.id() == entry.format().id()
             {
-                if !entry.format_pinned && entry.data_rows().is_some() {
-                    let mut new_entry = entry.clone();
-                    new_entry.format_pinned = true;
-                    planned.push(PlannedTable {
-                        key: key.clone(),
-                        entry: new_entry,
-                        new_files: Vec::new(),
-                        processed: 0,
-                        created: 0,
-                        compacted_files: Vec::new(),
-                        removed_delete_files: Vec::new(),
-                    });
-                }
                 continue;
             }
             // Only v4/v5 entries: a legacy v1–v3 entry lists one data file
@@ -826,8 +811,6 @@ impl Lake {
             if target_format.is_some() && entry.files.is_empty() {
                 let mut new_entry = entry.clone();
                 new_entry.format = target_format;
-                // An explicit conversion pins what it produces (wave 88).
-                new_entry.format_pinned = true;
                 planned.push(PlannedTable {
                     key: key.clone(),
                     entry: new_entry,
@@ -1033,9 +1016,8 @@ impl Lake {
             if target_format.is_some() {
                 // The whole entry moved: every remaining file is encoded with
                 // the target provider (the rows invariant below re-checks the
-                // manifest), and the explicit conversion pins the result.
+                // manifest).
                 new_entry.format = target_format;
-                new_entry.format_pinned = true;
             }
             // The manifest's own rows invariant must survive compaction; the
             // live inlined rows are untouched by a merge or rewrite and stay

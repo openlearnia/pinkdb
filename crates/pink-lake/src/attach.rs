@@ -208,6 +208,10 @@ struct AttachedFile {
     /// with the table's current spec (a file written before the spec was set
     /// carries none; a spec change does not rewrite old files).
     partition: Option<std::collections::BTreeMap<String, Option<String>>>,
+    /// Where the file's footer is (wave 102, `.pink` data files): recorded by
+    /// the catalog so a projected read fetches the footer without probing
+    /// the trailer. `None` for formats the catalog does not locate this way.
+    footer: Option<crate::format::FooterLocation>,
 }
 
 /// One attached table's data-file list plus how to materialize it.
@@ -863,7 +867,14 @@ fn load_file(
 ) -> Result<(DataTable, Vec<bool>)> {
     let key = entry.key();
     let abs = storage.abs(&file.rel);
-    let data_file = DataFile::new(&abs, &file.rel, Arc::clone(storage));
+    // The catalog's footer location saves the trailer probe; the file's
+    // positional deletes tell a row-group-pruning provider not to prune this
+    // file (delete positions address the file's full row sequence).
+    let mut data_file =
+        DataFile::new(&abs, &file.rel, Arc::clone(storage)).with_footer(file.footer);
+    if !file.deletes.is_empty() {
+        data_file = data_file.with_deletes(file.deletes.clone());
+    }
     if !entry.projected {
         // No projected reader exists for this provider (the engine `.pink`
         // bytes are the built-in case): any missing column materializes the
@@ -1029,7 +1040,21 @@ fn load_file(
                 }
             }
         };
-        if file_table.num_rows() as u64 != file.rows {
+        // A provider that prunes row groups inside a file (wave 102, `.pink`)
+        // returns only the row groups that can match the predicates — never
+        // for a file with deletes (positions must stay aligned). The engine
+        // re-applies the full predicate above the scan, and a pruned load is
+        // never cached, so fewer rows is correct there; every other read must
+        // return exactly the manifest's count.
+        let may_prune_rows = entry.format.prunes_row_groups()
+            && !physical_filters.is_empty()
+            && file.deletes.is_empty();
+        let rows_ok = if may_prune_rows {
+            file_table.num_rows() as u64 <= file.rows
+        } else {
+            file_table.num_rows() as u64 == file.rows
+        };
+        if !rows_ok {
             return Err(LakeError::Corrupt {
                 path: storage.abs(&file.rel),
                 message: format!(
@@ -1919,6 +1944,7 @@ pub(crate) fn build_from(
                 deletes: deletes.clone(),
                 zone: Some(zone.clone()),
                 partition: file.partition().cloned(),
+                footer: file.footer_location(),
             })
             .collect();
         let lkey = (dbname.to_ascii_lowercase(), table.to_ascii_lowercase());
@@ -2104,14 +2130,21 @@ mod tests {
             vec![vec![Value::Bigint(2)]]
         );
         assert_eq!(db.loads(), 0, "COUNT(col) must not decode the data file");
-        // A filtered scan materializes the table exactly once.
+        // A filtered scan of a `.pink` file takes the row-group-pruning path
+        // (wave 102): a pruned load is a subset of rows, so it is never
+        // cached — the next unfiltered query materializes (and caches) the
+        // table once, and later queries reuse it.
         let rows = query(&mut store, "SELECT COUNT(*) FROM t WHERE i > 0;");
         assert_eq!(db.loads(), 1);
         assert_eq!(db.files_decoded(), 1, "the one data file decoded");
         assert_eq!(rows, vec![vec![Value::Bigint(1)]]);
         let _ = query(&mut store, "SELECT SUM(i) FROM t;");
-        assert_eq!(db.loads(), 1, "materialized tables are reused");
-        assert_eq!(db.files_decoded(), 1, "no extra file decode");
+        // A `vortexlake` build writes this table as Vortex, which does not
+        // prune inside a file: its filtered scan already took the cached path.
+        let materialized = if cfg!(feature = "vortexlake") { 1 } else { 2 };
+        assert_eq!(db.loads(), materialized, "the table is materialized once");
+        let _ = query(&mut store, "SELECT MAX(i) + SUM(i) FROM t;");
+        assert_eq!(db.loads(), materialized, "materialized tables are reused");
         // The empty table answers counts and NULL min/max without decoding.
         assert_eq!(
             query(
@@ -2241,11 +2274,13 @@ mod tests {
                 stats: block,
                 partition: None,
                 row_id_start: None,
+                footer_offset: None,
+                footer_len: None,
+                footer_crc32c: None,
             }],
             rows: 3,
             table_id: None,
             format: Some(FileFormat::pink()),
-            format_pinned: false,
             stats: None,
             deletes: Vec::new(),
             partition_by: None,
@@ -2315,7 +2350,6 @@ mod tests {
             rows: 3,
             table_id: None,
             format: None,
-            format_pinned: false,
             stats: Some(block),
             deletes: Vec::new(),
             partition_by: None,

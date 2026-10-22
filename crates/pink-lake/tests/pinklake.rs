@@ -1,14 +1,10 @@
-//! Lean (`vortexlake`-less) lake tests: the v1 `.pink` data-file format is
-//! the only one this build reads and writes, so every lake here is a v1 lake.
-//! The wave-45k statistics block is written by every save here and is what
-//! `.lake attach` reads without opening a data file.
+//! Lean (`vortexlake`-less) lake tests: `.pink` (PINKDB06) is the data-file
+//! format this build reads and writes. The statistics block is written by
+//! every save here and is what `.lake attach` reads without opening a data
+//! file; queries that need data read only the projected column chunks.
 //!
 //! `vortexlake` builds run `tests/lake.rs` instead; the two files pin the
-//! same contract from opposite sides, and this one additionally opens the
-//! checked-in `tests/fixtures/lake_v1_v4/` fixture (a v1 lake written by the
-//! **lean writer**, read bit-exactly by the full build in `tests/lake.rs`)
-//! and `tests/fixtures/lake_v1_v4_stats/` (the same store written with
-//! statistics blocks: attached by both builds).
+//! same contract from opposite sides.
 
 #![cfg(not(feature = "vortexlake"))]
 
@@ -141,12 +137,12 @@ fn assert_same_store(a: &PinkDb, b: &PinkDb) {
 /// per-commit delta manifest — then loads it back bit-exactly.
 #[test]
 fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
-    assert_eq!(FORMAT_VERSION, 6, "a lean build writes v6");
+    assert_eq!(FORMAT_VERSION, 7, "a lean build writes v7");
     let dir = scratch("roundtrip");
     let lake_dir = dir.join("lake");
     let expected = common::fidelity_store();
     let mut lake = Lake::create(&lake_dir).unwrap();
-    assert_eq!(lake.format_version(), 6, "create publishes a v6 lake");
+    assert_eq!(lake.format_version(), 7, "create publishes a v7 lake");
     let report = lake.write_from_store_report(&expected).unwrap();
     assert_eq!(report.version, 2);
     assert_eq!(report.tables, all_tables(&expected).len());
@@ -155,7 +151,7 @@ fn lean_save_publishes_a_v5_lake_and_reloads_bit_exactly() {
     // The on-disk shape: a v4 entry per table, `.pink` files as objects with
     // their row counts and statistics blocks.
     let catalog = read_json(&lake_dir.join("catalog.json"));
-    assert_eq!(catalog["format_version"], 6, "{catalog}");
+    assert_eq!(catalog["format_version"], 7, "{catalog}");
     assert_eq!(catalog["version"], 2, "{catalog}");
     for (key, entry) in catalog["tables"].as_object().unwrap() {
         assert_eq!(entry["format"], "pink", "{key}: {entry}");
@@ -303,67 +299,30 @@ fn lean_save_is_deterministic_for_the_same_store() {
     cleanup(&dir);
 }
 
-/// A v2/v3 Vortex lake is refused at the very first manifest parse with a
-/// clear feature error — never a corrupt-file error.
+/// Wave 88 rule 5: a lake with a Vortex entry **opens** in a lean build; that
+/// table is unavailable (every read/write of it is the feature error) and the
+/// rest of the lake still works.
 #[test]
-fn lean_build_refuses_vortex_lakes_with_a_feature_error() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v2");
-    let err = Lake::open(&fixture).unwrap_err();
-    assert!(matches!(err, LakeError::FeatureMissing { .. }), "{err:?}");
-    let text = err.to_string();
-    assert!(
-        text.contains("built without Vortex format support"),
-        "{text}"
-    );
-    assert!(text.contains("--features vortexlake"), "{text}");
-    assert!(
-        !text.contains("corrupt"),
-        "must not read as corrupt metadata: {text}"
-    );
-
-    // The same holds for a v3 (current full-build) manifest and a snapshot at
-    // a fetched version, not just the catalog.
-    let dir = scratch("refuse_v3");
-    let lake = dir.join("lake");
-    std::fs::create_dir_all(lake.join("snapshots")).unwrap();
-    let manifest = serde_json::json!({
-        "format_version": 3,
-        "updated": "2026-10-15T00:00:00.000Z",
-        "version": 1,
-        "tables": {},
-    });
-    let bytes = serde_json::to_vec(&manifest).unwrap();
-    std::fs::write(lake.join("catalog.json"), &bytes).unwrap();
-    std::fs::write(lake.join("snapshots/1.json"), &bytes).unwrap();
-    let err = Lake::open(&lake).unwrap_err();
-    assert!(matches!(err, LakeError::FeatureMissing { .. }), "{err:?}");
-    assert!(err.to_string().contains("format_version 3"), "{err}");
-    cleanup(&dir);
-}
-
-/// Wave 88 rule 5: a v4–v6 lake with a Vortex entry **opens** in a lean build;
-/// that table is unavailable (every read/write of it is the feature error) and
-/// the rest of the lake still works. Only v2/v3 keep the whole-lake refusal.
-#[test]
-fn a_v4_vortex_entry_is_a_per_table_feature_error() {
+fn a_vortex_entry_is_a_per_table_feature_error() {
     let dir = scratch("v4_vortex_per_table");
     let lake_dir = dir.join("lake");
-    std::fs::create_dir_all(lake_dir.join("snapshots")).unwrap();
-    let manifest = serde_json::json!({
-        "format_version": 4,
-        "updated": "2026-10-21T00:00:00.000Z",
-        "version": 1,
-        "tables": {
-            "main.t": {
-                "files": [{"path": "data/main.t/x.vortex", "rows": 0}],
-                "rows": 0,
-                "format": "vortex"
-            }
-        }
+    // A real lean lake (identity, highest version), then a Vortex entry
+    // injected into its current catalog and snapshot.
+    let mut db = PinkDb::new();
+    db.execute("CREATE TABLE keep (x INTEGER); INSERT INTO keep VALUES (1);")
+        .unwrap();
+    save_store(&db, &lake_dir).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(lake_dir.join("catalog.json")).unwrap()).unwrap();
+    manifest["tables"]["main.t"] = serde_json::json!({
+        "files": [{"path": "data/main.t/x.vortex", "rows": 0}],
+        "rows": 0,
+        "format": "vortex"
     });
+    let version = manifest["version"].as_u64().unwrap();
     let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
     std::fs::write(lake_dir.join("catalog.json"), &bytes).unwrap();
-    std::fs::write(lake_dir.join("snapshots/1.json"), &bytes).unwrap();
+    std::fs::write(lake_dir.join(format!("snapshots/{version}.json")), &bytes).unwrap();
 
     // Open succeeds; the Vortex table is listed as unavailable.
     let lake = Lake::open(&lake_dir).unwrap();
@@ -376,10 +335,14 @@ fn a_v4_vortex_entry_is_a_per_table_feature_error() {
         "{:?}",
         unavailable[0].error
     );
-    // `load` skips it; attach still lists it but any read is the feature error.
-    assert!(lake.load(None).unwrap().list_tables().is_empty());
+    // `load` skips it (the readable table still loads); attach still lists
+    // it but any read is the feature error.
+    assert_eq!(
+        lake.load(None).unwrap().list_tables(),
+        vec!["keep".to_string()]
+    );
     let attachment = lake.attach(None).unwrap();
-    assert_eq!(attachment.tables, 1, "the unavailable table is listed");
+    assert_eq!(attachment.tables, 2, "the unavailable table is listed too");
     let text = attachment.lake.load("main", "t").unwrap_err().to_string();
     assert!(text.contains("main.t"), "{text}");
     assert!(text.contains("vortex"), "{text}");
@@ -401,7 +364,7 @@ fn a_v4_vortex_entry_is_a_per_table_feature_error() {
     cleanup(&dir);
 }
 
-/// A `format_version` this codebase does not know at all (7+) is the same
+/// A `format_version` this codebase does not know at all (8+) is the same
 /// [`LakeError::Unsupported`] as in a full build, not a feature error.
 #[test]
 fn unsupported_future_format_versions_are_named() {
@@ -409,7 +372,7 @@ fn unsupported_future_format_versions_are_named() {
     let lake = dir.join("lake");
     std::fs::create_dir_all(&lake).unwrap();
     let manifest = serde_json::json!({
-        "format_version": 7,
+        "format_version": 8,
         "updated": "2026-10-15T00:00:00.000Z",
         "version": 1,
         "tables": {},
@@ -421,24 +384,19 @@ fn unsupported_future_format_versions_are_named() {
     .unwrap();
     let err = Lake::open(&lake).unwrap_err();
     assert!(
-        matches!(err, LakeError::Unsupported { found: 7, .. }),
+        matches!(err, LakeError::Unsupported { found: 8, .. }),
         "{err:?}"
     );
     assert!(
         err.to_string()
-            .contains("unsupported lake format_version 7"),
+            .contains("unsupported lake format_version 8"),
         "{err}"
     );
     assert!(err.to_string().contains("newer pinkdb"), "{err}");
     cleanup(&dir);
 }
 
-/// `tests/fixtures/lake_v1_v4/` is a v1 lake written by **this** (lean)
-/// writer: engine v4 `.pink` data files under a v1 catalog. The lean build
-/// reads it bit-exactly, and `tests/lake.rs` (the full build) opens the same
-/// directory — that is the lean-writes / full-reads compatibility pin, and
-/// the byte-identity of the re-save proves no value or chunking was lost.
-/// A v1 lake over the mock S3 backend: the lean writer puts one `.pink`
+/// A lake over the mock S3 backend: the lean writer puts one `.pink`
 /// object per table with the same catalog/snapshot contract, and reads it
 /// back bit-exactly.
 #[cfg(feature = "s3")]
@@ -453,7 +411,7 @@ fn lean_s3_v4_roundtrip() {
         .with_credentials(mock.access_key_id(), "mock-secret");
     let expected = common::fidelity_store();
     let mut lake = Lake::create_s3(config).unwrap();
-    assert_eq!(lake.format_version(), 6);
+    assert_eq!(lake.format_version(), 7);
     lake.write_from_store(&expected).unwrap();
 
     let keys = mock.keys();
@@ -486,9 +444,6 @@ fn lean_s3_v4_roundtrip() {
 // same fixture is attached by the full build in `tests/lake.rs`).
 // ---------------------------------------------------------------------------
 
-/// The `lake_v1_v4_stats` fixture: a v1 lake with statistics blocks loads
-/// bit-exactly, attaches without touching a data file, answers the fast paths
-/// exactly, and attaches with identical answers as a full build.
 /// Query `db` and return the rows bit-exactly (NaN payloads and `-0.0`
 /// compared by bits).
 fn select_rows(db: &mut PinkDb, sql: &str) -> Vec<Vec<Value>> {
@@ -594,7 +549,7 @@ fn lean_attach_fast_paths_decode_nothing_and_fallbacks_decode_once() {
     save_store(&db, &lake_dir).unwrap();
     let lake = Lake::open(&lake_dir).unwrap();
     let report = lake.attach(None).unwrap();
-    assert_eq!(report.format_version, 6);
+    assert_eq!(report.format_version, 7);
     assert!(!report.remote, "a `.pink` attach reads no data file");
     let mut attached = PinkDb::new();
     attached.attach_lake(report.lake.clone()).unwrap();
@@ -622,13 +577,15 @@ fn lean_attach_fast_paths_decode_nothing_and_fallbacks_decode_once() {
             0,
         ),
         // `d` holds a NaN and `z` a -0.0: those MIN/MAX cannot come from
-        // statistics, so the whole query materializes once.
+        // statistics. A `.pink` file decodes only the columns a query needs
+        // (wave 102), so each new column is one projected load.
         ("SELECT MIN(d), MAX(d) FROM t;", 1),
-        ("SELECT MIN(z), MAX(z) FROM t;", 1),
-        ("SELECT SUM(i) FROM t;", 1),
-        // Cached: the same answers, no second decode.
-        ("SELECT MIN(i), MAX(i), COUNT(v) FROM t;", 1),
-        ("SELECT COUNT(*) FROM t WHERE i > 0;", 1),
+        ("SELECT MIN(z), MAX(z) FROM t;", 2),
+        ("SELECT SUM(i) FROM t;", 3),
+        // Cached: the same column again, no further decode.
+        ("SELECT MIN(i), MAX(i), COUNT(v) FROM t;", 3),
+        // A filtered scan prunes row groups and is never cached: one load.
+        ("SELECT COUNT(*) FROM t WHERE i > 0;", 4),
     ];
     for (sql, want_loads) in cases {
         let a = select_rows(&mut attached, sql);
@@ -683,17 +640,6 @@ fn lean_attach_refuses_corrupted_and_stats_less_lakes() {
     assert!(err.contains("use .lake open"), "{err}");
     assert_same_store(&db, &lake.load(None).unwrap());
 
-    // The v1 fixtures written before statistics existed are refused the same
-    // way (and still load bit-exactly).
-    for name in ["lake_v1", "lake_v1_v4"] {
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures")
-            .join(name);
-        let lake = Lake::open(&fixture).unwrap();
-        let err = lake.attach(None).unwrap_err().to_string();
-        assert!(err.contains("without a statistics block"), "{name}: {err}");
-        assert!(err.contains("use .lake open"), "{name}: {err}");
-    }
     cleanup(&dir);
 }
 
@@ -728,13 +674,11 @@ fn lean_s3_attach_answers_from_statistics() {
         vec![vec![Value::Bigint(expected_rows as i64)]]
     );
     assert_eq!(report.lake.decode_stats().0, 0, "fast paths must not load");
-    // The fallback decodes the whole table once (via a whole-object download).
+    // The fallback decodes only the needed column (wave 102: projected,
+    // ranged `.pink` reads), not the whole table.
     let _ = select_rows(&mut attached, "SELECT SUM(i) FROM t;");
     assert_eq!(report.lake.decode_stats().0, 1);
-    assert_eq!(
-        report.lake.decode_stats().1 as usize,
-        db.table("t").unwrap().num_cols()
-    );
+    assert_eq!(report.lake.decode_stats().1, 1, "only column i is decoded");
 }
 
 /// Time travel over the lean (v1 `.pink`) format: each version's data file

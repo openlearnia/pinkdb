@@ -19,8 +19,6 @@
 //! 5. `rewrite_table_format` pink → provider → pink preserves the data
 //!    exactly (for `pink` itself, the same-format rewrite is the documented
 //!    no-op);
-//! 6. an explicit per-table format choice pins the catalog entry
-//!    (`"format_pinned": true`).
 //!
 //! Every assertion names the format id under test, so one failing provider is
 //! unambiguous when the same body runs for `pink`, `vortex` and `parquet` in
@@ -686,35 +684,6 @@ fn rewrite_check(format_id: &str, opts: &ContractOptions, dir: &Path) {
     }
 }
 
-/// Step 6: an explicit per-table choice records `"format_pinned": true`.
-fn pinned_check(format_id: &str, dir: &Path) {
-    let lake_dir = dir.join("pinned_lake");
-    let mut lake =
-        Lake::create(&lake_dir).unwrap_or_else(|e| panic!("{format_id}: pinned lake create: {e}"));
-    lake.set_table_format("main", "t", format_id)
-        .unwrap_or_else(|e| panic!("{format_id}: set_table_format: {e}"));
-    let mut store = PinkDb::new();
-    add_table(
-        &mut store,
-        "t",
-        &schema_with_types(&[("i", DataType::Integer)]),
-        &[vec![Value::Integer(7)]],
-    );
-    lake.write_from_store_report(&store)
-        .unwrap_or_else(|e| panic!("{format_id}: pinned lake save: {e}"));
-    let catalog = read_catalog(&lake_dir);
-    let entry = &catalog["tables"]["main.t"];
-    assert_eq!(
-        entry["format"], format_id,
-        "{format_id}: an explicit per-table choice must select the entry's format: {catalog}"
-    );
-    assert_eq!(
-        entry["format_pinned"],
-        serde_json::json!(true),
-        "{format_id}: an explicit per-table choice must record \"format_pinned\": true: {catalog}"
-    );
-}
-
 /// Step 3: `attach` answers exactly the same per-column COUNT/MIN/MAX facts as
 /// the loaded store.
 fn attach_check(format_id: &str, lake: &Lake, source: &PinkDb, opened: &mut PinkDb) {
@@ -795,9 +764,6 @@ pub fn run_contract(format_id: &str, opts: ContractOptions) {
 
     // 5. rewrite pink -> provider -> pink preserves the data.
     rewrite_check(format_id, &opts, &dir);
-
-    // 6. an explicit per-table choice pins the entry.
-    pinned_check(format_id, &dir);
 
     cleanup(&dir);
 }

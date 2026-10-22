@@ -2042,6 +2042,9 @@ impl Lake {
                     stats: Some(stats),
                     partition: None,
                     row_id_start: Some(start),
+                    footer_offset: None,
+                    footer_len: None,
+                    footer_crc32c: None,
                 };
                 new_entry.files.push(file.clone());
                 new_entry.rows =
@@ -2183,15 +2186,14 @@ impl Lake {
                 continue;
             }
             let keys = specs.get(key).map(Vec::as_slice).unwrap_or(&[]);
-            // Wave 88: an existing entry's format and pin flag always win
-            // for an append; a table this commit creates takes the handle's
-            // per-table choice (pinned), else its write format (pinned when
-            // explicitly chosen).
-            let (format, pinned) = self.resolve_append_format(key, entry);
+            // An existing entry's format always wins for an append; a table
+            // this commit creates takes the handle's per-table choice, else
+            // its write format (wave 102: formats change only explicitly).
+            let format = self.resolve_append_format(key, entry);
             let (files, bytes) = self.write_data_files(key, format.clone(), keys, rows)?;
             uploaded.bytes += bytes;
             uploaded.appends.insert(key.clone(), files);
-            uploaded.formats.insert(key.clone(), (format, pinned));
+            uploaded.formats.insert(key.clone(), format);
         }
         for (key, files) in &commit.deletes {
             for (file, positions) in files {
@@ -2392,9 +2394,8 @@ impl Lake {
                 let mut next_row_id = 0u64;
                 // Wave 88: the format the appended files were written with
                 // (the handle's per-table choice, else its write format) is
-                // the one the new entry carries, with the pin flag that
-                // choice implies (explicit choices pin).
-                let (created_format, created_pinned) = uploaded
+                // the one the new entry carries.
+                let created_format = uploaded
                     .formats
                     .get(key)
                     .cloned()
@@ -2404,7 +2405,6 @@ impl Lake {
                     rows: added,
                     table_id: None,
                     format: Some(created_format),
-                    format_pinned: created_pinned,
                     stats: None,
                     deletes: Vec::new(),
                     partition_by: spec.clone(),
@@ -2475,7 +2475,7 @@ impl Lake {
             // head whose entry now pins another format (a concurrent
             // rewrite_table_format) cannot list them: one entry names one
             // data-file format. Refuse rather than mislabel the files.
-            if let Some((written, _)) = uploaded.formats.get(key)
+            if let Some(written) = uploaded.formats.get(key)
                 && written.id() != entry.format().id()
             {
                 return Err(PublishFailure::Fatal(LakeError::Conflict {
@@ -2895,7 +2895,7 @@ struct UploadedCommit {
     /// publishes the flag; an append to an existing entry keeps its own).
     /// The publish refuses a rebase onto a head whose entry pins another
     /// format (the files would be mislabeled).
-    formats: BTreeMap<String, (crate::catalog::FileFormat, bool)>,
+    formats: BTreeMap<String, crate::catalog::FileFormat>,
     bytes: u64,
 }
 

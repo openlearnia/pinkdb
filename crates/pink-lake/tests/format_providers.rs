@@ -149,6 +149,7 @@ impl LakeFormat for PinkWrap {
         Ok(EncodedFile {
             bytes: wrapped,
             stats,
+            footer: None,
         })
     }
 

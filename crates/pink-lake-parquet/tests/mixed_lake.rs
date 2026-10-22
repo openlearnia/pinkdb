@@ -6,7 +6,7 @@
 //! one process. It covers the plan's mixed-lake contract: three tables in
 //! `pink`, `vortex` and `parquet` round-trip through save/open; attach answers
 //! the same COUNT/MIN/MAX facts as open for each table; appends keep each
-//! table's pinned format even when the handle's write format differs; a
+//! table's format even when the handle's write format differs; a
 //! whole-store save with a different handle default keeps every existing
 //! table's format; a per-table choice selects a new table's format; a rewrite
 //! converts one table and open/attach agree before and after; and an entry
@@ -162,10 +162,14 @@ fn assert_format(catalog: &serde_json::Value, key: &str, id: &str, extension: &s
     }
 }
 
-fn entry_pinned(catalog: &serde_json::Value, key: &str) -> bool {
-    catalog["tables"][key]["format_pinned"]
-        .as_bool()
-        .unwrap_or(false)
+/// Wave 102: formats change only explicitly, so the catalog records no pin.
+fn assert_no_pin_field(catalog: &serde_json::Value) {
+    for (key, entry) in catalog["tables"].as_object().unwrap() {
+        assert!(
+            entry.get("format_pinned").is_none(),
+            "table {key}: {catalog}"
+        );
+    }
 }
 
 /// Every table of the mixed store answers the same COUNT/MIN/MAX facts from
@@ -209,10 +213,7 @@ fn mixed_formats_round_trip_appends_and_pins() {
     assert_format(&catalog, "main.as_pink", "pink", "pink");
     assert_format(&catalog, "main.as_vortex", "vortex", "vortex");
     assert_format(&catalog, "main.as_parquet", FORMAT_ID, "parquet");
-    // Every explicitly chosen format is recorded as pinned.
-    for key in ["main.as_pink", "main.as_vortex", "main.as_parquet"] {
-        assert!(entry_pinned(&catalog, key), "table {key}: {catalog}");
-    }
+    assert_no_pin_field(&catalog);
 
     // Open equals the source; attach equals open for every table.
     let reopened = Lake::open(&lake_dir).unwrap();
@@ -220,7 +221,7 @@ fn mixed_formats_round_trip_appends_and_pins() {
     assert_store_equal(&source, &opened, "mixed lake open");
     assert_open_attach_agree(&reopened, &["as_pink", "as_vortex", "as_parquet"]);
 
-    // Appends keep each table's pinned format, whatever the handle's write
+    // Appends keep each table's format, whatever the handle's write
     // format says (set here to parquet, which differs from pink and vortex).
     let mut lake = Lake::open(&lake_dir).unwrap();
     lake.set_write_format(FORMAT_ID).unwrap();
@@ -270,7 +271,7 @@ fn mixed_formats_round_trip_appends_and_pins() {
     assert_format(&catalog, "main.committed", "pink", "pink");
 
     // A whole-store save with a different handle default keeps every existing
-    // table's pinned format (no silent re-encoding).
+    // table's format (no silent re-encoding).
     let reopened = Lake::open(&lake_dir).unwrap();
     let store = reopened.load(None).unwrap();
     let mut lake = Lake::open(&lake_dir).unwrap();
@@ -281,21 +282,13 @@ fn mixed_formats_round_trip_appends_and_pins() {
     assert_format(&catalog, "main.as_vortex", "vortex", "vortex");
     assert_format(&catalog, "main.as_parquet", FORMAT_ID, "parquet");
     assert_format(&catalog, "main.committed", "pink", "pink");
-    // The explicit choices are pinned, and the different handle default did
-    // not unpin or re-encode any of them.
-    for key in [
-        "main.as_pink",
-        "main.as_vortex",
-        "main.as_parquet",
-        "main.committed",
-    ] {
-        assert!(entry_pinned(&catalog, key), "table {key}: {catalog}");
-    }
+    // The different handle default re-encoded none of them.
+    assert_no_pin_field(&catalog);
     let reloaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
     assert_store_equal(&store, &reloaded, "whole-store save");
 
     // A per-table choice selects a new table's format even when the handle's
-    // write format says something else; existing tables stay pinned.
+    // write format says something else; existing tables keep their formats.
     let mut store = reloaded.clone();
     add_table(&mut store, "fresh", 500, 2);
     let mut lake = Lake::open(&lake_dir).unwrap();
@@ -308,7 +301,7 @@ fn mixed_formats_round_trip_appends_and_pins() {
     assert_format(&catalog, "main.as_vortex", "vortex", "vortex");
     assert_format(&catalog, "main.as_parquet", FORMAT_ID, "parquet");
     assert_format(&catalog, "main.committed", "pink", "pink");
-    assert!(entry_pinned(&catalog, "main.fresh"), "{catalog}");
+    assert_no_pin_field(&catalog);
 
     // An entry naming an unknown format id is a **per-table** refusal (wave
     // 88, rule 5): the lake opens, the other tables stay readable, the table
@@ -358,64 +351,6 @@ fn mixed_formats_round_trip_appends_and_pins() {
         .merge_adjacent_files(Some("main.as_vortex"), &MergeSettings::default())
         .unwrap_err();
     assert!(matches!(err, LakeError::UnknownFormat { .. }), "{err:?}");
-
-    cleanup(&dir);
-}
-
-/// Wave 88 rule 2: an **unpinned** `pink` entry keeps the wave-45 migration
-/// behavior — a full save with an explicit write format re-encodes it and
-/// records the result as pinned.
-#[test]
-fn an_unpinned_pink_table_migrates_to_the_explicit_write_format() {
-    register_providers();
-    let dir = scratch("unpinned_migrate");
-    let lake_dir = dir.join("lake");
-    let mut source = PinkDb::new();
-    add_table(&mut source, "t", 0, 3);
-
-    // An explicitly chosen format is pinned.
-    let mut lake = Lake::create(&lake_dir).unwrap();
-    lake.set_table_format("main", "t", "pink").unwrap();
-    lake.write_from_store_report(&source).unwrap();
-    let catalog = read_catalog(&lake_dir);
-    assert_eq!(entry_format(&catalog, "main.t"), "pink");
-    assert!(entry_pinned(&catalog, "main.t"), "{catalog}");
-
-    // Make the version-2 entry unpinned in both manifests (an entry written
-    // under the build default is what this simulates). Catalog and snapshot
-    // must agree: that byte-identity is the lake's own invariant.
-    for path in [
-        lake_dir.join("catalog.json"),
-        lake_dir.join("snapshots/2.json"),
-    ] {
-        let mut manifest: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        manifest["tables"]["main.t"]
-            .as_object_mut()
-            .unwrap()
-            .remove("format_pinned");
-        std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
-    }
-    let catalog = read_catalog(&lake_dir);
-    assert!(!entry_pinned(&catalog, "main.t"), "{catalog}");
-
-    // A full save with an explicit Vortex write format migrates the unpinned
-    // table and pins the result.
-    let store = Lake::open(&lake_dir).unwrap().load(None).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    lake.set_write_format("vortex").unwrap();
-    lake.write_from_store_report(&store).unwrap();
-    let catalog = read_catalog(&lake_dir);
-    assert_eq!(entry_format(&catalog, "main.t"), "vortex", "{catalog}");
-    assert!(entry_pinned(&catalog, "main.t"), "{catalog}");
-    assert!(
-        file_extensions(&catalog, "main.t")
-            .iter()
-            .all(|extension| extension == "vortex"),
-        "{catalog}"
-    );
-    let loaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
-    assert_eq!(loaded.table_in("main", "t").unwrap().num_rows(), 3);
 
     cleanup(&dir);
 }
@@ -494,7 +429,7 @@ fn rewrite_converts_one_table_and_reads_agree() {
     );
     assert_open_attach_agree(&lake, &["t", "u"]);
 
-    // Converting into the already-pinned format is a no-op.
+    // Converting into the format a table already has is a no-op.
     let version = lake.current_version();
     let report = lake.rewrite_table_format("main", "t", FORMAT_ID).unwrap();
     assert!(!report.committed, "{report:?}");

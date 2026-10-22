@@ -1,6 +1,6 @@
 # Wave 102 — one fast `.pink` format: ranged, projectable, no legacy (plan)
 
-Started 2026-10-22, queued right after 98b by the user ("we need to make
+Started 2026-10-22; **done** the same day. Queued right after 98b by the user ("we need to make
 pinkdb/pinklakes faster … if we need to steal stuff from vortex or parquet
 so be it"), with all legacy compatibility dropped ("legacy doesn't make
 sense for us … we are in early development").
@@ -169,3 +169,73 @@ open 2.57 s → 0.17 s.
 Other review fixes: `crc32c` uses `as_chunks::<8>()` (stable clippy 1.99),
 two vortexlake-only CLI tests that read old `.pink` fixtures deleted (the
 remaining legacy lake fixtures go in T2).
+
+## T2 — how it was built (2026-10-22)
+
+Delegated to OpenCode `opencode-go/minimax-m3.1-flash-free`; the model ended
+its turn early twice (once announcing its next step, once after a short
+continuation via `opencode run -s <session>`), leaving the persist footer API,
+`crates/pink-lake/src/ranged.rs`, the catalog footer fields, the projected
+`pink` reader in `format.rs` and the `format_pinned` removal, with the crate
+not compiling. **Finished here.**
+
+Landed: catalog `format_version` **7** only (`MIN = MAX = 7`; older catalogs
+refused with "written by an older pinkdb"; the per-entry shape rules extended
+to v7); `.pink` file entries carry `footer_offset` / `footer_len` /
+`footer_crc32c`; the `pink` provider reads the footer at that location (or
+probes the 20-byte trailer), prunes row groups by their exact chunk
+statistics, fetches only the projected chunks through coalesced, bounded
+concurrent range reads, and decodes them in parallel in order
+(`persist::read_layout` / `decode_projected_columns`); the wave 88 hybrid
+migration rule and `format_pinned` removed (formats change only explicitly);
+the legacy fixtures (`lake_v1`, `lake_v1_v4`, `lake_v1_v4_stats`, `lake_v2`)
+and every test built on them deleted.
+
+**Review fixes in the agent's code:**
+
+- **Deletes vs row-group pruning.** `DataFile::with_deletes` /
+  `with_footer` were never called, so the reader could prune row groups of a
+  file with positional deletes — the delete positions address the file's
+  full row sequence, so the wrong rows would have been dropped. Attach now
+  passes both; pruning is off for files with deletes.
+- **Path validation on v7.** The manifest's per-version match covered
+  `4..=6`; a v7 manifest would have fallen through to `_ => {}` and skipped
+  `validate_rel_path` (data paths must stay under `data/`). Every arm now
+  covers 7.
+- **Row-count check.** A pruned read returns fewer rows than the manifest by
+  design; the check is relaxed to `<=` only when the provider prunes row
+  groups, filters were passed and the file has no deletes (pruned loads are
+  never cached; the engine re-applies the predicate).
+
+New test `crates/pink-lake/tests/pink_ranged_reads.rs` (mock S3, two row
+groups): `COUNT(*)` issues no data request; a 2-of-4-column query issues only
+range requests (footer at the catalog location + coalesced chunks, about
+2.3 MB of a 3.65 MB file); a `seq` predicate that prunes one row group reads
+less; answers equal the in-memory store. Behavior changes pinned in updated
+tests: an attached `.pink` lake now decodes only the columns a query needs
+(`SUM(i)` decodes 1 column, not 8), and a filtered scan takes the uncached
+row-group-pruning path.
+
+Follow-ups noted: the reader `HEAD`s the data file even when the catalog
+gives the footer location; the 1 MiB coalescing gap can merge across an
+unneeded column; pruned reads are not cached (repeated filtered queries
+re-read their chunks).
+
+## Results (R2 `pinkdb-bench`, TPC-H SF1, median of 3, DuckDB 2.0.0)
+
+The three SF1 lakes were re-saved under `lakes/v7/` (the pre-102 lakes have
+v6 catalogs and are now refused by design; the old objects were left in
+place).
+
+| SF1 lake on R2 | DuckLake | `.pink` before → after | Parquet lake | Vortex lake (DOUBLE) |
+|---|---|---|---|---|
+| attach + Q6 | 2.20 s | 20.4 s → **4.56 s** | 7.67 s | 4.88 s |
+| attach + Q1 | 2.36 s | 19.5 s → **4.25 s** | 9.70 s | 4.79 s |
+| attach + `count(*)` | 0.08 s | 1.84 s → 2.05 s | 2.20 s | 2.42 s |
+| lake size | 308 MiB | 680 MiB → **321 MB** | 642 MiB | 248 MiB |
+| save (from R2 Parquet) | 47.7 s | 49.7 s → **29.2 s** | 51.2 s | 24.8 s |
+
+The `.pink` lake is now the fastest pinkdb lake format and within ~2× of
+DuckLake. The remaining `count(*)` gap is catalog round trips (the catalog
+lives on R2 next to the data; DuckLake's was a local DuckDB file) — wave
+96a's SQLite/Postgres catalogs address it.

@@ -213,19 +213,6 @@ fn scan_rows(lake_dir: &Path, version: Option<u64>) -> Vec<(i32, String)> {
         .collect()
 }
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        let target = to.join(e.file_name());
-        if e.file_type().unwrap().is_dir() {
-            copy_dir(&e.path(), &target);
-        } else {
-            std::fs::copy(e.path(), target).unwrap();
-        }
-    }
-}
-
 /// Backdate a file's mtime (the cleanup age-gate fixture).
 fn backdate(path: &Path, secs_ago: u64) {
     let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
@@ -750,35 +737,6 @@ fn merge_respects_size_filters_and_max_compacted_files() {
     assert_eq!(report.files_created(), 1);
     assert_eq!(file_paths(&lake_dir2, "main.t").len(), 3);
     cleanup(&dir2);
-}
-
-#[test]
-fn merge_on_a_legacy_v1_lake_is_skipped_or_refused() {
-    let dir = scratch("merge-legacy");
-    let lake_dir = dir.join("lake");
-    copy_dir(
-        &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lake_v1"),
-        &lake_dir,
-    );
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    // A scan skips every v1 entry (one path-only file, no per-file counts).
-    let report = lake
-        .merge_adjacent_files(None, &MergeSettings::default())
-        .unwrap();
-    assert!(!report.committed, "{report:?}");
-    // An explicit request is a clean error naming the reason.
-    let err = lake
-        .merge_adjacent_files(Some("main.fid"), &MergeSettings::default())
-        .unwrap_err();
-    assert!(matches!(err, LakeError::NotRepresentable { .. }), "{err:?}");
-    assert!(err.to_string().contains("format_version < 4"), "{err}");
-    // A missing table is a clean error too.
-    let err = lake
-        .merge_adjacent_files(Some("main.nope"), &MergeSettings::default())
-        .unwrap_err();
-    assert!(matches!(err, LakeError::NotRepresentable { .. }), "{err:?}");
-    cleanup(&dir);
 }
 
 #[test]

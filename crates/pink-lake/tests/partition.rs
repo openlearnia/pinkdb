@@ -345,11 +345,8 @@ fn zone_map_pruning_decodes_only_matching_files() {
         attached_query(&lake_dir, "SELECT s FROM t WHERE id = 11;");
     assert_eq!(got, vec![vec![Value::Varchar("v11".to_string())]]);
     assert_eq!((loads, files), (1, 1), "one load, one file");
-    #[cfg(feature = "vortexlake")]
+    // Vortex and `.pink` (wave 102) both decode only the needed columns.
     assert_eq!(columns, 2, "id (predicate) and s (projection) only");
-    // A lean `.pink` projection decodes the whole (single-file) table.
-    #[cfg(not(feature = "vortexlake"))]
-    assert_eq!(columns, 3, "the `.pink` decode counts every column");
     cleanup(&dir);
 }
 

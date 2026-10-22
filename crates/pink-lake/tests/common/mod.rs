@@ -1,7 +1,6 @@
 //! Shared fixtures for the pink-lake integration tests.
 //!
-//! `fidelity_store` is the store behind the checked-in v1 lake fixture
-//! (`tests/fixtures/lake_v1/`) and the v2 round-trip tests: every type,
+//! `fidelity_store` is the round-trip corpus for the lake tests: every type,
 //! NULLs, empty strings, embedded NULs, multibyte strings, `-0.0`, NaN
 //! payloads (positive and negative, signaling and quiet), i32/i64/DATE/
 //! TIMESTAMP extremes, a multi-chunk table, an empty table, multiple

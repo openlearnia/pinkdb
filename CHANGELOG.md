@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-22
+### Wave 102 (part 2) — `.pink` lakes read only what a query needs ✅
+- Querying a `.pink` lake on S3/R2 now reads just the needed columns of the
+  row groups that can match the query, with several range requests in
+  flight; `COUNT(*)` and similar answers still come from the catalog alone.
+- Lakes use one catalog version (7), which records where each `.pink` file's
+  directory is, so no extra request is needed to find it.
+- A table now always keeps its file format until you change it explicitly.
+- Lakes written by earlier pinkdb versions are no longer readable (early
+  development: one current format); they are refused with a clear message.
+
 ### Wave 102 (part 1) — a new, faster `.pink` file format
 - `.pink` files use a new layout (`PINKDB06`): column data in row groups
   with a directory at the end, a checksum per column chunk, and new

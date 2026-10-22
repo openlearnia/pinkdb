@@ -509,58 +509,6 @@ fn drop_and_readd_the_same_name_reads_the_default_not_old_bytes() {
     cleanup(&dir);
 }
 
-#[test]
-fn legacy_v4_lake_upgrades_on_the_first_schema_change() {
-    // A v4 lake (no schema records) stays readable; a schema change migrates
-    // the entry to a v5 record, stamping the old files with epoch 1.
-    let dir = scratch("legacy");
-    let lake_dir = dir.join("lake");
-    save_store(&store(3), &lake_dir).unwrap();
-    // Degrade the manifest to v4 shape: strip the record and the file epoch.
-    let catalog_path = lake_dir.join("catalog.json");
-    let mut manifest = json(&catalog_path);
-    manifest["format_version"] = serde_json::json!(4);
-    manifest.as_object_mut().unwrap().remove("lake_id");
-    for (_, e) in manifest["tables"].as_object_mut().unwrap() {
-        e.as_object_mut().unwrap().remove("schema_version");
-        e.as_object_mut().unwrap().remove("columns");
-        e.as_object_mut().unwrap().remove("renames");
-        for f in e["files"].as_array_mut().unwrap() {
-            f.as_object_mut().unwrap().remove("schema_version");
-        }
-    }
-    let snapshot_path = lake_dir
-        .join("snapshots")
-        .join(format!("{}.json", manifest["version"].as_u64().unwrap()));
-    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
-    std::fs::write(&catalog_path, &bytes).unwrap();
-    std::fs::write(&snapshot_path, &bytes).unwrap();
-
-    let mut wa = WritableAttachment::open(lake_dir.to_str().unwrap(), None).unwrap();
-    wa.set_data_inlining_row_limit(0);
-    let mut db = materialize(&wa);
-    db.execute("ALTER TABLE t ADD COLUMN n INTEGER DEFAULT 5;")
-        .unwrap();
-    let report = wa.commit(&db, &settings()).unwrap();
-    assert_eq!(report.schema_changes, 1, "{report:?}");
-    let mut lake = Lake::open(&lake_dir).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    let mut db = lake.load(None).unwrap();
-    assert_eq!(
-        query(&mut db, "SELECT i, n FROM t ORDER BY i;"),
-        vec![
-            vec![Value::Integer(100), Value::Integer(5)],
-            vec![Value::Integer(101), Value::Integer(5)],
-            vec![Value::Integer(102), Value::Integer(5)],
-        ]
-    );
-    let e = entry(&lake_dir, "main.t");
-    assert_eq!(json(&catalog_path)["format_version"], 6);
-    assert_eq!(e["schema_version"], 2, "the legacy base is epoch 1: {e}");
-    assert_eq!(e["files"][0]["schema_version"], 1, "migrated file: {e}");
-    cleanup(&dir);
-}
-
 // ---------------------------------------------------------------------------
 // Lake-wide schema versions
 // ---------------------------------------------------------------------------

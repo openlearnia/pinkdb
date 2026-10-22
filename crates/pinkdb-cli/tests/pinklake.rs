@@ -135,7 +135,7 @@ fn lean_save_open_versions_tables_info() {
     assert!(out.contains("2 tables, 3 rows"), "{out}");
     assert!(out.contains("Opened lake version 2"), "{out}");
     assert!(out.contains("2 (current)"), "{out}");
-    assert!(out.contains("format version:  6"), "{out}");
+    assert!(out.contains("format version:  7"), "{out}");
     assert!(out.contains("main.t (2 rows)"), "{out}");
     assert!(out.contains("analytics.u (1 row)"), "{out}");
     // The reloaded values are the inserted ones (NULL included).
@@ -145,7 +145,7 @@ fn lean_save_open_versions_tables_info() {
     // The on-disk shape: a v6 catalog, no `format` fields, `.pink` data
     // files with the engine's own magic.
     let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
-    assert!(catalog.contains("\"format_version\": 6"), "{catalog}");
+    assert!(catalog.contains("\"format_version\": 7"), "{catalog}");
     assert!(catalog.contains("\"format\": \"pink\""), "{catalog}");
     let files = data_files(&lake.join("data"));
     assert_eq!(files.len(), 2);
@@ -214,41 +214,17 @@ fn lean_attach_answers_from_statistics_without_decoding() {
         out.contains("│ 3        │ 3        │ 2        │ 2        │"),
         "{out}"
     );
-    // The fast paths decoded nothing; the fallback materialized once and the
-    // second fallback reused the cache.
+    // The fast paths decoded nothing; each fallback decoded only the columns
+    // it needed.
     let zero = out.matches("decodes: 0 loads, 0 columns").count();
     assert_eq!(zero, 1, "fast paths must not decode:\n{out}");
-    assert_eq!(
-        out.matches("decodes: 1 load, 5 columns").count(),
-        2,
-        "one decode, then cached:\n{out}"
+    // `.pink` files decode only the columns a query needs (wave 102): the
+    // first fallback reads one column, the second a further one.
+    assert!(
+        out.contains("decodes: 1 load, 1 column") && out.contains("decodes: 2 loads, 2 columns"),
+        "projected decodes, one column at a time:\n{out}"
     );
     cleanup(&dir);
-}
-
-/// A v2/v3 Vortex lake is refused by every `.lake` command with the clear
-/// feature error (never "corrupt" and never a wrong-format guess).
-#[test]
-fn vortex_lakes_are_refused_with_a_feature_error() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v2");
-    for cmd in [".lake open", ".lake versions", ".lake tables", ".lake info"] {
-        let out = run(&format!("{cmd} {}\n.quit\n", fixture.display()));
-        assert!(
-            out.contains("built without Vortex format support"),
-            "{cmd} must name the missing feature:\n{out}"
-        );
-        assert!(
-            !out.to_lowercase().contains("corrupt"),
-            "{cmd} must not read as corrupt:\n{out}"
-        );
-    }
-
-    // And saving on top of a Vortex lake is refused too (before any write).
-    let out = run(&format!(
-        "CREATE TABLE t (a INTEGER);\n.lake save {}\n.quit\n",
-        fixture.display()
-    ));
-    assert!(out.contains("built without Vortex format support"), "{out}");
 }
 
 /// The core lean equivalence gate: the same data, the same query battery,
@@ -310,15 +286,14 @@ fn lean_attach_answers_equal_open_and_in_memory() {
         "fast paths must not decode:\n{stats_arm}"
     );
     assert_eq!(
-        stats_arm.matches("decodes: 1 load, 8 columns").count(),
+        stats_arm.matches("decodes: 1 load, 1 column").count(),
         2,
-        "the fallbacks decode the whole table (v1 has no projected reader) once, then cache:\n{stats_arm}"
+        "the fallback decodes only its column once (wave 102), then the cache serves it:\n{stats_arm}"
     );
     cleanup(&dir);
 }
 
-/// A v1 lake saved before statistics existed is refused with a clear message
-/// (never a guess); a corrupted statistics block is refused fail-closed.
+/// A corrupted statistics block is refused fail-closed (never a guess).
 ///
 /// Both cases are decided by the catalog alone (`.lake attach` never reads a
 /// data file), so they hold whatever the data files' format is.
@@ -326,20 +301,16 @@ fn lean_attach_answers_equal_open_and_in_memory() {
 fn lean_attach_refuses_stats_less_and_corrupted_lakes() {
     let dir = scratch("attach_refuse");
 
-    // The wave-34..45 v1 fixture: no stats block anywhere.
-    let stats_less =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v1_v4");
-    let out = run(&format!(".lake attach {}\n.quit\n", stats_less.display()));
-    assert!(out.contains("without a statistics block"), "{out}");
-    assert!(out.contains("use .lake open"), "{out}");
-
-    // A corrupted statistics block: an edited min without a re-sealed CRC.
-    // (No JSON parser here: a textual edit of the manifest is enough to
-    // break the block's CRC.)
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../pink-lake/tests/fixtures/lake_v1_v4_stats");
+    // A corrupted statistics block on a freshly saved lake.
     let tampered = dir.join("tampered");
-    copy_dir(&fixture, &tampered);
+    run(&format!(
+        "CREATE TABLE fid (i INTEGER);\n\
+         INSERT INTO fid VALUES (1), (5), (9);\n\
+         .lake save {}\n\
+         .quit\n",
+        tampered.display()
+    ));
+
     let catalog_path = tampered.join("catalog.json");
     let text = std::fs::read_to_string(&catalog_path).unwrap();
     let fid = text.find("\"main.fid\"").expect("main.fid in catalog");

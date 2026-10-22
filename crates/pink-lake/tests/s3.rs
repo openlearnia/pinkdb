@@ -92,7 +92,7 @@ fn full_cycle_create_save_open_versions_tables() {
     // create → v1, snapshots/1.json + catalog.json at the lake prefix.
     let mut lake = Lake::create_s3(mock_config(&mock, "test-bucket", "lakes/mine")).unwrap();
     assert_eq!(lake.current_version(), 1);
-    assert_eq!(lake.format_version(), 6);
+    assert_eq!(lake.format_version(), 7);
     assert_eq!(lake.versions().unwrap(), vec![1]);
     assert_eq!(lake.path().to_str().unwrap(), "s3://test-bucket/lakes/mine");
     let keys = mock.keys();
@@ -126,7 +126,7 @@ fn full_cycle_create_save_open_versions_tables() {
         "catalog.json must be byte-identical to its snapshot"
     );
     assert!(
-        catalog.starts_with(b"{\n  \"format_version\": 6"),
+        catalog.starts_with(b"{\n  \"format_version\": 7"),
         "{}",
         String::from_utf8_lossy(&catalog)
     );
@@ -1034,64 +1034,6 @@ fn lost_put_responses_leave_a_safe_recoverable_state() {
         "catalog == snapshot after the lost response"
     );
     assert!(reopened.load(None).is_ok());
-}
-
-/// A wave-34 v1 lake (`.pink` data files, no `format` field) stored in S3
-/// loads through the temp-copy bridge; the lock-step with the local writer
-/// is byte-exact.
-#[test]
-fn v1_pink_data_files_load_over_s3() {
-    let mock = MockS3::start();
-    let scratch = scratch("v1");
-    let mut one = PinkDb::new();
-    one.execute("CREATE TABLE t (a INTEGER, b VARCHAR);")
-        .unwrap();
-    one.execute("INSERT INTO t VALUES (1, 'x'), (2, NULL), (3, 'z');")
-        .unwrap();
-    let pink_bytes = store_bytes(&one, &scratch, "v1-data");
-
-    // The v1 catalog shape: no `format` field, a `data/…/*.pink` file.
-    let rel = "data/main.t/00000000-0000-4000-8000-000000000000.pink";
-    let catalog = format!(
-        "{{\n  \"format_version\": 1,\n  \"updated\": \"2026-10-14T00:00:00.000Z\",\n  \
-         \"version\": 1,\n  \"tables\": {{\n    \"main.t\": {{\n      \"files\": [\"{rel}\"],\n      \
-         \"rows\": 3\n    }}\n  }}\n}}\n"
-    );
-    mock.put_object("v1/catalog.json", catalog.as_bytes());
-    mock.put_object("v1/snapshots/1.json", catalog.as_bytes());
-    mock.put_object(
-        "v1/data/main.t/00000000-0000-4000-8000-000000000000.pink",
-        &pink_bytes,
-    );
-
-    let mut lake = Lake::open_s3(mock_config(&mock, "v1-bucket", "v1")).unwrap();
-    lake.set_data_inlining_row_limit(0);
-    assert_eq!(lake.format_version(), 1);
-    assert_eq!(lake.current_version(), 1);
-    assert_eq!(lake.tables().unwrap(), vec![("main.t".to_string(), 3)]);
-    let loaded = lake.load(None).unwrap();
-    assert_eq!(
-        store_bytes(&loaded, &scratch, "v1-loaded"),
-        store_bytes(&one, &scratch, "v1-original"),
-        "the temp-copy bridge is byte-exact"
-    );
-    // The v1 file's temp copy is removed when the load finishes (the
-    // `LocalCopy::drop` path); the storage-level unit test
-    // (`storage_trait_roundtrip_over_the_mock`) pins the drop itself with a
-    // deterministic path assertion, here we only make sure the bridge works.
-    // (Scanning `std::env::temp_dir()` would race the other tests in this
-    // binary, which use the same temp prefix.)
-
-    // A v1 lake still migrates on the next save (a full Vortex rewrite).
-    let mut lake = lake;
-    assert_eq!(lake.write_from_store(&loaded).unwrap(), 2);
-    assert_eq!(lake.format_version(), 6);
-    assert!(
-        mock.keys()
-            .iter()
-            .any(|k| k.starts_with("v1/data/main.t/") && k.ends_with(".vortex"))
-    );
-    std::fs::remove_dir_all(&scratch).ok();
 }
 
 /// The error taxonomy: `SlowDown` 503, a redirect-shaped 301, and
