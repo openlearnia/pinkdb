@@ -325,6 +325,17 @@ jobs:
       # in-tree public key, the live catalog + signature must verify, and
       # every artifact published by this run must download and hash-match the
       # signed catalog. Non-zero on any failure.
+      # Deploy before verifying: verification fetches /index.json.sig through
+      # the Worker, so a Worker that predates a route fails it (v0.1.0's first
+      # real run). The catalog is already live in R2 at this point, so the
+      # order changes nothing about what is published.
+      - name: deploy the extension Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
+        working-directory: ext-repo/worker
+        run: wrangler deploy
+
       - name: verify the published catalog signature and artifacts
         if: steps.filter.outputs.count != '0'
         run: |
@@ -354,13 +365,6 @@ jobs:
       # Exactly one deploy, after every catalog write and verification, so the
       # Worker never serves a half-updated catalog. It needs Cloudflare
       # credentials but never the signing key.
-      - name: deploy the extension Worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN || secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.CLOUDFLARE_ACCOUNT_ID }}
-        working-directory: ext-repo/worker
-        run: wrangler deploy
-
       - name: report artifact URLs
         if: steps.filter.outputs.count != '0'
         run: |
