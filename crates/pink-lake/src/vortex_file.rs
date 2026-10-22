@@ -60,9 +60,11 @@
 //! after a caught panic.
 
 use std::any::Any;
+use std::future::Future;
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use rayon::prelude::*;
@@ -73,21 +75,24 @@ use vortex::VortexSessionDefault;
 use vortex::array::arrays::bool::BoolArrayExt;
 use vortex::array::arrays::struct_::StructArrayExt;
 use vortex::array::arrays::{BoolArray, PrimitiveArray, StructArray, VarBinViewArray};
+use vortex::array::buffer::BufferHandle;
 use vortex::array::stats::StatsSet;
 use vortex::array::validity::Validity;
 use vortex::array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
-use vortex::buffer::{BitBuffer, Buffer, ByteBuffer};
+use vortex::buffer::{Alignment, BitBuffer, Buffer, ByteBuffer};
 use vortex::dtype::{DType, FieldNames, Nullability, PType, StructFields};
+use vortex::error::{VortexError, VortexResult};
 use vortex::expr::stats::{Precision, Stat};
 use vortex::expr::{root, select};
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::io::runtime::BlockingRuntime;
 use vortex::io::runtime::current::{CurrentThreadRuntime, CurrentThreadWorkerPool};
 use vortex::io::session::RuntimeSessionExt;
+use vortex::io::{CoalesceConfig, VortexReadAt};
 use vortex::scalar::ScalarValue;
 use vortex::session::VortexSession;
 
-use crate::format::{DataFile, FileFooter};
+use crate::format::{DataFile, FileFooter, RangedFile};
 use crate::{LakeError, Result, empty_single_table_store};
 
 /// The user metadata segment key holding the table identity + pinkdb schema.
@@ -186,6 +191,110 @@ fn write_session(parallel: bool) -> (CurrentThreadRuntime, CurrentThreadWorkerPo
     }
     let session = VortexSession::default().with_handle(runtime.handle());
     (runtime, pool, session)
+}
+
+/// [`VortexReadAt`] over the lake's positional reader (wave 98b): the footer
+/// and exactly the projected segments a scan references are fetched as range
+/// reads, never the whole object.
+#[derive(Clone)]
+struct LakeReadAt {
+    file: Arc<dyn RangedFile>,
+    size: u64,
+    parallelism: usize,
+    /// The Vortex runtime's handle: each range read runs as a blocking task,
+    /// so Vortex's concurrent `read_ranges` really does issue several lake
+    /// range requests at once (bounded by `concurrency`).
+    handle: vortex::io::runtime::Handle,
+}
+
+impl VortexReadAt for LakeReadAt {
+    fn coalesce_config(&self) -> Option<CoalesceConfig> {
+        // Object-storage-sized coalescing: neighbouring footer/segment reads
+        // become one request, while a projection never pulls unrelated data.
+        Some(CoalesceConfig::object_storage())
+    }
+
+    fn concurrency(&self) -> usize {
+        self.parallelism.max(1)
+    }
+
+    fn size(&self) -> Pin<Box<dyn Future<Output = VortexResult<u64>> + Send>> {
+        let size = self.size;
+        Box::pin(async move { Ok(size) })
+    }
+
+    fn read_at(
+        &self,
+        offset: u64,
+        length: usize,
+        alignment: Alignment,
+    ) -> Pin<Box<dyn Future<Output = VortexResult<BufferHandle>> + Send>> {
+        let file = Arc::clone(&self.file);
+        let handle = self.handle.clone();
+        Box::pin(async move {
+            handle
+                .spawn_blocking(move || {
+                    let bytes = file
+                        .read_range(offset, length as u64)
+                        .map_err(|e| VortexError::from(std::io::Error::other(e.to_string())))?;
+                    if bytes.len() != length {
+                        return Err(VortexError::from(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "data file \"{}\" returned {} bytes for the {length}-byte \
+                                 range at {offset}",
+                                file.path().display(),
+                                bytes.len()
+                            ),
+                        )));
+                    }
+                    Ok(BufferHandle::new_host(
+                        ByteBuffer::from(bytes).aligned(alignment),
+                    ))
+                })
+                .await
+        })
+    }
+}
+
+/// Open one data file for a Vortex read: a local plaintext file with
+/// positioned reads (`open_path`), an object-storage plaintext file through
+/// [`LakeReadAt`] (`open_read`), or the whole (unsealed) buffer for an
+/// encrypted lake, where no plaintext byte range exists.
+fn open_data_file(
+    runtime: &CurrentThreadRuntime,
+    session: &VortexSession,
+    file: &DataFile<'_>,
+) -> Result<vortex::file::VortexFile> {
+    let path = file.path();
+    let opened = match file.local_path() {
+        Some(local) => {
+            // Preserve the historical missing-file error: a `.lake open` of a
+            // deleted local data file names it in the "loading data file"
+            // context, not as an opaque Vortex I/O error.
+            file.len()?;
+            runtime.block_on(session.open_options().include_metadata().open_path(&local))
+        }
+        None => match file.range_source() {
+            Some(source) => {
+                let reader = LakeReadAt {
+                    size: source.len(),
+                    parallelism: source.parallelism(),
+                    file: source,
+                    handle: runtime.handle(),
+                };
+                runtime.block_on(session.open_options().include_metadata().open_read(reader))
+            }
+            None => {
+                let bytes = file.read()?;
+                session
+                    .open_options()
+                    .include_metadata()
+                    .open_buffer(ByteBuffer::from(bytes))
+            }
+        },
+    };
+    opened.map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))
 }
 
 fn corrupt(path: &Path, message: String) -> LakeError {
@@ -441,12 +550,16 @@ pub(crate) fn decode_table(path: &Path, bytes: &[u8]) -> Result<PinkDb> {
     decode_buffer(path, ByteBuffer::copy_from(bytes))
 }
 
-/// [`decode_table`] for a buffer the caller already owns: the bytes are
-/// *moved* into the Vortex byte buffer (zero copy), not copied again. This
-/// is the object-storage entry (the whole object arrives as a `Vec<u8>`)
-/// and the local entry (the file is read into exactly this buffer).
-pub(crate) fn decode_table_owned(path: &Path, bytes: Vec<u8>) -> Result<PinkDb> {
-    decode_buffer(path, ByteBuffer::from(bytes))
+/// Decode a whole data file through the best positional reader available:
+/// local `open_path`, object-storage `open_read` (ranged), or a whole unsealed
+/// buffer for an encrypted lake.
+pub(crate) fn decode_table_file(file: &DataFile<'_>) -> Result<PinkDb> {
+    let path = file.path();
+    with_decoder_guard(path, "opening and decoding it", || {
+        let (runtime, session) = session();
+        let opened = open_data_file(&runtime, &session, file)?;
+        decode_open_file(path, &runtime, &session, opened)
+    })
 }
 
 /// Decode only the `projection` columns (ascending schema indices) of one
@@ -457,9 +570,10 @@ pub(crate) fn decode_table_owned(path: &Path, bytes: Vec<u8>) -> Result<PinkDb> 
 ///
 /// Locally the file is opened with positioned reads (`open_path`): the
 /// unprojected columns' data segments are never read, let alone decoded.
-/// Over object storage (no ranged reads in this build) — and for an
-/// encrypted lake, where the whole container is unsealed first — the object
-/// is read whole, still decoding only `projection`.
+/// Over object storage the footer and the projected segments are **range
+/// reads** through [`crate::format::RangedFile`] (wave 98b), so the object is
+/// never downloaded whole. For an encrypted lake the whole container is
+/// unsealed first, still decoding only `projection`.
 ///
 /// Chunks are streamed and decoded in bounded windows
 /// ([`CONVERT_WINDOW`]-many engine chunks at a time); nothing collects the
@@ -472,22 +586,7 @@ pub(crate) fn decode_projected(
     let path = file.path();
     with_decoder_guard(path, "opening and decoding it", || {
         let (runtime, session) = session();
-        let opened = match file.local_path() {
-            // Local: positioned reads of the footer plus exactly the
-            // projected fields' segments.
-            Some(local) => {
-                runtime.block_on(session.open_options().include_metadata().open_path(&local))
-            }
-            // Object storage: whole-object read, still no unprojected decode.
-            None => {
-                let bytes = file.read()?;
-                session
-                    .open_options()
-                    .include_metadata()
-                    .open_buffer(ByteBuffer::from(bytes))
-            }
-        }
-        .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?;
+        let opened = open_data_file(&runtime, &session, file)?;
         let metadata = parse_metadata(path, &opened)?;
         let schema = schema_of(path, &opened, &metadata)?;
         decode_projected_file(
@@ -848,22 +947,7 @@ pub(crate) fn read_footer(file: &DataFile<'_>) -> Result<FileFooter> {
     let path = file.path();
     with_decoder_guard(path, "opening it footer-only", || {
         let (runtime, session) = session();
-        let opened = match file.local_path() {
-            // Local: positioned reads of the postscript + footer + metadata
-            // segments; the file's data segments are never touched.
-            Some(local) => {
-                runtime.block_on(session.open_options().include_metadata().open_path(&local))
-            }
-            // Object storage: whole-object read, still no decode.
-            None => {
-                let bytes = file.read()?;
-                session
-                    .open_options()
-                    .include_metadata()
-                    .open_buffer(ByteBuffer::from(bytes))
-            }
-        }
-        .map_err(|e| corrupt(path, format!("not a valid Vortex file: {e}")))?;
+        let opened = open_data_file(&runtime, &session, file)?;
         let metadata = parse_metadata(path, &opened)?;
         let schema = schema_of(path, &opened, &metadata)?;
         let stats = file_column_stats(path, &opened, &schema)?;
@@ -1003,6 +1087,7 @@ fn double_stat(set: &StatsSet, stat: Stat) -> Option<Value> {
 }
 
 /// The in-memory entry: one `ByteBuffer` holding the whole file.
+#[cfg_attr(not(test), allow(dead_code))]
 fn decode_buffer(path: &Path, buffer: ByteBuffer) -> Result<PinkDb> {
     with_decoder_guard(path, "opening and decoding it", || {
         let (runtime, session) = session();
@@ -2084,9 +2169,10 @@ mod tests {
         let rel = "data/t/x.vortex";
         std::fs::create_dir_all(dir.join("data/t")).unwrap();
         std::fs::write(dir.join(rel), bytes).unwrap();
-        let storage = crate::local::LocalStorage::new(&dir);
+        let storage: std::sync::Arc<dyn crate::storage::Storage> =
+            std::sync::Arc::new(crate::local::LocalStorage::new(&dir));
         let path = dir.join(rel);
-        let file = crate::format::DataFile::new(&path, rel, &storage);
+        let file = crate::format::DataFile::new(&path, rel, std::sync::Arc::clone(&storage));
         let out = read_footer(&file);
         std::fs::remove_dir_all(&dir).ok();
         out

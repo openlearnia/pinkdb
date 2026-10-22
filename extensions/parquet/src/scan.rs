@@ -6,6 +6,10 @@
 //! The engine hands the scan the statement's projection (a column set) and
 //! the `WHERE` conjuncts it could prove over the scan. Both are used:
 //!
+//! A file resolved from a [`crate::ranged::RangeSource`] (a remote object or a
+//! lake data file) is read through parquet's `ChunkReader` over that source;
+//! the local/remote split below only decides how the bytes arrive.
+//!
 //! - **Projection**: only the named output columns are decoded. Every other
 //!   column is a zero-length placeholder in the emitted chunks, exactly like
 //!   an attached-lake scan's absent columns.
@@ -39,7 +43,7 @@ use pinkdb::{
     CHUNK_SIZE, DataChunk, DataType, PinkDbError, Result, TableScanOutput, Value, Vector,
 };
 
-use crate::remote::RemoteReadStats;
+use crate::ranged::RemoteReadStats;
 use crate::resolve::{FileResolved, OutKind, Resolved, convert_value, file_constant_value};
 use crate::schema_map::FileColumn;
 
@@ -69,8 +73,7 @@ pub fn scan(
         None => needed.iter_mut().for_each(|n| *n = true),
     }
 
-    #[cfg(feature = "remote")]
-    let transport = Arc::new(crate::remote::TransportCounters::default());
+    let transport = Arc::new(crate::ranged::TransportCounters::default());
 
     let mut out = TableScanOutput::default();
     let mut chunks: Vec<DataChunk> = Vec::new();
@@ -98,14 +101,13 @@ pub fn scan(
             scan_metadata_only(file, &plan, &mut out, &mut chunks)?;
             continue;
         }
-        // Remote objects are read through parquet's `ChunkReader` over the
-        // shared transport. The default path prefetches whole projected
-        // column-chunk ranges concurrently; `PINKDB_HTTPFS_PARALLELISM=1`
-        // keeps the legacy lazy 128 KiB serial reads.
-        #[cfg(feature = "remote")]
+        // Ranged objects (a remote URL or a lake data file) are read through
+        // parquet's `ChunkReader` over their byte-range source. The default
+        // path prefetches whole projected column-chunk ranges concurrently;
+        // `PINKDB_HTTPFS_PARALLELISM=1` keeps the lazy 128 KiB serial reads.
         if let Some(spec) = &file.remote {
             let remote_file =
-                crate::remote::RemoteFile::with_counters(spec, Arc::clone(&transport));
+                crate::ranged::RemoteFile::with_counters(spec, Arc::clone(&transport));
             let cache = remote_file.cache();
             let reader = SerializedFileReader::new(remote_file).map_err(|e| {
                 PinkDbError::Execution(format!(
@@ -117,7 +119,7 @@ pub fn scan(
                 scan_remote_parallel(
                     &reader,
                     &cache,
-                    spec.fetcher.as_ref(),
+                    spec.source.as_ref(),
                     spec.parallelism,
                     &transport,
                     file,
@@ -147,11 +149,7 @@ pub fn scan(
         scan_reader(&reader, file, &plan, &mut out, &mut chunks)?;
     }
     out.chunks = chunks;
-    #[cfg(feature = "remote")]
-    let stats = transport.snapshot();
-    #[cfg(not(feature = "remote"))]
-    let stats = RemoteReadStats::default();
-    Ok((out, stats))
+    Ok((out, transport.snapshot()))
 }
 
 /// Whether this file has a projected column that must be decoded from data
@@ -351,24 +349,23 @@ fn assemble_row_group(
     Ok(())
 }
 
-/// The wave-98a remote path: prefetch the projected column-chunk ranges of
+/// The wave-98a ranged path: prefetch the projected column-chunk ranges of
 /// the next row groups with a bounded pool, install them in the reader's
 /// cache, decode (in parallel when possible) and assemble strictly in
 /// row-group order.
-#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 fn scan_remote_parallel(
-    reader: &SerializedFileReader<crate::remote::RemoteFile>,
-    cache: &crate::remote::RangeCache,
-    fetcher: &dyn pinkdb_httpfs::Fetcher,
+    reader: &SerializedFileReader<crate::ranged::RemoteFile>,
+    cache: &crate::ranged::RangeCache,
+    source: &dyn crate::ranged::RangeSource,
     parallelism: usize,
-    transport: &Arc<crate::remote::TransportCounters>,
+    transport: &Arc<crate::ranged::TransportCounters>,
     file: &FileResolved,
     plan: &DecodePlan<'_>,
     out: &mut TableScanOutput,
     chunks: &mut Vec<DataChunk>,
 ) -> Result<()> {
-    use crate::remote::ByteSpan;
+    use crate::ranged::ByteSpan;
 
     let decoded_columns = decoded_columns(file, plan);
     let decoded = decoded_columns.as_slice();
@@ -386,15 +383,15 @@ fn scan_remote_parallel(
         out.row_groups += 1;
         let spans: Vec<ByteSpan> = decoded
             .iter()
-            .filter_map(|(_, leaf, _)| rg.chunks.get(*leaf).and_then(crate::remote::chunk_span))
+            .filter_map(|(_, leaf, _)| rg.chunks.get(*leaf).and_then(crate::ranged::chunk_span))
             // The single-request cap: a chunk larger than it stays on the
             // lazy path (it cannot be split without chaining reads).
-            .filter(|span| span.len <= crate::remote::MAX_REQUEST_BYTES)
+            .filter(|span| span.len <= crate::ranged::MAX_REQUEST_BYTES)
             .collect();
         surviving.push((
             rg_index,
             rg.rows as usize,
-            crate::remote::coalesce_spans(spans),
+            crate::ranged::coalesce_spans(spans),
         ));
     }
 
@@ -405,7 +402,7 @@ fn scan_remote_parallel(
         let mut window_bytes = 0u64;
         while end < surviving.len() {
             let bytes: u64 = surviving[end].2.iter().map(|span| span.len).sum();
-            if end > at && window_bytes.saturating_add(bytes) > crate::remote::MAX_PREFETCH_BYTES {
+            if end > at && window_bytes.saturating_add(bytes) > crate::ranged::MAX_PREFETCH_BYTES {
                 break;
             }
             window_bytes = window_bytes.saturating_add(bytes);
@@ -416,7 +413,7 @@ fn scan_remote_parallel(
             .iter()
             .flat_map(|(_, _, spans)| spans.iter().copied())
             .collect();
-        let fetched = crate::remote::fetch_spans(fetcher, &spans, parallelism, transport);
+        let fetched = crate::ranged::fetch_spans(source, &spans, parallelism, transport);
         for (span, result) in spans.iter().zip(fetched) {
             let bytes = result
                 .map_err(|e| PinkDbError::Execution(format!("remote parquet read failed: {e}")))?;

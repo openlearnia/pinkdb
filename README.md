@@ -1020,8 +1020,11 @@ manifest whose rows do not add up) is a clear `Corrupt` error, never a guess.
   leaves nothing behind.
 - **Read-only attach (wave 45d): `.lake attach <dir|s3> [version]`** reads the
   catalog, the chosen manifest and every data file's footer, metadata and
-  statistics — no column data is decoded (over object storage the whole objects
-  are read, still without decoding). A `.pink` lake attaches from the
+  statistics — no column data is decoded. Over object storage (and local
+  plaintext lakes) footers and metadata are **positioned range reads**, and
+  the footers of all data files are read concurrently (bounded by
+  `PINKDB_HTTPFS_PARALLELISM`); an encrypted lake unseals each container
+  whole, still without decoding. A `.pink` lake attaches from the
   manifest's **statistics blocks** instead (wave 45k; v4 stores one per file,
   v1 one per entry): not even the data file is opened, and a block that fails
   its CRC-32 checksum, disagrees with the entry (table/file/rows), declares an
@@ -1345,9 +1348,10 @@ published to both. A keyed open of a plaintext lake, a keyless open of an
 encrypted lake, and a wrong key are each refused with a distinct,
 authenticated error; a plaintext lake is never silently rewritten as
 encrypted. Without the variable the lake stays plaintext, byte-identically.
-A keyed attach reads whole ciphertext objects for the Vortex footers (stage
-1: footer-range reads over unsealed segments are a follow-up) while still
-decoding nothing for `COUNT`/`MIN`/`MAX`; lean `.pink` lakes attach from the
+A keyed attach reads whole ciphertext objects for the Vortex footers (a
+sealed container has no plaintext byte ranges; the object is downloaded as
+concurrent 8 MiB parts where the backend allows it) while still decoding
+nothing for `COUNT`/`MIN`/`MAX`; lean `.pink` lakes attach from the
 encrypted manifests' statistics blocks without opening any data file.
 
 With the `s3` feature every `<dir>` may be an `s3://bucket/prefix` URL — see
@@ -1535,6 +1539,48 @@ cargo build -p pinkdb-cli --features vortexlake,s3
   the lake and run `.lake versions`, compare it with what the error said, and
   only then retry — never blindly re-run a save on the old handle (it will
   fail with the version conflict, which is the safe outcome).
+- **Fast reads (wave 98b): only the bytes a query needs, fetched in
+  parallel.** The lake's storage layer now exposes real positioned reads:
+  `Storage::read_range` is an S3 `Range` GET (retries unchanged) and a local
+  positioned read; the encryption wrapper refuses ranges of a sealed object,
+  and callers fall back to a whole read. On top of that seam:
+  - **Parquet lake files** decode only the projected columns. Their footer
+    and column-chunk ranges go through the same coalescing, bounded
+    concurrent read-ahead and ordered assembly as wave 98a's remote
+    `read_parquet` (the scan core was factored out of the httpfs-specific
+    module, not duplicated), and the query's pushed-down predicates prune
+    row groups. `supports_projection()` is true for the `parquet` provider;
+    attach still reads the manifest's statistics blocks and touches no data
+    file.
+  - **Vortex lake files** implement Vortex's `VortexReadAt` over the lake
+    storage: footers and only the projected segments are range reads, with
+    object-storage coalescing and the same parallelism limit. Attach reads
+    the footers of **all** files (across tables) concurrently, then validates
+    in manifest order.
+  - **Whole-object reads** (`.pink` data files, encrypted containers and any
+    object an endpoint cannot range) download as 8 MiB parts with a bounded
+    concurrent pool (`PINKDB_HTTPFS_PARALLELISM`, 0/1 = serial) and are
+    reassembled in order; a small object is still one request. All parts must
+    report the same ETag, or the read falls back to one atomic GET.
+  - **Files of one table** (and the footer jobs of all tables) are fetched
+    concurrently, bounded, and merged in manifest order, so values and row
+    order are identical to the serial path.
+  - **Open/attach round trips**: `lake.json` and `catalog.json` are fetched
+    concurrently, `highest.json` and the snapshot concurrently, and the
+    independent HEAD probes are gone (the identity HEAD is kept so a
+    credentials failure keeps its historical `AccessDenied` error). A fresh
+    open of a v6 lake is 5 requests instead of 8; the identity, catalog,
+    highest-version and snapshot agreement checks are unchanged.
+  - **Diagnostics**: `AttachmentReport` carries `requests`, `bytes`,
+    `wait_nanos`, `ranged` and `parallelism`; `Lake::transport_stats()`
+    returns the handle's running `(requests, bytes, wait_nanos)`; the S3
+    client exposes `S3Client::stats()`; `.lake attach` prints a `Transport:`
+    line with the attach's request/byte/wait totals.
+  - **Unchanged results**: every path decodes into the same tables in the
+    same order (the fast-read tests compare a projected scan with the eager
+    load value-for-value). Encrypted lakes keep whole-object reads and
+    equality with plaintext; local lakes use positioned reads too, so they
+    do not regress.
 - **What is not implemented:** multipart uploads — one `PutObject` per
   object, so a single table's data file must be ≤ 5 GiB (the S3 single-PUT
   limit; the client refuses larger bodies with a clear error before sending

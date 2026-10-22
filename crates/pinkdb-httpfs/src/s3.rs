@@ -64,7 +64,9 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::sigv4;
 use crate::sigv4::{Credentials, SigningInput};
@@ -76,6 +78,66 @@ const S3_SERVICE: &str = "s3";
 /// Retries for a retryable conditional-write race (`409 Conflict` when a
 /// concurrent delete raced the write; AWS documents retrying `PutObject`).
 const CONFLICT_RETRIES: usize = 3;
+
+/// One client's transport totals: requests issued (retries included), response
+/// bytes received, and wall time spent inside the transport. Wave 98b added
+/// this so a lake can report exactly what an attach/scan read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportStats {
+    /// Request attempts (a retried request counts once per attempt).
+    pub requests: u64,
+    /// Response body bytes received.
+    pub bytes: u64,
+    /// Wall-clock nanoseconds spent in request/response I/O.
+    pub wait_nanos: u64,
+}
+
+/// Atomic counters behind one [`S3Client`]. Cloned with the client (an `Arc`),
+/// so every handle sharing a client sees the same totals.
+#[derive(Debug, Default)]
+pub struct ClientCounters {
+    requests: AtomicU64,
+    bytes: AtomicU64,
+    wait_nanos: AtomicU64,
+}
+
+impl ClientCounters {
+    /// A consistent-enough snapshot for diagnostics (each field is loaded
+    /// independently; a concurrent request may land between loads).
+    pub fn snapshot(&self) -> TransportStats {
+        TransportStats {
+            requests: self.requests.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            wait_nanos: self.wait_nanos.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_request(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_bytes(&self, bytes: usize) {
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn record_wait(&self, elapsed: Duration) {
+        self.wait_nanos
+            .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Adds the elapsed time of one request attempt to the counters when dropped
+/// (so every early return is still measured).
+struct WaitTimer<'a> {
+    counters: &'a ClientCounters,
+    start: Instant,
+}
+
+impl Drop for WaitTimer<'_> {
+    fn drop(&mut self) {
+        self.counters.record_wait(self.start.elapsed());
+    }
+}
 
 /// Explicit S3 configuration (the `s3://` URL path resolves the same fields
 /// from the environment).
@@ -727,6 +789,8 @@ pub struct S3Client {
     max_object_bytes: u64,
     /// Retries after a retryable failure (see the module docs).
     retries: u32,
+    /// Transport totals since this client was created (wave 98b diagnostics).
+    counters: Arc<ClientCounters>,
 }
 
 impl S3Client {
@@ -763,7 +827,20 @@ impl S3Client {
                 .into(),
             max_object_bytes: MAX_OBJECT_BYTES,
             retries: resolved.retries,
+            counters: Arc::new(ClientCounters::default()),
         }
+    }
+
+    /// This client's transport totals: request attempts, response bytes and
+    /// network wait. A shared handle (the lake) reads them for diagnostics.
+    pub fn stats(&self) -> TransportStats {
+        self.counters.snapshot()
+    }
+
+    /// The shared counters (an embedder can snapshot before/after an
+    /// operation to measure just that operation).
+    pub fn counters(&self) -> Arc<ClientCounters> {
+        Arc::clone(&self.counters)
     }
 
     /// The bucket this client is rooted at.
@@ -776,6 +853,13 @@ impl S3Client {
     #[doc(hidden)]
     pub fn set_max_object_bytes(&mut self, bytes: u64) {
         self.max_object_bytes = bytes;
+    }
+
+    /// The current read/write body cap (tests read it back; see
+    /// [`S3Client::set_max_object_bytes`]).
+    #[doc(hidden)]
+    pub fn max_object_bytes(&self) -> u64 {
+        self.max_object_bytes
     }
 
     /// One signed request with retries: `429`/`503` always, `500`/`502`/
@@ -821,6 +905,11 @@ impl S3Client {
         extra: &[(&'static str, String)],
         body: &[u8],
     ) -> Result<HttpResponse, Error> {
+        self.counters.record_request();
+        let _wait = WaitTimer {
+            counters: &self.counters,
+            start: Instant::now(),
+        };
         let query = canonical_query(query_pairs);
         let target = self.endpoint.target(&self.bucket, key, &query);
         let context = format!("{method} {}", target.url);
@@ -926,6 +1015,7 @@ impl S3Client {
                     source: io::Error::other(e.to_string()),
                 })?
         };
+        self.counters.record_bytes(bytes.len());
         Ok(HttpResponse {
             status,
             etag,

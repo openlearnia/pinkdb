@@ -1,4 +1,5 @@
-//! pink-lake's **Parquet** data-file format provider (wave 87, task T2).
+//! pink-lake's **Parquet** data-file format provider (wave 87; ranged and
+//! projected in wave 98b).
 //!
 //! This is the bridge between the lake's [`LakeFormat`] seam and the
 //! `pinkdb-parquet` extension:
@@ -9,16 +10,23 @@
 //!   [`pinkdb::persist::table_stats`] — the same `SavedTableStats` the `.pink`
 //!   and Vortex providers publish. The lake's shared exactness gate applies
 //!   to the block uniformly.
-//! - **read**: the whole file is decoded with the *existing* parquet reader
-//!   (`pinkdb_parquet::source()` bound to `read_parquet('<path>')`) and
-//!   rebuilt as the one-database/one-table [`PinkDb`] every lake loader
-//!   expects. The database/table names come from the file's
+//! - **read**: the file's footer and the projected column-chunk ranges are
+//!   read through the lake's positional [`pink_lake::format::RangedFile`] and
+//!   the *existing* parquet reader's ranged scan core
+//!   ([`pinkdb_parquet::scan_source`]): 98a's coalescing, bounded concurrent
+//!   read-ahead and ordered assembly, with no whole-object download. A local
+//!   plaintext file uses the same path (positioned reads); an encrypted lake
+//!   (no plaintext ranges exist) falls back to the staged whole-object read.
+//! - **projection**: [`LakeFormat::supports_projection`] is `true`;
+//!   [`LakeFormat::read_projected`] decodes only the requested columns and
+//!   passes the query's pushed-down filters to the parquet scan for row-group
+//!   pruning. The database/table names come from the file's
 //!   `pinkdb.db`/`pinkdb.table` footer keys (written by the bridge), so the
 //!   lake's identity check sees the catalog's names.
-//! - **no footer statistics**: [`LakeFormat::footer_stats`] keeps the
-//!   default (`None`), so attach reads the CRC-protected statistics block
-//!   from the manifest — parquet's own chunk statistics are not converted
-//!   (and would need the same exactness gate as anyway).
+//! - **no footer statistics for attach**: [`LakeFormat::has_footer_stats`]
+//!   stays `false`, so attach reads the CRC-protected statistics block from
+//!   the manifest and touches no data file. A projected query reads the
+//!   footer once (ranged) to map the file's physical schema.
 //!
 //! [`register`] installs the provider process-wide; it is idempotent for this
 //! provider (a duplicate registration of another provider under `parquet`
@@ -28,9 +36,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::format::{DataFile, EncodedFile, LakeFormat, register_lake_format};
+use pink_lake::format::{
+    DataFile, EncodedFile, FileFooter, LakeFormat, RangedFile, register_lake_format,
+};
 use pink_lake::{LakeError, Result};
-use pinkdb::{DataTable, PinkDb, PinkDbError, TableFunctionArg, TableFunctionCall, Value};
+use pinkdb::{
+    ColumnStats, DataTable, DataType, PinkDb, PinkDbError, TableFunctionArg, TableFunctionCall,
+    TableScanOutput, Value, Vector,
+};
 
 /// The catalog's format id for Parquet data files.
 pub const FORMAT_ID: &str = "parquet";
@@ -46,6 +59,24 @@ pub struct ParquetLakeFormat;
 impl ParquetLakeFormat {
     pub fn new() -> Self {
         Self
+    }
+}
+
+/// [`pinkdb_parquet::RangeSource`] over the lake's positional reader.
+#[derive(Debug)]
+struct LakeRange(Arc<dyn RangedFile>);
+
+impl pinkdb_parquet::RangeSource for LakeRange {
+    fn len(&self) -> u64 {
+        self.0.len()
+    }
+
+    fn read_range(&self, offset: u64, len: u64) -> std::result::Result<Vec<u8>, String> {
+        self.0.read_range(offset, len).map_err(|e| e.to_string())
+    }
+
+    fn parallelism(&self) -> usize {
+        self.0.parallelism()
     }
 }
 
@@ -79,67 +110,234 @@ impl LakeFormat for ParquetLakeFormat {
     }
 
     fn read(&self, file: &DataFile<'_>) -> Result<PinkDb> {
-        // The existing reader resolves a path (local file, glob, …). A local
-        // plaintext file is read in place; object storage and encrypted lakes
-        // (`local_path` is `None`) are staged as one plaintext copy, removed
-        // when the guard drops.
-        let (path, _staged) = match file.local_path() {
-            Some(path) => (path, None),
-            None => {
-                let bytes = file.read()?;
-                let staged = StagedFile::new(&bytes).map_err(|e| LakeError::Corrupt {
-                    path: file.path().to_path_buf(),
-                    message: format!("cannot stage the data file for decoding: {e}"),
-                })?;
-                (staged.path(), Some(staged))
-            }
-        };
-        let path_text = path.display().to_string();
-        let source = pinkdb_parquet::source();
-        let call = TableFunctionCall::Function {
-            name: "read_parquet".to_string(),
-            args: vec![TableFunctionArg {
-                name: None,
-                value: Value::Varchar(path_text),
-            }],
-        };
-        let corrupt = |message: String| LakeError::Corrupt {
+        // A local plaintext file keeps its path-based reader (one open, one
+        // positioned read stream — the pre-98b behavior, no regression).
+        if let Some(path) = file.local_path() {
+            return read_local_path(file, &path);
+        }
+        if let Some(source) = file.range_source() {
+            // Object storage: footer + every column chunk through the shared
+            // ranged scan core, never a whole-object download.
+            let path_text = file.path().display().to_string();
+            let scan =
+                pinkdb_parquet::scan_source(&path_text, Arc::new(LakeRange(source)), None, &[])
+                    .map_err(|e| corrupt(file, format!("cannot decode the parquet data: {e}")))?;
+            let schema = meta_schema(&scan.meta);
+            let (db, table) = meta_identity(&scan.meta);
+            return build_store(file, &db, &table, schema, scan.output);
+        }
+        // Encrypted lakes have no plaintext byte ranges: stage one decrypted
+        // copy and use the path-based reader.
+        let bytes = file.read()?;
+        let staged = StagedFile::new(&bytes).map_err(|e| LakeError::Corrupt {
             path: file.path().to_path_buf(),
-            message,
-        };
-        let schema = source
-            .bind(&call)
-            .map_err(|e| corrupt(format!("cannot read the parquet footer: {e}")))?
-            .ok_or_else(|| corrupt("the parquet source did not claim the data file".to_string()))?;
-        let output = source
-            .scan(&call, None, &[])
-            .map_err(|e| corrupt(format!("cannot decode the parquet data: {e}")))?;
-        let identity = pinkdb_parquet::write::read_identity(&path)
-            .map_err(|e| corrupt(format!("cannot read the parquet metadata: {e}")))?;
-        let (db, table) = identity.unwrap_or_else(|| ("main".to_string(), "data".to_string()));
+            message: format!("cannot stage the data file for decoding: {e}"),
+        })?;
+        read_local_path(file, &staged.path())
+    }
 
-        let mut store = PinkDb::new();
-        if !db.eq_ignore_ascii_case("main") {
-            store
-                .create_database(&db)
-                .map_err(|e| engine(format!("creating database \"{db}\""), e))?;
-            store
-                .drop_database("main")
-                .map_err(|e| engine("dropping the default database".to_string(), e))?;
-        }
-        store
-            .create_table_in(&db, &table, schema)
-            .map_err(|e| engine(format!("creating table \"{db}.{table}\""), e))?;
-        {
-            let dst = store
-                .table_mut_in(&db, &table)
-                .map_err(|e| engine(format!("opening table \"{db}.{table}\""), e))?;
-            for chunk in output.chunks {
-                dst.append_shared_chunk(&chunk.columns)
-                    .map_err(|e| engine(format!("appending rows to \"{db}.{table}\""), e))?;
+    /// The footer's schema/identity/row count, without decoding a column. Not
+    /// advertised as attach statistics ([`LakeFormat::has_footer_stats`] is
+    /// `false`): attach stays manifest-only. A projected query calls this to
+    /// map the file's physical schema through a v5 record.
+    fn footer_stats(&self, file: &DataFile<'_>) -> Result<Option<FileFooter>> {
+        let Some(meta) = read_meta(file)? else {
+            return Ok(None);
+        };
+        let (db, table) = meta_identity(&meta);
+        Ok(Some(FileFooter {
+            db,
+            table,
+            rows: meta.rows,
+            schema: meta_schema(&meta),
+            // Parquet's own statistics are not gated to the lake's exactness
+            // rules here; attach uses the manifest block instead.
+            stats: vec![ColumnStats::unknown(); meta.columns.len()],
+        }))
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
+    }
+
+    fn prunes_row_groups(&self) -> bool {
+        true
+    }
+
+    fn read_projected(
+        &self,
+        file: &DataFile<'_>,
+        columns: &[usize],
+        filters: &[pinkdb::PrunePredicate],
+    ) -> Result<Option<(PinkDb, Vec<bool>)>> {
+        let Some(source) = file.range_source() else {
+            // Encrypted (or a backend without positioned reads): the caller
+            // falls back to a full decode.
+            return Ok(None);
+        };
+        let path_text = file.path().display().to_string();
+        let scan = pinkdb_parquet::scan_source(
+            &path_text,
+            Arc::new(LakeRange(source)),
+            Some(columns),
+            filters,
+        )
+        .map_err(|e| corrupt(file, format!("cannot decode the parquet data: {e}")))?;
+        let schema = meta_schema(&scan.meta);
+        let (db, table) = meta_identity(&scan.meta);
+        let mut present = vec![false; schema.len()];
+        for &column in columns {
+            if column < present.len() {
+                present[column] = true;
             }
         }
-        Ok(store)
+        let output = fill_placeholders(scan.output, &schema, &present)?;
+        let store = build_store(file, &db, &table, schema, output)?;
+        Ok(Some((store, present)))
+    }
+}
+
+/// Decode one parquet file through the path-based reader (a local plaintext
+/// file, or a decrypted staged copy of an encrypted one). This is the
+/// pre-98b path; object-storage files use the ranged scan core instead.
+fn read_local_path(file: &DataFile<'_>, path: &std::path::Path) -> Result<PinkDb> {
+    let path_text = path.display().to_string();
+    let source = pinkdb_parquet::source();
+    let call = TableFunctionCall::Function {
+        name: "read_parquet".to_string(),
+        args: vec![TableFunctionArg {
+            name: None,
+            value: Value::Varchar(path_text),
+        }],
+    };
+    let schema = source
+        .bind(&call)
+        .map_err(|e| corrupt(file, format!("cannot read the parquet footer: {e}")))?
+        .ok_or_else(|| {
+            corrupt(
+                file,
+                "the parquet source did not claim the data file".to_string(),
+            )
+        })?;
+    let output = source
+        .scan(&call, None, &[])
+        .map_err(|e| corrupt(file, format!("cannot decode the parquet data: {e}")))?;
+    let identity = pinkdb_parquet::write::read_identity(path)
+        .map_err(|e| corrupt(file, format!("cannot read the parquet metadata: {e}")))?;
+    let (db, table) = identity.unwrap_or_else(|| ("main".to_string(), "data".to_string()));
+    build_store(file, &db, &table, schema, output)
+}
+
+/// Read one file's footer metadata through the positional source when there
+/// is one, else the local path; `None` for a sealed lake (no plaintext
+/// footer).
+fn read_meta(file: &DataFile<'_>) -> Result<Option<pinkdb_parquet::FileMeta>> {
+    if let Some(source) = file.range_source() {
+        let path = file.path().display().to_string();
+        return pinkdb_parquet::read_meta_source(&path, Arc::new(LakeRange(source)))
+            .map(Some)
+            .map_err(|e| corrupt(file, format!("cannot read the parquet footer: {e}")));
+    }
+    let Some(path) = file.local_path() else {
+        return Ok(None);
+    };
+    let path_text = path.display().to_string();
+    pinkdb_parquet::read_meta_path(&path_text)
+        .map(Some)
+        .map_err(|e| corrupt(file, format!("cannot read the parquet footer: {e}")))
+}
+
+fn meta_schema(meta: &pinkdb_parquet::FileMeta) -> Vec<(String, DataType)> {
+    meta.columns
+        .iter()
+        .map(|column| (column.name.clone(), column.ty))
+        .collect()
+}
+
+fn meta_identity(meta: &pinkdb_parquet::FileMeta) -> (String, String) {
+    let mut db = None;
+    let mut table = None;
+    for (key, value) in &meta.kv {
+        match key.as_str() {
+            pinkdb_parquet::write::DB_METADATA_KEY => {
+                db = String::from_utf8(value.clone()).ok();
+            }
+            pinkdb_parquet::write::TABLE_METADATA_KEY => {
+                table = String::from_utf8(value.clone()).ok();
+            }
+            _ => {}
+        }
+    }
+    (
+        db.unwrap_or_else(|| "main".to_string()),
+        table.unwrap_or_else(|| "data".to_string()),
+    )
+}
+
+/// Replace a projected scan's zero-length placeholders with NULL vectors of
+/// the chunk's row count, so the lake can merge the file into its full-schema
+/// cache (every column chunk-aligned).
+fn fill_placeholders(
+    mut output: TableScanOutput,
+    schema: &[(String, DataType)],
+    present: &[bool],
+) -> Result<TableScanOutput> {
+    for chunk in &mut output.chunks {
+        let rows = chunk.num_rows();
+        for (index, (_, dtype)) in schema.iter().enumerate() {
+            if present.get(index).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut vector = Vector::with_capacity(*dtype, rows);
+            for _ in 0..rows {
+                vector.push_null().map_err(|e| LakeError::Engine {
+                    context: format!("building the NULL placeholder of column {index}"),
+                    source: e,
+                })?;
+            }
+            chunk.columns[index] = Arc::new(vector);
+        }
+    }
+    Ok(output)
+}
+
+/// Build the one-database/one-table store the lake's loaders expect.
+fn build_store(
+    file: &DataFile<'_>,
+    db: &str,
+    table: &str,
+    schema: Vec<(String, DataType)>,
+    output: TableScanOutput,
+) -> Result<PinkDb> {
+    let mut store = PinkDb::new();
+    if !db.eq_ignore_ascii_case("main") {
+        store
+            .create_database(db)
+            .map_err(|e| engine(format!("creating database \"{db}\""), e))?;
+        store
+            .drop_database("main")
+            .map_err(|e| engine("dropping the default database".to_string(), e))?;
+    }
+    store
+        .create_table_in(db, table, schema)
+        .map_err(|e| engine(format!("creating table \"{db}.{table}\""), e))?;
+    {
+        let dst = store
+            .table_mut_in(db, table)
+            .map_err(|e| engine(format!("opening table \"{db}.{table}\""), e))?;
+        for chunk in output.chunks {
+            dst.append_shared_chunk(&chunk.columns)
+                .map_err(|e| engine(format!("appending rows to \"{db}.{table}\""), e))?;
+        }
+    }
+    let _ = file;
+    Ok(store)
+}
+
+fn corrupt(file: &DataFile<'_>, message: String) -> LakeError {
+    LakeError::Corrupt {
+        path: file.path().to_path_buf(),
+        message,
     }
 }
 

@@ -102,6 +102,13 @@
 //!   once and reused. Credentials/envs are the lake's (`AWS_*` /
 //!   `PINKDB_S3_*`); the source's `remote_stats()` reports requests, bytes
 //!   and network wait per session.
+//! - **A reusable ranged scan core (wave 98b)**: that machinery is
+//!   transport-agnostic. [`RangeSource`] is a positional reader, and
+//!   [`scan_source`] runs the same footer reads, coalescing, bounded
+//!   read-ahead, row-group pruning and ordered assembly over any
+//!   implementation. pink-lake's Parquet provider uses it to read lake data
+//!   files (`s3://` or local) with projection pushdown, so the lake and
+//!   remote-parquet paths cannot drift.
 //!
 //! # Honest limits
 //!
@@ -129,6 +136,7 @@ mod glob;
 mod hive;
 mod introspect;
 mod parse;
+mod ranged;
 mod remote;
 mod resolve;
 mod scan;
@@ -138,10 +146,12 @@ pub mod write;
 use std::sync::Arc;
 
 use pinkdb::attached::PrunePredicate;
-use pinkdb::{DataType, PinkDb, Result, TableFunctionCall, TableScanOutput, TableSource};
+use pinkdb::{
+    DataType, PinkDb, PinkDbError, Result, TableFunctionCall, TableScanOutput, TableSource,
+};
 
 pub use file_meta::{ChunkInfo, ColStats, FileMeta, RowGroupMeta};
-pub use remote::RemoteReadStats;
+pub use ranged::{RangeSource, RemoteReadStats};
 pub use resolve::{Call, Options, OutKind, Resolved};
 pub use schema_map::FileColumn;
 
@@ -169,6 +179,56 @@ pub fn register(db: &mut PinkDb) {
 /// calling it must use [`register`] per store instead. Idempotent.
 pub fn ensure_registered() {
     pinkdb::table_source::register_global_table_source(source());
+}
+
+/// The result of one ranged parquet scan: the engine's chunks/counters, the
+/// file metadata the provider needs for its table identity, and the
+/// transport totals (wave 98b).
+#[derive(Debug)]
+pub struct RangedScan {
+    pub output: TableScanOutput,
+    /// The footer metadata (identity KV pairs, schema, row groups).
+    pub meta: FileMeta,
+    /// Requests, bytes and wait time this scan spent.
+    pub stats: RemoteReadStats,
+}
+
+/// Scan one parquet object through a positional [`RangeSource`] — the lake's
+/// projected/ranged read path (wave 98b). The same coalescing, bounded
+/// read-ahead, row-group pruning and ordered assembly as a remote
+/// `read_parquet` apply; `projection` selects output columns and `filters`
+/// prune row groups.
+pub fn scan_source(
+    path: &str,
+    source: Arc<dyn RangeSource>,
+    projection: Option<&[usize]>,
+    filters: &[PrunePredicate],
+) -> Result<RangedScan> {
+    let resolved = resolve::resolve_source(path, source)?;
+    let (output, stats) = scan::scan(&resolved, projection, filters)?;
+    let meta = resolved
+        .files
+        .into_iter()
+        .next()
+        .map(|file| file.meta)
+        .ok_or_else(|| PinkDbError::Execution("the ranged parquet scan resolved no file".into()))?;
+    Ok(RangedScan {
+        output,
+        meta,
+        stats,
+    })
+}
+
+/// Read one object's parquet metadata (footer only, no data pages) through a
+/// positional [`RangeSource`]. This is the lake provider's footer read.
+pub fn read_meta_source(path: &str, source: Arc<dyn RangeSource>) -> Result<FileMeta> {
+    let spec = ranged::RemoteSpec::from_source(source);
+    file_meta::read_file_meta_source(path, &spec)
+}
+
+/// Read one local parquet file's metadata (footer only, no data pages).
+pub fn read_meta_path(path: &str) -> Result<FileMeta> {
+    file_meta::read_file_meta(path)
 }
 
 /// The parquet [`TableSource`]: one instance per store, holding the

@@ -725,8 +725,18 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
                     }
                 } else if report.remote {
                     println!(
-                        "Note: object storage has no ranged reads in this build: attach read \
-                         the Vortex data files whole (queries still skip the decode)."
+                        "Note: object storage: attach read each Vortex data file's footer and \
+                         metadata with ranged requests (no whole-object download)."
+                    );
+                }
+                if report.requests > 0 {
+                    println!(
+                        "Transport: {} request{}, {} byte{}, {:.3}s waiting (attach only).",
+                        report.requests,
+                        plural(report.requests as usize),
+                        report.bytes,
+                        if report.bytes == 1 { "" } else { "s" },
+                        report.wait_nanos as f64 / 1e9
                     );
                 }
             }

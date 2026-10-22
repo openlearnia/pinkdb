@@ -8,6 +8,19 @@
 //! feature-gated S3 backend implements the same operations over the S3 REST
 //! API (AWS S3, Cloudflare R2, MinIO, …).
 //!
+//! # Positioned reads and transport counters (wave 98b)
+//!
+//! [`Storage::read_range`] reads one byte window: a positioned file read
+//! locally, an S3 `Range` GET over object storage (same retry policy). The
+//! encryption decorator refuses ranges of a sealed object
+//! ([`Storage::ranged_reads`] is `false` there) because a `PNKLAKE1`
+//! container has no plaintext offsets; callers fall back to a whole read.
+//! [`Storage::stats`] reports requests, bytes and network wait so the lake can
+//! show exactly what an attach or query read. [`Storage::read_optional`] is
+//! one GET on object storage (absence is a 404), while the default keeps the
+//! local HEAD-then-read behavior (including the "not a regular file"
+//! refusal).
+//!
 //! Two operations carry the single-writer contract:
 //!
 //! - [`Storage::put_new`] publishes a snapshot manifest **only if it does not
@@ -53,6 +66,16 @@ pub(crate) enum Head {
 pub(crate) struct ObjectInfo {
     pub(crate) size: u64,
     pub(crate) modified_micros: Option<i64>,
+}
+
+/// Transport totals of one storage backend, for diagnostics (wave 98b):
+/// requests issued, response bytes received, and wall time spent waiting on
+/// the network. Local storage reports zeros.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StorageStats {
+    pub(crate) requests: u64,
+    pub(crate) bytes: u64,
+    pub(crate) wait_nanos: u64,
 }
 
 /// An opaque storage version tag.
@@ -215,6 +238,48 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
     /// style as the local backend (`reading <abs>`, `loading data file "…"`).
     fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>>;
 
+    /// Read one object, or `None` when it does not exist. Object storage
+    /// answers this with one GET (a 404 is the absence); the default checks
+    /// `head` first, preserving the local backend's "not a regular file"
+    /// refusal.
+    fn read_optional(&self, rel: &str, context: &str) -> Result<Option<Vec<u8>>> {
+        match self.head(rel)? {
+            Head::Missing => Ok(None),
+            Head::NotAFile => Err(LakeError::Corrupt {
+                path: self.abs(rel),
+                message: format!("{} is not a regular file", self.abs(rel).display()),
+            }),
+            Head::File => Ok(Some(self.read(rel, context)?)),
+        }
+    }
+
+    /// Read a byte window of one object: `offset..offset+len`. The default
+    /// falls back to a whole read (and slices); the local and S3 backends
+    /// implement positioned reads. Callers gate on [`Storage::ranged_reads`]
+    /// first, so a backend that cannot do better never pays for the fallback
+    /// twice.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    fn read_range(&self, rel: &str, offset: u64, len: u64, context: &str) -> Result<Vec<u8>> {
+        let bytes = self.read(rel, context)?;
+        slice_range(&bytes, offset, len, &self.abs(rel))
+    }
+
+    /// Whether [`Storage::read_range`] is a real positioned read (no whole
+    /// object behind it). Object storage and local plaintext files answer
+    /// `true`; encrypted sessions answer `false` (a sealed container must be
+    /// unsealed whole before any plaintext range exists).
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    fn ranged_reads(&self) -> bool {
+        false
+    }
+
+    /// The backend's transport totals (wave 98b diagnostics). Local storage
+    /// and wrappers report zeros unless they issue network requests.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    fn stats(&self) -> StorageStats {
+        StorageStats::default()
+    }
+
     /// [`Storage::read`] plus the version tag for a later conditional
     /// replace. The tag must come from the same read the caller reasons
     /// about.
@@ -357,6 +422,26 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         self.read(rel, context)
     }
 
+    /// [`Storage::read_highest`] for a marker that may legitimately be
+    /// missing (`None`). One GET on object storage; the default maps the
+    /// backend's not-found to `None` so a missing marker still gets the
+    /// caller's clear "highest.json is missing" error.
+    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
+    fn read_highest_optional(
+        &self,
+        rel: &str,
+        context: &str,
+        lake_id: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        match self.read_highest(rel, context, lake_id) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(LakeError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Best-effort narrow pre-existing artifacts to 0600 (M-5). The local
     /// backend overrides this; object storage has no file modes.
     fn tighten_existing(&self) -> Result<()> {
@@ -374,6 +459,33 @@ pub(crate) trait Storage: fmt::Debug + Send + Sync {
         let bytes = self.read(rel, context)?;
         Ok((bytes.clone(), bytes))
     }
+}
+
+/// One object's byte window from a whole buffer (the fallback for a backend
+/// without positioned reads). A window past the end is a clean error naming
+/// the object, never a short slice.
+fn slice_range(bytes: &[u8], offset: u64, len: u64, path: &Path) -> Result<Vec<u8>> {
+    let start = usize::try_from(offset).map_err(|_| LakeError::Corrupt {
+        path: path.to_path_buf(),
+        message: format!("byte range offset {offset} does not fit this platform"),
+    })?;
+    let end = offset
+        .checked_add(len)
+        .and_then(|end| usize::try_from(end).ok())
+        .ok_or_else(|| LakeError::Corrupt {
+            path: path.to_path_buf(),
+            message: format!("byte range {offset}..+{len} overflows this platform"),
+        })?;
+    if end > bytes.len() {
+        return Err(LakeError::Corrupt {
+            path: path.to_path_buf(),
+            message: format!(
+                "byte range {offset}..{end} is past the {}-byte object",
+                bytes.len()
+            ),
+        });
+    }
+    Ok(bytes[start..end].to_vec())
 }
 
 /// The version encoded in `snapshots/<v>.json`, if `rel` is a canonical
@@ -619,6 +731,42 @@ impl Storage for CryptoStorage {
     fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
         let stored = self.inner.read(rel, context)?;
         self.plain(rel, stored)
+    }
+
+    fn read_optional(&self, rel: &str, context: &str) -> Result<Option<Vec<u8>>> {
+        match self.inner.read_optional(rel, context)? {
+            Some(stored) => Ok(Some(self.plain(rel, stored)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn read_range(&self, rel: &str, offset: u64, len: u64, context: &str) -> Result<Vec<u8>> {
+        if self.crypto.is_some() {
+            return Err(LakeError::Internal {
+                message: format!(
+                    "ranged reads of the sealed object {rel} are not supported; \
+                     the caller must fall back to Storage::read"
+                ),
+            });
+        }
+        let bytes = self.inner.read_range(rel, offset, len, context)?;
+        // A keyless session never hands out ciphertext: the container magic
+        // is at offset 0 only, and a range that does not include it cannot be
+        // a container's footer either (callers only reach this over a
+        // plaintext lake; a keyless open of an encrypted one already failed
+        // at the catalog).
+        if offset == 0 && bytes.starts_with(crypto::ENC_MAGIC) {
+            return Err(crypto::encrypted_error(&self.inner.abs(rel)));
+        }
+        Ok(bytes)
+    }
+
+    fn ranged_reads(&self) -> bool {
+        self.crypto.is_none() && self.inner.ranged_reads()
+    }
+
+    fn stats(&self) -> StorageStats {
+        self.inner.stats()
     }
 
     fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
@@ -1103,6 +1251,54 @@ mod tests {
         assert!(
             matches!(err, LakeError::WrongKey { .. } | LakeError::Tampered { .. }),
             "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Wave 98b: the local backend serves real positioned reads, and the
+    /// encryption decorator refuses ranges of a sealed object (callers fall
+    /// back to a whole read).
+    #[test]
+    fn ranged_reads_are_positioned_and_sealed_objects_refuse_them() {
+        let dir = std::env::temp_dir().join(format!(
+            "pink_lake_ranged_{}_{}",
+            std::process::id(),
+            crate::fresh_id()
+        ));
+        std::fs::create_dir_all(dir.join("data/t")).unwrap();
+        std::fs::write(dir.join("data/t/x.pink"), b"0123456789").unwrap();
+        let storage: Arc<dyn Storage> = Arc::new(crate::local::LocalStorage::new(&dir));
+        assert!(storage.ranged_reads());
+        assert_eq!(
+            storage
+                .read_range("data/t/x.pink", 2, 4, "reading")
+                .unwrap(),
+            b"2345"
+        );
+        assert_eq!(
+            storage
+                .read_range("data/t/x.pink", 8, 2, "reading")
+                .unwrap(),
+            b"89"
+        );
+        assert_eq!(storage.stats().requests, 0);
+
+        #[cfg(feature = "encryption")]
+        {
+            let keyed = CryptoStorage::new(
+                Arc::clone(&storage),
+                Some(crypto::EncryptionKey::from_passphrase("ranged test key")),
+            )
+            .unwrap();
+            assert!(!keyed.ranged_reads());
+            assert!(keyed.read_range("data/t/x.pink", 0, 2, "reading").is_err());
+        }
+        // A keyless session passes plaintext ranges through.
+        let plain = CryptoStorage::new(Arc::clone(&storage), None).unwrap();
+        assert!(plain.ranged_reads());
+        assert_eq!(
+            plain.read_range("data/t/x.pink", 1, 3, "reading").unwrap(),
+            b"123"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

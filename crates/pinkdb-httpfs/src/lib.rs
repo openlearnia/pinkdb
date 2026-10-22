@@ -112,6 +112,8 @@ pub use fetch::{Fetcher, HttpfsConfig, open, open_with};
 pub use http::{ByteRange, HttpClient};
 #[cfg(feature = "s3")]
 pub use s3::S3Config;
+#[cfg(feature = "s3")]
+pub use s3::{ClientCounters, TransportStats};
 
 /// Retries after a retryable failure (so up to 4 attempts), shared with
 /// pink-lake's default (`DEFAULT_RETRIES`).

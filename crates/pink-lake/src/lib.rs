@@ -1096,11 +1096,77 @@ impl Lake {
         let storage: Arc<dyn Storage> = Arc::new(CryptoStorage::new(inner, key)?);
         let root = storage.abs("");
         storage.tighten_existing()?;
-        let identity = read_identity(&*storage, &root)?;
-        if let Some(id) = &identity {
-            storage.set_manifest_lake_id(Some(id.clone()));
-        }
-        let manifest = read_catalog(&*storage, &root)?;
+        // Wave 98b: the identity and catalog are independent objects. The
+        // identity is HEAD-probed first (a credentials failure keeps the
+        // historical `AccessDenied` shape), then fetched concurrently with the
+        // catalog. A keyed session reads the identity first: its lake id is
+        // the binding every manifest is authenticated under, and setting it
+        // before the catalog is unsealed keeps the M-7 check exactly where it
+        // was.
+        let (identity, manifest) = if storage.encrypted() {
+            let identity = read_identity(&*storage, &root)?;
+            if let Some(id) = &identity {
+                storage.set_manifest_lake_id(Some(id.clone()));
+            }
+            let manifest = read_catalog(&*storage, &root)?;
+            (identity, manifest)
+        } else {
+            // The identity probe keeps its historical HEAD: a credentials
+            // failure is the same `AccessDenied` open always reported (a GET
+            // would surface `SignatureDoesNotMatch` first). A present
+            // identity is then fetched concurrently with the catalog.
+            match storage.head(LAKE_FILE)? {
+                Head::Missing => {
+                    let manifest = match storage.read_optional(
+                        CATALOG_FILE,
+                        &format!("reading {}", storage.abs(CATALOG_FILE).display()),
+                    )? {
+                        Some(bytes) => parse_catalog(&root, &bytes)?,
+                        None => {
+                            return Err(LakeError::NotALake {
+                                path: root.to_path_buf(),
+                            });
+                        }
+                    };
+                    (None, manifest)
+                }
+                Head::NotAFile => {
+                    return Err(LakeError::Corrupt {
+                        path: storage.abs(LAKE_FILE),
+                        message: format!(
+                            "{} is not a regular file",
+                            storage.abs(LAKE_FILE).display()
+                        ),
+                    });
+                }
+                Head::File => {
+                    let paths = [LAKE_FILE, CATALOG_FILE];
+                    let mut fetched = map_bounded(&paths, parallel_limit(), |rel| {
+                        storage
+                            .read_optional(rel, &format!("reading {}", storage.abs(rel).display()))
+                    })
+                    .into_iter();
+                    let identity = match fetched.next().expect("two objects fetched") {
+                        Ok(Some(bytes)) => Some(parse_identity(&*storage, &bytes)?),
+                        Ok(None) => None,
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(id) = &identity {
+                        storage.set_manifest_lake_id(Some(id.clone()));
+                    }
+                    let manifest = match fetched.next().expect("two objects fetched") {
+                        Ok(Some(bytes)) => parse_catalog(&root, &bytes)?,
+                        Ok(None) => {
+                            return Err(LakeError::NotALake {
+                                path: root.to_path_buf(),
+                            });
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    (identity, manifest)
+                }
+            }
+        };
         let lake_id = match manifest.lake_id.clone() {
             Some(id) => {
                 match &identity {
@@ -1147,10 +1213,25 @@ impl Lake {
             }
         };
         if manifest.format_version >= 6 {
+            // The authenticated highest-version marker and the snapshot of
+            // this version are independent objects: fetch them concurrently
+            // (wave 98b), then validate in the historical order (highest
+            // first, then the snapshot pair).
+            let snapshot_rel = format!("snapshots/{}.json", manifest.version);
+            let snapshot_context = format!("reading {}", storage.abs(&snapshot_rel).display());
+            let (highest, snapshot_read) = std::thread::scope(|scope| {
+                let highest = scope.spawn(|| read_highest(&*storage, &lake_id));
+                let snapshot =
+                    scope.spawn(|| storage.read_optional(&snapshot_rel, &snapshot_context));
+                (
+                    highest.join().expect("highest.json reader panicked"),
+                    snapshot.join().expect("snapshot reader panicked"),
+                )
+            });
             // The authenticated highest-version marker: a catalog below it is
             // a rollback. A catalog *above* it is the narrow crash window
             // between the catalog replace and the marker write; heal it.
-            let highest = read_highest(&*storage, &lake_id)?;
+            let highest = highest?;
             if manifest.version < highest {
                 return Err(LakeError::Corrupt {
                     path: root.join(CATALOG_FILE),
@@ -1172,10 +1253,22 @@ impl Lake {
             }
             // Catalog and snapshot of the same version must agree on both the
             // version and the lake identity (M-7).
-            let (snapshot, snapshot_path) = manifest_for(&*storage, &root, Some(manifest.version))?;
-            if snapshot.version != manifest.version
-                || snapshot.lake_id.as_deref() != Some(lake_id.as_str())
-            {
+            let snapshot_path = storage.abs(&snapshot_rel);
+            let snapshot_bytes = snapshot_read?.ok_or_else(|| LakeError::VersionNotFound {
+                path: root.clone(),
+                version: manifest.version,
+            })?;
+            let snapshot = read_manifest(&snapshot_path, &snapshot_bytes)?;
+            if snapshot.version != manifest.version {
+                return Err(LakeError::Corrupt {
+                    path: snapshot_path.clone(),
+                    message: format!(
+                        "snapshot file declares version {}, expected {}",
+                        snapshot.version, manifest.version
+                    ),
+                });
+            }
+            if snapshot.lake_id.as_deref() != Some(lake_id.as_str()) {
                 return Err(LakeError::Corrupt {
                     path: snapshot_path,
                     message: format!(
@@ -1463,13 +1556,12 @@ impl Lake {
     /// Footer-only *attach* of the latest version (`None`) or a specific
     /// snapshot: read the manifest, then the statistics attach needs — a
     /// Vortex data file's footer, metadata segment and stored statistics
-    /// (`vortexlake` builds; no column data is read or decoded, unless the
-    /// files live on object storage — whole-object reads, still no decode —
-    /// or the lake is encrypted, where each container is unsealed whole
-    /// first: the documented stage-1 cost, with footer-range reads over
-    /// unsealed segments as the follow-up), or the `.pink` files' published
-    /// statistics blocks (every build: the manifest is all attach reads;
-    /// `data` files are never opened, encrypted or not).
+    /// (`vortexlake` builds; no column data is read or decoded. The footers
+    /// of all files are read concurrently, and over object storage they are
+    /// **range** reads — wave 98b. An encrypted lake unseals each container
+    /// whole first, since a sealed object has no plaintext ranges), or the
+    /// `.pink` files' published statistics blocks (every build: the manifest
+    /// is all attach reads; `data` files are never opened, encrypted or not).
     ///
     /// The returned [`AttachmentReport`] carries the version-pinned
     /// [`pinkdb::AttachedLake`] handle; register it with
@@ -1491,8 +1583,22 @@ impl Lake {
     /// read of it, including the `COUNT`/`MIN`/`MAX` fast paths, fails with
     /// the provider error naming the table and the id.
     pub fn attach(&self, version: Option<u64>) -> Result<AttachmentReport> {
-        let (_, report) = attach::build(self, version)?;
+        let before = self.storage.stats();
+        let (_, mut report) = attach::build(self, version)?;
+        let after = self.storage.stats();
+        report.requests = after.requests.saturating_sub(before.requests);
+        report.bytes = after.bytes.saturating_sub(before.bytes);
+        report.wait_nanos = after.wait_nanos.saturating_sub(before.wait_nanos);
         Ok(report)
+    }
+
+    /// This handle's transport totals since it was opened: request attempts,
+    /// response bytes and wall time spent waiting on the network. Local lakes
+    /// report zeros. Wave 98b diagnostics; a caller can snapshot before and
+    /// after a query to see exactly what it read.
+    pub fn transport_stats(&self) -> (u64, u64, u64) {
+        let stats = self.storage.stats();
+        (stats.requests, stats.bytes, stats.wait_nanos)
     }
 
     /// The tables of the current version this build cannot read (wave 88,
@@ -2535,7 +2641,7 @@ impl Lake {
     fn open_data_file(&self, rel: &str, format: FileFormat) -> Result<PinkDb> {
         let provider = crate::format::format_for(format.id(), &self.root.join(CATALOG_FILE))?;
         let path = self.storage.abs(rel);
-        let file = crate::format::DataFile::new(&path, rel, &*self.storage);
+        let file = crate::format::DataFile::new(&path, rel, Arc::clone(&self.storage));
         provider.read(&file)
     }
 }
@@ -2703,13 +2809,14 @@ pub(crate) fn manifest_for(
         Some(v) => {
             let rel = format!("snapshots/{v}.json");
             let path = storage.abs(&rel);
-            if !storage.exists(&rel)? {
+            let Some(bytes) =
+                storage.read_optional(&rel, &format!("reading {}", path.display()))?
+            else {
                 return Err(LakeError::VersionNotFound {
                     path: root.to_path_buf(),
                     version: v,
                 });
-            }
-            let bytes = storage.read(&rel, &format!("reading {}", path.display()))?;
+            };
             let manifest = read_manifest(&path, &bytes)?;
             if manifest.version != v {
                 return Err(LakeError::Corrupt {
@@ -2839,39 +2946,39 @@ fn highest_json(lake_id: &str, version: u64) -> Result<Vec<u8>> {
 }
 
 /// Read `lake.json`, or `None` when this is a pre-v6 lake (the file did not
-/// exist before M-7).
+/// exist before M-7). One GET over object storage; the default local path
+/// still checks `head` first so a directory named `lake.json` is refused the
+/// same way it always was.
 fn read_identity(storage: &dyn Storage, _root: &Path) -> Result<Option<String>> {
-    match storage.head(LAKE_FILE)? {
-        Head::Missing => Ok(None),
-        Head::NotAFile => Err(LakeError::Corrupt {
-            path: storage.abs(LAKE_FILE),
-            message: "lake.json is not a regular file".to_string(),
-        }),
-        Head::File => {
-            let path = storage.abs(LAKE_FILE);
-            let bytes = storage.read(LAKE_FILE, &format!("reading {}", path.display()))?;
-            let identity: LakeIdentity =
-                serde_json::from_slice(&bytes).map_err(|e| LakeError::Corrupt {
-                    path: path.clone(),
-                    message: format!("lake.json does not parse: {e}"),
-                })?;
-            if identity.lake_format != LAKE_ID_FORMAT {
-                return Err(LakeError::Unsupported {
-                    path,
-                    found: identity.lake_format,
-                });
-            }
-            if !is_lake_id(&identity.lake_id) {
-                return Err(LakeError::Corrupt {
-                    path,
-                    message: "lake.json carries an invalid lake_id (expected 32 lowercase hex \
-                              characters)"
-                        .to_string(),
-                });
-            }
-            Ok(Some(identity.lake_id))
-        }
+    let path = storage.abs(LAKE_FILE);
+    match storage.read_optional(LAKE_FILE, &format!("reading {}", path.display()))? {
+        Some(bytes) => Ok(Some(parse_identity(storage, &bytes)?)),
+        None => Ok(None),
     }
+}
+
+/// Parse and validate one `lake.json` payload.
+fn parse_identity(storage: &dyn Storage, bytes: &[u8]) -> Result<String> {
+    let path = storage.abs(LAKE_FILE);
+    let identity: LakeIdentity = serde_json::from_slice(bytes).map_err(|e| LakeError::Corrupt {
+        path: path.clone(),
+        message: format!("lake.json does not parse: {e}"),
+    })?;
+    if identity.lake_format != LAKE_ID_FORMAT {
+        return Err(LakeError::Unsupported {
+            path,
+            found: identity.lake_format,
+        });
+    }
+    if !is_lake_id(&identity.lake_id) {
+        return Err(LakeError::Corrupt {
+            path,
+            message: "lake.json carries an invalid lake_id (expected 32 lowercase hex \
+                      characters)"
+                .to_string(),
+        });
+    }
+    Ok(identity.lake_id)
 }
 
 /// Read and validate `highest.json` for `lake_id`. A missing or unreadable
@@ -2879,28 +2986,19 @@ fn read_identity(storage: &dyn Storage, _root: &Path) -> Result<Option<String>> 
 /// would silently restore the rollback surface M-7 closes.
 fn read_highest(storage: &dyn Storage, lake_id: &str) -> Result<u64> {
     let path = storage.abs(HIGHEST_FILE);
-    match storage.head(HIGHEST_FILE)? {
-        Head::Missing => {
-            return Err(LakeError::Corrupt {
-                path,
-                message: "highest.json is missing (the authenticated rollback marker was \
-                          removed); refusing to open"
-                    .to_string(),
-            });
-        }
-        Head::NotAFile => {
-            return Err(LakeError::Corrupt {
-                path,
-                message: "highest.json is not a regular file".to_string(),
-            });
-        }
-        Head::File => {}
-    }
-    let bytes = storage.read_highest(
+    let bytes = storage.read_highest_optional(
         HIGHEST_FILE,
         &format!("reading {}", path.display()),
         lake_id,
     )?;
+    let Some(bytes) = bytes else {
+        return Err(LakeError::Corrupt {
+            path,
+            message: "highest.json is missing (the authenticated rollback marker was \
+                      removed); refusing to open"
+                .to_string(),
+        });
+    };
     let highest: HighestVersion =
         serde_json::from_slice(&bytes).map_err(|e| LakeError::Corrupt {
             path: path.clone(),
@@ -2933,25 +3031,22 @@ fn read_highest(storage: &dyn Storage, lake_id: &str) -> Result<u64> {
     Ok(highest.version)
 }
 
-/// Read and validate `catalog.json`.
+/// Read and validate `catalog.json`. One GET over object storage (a 404 is
+/// the absence); the local default still checks `head` first.
 fn read_catalog(storage: &dyn Storage, root: &Path) -> Result<Catalog> {
     let path = storage.abs(CATALOG_FILE);
-    match storage.head(CATALOG_FILE)? {
-        Head::Missing => {
-            return Err(LakeError::NotALake {
-                path: root.to_path_buf(),
-            });
-        }
-        Head::NotAFile => {
-            return Err(LakeError::Corrupt {
-                path,
-                message: "catalog.json is not a regular file".to_string(),
-            });
-        }
-        Head::File => {}
+    match storage.read_optional(CATALOG_FILE, &format!("reading {}", path.display()))? {
+        Some(bytes) => parse_catalog(root, &bytes),
+        None => Err(LakeError::NotALake {
+            path: root.to_path_buf(),
+        }),
     }
-    let bytes = storage.read(CATALOG_FILE, &format!("reading {}", path.display()))?;
-    read_manifest(&path, &bytes)
+}
+
+/// Parse and validate one `catalog.json` payload.
+fn parse_catalog(root: &Path, bytes: &[u8]) -> Result<Catalog> {
+    let path = root.join(CATALOG_FILE);
+    read_manifest(&path, bytes)
 }
 
 /// Parse + validate one manifest (`catalog.json` or a snapshot). The version
@@ -3437,6 +3532,61 @@ pub(crate) fn decode_key(segment: &str) -> Option<String> {
 /// over clock + pid + stack address + a process counter. Uniqueness (not
 /// cryptographic randomness) is the requirement. Also used by
 /// [`LocalStorage`] for unique temp-file names.
+/// The bounded in-flight limit for parallel lake reads: the shared
+/// `PINKDB_HTTPFS_PARALLELISM` (default 8, clamped to 16, 0/1 = serial) when
+/// the S3/httpfs transport is built; 8 otherwise (local lakes still decode
+/// files concurrently). One knob for every read path.
+pub(crate) fn parallel_limit() -> usize {
+    #[cfg(feature = "s3")]
+    {
+        pinkdb_httpfs::parallelism_from_env()
+    }
+    #[cfg(not(feature = "s3"))]
+    {
+        8
+    }
+}
+
+/// Apply `f` to every item with at most `limit` concurrent workers, returning
+/// results in input order. `limit <= 1` (or one item) runs inline. Results are
+/// therefore deterministic even though the work runs concurrently; callers
+/// pick the first error in order.
+pub(crate) fn map_bounded<T, R, F>(items: &[T], limit: usize, f: F) -> Vec<R>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> R + Sync,
+{
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let workers = limit.clamp(1, items.len().max(1));
+    if workers == 1 || items.len() <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let slots: Vec<Option<R>> = (0..items.len()).map(|_| None).collect();
+    let slots = std::sync::Mutex::new(slots);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    let result = f(item);
+                    slots.lock().unwrap()[index] = Some(result);
+                }
+            });
+        }
+    });
+    slots
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|slot| slot.expect("every bounded-map item is claimed"))
+        .collect()
+}
+
 pub(crate) fn fresh_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);

@@ -100,6 +100,17 @@ impl FileMeta {
     }
 }
 
+/// Read one ranged object's metadata through a [`crate::ranged::RangeSource`]
+/// (footer + thrift metadata only; no data pages). This is the lake provider's
+/// footer read: exactly the bytes parquet's metadata decoder asks for.
+pub fn read_file_meta_source(path: &str, spec: &crate::ranged::RemoteSpec) -> Result<FileMeta> {
+    let reader = SerializedFileReader::new(crate::ranged::RemoteFile::from_spec(spec))
+        .map_err(|e| PinkDbError::Execution(format!("cannot read parquet file \"{path}\": {e}")))?;
+    let footer_size = crate::ranged::footer_size(spec)
+        .map_err(|e| PinkDbError::Execution(format!("remote parquet read failed: {e}")))?;
+    build_meta(path, reader.metadata(), spec.len(), footer_size)
+}
+
 /// Read one local file's metadata (no data pages).
 pub fn read_file_meta(path: &str) -> Result<FileMeta> {
     let file = std::fs::File::open(path).map_err(|e| {
@@ -118,11 +129,8 @@ pub fn read_file_meta(path: &str) -> Result<FileMeta> {
 /// Read one remote object's metadata through its ranged [`ChunkReader`]
 /// (footer + thrift metadata only; no data pages).
 #[cfg(feature = "remote")]
-pub fn read_file_meta_remote(path: &str, spec: &crate::remote::RemoteSpec) -> Result<FileMeta> {
-    let reader = SerializedFileReader::new(crate::remote::RemoteFile::from_spec(spec))
-        .map_err(|e| PinkDbError::Execution(format!("cannot read parquet file \"{path}\": {e}")))?;
-    let footer_size = crate::remote::footer_size(spec)?;
-    build_meta(path, reader.metadata(), spec.len, footer_size)
+pub fn read_file_meta_remote(path: &str, spec: &crate::ranged::RemoteSpec) -> Result<FileMeta> {
+    read_file_meta_source(path, spec)
 }
 
 /// Project one file's parsed metadata into [`FileMeta`] (shared by the local

@@ -188,6 +188,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-22">2026-10-22<a class="anchor" href="#2026-10-22" aria-label="Permalink: 2026-10-22">#</a></h2>
+<h3>Wave 98b — fast lakes on S3/R2 ✅</h3>
+<ul>
+<li>Lakes on object storage read only what a query needs: Parquet and Vortex lake files fetch just the queried columns with concurrent range requests, Vortex footers are read in parallel, and whole files download in parallel parts. On R2, TPC-H Q6 over a Parquet lake went from 23 s to 6 s, over a Vortex lake from 31 s to 4.5 s, and opening a Vortex lake from 15 s to 2 s.</li>
+<li>Encrypted lakes keep reading whole files (each file is one sealed container).</li>
+<li><code>.lake attach</code> reports the requests and bytes it transferred.</li>
+</ul>
 <h3>Wave 98a — fast remote Parquet ✅</h3>
 <ul>
 <li>Reading Parquet from S3/R2/HTTPS is dramatically faster: TPC-H Q6 on a 196 MB file went from 6 min 46 s to about 4 s, on par with DuckDB 2.0, and <code>count(*)</code> is answered from the file footer (29 s → 0.6 s).</li>

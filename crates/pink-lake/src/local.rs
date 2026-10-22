@@ -14,7 +14,7 @@
 //! atomicity, same errors) — the trait is what wave 36 adds for S3.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -247,6 +247,45 @@ impl Storage for LocalStorage {
             context: context.to_string(),
             source: e,
         })
+    }
+
+    fn read_range(&self, rel: &str, offset: u64, len: u64, context: &str) -> Result<Vec<u8>> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let path = self.checked_path(rel)?;
+        let mut file = File::open(&path).map_err(|e| LakeError::Io {
+            context: context.to_string(),
+            source: e,
+        })?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| LakeError::Io {
+                context: context.to_string(),
+                source: e,
+            })?;
+        let mut bytes = vec![
+            0u8;
+            usize::try_from(len).map_err(|_| LakeError::Io {
+                context: context.to_string(),
+                source: std::io::Error::other(format!(
+                    "byte range length {len} does not fit this platform"
+                )),
+            })?
+        ];
+        file.read_exact(&mut bytes).map_err(|e| LakeError::Io {
+            context: format!(
+                "{} (byte range {offset}..{} of {})",
+                context,
+                offset.saturating_add(len),
+                path.display()
+            ),
+            source: e,
+        })?;
+        Ok(bytes)
+    }
+
+    fn ranged_reads(&self) -> bool {
+        true
     }
 
     fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {

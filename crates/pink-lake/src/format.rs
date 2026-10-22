@@ -46,7 +46,20 @@
 //!
 //! A provider may additionally advertise
 //! [`LakeFormat::supports_projection`] to let attach decode only requested
-//! columns; the lake falls back to a full decode otherwise.
+//! columns; the lake falls back to a full decode otherwise. A projected
+//! provider implements [`LakeFormat::read_projected`] (Vortex: projected
+//! segments; Parquet: the shared ranged scan core) and reports its file's
+//! physical footer via [`LakeFormat::footer_stats`] so a v5 schema record can
+//! map logical columns onto it.
+//!
+//! # Ranged reads (wave 98b)
+//!
+//! [`DataFile`] exposes the lake storage's positional reader
+//! ([`DataFile::read_range`], [`DataFile::range_source`]): object storage and
+//! local plaintext files answer with real range reads, an encrypted lake
+//! answers `None` (a sealed container must be unsealed whole). Providers use
+//! [`RangedFile`] to fetch exactly the footer and projected column segments a
+//! read needs.
 //!
 //! # Writing
 //!
@@ -96,13 +109,13 @@ pub struct EncodedFile {
 pub struct DataFile<'a> {
     path: &'a Path,
     rel: &'a str,
-    storage: &'a dyn Storage,
+    storage: Arc<dyn Storage>,
 }
 
 impl<'a> DataFile<'a> {
     /// Wrap one data-file reference for a provider (crate-internal: the lake
     /// owns the storage handle).
-    pub(crate) fn new(path: &'a Path, rel: &'a str, storage: &'a dyn Storage) -> Self {
+    pub(crate) fn new(path: &'a Path, rel: &'a str, storage: Arc<dyn Storage>) -> Self {
         Self { path, rel, storage }
     }
 
@@ -124,6 +137,59 @@ impl<'a> DataFile<'a> {
             .read(self.rel, &format!("loading data file \"{}\"", self.rel))
     }
 
+    /// The file's stored byte length (ciphertext length for an encrypted
+    /// lake). Used to size a positional reader.
+    pub fn len(&self) -> Result<u64> {
+        match self.storage.stat(self.rel)? {
+            Some(info) => Ok(info.size),
+            None => Err(LakeError::Io {
+                context: format!("loading data file \"{}\"", self.rel),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("{} is missing", self.path.display()),
+                ),
+            }),
+        }
+    }
+
+    /// Whether the stored object is zero bytes (paired with
+    /// [`DataFile::len`]).
+    pub fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+
+    /// A byte window of the file's plaintext, when the backend can read one
+    /// without downloading/unsealing the whole object.
+    pub fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.storage.read_range(
+            self.rel,
+            offset,
+            len,
+            &format!("loading data file \"{}\"", self.rel),
+        )
+    }
+
+    /// Whether [`DataFile::read_range`] is a real positioned read.
+    pub fn ranged(&self) -> bool {
+        self.storage.ranged_reads()
+    }
+
+    /// A positional reader for this file, when the backend supports one and
+    /// the object exists. `None` means "fall back to [`DataFile::read`]".
+    pub fn range_source(&self) -> Option<Arc<dyn RangedFile>> {
+        if !self.storage.ranged_reads() {
+            return None;
+        }
+        let len = self.len().ok()?;
+        Some(Arc::new(StorageRange {
+            path: self.path.to_path_buf(),
+            rel: self.rel.to_string(),
+            storage: Arc::clone(&self.storage),
+            len,
+            parallelism: crate::parallel_limit(),
+        }))
+    }
+
     /// The real filesystem path when the backend is local **and** plaintext;
     /// `None` for object storage and encrypted lakes (the caller then falls
     /// back to [`DataFile::read`]).
@@ -137,6 +203,62 @@ impl<'a> DataFile<'a> {
     pub(crate) fn local_copy(&self) -> Result<LocalCopy> {
         self.storage
             .local_copy(self.rel, &format!("loading data file \"{}\"", self.rel))
+    }
+}
+
+/// A positional reader over one lake data file (wave 98b).
+///
+/// This is the seam between the lake's ranged [`Storage`] and a format
+/// provider (parquet's remote scan, Vortex's `VortexReadAt`): the provider
+/// names byte windows and the lake fetches exactly them, with the storage's
+/// retry policy. Implementations are `Send + Sync` so a scan may read ahead
+/// from several threads.
+pub trait RangedFile: fmt::Debug + Send + Sync {
+    /// The file's absolute path (error messages).
+    fn path(&self) -> &Path;
+    /// The stored byte length.
+    fn len(&self) -> u64;
+    /// Whether the file is zero bytes (paired with [`RangedFile::len`]).
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// `len` bytes starting at `offset`.
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>>;
+    /// The bounded in-flight request limit (`PINKDB_HTTPFS_PARALLELISM`).
+    fn parallelism(&self) -> usize;
+}
+
+/// [`RangedFile`] over the lake's [`Storage`]: one object key plus the shared
+/// backend handle.
+#[derive(Debug)]
+struct StorageRange {
+    path: PathBuf,
+    rel: String,
+    storage: Arc<dyn Storage>,
+    len: u64,
+    parallelism: usize,
+}
+
+impl RangedFile for StorageRange {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_range(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.storage.read_range(
+            &self.rel,
+            offset,
+            len,
+            &format!("loading data file \"{}\"", self.rel),
+        )
+    }
+
+    fn parallelism(&self) -> usize {
+        self.parallelism
     }
 }
 
@@ -220,9 +342,39 @@ pub trait LakeFormat: fmt::Debug + Send + Sync {
 
     /// Whether this format can decode a column projection (a subset of the
     /// physical columns). The default is `false`: a projection decodes the
-    /// whole file. Only the Vortex provider opts in.
+    /// whole file. The Vortex and Parquet providers opt in.
     fn supports_projection(&self) -> bool {
         false
+    }
+
+    /// Whether this format can prune **row groups** from a query's pushed-down
+    /// predicates (Parquet's column-chunk statistics). The default is `false`.
+    /// A provider that answers `true` makes [`LakeAttachment::load_filtered`]
+    /// decode an uncached, pruned row-group set even when no whole file was
+    /// pruned; the engine re-applies the full predicate, so the answer is
+    /// unchanged.
+    fn prunes_row_groups(&self) -> bool {
+        false
+    }
+
+    /// Decode only `columns` (ascending physical schema indices) of one data
+    /// file, returning the file's **full physical schema** with unprojected
+    /// columns as NULL placeholders, plus the per-column decoded mask. The
+    /// lake's attach layer maps that onto the logical schema, applies delete
+    /// files and validates the row count, exactly as it does for a full read.
+    ///
+    /// `filters` are the query's pushed-down conjuncts: a provider may prune
+    /// row groups with them, but must never let pruning change the answer
+    /// (the engine re-applies the full predicate). `None` (the default) means
+    /// "this provider has no projected reader"; the caller falls back to
+    /// [`LakeFormat::read`].
+    fn read_projected(
+        &self,
+        _file: &DataFile<'_>,
+        _columns: &[usize],
+        _filters: &[pinkdb::PrunePredicate],
+    ) -> Result<Option<(PinkDb, Vec<bool>)>> {
+        Ok(None)
     }
 }
 
@@ -400,8 +552,7 @@ impl LakeFormat for VortexFormat {
     }
 
     fn read(&self, file: &DataFile<'_>) -> Result<PinkDb> {
-        let bytes = file.read()?;
-        crate::vortex_file::decode_table_owned(file.path(), bytes)
+        crate::vortex_file::decode_table_file(file)
     }
 
     fn footer_stats(&self, file: &DataFile<'_>) -> Result<Option<FileFooter>> {
@@ -414,6 +565,15 @@ impl LakeFormat for VortexFormat {
 
     fn supports_projection(&self) -> bool {
         true
+    }
+
+    fn read_projected(
+        &self,
+        file: &DataFile<'_>,
+        columns: &[usize],
+        _filters: &[pinkdb::PrunePredicate],
+    ) -> Result<Option<(PinkDb, Vec<bool>)>> {
+        Ok(Some(crate::vortex_file::decode_projected(file, columns)?))
     }
 }
 

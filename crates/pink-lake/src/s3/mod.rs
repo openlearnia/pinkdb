@@ -15,6 +15,17 @@
 //! [`S3Config::resolve`] returns the shared `ConfigError`, which
 //! [`S3Storage::new`] maps to the lake's `BadLocation`/`Auth` variants with
 //! the historical messages.
+//!
+//! # Fast reads (wave 98b)
+//!
+//! [`Storage::read_range`] issues a signed `Range` GET (the shared client's
+//! retries and timeouts apply); [`Storage::read`] downloads a whole object as
+//! 8 MiB parts with a bounded concurrent pool
+//! (`PINKDB_HTTPFS_PARALLELISM`, 0/1 = serial) and reassembles them in
+//! offset order — a small object is still one request. All parts must carry
+//! the same ETag; a mismatch (a concurrent replace) falls back to one atomic
+//! GET, never a mixed body. [`Storage::stats`] exposes the client's request/
+//! byte/wait counters.
 
 use std::io;
 use std::path::PathBuf;
@@ -23,7 +34,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use pinkdb_httpfs::s3::{Condition, Get, ListPage, Put, ResolvedS3, S3Client};
 use pinkdb_httpfs::{ConfigError, Error as HttpfsError};
 
-use crate::storage::{Head, LocalCopy, ObjectInfo, Storage, VersionTag};
+use crate::storage::{Head, LocalCopy, ObjectInfo, Storage, StorageStats, VersionTag};
 use crate::{LakeError, Result};
 
 pub use pinkdb_httpfs::{DEFAULT_RETRIES, S3Config};
@@ -31,6 +42,12 @@ pub use pinkdb_httpfs::{DEFAULT_RETRIES, S3Config};
 /// The most `ListObjectsV2` pages one `list` follows before giving up (a
 /// broken endpoint repeating its continuation token must not loop forever).
 const MAX_LIST_PAGES: usize = 10_000;
+
+/// Whole-object downloads are split into parts of this size (wave 98b: 8 MiB,
+/// inside the 8–16 MiB band the plan names). A small object stays one request;
+/// a large one uses the link instead of one stream. Bounded by
+/// `PINKDB_HTTPFS_PARALLELISM` (0/1 = one part at a time).
+const DOWNLOAD_PART_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The message every refused degraded write carries. The task of the client
 /// is to be safe by default: a check-then-put fallback cannot keep the
@@ -262,6 +279,189 @@ impl S3Storage {
             Err(e) => Err(self.map(context, e)),
         }
     }
+
+    /// The whole object as concurrent range requests (wave 98b): 8 MiB parts,
+    /// a bounded pool (`PINKDB_HTTPFS_PARALLELISM`), reassembled in order. A
+    /// small object is still one request; all parts must report the same ETag,
+    /// otherwise the object changed mid-read and the caller gets a fresh
+    /// single GET (the pre-98b semantics: one atomic object).
+    fn read_parallel(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Option<String>)> {
+        let key = self.key(rel);
+        let parallelism = pinkdb_httpfs::parallelism_from_env();
+        if parallelism <= 1 {
+            // The documented serial switch: one atomic GET, exactly the
+            // pre-98b read path.
+            return self.read_single_tagged(rel, context);
+        }
+        let first = match self.client.get_object_range(&key, 0, DOWNLOAD_PART_BYTES) {
+            Ok(Get::Found {
+                bytes,
+                etag,
+                content_range,
+            }) => (bytes, etag, content_range),
+            Ok(Get::NotFound) => {
+                self.confirm_bucket_after_404(context)?;
+                return Err(self.not_found(rel, context));
+            }
+            Err(HttpfsError::Status { status: 416, .. }) => {
+                // An empty object: a range at 0 is unsatisfiable. Fall back to
+                // the plain GET (which also carries the ETag).
+                return self.read_single_tagged(rel, context);
+            }
+            Err(e) => return Err(self.map(context, e)),
+        };
+        self.bucket_confirmed.store(true, Ordering::Relaxed);
+        let (first_bytes, first_etag, content_range) = first;
+        let total = total_from_content_range(content_range.as_deref()).or(
+            if first_bytes.len() as u64 == DOWNLOAD_PART_BYTES {
+                self.stat(rel)?.map(|info| info.size)
+            } else {
+                Some(first_bytes.len() as u64)
+            },
+        );
+        let Some(total) = total else {
+            // No size from the endpoint: one whole GET is the only safe read.
+            return self.read_single_tagged(rel, context);
+        };
+        if total <= first_bytes.len() as u64 {
+            return Ok((first_bytes, first_etag));
+        }
+        let cap = self.client.max_object_bytes();
+        if total > cap {
+            return Err(LakeError::Io {
+                context: context.to_string(),
+                source: io::Error::other(format!(
+                    "the object is {total} bytes, over this client's {cap}-byte object cap \
+                     (no multipart downloads)"
+                )),
+            });
+        }
+        // The remaining windows, fetched concurrently and reassembled in
+        // offset order. `fetch` is the one counted/error-mapped call.
+        let starts: Vec<u64> = (DOWNLOAD_PART_BYTES..total)
+            .step_by(DOWNLOAD_PART_BYTES as usize)
+            .collect();
+        let parts = fetch_parts(self, &key, rel, &starts, total, parallelism, context)?;
+        let mut etag = first_etag;
+        let mut out = Vec::with_capacity(total.min(usize::MAX as u64) as usize);
+        out.extend_from_slice(&first_bytes);
+        for (start, bytes, part_etag) in parts {
+            match (&etag, &part_etag) {
+                (Some(a), Some(b)) if a != b => {
+                    // The object changed between parts: a mixed body is never
+                    // returned. One GET is atomic per S3 version.
+                    return self.read_single_tagged(rel, context);
+                }
+                (None, Some(b)) => etag = Some(b.clone()),
+                _ => {}
+            }
+            debug_assert_eq!(start, out.len() as u64);
+            out.extend_from_slice(&bytes);
+        }
+        if out.len() as u64 != total {
+            return Err(LakeError::Io {
+                context: context.to_string(),
+                source: io::Error::other(format!(
+                    "S3 parallel download of {} assembled {} of {total} bytes",
+                    self.abs(rel).display(),
+                    out.len()
+                )),
+            });
+        }
+        Ok((out, etag))
+    }
+
+    /// One unconditional GET (the pre-98b read path): an atomic object read
+    /// and its ETag.
+    fn read_single_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, Option<String>)> {
+        match self.client.get_object(&self.key(rel)) {
+            Ok(Get::Found { bytes, etag, .. }) => {
+                self.bucket_confirmed.store(true, Ordering::Relaxed);
+                Ok((bytes, etag))
+            }
+            Ok(Get::NotFound) => {
+                self.confirm_bucket_after_404(context)?;
+                Err(self.not_found(rel, context))
+            }
+            Err(e) => Err(self.map(context, e)),
+        }
+    }
+}
+
+/// One downloaded part: its start offset, bytes and the object's ETag.
+type DownloadPart = (u64, Vec<u8>, Option<String>);
+
+/// Fetch the remaining windows of a parallel download with a bounded pool,
+/// preserving offset order. Each part returns `(start, bytes, etag)`.
+fn fetch_parts(
+    storage: &S3Storage,
+    key: &str,
+    rel: &str,
+    starts: &[u64],
+    total: u64,
+    parallelism: usize,
+    context: &str,
+) -> Result<Vec<DownloadPart>> {
+    use std::sync::atomic::AtomicUsize;
+    let results: Vec<Option<Result<DownloadPart>>> = (0..starts.len()).map(|_| None).collect();
+    let results = std::sync::Mutex::new(results);
+    let next = AtomicUsize::new(0);
+    let workers = parallelism.clamp(1, starts.len().max(1));
+    let fetch = |index: usize| -> Result<DownloadPart> {
+        let start = starts[index];
+        let len = (total - start).min(DOWNLOAD_PART_BYTES);
+        match storage.client.get_object_range(key, start, len) {
+            Ok(Get::Found { bytes, etag, .. }) if bytes.len() as u64 == len => {
+                Ok((start, bytes, etag))
+            }
+            Ok(Get::Found { bytes, .. }) => Err(LakeError::Io {
+                context: context.to_string(),
+                source: io::Error::other(format!(
+                    "S3 range {start}..{} of {} returned {} bytes, expected {len}",
+                    start + len,
+                    storage.abs(rel).display(),
+                    bytes.len()
+                )),
+            }),
+            Ok(Get::NotFound) => Err(storage.not_found(rel, context)),
+            Err(e) => Err(storage.map(context, e)),
+        }
+    };
+    if workers == 1 {
+        for index in 0..starts.len() {
+            results.lock().unwrap()[index] = Some(fetch(index));
+        }
+    } else {
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= starts.len() {
+                            break;
+                        }
+                        let part = fetch(index);
+                        results.lock().unwrap()[index] = Some(part);
+                    }
+                });
+            }
+        });
+    }
+    let mut out = Vec::with_capacity(starts.len());
+    for slot in results.into_inner().unwrap() {
+        out.push(slot.expect("every download part is claimed")?);
+    }
+    Ok(out)
+}
+
+/// The total size in a `Content-Range: bytes start-end/total` value.
+fn total_from_content_range(value: Option<&str>) -> Option<u64> {
+    let after_slash = value?.rsplit_once('/')?.1.trim();
+    if after_slash == "*" {
+        None
+    } else {
+        after_slash.parse().ok()
+    }
 }
 
 /// Map the shared config error to the lake's historical variants (same
@@ -300,9 +500,38 @@ impl Storage for S3Storage {
     }
 
     fn read(&self, rel: &str, context: &str) -> Result<Vec<u8>> {
+        self.read_parallel(rel, context).map(|(bytes, _)| bytes)
+    }
+
+    fn read_optional(&self, rel: &str, context: &str) -> Result<Option<Vec<u8>>> {
         match self.client.get_object(&self.key(rel)) {
             Ok(Get::Found { bytes, .. }) => {
                 self.bucket_confirmed.store(true, Ordering::Relaxed);
+                Ok(Some(bytes))
+            }
+            Ok(Get::NotFound) => {
+                self.confirm_bucket_after_404(context)?;
+                Ok(None)
+            }
+            Err(e) => Err(self.map(context, e)),
+        }
+    }
+
+    fn read_range(&self, rel: &str, offset: u64, len: u64, context: &str) -> Result<Vec<u8>> {
+        match self.client.get_object_range(&self.key(rel), offset, len) {
+            Ok(Get::Found { bytes, .. }) => {
+                self.bucket_confirmed.store(true, Ordering::Relaxed);
+                if bytes.len() as u64 != len {
+                    return Err(LakeError::Io {
+                        context: context.to_string(),
+                        source: io::Error::other(format!(
+                            "S3 range {offset}..{} of {} returned {} bytes, expected {len}",
+                            offset.saturating_add(len),
+                            self.abs(rel).display(),
+                            bytes.len()
+                        )),
+                    });
+                }
                 Ok(bytes)
             }
             Ok(Get::NotFound) => {
@@ -313,28 +542,30 @@ impl Storage for S3Storage {
         }
     }
 
+    fn ranged_reads(&self) -> bool {
+        true
+    }
+
+    fn stats(&self) -> StorageStats {
+        let stats = self.client.stats();
+        StorageStats {
+            requests: stats.requests,
+            bytes: stats.bytes,
+            wait_nanos: stats.wait_nanos,
+        }
+    }
+
     fn read_tagged(&self, rel: &str, context: &str) -> Result<(Vec<u8>, VersionTag)> {
-        match self.client.get_object(&self.key(rel)) {
-            Ok(Get::Found {
-                bytes,
-                etag: Some(etag),
-                ..
-            }) => {
-                self.bucket_confirmed.store(true, Ordering::Relaxed);
-                Ok((bytes, VersionTag(etag)))
-            }
-            Ok(Get::Found { etag: None, .. }) => Err(self.map(
+        let (bytes, etag) = self.read_parallel(rel, context)?;
+        match etag {
+            Some(etag) => Ok((bytes, VersionTag(etag))),
+            None => Err(self.map(
                 context,
                 HttpfsError::Protocol {
                     context: context.to_string(),
                     message: "response carried no ETag; conditional writes are impossible".into(),
                 },
             )),
-            Ok(Get::NotFound) => {
-                self.confirm_bucket_after_404(context)?;
-                Err(self.not_found(rel, context))
-            }
-            Err(e) => Err(self.map(context, e)),
         }
     }
 
@@ -910,6 +1141,57 @@ mod tests {
         assert!(matches!(err, LakeError::Io { .. }), "{err:?}");
         assert!(err.to_string().contains("capped at 16 bytes"), "{err}");
         assert!(mock.keys().iter().all(|k| k != "ops/small"));
+    }
+
+    /// A large whole-object read is several concurrent range requests (wave
+    /// 98b), reassembled in order; a small object stays one request. The
+    /// bytes are exactly what one GET returned before.
+    #[test]
+    fn whole_object_reads_use_concurrent_parts() {
+        let mock = crate::mock_s3::MockS3::start();
+        let size = 20 * 1024 * 1024 + 123;
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        mock.put_object("ops/big", &bytes);
+        let storage = storage(&mock, "ops-bucket", "ops");
+
+        let got = storage.read("big", "reading big").unwrap();
+        assert_eq!(got.len(), bytes.len());
+        assert_eq!(got, bytes, "the parts must reassemble in order");
+        let all_ranges = mock.ranges();
+        let mut ranges: Vec<String> = all_ranges
+            .iter()
+            .filter(|r| !r.is_empty())
+            .cloned()
+            .collect();
+        ranges.sort();
+        if pinkdb_httpfs::parallelism_from_env() > 1 {
+            assert_eq!(ranges.len(), 3, "8 MiB parts: {ranges:?}");
+            assert_eq!(
+                ranges,
+                vec![
+                    "bytes=0-8388607".to_string(),
+                    "bytes=16777216-20971642".to_string(),
+                    "bytes=8388608-16777215".to_string()
+                ]
+            );
+        } else {
+            assert!(
+                ranges.is_empty(),
+                "PINKDB_HTTPFS_PARALLELISM=1 is one whole GET: {ranges:?}"
+            );
+        }
+
+        // The tagged read runs the same download and keeps the object's ETag.
+        let (tagged, tag) = storage.read_tagged("big", "reading big").unwrap();
+        assert_eq!(tagged, bytes);
+        assert!(tag.0.starts_with('"'), "{tag:?}");
+
+        // A small object is still one range request.
+        mock.put_object("ops/small", b"tiny");
+        let before = mock.ranges().iter().filter(|r| !r.is_empty()).count();
+        assert_eq!(storage.read("small", "reading small").unwrap(), b"tiny");
+        let after = mock.ranges().iter().filter(|r| !r.is_empty()).count();
+        assert_eq!(after - before, 1, "a small object is one request");
     }
 
     /// A broken endpoint repeating its continuation token cannot loop

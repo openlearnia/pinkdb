@@ -30,7 +30,10 @@ const QUERIES: &[(&str, &str)] = &[
          GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus;",
     ),
     ("orders, all rows (1.5M x 9)", "SELECT * FROM orders;"),
-    ("lineitem, 1M rows x 16", "SELECT * FROM lineitem LIMIT 1000000;"),
+    (
+        "lineitem, 1M rows x 16",
+        "SELECT * FROM lineitem LIMIT 1000000;",
+    ),
 ];
 
 fn rows(results: &[QueryResult]) -> usize {
@@ -62,7 +65,9 @@ fn main() {
 
     for (label, sql) in QUERIES {
         let start = Instant::now();
-        let results = client.execute(sql).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let results = client
+            .execute(sql)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
         println!(
             "{label}: {:.3} s ({} rows received)",
             start.elapsed().as_secs_f64(),

@@ -8,11 +8,15 @@
 //! - a format whose provider advertises **footer statistics** (Vortex, in
 //!   `vortexlake` builds): each data file's footer, the `pinkdb.table`
 //!   identity/schema segment and the stored statistics — no data segment is
-//!   read and no column is decoded. Locally that is a positioned read of the
-//!   postscript + footer per file; over object storage (which has no ranged
-//!   reads in this build) — and for an encrypted lake, where the container
-//!   must be unsealed before the footer can be parsed — the whole object is
-//!   read into memory and opened in place, still skipping the decode.
+//!   read and no column is decoded. The footers of **all** files (across
+//!   tables) are read concurrently, bounded by
+//!   `PINKDB_HTTPFS_PARALLELISM`, and validated in manifest order. Locally
+//!   that is a positioned read of the postscript + footer per file; over
+//!   object storage it is a ranged read through the lake's storage
+//!   (`DataFile::range_source`), never a whole-object download. For an
+//!   encrypted lake the container must be unsealed first, so each object is
+//!   read whole (concurrently, in parts where the backend allows it), still
+//!   skipping the decode.
 //! - a **`.pink`** entry (every build) and every provider that returns no
 //!   footer statistics: the per-file statistics blocks published in the
 //!   manifest and nothing else — no data file is opened at attach, encrypted
@@ -67,7 +71,11 @@
 //! [`pinkdb::AttachedLake::decode_stats`] reports `(loads, columns decoded,
 //! files decoded)` over the attachment and its time-travel views — the
 //! observability behind "a statistics-only query decodes nothing" and "a
-//! pruned scan decodes only the matching files".
+//! pruned scan decodes only the matching files". Wave 98b adds
+//! [`AttachmentReport::requests`] / [`AttachmentReport::bytes`] /
+//! [`AttachmentReport::wait_nanos`] (what attach itself fetched) and
+//! `Lake::transport_stats()` (the running totals of one handle), so the
+//! request/byte pattern is visible without a packet capture.
 //!
 //! The result is a [`pinkdb::AttachedLake`]: descriptors the engine can
 //! answer exact `COUNT`/`MIN`/`MAX` from, and a per-table loader that decodes
@@ -114,8 +122,6 @@ use crate::format::{DataFile, LakeFormat};
 use crate::incremental::entry_layout;
 use crate::inlined::InlinedFact;
 use crate::storage::{Head, Storage};
-#[cfg(feature = "vortexlake")]
-use crate::vortex_file;
 use crate::zone::{self, FileFacts};
 use crate::{
     Lake, LakeError, Result, apply_file_deletes, copy_chunks, manifest_for, only_table,
@@ -132,19 +138,21 @@ pub struct AttachmentReport {
     pub tables: usize,
     /// The lake's catalog `format_version` (1–4 in this build).
     pub format_version: u32,
-    /// True when Vortex data files live on object storage and attach read
-    /// whole objects (no ranged reads in this build), still without
-    /// decoding. Always false for `.pink` entries: attach reads no data file
-    /// at all. (An encrypted *local* lake also reads whole objects — see
-    /// [`AttachmentReport::encrypted`] — but that is not a `remote` fact.)
+    /// True when Vortex data files live on object storage. Wave 98b reads
+    /// their footers through ranged requests (see
+    /// [`AttachmentReport::ranged`]); the flag stays "the data files are
+    /// remote" for compatibility. Always false for `.pink` entries: attach
+    /// reads no data file at all. (An encrypted *local* lake also reads whole
+    /// objects — see [`AttachmentReport::encrypted`] — but that is not a
+    /// `remote` fact.)
     pub remote: bool,
     /// True when the lake is encrypted at rest: the manifests, statistics
     /// and every data file were unsealed for this attachment. A Vortex
-    /// footer read then costs the whole ciphertext of each data file (the
-    /// encrypted lake's positioned/footer-range reads are a follow-up), and
-    /// a `.pink` entry still reads no data file at all — the published
-    /// statistics blocks ride inside the (now encrypted) manifest. Never a
-    /// decode either way.
+    /// footer read then costs the whole ciphertext of each data file (a sealed
+    /// container has no plaintext ranges; the object is downloaded in parts
+    /// where the backend allows it), and a `.pink` entry still reads no data
+    /// file at all — the published statistics blocks ride inside the (now
+    /// encrypted) manifest. Never a decode either way.
     pub encrypted: bool,
     /// True when no attached entry needed a data-file footer read, so attach
     /// read the manifests' CRC-protected statistics blocks and **no data file
@@ -152,6 +160,21 @@ pub struct AttachmentReport {
     /// provider carries its statistics in the file (Vortex's "footer-only"
     /// shape).
     pub statistics_only: bool,
+    /// Transport requests this attach issued (wave 98b diagnostics): the
+    /// catalog/manifest reads plus any ranged data-file footer reads. Local
+    /// lakes report zero.
+    pub requests: u64,
+    /// Response bytes this attach received. Local lakes report 0.
+    pub bytes: u64,
+    /// Wall-clock nanoseconds this attach spent waiting on the transport.
+    pub wait_nanos: u64,
+    /// True when the backend supports positioned reads and the attachment
+    /// used them (object storage, or a local plaintext lake). False for an
+    /// encrypted lake (a sealed object has no plaintext ranges).
+    pub ranged: bool,
+    /// The bounded in-flight limit the attach used for concurrent footer
+    /// reads (`PINKDB_HTTPFS_PARALLELISM`, 1 = serial).
+    pub parallelism: usize,
     /// The read-only handle to register with the engine
     /// ([`pinkdb::PinkDb::attach_lake`]).
     pub lake: Arc<dyn AttachedLake>,
@@ -491,10 +514,11 @@ impl AttachedLake for LakeAttachment {
             })
             .cloned()
             .collect();
-        if survivors.len() == entry.files.len() {
-            // Nothing pruned: take the ordinary cached path, so a query whose
-            // predicates cannot prune behaves exactly as before (and shares
-            // the materialized columns).
+        if survivors.len() == entry.files.len() && !entry.format.prunes_row_groups() {
+            // Nothing pruned and the provider cannot prune *inside* a file:
+            // take the ordinary cached path, so a query whose predicates
+            // cannot prune behaves exactly as before (and shares the
+            // materialized columns).
             return self.load_projected(db, table, columns);
         }
         // A pruned load is a different row set than the full table, so it is
@@ -515,7 +539,12 @@ impl AttachedLake for LakeAttachment {
         let full = !entry.projected || requested.iter().all(|&w| w);
         let decoded: Vec<usize> = (0..requested.len()).filter(|&i| requested[i]).collect();
         let (table, present) = self
-            .load_some(&entry, &survivors, if full { None } else { Some(&decoded) })
+            .load_some(
+                &entry,
+                &survivors,
+                if full { None } else { Some(&decoded) },
+                predicates,
+            )
             .map_err(|e| PinkDbError::Execution(e.to_string()))?;
         Ok(AttachedScan {
             table: Arc::new(table),
@@ -694,7 +723,7 @@ impl LakeAttachment {
         entry: &AttachedEntry,
         columns: Option<&[usize]>,
     ) -> Result<(DataTable, Vec<bool>)> {
-        self.load_some(entry, &entry.files, columns)
+        self.load_some(entry, &entry.files, columns, &[])
     }
 
     /// [`LakeAttachment::load_entry`] over a chosen subset of the entry's
@@ -712,10 +741,19 @@ impl LakeAttachment {
         entry: &AttachedEntry,
         files: &[AttachedFile],
         columns: Option<&[usize]>,
+        filters: &[pinkdb::attached::PrunePredicate],
     ) -> Result<(DataTable, Vec<bool>)> {
+        // Wave 98b: files of one table are independent, so decode them
+        // concurrently (bounded by `PINKDB_HTTPFS_PARALLELISM`) and merge in
+        // manifest order. `map_bounded` returns results in input order, so
+        // the first error is the same one a serial loop would report.
+        let decoded = crate::map_bounded(files, crate::parallel_limit(), |file| {
+            load_file(&self.storage, &self.root, entry, file, columns, filters)
+        });
         let mut union: Option<(DataTable, Vec<bool>)> = None;
-        for (i, file) in files.iter().enumerate() {
-            let (table, present) = load_file(&*self.storage, &self.root, entry, file, columns)?;
+        for (i, result) in decoded.into_iter().enumerate() {
+            let (table, present) = result?;
+            let file = &files[i];
             match &mut union {
                 None => union = Some((table, present)),
                 Some((dst, first_present)) => {
@@ -816,15 +854,16 @@ fn requested_mask(n_cols: usize, columns: Option<&[usize]>) -> Vec<bool> {
 /// needs, `.pink` files decode whole and project in memory.
 #[cfg_attr(not(feature = "vortexlake"), allow(unused_variables))]
 fn load_file(
-    storage: &dyn Storage,
+    storage: &Arc<dyn Storage>,
     root: &std::path::Path,
     entry: &AttachedEntry,
     file: &AttachedFile,
     columns: Option<&[usize]>,
+    filters: &[pinkdb::attached::PrunePredicate],
 ) -> Result<(DataTable, Vec<bool>)> {
     let key = entry.key();
     let abs = storage.abs(&file.rel);
-    let data_file = DataFile::new(&abs, &file.rel, storage);
+    let data_file = DataFile::new(&abs, &file.rel, Arc::clone(storage));
     if !entry.projected {
         // No projected reader exists for this provider (the engine `.pink`
         // bytes are the built-in case): any missing column materializes the
@@ -860,90 +899,32 @@ fn load_file(
             }
         }
     } else {
-        #[cfg(feature = "vortexlake")]
-        {
-            // With a record: resolve which physical columns the request
-            // needs (mapped logical ones only — never a dropped column's
-            // bytes) from the file's own (footer) schema.
-            let (table, present) = match &entry.record {
-                Some(schema) => {
-                    let path = storage.abs(&file.rel);
-                    let footer = entry.format.footer_stats(&data_file)?.ok_or_else(|| {
-                        LakeError::Internal {
-                            message: format!(
-                                "format \"{}\" advertises footer statistics but returned none \
-                                 for \"{}\"",
-                                entry.format.id(),
-                                file.rel
-                            ),
-                        }
-                    })?;
-                    let mapping = schema.map_file(file.schema_version, &footer.schema, &path)?;
-                    let wanted: Vec<bool> = match columns {
-                        Some(cols) => {
-                            let mut w = vec![false; schema.columns.len()];
-                            for &i in cols {
-                                if i < w.len() {
-                                    w[i] = true;
-                                }
-                            }
-                            w
-                        }
-                        None => vec![true; schema.columns.len()],
-                    };
-                    let mut physical: Vec<usize> = Vec::new();
-                    for (li, on) in wanted.iter().enumerate() {
-                        if *on
-                            && let Some(pi) = mapping.physical[li]
-                            && !physical.contains(&pi)
-                        {
-                            physical.push(pi);
-                        }
-                    }
-                    physical.sort_unstable();
-                    let (file_table, file_present) = if physical.len() == footer.schema.len() {
-                        let table = decode_via_provider(entry, &data_file, root)?;
-                        let present = vec![true; table.num_cols()];
-                        (table, present)
-                    } else {
-                        // Decode at least one physical column: the row count
-                        // has to come from somewhere even when the request
-                        // only needs default-filled columns.
-                        let decode_cols: Vec<usize> = if physical.is_empty() {
-                            vec![0]
-                        } else {
-                            physical.clone()
-                        };
-                        load_projected_table(entry, storage, root, &file.rel, &decode_cols)?
-                    };
-                    if file_table.num_rows() as u64 != file.rows {
-                        return Err(LakeError::Corrupt {
-                            path: storage.abs(&file.rel),
-                            message: format!(
-                                "table \"{key}\": data file \"{}\" has {} rows, but the \
-                                 manifest says {}",
-                                file.rel,
-                                file_table.num_rows(),
-                                file.rows
-                            ),
-                        });
-                    }
-                    let file_table =
-                        apply_file_deletes(&file_table, &file.deletes, &key, &file.rel)?;
-                    schema.project_table(&mapping, &file_table, &file_present, &entry.table)?
-                }
-                None => {
-                    let (table, present) = match columns {
-                        Some(cols) => load_projected_table(entry, storage, root, &file.rel, cols)?,
-                        None => {
-                            let table = decode_via_provider(entry, &data_file, root)?;
-                            let present = vec![true; table.num_cols()];
-                            (table, present)
-                        }
-                    };
+        // A projection-capable provider (Vortex, Parquet). With a v5 record
+        // whose epoch equals the file's, the record already is the file's
+        // physical schema: no footer read is needed to map columns (a
+        // Parquet scan still reads the footer once to decode). Otherwise the
+        // footer is the authority; a provider without one falls back to the
+        // always-correct full decode.
+        let path = storage.abs(&file.rel);
+        let need_footer = entry.format.has_footer_stats()
+            || entry
+                .record
+                .as_ref()
+                .is_none_or(|record| file.schema_version != record.version);
+        let footer = if need_footer {
+            entry.format.footer_stats(&data_file)?
+        } else {
+            None
+        };
+        let physical_schema: Vec<(String, pinkdb::DataType)> = match &footer {
+            Some(footer) => footer.schema.clone(),
+            None => match &entry.record {
+                Some(record) if !need_footer => record.schema_pairs(),
+                _ => {
+                    let table = decode_via_provider(entry, &data_file, root)?;
                     if table.num_rows() as u64 != file.rows {
                         return Err(LakeError::Corrupt {
-                            path: storage.abs(&file.rel),
+                            path,
                             message: format!(
                                 "table \"{key}\": data file \"{}\" has {} rows, but the \
                                  manifest says {}",
@@ -954,27 +935,148 @@ fn load_file(
                         });
                     }
                     let table = apply_file_deletes(&table, &file.deletes, &key, &file.rel)?;
+                    return match &entry.record {
+                        Some(schema) => {
+                            let mapping = schema.map_file(
+                                file.schema_version,
+                                &table.schema(),
+                                &storage.abs(&file.rel),
+                            )?;
+                            let all = vec![true; table.num_cols()];
+                            schema.project_table(&mapping, &table, &all, &entry.table)
+                        }
+                        None => {
+                            let present = vec![true; table.num_cols()];
+                            Ok((table, present))
+                        }
+                    };
+                }
+            },
+        };
+        // Which physical columns the request needs. With a record, logical
+        // indices are mapped through the file's schema epoch (a dropped
+        // column's bytes are never read; a default-filled one needs no data).
+        let mapping = match &entry.record {
+            Some(schema) => schema.map_file(file.schema_version, &physical_schema, &path)?,
+            None => crate::schema::FileMapping {
+                physical: (0..physical_schema.len()).map(Some).collect(),
+            },
+        };
+        let logical_width = mapping.physical.len();
+        let wanted: Vec<bool> = match columns {
+            Some(cols) => {
+                let mut w = vec![false; logical_width];
+                for &i in cols {
+                    if i < w.len() {
+                        w[i] = true;
+                    }
+                }
+                w
+            }
+            None => vec![true; logical_width],
+        };
+        let mut physical: Vec<usize> = Vec::new();
+        for (li, on) in wanted.iter().enumerate() {
+            if *on
+                && let Some(pi) = mapping.physical[li]
+                && !physical.contains(&pi)
+            {
+                physical.push(pi);
+            }
+        }
+        physical.sort_unstable();
+        // The query's predicates use logical column indices; the provider's
+        // ranged scan sees the file's physical schema. Translate (and drop a
+        // predicate on a column this file does not physically carry) before
+        // handing them over. Pruning is only ever an optimization, so
+        // dropping a translation is safe; passing a wrong index is not.
+        let physical_filters: Vec<pinkdb::PrunePredicate> = filters
+            .iter()
+            .filter_map(|filter| {
+                let physical = (*mapping.physical.get(filter.column)?)?;
+                Some(pinkdb::PrunePredicate {
+                    column: physical,
+                    op: filter.op,
+                    value: filter.value.clone(),
+                })
+            })
+            .collect();
+        let (file_table, file_present) = if physical.len() == physical_schema.len() {
+            let table = decode_via_provider(entry, &data_file, root)?;
+            let present = vec![true; table.num_cols()];
+            (table, present)
+        } else {
+            // Decode at least one physical column: the row count has to come
+            // from somewhere even when the request only needs default-filled
+            // columns.
+            let decode_cols: Vec<usize> = if physical.is_empty() {
+                vec![0]
+            } else {
+                physical.clone()
+            };
+            match decode_projected_via_provider(
+                entry,
+                &data_file,
+                root,
+                &decode_cols,
+                &physical_filters,
+            )? {
+                Some(decoded) => decoded,
+                None => {
+                    let table = decode_via_provider(entry, &data_file, root)?;
+                    let present = vec![true; table.num_cols()];
                     (table, present)
                 }
-            };
-            Ok((table, present))
-        }
-        #[cfg(not(feature = "vortexlake"))]
-        {
-            // Unreachable: a footer-statistics provider this lean build does
-            // not have (`vortex`) is skipped by the per-table availability
-            // check before its files are touched (wave 88, rule 5). A clear
-            // error, never a panic.
-            Err(LakeError::FeatureMissing {
-                feature: "vortexlake",
+            }
+        };
+        if file_table.num_rows() as u64 != file.rows {
+            return Err(LakeError::Corrupt {
+                path: storage.abs(&file.rel),
                 message: format!(
-                    "table \"{key}\" uses a data file (\"{}\") whose provider is not built \
-                     into this lean build — rebuild with the `vortexlake` feature",
-                    file.rel
+                    "table \"{key}\": data file \"{}\" has {} rows, but the manifest says {}",
+                    file.rel,
+                    file_table.num_rows(),
+                    file.rows
                 ),
-            })
+            });
+        }
+        let file_table = apply_file_deletes(&file_table, &file.deletes, &key, &file.rel)?;
+        match &entry.record {
+            Some(schema) => {
+                schema.project_table(&mapping, &file_table, &file_present, &entry.table)
+            }
+            None => Ok((file_table, file_present)),
         }
     }
+}
+
+/// Decode one data file's projected physical columns through its provider,
+/// checking the file's identity against the catalog key. `None` means the
+/// provider has no projected reader (the caller falls back to a full decode).
+fn decode_projected_via_provider(
+    entry: &AttachedEntry,
+    file: &DataFile<'_>,
+    root: &std::path::Path,
+    columns: &[usize],
+    filters: &[pinkdb::attached::PrunePredicate],
+) -> Result<Option<(DataTable, Vec<bool>)>> {
+    let Some((mini, present)) = entry.format.read_projected(file, columns, filters)? else {
+        return Ok(None);
+    };
+    let (file_db, file_table) = only_table(&mini, file.rel(), root)?;
+    if !file_db.eq_ignore_ascii_case(&entry.db)
+        || !file_table.name.eq_ignore_ascii_case(&entry.table)
+    {
+        return Err(LakeError::Corrupt {
+            path: file.path().to_path_buf(),
+            message: format!(
+                "data file holds {file_db}.{}, but the catalog says \"{}\"",
+                file_table.name,
+                entry.key()
+            ),
+        });
+    }
+    Ok(Some((file_table.clone(), present)))
 }
 
 /// Wrap a lake metadata error as an engine catalog error (resolution and
@@ -1006,36 +1108,6 @@ fn decode_via_provider(
         });
     }
     Ok(file_table.clone())
-}
-
-/// [`vortex_file::decode_projected`]'s per-file read for one table: decode
-/// only `columns`, check the file's identity against its catalog key, and
-/// hand the full-schema table (decoded columns + NULL placeholders) back.
-#[cfg(feature = "vortexlake")]
-fn load_projected_table(
-    entry: &AttachedEntry,
-    storage: &dyn Storage,
-    root: &std::path::Path,
-    rel: &str,
-    columns: &[usize],
-) -> Result<(DataTable, Vec<bool>)> {
-    let path = storage.abs(rel);
-    let data_file = DataFile::new(&path, rel, storage);
-    let (mini, present) = vortex_file::decode_projected(&data_file, columns)?;
-    let (file_db, file_table) = only_table(&mini, rel, root)?;
-    if !file_db.eq_ignore_ascii_case(&entry.db)
-        || !file_table.name.eq_ignore_ascii_case(&entry.table)
-    {
-        return Err(LakeError::Corrupt {
-            path,
-            message: format!(
-                "data file holds {file_db}.{}, but the catalog says \"{}\"",
-                file_table.name,
-                entry.key()
-            ),
-        });
-    }
-    Ok((file_table.clone(), present))
 }
 
 /// Swap freshly decoded columns into an already materialized table. The two
@@ -1334,6 +1406,7 @@ pub(crate) fn build_from(
     version: Option<u64>,
     lake_id: Option<&str>,
 ) -> Result<(Arc<LakeAttachment>, AttachmentReport)> {
+    let stats_before = storage.stats();
     let (manifest, manifest_path) = manifest_for(&**storage, root, version)?;
     if let Some(expected) = lake_id
         && manifest.format_version >= 6
@@ -1358,6 +1431,64 @@ pub(crate) fn build_from(
     let mut remote = false;
     #[cfg(not(feature = "vortexlake"))]
     let remote = false;
+    // Wave 98b: the footer of every file whose provider carries one is read
+    // **now**, concurrently and bounded — attach used to read them one after
+    // another. The results are consumed in manifest order below, so error
+    // attribution and validation order are unchanged. A provider whose
+    // format this build cannot read is skipped (that table's files are never
+    // touched; wave 88 rule 5).
+    let footer_jobs: Vec<(String, usize, String, Arc<dyn LakeFormat>)> = manifest
+        .tables
+        .iter()
+        .flat_map(|(key, entry)| {
+            let Ok(provider) = crate::format::format_for(entry.format().id(), &manifest_path)
+            else {
+                return Vec::new();
+            };
+            if !provider.has_footer_stats() {
+                return Vec::new();
+            }
+            entry
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| {
+                    (
+                        key.clone(),
+                        index,
+                        file.path().to_string(),
+                        Arc::clone(&provider),
+                    )
+                })
+                .collect()
+        })
+        .collect();
+    #[cfg(feature = "vortexlake")]
+    for (_, _, rel, _) in &footer_jobs {
+        let local = storage.local_path(rel).is_some();
+        remote |= !local && !encrypted;
+    }
+    #[cfg_attr(not(feature = "vortexlake"), allow(unused_variables, unused_mut))]
+    let mut footer_map: HashMap<(String, usize), Result<crate::format::FileFooter>> =
+        crate::map_bounded(&footer_jobs, crate::parallel_limit(), |job| {
+            let (key, index, rel, provider) = job;
+            let abs = storage.abs(rel);
+            let data_file = DataFile::new(&abs, rel, Arc::clone(storage));
+            (
+                (key.clone(), *index),
+                provider.footer_stats(&data_file).and_then(|footer| {
+                    footer.ok_or_else(|| LakeError::Internal {
+                        message: format!(
+                            "format \"{}\" advertises footer statistics but returned none \
+                             for \"{rel}\"",
+                            provider.id()
+                        ),
+                    })
+                }),
+            )
+        })
+        .into_iter()
+        .collect();
     for (key, entry) in &manifest.tables {
         let (dbname, table) = split_key(key, &manifest_path)?;
         // Wave 88, rule 5: a table whose format this build cannot read is
@@ -1500,21 +1631,11 @@ pub(crate) fn build_from(
                     // as `None` too: the whole object is read and
                     // unsealed before the footer is parsed, which is the
                     // documented stage-1 cost, not an object-storage
-                    // fact.
-                    let local = storage.local_path(file.path()).is_some();
-                    remote |= !local && !encrypted;
-                    let data_file = DataFile::new(&path, file.path(), &**storage);
-                    let footer =
-                        provider
-                            .footer_stats(&data_file)?
-                            .ok_or_else(|| LakeError::Internal {
-                                message: format!(
-                                    "format \"{}\" advertises footer statistics but returned none \
-                                 for \"{}\"",
-                                    provider.id(),
-                                    file.path()
-                                ),
-                            })?;
+                    // fact. The `remote` flag was computed before the
+                    // concurrent footer reads.
+                    let footer = footer_map
+                        .remove(&(key.clone(), fi))
+                        .expect("one precomputed footer per file")?;
                     if !footer.db.eq_ignore_ascii_case(dbname)
                         || !footer.table.eq_ignore_ascii_case(table)
                     {
@@ -1842,6 +1963,7 @@ pub(crate) fn build_from(
         views: Mutex::new(HashMap::new()),
         index: Mutex::new(None),
     });
+    let stats_after = storage.stats();
     let report = AttachmentReport {
         version: manifest.version,
         tables: attachment.tables.len(),
@@ -1849,6 +1971,13 @@ pub(crate) fn build_from(
         remote,
         encrypted,
         statistics_only,
+        requests: stats_after.requests.saturating_sub(stats_before.requests),
+        bytes: stats_after.bytes.saturating_sub(stats_before.bytes),
+        wait_nanos: stats_after
+            .wait_nanos
+            .saturating_sub(stats_before.wait_nanos),
+        ranged: storage.ranged_reads(),
+        parallelism: crate::parallel_limit(),
         lake: Arc::clone(&attachment) as Arc<dyn AttachedLake>,
     };
     Ok((attachment, report))

@@ -412,9 +412,10 @@ fn lake_s3_attach_reports_and_queries() {
         ),
     );
     assert!(
-        out.contains("footer-only") && out.contains("no ranged reads"),
+        out.contains("footer-only") && out.contains("ranged requests"),
         "{out}"
     );
+    assert!(out.contains("Transport:"), "{out}");
     assert!(out.contains("main.t (2 rows)"), "{out}");
     assert!(out.contains("Detached"), "{out}");
     assert!(!out.contains("Error:"), "{out}");

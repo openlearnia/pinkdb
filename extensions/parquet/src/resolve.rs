@@ -243,10 +243,9 @@ pub struct FileResolved {
     /// Per hive column (aligned with [`Resolved::hive`]): this file's value,
     /// `None` when the path has no such key.
     pub hive: Vec<Option<String>>,
-    /// The transport handle for a remote object (reused by the scan); `None`
+    /// The transport handle for a ranged object (reused by the scan); `None`
     /// for local files.
-    #[cfg(feature = "remote")]
-    pub(crate) remote: Option<remote::RemoteSpec>,
+    pub(crate) remote: Option<crate::ranged::RemoteSpec>,
 }
 
 /// A resolved `read_parquet` call: the files, the output schema and where
@@ -272,8 +271,7 @@ impl Resolved {
 /// the union schema.
 pub fn resolve(path: &str, options: &Options) -> Result<Resolved> {
     let mut metas = Vec::new();
-    #[cfg(feature = "remote")]
-    let mut remote_specs: Vec<Option<remote::RemoteSpec>> = Vec::new();
+    let mut remote_specs: Vec<Option<crate::ranged::RemoteSpec>> = Vec::new();
     if remote::is_remote(path) {
         #[cfg(feature = "remote")]
         {
@@ -310,7 +308,6 @@ pub fn resolve(path: &str, options: &Options) -> Result<Resolved> {
         metas.reserve(paths.len());
         for file in &paths {
             metas.push(read_file_meta(file)?);
-            #[cfg(feature = "remote")]
             remote_specs.push(None);
         }
     }
@@ -503,7 +500,6 @@ pub fn resolve(path: &str, options: &Options) -> Result<Resolved> {
                 meta,
                 out_to_file,
                 hive: hive_values,
-                #[cfg(feature = "remote")]
                 remote: remote_specs[i].take(),
             }
         })
@@ -515,6 +511,33 @@ pub fn resolve(path: &str, options: &Options) -> Result<Resolved> {
         kind,
         hive,
         options: options.clone(),
+    })
+}
+
+/// Resolve a single ranged object: read its footer through `source` and build
+/// the same one-file [`Resolved`] shape a local `read_parquet(path)` would
+/// produce (no hive columns, no filename/row-number virtual columns).
+pub fn resolve_source(path: &str, source: Arc<dyn crate::ranged::RangeSource>) -> Result<Resolved> {
+    let spec = crate::ranged::RemoteSpec::from_source(source);
+    let meta = crate::file_meta::read_file_meta_source(path, &spec)?;
+    let schema: Vec<(String, DataType)> = meta
+        .columns
+        .iter()
+        .map(|column| (column.name.clone(), column.ty))
+        .collect();
+    let kind = vec![OutKind::FileColumn; schema.len()];
+    let file = FileResolved {
+        out_to_file: (0..schema.len()).map(Some).collect(),
+        hive: Vec::new(),
+        remote: Some(spec),
+        meta,
+    };
+    Ok(Resolved {
+        files: vec![file],
+        schema,
+        kind,
+        hive: Vec::new(),
+        options: Options::default(),
     })
 }
 
