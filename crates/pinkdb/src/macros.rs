@@ -224,7 +224,11 @@ pub(crate) fn substitute_expr(
 ) -> Result<Expr> {
     tick(used, 1)?;
     Ok(match expr {
-        Expr::Column { table: None, name } => {
+        Expr::Column {
+            db: None,
+            table: None,
+            name,
+        } => {
             if let Some(replacement) = args.get(&name.to_ascii_lowercase()) {
                 count_expr(replacement, used)?;
                 replacement.clone()
@@ -348,8 +352,8 @@ pub(crate) fn substitute_expr(
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Star
-        | Expr::QualifiedStar(_)
-        | Expr::Column { table: Some(_), .. } => expr.clone(),
+        | Expr::QualifiedStar { .. }
+        | Expr::Column { .. } => expr.clone(),
     })
 }
 
@@ -538,7 +542,7 @@ fn count_expr(expr: &Expr, used: &std::cell::Cell<usize>) -> Result<()> {
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Star
-        | Expr::QualifiedStar(_)
+        | Expr::QualifiedStar { .. }
         | Expr::Column { .. } => Ok(()),
     }
 }
@@ -665,7 +669,7 @@ fn collect_expr_calls(expr: &Expr, out: &mut HashSet<String>) {
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Star
-        | Expr::QualifiedStar(_)
+        | Expr::QualifiedStar { .. }
         | Expr::Column { .. } => {}
     }
 }
@@ -839,6 +843,7 @@ mod tests {
             Some(Expr::Binary {
                 op: crate::sql::ast::BinaryOp::Eq,
                 left: Box::new(Expr::Column {
+                    db: None,
                     table: None,
                     name: "b".to_string()
                 }),

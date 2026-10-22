@@ -338,8 +338,23 @@ other sessions — `Database`/`Connection` carry their own current database, the
 shared store is untouched. `db.table` qualifies any table reference in
 `FROM`/`JOIN`, `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`, `DROP TABLE`,
 `CREATE VIEW` and `DROP VIEW`; cross-database joins (`db1.t JOIN db2.u`) work.
-Three-part column references (`db.table.col`) are not supported (clear parse
-error). CTEs shadow unqualified names only; a qualified name never resolves to
+A column may carry the same database qualifier: `db.table.column` anywhere a
+column expression is allowed (SELECT list, WHERE, HAVING, GROUP BY, ORDER BY,
+join `ON`, window `PARTITION BY`/`ORDER BY`, function arguments, subqueries,
+CTE bodies, `UPDATE … SET` right-hand sides/`WHERE`, `DELETE … WHERE`), and
+`db.table.*` in a projection (alone or beside other columns). `db.table` is
+resolved exactly like the FROM clause (case-insensitive; the database must
+exist) and must name an **unaliased** base table or view of that database —
+`SELECT db.t.a FROM db.t AS x` fails and tells you to write `x.a`, while the
+workaround `FROM db.t AS x … x.col` is unchanged. An unqualified `FROM t`
+belongs to the session's current database, so `SELECT main.t.a FROM t` works
+while `main` is current. Derived tables, CTEs, table functions and file scans
+have no database and never match. Two unaliased tables with the same name can
+only come from different databases (`FROM db1.t JOIN db2.t`): a two-part
+`t.c` there is an ambiguous-reference error naming both, so use `db1.t.c`,
+`db2.t.c` or aliases. Qualifiers in `UPDATE … SET` must name the statement's
+own target table (and database); errors name the full reference. CTEs shadow
+unqualified names only; a qualified name never resolves to
 a CTE. Views are session-local *and* per-database: created in the current
 database and resolved there, with their body resolving unqualified names in
 that same database. View bodies are self-contained: the caller's CTEs never
@@ -2725,8 +2740,6 @@ ties in ORDER BY have no stable order on either engine).
   checkpoint resets that coverage). A missing file at replay time is a hard
   error, and loading the same extension twice reports
   `extension "x" is already loaded`
-- Three-part column references (`db.table.col`) are unsupported; use an alias
-  (`SELECT x.col FROM db.table AS x`)
 - `USE`, `DATABASE`, `LOAD`, `EXTENSION` and
   `LEFT`/`RIGHT`/`OUTER`/`FULL`/`CROSS` are reserved
   words; quote identifiers to use them as names (`"use"` works)

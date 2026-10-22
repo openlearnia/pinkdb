@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-22
+### Wave 94 — `database.table.column` references ✅
+- Columns can be qualified with their database: `SELECT db1.t.a FROM db1.t`,
+  and `db1.t.*` in a SELECT list. It works in every clause, in `UPDATE … SET`
+  targets, and through the current database (`SELECT main.t.a FROM t`).
+- Joining two tables with the same name from different databases now works;
+  a plain `t.a` there is reported as ambiguous instead of silently picking
+  one of them.
+- An alias hides the table's own name, as in Postgres and DuckDB: with
+  `FROM db1.t AS x`, write `x.a` (the error says so).
+
 ### Wave 89 — lake replication jobs ✅
 - A lake can now keep copies of another lake's tables, or of a database in
   your session, in sync: `.lake replicate create <dest> from <source>`, then

@@ -219,7 +219,7 @@ fn check_source_positions(source: &FromSource) -> Result<()> {
 /// per-select rules.
 fn check_expr_positions(expr: &Expr) -> Result<()> {
     match expr {
-        Expr::Parameter(_) | Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) => Ok(()),
+        Expr::Parameter(_) | Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } => Ok(()),
         Expr::Column { .. } => Ok(()),
         Expr::Binary { left, right, .. } => {
             check_expr_positions(left)?;
@@ -276,7 +276,7 @@ fn check_expr_positions(expr: &Expr) -> Result<()> {
 fn expr_contains_parameter(expr: &Expr) -> bool {
     match expr {
         Expr::Parameter(_) => true,
-        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) | Expr::Column { .. } => false,
+        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } | Expr::Column { .. } => false,
         Expr::Binary { left, right, .. } => {
             expr_contains_parameter(left) || expr_contains_parameter(right)
         }
@@ -466,7 +466,7 @@ fn collect_source_offsets(source: &FromSource, out: &mut Vec<usize>) {
 fn collect_expr_offsets(expr: &Expr, out: &mut Vec<usize>) {
     match expr {
         Expr::Parameter(off) => out.push(*off),
-        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) | Expr::Column { .. } => {}
+        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } | Expr::Column { .. } => {}
         Expr::Binary { left, right, .. } => {
             collect_expr_offsets(left, out);
             collect_expr_offsets(right, out);
@@ -626,7 +626,7 @@ fn apply_expr_ranks(expr: &mut Expr, offsets: &[usize]) {
             debug_assert!(offsets.binary_search(off).is_ok());
             *off = offsets.binary_search(off).unwrap_or(0);
         }
-        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar(_) | Expr::Column { .. } => {}
+        Expr::Literal(_) | Expr::Star | Expr::QualifiedStar { .. } | Expr::Column { .. } => {}
         Expr::Binary { left, right, .. } => {
             apply_expr_ranks(left, offsets);
             apply_expr_ranks(right, offsets);
@@ -1152,11 +1152,14 @@ peg::parser! {
 
         /// `name` or `db.name` — a table reference. Three-part names are
         /// rejected as soon as the second dot appears, with a clear error
-        /// (this alternative reaches furthest and wins, whatever follows the
-        /// dot: `.col`, `.*`, or nothing at all).
+        /// saying a *table* has at most two parts (this alternative reaches
+        /// furthest and wins, whatever follows the dot: `.col`, `.*`, or
+        /// nothing at all). Column references are a separate grammar rule and
+        /// accept three parts (wave 94).
         rule table_ref() -> (Option<String>, String)
             = _db:ident() dot() _t:ident() dot() {?
-                  Err("three-part names (db.table.col) are not supported")
+                  Err("a table reference has at most two parts (database.table); \
+                       column references may be database.table.column")
               }
             / db:ident() dot() name:ident() { (Some(db), name) }
             / name:ident() { (None, name) }
@@ -1437,7 +1440,18 @@ peg::parser! {
                   Statement::Update { db: t.0, table: t.1, sets, where_clause: where_ }
               }
 
-        rule set_item() -> (String, Expr) = col:ident() eq() e:expr() { (col, e) }
+        /// One `SET` target: `column`, `table.column` or `db.table.column`
+        /// (wave 94); the binder checks a qualifier against the UPDATE target.
+        rule set_item() -> (crate::sql::ast::SetTarget, Expr)
+            = db:ident() dot() t:ident() dot() c:ident() eq() e:expr() {
+                  (crate::sql::ast::SetTarget { db: Some(db), table: Some(t), column: c }, e)
+              }
+            / t:ident() dot() c:ident() eq() e:expr() {
+                  (crate::sql::ast::SetTarget { db: None, table: Some(t), column: c }, e)
+              }
+            / c:ident() eq() e:expr() {
+                  (crate::sql::ast::SetTarget { db: None, table: None, column: c }, e)
+              }
 
         rule delete() -> Statement
             = kw(Keyword::Delete) kw(Keyword::From) t:table_ref() where_:where_clause()? {
@@ -1591,11 +1605,14 @@ peg::parser! {
                   CteDef { name, cols, query: Box::new(query) }
               }
 
-        /// `*` / `t.*` are whole-list-only in v1; a mid-list `*` is rejected by
-        /// `projection`'s top-level check.
+        /// A bare `*` and a two-part `t.*` are whole-list-only in v1 (a
+        /// mid-list one is rejected). A three-part `db.t.*` is an ordinary
+        /// projection and may sit next to other columns (wave 94).
         rule projection_list() -> Vec<Projection>
             = star() !"," { vec![Projection::Star] }
-            / t:ident() dot() star() !"," { vec![Projection::QualifiedStar(t)] }
+            / t:ident() dot() star() !"," {
+                  vec![Projection::QualifiedStar { db: None, table: t }]
+              }
             / first:projection() rest:(comma() p:projection() { p })* {
                   let mut out = vec![first];
                   out.extend(rest);
@@ -1603,8 +1620,11 @@ peg::parser! {
               }
 
         rule projection() -> Projection
-            = e:expr() alias:alias()? {?
-                  if matches!(&e, Expr::Star | Expr::QualifiedStar(_)) {
+            = db:ident() dot() t:ident() dot() star() {
+                  Projection::QualifiedStar { db: Some(db), table: t }
+              }
+            / e:expr() alias:alias()? {?
+                  if matches!(&e, Expr::Star | Expr::QualifiedStar { .. }) {
                       Err("`*` must be the whole projection list in v1")
                   } else {
                       Ok(Projection::Expr { expr: e, alias })
@@ -2000,20 +2020,37 @@ peg::parser! {
         rule ident_expr() -> Expr
             = coalesce_call()
             / fn_call()
-            / three_part_column()
-            / name:ident() dot() col:ident() { Expr::Column { table: Some(name), name: col } }
-            / name:ident() dot() star() { Expr::QualifiedStar(Some(name)) }
-            / name:ident() { Expr::Column { table: None, name } }
-
-        /// `db.table.col` / `db.table.*` are not supported: fail with a clear
-        /// message. This alternative consumes one token further than the
-        /// valid two-part forms, so its error is the one that surfaces.
-        rule three_part_column() -> Expr
-            = _db:ident() dot() _t:ident() dot() _c:ident() {?
-                  Err("three-part column references (db.table.col) are not supported")
+            / four_part_column()
+            / db:ident() dot() t:ident() dot() c:ident() {
+                  Expr::Column { db: Some(db), table: Some(t), name: c }
               }
-            / _db:ident() dot() _t:ident() dot() star() {?
-                  Err("three-part references (db.table.*) are not supported")
+            / db:ident() dot() t:ident() dot() star() {
+                  Expr::QualifiedStar { db: Some(db), table: t }
+              }
+            / name:ident() dot() col:ident() {
+                  Expr::Column { db: None, table: Some(name), name: col }
+              }
+            / name:ident() dot() star() {
+                  Expr::QualifiedStar { db: None, table: name }
+              }
+            / name:ident() { Expr::Column { db: None, table: None, name } }
+
+        /// Four or more parts (`a.b.c.d`, `a.b.c.d.e`, …) are refused. The
+        /// grammar cannot carry a dynamic PEG error (the error type is
+        /// `&'static str`), so it produces a marked column node carrying the
+        /// written reference; [`super::check_ast_depth`] walks the tree and
+        /// turns the marker into a parse error that names it. This rule is
+        /// tried before the valid three-part form so its longer match wins.
+        rule four_part_column() -> Expr
+            = text:$(_a:ident() dot() _b:ident() dot() _c:ident() dot() _d:ident()
+                       (dot() _r:ident())*) {
+                  Expr::Column {
+                      db: Some(crate::sql::FOUR_PART_MARKER.to_string()),
+                      table: None,
+                      // Identifiers consume trailing whitespace; name the
+                      // reference as written, without it.
+                      name: text.trim_end().to_string(),
+                  }
               }
 
         rule coalesce_call() -> Expr
@@ -3191,9 +3228,7 @@ mod tests {
         "SELECT a FROM db1.t.;",
         "CREATE TABLE db1.t.col (a INTEGER);",
         "CREATE VIEW db1.t.col AS SELECT 1;",
-        "SELECT db1.t.a FROM db1.t;",
-        "SELECT db1.t.* FROM db1.t;",
-        "SELECT a FROM db1.t WHERE db1.t.a = 1;",
+        "SELECT a.b.c.d FROM a;",
         "DROP TABLE db1.;",
         "CREATE VIEW db1.;",
         "SELECT * FROM db1.t JOIN db2.u;",
@@ -4084,11 +4119,51 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        // Three-part references are rejected with a clear message.
-        let e = parse("SELECT db1.t.a FROM db1.t;").unwrap_err();
-        assert!(e.to_string().contains("three-part"), "{e}");
-        let e = parse("SELECT db1.t.* FROM db1.t;").unwrap_err();
-        assert!(e.to_string().contains("three-part"), "{e}");
+        // Three-part column references parse (wave 94); the binder resolves
+        // them. Quoted and multi-word parts work in every position.
+        let Statement::Select(sel) = parse_one("SELECT db1.t.a, db1.t.* FROM db1.t;") else {
+            panic!()
+        };
+        match &sel.projections[0] {
+            Projection::Expr {
+                expr:
+                    Expr::Column {
+                        db: Some(db),
+                        table: Some(table),
+                        name,
+                    },
+                ..
+            } => {
+                assert_eq!(
+                    (db.as_str(), table.as_str(), name.as_str()),
+                    ("db1", "t", "a")
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            &sel.projections[1],
+            Projection::QualifiedStar { db: Some(db), table } if db == "db1" && table == "t"
+        ));
+        let Statement::Select(sel) =
+            parse_one("SELECT \"My Db\".\"t 1\".\"a b\" FROM \"My Db\".\"t 1\";")
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            &sel.projections[0],
+            Projection::Expr {
+                expr: Expr::Column { db: Some(db), table: Some(t), name },
+                ..
+            } if db == "My Db" && t == "t 1" && name == "a b"
+        ));
+        // Four or more parts are refused with a clear message naming the
+        // written reference.
+        let e = parse("SELECT a.b.c.d FROM a;").unwrap_err().to_string();
+        assert!(e.contains("at most three parts"), "{e}");
+        assert!(e.contains("a.b.c.d"), "{e}");
+        let e = parse("SELECT a.b.c.d.e FROM a;").unwrap_err().to_string();
+        assert!(e.contains("a.b.c.d.e"), "{e}");
     }
 
     #[test]
@@ -4213,10 +4288,10 @@ mod tests {
         assert_eq!(lit("SELECT 'a\0b';"), Value::Varchar("a\0b".to_string()));
     }
 
-    /// The four three-part shapes fail with a clear, specific message, not a
-    /// generic PEG error.
+    /// Three-part *table* names still fail with a clear message that no
+    /// longer claims column references are unsupported (wave 94).
     #[test]
-    fn three_part_reference_errors_are_clear() {
+    fn three_part_table_names_are_refused_clearly() {
         let cases = [
             "SELECT * FROM db1.t.*;",
             "SELECT a FROM db1.t.;",
@@ -4226,7 +4301,11 @@ mod tests {
         for sql in cases {
             let e = parse(sql).unwrap_err().to_string();
             assert!(
-                e.contains("three-part names (db.table.col) are not supported"),
+                e.contains("a table reference has at most two parts (database.table)"),
+                "{sql}: {e}"
+            );
+            assert!(
+                !e.contains("column references are not supported"),
                 "{sql}: {e}"
             );
         }

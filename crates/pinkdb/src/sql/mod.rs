@@ -27,6 +27,13 @@ pub(crate) use binder::{bind_mv_query, bind_tracked};
 /// smallest measured crash point.
 pub(crate) const MAX_AST_DEPTH: usize = 64;
 
+/// Internal marker the PEG grammar puts in `Expr::Column.db` for a reference
+/// with four or more parts (`a.b.c.d`). The grammar's error type cannot carry
+/// a dynamic message, so [`check_ast_depth`] walks the tree and reports the
+/// written reference. Never produced for valid SQL (`table` is `None` only
+/// here); see `four_part_column` in the parser.
+pub(crate) const FOUR_PART_MARKER: &str = "__pinkdb_four_part_reference__";
+
 /// Maximum nesting depth the parser accepts, measured in "nesting units":
 /// one unit per open `(`, open `CASE` arm, or consecutive prefix unary
 /// operator enclosing the current point. Deeper input is rejected with
@@ -194,7 +201,7 @@ pub(crate) fn parameter_offsets(sql: &str) -> Vec<usize> {
 /// returned: dropping an over-deep tree would otherwise recurse through the
 /// drop glue and overflow the very stack this guard exists to protect.
 pub(crate) fn check_ast_depth(stmts: &mut Vec<ast::Statement>) -> Result<()> {
-    let depth = max_ast_depth(stmts);
+    let depth = max_ast_depth(stmts)?;
     if depth <= MAX_AST_DEPTH {
         return Ok(());
     }
@@ -220,11 +227,26 @@ enum NodeRef<'a> {
 }
 
 /// Maximum root-to-leaf node count, via an explicit worklist (no recursion).
-fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
+fn max_ast_depth(stmts: &[ast::Statement]) -> Result<usize> {
     let mut work: Vec<(NodeRef, usize)> =
         stmts.iter().map(|s| (NodeRef::Statement(s), 1)).collect();
     let mut max = 0;
     while let Some((node, depth)) = work.pop() {
+        // A four-or-more-part column reference: the parser marks it (its PEG
+        // error type cannot carry the written text), and this walk reports it
+        // with the reference named (wave 94).
+        if let NodeRef::Expr(ast::Expr::Column {
+            db: Some(marker),
+            table: None,
+            name,
+        }) = node
+            && marker == FOUR_PART_MARKER
+        {
+            return Err(PinkDbError::Parse(format!(
+                "column references have at most three parts (database.table.column), \
+                 got \"{name}\""
+            )));
+        }
         max = max.max(depth);
         let child = depth + 1;
         match node {
@@ -264,6 +286,11 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                 }
                 ast::Statement::Select(select) => {
                     work.push((NodeRef::Select(select), child));
+                }
+                ast::Statement::Call { args, .. } => {
+                    for e in args {
+                        work.push((NodeRef::Expr(e), child));
+                    }
                 }
                 ast::Statement::CreateMacro { params, body, .. } => {
                     for p in params {
@@ -373,7 +400,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
                 | ast::Expr::Parameter(_)
                 | ast::Expr::Star
                 | ast::Expr::Column { .. }
-                | ast::Expr::QualifiedStar(_) => {}
+                | ast::Expr::QualifiedStar { .. } => {}
             },
             NodeRef::FromClause(from) => {
                 work.push((NodeRef::FromSource(&from.source), child));
@@ -415,7 +442,7 @@ fn max_ast_depth(stmts: &[ast::Statement]) -> usize {
             }
         }
     }
-    max
+    Ok(max)
 }
 
 /// Free an over-deep AST without recursing: move every child into an explicit
@@ -502,6 +529,9 @@ fn take_statement_children(
         }
         ast::Statement::Select(select) => {
             selects.push(std::mem::replace(select, empty_select()));
+        }
+        ast::Statement::Call { args, .. } => {
+            exprs.append(args);
         }
         ast::Statement::CreateMacro { params, body, .. } => {
             for p in params.drain(..) {
@@ -631,7 +661,7 @@ fn take_expr_children(
         | ast::Expr::Parameter(_)
         | ast::Expr::Star
         | ast::Expr::Column { .. }
-        | ast::Expr::QualifiedStar(_) => {}
+        | ast::Expr::QualifiedStar { .. } => {}
     }
 }
 

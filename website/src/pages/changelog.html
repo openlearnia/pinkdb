@@ -9,6 +9,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-22</h2>
+<h3>Wave 94 — <code>database.table.column</code> references ✅</h3>
+<ul>
+<li>Columns can be qualified with their database: <code>SELECT db1.t.a FROM db1.t</code>, and <code>db1.t.*</code> in a SELECT list. It works in every clause, in <code>UPDATE … SET</code> targets, and through the current database (<code>SELECT main.t.a FROM t</code>).</li>
+<li>Joining two tables with the same name from different databases now works; a plain <code>t.a</code> there is reported as ambiguous instead of silently picking one of them.</li>
+<li>An alias hides the table's own name, as in Postgres and DuckDB: with <code>FROM db1.t AS x</code>, write <code>x.a</code> (the error says so).</li>
+</ul>
 <h3>Wave 89 — lake replication jobs ✅</h3>
 <ul>
 <li>A lake can now keep copies of another lake's tables, or of a database in your session, in sync: <code>.lake replicate create &lt;dest&gt; from &lt;source&gt;</code>, then <code>.lake replicate catchup</code> or a background <code>.lake replicate start</code>.</li>

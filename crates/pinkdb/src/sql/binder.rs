@@ -965,7 +965,26 @@ impl ParamSlots {
 struct ScopeTable {
     /// Effective name (alias if present, else table name), lowercased.
     name: String,
+    /// Original table/view name (lowercased) for a base table or view; `None`
+    /// for derived tables, CTEs, table functions and file scans — scopes with
+    /// no database, which never match a three-part reference.
+    original: Option<String>,
+    /// Database holding the base table/view; `None` when there is none.
+    db: Option<String>,
+    /// True when `name` is an alias (which hides `original`, wave 94).
+    is_alias: bool,
     columns: Vec<(String, DataType)>,
+}
+
+impl ScopeTable {
+    /// The `db.table` name this scope resolves under, for error messages.
+    /// A scope with no database is named by its effective name.
+    fn qualified_name(&self) -> String {
+        match (&self.db, &self.original) {
+            (Some(db), Some(table)) => format!("{db}.{table}"),
+            _ => self.name.clone(),
+        }
+    }
 }
 
 struct Binder<'a> {
@@ -1192,41 +1211,135 @@ impl<'a> Binder<'a> {
         }
     }
 
-    fn lookup_column(&self, table: Option<&str>, col: &str) -> Result<(usize, DataType)> {
-        let mut found: Option<(usize, DataType)> = None;
-        let mut base = 0;
-        for t in &self.tables {
-            if let Some(q) = table
-                && !t.name.eq_ignore_ascii_case(q)
-            {
-                base += t.columns.len();
-                continue;
-            }
-            for (i, (name, dtype)) in t.columns.iter().enumerate() {
-                if name.eq_ignore_ascii_case(col) {
-                    if table.is_none() && found.is_some() {
-                        return Err(PinkDbError::Catalog(format!(
-                            "column \"{col}\" is ambiguous"
-                        )));
+    /// Resolve a column reference against the FROM scope.
+    ///
+    /// - `db.table.column` (wave 94): `db.table` must be an **unaliased** base
+    ///   table or view of database `db` (an alias hides the original name);
+    ///   derived tables, CTEs, table functions and file scans never match.
+    /// - `table.column`: matches by effective name; a name shared by two
+    ///   entries (only possible across databases) is ambiguous.
+    /// - `column`: today's bare-name ambiguity rule.
+    fn lookup_column(
+        &self,
+        db: Option<&str>,
+        table: Option<&str>,
+        col: &str,
+    ) -> Result<(usize, DataType)> {
+        if let Some(qdb) = db {
+            let qtable = table.expect("a database qualifier implies a table qualifier");
+            let mut found: Option<(usize, DataType)> = None;
+            let mut aliased_as: Option<&str> = None;
+            // Whether any FROM entry is the named base table/view of `qdb`
+            // (aliased or not) separates "not in scope" from "aliased".
+            let mut in_scope = false;
+            // An unaliased entry wins over any aliased one of the same name:
+            // `db.t` stays visible when `db.t AS x` is also joined in.
+            let mut unaliased_in_scope = false;
+            let mut base = 0;
+            for t in &self.tables {
+                let same_table = t.db.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(qdb))
+                    && t.original
+                        .as_deref()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(qtable));
+                if !same_table {
+                    base += t.columns.len();
+                    continue;
+                }
+                in_scope = true;
+                if t.is_alias {
+                    // An alias hides the original table name (Postgres /
+                    // DuckDB rule): remember it to name the workaround.
+                    if aliased_as.is_none() {
+                        aliased_as = Some(&t.name);
                     }
-                    found = Some((base + i, *dtype));
-                    if table.is_some() {
+                    base += t.columns.len();
+                    continue;
+                }
+                unaliased_in_scope = true;
+                for (i, (name, dtype)) in t.columns.iter().enumerate() {
+                    if name.eq_ignore_ascii_case(col) {
+                        found = Some((base + i, *dtype));
                         break;
                     }
                 }
+                if found.is_some() {
+                    break;
+                }
+                base += t.columns.len();
             }
-            if table.is_some() && found.is_some() {
-                break;
+            if let Some(hit) = found {
+                return Ok(hit);
             }
-            base += t.columns.len();
+            if let Some(alias) = aliased_as
+                && !unaliased_in_scope
+            {
+                return Err(PinkDbError::Catalog(format!(
+                    "table \"{qdb}.{qtable}\" is aliased as \"{alias}\" in this query; \
+                     refer to its columns as {alias}.{col}"
+                )));
+            }
+            if in_scope {
+                return Err(PinkDbError::Catalog(format!(
+                    "no column \"{qdb}.{qtable}.{col}\""
+                )));
+            }
+            return Err(PinkDbError::Catalog(format!(
+                "no table \"{qdb}.{qtable}\" in this query's FROM clause"
+            )));
         }
-        found.ok_or_else(|| {
-            if let Some(q) = table {
-                PinkDbError::Catalog(format!("no column \"{q}.{col}\""))
-            } else {
-                PinkDbError::Catalog(format!("no column \"{col}\""))
+
+        if let Some(q) = table {
+            // Every entry whose effective name is `q` (only aliases or
+            // unaliased base tables share one name; duplicates within one
+            // database are rejected when the FROM clause binds).
+            let mut matches: Vec<(&ScopeTable, usize)> = Vec::new();
+            let mut base = 0;
+            for t in &self.tables {
+                if t.name.eq_ignore_ascii_case(q) {
+                    matches.push((t, base));
+                }
+                base += t.columns.len();
             }
-        })
+            match matches.as_slice() {
+                [] => Err(PinkDbError::Catalog(format!("no column \"{q}.{col}\""))),
+                [(t, base)] => {
+                    for (i, (name, dtype)) in t.columns.iter().enumerate() {
+                        if name.eq_ignore_ascii_case(col) {
+                            return Ok((base + i, *dtype));
+                        }
+                    }
+                    Err(PinkDbError::Catalog(format!("no column \"{q}.{col}\"")))
+                }
+                many => {
+                    // Wave 94: `FROM db1.t JOIN db2.t` — both are effective
+                    // `t`, so a two-part reference cannot pick one. (Before
+                    // this, the first entry won silently.)
+                    let names: Vec<String> = many.iter().map(|(t, _)| t.qualified_name()).collect();
+                    Err(PinkDbError::Catalog(format!(
+                        "column reference \"{q}.{col}\" is ambiguous: table name \"{q}\" matches \
+                         {}; use the three-part form db.{q}.{col} or an alias",
+                        names.join(" and ")
+                    )))
+                }
+            }
+        } else {
+            let mut found: Option<(usize, DataType)> = None;
+            let mut base = 0;
+            for t in &self.tables {
+                for (i, (name, dtype)) in t.columns.iter().enumerate() {
+                    if name.eq_ignore_ascii_case(col) {
+                        if found.is_some() {
+                            return Err(PinkDbError::Catalog(format!(
+                                "column \"{col}\" is ambiguous"
+                            )));
+                        }
+                        found = Some((base + i, *dtype));
+                    }
+                }
+                base += t.columns.len();
+            }
+            found.ok_or_else(|| PinkDbError::Catalog(format!("no column \"{col}\"")))
+        }
     }
 
     fn bind_expr(
@@ -1241,20 +1354,23 @@ impl<'a> Binder<'a> {
             Expr::Star => Err(PinkDbError::Parse(
                 "`*` is only valid in the projection list or COUNT(*)".to_string(),
             )),
-            Expr::QualifiedStar(_) => Err(PinkDbError::Parse(
+            Expr::QualifiedStar { .. } => Err(PinkDbError::Parse(
                 "`t.*` is only valid in the projection list".to_string(),
             )),
-            Expr::Column { table, name } => {
+            Expr::Column { db, table, name } => {
                 // Wave 44: a procedure call's variables shadow columns. The
                 // variable's *value* is bound as a literal (never SQL text).
-                if table.is_none()
+                // Wave 94: only unqualified names can be variables.
+                if db.is_none()
+                    && table.is_none()
                     && let Some(value) = self.params.as_ref().and_then(|slots| slots.variable(name))
                 {
                     return Ok(BoundExpr::Literal(value));
                 }
                 // Alias substitution (`... ORDER BY x`), with a cycle guard so
                 // `SELECT x AS x` resolves to the column instead of recursing.
-                if table.is_none() && self.allow_alias {
+                // Only unqualified names are select aliases.
+                if db.is_none() && table.is_none() && self.allow_alias {
                     let key = name.to_ascii_lowercase();
                     if !self.resolving.contains(&key)
                         && let Some(aliased) = self.aliases.get(&key).cloned()
@@ -1265,7 +1381,14 @@ impl<'a> Binder<'a> {
                         return bound;
                     }
                 }
-                let (index, dtype) = self.lookup_column(table.as_deref(), name)?;
+                // A database qualifier resolves like a FROM reference: the
+                // database must exist (wave 94).
+                if let Some(q) = db
+                    && !self.db.database_exists(q)
+                {
+                    return Err(PinkDbError::Catalog(format!("database \"{q}\" not found")));
+                }
+                let (index, dtype) = self.lookup_column(db.as_deref(), table.as_deref(), name)?;
                 Ok(BoundExpr::Column { index, dtype })
             }
             Expr::Binary { op, left, right } => {
@@ -2457,13 +2580,14 @@ fn default_name(expr: &Expr) -> String {
         // first; the display name keeps `SELECT ?`-style output sensible.
         Expr::Parameter(i) => format!("?{}", i + 1),
         Expr::Star => "*".to_string(),
-        Expr::Column { table, name } => match table {
-            Some(t) => format!("{t}.{name}"),
-            None => name.clone(),
+        Expr::Column { db, table, name } => match (db, table) {
+            (Some(d), Some(t)) => format!("{d}.{t}.{name}"),
+            (None, Some(t)) => format!("{t}.{name}"),
+            _ => name.clone(),
         },
-        Expr::QualifiedStar(t) => match t {
-            Some(t) => format!("{t}.*"),
-            None => "*".to_string(),
+        Expr::QualifiedStar { db, table } => match db {
+            Some(d) => format!("{d}.{table}.*"),
+            None => format!("{table}.*"),
         },
         Expr::Binary { op, left, right } => {
             let sym = match op {
@@ -3751,7 +3875,7 @@ fn expr_has_subquery(expr: &Expr) -> bool {
         Expr::Literal(_)
         | Expr::Parameter(_)
         | Expr::Star
-        | Expr::QualifiedStar(_)
+        | Expr::QualifiedStar { .. }
         | Expr::Column { .. } => false,
     }
 }
@@ -4187,7 +4311,7 @@ fn bind_update(
     default_db: &str,
     qdb: &Option<String>,
     table: &str,
-    sets: &[(String, Expr)],
+    sets: &[(SetTarget, Expr)],
     where_clause: &Option<Expr>,
     params: Option<ParamSlots>,
 ) -> Result<(LogicalPlan, Vec<String>)> {
@@ -4201,11 +4325,39 @@ fn bind_update(
             "UPDATE needs at least one SET assignment".to_string(),
         ));
     }
-    let mut seen = std::collections::HashSet::new();
-    for (col, _) in sets {
-        if !seen.insert(col.to_ascii_lowercase()) {
+    // Wave 94: a qualified SET target must name this statement's own target
+    // table (and database); any other qualifier is an error naming both.
+    let own_ref = format!("{table_db}.{}", t.name);
+    for (target, _) in sets {
+        if let Some(qdb) = &target.db
+            && !qdb.eq_ignore_ascii_case(&table_db)
+        {
             return Err(PinkDbError::Catalog(format!(
-                "duplicate SET column \"{col}\""
+                "UPDATE SET target \"{qdb}.{}.{}\" does not match the statement's target \
+                 table \"{own_ref}\"",
+                target.table.as_deref().unwrap_or_default(),
+                target.column
+            )));
+        }
+        if let Some(qtable) = &target.table
+            && !qtable.eq_ignore_ascii_case(&t.name)
+        {
+            let written = match &target.db {
+                Some(qdb) => format!("{qdb}.{qtable}.{}", target.column),
+                None => format!("{qtable}.{}", target.column),
+            };
+            return Err(PinkDbError::Catalog(format!(
+                "UPDATE SET target \"{written}\" does not match the statement's target table \
+                 \"{own_ref}\""
+            )));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (target, _) in sets {
+        if !seen.insert(target.column.to_ascii_lowercase()) {
+            return Err(PinkDbError::Catalog(format!(
+                "duplicate SET column \"{}\"",
+                target.column
             )));
         }
     }
@@ -4213,10 +4365,14 @@ fn bind_update(
     binder.allow_win = false;
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
+        original: Some(t.name.to_ascii_lowercase()),
+        db: Some(table_db.clone()),
+        is_alias: false,
         columns: t.schema(),
     });
     let mut bound_sets = Vec::with_capacity(sets.len());
-    for (col, expr) in sets {
+    for (set_target, expr) in sets {
+        let col = &set_target.column;
         let idx = t
             .column_index(col)
             .map_err(|_| PinkDbError::Catalog(format!("no column \"{col}\"")))?;
@@ -4286,6 +4442,9 @@ fn bind_delete(
     binder.allow_alias = false;
     binder.tables.push(ScopeTable {
         name: t.name.to_ascii_lowercase(),
+        original: Some(t.name.to_ascii_lowercase()),
+        db: Some(table_db.clone()),
+        is_alias: false,
         columns: t.schema(),
     });
     let mut no_aggs = Vec::new();
@@ -5558,6 +5717,9 @@ fn bind_table_function(
             return Ok((
                 ScopeTable {
                     name: eff.to_ascii_lowercase(),
+                    original: None,
+                    db: None,
+                    is_alias: alias.is_some(),
                     columns: schema.clone(),
                 },
                 LogicalPlan::TableFunction {
@@ -5639,6 +5801,9 @@ fn bind_source(
                 return Ok((
                     ScopeTable {
                         name: eff.to_ascii_lowercase(),
+                        original: None,
+                        db: None,
+                        is_alias: alias.is_some(),
                         columns: schema.clone(),
                     },
                     LogicalPlan::Scan {
@@ -5696,6 +5861,9 @@ fn bind_source(
                 return Ok((
                     ScopeTable {
                         name: eff.to_ascii_lowercase(),
+                        original: Some(name.to_ascii_lowercase()),
+                        db: Some(lookup_db.clone()),
+                        is_alias: alias.is_some(),
                         columns: schema,
                     },
                     sub,
@@ -5712,6 +5880,9 @@ fn bind_source(
             Ok((
                 ScopeTable {
                     name: eff.to_ascii_lowercase(),
+                    original: Some(name.to_ascii_lowercase()),
+                    db: Some(lookup_db.clone()),
+                    is_alias: alias.is_some(),
                     columns,
                 },
                 LogicalPlan::Scan {
@@ -5769,6 +5940,9 @@ fn bind_source(
                 return Ok((
                     ScopeTable {
                         name: eff.to_ascii_lowercase(),
+                        original: None,
+                        db: None,
+                        is_alias: alias.is_some(),
                         columns: schema,
                     },
                     sub,
@@ -5794,6 +5968,9 @@ fn bind_source(
                     return Ok((
                         ScopeTable {
                             name: eff.to_ascii_lowercase(),
+                            original: None,
+                            db: None,
+                            is_alias: alias.is_some(),
                             columns: schema.clone(),
                         },
                         LogicalPlan::TableFunction {
@@ -5828,6 +6005,9 @@ fn bind_source(
             Ok((
                 ScopeTable {
                     name: alias.to_ascii_lowercase(),
+                    original: None,
+                    db: None,
+                    is_alias: true,
                     columns: schema,
                 },
                 sub,
@@ -5920,7 +6100,19 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         binder.tables.push(left);
         for join in &from.joins {
             let (right, right_plan) = bind_source(db, binder, &join.source, &join.alias, join.at)?;
-            if binder.tables.iter().any(|t| t.name == right.name) {
+            // The same effective name twice is refused, except for two
+            // unaliased base tables from *different* databases
+            // (`FROM db1.t JOIN db2.t`, wave 94): those stay in scope and a
+            // two-part `t.c` is ambiguous; a three-part reference or an alias
+            // disambiguates. Every other duplicate keeps the old error.
+            let duplicate = binder.tables.iter().any(|t| {
+                t.name == right.name
+                    && match (&t.db, &right.db) {
+                        (Some(a), Some(b)) => a == b,
+                        _ => true,
+                    }
+            });
+            if duplicate {
                 return Err(PinkDbError::Catalog(format!(
                     "table name \"{}\" specified more than once (use an alias)",
                     right.name
@@ -6004,11 +6196,19 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
         match proj {
             Projection::Star => {
                 for t in &binder.tables {
-                    // Qualify: with two tables in scope, bare names are ambiguous.
-                    let q = t.name.clone();
+                    // Qualify: with two tables in scope, bare names are
+                    // ambiguous. An unaliased base table uses its three-part
+                    // name, because another database may hold the same table
+                    // name (`db1.t JOIN db2.t`, wave 94); an alias or a
+                    // database-less scope has a unique effective name.
+                    let (db, q) = match (&t.db, t.is_alias) {
+                        (Some(d), false) => (Some(d.clone()), t.name.clone()),
+                        _ => (None, t.name.clone()),
+                    };
                     for (name, _) in &t.columns.clone() {
                         pending.push((
                             Expr::Column {
+                                db: db.clone(),
                                 table: Some(q.clone()),
                                 name: name.clone(),
                             },
@@ -6017,17 +6217,77 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
                     }
                 }
             }
-            Projection::QualifiedStar(q) => {
-                let cols = binder
-                    .tables
-                    .iter()
-                    .find(|t| t.name.eq_ignore_ascii_case(q))
-                    .map(|t| t.columns.clone())
-                    .ok_or_else(|| PinkDbError::Catalog(format!("no table \"{q}\" for `{q}.*`")))?;
+            Projection::QualifiedStar { db, table } => {
+                let star = match db {
+                    Some(d) => format!("{d}.{table}.*"),
+                    None => format!("{table}.*"),
+                };
+                let cols = if let Some(qdb) = db {
+                    // Wave 94: `db.table.*` names an unaliased base table or
+                    // view of `qdb`, exactly like a three-part column.
+                    if !binder.db.database_exists(qdb) {
+                        return Err(PinkDbError::Catalog(format!(
+                            "database \"{qdb}\" not found"
+                        )));
+                    }
+                    let mut unaliased = None;
+                    let mut aliased_as = None;
+                    for t in &binder.tables {
+                        let same_table =
+                            t.db.as_deref().is_some_and(|d| d.eq_ignore_ascii_case(qdb))
+                                && t.original
+                                    .as_deref()
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(table));
+                        if !same_table {
+                            continue;
+                        }
+                        if t.is_alias {
+                            aliased_as.get_or_insert(t.name.clone());
+                        } else {
+                            unaliased = Some(t.columns.clone());
+                        }
+                    }
+                    if let Some(cols) = unaliased {
+                        cols
+                    } else if let Some(alias) = aliased_as {
+                        return Err(PinkDbError::Catalog(format!(
+                            "table \"{qdb}.{table}\" is aliased as \"{alias}\" in this query; \
+                             refer to its columns as {alias}.*"
+                        )));
+                    } else {
+                        return Err(PinkDbError::Catalog(format!(
+                            "no table \"{qdb}.{table}\" in this query's FROM clause"
+                        )));
+                    }
+                } else {
+                    let matches: Vec<&ScopeTable> = binder
+                        .tables
+                        .iter()
+                        .filter(|t| t.name.eq_ignore_ascii_case(table))
+                        .collect();
+                    match matches.as_slice() {
+                        [] => {
+                            return Err(PinkDbError::Catalog(format!(
+                                "no table \"{table}\" for `{star}`"
+                            )));
+                        }
+                        [t] => t.columns.clone(),
+                        many => {
+                            let names: Vec<String> =
+                                many.iter().map(|t| t.qualified_name()).collect();
+                            return Err(PinkDbError::Catalog(format!(
+                                "table reference \"{star}\" is ambiguous: table name \"{table}\" \
+                                 matches {}; use db.{table}.* or an alias",
+                                names.join(" and ")
+                            )));
+                        }
+                    }
+                };
                 for (name, _) in &cols {
                     pending.push((
                         Expr::Column {
-                            table: Some(q.clone()),
+                            db: db.clone(),
+                            table: Some(table.clone()),
                             name: name.clone(),
                         },
                         name.clone(),
@@ -6252,7 +6512,11 @@ fn bind_select_body(db: &PinkDb, binder: &mut Binder, sel: &Select) -> Result<Lo
             continue;
         }
         // Select alias → reuse that output (no hidden column).
-        if let Expr::Column { table: None, name } = &item.expr
+        if let Expr::Column {
+            db: None,
+            table: None,
+            name,
+        } = &item.expr
             && let Some(pos) = proj_names[..visible]
                 .iter()
                 .position(|n| n.eq_ignore_ascii_case(name))

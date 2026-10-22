@@ -1910,9 +1910,16 @@ mod tests {
                 ],
             ]
         );
-        // Three-part column references stay a parse error.
-        let err = c.execute("SELECT db1.t.a FROM db1.t;").unwrap_err();
-        assert!(err.to_string().contains("three-part"), "{err}");
+        // Three-part column references resolve (wave 94). Two databases may
+        // each have an unaliased `t`, so the two-part form is ambiguous.
+        assert_eq!(
+            rows_of(c.execute("SELECT db1.t.a FROM db1.t ORDER BY 1;").unwrap()),
+            vec![vec![Value::Integer(1)], vec![Value::Integer(2)]]
+        );
+        let err = c
+            .execute("SELECT t.tag FROM main.t JOIN db1.t ON main.t.a = db1.t.a;")
+            .unwrap_err();
+        assert!(err.to_string().contains("ambiguous"), "{err}");
     }
 
     #[test]

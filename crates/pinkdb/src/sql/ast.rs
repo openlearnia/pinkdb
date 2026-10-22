@@ -34,8 +34,10 @@ pub enum Statement {
     Update {
         db: Option<String>,
         table: String,
-        /// `(column, expression)` pairs in written order.
-        sets: Vec<(String, Expr)>,
+        /// `(target, expression)` pairs in written order. The target may be
+        /// `column`, `table.column` or `db.table.column` (wave 94); a
+        /// qualifier must name this statement's own target table.
+        sets: Vec<(SetTarget, Expr)>,
         where_clause: Option<Expr>,
     },
     Delete {
@@ -420,10 +422,20 @@ pub enum SetOp {
 pub enum Projection {
     /// `*`
     Star,
-    /// `alias.*`
-    QualifiedStar(String),
+    /// `table.*` or `db.table.*` (wave 94). `db` is `None` for the two-part
+    /// form; a database qualifier is never present without a table.
+    QualifiedStar { db: Option<String>, table: String },
     /// `expr [AS alias]`
     Expr { expr: Expr, alias: Option<String> },
+}
+
+/// One `UPDATE ... SET` target: `column`, `table.column` or
+/// `db.table.column` (wave 94). `db` implies `table`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetTarget {
+    pub db: Option<String>,
+    pub table: Option<String>,
+    pub column: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -580,11 +592,20 @@ pub enum Expr {
     Parameter(usize),
     /// Bare `*` (only valid as a function arg for `COUNT(*)`).
     Star,
+    /// `column`, `table.column` or `db.table.column` (wave 94). A database
+    /// qualifier implies a table qualifier.
     Column {
+        db: Option<String>,
         table: Option<String>,
         name: String,
     },
-    QualifiedStar(Option<String>),
+    /// `table.*` or `db.table.*` in expression position (rejected by the
+    /// binder outside a projection; the projection parser owns the accepted
+    /// shapes).
+    QualifiedStar {
+        db: Option<String>,
+        table: String,
+    },
     Binary {
         op: BinaryOp,
         left: Box<Expr>,

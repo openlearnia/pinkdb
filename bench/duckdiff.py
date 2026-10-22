@@ -6,7 +6,8 @@ mutations never leak between cases. Results compare at value level:
 ints exact, floats within tolerance, NULLs, dates/timestamps normalized
 to microseconds. Column names are ignored (header formats differ).
 
-Batteries: small relational set (in-SQL setup) + 1M-row CSV set + the two
+Batteries: small relational set (in-SQL setup) + three-part column references
+(wave 94; per-engine multi-database setup) + 1M-row CSV set + the two
 file-format batteries (Arrow IPC and Parquet) + the remote-file battery
 (wave 75: https/http and s3 are covered by Rust tests; this battery reads
 parquet/CSV from a local HTTP server with both engines), which need a pinkdb
@@ -683,6 +684,7 @@ def run_small():
     for label, sql, ordered, expect_error in NAN_QUERIES:
         run_case(label, sql, ordered, expect_error, SETUP + "\n" + NAN_SETUP,
                  SETUP + "\n" + NAN_SETUP)
+    run_three_part()
     run_arrow()
     run_parquet()
 
@@ -855,6 +857,87 @@ def run_pair(label, psql, dsql, shared_setup_and_psetup, ordered):
     prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
     ok = rows_equal(prows_n, d[1], ordered)
     check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
+
+
+# ---- wave 94: three-part column references (`db.table.column`) ----
+#
+# DuckDB spells a database as an attached catalog (`ATTACH ':memory:' AS db1`),
+# pinkdb as `CREATE DATABASE db1`. The two sides therefore need different
+# setup SQL for the same shape; every probe below selects the same rows.
+THREE_PART_PINK_SETUP = """
+CREATE DATABASE db1;
+CREATE DATABASE db2;
+CREATE TABLE db1.t (a INTEGER, b VARCHAR);
+INSERT INTO db1.t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE TABLE db2.t (a INTEGER, b VARCHAR);
+INSERT INTO db2.t VALUES (2, 'deux'), (3, 'trois'), (4, 'quatre');
+CREATE TABLE db1.u (a INTEGER, c VARCHAR);
+INSERT INTO db1.u VALUES (1, 'x'), (3, 'z');
+"""
+
+THREE_PART_DUCK_SETUP = """
+ATTACH ':memory:' AS db1;
+ATTACH ':memory:' AS db2;
+CREATE TABLE db1.t (a INTEGER, b VARCHAR);
+INSERT INTO db1.t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+CREATE TABLE db2.t (a INTEGER, b VARCHAR);
+INSERT INTO db2.t VALUES (2, 'deux'), (3, 'trois'), (4, 'quatre');
+CREATE TABLE db1.u (a INTEGER, c VARCHAR);
+INSERT INTO db1.u VALUES (1, 'x'), (3, 'z');
+"""
+
+# (label, pinkdb sql, duckdb sql, ordered). DuckDB's parser rejects a
+# database qualifier on a star (`db1.t.*` — "more than one column in front of
+# a star"), so those probes spell the same columns out on its side; the pinkdb
+# side still exercises `db.table.*`.
+THREE_PART_PROBES = [
+    ("three-part-select",
+     "SELECT db1.t.a, db1.t.b FROM db1.t ORDER BY db1.t.a;",
+     "SELECT db1.t.a, db1.t.b FROM db1.t ORDER BY db1.t.a;", True),
+    ("three-part-where",
+     "SELECT db1.t.a FROM db1.t WHERE db1.t.a >= 2 ORDER BY db1.t.a;",
+     "SELECT db1.t.a FROM db1.t WHERE db1.t.a >= 2 ORDER BY db1.t.a;", True),
+    ("three-part-cross-db-join",
+     "SELECT db1.t.a, db2.t.b FROM db1.t JOIN db2.t ON db1.t.a = db2.t.a "
+     "ORDER BY db1.t.a;",
+     "SELECT db1.t.a, db2.t.b FROM db1.t JOIN db2.t ON db1.t.a = db2.t.a "
+     "ORDER BY db1.t.a;", True),
+    ("three-part-group",
+     "SELECT db1.t.a, COUNT(*) FROM db1.t GROUP BY db1.t.a "
+     "ORDER BY db1.t.a;",
+     "SELECT db1.t.a, COUNT(*) FROM db1.t GROUP BY db1.t.a "
+     "ORDER BY db1.t.a;", True),
+    ("three-part-having",
+     "SELECT db1.t.a, COUNT(*) FROM db1.t GROUP BY db1.t.a "
+     "HAVING max(db1.t.a) >= 2 ORDER BY db1.t.a;",
+     "SELECT db1.t.a, COUNT(*) FROM db1.t GROUP BY db1.t.a "
+     "HAVING max(db1.t.a) >= 2 ORDER BY db1.t.a;", True),
+    ("three-part-star",
+     "SELECT db1.t.* FROM db1.t ORDER BY db1.t.a;",
+     "SELECT db1.t.a, db1.t.b FROM db1.t ORDER BY db1.t.a;", True),
+    ("three-part-star-beside-column",
+     "SELECT db1.u.c, db1.t.* FROM db1.t JOIN db1.u ON db1.t.a = db1.u.a "
+     "ORDER BY db1.t.a;",
+     "SELECT db1.u.c, db1.t.a, db1.t.b FROM db1.t "
+     "JOIN db1.u ON db1.t.a = db1.u.a ORDER BY db1.t.a;", True),
+]
+
+
+def run_three_part():
+    print("== three-part column references battery (wave 94) ==")
+    for label, psql, dsql, ordered in THREE_PART_PROBES:
+        got = pink_query(THREE_PART_PINK_SETUP, psql)
+        if got[0] == "error":
+            check(label, False, f"pinkdb error: {got[1]}")
+            continue
+        _, types, prows = got
+        d = duck_query(THREE_PART_DUCK_SETUP, dsql)
+        if d[0] == "error":
+            check(label, False, f"duckdb error: {d[1]}")
+            continue
+        prows_n = [[norm_pink(c, t) for c, t in zip(r, types)] for r in prows]
+        ok = rows_equal(prows_n, d[1], ordered)
+        check(label, ok, "" if ok else f"\npink={prows_n}\nduck={d[1]}")
 
 
 def run_case(label, sql, ordered, expect_error, setup, duck_setup=SETUP):
