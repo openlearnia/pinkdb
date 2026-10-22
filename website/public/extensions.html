@@ -402,6 +402,41 @@
     return found;
   }
 
+  // The catalog has one entry per (name, version, platform); the list shows
+  // one card per extension name, so entries are grouped here.
+  function groupByName(entries) {
+    var order = [];
+    var groups = {};
+    for (var i = 0; i < (entries || []).length; i++) {
+      var name = String(entries[i].name);
+      if (!Object.prototype.hasOwnProperty.call(groups, name)) {
+        groups[name] = [];
+        order.push(name);
+      }
+      groups[name].push(entries[i]);
+    }
+    order.sort();
+    return order.map(function (name) { return groups[name]; });
+  }
+
+  // The entries of the newest version in a group (one per platform), sorted
+  // by platform.
+  function latestEntries(group) {
+    var primary = pickPrimary(group);
+    if (primary === null) return [];
+    return sortEntries(group.filter(function (entry) {
+      return entry.version === primary.version;
+    }));
+  }
+
+  // A group matches when any of its entries does (so a platform search still
+  // finds the extension).
+  function filterGroups(groups, query) {
+    return (groups || []).filter(function (group) {
+      return group.some(function (entry) { return matchesQuery(entry, query); });
+    });
+  }
+
   function countText(shown, total, query) {
     var unit = total === 1 ? "extension" : "extensions";
     if (String(query == null ? "" : query).trim() === "") return total + " " + unit;
@@ -421,33 +456,42 @@
     return "#/" + esc(encodeURIComponent(String(name)));
   }
 
-  function cardHtml(entry) {
-    var name = String(entry.name);
-    var sha = typeof entry.sha256 === "string" ? entry.sha256 : "";
+  function platformBadgesHtml(entries) {
+    return entries.map(function (entry) { return badgeHtml(entry.platform, "now"); }).join("");
+  }
+
+  // One card per extension: `group` is every catalog entry with that name (a
+  // single entry is accepted too). The card shows the newest version, one
+  // platform badge per build of it, and one download link per platform.
+  function cardHtml(group) {
+    var entries = Array.isArray(group) ? group : [group];
+    var latest = latestEntries(entries);
+    var primary = latest[0];
+    var name = String(primary.name);
     var lines = [];
     lines.push('<li class="card">');
     lines.push('<div class="badges">' +
-      badgeHtml(entry.platform, "now") +
-      badgeHtml("abi " + entry.abi) +
-      badgeHtml("v" + entry.version) +
+      badgeHtml("v" + primary.version) +
+      badgeHtml("abi " + primary.abi) +
+      badgeHtml(latest.length === 1 ? latest[0].platform : latest.length + " platforms", "now") +
       "</div>");
     lines.push('<h3 class="card-title"><a href="' + nameHref(name) + '">' + esc(name) + "</a></h3>");
-    lines.push('<p class="card-desc">' + esc(entry.description == null ? "" : entry.description) + "</p>");
-    lines.push('<div class="hash-row"><code class="hash" title="' + esc(sha) + '">' +
-      esc(shortHash(sha)) + "</code>" +
-      copyButtonHtml(sha, "Copy SHA-256 of " + name + " " + entry.version) +
-      "</div>");
+    lines.push('<p class="card-desc">' + esc(primary.description == null ? "" : primary.description) + "</p>");
     lines.push('<div class="card-foot">');
-    lines.push('<a class="button primary small" href="' + esc(artifactUrl(entry)) + '" download>Download</a>');
-    lines.push('<a class="button small" href="' + nameHref(name) + '">Details</a>');
-    lines.push('<span class="size" title="artifact size">' + esc(formatSize(entry.size)) + "</span>");
+    for (var i = 0; i < latest.length; i++) {
+      var entry = latest[i];
+      lines.push('<a class="button small" href="' + esc(artifactUrl(entry)) + '" download title="' +
+        esc(entry.platform + " · " + formatSize(entry.size) + " · sha256 " + shortHash(entry.sha256)) +
+        '">' + esc(entry.platform) + "</a>");
+    }
+    lines.push('<a class="button primary small" href="' + nameHref(name) + '">Details</a>');
     lines.push("</div>");
     lines.push("</li>");
     return lines.join("");
   }
 
-  function cardsHtml(entries, query, total) {
-    if (entries.length === 0) {
+  function cardsHtml(groups, query, total) {
+    if (groups.length === 0) {
       if (total > 0) {
         return '<li class="empty"><p>No extensions match &ldquo;' + esc(String(query).trim()) +
           '&rdquo;.</p><button type="button" class="button small" data-clear-filter>Clear filter</button></li>';
@@ -456,7 +500,7 @@
         '<p class="empty-note">Publish one with <code>ext-repo/publish.sh &lt;dylib&gt; --name &hellip; --version &hellip; --platform &hellip; --description &hellip;</code>.</p></li>';
     }
     var out = [];
-    for (var i = 0; i < entries.length; i++) out.push(cardHtml(entries[i]));
+    for (var i = 0; i < groups.length; i++) out.push(cardHtml(groups[i]));
     return out.join("");
   }
 
@@ -482,31 +526,38 @@
     return '<tr><th scope="row">' + esc(label) + "</th><td>" + valueHtml + "</td></tr>";
   }
 
-  function metaTableHtml(entry) {
-    var sha = typeof entry.sha256 === "string" ? entry.sha256 : "";
+  function metaTableHtml(latest) {
+    var entry = latest[0];
+    var platforms = latest.map(function (e) { return "<code>" + esc(e.platform) + "</code>"; }).join(" ");
     var rows = [
       metaRow("Name", "<code>" + esc(entry.name) + "</code>"),
       metaRow("Version", esc(entry.version)),
       metaRow("ABI", esc(entry.abi)),
-      metaRow("Platform", "<code>" + esc(entry.platform) + "</code>"),
-      metaRow("Size", esc(formatSize(entry.size))),
-      metaRow("SHA-256", '<code class="wrap">' + esc(sha) + "</code> " +
-        copyButtonHtml(sha, "Copy SHA-256 of " + entry.name + " " + entry.version)),
-      metaRow("File", "<code>" + esc(entry.file) + "</code>"),
+      metaRow("Platforms", platforms),
       metaRow("Description", esc(entry.description == null ? "" : entry.description)),
     ];
     return '<div class="table-wrap"><table><tbody>' + rows.join("") + "</tbody></table></div>";
   }
 
-  function downloadPanelHtml(entry) {
+  function downloadPanelHtml(latest) {
+    var rows = latest.map(function (entry) {
+      var sha = typeof entry.sha256 === "string" ? entry.sha256 : "";
+      return "<tr><td><code>" + esc(entry.platform) + "</code></td>" +
+        '<td class="num">' + esc(formatSize(entry.size)) + "</td>" +
+        '<td><code class="wrap">' + esc(sha) + "</code> " +
+        copyButtonHtml(sha, "Copy SHA-256 of " + entry.name + " " + entry.version + " " + entry.platform) +
+        "</td>" +
+        '<td><a class="button primary small" href="' + esc(artifactUrl(entry)) + '" download>Download</a></td></tr>';
+    }).join("");
     return [
       '<section class="panel" aria-labelledby="download-h">',
       '<h2 id="download-h">Download</h2>',
-      '<p class="panel-note">Immutable artifact — verify the SHA-256 after downloading.</p>',
-      '<p><a class="button primary" href="' + esc(artifactUrl(entry)) + '" download>Download ' +
-        esc(entry.name + " " + entry.version) + "</a></p>",
-      '<p class="panel-note"><code class="wrap">' + esc(artifactUrl(entry)) + "</code> <span>(" +
-        esc(formatSize(entry.size)) + ")</span></p>",
+      '<p class="panel-note">Immutable artifacts, one per platform — verify the SHA-256 after downloading.</p>',
+      '<div class="table-wrap"><table><thead><tr>' +
+        '<th scope="col">Platform</th><th scope="col" class="num">Size</th>' +
+        '<th scope="col">SHA-256</th><th scope="col">Artifact</th></tr></thead><tbody>',
+      rows,
+      "</tbody></table></div>",
       "</section>",
     ].join("");
   }
@@ -543,21 +594,22 @@
   }
 
   function detailHtml(entries) {
-    var primary = pickPrimary(entries);
+    var latest = latestEntries(entries);
+    var primary = latest[0];
     var parts = [
       '<a class="backlink" href="#/"><span aria-hidden="true">&#8592;</span> All extensions</a>',
       '<p class="kicker">extension</p>',
       "<h1>" + esc(primary.name) + "</h1>",
       '<p class="lede">' + esc(primary.description == null ? "" : primary.description) + "</p>",
       '<div class="badges">' +
-        badgeHtml(primary.platform, "now") +
-        badgeHtml("abi " + primary.abi) +
         badgeHtml("v" + primary.version) +
+        badgeHtml("abi " + primary.abi) +
+        platformBadgesHtml(latest) +
         "</div>",
       installPanelHtml(primary),
-      downloadPanelHtml(primary),
+      downloadPanelHtml(latest),
       '<section class="panel" aria-labelledby="meta-h"><h2 id="meta-h">Metadata</h2>' +
-        metaTableHtml(primary) + "</section>",
+        metaTableHtml(latest) + "</section>",
       versionsPanelHtml(entries),
     ];
     parts.push(rawPanelHtml(entries));
@@ -565,8 +617,8 @@
   }
 
   function listView(catalog, query) {
-    var all = Array.isArray(catalog.extensions) ? catalog.extensions : [];
-    var shown = filterEntries(all, query);
+    var all = groupByName(Array.isArray(catalog.extensions) ? catalog.extensions : []);
+    var shown = filterGroups(all, query);
     var parts = [
       '<p class="doc-meta">format v' + esc(catalog.format_version) +
         " &middot; catalog updated " + esc(fmtTimestamp(catalog.updated)) + "</p>",
@@ -639,6 +691,9 @@
     matchesQuery: matchesQuery,
     filterEntries: filterEntries,
     entriesByName: entriesByName,
+    groupByName: groupByName,
+    latestEntries: latestEntries,
+    filterGroups: filterGroups,
     countText: countText,
     cardHtml: cardHtml,
     cardsHtml: cardsHtml,
@@ -731,8 +786,8 @@
   }
 
   function refreshGrid() {
-    var all = state.catalog && Array.isArray(state.catalog.extensions) ? state.catalog.extensions : [];
-    var shown = filterEntries(all, state.query);
+    var all = groupByName(state.catalog && Array.isArray(state.catalog.extensions) ? state.catalog.extensions : []);
+    var shown = filterGroups(all, state.query);
     var grid = document.getElementById("grid");
     var count = document.getElementById("count");
     if (grid) grid.innerHTML = cardsHtml(shown, state.query, all.length);

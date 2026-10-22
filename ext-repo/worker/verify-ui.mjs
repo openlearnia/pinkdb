@@ -95,7 +95,9 @@ function loadPure(page) {
 // canonical <link rel="canonical"> is metadata (it points at the page's own
 // URL), not an asset, so it is excluded.
 const ASSET_PATTERNS = [
-  [/<script\b[^>]*\bsrc=/i, "<script src="],
+  // External scripts only: the playground loads its own same-origin module
+  // (`assets/playground/playground.js`), which is not an external asset.
+  [/<script\b[^>]*\bsrc=["']?(?:https?:)?\/\//i, "<script src=http…>"],
   [/<link\b(?![^>]*\brel="canonical")[^>]*\bhref="https?:/i, '<link href="http…"'],
   [/<img\b/i, "<img"],
   [/<iframe\b/i, "<iframe"],
@@ -592,6 +594,37 @@ if (catalog && pure) {
       "details render the all-versions table when an extension has several entries",
     );
   }
+
+  // One card per extension name, not one per (version, platform) entry.
+  const names = [...new Set(entries.map((entry) => String(entry.name)))].sort();
+  const groups = pure.groupByName(entries);
+  check(groups.length === names.length &&
+      groups.every((group, i) => group.every((entry) => String(entry.name) === names[i])),
+    "groupByName returns one group per extension name, sorted",
+    `${groups.length} groups for ${names.length} names`);
+  const list = pure.listView(catalog, "");
+  const cards = (list.match(/<li class="card">/g) || []).length;
+  check(cards === names.length, "the list renders one card per extension name",
+    `${cards} cards for ${names.length} names (${entries.length} entries)`);
+  check(list.includes(pure.countText(names.length, names.length, "")),
+    "the list count counts extensions, not catalog entries");
+  for (const group of groups) {
+    const latest = pure.latestEntries(group);
+    const card = pure.cardHtml(group);
+    check(latest.every((entry) => card.includes(pure.artifactUrl(entry)) && card.includes(entry.platform)),
+      `the ${group[0].name} card links every platform of its newest version`);
+    check(pure.filterGroups(groups, latest[0].platform).includes(group),
+      `a platform search still finds ${group[0].name}`);
+  }
+  const twin = { name: "zz-twin", version: "1.0.0", abi: 1, platform: "darwin-arm64",
+    file: "artifacts/zz-twin/1.0.0/darwin-arm64/zz-twin.dylib", sha256: "a".repeat(64), size: 1 };
+  const twins = [twin, { ...twin, platform: "linux-x64", file: "artifacts/zz-twin/1.0.0/linux-x64/zz-twin.so" },
+    { ...twin, version: "0.9.0" }];
+  const twinView = pure.listView({ format_version: 1, updated: null, extensions: twins }, "");
+  check((twinView.match(/<li class="card">/g) || []).length === 1 &&
+      twinView.includes("darwin-arm64") && twinView.includes("linux-x64") &&
+      twinView.includes("v1.0.0") && !twinView.includes("v0.9.0"),
+    "three entries of one extension render as one card for the newest version with both platforms");
 
   check(pure.formatSize(1024) === "1 KiB", "formatSize(1024) is 1 KiB", pure.formatSize(1024));
   check(pure.formatSize(0) === "0 B", "formatSize(0) is 0 B", pure.formatSize(0));
