@@ -1,0 +1,24 @@
+# Only the workspace manifests, Rust sources and the docker entrypoint are
+# needed to build the image. Everything else stays out of the context.
+.git
+.github
+.claude
+.commandcode
+target
+**/target
+dist
+ext-dist
+website
+docs
+bench
+bindings
+tests
+ext-repo
+ext-sdk/c
+ext-sdk/go
+*.pink
+*.csv
+.DS_Store
+__pycache__
+**/__pycache__
+extensions/*/build

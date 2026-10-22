@@ -98,6 +98,11 @@ transport), <code>-async-server</code> (tokio transport) and <code>-tls</code>
 <code>SHA256SUMS</code> to verify them. Install with your package manager or by
 unpacking the tarball; there is no server install script.</p>
 
+<p>For a container deployment, use the public multi-arch image instead:
+<a href="{{root}}docs/docker.html"><code>ghcr.io/openlearnia/pinkdb</code></a>
+contains the server and the CLI, runs non-root, and keeps the database on a
+<code>/data</code> volume.</p>
+
 <h2>Build from source</h2>
 
 <p>If your platform or feature combination is not in the matrix, build it with

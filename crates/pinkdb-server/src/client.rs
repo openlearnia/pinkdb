@@ -18,7 +18,7 @@
 //! # Ok::<(), pinkdb_server::ClientError>(())
 //! ```
 
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
@@ -138,6 +138,41 @@ impl Client {
     pub fn connect(addr: impl ToSocketAddrs) -> Result<Client> {
         let stream = TcpStream::connect(addr).map_err(ProtocolError::Io)?;
         configure_client_socket(&stream);
+        Self::handshake(Transport::Plain(stream))
+    }
+
+    /// Connect with a caller-chosen timeout and perform the `Hello`
+    /// handshake.
+    ///
+    /// The timeout bounds the TCP connect and every read/write on the
+    /// resulting socket, so a caller such as `pinkdb-server --health-check`
+    /// can fail fast against a host that is down or a peer that accepts the
+    /// connection and never answers. Unlike [`Client::connect`] this does not
+    /// consult `PINKDB_CLIENT_TIMEOUT_MS`: the caller's timeout is the whole
+    /// budget.
+    pub fn connect_timeout(addr: impl ToSocketAddrs, timeout: Duration) -> Result<Client> {
+        let addrs = addr.to_socket_addrs().map_err(ProtocolError::Io)?;
+        let mut last_error = None;
+        let mut stream = None;
+        for socket in addrs {
+            match TcpStream::connect_timeout(&socket, timeout) {
+                Ok(connected) => {
+                    stream = Some(connected);
+                    break;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        let stream = match stream {
+            Some(stream) => stream,
+            None => {
+                let error = last_error.unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "no addresses to connect to")
+                });
+                return Err(ProtocolError::Io(error).into());
+            }
+        };
+        configure_client_socket_with_timeout(&stream, Some(timeout));
         Self::handshake(Transport::Plain(stream))
     }
 
@@ -591,19 +626,24 @@ impl Client {
 /// so a stalling server cannot hang the client forever. With TLS, the same
 /// socket timeouts bound the handshake and every encrypted read/write.
 fn configure_client_socket(stream: &TcpStream) {
-    if let Err(e) = stream.set_nodelay(true) {
-        eprintln!("pinkdb: cannot set TCP_NODELAY on the client socket: {e}");
-    }
     let timeout_ms = std::env::var("PINKDB_CLIENT_TIMEOUT_MS")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(300_000);
-    if timeout_ms > 0 {
-        let timeout = Some(std::time::Duration::from_millis(timeout_ms));
-        if let Err(e) = stream.set_read_timeout(timeout) {
+    let timeout = (timeout_ms > 0).then(|| Duration::from_millis(timeout_ms));
+    configure_client_socket_with_timeout(stream, timeout);
+}
+
+/// Apply `TCP_NODELAY` and an explicit socket timeout (or none).
+fn configure_client_socket_with_timeout(stream: &TcpStream, timeout: Option<Duration>) {
+    if let Err(e) = stream.set_nodelay(true) {
+        eprintln!("pinkdb: cannot set TCP_NODELAY on the client socket: {e}");
+    }
+    if let Some(timeout) = timeout {
+        if let Err(e) = stream.set_read_timeout(Some(timeout)) {
             eprintln!("pinkdb: cannot set the client read timeout: {e}");
         }
-        if let Err(e) = stream.set_write_timeout(timeout) {
+        if let Err(e) = stream.set_write_timeout(Some(timeout)) {
             eprintln!("pinkdb: cannot set the client write timeout: {e}");
         }
     }

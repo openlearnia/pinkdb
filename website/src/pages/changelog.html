@@ -9,6 +9,12 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2>2026-10-22</h2>
+<h3>Wave 91 — Docker image ✅</h3>
+<ul>
+<li>pinkdb ships as a container: <code>docker run -p 5433:5433 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb</code> runs the server with a durable database on the volume; <code>docker run --rm -it ghcr.io/openlearnia/pinkdb pinkdb</code> gives the CLI. A <code>lake</code> tag adds the Vortex/Parquet lake features.</li>
+<li>Small (about 37 MB), runs as a non-root user, configurable with <code>PINKDB_*</code> environment variables, and reports its health to Docker.</li>
+<li>Images are built and published automatically with each release (the first images appear with the next release tag).</li>
+</ul>
 <h3>Wave 102 (part 2) — <code>.pink</code> lakes read only what a query needs ✅</h3>
 <ul>
 <li>Querying a <code>.pink</code> lake on S3/R2 now reads just the needed columns of the row groups that can match the query, with several range requests in flight; <code>COUNT(*)</code> and similar answers still come from the catalog alone.</li>

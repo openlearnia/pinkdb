@@ -9,6 +9,16 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-22
+### Wave 91 — Docker image ✅
+- pinkdb ships as a container: `docker run -p 5433:5433 -v pinkdb-data:/data
+  ghcr.io/openlearnia/pinkdb` runs the server with a durable database on the
+  volume; `docker run --rm -it ghcr.io/openlearnia/pinkdb pinkdb` gives the
+  CLI. A `lake` tag adds the Vortex/Parquet lake features.
+- Small (about 37 MB), runs as a non-root user, configurable with
+  `PINKDB_*` environment variables, and reports its health to Docker.
+- Images are built and published automatically with each release (the
+  first images appear with the next release tag).
+
 ### Wave 102 (part 2) — `.pink` lakes read only what a query needs ✅
 - Querying a `.pink` lake on S3/R2 now reads just the needed columns of the
   row groups that can match the query, with several range requests in

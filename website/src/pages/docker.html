@@ -1,0 +1,155 @@
+<h1>Docker</h1>
+
+<p class="doc-meta">The public multi-arch image contains <code>pinkdb-server</code>
+(TLS + async transport) and the <code>pinkdb</code> CLI. It runs as a fixed
+non-root user, keeps the durable database on a <code>/data</code> volume, and
+has a protocol-level health check — no curl, shell or extra tools in the probe.
+Images are published to GHCR from <code>v*</code> tags for
+<code>linux/amd64</code> and <code>linux/arm64</code>.</p>
+
+<h2>Quick start</h2>
+
+<pre class="code" data-lang="sh"><code># server on 0.0.0.0:5433, durable /data/pinkdb.pink, non-root
+docker run -p 5433:5433 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb
+
+# the image's own CLI, remote mode, against the published port
+docker run --rm -it ghcr.io/openlearnia/pinkdb pinkdb --host host.docker.internal:5433</code></pre>
+
+<p>The server is durable by default: rows acknowledged to a client survive a
+container restart because the checkpoint and WAL live on the named volume.
+<code>docker stop</code>/<code>docker rm</code> the container without removing
+the volume to keep the data. The entrypoint passes through when the first
+argument is <code>pinkdb</code>, so the CLI and the server share one image.</p>
+
+<pre class="code" data-lang="sh"><code>docker run --rm -it ghcr.io/openlearnia/pinkdb pinkdb
+docker run --rm ghcr.io/openlearnia/pinkdb pinkdb --version</code></pre>
+
+<h2>Variants and tags</h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Tag</th><th>Server</th><th>CLI features</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>:&lt;version&gt;</code>, <code>:latest</code></td>
+      <td><code>tls</code> + <code>async-server</code></td>
+      <td>default + <code>client,tls,pinklake,s3</code> — <code>.lake</code>
+      over <code>.pink</code> files and <code>s3://</code> storage</td>
+    </tr>
+    <tr>
+      <td><code>:&lt;version&gt;-lake</code>, <code>:lake</code></td>
+      <td>the same server</td>
+      <td>default + <code>client,tls,vortexlake,s3,parquetlake</code> —
+      Vortex and Parquet lake data files (a larger image)</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<pre class="code" data-lang="sh"><code>docker run -p 5433:5433 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb:lake</code></pre>
+
+<h2>Command and environment</h2>
+
+<p>Every <code>pinkdb-server</code> flag still works after the image name;
+explicit arguments win over the environment, and the environment wins over
+the image defaults:</p>
+
+<pre class="code" data-lang="sh"><code>docker run -p 6000:6000 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb \
+  --port 6000 --idle-timeout 60</code></pre>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Server flag</th></tr></thead>
+  <tbody>
+    <tr><td><code>PINKDB_HOST</code></td><td><code>0.0.0.0</code></td><td><code>--host</code></td></tr>
+    <tr><td><code>PINKDB_PORT</code></td><td><code>5433</code></td><td><code>--port</code></td></tr>
+    <tr><td><code>PINKDB_FILE</code></td><td><code>/data/pinkdb.pink</code></td><td><code>--file</code></td></tr>
+    <tr><td><code>PINKDB_TRANSPORT</code></td><td><code>sync</code></td><td><code>--transport</code></td></tr>
+    <tr><td><code>PINKDB_TLS_CERT</code> / <code>PINKDB_TLS_KEY</code></td><td>—</td><td><code>--tls-cert</code> / <code>--tls-key</code></td></tr>
+    <tr><td><code>PINKDB_MAX_CONNECTIONS</code></td><td><code>128</code></td><td><code>--max-connections</code></td></tr>
+    <tr><td><code>PINKDB_IDLE_TIMEOUT</code></td><td><code>300</code></td><td><code>--idle-timeout</code></td></tr>
+    <tr><td><code>PINKDB_STATEMENT_TIMEOUT_MS</code></td><td><code>30000</code></td><td><code>--statement-timeout-ms</code></td></tr>
+    <tr><td><code>PINKDB_MAX_RESULT_ROWS</code></td><td><code>10000000</code></td><td><code>--max-result-rows</code></td></tr>
+    <tr><td><code>PINKDB_MAX_RESULT_BYTES</code></td><td><code>268435456</code></td><td><code>--max-result-bytes</code></td></tr>
+    <tr><td><code>PINKDB_MAX_CONCURRENT_LOGINS</code></td><td><code>4</code></td><td><code>--max-concurrent-logins</code></td></tr>
+    <tr><td><code>PINKDB_ALLOW_LOAD_EXTENSION</code></td><td>off</td><td><code>--allow-load-extension</code></td></tr>
+    <tr><td><code>PINKDB_EXTENSION_ROOT</code></td><td>—</td><td><code>--extension-root</code></td></tr>
+    <tr><td><code>PINKDB_ALLOW_COPY_TO</code></td><td>off</td><td><code>--allow-copy-to</code></td></tr>
+    <tr><td><code>PINKDB_COPY_ROOT</code></td><td>—</td><td><code>--copy-root</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Values of <code>1</code>, <code>true</code>, <code>TRUE</code> or
+<code>yes</code> turn the two opt-ins on. <code>PINKDB_FILE</code> must stay
+inside the writable <code>/data</code> volume unless you mount another path.</p>
+
+<h2>Health check</h2>
+
+<p>The image's <code>HEALTHCHECK</code> runs</p>
+
+<pre class="code" data-lang="sh"><code>pinkdb-server --health-check</code></pre>
+
+<p>which connects, speaks the protocol <code>Ping</code>, prints
+<code>healthy</code> and exits 0, or exits 1 within a short timeout. Without an
+explicit address it reads <code>PINKDB_HEALTHCHECK_ADDR</code>, then
+<code>PINKDB_HOST</code>/<code>PINKDB_PORT</code>, then
+<code>127.0.0.1:5433</code>; a wildcard bind is mapped to loopback.
+<code>PINKDB_HEALTHCHECK_TIMEOUT_MS</code> bounds the probe (default 2000 ms).
+The same probe is available from the shell, and a dead port is a nonzero exit:</p>
+
+<pre class="code" data-lang="sh"><code>docker exec &lt;name&gt; pinkdb-server --health-check
+docker exec &lt;name&gt; pinkdb-server --health-check 127.0.0.1:1   # exit 1</code></pre>
+
+<p>If you override the port with a CLI flag rather than
+<code>PINKDB_PORT</code>, pass a matching <code>--health-cmd</code> or set
+<code>PINKDB_HEALTHCHECK_ADDR</code>, because the built-in probe follows the
+environment.</p>
+
+<h2>Security posture</h2>
+
+<div class="callout security">
+  <span class="callout-title">Non-root, but authentication is per store</span>
+  <p>The container runs as UID/GID 10001 and only <code>/data</code> is
+  writable by convention. That is OS isolation, not database authentication:
+  the served store decides. A fresh store with no users trusts every connection
+  and says so at startup; once a user exists, connections must log in and every
+  statement is checked against that user's grants.
+  <code>LOAD EXTENSION</code> and <code>COPY … TO</code> stay off unless the
+  matching opt-in and root are set.</p>
+</div>
+
+<pre class="code" data-lang="sql"><code>-- bootstrap over the wire; the catalog, not the image, is the switch
+CREATE USER alice PASSWORD 'a long passphrase';
+GRANT ADMIN TO alice;</code></pre>
+
+<p>Publishing <code>5433</code> to an untrusted network before the store has
+users is remote shell-level access to the database; bind to a trusted network
+first. For encrypted transport, mount a certificate/key pair and start the
+server with <code>PINKDB_TLS_CERT</code>/<code>PINKDB_TLS_KEY</code> (TLS is
+supported by the default <code>sync</code> transport only; the async transport
+refuses those flags). TLS identifies the server, not the client — login is what
+gates statements.</p>
+
+<h2>Build the image yourself</h2>
+
+<pre class="code" data-lang="sh"><code>docker build --build-arg VARIANT=default -t pinkdb:default .
+docker build --build-arg VARIANT=lake -t pinkdb:lake .
+scripts/docker/smoke.sh --image pinkdb:default --variant default
+scripts/docker/smoke.sh --image pinkdb:lake --variant lake</code></pre>
+
+<p>The Dockerfile builds both binaries from source in a pinned Rust builder and
+publishes the smaller runtime that passes the smoke test. The smoke test starts
+the container, waits for <code>healthy</code>, runs the image's own CLI in
+remote mode (<code>pinkdb --host</code>), creates/inserts/selects, restarts the
+container to prove persistence, checks <code>--health-check</code> exit codes,
+and on the lake variant runs <code>.lake save</code>/<code>.lake open</code> on
+the volume. See <a href="{{root}}docs/install.html">Install</a> for the
+non-container binaries and <a href="{{root}}docs/server.html">Server</a> for
+the full protocol and security reference.</p>
+
+<ul class="next-links">
+  <li><a href="{{root}}docs/server.html">Server →</a></li>
+  <li><a href="{{root}}docs/cli.html">CLI &amp; REPL →</a></li>
+  <li><a href="{{root}}docs/persistence.html">Persistence &amp; WAL →</a></li>
+</ul>

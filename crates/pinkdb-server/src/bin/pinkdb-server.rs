@@ -10,6 +10,7 @@
 //!               [--allow-copy-to --copy-root PATH]
 //!               [--tls-cert PATH --tls-key PATH]        (built with `tls`)
 //!               [--enable-ui --ui-host HOST --ui-port PORT]  (built with `ui`)
+//! pinkdb-server --health-check [HOST:PORT]
 //! ```
 //!
 //! Without `--file` the database is in-memory; with it, the server opens the
@@ -33,6 +34,17 @@
 //! TLS encrypts the transport and identifies the server; it does **not**
 //! identify the client — login is what gates statements once the store has
 //! users. Bind localhost until then.
+//!
+//! `--health-check [HOST:PORT]` is a one-shot liveness probe for container
+//! orchestrators: connect, speak the protocol `Ping`, print a line, and exit
+//! 0 (healthy) or 1 (unhealthy) within a short timeout. It needs no shell,
+//! curl or extra tools, so it works in a minimal image. Without an explicit
+//! address it reads `PINKDB_HEALTHCHECK_ADDR`, then `PINKDB_HOST`/
+//! `PINKDB_PORT`, then `127.0.0.1:5433`; `PINKDB_HEALTHCHECK_TIMEOUT_MS`
+//! bounds the probe (default 2000 ms). When `PINKDB_TLS_CERT` is set (the
+//! container serves TLS), the probe checks that the port accepts a TCP
+//! connection instead: a TLS server refuses the plaintext `Ping`, and a
+//! localhost probe cannot generally verify a self-signed certificate.
 
 use std::process::ExitCode;
 
@@ -40,12 +52,13 @@ use pinkdb::{Database, DurableOpenOptions};
 use std::time::Duration;
 
 use pinkdb_server::{
-    DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONCURRENT_LOGINS, DEFAULT_MAX_CONNECTIONS,
+    Client, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_CONCURRENT_LOGINS, DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_RESULT_BYTES, DEFAULT_MAX_RESULT_ROWS, DEFAULT_STATEMENT_TIMEOUT_MS, Server,
 };
 
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5433;
+const DEFAULT_HEALTH_CHECK_TIMEOUT_MS: u64 = 2_000;
 
 /// The console's default bind address: loopback only.
 #[cfg(feature = "ui")]
@@ -137,6 +150,7 @@ fn usage() -> &'static str {
      \x20                    [--extension-root PATH]\n\
      \x20                    [--allow-copy-to --copy-root PATH]\n\
      \x20                    [--tls-cert PATH.pem --tls-key PATH.pem]\n\
+     \x20       pinkdb-server --health-check [HOST:PORT]\n\
      \n\
      \x20 --host HOST            bind address (default 127.0.0.1)\n\
      \x20 --port PORT            TCP port; 0 picks an ephemeral port (default 5433)\n\
@@ -185,6 +199,12 @@ fn usage() -> &'static str {
      \x20 --ui-workers N        the console's runtime threads (default 4)\n\
      \x20 --ui-max-connections N  the console's concurrent connections (default 64)\n\
      \x20 --ui-max-page-size N  the console's row-preview page-size bound (default 500)\n\
+     \n\
+     \x20 --health-check [HOST:PORT]  one-shot liveness probe: connect, send Ping, and\n\
+     \x20                        exit 0 (healthy) or 1 (unhealthy). Without an address it\n\
+     \x20                        reads PINKDB_HEALTHCHECK_ADDR, then PINKDB_HOST/\n\
+     \x20                        PINKDB_PORT, then 127.0.0.1:5433;\n\
+     \x20                        PINKDB_HEALTHCHECK_TIMEOUT_MS bounds it (default 2000)\n\
      \n\
      At-rest encryption is not wired into the server: PINKDB_KEY is ignored and\n\
      --file must be a plaintext database (an encrypted one is refused at startup).\n\
@@ -499,7 +519,121 @@ fn ui_feature_missing() -> String {
         .to_string()
 }
 
+/// The health-check target resolution shared by the binary and its unit
+/// tests: an explicit flag value, then the container-oriented environment,
+/// then the server's default address.
+fn health_check_addr(host: &str, port: &str) -> String {
+    let host = match host {
+        "" | "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        other => other,
+    };
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// `Some(None)` for `--health-check` (use the environment), `Some(Some(addr))`
+/// for `--health-check HOST:PORT` or `--health-check=HOST:PORT`, and `None`
+/// when the mode was not requested. `--help` wins over the probe so the
+/// operator always gets the usage text.
+fn parse_health_check_arg(args: &[String]) -> Option<Option<String>> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        return None;
+    }
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--health-check" {
+            let addr = args
+                .get(index + 1)
+                .filter(|value| !value.starts_with('-'))
+                .cloned();
+            return Some(addr);
+        }
+        if let Some(addr) = arg.strip_prefix("--health-check=") {
+            let addr = (!addr.is_empty()).then(|| addr.to_string());
+            return Some(addr);
+        }
+    }
+    None
+}
+
+fn health_check_target(explicit: Option<&str>) -> String {
+    if let Some(addr) = explicit {
+        return addr.to_string();
+    }
+    if let Ok(addr) = std::env::var("PINKDB_HEALTHCHECK_ADDR") {
+        let addr = addr.trim();
+        if !addr.is_empty() {
+            return addr.to_string();
+        }
+    }
+    let host = std::env::var("PINKDB_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string());
+    let port = std::env::var("PINKDB_PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
+    health_check_addr(&host, &port)
+}
+
+/// Connect, speak the protocol `Ping`, and map the outcome to the process
+/// exit code. The probe is deliberately tiny: it is the image's `HEALTHCHECK`
+/// and must work without a shell or any extra binary.
+fn run_health_check(target: &str) -> ExitCode {
+    let timeout_ms = std::env::var("PINKDB_HEALTHCHECK_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT_MS);
+    let timeout = Duration::from_millis(timeout_ms);
+    // A TLS server refuses the plaintext protocol, and a localhost probe
+    // cannot generally verify a container's (often self-signed) certificate,
+    // so with TLS configured the probe checks that the port accepts TCP
+    // connections instead of speaking `Ping`.
+    if std::env::var("PINKDB_TLS_CERT").is_ok_and(|cert| !cert.trim().is_empty()) {
+        return run_tcp_health_check(target, timeout);
+    }
+    match Client::connect_timeout(target, timeout).and_then(|mut client| client.ping()) {
+        Ok(()) => {
+            println!("pinkdb-server: healthy ({target})");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("pinkdb-server: unhealthy ({target}): {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The TLS-server variant of the probe: the port accepts a TCP connection
+/// within `timeout`.
+fn run_tcp_health_check(target: &str, timeout: Duration) -> ExitCode {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addrs = match target.to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            eprintln!("pinkdb-server: unhealthy ({target}): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            println!("pinkdb-server: healthy ({target}, TLS server: TCP accept)");
+            return ExitCode::SUCCESS;
+        }
+    }
+    eprintln!("pinkdb-server: unhealthy ({target}): no TCP connection (TLS server)");
+    ExitCode::FAILURE
+}
+
 fn main() -> ExitCode {
+    // The probe is a mode of its own: it must run before any database or
+    // listener setup (a health check inside the server container is a second
+    // process and must not open the store).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(explicit) = parse_health_check_arg(&argv) {
+        let target = health_check_target(explicit.as_deref());
+        return run_health_check(&target);
+    }
+
     let args = match parse_args() {
         Ok(args) => args,
         Err(msg) => {
@@ -733,5 +867,54 @@ fn announce(addr: std::net::SocketAddr, mode: &str, transport: &str) {
              has none, every connection is trusted and this port is plaintext — keep the \
              bind address trusted"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn health_check_flag_accepts_an_optional_address() {
+        assert_eq!(
+            parse_health_check_arg(&args(&["--health-check"])),
+            Some(None)
+        );
+        assert_eq!(
+            parse_health_check_arg(&args(&["--health-check", "127.0.0.1:6000"])),
+            Some(Some("127.0.0.1:6000".to_string()))
+        );
+        assert_eq!(
+            parse_health_check_arg(&args(&["--health-check=db:5433"])),
+            Some(Some("db:5433".to_string()))
+        );
+        // A following flag is not an address.
+        assert_eq!(
+            parse_health_check_arg(&args(&["--health-check", "--port", "6000"])),
+            Some(None)
+        );
+        assert_eq!(parse_health_check_arg(&args(&["--port", "6000"])), None);
+    }
+
+    #[test]
+    fn help_wins_over_the_health_check_mode() {
+        assert_eq!(
+            parse_health_check_arg(&args(&["--health-check", "--help"])),
+            None
+        );
+    }
+
+    #[test]
+    fn health_check_addr_maps_wildcard_binds_to_loopback() {
+        assert_eq!(health_check_addr("0.0.0.0", "5433"), "127.0.0.1:5433");
+        assert_eq!(health_check_addr("", "6000"), "127.0.0.1:6000");
+        assert_eq!(health_check_addr("::", "5433"), "[::1]:5433");
+        assert_eq!(health_check_addr("[::1]", "5433"), "[::1]:5433");
+        assert_eq!(health_check_addr("::1", "5433"), "[::1]:5433");
+        assert_eq!(health_check_addr("db.internal", "5433"), "db.internal:5433");
     }
 }

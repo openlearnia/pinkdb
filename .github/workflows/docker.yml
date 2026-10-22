@@ -1,0 +1,244 @@
+# Build, smoke-test and publish the public pinkdb container image.
+#
+#   * pull requests and pushes to main that touch the image's inputs: build
+#     both variants natively for linux/amd64 and run the smoke test (no
+#     emulated arm64 build, no push — an emulated Rust build takes hours);
+#   * v<version> tags (and workflow_dispatch with a version): build and smoke
+#     amd64, then build linux/amd64 + linux/arm64 (QEMU) and push both
+#     variants to GHCR with the GITHUB_TOKEN.
+#
+# Tags: <version> and latest (default CLI features), <version>-lake and lake
+# (Vortex/Parquet lake CLI features). The version is checked against the same
+# three Cargo.toml files as release.yml. Publishing is the only writer.
+name: Docker
+
+on:
+  # Image builds are slow (a Rust release build per variant), so pushes and
+  # pull requests run them only when the image's own inputs change; a `v*`
+  # tag always builds, smokes and publishes.
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - scripts/docker/**
+      - .github/workflows/docker.yml
+      - Cargo.toml
+      - Cargo.lock
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - docker/**
+      - scripts/docker/**
+      - .github/workflows/docker.yml
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "version to publish (no v prefix; must match Cargo.toml)"
+        required: true
+        type: string
+
+# Least privilege: read the repository unless the publishing job opts in.
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  prepare:
+    name: resolve version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: resolve and check the version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          publish=false
+          if [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            case "$REF_NAME" in
+              v[0-9]*) ;;
+              *) echo "::error::image tags must look like v<version>, got '$REF_NAME'"; exit 1 ;;
+            esac
+            version="${REF_NAME#v}"
+            publish=true
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION#v}"
+            publish=true
+          else
+            version=$(grep -m1 '^version' crates/pinkdb-server/Cargo.toml | cut -d'"' -f2)
+          fi
+          case "$version" in
+            '' | *[!0-9A-Za-z._+-]*)
+              echo "::error::invalid image version '$version'"
+              exit 1
+              ;;
+          esac
+          for manifest in crates/pinkdb/Cargo.toml crates/pinkdb-cli/Cargo.toml crates/pinkdb-server/Cargo.toml; do
+            cargo_version=$(grep -m1 '^version' "$manifest" | cut -d'"' -f2)
+            if [ "$cargo_version" != "$version" ]; then
+              echo "::error::$manifest version $cargo_version does not match image version $version"
+              exit 1
+            fi
+          done
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+          echo "image version $version (publish: $publish)"
+
+  # Pull requests and pushes to main: prove both variants build for both
+  # architectures and smoke the native amd64 image. Nothing is pushed.
+  build:
+    name: build (${{ matrix.variant }})
+    needs: prepare
+    if: needs.prepare.outputs.publish != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, lake]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+
+      - name: set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: build the native amd64 image for the smoke
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --build-arg VARIANT=${{ matrix.variant }} \
+            --build-arg VERSION=${{ needs.prepare.outputs.version }} \
+            --build-arg REVISION=${{ github.sha }} \
+            -t pinkdb-smoke:${{ matrix.variant }} .
+
+      - name: smoke the image
+        run: |
+          bash scripts/docker/smoke.sh \
+            --image pinkdb-smoke:${{ matrix.variant }} \
+            --variant ${{ matrix.variant }}
+
+  publish:
+    name: publish (${{ matrix.variant }})
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, lake]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: set up QEMU (arm64)
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+
+      - name: set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: resolve the image tags
+        id: tags
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          image=$(printf '%s' "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          if [ "$VARIANT" = "lake" ]; then
+            versioned="$image:$VERSION-lake"
+            moving="$image:lake"
+          else
+            versioned="$image:$VERSION"
+            moving="$image:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$versioned"
+            echo "$moving"
+            echo "EOF"
+          } >>"$GITHUB_OUTPUT"
+          echo "publishing $versioned and $moving"
+
+      - name: build the native amd64 image for the smoke
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --build-arg VARIANT=${{ matrix.variant }} \
+            --build-arg VERSION=${{ needs.prepare.outputs.version }} \
+            --build-arg REVISION=${{ github.sha }} \
+            -t pinkdb-smoke:${{ matrix.variant }} .
+
+      - name: smoke the image
+        run: |
+          bash scripts/docker/smoke.sh \
+            --image pinkdb-smoke:${{ matrix.variant }} \
+            --variant ${{ matrix.variant }}
+
+      - name: build both architectures and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            VARIANT=${{ matrix.variant }}
+            VERSION=${{ needs.prepare.outputs.version }}
+            REVISION=${{ github.sha }}
+          provenance: true
+          sbom: true
+          labels: |
+            org.opencontainers.image.title=pinkdb
+            org.opencontainers.image.description=pinkdb: an embeddable analytical SQL engine, CLI and TCP server
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.documentation=https://github.com/${{ github.repository }}/blob/main/README.md
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}

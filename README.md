@@ -59,6 +59,69 @@ not supported** — there is no Windows binary or `install.ps1`. See
 [`docs/releasing.md`](docs/releasing.md) for the full matrix, checksum
 verification, and immutable-release policy.
 
+### Docker image
+
+The same release publishes a public multi-arch image (linux/amd64 and
+linux/arm64) to GHCR. It contains `pinkdb-server` (TLS + async transport) and
+the `pinkdb` CLI, runs as a fixed non-root user (UID/GID 10001), keeps the
+database on the `/data` volume, and has a protocol-level `HEALTHCHECK`:
+
+```sh
+docker run -p 5433:5433 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb
+```
+
+The server listens on `0.0.0.0:5433` and opens
+`/data/pinkdb.pink` (durable mode: checkpoint + WAL). Use the image's own CLI
+against it, locally or in a second container:
+
+```sh
+docker run --rm -it ghcr.io/openlearnia/pinkdb pinkdb --host host.docker.internal:5433
+# or, from inside the same container network namespace:
+docker run --rm --network container:<name> ghcr.io/openlearnia/pinkdb \
+  pinkdb --host 127.0.0.1:5433
+```
+
+Two CLI variants are tagged: `:<version>` / `:latest` (default features plus
+`pinklake,s3` — `.lake` over `.pink` data files and `s3://` storage) and
+`:<version>-lake` / `:lake` (adds `vortexlake,parquetlake,s3` — Vortex and
+Parquet data files; a larger image). Both share the same server binary.
+
+Every `pinkdb-server` flag still works after the image name; explicit flags
+win over the environment:
+
+```sh
+docker run -p 6000:6000 -v pinkdb-data:/data ghcr.io/openlearnia/pinkdb \
+  --port 6000 --idle-timeout 60
+```
+
+The entrypoint maps the common settings from the environment:
+`PINKDB_HOST` (default `0.0.0.0`), `PINKDB_PORT` (`5433`), `PINKDB_FILE`
+(`/data/pinkdb.pink`), `PINKDB_TRANSPORT` (`sync`; the image has both
+transports), `PINKDB_TLS_CERT`/`PINKDB_TLS_KEY`, the limit flags
+(`PINKDB_MAX_CONNECTIONS`, `PINKDB_IDLE_TIMEOUT`,
+`PINKDB_STATEMENT_TIMEOUT_MS`, `PINKDB_MAX_RESULT_ROWS`,
+`PINKDB_MAX_RESULT_BYTES`, `PINKDB_MAX_CONCURRENT_LOGINS`), and the
+extension/COPY opt-ins (`PINKDB_ALLOW_LOAD_EXTENSION`,
+`PINKDB_EXTENSION_ROOT`, `PINKDB_ALLOW_COPY_TO`, `PINKDB_COPY_ROOT`).
+Environment beats the image defaults and explicit arguments beat both.
+`PINKDB_HEALTHCHECK_ADDR` and `PINKDB_HEALTHCHECK_TIMEOUT_MS` tune the
+`HEALTHCHECK`; `docker exec <name> pinkdb-server --health-check` is the same
+probe from the shell.
+
+**RBAC is per store, not an image setting.** Authentication switches on when
+the served database has users: create the first one over the wire
+(`CREATE USER … PASSWORD …`, then `GRANT ADMIN …`) and the catalog becomes the
+source of truth. Until then every connection is trusted, so do not publish
+port 5433 to an untrusted network before the store has users and, for
+encrypted transport, TLS certificates. The image's `pinkdb-server` is built
+with the `tls` and `async-server` features; TLS is still `sync`-only.
+
+The image is built from source by the root `Dockerfile`
+(`--build-arg VARIANT=default|lake` selects the CLI features) and published by
+`.github/workflows/docker.yml` on `v*` tags with provenance and an SBOM. See
+[`docs/releasing.md`](docs/releasing.md) and
+[`scripts/docker/smoke.sh`](scripts/docker/smoke.sh).
+
 Library use:
 
 ```rust
@@ -1809,6 +1872,11 @@ explicitly. TLS is available only with the default `sync` transport:
 `--tls-cert`/`--tls-key` is refused at startup (exit code 2) rather than
 silently serving plaintext. The server
 prints its listening address on startup and runs until terminated.
+`pinkdb-server --health-check [HOST:PORT]` is a one-shot liveness probe:
+connect, send the protocol `Ping`, and exit 0 (healthy) or 1 (unhealthy)
+within `PINKDB_HEALTHCHECK_TIMEOUT_MS` (default 2000 ms); without an address it
+reads `PINKDB_HEALTHCHECK_ADDR`, then `PINKDB_HOST`/`PINKDB_PORT`, then
+`127.0.0.1:5433`. It is what the Docker image's `HEALTHCHECK` uses.
 
 Server robustness, in one place:
 

@@ -76,6 +76,8 @@ NAV = [
              "out": "docs/getting-started.html"},
             {"key": "install", "label": "Install",
              "out": "docs/install.html"},
+            {"key": "docker", "label": "Docker",
+             "out": "docs/docker.html"},
         ],
     },
     {
@@ -185,6 +187,17 @@ PAGES = {
             "Install a released pinkdb CLI on Linux or macOS with install.sh: "
             "latest or pinned version, feature variants, SHA-256 verification, "
             "and the supported platform matrix."
+        ),
+    },
+    "docker.html": {
+        "out": "docs/docker.html",
+        "nav": "docker",
+        "title": "Docker — pinkdb",
+        "description": (
+            "Run pinkdb in Docker: the public multi-arch image with the server "
+            "and CLI, the /data volume, remote mode, lake variants, environment "
+            "variables, the protocol health check, and the non-root security "
+            "posture."
         ),
     },
     "cli.html": {

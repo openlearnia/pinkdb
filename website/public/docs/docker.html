@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docker — pinkdb</title>
+<meta name="description" content="Run pinkdb in Docker: the public multi-arch image with the server and CLI, the /data volume, remote mode, lake variants, environment variables, the protocol health check, and the non-root security posture.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#F7F1E8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#1B1815" media="(prefers-color-scheme: dark)">
+<link rel="canonical" href="https://pinkdb-docs.defaultcms.workers.dev/docs/docker.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="pinkdb docs">
+<meta property="og:title" content="Docker — pinkdb">
+<meta property="og:description" content="Run pinkdb in Docker: the public multi-arch image with the server and CLI, the /data volume, remote mode, lake variants, environment variables, the protocol health check, and the non-root security posture.">
+<meta property="og:url" content="https://pinkdb-docs.defaultcms.workers.dev/docs/docker.html">
+<meta property="og:image" content="https://pinkdb-docs.defaultcms.workers.dev/assets/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="pinkdb — a mini DuckDB in Rust. Docs, extensions, lake, bindings.">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="../assets/favicon.png" sizes="64x64" type="image/png">
+<link rel="apple-touch-icon" href="../assets/favicon.png">
+<link rel="preload" href="../assets/fonts/public-sans.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="../assets/fonts/bricolage-grotesque.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="../assets/style.css">
+<script data-theme-script>
+/* Theme: follows the OS until the visitor picks one; the choice is kept in
+   localStorage and applied before first paint. Without JS the controls stay
+   hidden and the page simply follows prefers-color-scheme. */
+(function () {
+  var KEY = "pinkdb-theme";
+  var root = document.documentElement;
+  var media = window.matchMedia("(prefers-color-scheme: dark)");
+  var mode = "system";
+  try {
+    var saved = localStorage.getItem(KEY);
+    if (saved === "light" || saved === "dark") mode = saved;
+  } catch (e) {}
+
+  function effective() { return mode === "system" ? (media.matches ? "dark" : "light") : mode; }
+
+  function apply() {
+    if (mode === "system") root.removeAttribute("data-theme");
+    else root.setAttribute("data-theme", mode);
+    var dark = effective() === "dark";
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-pressed", String(dark));
+      toggles[i].setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+      toggles[i].title = dark ? "Switch to light theme" : "Switch to dark theme";
+    }
+    var choices = document.querySelectorAll("[data-theme-choice]");
+    for (var j = 0; j < choices.length; j++) {
+      choices[j].setAttribute("aria-pressed", String(choices[j].getAttribute("data-theme-choice") === mode));
+    }
+  }
+
+  function choose(next) {
+    mode = next;
+    try {
+      if (mode === "system") localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, mode);
+    } catch (e) {}
+    // Switch in one frame: no per-element colour transitions.
+    root.classList.add("theme-switching");
+    apply();
+    void root.offsetWidth;
+    requestAnimationFrame(function () { root.classList.remove("theme-switching"); });
+  }
+
+  apply();
+  if (media.addEventListener) media.addEventListener("change", apply);
+
+  document.addEventListener("DOMContentLoaded", function () {
+    var controls = document.querySelectorAll("[data-theme-toggle], .theme-switch");
+    for (var i = 0; i < controls.length; i++) controls[i].hidden = false;
+    document.addEventListener("click", function (event) {
+      var target = event.target.closest("[data-theme-toggle], [data-theme-choice]");
+      if (!target) return;
+      if (target.hasAttribute("data-theme-toggle")) choose(effective() === "dark" ? "light" : "dark");
+      else choose(target.getAttribute("data-theme-choice"));
+    });
+    apply();
+  });
+})();
+</script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="site-header">
+  <div class="container header-row">
+    <a class="brand" href="../"><span class="brand-dot" aria-hidden="true"></span>pinkdb</a>
+    <nav class="site-nav" aria-label="Site">
+      <ul>
+        <li><a href="getting-started" class="active">Docs</a></li>
+        <li><a href="guide-csv-to-lake">Guides</a></li>
+        <li><a href="bindings">API</a></li>
+        <li><a href="../playground">Playground</a></li>
+        <li><a href="../extensions">Extensions</a></li>
+        <li><a href="roadmap">Roadmap</a></li>
+      </ul>
+    </nav>
+    <div class="header-actions">
+    <button class="theme-toggle" type="button" data-theme-toggle hidden aria-label="Switch theme">
+      <svg class="i-moon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5a8.5 8.5 0 1 0 10.7 10.7z"/></svg>
+      <svg class="i-sun" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><g fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M5.3 18.7l1.4-1.4M17.3 6.7l1.4-1.4"/></g></svg>
+    </button>
+    <a class="nav-out" href="https://github.com/openlearnia/pinkdb" rel="noopener">GitHub&nbsp;&#8599;</a>
+    </div>
+  </div>
+</header>
+<main id="main">
+<div class="container docs-shell has-toc">
+<aside class="sidebar">
+<input class="sidebar-toggle-cb" type="checkbox" id="sidebar-toggle">
+<label class="sidebar-toggle" for="sidebar-toggle">
+<span class="sidebar-toggle-icon" aria-hidden="true"></span>
+<span class="sidebar-toggle-label">Docs</span>
+<span class="sidebar-toggle-current">Docker</span>
+<span class="sidebar-toggle-arrow" aria-hidden="true"></span></label>
+<nav class="sidebar-nav" aria-label="Documentation">
+<div class="side-group">
+<p class="side-group-title">Start here</p>
+<ul>
+<li><a href="getting-started">Getting started</a></li>
+<li><a href="install">Install</a></li>
+<li><a href="docker" class="active" aria-current="page">Docker</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Guides</p>
+<ul>
+<li><a href="guide-csv-to-lake">CSV to a lake</a></li>
+<li><a href="guide-s3-lake">S3 / R2 lakes</a></li>
+<li><a href="guide-encryption">Encrypted databases</a></li>
+<li><a href="guide-durable-multiprocess">Multi-process writers</a></li>
+<li><a href="guide-embedding">Embedding</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Reference</p>
+<ul>
+<li><a href="cli">CLI &amp; REPL</a></li>
+<li><a href="sql">SQL</a></li>
+<li><a href="dialect">SQL dialect</a></li>
+<li><a href="persistence">Persistence</a></li>
+<li><a href="lake">Lake</a></li>
+<li><a href="server">Server</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">APIs</p>
+<ul>
+<li><a href="bindings">Bindings overview</a></li>
+<li><a href="api-rust">Rust</a></li>
+<li><a href="api-c">C</a></li>
+<li><a href="api-python">Python</a></li>
+<li><a href="api-go">Go</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Extensions</p>
+<ul>
+<li><a href="extensions">Using extensions</a></li>
+<li><a href="../extensions">Extension catalog</a></li>
+</ul>
+</div>
+<div class="side-group">
+<p class="side-group-title">Project</p>
+<ul>
+<li><a href="roadmap">Roadmap</a></li>
+<li><a href="changelog">Changelog</a></li>
+</ul>
+</div>
+</nav>
+</aside>
+<article class="doc-main">
+<p class="eyebrow">Start here</p>
+<h1>Docker</h1>
+
+<p class="doc-meta">The public multi-arch image contains <code>pinkdb-server</code>
+(TLS + async transport) and the <code>pinkdb</code> CLI. It runs as a fixed
+non-root user, keeps the durable database on a <code>/data</code> volume, and
+has a protocol-level health check — no curl, shell or extra tools in the probe.
+Images are published to GHCR from <code>v*</code> tags for
+<code>linux/amd64</code> and <code>linux/arm64</code>.</p>
+
+<h2 id="quick-start">Quick start<a class="anchor" href="#quick-start" aria-label="Permalink: Quick start">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code><span class="tok-c"># server on 0.0.0.0:5433, durable /data/pinkdb.pink, non-root</span>
+docker run <span class="tok-f">-p</span> 5433:5433 <span class="tok-f">-v</span> pinkdb-data:/data ghcr.io/openlearnia/pinkdb
+
+<span class="tok-c"># the image's own CLI, remote mode, against the published port</span>
+docker run <span class="tok-f">--rm</span> <span class="tok-f">-it</span> ghcr.io/openlearnia/pinkdb pinkdb <span class="tok-f">--host</span> host.docker.internal:5433</code></pre></div>
+
+<p>The server is durable by default: rows acknowledged to a client survive a
+container restart because the checkpoint and WAL live on the named volume.
+<code>docker stop</code>/<code>docker rm</code> the container without removing
+the volume to keep the data. The entrypoint passes through when the first
+argument is <code>pinkdb</code>, so the CLI and the server share one image.</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>docker run <span class="tok-f">--rm</span> <span class="tok-f">-it</span> ghcr.io/openlearnia/pinkdb pinkdb
+docker run <span class="tok-f">--rm</span> ghcr.io/openlearnia/pinkdb pinkdb <span class="tok-f">--version</span></code></pre></div>
+
+<h2 id="variants-and-tags">Variants and tags<a class="anchor" href="#variants-and-tags" aria-label="Permalink: Variants and tags">#</a></h2>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Tag</th><th>Server</th><th>CLI features</th></tr></thead>
+  <tbody>
+    <tr>
+      <td><code>:&lt;version&gt;</code>, <code>:latest</code></td>
+      <td><code>tls</code> + <code>async-server</code></td>
+      <td>default + <code>client,tls,pinklake,s3</code> — <code>.lake</code>
+      over <code>.pink</code> files and <code>s3://</code> storage</td>
+    </tr>
+    <tr>
+      <td><code>:&lt;version&gt;-lake</code>, <code>:lake</code></td>
+      <td>the same server</td>
+      <td>default + <code>client,tls,vortexlake,s3,parquetlake</code> —
+      Vortex and Parquet lake data files (a larger image)</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>docker run <span class="tok-f">-p</span> 5433:5433 <span class="tok-f">-v</span> pinkdb-data:/data ghcr.io/openlearnia/pinkdb:lake</code></pre></div>
+
+<h2 id="command-and-environment">Command and environment<a class="anchor" href="#command-and-environment" aria-label="Permalink: Command and environment">#</a></h2>
+
+<p>Every <code>pinkdb-server</code> flag still works after the image name;
+explicit arguments win over the environment, and the environment wins over
+the image defaults:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>docker run <span class="tok-f">-p</span> 6000:6000 <span class="tok-f">-v</span> pinkdb-data:/data ghcr.io/openlearnia/pinkdb \
+  <span class="tok-f">--port</span> 6000 <span class="tok-f">--idle-timeout</span> 60</code></pre></div>
+
+<div class="table-wrap">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Server flag</th></tr></thead>
+  <tbody>
+    <tr><td><code>PINKDB_HOST</code></td><td><code>0.0.0.0</code></td><td><code>--host</code></td></tr>
+    <tr><td><code>PINKDB_PORT</code></td><td><code>5433</code></td><td><code>--port</code></td></tr>
+    <tr><td><code>PINKDB_FILE</code></td><td><code>/data/pinkdb.pink</code></td><td><code>--file</code></td></tr>
+    <tr><td><code>PINKDB_TRANSPORT</code></td><td><code>sync</code></td><td><code>--transport</code></td></tr>
+    <tr><td><code>PINKDB_TLS_CERT</code> / <code>PINKDB_TLS_KEY</code></td><td>—</td><td><code>--tls-cert</code> / <code>--tls-key</code></td></tr>
+    <tr><td><code>PINKDB_MAX_CONNECTIONS</code></td><td><code>128</code></td><td><code>--max-connections</code></td></tr>
+    <tr><td><code>PINKDB_IDLE_TIMEOUT</code></td><td><code>300</code></td><td><code>--idle-timeout</code></td></tr>
+    <tr><td><code>PINKDB_STATEMENT_TIMEOUT_MS</code></td><td><code>30000</code></td><td><code>--statement-timeout-ms</code></td></tr>
+    <tr><td><code>PINKDB_MAX_RESULT_ROWS</code></td><td><code>10000000</code></td><td><code>--max-result-rows</code></td></tr>
+    <tr><td><code>PINKDB_MAX_RESULT_BYTES</code></td><td><code>268435456</code></td><td><code>--max-result-bytes</code></td></tr>
+    <tr><td><code>PINKDB_MAX_CONCURRENT_LOGINS</code></td><td><code>4</code></td><td><code>--max-concurrent-logins</code></td></tr>
+    <tr><td><code>PINKDB_ALLOW_LOAD_EXTENSION</code></td><td>off</td><td><code>--allow-load-extension</code></td></tr>
+    <tr><td><code>PINKDB_EXTENSION_ROOT</code></td><td>—</td><td><code>--extension-root</code></td></tr>
+    <tr><td><code>PINKDB_ALLOW_COPY_TO</code></td><td>off</td><td><code>--allow-copy-to</code></td></tr>
+    <tr><td><code>PINKDB_COPY_ROOT</code></td><td>—</td><td><code>--copy-root</code></td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Values of <code>1</code>, <code>true</code>, <code>TRUE</code> or
+<code>yes</code> turn the two opt-ins on. <code>PINKDB_FILE</code> must stay
+inside the writable <code>/data</code> volume unless you mount another path.</p>
+
+<h2 id="health-check">Health check<a class="anchor" href="#health-check" aria-label="Permalink: Health check">#</a></h2>
+
+<p>The image's <code>HEALTHCHECK</code> runs</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>pinkdb-server <span class="tok-f">--health-check</span></code></pre></div>
+
+<p>which connects, speaks the protocol <code>Ping</code>, prints
+<code>healthy</code> and exits 0, or exits 1 within a short timeout. Without an
+explicit address it reads <code>PINKDB_HEALTHCHECK_ADDR</code>, then
+<code>PINKDB_HOST</code>/<code>PINKDB_PORT</code>, then
+<code>127.0.0.1:5433</code>; a wildcard bind is mapped to loopback.
+<code>PINKDB_HEALTHCHECK_TIMEOUT_MS</code> bounds the probe (default 2000 ms).
+The same probe is available from the shell, and a dead port is a nonzero exit:</p>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>docker exec &lt;name&gt; pinkdb-server <span class="tok-f">--health-check</span>
+docker exec &lt;name&gt; pinkdb-server <span class="tok-f">--health-check</span> 127.0.0.1:1   <span class="tok-c"># exit 1</span></code></pre></div>
+
+<p>If you override the port with a CLI flag rather than
+<code>PINKDB_PORT</code>, pass a matching <code>--health-cmd</code> or set
+<code>PINKDB_HEALTHCHECK_ADDR</code>, because the built-in probe follows the
+environment.</p>
+
+<h2 id="security-posture">Security posture<a class="anchor" href="#security-posture" aria-label="Permalink: Security posture">#</a></h2>
+
+<div class="callout security">
+  <span class="callout-title">Non-root, but authentication is per store</span>
+  <p>The container runs as UID/GID 10001 and only <code>/data</code> is
+  writable by convention. That is OS isolation, not database authentication:
+  the served store decides. A fresh store with no users trusts every connection
+  and says so at startup; once a user exists, connections must log in and every
+  statement is checked against that user's grants.
+  <code>LOAD EXTENSION</code> and <code>COPY … TO</code> stay off unless the
+  matching opt-in and root are set.</p>
+</div>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">SQL</span></div><pre class="code" data-lang="sql"><code><span class="tok-c">-- bootstrap over the wire; the catalog, not the image, is the switch</span>
+<span class="tok-k">CREATE</span> USER alice PASSWORD <span class="tok-s">'a long passphrase'</span>;
+GRANT ADMIN TO alice;</code></pre></div>
+
+<p>Publishing <code>5433</code> to an untrusted network before the store has
+users is remote shell-level access to the database; bind to a trusted network
+first. For encrypted transport, mount a certificate/key pair and start the
+server with <code>PINKDB_TLS_CERT</code>/<code>PINKDB_TLS_KEY</code> (TLS is
+supported by the default <code>sync</code> transport only; the async transport
+refuses those flags). TLS identifies the server, not the client — login is what
+gates statements.</p>
+
+<h2 id="build-the-image-yourself">Build the image yourself<a class="anchor" href="#build-the-image-yourself" aria-label="Permalink: Build the image yourself">#</a></h2>
+
+<div class="codeblock"><div class="codeblock-head"><span class="codeblock-lang">Shell</span></div><pre class="code" data-lang="sh"><code>docker build <span class="tok-f">--build-arg</span> <span class="tok-v">VARIANT</span>=default <span class="tok-f">-t</span> pinkdb:default .
+docker build <span class="tok-f">--build-arg</span> <span class="tok-v">VARIANT</span>=lake <span class="tok-f">-t</span> pinkdb:lake .
+scripts/docker/smoke.sh <span class="tok-f">--image</span> pinkdb:default <span class="tok-f">--variant</span> default
+scripts/docker/smoke.sh <span class="tok-f">--image</span> pinkdb:lake <span class="tok-f">--variant</span> lake</code></pre></div>
+
+<p>The Dockerfile builds both binaries from source in a pinned Rust builder and
+publishes the smaller runtime that passes the smoke test. The smoke test starts
+the container, waits for <code>healthy</code>, runs the image's own CLI in
+remote mode (<code>pinkdb --host</code>), creates/inserts/selects, restarts the
+container to prove persistence, checks <code>--health-check</code> exit codes,
+and on the lake variant runs <code>.lake save</code>/<code>.lake open</code> on
+the volume. See <a href="../docs/install">Install</a> for the
+non-container binaries and <a href="../docs/server">Server</a> for
+the full protocol and security reference.</p>
+
+<ul class="next-links">
+  <li><a href="../docs/server">Server →</a></li>
+  <li><a href="../docs/cli">CLI &amp; REPL →</a></li>
+  <li><a href="../docs/persistence">Persistence &amp; WAL →</a></li>
+</ul>
+
+<footer class="doc-footer">
+<nav class="pager" aria-label="Previous and next"><a class="pager-link prev" href="install"><span class="pager-dir">Previous</span><span class="pager-title">Install</span></a><a class="pager-link next" href="guide-csv-to-lake"><span class="pager-dir">Next</span><span class="pager-title">CSV to a lake</span></a></nav>
+<p class="edit-link"><a href="https://github.com/openlearnia/pinkdb/blob/main/website/src/pages/docker.html" rel="noopener">Edit this page on GitHub</a></p>
+</footer>
+</article>
+<nav class="toc" aria-label="On this page">
+<p class="toc-title">On this page</p>
+<ul>
+  <li><a href="#quick-start">Quick start</a></li>
+  <li><a href="#variants-and-tags">Variants and tags</a></li>
+  <li><a href="#command-and-environment">Command and environment</a></li>
+  <li><a href="#health-check">Health check</a></li>
+  <li><a href="#security-posture">Security posture</a></li>
+  <li><a href="#build-the-image-yourself">Build the image yourself</a></li>
+</ul>
+<p class="toc-top"><a href="#main">Back to top &#8593;</a></p>
+</nav>
+</div>
+</main>
+<footer class="site-footer">
+  <div class="container footer-row">
+    <p>pinkdb — an embedded analytical SQL database in Rust.</p>
+    <p class="colophon" aria-hidden="true">soft data-zine · self-hosted type · no trackers</p>
+    <div class="theme-switch" role="group" aria-label="Paper edition" hidden>
+      <span class="theme-switch-label" aria-hidden="true">edition</span>
+      <button type="button" data-theme-choice="system" aria-pressed="true">Auto</button>
+      <button type="button" data-theme-choice="light" aria-pressed="false">Day</button>
+      <button type="button" data-theme-choice="dark" aria-pressed="false">Night</button>
+    </div>
+    <p><a href="../docs/getting-started">Docs</a> · <a href="../extensions">Extensions</a> · <a href="../docs/changelog">Changelog</a> · <a href="https://github.com/openlearnia/pinkdb" rel="noopener">Source on GitHub</a> · <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md" rel="noopener">Engineering log</a></p>
+  </div>
+</footer>
+</body>
+</html>
