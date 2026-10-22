@@ -188,6 +188,13 @@ counts, integration notes) lives in the
 progress log</a>.</p>
 
 <h2 id="2026-10-22">2026-10-22<a class="anchor" href="#2026-10-22" aria-label="Permalink: 2026-10-22">#</a></h2>
+<h3>Wave 89 — lake replication jobs ✅</h3>
+<ul>
+<li>A lake can now keep copies of another lake's tables, or of a database in your session, in sync: <code>.lake replicate create &lt;dest&gt; from &lt;source&gt;</code>, then <code>.lake replicate catchup</code> or a background <code>.lake replicate start</code>.</li>
+<li>Each table syncs the cheapest safe way: by a timestamp/ID column you name, by replaying the source lake's changes, by primary key, or by a full copy — and falls back to a full copy whenever it can't be sure.</li>
+<li>One failing table doesn't stop the others; a job never overwrites a table it doesn't manage; a table dropped or excluded on the source is dropped from the copy; a recreated source table is re-copied from scratch.</li>
+<li><code>.lake replicate status</code> and <code>tables</code> show how far behind each job and table is and the last error. Copied tables are ordinary lake tables (time travel, attach and changes all work).</li>
+</ul>
 <h3>Wave 88 — mixed-format lakes ✅</h3>
 <ul>
 <li>One lake can hold tables in different formats: <code>.lake format parquet for main.events</code> picks a table's format, and <code>.lake rewrite &lt;dir&gt; &lt;table&gt; format &lt;id&gt;</code> converts an existing table in one step.</li>

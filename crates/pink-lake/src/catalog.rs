@@ -42,6 +42,23 @@
 //! read (wave 88, rule 5). The catalog stores only the id string, so existing
 //! manifests stay byte-identical.
 //!
+//! Wave 89 adds the optional per-table `"table_id"` — a random 128-bit
+//! identity (32 lowercase hex characters), assigned when a table is created
+//! and preserved for the same catalog key across later versions:
+//!
+//! ```json
+//! "main.t": { "files": [ … ], "rows": 7, "format": "vortex",
+//!             "table_id": "0123456789abcdef0123456789abcdef" }
+//! ```
+//!
+//! The field is additive: absent on entries written by older builds (and
+//! omitted while it is absent, so old manifests stay byte-identical), ignored
+//! by older readers. Every version this build publishes assigns an id to
+//! every entry that lacks one, so an old lake acquires ids on its next write.
+//! A table dropped and recreated gets a **new** id; replication
+//! (`crate::replication`) compares the source entry's id with the one it
+//! recorded and reseeds when it changed.
+//!
 //! Wave 88 adds the optional per-table `"format_pinned"` flag:
 //!
 //! ```json
@@ -724,6 +741,16 @@ pub(crate) struct TableEntry {
     pub(crate) files: Vec<FileRef>,
     /// Logical rows: data rows minus the positions every delete file drops.
     pub(crate) rows: u64,
+    /// Wave 89: the table's random 128-bit identity (32 lowercase hex), a
+    /// stable name-independent identity for replication. Assigned when the
+    /// table is created and preserved for the same catalog key across later
+    /// save/commit/maintenance versions; a drop + recreate mints a new one.
+    /// Absent on entries written by older builds; any version this build
+    /// writes assigns ids to every entry that lacks one. Omitted from JSON
+    /// while absent, so older manifests stay byte-identical and older builds
+    /// ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) table_id: Option<String>,
     /// The data-file format; required in a `format_version` 2+ manifest,
     /// absent (⇒ `"pink"`) in a `format_version` 1 manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -844,6 +871,21 @@ impl TableEntry {
             )
             .max()
     }
+}
+
+/// Assign a fresh random 128-bit id to every table entry that has none
+/// (wave 89). Every publishing path calls this right before building its
+/// manifest, so one version written by this build upgrades the whole catalog
+/// — old lakes acquire ids on their next write, and entries that already
+/// carry one (a full save copies it from the previous entry; commits and
+/// maintenance clone their entries) keep it.
+pub(crate) fn assign_missing_table_ids(tables: &mut BTreeMap<String, TableEntry>) -> Result<()> {
+    for entry in tables.values_mut() {
+        if entry.table_id.is_none() {
+            entry.table_id = Some(crate::fresh_lake_id()?);
+        }
+    }
+    Ok(())
 }
 
 /// One commit's delta manifest (`commits/<version>.json`): the data and

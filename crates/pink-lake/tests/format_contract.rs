@@ -12,6 +12,7 @@
 mod format_contract;
 
 use format_contract::{ContractOptions, run_contract};
+#[cfg(feature = "vortexlake")]
 use pinkdb::DataType;
 
 #[test]

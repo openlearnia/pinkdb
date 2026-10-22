@@ -18,6 +18,7 @@
 //!   data/<table>/<uuid>.vortex  immutable per-table data files (v4, Vortex)
 //!   data/<table>/<uuid>.pink    `.pink` data files (v1/v4 lean builds)
 //!   data/<table>/<uuid>.pinkdel positional delete files (v4; see delete_file)
+//!   replication/state.json      replication jobs + per-table cursor state (wave 89)
 //! ```
 //!
 //! `catalog.json` and every snapshot manifest are JSON of the same shape:
@@ -39,11 +40,16 @@
 //!           "count": 1 }
 //!       ],
 //!       "rows": 6,
-//!       "format": "vortex"
+//!       "format": "vortex",
+//!       "table_id": "0123456789abcdef0123456789abcdef"
 //!     }
 //!   }
 //! }
 //! ```
+//!
+//! Wave 89 adds the optional table identity `table_id` (a random 128-bit
+//! hex string assigned on creation, preserved for the same key across later
+//! writes and omitted while absent; see [`Lake::table_ids`]).
 //!
 //! A `format_version` 4 entry is **incremental**: every data file carries its
 //! own exact row count, scans union the files in listed order, and each
@@ -321,6 +327,34 @@
 //! `maintenance` module documents every rule, the live DuckLake probes
 //! behind them, and the honest differences.
 //!
+//! # Replication (wave 89)
+//!
+//! [`replication`] is the **table-level** replication API: a writable
+//! destination lake carries jobs (`replication/state.json`) that copy the
+//! tables of one source — another lake, or one database of the caller's live
+//! [`PinkDb`] store — under the same `db.table` names. A job's tables are
+//! ordinary lake tables: every destination write is an incremental
+//! [`Lake::commit_from_tables`] version with only that table in
+//! `base`/`current`, so time travel, attach, CDC and maintenance all apply.
+//! Each table picks a strategy — **watermark** (append-only cursor on a
+//! configured column), **snapshot** (lake sources; replay
+//! [`Lake::table_changes`] and verify), **merge** (store sources with a
+//! `PRIMARY KEY`; key-level diff) or **full** (copy) — and the state row
+//! records the strategy and cursor. Table identity ([`Lake::table_ids`])
+//! detects a drop + recreate on the source and forces a reseed; schema drift
+//! is extended in place when additive and recreated otherwise. The state file
+//! is written with conditional writes (`put_new`/`put_if_match`) and is
+//! sealed like every other artifact when the destination is keyed.
+//! [`replication::catch_up`] runs one cycle. [`replication::Supervisor`] runs
+//! one background thread per destination: due `running`/`error` lake-source
+//! jobs on their interval (a 250 ms floor), exponential backoff capped at
+//! 60 s after a failed cycle, a condvar woken by stop/notify/pause/resume, and
+//! a stop that aborts an in-flight cycle at the next table boundary. Cycles
+//! never overlap. Store-source jobs are not supervised — a single-threaded
+//! store runs them through `catch_up` from the process that owns it. The CLI
+//! surface is `.lake replicate …` (create, catchup, start/stop, pause/resume/
+//! resume-all, status, tables, drop).
+//!
 //! # Crash safety and durability
 //!
 //! Publication order is data and delete files → commit manifest
@@ -455,6 +489,8 @@ mod time;
 #[cfg(feature = "vortexlake")]
 mod vortex_file;
 mod zone;
+
+pub mod replication;
 
 pub use attach::AttachmentReport;
 use catalog::{Catalog, DeleteRef, FileFormat, FileRef, PartitionKey, TableEntry};
@@ -1395,6 +1431,24 @@ impl Lake {
             .collect())
     }
 
+    /// The current version's per-table identity (wave 89): `(db.table,
+    /// table_id)`, sorted by name. `table_id` is the entry's random 128-bit
+    /// hex string, `None` for an entry written by a build before wave 89
+    /// (the next version this build publishes assigns one to every entry
+    /// that lacks it).
+    ///
+    /// This is the read-only identity replication compares across cycles: a
+    /// different id under the same key means the source table was dropped and
+    /// recreated, so a replica must reseed instead of trusting its cursors.
+    pub fn table_ids(&self) -> Result<Vec<(String, Option<String>)>> {
+        let (manifest, _) = self.manifest(None)?;
+        Ok(manifest
+            .tables
+            .into_iter()
+            .map(|(key, entry)| (key, entry.table_id))
+            .collect())
+    }
+
     /// Rebuild a [`PinkDb`] from the latest version (`None`) or a specific
     /// snapshot. Views are session-local in the engine and never come back.
     ///
@@ -1689,6 +1743,12 @@ impl Lake {
                     TableEntry {
                         files,
                         rows: src.num_rows() as u64,
+                        // Wave 89: a save preserves the table identity of the
+                        // same key (a dropped + recreated table was dropped by
+                        // an earlier published version, so this lookup no
+                        // longer finds the old entry); a fresh table is
+                        // assigned one below.
+                        table_id: previous_entry.and_then(|e| e.table_id.clone()),
                         format: Some(format.clone()),
                         format_pinned,
                         stats: None,
@@ -1714,6 +1774,10 @@ impl Lake {
             rows = rows.saturating_add(entry.rows);
             tables.insert(key, entry);
         }
+        // Wave 89: every entry this version publishes carries an identity —
+        // a table this save created gets a fresh one, a pre-wave-89 entry
+        // acquires one here.
+        catalog::assign_missing_table_ids(&mut tables)?;
         // The per-version record: the author/message [`Lake::set_commit_message`]
         // recorded for this save (kept pending until the save succeeds below),
         // and the change summary — the diff against the previous version's

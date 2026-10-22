@@ -687,6 +687,7 @@ impl Lake {
                     crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
                 });
             let schema_version = next_schema_version(Some(&head), &tables);
+            crate::catalog::assign_missing_table_ids(&mut tables)?;
             let new_catalog = Catalog {
                 format_version: FORMAT_VERSION,
                 lake_id: Some(self.lake_id.clone()),

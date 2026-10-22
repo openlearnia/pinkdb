@@ -79,8 +79,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use pink_lake::replication::{self, JobSpec, Source, Supervisor};
 use pink_lake::{
     CleanupSettings, CommitSettings, ExpireSettings, Lake, MergeSettings, RewriteSettings,
     WritableAttachment,
@@ -176,6 +177,24 @@ static WRITE_FORMAT: Mutex<Option<String>> = Mutex::new(None);
 /// per-table data-file formats keyed by the flat catalog key. Applied to every
 /// handle about to write, like [`WRITE_FORMAT`]; not persisted.
 static TABLE_FORMATS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+/// The session's replication supervisors (wave 89), one per resolved
+/// destination location. `.lake replicate start` inserts a supervisor and
+/// `.lake replicate stop` removes and joins it; a session that exits with one
+/// still running ends the process (and its thread).
+static SUPERVISORS: Mutex<BTreeMap<String, Supervisor>> = Mutex::new(BTreeMap::new());
+
+fn supervisors() -> MutexGuard<'static, BTreeMap<String, Supervisor>> {
+    SUPERVISORS.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The resolved location that keys [`SUPERVISORS`] (the same string the
+/// supervisor's registry and `catch_up`'s status hook use).
+fn supervisor_key(dir: &str) -> Option<String> {
+    open_lake(dir)
+        .ok()
+        .map(|lake| lake.path().display().to_string())
+}
 
 fn chosen_write_format() -> Option<String> {
     WRITE_FORMAT
@@ -276,6 +295,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "open" => cmd_open(db, rest),
         "attach" => cmd_attach(db, rest),
         "commit" => cmd_commit(db, rest),
+        "replicate" => cmd_replicate(db, rest),
         "partition" => cmd_partition(db, rest),
         "inlining" => cmd_inlining(rest),
         "flush" => cmd_flush(rest),
@@ -298,7 +318,7 @@ pub(crate) fn cmd_lake(db: &mut PinkDb, arg: &str) {
         "tables" => cmd_tables(rest),
         "info" => cmd_info(rest),
         "" => println!(
-            "Usage: .lake <save|open|attach|commit|partition|inlining|flush|changes|\
+            "Usage: .lake <save|open|attach|commit|replicate|partition|inlining|flush|changes|\
              add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
              settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),
@@ -1820,6 +1840,463 @@ fn warn_missing_data_files(lake: &Lake) {
                 );
             }
         }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Replication (wave 89): `.lake replicate …` — table-level jobs between a
+// source (another lake, or one database of the session store) and a writable
+// destination lake. Jobs and their cursors live in the destination
+// (`replication/state.json`); `start` keeps a supervisor for this session.
+
+/// The `.lake replicate` command list.
+fn replicate_usage() {
+    println!(
+        "Usage: .lake replicate create <dest> from <source-dir|s3://...|store:<db>> \
+         [every <secs>]"
+    );
+    println!("                              [include <patterns>] [exclude <patterns>]");
+    println!("                              [watermark <db.table=col,...>]");
+    println!("       .lake replicate catchup <dest> <id>");
+    println!("       .lake replicate start|stop <dest>");
+    println!("       .lake replicate pause|resume <dest> <id>");
+    println!("       .lake replicate resume-all <dest>");
+    println!("       .lake replicate status <dest>");
+    println!("       .lake replicate tables <dest> [<id>]");
+    println!("       .lake replicate drop <dest> <id>{HINT}");
+}
+
+fn cmd_replicate(db: &mut PinkDb, arg: &str) {
+    let Some((sub, rest)) = take_token(arg) else {
+        replicate_usage();
+        return;
+    };
+    match sub.to_ascii_lowercase().as_str() {
+        "create" => cmd_replicate_create(rest),
+        "catchup" | "catch_up" => cmd_replicate_catchup(db, rest),
+        "start" => cmd_replicate_start(rest),
+        "stop" => cmd_replicate_stop(rest),
+        "pause" => cmd_replicate_pause(rest),
+        "resume" => cmd_replicate_resume(rest),
+        "resume-all" | "resume_all" => cmd_replicate_resume_all(rest),
+        "status" => cmd_replicate_status(rest),
+        "tables" => cmd_replicate_tables(rest),
+        "drop" => cmd_replicate_drop(rest),
+        other => cli_error!("unknown .lake replicate subcommand \"{other}\". Try .help"),
+    }
+}
+
+/// Parse `<dest>` alone (a trailing token is a usage error).
+fn replicate_dest(arg: &str, usage: &str) -> Option<String> {
+    let Some((dest, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return None;
+    };
+    if !rest.trim().is_empty() {
+        println!("{usage}");
+        return None;
+    }
+    Some(unquote(&dest))
+}
+
+/// Parse `<dest> <id>` (a trailing token is a usage error).
+fn replicate_dest_id(arg: &str, usage: &str) -> Option<(String, u64)> {
+    let Some((dest, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return None;
+    };
+    let Some((id, tail)) = take_token(rest) else {
+        println!("{usage}");
+        return None;
+    };
+    if !tail.trim().is_empty() {
+        println!("{usage}");
+        return None;
+    }
+    let Ok(id) = id.parse::<u64>() else {
+        println!("{usage}");
+        return None;
+    };
+    Some((unquote(&dest), id))
+}
+
+/// Run `change` under the session supervisor for `dest`, or `None` when no
+/// supervisor is running there.
+fn with_supervisor<T>(
+    dest: &str,
+    change: impl FnOnce(&Supervisor) -> pink_lake::Result<T>,
+) -> Option<pink_lake::Result<T>> {
+    let key = supervisor_key(dest)?;
+    let supervisors = supervisors();
+    supervisors.get(&key).map(change)
+}
+
+/// `.lake replicate create <dest> from <source> …`: record a job in the
+/// destination (creating the destination lake when it does not exist yet).
+fn cmd_replicate_create(arg: &str) {
+    let usage = "Usage: .lake replicate create <dest> from <source-dir|s3://...|store:<db>> \
+                 [every <secs>] [include <patterns>] [exclude <patterns>] \
+                 [watermark <db.table=col,...>]";
+    let Some((dest_token, rest)) = take_token(arg) else {
+        replicate_usage();
+        return;
+    };
+    let dest = unquote(&dest_token);
+    let Some((from, rest)) = take_token(rest) else {
+        println!("{usage}");
+        return;
+    };
+    if !from.eq_ignore_ascii_case("from") {
+        println!("{usage}");
+        return;
+    }
+    let Some((source_token, mut rest)) = take_token(rest) else {
+        println!("{usage}");
+        return;
+    };
+    let source_text = unquote(&source_token);
+    let source = match source_text.strip_prefix("store:") {
+        Some(database) if !database.is_empty() => Source::Store {
+            database: database.to_string(),
+        },
+        Some(_) => {
+            cli_error!("invalid store source \"{source_text}\": expected store:<database>");
+            return;
+        }
+        None => Source::Lake {
+            location: source_text.clone(),
+        },
+    };
+    let mut spec = JobSpec::new(source);
+    loop {
+        let tail = rest.trim_start();
+        if tail.is_empty() {
+            break;
+        }
+        let Some((token, after)) = take_token(tail) else {
+            break;
+        };
+        match token.to_ascii_lowercase().as_str() {
+            "every" => {
+                let Some((value, after)) = take_token(after) else {
+                    println!("{usage}");
+                    return;
+                };
+                match value.parse::<u64>() {
+                    Ok(secs) => spec.interval = Duration::from_secs(secs),
+                    Err(_) => {
+                        cli_error!("invalid every {value:?}: expected whole seconds");
+                        return;
+                    }
+                }
+                rest = after;
+            }
+            "include" | "exclude" | "watermark" => {
+                let Some((value, after)) = take_value(after) else {
+                    println!("{usage}");
+                    return;
+                };
+                match token.to_ascii_lowercase().as_str() {
+                    "include" => spec.include = value,
+                    "exclude" => spec.exclude = value,
+                    _ => spec.watermark_columns = value,
+                }
+                rest = after;
+            }
+            _ => {
+                println!("{usage}");
+                return;
+            }
+        }
+    }
+    let source_label = spec.source.to_string();
+    let interval_secs = spec.interval.as_secs();
+    let mut lake = match open_or_create_lake(&dest) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match replication::create(&mut lake, spec) {
+        Ok(id) => println!(
+            "Created replication job {id} on {dest} from {source_label} (every {interval_secs}s)"
+        ),
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake replicate catchup <dest> <id>`: run one cycle now (store-source jobs
+/// use this session's store).
+fn cmd_replicate_catchup(db: &mut PinkDb, arg: &str) {
+    let usage = "Usage: .lake replicate catchup <dest> <id>";
+    let Some((dest, id)) = replicate_dest_id(arg, usage) else {
+        return;
+    };
+    let mut lake = match open_lake(&dest) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match replication::catch_up(&mut lake, id, Some(db), lake_key()) {
+        Ok(report) => println!(
+            "Caught up replication job {id} on {dest}: {}",
+            report.message
+        ),
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake replicate start <dest>`: start the session supervisor (one thread,
+/// kept in [`SUPERVISORS`] and stopped on `.lake replicate stop` or exit).
+fn cmd_replicate_start(arg: &str) {
+    let usage = "Usage: .lake replicate start <dest>";
+    let Some(dest) = replicate_dest(arg, usage) else {
+        return;
+    };
+    if supervisor_key(&dest).is_some_and(|key| supervisors().contains_key(&key)) {
+        println!("A replication supervisor for {dest} is already running in this session");
+        return;
+    }
+    match Supervisor::start(&dest, lake_key()) {
+        Ok(supervisor) => {
+            let location = supervisor.destination().to_string();
+            let skipped = supervisor.skipped();
+            supervisors().insert(location, supervisor);
+            println!("Started replication supervisor for {dest}");
+            for (id, reason) in skipped {
+                println!("  job {id} skipped: {reason}");
+            }
+        }
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake replicate stop <dest>`: stop and join the session supervisor.
+fn cmd_replicate_stop(arg: &str) {
+    let usage = "Usage: .lake replicate stop <dest>";
+    let Some(dest) = replicate_dest(arg, usage) else {
+        return;
+    };
+    let Some(key) = supervisor_key(&dest) else {
+        cli_error!("no replication supervisor for {dest} is running in this session");
+        return;
+    };
+    let supervisor = supervisors().remove(&key);
+    match supervisor {
+        Some(supervisor) => {
+            supervisor.stop();
+            println!("Stopped replication supervisor for {dest}");
+        }
+        None => cli_error!("no replication supervisor for {dest} is running in this session"),
+    }
+}
+
+/// `.lake replicate pause <dest> <id>`.
+fn cmd_replicate_pause(arg: &str) {
+    let usage = "Usage: .lake replicate pause <dest> <id>";
+    let Some((dest, id)) = replicate_dest_id(arg, usage) else {
+        return;
+    };
+    let result = match with_supervisor(&dest, |supervisor| supervisor.pause(id)) {
+        Some(result) => result,
+        None => open_lake(&dest).and_then(|mut lake| replication::pause(&mut lake, id)),
+    };
+    match result {
+        Ok(()) => println!("Paused replication job {id} on {dest}"),
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake replicate resume <dest> <id>`.
+fn cmd_replicate_resume(arg: &str) {
+    let usage = "Usage: .lake replicate resume <dest> <id>";
+    let Some((dest, id)) = replicate_dest_id(arg, usage) else {
+        return;
+    };
+    let result = match with_supervisor(&dest, |supervisor| supervisor.resume(id)) {
+        Some(result) => result,
+        None => open_lake(&dest).and_then(|mut lake| replication::resume(&mut lake, id)),
+    };
+    match result {
+        Ok(()) => println!("Resumed replication job {id} on {dest}"),
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake replicate resume-all <dest>`.
+fn cmd_replicate_resume_all(arg: &str) {
+    let usage = "Usage: .lake replicate resume-all <dest>";
+    let Some(dest) = replicate_dest(arg, usage) else {
+        return;
+    };
+    let result = match with_supervisor(&dest, |supervisor| supervisor.resume_all()) {
+        Some(result) => result,
+        None => open_lake(&dest).and_then(|mut lake| replication::resume_all(&mut lake)),
+    };
+    match result {
+        Ok(ids) if ids.is_empty() => println!("No paused or errored jobs on {dest}"),
+        Ok(ids) => println!(
+            "Resumed {count} replication job{plural} on {dest}: {list}",
+            count = ids.len(),
+            plural = plural(ids.len()),
+            list = ids
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Err(e) => cli_error!("{e}"),
+    }
+}
+
+/// `.lake replicate status <dest>`: one line per job (id, source, status,
+/// versions behind, last success and last error).
+fn cmd_replicate_status(arg: &str) {
+    let usage = "Usage: .lake replicate status <dest>";
+    let Some(dest) = replicate_dest(arg, usage) else {
+        return;
+    };
+    let lake = match open_lake(&dest) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let jobs = match replication::jobs(&lake) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    if jobs.is_empty() {
+        println!("(no replication jobs)");
+        return;
+    }
+    for job in jobs {
+        let behind = match replication::versions_behind(&lake, job.id) {
+            Ok(Some(versions)) => versions.to_string(),
+            Ok(None) => "-".to_string(),
+            Err(e) => format!("unknown ({e})"),
+        };
+        println!(
+            "job {}  {}  status={}  behind={}  last ok={}  last error={}",
+            job.id,
+            sanitize_terminal(&job.source.to_string()),
+            job.status.as_str(),
+            behind,
+            sanitize_terminal(job.last_ok.as_deref().unwrap_or("-")),
+            job.last_error
+                .as_deref()
+                .map(sanitize_terminal)
+                .unwrap_or_else(|| "-".to_string()),
+        );
+    }
+}
+
+/// `.lake replicate tables <dest> [<id>]`: per-table state rows (every job
+/// when no id is given).
+fn cmd_replicate_tables(arg: &str) {
+    let usage = "Usage: .lake replicate tables <dest> [<id>]";
+    let Some((dest_token, rest)) = take_token(arg) else {
+        println!("{usage}");
+        return;
+    };
+    let dest = unquote(&dest_token);
+    let rest = rest.trim();
+    let selected = if rest.is_empty() {
+        None
+    } else {
+        match rest.parse::<u64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                println!("{usage}");
+                return;
+            }
+        }
+    };
+    let lake = match open_lake(&dest) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    let ids: Vec<u64> = match selected {
+        Some(id) => vec![id],
+        None => match replication::jobs(&lake) {
+            Ok(jobs) => jobs.into_iter().map(|job| job.id).collect(),
+            Err(e) => {
+                cli_error!("{e}");
+                return;
+            }
+        },
+    };
+    let mut any = false;
+    for job_id in ids {
+        let tables = match replication::tables(&lake, job_id) {
+            Ok(tables) => tables,
+            Err(e) => {
+                cli_error!("{e}");
+                return;
+            }
+        };
+        for table in tables {
+            any = true;
+            println!(
+                "job {job_id}  {} -> {}  strategy={}  rows={}  watermark={}  source version={}  \
+                 full sync={}  synced={}  error={}",
+                sanitize_terminal(&table.source),
+                sanitize_terminal(&table.dest),
+                table.strategy,
+                table
+                    .rows_dest
+                    .map(|rows| rows.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                table.watermark_column.as_deref().unwrap_or("-"),
+                table
+                    .last_source_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                table
+                    .last_full_sync_version
+                    .map(|version| version.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                sanitize_terminal(table.synced.as_deref().unwrap_or("-")),
+                table
+                    .last_error
+                    .as_deref()
+                    .map(sanitize_terminal)
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+        }
+    }
+    if !any {
+        println!("(no replication tables)");
+    }
+}
+
+/// `.lake replicate drop <dest> <id>`: remove a job's state; the replicated
+/// tables stay.
+fn cmd_replicate_drop(arg: &str) {
+    let usage = "Usage: .lake replicate drop <dest> <id>";
+    let Some((dest, id)) = replicate_dest_id(arg, usage) else {
+        return;
+    };
+    let mut lake = match open_lake(&dest) {
+        Ok(lake) => lake,
+        Err(e) => {
+            cli_error!("{e}");
+            return;
+        }
+    };
+    match replication::drop(&mut lake, id) {
+        Ok(()) => println!("Dropped replication job {id} from {dest} (its replicated tables stay)"),
         Err(e) => cli_error!("{e}"),
     }
 }

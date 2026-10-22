@@ -9,6 +9,20 @@ integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
 ## 2026-10-22
+### Wave 89 — lake replication jobs ✅
+- A lake can now keep copies of another lake's tables, or of a database in
+  your session, in sync: `.lake replicate create <dest> from <source>`, then
+  `.lake replicate catchup` or a background `.lake replicate start`.
+- Each table syncs the cheapest safe way: by a timestamp/ID column you name,
+  by replaying the source lake's changes, by primary key, or by a full copy —
+  and falls back to a full copy whenever it can't be sure.
+- One failing table doesn't stop the others; a job never overwrites a table
+  it doesn't manage; a table dropped or excluded on the source is dropped from
+  the copy; a recreated source table is re-copied from scratch.
+- `.lake replicate status` and `tables` show how far behind each job and
+  table is and the last error. Copied tables are ordinary lake tables (time
+  travel, attach and changes all work).
+
 ### Wave 88 — mixed-format lakes ✅
 - One lake can hold tables in different formats: `.lake format parquet for
   main.events` picks a table's format, and `.lake rewrite <dir> <table>

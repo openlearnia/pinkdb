@@ -261,7 +261,7 @@ fn lake_errors_are_clear() {
     assert!(out.contains("Usage: .lake info <dir>"), "{out}");
     assert!(
         out.contains(
-            "Usage: .lake <save|open|attach|commit|partition|inlining|flush|changes|\
+            "Usage: .lake <save|open|attach|commit|replicate|partition|inlining|flush|changes|\
              add_data_files|merge|rewrite|expire|cleanup|orphans|files|table_info|options|\
              settings|format|detach|attached|versions|snapshots|tables|info> ..."
         ),

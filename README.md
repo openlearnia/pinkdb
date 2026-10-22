@@ -771,6 +771,38 @@ format contract test (type round-trips including NULL/NaN/±0.0/±inf, clean
 refusal of unsupported types, attach statistics equal to an opened store,
 appends and rewrites).
 
+**Replication (wave 89).** A writable lake can carry **replication jobs** that
+copy the tables of one source — another lake (local or `s3://`) or one
+database of the caller's live `PinkDb` store — into it under the same
+`db.table` names. Jobs and their per-table cursors live **in the destination**
+(`replication/state.json`, conditional writes), so every process that opens
+the destination sees them. Each table picks a strategy: **watermark** (an
+append-only cursor on a configured column; NULLs refuse the table and a
+backwards source reseeds), **snapshot** (lake sources: replay `table_changes`
+per version, verify against the source, reseed when history expired or a full
+save is in range), **merge** (store tables with a `PRIMARY KEY`: key-level
+insert/update/delete) or **full** (copy). Table identity detects a source drop
++ recreate and forces a reseed; an additive schema change is applied in place
+where the strategy allows and incompatible drift recreates the table. Every
+destination write is an ordinary incremental lake version, so time travel,
+attach, CDC and maintenance all apply, and the existing concurrent-writer
+rebase/retry/conflict rules govern races. Safety rules: a source that cannot
+be listed fails the whole cycle (never "empty", which would drop replicas), a
+table failure is isolated, an existing destination table another job owns (or
+no job owns) is refused, and one in-process cycle per (destination, job).
+`Supervisor::start` runs one background thread per destination: due
+`running`/`error` lake-source jobs on their interval (minimum 250 ms),
+exponential backoff up to 60 s after a failure, and a condvar woken by
+stop/notify/pause/resume. A stop aborts an in-flight cycle at the next table
+boundary. CLI: `.lake replicate create <dest> from <dir|s3://…|store:<db>>
+[every <secs>] [include <patterns>] [exclude <patterns>] [watermark
+<db.t=col,…>]`, `catchup <dest> <id>`, `start|stop <dest>` (a session-scoped
+supervisor, kept in the CLI's lake state), `pause|resume <dest> <id>`,
+`resume-all <dest>`, `status <dest>`, `tables <dest> [<id>]` and `drop <dest>
+<id>`. Encrypted lakes use `PINKDB_KEY` like every other `.lake` command.
+**Limitation:** store-source jobs are not supervised (the session store is
+single-threaded); they run only through `.lake replicate catchup`.
+
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
 JSON catalog plus immutable per-table data files, on local disk or (with the
 `s3` feature) in an S3 bucket/prefix. Wave 35 makes **Vortex the default data

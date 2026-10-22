@@ -261,6 +261,14 @@ fn print_help() {
         );
         println!("  .lake format [<id>]         show or choose the data-file format for");
         println!("                                subsequent .lake save / .lake commit writes");
+        println!("  .lake replicate create {LAKE} from <dir|s3://...|store:<db>> [every s] [...]");
+        println!("                                table-level replication jobs (wave 89)");
+        println!(
+            "  .lake replicate catchup|start|stop|pause|resume|resume-all|status|tables|drop ..."
+        );
+        println!(
+            "                                run/inspect jobs; start keeps a session supervisor"
+        );
         println!(
             "  FROM t AT (VERSION => n)     query an attached lake table at a version \
              (or AT (TIMESTAMP => TIMESTAMP '…'))"

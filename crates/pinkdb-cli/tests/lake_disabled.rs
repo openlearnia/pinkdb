@@ -14,7 +14,12 @@ use std::process::Command;
 
 #[test]
 fn lake_dot_commands_report_the_missing_feature() {
-    let input = String::from_utf8_lossy(b".help\n.lake save /tmp/x\n.lake open /tmp/x\n.lake versions /tmp/x\n.lake tables /tmp/x\n.lake info /tmp/x\n.quit\n").into_owned();
+    let input = String::from_utf8_lossy(
+        b".help\n.lake save /tmp/x\n.lake open /tmp/x\n.lake versions /tmp/x\n\
+          .lake tables /tmp/x\n.lake info /tmp/x\n.lake replicate status /tmp/x\n\
+          .lake replicate start /tmp/x\n.quit\n",
+    )
+    .into_owned();
     let (text, status) = common::run_merged(Command::new(env!("CARGO_BIN_EXE_pinkdb")), &input);
     common::assert_script_exit(status);
     assert!(

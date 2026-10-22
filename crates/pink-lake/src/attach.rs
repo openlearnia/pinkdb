@@ -2114,6 +2114,7 @@ mod tests {
                 row_id_start: None,
             }],
             rows: 3,
+            table_id: None,
             format: Some(FileFormat::pink()),
             format_pinned: false,
             stats: None,
@@ -2183,6 +2184,7 @@ mod tests {
         let v1 = TableEntry {
             files: vec![FileRef::Path("data/main.t/x.pink".to_string())],
             rows: 3,
+            table_id: None,
             format: None,
             format_pinned: false,
             stats: Some(block),

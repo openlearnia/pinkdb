@@ -1777,6 +1777,7 @@ impl Lake {
                     crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
                 });
             let schema_version = crate::next_schema_version(Some(&head), &tables);
+            crate::catalog::assign_missing_table_ids(&mut tables)?;
             let new_catalog = Catalog {
                 format_version: FORMAT_VERSION,
                 lake_id: Some(self.lake_id.clone()),
@@ -2070,6 +2071,7 @@ impl Lake {
                     crate::snapshot::ChangeSummary::diff(&previous.tables, &tables)
                 });
             let schema_version = crate::next_schema_version(Some(&head), &tables);
+            crate::catalog::assign_missing_table_ids(&mut tables)?;
             let new_catalog = Catalog {
                 format_version: FORMAT_VERSION,
                 lake_id: Some(self.lake_id.clone()),
@@ -2400,6 +2402,7 @@ impl Lake {
                 let mut entry = TableEntry {
                     files: Vec::new(),
                     rows: added,
+                    table_id: None,
                     format: Some(created_format),
                     format_pinned: created_pinned,
                     stats: None,
@@ -2732,6 +2735,10 @@ impl Lake {
             delta.partition_changed = true;
             delta.partition_by = spec.clone();
         }
+        // Wave 89: a table this commit created gets a fresh identity, and an
+        // entry written before wave 89 acquires one. Existing entries were
+        // cloned from the head, so their id is preserved.
+        crate::catalog::assign_missing_table_ids(&mut tables).map_err(PublishFailure::Fatal)?;
         // The per-version record, mirroring a save: the author/message kept
         // pending by `Lake::set_commit_message` and the change summary diffed
         // against the base manifest (absent when it is unavailable).
