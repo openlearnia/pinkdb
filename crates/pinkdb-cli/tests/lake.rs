@@ -2535,3 +2535,64 @@ fn add_data_files_registers_through_the_cli() {
     assert!(out.contains("version 3  rowid"), "{out}");
     cleanup(&dir);
 }
+
+/// Wave 88 rule 5: `.lake open` and `.lake attach` print one warning line per
+/// table whose data-file format this build cannot read. The lake still opens
+/// (the table is skipped), attach still lists it, and a read of it fails
+/// naming the id.
+#[test]
+fn unavailable_tables_print_one_warning_on_open_and_attach() {
+    let dir = scratch("unavailable_warn");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (i INTEGER);\n\
+         INSERT INTO t VALUES (1), (2);\n\
+         .lake save {lake}\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Saved lake version 2"), "{out}");
+
+    // Give the one entry a format id no provider serves (still a valid v6
+    // manifest, as a hand edit or a newer writer's extension id would be).
+    let path = lake.join("catalog.json");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let tampered = text.replacen("\"format\": \"vortex\"", "\"format\": \"nosuch\"", 1);
+    assert_ne!(text, tampered, "{text}");
+    std::fs::write(&path, tampered).unwrap();
+
+    // Open succeeds and warns that the table was skipped.
+    let out = run(&format!(
+        ".lake open {lake}\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Opened lake version 2"), "{out}");
+    assert!(
+        out.contains(
+            "warning: table main.t uses data-file format \"nosuch\", which this build cannot \
+             read; it was skipped"
+        ),
+        "{out}"
+    );
+
+    // Attach lists it and warns that reading it will fail; the read does.
+    let out = run(&format!(
+        ".lake attach {lake}\nSELECT COUNT(*) FROM t;\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Attached"), "{out}");
+    assert!(
+        out.contains(
+            "warning: table main.t uses data-file format \"nosuch\", which this build cannot \
+             read; reading it will fail"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("nosuch"), "{out}");
+    assert!(
+        out.contains("no lake format provider is registered"),
+        "{out}"
+    );
+
+    cleanup(&dir);
+}

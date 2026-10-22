@@ -8,6 +8,14 @@ counts, integration notes) lives in the
 <a href="https://github.com/openlearnia/pinkdb/blob/main/ROADMAP.md#progress-log" rel="noopener">ROADMAP
 progress log</a>.</p>
 
+<h2>2026-10-22</h2>
+<h3>Wave 88 — mixed-format lakes ✅</h3>
+<ul>
+<li>One lake can hold tables in different formats: <code>.lake format parquet for main.events</code> picks a table's format, and <code>.lake rewrite &lt;dir&gt; &lt;table&gt; format &lt;id&gt;</code> converts an existing table in one step.</li>
+<li>A format you choose explicitly is remembered in the catalog ("pinned"), so later saves and appends keep it. Tables written with the build's default still migrate to the saving build's format, as before.</li>
+<li>A table in a format this build can't read no longer blocks the whole lake: the other tables open, the CLI warns about the skipped one, reading it gives a clear error, and saving keeps it unchanged.</li>
+<li>Every format (<code>.pink</code>, Vortex, Parquet) now passes the same contract test suite. It caught two bugs, now fixed: saving a DECIMAL or INTERVAL table as Vortex crashed instead of giving an error, and very large INTERVAL values made <code>.lake attach</code> refuse the lake.</li>
+</ul>
 <h2>2026-10-21</h2>
 <h3>Wave 87 — lake data formats are pluggable; Parquet lakes ✅</h3>
 <ul>

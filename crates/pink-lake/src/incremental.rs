@@ -875,9 +875,20 @@ fn materialize_tables(
     version: Option<u64>,
 ) -> Result<(u64, BTreeMap<String, Arc<DataTable>>)> {
     let (attachment, report) = crate::attach::build(lake, version)?;
+    // A table this build cannot read has no logical content to materialize:
+    // it is skipped, exactly like `.lake open` (wave 88, rule 5). A commit
+    // diff computed against this base never touches it, so it rides along.
+    let unavailable: BTreeSet<String> = lake
+        .unavailable_tables_at(version)?
+        .into_iter()
+        .map(|u| u.table)
+        .collect();
     let mut base = BTreeMap::new();
     for t in attachment.tables() {
         let key = format!("{}.{}", t.db, t.table);
+        if unavailable.contains(&key) {
+            continue;
+        }
         let table = attachment
             .load(&t.db, &t.table)
             .map_err(|e| LakeError::Engine {
@@ -1672,6 +1683,15 @@ impl Lake {
             let mut data_files = 0usize;
             for key in keys {
                 let entry = tables.get(&key).cloned().expect("checked above");
+                // Wave 88, rule 5: a flush of one unavailable table fails;
+                // a lake-wide flush skips it (there is nothing this build
+                // could decode or re-encode).
+                if let Err(e) = crate::format::format_for(entry.format().id(), &manifest_path) {
+                    if table.is_some() {
+                        return Err(e);
+                    }
+                    continue;
+                }
                 let live = entry.live_inlined();
                 if live.is_empty() {
                     continue;
@@ -1693,8 +1713,10 @@ impl Lake {
                     None,
                     &manifest_path,
                 )?;
+                // Wave 88: flushed rows join the entry's own file list, so
+                // they must be encoded in the entry's pinned format.
                 let (files, bytes) =
-                    self.write_data_files(&key, None, entry.partition_keys(), &rows)?;
+                    self.write_data_files(&key, entry.format(), entry.partition_keys(), &rows)?;
                 file_bytes += bytes;
                 data_files += files.len();
                 written.extend(files.iter().map(|f| f.path().to_string()));
@@ -2103,6 +2125,29 @@ impl Lake {
         entry_layout(&*self.storage, entry, key, manifest_path)
     }
 
+    /// Wave 88, rule 5: refuse a commit that touches a table whose data-file
+    /// format this build cannot read or write. Only tables the commit names
+    /// are checked — a lake may hold unavailable tables the commit does not
+    /// touch, and they simply ride along in the published manifest.
+    fn ensure_commit_tables_available(&self, head: &Catalog, commit: &Commit) -> Result<()> {
+        let manifest_path = self.storage.abs(CATALOG_FILE);
+        for key in commit
+            .appends
+            .keys()
+            .chain(commit.deletes.keys())
+            .chain(commit.inlined_deletes.keys())
+            .chain(commit.drops.iter())
+            .chain(commit.partition_changes.keys())
+            .chain(commit.inlining_changes.keys())
+            .chain(commit.schemas.keys())
+        {
+            if let Some(entry) = head.tables.get(key) {
+                crate::format::format_for(entry.format().id(), &manifest_path)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Write every data and delete file the commit adds (immutable, uniquely
     /// named), returning what the publish loop should reference. The appends
     /// follow the head's partition specification (or the spec this same
@@ -2120,6 +2165,10 @@ impl Lake {
         specs: &BTreeMap<String, Vec<PartitionKey>>,
     ) -> Result<UploadedCommit> {
         let head = crate::read_catalog(&*self.storage, &self.root)?;
+        // Wave 88, rule 5: a commit that targets a table this build cannot
+        // read fails before any file is written; a commit that merely
+        // coexists with one is fine (the entry rides through the publish).
+        self.ensure_commit_tables_available(&head, commit)?;
         let mut uploaded = UploadedCommit::default();
         for (key, rows) in &commit.appends {
             let entry = head.tables.get(key);
@@ -2132,9 +2181,15 @@ impl Lake {
                 continue;
             }
             let keys = specs.get(key).map(Vec::as_slice).unwrap_or(&[]);
-            let (files, bytes) = self.write_data_files(key, None, keys, rows)?;
+            // Wave 88: an existing entry's format and pin flag always win
+            // for an append; a table this commit creates takes the handle's
+            // per-table choice (pinned), else its write format (pinned when
+            // explicitly chosen).
+            let (format, pinned) = self.resolve_append_format(key, entry);
+            let (files, bytes) = self.write_data_files(key, format.clone(), keys, rows)?;
             uploaded.bytes += bytes;
             uploaded.appends.insert(key.clone(), files);
+            uploaded.formats.insert(key.clone(), (format, pinned));
         }
         for (key, files) in &commit.deletes {
             for (file, positions) in files {
@@ -2225,6 +2280,10 @@ impl Lake {
                 head.format_version,
             )));
         }
+        // A rebase may land on a head whose touched table became unavailable
+        // (another writer changed its format): refuse before mutating.
+        self.ensure_commit_tables_available(&head, commit)
+            .map_err(PublishFailure::Fatal)?;
         let version = self
             .version
             .checked_add(1)
@@ -2329,10 +2388,20 @@ impl Lake {
                 let spec = commit.partition_changes.get(key).cloned().flatten();
                 let created_version = commit.schemas.get(key).map_or(1, |s| s.version);
                 let mut next_row_id = 0u64;
+                // Wave 88: the format the appended files were written with
+                // (the handle's per-table choice, else its write format) is
+                // the one the new entry carries, with the pin flag that
+                // choice implies (explicit choices pin).
+                let (created_format, created_pinned) = uploaded
+                    .formats
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| self.resolve_append_format(key, None));
                 let mut entry = TableEntry {
                     files: Vec::new(),
                     rows: added,
-                    format: Some(self.write_format()),
+                    format: Some(created_format),
+                    format_pinned: created_pinned,
                     stats: None,
                     deletes: Vec::new(),
                     partition_by: spec.clone(),
@@ -2398,6 +2467,25 @@ impl Lake {
                 }
                 continue;
             };
+            // Wave 88: the appended files were encoded in the format the
+            // entry pinned when the commit uploaded them. A rebase onto a
+            // head whose entry now pins another format (a concurrent
+            // rewrite_table_format) cannot list them: one entry names one
+            // data-file format. Refuse rather than mislabel the files.
+            if let Some((written, _)) = uploaded.formats.get(key)
+                && written.id() != entry.format().id()
+            {
+                return Err(PublishFailure::Fatal(LakeError::Conflict {
+                    path: self.storage.abs(CATALOG_FILE),
+                    message: format!(
+                        "table \"{key}\" changed its data-file format from \"{}\" to \"{}\" \
+                         while this commit was in flight; the appended files cannot join the \
+                         entry — re-run the commit against the current version",
+                        written.id(),
+                        entry.format().id()
+                    ),
+                }));
+            }
             if let Some((record, names, dtypes)) = &records {
                 // Wave 68: store the appended rows in the manifest. Row ids
                 // continue the table's counter (never backwards, whatever a
@@ -2795,6 +2883,12 @@ struct UploadedCommit {
     /// Wave 68: `db.table` → the appended rows that inline (no data file was
     /// written; the publish stores them in the manifest).
     inlined: BTreeMap<String, Arc<DataTable>>,
+    /// Wave 88: `db.table` → the format the appended files were encoded
+    /// with and whether that choice pins it (a table this commit creates
+    /// publishes the flag; an append to an existing entry keeps its own).
+    /// The publish refuses a rebase onto a head whose entry pins another
+    /// format (the files would be mislabeled).
+    formats: BTreeMap<String, (crate::catalog::FileFormat, bool)>,
     bytes: u64,
 }
 

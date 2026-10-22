@@ -144,6 +144,83 @@ fn attach_answers_from_the_parquet_lake_statistics() {
 }
 
 #[test]
+fn per_table_format_choice_and_rewrite_conversion() {
+    let dir = scratch("table_choice");
+    let lake = dir.join("lake");
+    let out = run(&format!(
+        "CREATE TABLE t (i INTEGER);\n\
+         INSERT INTO t VALUES (1), (2);\n\
+         CREATE TABLE u (i INTEGER);\n\
+         INSERT INTO u VALUES (3);\n\
+         .lake format parquet for main.t\n\
+         .lake format\n\
+         .lake save {lake}\n\
+         .lake open {lake}\n\
+         SELECT i FROM t ORDER BY i;\n\
+         SELECT COUNT(*) FROM u;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(
+        out.contains("Lake format for \"main.t\" set to \"parquet\""),
+        "{out}"
+    );
+    assert!(out.contains("Per-table formats: main.t=parquet"), "{out}");
+    assert!(out.contains("Saved lake version 2"), "{out}");
+    assert!(out.contains("Opened lake version 2"), "{out}");
+    assert!(out.contains("│ 1       │"), "{out}");
+    assert!(out.contains("│ 2       │"), "{out}");
+    assert!(out.contains("│ 1        │"), "{out}");
+
+    // Only `t` switched: `u` keeps the build default (`.pink` in this
+    // parquetlake build), and each table's referenced files carry its format's
+    // extension.
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert_eq!(
+        catalog.matches("\"format\": \"parquet\"").count(),
+        1,
+        "{catalog}"
+    );
+    assert_eq!(
+        catalog.matches("\"format\": \"pink\"").count(),
+        1,
+        "{catalog}"
+    );
+    let files = data_files(&lake);
+    assert_eq!(files.len(), 2, "{files:?}");
+    let extensions: Vec<String> = files
+        .iter()
+        .map(|file| file.extension().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert!(extensions.contains(&"parquet".to_string()), "{files:?}");
+    assert!(extensions.contains(&"pink".to_string()), "{files:?}");
+
+    // `.lake rewrite <dir> <table> format <id>` converts the table in one
+    // maintenance version; the data survives and open still answers.
+    let out = run(&format!(
+        ".lake rewrite {lake} main.t format pink\n.quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("Converted main.t to format \"pink\""), "{out}");
+    let catalog = std::fs::read_to_string(lake.join("catalog.json")).unwrap();
+    assert!(
+        !catalog.contains("\"format\": \"parquet\""),
+        "the table moved back to pink: {catalog}"
+    );
+    assert!(catalog.contains("\"format\": \"pink\""), "{catalog}");
+
+    let out = run(&format!(
+        ".lake open {lake}\n\
+         SELECT COUNT(*), MIN(i), MAX(i) FROM t;\n\
+         .quit\n",
+        lake = lake.display()
+    ));
+    assert!(out.contains("│ 2        │ 1       │ 2       │"), "{out}");
+
+    cleanup(&dir);
+}
+
+#[test]
 fn an_unknown_format_is_a_clear_error_and_changes_nothing() {
     let dir = scratch("unknown");
     let lake = dir.join("lake");

@@ -1,10 +1,14 @@
-//! Wave 87: lake data-file format providers.
+//! Wave 87/88: lake data-file format providers.
 //!
 //! Two things are proved here:
 //!
-//! - an unknown format id in a catalog is refused cleanly — naming the id and
-//!   saying no provider is registered — on open, read (`load`), attach and
-//!   maintenance (never a panic, never a fallback);
+//! - an unknown format id in a v4–v6 catalog is refused **per table** (wave
+//!   88, rule 5): the lake opens, the readable tables load, the table is
+//!   listed by `unavailable_tables`, attach lists it but every read fails
+//!   with the `UnknownFormat` error naming the id, targeted maintenance and
+//!   commits fail, lake-wide maintenance skips it, and a full save carries
+//!   its entry forward verbatim unless the store has that key (then the save
+//!   is refused);
 //! - a test-only provider (`pinkwrap`, `.pink` bytes behind a 4-byte header)
 //!   registered through the public seam works end to end: save → reopen →
 //!   open → attach (`COUNT`/`MIN`/`MAX` equal to `open`) → append → merge
@@ -55,6 +59,23 @@ fn store(rows: usize) -> PinkDb {
         .unwrap();
     for r in 0..rows {
         db.table_mut("t")
+            .unwrap()
+            .append_row(vec![
+                Value::Integer(r as i32 - 2),
+                Value::Varchar(format!("row-{r}")),
+            ])
+            .unwrap();
+    }
+    db
+}
+
+/// `main.t` and `main.u`, both `(i INTEGER, s VARCHAR)`, `rows` rows each.
+fn two_table_store(rows: usize) -> PinkDb {
+    let mut db = store(rows);
+    db.execute("CREATE TABLE main.u (i INTEGER, s VARCHAR);")
+        .unwrap();
+    for r in 0..rows {
+        db.table_mut_in("main", "u")
             .unwrap()
             .append_row(vec![
                 Value::Integer(r as i32 - 2),
@@ -167,39 +188,125 @@ fn assert_unknown_format(err: &LakeError, id: &str) {
     );
 }
 
-/// An id with no registered provider refuses the catalog at open, read,
-/// attach and maintenance — naming the id and saying no provider exists.
+/// An id with no registered provider is refused **per table** (wave 88, rule
+/// 5): the lake opens, the readable table loads, attach lists the table but
+/// every read fails naming the id, targeted maintenance/commits fail,
+/// lake-wide maintenance skips it, and a full save carries it forward unless
+/// the store has that key.
 #[test]
-fn an_unknown_format_id_is_refused_cleanly_on_open_attach_read_and_maintenance() {
+fn an_unknown_format_refuses_only_its_own_table() {
     let dir = scratch("unknown");
     let lake_dir = dir.join("lake");
-    save_store(&store(4), &lake_dir).unwrap();
-    let mut lake = Lake::open(&lake_dir).unwrap();
+    let source = two_table_store(4);
+    save_store(&source, &lake_dir).unwrap();
 
     // Pin a format id no provider can serve. The catalog keeps its version
     // and lake id, so the manifest is otherwise a valid v6 head.
     let catalog_path = lake_dir.join("catalog.json");
     let mut catalog = read_json(&catalog_path);
     assert!(
-        catalog["tables"]["main.t"]["format"].is_string(),
+        catalog["tables"]["main.u"]["format"].is_string(),
         "{catalog}"
     );
-    catalog["tables"]["main.t"]["format"] = serde_json::json!("nosuch");
+    catalog["tables"]["main.u"]["format"] = serde_json::json!("nosuch");
     std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
 
-    let err = Lake::open(&lake_dir).unwrap_err();
-    assert_unknown_format(&err, "nosuch");
+    // Open succeeds; only the readable table materializes.
+    let lake = Lake::open(&lake_dir).unwrap();
+    let loaded = lake.load(None).unwrap();
+    assert_eq!(loaded.list_tables(), vec!["t".to_string()]);
+    assert_eq!(loaded.table("t").unwrap().num_rows(), 4);
 
-    // The handle opened before the edit reads the catalog again for every
-    // operation, so each path sees the unknown id.
-    let err = lake.load(None).unwrap_err();
-    assert_unknown_format(&err, "nosuch");
-    let err = lake.attach(None).unwrap_err();
-    assert_unknown_format(&err, "nosuch");
+    let unavailable = lake.unavailable_tables().unwrap();
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].table, "main.u");
+    assert_eq!(unavailable[0].format, "nosuch");
+    assert_unknown_format(&unavailable[0].error, "nosuch");
+
+    // Attach lists both; the unavailable descriptor cannot answer and every
+    // read of it fails with the provider error naming table and id.
+    let attachment = lake.attach(None).unwrap();
+    assert_eq!(attachment.tables, 2, "both tables are listed");
+    let outage = attachment
+        .lake
+        .tables()
+        .iter()
+        .find(|t| t.table == "u")
+        .expect("the unavailable table is listed");
+    assert_eq!(outage.rows, pink_lake::UNAVAILABLE_ROWS);
+    let text = attachment.lake.load("main", "u").unwrap_err().to_string();
+    assert!(text.contains("main.u"), "{text}");
+    assert!(text.contains("nosuch"), "{text}");
+    assert!(
+        text.contains("no lake format provider is registered"),
+        "{text}"
+    );
+
+    let mut attached = PinkDb::new();
+    attached.attach_lake(attachment.lake).unwrap();
+    assert_eq!(
+        query(&mut attached, "SELECT COUNT(*) FROM t;"),
+        vec![vec![Value::Bigint(4)]]
+    );
+    for sql in [
+        "SELECT COUNT(*) FROM u;",
+        "SELECT COUNT(i) FROM u;",
+        "SELECT MIN(i), MAX(i) FROM u;",
+        "SELECT i FROM u;",
+    ] {
+        let text = attached.execute(sql).unwrap_err().to_string();
+        assert!(text.contains("main.u"), "{sql}: {text}");
+        assert!(text.contains("nosuch"), "{sql}: {text}");
+    }
+
+    // A targeted maintenance/rewrite/commit fails with the provider error.
+    let mut lake = Lake::open(&lake_dir).unwrap();
     let err = lake
-        .merge_adjacent_files(None, &MergeSettings::default())
+        .merge_adjacent_files(Some("main.u"), &MergeSettings::default())
         .unwrap_err();
     assert_unknown_format(&err, "nosuch");
+    let err = lake
+        .rewrite_table_format("main", "u", pink_lake::format::PINK_FORMAT_ID)
+        .unwrap_err();
+    assert_unknown_format(&err, "nosuch");
+    let mut commit = Commit::new();
+    commit.append("main.u", sub_table(&[(9, "nine")]));
+    let err = lake.commit(&commit).unwrap_err();
+    assert_unknown_format(&err, "nosuch");
+
+    // Lake-wide maintenance skips it and reports the key.
+    let report = lake
+        .merge_adjacent_files(None, &MergeSettings::default())
+        .unwrap();
+    assert!(!report.committed, "{report:?}");
+    assert_eq!(report.skipped, vec!["main.u".to_string()], "{report:?}");
+
+    // A full save carries the entry forward verbatim: same file list, same
+    // pin flag — the store has no table under that key.
+    let store = lake.load(None).unwrap();
+    let before = read_json(&catalog_path);
+    let report = lake.write_from_store_report(&store).unwrap();
+    assert_eq!(report.version, 3);
+    let after = read_json(&catalog_path);
+    assert_eq!(after["tables"]["main.u"]["format"], "nosuch", "{after}");
+    for field in ["files", "rows", "stats", "format_pinned"] {
+        assert_eq!(
+            after["tables"]["main.u"][field], before["tables"]["main.u"][field],
+            "carried field {field}: {after}"
+        );
+    }
+    let reloaded = Lake::open(&lake_dir).unwrap().load(None).unwrap();
+    assert_eq!(reloaded.table("t").unwrap().num_rows(), 4);
+
+    // A store that has the key would replace data this build cannot read:
+    // the save is refused and publishes nothing.
+    let text = lake
+        .write_from_store_report(&two_table_store(4))
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("main.u"), "{text}");
+    assert!(text.contains("nosuch"), "{text}");
+    assert_eq!(lake.current_version(), 3, "nothing was published");
 
     cleanup(&dir);
 }
@@ -332,6 +439,47 @@ fn a_registered_provider_is_used_end_to_end() {
             Value::Integer(13)
         ]]
     );
+
+    cleanup(&dir);
+}
+
+/// Wave 88, rule 5: a v4–v6 entry naming `vortex` is unavailable **per table**
+/// in a lean build — the lake opens, the table is listed, and a read is the
+/// clean `FeatureMissing` naming the table, never a whole-lake refusal. The
+/// file is never opened, so the saved `.pink` file under the rewritten entry
+/// is irrelevant here.
+#[cfg(not(feature = "vortexlake"))]
+#[test]
+fn a_vortex_entry_is_unavailable_per_table_in_a_lean_build() {
+    let dir = scratch("vortex_unavailable");
+    let lake_dir = dir.join("lake");
+    save_store(&store(3), &lake_dir).unwrap();
+
+    let catalog_path = lake_dir.join("catalog.json");
+    let mut catalog = read_json(&catalog_path);
+    catalog["tables"]["main.t"]["format"] = serde_json::json!("vortex");
+    std::fs::write(&catalog_path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
+
+    let lake = Lake::open(&lake_dir).unwrap();
+    let unavailable = lake.unavailable_tables().unwrap();
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].table, "main.t");
+    assert_eq!(unavailable[0].format, "vortex");
+    assert!(
+        matches!(unavailable[0].error, LakeError::FeatureMissing { .. }),
+        "{:?}",
+        unavailable[0].error
+    );
+    assert!(
+        lake.load(None).unwrap().list_tables().is_empty(),
+        "the unavailable table is skipped"
+    );
+
+    let attachment = lake.attach(None).unwrap();
+    assert_eq!(attachment.tables, 1, "attach still lists the table");
+    let text = attachment.lake.load("main", "t").unwrap_err().to_string();
+    assert!(text.contains("main.t"), "{text}");
+    assert!(text.contains("vortexlake"), "{text}");
 
     cleanup(&dir);
 }

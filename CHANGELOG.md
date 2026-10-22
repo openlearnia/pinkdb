@@ -8,6 +8,22 @@ detail (probes, gate counts, integration notes). Entries are appended at
 integration time starting with wave 63; earlier waves are backfilled as
 one-liners below.
 
+## 2026-10-22
+### Wave 88 — mixed-format lakes ✅
+- One lake can hold tables in different formats: `.lake format parquet for
+  main.events` picks a table's format, and `.lake rewrite <dir> <table>
+  format <id>` converts an existing table in one step.
+- A format you choose explicitly is remembered in the catalog ("pinned"), so
+  later saves and appends keep it. Tables written with the build's default
+  still migrate to the saving build's format, as before.
+- A table in a format this build can't read no longer blocks the whole lake:
+  the other tables open, the CLI warns about the skipped one, reading it
+  gives a clear error, and saving keeps it unchanged.
+- Every format (`.pink`, Vortex, Parquet) now passes the same contract test
+  suite. It caught two bugs, now fixed: saving a DECIMAL or INTERVAL table
+  as Vortex crashed instead of giving an error, and very large INTERVAL
+  values made `.lake attach` refuse the lake.
+
 ## 2026-10-21
 ### Wave 87 — lake data formats are pluggable; Parquet lakes ✅
 - A lake's data files are now written by a registered **format provider**:

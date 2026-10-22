@@ -55,6 +55,19 @@
 //! catalog-published zone map); prune tests pin that the surviving decode
 //! counters still fire.
 //!
+//! Wave 88 adds [`Lake::rewrite_table_format`]: the same engine in **convert**
+//! mode. Every file of one table — whatever its delete ratio — is decoded
+//! (deletes applied) and re-encoded with the target provider, grouped exactly
+//! like a merge (partition values, schema epoch), and the published entry
+//! records `"format_pinned": true` in one atomic version. Converting to the
+//! format the entry already pins is a no-op (or a metadata-only pin when the
+//! entry was unpinned); a legacy v1–v3 entry is refused. Ordinary
+//! merge/rewrite keeps the entry's format and pin flag.
+//!
+//! A lake-wide merge/rewrite **skips** a table whose format this build cannot
+//! read and lists it in [`CompactionReport::skipped`]; a targeted call naming
+//! one fails with that provider error (wave 88, rule 5).
+//!
 //! # Snapshots: `expire_snapshots`
 //!
 //! Removes `snapshots/<v>.json` **and its `commits/<v>.json`** for versions
@@ -213,6 +226,10 @@ pub struct CompactionReport {
     pub retries: u32,
     /// One row per compacted table (empty when nothing was compacted).
     pub tables: Vec<TableCompaction>,
+    /// Wave 88, rule 5: tables a **lake-wide** call skipped because their
+    /// data-file format is unavailable in this build (`db.table` keys,
+    /// sorted). A targeted call naming such a table fails instead.
+    pub skipped: Vec<String>,
     /// Bytes written: new data files + commit manifest + snapshot + catalog.
     pub bytes_written: u64,
 }
@@ -236,6 +253,7 @@ impl CompactionReport {
             committed: false,
             retries: 0,
             tables: Vec::new(),
+            skipped: Vec::new(),
             bytes_written: 0,
         }
     }
@@ -428,6 +446,9 @@ struct Candidate {
 enum CompactionKind {
     Merge,
     Rewrite,
+    /// Wave 88: re-encode every file of one table into another format
+    /// ([`Lake::rewrite_table_format`]).
+    Convert,
 }
 
 /// The grouping key of a compaction: files merge only within one
@@ -438,12 +459,15 @@ type GroupKey = (Option<BTreeMap<String, Option<String>>>, Option<u64>);
 
 /// The settings both compaction kinds read, flattened by the public entry
 /// points.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PlanOptions {
     min_file_size: Option<u64>,
     max_file_size: Option<u64>,
     max_compacted_files: Option<u64>,
     delete_threshold: f64,
+    /// `CompactionKind::Convert` only: the format every rewritten file is
+    /// encoded with and the entry switches to.
+    target_format: Option<FileFormat>,
 }
 
 /// One table's planned maintenance: the entry the new version publishes and
@@ -486,6 +510,7 @@ impl Lake {
             max_file_size: settings.max_file_size,
             max_compacted_files: settings.max_compacted_files,
             delete_threshold: 0.0,
+            target_format: None,
         };
         self.compact(table, CompactionKind::Merge, plan)
     }
@@ -511,8 +536,49 @@ impl Lake {
             max_file_size: None,
             max_compacted_files: settings.max_compacted_files,
             delete_threshold: settings.delete_threshold,
+            target_format: None,
         };
         self.compact(table, CompactionKind::Rewrite, plan)
+    }
+
+    /// Convert one table's data files to another registered data-file format
+    /// (wave 88), publishing exactly one new maintenance version:
+    /// `db.table` must exist, `id` must resolve through the provider
+    /// registry ([`LakeError::UnknownFormat`]/[`LakeError::FeatureMissing`]
+    /// otherwise), and every file of the table — whatever its delete ratio —
+    /// is decoded (its positional deletes applied) and re-encoded with the
+    /// target provider. The new entry records `"format_pinned": true` (an
+    /// explicit conversion is always pinned, wave 88 rule 2); its delete
+    /// files are gone (their positions are baked into the rewritten files);
+    /// source files stay on disk byte-identical for older versions and are
+    /// retired by [`Lake::expire_snapshots`] / [`Lake::cleanup_old_files`]
+    /// later.
+    ///
+    /// Partition values and schema epochs are preserved (files group by
+    /// them, so a partitioned table keeps one rewritten file per partition
+    /// value set). A table already in `id` is a no-op
+    /// ([`CompactionReport::committed`] false) — unless it is an unpinned
+    /// v4+ entry, which this explicit request pins (metadata-only).
+    /// A legacy `format_version` 1–3 entry (one path-only file) is refused —
+    /// re-save the lake first — and a table whose current format this build
+    /// cannot read is refused with that provider error (wave 88, rule 5).
+    pub fn rewrite_table_format(
+        &mut self,
+        db: &str,
+        table: &str,
+        id: &str,
+    ) -> Result<CompactionReport> {
+        let key = format!("{db}.{table}");
+        split_key(&key, &self.root)?;
+        crate::format::format_for(id, &self.root.join(CATALOG_FILE))?;
+        let plan = PlanOptions {
+            min_file_size: None,
+            max_file_size: None,
+            max_compacted_files: None,
+            delete_threshold: 0.0,
+            target_format: Some(FileFormat::new(id)),
+        };
+        self.compact(Some(&key), CompactionKind::Convert, plan)
     }
 
     /// Delete one object, ignoring "it is already gone" (S3 DELETE is
@@ -567,7 +633,7 @@ impl Lake {
             // Unpublished files this attempt wrote: deleted best-effort
             // before a retry or on failure — nothing ever references them.
             let mut written: Vec<String> = Vec::new();
-            let (planned, files_bytes) =
+            let (planned, files_bytes, skipped) =
                 match self.plan_compaction(&head, table, kind, &options, &mut written) {
                     Ok(planned) => planned,
                     Err(e) => {
@@ -577,7 +643,9 @@ impl Lake {
                 };
             if planned.is_empty() {
                 self.discard_unpublished(&written);
-                return Ok(CompactionReport::empty(head.version));
+                let mut report = CompactionReport::empty(head.version);
+                report.skipped = skipped;
+                return Ok(report);
             }
             let mut tables = head.tables.clone();
             let mut deltas: BTreeMap<String, TableDelta> = BTreeMap::new();
@@ -644,6 +712,7 @@ impl Lake {
                 committed: true,
                 retries: attempt,
                 tables: report_tables,
+                skipped,
                 bytes_written: files_bytes
                     + commit_bytes.len() as u64
                     + 2 * snapshot_plain.len() as u64,
@@ -676,7 +745,7 @@ impl Lake {
         kind: CompactionKind,
         options: &PlanOptions,
         written: &mut Vec<String>,
-    ) -> Result<(Vec<PlannedTable>, u64)> {
+    ) -> Result<(Vec<PlannedTable>, u64, Vec<String>)> {
         let manifest_path = self.storage.abs(CATALOG_FILE);
         if let Some(selected) = table {
             // DuckLake resolves the named table up front and raises when it
@@ -692,10 +761,47 @@ impl Lake {
         }
         let mut planned = Vec::new();
         let mut bytes_written = 0u64;
+        let mut skipped: Vec<String> = Vec::new();
         for (key, entry) in &head.tables {
             if let Some(selected) = table
                 && key != selected
             {
+                continue;
+            }
+            // Wave 88, rule 5: a targeted maintenance call naming an
+            // unavailable table fails; a lake-wide call skips it and reports
+            // the key.
+            if let Err(e) = crate::format::format_for(entry.format().id(), &manifest_path) {
+                if table.is_some() {
+                    return Err(e);
+                }
+                skipped.push(key.clone());
+                continue;
+            }
+            // Wave 88: a conversion into the format the entry already pins
+            // is a no-op (checked before the legacy rule, so converting a v1
+            // `.pink` entry to `pink` is not an error). An unpinned v4+
+            // entry is pinned by the explicit request (metadata-only): the
+            // rewrite pins its result.
+            let target_format = (kind == CompactionKind::Convert)
+                .then(|| options.target_format.clone())
+                .flatten();
+            if let Some(target) = &target_format
+                && target.id() == entry.format().id()
+            {
+                if !entry.format_pinned && entry.data_rows().is_some() {
+                    let mut new_entry = entry.clone();
+                    new_entry.format_pinned = true;
+                    planned.push(PlannedTable {
+                        key: key.clone(),
+                        entry: new_entry,
+                        new_files: Vec::new(),
+                        processed: 0,
+                        created: 0,
+                        compacted_files: Vec::new(),
+                        removed_delete_files: Vec::new(),
+                    });
+                }
                 continue;
             }
             // Only v4/v5 entries: a legacy v1–v3 entry lists one data file
@@ -711,6 +817,25 @@ impl Lake {
                         ),
                     });
                 }
+                continue;
+            }
+            // A table whose rows are all inlined (an empty committed table
+            // included) lists no data file: switching its pinned format is
+            // metadata-only, and there is nothing to decode.
+            if target_format.is_some() && entry.files.is_empty() {
+                let mut new_entry = entry.clone();
+                new_entry.format = target_format;
+                // An explicit conversion pins what it produces (wave 88).
+                new_entry.format_pinned = true;
+                planned.push(PlannedTable {
+                    key: key.clone(),
+                    entry: new_entry,
+                    new_files: Vec::new(),
+                    processed: 0,
+                    created: 0,
+                    compacted_files: Vec::new(),
+                    removed_delete_files: Vec::new(),
+                });
                 continue;
             }
             let layout =
@@ -750,6 +875,9 @@ impl Lake {
                             continue;
                         }
                     }
+                    // Every file of the table is a candidate: the whole
+                    // entry moves to the target format in one version.
+                    CompactionKind::Convert => {}
                 }
                 candidates.push(Candidate {
                     index: i,
@@ -784,9 +912,13 @@ impl Lake {
             let mut merged_at: BTreeMap<usize, FileRef> = BTreeMap::new();
             let mut member: BTreeSet<usize> = BTreeSet::new();
             for group in group_list {
-                if options
-                    .max_compacted_files
-                    .is_some_and(|cap| groups_done >= cap)
+                // A cap may never split a conversion: every file must move,
+                // or the entry's single pinned format would not describe the
+                // remaining files.
+                if kind != CompactionKind::Convert
+                    && options
+                        .max_compacted_files
+                        .is_some_and(|cap| groups_done >= cap)
                 {
                     break;
                 }
@@ -847,7 +979,10 @@ impl Lake {
                         ),
                     });
                 }
-                let (file, bytes) = self.write_data_file(key, Some(entry.format()), &merged)?;
+                // A conversion encodes every rewritten file with the target
+                // provider; a merge/rewrite keeps the entry's pinned format.
+                let write_format = target_format.clone().unwrap_or_else(|| entry.format());
+                let (file, bytes) = self.write_data_file(key, write_format, &merged)?;
                 bytes_written += bytes;
                 written.push(file.path().to_string());
                 let mut file = file.with_schema_version(group[0].epoch);
@@ -894,6 +1029,13 @@ impl Lake {
             let mut new_entry = entry.clone();
             new_entry.files = new_files;
             new_entry.deletes = new_deletes;
+            if target_format.is_some() {
+                // The whole entry moved: every remaining file is encoded with
+                // the target provider (the rows invariant below re-checks the
+                // manifest), and the explicit conversion pins the result.
+                new_entry.format = target_format;
+                new_entry.format_pinned = true;
+            }
             // The manifest's own rows invariant must survive compaction; the
             // live inlined rows are untouched by a merge or rewrite and stay
             // part of the logical count (wave 68).
@@ -927,7 +1069,7 @@ impl Lake {
                 removed_delete_files: removed,
             });
         }
-        Ok((planned, bytes_written))
+        Ok((planned, bytes_written, skipped))
     }
 
     /// Decode one data file for compaction: its physical table as written

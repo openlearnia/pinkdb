@@ -172,8 +172,20 @@ fn writables() -> MutexGuard<'static, BTreeMap<String, WritableAttachment>> {
 /// persisted (a lake's existing files keep their entry's format).
 static WRITE_FORMAT: Mutex<Option<String>> = Mutex::new(None);
 
+/// The session's `.lake format <id> for <db.table>` choices (wave 88):
+/// per-table data-file formats keyed by the flat catalog key. Applied to every
+/// handle about to write, like [`WRITE_FORMAT`]; not persisted.
+static TABLE_FORMATS: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
 fn chosen_write_format() -> Option<String> {
     WRITE_FORMAT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+fn table_format_choices() -> BTreeMap<String, String> {
+    TABLE_FORMATS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone()
@@ -202,12 +214,18 @@ fn registered_format_ids() -> Vec<&'static str> {
         .collect()
 }
 
-/// Apply the session's chosen format to a handle that is about to write.
+/// Apply the session's chosen formats to a handle that is about to write:
+/// the handle-wide `.lake format <id>` choice first, then every per-table
+/// `.lake format <id> for <db.table>` choice (wave 88).
 fn apply_write_format(lake: &mut Lake) -> pink_lake::Result<()> {
-    match chosen_write_format() {
-        Some(id) => lake.set_write_format(&id),
-        None => Ok(()),
+    if let Some(id) = chosen_write_format() {
+        lake.set_write_format(&id)?;
     }
+    for (key, id) in table_format_choices() {
+        let (db, table) = key.split_once('.').unwrap_or(("main", key.as_str()));
+        lake.set_table_format(db, table, &id)?;
+    }
+    Ok(())
 }
 
 /// The commit retry settings of a `.lake commit`, from the environment with
@@ -455,6 +473,24 @@ fn cmd_save(db: &PinkDb, arg: &str) {
     }
 }
 
+/// One warning line per table whose data-file format this build cannot read
+/// (wave 88, rule 5): the table is listed/skipped and any read of it fails.
+/// `outcome` completes the sentence (`it was skipped`, `reading it will fail`).
+fn warn_unavailable_tables(lake: &Lake, version: Option<u64>, outcome: &str) {
+    let tables = match lake.unavailable_tables_at(version) {
+        Ok(tables) => tables,
+        Err(_) => return,
+    };
+    for table in tables {
+        println!(
+            "warning: table {} uses data-file format {:?}, which this build cannot read; \
+             {outcome}",
+            sanitize_terminal(&table.table),
+            sanitize_terminal(&table.format),
+        );
+    }
+}
+
 /// `.lake open <location> [version]`: replace the in-memory store with the lake's
 /// latest (or the given) version.
 fn cmd_open(db: &mut PinkDb, arg: &str) {
@@ -551,6 +587,7 @@ fn cmd_open(db: &mut PinkDb, arg: &str) {
                 t0.elapsed().as_secs_f64(),
                 plural(tables)
             );
+            warn_unavailable_tables(&lake, version, "it was skipped");
             if db.current_db() != previous_db {
                 println!(
                     "Note: the session database was reset to \"{}\".",
@@ -652,6 +689,7 @@ fn cmd_attach(db: &mut PinkDb, arg: &str) {
                     tables.len(),
                     plural(tables.len())
                 );
+                warn_unavailable_tables(&lake, version, "reading it will fail");
                 if report.encrypted {
                     if report.statistics_only {
                         println!(
@@ -722,6 +760,7 @@ fn cmd_attach_write(db: &mut PinkDb, dir: &str, version: Option<u64>) {
         cli_error!("{e}");
         return;
     }
+    warn_unavailable_tables(wa.lake(), version, "it was skipped");
     if let Some(limit) = attach_inlining_limit() {
         wa.set_data_inlining_row_limit(limit);
     }
@@ -1504,12 +1543,15 @@ fn cmd_attached(db: &PinkDb, arg: &str) {
     for ((location, tables), (_, loads, columns, files)) in lakes.into_iter().zip(stats) {
         println!("{}", sanitize_terminal(location));
         for t in tables {
+            let rows = if t.rows == pink_lake::UNAVAILABLE_ROWS {
+                "unavailable: its data-file format cannot be read".to_string()
+            } else {
+                format!("{} row{}", t.rows, plural(t.rows as usize))
+            };
             println!(
-                "  {}.{} ({} row{})",
+                "  {}.{} ({rows})",
                 sanitize_terminal(&t.db),
-                sanitize_terminal(&t.table),
-                t.rows,
-                plural(t.rows as usize)
+                sanitize_terminal(&t.table)
             );
         }
         println!(
@@ -1967,17 +2009,47 @@ fn cmd_merge(arg: &str) {
 /// — DuckLake's `ducklake_rewrite_data_files`: materialize the deletes of the
 /// files whose delete ratio reaches the threshold (default 0.95) into fresh
 /// data files, dropping their delete files from the new version.
+///
+/// `.lake rewrite <dir> <table> format <id>` (wave 88) instead converts every
+/// data file of the table into the registered format `id`, materializing its
+/// deletes, and pins the entry to that format in one published version.
 fn cmd_rewrite(arg: &str) {
     let usage = "Usage: .lake rewrite <dir> [table] [delete_threshold=F] \
-                 [max_compacted_files=N]";
+                 [max_compacted_files=N] [format <id>]";
     let Some(args) = parse_maintenance_args(usage, arg) else {
         return;
     };
-    if args.bare.len() > 1 {
+    // Wave 88: `.lake rewrite <dir> <table> format <id>` converts the whole
+    // table (every file, deletes materialized) into another registered
+    // format. The ordinary form still takes at most one bare table token.
+    let mut table: Option<String> = None;
+    let mut format: Option<String> = None;
+    let mut i = 0;
+    while i < args.bare.len() {
+        if args.bare[i].eq_ignore_ascii_case("format") {
+            if format.is_some() || i + 1 >= args.bare.len() {
+                unexpected_token(usage);
+                return;
+            }
+            format = Some(args.bare[i + 1].clone());
+            i += 2;
+        } else if table.is_none() {
+            table = Some(flat_table_key(&args.bare[i]));
+            i += 1;
+        } else {
+            unexpected_token(usage);
+            return;
+        }
+    }
+    if format.is_some() && table.is_none() {
         unexpected_token(usage);
         return;
     }
-    let table = args.bare.first().map(|token| flat_table_key(token));
+    // A conversion rewrites every file; the rewrite-only knobs do not apply.
+    if format.is_some() && !args.options.is_empty() {
+        unexpected_token(usage);
+        return;
+    }
     let mut settings = RewriteSettings::default();
     for (key, value) in &args.options {
         match key.as_str() {
@@ -2018,6 +2090,32 @@ fn cmd_rewrite(arg: &str) {
         }
     };
     let t0 = Instant::now();
+    if let Some(id) = format {
+        let table = table.expect("format requires a table (checked above)");
+        let (db, name) = table
+            .split_once('.')
+            .expect("flat_table_key yields a db.table key");
+        match lake.rewrite_table_format(db, name, &id) {
+            Ok(report) if !report.committed => println!(
+                "Nothing to convert in {dir}: table \"{table}\" already uses format \"{id}\""
+            ),
+            Ok(report) => {
+                set_baseline_version_only(&dir, report.version);
+                println!(
+                    "Converted {table} to format \"{id}\" ({} file{} into {}, version {}, \
+                     {} bytes written, {:.3}s)",
+                    report.files_processed(),
+                    plural(report.files_processed() as usize),
+                    report.files_created(),
+                    report.version,
+                    report.bytes_written,
+                    t0.elapsed().as_secs_f64(),
+                );
+            }
+            Err(e) => cli_error!("{e}"),
+        }
+        return;
+    }
     match lake.rewrite_data_files(table.as_deref(), &settings) {
         Ok(report) if !report.committed => println!(
             "Nothing to rewrite in {dir} (no file's delete ratio reaches the threshold; the \
@@ -2503,28 +2601,61 @@ fn cmd_settings(arg: &str) {
     );
 }
 
-/// `.lake format [<id>]`: show the session's write format and the registered
-/// provider ids, or choose the format for every subsequent full save, commit
-/// and inlined flush (`Lake::set_write_format`, applied here and to the
-/// session's writable attachments). An id with no registered provider is a
-/// clear error — never a silent fallback to the build default.
+/// `.lake format [<id> [for <db.table>]]` (wave 87/88): show the session's
+/// write format, the registered provider ids and the per-table choices, or
+/// choose the format for every subsequent full save / commit / inlined flush
+/// (`Lake::set_write_format`), or choose one table's format
+/// (`Lake::set_table_format`; wins over the entry's pinned format for a full
+/// save, and selects the format of a table a commit creates). An id with no
+/// registered provider is a clear error — never a silent fallback to the
+/// build default.
 fn cmd_format(arg: &str) {
+    let usage = "Usage: .lake format [<id> [for <db.table>]]";
     let arg = arg.trim();
     if arg.is_empty() {
         println!("Lake write format: {}", current_write_format_id());
         println!("Registered formats: {}", registered_format_ids().join(", "));
-        println!("Usage: .lake format <id>");
+        let choices = table_format_choices();
+        if choices.is_empty() {
+            println!("Per-table formats: (none)");
+        } else {
+            let text = choices
+                .iter()
+                .map(|(key, id)| format!("{key}={id}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("Per-table formats: {text}");
+        }
+        println!("{usage}");
         return;
     }
     let Some((token, rest)) = take_token(arg) else {
-        println!("Usage: .lake format <id>");
+        println!("{usage}");
         return;
     };
-    if !rest.trim().is_empty() {
-        println!("Usage: .lake format <id>");
-        return;
-    }
     let id = unquote(&token);
+    let rest = rest.trim();
+    let table = if rest.is_empty() {
+        None
+    } else {
+        let Some((word, after)) = take_token(rest) else {
+            println!("{usage}");
+            return;
+        };
+        if !word.eq_ignore_ascii_case("for") {
+            println!("{usage}");
+            return;
+        }
+        let Some((table_token, tail)) = take_token(after) else {
+            println!("{usage}");
+            return;
+        };
+        if !tail.trim().is_empty() {
+            println!("{usage}");
+            return;
+        }
+        Some(unquote(&table_token))
+    };
     if pink_lake::format::lake_format(&id).is_none() {
         let ids = registered_format_ids();
         cli_error!(
@@ -2534,23 +2665,50 @@ fn cmd_format(arg: &str) {
         );
         return;
     }
-    // Existing writable attachments write through their own handle: apply the
-    // choice now so a following `.lake commit` uses it.
+    let Some(table) = table else {
+        // Existing writable attachments write through their own handle: apply
+        // the choice now so a following `.lake commit` uses it.
+        {
+            let mut writables = writables();
+            for (location, wa) in writables.iter_mut() {
+                if let Err(e) = wa.lake_mut().set_write_format(&id) {
+                    cli_error!(
+                        "cannot apply format \"{id}\" to the writable attach at {location}: {e}"
+                    );
+                    return;
+                }
+            }
+        }
+        *WRITE_FORMAT.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.clone());
+        println!(
+            "Lake write format set to \"{id}\" for subsequent .lake save / .lake commit / \
+             .lake flush writes"
+        );
+        return;
+    };
+    let key = flat_table_key(&table);
+    let (db, name) = key
+        .split_once('.')
+        .expect("flat_table_key yields a db.table key");
     {
         let mut writables = writables();
         for (location, wa) in writables.iter_mut() {
-            if let Err(e) = wa.lake_mut().set_write_format(&id) {
+            if let Err(e) = wa.lake_mut().set_table_format(db, name, &id) {
                 cli_error!(
-                    "cannot apply format \"{id}\" to the writable attach at {location}: {e}"
+                    "cannot apply format \"{id}\" for table \"{key}\" to the writable attach at \
+                     {location}: {e}"
                 );
                 return;
             }
         }
     }
-    *WRITE_FORMAT.lock().unwrap_or_else(|p| p.into_inner()) = Some(id.clone());
+    TABLE_FORMATS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key.clone(), id.clone());
     println!(
-        "Lake write format set to \"{id}\" for subsequent .lake save / .lake commit / \
-         .lake flush writes"
+        "Lake format for \"{key}\" set to \"{id}\" for subsequent full saves (an existing \
+         table keeps its pinned format on appends)"
     );
 }
 

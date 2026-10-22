@@ -21,7 +21,7 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use pink_lake::{FORMAT_VERSION, Lake, LakeError, save_store};
+use pink_lake::{FORMAT_VERSION, Lake, LakeError, MergeSettings, save_store};
 use pinkdb::{PinkDb, Value};
 
 #[cfg(feature = "s3")]
@@ -337,6 +337,66 @@ fn lean_build_refuses_vortex_lakes_with_a_feature_error() {
     let err = Lake::open(&lake).unwrap_err();
     assert!(matches!(err, LakeError::FeatureMissing { .. }), "{err:?}");
     assert!(err.to_string().contains("format_version 3"), "{err}");
+    cleanup(&dir);
+}
+
+/// Wave 88 rule 5: a v4–v6 lake with a Vortex entry **opens** in a lean build;
+/// that table is unavailable (every read/write of it is the feature error) and
+/// the rest of the lake still works. Only v2/v3 keep the whole-lake refusal.
+#[test]
+fn a_v4_vortex_entry_is_a_per_table_feature_error() {
+    let dir = scratch("v4_vortex_per_table");
+    let lake_dir = dir.join("lake");
+    std::fs::create_dir_all(lake_dir.join("snapshots")).unwrap();
+    let manifest = serde_json::json!({
+        "format_version": 4,
+        "updated": "2026-10-21T00:00:00.000Z",
+        "version": 1,
+        "tables": {
+            "main.t": {
+                "files": [{"path": "data/main.t/x.vortex", "rows": 0}],
+                "rows": 0,
+                "format": "vortex"
+            }
+        }
+    });
+    let bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+    std::fs::write(lake_dir.join("catalog.json"), &bytes).unwrap();
+    std::fs::write(lake_dir.join("snapshots/1.json"), &bytes).unwrap();
+
+    // Open succeeds; the Vortex table is listed as unavailable.
+    let lake = Lake::open(&lake_dir).unwrap();
+    let unavailable = lake.unavailable_tables().unwrap();
+    assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+    assert_eq!(unavailable[0].table, "main.t");
+    assert_eq!(unavailable[0].format, "vortex");
+    assert!(
+        matches!(unavailable[0].error, LakeError::FeatureMissing { .. }),
+        "{:?}",
+        unavailable[0].error
+    );
+    // `load` skips it; attach still lists it but any read is the feature error.
+    assert!(lake.load(None).unwrap().list_tables().is_empty());
+    let attachment = lake.attach(None).unwrap();
+    assert_eq!(attachment.tables, 1, "the unavailable table is listed");
+    let text = attachment.lake.load("main", "t").unwrap_err().to_string();
+    assert!(text.contains("main.t"), "{text}");
+    assert!(text.contains("vortex"), "{text}");
+    assert!(
+        text.contains("built without Vortex format support"),
+        "{text}"
+    );
+    // A targeted maintenance call fails; a lake-wide one skips and reports.
+    let mut lake = Lake::open(&lake_dir).unwrap();
+    let err = lake
+        .merge_adjacent_files(Some("main.t"), &MergeSettings::default())
+        .unwrap_err();
+    assert!(matches!(err, LakeError::FeatureMissing { .. }), "{err:?}");
+    let report = lake
+        .merge_adjacent_files(None, &MergeSettings::default())
+        .unwrap();
+    assert!(!report.committed, "{report:?}");
+    assert_eq!(report.skipped, vec!["main.t".to_string()], "{report:?}");
     cleanup(&dir);
 }
 

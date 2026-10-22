@@ -1568,15 +1568,31 @@ fn catalog_format_fields_are_validated() {
         );
     }
 
-    // An unknown `format` string is stopped by serde, not silently treated
-    // as one of the known formats.
+    // A v4–v6 format id with no provider is a **per-table** refusal (wave
+    // 88, rule 5): the lake still opens, the table is listed as unavailable,
+    // and only a read/write of it fails. It is never silently treated as one
+    // of the known formats.
     std::fs::write(dir.join("catalog.json"), &good).unwrap();
     let mut cat = read_json(&dir.join("catalog.json"));
     cat["tables"]["main.t"]["format"] = serde_json::json!("parquet");
     write_json(&dir.join("catalog.json"), &cat);
-    let err = Lake::open(&dir).unwrap_err().to_string();
-    assert!(err.contains("corrupt lake metadata"), "{err}");
-    assert!(err.contains("parquet"), "{err}");
+    let lake = Lake::open(&dir).unwrap();
+    let unavailable = lake.unavailable_tables().unwrap();
+    assert!(
+        unavailable
+            .iter()
+            .any(|u| u.table == "main.t" && u.format == "parquet"),
+        "{unavailable:?}"
+    );
+    assert!(
+        !lake
+            .load(None)
+            .unwrap()
+            .list_tables()
+            .contains(&"t".to_string()),
+        "the unreadable table is skipped"
+    );
+    assert!(lake.attach(None).is_ok(), "attach lists the table");
 
     // A v3 entry declaring `"pink"` is corrupt: the v3 writer emits Vortex
     // only, so this is tampered metadata, not a downgrade (v4 allows pink).

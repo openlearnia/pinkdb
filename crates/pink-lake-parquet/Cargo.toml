@@ -16,3 +16,7 @@ pinkdb-parquet = { path = "../../extensions/parquet" }
 
 [dev-dependencies]
 serde_json = "1"
+# The wave-88 mixed-lake test needs the built-in Vortex provider and the
+# Parquet provider in one process; enabling `vortexlake` here affects test
+# targets only (the normal dependency above stays feature-lean).
+pink-lake = { path = "../pink-lake", features = ["vortexlake"] }

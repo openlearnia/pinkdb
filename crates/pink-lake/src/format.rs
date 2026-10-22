@@ -20,11 +20,13 @@
 //! deterministically, or one lake could be read differently by two
 //! components in the same process).
 //!
-//! An id with no provider is [`LakeError::UnknownFormat`] at open, attach,
-//! read and maintenance alike; there is never a panic or a silent fallback
-//! to `"pink"`. (A `vortex` entry in a build without the `vortexlake`
-//! feature keeps its established [`LakeError::FeatureMissing`], because the
-//! id is known but this build cannot provide it.)
+//! An id with no provider is [`LakeError::UnknownFormat`] whenever that
+//! table is read or written; there is never a panic or a silent fallback to
+//! `"pink"`. (A `vortex` entry in a build without the `vortexlake` feature
+//! keeps its established [`LakeError::FeatureMissing`], because the id is
+//! known but this build cannot provide it.) Wave 88 makes the refusal
+//! per-table: a v4–v6 lake still opens, [`crate::Lake::unavailable_tables`]
+//! lists the affected tables, and only reads/writes of those tables fail.
 //!
 //! # The contract
 //!

@@ -308,6 +308,24 @@ pub(crate) fn encode_table(dbname: &str, table: &str, src: &DataTable) -> Result
     Ok(bytes)
 }
 
+/// DECIMAL and INTERVAL have no Vortex storage mapping yet: the engine's
+/// persistence (`.pink` v5) and the `pinklake` lake format support both.
+/// Refuse at the encode entry instead of mis-encoding.
+fn refuse_unrepresentable(schema: &[(String, DataType)]) -> Result<()> {
+    if let Some((name, dtype)) = schema
+        .iter()
+        .find(|(_, t)| matches!(t, DataType::Decimal { .. } | DataType::Interval))
+    {
+        return Err(LakeError::NotRepresentable {
+            message: format!(
+                "column \"{name}\" ({dtype}) is not supported by the Vortex lake format \
+                 yet; use the `pinklake` build or the engine's `.pink` persistence"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Encode one table as a Vortex file (with its `pinkdb.table` segment)
 /// straight into `sink` (the lake streams it into the data file's temp
 /// file instead of materializing the whole file in memory).
@@ -317,6 +335,10 @@ pub(crate) fn encode_table_into(
     src: &DataTable,
     sink: &mut (dyn Write + Send),
 ) -> Result<()> {
+    // Refuse unrepresentable types before `table_metadata`, whose type tags
+    // have no DECIMAL/INTERVAL mapping (the wave-88 format contract found
+    // that order panicking instead of returning this error).
+    refuse_unrepresentable(&src.schema())?;
     let metadata = table_metadata(dbname, table, src)?;
     encode_table_with_metadata(dbname, table, src, Some(metadata), sink, true)
 }
@@ -349,20 +371,7 @@ fn encode_table_with_metadata(
             ),
         });
     }
-    // DECIMAL and INTERVAL have no Vortex storage mapping yet: the engine's
-    // persistence (`.pink` v5) and the `pinklake` lake format support
-    // both. Refuse at the encode entry instead of mis-encoding.
-    if let Some((name, dtype)) = schema
-        .iter()
-        .find(|(_, t)| matches!(t, DataType::Decimal { .. } | DataType::Interval))
-    {
-        return Err(LakeError::NotRepresentable {
-            message: format!(
-                "column \"{name}\" ({dtype}) is not supported by the Vortex lake format \
-                 yet; use the `pinklake` build or the engine's `.pink` persistence"
-            ),
-        });
-    }
+    refuse_unrepresentable(&schema)?;
     // One pass over the chunks computes both the per-chunk NULL flags (used
     // to build each chunk's validity) and the table-level nullability (all
     // chunks of a table share one dtype, so one nullable chunk makes the

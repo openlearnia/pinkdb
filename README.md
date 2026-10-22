@@ -748,10 +748,28 @@ millisecond-precision, so such a table is refused rather than written
 lossily). Choose the write format with `.lake format <id>` (no argument lists
 the registered ids) or `Lake::set_write_format`; everything else — catalog,
 commits, attach (exact `COUNT`/`MIN`/`MAX` from manifest statistics), S3,
-encryption, maintenance — works the same for every provider. A lake whose
-catalog names an id this build has no provider for is refused with a clear
-error. Existing catalogs are byte-identical. Iceberg reads through the same
-seam are a follow-up.
+encryption, maintenance — works the same for every provider. Existing
+catalogs are byte-identical. Iceberg reads through the same seam are a
+follow-up.
+
+**Mixed lakes (wave 88).** One lake may hold tables in different formats.
+`.lake format <id> for <db.table>` (`Lake::set_table_format`) chooses a
+table's format for later saves, and `.lake rewrite <dir> <table> format <id>`
+(`Lake::rewrite_table_format`) converts an existing table in one atomically
+published version. A format chosen explicitly — per table, with `.lake format
+<id>`, or by a rewrite — is **pinned** in the table's catalog entry
+(`"format_pinned": true`): later saves and appends keep it. A table written
+under the build default is not pinned and migrates to the saving build's
+format, as described under **Migration** below; Parquet tables are always
+pinned. A table whose format this build cannot read (an unregistered id, or
+Vortex in a build without `vortexlake`) is refused **per table**, not per
+lake: `.lake open` loads the other tables and prints a warning for each
+skipped one, `.lake attach` lists it but any read of it fails naming the
+format, and a save carries it forward unchanged (a save whose store has a
+table under the same name is refused). Every provider passes one shared
+format contract test (type round-trips including NULL/NaN/±0.0/±inf, clean
+refusal of unsupported types, attach statistics equal to an opened store,
+appends and rewrites).
 
 `pink-lake` is the minimal lake: **metadata and data storage decoupled** — a
 JSON catalog plus immutable per-table data files, on local disk or (with the
@@ -850,10 +868,11 @@ byte-identical to the pre-wave-64 shape.
 **Migration:** open an old lake and `.lake save` again — the next snapshot is a
 full rewrite in this build's v4 format; old snapshots and their data files stay
 untouched, so every published version still loads. A `pinklake` build
-refuses a v4 (or v2/v3) **Vortex** lake with the rebuild-with-`vortexlake`
-error (a pinklake-written lake opens bit-exactly in a vortexlake build, which
-migrates it on the next save), and a v1/v2/v3 lake stays readable in both
-builds. Any unknown
+refuses a v2/v3 **Vortex** lake with the rebuild-with-`vortexlake` error and,
+since wave 88, skips the Vortex tables of a v4+ lake per table (a
+pinklake-written lake opens bit-exactly in a vortexlake build, which migrates
+its unpinned tables on the next save), and a v1/v2/v3 lake stays readable in
+both builds. Any unknown
 `format_version` (a lake written by a newer pinkdb) refuses with "the lake was
 written by a newer pinkdb — upgrade to open it", and a wrong-shape entry (a
 v2/v3 entry without `format`, a v4 file object without its row count, a v4

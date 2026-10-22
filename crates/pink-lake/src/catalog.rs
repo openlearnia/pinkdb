@@ -36,9 +36,27 @@
 //! id**, resolved through the process-global provider registry
 //! ([`crate::format`]): `"pink"` and `"vortex"` are the built-ins, and an
 //! extension may register more. An id with no registered provider is a clean
-//! [`LakeError::UnknownFormat`] at open/attach/read/maintenance — never a
-//! panic or a silent fallback. The catalog stores only the id string, so
-//! existing manifests stay byte-identical.
+//! [`LakeError::UnknownFormat`] when that table is read or written — never a
+//! panic or a silent fallback; a v4–v6 lake still opens, and
+//! [`crate::Lake::unavailable_tables`] names the tables this build cannot
+//! read (wave 88, rule 5). The catalog stores only the id string, so existing
+//! manifests stay byte-identical.
+//!
+//! Wave 88 adds the optional per-table `"format_pinned"` flag:
+//!
+//! ```json
+//! "main.t": { "files": [ … ], "rows": 7, "format": "vortex",
+//!             "format_pinned": true }
+//! ```
+//!
+//! A format chosen explicitly — a per-table choice, an explicit
+//! `Lake::set_write_format`, or `Lake::rewrite_table_format` — is recorded as
+//! `true`; an entry written under the build default is not pinned (the field
+//! is omitted, so catalogs written by default stay byte-identical, and older
+//! builds ignore it). A full save keeps a pinned entry's format; an unpinned
+//! entry keeps the wave-45 migration behavior (it is re-encoded into the
+//! saving build's write format). An entry whose format id is not a built-in
+//! default (anything but `pink`/`vortex`) is always treated as pinned.
 //!
 //! `format_version` 2 and 3 are single-file Vortex lakes (3: larger row
 //! blocks), readable but not written any more; a v1 manifest — written by the
@@ -710,6 +728,18 @@ pub(crate) struct TableEntry {
     /// absent (⇒ `"pink"`) in a `format_version` 1 manifest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) format: Option<FileFormat>,
+    /// Wave 88: true when [`TableEntry::format`] was chosen **explicitly**
+    /// (a per-table choice, an explicit
+    /// [`Lake::set_write_format`](crate::Lake::set_write_format), or
+    /// [`Lake::rewrite_table_format`](crate::Lake::rewrite_table_format)), so
+    /// a later full save keeps it. Unpinned entries follow the wave-45
+    /// migration behavior: a full save re-encodes them into the saving
+    /// build's write format. Omitted when false, so catalogs written by
+    /// default stay byte-identical; older builds ignore the field. An entry
+    /// whose format id is not a built-in default (`pink`/`vortex`) is always
+    /// treated as pinned, whatever this field says.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) format_pinned: bool,
     /// The v1 `.pink` statistics block (see the struct docs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stats: Option<crate::stats::StatsBlock>,

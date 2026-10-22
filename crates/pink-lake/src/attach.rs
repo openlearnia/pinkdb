@@ -30,6 +30,18 @@
 //! the affected queries materialize; the row count stays exact and
 //! `COUNT(*)` keeps its fast path.
 //!
+//! # Unavailable formats (wave 88, rule 5)
+//!
+//! A v4–v6 entry whose format id has no registered provider (an unknown id,
+//! or `vortex` in a build without `vortexlake`) no longer refuses the lake.
+//! Attach lists the table in its descriptors — schema from the v5 record, or
+//! from the manifest's statistics block, so the planner can bind it — but
+//! every read of it (a scan, a projection, or any `COUNT`/`MIN`/`MAX` fast
+//! path that falls back) returns the provider error naming the table and the
+//! id. The descriptor advertises [`crate::UNAVAILABLE_ROWS`], a row count the
+//! engine's statistics fast paths cannot represent, which forces those fast
+//! paths onto the loader (and thus onto the error) instead of answering.
+//!
 //! # Pruned scans (wave 66)
 //!
 //! Per **file**, attach also keeps the file's own zone map and partition
@@ -218,6 +230,13 @@ pub(crate) struct LakeAttachment {
     lake_id: Option<String>,
     /// lowercased `(db, table)` → the data files and how to decode them.
     files: HashMap<(String, String), AttachedEntry>,
+    /// Wave 88, rule 5: lowercased `(db, table)` → the reason this build
+    /// cannot read the table's data-file format. The table is still listed
+    /// (with [`crate::UNAVAILABLE_ROWS`] as its advertised row count, so the
+    /// engine's statistics fast paths fall back to the loader), but every
+    /// load returns this message — naming the table and the format id —
+    /// instead of touching a file.
+    unavailable: HashMap<(String, String), String>,
     tables: Vec<AttachedTable>,
     /// Materialized columns per table, decoded lazily and cached.
     cache: Mutex<HashMap<(String, String), CachedTable>>,
@@ -346,6 +365,9 @@ impl AttachedLake for LakeAttachment {
         columns: Option<&[usize]>,
     ) -> std::result::Result<AttachedScan, PinkDbError> {
         let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        if let Some(message) = self.unavailable.get(&key) {
+            return Err(PinkDbError::Execution(message.clone()));
+        }
         // One decode per table at a time: the lock is held across the decode
         // so concurrent readers of one store materialize each column once.
         let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -444,6 +466,9 @@ impl AttachedLake for LakeAttachment {
         predicates: &[pinkdb::PrunePredicate],
     ) -> std::result::Result<AttachedScan, PinkDbError> {
         let key = (db.to_ascii_lowercase(), table.to_ascii_lowercase());
+        if let Some(message) = self.unavailable.get(&key) {
+            return Err(PinkDbError::Execution(message.clone()));
+        }
         if predicates.is_empty() {
             return self.load_projected(db, table, columns);
         }
@@ -936,9 +961,10 @@ fn load_file(
         }
         #[cfg(not(feature = "vortexlake"))]
         {
-            // Unreachable: `read_manifest` refuses a format this build has no
-            // provider for before an attach could see one. A clear error,
-            // never a panic.
+            // Unreachable: a footer-statistics provider this lean build does
+            // not have (`vortex`) is skipped by the per-table availability
+            // check before its files are touched (wave 88, rule 5). A clear
+            // error, never a panic.
             Err(LakeError::FeatureMissing {
                 feature: "vortexlake",
                 message: format!(
@@ -1325,6 +1351,7 @@ pub(crate) fn build_from(
     let root = root.to_path_buf();
     let mut tables: Vec<AttachedTable> = Vec::with_capacity(manifest.tables.len());
     let mut files: HashMap<(String, String), AttachedEntry> = HashMap::new();
+    let mut unavailable: HashMap<(String, String), String> = HashMap::new();
     let mut statistics_only = true;
     let encrypted = storage.encrypted();
     #[cfg(feature = "vortexlake")]
@@ -1333,6 +1360,56 @@ pub(crate) fn build_from(
     let remote = false;
     for (key, entry) in &manifest.tables {
         let (dbname, table) = split_key(key, &manifest_path)?;
+        // Wave 88, rule 5: a table whose format this build cannot read is
+        // still **listed**, but no file is touched for it and every read
+        // fails with the per-table message. The descriptor's schema comes
+        // from the v5 record, else from the published statistics block (both
+        // live in the manifest; no data file is opened), else it is empty.
+        let format = entry.format();
+        let provider = match crate::format::format_for(format.id(), &manifest_path) {
+            Ok(provider) => provider,
+            Err(error) => {
+                let record = crate::schema::TableSchema::from_entry(key, entry, &manifest_path)?;
+                let schema = match &record {
+                    Some(record) => record.schema_pairs(),
+                    None => entry
+                        .files
+                        .first()
+                        .and_then(|file| {
+                            block_file_stats(key, entry, file, &manifest_path, format.id())
+                                .ok()
+                                .map(|(schema, _)| schema)
+                        })
+                        .unwrap_or_default(),
+                };
+                let lkey = (dbname.to_ascii_lowercase(), table.to_ascii_lowercase());
+                if files.contains_key(&lkey) || unavailable.contains_key(&lkey) {
+                    return Err(LakeError::Corrupt {
+                        path: manifest_path.clone(),
+                        message: format!(
+                            "the manifest names \"{key}\" twice under one case-insensitive \
+                             name; refusing to attach an ambiguous table"
+                        ),
+                    });
+                }
+                unavailable.insert(
+                    lkey,
+                    format!(
+                        "lake table \"{key}\" uses data-file format \"{}\", which this build \
+                         cannot read: {error}",
+                        format.id()
+                    ),
+                );
+                tables.push(AttachedTable {
+                    db: dbname.to_string(),
+                    table: table.to_string(),
+                    rows: crate::UNAVAILABLE_ROWS,
+                    stats: vec![ColumnStats::unknown(); schema.len()],
+                    schema,
+                });
+                continue;
+            }
+        };
         // Every file (and delete file) must be present before anything is
         // read from it; the layout read decodes and validates every delete
         // file against the entry.
@@ -1388,8 +1465,6 @@ pub(crate) fn build_from(
                 }
             }
         }
-        let format = entry.format();
-        let provider = crate::format::format_for(format.id(), &manifest_path)?;
         let projected = provider.supports_projection();
         if provider.has_footer_stats() {
             statistics_only = false;
@@ -1502,9 +1577,10 @@ pub(crate) fn build_from(
                 }
                 #[cfg(not(feature = "vortexlake"))]
                 {
-                    // Unreachable: `read_manifest` refuses an entry whose
-                    // provider this lean build does not register. A clear
-                    // error, never a panic.
+                    // Unreachable: an entry whose provider this lean build
+                    // does not register is listed as unavailable and never
+                    // reaches its files (wave 88, rule 5). A clear error,
+                    // never a panic.
                     return Err(LakeError::FeatureMissing {
                         feature: "vortexlake",
                         message: format!(
@@ -1725,7 +1801,7 @@ pub(crate) fn build_from(
             })
             .collect();
         let lkey = (dbname.to_ascii_lowercase(), table.to_ascii_lowercase());
-        if files.contains_key(&lkey) {
+        if files.contains_key(&lkey) || unavailable.contains_key(&lkey) {
             return Err(LakeError::Corrupt {
                 path: manifest_path.clone(),
                 message: format!(
@@ -1756,6 +1832,7 @@ pub(crate) fn build_from(
         root,
         lake_id: lake_id.map(str::to_string),
         files,
+        unavailable,
         tables,
         cache: Mutex::new(HashMap::new()),
         loads: AtomicU64::new(0),
@@ -2038,6 +2115,7 @@ mod tests {
             }],
             rows: 3,
             format: Some(FileFormat::pink()),
+            format_pinned: false,
             stats: None,
             deletes: Vec::new(),
             partition_by: None,
@@ -2106,6 +2184,7 @@ mod tests {
             files: vec![FileRef::Path("data/main.t/x.pink".to_string())],
             rows: 3,
             format: None,
+            format_pinned: false,
             stats: Some(block),
             deletes: Vec::new(),
             partition_by: None,

@@ -398,6 +398,13 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
             scale,
         ),
         DataType::Interval => {
+            if let Some((months, days, micros)) = decode_interval_exact(s) {
+                return Some(Value::Interval {
+                    months,
+                    days,
+                    micros,
+                });
+            }
             let iv = pinkdb::types::parse_interval(s)?;
             Value::Interval {
                 months: iv.months,
@@ -408,9 +415,102 @@ pub(crate) fn decode_value(dtype: DataType, s: &str) -> Option<Value> {
     })
 }
 
+/// Exact decoder for the canonical text [`encode_value`] writes for an
+/// INTERVAL (`pinkdb::types::format_interval`: optional `<n> year[s]`,
+/// `<n> month[s]`, `<n> day[s]`, then an optional signed
+/// `HH:MM:SS[.ffffff]`). The general SQL parser `parse_interval` accumulates
+/// in `f64`, which rounds micros beyond 2^53 and cannot reach `i64::MIN`;
+/// this integer path keeps every encoded value exact. `None` for anything
+/// that is not canonical (the caller then falls back to `parse_interval`).
+fn decode_interval_exact(s: &str) -> Option<(i32, i32, i64)> {
+    let mut months: i64 = 0;
+    let mut days: i64 = 0;
+    let mut micros: i64 = 0;
+    let mut tokens = s.split(' ').peekable();
+    while let Some(tok) = tokens.next() {
+        if tok.contains(':') {
+            if tokens.peek().is_some() {
+                return None;
+            }
+            let (neg, body) = match tok.strip_prefix('-') {
+                Some(rest) => (true, rest),
+                None => (false, tok),
+            };
+            let mut fields = body.split(':');
+            let h: u64 = fields.next()?.parse().ok()?;
+            let m: u64 = fields.next()?.parse().ok()?;
+            let sec = fields.next()?;
+            if fields.next().is_some() || m > 59 {
+                return None;
+            }
+            let (sec, frac) = match sec.split_once('.') {
+                Some((sec, f)) => {
+                    if f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()) {
+                        return None;
+                    }
+                    (sec, format!("{f:0<6}").parse::<u64>().ok()?)
+                }
+                None => (sec, 0),
+            };
+            let sec: u64 = sec.parse().ok()?;
+            if sec > 59 {
+                return None;
+            }
+            let total = i128::from(h) * 3_600_000_000
+                + i128::from(m) * 60_000_000
+                + i128::from(sec) * 1_000_000
+                + i128::from(frac);
+            micros = i64::try_from(if neg { -total } else { total }).ok()?;
+            continue;
+        }
+        let n: i64 = tok.parse().ok()?;
+        let unit = tokens.next()?;
+        match unit {
+            "year" | "years" => months = months.checked_add(n.checked_mul(12)?)?,
+            "month" | "months" => months = months.checked_add(n)?,
+            "day" | "days" => days = days.checked_add(n)?,
+            _ => return None,
+        }
+    }
+    Some((
+        i32::try_from(months).ok()?,
+        i32::try_from(days).ok()?,
+        micros,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interval_statistics_round_trip_exactly_at_the_extremes() {
+        for (months, days, micros) in [
+            (0, 0, 0),
+            (-12, -30, i64::MIN),
+            (i32::MAX, i32::MIN, i64::MAX),
+            (i32::MIN, i32::MAX, -1),
+            (13, 1, (1i64 << 53) + 1),
+            (-1, 0, 1),
+        ] {
+            let v = Value::Interval {
+                months,
+                days,
+                micros,
+            };
+            let text = encode_value(DataType::Interval, &v).unwrap();
+            assert_eq!(decode_value(DataType::Interval, &text), Some(v), "{text}");
+        }
+        // Statistics written before the exact decoder keep decoding.
+        assert_eq!(
+            decode_value(DataType::Interval, "1 day 02:00:00"),
+            Some(Value::Interval {
+                months: 0,
+                days: 1,
+                micros: 7_200_000_000,
+            })
+        );
+    }
 
     fn saved(dtype: DataType, min: Option<Value>, max: Option<Value>) -> SavedTableStats {
         SavedTableStats {
